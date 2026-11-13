@@ -76,6 +76,31 @@ it("uses declared effort families only for SDK harnesses", () => {
 });
 
 describe("effortLevelsForConv", () => {
+  it.each(["omp-native", "omp", "native-omp"])(
+    "offers OMP model and thinking controls for %s",
+    (harness) => {
+      const conv = { harness, labels: {} };
+      expect(modelPickerKindForConv(conv)).toBe("omp");
+      expect(shouldShowEffortPicker(conv)).toBe(true);
+      expect(effortLevelsForConv(conv)).toEqual([
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+      ]);
+      const child = {
+        harness,
+        labels: { "omnigent.wrapper": "omp-native-ui-subagent" },
+        parentSessionId: "parent",
+      };
+      expect(shouldShowModelPicker(child)).toBe(false);
+      expect(shouldShowEffortPicker(child)).toBe(false);
+    },
+  );
+
   it("returns the extended ladder (xhigh, max) for claude-code-native-ui", () => {
     // WHY: claude-native exposes the full reasoning ladder; dropping xhigh/max
     // here would silently cap those sessions at "high".
@@ -148,6 +173,7 @@ describe("shouldShowModelPicker", () => {
     // pi injects a live model switch into the running Pi process (via the bridge
     // inbox → setModel) and mirrors in-TUI /model picks back to model_override.
     expect(shouldShowModelPicker({ labels: { "omnigent.wrapper": "pi-native-ui" } })).toBe(true);
+    expect(shouldShowModelPicker({ labels: { "omnigent.wrapper": "omp-native-ui" } })).toBe(true);
     // devin mirrors its live model into model_override (the executor types
     // /model when a routed model changes), like opencode/pi.
     expect(shouldShowModelPicker({ labels: { "omnigent.wrapper": "devin-native-ui" } })).toBe(true);

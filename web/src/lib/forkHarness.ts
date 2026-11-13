@@ -76,6 +76,9 @@ export function isNativeHarness(harness: string | null | undefined): boolean {
     harness === "native-devin" ||
     harness === "pi-native" ||
     harness === "native-pi" ||
+    harness === "omp-native" ||
+    harness === "omp" ||
+    harness === "native-omp" ||
     harness === "antigravity-native" ||
     harness === "native-antigravity" ||
     harness === "agy-native" ||
@@ -99,6 +102,9 @@ const NATIVE_REBUILD_HARNESSES: ReadonlySet<string> = new Set([
   "native-codex",
   "pi-native",
   "native-pi",
+  "omp-native",
+  "omp",
+  "native-omp",
   "hermes-native",
   "native-hermes",
   "qwen-native",

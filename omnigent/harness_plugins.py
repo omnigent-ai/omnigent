@@ -24,6 +24,7 @@ from omnigent._wrapper_labels import (
     HERMES_NATIVE_WRAPPER_VALUE,
     KIMI_NATIVE_WRAPPER_VALUE,
     KIRO_NATIVE_WRAPPER_VALUE,
+    OMP_NATIVE_WRAPPER_VALUE,
     OPENCODE_NATIVE_WRAPPER_VALUE,
     PI_NATIVE_WRAPPER_VALUE,
     QWEN_NATIVE_WRAPPER_VALUE,
@@ -175,6 +176,16 @@ PI_NATIVE_CODING_AGENT = NativeCodingAgent(
     terminal_name="pi",
 )
 
+OMP_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="omp",
+    display_name="OMP",
+    agent_name="omp-native-ui",
+    harness="omp-native",
+    wrapper_label=OMP_NATIVE_WRAPPER_VALUE,
+    terminal_name="omp",
+    subagent_wrapper_label="omp-native-ui-subagent",
+)
+
 OPENCODE_NATIVE_CODING_AGENT = NativeCodingAgent(
     key="opencode",
     display_name="OpenCode",
@@ -315,6 +326,7 @@ _BUILTIN_NATIVE_PROVIDERS: tuple[NativeHarnessProvider, ...] = tuple(
         CLAUDE_NATIVE_CODING_AGENT,
         CODEX_NATIVE_CODING_AGENT,
         PI_NATIVE_CODING_AGENT,
+        OMP_NATIVE_CODING_AGENT,
         OPENCODE_NATIVE_CODING_AGENT,
         CURSOR_NATIVE_CODING_AGENT,
         KIRO_NATIVE_CODING_AGENT,
@@ -406,6 +418,26 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.REBUILD,
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
+        instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
+        workspace_file_mentions=True,
+    ),
+    "omp-native": _C(
+        _IM.NATIVE_TUI,
+        _EL.HOOK,
+        _RS.WARM_REATTACH,
+        _EF.PI,
+        _MF.MULTI,
+        _AU.SESSION_SCOPED_CONFIG,
+        subagents=True,
+        interrupt=True,
+        streaming=True,
+        steering=True,
+        live_queue=True,
+        images=True,
+        compaction=True,
+        fork_history=_FH.REBUILD,
+        shell_tool_name="bash",
+        shell_tool_prompt=_SHELL_PROMPT,
         instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
         workspace_file_mentions=True,
     ),
@@ -800,6 +832,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "open-responses",
             "openai-agents",
             "opencode-native",
+            "omp-native",
             "pi",
             "pi-native",
             "qwen",
@@ -832,6 +865,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "kiro-native": "omnigent.inner.kiro_native_harness",
         "openai-agents": "omnigent.inner.openai_agents_sdk_harness",
         "opencode-native": "omnigent.inner.opencode_native_harness",
+        "omp-native": "omnigent.inner.omp_native_harness",
         "pi": "omnigent.inner.pi_harness",
         "pi-native": "omnigent.inner.pi_native_harness",
         "qwen": "omnigent.inner.qwen_harness",
@@ -864,6 +898,8 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "native-kiro": "kiro-native",
         "native-opencode": "opencode-native",
         "native-pi": "pi-native",
+        "native-omp": "omp-native",
+        "omp": "omp-native",
         "native-qwen": "qwen-native",
         "opencode": "opencode-native",
         "openai-agents-sdk": "openai-agents",
@@ -896,6 +932,9 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "native-qwen",
             "opencode-native",
             "pi-native",
+            "omp-native",
+            "native-omp",
+            "omp",
             "qwen-native",
         }
     ),
@@ -903,6 +942,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         CLAUDE_NATIVE_CODING_AGENT,
         CODEX_NATIVE_CODING_AGENT,
         PI_NATIVE_CODING_AGENT,
+        OMP_NATIVE_CODING_AGENT,
         OPENCODE_NATIVE_CODING_AGENT,
         CURSOR_NATIVE_CODING_AGENT,
         KIRO_NATIVE_CODING_AGENT,
@@ -916,11 +956,26 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
     native_providers=_BUILTIN_NATIVE_PROVIDERS,
     # Catalog rows gate readiness on their vendor binary; the install spec also
     # feeds setup steps and (for npm rows) the one-click install path.
-    install_specs={name: row.install for name, row in ACP_CLI_HARNESSES.items()},
+    install_specs={
+        **{name: row.install for name, row in ACP_CLI_HARNESSES.items()},
+        "omp": HarnessInstallSpec(
+            "OMP",
+            "omp",
+            "@oh-my-pi/pi-coding-agent",
+            login_args=("login",),
+            min_version="18.19.0",
+            auth_hint="run `omp login` or configure an Omnigent provider",
+        ),
+    },
     harness_install_keys={
-        spelling: name
-        for name, row in ACP_CLI_HARNESSES.items()
-        for spelling in (name, *row.aliases)
+        **{
+            spelling: name
+            for name, row in ACP_CLI_HARNESSES.items()
+            for spelling in (name, *row.aliases)
+        },
+        "omp": "omp",
+        "omp-native": "omp",
+        "native-omp": "omp",
     },
     model_env_keys={
         "acp": "HARNESS_ACP_MODEL",

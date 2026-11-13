@@ -33,13 +33,24 @@ def timeout_seconds(req: dict[str, Any]) -> float | None:
     return float(raw) / 1000.0
 
 
-def to_elicitation_params(req: dict[str, Any]) -> ElicitationRequestParams:
-    """Convert a Pi extension UI request into elicitation params for the web UI."""
+def to_elicitation_params(
+    req: dict[str, Any], *, harness: str = "pi-native"
+) -> ElicitationRequestParams:
+    """Convert a native extension dialog into safe web form controls."""
     method = req.get("method")
-    if not is_dialog_method(method):
+    omp = harness == "omp-native"
+    extras: dict[str, Any] = {"omp_extension_ui" if omp else "pi_extension_ui": req}
+    if method == "formDialog" and omp:
+        return ElicitationRequestParams(
+            mode="form",
+            message=_nonempty_str(req.get("title")) or "OMP needs your input",
+            requestedSchema=_native_form_schema(req),
+            phase="omp_extension_ui",
+            policy_name="omp_native_extension_ui",
+            **extras,
+        )
+    if not isinstance(method, str) or not is_dialog_method(method):
         raise ValueError(f"Unsupported Pi extension UI method: {method!r}")
-
-    extras: dict[str, Any] = {"pi_extension_ui": req}
     if method == "confirm":
         return ElicitationRequestParams(
             mode="form",
@@ -67,12 +78,49 @@ def to_elicitation_params(req: dict[str, Any]) -> ElicitationRequestParams:
 def to_ui_response(
     req: dict[str, Any],
     result: ElicitationResult | None,
+    *,
+    timed_out: bool = False,
 ) -> dict[str, Any]:
     """Convert an elicitation verdict into a Pi ``extension_ui_response``."""
     response_id = req.get("id")
     req_id = response_id if isinstance(response_id, str) and response_id else ""
     method = req.get("method")
     accepted = result is not None and result.action == "accept"
+    if method == "formDialog":
+        if not accepted:
+            return {
+                "type": "extension_ui_response",
+                "id": req_id,
+                "cancelled": True,
+                "timedOut": result is None and timed_out,
+            }
+        content = result.content or {}
+        properties = _native_form_schema(req)["properties"]
+        values: dict[str, Any] = {}
+        for name, prop in properties.items():
+            if name not in content:
+                continue
+            value = content[name]
+            kind = prop["type"]
+            valid = (
+                (kind == "boolean" and isinstance(value, bool))
+                or (kind == "string" and isinstance(value, str))
+                or (
+                    kind == "number"
+                    and not isinstance(value, bool)
+                    and isinstance(value, int | float)
+                )
+                or (
+                    kind == "number"
+                    and prop.get("x-preserve-empty") is True
+                    and isinstance(value, str)
+                    and not value.strip()
+                )
+            )
+            if not valid:
+                return {"type": "extension_ui_response", "id": req_id, "cancelled": True}
+            values[name] = value
+        return {"type": "extension_ui_response", "id": req_id, "value": values}
     if method == "confirm":
         return {
             "type": "extension_ui_response",
@@ -164,3 +212,26 @@ def _answer_labels(answer: object) -> list[str]:
 
 def _nonempty_str(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _native_form_schema(req: dict[str, Any]) -> dict[str, Any]:
+    """Allow primitive schema controls only; HTML is parsed inside OMP, not here."""
+    schema = req.get("requestedSchema")
+    if not isinstance(schema, dict) or schema.get("type") != "object":
+        raise ValueError("OMP formDialog requires an object requestedSchema")
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        raise ValueError("OMP formDialog requires schema properties")
+    for name, prop in properties.items():
+        if (
+            not isinstance(name, str)
+            or not isinstance(prop, dict)
+            or prop.get("type") not in {"string", "number", "boolean"}
+        ):
+            raise ValueError("OMP formDialog supports primitive named schema controls")
+    required = schema.get("required", [])
+    if not isinstance(required, list) or any(
+        not isinstance(name, str) or name not in properties for name in required
+    ):
+        raise ValueError("OMP formDialog required fields must name schema properties")
+    return {**schema, "properties": properties, "required": required}

@@ -79,6 +79,7 @@ import {
 } from "@/lib/nativeHarnessModes";
 import {
   CLAUDE_NATIVE_EFFORTS,
+  PI_NATIVE_EFFORTS,
   DescribedSelect,
   EFFORT_SELECT_NONE,
   MODEL_SELECT_DEFAULT,
@@ -321,6 +322,9 @@ function ForkRunConfig({
   // the modelPicker capability (mirrors the new-session dialog).
   const isCodex = targetHarness === "codex-native";
   const showModel = hasModelPicker || isCodex;
+  const hasThinkingLevel = targetHarness === "omp-native";
+  const effortOptions = hasThinkingLevel ? PI_NATIVE_EFFORTS : CLAUDE_NATIVE_EFFORTS;
+  const showEffort = hasPermission || hasThinkingLevel;
 
   // Live model catalog for the target harness on the picked host. Only the
   // native harnesses that expose a picker resolve a catalog; others pass a
@@ -360,10 +364,8 @@ function ForkRunConfig({
     // offered vocabulary (e.g. "minimal") falls back to Default rather than
     // leaving the Select on an empty, unselectable value.
     const effort = sameFamilyAsSource ? sourceSession?.reasoningEffort : null;
-    return effort && CLAUDE_NATIVE_EFFORTS.some((e) => e.value === effort)
-      ? effort
-      : EFFORT_SELECT_NONE;
-  }, [sameFamilyAsSource, sourceSession]);
+    return effort && effortOptions.some((e) => e.value === effort) ? effort : EFFORT_SELECT_NONE;
+  }, [sameFamilyAsSource, sourceSession, effortOptions]);
   const seededPermission = useMemo(() => {
     // Permission mode rides terminal_launch_args, which the backend copies
     // ONLY on a same-AGENT fork (copy_terminal_launch_args = not switching).
@@ -475,10 +477,10 @@ function ForkRunConfig({
     if (showModel && touched.model) {
       value.modelOverride = model === MODEL_SELECT_DEFAULT ? "default" : model;
     }
+    if (showEffort && touched.effort) {
+      value.reasoningEffort = effort === EFFORT_SELECT_NONE ? "default" : effort;
+    }
     if (hasPermission) {
-      if (touched.effort) {
-        value.reasoningEffort = effort === EFFORT_SELECT_NONE ? "default" : effort;
-      }
       if (touched.permission) {
         value.terminalLaunchArgs =
           permission === CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
@@ -503,6 +505,7 @@ function ForkRunConfig({
     onChange(value);
   }, [
     showModel,
+    showEffort,
     hasPermission,
     hasApproval,
     hasCursor,
@@ -550,46 +553,46 @@ function ForkRunConfig({
         </ForkConfigRow>
       )}
 
-      {hasPermission && (
-        <>
-          <ForkConfigRow label="Effort">
-            <Select
-              value={effort}
-              onValueChange={changeEffort}
-              componentId="fork_session.config.effort"
-              valueHasNoPii
+      {showEffort && (
+        <ForkConfigRow label={hasThinkingLevel ? "Thinking level" : "Effort"}>
+          <Select
+            value={effort}
+            onValueChange={changeEffort}
+            componentId="fork_session.config.effort"
+            valueHasNoPii
+          >
+            <SelectTrigger
+              className="w-full cursor-pointer text-sm"
+              data-testid="fork-session-config-effort"
+              aria-label="Reasoning effort"
             >
-              <SelectTrigger
-                className="w-full cursor-pointer text-sm"
-                data-testid="fork-session-config-effort"
-                aria-label="Reasoning effort"
-              >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent position="popper" align="start" className={FORK_SELECT_ITEM_SM}>
-                <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
-                {CLAUDE_NATIVE_EFFORTS.map((e) => (
-                  <SelectItem key={e.value} value={e.value}>
-                    {e.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </ForkConfigRow>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent position="popper" align="start" className={FORK_SELECT_ITEM_SM}>
+              <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
+              {effortOptions.map((e) => (
+                <SelectItem key={e.value} value={e.value}>
+                  {e.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </ForkConfigRow>
+      )}
 
-          <ForkConfigRow label="Permissions">
-            <DescribedSelect
-              value={permission}
-              onValueChange={changePermission}
-              options={CLAUDE_NATIVE_PERMISSION_MODES}
-              testId="fork-session-config-permission"
-              ariaLabel="Permissions"
-              triggerClassName="text-sm"
-              contentClassName={FORK_SELECT_ITEM_SM}
-              componentId="fork_session.config.permission"
-            />
-          </ForkConfigRow>
-        </>
+      {hasPermission && (
+        <ForkConfigRow label="Permissions">
+          <DescribedSelect
+            value={permission}
+            onValueChange={changePermission}
+            options={CLAUDE_NATIVE_PERMISSION_MODES}
+            testId="fork-session-config-permission"
+            ariaLabel="Permissions"
+            triggerClassName="text-sm"
+            contentClassName={FORK_SELECT_ITEM_SM}
+            componentId="fork_session.config.permission"
+          />
+        </ForkConfigRow>
       )}
 
       {hasApproval && (

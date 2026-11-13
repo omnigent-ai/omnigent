@@ -84,9 +84,11 @@ export function missingHarnessCredentialCopy(
     ? "ChatGPT account or API key"
     : canonicalHarness === "claude-native" || canonicalHarness === "claude"
       ? "Claude subscription or API key"
-      : harnessCredentialFamily(harness) !== null
-        ? "API key or gateway credential"
-        : "credentials";
+      : canonicalHarness === "omp-native"
+        ? "OMP login, API key or gateway credential"
+        : harnessCredentialFamily(harness) !== null
+          ? "API key or gateway credential"
+          : "credentials";
   return `No ${credential} on ${hostName}, so new sessions can’t use ${harnessName}.`;
 }
 
@@ -361,6 +363,7 @@ export function harnessCredentialFamily(harness: string | null | undefined): str
   if (["claude", "claude-native", "native-claude"].includes(harness)) return "anthropic";
   if (["codex", "codex-native", "native-codex"].includes(harness)) return "openai";
   if (["pi", "pi-native", "native-pi"].includes(harness)) return "anthropic";
+  if (canonicalNativeHarness(harness) === "omp-native") return "anthropic";
   return null;
 }
 
@@ -379,6 +382,7 @@ export function harnessCredentialFamily(harness: string | null | undefined): str
 export function harnessCredentialAdoptFamilies(harness: string | null | undefined): string[] {
   const family = harnessCredentialFamily(harness);
   if (family === null) return [];
+  if (harness && canonicalNativeHarness(harness) === "omp-native") return ["anthropic", "openai"];
   if (["pi", "pi-native", "native-pi"].includes(harness as string)) return ["anthropic", "openai"];
   return [family];
 }

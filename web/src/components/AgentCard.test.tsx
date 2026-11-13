@@ -54,6 +54,7 @@ describe("AgentCard icon selection", () => {
     { name: "opencode-native-ui", harness: "opencode-native", expected: "opencode" },
     { name: "claude-native-ui", harness: "claude-native", expected: "claude" },
     { name: "pi-native-ui", harness: "pi-native", expected: "pi" },
+    { name: "omp-native-ui", harness: "omp-native", expected: "pi" },
     { name: "cursor-native-ui", harness: "cursor-native", expected: "cursor" },
     { name: "goose-native-ui", harness: "goose-native", expected: "goose" },
     // A goose-harnessed agent also reads as Goose via the harness fallback —

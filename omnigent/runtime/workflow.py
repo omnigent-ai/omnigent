@@ -1179,7 +1179,7 @@ def _resolve_provider_for_build(
     bound = resolve_bound_provider(explicit_config, identity, spec.executor.auth)
     if bound is not None:
         return bound
-    harness = _provider_harness_name(harness_type)
+    harness = "omp-native" if identity == "omp-native" else _provider_harness_name(harness_type)
     auth = spec.executor.auth
     if isinstance(auth, ProviderAuth):
         # A named provider is resolved against the explicit config merged with

@@ -4612,3 +4612,84 @@ async def test_events_compact_on_claude_sdk_buffered_compact_failed_fallback() -
         f"swallowed); got {len(in_progress)} from types {[e.get('type') for e in events]}"
     )
     assert completed == [], "no completed should appear when nothing compacted"
+
+
+@pytest.mark.asyncio
+async def test_events_clear_on_omp_native_rotates_only_omp_under_launch_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """API clear rotates OMP without pre-clearing the UUID needed by hook CAS."""
+    from omnigent.runner.native import orchestration
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = f"conv_{uuid.uuid4().hex[:12]}"
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("omp", "main", tmp_path)
+    terminal_registry._by_conversation[conv_id] = {("omp", "main"): instance}
+    calls: list[dict[str, Any]] = []
+    closed: list[tuple[str, str]] = []
+
+    async def relaunch(session_id: str, *args: Any, **kwargs: Any) -> None:
+        calls.append({"session_id": session_id, **kwargs})
+
+    async def close(self: Any, session_id: str, terminal_id: str) -> bool:
+        closed.append((session_id, terminal_id))
+        return True
+
+    monkeypatch.setattr(orchestration, "_auto_create_omp_terminal", relaunch)
+    monkeypatch.setattr(SessionResourceRegistry, "close_terminal", close)
+    app, _ = await _build_app_for_spec(
+        _harness_spec("omp-native"), terminal_registry=terminal_registry,
+    )
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert created.status_code == 201, created.text
+        lock = app.state.native_terminal_ensure_locks["omp"].setdefault(
+            conv_id, asyncio.Lock(),
+        )
+        async with lock:
+            clear = asyncio.create_task(client.post(
+                f"/v1/sessions/{conv_id}/events", json={"type": "clear"},
+            ))
+            await asyncio.sleep(0.1)
+            assert not calls
+            assert not closed
+        response = await clear
+    assert response.status_code == 200, response.text
+    assert closed == [(conv_id, "terminal_omp_main")]
+    assert len(calls) == 1
+    assert calls[0]["fresh"] is True
+    assert calls[0]["session_id"] == conv_id
+
+
+@pytest.mark.asyncio
+async def test_events_clear_on_omp_native_reports_failed_rotation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runner.native import orchestration
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+
+    async def fail(*args: Any, **kwargs: Any) -> None:
+        raise OSError("could not launch OMP")
+
+    async def close(*args: Any, **kwargs: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(orchestration, "_auto_create_omp_terminal", fail)
+    monkeypatch.setattr(SessionResourceRegistry, "close_terminal", close)
+    app, _ = await _build_app_for_spec(_harness_spec("omp-native"))
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_omp_clear_error", "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert created.status_code == 201, created.text
+        response = await client.post(
+            "/v1/sessions/conv_omp_clear_error/events", json={"type": "clear"},
+        )
+    assert response.status_code == 503, response.text
+    assert response.json()["error"] == "omp_native_clear_failed"

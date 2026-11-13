@@ -199,6 +199,7 @@ describe("useSessionModelLabel", () => {
     ["codex-native", "gpt-6.1-sol", "system.ai.gpt-6-1-sol", "GPT-6.1-Sol"],
     ["claude-native", "SYSTEM.AI.CLAUDE-SONNET-5", "claude-sonnet-5", "Sonnet 5"],
     ["pi-native", "provider/GLM-5.3", "provider/glm-5.3", "GLM-5.3"],
+    ["omp-native", "provider/GLM-5.3", "provider/glm-5.3", "GLM-5.3"],
     ["cursor-native", "GEMINI-2.5-PRO", "gemini-2.5-pro", "Gemini 2.5 Pro"],
   ])(
     "keeps %s names consistent across host, live and cached catalogs",

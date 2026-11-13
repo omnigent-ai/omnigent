@@ -85,7 +85,7 @@ export type NativeCodingAgentCapability =
   | "devinPermission";
 
 export interface NativeCodingAgentSpec {
-  key: NativeCodingAgentIconKind;
+  key: NativeCodingAgentIconKind | "omp";
   agentName: string;
   harness: string;
   wrapperLabel: string;
@@ -200,6 +200,17 @@ export const NATIVE_CODING_AGENTS = [
     capabilities: ["modelPicker"],
   },
   {
+    key: "omp",
+    agentName: "omp-native-ui",
+    harness: "omp-native",
+    wrapperLabel: "omp-native-ui",
+    subagentWrapperLabel: "omp-native-ui-subagent",
+    displayName: "OMP",
+    iconKind: "pi",
+    sortRank: 42,
+    capabilities: ["modelPicker"],
+  },
+  {
     key: "kiro",
     agentName: "kiro-native-ui",
     harness: "kiro-native",
@@ -297,6 +308,8 @@ const BY_SUBAGENT_WRAPPER = new Map<string, NativeCodingAgentSpec>(
 // only use the canonical form, so they need no reversed entry here).
 const HARNESS_ALIASES: Record<string, string> = {
   "native-pi": "pi-native",
+  omp: "omp-native",
+  "native-omp": "omp-native",
   "native-cursor": "cursor-native",
   "native-kiro": "kiro-native",
   "native-antigravity": "antigravity-native",

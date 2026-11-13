@@ -20,6 +20,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
       "codex-native",
       "opencode-native",
       "pi-native",
+      "omp-native",
       "qwen-native",
     ],
   }),
@@ -63,6 +64,16 @@ const catalog = {
         detail: "",
         action: "command",
         command: null,
+        status_key: "authed",
+      },
+    ],
+    "omp-native": [
+      {
+        kind: "auth",
+        title: "Sign in",
+        detail: "",
+        action: "command",
+        command: "omp login",
         status_key: "authed",
       },
     ],
@@ -1261,6 +1272,7 @@ describe("HarnessFixDialog", () => {
     ["claude-native", "Claude Code"],
     ["codex-native", "Codex"],
     ["pi-native", "Pi"],
+    ["omp-native", "OMP"],
   ])("offers and preselects Isaac for %s when Databricks is detected", (harness, harnessLabel) => {
     renderDialog({ harness, harnessLabel });
 
@@ -1268,6 +1280,21 @@ describe("HarnessFixDialog", () => {
     if (harness === "pi-native") {
       expect(screen.queryByRole("radio", { name: /Personal subscription/ })).toBeNull();
     }
+  });
+
+  it("offers OMP's own login alongside managed credentials without claiming a subscription", async () => {
+    renderDialog({ harness: "omp-native", harnessLabel: "OMP" });
+    const user = userEvent.setup();
+    expect(screen.getByRole("radio", { name: /Isaac/ })).toBeVisible();
+    expect(screen.queryByRole("radio", { name: /Personal subscription/ })).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Use an API key or gateway URL instead" }),
+    ).toBeVisible();
+    await user.click(screen.getByRole("radio", { name: /OMP login/ }));
+    await user.click(screen.getByRole("button", { name: "Authenticate" }));
+    expect(screen.getByRole("heading", { name: "Sign in to OMP on Local laptop" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Copy login command" }));
+    expect(copyText).toHaveBeenCalledWith("omp login");
   });
 
   it.each([

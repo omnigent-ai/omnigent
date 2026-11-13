@@ -651,6 +651,53 @@ def test_harness_model_override_and_dimension_slice_reach_report(capsys) -> None
     assert [cell["dimension"] for cell in harness["cells"]] == ["basic_turn", "reasoning"]
 
 
+@pytest.mark.parametrize("name", ["omp-native", "omp", "native-omp"])
+def test_omp_native_selection_uses_registry_transport(name: str) -> None:
+    from tests.harness_bench.native_tui_driver import (
+        NativeTuiDriver,
+        native_vendor,
+        requires_gateway,
+    )
+    from tests.harness_bench.transport import resolve_driver_class
+
+    profile = resolve_profile(name)
+    assert profile.harness == "omp-native"
+    assert profile.transport == "native-tui"
+    assert profile.cli_binary == "omp"
+    assert profile == OFFICIAL_PROFILES["omp-native"]
+    assert resolve_driver_class(profile) is NativeTuiDriver
+    assert resolve_driver_class(profile, fast=True) is NativeTuiDriver
+    assert not requires_gateway(profile)
+    vendor = native_vendor(profile.harness)
+    assert vendor is not None
+    assert vendor.agent_name == "omp-native-ui"
+    assert vendor.terminal_name == "omp"
+    assert vendor.own_auth
+    assert vendor.tool_name == "bash"
+    assert vendor.tool_prompt
+    # The native driver does not send a model override, even for a multi-model CLI.
+    assert not NativeTuiDriver(profile, databricks_profile=None).applied_model_override
+
+
+@pytest.mark.parametrize("name", ["omp-native", "omp", "native-omp"])
+def test_omp_native_cli_selects_mcp_without_observing_it(
+    name: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from tests.harness_bench.__main__ import main
+
+    assert main(["--no-live", "--harness", name, "--dimension", "omnigent_mcp", "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert not payload["complete"]
+    assert not payload["has_drift"]
+    report = payload["harnesses"][0]
+    assert report["harness"] == "omp-native"
+    assert report["resolved_transport"] == "native-tui"
+    assert [cell["dimension"] for cell in report["cells"]] == ["basic_turn", "omnigent_mcp"]
+    assert all(cell["observed"] == "skipped" for cell in report["cells"])
+    assert report["cells"][1]["declared"] == "unknown"
+
+
 def test_multi_harness_specs_keep_models_attached(capsys) -> None:
     from tests.harness_bench.__main__ import main
 

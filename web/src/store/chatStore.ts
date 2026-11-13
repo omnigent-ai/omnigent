@@ -2603,7 +2603,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (
         local?.sessionHarness === "codex-native" ||
         local?.sessionHarness === "claude-sdk" ||
-        local?.sessionHarness === "pi-native"
+        local?.sessionHarness === "pi-native" ||
+        local?.sessionHarness === "omp-native"
       ) {
         if (local.sessionStatus === "running") continue;
         if (local.status === "streaming") {
@@ -4109,7 +4110,10 @@ export function isCompactControl(
   files?: File[],
 ): boolean {
   return (
-    (harness === "codex-native" || harness === "claude-sdk" || harness === "pi-native") &&
+    (harness === "codex-native" ||
+      harness === "claude-sdk" ||
+      harness === "pi-native" ||
+      harness === "omp-native") &&
     !files?.length &&
     text.trim() === "/compact"
   );
@@ -4117,7 +4121,12 @@ export function isCompactControl(
 
 export function rejectBusyCompact(conversationId: string | null): boolean {
   const state = conversationId === null ? undefined : setterForState(conversationId);
-  if (state?.sessionHarness === "claude-sdk" || state?.sessionHarness === "pi-native") return false;
+  if (
+    state?.sessionHarness === "claude-sdk" ||
+    state?.sessionHarness === "pi-native" ||
+    state?.sessionHarness === "omp-native"
+  )
+    return false;
   if (state?.status !== "streaming" && state?.sessionStatus !== "running") return false;
   toast.error("Compact is disabled while a chat is in progress", { richColors: true });
   return true;

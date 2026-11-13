@@ -108,6 +108,21 @@ describe("resolveHarnessPreference", () => {
     expect(result.candidate?.value).toBe("pi");
   });
 
+  it.each(["omp-native", "omp", "native-omp"])(
+    "restores an OMP preference stored as %s",
+    (alias) => {
+      expect(
+        resolveHarnessPreference(
+          [{ harness: "omp-native", readiness: ready, value: "omp" }],
+          alias,
+        ),
+      ).toMatchObject({
+        source: "preferred",
+        candidate: { value: "omp" },
+      });
+    },
+  );
+
   it("falls back deterministically to the first runnable candidate", () => {
     expect(resolveHarnessPreference(candidates, "pi-native")).toMatchObject({
       source: "fallback",

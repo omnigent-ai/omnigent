@@ -20481,11 +20481,12 @@ describe("chatStore — policy deny renders once", () => {
 
 describe("chatStore — client-side message queue", () => {
   it.each([
-    ...["codex-native", "claude-sdk", "pi-native"].flatMap((harness) =>
+    ...["codex-native", "claude-sdk", "pi-native", "omp-native"].flatMap((harness) =>
       ["foreground", "background", "evicted", "stranded"].map((mode) => [harness, mode]),
     ),
     ["claude-sdk", "steered"],
     ["pi-native", "steered"],
+    ["omp-native", "steered"],
   ])(
     "queues %s compact as a control and holds the next message until idle (%s)",
     async (harness, mode) => {

@@ -438,6 +438,7 @@ _UI_INSTALLABLE_HARNESS_TO_KEY: dict[str, str] = {
     "claude": ANTHROPIC_FAMILY,
     "codex": OPENAI_FAMILY,
     PI_KEY: PI_KEY,
+    "omp": "omp",
     OPENCODE_KEY: OPENCODE_KEY,
     QWEN_KEY: QWEN_KEY,
 }
@@ -508,7 +509,9 @@ def ui_installable_harnesses() -> frozenset[str]:
 # (omnigent stores no key for them), so they are NOT credential-configurable.
 # ``pi`` consumes anthropic/openai and is handled by the host store-secret
 # handler, so it's included via its own key.
-_UI_CREDENTIAL_FAMILIES: frozenset[str] = frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_KEY})
+_UI_CREDENTIAL_FAMILIES: frozenset[str] = frozenset(
+    {ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_KEY, "omp"}
+)
 
 
 def ui_credential_configurable_harnesses() -> frozenset[str]:
@@ -590,6 +593,14 @@ _UI_AUTH_STEP_BY_KEY: dict[str, SetupStep] = {
         detail="Add an API key or a gateway so Pi can run.",
         action="auth",
         command=None,
+        status_key="authed",
+    ),
+    "omp": SetupStep(
+        kind="auth",
+        title="Set up OMP authentication",
+        detail="Sign in with OMP or select an API key or gateway provider.",
+        action="auth",
+        command="omp login",
         status_key="authed",
     ),
     QWEN_KEY: SetupStep(
@@ -965,10 +976,10 @@ def harness_cli_binary(key: str) -> str | None:
     if spec is None:
         return None
     command = spec.binary
-    if key == PI_KEY:
+    if key in {PI_KEY, "omp"}:
         from omnigent.harness_startup_config import resolve_harness_path
 
-        command = resolve_harness_path("pi") or command
+        command = resolve_harness_path(key) or command
     return resolve_cli_binary(command)
 
 

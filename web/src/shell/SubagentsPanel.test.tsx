@@ -376,6 +376,11 @@ describe("SubagentsPanel", () => {
       expectedKind: "pi-native",
     },
     {
+      name: "omp-native wrapper → omp-native marker",
+      labels: { "omnigent.wrapper": "omp-native-ui" },
+      expectedKind: "omp-native",
+    },
+    {
       name: "nessie agent → nessie marker",
       labels: {},
       agentName: "nessie",

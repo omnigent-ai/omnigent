@@ -101,7 +101,6 @@ from omnigent.runner.resource_registry import (
     KIRO_NATIVE_TERMINAL_ROLE,
     OMNIGENT_REPL_TERMINAL_ROLE,
     OPENCODE_NATIVE_TERMINAL_ROLE,
-    PI_NATIVE_TERMINAL_ROLE,
     QWEN_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
     redacted_terminal_output,
@@ -2619,6 +2618,7 @@ def _build_pi_native_args(
     system_prompt_mode: str = "append",
     workspace: Path,
     agent_dir: Path,
+    harness: str = "pi-native",
 ) -> list[str]:
     """
     Build Pi CLI args for a runner-owned native TUI session.
@@ -2643,7 +2643,7 @@ def _build_pi_native_args(
         and system_prompt_mode == "append"
         and "--append-system-prompt" not in user_args
     ):
-        project_trusted = approve
+        project_trusted = harness == "omp-native" or approve
         for arg in user_args:
             if arg in ("--approve", "-a"):
                 project_trusted = True
@@ -2651,7 +2651,7 @@ def _build_pi_native_args(
                 project_trusted = False
         candidates = []
         if project_trusted:
-            candidates.append(workspace / ".pi" / "APPEND_SYSTEM.md")
+            candidates.append(workspace / (".omp" if harness == "omp-native" else ".pi") / "APPEND_SYSTEM.md")
         candidates.append(agent_dir / "APPEND_SYSTEM.md")
         # Our append flag disables Pi's discovery, so pass its selected file explicitly.
         for path in candidates:
@@ -2668,7 +2668,7 @@ def _build_pi_native_args(
     )
     if not context_files:
         args.append("--no-context-files")
-    if approve:
+    if approve and harness == "pi-native":
         # Pre-accept the project-folder trust dialog. Pi 0.79+ shows a
         # blocking TUI prompt on first launch in a directory with .pi/
         # resources. In a web-UI-driven session there is nobody at the
@@ -2678,6 +2678,8 @@ def _build_pi_native_args(
         args.extend(["--session-dir", str(session_dir)])
         if external_session_id:
             args.extend(["--session", external_session_id])
+    if harness == "omp-native":
+        args.extend(["--config", str(extension_path.parent / "omp-settings.yml")])
     args.extend(user_args)
     return args
 
@@ -2689,6 +2691,7 @@ async def _resolve_pi_resume_session(
     session_dir: Path,
     workspace: Path,
     server_client: httpx.AsyncClient | None,
+    harness: str = "pi-native",
 ) -> str | None:
     """
     Ensure Pi has a local session JSONL and return the id to launch with.
@@ -2736,7 +2739,10 @@ async def _resolve_pi_resume_session(
     # missing model is harmless.
     model = ""
     try:
-        from omnigent.harnesses.pi_native.credentials import resolve_pi_native_provider
+        if harness == "omp-native":
+            from omnigent.harnesses.omp_native.credentials import resolve_omp_native_provider as resolve_pi_native_provider
+        else:
+            from omnigent.harnesses.pi_native.credentials import resolve_pi_native_provider
 
         provider = await asyncio.to_thread(resolve_pi_native_provider)
         if provider is not None and getattr(provider, "model", None):
@@ -2846,6 +2852,8 @@ async def _auto_create_pi_terminal(
     server_client: httpx.AsyncClient | None,
     agent_spec: AgentSpec | ResolvedSpec | None = None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    harness: str = "pi-native",
+    fresh: bool = False,
 ) -> SessionResourceView:
     """
     Auto-create a Pi terminal for a pi-native session.
@@ -2863,21 +2871,38 @@ async def _auto_create_pi_terminal(
     """
     await _cancel_auto_forwarder_task(session_id)
     from omnigent.conversation_browser import conversation_url
-    from omnigent.harnesses.pi_native.bridge import (
-        PI_NATIVE_CONFIG_ENV_VAR,
-        clear_inbox,
-        pi_native_env_unset,
-        pi_session_dir,
-        prepare_bridge_dir,
-        write_agent_instructions,
-        write_extension_files,
-    )
-    from omnigent.harnesses.pi_native.bridge import extension_path as pi_extension_path
-    from omnigent.harnesses.pi_native.credentials import (
-        PI_CODING_AGENT_DIR_ENV_VAR,
-        global_pi_agent_dir,
-    )
-    from omnigent.harnesses.pi_native.main import resolve_pi_executable
+    if harness == "omp-native":
+        from omnigent.harnesses.omp_native.bridge import (
+            OMP_NATIVE_CONFIG_ENV_VAR as PI_NATIVE_CONFIG_ENV_VAR,
+            clear_inbox,
+            omp_native_env_unset as pi_native_env_unset,
+            omp_session_dir as pi_session_dir,
+            prepare_bridge_dir,
+            write_agent_instructions,
+            write_extension_files,
+            extension_path as pi_extension_path,
+        )
+        from omnigent.harnesses.omp_native.credentials import (
+            PI_CODING_AGENT_DIR_ENV_VAR,
+            global_omp_agent_dir as global_pi_agent_dir,
+        )
+        from omnigent.harnesses.omp_native.main import resolve_omp_executable as resolve_pi_executable
+    else:
+        from omnigent.harnesses.pi_native.bridge import (
+            PI_NATIVE_CONFIG_ENV_VAR,
+            clear_inbox,
+            pi_native_env_unset,
+            pi_session_dir,
+            prepare_bridge_dir,
+            write_agent_instructions,
+            write_extension_files,
+        )
+        from omnigent.harnesses.pi_native.bridge import extension_path as pi_extension_path
+        from omnigent.harnesses.pi_native.credentials import (
+            PI_CODING_AGENT_DIR_ENV_VAR,
+            global_pi_agent_dir,
+        )
+        from omnigent.harnesses.pi_native.main import resolve_pi_executable
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.runner._entry import _make_auth_token_factory
     from omnigent.runtime.prompt import raw_author_instructions
@@ -2941,6 +2966,8 @@ async def _auto_create_pi_terminal(
         auth_headers=auth_headers,
         tools=pi_tools,
         usage_baseline=launch_config.native_usage_baseline,
+        **({"previous_external_session_id": launch_config.external_session_id, "fresh": True}
+           if harness == "omp-native" and fresh else {}),
     )
     pi_command = resolve_pi_executable()
     # One ``pi --version`` probe feeds both the floor gate and the --approve
@@ -2951,19 +2978,22 @@ async def _auto_create_pi_terminal(
         pi_version,
     )
 
-    pi_cli_version = await asyncio.to_thread(pi_version, pi_command)
+    pi_cli_version = (
+        await asyncio.to_thread(pi_version, pi_command) if harness == "pi-native" else None
+    )
     if pi_cli_version is not None:
         check_pi_cli_version_floor(pi_cli_version)
     # Rebuild the local Pi session JSONL from committed Omnigent items so a
     # cold-resume or fork opens with prior conversation context (parity with
     # claude-native / codex-native). Returns the id to launch with via
     # ``--session`` (the captured id, a minted fork id, or None for fresh).
-    resume_session_id = await _resolve_pi_resume_session(
+    resume_session_id = None if fresh else await _resolve_pi_resume_session(
         session_id=session_id,
         launch_config=launch_config,
         session_dir=session_dir,
         workspace=launch_config.workspace,
         server_client=server_client,
+        **({"harness": harness} if harness == "omp-native" else {}),
     )
     pi_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     context_files = True
@@ -2979,8 +3009,15 @@ async def _auto_create_pi_terminal(
     pi_env_unset = pi_native_env_unset(os.environ)
     pi_env = {
         PI_NATIVE_CONFIG_ENV_VAR: str(config),
-        "OMNIGENT_PI_NATIVE_BRIDGE_DIR": str(bridge_dir),
+        f"OMNIGENT_{'OMP' if harness == 'omp-native' else 'PI'}_NATIVE_BRIDGE_DIR": str(bridge_dir),
     }
+    if harness == "omp-native":
+        pi_env["OMNIGENT_NATIVE_CONFIG"] = str(config)
+        pi_env["OMP_SKIP_SETUP"] = "1"
+        pi_env_unset.extend([
+            "HARNESS_PI_NATIVE_BRIDGE_DIR", "HARNESS_PI_NATIVE_REQUEST_SESSION_ID",
+            "OMNIGENT_PI_NATIVE_CONFIG", "OMNIGENT_PI_NATIVE_BRIDGE_DIR",
+        ])
     # Route the runner-owned Pi process through the provider configured by
     # ``omnigent setup`` (Databricks gateway / API key), so a separate
     # ``pi /login`` isn't required — the parity codex-native/claude-native
@@ -2994,18 +3031,25 @@ async def _auto_create_pi_terminal(
     model_notice: str | None = None
     from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
 
-    pi_binding = binding_for_harness(load_runtime_inference_config(), "pi-native")
+    pi_binding = binding_for_harness(load_runtime_inference_config(), harness)
     if pi_binding is not None and _pi_args_have_provider(launch_config.terminal_launch_args or []):
         raise ValueError(
             "This session has a configured Pi provider. Select its model in the composer "
             "and remove --provider, --model, and --api-key from terminal arguments."
         )
     if not _pi_args_have_provider(launch_config.terminal_launch_args or []):
-        from omnigent.harnesses.pi_native.credentials import (
-            pi_native_provider_launch,
-            pi_own_login_model_arg,
-            resolve_pi_native_provider,
-        )
+        if harness == "omp-native":
+            from omnigent.harnesses.omp_native.credentials import (
+                omp_native_provider_launch as pi_native_provider_launch,
+                omp_own_login_model_arg as pi_own_login_model_arg,
+                resolve_omp_native_provider as resolve_pi_native_provider,
+            )
+        else:
+            from omnigent.harnesses.pi_native.credentials import (
+                pi_native_provider_launch,
+                pi_own_login_model_arg,
+                resolve_pi_native_provider,
+            )
 
         # Provider-qualified picker values select one of the configured models.
         spec_model = launch_config.model_override or _pi_native_model_from_spec(agent_spec)
@@ -3019,15 +3063,15 @@ async def _auto_create_pi_terminal(
             provider = await asyncio.to_thread(resolve_pi_native_provider, model=spec_model)
         if provider is not None:
             launch = pi_native_provider_launch(
-                bridge_dir / "pi-agent",
+                bridge_dir / ("omp-agent" if harness == "omp-native" else "pi-agent"),
                 provider,
                 launch_config.reasoning_effort,
                 selection=spec_model,
                 global_agent_dir=global_pi_agent_dir(workspace=launch_config.workspace),
                 client_surface=resource_registry.client_surface(session_id),
-                pi_env=terminal_pane_environment(
+                **{("omp_env" if harness == "omp-native" else "pi_env"): terminal_pane_environment(
                     inherit_env=True, env=pi_env, env_unset=pi_env_unset
-                ),
+                )},
             )
             pi_env.update(launch.env)
             provider_args.extend(launch.args)
@@ -3048,7 +3092,14 @@ async def _auto_create_pi_terminal(
             own_login_model = pi_own_login_model_arg(spec_model)
             if own_login_model is not None:
                 provider_args.extend(["--model", own_login_model])
-    agent_dir = Path(pi_env.get(PI_CODING_AGENT_DIR_ENV_VAR) or global_pi_agent_dir()).expanduser()
+    if launch_config.reasoning_effort and not any(
+        arg == "--thinking" or arg.startswith("--thinking=")
+        for arg in [*(launch_config.terminal_launch_args or []), *provider_args]
+    ):
+        from omnigent.util.reasoning_effort import to_pi_thinking_level
+
+        provider_args.extend(["--thinking", to_pi_thinking_level(launch_config.reasoning_effort)])
+    agent_dir = Path(pi_env.get(PI_CODING_AGENT_DIR_ENV_VAR) or global_pi_agent_dir(workspace=launch_config.workspace)).expanduser()
     if not agent_dir.is_absolute():
         agent_dir = launch_config.workspace / agent_dir
     pi_args = _build_pi_native_args(
@@ -3062,9 +3113,13 @@ async def _auto_create_pi_terminal(
         approve=pi_cli_version is not None and pi_cli_version >= PI_APPROVE_MIN_VERSION,
         workspace=launch_config.workspace,
         agent_dir=agent_dir,
+        **({"harness": harness} if harness == "omp-native" else {}),
     )
     pi_args.extend(provider_args)
     from omnigent.harnesses.pi_native.auth_command import AUTH_DIR_ENV, refresh_model_auth
+
+    if harness == "omp-native":
+        from omnigent.harnesses.omp_native.credentials import AUTH_DIR_ENV
 
     model_auth_dir = Path(pi_env[AUTH_DIR_ENV]) if AUTH_DIR_ENV in pi_env else None
     if model_auth_dir is not None:
@@ -3076,9 +3131,9 @@ async def _auto_create_pi_terminal(
     agent_os_env = _agent_os_env_from_spec(agent_spec)
     terminal_view = await resource_registry.launch_required_terminal(
         session_id=session_id,
-        terminal_name="pi",
+        terminal_name="omp" if harness == "omp-native" else "pi",
         session_key="main",
-        resource_role=PI_NATIVE_TERMINAL_ROLE,
+        resource_role=harness,
         parent_os_env=agent_os_env,
         spec=TerminalEnvSpec(
             os_env=OSEnvSpec(
@@ -3151,14 +3206,14 @@ async def _auto_create_pi_terminal(
         await _post_native_launch_notice(
             session_id=session_id,
             server_client=server_client,
-            code="pi_native_effort_ignored",
+            code=f"{harness.replace('-', '_')}_effort_ignored",
             notice=effort_notice,
         )
     if model_notice is not None:
         await _post_native_launch_notice(
             session_id=session_id,
             server_client=server_client,
-            code="pi_native_model_rerouted",
+            code=f"{harness.replace('-', '_')}_model_rerouted",
             notice=model_notice,
         )
     # TUI-typed turns bypass the executor's per-turn bearer refresh. Pi has no
@@ -3176,7 +3231,7 @@ async def _auto_create_pi_terminal(
                     workspace=launch_config.workspace,
                     refresh_bridge=bool(auth_token),
                 ),
-                name=f"pi-auth-refresh-{session_id}",
+                name=f"{harness.removesuffix('-native')}-auth-refresh-{session_id}",
             ),
         )
     return terminal_view
@@ -10361,6 +10416,7 @@ async def _delete_native_bridge_dirs(
     from omnigent.harnesses.pi_native.bridge import (
         bridge_dir_for_session_id as pi_bridge_dir,
     )
+    from omnigent.harnesses.omp_native.bridge import bridge_dir_for_session_id as omp_bridge_dir
     from omnigent.harnesses.qwen_native.bridge import (
         bridge_dir_for_session_id as qwen_bridge_dir,
     )
@@ -10388,6 +10444,7 @@ async def _delete_native_bridge_dirs(
         opencode_bridge_dir(labels.get(OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
         opencode_bridge_dir(session_id),
         pi_bridge_dir(session_id),
+        omp_bridge_dir(session_id),
         qwen_bridge_dir(session_id),
     }
     # A cache can survive a missing bridge directory, including after a reboot.
@@ -10597,6 +10654,31 @@ class PreLaunchResult:
     skip: bool = False
     force_recreate: bool = False
     needs_terminal: bool = True
+
+
+async def _auto_create_omp_terminal(
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, _JsonObject], None],
+    *,
+    server_client: httpx.AsyncClient | None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
+    ensure_comment_relay: _EnsureCommentRelay | None = None,
+    fresh: bool = False,
+) -> SessionResourceView:
+    return await _auto_create_pi_terminal(
+        session_id, resource_registry, publish_event,
+        server_client=server_client, agent_spec=agent_spec,
+        ensure_comment_relay=ensure_comment_relay, harness="omp-native", fresh=fresh,
+    )
+
+
+async def _launch_omp(ctx: NativeLaunchContext) -> SessionResourceView:
+    return await _auto_create_omp_terminal(
+        ctx.session_id, ctx.resource_registry, ctx.publish_event,
+        server_client=ctx.server_client, agent_spec=ctx.agent_spec,
+        ensure_comment_relay=ctx.ensure_comment_relay,
+    )
 
 
 async def _launch_pi(ctx: NativeLaunchContext) -> SessionResourceView:

@@ -266,6 +266,8 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
         return _installer_only_availability(HERMES_KEY)
     if canonical in _DEVIN_NATIVE_HARNESSES:
         return _installer_only_availability(DEVIN_KEY)
+    if canonical == "omp-native":
+        return _installer_only_availability("omp")
     if canonical == CURSOR_KEY:
         # Cursor runs in-process via ``cursor-sdk`` and authenticates with a
         # ``CURSOR_API_KEY`` (a ``cursor-agent login`` does not apply). So,
@@ -980,6 +982,17 @@ def _harness_availability(canonical: str) -> HarnessAvailability:
         # bare ``False`` it historically reported. That keeps the picker badge /
         # warning copy uniform across every CLI-backed native harness.
         return _cli_family_availability(canonical, install_key)
+    if canonical == "omp-native":
+        binary_state = _binary_availability_reason("omp")
+        if binary_state is not True:
+            return binary_state
+        try:
+            from omnigent.harnesses.omp_native.credentials import omp_native_model_options
+
+            return True if omp_native_model_options() else HARNESS_NEEDS_AUTH
+        except Exception:
+            _logger.debug("OMP credential inventory unavailable", exc_info=True)
+            return HARNESS_NEEDS_AUTH
     if canonical in _PI_HARNESSES:
         # pi has no CLI login — its only credential is either an omnigent-managed
         # provider (an API key / gateway) or a pi-subscription ("Pi original auth",

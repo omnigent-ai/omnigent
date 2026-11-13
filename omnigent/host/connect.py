@@ -3728,6 +3728,7 @@ class HostProcess:
             ANTHROPIC_FAMILY: ANTHROPIC_FAMILY,
             OPENAI_FAMILY: OPENAI_FAMILY,
             "pi": ANTHROPIC_FAMILY,
+            "omp": ANTHROPIC_FAMILY,
         }.get(install_key or "")
         if family is None:
             return HostStoreSecretResultFrame(
@@ -4257,6 +4258,24 @@ class HostProcess:
                 request_id=frame.request_id,
                 status="ok",
                 models=with_source(pi_models),
+            )
+
+        if harness == "omp-native":
+            try:
+                from omnigent.harnesses.omp_native.credentials import omp_native_model_options
+
+                omp_models = await asyncio.to_thread(omp_native_model_options)
+            except Exception:
+                _logger.warning("OMP model catalog unavailable", exc_info=True)
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error="failed to resolve OMP model options",
+                )
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                models=with_source(omp_models),
             )
 
         if harness == "devin-native":

@@ -47,6 +47,8 @@ describe("permissionModeConcept", () => {
     expect(canonicalNativeHarness("native-claude")).toBe("claude-native");
     expect(canonicalNativeHarness("native-codex")).toBe("codex-native");
     expect(canonicalNativeHarness("native-pi")).toBe("pi-native");
+    expect(canonicalNativeHarness("omp")).toBe("omp-native");
+    expect(canonicalNativeHarness("native-omp")).toBe("omp-native");
     expect(canonicalNativeHarness("opencode-native")).toBe("opencode-native");
   });
 
@@ -54,6 +56,7 @@ describe("permissionModeConcept", () => {
     expect(harnessAccountKey("codex-native")).toBe("codex");
     expect(harnessAccountKey("native-claude")).toBe("claude");
     expect(harnessAccountKey("pi-native")).toBe("pi");
+    expect(harnessAccountKey("omp-native")).toBe("omp");
     expect(harnessAccountKey("opencode-native")).toBe("opencode");
   });
 

@@ -1083,6 +1083,9 @@ describe("Composer slash-command menu", () => {
     ["pi-native", "/compact", "idle"],
     ["pi-native", "/compact instructions", "idle"],
     ["pi-native", "/compact", "running"],
+    ["omp-native", "/compact", "idle"],
+    ["omp-native", "/compact instructions", "idle"],
+    ["omp-native", "/compact", "running"],
     ["opencode-native", "/compact", "idle"],
   ] as const)("%s handles %s (status: %s)", (harness, command, turnStatus) => {
     const { sessionHarness, status, sessionStatus } = useChatStore.getState();
@@ -1111,13 +1114,17 @@ describe("Composer slash-command menu", () => {
     fireEvent.change(textarea(), { target: { value: command + " " } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
     if (
-      (harness === "codex-native" || harness === "claude-sdk" || harness === "pi-native") &&
+      (harness === "codex-native" ||
+        harness === "claude-sdk" ||
+        harness === "pi-native" ||
+        harness === "omp-native") &&
       command !== "/compact"
     ) {
       expect(textarea()).toHaveValue(command + " ");
       const harnessName = {
         "codex-native": "Codex",
         "pi-native": "Pi",
+        "omp-native": "OMP",
         "claude-sdk": "Claude SDK",
       }[harness];
       expect(
@@ -8340,6 +8347,7 @@ describe("Composer config gear", () => {
     "kiro",
     "opencode",
     "pi",
+    "omp",
     "devin",
     "acp",
     "configured",

@@ -22,6 +22,25 @@ describe("nativeCodingAgentForHarness", () => {
     expect(nativeCodingAgentForHarness("pi-native")?.key).toBe("pi");
   });
 
+  it.each(["omp-native", "omp", "native-omp"])(
+    "recognizes %s as OMP without Pi identity",
+    (harness) => {
+      const agent = { name: "custom-omp", harness };
+      expect(nativeCodingAgentForHarness(harness)).toMatchObject({
+        key: "omp",
+        harness: "omp-native",
+        displayName: "OMP",
+        iconKind: "pi",
+      });
+      expect(nativeWrapperLabelsForAgent(agent)).toEqual({
+        [UI_MODE_LABEL_KEY]: UI_MODE_TERMINAL_VALUE,
+        [WRAPPER_LABEL_KEY]: "omp-native-ui",
+      });
+      expect(isNativeTerminalSession({ harness })).toBe(true);
+      expect(isFullySupportedNativeCodingAgent(agent)).toBe(false);
+    },
+  );
+
   it("resolves the canonical opencode-native harness", () => {
     expect(nativeCodingAgentForHarness("opencode-native")?.key).toBe("opencode");
   });
@@ -144,6 +163,7 @@ describe("nativeCodingAgentForSubagentWrapper", () => {
     expect(nativeCodingAgentForSubagentWrapper("devin-native-ui-subagent")?.displayName).toBe(
       "Devin",
     );
+    expect(nativeCodingAgentForSubagentWrapper("omp-native-ui-subagent")?.displayName).toBe("OMP");
   });
 
   it("does not resolve parent wrappers or unknown labels", () => {
@@ -157,6 +177,7 @@ describe("nativeCodingAgentForSubagentWrapper", () => {
   // one, hide Smart Routing's eligibility check behind the wrong branch).
   it("keeps sub-agent wrappers out of the native-terminal wrapper lookup", () => {
     expect(isNativeWrapper("claude-code-native-ui-subagent")).toBe(false);
+    expect(isNativeWrapper("omp-native-ui-subagent")).toBe(false);
     expect(
       isNativeTerminalSession({
         labels: { [WRAPPER_LABEL_KEY]: "claude-code-native-ui-subagent" },

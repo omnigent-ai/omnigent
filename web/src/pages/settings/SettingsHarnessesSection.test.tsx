@@ -171,6 +171,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
       "codex-native",
       "opencode-native",
       "pi-native",
+      "omp-native",
       "qwen-native",
     ],
   }),
@@ -688,6 +689,7 @@ describe("Harness details", () => {
           "claude-native": true,
           "codex-native": true,
           "pi-native": true,
+          "omp-native": true,
           "opencode-native": true,
         },
         harness_accounts: {
@@ -700,6 +702,10 @@ describe("Harness details", () => {
           pi: {
             kind: "providers",
             providers: [{ id: "anthropic", label: "Anthropic", auth_type: "oauth" }],
+          },
+          omp: {
+            kind: "providers",
+            providers: [{ id: "openai", label: "OpenAI", auth_type: "oauth" }],
           },
           opencode: {
             kind: "providers",
@@ -716,6 +722,7 @@ describe("Harness details", () => {
     expect(within(card("claude-native")).getByText("· person@example.com · Max")).toBeTruthy();
     expect(within(card("codex-native")).getByText("· codex@example.com · Plus")).toBeTruthy();
     expect(within(card("pi-native")).getByText("· Anthropic")).toBeTruthy();
+    expect(within(card("omp-native")).getByText("· OpenAI")).toBeTruthy();
     expect(within(card("opencode-native")).getByText("· Anthropic, OpenRouter")).toBeTruthy();
 
     fireEvent.click(screen.getByTestId("harness-settings-opencode-native"));
@@ -908,6 +915,18 @@ describe("Harness details", () => {
       ),
     ).toBeTruthy();
     expect(screen.queryByText(/No Claude subscription or API key/)).toBeNull();
+  });
+
+  it("offers OMP reconfiguration with own-login and managed-provider credential wording", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "omp-native": "needs-auth" } }];
+    renderHarnesses("omp-native");
+    expect(
+      screen.getByText(
+        "No OMP login, API key or gateway credential on my-laptop, so new sessions can’t use OMP.",
+      ),
+    ).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Reconfigure" }));
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-mode", "reconfigure");
   });
 
   it("uses Claude credential copy for Claude needs-auth", () => {

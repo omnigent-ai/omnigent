@@ -2351,59 +2351,71 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.reasoning_effort).toBe("high");
   });
 
-  it("rides an omni-setup model along to create for pi-native", async () => {
-    setAgents([
-      agent({
-        id: "ag_pi",
-        name: "pi-native-ui",
-        display_name: "Pi",
-        harness: "pi-native",
-      }),
-    ]);
-    vi.mocked(useHostModelOptions).mockReturnValue({
-      data: [
-        {
-          id: "omnigent-openai/system.ai.gpt-5-6-sol",
-          model: "omnigent-openai/system.ai.gpt-5-6-sol",
-          displayName: "GPT 5.6 Sol",
-        },
-        {
-          id: "omnigent/databricks-claude-sonnet-4-6",
-          model: "omnigent/databricks-claude-sonnet-4-6",
-          displayName: "Claude Sonnet 4.6",
-        },
-      ],
-      isLoading: false,
-    } as unknown as ReturnType<typeof useHostModelOptions>);
-    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ id: "conv_pi" }),
-    } as unknown as Response);
+  it.each([
+    ["pi-native", "Pi", ""],
+    ["omp-native", "OMP", "minimal"],
+  ])(
+    "rides managed model and thinking choices along to create for %s",
+    async (harness, displayName, effort) => {
+      setAgents([
+        agent({
+          id: "ag_pi",
+          name: `${harness}-ui`,
+          display_name: displayName,
+          harness,
+        }),
+      ]);
+      if (effort) {
+        localStorage.setItem(
+          "omnigent:last-mode-by-harness",
+          JSON.stringify({ [harness]: { effort } }),
+        );
+      }
+      vi.mocked(useHostModelOptions).mockReturnValue({
+        data: [
+          {
+            id: "omnigent-openai/system.ai.gpt-5-6-sol",
+            model: "omnigent-openai/system.ai.gpt-5-6-sol",
+            displayName: "GPT 5.6 Sol",
+          },
+          {
+            id: "omnigent/databricks-claude-sonnet-4-6",
+            model: "omnigent/databricks-claude-sonnet-4-6",
+            displayName: "Claude Sonnet 4.6",
+          },
+        ],
+        isLoading: false,
+      } as unknown as ReturnType<typeof useHostModelOptions>);
+      vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ id: "conv_pi" }),
+      } as unknown as Response);
 
-    renderLanding();
-    await waitForWorkspaceSeed();
-    openAgentModels("ag_pi");
-    const fullNameRow = document.querySelector(
-      '[data-testid="new-chat-landing-agent-model-omnigent-openai/system.ai.gpt-5-6-sol"]',
-    );
-    expect(fullNameRow).not.toBeNull();
-    expect(fullNameRow).toHaveTextContent("GPT 5.6 Sol");
-    expect(fullNameRow).toHaveAttribute("title", "omnigent-openai/system.ai.gpt-5-6-sol");
-    fireEvent.click(screen.getByText("GPT 5.6 Sol"));
-    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
-    typeMessage("go");
-    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      renderLanding();
+      await waitForWorkspaceSeed();
+      openAgentModels("ag_pi");
+      const fullNameRow = document.querySelector(
+        '[data-testid="new-chat-landing-agent-model-omnigent-openai/system.ai.gpt-5-6-sol"]',
+      );
+      expect(fullNameRow).not.toBeNull();
+      expect(fullNameRow).toHaveTextContent("GPT 5.6 Sol");
+      expect(fullNameRow).toHaveAttribute("title", "omnigent-openai/system.ai.gpt-5-6-sol");
+      fireEvent.click(screen.getByText("GPT 5.6 Sol"));
+      fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
+      typeMessage("go");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
-    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
-    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
-    const body = JSON.parse(init.body as string);
-    expect(body.model_override).toBe("omnigent-openai/system.ai.gpt-5-6-sol");
-    expect(body.reasoning_effort).toBeUndefined();
-    expect(body.labels?.["omnigent.wrapper"]).toBe("pi-native-ui");
-    expect(
-      JSON.parse(localStorage.getItem("omnigent:last-mode-by-harness") ?? "{}")["pi-native"]?.model,
-    ).toBe("omnigent-openai/system.ai.gpt-5-6-sol");
-  });
+      await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+      const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+      const body = JSON.parse(init.body as string);
+      expect(body.model_override).toBe("omnigent-openai/system.ai.gpt-5-6-sol");
+      expect(body.reasoning_effort).toBe(effort || undefined);
+      expect(body.labels?.["omnigent.wrapper"]).toBe(`${harness}-ui`);
+      expect(
+        JSON.parse(localStorage.getItem("omnigent:last-mode-by-harness") ?? "{}")[harness]?.model,
+      ).toBe("omnigent-openai/system.ai.gpt-5-6-sol");
+    },
+  );
 
   it("seeds the model + effort from the last pick for claude-native on a new session", async () => {
     // A returning user's last model/effort pick for this harness is on record;
