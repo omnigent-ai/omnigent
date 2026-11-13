@@ -1,17 +1,10 @@
 /** UI-only session capability gates, derived from the live session snapshot. */
 
-export const SANDBOX_FORK_UNSUPPORTED = "Forking this sandbox session is not supported yet.";
 export const SANDBOX_SWITCH_HOST_UNSUPPORTED =
   "Switching hosts is not supported for this sandbox session yet.";
 export const SESSION_ACTIONS_LOADING = "Checking session capabilities…";
 export const SESSION_ACTIONS_UNAVAILABLE =
   "Unable to check session capabilities. Reload to try again.";
-
-/**
- * Fallback wire IDs for snapshots missing the deployment's managed marker.
- * Other sandbox providers remain forkable in the core server.
- */
-const UNSUPPORTED_FORK_PROVIDERS = new Set(["arclet", "lakebox"]);
 
 export interface SessionActionSource {
   labels?: Record<string, string | null> | null;
@@ -24,16 +17,13 @@ export interface SessionActionSource {
 export function sessionActionRestrictions(
   session: SessionActionSource | null | undefined,
   host?: { sandbox_provider?: string | null },
-): { forkDisabledReason?: string; switchHostDisabledReason?: string } {
-  // The embedded deployment derives this marker alongside its managed-fork ban,
-  // regardless of provider. It is distinct from core `host_type: managed` launches.
-  const unsupportedSource =
-    session?.labels?.["omnigent.host_type"] === "managed" ||
-    (host?.sandbox_provider != null && UNSUPPORTED_FORK_PROVIDERS.has(host.sandbox_provider));
+): { switchHostDisabledReason?: string } {
+  // The embedded deployment derives this marker regardless of provider. It is
+  // distinct from core `host_type: managed` launches.
+  const managedSource = session?.labels?.["omnigent.host_type"] === "managed";
   return {
-    forkDisabledReason: unsupportedSource ? SANDBOX_FORK_UNSUPPORTED : undefined,
     switchHostDisabledReason:
-      unsupportedSource || host?.sandbox_provider ? SANDBOX_SWITCH_HOST_UNSUPPORTED : undefined,
+      managedSource || host?.sandbox_provider ? SANDBOX_SWITCH_HOST_UNSUPPORTED : undefined,
   };
 }
 
@@ -114,4 +104,48 @@ export function supportsEffortControl(
     session.parentSessionId == null &&
     effortLevelsForFamily(effortFamily).length > 0
   );
+}
+
+type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
+
+/**
+ * Resolve a structural read-only reason from session labels.
+ *
+ * The live session snapshot is checked first because child sessions do
+ * not appear in the sidebar list and because labels can change after
+ * initial navigation (for example ``sys_session_close`` marks a child
+ * ``omnigent.closed=true``). The sidebar row is only a fallback.
+ *
+ * @param activeSession - Live session snapshot, if loaded.
+ * @param activeConv - Sidebar/session-list row fallback.
+ * @returns Placeholder text for the composer when the session is
+ *   structurally read-only, or ``null`` when normal permissions apply.
+ */
+export function readOnlyReasonForSessionLabels(
+  activeSession: LabelSource,
+  activeConv: LabelSource,
+): string | null {
+  const closed =
+    activeSession?.labels?.["omnigent.closed"] ?? activeConv?.labels?.["omnigent.closed"];
+  if (closed === "true") {
+    // A codex /side child is sealed (server-computed) once its ephemeral fork's
+    // runner is gone; give it a side-chat-specific reason rather than the
+    // generic sub-agent one so the user understands it's read-only for good.
+    // "Side chat" is the nickname the server stamps on a /side fork.
+    const wrapperLabel =
+      activeSession?.labels?.["omnigent.wrapper"] ?? activeConv?.labels?.["omnigent.wrapper"];
+    const nickname =
+      activeSession?.labels?.["omnigent.codex_native.agent_nickname"] ??
+      activeConv?.labels?.["omnigent.codex_native.agent_nickname"];
+    if (wrapperLabel === "codex-native-ui-subagent" && nickname === "Side chat") {
+      return "This side chat has ended and can't receive new messages";
+    }
+    return "This sub-agent session is closed";
+  }
+  const wrapper =
+    activeSession?.labels?.["omnigent.wrapper"] ?? activeConv?.labels?.["omnigent.wrapper"];
+  if (wrapper === "claude-code-native-ui-subagent") {
+    return "Claude Code sub-agents are read-only";
+  }
+  return null;
 }

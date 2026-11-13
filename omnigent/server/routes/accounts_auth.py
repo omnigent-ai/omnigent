@@ -38,7 +38,12 @@ from starlette.responses import JSONResponse, RedirectResponse, Response
 from omnigent.db.account_authority import bind_account_authority, target_account_scope
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.admin_list import AdminList, promote_if_listed
-from omnigent.server.auth import _RESERVED_USERS, RESERVED_USER_LOCAL, UnifiedAuthProvider
+from omnigent.server.auth import (
+    _RESERVED_USERS,
+    RESERVED_USER_LOCAL,
+    UnifiedAuthProvider,
+    effective_admin,
+)
 from omnigent.server.oidc import mint_session_cookie
 from omnigent.server.passwords import (
     InvalidPasswordError,
@@ -422,7 +427,7 @@ def create_accounts_auth_router(
     async def invite(request: Request, body: InviteRequest) -> Response:
         """Mint a single-use invite URL (admin only)."""
         admin_id = auth_provider.get_user_id(request)
-        if admin_id is None or not account_store.is_admin(admin_id):
+        if admin_id is None or not effective_admin(account_store.is_admin(admin_id)):
             return JSONResponse(status_code=403, content={"error": "admin only"})
 
         token_id = secrets.token_urlsafe(32)
@@ -725,7 +730,7 @@ def create_accounts_auth_router(
     async def list_users(request: Request) -> Response:
         """List all users (admin only)."""
         admin_id = auth_provider.get_user_id(request)
-        if admin_id is None or not account_store.is_admin(admin_id):
+        if admin_id is None or not effective_admin(account_store.is_admin(admin_id)):
             return JSONResponse(status_code=403, content={"error": "admin only"})
 
         users = account_store.list_users()
@@ -765,13 +770,15 @@ def create_accounts_auth_router(
           two different admins can't both slip past the check.
         """
         admin_id = auth_provider.get_user_id(request)
-        if admin_id is None or not account_store.is_admin(admin_id):
+        if admin_id is None or not effective_admin(account_store.is_admin(admin_id)):
             return JSONResponse(status_code=403, content={"error": "admin only"})
         if user_id == admin_id:
             return JSONResponse(status_code=400, content={"error": "cannot delete self"})
 
+        scheduler = getattr(request.app.state, "scheduled_task_scheduler", None)
+        persistent = getattr(request.app.state, "scheduled_task_dispatch_enabled", False)
         owned_task_ids: list[str] = []
-        if scheduled_task_store is not None:
+        if scheduled_task_store is not None and scheduler is not None and not persistent:
             owned_task_ids = [t.id for t in scheduled_task_store.list(owner_user_id=user_id)]
 
         result = account_store.delete_user(user_id)
@@ -787,8 +794,7 @@ def create_accounts_auth_router(
             )
         # The store already disabled the rows; drop the in-memory timers so
         # the scheduler stops re-arming them.
-        scheduler = getattr(request.app.state, "scheduled_task_scheduler", None)
-        if scheduler is not None:
+        if scheduler is not None and not persistent:
             for task_id in owned_task_ids:
                 scheduler.remove(task_id)
         auth_provider.revoke_user_sessions(user_id)
@@ -804,7 +810,7 @@ def create_accounts_auth_router(
         Also revokes the user's existing sessions and CLI logins.
         """
         admin_id = auth_provider.get_user_id(request)
-        if admin_id is None or not account_store.is_admin(admin_id):
+        if admin_id is None or not effective_admin(account_store.is_admin(admin_id)):
             return JSONResponse(status_code=403, content={"error": "admin only"})
 
         user = account_store.get_user(user_id)

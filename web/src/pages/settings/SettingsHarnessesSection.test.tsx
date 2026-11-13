@@ -4,16 +4,29 @@
 // host inventory, and the heavy composer/dialog imports are mocked so it renders
 // without a backend.
 
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { SkillContent } from "@/hooks/useSkillContent";
-import type { HarnessInventory } from "@/hooks/useHarnessInventory";
+import type { HarnessInventory, HostMcpServer } from "@/hooks/useHarnessInventory";
+import { toast } from "sonner";
 import { ApiError } from "@/lib/sessionsApi";
 import type { HarnessStartup, Host } from "@/hooks/useHosts";
+import { NATIVE_CODING_AGENTS } from "@/lib/nativeCodingAgents";
 import { SettingsHarnessesSection } from "./SettingsHarnessesSection";
 
+vi.mock("sonner", () => ({ toast: { error: vi.fn(), success: vi.fn() } }));
+
+let curatedOut: ReadonlySet<string> = new Set();
+vi.mock("@/hooks/useCuratedOutHarnesses", () => ({
+  useCuratedOutHarnesses: () => curatedOut,
+}));
+
+const setEnabled = vi.hoisted(() => vi.fn());
+vi.mock("@/lib/mcpServerEnabledApi", () => ({ setMcpServerEnabled: setEnabled }));
 let pluginMetadataRequested = false;
 const CONTENT: SkillContent = {
   name: "review",
@@ -84,13 +97,27 @@ const STARTUP: HarnessStartup = {
 let startupData = STARTUP;
 let startupError: ApiError | null = null;
 const startupCalls = vi.fn();
+const accountRefreshCalls = vi.fn();
+const hostsCalls = vi.fn();
 let hosts: Host[] = [];
+let hostsPending = false;
 vi.mock("@/hooks/useHosts", async (importActual) => ({
   ...(await importActual()),
-  useHosts: () => ({ data: hosts }),
+  useHosts: (options?: unknown) => {
+    hostsCalls(options);
+    return useQuery({
+      queryKey: hostsPending ? ["hosts", "pending"] : ["hosts", { includeSandbox: false }],
+      queryFn: () => (hostsPending ? new Promise<Host[]>(() => {}) : Promise.resolve(hosts)),
+      initialData: hostsPending ? undefined : hosts,
+    });
+  },
   useHarnessStartup: (hostId: string, harness: string) => {
     startupCalls(hostId, harness);
     return { data: startupError ? undefined : startupData, error: startupError, isPending: false };
+  },
+  useRefreshHarnessAccounts: (hostId: string | null, enabled: boolean) => {
+    accountRefreshCalls(hostId, enabled);
+    return { data: undefined, isPending: false };
   },
 }));
 
@@ -124,10 +151,15 @@ const INVENTORY: HarnessInventory = {
   },
 };
 let inventory: HarnessInventory = INVENTORY;
+let inventoryFamilies: readonly string[] | undefined;
 vi.mock("@/hooks/useHarnessInventory", async (importActual) => ({
   ...(await importActual()),
-  useHarnessInventory: (_host: Host, options: { includePluginMetadata: boolean }) => {
+  useHarnessInventory: (
+    _host: Host,
+    options: { includePluginMetadata: boolean; families?: readonly string[] },
+  ) => {
     pluginMetadataRequested = options.includePluginMetadata;
+    inventoryFamilies = options.families;
     return inventory;
   },
 }));
@@ -135,9 +167,18 @@ vi.mock("@/hooks/useHarnessInventory", async (importActual) => ({
 // The "Set up" button is gated on the harness_install feature (like New Chat),
 // so drive that flag through the server-info mock.
 let harnessInstall = true;
+let databricksFeatures = true;
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
+    databricks_features: databricksFeatures,
     features: { harness_install: harnessInstall },
+    installable_harnesses: [
+      "claude-native",
+      "codex-native",
+      "opencode-native",
+      "pi-native",
+      "qwen-native",
+    ],
   }),
 }));
 
@@ -146,28 +187,58 @@ vi.mock("@/shell/NewChatDialog", () => ({
   ComposerAgentIcon: () => <span data-testid="agent-icon" />,
 }));
 
-// Assert the setup dialog is opened with the right harness/host, without
-// rendering its full install/auth flow.
-const setupDialogProps = vi.fn();
-vi.mock("@/shell/HarnessSetupDialog", () => ({
-  HarnessSetupDialog: (props: { open: boolean; harness: string | null; host: Host | null }) => {
-    setupDialogProps(props);
+const fixDialogProps = vi.fn();
+vi.mock("./HarnessFixDialog", () => ({
+  HarnessFixDialog: (props: {
+    open: boolean;
+    mode: "reconfigure" | "update" | "install" | "switch";
+    harness: string;
+    host: Host;
+    onFixed: (result: {
+      configuredHarnesses: Record<string, boolean | string>;
+      credentialKind?: "isaac" | "personal";
+      gatewayInference?: Record<string, boolean> | null;
+    }) => void;
+  }) => {
+    fixDialogProps(props);
     return props.open ? (
       <div
-        data-testid="setup-dialog"
+        data-testid="fix-dialog"
         data-harness={props.harness}
-        data-host={props.host?.host_id ?? ""}
-      />
+        data-host={props.host.host_id}
+        data-mode={props.mode}
+      >
+        <button
+          type="button"
+          onClick={() =>
+            props.onFixed({
+              configuredHarnesses: { [props.harness]: true },
+              credentialKind: "isaac",
+              gatewayInference: { [props.harness]: true },
+            })
+          }
+        >
+          Complete fix
+        </button>
+      </div>
     ) : null;
   },
 }));
 
-function renderHarnesses(harness?: string) {
+function renderHarnesses(harness?: string, search = "") {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
-    <MemoryRouter initialEntries={[`/settings/harnesses${harness ? `/${harness}` : ""}`]}>
-      <SettingsHarnessesSection />
-    </MemoryRouter>,
+    <QueryClientProvider client={queryClient}>
+      <TooltipProvider>
+        <MemoryRouter
+          initialEntries={[`/settings/harnesses${harness ? `/${harness}` : ""}${search}`]}
+        >
+          <SettingsHarnessesSection />
+        </MemoryRouter>
+      </TooltipProvider>
+    </QueryClientProvider>,
   );
+  return queryClient;
 }
 
 // Radix Tabs activate on focus; jsdom's synthetic click doesn't move focus.
@@ -188,6 +259,7 @@ const ONLINE: Host = {
 };
 
 afterEach(() => {
+  setEnabled.mockReset();
   contentQuery = { data: CONTENT, isPending: false };
   contentLookup = null;
   contentSource = undefined;
@@ -205,37 +277,168 @@ afterEach(() => {
   hosts = [];
   inventory = INVENTORY;
   harnessInstall = true;
-  setupDialogProps.mockReset();
+  databricksFeatures = true;
+  fixDialogProps.mockReset();
   startupCalls.mockClear();
+  accountRefreshCalls.mockClear();
+  hostsCalls.mockClear();
+  hostsPending = false;
   startupData = STARTUP;
   startupError = null;
+  curatedOut = new Set();
 });
 
 describe("Harnesses grid", () => {
-  it("shows Installed (no Set-up) for a ready harness and a badge + Set-up for a not-ready one", () => {
+  it("leaves out the harnesses the deployment curated out, even by direct link", () => {
+    hosts = [ONLINE];
+    curatedOut = new Set(["codex-native"]);
+    renderHarnesses("codex-native");
+
+    // A link to a curated-out harness lands on the grid, like an unknown one.
+    expect(screen.getByRole("heading", { name: "Harnesses" })).toBeInTheDocument();
+    expect(card("claude-native")).toBeInTheDocument();
+    expect(screen.queryByTestId("harness-card-codex-native")).toBeNull();
+    expect(startupCalls).not.toHaveBeenCalledWith("h1", "codex-native");
+  });
+
+  it("says so when the deployment offers no harness", () => {
+    hosts = [ONLINE];
+    curatedOut = new Set(NATIVE_CODING_AGENTS.map((spec) => spec.harness));
+    renderHarnesses();
+
+    expect(screen.getByText("This server offers no harnesses to set up.")).toBeInTheDocument();
+  });
+
+  it("requests accounts only for a selected capable host while setup is enabled", () => {
+    hosts = [{ ...ONLINE, harness_accounts_supported: true }];
+    renderHarnesses();
+    expect(accountRefreshCalls).toHaveBeenLastCalledWith("h1", true);
+
+    cleanup();
+    accountRefreshCalls.mockClear();
+    harnessInstall = false;
+    renderHarnesses();
+    expect(accountRefreshCalls).toHaveBeenLastCalledWith("h1", false);
+  });
+
+  it("preselects the linked online host and keeps it after returning to the grid", () => {
+    hosts = [ONLINE, { ...ONLINE, host_id: "host & two", name: "session-host" }];
+    renderHarnesses("claude-native", "?host=host%20%26%20two&tab=settings");
+    expect(startupCalls).toHaveBeenCalledWith("host & two", "claude-native");
+    fireEvent.click(screen.getByRole("link", { name: /Harnesses/ }));
+    expect(screen.getByRole("button", { name: "session-host" })).toBeInTheDocument();
+  });
+
+  it("asks for a session's linked host even when it is a sandbox the picker hides", () => {
+    hosts = [{ ...ONLINE, host_id: "sandbox_1", sandbox_provider: "example-sandbox" }];
+    renderHarnesses("claude-native", "?host=sandbox_1&tab=settings");
+    // fetchHosts keeps a sandbox host only when it is named as the source host.
+    expect(hostsCalls).toHaveBeenCalledWith({ refetchOnFocus: true, sourceHostId: "sandbox_1" });
+    expect(startupCalls).toHaveBeenCalledWith("sandbox_1", "claude-native");
+    expect(screen.queryByText(/Connect an online host/)).toBeNull();
+    // In-section links drop `?host`; the linked sandbox host must stay listed.
+    fireEvent.click(screen.getByRole("link", { name: /Harnesses/ }));
+    expect(hostsCalls).toHaveBeenLastCalledWith({
+      refetchOnFocus: true,
+      sourceHostId: "sandbox_1",
+    });
+  });
+
+  it("reads the shared hosts list when no host is linked", () => {
+    hosts = [ONLINE];
+    renderHarnesses();
+    // `null` would key a separate cache entry from every other `useHosts()` caller.
+    expect(hostsCalls).toHaveBeenCalled();
+    for (const [options] of hostsCalls.mock.calls)
+      expect((options as { sourceHostId?: unknown }).sourceHostId).toBeUndefined();
+  });
+
+  it("shows hosts loading rather than asking to connect one while the list loads", () => {
+    hostsPending = true;
+    renderHarnesses("claude-native", "?host=sandbox_1&tab=settings");
+    expect(screen.getByText("Loading hosts…")).toBeTruthy();
+    expect(screen.queryByTestId("harness-no-host")).toBeNull();
+  });
+
+  it.each([
+    ["offline", [ONLINE, { ...ONLINE, host_id: "linked", status: "offline" as const }]],
+    ["no longer listed", [ONLINE]],
+  ])("falls back to an online host if the linked host is %s", (_, linkedHosts) => {
+    hosts = linkedHosts;
+    renderHarnesses("claude-native", "?host=linked&tab=settings");
+    expect(startupCalls).toHaveBeenCalledWith("h1", "claude-native");
+    expect(startupCalls).not.toHaveBeenCalledWith("linked", "claude-native");
+  });
+
+  it("shows the configured credential and a reconfiguration warning with its reason", async () => {
     hosts = [ONLINE];
     renderHarnesses();
 
-    // claude-native is ready → "Installed", no action button.
     expect(within(card("claude-native")).getByText("Configured")).toBeTruthy();
+    expect(within(card("claude-native")).getByText("· Signed in")).toBeTruthy();
     expect(screen.queryByTestId("harness-action-claude-native")).toBeNull();
 
-    // codex-native reports needs-auth → warning badge + a Set-up button.
-    expect(screen.getByText("Needs auth")).toBeTruthy();
-    expect(screen.getByTestId("harness-action-codex-native")).toBeTruthy();
+    const warning = within(card("codex-native")).getByLabelText(
+      "Needs reconfiguration: Missing credentials",
+    );
+    expect(warning.textContent).toContain("Needs reconfiguration");
+    expect(screen.getByTestId("harness-settings-codex-native")).toBeTruthy();
+    fireEvent.focus(warning);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Missing credentials");
   });
 
-  it("opens the setup dialog for the clicked harness", () => {
-    hosts = [ONLINE];
+  it("opens install for a not-installed harness on the selected host", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "binary-missing" } }];
     renderHarnesses();
 
     fireEvent.click(screen.getByTestId("harness-action-codex-native"));
 
-    const dialog = screen.getByTestId("setup-dialog");
+    const dialog = screen.getByTestId("fix-dialog");
     expect(dialog.getAttribute("data-harness")).toBe("codex-native");
-    // The dialog is bound to the host chosen when setup opened, not the live
-    // selection — a later host switch can't redirect the credential/install.
     expect(dialog.getAttribute("data-host")).toBe("h1");
+    expect(dialog.getAttribute("data-mode")).toBe("install");
+    expect(within(card("codex-native")).queryByText("Needs reconfiguration")).toBeNull();
+    expect(within(card("codex-native")).getByText("Not installed")).toBeTruthy();
+  });
+
+  it.each(["pi-native", "codex-native"])(
+    "says a CLI that missed its version check did not respond, not that it is outdated (%s)",
+    (harness) => {
+      hosts = [{ ...ONLINE, configured_harnesses: { [harness]: "cli-unresponsive" } }];
+      renderHarnesses();
+
+      expect(within(card(harness)).getByText("CLI did not respond")).toBeTruthy();
+      expect(within(card(harness)).queryByLabelText(/Out of date/)).toBeNull();
+      expect(screen.queryByTestId(`harness-action-${harness}`)).toBeNull();
+      expect(card(harness).getAttribute("href")).toBe(
+        `/settings/harnesses/${harness}?tab=settings`,
+      );
+
+      fireEvent.click(screen.getByTestId(`harness-settings-${harness}`));
+      expect(screen.getByText(/CLI on my-laptop didn’t respond to a version check/)).toBeTruthy();
+      expect(screen.queryByText(/out of date|isn’t set up/)).toBeNull();
+      expect(
+        screen.queryByRole("button", { name: /^(Update|Install|Reconfigure|Set up)$/ }),
+      ).toBeNull();
+      expect(screen.getByText("Not checked")).toBeTruthy();
+      expect(screen.getByRole("heading", { name: "Startup configuration" })).toBeTruthy();
+    },
+  );
+
+  it("does not offer one-click install for a not-installed Cursor harness", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "cursor-native": "binary-missing" } }];
+    renderHarnesses();
+
+    expect(screen.queryByTestId("harness-action-cursor-native")).toBeNull();
+    expect(screen.getByTestId("harness-settings-cursor-native")).toBeTruthy();
+  });
+
+  it("uses the existing inventory label instead of guessing a personal subscription", () => {
+    hosts = [{ ...ONLINE, gateway_inference: { "claude-native": false } }];
+    renderHarnesses();
+
+    expect(within(card("claude-native")).getByText("· Signed in")).toBeTruthy();
+    expect(within(card("claude-native")).queryByText(/Personal subscription/)).toBeNull();
   });
 
   it("treats unknown readiness (host reports nothing) as neutral, not needs-setup", () => {
@@ -247,7 +450,7 @@ describe("Harnesses grid", () => {
     expect(screen.queryByTestId("harness-action-codex-native")).toBeNull();
     expect(screen.queryByTestId("harness-action-claude-native")).toBeNull();
     expect(within(card("claude-native")).queryByText("Installed")).toBeNull();
-    expect(screen.queryByText("Needs setup")).toBeNull();
+    expect(screen.queryByText("Needs reconfiguration")).toBeNull();
   });
 
   it("hides Set-up (keeps the badge) when harness_install is disabled", () => {
@@ -257,8 +460,11 @@ describe("Harnesses grid", () => {
     hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "binary-missing" } }];
     renderHarnesses();
 
-    expect(screen.getByText("Binary missing")).toBeTruthy();
+    expect(within(card("codex-native")).getByText("Binary missing")).toBeTruthy();
+    expect(within(card("codex-native")).queryByText("Not installed")).toBeNull();
+    expect(within(card("codex-native")).queryByLabelText(/Needs reconfiguration/)).toBeNull();
     expect(screen.queryByTestId("harness-action-codex-native")).toBeNull();
+    expect(screen.queryByTestId("harness-settings-codex-native")).toBeNull();
   });
 
   it("shows the no-host notice and no Set-up buttons when no host is online", () => {
@@ -290,12 +496,14 @@ describe("Harnesses grid", () => {
     expect(screen.queryByTestId("harness-card-codex-native")).toBeNull();
   });
 
-  it("links an installed harness's card to its details page, but not a not-ready one", () => {
+  it("links ready and broken harness cards to details while the feature is enabled", () => {
     hosts = [ONLINE];
     renderHarnesses();
 
     expect(card("claude-native").getAttribute("href")).toBe("/settings/harnesses/claude-native");
-    expect(card("codex-native").getAttribute("href")).toBeNull();
+    expect(card("codex-native").getAttribute("href")).toBe(
+      "/settings/harnesses/codex-native?tab=settings",
+    );
   });
 });
 
@@ -318,6 +526,15 @@ describe("Harness card navigation", () => {
     fireEvent.click(screen.getByTestId("harness-settings-claude-native"));
     expect(selected("Settings")).toBe("true");
   });
+
+  it("opens a broken harness on Settings from its gear", () => {
+    hosts = [ONLINE];
+    renderHarnesses();
+
+    fireEvent.click(screen.getByTestId("harness-settings-codex-native"));
+    expect(selected("Settings")).toBe("true");
+    expect(screen.getByText(/No ChatGPT account or API key on my-laptop/)).toBeTruthy();
+  });
 });
 
 describe("Harness details", () => {
@@ -330,16 +547,30 @@ describe("Harness details", () => {
     expect(screen.getByRole("tab", { name: "MCP servers · 2" })).toBeTruthy();
     expect(screen.getByRole("tab", { name: "Skills · 1" })).toBeTruthy();
     expect(screen.getByRole("tab", { name: "Plugins · 1" })).toBeTruthy();
-    expect(screen.getByTestId("catalog-row-github")).toBeTruthy();
+    // Known servers show their brand spelling, as on the tool-call rows.
+    expect(within(screen.getByTestId("catalog-row-github")).getByText("GitHub")).toBeTruthy();
+    expect(within(screen.getByTestId("catalog-row-linear")).getByText("Linear")).toBeTruthy();
     expect(screen.queryByTestId("catalog-row-docs")).toBeNull();
 
     // The credential lives under the Settings tab.
     selectTab("Settings");
-    expect(screen.getByText("Unity Gateway")).toBeTruthy();
+    expect(screen.getByText("Isaac")).toBeTruthy();
+    expect(screen.getByText("Databricks-managed credential via the Unity Gateway")).toBeTruthy();
     expect(screen.getByText("/opt/bin/claude")).toBeTruthy();
     for (const arg of STARTUP.args ?? []) expect(screen.getAllByText(arg)).toHaveLength(1);
     expect(screen.getByText(/Sessions and workspaces may override/)).toBeTruthy();
     expect(screen.getByText(/harness.claude-native in ~\/.omnigent\/config.yaml/)).toBeTruthy();
+  });
+
+  it("keeps the Isaac label when databricks_features is false", () => {
+    databricksFeatures = false;
+    hosts = [{ ...ONLINE, gateway_inference: { "claude-native": true } }];
+    renderHarnesses();
+
+    expect(within(card("claude-native")).getByText("· Isaac")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("harness-settings-claude-native"));
+    expect(screen.getByText("Isaac")).toBeTruthy();
+    expect(screen.getByText("Databricks-managed credential via the Unity Gateway")).toBeTruthy();
   });
 
   it("keeps tool discovery lazy and shows host-reported details", () => {
@@ -397,20 +628,422 @@ describe("Harness details", () => {
   });
 
   it("says the catalog isn't listed for a ready harness the inventory doesn't cover", () => {
-    hosts = [{ ...ONLINE, configured_harnesses: { "pi-native": true } }];
-    renderHarnesses("pi-native");
+    hosts = [{ ...ONLINE, configured_harnesses: { "opencode-native": true } }];
+    renderHarnesses("opencode-native");
 
-    expect(screen.getByText(/aren't listed for Pi yet/)).toBeTruthy();
+    expect(screen.getByText(/aren't listed for OpenCode yet/)).toBeTruthy();
     expect(screen.queryByRole("tab", { name: /MCP servers/ })).toBeNull();
   });
 
-  it("offers Set up instead of the catalog for a harness that isn't ready", () => {
+  it("lists Pi's MCP servers without offering a tool probe", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "pi-native": true } }];
+    inventory = {
+      ...INVENTORY,
+      context: {
+        ...INVENTORY.context,
+        mcps: [
+          ...INVENTORY.context.mcps,
+          { id: "pi:wiki", name: "wiki", harness: "pi", detail: "wiki.example.com" },
+        ],
+      },
+    };
+    renderHarnesses("pi-native");
+
+    expect(inventoryFamilies).toEqual(["pi"]);
+    expect(screen.getByRole("tab", { name: "MCP servers · 1" })).toBeTruthy();
+    const wiki = screen.getByTestId("catalog-row-wiki");
+    expect(within(wiki).getByText("wiki.example.com")).toBeTruthy();
+    expect(wiki.tagName).not.toBe("BUTTON");
+    expect(screen.queryByTestId("catalog-row-github")).toBeNull();
+    expect(mcpLookups).toEqual([]);
+  });
+
+  it("lists Pi's skills without opening their contents", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "pi-native": true } }];
+    inventory = {
+      ...INVENTORY,
+      context: {
+        ...INVENTORY.context,
+        skills: [...INVENTORY.context.skills, { id: "pi:plan", name: "plan", harness: "pi" }],
+      },
+    };
+    renderHarnesses("pi-native");
+
+    selectTab("Skills · 1");
+    expect(screen.getByTestId("catalog-row-plan").tagName).not.toBe("BUTTON");
+    expect(contentLookup).toBeNull();
+  });
+
+  it("uses the credential card as the warning for a missing credential", () => {
+    hosts = [ONLINE];
+    renderHarnesses("codex-native");
+
+    expect(screen.queryByText(/Codex can’t sign in on my-laptop/)).toBeNull();
+    expect(
+      screen.getByText(
+        "No ChatGPT account or API key on my-laptop, so new sessions can’t use Codex.",
+      ),
+    ).toBeTruthy();
+    expect(screen.getByText("Not signed in")).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: "Reconfigure" })).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: "Reconfigure credential" })).toBeNull();
+    expect(screen.getByRole("tab", { name: /MCP servers/ })).toBeTruthy();
+  });
+
+  it("opens reconfiguration from the credential card", () => {
+    hosts = [ONLINE];
+    renderHarnesses("codex-native");
+
+    fireEvent.click(screen.getByRole("button", { name: "Reconfigure" }));
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-mode", "reconfigure");
+
+    cleanup();
+    renderHarnesses("codex-native");
+    fireEvent.click(
+      screen
+        .getByText(/No ChatGPT account or API key on my-laptop/)
+        .closest("button") as HTMLButtonElement,
+    );
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-mode", "reconfigure");
+  });
+
+  it("shows account identity and provider labels from host metadata", () => {
+    hosts = [
+      {
+        ...ONLINE,
+        configured_harnesses: {
+          "claude-native": true,
+          "codex-native": true,
+          "pi-native": true,
+          "opencode-native": true,
+        },
+        harness_accounts: {
+          claude: {
+            kind: "subscription",
+            email: "person@example.com",
+            plan: "Max",
+          },
+          codex: { kind: "chatgpt", email: "codex@example.com", plan: "Plus" },
+          pi: {
+            kind: "providers",
+            providers: [{ id: "anthropic", label: "Anthropic", auth_type: "oauth" }],
+          },
+          opencode: {
+            kind: "providers",
+            providers: [
+              { id: "anthropic", label: "Anthropic", auth_type: "api_key" },
+              { id: "openrouter", label: "OpenRouter", auth_type: "api_key" },
+            ],
+          },
+        },
+      },
+    ];
+    renderHarnesses();
+
+    expect(within(card("claude-native")).getByText("· person@example.com · Max")).toBeTruthy();
+    expect(within(card("codex-native")).getByText("· codex@example.com · Plus")).toBeTruthy();
+    expect(within(card("pi-native")).getByText("· Anthropic")).toBeTruthy();
+    expect(within(card("opencode-native")).getByText("· Anthropic, OpenRouter")).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId("harness-settings-opencode-native"));
+    expect(screen.getByText("Providers")).toBeTruthy();
+    expect(screen.getByText("Anthropic (API key) · OpenRouter (API key)")).toBeTruthy();
+  });
+
+  it("shows an expired amber credential card without a duplicate banner", () => {
+    hosts = [
+      {
+        ...ONLINE,
+        harness_accounts: {
+          codex: {
+            kind: "chatgpt",
+            email: "codex@example.com",
+            plan: "Plus",
+            expired: true,
+          },
+        },
+      },
+    ];
+    renderHarnesses("codex-native");
+
+    expect(screen.getByText("Sign-in expired")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Sign in again" })).toBeTruthy();
+    expect(screen.queryByText(/Codex can’t sign in/)).toBeNull();
+  });
+
+  it("keeps a ready gateway credential authoritative over stale account metadata", () => {
+    hosts = [
+      {
+        ...ONLINE,
+        configured_harnesses: { "codex-native": true },
+        gateway_inference: { "codex-native": true },
+        harness_accounts: { codex: { kind: "unknown", expired: true } },
+      },
+    ];
+    renderHarnesses("codex-native");
+    selectTab("Settings");
+
+    expect(screen.getAllByText("Isaac").length).toBeGreaterThan(0);
+    expect(screen.queryByText("Not signed in")).toBeNull();
+    expect(screen.queryByText("Sign-in expired")).toBeNull();
+  });
+
+  it("keeps ready provider metadata authoritative over an expired probe", () => {
+    hosts = [
+      {
+        ...ONLINE,
+        configured_harnesses: { "opencode-native": true },
+        harness_accounts: {
+          opencode: {
+            kind: "providers",
+            expired: true,
+            providers: [{ id: "anthropic", label: "Anthropic", auth_type: "api_key" }],
+          },
+        },
+      },
+    ];
+    renderHarnesses("opencode-native");
+
+    expect(screen.getByText("Providers")).toBeTruthy();
+    expect(screen.queryByText("Not signed in")).toBeNull();
+    expect(screen.queryByText("Sign-in expired")).toBeNull();
+  });
+
+  it("opens switch-account confirmation for a ready subscription", () => {
+    hosts = [
+      {
+        ...ONLINE,
+        harness_login_supported: true,
+        harness_accounts: {
+          claude: {
+            kind: "subscription",
+            email: "person@example.com",
+            plan: "Pro",
+          },
+        },
+      },
+    ];
+    renderHarnesses("claude-native");
+    selectTab("Settings");
+
+    fireEvent.click(screen.getByRole("button", { name: "Switch account" }));
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-mode", "switch");
+  });
+
+  it("does not offer account switching when the host lacks login support", () => {
+    hosts = [
+      {
+        ...ONLINE,
+        harness_accounts: {
+          claude: { kind: "subscription", email: "person@example.com", plan: "Pro" },
+        },
+      },
+    ];
+    renderHarnesses("claude-native");
+    selectTab("Settings");
+
+    expect(screen.queryByRole("button", { name: "Switch account" })).toBeNull();
+    expect(screen.getAllByText("Configured").length).toBeGreaterThan(0);
+  });
+
+  it.each([
+    ["codex-native", { kind: "api_key" as const }],
+    [
+      "opencode-native",
+      {
+        kind: "providers" as const,
+        providers: [{ id: "anthropic", label: "Anthropic", auth_type: "api_key" as const }],
+      },
+    ],
+  ])("does not offer account switching for %s non-subscription credentials", (harness, account) => {
+    hosts = [
+      {
+        ...ONLINE,
+        configured_harnesses: { [harness]: true },
+        harness_login_supported: true,
+        harness_accounts: { [harness === "codex-native" ? "codex" : "opencode"]: account },
+      },
+    ];
+    renderHarnesses(harness);
+    if (screen.queryByRole("tab", { name: "Settings" })) selectTab("Settings");
+
+    expect(screen.queryByRole("button", { name: "Switch account" })).toBeNull();
+  });
+
+  it("uses Update for an outdated harness", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "version-too-low" } }];
+    renderHarnesses("codex-native");
+
+    expect(
+      screen.getByText(
+        "Codex is out of date on my-laptop. Update it so new sessions can use Codex.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText("Not signed in")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-mode", "update");
+  });
+
+  it("uses Set up tmux when the host has no usable tmux", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "tmux-unavailable" } }];
+    renderHarnesses("codex-native");
+
+    expect(
+      screen.getByText(
+        "Codex needs tmux 3.3 or newer on my-laptop. Install or upgrade tmux so new sessions can use Codex.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Install" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Set up tmux" }));
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-mode", "tmux");
+  });
+
+  it("uses Set up for a not-installed Cursor harness", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "cursor-native": "binary-missing" } }];
+    renderHarnesses("cursor-native");
+
+    expect(screen.queryByRole("button", { name: "Install" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Set up" }));
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-mode", "install");
+  });
+
+  it("uses Set up instead of Update for an outdated Cursor harness", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "cursor-native": "version-too-low" } }];
+    renderHarnesses("cursor-native");
+
+    expect(screen.queryByRole("button", { name: "Update" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Set up" }));
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-mode", "update");
+  });
+
+  it("uses the credential-card Reconfigure action for Cursor needs-auth", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "cursor-native": "needs-auth" } }];
+    renderHarnesses("cursor-native");
+
+    expect(screen.queryByRole("button", { name: "Set up" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Reconfigure" }));
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-mode", "reconfigure");
+  });
+
+  it("uses generic credential copy for Pi needs-auth", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "pi-native": "needs-auth" } }];
+    renderHarnesses("pi-native");
+
+    expect(
+      screen.getByText(
+        "No API key or gateway credential on my-laptop, so new sessions can’t use Pi.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(/No Claude subscription or API key/)).toBeNull();
+  });
+
+  it("uses Claude credential copy for Claude needs-auth", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "claude-native": "needs-auth" } }];
+    renderHarnesses("claude-native");
+
+    expect(
+      screen.getByText(
+        "No Claude subscription or API key on my-laptop, so new sessions can’t use Claude Code.",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("never calls a missing binary reconfiguration", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "binary-missing" } }];
+    renderHarnesses("codex-native");
+
+    expect(screen.getAllByText("Not installed")).toHaveLength(2);
+    expect(screen.queryByText("Needs reconfiguration")).toBeNull();
+  });
+
+  it("keeps an unconfigured credential family on the install path", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": false } }];
+    renderHarnesses("codex-native");
+
+    expect(screen.getAllByText("Not configured")).toHaveLength(2);
+    expect(screen.getByText(/Codex isn’t set up on my-laptop/)).toBeTruthy();
+    expect(screen.queryByText("Not signed in")).toBeNull();
+    expect(screen.queryByText(/No ChatGPT account or API key on my-laptop/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Install" }));
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-mode", "install");
+  });
+
+  it("uses dedicated recovery copy for a readiness error", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "readiness-error" } }];
+    renderHarnesses("codex-native");
+
+    expect(
+      screen.getByText("Codex isn’t working on my-laptop. Run setup again to fix it."),
+    ).toBeTruthy();
+    expect(screen.queryByText(/credential is missing/)).toBeNull();
+  });
+
+  it("applies the fixed readiness immediately and shows the ready notice", () => {
+    hosts = [ONLINE];
+    const queryClient = renderHarnesses("codex-native");
+    const hostsKey = ["hosts", { includeSandbox: false }];
+    queryClient.setQueryData(hostsKey, [ONLINE]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Reconfigure" }));
+    fireEvent.click(screen.getByRole("button", { name: "Complete fix" }));
+
+    expect(screen.getByText("Codex is ready on my-laptop. Checked just now.")).toBeTruthy();
+    expect(screen.getByText("· Isaac")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Reconfigure" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reconfigure credential" })).toBeNull();
+    expect(queryClient.getQueryData<Host[]>(hostsKey)?.[0].configured_harnesses).toEqual({
+      "codex-native": true,
+    });
+    expect(queryClient.getQueryData<Host[]>(hostsKey)?.[0].gateway_inference).toEqual({
+      "codex-native": true,
+    });
+  });
+
+  it("keeps the original broken detail when harness_install is disabled", () => {
+    harnessInstall = false;
     hosts = [ONLINE];
     renderHarnesses("codex-native");
 
     expect(screen.getByText(/Set up Codex on my-laptop/)).toBeTruthy();
-    expect(screen.getByTestId("harness-action-codex-native")).toBeTruthy();
+    expect(screen.queryByText("Machine")).toBeNull();
     expect(screen.queryByRole("tab", { name: /MCP servers/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reconfigure" })).toBeNull();
+    expect(screen.queryByText("Not signed in")).toBeNull();
+    expect(screen.queryByText(/No ChatGPT account or API key on my-laptop/)).toBeNull();
+  });
+
+  it("keeps the working detail unchanged when harness_install is disabled", () => {
+    harnessInstall = false;
+    hosts = [{ ...ONLINE, gateway_inference: { "claude-native": true } }];
+    renderHarnesses("claude-native");
+
+    selectTab("Settings");
+    expect(screen.getByText("Unity Gateway")).toBeTruthy();
+    expect(screen.queryByText("Isaac")).toBeNull();
+    expect(screen.queryByText("Machine")).toBeNull();
+  });
+
+  it("hides fix actions for a managed sandbox host", () => {
+    hosts = [{ ...ONLINE, sandbox_provider: "modal" }];
+    renderHarnesses("codex-native");
+
+    expect(screen.queryByRole("button", { name: "Reconfigure" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reconfigure credential" })).toBeNull();
+    expect(screen.queryByTestId("fix-dialog")).toBeNull();
+  });
+
+  it("hides Sign in again for an expired account on a managed sandbox host", () => {
+    hosts = [
+      {
+        ...ONLINE,
+        sandbox_provider: "modal",
+        harness_accounts: { codex: { kind: "chatgpt", expired: true } },
+      },
+    ];
+    renderHarnesses("codex-native");
+
+    expect(screen.getByLabelText("Needs reconfiguration: Missing credentials")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Sign in again" })).toBeNull();
   });
 
   it("falls back to the grid for an unknown harness slug", () => {
@@ -746,9 +1379,9 @@ it("uses the same lazy tools accordion on plugin pages", () => {
 
 it.each([
   [501, "Update my-laptop to list tools."],
-  [502, "Couldn't reach github."],
+  [502, "Couldn't reach GitHub."],
   [503, "Host is busy probing other MCP servers. Collapse and reopen to retry."],
-  [504, "Couldn't reach github."],
+  [504, "Couldn't reach GitHub."],
 ])("shows the MCP error for %s", (status, message) => {
   hosts = [ONLINE];
   mcpResult = { error: new ApiError("private", status, null), isPending: false };
@@ -765,7 +1398,10 @@ it("hides MCP expansion on old-server 404", () => {
   fireEvent.click(screen.getByTestId("catalog-row-github"));
   expect(screen.getByTestId("catalog-row-github").tagName).not.toBe("BUTTON");
   expect(screen.getByTestId("catalog-row-linear").tagName).not.toBe("BUTTON");
-  expect(screen.queryByText("Couldn't reach github.")).toBeNull();
+  // The fallback rows use the same display names as the expandable ones.
+  expect(within(screen.getByTestId("catalog-row-github")).getByText("GitHub")).toBeTruthy();
+  expect(within(screen.getByTestId("catalog-row-linear")).getByText("Linear")).toBeTruthy();
+  expect(screen.queryByText("Couldn't reach GitHub.")).toBeNull();
 });
 
 it.each([
@@ -795,12 +1431,22 @@ it.each([
   expect(screen.queryByText(/· 0 tools/)).toBeNull();
 });
 
-it.each([false, true])("uses installed MCP identity and honors enabled=%s", (enabled) => {
+it.each([false, true])("uses installed MCP identity and honors enabled=%s", async (enabled) => {
   hosts = [ONLINE];
   inventory = {
     ...INVENTORY,
     context: {
       ...INVENTORY.context,
+      mcps: ["first", "second"].map((marketplace) => ({
+        id: `inventory-${marketplace}`,
+        name: "docs",
+        harness: "claude",
+        plugin: "toolkit",
+        detail: "toolkit plugin · host",
+        sourceId: `${marketplace}-mcp`,
+        enabled: true,
+        locked: false,
+      })),
       plugins: ["first", "second"].map((marketplace) => ({
         id: marketplace,
         name: "toolkit",
@@ -813,10 +1459,13 @@ it.each([false, true])("uses installed MCP identity and honors enabled=%s", (ena
       })),
     },
   };
-  renderHarnesses("claude-native");
+  const client = renderHarnesses("claude-native");
   selectTab("Plugins · 2");
   fireEvent.click(screen.getAllByTestId("catalog-row-toolkit")[1]);
   selectTab("MCPs · 1");
+  const toggle = screen.getByRole("switch", { name: "Enable docs for claude" });
+  expect(toggle).toHaveAttribute("aria-checked", "true");
+  expect(screen.queryByText("toolkit plugin · host")).toBeNull();
   const row = screen.getByTestId("catalog-row-docs");
   fireEvent.click(row);
   if (enabled) {
@@ -829,6 +1478,27 @@ it.each([false, true])("uses installed MCP identity and honors enabled=%s", (ena
     expect(mcpSources).toEqual([]);
     expect(mcpLookups.every((lookup) => !lookup[4])).toBe(true);
   }
+  const refreshEnablement = async (serverEnabled: boolean) => {
+    inventory = {
+      ...inventory,
+      context: {
+        ...inventory.context,
+        mcps: inventory.context.mcps.map((server) =>
+          server.sourceId === "second-mcp" ? { ...server, enabled: serverEnabled } : server,
+        ),
+      },
+    };
+    mcpLookups = [];
+    hosts = [{ ...ONLINE, name: `host-${serverEnabled}` }];
+    await act(async () => {
+      client.setQueryData(["hosts", { includeSandbox: false }], hosts);
+    });
+    expect(screen.getByRole("heading", { name: "toolkit" })).toBeInTheDocument();
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", String(serverEnabled)));
+    expect(mcpLookups.every((lookup) => !lookup[4])).toBe(true);
+  };
+  await refreshEnablement(false);
+  await refreshEnablement(true);
 });
 
 it("requests a host update instead of guessing installed MCP identity", () => {
@@ -837,6 +1507,7 @@ it("requests a host update instead of guessing installed MCP identity", () => {
     ...INVENTORY,
     context: {
       ...INVENTORY.context,
+      mcps: [{ id: "docs", name: "docs", harness: "claude", plugin: "toolkit", enabled: false }],
       plugins: [
         {
           ...INVENTORY.context.plugins[0],
@@ -854,4 +1525,151 @@ it("requests a host update instead of guessing installed MCP identity", () => {
   expect(screen.getByText("Update my-laptop to inspect installed plugin MCP tools.")).toBeTruthy();
   expect(screen.getByTestId("catalog-row-docs").tagName).not.toBe("BUTTON");
   expect(mcpSources).toEqual([]);
+  expect(screen.getByRole("switch", { name: "Enable docs for claude" })).toHaveAttribute(
+    "aria-checked",
+    "false",
+  );
+});
+
+it("keeps old-host and unsupported harness rows without a switch", () => {
+  hosts = [ONLINE];
+  renderHarnesses("claude-native");
+  expect(screen.queryByRole("switch")).toBeNull();
+});
+
+it.each([false, true])("renders MCP enabled=%s and suppresses off probes", (enabled) => {
+  hosts = [ONLINE];
+  inventory = {
+    ...INVENTORY,
+    context: {
+      ...INVENTORY.context,
+      mcps: [{ id: "docs", name: "docs", harness: "claude", enabled }],
+    },
+  };
+  renderHarnesses("claude-native");
+  expect(screen.getByRole("switch", { name: "Enable docs for claude" })).toHaveAttribute(
+    "aria-checked",
+    String(enabled),
+  );
+  fireEvent.click(screen.getByTestId("catalog-row-docs"));
+  if (!enabled) {
+    expect(screen.getByText("Off")).toBeInTheDocument();
+    expect(mcpLookups.every((lookup) => !lookup[4])).toBe(true);
+    expect(screen.getByTestId("catalog-row-docs")).toHaveClass("opacity-50");
+  } else expect(mcpLookups).toContainEqual(["h1", "claude", "docs", undefined, true]);
+});
+
+it("locks managed MCP switches", () => {
+  hosts = [ONLINE];
+  inventory = {
+    ...INVENTORY,
+    context: {
+      ...INVENTORY.context,
+      mcps: [{ id: "docs", name: "docs", harness: "claude", enabled: true, locked: true }],
+    },
+  };
+  renderHarnesses("claude-native");
+  expect(screen.getByRole("switch", { name: "Enable docs for claude" })).toBeDisabled();
+  expect(setEnabled).not.toHaveBeenCalled();
+});
+
+it.each([false, true])(
+  "optimistically toggles a plugin MCP and rolls back on failure=%s",
+  async (fails) => {
+    hosts = [ONLINE];
+    inventory = {
+      ...INVENTORY,
+      context: {
+        ...INVENTORY.context,
+        mcps: [
+          {
+            id: "source",
+            name: "docs",
+            harness: "claude",
+            plugin: "toolkit",
+            sourceId: "a".repeat(64),
+            enabled: true,
+          },
+        ],
+      },
+    };
+    const server: HostMcpServer = {
+      name: "docs",
+      harness: "claude",
+      transport: "stdio",
+      scope: "user",
+      plugin: "toolkit",
+      source_id: "a".repeat(64),
+      enabled: true,
+      locked: false,
+    };
+    let finish!: () => void;
+    setEnabled.mockImplementation(
+      () =>
+        new Promise((resolve, reject) => {
+          finish = () =>
+            fails ? reject(new Error("offline")) : resolve({ ...server, enabled: false });
+        }),
+    );
+    const client = renderHarnesses("claude-native");
+    client.setQueryData(["host-mcp-servers", "h1"], [server]);
+    fireEvent.click(screen.getByTestId("catalog-row-docs"));
+    expect(screen.getByTestId("catalog-row-docs")).toHaveAttribute("aria-expanded", "true");
+    const toggle = screen.getByRole("switch", { name: "Enable docs for claude" });
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
+    expect(toggle).toBeDisabled();
+    expect(setEnabled).toHaveBeenCalledWith("h1", {
+      harness: "claude",
+      server: "docs",
+      plugin: "toolkit",
+      source_id: "a".repeat(64),
+      enabled: false,
+    });
+    finish();
+    await waitFor(() => expect(toggle).not.toBeDisabled());
+    expect(
+      client.getQueryData<{ enabled: boolean }[]>(["host-mcp-servers", "h1"])?.[0].enabled,
+    ).toBe(fails);
+    if (fails) expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("catalog-row-docs")).toHaveAttribute("aria-expanded", "false");
+    expect(mcpLookups.at(-1)?.[4]).toBe(false);
+  },
+);
+
+it("retains the enablement switch when tool discovery is unavailable", () => {
+  hosts = [ONLINE];
+  inventory = {
+    ...INVENTORY,
+    context: {
+      ...INVENTORY.context,
+      mcps: [{ id: "docs", name: "docs", harness: "claude", enabled: true }],
+    },
+  };
+  mcpResult = { error: new ApiError("404", 404, null), isPending: false };
+  renderHarnesses("claude-native");
+  fireEvent.click(screen.getByTestId("catalog-row-docs"));
+  expect(screen.getByTestId("catalog-row-docs").tagName).not.toBe("BUTTON");
+  expect(screen.getByRole("switch", { name: "Enable docs for claude" })).toBeEnabled();
+});
+
+it.each([
+  [new ApiError("invalid", 422, null), "This server changed. Refresh and try again."],
+  [new ApiError("host is offline", 409, "conflict"), "Host is offline."],
+  [new ApiError("old", 501, null), "Update the host to turn MCP servers on or off."],
+  [new ApiError("Storage is unavailable.", 502, null), "Storage is unavailable."],
+  [new Error(""), "Couldn't update MCP server. Please try again."],
+])("shows the MCP enablement error: %s", async (error, message) => {
+  hosts = [ONLINE];
+  inventory = {
+    ...INVENTORY,
+    context: {
+      ...INVENTORY.context,
+      mcps: [{ id: "docs", name: "docs", harness: "claude", enabled: true }],
+    },
+  };
+  setEnabled.mockRejectedValue(error);
+  renderHarnesses("claude-native");
+  fireEvent.click(screen.getByRole("switch", { name: "Enable docs for claude" }));
+  await waitFor(() => expect(toast.error).toHaveBeenCalledWith(message));
 });

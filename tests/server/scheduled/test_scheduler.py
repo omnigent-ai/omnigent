@@ -26,10 +26,7 @@ from omnigent.server.scheduled.scheduler import (
 class _FakeTask:
     """The slice of ``ScheduledTask`` the scheduler reads.
 
-    The scheduler only touches ``id``, ``workspace_id``, ``rrule``,
-    ``timezone``, and ``state``, so the tests drive it with this local stand-in
-    rather than the full persisted entity — keeping the scheduler unit tests
-    independent of the entity's field set.
+    Keep scheduler tests independent of unrelated persisted entity fields.
     """
 
     id: str
@@ -37,6 +34,8 @@ class _FakeTask:
     timezone: str
     state: str
     workspace_id: int = 0
+    session_mode: str = "new"
+    execution_target: str = "connected_host"
 
 
 # ── Fakes ────────────────────────────────────────────────────────────────────
@@ -393,3 +392,76 @@ async def _fire_timer(timer) -> None:
 def scheduler_task_of(scheduler: ScheduledTaskScheduler, task_id: str) -> _FakeTask:
     """Reach into the fake store to get the seed task for update tests."""
     return scheduler._store.get(task_id)  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("mutation", ["create", "edit", "resume", "pause", "delete", "stop"])
+async def test_startup_snapshot_preserves_changes_during_load(monkeypatch, mutation):
+    from threading import Event
+
+    original = _task("changed", state="paused" if mutation == "resume" else "active")
+    scheduler, _clock, timers, _fired = _make([original, _task("untouched")])
+    entered, release = asyncio.Event(), Event()
+    loop = asyncio.get_running_loop()
+    load = scheduler._store.list_active_all_workspaces
+
+    def snapshot_then_wait():
+        snapshot = load()
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(10), "Startup snapshot was never released"
+        return snapshot
+
+    monkeypatch.setattr(scheduler._store, "list_active_all_workspaces", snapshot_then_wait)
+    startup = asyncio.create_task(scheduler.start())
+    target = "new" if mutation == "create" else "changed"
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        if mutation == "create":
+            scheduler.add(_task(target))
+        elif mutation in ("edit", "resume"):
+            scheduler.update(
+                replace(
+                    original, state="active", rrule="FREQ=DAILY;BYHOUR=9", timezone="Asia/Tokyo"
+                )
+            )
+        elif mutation == "pause":
+            scheduler.update(replace(original, state="paused"))
+        elif mutation == "delete":
+            scheduler.remove(target)
+        else:
+            scheduler.stop()
+        expected = scheduler.next_run_at(target)
+    finally:
+        release.set()
+        await startup
+    try:
+        assert scheduler.next_run_at(target) == expected
+        assert (expected is not None) == (mutation in ("create", "edit", "resume"))
+        assert scheduler.is_started == (mutation != "stop")
+        assert (scheduler.next_run_at("untouched") is not None) == (mutation != "stop")
+        assert len(timers.live()) == scheduler.job_count
+    finally:
+        scheduler.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("execution_target", ["connected_host", "managed_sandbox"])
+@pytest.mark.parametrize("session_mode", ["new", "continue"])
+async def test_ten_minute_timer_by_execution(execution_target, session_mode):
+    armed = execution_target == "connected_host" or session_mode == "continue"
+    task = replace(
+        _task("ten_minutes", "FREQ=MINUTELY;INTERVAL=10"),
+        session_mode=session_mode,
+        execution_target=execution_target,
+    )
+    scheduler, clock, seam, fired = _make([task])
+    await scheduler.start()
+    try:
+        assert bool(seam.live()) is armed
+        if armed:
+            assert 0 < seam.live()[-1].delay <= 600
+            clock.advance(seam.live()[-1].delay)
+            await seam.fire_latest()
+            assert fired.calls == [(0, task.id)]
+            assert seam.live()[-1].delay == 600
+    finally:
+        scheduler.stop()

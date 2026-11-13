@@ -12,10 +12,10 @@ from __future__ import annotations
 
 import shlex
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
-import tomllib
 import yaml
 
 from omnigent.errors import OmnigentError
@@ -261,7 +261,7 @@ def test_resolve_native_codex_launch_subscription_logged_in_uses_cli_login(
     When Codex actually has a stored login, deferring to its own auth is
     correct — the bridged ``auth.json`` authenticates it. The launch still
     pins the built-in ``openai`` provider: the bridged config.toml may set a
-    custom default ``model_provider`` (e.g. isaac's Databricks Unity Gateway),
+    custom default ``model_provider`` (e.g. a Databricks Unity Gateway),
     which would otherwise silently hijack the Subscription selection. Failure
     with extra overrides means we synthesized a provider route over a working
     subscription; failure with NO overrides means the pin regressed and a

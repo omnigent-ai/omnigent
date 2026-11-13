@@ -24,13 +24,11 @@ spawn-env builder. Rows own their auth and model selection (``OWN_AUTH``): no
 Omnigent credential or model override is wired, so a ``/model`` pick is
 rejected up front rather than silently dropped.
 
-One consequence worth knowing before adding a row: the generic ACP spawn env is
-deny-by-default and a row has no ``env_passthrough`` of its own (only a
-user-configured ``acp:<slug>`` agent can declare one), so a row's CLI reaches the
-agent with the base environment only. A vendor that configures or authenticates
-*solely* from an environment variable therefore needs a user-configured agent
-rather than a row here; a vendor that reads stored credentials from disk (Devin,
-Grok's OAuth login) works as a row.
+The generic ACP spawn env is deny-by-default. Each row declares the variable
+names its CLI needs in ``env_passthrough``. Spec declarations and the host owner's
+``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` can also grant specific names; unrelated
+provider variables stay filtered. Vendors that read stored credentials from
+disk (Devin, Grok's OAuth login) need no environment grant.
 
 This module stays import-light (stdlib + :mod:`omnigent.harness_install_spec`)
 so the registry, onboarding, and runner layers can all read it without cycles.
@@ -59,12 +57,17 @@ class AcpCliHarness:
         MCP and ignore ``mcpServers``, configuring MCP out of band instead
         (e.g. jcode reads ``~/.jcode/mcp.json``); set ``False`` for those so
         the server isn't advertised.
+    :param env_passthrough: Environment variable *names* the vendor CLI reads
+        for its own auth, e.g. ``("XAI_API_KEY",)``. The ACP spawn env is
+        deny-by-default, so a key the row's ``auth_hint`` advertises is
+        dropped before the CLI starts unless it is named here.
     """
 
     install: HarnessInstallSpec
     args: tuple[str, ...]
     aliases: tuple[str, ...] = ()
     omnigent_mcp: bool = True
+    env_passthrough: tuple[str, ...] = ()
 
     @property
     def label(self) -> str:
@@ -98,10 +101,14 @@ ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
             None,
             login_args=("login", "--device-auth"),
             install_hint="curl -fsSL https://x.ai/cli/install.sh | bash",
-            auth_hint="run `grok login --device-auth` (xAI OAuth) or set XAI_API_KEY",
+            auth_hint=(
+                "run `grok login --device-auth` (xAI OAuth) or forward XAI_API_KEY "
+                "with `OMNIGENT_RUNNER_ENV_PASSTHROUGH=XAI_API_KEY`"
+            ),
         ),
         args=("agent", "stdio"),
         aliases=("grok-build",),
+        env_passthrough=("XAI_API_KEY",),
     ),
     # jcode (https://jcode.sh) drives ``jcode acp``. Ships via a curl
     # installer (not npm) and owns its provider/model config in

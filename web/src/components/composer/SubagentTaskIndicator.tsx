@@ -8,6 +8,7 @@ import { useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSession
 import { Link, useLocation } from "@/lib/routing";
 import { sessionNavigationSearch } from "@/lib/sessionNavigation";
 import { cn } from "@/lib/utils";
+import { useOpenSubagentInPanel } from "@/shell/subagentPanelOpener";
 import { childStatus } from "@/shell/subagentStatus";
 
 /**
@@ -107,6 +108,7 @@ function SubagentNavigationRow({
   onNavigate: (event: MouseEvent<HTMLAnchorElement>) => void;
 }) {
   const search = sessionNavigationSearch(useLocation().search);
+  const openInPanel = useOpenSubagentInPanel();
   const label = subagentLabel(child);
   const tool = child.tool?.trim();
   const showTool = !!tool && tool !== label;
@@ -116,7 +118,10 @@ function SubagentNavigationRow({
       <Link
         to={{ pathname: `/c/${child.id}`, search }}
         componentId="composer-subagent-indicator-row"
-        onClick={onNavigate}
+        onClick={(event) => {
+          openInPanel(child.id, event);
+          onNavigate(event);
+        }}
         className="flex items-start gap-2 rounded-lg px-1 py-2 hover:bg-accent/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
       >
         <span className="flex h-5 w-5 shrink-0 items-center justify-center text-muted-foreground">

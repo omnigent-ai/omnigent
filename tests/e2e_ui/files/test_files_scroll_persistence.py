@@ -11,6 +11,7 @@ asserts the position survives.
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 from collections.abc import Iterator
@@ -26,10 +27,13 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _FILE_COUNT = 80
 
 
-def _seed_file(base_url: str, session_id: str, path: str) -> None:
+def _seed_file(base_url: str, session_id: str, path: str, content: str | None = None) -> None:
     resp = httpx.put(
         f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/{path}",
-        json={"content": f"contents of {path}\n", "encoding": "utf-8"},
+        json={
+            "content": f"contents of {path}\n" if content is None else content,
+            "encoding": "utf-8",
+        },
         timeout=10.0,
     )
     resp.raise_for_status()
@@ -168,3 +172,213 @@ def test_open_file_scroll_survives_session_switch(
             break
         page.wait_for_timeout(200)
     assert restored == 250
+
+
+def _plan_steps(first: int, last: int) -> str:
+    return "".join(
+        f"<section><h2>Step {i}</h2><p>Details for step {i} of the plan.</p></section>"
+        for i in range(first, last + 1)
+    )
+
+
+# Records each frame's opacity and offset from the first frame on, so a test can tell
+# whether the preview was ever shown away from the offset it restores.
+_FRAME_SAMPLER = (
+    "<script>window.sampledFrames=[];requestAnimationFrame(function sample(){"
+    "sampledFrames.push([getComputedStyle(document.documentElement).opacity,scrollY]);"
+    "requestAnimationFrame(sample)})</script>"
+)
+
+# A long HTML artifact whose later steps arrive after load, so the browser clamps
+# the restored offset until the page grows tall enough to reach it. A banner above the
+# reader then grows without changing the page height, which scroll anchoring follows.
+_HTML_ARTIFACT = (
+    "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Plan</title>"
+    "<style>body{font-family:sans-serif;margin:24px}section{min-height:220px}</style>"
+    + _FRAME_SAMPLER
+    + "</head><body><h1>Migration plan</h1><div id='banner' style='height:100px'></div>"
+    + _plan_steps(1, 8)
+    + "<script>setTimeout(() => document.body.insertAdjacentHTML('beforeend', "
+    + json.dumps(_plan_steps(9, 40) + "<div id='spacer' style='height:300px'></div>")
+    + "), 400); setTimeout(() => { banner.style.height = '400px'; spacer.style.height = '0'; },"
+    + " 600);</script></body></html>"
+)
+
+# The plan with its later steps arriving after the restore budget, as a slow fetch would.
+_HTML_ARTIFACT_LOADING_SLOWLY = (
+    "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Plan</title>"
+    "<style>body{font-family:sans-serif;margin:24px}section{min-height:220px}</style>"
+    "</head><body><h1>Migration plan</h1>"
+    + _plan_steps(1, 8)
+    + "<script>setTimeout(() => document.body.insertAdjacentHTML('beforeend', "
+    + json.dumps(_plan_steps(9, 40) + "<p id='loaded'>All steps loaded.</p>")
+    + "), 3000);</script></body></html>"
+)
+
+# The plan rewritten with a CSP that blocks every script, the preview's runtime included.
+_HTML_ARTIFACT_WITHOUT_SCRIPTS = (
+    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+    "<meta http-equiv='Content-Security-Policy' content=\"script-src 'none'\">"
+    "<title>Plan</title></head><body><h1>Revised migration plan</h1>"
+    "<label><input type='checkbox' id='reviewed'> Reviewed</label>"
+    + _plan_steps(1, 40)
+    + "</body></html>"
+)
+
+_HTML_PREVIEW = 'iframe[title="HTML preview"]'
+
+
+@pytest.fixture
+def seeded_html_sessions(
+    seeded_session_pair: tuple[str, str, str],
+) -> Iterator[tuple[str, str, str]]:
+    """Session A holds a long HTML artifact plus a notes file; B holds one file."""
+    base_url, session_a, session_b = seeded_session_pair
+    _seed_file(base_url, session_a, "plan.html", _HTML_ARTIFACT)
+    _seed_file(base_url, session_a, "notes.md", "# Notes\n\nShort notes file.\n")
+    _seed_file(base_url, session_b, "other_session_file.txt")
+    try:
+        yield (base_url, session_a, session_b)
+    finally:
+        for session_id in (session_a, session_b):
+            shutil.rmtree(_REPO_ROOT / session_id, ignore_errors=True)
+
+
+def _open_html_artifact(page: Page, base_url: str, session_id: str) -> int:
+    """Open plan.html from the Files panel, scroll to step 25, and return the offset."""
+    # The autouse baseline opens the panel only for tests that take ``page`` directly.
+    page.add_init_script("window.localStorage.setItem('omnigent:default-workspace-panel', 'open')")
+    page.goto(f"{base_url}/c/{session_id}?view=explore")
+    rail = page.get_by_role("complementary", name="Workspace")
+    row = rail.get_by_role("button", name=re.compile(r"plan\.html")).first
+    expect(row).to_be_visible(timeout=30_000)
+    row.click()
+    preview = page.frame_locator(_HTML_PREVIEW)
+    expect(preview.get_by_role("heading", name="Migration plan")).to_be_visible(timeout=30_000)
+    expect(preview.locator("#banner")).to_have_css("height", "400px")
+
+    # Scroll with the wheel, as a reader would, until step 25 is on screen.
+    page.locator(_HTML_PREVIEW).hover()
+    step = preview.get_by_role("heading", name="Step 25", exact=True)
+    for _ in range(40):
+        if step.evaluate("el => el.getBoundingClientRect().top < innerHeight / 2"):
+            break
+        page.mouse.wheel(0, 300)
+        page.wait_for_timeout(100)
+    else:
+        raise AssertionError("wheel scrolling never brought Step 25 into view")
+    return _settled_html_scroll(page)
+
+
+def _settled_html_scroll(page: Page) -> int:
+    """The preview document's scroll offset once it stops changing."""
+    frame = page.frame_locator(_HTML_PREVIEW).locator("html")
+    previous = -1
+    for _ in range(30):
+        current = int(frame.evaluate("() => Math.round(window.scrollY)"))
+        if current == previous:
+            return current
+        previous = current
+        page.wait_for_timeout(150)
+    raise AssertionError(f"preview scroll offset never settled (last {previous})")
+
+
+def _expect_html_scroll(page: Page, expected: int) -> None:
+    """The remounted preview reopens at ``expected`` on step 25 and is never shown elsewhere."""
+    preview = page.frame_locator(_HTML_PREVIEW)
+    expect(preview.get_by_role("heading", name="Step 25", exact=True)).to_be_in_viewport(
+        timeout=15_000
+    )
+    expect(preview.locator("#banner")).to_have_css("height", "400px")
+    frame = page.locator(_HTML_PREVIEW).element_handle().content_frame()
+    assert frame is not None
+    frame.wait_for_function(
+        "expected => Math.round(window.scrollY) === expected", arg=expected, timeout=10_000
+    )
+    frame.wait_for_function(
+        "() => getComputedStyle(document.documentElement).opacity === '1'", timeout=5_000
+    )
+    samples = frame.evaluate("() => window.sampledFrames")
+    shown_elsewhere = [
+        round(top) for opacity, top in samples if float(opacity) > 0 and abs(top - expected) > 1
+    ]
+    assert samples, "the preview painted no frames"
+    assert not shown_elsewhere, f"preview shown at {shown_elsewhere}, away from {expected}"
+
+
+def test_html_preview_scroll_survives_tab_switch(
+    request: pytest.FixtureRequest,
+    seeded_html_sessions: tuple[str, str, str],
+) -> None:
+    """Scroll an HTML artifact, open another file tab, return: the offset is restored.
+
+    A rewrite that blocks the preview's runtime still shows once the hide style expires.
+    """
+    base_url, session_a, _ = seeded_html_sessions
+    page: Page = request.getfixturevalue("page")
+    offset = _open_html_artifact(page, base_url, session_a)
+    assert offset > 1000
+
+    # Opening another file unmounts the preview, so returning to plan.html remounts it.
+    rail = page.get_by_role("complementary", name="Workspace")
+    rail.get_by_role("tab", name="Files").click()
+    rail.get_by_role("button", name=re.compile(r"notes\.md")).first.click()
+    expect(page.locator(_HTML_PREVIEW)).to_have_count(0, timeout=15_000)
+    expect(page.get_by_text("Short notes file.").first).to_be_visible(timeout=30_000)
+
+    page.locator('[role="button"][title="plan.html"]').click()
+    _expect_html_scroll(page, offset)
+
+    _seed_file(base_url, session_a, "plan.html", _HTML_ARTIFACT_WITHOUT_SCRIPTS)
+    preview = page.frame_locator(_HTML_PREVIEW)
+    expect(preview.get_by_role("heading", name="Revised migration plan")).to_be_attached(
+        timeout=15_000
+    )
+    expect(preview.locator("html")).to_have_css("opacity", "1", timeout=10_000)
+    # The runtime never ran to remove the style, so its own expiry showed the page.
+    expect(preview.locator("style[data-omni-restore-hide]")).to_have_count(1)
+    preview.locator("#reviewed").click()
+    expect(preview.locator("#reviewed")).to_be_checked()
+
+
+def test_html_preview_scroll_survives_slow_load(
+    request: pytest.FixtureRequest,
+    seeded_html_sessions: tuple[str, str, str],
+) -> None:
+    """A preview that loads after the restore budget keeps the reader's offset for the next one."""
+    base_url, session_a, _ = seeded_html_sessions
+    page: Page = request.getfixturevalue("page")
+    offset = _open_html_artifact(page, base_url, session_a)
+    assert offset > 1000
+
+    _seed_file(base_url, session_a, "plan.html", _HTML_ARTIFACT_LOADING_SLOWLY)
+    preview = page.frame_locator(_HTML_PREVIEW)
+    expect(preview.locator("#loaded")).to_be_attached(timeout=15_000)
+    expect(preview.locator("html")).to_have_css("opacity", "1")
+    # The budget ran out while the page was short, so it shows where the clamp left it.
+    assert _settled_html_scroll(page) < offset
+
+    # A rewrite that loads in time reopens where the reader was, not at the clamp.
+    _seed_file(base_url, session_a, "plan.html", _HTML_ARTIFACT)
+    _expect_html_scroll(page, offset)
+
+
+def test_html_preview_scroll_survives_session_switch(
+    request: pytest.FixtureRequest,
+    seeded_html_sessions: tuple[str, str, str],
+) -> None:
+    """Scroll an HTML artifact, switch sessions and back: the offset is restored."""
+    base_url, session_a, session_b = seeded_html_sessions
+    page: Page = request.getfixturevalue("page")
+    offset = _open_html_artifact(page, base_url, session_a)
+    assert offset > 1000
+    expect(page.locator(f'a[href="/c/{session_b}"]')).to_be_visible(timeout=30_000)
+
+    page.locator(f'a[href="/c/{session_b}"]').click()
+    expect(page).to_have_url(f"{base_url}/c/{session_b}", timeout=15_000)
+    rail = page.get_by_role("complementary", name="Workspace")
+    expect(rail.get_by_text("other_session_file.txt")).to_be_visible(timeout=30_000)
+
+    page.locator(f'a[href="/c/{session_a}"]').click()
+    expect(page).to_have_url(re.compile(rf"/c/{session_a}"), timeout=15_000)
+    _expect_html_scroll(page, offset)
