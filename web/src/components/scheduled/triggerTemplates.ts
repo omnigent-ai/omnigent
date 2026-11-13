@@ -750,6 +750,23 @@ export function triggerServiceName(source: TriggerSource): string {
   return SERVICE_NAMES[source];
 }
 
+/**
+ * The catalog service a trigger's source reads from: matched by id (``slack``, or a
+ * namespaced ``system.ai.slack``) or by its title.
+ */
+export function triggerMcpService<T extends { id: string; title: string }>(
+  source: TriggerSource,
+  services: readonly T[],
+): T | undefined {
+  const name = triggerServiceName(source).toLowerCase();
+  return services.find(
+    (service) =>
+      service.id === source ||
+      service.id.endsWith(`.${source}`) ||
+      service.title.toLowerCase() === name,
+  );
+}
+
 /** How every rendered trigger prompt begins, e.g. "This automation watches Jira and starts". */
 function triggerPromptOpening(source: TriggerSource): string {
   return `This automation watches ${triggerServiceName(source)} and starts one Omnigent session`;

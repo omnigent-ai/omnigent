@@ -1,7 +1,7 @@
 // Trigger-template fields shown in place of the scheduled-task prompt.
 
 import { useState } from "react";
-import { InfoIcon, PlusIcon, TriangleAlertIcon, XIcon } from "lucide-react";
+import { InfoIcon, PlugIcon, PlusIcon, TriangleAlertIcon, XIcon } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -85,12 +85,22 @@ function WarningTag({
   );
 }
 
+/** The server's MCP service for a trigger's source, when it offers one. */
+export interface TriggerMcpService {
+  title: string;
+  /** Selected for the task's runs, or still waiting for the owner to sign in. */
+  state: "selected" | "needs-sign-in";
+  signingIn: boolean;
+  onSignIn: () => void;
+}
+
 export function TriggerTemplateFields({
   source,
   fields,
   onChange,
   onSelectOpenChange,
   toolsProvided = false,
+  mcpService,
   taskSessionMode = "new",
 }: {
   source: TriggerSource;
@@ -102,6 +112,8 @@ export function TriggerTemplateFields({
   onSelectOpenChange: (open: boolean) => void;
   /** Where the task runs already gives the agent the service's tools, so skip that warning. */
   toolsProvided?: boolean;
+  /** The matching MCP service, which replaces the warning that one is needed. */
+  mcpService?: TriggerMcpService;
 }) {
   const template = TRIGGER_TEMPLATES[source];
   const Icon = template.icon;
@@ -245,12 +257,35 @@ export function TriggerTemplateFields({
                   </TooltipProvider>
                 </div>
                 <div className="flex flex-wrap gap-1.5">
-                  {!toolsProvided && (
+                  {mcpService?.state === "selected" ? (
                     <WarningTag
-                      label="MCP required"
-                      message={toolsWarning}
-                      testId="task-trigger-tools-note"
+                      label={`Uses ${mcpService.title} MCP`}
+                      message={`Every run, and each session it starts, uses your ${mcpService.title} MCP service.`}
+                      testId="task-trigger-mcp-note"
                     />
+                  ) : mcpService?.state === "needs-sign-in" ? (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-5 gap-1 rounded-md px-2 text-xs"
+                      disabled={mcpService.signingIn}
+                      onClick={mcpService.onSignIn}
+                      data-testid="task-trigger-mcp-sign-in"
+                    >
+                      <PlugIcon aria-hidden="true" className="size-3" />
+                      {mcpService.signingIn
+                        ? `Signing in to ${mcpService.title}…`
+                        : `Sign in to use ${mcpService.title} MCP`}
+                    </Button>
+                  ) : (
+                    !toolsProvided && (
+                      <WarningTag
+                        label="MCP required"
+                        message={toolsWarning}
+                        testId="task-trigger-tools-note"
+                      />
+                    )
                   )}
                   <WarningTag
                     label="Untrusted source"

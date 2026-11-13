@@ -30,7 +30,7 @@ import * as identity from "@/lib/identity";
 import * as sandboxModelsHook from "@/hooks/useSandboxModelOptions";
 import * as hostsHook from "@/hooks/useHosts";
 import * as scheduledHooks from "@/hooks/useScheduledTasks";
-import { registryRequest, type RegistryService } from "@/lib/mcpRegistry";
+import { authorizeRegistryService, registryRequest, type RegistryService } from "@/lib/mcpRegistry";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
@@ -6519,6 +6519,64 @@ describe("CreateScheduledTaskDialog MCP services", () => {
 
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     expect(updateMutateAsync.mock.calls[0][0].input.mcpServices).toEqual(expected);
+  });
+
+  function renderTrigger(source: "slack" | "jira", services: RegistryService[]) {
+    vi.mocked(registryRequest).mockResolvedValue({ data: services });
+    return render(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          scheduled_task_session_modes: true,
+          scheduled_task_trigger_headers: true,
+          scheduled_task_mcp_services: true,
+          enabled_connections: ["mcp"],
+        }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} initialTrigger={source} />
+      </CapabilitiesProvider>,
+    );
+  }
+  const slack: RegistryService = { ...github, id: "slack", title: "Slack" };
+
+  it("turns on a trigger's MCP service the owner is signed in to, once", async () => {
+    renderTrigger("slack", [github, slack]);
+    const chip = screen.getByTestId("task-mcp-services-trigger");
+    await waitFor(() => expect(chip).toHaveTextContent("MCPs · 1"));
+    expect(screen.getByTestId("task-trigger-mcp-note")).toHaveTextContent("Uses Slack MCP");
+    expect(screen.queryByTestId("task-trigger-tools-note")).not.toBeInTheDocument();
+
+    // Turning it off sticks, and the run is back to needing tools from elsewhere.
+    fireEvent.click(await mcpSwitch("Slack"));
+    await waitFor(() => expect(chip).toHaveTextContent("No MCPs"));
+    expect(screen.getByTestId("task-trigger-tools-note")).toHaveTextContent("MCP required");
+  });
+
+  it("offers sign-in for a trigger's MCP service without blocking the save", async () => {
+    vi.mocked(authorizeRegistryService).mockResolvedValue(undefined);
+    renderTrigger("slack", [github, { ...slack, connected: false }]);
+    const signIn = await screen.findByTestId("task-trigger-mcp-sign-in");
+    expect(signIn).toHaveTextContent("Sign in to use Slack MCP");
+    // Nothing is picked for the owner, so nothing needs sign-in to save.
+    expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("No MCPs");
+    expect(screen.queryByTestId("task-mcp-services-blocked")).not.toBeInTheDocument();
+    expect(authorizeRegistryService).not.toHaveBeenCalled();
+
+    vi.mocked(registryRequest).mockResolvedValue({ data: [github, slack] });
+    fireEvent.click(signIn);
+    await waitFor(() =>
+      expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("MCPs · 1"),
+    );
+    expect(authorizeRegistryService).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("task-trigger-mcp-note")).toHaveTextContent("Uses Slack MCP");
+  });
+
+  it("keeps the tools warning for a trigger the server has no MCP service for", async () => {
+    renderTrigger("jira", [github, slack]);
+    await waitFor(() => expect(registryRequest).toHaveBeenCalled());
+    expect(screen.getByTestId("task-trigger-tools-note")).toHaveTextContent("MCP required");
+    expect(screen.queryByTestId("task-trigger-mcp-sign-in")).not.toBeInTheDocument();
+    expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("No MCPs");
   });
 
   it("leaves a continued session's services alone", async () => {

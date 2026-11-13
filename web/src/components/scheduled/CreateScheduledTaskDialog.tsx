@@ -53,7 +53,10 @@ import { ComposerConfigSections } from "@/components/composer/ComposerConfigSect
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { ComposerHarnessTrigger } from "@/components/composer/ComposerControls";
 import { PickerSectionHeader } from "@/components/composer/HarnessMenuRow";
-import { TriggerTemplateFields } from "@/components/scheduled/TriggerTemplateFields";
+import {
+  TriggerTemplateFields,
+  type TriggerMcpService,
+} from "@/components/scheduled/TriggerTemplateFields";
 import {
   TriggerWorkerHarnessField,
   TriggerWorkerSettingsFields,
@@ -75,6 +78,7 @@ import {
   TRIGGER_TEMPLATES,
   triggerFieldsComplete,
   triggerPromptSource,
+  triggerMcpService,
   triggerServiceName,
   triggerWorkerSettingsOf,
   updateTriggerWorkerSettings,
@@ -94,7 +98,7 @@ import { useHosts } from "@/hooks/useHosts";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { McpRegistryPicker } from "@/components/McpRegistry";
-import { useMcpRegistryCatalog } from "@/hooks/useMcpRegistry";
+import { useMcpRegistryCatalog, useRegistrySignIn } from "@/hooks/useMcpRegistry";
 import { readLastMcpServices } from "@/lib/mcpPreferences";
 import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { isFeatureEnabled, pickerCuration, sandboxOptionLabel } from "@/lib/capabilities";
@@ -1257,6 +1261,47 @@ export function CreateScheduledTaskDialog({
     setMcpServices((current) =>
       next ? [...new Set([...current, id])] : current.filter((service) => service !== id),
     );
+  const { signIn: signInMcp, authorizing: mcpSigningIn } = useRegistrySignIn(mcpCatalog.refresh);
+  // A trigger reads its source through that service's MCP, when the server offers one.
+  const triggerMcp =
+    mcpPickerShown && trigger !== null && !reusesExistingSession
+      ? triggerMcpService(trigger, mcpCatalog.services)
+      : undefined;
+  // Picking a trigger turns its service on once, if the owner is already signed in;
+  // turning it off afterwards sticks.
+  const preselectedTrigger = useRef<string | null>(null);
+  useEffect(() => {
+    if (!open) {
+      preselectedTrigger.current = null;
+      return;
+    }
+    if (isEdit || triggerMcp === undefined || !triggerMcp.connected) return;
+    if (preselectedTrigger.current === trigger) return;
+    preselectedTrigger.current = trigger;
+    toggleMcpService(triggerMcp.id, true);
+  }, [open, isEdit, trigger, triggerMcp]);
+  const triggerMcpNote: TriggerMcpService | undefined =
+    triggerMcp === undefined
+      ? undefined
+      : !triggerMcp.connected
+        ? {
+            title: triggerMcp.title,
+            state: "needs-sign-in",
+            signingIn: mcpSigningIn === triggerMcp.id,
+            onSignIn: () => {
+              // A Databricks service first asks for its workspace, which the menu collects.
+              if (triggerMcp.auth === "databricks") {
+                setMcpMenuOpen(true);
+                return;
+              }
+              void signInMcp(triggerMcp).then(
+                (signedIn) => signedIn && toggleMcpService(triggerMcp.id, true),
+              );
+            },
+          }
+        : offeredMcpServices.includes(triggerMcp.id)
+          ? { title: triggerMcp.title, state: "selected", signingIn: false, onSignIn: () => {} }
+          : undefined;
   const canSubmit =
     !curationPending &&
     name.trim() !== "" &&
@@ -1271,6 +1316,7 @@ export function CreateScheduledTaskDialog({
     !(workerSettings !== null && workerHarnessSettings.blockedReason) &&
     mcpBlockedReason === null &&
     !mcpAuthorizing &&
+    mcpSigningIn === null &&
     !mutationPending;
   // Problems that disable Save but whose explanation or fix lives under Advanced settings.
   const advancedBlocksSubmit =
@@ -1741,6 +1787,7 @@ export function CreateScheduledTaskDialog({
                           }) !== null
                         }
                         taskSessionMode={triggerTaskSessionMode}
+                        mcpService={triggerMcpNote}
                       />
                     ) : (
                       <div ref={promptFieldsRef} className="flex flex-col gap-1.5">

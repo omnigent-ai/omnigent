@@ -36,6 +36,7 @@ import {
   type TriggerConfig,
   type TriggerFields,
   type TriggerPromptContext,
+  triggerMcpService,
 } from "./triggerTemplates";
 
 const CTX: TriggerPromptContext = {
@@ -1785,5 +1786,22 @@ describe("one task session for every match", () => {
     expect(splitTriggerPrompt(perItemHeading).userPrompt).toBe(
       "Include\n\nInstructions for each session:\nan agenda.",
     );
+  });
+});
+
+describe("triggerMcpService", () => {
+  const services = [
+    { id: "github", title: "GitHub" },
+    { id: "system.ai.slack", title: "Slack workspace" },
+    { id: "atlassian", title: "Jira" },
+  ];
+
+  it.each([
+    ["github", "github"],
+    ["slack", "system.ai.slack"],
+    ["jira", "atlassian"],
+    ["linear", undefined],
+  ] as const)("matches %s to %s", (source, id) => {
+    expect(triggerMcpService(source, services)?.id).toBe(id);
   });
 });
