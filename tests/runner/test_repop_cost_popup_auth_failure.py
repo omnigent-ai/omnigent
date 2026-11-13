@@ -14,6 +14,7 @@ from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.telemetry.request_headers import client_identity_headers
 from tests.runner.helpers import NullServerClient
 
 
@@ -97,5 +98,8 @@ async def test_cost_popup_resolves_credentials_outside_event_loop(
     assert config_path.is_relative_to(tmp_path)
     assert json.loads(config_path.read_text()) == {
         "ap_server_url": "http://ap.example",
-        "ap_auth_headers": {"Authorization": "Bearer mock-popup-token"},
+        "ap_auth_headers": {
+            **client_identity_headers(),
+            "Authorization": "Bearer mock-popup-token",
+        },
     }
