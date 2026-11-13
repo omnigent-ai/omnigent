@@ -1037,6 +1037,36 @@ async function fetchWorkspaceEnvironment(conversationId: string): Promise<Worksp
 }
 
 /**
+ * Refetch the environment when the session snapshot reports a newly bound
+ * runner. A session can be opened before its runner binds; that GET fails
+ * with a 409 that is not retried, and no file event follows the bind.
+ */
+function useRefetchEnvironmentOnRunnerBind(conversationId: string | undefined) {
+  const queryClient = useQueryClient();
+  const { session } = useSession(conversationId);
+  // `undefined` while the snapshot is unknown, so the first load is not a bind.
+  const runnerId = session ? (session.runnerId ?? null) : undefined;
+  const lastKnown = useRef<{ id: string | undefined; runnerId: string | null | undefined }>({
+    id: conversationId,
+    runnerId,
+  });
+  useEffect(() => {
+    const previous =
+      lastKnown.current.id === conversationId ? lastKnown.current.runnerId : undefined;
+    lastKnown.current = {
+      id: conversationId,
+      runnerId: runnerId === undefined ? previous : runnerId,
+    };
+    if (!conversationId || !runnerId || previous === undefined || runnerId === previous) return;
+    // Several panels share this query; let them join one refetch.
+    void queryClient.invalidateQueries(
+      { queryKey: ["workspace-environment", conversationId] },
+      { cancelRefetch: false },
+    );
+  }, [conversationId, runnerId, queryClient]);
+}
+
+/**
  * Fetch the default environment resource for a session.
  *
  * Returns the workspace root path from the environment's metadata, or
@@ -1053,6 +1083,7 @@ export function useWorkspaceEnvironment(
   const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
   const serveable = useWorkspaceServeable(conversationId);
   const retry = useRunnerOfflineRetry(useRunnerRecovering(conversationId));
+  useRefetchEnvironmentOnRunnerBind(conversationId);
   return useQuery({
     queryKey: ["workspace-environment", conversationId],
     queryFn: () => fetchWorkspaceEnvironment(conversationId!),

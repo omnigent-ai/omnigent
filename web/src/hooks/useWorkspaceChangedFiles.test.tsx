@@ -52,7 +52,9 @@ const sessionMock = vi.mocked(useSession);
 const chatStoreMock = vi.mocked(useChatStore);
 const fetchMock = vi.fn();
 
-function stubSession(opts: { hostId?: string | null; createdAtSecondsAgo?: number } | null) {
+function stubSession(
+  opts: { hostId?: string | null; createdAtSecondsAgo?: number; runnerId?: string | null } | null,
+) {
   if (opts === null) {
     sessionMock.mockReturnValue({ session: null, isLoading: false, error: null });
     return;
@@ -61,6 +63,7 @@ function stubSession(opts: { hostId?: string | null; createdAtSecondsAgo?: numbe
   sessionMock.mockReturnValue({
     session: {
       hostId: opts.hostId ?? "host_1",
+      runnerId: opts.runnerId,
       permissionLevel: null,
       createdAt,
     } as Session,
@@ -695,6 +698,64 @@ describe("useWorkspaceEnvironment gating", () => {
     await flushMicrotasks();
 
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("useWorkspaceEnvironment runner bind", () => {
+  const environmentUrl = "/v1/sessions/conv_new/resources/environments/default";
+  const notBound = () => jsonResponse({ error: { code: "conflict" } }, 409);
+
+  function renderShared(probe: () => ReactNode) {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = () => <QueryClientProvider client={qc}>{probe()}</QueryClientProvider>;
+    const view = render(tree());
+    return () => view.rerender(tree());
+  }
+
+  it("refetches a pre-bind 409 once the snapshot reports the bound runner", async () => {
+    onlineMock.mockReturnValue(true);
+    stubSession({ runnerId: null });
+    fetchMock
+      .mockResolvedValueOnce(notBound())
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValue(changedFilesResponse());
+
+    const rerender = renderShared(() => (
+      <>
+        <ChangedFilesProbe id="conv_new" />
+        <EnvironmentProbe id="conv_new" />
+      </>
+    ));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    stubSession({ runnerId: null });
+    rerender();
+    await flushMicrotasks();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    stubSession({ runnerId: "runner_1" });
+    rerender();
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      environmentUrl,
+      environmentUrl,
+      `${environmentUrl}/changes`,
+    ]);
+  });
+
+  it("does not treat the first loaded snapshot as a bind", async () => {
+    onlineMock.mockReturnValue(true);
+    sessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
+    fetchMock.mockResolvedValue(notBound());
+
+    const rerender = renderShared(() => <EnvironmentProbe id="conv_new" />);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    stubSession({ runnerId: "runner_1" });
+    rerender();
+    rerender();
+    await flushMicrotasks();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 
