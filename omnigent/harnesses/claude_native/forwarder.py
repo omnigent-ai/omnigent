@@ -52,6 +52,11 @@ from omnigent.harnesses.claude_native.bridge import (
     url_component,
     write_active_session_id,
 )
+from omnigent.harnesses.claude_native.clear_recovery import (
+    pending_clear_supersessions,
+    record_clear_supersession,
+    replay_clear_supersessions,
+)
 from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import sync_raw_status_context
@@ -65,9 +70,6 @@ from omnigent.native._native_post_delivery import (
 from omnigent.native._native_supersession import (
     clear_replacement_create_body,
     unfiled_clear_replacement_body,
-)
-from omnigent.native._native_supersession import (
-    post_clear_supersession as _post_clear_supersession,
 )
 from omnigent.native.failure_telemetry import (
     FailureContext,
@@ -1371,6 +1373,9 @@ async def forward_claude_transcript_to_session(
     task_statuses: dict[str, str] = {}
     task_order: list[str] = []
     subagent_task: asyncio.Task[SubagentForwardState] | None = None
+    subagent_task_session_id: str | None = None
+    clear_cleanup_task: asyncio.Task[None] | None = None
+    clear_cleanup_retry_at = 0.0
     observer_stderr_offset = 0
     transcript_diagnostics = _TranscriptDiscoveryDiagnostics(started_at=time.monotonic())
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
@@ -1393,6 +1398,7 @@ async def forward_claude_transcript_to_session(
             timeout=subagent_timeout,
             event_dispatcher=event_dispatcher,
         ) as subagent_client,
+        asyncio.TaskGroup() as clear_cleanup_tasks,
     ):
         loop_failures = 0
         loop_failure_logged_at = 0.0
@@ -1435,23 +1441,25 @@ async def forward_claude_transcript_to_session(
                     if rotation is not None:
                         await _cancel_subagent_forward_task(subagent_task)
                         subagent_task = None
-                        # Tell the superseded (old) conversation it was cleared:
-                        # persist a notice linking to the rotated-to session and
-                        # emit a live redirect event. Use the loop's ``session_id``
-                        # (the session being forwarded BEFORE this poll), NOT
-                        # ``current_session_id``: when the hook rotated the bridge's
-                        # active session synchronously, ``current_session_id`` already
-                        # reads the NEW id, whereas ``session_id`` is not reassigned
-                        # to ``rotation`` until below. The call is fully best-effort
-                        # (swallows its own errors) so the state reset below always
-                        # runs.
-                        await _post_clear_supersession(
-                            client,
-                            old_session_id=session_id,
-                            new_session_id=rotation,
-                            agent_name=agent_name,
-                            detach_runner=True,
-                        )
+                    if clear_cleanup_task is not None and clear_cleanup_task.done():
+                        clear_cleanup_task.result()
+                        clear_cleanup_task = None
+                        clear_cleanup_retry_at = time.monotonic() + 5.0
+                    if clear_cleanup_task is None and (
+                        rotation is not None or time.monotonic() >= clear_cleanup_retry_at
+                    ):
+                        pending = await asyncio.to_thread(pending_clear_supersessions, bridge_dir)
+                        if pending:
+                            if any(old == subagent_task_session_id for _, old, _ in pending):
+                                await _cancel_subagent_forward_task(subagent_task)
+                                subagent_task = None
+                                subagent_task_session_id = None
+                            clear_cleanup_task = clear_cleanup_tasks.create_task(
+                                replay_clear_supersessions(client, pending, agent_name=agent_name),
+                                name="claude-clear-cleanup",
+                            )
+                        clear_cleanup_retry_at = time.monotonic() + 5.0
+                    if rotation is not None:
                         session_id = rotation
                         state = None
                         hook_state = None
@@ -1631,6 +1639,7 @@ async def forward_claude_transcript_to_session(
                             subagent_state = await asyncio.to_thread(
                                 _read_subagent_forward_state, bridge_dir
                             )
+                            subagent_task_session_id = current_session_id
                             subagent_task = asyncio.create_task(
                                 asyncio.wait_for(
                                     _forward_available_subagents(
@@ -3605,22 +3614,20 @@ async def _create_clear_replacement_session(
     transfer_resp.raise_for_status()
 
     write_active_session_id(bridge_dir, new_session_id)
-    clear_resp = await client.patch(
-        f"/v1/sessions/{url_component(old_session_id)}",
-        json={
-            # A distinct bridge id keeps a resumed old session from sharing the
-            # live transcript with the new session's forwarder.
-            "labels": {BRIDGE_ID_LABEL_KEY: f"{old_session_id}-cleared"},
-        },
-    )
-    if clear_resp.status_code >= 400:
+    await asyncio.to_thread(record_clear_supersession, bridge_dir, old_session_id, new_session_id)
+    try:
+        clear_resp = await client.patch(
+            f"/v1/sessions/{url_component(old_session_id)}",
+            json={"labels": {BRIDGE_ID_LABEL_KEY: f"{old_session_id}-cleared"}},
+        )
+        clear_resp.raise_for_status()
+    except (httpx.HTTPError, ConnectionError):
         _logger.warning(
-            "Failed to re-key old claude-native bridge after /clear; "
-            "old_session=%s new_session=%s status=%s body=%s",
+            "Failed to re-key old claude-native bridge after /clear; cleanup will retry; "
+            "old_session=%s new_session=%s",
             old_session_id,
             new_session_id,
-            clear_resp.status_code,
-            clear_resp.text,
+            exc_info=True,
             extra={"session_id": old_session_id},
         )
     return new_session_id

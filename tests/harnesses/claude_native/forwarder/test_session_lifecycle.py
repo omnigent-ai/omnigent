@@ -18,6 +18,7 @@ from omnigent.harnesses.claude_native.bridge import (
     record_hook_event,
     write_active_session_id,
 )
+from omnigent.native._native_supersession import post_clear_supersession
 from tests.harnesses.claude_native.forwarder._support import (
     _get_recorded_request,
     _start_recording_server,
@@ -26,12 +27,15 @@ from tests.harnesses.claude_native.forwarder._support import (
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "project_available", [True, False], ids=["project-available", "project-not-found"]
+    ("project_available", "checkpoint_crash"),
+    [(True, False), (False, False), (True, True)],
+    ids=["project-available", "project-not-found", "checkpoint-crash"],
 )
 async def test_clear_hook_rotates_active_session_without_reprocessing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     project_available: bool,
+    checkpoint_crash: bool,
 ) -> None:
     """
     Claude ``/clear`` creates a fresh Omnigent session and consumes the hook.
@@ -112,12 +116,27 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
             start_at_end=False,
             session_id="conv_old",
         )
-        rotated_to = await forwarder._maybe_rotate_session_on_clear(
-            client=client,
-            session_id="conv_old",
-            bridge_dir=bridge_dir,
-            state=hook_state,
-        )
+        save_hook_state = forwarder._write_hook_state_async
+
+        async def crash_after_checkpoint(*args: Any, **kwargs: Any) -> None:
+            await save_hook_state(*args, **kwargs)
+            raise asyncio.CancelledError
+
+        if checkpoint_crash:
+            monkeypatch.setattr(forwarder, "_write_hook_state_async", crash_after_checkpoint)
+            with pytest.raises(asyncio.CancelledError):
+                await forwarder._maybe_rotate_session_on_clear(
+                    client=client, session_id="conv_old", bridge_dir=bridge_dir, state=hook_state
+                )
+            monkeypatch.setattr(forwarder, "_write_hook_state_async", save_hook_state)
+            rotated_to = None
+        else:
+            rotated_to = await forwarder._maybe_rotate_session_on_clear(
+                client=client,
+                session_id="conv_old",
+                bridge_dir=bridge_dir,
+                state=hook_state,
+            )
         replay_state = await forwarder._ensure_hook_state(
             bridge_dir,
             start_at_end=False,
@@ -130,10 +149,10 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
             state=replay_state,
         )
 
-    assert rotated_to == "conv_new"
+    assert rotated_to == (None if checkpoint_crash else "conv_new")
     assert rotated_again is None
     assert read_active_session_id(bridge_dir) == "conv_new"
-    assert not (bridge_dir / "transcript_forwarder.json").exists()
+    assert (bridge_dir / "transcript_forwarder.json").exists() is checkpoint_crash
     assert (bridge_dir / "hook_forwarder.json").exists()
     unfiled_body = {
         "agent_id": "ag_claude",
@@ -165,6 +184,50 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
             {"labels": {BRIDGE_ID_LABEL_KEY: "conv_old-cleared"}},
         ),
     ]
+
+    from omnigent.harnesses.claude_native.clear_recovery import (
+        pending_clear_supersessions,
+        replay_clear_supersessions,
+    )
+
+    pending = pending_clear_supersessions(bridge_dir)
+    assert [(old, new) for _, old, new in pending] == [("conv_old", "conv_new")]
+    # Bridge reattachment replaces hook cursors but must retain pending cleanup.
+    prepare_bridge_dir("conv_new", bridge_id="bridge_shared", workspace=tmp_path)
+    cleanup_calls = []
+    detach_attempts = 0
+
+    def cleanup_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal detach_attempts
+        cleanup_calls.append((request.method, request.url.path, json.loads(request.content)))
+        if request.method == "PATCH" and json.loads(request.content) == {"runner_id": ""}:
+            detach_attempts += 1
+            if checkpoint_crash and detach_attempts == 1:
+                return httpx.Response(503)
+        return httpx.Response(200)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(cleanup_handler), base_url="http://ap"
+    ) as resumed_client:
+        await replay_clear_supersessions(
+            resumed_client, pending_clear_supersessions(bridge_dir), agent_name="claude-native-ui"
+        )
+        assert bool(pending_clear_supersessions(bridge_dir)) is checkpoint_crash
+        await replay_clear_supersessions(
+            resumed_client, pending_clear_supersessions(bridge_dir), agent_name="claude-native-ui"
+        )
+        assert pending_clear_supersessions(bridge_dir) == []
+        count = len(cleanup_calls)
+        await replay_clear_supersessions(
+            resumed_client, pending_clear_supersessions(bridge_dir), agent_name="claude-native-ui"
+        )
+        assert len(cleanup_calls) == count
+    assert detach_attempts == (2 if checkpoint_crash else 1)
+    assert all(path.startswith("/v1/sessions/conv_old") for _, path, _ in cleanup_calls)
+    notices = [
+        body for _, _, body in cleanup_calls if body.get("type") == "external_conversation_item"
+    ]
+    assert {body["data"]["source_id"] for body in notices} == {"native-clear:conv_old:conv_new"}
 
 
 @pytest.mark.asyncio
@@ -287,9 +350,13 @@ async def test_clear_after_resume_preserves_input_recorded_before_cursor_handoff
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["status", "transport"])
+@pytest.mark.parametrize("sync_hook", [False, True], ids=["forwarder", "hook"])
 async def test_clear_hook_rotation_survives_old_runner_clear_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    sync_hook: bool,
 ) -> None:
     """
     Old runner-binding cleanup failure must not retry the fork.
@@ -305,13 +372,6 @@ async def test_clear_hook_rotation_survives_old_runner_clear_failure(
         "conv_old",
         bridge_id="bridge_shared",
         workspace=tmp_path,
-    )
-    record_hook_event(
-        bridge_dir,
-        {
-            "hook_event_name": "SessionStart",
-            "source": "clear",
-        },
     )
     create_count = 0
 
@@ -351,10 +411,28 @@ async def test_clear_hook_rotation_survives_old_runner_clear_failure(
             assert body == {
                 "labels": {BRIDGE_ID_LABEL_KEY: "conv_old-cleared"},
             }
+            from omnigent.harnesses.claude_native.clear_recovery import pending_clear_supersessions
+
+            assert [(old, new) for _, old, new in pending_clear_supersessions(bridge_dir)] == [
+                ("conv_old", "conv_new")
+            ]
+            if failure == "transport":
+                raise httpx.ConnectError("temporary connection failure", request=request)
             return httpx.Response(503, json={"error": {"message": "temporary failure"}})
         raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
 
     transport = httpx.MockTransport(handler)
+    payload: dict[str, Any] = {"hook_event_name": "SessionStart", "source": "clear"}
+    if sync_hook:
+        from omnigent.harnesses.claude_native import hook
+
+        with httpx.Client(transport=transport) as sync_client:
+            rotated = hook._create_clear_replacement_session(
+                sync_client, "http://ap", "conv_old", bridge_dir
+            )
+        assert rotated == "conv_new"
+        payload["omnigent_clear_rotated_to"] = rotated
+    record_hook_event(bridge_dir, payload)
     async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
         hook_state = await forwarder._ensure_hook_state(
             bridge_dir,
@@ -495,7 +573,7 @@ async def test_post_clear_supersession_notifies_old_session(detach_failure, capl
 
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
-        await forwarder._post_clear_supersession(
+        await post_clear_supersession(
             client,
             old_session_id="conv_old",
             new_session_id="conv_new",
@@ -552,7 +630,7 @@ async def test_post_clear_supersession_skips_when_old_equals_new() -> None:
 
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
-        await forwarder._post_clear_supersession(
+        await post_clear_supersession(
             client,
             old_session_id="conv_same",
             new_session_id="conv_same",
@@ -578,7 +656,7 @@ async def test_post_clear_supersession_swallows_post_failure() -> None:
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
         # Must not raise despite both POSTs returning 500.
-        await forwarder._post_clear_supersession(
+        await post_clear_supersession(
             client,
             old_session_id="conv_old",
             new_session_id="conv_new",
@@ -1175,3 +1253,159 @@ async def test_forwarder_does_not_mirror_when_hook_payload_lacks_session_id(
     # — a regression that would route empty/null
     # external_session_id values to the server.
     assert "PATCH" not in methods, f"unexpected PATCH(es): {drained}"
+
+
+@pytest.mark.asyncio
+async def test_clear_cleanup_retry_preserves_replacement_subagent_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from contextlib import asynccontextmanager
+    from itertools import count
+    from types import SimpleNamespace
+
+    from omnigent.harnesses.claude_native.clear_recovery import (
+        pending_clear_supersessions,
+        record_clear_supersession,
+    )
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("conv_old", bridge_id="bridge_shared", workspace=tmp_path)
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "SessionStart", "transcript_path": str(transcript)},
+    )
+    write_active_session_id(bridge_dir, "conv_old")
+    started = {sid: asyncio.Event() for sid in ("conv_old", "conv_new")}
+    cancelled = {sid: asyncio.Event() for sid in started}
+    workers: dict[str, asyncio.Task[Any]] = {}
+    worker_starts: list[str] = []
+    cleanup_attempts: asyncio.Queue[tuple[bool, bool]] = asyncio.Queue()
+
+    async def child_history(*, parent_session_id: str, **_kwargs: Any) -> Any:
+        worker_starts.append(parent_session_id)
+        worker = asyncio.current_task()
+        assert worker is not None
+        workers[parent_session_id] = worker
+        started[parent_session_id].set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled[parent_session_id].set()
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_old":
+            if "labels" in json.loads(request.content):
+                assert cancelled["conv_old"].is_set()
+                return httpx.Response(200)
+            assert json.loads(request.content) == {"runner_id": ""}
+            cleanup_attempts.put_nowait(
+                (cancelled["conv_old"].is_set(), cancelled["conv_new"].is_set())
+            )
+            return httpx.Response(503)
+        return httpx.Response(200, json={})
+
+    @asynccontextmanager
+    async def open_client(*_args: Any, **_kwargs: Any):
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(respond), base_url="http://ap"
+        ) as client:
+            yield client
+
+    # Advance only the forwarder's retry clock, leaving asyncio deadlines real.
+    ticks = count()
+    monkeypatch.setattr(
+        forwarder,
+        "time",
+        SimpleNamespace(monotonic=lambda: float(next(ticks)), time=forwarder.time.time),
+    )
+    monkeypatch.setattr("omnigent.cli_auth.open_server_client", open_client)
+    monkeypatch.setattr(forwarder, "_forward_available_subagents", child_history)
+    task = asyncio.create_task(
+        forwarder.forward_claude_transcript_to_session(
+            base_url="http://ap",
+            headers={},
+            session_id="conv_old",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.001,
+        )
+    )
+    try:
+        await asyncio.wait_for(started["conv_old"].wait(), 5)
+        record_clear_supersession(bridge_dir, "conv_old", "conv_new")
+        write_active_session_id(bridge_dir, "conv_new")
+        assert await asyncio.wait_for(cleanup_attempts.get(), 5) == (True, False)
+        await asyncio.wait_for(started["conv_new"].wait(), 5)
+        replacement = workers["conv_new"]
+        for _ in range(2):
+            assert await asyncio.wait_for(cleanup_attempts.get(), 5) == (True, False)
+        assert workers["conv_new"] is replacement
+        assert not replacement.done()
+        assert worker_starts == ["conv_old", "conv_new"]
+        assert [(old, new) for _, old, new in pending_clear_supersessions(bridge_dir)] == [
+            ("conv_old", "conv_new")
+        ]
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["transport", 503, 403, 404])
+async def test_clear_replay_rekeys_before_notifications_and_detach(
+    tmp_path: Path, failure: str | int
+) -> None:
+    from omnigent.harnesses.claude_native.clear_recovery import (
+        pending_clear_supersessions,
+        record_clear_supersession,
+        replay_clear_supersessions,
+    )
+
+    record_clear_supersession(tmp_path, "conv_old", "conv_new")
+    requests: list[tuple[str, str, dict[str, Any]]] = []
+    recovered = False
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append((request.method, request.url.path, body))
+        if not recovered:
+            assert body == {"labels": {BRIDGE_ID_LABEL_KEY: "conv_old-cleared"}}
+            if failure == "transport":
+                raise httpx.ConnectError("temporary connection failure", request=request)
+            assert isinstance(failure, int)
+            return httpx.Response(failure)
+        return httpx.Response(200)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://ap"
+    ) as client:
+        await replay_clear_supersessions(
+            client, pending_clear_supersessions(tmp_path), agent_name="claude-native-ui"
+        )
+        assert len(requests) == 1
+        assert requests[0][:2] == ("PATCH", "/v1/sessions/conv_old")
+        transient = failure in ("transport", 503)
+        assert bool(pending_clear_supersessions(tmp_path)) is transient
+        recovered = True
+        await replay_clear_supersessions(
+            client, pending_clear_supersessions(tmp_path), agent_name="claude-native-ui"
+        )
+        assert pending_clear_supersessions(tmp_path) == []
+
+    if transient:
+        assert [method for method, _, _ in requests[1:]] == [
+            "PATCH",
+            "POST",
+            "POST",
+            "POST",
+            "PATCH",
+        ]
+        assert requests[1][2] == {"labels": {BRIDGE_ID_LABEL_KEY: "conv_old-cleared"}}
+        assert requests[-1][2] == {"runner_id": ""}
+        assert all(path.startswith("/v1/sessions/conv_old") for _, path, _ in requests)
+    else:
+        assert len(requests) == 1

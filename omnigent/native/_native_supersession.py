@@ -106,7 +106,7 @@ async def post_clear_supersession(
     new_session_id: str,
     agent_name: str,
     detach_runner: bool = False,
-) -> None:
+) -> bool:
     """
     Notify the superseded session that a ``/clear`` rotated it away.
 
@@ -134,14 +134,15 @@ async def post_clear_supersession(
     :param agent_name: Agent name to stamp on the notice message — an
         assistant ``message`` item requires one.
     :param detach_runner: Clear the old runner binding after all notifications.
-    :returns: None.
+    :returns: Whether detachment completed or was not requested. A scope denial
+        or missing old session also completes cleanup because authority is gone.
     """
     if old_session_id == new_session_id:
         # Defensive: never address the notice/redirect at the live session.
         # The caller resolves the old id from the pre-rotation forwarder
         # state, but if that ever collapses to the new id, posting here
         # would dump the "you were cleared" banner onto the active chat.
-        return
+        return True
     events_path = f"/v1/sessions/{urllib.parse.quote(old_session_id, safe='')}/events"
     try:
         status_resp = await client.post(
@@ -168,6 +169,7 @@ async def post_clear_supersession(
                 "type": "external_conversation_item",
                 "data": {
                     "item_type": "message",
+                    "source_id": f"native-clear:{old_session_id}:{new_session_id}",
                     "item_data": {
                         "role": "assistant",
                         "agent": agent_name,
@@ -204,13 +206,15 @@ async def post_clear_supersession(
         )
 
     if not detach_runner:
-        return
+        return True
     # Detach last: a confined runner cannot reach the old session once unbound.
     try:
         detach_resp = await client.patch(
             f"/v1/sessions/{urllib.parse.quote(old_session_id, safe='')}",
             json={"runner_id": ""},
         )
+        if detach_resp.status_code in (403, 404):
+            return True
         detach_resp.raise_for_status()
     except httpx.HTTPError:
         _logger.warning(
@@ -219,3 +223,5 @@ async def post_clear_supersession(
             exc_info=True,
             extra={"session_id": old_session_id},
         )
+        return False
+    return True

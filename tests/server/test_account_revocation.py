@@ -1536,7 +1536,7 @@ def test_runner_child_pagination_keeps_hidden_positions_private(setup_app, order
 async def test_runner_clear_finalizes_before_detaching(setup_app, monkeypatch, legacy):
     import httpx
 
-    from omnigent.harnesses.claude_native.forwarder import _post_clear_supersession
+    from omnigent.native._native_supersession import post_clear_supersession
     from omnigent.runtime import session_stream
 
     _, alice, stores, _ = setup_app
@@ -1585,7 +1585,7 @@ async def test_runner_clear_finalizes_before_detaching(setup_app, monkeypatch, l
             ):
                 await client.post(f"/v1/sessions/{old_id}/events", json=event)
         else:
-            await _post_clear_supersession(
+            await post_clear_supersession(
                 client,
                 old_session_id=old_id,
                 new_session_id=new_id,
