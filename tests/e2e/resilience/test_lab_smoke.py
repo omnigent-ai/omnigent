@@ -13,7 +13,9 @@ import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
+import httpx
 import psutil
 import pytest
 
@@ -107,6 +109,45 @@ def test_lab_client_retires_idle_connections_before_the_server(
         time.sleep(2.0)
         assert lab.client.get("/health").status_code == 200
         assert len(lab.events.events(source="proxy:client", kind="connect")) == 2
+
+
+def test_host_start_waits_for_a_live_tunnel_after_the_online_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lab = Lab(LabConfig(root=tmp_path / "lab"))
+    filesystem_path = f"/v1/hosts/{lab.host_id}/filesystem"
+    requests: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        if request.url.path == "/v1/hosts":
+            return httpx.Response(
+                200, json={"hosts": [{"host_id": lab.host_id, "status": "online"}]}
+            )
+        assert request.url.path == filesystem_path
+        assert request.url.params["limit"] == "1"
+        if requests.count(filesystem_path) == 1:
+            return httpx.Response(400, json={"error": {"code": "wrong_replica"}})
+        return httpx.Response(200, json={"data": []})
+
+    monkeypatch.setattr(lab, "_host_side_env", dict)
+    monkeypatch.setattr(lab, "_spawn", lambda *_args: SimpleNamespace(running=True))
+    monkeypatch.setattr(
+        Lab,
+        "proxies",
+        property(
+            lambda _lab: SimpleNamespace(host=SimpleNamespace(url="http://host.example.test"))
+        ),
+    )
+    try:
+        with httpx.Client(
+            base_url="http://server.example.test", transport=httpx.MockTransport(respond)
+        ) as observer:
+            lab.observer = observer
+            lab._start_host()
+        assert requests == ["/v1/hosts", filesystem_path, "/v1/hosts", filesystem_path]
+    finally:
+        lab.stop()
 
 
 def _round_trip(lab: Lab, session_id: str) -> str:
