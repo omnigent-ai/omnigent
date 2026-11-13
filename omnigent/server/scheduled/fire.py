@@ -120,6 +120,7 @@ from omnigent.server.scheduled.harness_settings import (
 )
 from omnigent.server.scheduled.run_sharing import (
     delete_task_grants,
+    is_managed_run_session,
     share_new_run_session,
     sync_continued_session,
 )
@@ -886,6 +887,7 @@ async def _run_fire_for_task(
             conv.id,
         )
     # Before dispatch, so recipients can follow the run from its first turn.
+    start_fire_stage("session_sharing", session_id=conv.id)
     await share_new_run_session(
         effective,
         conv,
@@ -1087,9 +1089,12 @@ async def _continue_session(
             error_code="continued_session_budget_conflict",
         )
         return
+    start_fire_stage("session_sharing", session_id=session_id)
     await sync_continued_session(
         task,
         conv,
+        # A run changes the session's sharing only once the automation is shared.
+        forced=False,
         permission_store=deps.permission_store,
         app_state=deps.app_state,
         host_registry=deps.host_registry,
@@ -2145,14 +2150,9 @@ async def _grant_default_public(deps: FireDeps, task: ScheduledTask, conversatio
     """
     if deps.permission_store is None or deps.app_state is None:
         return
-    from omnigent.server.sharing_settings import (
-        host_is_managed_sandbox,
-        new_session_starts_public,
-    )
+    from omnigent.server.sharing_settings import new_session_starts_public
 
-    managed = task.execution_target == "managed_sandbox" or host_is_managed_sandbox(
-        deps.host_registry, task.host_id
-    )
+    managed = is_managed_run_session(task, task.host_id, deps.host_registry)
     if not new_session_starts_public(deps.app_state, managed=managed, workspace=task.workspace):
         return
     await asyncio.to_thread(deps.permission_store.ensure_user, RESERVED_USER_PUBLIC)

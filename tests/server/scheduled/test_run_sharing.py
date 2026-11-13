@@ -16,6 +16,7 @@ import pytest
 from omnigent.entities import ScheduledTask
 from omnigent.server.auth import (
     LEVEL_EDIT,
+    LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
     RESERVED_USER_LOCAL,
@@ -27,6 +28,7 @@ from omnigent.server.scheduled.run_sharing import (
     sync_continued_session,
     sync_task_session,
 )
+from omnigent.stores import permission_store as permission_store_module
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests.server.scheduled.test_fire import (
@@ -129,7 +131,9 @@ async def test_a_store_without_automation_grants_changes_no_session(
     fresh = _session(permissions)
     common: dict[str, Any] = {"app_state": None, "host_registry": None}
 
-    await sync_continued_session(task, continued, permission_store=permissions, **common)
+    await sync_continued_session(
+        task, continued, forced=True, permission_store=permissions, **common
+    )
     await share_new_run_session(task, fresh, permission_store=permissions, **common)
     await share_new_run_session(task, fresh, permission_store=None, **common)
 
@@ -137,26 +141,118 @@ async def test_a_store_without_automation_grants_changes_no_session(
     assert _levels(permissions, fresh.id) == {}
 
 
-async def test_a_case_variant_of_a_grantee_is_neither_lowered_nor_revoked(
-    permissions, task
+async def _sync(
+    permissions: SqlAlchemyPermissionStore,
+    task: ScheduledTask,
+    session: _FakeConversation,
+    *,
+    app_state: Any = None,
 ) -> None:
-    # MySQL keys match case variants to one row.
-    session = _session(permissions, **{"Alice@example.com": LEVEL_EDIT})
-
     await sync_continued_session(
-        task, session, permission_store=permissions, app_state=None, host_registry=None
+        task,
+        session,
+        forced=False,
+        permission_store=permissions,
+        app_state=app_state,
+        host_registry=None,
     )
 
+
+async def test_a_sync_reads_every_page_of_the_sessions_grants(
+    permissions, task, monkeypatch
+) -> None:
+    # Two grants a page puts Bob's Edit and Carol's hand-made share on the second.
+    monkeypatch.setattr(permission_store_module, "MAX_GRANTS_PAGE_SIZE", 2)
+    session = _session(
+        permissions,
+        **{
+            "amy@example.com": LEVEL_READ,
+            "ann@example.com": LEVEL_READ,
+            "bob@example.com": LEVEL_EDIT,
+            "carol@example.com": LEVEL_READ,
+            RESERVED_USER_LOCAL: LEVEL_OWNER,
+        },
+    )
+
+    await _sync(permissions, task, session)
+
     assert _levels(permissions, session.id) == {
-        "Alice@example.com": LEVEL_EDIT,
-        "bob@example.com": LEVEL_READ,
+        "alice@example.com": LEVEL_READ,
+        "bob@example.com": LEVEL_EDIT,
+        RESERVED_USER_LOCAL: LEVEL_OWNER,
     }
 
 
-@pytest.mark.parametrize("case", ["owned", "not_owned", "new_session_each_run"])
+async def test_a_sync_never_revokes_an_owner_grant_or_the_automation_owner(
+    permissions, task
+) -> None:
+    # Each is kept by its own rule: an Owner grant, and the automation owner's ID.
+    session = _session(
+        permissions,
+        **{
+            "dana@example.com": LEVEL_OWNER,
+            RESERVED_USER_LOCAL: LEVEL_MANAGE,
+            "carol@example.com": LEVEL_READ,
+        },
+    )
+
+    await _sync(permissions, task, session)
+
+    assert _levels(permissions, session.id) == {
+        "dana@example.com": LEVEL_OWNER,
+        RESERVED_USER_LOCAL: LEVEL_MANAGE,
+        **dict.fromkeys(GRANTEES, LEVEL_READ),
+    }
+
+
+async def test_a_sync_still_revokes_when_the_sharing_policy_refuses_grants(
+    permissions, task
+) -> None:
+    session = _session(
+        permissions, **{RESERVED_USER_LOCAL: LEVEL_OWNER, "carol@example.com": LEVEL_READ}
+    )
+
+    await _sync(
+        permissions, task, session, app_state=SimpleNamespace(sharing_mode=lambda: SharingMode.OFF)
+    )
+
+    assert _levels(permissions, session.id) == {RESERVED_USER_LOCAL: LEVEL_OWNER}
+
+
+async def test_a_grant_list_that_fails_part_way_revokes_nothing(
+    permissions, task, monkeypatch
+) -> None:
+    monkeypatch.setattr(permission_store_module, "MAX_GRANTS_PAGE_SIZE", 1)
+    list_page = permissions.list_for_scheduled_task
+
+    def fail_after_the_first_page(task_id: str, **kwargs: Any) -> Any:
+        if kwargs.get("after_user_id") is not None:
+            raise RuntimeError("second page failed")
+        return list_page(task_id, **kwargs)
+
+    monkeypatch.setattr(permissions, "list_for_scheduled_task", fail_after_the_first_page)
+    grants = {
+        RESERVED_USER_LOCAL: LEVEL_OWNER,
+        "bob@example.com": LEVEL_READ,
+        "carol@example.com": LEVEL_READ,
+    }
+    session = _session(permissions, **grants)
+
+    await _sync(permissions, task, session)
+
+    # Only Alice's page was read; Bob, who is on the list, and Carol both keep access.
+    assert _levels(permissions, session.id) == grants
+
+
+@pytest.mark.parametrize(
+    "case", ["owned", "owned_without_grants", "not_owned", "new_session_each_run"]
+)
 async def test_a_grant_change_syncs_only_a_continued_session_its_owner_owns(
     permissions, task, case
 ) -> None:
+    if case == "owned_without_grants":
+        for grantee in GRANTEES:
+            permissions.revoke_for_scheduled_task(grantee, task.id)
     hand_made = {"carol@example.com": LEVEL_READ}
     owner = {RESERVED_USER_LOCAL: LEVEL_OWNER} if case != "not_owned" else {}
     session = _session(permissions, **owner, **hand_made)
@@ -170,7 +266,9 @@ async def test_a_grant_change_syncs_only_a_continued_session_its_owner_owns(
         host_registry=None,
     )
 
-    expected = (
-        {**owner, **dict.fromkeys(GRANTEES, LEVEL_READ)} if case == "owned" else owner | hand_made
-    )
+    # The sync is forced: removing the last grantee still revokes the hand-made share.
+    expected = {
+        "owned": {**owner, **dict.fromkeys(GRANTEES, LEVEL_READ)},
+        "owned_without_grants": owner,
+    }.get(case, owner | hand_made)
     assert _levels(permissions, session.id) == expected

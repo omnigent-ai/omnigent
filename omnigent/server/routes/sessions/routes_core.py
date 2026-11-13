@@ -292,7 +292,7 @@ from omnigent.stores.conversation_store import (
 )
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import host_is_live
-from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.permission_store import PermissionStore, read_all_grants
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.session_pull_request_store import SessionSummary
 from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY, resolve_client_surface
@@ -663,15 +663,10 @@ def register_core_routes(
     async def _list_session_grants(session_id: str) -> dict[str, int]:
         """Every grant on *session_id*, as grantee to level."""
         assert permission_store is not None
-        levels: dict[str, int] = {}
-        after: str | None = None
-        while True:
-            grants, after = await asyncio.to_thread(
-                permission_store.list_for_session, session_id, limit=500, after_user_id=after
-            )
-            levels.update((grant.user_id, grant.level) for grant in grants)
-            if after is None:
-                return levels
+        grants = await asyncio.to_thread(
+            read_all_grants, permission_store.list_for_session, session_id
+        )
+        return {grant.user_id: grant.level for grant in grants}
 
     async def _copy_session_grants(source_id: str, target_id: str) -> None:
         """Give *target_id*, a session created with no grants, exactly *source_id*'s."""

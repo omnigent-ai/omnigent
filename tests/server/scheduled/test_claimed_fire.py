@@ -504,21 +504,33 @@ def _session_levels(permissions: SqlAlchemyPermissionStore, session_id: str) -> 
     return {grant.user_id: grant.level for grant in grants}
 
 
+def _dispatch_recording_shares(
+    permissions: SqlAlchemyPermissionStore, seen: list[dict[str, int]]
+) -> AsyncMock:
+    """A launch seam that records the session's grants as dispatch finds them."""
+
+    async def dispatch(conv: Any, task: ScheduledTask) -> None:
+        seen.append(_session_levels(permissions, conv.id))
+
+    return AsyncMock(side_effect=dispatch)
+
+
 async def test_each_claimed_run_shares_its_new_session_with_the_current_grants(
     store, db_uri, monkeypatch
 ) -> None:
-    from omnigent.server.scheduled import run_sharing
+    from omnigent.stores import permission_store
 
     # Smaller pages, so the grantees span more than one.
-    monkeypatch.setattr(run_sharing, "GRANT_PAGE_SIZE", 2)
+    monkeypatch.setattr(permission_store, "MAX_GRANTS_PAGE_SIZE", 2)
     permissions = SqlAlchemyPermissionStore(db_uri)
     claimed = _claim(store)
     grantees = ["alice@example.com", "bob@example.com", "carol@example.com"]
     _share_task(permissions, claimed.task.id, *grantees)
     conversations = _ConversationStore()
+    dispatched: list[dict[str, int]] = []
     executor = ClaimedRunExecutor(
         _deps(store, conversation_store=conversations, permission_store=permissions),
-        launch_dispatch=AsyncMock(),
+        launch_dispatch=_dispatch_recording_shares(permissions, dispatched),
     )
 
     await executor.fire(claimed.task, claimed.lease)
@@ -528,51 +540,60 @@ async def test_each_claimed_run_shares_its_new_session_with_the_current_grants(
 
     first, second = conversations.ids
     owner = {RESERVED_USER_LOCAL: LEVEL_OWNER}
-    assert _session_levels(permissions, first) == {**owner, **dict.fromkeys(grantees, LEVEL_READ)}
-    assert _session_levels(permissions, second) == {
-        **owner,
-        "alice@example.com": LEVEL_READ,
-        "carol@example.com": LEVEL_READ,
-    }
+    first_shares = {**owner, **dict.fromkeys(grantees, LEVEL_READ)}
+    second_shares = {**owner, "alice@example.com": LEVEL_READ, "carol@example.com": LEVEL_READ}
+    # Each session was shared before its prompt was dispatched.
+    assert dispatched == [first_shares, second_shares]
+    assert _session_levels(permissions, first) == first_shares
+    assert _session_levels(permissions, second) == second_shares
     assert [run.status for run in _runs(store, claimed.task)] == ["running", "running"]
 
 
-async def test_each_claimed_continue_run_syncs_its_session_to_the_grants(store, db_uri) -> None:
+async def test_a_claimed_continue_run_syncs_its_session_once_the_automation_is_shared(
+    store, db_uri
+) -> None:
     permissions = SqlAlchemyPermissionStore(db_uri)
     claimed = _claim(store, session_mode="continue", session_id=_CONV_ID)
-    _share_task(permissions, claimed.task.id, "alice@example.com", "bob@example.com")
-    # Alice is listed and was shared by hand at Edit; Carol was shared by hand only.
-    for user_id, level in [
-        (RESERVED_USER_LOCAL, LEVEL_OWNER),
-        (RESERVED_USER_PUBLIC, LEVEL_READ),
-        ("alice@example.com", LEVEL_EDIT),
-        ("carol@example.com", LEVEL_READ),
-    ]:
+    # Alice was shared by hand at Edit, Carol by hand only.
+    hand_made = {
+        RESERVED_USER_LOCAL: LEVEL_OWNER,
+        RESERVED_USER_PUBLIC: LEVEL_READ,
+        "alice@example.com": LEVEL_EDIT,
+        "carol@example.com": LEVEL_READ,
+    }
+    for user_id, level in hand_made.items():
         permissions.ensure_user(user_id)
         permissions.grant(user_id, _CONV_ID, level)
     conversations = _ExistingConversationStore(
         _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, host_id=_HOST_ID, workspace="/repo")
     )
+    dispatched: list[dict[str, int]] = []
     executor = ClaimedRunExecutor(
         _deps(store, conversation_store=conversations, permission_store=permissions),
-        launch_dispatch=AsyncMock(),
+        launch_dispatch=_dispatch_recording_shares(permissions, dispatched),
     )
+
+    # Nobody has shared the automation yet, so runs leave the session's sharing alone.
+    await executor.fire(claimed.task, claimed.lease)
+    permissions.ensure_user("dave@example.com")
+    permissions.grant("dave@example.com", _CONV_ID, LEVEL_READ)
+    await executor.fire(claimed.task, _second_claim(store, claimed))
+    with_dave = {**hand_made, "dave@example.com": LEVEL_READ}
+    assert _session_levels(permissions, _CONV_ID) == with_dave
+    # Once it is shared, the next run syncs the session to its grants.
+    _share_task(permissions, claimed.task.id, "alice@example.com", "bob@example.com")
+    await executor.fire(claimed.task, _second_claim(store, claimed))
+
     synced = {
         RESERVED_USER_LOCAL: LEVEL_OWNER,
         RESERVED_USER_PUBLIC: LEVEL_READ,
         "alice@example.com": LEVEL_EDIT,
         "bob@example.com": LEVEL_READ,
     }
-
-    await executor.fire(claimed.task, claimed.lease)
+    # The sync ran before the third run's prompt was dispatched.
+    assert dispatched == [hand_made, with_dave, synced]
     assert _session_levels(permissions, _CONV_ID) == synced
-    # A share the owner adds by hand lasts until the next run.
-    permissions.ensure_user("dave@example.com")
-    permissions.grant("dave@example.com", _CONV_ID, LEVEL_READ)
-    await executor.fire(claimed.task, _second_claim(store, claimed))
-
-    assert _session_levels(permissions, _CONV_ID) == synced
-    assert [run.status for run in _runs(store, claimed.task)] == ["succeeded", "succeeded"]
+    assert [run.status for run in _runs(store, claimed.task)] == ["succeeded"] * 3
 
 
 async def test_a_second_run_sends_into_a_session_another_run_is_using(store) -> None:

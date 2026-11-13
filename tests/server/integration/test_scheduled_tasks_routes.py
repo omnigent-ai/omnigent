@@ -1676,7 +1676,11 @@ async def test_update_rejects_invalid_reasoning_effort(
 @pytest.mark.parametrize("claimed", [False, True])
 @pytest.mark.parametrize("shared", [False, True])
 async def test_delete_removes_task(
-    auth_client: httpx.AsyncClient, db_uri: str, claimed: bool, shared: bool
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    claimed: bool,
+    shared: bool,
 ) -> None:
     from omnigent.db.db_models import current_workspace_id
     from omnigent.server.auth import LEVEL_READ
@@ -1733,8 +1737,21 @@ async def test_delete_removes_task(
     assert await conversations.delete_conversation(session.id)
     assert hosts.get_host(host_id).status == "online"
 
+    delete_grants = SqlAlchemyPermissionStore.delete_for_scheduled_task
+    task_at_grant_delete: list[Any] = []
+
+    def record_task_then_delete(self: SqlAlchemyPermissionStore, scheduled_task_id: str) -> int:
+        task_at_grant_delete.append(store.get(scheduled_task_id))
+        return delete_grants(self, scheduled_task_id)
+
+    monkeypatch.setattr(
+        SqlAlchemyPermissionStore, "delete_for_scheduled_task", record_task_then_delete
+    )
     deleted = await auth_client.delete(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert deleted.status_code == 200, deleted.text
+    # The grants go only once the task is deleted, so a racing grant is refused.
+    [task_then] = task_at_grant_delete
+    assert task_then is None or task_then.state == "deleted"
     assert permissions.list_for_scheduled_task(task_id) == ([], None)
     retained_host = hosts.get_host(host_id, include_deleted=True)
     assert retained_host is not None
