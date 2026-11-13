@@ -468,7 +468,7 @@ function lineContainers(
     }
     const rest = line.slice(lead.at);
     if (THEMATIC_BREAK_RE.test(rest)) break;
-    const marker = LIST_MARKER_RE.exec(rest);
+    const marker = rest.match(LIST_MARKER_RE);
     if (!marker) break;
     const markerEnd = lead.at + marker[0].length;
     const markerColumn = lead.column + marker[0].length;
@@ -577,7 +577,7 @@ function parseFence(
   const firstEnd = lineEndAt(text, blockStart, cr);
   const firstLine = text.slice(blockStart, firstEnd);
   const openText = skipIndent(firstLine, opener.contentStart, 0).at;
-  const openMatch = FENCE_OPEN_RE.exec(firstLine.slice(openText))!;
+  const openMatch = firstLine.slice(openText).match(FENCE_OPEN_RE)!;
   const run = openMatch[1];
   const openRun = { start: openText, end: openText + openMatch[0].length };
   markQuote(blockStart, opener.marks, firstEnd);
@@ -597,7 +597,7 @@ function parseFence(
     end = nextLineStart(text, lineEnd);
     const lead = skipIndent(line, prefix.cursor.at, prefix.cursor.column);
     const close =
-      lead.column - prefix.cursor.base <= 3 ? FENCE_CLOSE_RE.exec(line.slice(lead.at)) : null;
+      lead.column - prefix.cursor.base <= 3 ? line.slice(lead.at).match(FENCE_CLOSE_RE) : null;
     if (close && close[1][0] === run[0] && close[1].length >= run.length) {
       closeLine = pos - blockStart;
       closeRun = {
@@ -775,7 +775,7 @@ function blockAt(
   if (continues && !lazyLine && SETEXT_UNDERLINE_RE.test(rest)) return { ends: true, item: null };
   if (THEMATIC_BREAK_RE.test(rest) || HEADING_RE.test(rest) || FENCE_OPEN_RE.test(rest))
     return { ends: true, item: null };
-  const marker = LIST_MARKER_RE.exec(rest);
+  const marker = rest.match(LIST_MARKER_RE);
   if (!marker) return { ends: false, item: null };
   const markerColumn = column + marker[0].length;
   const content = skipIndent(line, at + marker[0].length, markerColumn);
@@ -901,25 +901,34 @@ interface CodePiece {
   flags: number;
 }
 
-const CODE_SCAN_RE = /[\\`]/g;
+/** Index of the next backslash or backtick at or after `from`, or -1. */
+function nextCodeScanStop(text: string, from: number): number {
+  for (let i = from; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c === BACKSLASH || c === BACKTICK) return i;
+  }
+  return -1;
+}
 
 /** Code spans come first in CommonMark: find them before any emphasis. */
 function findCodePieces(text: string): { pieces: CodePiece[]; tokens: MarkdownToken[] } {
   const pieces: CodePiece[] = [];
   const tokens: MarkdownToken[] = [];
   const backtickRuns = new BacktickRuns(text);
-  CODE_SCAN_RE.lastIndex = 0;
-  for (let match = CODE_SCAN_RE.exec(text); match; match = CODE_SCAN_RE.exec(text)) {
-    const i = match.index;
+  let next = 0;
+  for (;;) {
+    const i = nextCodeScanStop(text, next);
+    if (i === -1) break;
+    next = i + 1;
     if (text.charCodeAt(i) === BACKSLASH) {
       const escaped = i + 1 < text.length ? text.charCodeAt(i + 1) : 0;
-      if (escaped < 128 && ASCII_GROUPS[escaped] === PUNCTUATION) CODE_SCAN_RE.lastIndex = i + 2;
+      if (escaped < 128 && ASCII_GROUPS[escaped] === PUNCTUATION) next = i + 2;
       continue;
     }
     const runEnd = runEndAt(text, i, BACKTICK);
     const close = backtickRuns.closing(runEnd, runEnd - i);
     if (close === -1) {
-      CODE_SCAN_RE.lastIndex = runEnd;
+      next = runEnd;
       continue;
     }
     const closeEnd = close + (runEnd - i);
@@ -936,7 +945,7 @@ function findCodePieces(text: string): { pieces: CodePiece[]; tokens: MarkdownTo
       { start: runEnd, end: close, flags: MD_CODE },
       { start: close, end: closeEnd, flags: MD_CODE | MD_MARKER },
     );
-    CODE_SCAN_RE.lastIndex = closeEnd;
+    next = closeEnd;
   }
   return { pieces: pieces.filter((piece) => piece.end > piece.start), tokens };
 }

@@ -64,8 +64,8 @@ export function tidyEmphasisAfterTyping(text: string, caret: number): ComposerEd
   }
   if (openerStart === -1 || isEscaped(text, openerStart)) return null;
   const content = text.slice(openerEnd, closerStart);
-  const lead = /^[ \t]*/.exec(content)![0].length;
-  const trail = /[ \t]*$/.exec(content)![0].length;
+  const lead = content.match(/^[ \t]*/)![0].length;
+  const trail = content.match(/[ \t]*$/)![0].length;
   const inner = content.slice(lead, content.length - trail);
   if (inner === "" || (lead === 0 && trail === 0)) return null;
   // The opener starts a word: at a line start, or after whitespace or punctuation.
@@ -77,7 +77,7 @@ export function tidyEmphasisAfterTyping(text: string, caret: number): ComposerEd
   const lineStart = text.lastIndexOf("\n", openerStart - 1) + 1;
   if (size === 1 && isListMarker(text, lineStart, openerStart)) return null;
   // `2 * 3*`: arithmetic between numbers, not emphasis.
-  const operand = /\S(?=[ \t]*$)/.exec(text.slice(lineStart, openerStart))?.[0];
+  const operand = text.slice(lineStart, openerStart).match(/\S(?=[ \t]*$)/)?.[0];
   if (operand && DIGIT_RE.test(operand) && DIGIT_RE.test(inner[0])) return null;
   const markdown = tokenizeComposerMarkdown(text);
   if (flagsAt(markdown, closerStart) & (MD_CODE | MD_FENCE)) return null;
@@ -332,7 +332,7 @@ function isListMarker(text: string, lineStart: number, at: number): boolean {
       p++;
       continue;
     }
-    const ordered = /^\d{1,9}[.)](?=[ \t])/.exec(text.slice(p, p + 11));
+    const ordered = text.slice(p, p + 11).match(/^\d{1,9}[.)](?=[ \t])/);
     if (ordered) {
       p += ordered[0].length;
       continue;
@@ -368,10 +368,11 @@ function flagsAt(markdown: ComposerMarkdown, offset: number): number {
 }
 
 function paragraphStartBefore(text: string, offset: number): number {
-  const blank = /\n[ \t]*\n/g;
   let start = 0;
-  for (let match = blank.exec(text); match && match.index < offset; match = blank.exec(text))
+  for (const match of text.matchAll(/\n[ \t]*\n/g)) {
+    if (match.index >= offset) break;
     start = match.index + match[0].length;
+  }
   return Math.min(start, offset);
 }
 

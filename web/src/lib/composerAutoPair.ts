@@ -241,7 +241,7 @@ export function completeBoldAfterTyping(text: string, caret: number): ComposerEd
   if (isBoldCloser(candidate, caret - 1)) {
     // `2 **3*`: arithmetic between numbers, not emphasis.
     const opener = candidate.lastIndexOf("**", caret - 3);
-    const operand = /\S(?=[ \t]*$)/.exec(candidate.slice(0, opener))?.[0];
+    const operand = candidate.slice(0, opener).match(/\S(?=[ \t]*$)/)?.[0];
     if (operand && /[0-9]/.test(operand) && /[0-9]/.test(candidate[opener + 2] ?? "")) return null;
     return add;
   }
@@ -289,9 +289,10 @@ function hasOpenRun(
   char: PairChar,
 ): boolean {
   let start = 0;
-  const blank = /\n[ \t]*\n/g;
-  for (let match = blank.exec(text); match && match.index < end; match = blank.exec(text))
+  for (const match of text.matchAll(/\n[ \t]*\n/g)) {
+    if (match.index >= end) break;
     start = match.index + match[0].length;
+  }
   for (let i = start; i < end; i++) {
     if (text[i] !== char) continue;
     let runEnd = i;
@@ -299,7 +300,7 @@ function hasOpenRun(
     const lineStart = text.lastIndexOf("\n", i - 1) + 1;
     const lead = text.slice(lineStart, i);
     const spaced = SPACE_RE.test(text[runEnd] ?? "\n");
-    const operand = /\S(?=[ \t]*$)/.exec(lead)?.[0] ?? "";
+    const operand = lead.match(/\S(?=[ \t]*$)/)?.[0] ?? "";
     const opens =
       runEnd < end &&
       text.slice(runEnd, end).trim() !== "" &&
