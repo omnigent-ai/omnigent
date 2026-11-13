@@ -26,7 +26,7 @@ import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { WorkspacePathField } from "./WorkspacePathField";
 import { HostLabel } from "./HostLabel";
 import { normalizeWorkspacePath } from "./NewChatDialog";
-import { useHosts } from "@/hooks/useHosts";
+import { fetchHosts, useHosts } from "@/hooks/useHosts";
 import { useSession } from "@/hooks/useSession";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
@@ -297,7 +297,13 @@ function SupportedSwitchHostDialog({
       // A lost launch response can leave a new runner bound. Each retry stops
       // the current binding before releasing it, even after an earlier release.
       const currentHost = hosts?.find((host) => host.host_id === currentHostId);
-      if (currentHost?.status !== "offline") {
+      // A stale offline badge must not skip Stop after the host reconnects.
+      const confirmedOffline =
+        currentHost?.status === "offline" &&
+        (await fetchHosts(true)).some(
+          (host) => host.host_id === currentHostId && host.status === "offline",
+        );
+      if (!confirmedOffline) {
         try {
           await stopSession(sessionId);
         } catch (e) {

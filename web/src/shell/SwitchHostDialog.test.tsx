@@ -6,7 +6,7 @@ import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { SwitchHostDialog } from "./SwitchHostDialog";
-import { useHosts } from "@/hooks/useHosts";
+import { fetchHosts, useHosts } from "@/hooks/useHosts";
 import { useSession } from "@/hooks/useSession";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -64,7 +64,7 @@ vi.mock("./WorkspacePicker", async (importActual) => ({
 vi.mock("./HostLabel", () => ({
   HostLabel: ({ host }: { host: { name: string } }) => <span>{host.name}</span>,
 }));
-vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
+vi.mock("@/hooks/useHosts", () => ({ fetchHosts: vi.fn(), useHosts: vi.fn() }));
 vi.mock("@/hooks/useSession", () => ({ useSession: vi.fn() }));
 vi.mock("@/hooks/useHostFilesystem", () => ({ useHostFilesystem: vi.fn() }));
 vi.mock("@/hooks/useRecentWorkspaces", () => ({
@@ -121,6 +121,7 @@ vi.mock("@/components/ui/select", () => ({
 }));
 
 const useHostsMock = vi.mocked(useHosts);
+const fetchHostsMock = vi.mocked(fetchHosts);
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
 const launchRunnerMock = vi.mocked(launchRunner);
 const stopSessionMock = vi.mocked(stopSession);
@@ -179,6 +180,7 @@ function onlyOriginHostOnline(): void {
 beforeEach(() => {
   vi.mocked(useSession).mockReturnValue({ session: null, isLoading: false, error: null });
   useHostsMock.mockReset();
+  fetchHostsMock.mockReset();
   useHostFilesystemMock.mockReset();
   launchRunnerMock.mockReset();
   stopSessionMock.mockReset().mockResolvedValue({ queued: false });
@@ -355,21 +357,57 @@ describe("SwitchHostDialog", () => {
     expect(launchRunnerMock).not.toHaveBeenCalled();
   });
 
-  it("allows leaving an offline origin without waiting for its runner", async () => {
-    useHostsMock.mockReturnValue({
-      data: [
-        { host_id: "host_old", name: "laptop", owner: "alice", status: "offline" },
-        { host_id: "host_new", name: "workstation", owner: "alice", status: "online" },
-      ],
-    } as unknown as ReturnType<typeof useHosts>);
-    renderDialog();
-    const button = await screen.findByTestId("switch-host-button");
-    await waitFor(() => expect(button).not.toBeDisabled());
-    fireEvent.click(button);
-    await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
-    expect(stopSessionMock).not.toHaveBeenCalled();
-    expect(updateSessionMock).toHaveBeenCalledTimes(1);
-  });
+  it.each(["offline", "online", "missing", "error"] as const)(
+    "rechecks a cached offline origin before moving when fresh status is %s",
+    async (freshStatus) => {
+      useHostsMock.mockReturnValue({
+        data: [
+          { host_id: "host_old", name: "laptop", owner: "alice", status: "offline" },
+          { host_id: "host_new", name: "workstation", owner: "alice", status: "online" },
+        ],
+      } as unknown as ReturnType<typeof useHosts>);
+      let resolveHosts!: (hosts: Awaited<ReturnType<typeof fetchHosts>>) => void;
+      let rejectHosts!: (reason: Error) => void;
+      fetchHostsMock.mockReturnValueOnce(
+        new Promise((resolve, reject) => {
+          resolveHosts = resolve;
+          rejectHosts = reject;
+        }),
+      );
+      renderDialog();
+      const button = await screen.findByTestId("switch-host-button");
+      await waitFor(() => expect(button).not.toBeDisabled());
+      fireEvent.click(button);
+      await waitFor(() => expect(fetchHostsMock).toHaveBeenCalledWith(true));
+      expect(stopSessionMock).not.toHaveBeenCalled();
+      expect(updateSessionMock).not.toHaveBeenCalled();
+      expect(launchRunnerMock).not.toHaveBeenCalled();
+      await act(async () => {
+        if (freshStatus === "error") rejectHosts(new Error("Host refresh failed"));
+        else
+          resolveHosts(
+            freshStatus === "missing"
+              ? []
+              : [{ host_id: "host_old", name: "laptop", owner: "alice", status: freshStatus }],
+          );
+      });
+      if (freshStatus === "error") {
+        expect(await screen.findByTestId("switch-host-error")).toHaveTextContent(
+          "Host refresh failed",
+        );
+        expect(updateSessionMock).not.toHaveBeenCalled();
+        expect(launchRunnerMock).not.toHaveBeenCalled();
+      } else {
+        await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+        expect(stopSessionMock).toHaveBeenCalledTimes(freshStatus === "offline" ? 0 : 1);
+        expect(updateSessionMock).toHaveBeenCalledTimes(1);
+        if (freshStatus !== "offline")
+          expect(stopSessionMock.mock.invocationCallOrder[0]).toBeLessThan(
+            updateSessionMock.mock.invocationCallOrder[0],
+          );
+      }
+    },
+  );
 
   it("resets the terminals cache so the strip re-attaches to the new host", async () => {
     const client = renderDialog();
