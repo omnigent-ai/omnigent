@@ -34,7 +34,7 @@ from asgiref.testing import ApplicationCommunicator
 from fastapi import FastAPI
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.entities import Conversation
+from omnigent.entities import Conversation, MessageData, NewConversationItem
 from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.host.connect import HostProcess
 from omnigent.host.frames import (
@@ -4842,6 +4842,7 @@ def _shared_runner_family(
 async def test_archiving_child_does_not_stop_parents_shared_runner(
     client: httpx.AsyncClient,
     app: FastAPI,
+    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     _shared_runner_family: dict[str, str],
 ) -> None:
@@ -4855,6 +4856,17 @@ async def test_archiving_child_does_not_stop_parents_shared_runner(
     async with _HostFrameResponder(comm) as host:
         child = await _inline_child_session(client, parent["id"])
         _shared_runner_family.update(parent=parent["id"], child=child["id"])
+        transcript_content = [{"type": "input_text", "text": "Remember the completed worker."}]
+        (transcript_item,) = SqlAlchemyConversationStore(db_uri).append(
+            child["id"],
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="resp_completed_worker",
+                    data=MessageData(role="user", content=transcript_content),
+                )
+            ],
+        )
         sessions_module._session_status_cache[child["id"]] = "idle"
         child_backend = Mock(close=AsyncMock())
         parent_backend = Mock(close=AsyncMock())
@@ -4881,6 +4893,10 @@ async def test_archiving_child_does_not_stop_parents_shared_runner(
 
     child_row = (await client.get(f"/v1/sessions/{child['id']}")).json()
     assert child_row["archived"] is True
+    transcript = await client.get(f"/v1/sessions/{child['id']}/items")
+    assert transcript.status_code == 200, transcript.text
+    retained = next(item for item in transcript.json()["data"] if item["id"] == transcript_item.id)
+    assert retained["content"] == transcript_content
     parent_row = (await client.get(f"/v1/sessions/{parent['id']}")).json()
     assert parent_row["archived"] is False
     assert parent["runner_id"] not in host.stopped_runner_ids, (
