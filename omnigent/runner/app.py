@@ -2891,6 +2891,21 @@ def create_runner_app(
     from omnigent.entities.environment_filesystem import (
         ResourceError,
     )
+    from omnigent.runner.policy import AgentStartPolicyError
+
+    @app.exception_handler(AgentStartPolicyError)
+    async def _handle_agent_start_policy_error(
+        request: Request,
+        exc: AgentStartPolicyError,
+    ) -> JSONResponse:
+        del request
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": "agent_start_policy_unevaluable",
+                "detail": _client_safe_error_detail(exc, context="agent start policy"),
+            },
+        )
 
     @app.exception_handler(OmnigentError)
     async def _handle_omnigent_error(

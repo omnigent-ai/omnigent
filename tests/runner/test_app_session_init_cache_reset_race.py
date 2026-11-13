@@ -22,7 +22,9 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -139,6 +141,69 @@ async def test_session_init_memoizes_spec_when_no_reset_intervenes() -> None:
         f"({resolver_calls} calls): init's memoization was wrongly suppressed"
     )
     assert names == {"marker-v1"}, f"init's resolved spec not served; skills = {sorted(names)}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata", ["skills", "mcp"])
+async def test_lazy_metadata_policy_failure_is_structured_and_recovers(
+    metadata: str, monkeypatch: pytest.MonkeyPatch, pinned_runner_log: Path
+) -> None:
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.mcp_manager import McpSchemasResult
+    from omnigent.runner.policy import AgentStartPolicyError
+
+    broken = False
+
+    async def gate(spec: AgentSpec, harness: str) -> AgentSpec:
+        if broken:
+            raise AgentStartPolicyError("private_policy_name", "private failure detail")
+        return spec
+
+    monkeypatch.setattr(runner_app, "_apply_agent_start_gate", gate)
+    resolver = AsyncMock(return_value=_spec("v1"))
+    manager = _FakeProcessManager(_ScriptedHarnessClient([]))
+    mcp = AsyncMock()
+    mcp.schemas_for.return_value = McpSchemasResult(schemas=[], tool_names=set(), failures={})
+    app = create_runner_app(
+        process_manager=manager,  # type: ignore[arg-type]
+        spec_resolver=resolver,
+        server_client=_SessionSnapshotServerClient(),  # type: ignore[arg-type]
+        resource_registry=SessionResourceRegistry(terminal_registry=None),
+        mcp_manager=mcp,
+    )
+    path, body = (
+        ("skills/resolve", {"name": "marker-v1"})
+        if metadata == "skills"
+        else ("mcp/execute", {"method": "tools/list"})
+    )
+    async with _runner_client(app) as client:
+        initialized = await client.post(
+            "/v1/sessions", json={"session_id": _SESSION_ID, "agent_id": _AGENT_ID}
+        )
+        assert initialized.status_code == 201, initialized.text
+        assert (
+            await client.post(f"/v1/sessions/{_SESSION_ID}/{path}", json=body)
+        ).status_code == 200
+        calls_before_failure = mcp.schemas_for.await_count
+        broken = True
+        reset = await client.post(f"/v1/sessions/{_SESSION_ID}/agent-cache/reset")
+        assert reset.status_code == 200, reset.text
+        rejected = await client.post(f"/v1/sessions/{_SESSION_ID}/{path}", json=body)
+        assert rejected.status_code == 403, rejected.text
+        assert rejected.json() == {
+            "error": "agent_start_policy_unevaluable",
+            "detail": (
+                "Request failed on the runner; "
+                f"see the runner log for details: {pinned_runner_log}"
+            ),
+        }
+        assert mcp.schemas_for.await_count == calls_before_failure
+        broken = False
+        reset = await client.post(f"/v1/sessions/{_SESSION_ID}/agent-cache/reset")
+        assert reset.status_code == 200, reset.text
+        recovered = await client.post(f"/v1/sessions/{_SESSION_ID}/{path}", json=body)
+        assert recovered.status_code == 200, recovered.text
+        assert len(manager.get_client_calls) == 1
 
 
 @pytest.mark.asyncio
