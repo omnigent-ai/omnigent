@@ -104,6 +104,8 @@ def classify_surface(user_agent: str | None) -> str:
     for prefix, surface in _OMNIGENT_USER_AGENT_SURFACES.items():
         if user_agent.startswith(prefix):
             return surface
+    # Deprecated: bare httpx/requests also covers custom scripts. Classify them as
+    # "script" in v0.24.0, once clients older than v0.22 are no longer supported.
     if not user_agent or "python-httpx" in user_agent or "python-requests" in user_agent:
         return "cli"
     if "Electron" in user_agent:
