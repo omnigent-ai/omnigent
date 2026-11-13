@@ -142,6 +142,7 @@ import {
   openHtmlArtifactInNewTab,
 } from "./codeViewerHelpers";
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
+import { isDataTablePath } from "./dataTable";
 import { useScrollRestore } from "./useScrollRestore";
 import { isPdfAnchor } from "./pdfCommentHelpers";
 
@@ -867,7 +868,10 @@ function FileViewerBody({
     }
   }
   const isPreviewable =
-    (lang === "markdown" && !markdownPreviewFallback) || lang === "html" || isNotebookPath(path);
+    (lang === "markdown" && !markdownPreviewFallback) ||
+    lang === "html" ||
+    isNotebookPath(path) ||
+    isDataTablePath(path);
   // Images and PDFs render through CodeViewer's own viewers regardless of view
   // mode; they have no source/diff representation, so diff is suppressed for
   // them (Monaco would otherwise render the base64 payload as garbage text).
@@ -995,6 +999,7 @@ function FileViewerBody({
     largeMarkdown: markdownSourceFallback ?? false,
     largeMarkdownVisitMode,
     deepLinkedComment: deepLinkBiasPath === path,
+    previewHidesComments: isDataTablePath(path),
     preference: previewableViewMode,
   });
   // Local state triggers rendering; the WeakSet preserves dismissal across remounts.
@@ -1341,9 +1346,12 @@ function FileViewerBody({
       icon: activeMode.icon,
       options: modeOptions,
     });
-  } else if ((lang === "html" || isNotebookPath(path)) && viewMode !== "diff") {
-    // HTML and notebooks have no rich-text editor — a single toggle flips
-    // preview ↔ source.
+  } else if (
+    (lang === "html" || isNotebookPath(path) || isDataTablePath(path)) &&
+    viewMode !== "diff"
+  ) {
+    // HTML, notebooks and data tables have no rich-text editor — a single toggle
+    // flips preview ↔ source.
     toolbarActions.push({
       key: "preview",
       label: viewMode === "preview" ? "View source" : "View preview",
@@ -1357,6 +1365,8 @@ function FileViewerBody({
       onSelect: () => {
         dismissFilePosition(position);
         setDismissedPosition(position);
+        // An explicit choice ends a ?comment= link's pull toward source.
+        setDeepLinkBiasPath(null);
         setPreviewableViewMode(viewMode === "preview" ? "source" : "preview");
       },
     });

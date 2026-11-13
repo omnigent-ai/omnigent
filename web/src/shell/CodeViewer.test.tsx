@@ -1231,6 +1231,110 @@ describe("CodeViewer .ipynb routing", () => {
   });
 });
 
+describe("CodeViewer data-file routing", () => {
+  /** Open a data file in the viewer as the server would send it. */
+  function renderDataFile({
+    content,
+    encoding = "utf-8",
+    truncated = false,
+    searchOpen = false,
+    viewMode = "preview",
+  }: {
+    content: string;
+    encoding?: "utf-8" | "base64";
+    truncated?: boolean;
+    searchOpen?: boolean;
+    viewMode?: "preview" | "source";
+  }) {
+    return render(
+      <CodeViewer
+        markdownSourceFallback={false}
+        conversationId="conv_1"
+        path="sales.csv"
+        fileQuery={
+          {
+            data: { content, encoding, truncated },
+            isLoading: false,
+            isError: false,
+            isSuccess: true,
+            error: null,
+          } as unknown as ReturnType<typeof useFileContent>
+        }
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={() => {}}
+        panelOpen
+        searchOpen={searchOpen}
+        setSearchOpen={() => {}}
+        searchInputRef={noopRef}
+        viewMode={viewMode}
+      />,
+    );
+  }
+
+  it("renders a CSV as a table in preview mode", () => {
+    renderDataFile({ content: "city,people\nOslo,700000\n" });
+    expect(screen.getByRole("table", { name: "sales.csv" })).toBeDefined();
+    expect(screen.getByRole("cell", { name: "Oslo" })).toBeDefined();
+    expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+  });
+
+  it("keeps the raw text in source mode", async () => {
+    renderDataFile({ content: "city,people\nOslo,700000\n", viewMode: "source" });
+    // Monaco loads lazily.
+    expect(await screen.findByTestId("monaco-editor-stub")).toBeDefined();
+    expect(screen.queryByRole("table")).toBeNull();
+  });
+
+  it("tables a CSV the server sent as base64 instead of calling it binary", () => {
+    // "café" in Windows-1252, which isn't valid UTF-8.
+    const latin1 = btoa("name\ncaf\u00e9");
+    renderDataFile({ content: latin1, encoding: "base64" });
+    expect(screen.getByRole("cell", { name: "café" })).toBeDefined();
+    expect(screen.queryByText(/Preview not available/)).toBeNull();
+  });
+
+  it("opens find in the table when the viewer's find is requested", () => {
+    renderDataFile({ content: "city,people\nOslo,700000\n", searchOpen: true });
+    expect(screen.getByPlaceholderText("Find…")).toBeDefined();
+  });
+
+  it("finds again in the rows left after filtering", () => {
+    // jsdom has neither layout nor the CSS Custom Highlight API the find bar uses.
+    const rangeRect = Object.getOwnPropertyDescriptor(Range.prototype, "getBoundingClientRect");
+    const scrollBy = Object.getOwnPropertyDescriptor(Element.prototype, "scrollBy");
+    Range.prototype.getBoundingClientRect = () => ({ top: 0, bottom: 0 }) as DOMRect;
+    Element.prototype.scrollBy = () => {};
+    vi.stubGlobal("Highlight", function Highlight() {});
+    vi.stubGlobal("CSS", { highlights: { set: () => {}, delete: () => {} } });
+    try {
+      renderDataFile({ content: "name\nalpha\nbeta\nalpha two\n", searchOpen: true });
+      fireEvent.change(screen.getByPlaceholderText("Find…"), { target: { value: "alpha" } });
+      expect(screen.getByText("1 / 2")).toBeDefined();
+
+      fireEvent.change(screen.getByRole("textbox", { name: "Filter name" }), {
+        target: { value: "beta" },
+      });
+      expect(screen.getByText("No results")).toBeDefined();
+    } finally {
+      vi.unstubAllGlobals();
+      for (const [target, name, original] of [
+        [Range.prototype, "getBoundingClientRect", rangeRect],
+        [Element.prototype, "scrollBy", scrollBy],
+      ] as const) {
+        if (original) Object.defineProperty(target, name, original);
+        else Reflect.deleteProperty(target, name);
+      }
+    }
+  });
+
+  it("shows the shared truncation banner for a partial file", () => {
+    renderDataFile({ content: "city,people\nOslo,700000\n", truncated: true });
+    expect(screen.getByText(/too large to load fully/)).toBeDefined();
+    expect(screen.getByTestId("data-table-summary").textContent).toContain("At least 1 row ");
+  });
+});
+
 describe("source line navigation", () => {
   it("centers and highlights the requested Markdown source line", () => {
     const scroll = vi.fn();
