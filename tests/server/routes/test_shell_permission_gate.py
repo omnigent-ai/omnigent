@@ -301,7 +301,15 @@ def app(runner_globals_reset: None, runner_client: _RecordingRunnerClient) -> Fa
     set_runner_router(_FakeRunnerRouter(runner_client))  # type: ignore[arg-type]
 
     application = FastAPI()
-    application.state.feature_flags = FeatureFlags(frozenset({Feature.WORKSPACE_CONTENT_SEARCH}))
+    application.state.feature_flags = FeatureFlags(
+        frozenset(
+            {
+                Feature.WORKSPACE_CONTENT_SEARCH,
+                Feature.WORKSPACE_DIRECT_ACCESS,
+                Feature.WORKSPACE_API_SERVER_ACCESS,
+            }
+        )
+    )
 
     @application.exception_handler(OmnigentError)
     async def _handle_omnigent_error(
@@ -1050,6 +1058,8 @@ _MERGE_PATH = "/v1/sessions/conv_share/resources/github/merge"
 _MERGE_OPTIONS_PATH = "/v1/sessions/conv_share/resources/github/merge-options"
 _DISABLE_AUTO_MERGE_PATH = "/v1/sessions/conv_share/resources/github/disable-auto-merge"
 _MERGE_BODY = {"pr_url": _LABELS_PR_URL, "merge_method": "squash", "expected_head": "a" * 40}
+_MERGE_AS_PATH = "/v1/sessions/conv_share/resources/github/merge-as"
+_MERGE_AS_BODY = {**_MERGE_BODY, "account": "personal"}
 _COMMENTS_PATH = "/v1/sessions/conv_share/resources/github/comments"
 _REVIEW_REPLY_PATH = "/v1/sessions/conv_share/resources/github/review-threads/thread-1/replies"
 _DETAILS_PATH = "/v1/sessions/conv_share/resources/github/details"
@@ -1074,21 +1084,24 @@ async def test_pr_merge_routes_require_edit(
         _MERGE_OPTIONS_PATH, params={"pr_url": _LABELS_PR_URL}, headers=headers
     )
     merged = await client.post(_MERGE_PATH, json=_MERGE_BODY, headers=headers)
+    merged_as = await client.post(_MERGE_AS_PATH, json=_MERGE_AS_BODY, headers=headers)
     disabled = await client.post(
         _DISABLE_AUTO_MERGE_PATH, json={"pr_url": _LABELS_PR_URL}, headers=headers
     )
 
-    assert (options.status_code, merged.status_code, disabled.status_code) == (
-        expected,
-        expected,
-        expected,
-    ), merged.text
+    assert (
+        options.status_code,
+        merged.status_code,
+        merged_as.status_code,
+        disabled.status_code,
+    ) == (expected, expected, expected, expected), merged.text
     if expected == 403:
         assert runner_client.gets == runner_client.posts == []
         return
     assert runner_client.gets == [_MERGE_OPTIONS_PATH]
     assert runner_client.posts == [
         (_MERGE_PATH, _MERGE_BODY),
+        (_MERGE_AS_PATH, _MERGE_AS_BODY),
         (_DISABLE_AUTO_MERGE_PATH, {"pr_url": _LABELS_PR_URL}),
     ]
 
@@ -1158,9 +1171,19 @@ async def test_pr_attachment_upload_refuses_viewers_before_the_runner(
         (_COMMENTS_PATH, {"pr_url": _LABELS_PR_URL, "body": "Hello"}),
         (_REVIEW_REPLY_PATH, {"pr_url": _LABELS_PR_URL, "body": "Hello"}),
         (_MERGE_PATH, _MERGE_BODY),
+        (_MERGE_AS_PATH, _MERGE_AS_BODY),
         (_DISABLE_AUTO_MERGE_PATH, {"pr_url": _LABELS_PR_URL}),
     ],
-    ids=["labels", "reviewers", "details", "comments", "reply", "merge", "disable-auto-merge"],
+    ids=[
+        "labels",
+        "reviewers",
+        "details",
+        "comments",
+        "reply",
+        "merge",
+        "merge-as",
+        "disable-auto-merge",
+    ],
 )
 async def test_pr_edit_requires_a_json_body(
     client: httpx.AsyncClient,
@@ -1177,3 +1200,50 @@ async def test_pr_edit_requires_a_json_body(
 
     assert resp.status_code == 415, resp.text
     assert runner_client.posts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("user", "status"),
+    [
+        ("viewer@example.com", 403),
+        ("owner@example.com", 403),  # an edit collaborator, despite the name
+        ("manager@example.com", 403),
+        # The owner passes the gate; this harness has no connected host to offer.
+        ("real-owner@example.com", 404),
+    ],
+)
+async def test_workspace_direct_access_is_owner_only(
+    client: httpx.AsyncClient, user: str, status: int
+) -> None:
+    """A direct-access token reads the workspace with no per-read server check,
+    so only the session owner may get one."""
+    resp = await client.post(
+        "/v1/sessions/conv_share/workspace/direct-access", headers={"X-Forwarded-Email": user}
+    )
+
+    assert resp.status_code == status, resp.text
+    if status == 404:
+        assert "host is not connected" in resp.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("session", "status"), [("conv_share", 403), ("conv_open", 200)])
+async def test_workspace_api_follows_the_file_read_gate(
+    client: httpx.AsyncClient, session: str, status: int
+) -> None:
+    """A view-only collaborator reads the workspace API only where files are shared."""
+    resp = await client.post(
+        f"/v1/sessions/{session}/workspace"
+        "/omnigent.api.workspace.v1alpha1.WorkspaceService/ReadFile",
+        headers={
+            "X-Forwarded-Email": "viewer@example.com",
+            "Content-Type": "application/connect+json",
+        },
+        content=b"\x00\x00\x00\x00\x02{}",  # one enveloped Connect message
+    )
+
+    assert resp.status_code == status, resp.text
+    if status == 200:
+        # Past the gate; this harness has no host, so the stream ends with that error.
+        assert b"unavailable" in resp.content

@@ -23,11 +23,13 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
 
     assert flags.enabled_features == frozenset(
         {
+            Feature.AUTOMATIONS_V2,
             Feature.CLAUDE_OSC_STATUS,
             Feature.CODEX_PLAN_AT_LAUNCH,
-            Feature.CUSTOM_AGENTS_SETTINGS_UI,
             Feature.PEER_SESSION_MESSAGING,
+            Feature.PROJECT_REPOSITORY_CREATION,
             Feature.SESSION_ORCHESTRATION,
+            Feature.SIBLING_SESSIONS,
             Feature.SIDEBAR_GROUPING_UI,
         }
     )
@@ -38,15 +40,16 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "canvas": False,
         "arca_shutdown_warnings": False,
         "import_review": False,
-        "custom_agents_settings_ui": True,
         "sidebar_grouping_ui": True,
         "workspace_content_search": False,
         "grid_sessions_display_ui": False,
-        "automations_v2": False,
+        "automations_v2": True,
         "splittable_terminal_view_ui": False,
         "sidebar_windowed_rows": False,
+        "session_overview": False,
+        "project_repository_creation": True,
         "session_orchestration": True,
-        "sibling_sessions": False,
+        "sibling_sessions": True,
         "codex_plan_at_launch": True,
     }
 
@@ -57,12 +60,14 @@ def test_resolves_comma_separated_enabled_set() -> None:
     assert flags.enabled(Feature.USAGE_PAGE)
     assert flags.enabled(Feature.HARNESS_INSTALL)
     assert flags.enabled_names() == (
+        "automations_v2",
         "claude_osc_status",
         "codex_plan_at_launch",
-        "custom_agents_settings_ui",
         "harness_install",
         "peer_session_messaging",
+        "project_repository_creation",
         "session_orchestration",
+        "sibling_sessions",
         "sidebar_grouping_ui",
         "usage_page",
     )
@@ -79,10 +84,12 @@ def test_resolves_comma_separated_enabled_set() -> None:
 @pytest.mark.parametrize(
     "feature",
     [
+        "automations_v2",
         "claude_osc_status",
-        "custom_agents_settings_ui",
         "peer_session_messaging",
+        "project_repository_creation",
         "session_orchestration",
+        "sibling_sessions",
         "sidebar_grouping_ui",
     ],
 )
@@ -91,28 +98,43 @@ def test_explicit_disable_wins_and_preserves_other_features(override: str, featu
     flags = resolve_feature_flags({FEATURES_ENV_VAR: f"usage_page,{features}"})
 
     assert set(flags.enabled_names()) == {
+        "automations_v2",
         "claude_osc_status",
         "codex_plan_at_launch",
-        "custom_agents_settings_ui",
         "peer_session_messaging",
+        "project_repository_creation",
         "session_orchestration",
+        "sibling_sessions",
         "sidebar_grouping_ui",
         "usage_page",
     } - {feature}
 
 
-@pytest.mark.parametrize("feature", ["usage_page", "sibling_sessions"])
+@pytest.mark.parametrize("feature", ["usage_page", "canvas"])
 def test_default_off_features_can_also_be_explicitly_disabled(feature: str) -> None:
     flags = resolve_feature_flags({FEATURES_ENV_VAR: f"{feature},-{feature}"})
 
     assert flags.enabled_names() == (
+        "automations_v2",
         "claude_osc_status",
         "codex_plan_at_launch",
-        "custom_agents_settings_ui",
         "peer_session_messaging",
+        "project_repository_creation",
         "session_orchestration",
+        "sibling_sessions",
         "sidebar_grouping_ui",
     )
+
+
+@pytest.mark.parametrize("override", ["custom_agents_settings_ui", "-custom_agents_settings_ui"])
+def test_retired_feature_is_ignored_with_warning(
+    override: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        flags = resolve_feature_flags({FEATURES_ENV_VAR: f"usage_page,{override}"})
+
+    assert flags == resolve_feature_flags({FEATURES_ENV_VAR: "usage_page"})
+    assert f"{override} has been retired" in caplog.text
 
 
 def test_removed_harness_install_variable_fails_with_migration_hint() -> None:
@@ -132,12 +154,14 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
     assert flags.enabled(Feature.CANVAS)
     assert flags.frontend_dict()["canvas"] is True
     assert flags.enabled_names() == (
+        "automations_v2",
         "canvas",
         "claude_osc_status",
         "codex_plan_at_launch",
-        "custom_agents_settings_ui",
         "peer_session_messaging",
+        "project_repository_creation",
         "session_orchestration",
+        "sibling_sessions",
         "sidebar_grouping_ui",
     )
 
@@ -149,11 +173,9 @@ def test_arca_shutdown_warnings_are_frontend_visible() -> None:
     assert flags.frontend_dict()["arca_shutdown_warnings"] is True
 
 
-def test_sibling_sessions_can_be_enabled_without_other_opt_in_features() -> None:
+def test_sibling_sessions_explicit_enable_preserves_default_features() -> None:
     flags = resolve_feature_flags({FEATURES_ENV_VAR: "sibling_sessions"})
-    assert flags.enabled_features == resolve_feature_flags({}).enabled_features | {
-        Feature.SIBLING_SESSIONS
-    }
+    assert flags.enabled_features == resolve_feature_flags({}).enabled_features
     assert flags.frontend_dict()["sibling_sessions"] is True
 
 

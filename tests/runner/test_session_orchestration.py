@@ -24,13 +24,82 @@ def test_native_message_schema(spec, runner_features, monkeypatch):
     assert schema["parameters"]["required"] == ["session_id", "message"]
 
 
-def test_create_schema_exposes_project_name():
+def test_create_schema_exposes_project_name_and_permission_mode():
     schemas = build_native_relay_tool_schemas(AgentSpec(spec_version=1, spawn=True))
     schema = next(s for s in schemas if s["name"] == "sys_session_create")
-    # The schema forbids unlisted properties, so the project argument must be declared.
+    # The schema forbids unlisted properties, so each argument must be declared.
     assert schema["parameters"]["additionalProperties"] is False
     assert schema["parameters"]["properties"]["project_name"]["type"] == "string"
-    assert "project_id" not in schema["parameters"]["properties"]
+    assert schema["parameters"]["properties"]["permission_mode"]["type"] == "string"
+    assert schema["parameters"]["properties"]["project_id"]["type"] == "string"
+
+
+@pytest.mark.asyncio
+# None is an older server, which omits the field.
+@pytest.mark.parametrize("advertised", [True, False, None])
+async def test_create_sends_permission_mode_only_to_a_server_that_applies_it(advertised):
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        if request.url.path == "/v1/info":
+            info = {} if advertised is None else {"session_create_permission_modes": advertised}
+            return httpx.Response(200, json=info)
+        return httpx.Response(201, json={"id": "conv_worker", "agent_id": "worker"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {
+                        "agent_id": "worker",
+                        "placement": "same_host",
+                        "permission_mode": "approve-for-me",
+                    }
+                ),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+
+    posts = [request for request in requests if request.method == "POST"]
+    if advertised:
+        assert result["conversation_id"] == "conv_worker", result
+        assert json.loads(posts[0].content)["permission_mode"] == "approve-for-me"
+    else:
+        # An older server would drop the field and start the session in its default mode.
+        assert "can't set a new session's permission_mode" in result["error"]
+        assert posts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("arguments", "error"),
+    [
+        ({"agent_id": "worker", "permission_mode": ""}, "nonempty string"),
+        ({"agent_id": "worker", "permission_mode": 1}, "nonempty string"),
+        ({"config_path": "agent.yaml", "permission_mode": "auto"}, "requires agent_id"),
+    ],
+)
+async def test_create_refuses_unusable_permission_mode(arguments, error):
+    def unexpected(request):
+        pytest.fail("A refused permission_mode must not reach the server")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(unexpected), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(arguments),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+    assert error in result["error"]
 
 
 @pytest.mark.parametrize("spec", [AgentSpec(spec_version=1), None])
@@ -804,21 +873,21 @@ async def test_independent_create_files_a_named_project(placement, named_by, ser
     ("arguments", "error"),
     [
         (
-            {"placement": "same_host", "project_id": _PROJECT_ID},
-            "takes project_name, the project's name as shown in the UI, not project_id",
+            {"placement": "same_host", "project_id": _PROJECT_ID, "project_name": "T"},
+            "Provide only one of project_name or project_id",
         ),
-        ({"project_id": _PROJECT_ID}, "takes project_name, the project's name as shown in the UI"),
-        ({"project_name": "T"}, "project_name requires placement='same_host' or 'managed'"),
+        ({"project_id": _PROJECT_ID}, "project_id requires an independent placement"),
+        ({"project_name": "T"}, "project_name requires an independent placement"),
         (
             {"placement": "child", "project_name": "T"},
-            "project_name requires placement='same_host' or 'managed'",
+            "project_name requires an independent placement",
         ),
         ({"placement": "managed", "project_name": ""}, "nonempty string"),
         ({"placement": "managed", "project_name": 123}, "nonempty string"),
         ({"placement": "managed", "project_name": "  "}, "nonempty string"),
         (
             {"agent_id": None, "config_path": "agent.yaml", "project_name": "T"},
-            "project_name requires placement='same_host' or 'managed'",
+            "project_name requires an independent placement",
         ),
     ],
 )
@@ -1069,3 +1138,230 @@ async def test_independent_creation_supports_disabled_or_missing_sibling_capabil
     assert result["family"] == family
     assert paths.count("/v1/sessions/orchestrated") == 1
     assert "/v1/sessions" not in paths
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "supported,project_field,placement",
+    [
+        (True, "project_id", "host"),
+        (True, "project_name", "host"),
+        (False, "project_id", "host"),
+        (None, "project_id", "host"),
+        (False, "project_id", "same_host"),
+        (None, "project_id", "same_host"),
+    ],
+)
+async def test_explicit_host_create_preserves_worktree_and_project(
+    supported, project_field, placement
+):
+    requests = []
+    destination = uuid4().hex
+    session = uuid4().hex
+
+    def respond(request):
+        requests.append(request)
+        if request.url.path == "/v1/info":
+            return httpx.Response(
+                200, json={} if supported is None else {"scripted_sessions": supported}
+            )
+        if request.url.path == "/v1/projects":
+            return httpx.Response(200, json={"data": [{"id": _PROJECT_ID, "name": "Triage"}]})
+        if request.url.path.startswith("/v1/projects/"):
+            return httpx.Response(200, json={"id": _PROJECT_ID, "name": "Triage"})
+        if request.url.path.endswith("/events"):
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(201, json={"id": session, "project_id": _PROJECT_ID})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {
+                        "agent_id": "worker",
+                        "placement": placement,
+                        **(
+                            {
+                                "host_id": destination,
+                                "workspace": "/repos/example",
+                                "git": {"branch_name": "review", "base_branch": "main"},
+                            }
+                            if placement == "host"
+                            else {}
+                        ),
+                        project_field: _PROJECT_ID if project_field == "project_id" else "Triage",
+                        "message": "Review the change",
+                    }
+                ),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+    posts = [r for r in requests if r.method == "POST"]
+    if supported is not True:
+        assert "unavailable" in result["error"]
+        assert not posts
+        return
+    body = json.loads(posts[0].content)
+    assert posts[0].url.path == "/v1/sessions/orchestrated/host"
+    assert body["host_id"] == destination
+    assert body["workspace"] == "/repos/example"
+    assert body["git"] == {"branch_name": "review", "base_branch": "main"}
+    assert body["project_id"] == _PROJECT_ID
+    assert "parent_session_id" not in body
+    assert posts[0].extensions["omnigent_host_id"] == destination
+    assert posts[0].headers[ORCHESTRATION_SOURCE_HEADER] == "manager"
+    assert result["conversation_id"] == session
+    assert result["initial_message"]["queued"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"placement": "host"},
+        {"placement": "same_host", "host_id": "host"},
+        {"workspace": "/repo"},
+        {"placement": "host", "host_id": "host", "workspace": "/repo", "git": {}},
+    ],
+)
+async def test_invalid_host_options_do_not_create(arguments):
+    def unexpected(request):
+        pytest.fail("Invalid placement must be rejected before any request")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(unexpected), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": "worker", **arguments}),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "action,supported,explicit_target,host_routing",
+    [
+        ("attach", True, False, "host"),
+        ("remove", True, False, "host"),
+        ("attach", True, True, "host"),
+        ("attach", True, True, "legacy"),
+        ("attach", True, False, "hostless"),
+        ("remove", True, False, "hostless"),
+        ("attach", False, False, "host"),
+        ("attach", None, False, "host"),
+    ],
+)
+async def test_pr_link_routes_to_target_and_requires_capability(
+    monkeypatch, action, supported, explicit_target, host_routing
+):
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, open_server_client
+    from omnigent.runner._entry import _RunnerDatabricksAuth
+    from omnigent.runner.session_requests import REQUEST_HOST_EXTENSION
+
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
+    monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", "source-route")
+    requests = []
+    delivered = []
+    source = uuid4().hex
+    target = uuid4().hex if explicit_target else source
+    host = None if host_routing == "hostless" else uuid4().hex
+    legacy_host = host_routing == "legacy"
+
+    def respond(request):
+        requests.append(request)
+        if request.url.path == "/v1/info":
+            return httpx.Response(
+                200, json={} if supported is None else {"scripted_sessions": supported}
+            )
+        if request.method == "GET":
+            assert request.url.path == f"/v1/sessions/{target}"
+            return httpx.Response(200, json={"host_id": host})
+        if legacy_host and request.extensions[REQUEST_HOST_EXTENSION]:
+            return httpx.Response(400, json={"error": {"code": "wrong_replica"}})
+        delivered.append(request)
+        return httpx.Response(200, json={"prs": []})
+
+    async with open_server_client(
+        "http://sharded",
+        auth=_RunnerDatabricksAuth(lambda: "test-token", "http://sharded"),
+        transport=httpx.MockTransport(respond),
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_link_pr",
+                arguments=json.dumps(
+                    {
+                        "url": "https://github.com/example/repo/pull/1",
+                        "action": action,
+                        **({"session_id": target} if explicit_target else {}),
+                    }
+                ),
+                server_client=client,
+                conversation_id=source,
+            )
+        )
+        assert client.headers[OMNIGENT_SLICE_KEY_HEADER] == "source-route"
+    posts = [r for r in requests if r.method == "POST"]
+    if supported is not True:
+        assert "unavailable" in result["error"]
+        assert not posts
+        return
+    assert result == {"prs": []}
+    assert len(posts) == (2 if legacy_host else 1)
+    assert len(delivered) == 1
+    assert [r.extensions.get(REQUEST_HOST_EXTENSION) for r in posts] == (
+        [host, ""] if legacy_host else [host]
+    )
+    assert [r.headers.get(OMNIGENT_SLICE_KEY_HEADER) for r in posts] == (
+        [host, None] if legacy_host else [host or "source-route"]
+    )
+    assert all(r.headers[ORCHESTRATION_SOURCE_HEADER] == source for r in posts)
+    assert all(r.headers["Authorization"] == "Bearer test-token" for r in posts)
+    assert posts[0].url.path == f"/v1/sessions/{target}/resources/github/prs/orchestrated"
+    assert posts[0].headers[ORCHESTRATION_SOURCE_HEADER] == source
+    assert json.loads(posts[0].content)["action"] == action
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure", ["timeout", "server_error", "invalid_json", "invalid_shape", "forbidden"]
+)
+async def test_pr_link_uncertain_delivery_is_not_retried(failure):
+    posts = []
+
+    def respond(request):
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"scripted_sessions": True})
+        if request.method == "GET":
+            return httpx.Response(200, json={"host_id": "host"})
+        posts.append(request)
+        if failure == "timeout":
+            raise httpx.ReadTimeout("Lost response")
+        if failure == "invalid_json":
+            return httpx.Response(200, text="unavailable")
+        if failure == "invalid_shape":
+            return httpx.Response(200, json=[])
+        return httpx.Response(403 if failure == "forbidden" else 503)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_link_pr",
+                arguments=json.dumps({"url": "https://github.com/example/repo/pull/1"}),
+                server_client=client,
+                conversation_id=uuid4().hex,
+            )
+        )
+    assert len(posts) == 1
+    assert ("refused" if failure == "forbidden" else "could not be confirmed") in result["error"]

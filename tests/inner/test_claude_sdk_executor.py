@@ -19,12 +19,14 @@ import pytest
 
 from omnigent.inner.claude_sdk_executor import _to_anthropic_content_blocks
 from omnigent.inner.executor import (
+    INTERRUPTION_MARKER_TEXT,
     ExecutorConfig,
     ExecutorError,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
     ToolCallStatus,
+    TurnCancelled,
     TurnComplete,
 )
 from tests._helpers.live_server import terminate_process
@@ -210,6 +212,19 @@ class TestPromptExtraction(unittest.TestCase):
         self.assertIn("new two", prompt)
         self.assertNotIn("old one", prompt)
         self.assertNotIn("old two", prompt)
+
+    def test_resumed_session_trailing_run_starts_at_interruption_marker(self):
+        """A kept session already saw the interrupted request; send a pending marker onward."""
+        executor = self._make_executor()
+        messages = [
+            {"role": "user", "content": "Write a long essay."},
+            {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
+            {"role": "user", "content": "Summarize instead."},
+        ]
+        prompt = executor._build_prompt(messages, resume_session=True, after_interrupt=True)
+        self.assertEqual(prompt, f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead.")
+        prompt = executor._build_prompt(messages, resume_session=True)
+        self.assertEqual(prompt, "Summarize instead.")
 
     def test_resumed_session_multimodal_trailing_run_preserves_blocks(self):
         """A multimodal message in the trailing run keeps structured blocks for all."""
@@ -2144,6 +2159,25 @@ class TestGatewayModelVocabulary(unittest.TestCase):
             json.loads(_claude_settings_payload(None, {"claude-opus-4-8": "gw-opus"})),
             {"modelOverrides": {"claude-opus-4-8": "gw-opus"}},
         )
+        # The connector opt-out rides alongside gateway settings, or alone.
+        self.assertEqual(
+            json.loads(
+                _claude_settings_payload(
+                    "printf tok",
+                    {"claude-opus-4-8": "gw-opus"},
+                    disable_claude_ai_connectors=True,
+                )
+            ),
+            {
+                "apiKeyHelper": "printf tok",
+                "modelOverrides": {"claude-opus-4-8": "gw-opus"},
+                "disableClaudeAiConnectors": True,
+            },
+        )
+        self.assertEqual(
+            json.loads(_claude_settings_payload(None, {}, disable_claude_ai_connectors=True)),
+            {"disableClaudeAiConnectors": True},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2721,6 +2755,105 @@ class TestBundlePluginGating(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Tests: hermetic (skills=none) launch opts out of claude.ai connectors
+# ---------------------------------------------------------------------------
+
+
+class TestHermeticLaunchConnectorOptOut(unittest.TestCase):
+    """
+    ``skills: none`` forwards ``setting_sources=[]``, so the CLI never reads a
+    project's ``disableClaudeAiConnectors`` opt-out; the launch must carry that
+    opt-out itself, while other filters leave connectors to the host settings.
+    """
+
+    def _capture_launch_options(self, skills_filter, *, system_cli=True):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        captured = {}
+
+        def _construct():
+            if system_cli:
+                return ClaudeSDKExecutor(skills_filter=skills_filter)
+            with patch(
+                "omnigent.inner.claude_sdk_executor._find_system_claude", return_value=None
+            ):
+                return ClaudeSDKExecutor(skills_filter=skills_filter)
+
+        class _ResultMessage:
+            def __init__(self, session_id, result):
+                self.session_id = session_id
+                self.result = result
+
+        class _FakeSDK(_sdk_types()):
+            ResultMessage = _ResultMessage
+            messages = []
+
+            class ClaudeSDKClient(_SDKClient):
+                def __init__(self, options):
+                    super().__init__(options)
+                    captured["options"] = options
+
+                async def query(self, prompt, session_id="default"):
+                    _FakeSDK.messages = [_ResultMessage(f"claude-{session_id}", "ok")]
+
+                async def receive_response(self):
+                    for message in _FakeSDK.messages:
+                        yield message
+
+        async def _t():
+            executor = _construct()
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+                async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                    pass
+
+        _run(_t())
+        self.assertIn("options", captured, "SDK client was never constructed")
+        return captured["options"]
+
+    @staticmethod
+    def _launch_settings(options):
+        raw = getattr(options, "settings", None)
+        return json.loads(raw) if raw else {}
+
+    @staticmethod
+    def _launch_env(options):
+        return dict(getattr(options, "env", None) or {})
+
+    def test_skills_none_launch_disables_claude_ai_connectors(self):
+        options = self._capture_launch_options("none")
+
+        self.assertEqual(options.setting_sources, [])
+        self.assertIs(self._launch_settings(options).get("disableClaudeAiConnectors"), True)
+        self.assertEqual(self._launch_env(options).get("ENABLE_CLAUDEAI_MCP_SERVERS"), "false")
+
+    def test_skills_none_bundled_cli_fallback_keeps_env_opt_out(self):
+        # Without a system claude the SDK runs its bundled CLI; the
+        # environment knob must still reach it.
+        options = self._capture_launch_options("none", system_cli=False)
+
+        self.assertIsNone(getattr(options, "cli_path", None))
+        self.assertEqual(self._launch_env(options).get("ENABLE_CLAUDEAI_MCP_SERVERS"), "false")
+
+    def test_skills_none_user_settings_env_cannot_reenable_connectors(self):
+        # A hermetic launch merges the user settings ``env`` block; the
+        # executor's opt-out must win over a value set there.
+        with patch(
+            "omnigent.inner.claude_sdk_executor._claude_user_settings_env",
+            return_value={"ENABLE_CLAUDEAI_MCP_SERVERS": "true"},
+        ):
+            options = self._capture_launch_options("none")
+
+        self.assertEqual(self._launch_env(options).get("ENABLE_CLAUDEAI_MCP_SERVERS"), "false")
+
+    def test_other_filters_leave_connectors_to_host_settings(self):
+        for skills_filter in ("all", ["only"]):
+            with self.subTest(skills_filter=skills_filter):
+                options = self._capture_launch_options(skills_filter)
+                self.assertNotIn("disableClaudeAiConnectors", self._launch_settings(options))
+                self.assertNotIn("ENABLE_CLAUDEAI_MCP_SERVERS", self._launch_env(options))
+
+
+# ---------------------------------------------------------------------------
 # Tests: StreamEvent-based streaming
 # ---------------------------------------------------------------------------
 
@@ -3157,49 +3290,115 @@ class TestStreamEventStreaming(unittest.TestCase):
 
         _run(_t())
 
-    def test_interrupt_session_interrupts_then_drops_session(self):
-        """A user interrupt fires a safe interrupt, then drops the session.
+    def _interrupt_query_then_follow_up(self, *, compacts: bool):
+        """Interrupt a running query, optionally after a CLI compaction, then send a follow-up."""
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
-        ``run_turn`` decides whether to resume via
-        ``session_key in self._clients``. Dropping the session after an
-        interrupt is what forces the next turn to rebuild from full
-        history (with the runner's ``[System: interrupted]`` marker)
-        instead of resuming a live session whose transcript still holds
-        the abandoned prompt. If ``_clients`` were left populated, the
-        next turn would resume and silently continue the canceled
-        instruction.
-        """
-        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
-
-        interrupt = AsyncMock()
+        queries: list[object] = []
+        connect_calls: list[object] = []
         disconnect = AsyncMock()
-        client = type("Client", (), {"interrupt": interrupt, "disconnect": disconnect})()
+        interrupt_calls: list[object] = []
+        query_started = asyncio.Event()
+
+        class _ResultMessage:
+            def __init__(self, session_id, result):
+                self.session_id = session_id
+                self.result = result
+
+        class _SystemMessage:
+            subtype = "hook_started"
+            data = {"hook_event": "PreCompact"}
+            hook_event_name = "PreCompact"
+
+        class _FakeSDK(_sdk_types()):
+            ResultMessage = _ResultMessage
+            SystemMessage = _SystemMessage
+
+            class ClaudeSDKClient(_SDKClient):
+                async def connect(self):
+                    connect_calls.append(self)
+                    self.result_ready = asyncio.Event()
+
+                async def query(self, prompt, session_id="default"):
+                    queries.append(prompt)
+                    query_started.set()
+                    if len(queries) > 1:
+                        self.result_ready.set()
+
+                async def receive_response(self):
+                    if compacts and len(queries) == 1:
+                        yield _SystemMessage()
+                    await self.result_ready.wait()
+                    # The first follow-up ends without assistant text.
+                    yield _ResultMessage(
+                        "claude-session-a", [None, None, "THANKS"][len(queries) - 1]
+                    )
+
+                async def interrupt(self):
+                    interrupt_calls.append(self)
+                    self.result_ready.set()
+
+                async def disconnect(self):
+                    await disconnect()
 
         async def _t():
             executor = ClaudeSDKExecutor()
-            executor._clients["session-a"] = _ClaudeClientState(client=client, model=None)
+            history = [
+                {"role": "user", "content": "Write a long essay.", "session_id": "session-a"}
+            ]
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
 
-            interrupted = await executor.interrupt_session("session-a")
+                async def _collect(messages):
+                    return [e async for e in executor.run_turn(messages, [], "")]
 
-            self.assertTrue(interrupted)
-            # Safe interrupt is attempted first to halt the in-flight turn.
-            interrupt.assert_awaited_once_with()
-            # Then the session is torn down (disconnect) and removed from
-            # _clients so the next turn cannot resume it. An empty dict here
-            # is the invariant that prevents the canceled-instruction leak.
-            disconnect.assert_awaited_once_with()
-            self.assertEqual(executor._clients, {})
+                first_turn = asyncio.create_task(_collect(history))
+                await query_started.wait()
+                self.assertTrue(await executor.interrupt_session("session-a"))
+                self.assertTrue(await executor.interrupt_session("session-a"))
+                first_events = await first_turn
 
-        _run(_t())
+                history.append({"role": "user", "content": INTERRUPTION_MARKER_TEXT})
+                follow_up_events = []
+                for text in ("Summarize instead.", "Thanks."):
+                    history.append({"role": "user", "content": text, "session_id": "session-a"})
+                    follow_up_events.append(await _collect(list(history)))
+            await asyncio.gather(*executor._cancel_close_tasks)
+            return first_events, follow_up_events
 
-    def test_interrupt_session_closes_even_when_interrupt_fails(self):
-        """A failed safe interrupt still drops the session.
+        first_events, follow_up_events = _run(_t())
+        return first_events, follow_up_events, queries, connect_calls, interrupt_calls, disconnect
 
-        The session must be torn down regardless of whether the SDK's
-        ``interrupt()`` succeeds — otherwise a flaky interrupt would
-        leave the abandoned-prompt session resumable. If ``close_session``
-        is not awaited here, the interrupt-failure path leaks the session.
-        """
+    def test_interrupted_query_keeps_session_for_next_turn(self):
+        """An interrupted query ends as cancelled and the next query resumes the same client."""
+        first_events, follow_up_events, queries, connect_calls, interrupt_calls, disconnect = (
+            self._interrupt_query_then_follow_up(compacts=False)
+        )
+
+        self.assertIsInstance(first_events[-1], TurnCancelled)
+        self.assertEqual(len(interrupt_calls), 1)
+        self.assertEqual(len(connect_calls), 1)
+        disconnect.assert_not_awaited()
+        self.assertEqual(queries[1], f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead.")
+        self.assertNotIn(INTERRUPTION_MARKER_TEXT, queries[2])
+        self.assertTrue(queries[2].endswith("Thanks."))
+        self.assertFalse(follow_up_events[0][-1].response)
+        self.assertEqual(follow_up_events[1][-1].response, "THANKS")
+
+    def test_interrupted_query_that_compacted_replays_history_in_new_client(self):
+        """A compaction the server never received is not resumed; the next turn replays history."""
+        first_events, follow_up_events, queries, connect_calls, _, _ = (
+            self._interrupt_query_then_follow_up(compacts=True)
+        )
+
+        self.assertIsInstance(first_events[-1], TurnCancelled)
+        self.assertEqual(len(connect_calls), 2)
+        self.assertIn("Conversation so far:", queries[1])
+        self.assertIn("Write a long essay.", queries[1])
+        self.assertNotIn(INTERRUPTION_MARKER_TEXT, queries[2])
+        self.assertIsInstance(follow_up_events[-1][-1], TurnComplete)
+
+    def test_interrupt_session_closes_when_interrupt_fails(self):
+        """A failed interrupt drops the session so a still-running query cannot be resumed."""
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
 
         async def fail_interrupt():
@@ -5515,6 +5714,96 @@ async def test_result_message_other_failure_stays_unclassified() -> None:
     assert error.code is None
     assert error.title is None
     assert error.remediation is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("profile", "login_command"),
+    [
+        ("oss", "databricks auth login --profile oss"),
+        (None, "databricks auth login --host https://host"),
+    ],
+)
+async def test_failing_api_key_helper_is_an_auth_error_not_a_reply(
+    profile: str | None, login_command: str
+) -> None:
+    """An empty gateway ``apiKeyHelper`` token fails the turn with a re-login hint.
+
+    The Claude CLI answers a helper that prints no token with a ``<synthetic>``
+    assistant message carrying ``error`` and then an ``is_error`` result. If this
+    regresses, that CLI text streams out as the reply (``omnigent run -p`` prints
+    it and exits 0) and the user is told to "Run /status", which they cannot.
+    """
+    from claude_agent_sdk.types import AssistantMessage as SDKAssistantMessage
+    from claude_agent_sdk.types import ClaudeAgentOptions as SDKClaudeAgentOptions
+    from claude_agent_sdk.types import ResultMessage as SDKResultMessage
+    from claude_agent_sdk.types import StreamEvent as SDKStreamEvent
+    from claude_agent_sdk.types import TextBlock as SDKTextBlock
+    from claude_agent_sdk.types import ThinkingBlock as SDKThinkingBlock
+    from claude_agent_sdk.types import ToolUseBlock as SDKToolUseBlock
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    cli_text = (
+        "Your apiKeyHelper script is failing · This usually means you need to "
+        "re-authenticate with your provider · Run /status to see the script's error output"
+    )
+
+    class _FakeSDK(_sdk_types()):
+        AssistantMessage = SDKAssistantMessage
+        TextBlock = SDKTextBlock
+        ThinkingBlock = SDKThinkingBlock
+        ToolUseBlock = SDKToolUseBlock
+        StreamEvent = SDKStreamEvent
+        ResultMessage = SDKResultMessage
+        ClaudeAgentOptions = SDKClaudeAgentOptions
+        messages = [
+            SDKAssistantMessage(
+                content=[SDKTextBlock(text=cli_text)],
+                model="<synthetic>",
+                error="invalid_request",
+            ),
+            SDKResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=0,
+                is_error=True,
+                num_turns=1,
+                session_id="s1",
+                result=cli_text,
+                api_error_status=403,
+            ),
+        ]
+
+        class ClaudeSDKClient(_SDKClient):
+            async def receive_response(self):
+                for message in _FakeSDK.messages:
+                    yield message
+
+    with patch(
+        "omnigent.inner.claude_sdk_executor._resolve_gateway_env",
+        return_value={
+            "ANTHROPIC_BASE_URL": "https://host/ai-gateway/anthropic",
+            "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "900000",
+            "OMNIGENT_CLAUDE_API_KEY_HELPER": "databricks auth token ...",
+        },
+    ):
+        # A pinned model skips live model discovery against the real ~/.databrickscfg.
+        executor = ClaudeSDKExecutor(
+            gateway=True, databricks_profile=profile, model="databricks-claude-sonnet-5-5"
+        )
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+        events = [e async for e in executor.run_turn([{"role": "user", "content": "hi"}], [], "")]
+
+    streamed = "".join(e.text for e in events if isinstance(e, TextChunk))
+    assert "apiKeyHelper" not in streamed, "the CLI's error text streamed out as the reply"
+    assert not [e for e in events if isinstance(e, TurnComplete)]
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert len(errors) == 1
+    message = errors[0].message
+    assert message.startswith("Claude SDK provider authentication failed (status=403)")
+    assert "apiKeyHelper script is failing" in message
+    assert f"`{login_command}`" in message
 
 
 @pytest.mark.asyncio

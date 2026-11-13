@@ -26,7 +26,7 @@ import json
 import logging
 import uuid
 from collections.abc import Callable
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from time import monotonic
 from typing import cast
 
@@ -160,6 +160,7 @@ class ProxyMcpManager:
         ap_client: httpx.AsyncClient,
         publish_event: _EventPublisher | None = None,
         execution_registry: McpExecutionRegistry | None = None,
+        reattach_client_factory: Callable[[], httpx.AsyncClient] | None = None,
     ) -> None:
         """Create a proxy manager bound to one session.
 
@@ -173,11 +174,14 @@ class ProxyMcpManager:
             is irrelevant.
         :param execution_registry: Runner-owned MCP operations that a new
             server generation can reattach to after a tunnel replacement.
+        :param reattach_client_factory: Open an isolated server connection for
+            reattachment without disturbing requests on the shared client.
         """
         self._session_id = session_id
         self._omnigent_client = ap_client
         self._publish_event = publish_event
         self._execution_registry = execution_registry
+        self._reattach_client_factory = reattach_client_factory
         self._registry_services: set[str] = set()
 
     @property
@@ -416,12 +420,15 @@ class ProxyMcpManager:
                 },
             }
 
+        reattaching = False
+
         async def _wait_to_reattach(
             request_generation: int,
             cause: BaseException | None = None,
             *,
             response: httpx.Response | None = None,
         ) -> None:
+            nonlocal reattaching
             started = monotonic()
             trigger = type(cause).__name__ if cause is not None else "detached_response"
             registry = self._execution_registry
@@ -459,6 +466,8 @@ class ProxyMcpManager:
                     f"connected within {_SERVER_RECONNECT_WAIT_S:.0f}s"
                 ) from reconnect_exc
 
+            reattaching = True
+
         payload = _initial_payload()
         approval_retries = 0
 
@@ -468,21 +477,28 @@ class ProxyMcpManager:
             failure_phase = "transport"
             resp: httpx.Response | None = None
             try:
-                resp = await self._omnigent_client.post(
-                    url,
-                    json=payload,
-                    headers={"X-Omnigent-Session-Id": self._session_id} if managed else {},
-                    # Short connect timeout still fails fast on an unreachable
-                    # server; the read timeout covers ordinary proxy request
-                    # hangs. Sub-agent dispatch returns an async handle
-                    # immediately and no longer holds this call for a child turn.
-                    timeout=httpx.Timeout(
-                        connect=10.0,
-                        read=MCP_PROXY_CALL_TIMEOUT_S,
-                        write=10.0,
-                        pool=10.0,
-                    ),
+                # A pooled HTTP connection can still lead to the previous replica.
+                client_context = (
+                    self._reattach_client_factory()
+                    if reattaching and not managed and self._reattach_client_factory is not None
+                    else nullcontext(self._omnigent_client)
                 )
+                async with client_context as request_client:
+                    resp = await request_client.post(
+                        url,
+                        json=payload,
+                        headers={"X-Omnigent-Session-Id": self._session_id} if managed else {},
+                        # Short connect timeout still fails fast on an unreachable
+                        # server; the read timeout covers ordinary proxy request
+                        # hangs. Sub-agent dispatch returns an async handle
+                        # immediately and no longer holds this call for a child turn.
+                        timeout=httpx.Timeout(
+                            connect=10.0,
+                            read=MCP_PROXY_CALL_TIMEOUT_S,
+                            write=10.0,
+                            pool=10.0,
+                        ),
+                    )
                 failure_phase = "http_status"
                 resp.raise_for_status()
                 failure_phase = "response_decode"

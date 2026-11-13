@@ -6,9 +6,10 @@
 // shells, whose window-open policy routes links itself) to the platform.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as NativeBridge from "@/lib/nativeBridge";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 
@@ -47,18 +48,32 @@ const FILE_VIEWER = {
   workspaceHome: "/home/u",
 };
 
-function renderExternalLink(href = LINK_URL): HTMLElement {
+function renderExternalLink(href = LINK_URL, routedFrom?: string): HTMLElement {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: 0 } },
   });
-  render(
+  const markdown = (
     <QueryClientProvider client={client}>
       <FileViewerContext.Provider value={FILE_VIEWER}>
         <FilePathAwareMessageResponse>{`[docs](${href})`}</FilePathAwareMessageResponse>
       </FileViewerContext.Provider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
+  );
+  render(
+    routedFrom === undefined ? (
+      markdown
+    ) : (
+      <MemoryRouter initialEntries={[routedFrom]}>
+        {markdown}
+        <LocationProbe />
+      </MemoryRouter>
+    ),
   );
   return screen.getByText(/^docs(?: \[blocked\])?$/);
+}
+
+function LocationProbe() {
+  return <span data-testid="location">{useLocation().pathname}</span>;
 }
 
 function click(link: HTMLElement, init: MouseEventInit = {}): MouseEvent {
@@ -143,6 +158,59 @@ describe("external chat link clicks", () => {
 
     expect(openSpy).not.toHaveBeenCalled();
     expect(followedLinks).toEqual([]);
+  });
+
+  it.each([
+    ["a browser, which hands it to the OS", false],
+    ["the desktop shell, which asks before opening it", true],
+  ])("leaves a session link to another server to %s", (_label, native) => {
+    nativeShell.native = native;
+    const sessionLink = "omnigent://127.0.0.1:53694/c/e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9";
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+
+    const link = renderExternalLink(sessionLink);
+    expect(link).toHaveAttribute("href", sessionLink);
+    expect(link).toHaveAttribute("target", "_blank");
+    const event = click(link);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(openSpy).not.toHaveBeenCalled();
+    expect(followedLinks).toEqual([]);
+  });
+
+  it.each([
+    ["a browser", false],
+    ["the desktop shell", true],
+  ])("opens a session link to this server in the app in %s", async (_label, native) => {
+    nativeShell.native = native;
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+    const link = renderExternalLink(
+      `omnigent://${window.location.host}/c/worker_1`,
+      "/c/coordinator",
+    );
+    expect(link).toHaveAttribute("href", "/c/worker_1");
+    expect(link).not.toHaveAttribute("target");
+    const event = click(link);
+
+    expect(event.defaultPrevented).toBe(true);
+    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent("/c/worker_1"));
+    expect(openSpy).not.toHaveBeenCalled();
+  });
+
+  it("links a session link to this server under the base path outside the router", () => {
+    window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
+    try {
+      const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+      const link = renderExternalLink(`omnigent://${window.location.host}/c/worker_1`);
+      expect(link).toHaveAttribute("href", "/proxy/6767/c/worker_1");
+      expect(link).not.toHaveAttribute("target");
+      const event = click(link);
+
+      expect(event.defaultPrevented).toBe(false);
+      expect(openSpy).not.toHaveBeenCalled();
+    } finally {
+      delete window.__OMNIGENT_BASE_PATH__;
+    }
   });
 
   it("leaves mail links to the browser without opening an empty tab", () => {

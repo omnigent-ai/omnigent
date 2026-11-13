@@ -62,13 +62,14 @@ export type FeatureKey =
   | "canvas"
   | "arca_shutdown_warnings"
   | "import_review"
-  | "custom_agents_settings_ui"
   | "sidebar_grouping_ui"
   | "workspace_content_search"
   | "grid_sessions_display_ui"
   | "automations_v2"
   | "splittable_terminal_view_ui"
   | "sidebar_windowed_rows"
+  | "session_overview"
+  | "project_repository_creation"
   | "session_orchestration";
 
 /** Deployment-wide release-feature values advertised by the server. */
@@ -84,6 +85,8 @@ export function parseSiblingSessionDestinations(value: unknown): SiblingSessionD
 
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
+  /** The server enforces the browser's Admin view cookie; absent on older servers. */
+  admin_view?: boolean;
   sibling_sessions?: boolean;
   session_bundle_workspaces?: boolean;
   sibling_session_destinations?: SiblingSessionDestinations;
@@ -147,11 +150,19 @@ export interface ServerInfo {
     string,
     {
       multi_repo?: boolean;
+      /** Whether a session can move onto a new sandbox of this provider (Switch host). */
+      accepts_session_move?: boolean;
       inference_models?: boolean;
       default_models?: boolean;
       repo_catalog?: { name: string; url: string }[];
     }
   >;
+  /**
+   * What each launchable provider's unattended runs need from their owner, e.g.
+   * ``{ agent_sandbox: "Keep your laptop signed in." }``. The automation form
+   * shows the run target's notice; a provider absent from the map has none.
+   */
+  sandbox_provider_automation_notices?: Record<string, string>;
   /**
    * Connection providers this deploy has wired (config + store present),
    * e.g. ``["github"]`` or ``["github", "databricks"]``. Non-empty shows the
@@ -255,6 +266,12 @@ export interface ServerInfo {
    */
   scheduled_task_session_modes?: boolean;
   /**
+   * True when a session create (and so ``sys_session_create``) accepts
+   * ``permission_mode``. Older servers ignore the field, so trigger templates
+   * write a worker mode only here. Fails to ``false``.
+   */
+  session_create_permission_modes?: boolean;
+  /**
    * True when a scheduled task can start every run from a copy of an existing
    * session (``source_session_id``). Gates the session menu's "Create
    * automation…" item. Fails to ``false``.
@@ -262,18 +279,27 @@ export interface ServerInfo {
   scheduled_task_source_sessions?: boolean;
   /** Connected hosts and continued sandboxes accept ten-minute schedules. */
   scheduled_task_subhour?: boolean;
+  /** Runs drop a trigger prompt's header line before dispatch, so the form can save one. */
+  scheduled_task_trigger_headers?: boolean;
   /** Server default for new trigger templates, from 10 to 240 minutes. */
   automation_trigger_poll_minutes?: number;
   /** Sandbox automations accept a repository URL as their workspace. */
   scheduled_task_sandbox_workspaces?: boolean;
   /**
-   * True when a managed create accepts ``host_id`` naming its new sandbox
-   * host. Older servers reject it, so the create omits it there. Fails to
-   * ``false``.
+   * True when a managed create, fork or move accepts ``host_id`` naming its
+   * new sandbox host. Web JSON sends a minted id only when this is true.
+   * Fails to ``false``.
    */
   request_managed_sandbox_host_id?: boolean;
   /** True when sandbox forks accept an explicit `workspaces` list; absent on older servers. */
   session_fork_workspaces?: boolean;
+  /**
+   * True when ``POST /v1/sessions/{id}/managed-host`` can move a session onto
+   * a new sandbox. Gates Switch host's sandbox rows: an older server lacks the
+   * route, and the switch releases the runner before calling it. Fails to
+   * ``false``.
+   */
+  move_to_managed_sandbox?: boolean;
   /**
    * True when the server stores user agents (``omnigent agent add``,
    * ``GET /v1/agents?scope=user``). Gates the picker's "my agents" source
@@ -291,11 +317,15 @@ export interface ServerInfo {
    * list `clear` for native sessions only; absent there (off).
    */
   session_claude_sdk_clear?: boolean;
+  /** True when `POST /v1/sessions/{id}/rewind` exists; absent on older servers (off). */
+  session_rewind?: boolean;
   /**
    * True when the server stores session PRs (``/v1/sessions/{id}/pull-requests``
    * and ``Conversation.pull_request``); absent on older servers (off).
    */
   session_pull_requests?: boolean;
+  /** Session comments preserve PR revision and line anchors; absent on older servers. */
+  comment_anchor_metadata?: boolean;
   /**
    * True when the server stores each user's session title instructions
    * (``/v1/settings/session-title-instructions``); absent on older servers (off).
@@ -435,6 +465,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   sandbox_provider: null,
   sandbox_providers: [],
   sandbox_provider_capabilities: {},
+  sandbox_provider_automation_notices: {},
   enabled_connections: [],
   // Sharing fails OPEN (opposite of the other caps): a failed probe must
   // not silently disable sharing, so the sentinel is the permissive "on".
@@ -453,11 +484,15 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   automations_enabled: true,
   session_search_scope: false,
   scheduled_task_session_modes: false,
+  session_create_permission_modes: false,
   scheduled_task_source_sessions: false,
   scheduled_task_subhour: false,
+  scheduled_task_trigger_headers: false,
   scheduled_task_sandbox_workspaces: false,
   request_managed_sandbox_host_id: false,
   session_fork_workspaces: false,
+  move_to_managed_sandbox: false,
+  comment_anchor_metadata: false,
   branding: null,
   picker: UNRESTRICTED_PICKER,
 };
@@ -505,11 +540,7 @@ export function sandboxProfilesEnabled(info: ServerInfo | "loading"): boolean {
 }
 
 export function customAgentsSettingsEnabled(info: ServerInfo | "loading"): boolean {
-  return (
-    isFeatureEnabled(info, "custom_agents_settings_ui") &&
-    info !== "loading" &&
-    info.agent_install === true
-  );
+  return info !== "loading" && info.agent_install === true;
 }
 
 let cachedServerInfo: ServerInfo | null = null;
@@ -553,6 +584,15 @@ function parseSandboxProviderCapabilities(
   );
 }
 
+function parseProviderAutomationNotices(value: unknown): Record<string, string> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].trim() !== "",
+    ),
+  );
+}
+
 /**
  * Fetch ``/v1/info`` once and cache the result.
  *
@@ -569,7 +609,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
       // Route through the host transport (`hostFetch`) so the embed hits the
       // proxied omnigent API; standalone `hostFetch` falls back to plain
       // `fetch("/v1/info")`, preserving the original behavior.
-      const res = await hostFetch("/v1/info");
+      const res = await hostFetch("/v1/info", undefined, { hostless: true });
       if (res.ok) {
         const data = (await res.json()) as Partial<ServerInfo>;
         const smartRoutingEnabled = data.smart_routing_enabled === true;
@@ -594,6 +634,9 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             : [],
           sandbox_provider_capabilities: parseSandboxProviderCapabilities(
             data.sandbox_provider_capabilities,
+          ),
+          sandbox_provider_automation_notices: parseProviderAutomationNotices(
+            data.sandbox_provider_automation_notices,
           ),
           enabled_connections: Array.isArray(data.enabled_connections)
             ? data.enabled_connections.filter((p): p is string => typeof p === "string")
@@ -621,8 +664,10 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           automations_enabled: data.automations_enabled !== false,
           session_search_scope: data.session_search_scope === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
+          session_create_permission_modes: data.session_create_permission_modes === true,
           scheduled_task_source_sessions: data.scheduled_task_source_sessions === true,
           scheduled_task_subhour: data.scheduled_task_subhour === true,
+          scheduled_task_trigger_headers: data.scheduled_task_trigger_headers === true,
           automation_trigger_poll_minutes:
             typeof data.automation_trigger_poll_minutes === "number" &&
             Number.isInteger(data.automation_trigger_poll_minutes) &&
@@ -633,6 +678,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_sandbox_workspaces: data.scheduled_task_sandbox_workspaces === true,
           request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
           session_fork_workspaces: data.session_fork_workspaces === true,
+          move_to_managed_sandbox: data.move_to_managed_sandbox === true,
           agent_install: data.agent_install === true,
           agent_detail: data.agent_detail === true,
           agent_config_edit: data.agent_config_edit === true,
@@ -640,8 +686,11 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             ? data.session_event_types.filter((t): t is string => typeof t === "string")
             : [],
           session_claude_sdk_clear: data.session_claude_sdk_clear === true,
+          session_rewind: data.session_rewind === true,
           session_pull_requests: data.session_pull_requests === true,
           session_title_instructions: data.session_title_instructions === true,
+          admin_view: data.admin_view === true,
+          comment_anchor_metadata: data.comment_anchor_metadata === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,
