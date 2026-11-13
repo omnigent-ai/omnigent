@@ -165,11 +165,25 @@ def test_claude_sdk_session_answers_after_restarting_into_a_smaller_window(
             client, stack, {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(_CONTEXT_WINDOW_TOKENS)}
         )
 
-        after = _ask(client, mock_url, session_id, f"restart-1-{uid}", "Still here.")
+        restart_token = f"restart-1-{uid}"
+        requests_before_restart_turn = len(get_mock_requests(mock_url))
+        after = _ask(client, mock_url, session_id, restart_token, "Still here.")
         assert after["status"] == "completed", (
             f"the first turn after the runner restart failed: {after['error']}"
         )
         assert "Still here." in json.dumps(after["output"])
+        # Mirrors the mock gateway's own estimate of a request's prompt tokens.
+        attempt_tokens = [
+            len(json.dumps(request, separators=(",", ":"))) // 4
+            for request in get_mock_requests(mock_url)[requests_before_restart_turn:]
+            if restart_token in json.dumps(request)
+        ]
+        assert any(tokens > _CONTEXT_WINDOW_TOKENS for tokens in attempt_tokens), (
+            f"the gateway never rejected the restarted replay: {attempt_tokens}"
+        )
+        assert attempt_tokens[-1] <= _CONTEXT_WINDOW_TOKENS, (
+            f"the answered request did not fit the gateway window: {attempt_tokens}"
+        )
         follow_up = _ask(client, mock_url, session_id, f"restart-2-{uid}", "Still here too.")
         assert follow_up["status"] == "completed", (
             f"the follow-up turn after the runner restart failed: {follow_up['error']}"
