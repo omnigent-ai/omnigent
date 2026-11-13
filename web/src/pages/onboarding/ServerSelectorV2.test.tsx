@@ -266,11 +266,21 @@ describe("ServerSelectorV2", () => {
     expect(screen.getByText(/connecting to the local server/i)).toBeInTheDocument();
   });
 
-  it("a new MDM user's typed URL goes through the runner step", async () => {
-    const getRunnerOptions = vi.fn().mockResolvedValue({ remote: false });
+  it("a new MDM user's typed URL with no runner to set up opens directly, without installing", async () => {
+    const getRunnerOptions = vi.fn().mockResolvedValue({ remote: false, bundledCli: false });
+    const onConnect = vi.fn().mockResolvedValue({});
+    const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
+    const onConnectRunner = vi.fn().mockResolvedValue({ ok: true });
     render(
       <ServerSelectorV2
-        setup={makeSetup({ managedServers: ["https://team.example.com/"], getRunnerOptions })}
+        setup={makeSetup({
+          installed: false,
+          managedServers: ["https://team.example.com/"],
+          getRunnerOptions,
+          onConnect,
+          onInstallCli,
+          onConnectRunner,
+        })}
       />,
     );
     fireEvent.pointerDown(screen.getByRole("button", { name: /choose team url/i }), { button: 0 });
@@ -279,14 +289,40 @@ describe("ServerSelectorV2", () => {
     });
     fireEvent.keyDown(screen.getByLabelText("Server URL"), { key: "Enter" });
     fireEvent.click(screen.getByRole("button", { name: "Join your team (typed.example.com)" }));
+    await waitFor(() =>
+      expect(onConnect).toHaveBeenCalledWith("https://typed.example.com/", expect.any(Function)),
+    );
+    expect(getRunnerOptions).toHaveBeenCalledWith("https://typed.example.com/");
+    expect(screen.queryByRole("heading", { name: /where do you work today/i })).toBeNull();
+    expect(onInstallCli).not.toHaveBeenCalled();
+    expect(onConnectRunner).not.toHaveBeenCalled();
+  });
+
+  it("a new MDM user's typed local install keeps the runner step", async () => {
+    const onConnect = vi.fn().mockResolvedValue({});
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({
+          managedServers: ["https://team.example.com/"],
+          getRunnerOptions: vi.fn().mockResolvedValue({ remote: false, bundledCli: false }),
+          onConnect,
+        })}
+      />,
+    );
+    openPresetDropdown();
+    fireEvent.change(screen.getByLabelText("Server URL"), {
+      target: { value: "http://localhost:6767" },
+    });
+    fireEvent.keyDown(screen.getByLabelText("Server URL"), { key: "Enter" });
+    fireEvent.click(screen.getByRole("button", { name: /join your team \(localhost:6767\)/i }));
     expect(
       await screen.findByRole("heading", { name: /where do you work today/i }),
     ).toBeInTheDocument();
-    expect(getRunnerOptions).toHaveBeenCalledWith("https://typed.example.com/");
+    expect(onConnect).not.toHaveBeenCalled();
   });
 
   it("picking a preset offers only this laptop when the shell reports no remote environment", async () => {
-    const getRunnerOptions = vi.fn().mockResolvedValue({ remote: false });
+    const getRunnerOptions = vi.fn().mockResolvedValue({ remote: false, bundledCli: true });
     render(
       <ServerSelectorV2
         setup={makeSetup({ managedServers: ["https://team.example.com/"], getRunnerOptions })}
@@ -312,7 +348,7 @@ describe("ServerSelectorV2", () => {
             resolveFirst = resolve;
           }),
       )
-      .mockResolvedValue({ remote: false });
+      .mockResolvedValue({ remote: false, bundledCli: true });
     const onConnect = vi.fn().mockResolvedValue({});
     render(
       <ServerSelectorV2
@@ -332,28 +368,66 @@ describe("ServerSelectorV2", () => {
     fireEvent.keyDown(screen.getByLabelText("Server URL"), { key: "Enter" });
     fireEvent.click(screen.getByRole("button", { name: "Join your team (typed.example.com)" }));
     const laptop = await screen.findByRole("radio", { name: /my laptop/i });
-    resolveFirst({ remote: true });
+    await act(async () => resolveFirst({ remote: true }));
     await waitFor(() => expect(getRunnerOptions).toHaveBeenCalledTimes(2));
     expect(laptop).toBeChecked();
     expect(screen.queryByRole("radio", { name: "Arca" })).not.toBeInTheDocument();
+    expect(onConnect).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
-    await waitFor(() =>
-      expect(onConnect).toHaveBeenCalledWith("https://typed.example.com/", expect.any(Function)),
-    );
+    await waitFor(() => expect(onConnect).toHaveBeenCalledOnce());
+    expect(onConnect).toHaveBeenCalledWith("https://typed.example.com/", expect.any(Function));
   });
 
-  it("a failed runner lookup still opens the runner step, laptop only", async () => {
+  it("a slow runner lookup can't act after a newer pick opened directly", async () => {
+    let resolveFirst: (v: { remote: boolean; bundledCli: boolean }) => void = () => {};
+    const getRunnerOptions = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFirst = resolve;
+          }),
+      )
+      .mockResolvedValue({ remote: false, bundledCli: false });
+    const onConnect = vi.fn().mockResolvedValue({});
     render(
       <ServerSelectorV2
         setup={makeSetup({
           managedServers: ["https://team.example.com/"],
-          getRunnerOptions: vi.fn().mockRejectedValue(new Error("ipc down")),
+          getRunnerOptions,
+          onConnect,
         })}
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
-    expect(await screen.findByRole("radio", { name: /my laptop/i })).toBeChecked();
-    expect(screen.getAllByRole("radio")).toHaveLength(1);
+    openPresetDropdown();
+    fireEvent.change(screen.getByLabelText("Server URL"), {
+      target: { value: "https://typed.example.com" },
+    });
+    fireEvent.keyDown(screen.getByLabelText("Server URL"), { key: "Enter" });
+    fireEvent.click(screen.getByRole("button", { name: "Join your team (typed.example.com)" }));
+    await waitFor(() => expect(onConnect).toHaveBeenCalledOnce());
+    // Settling as "no runner" would open the stale pick too, without the guard.
+    await act(async () => resolveFirst({ remote: false, bundledCli: false }));
+    expect(onConnect).toHaveBeenCalledOnce();
+    expect(onConnect).toHaveBeenCalledWith("https://typed.example.com/", expect.any(Function));
+  });
+
+  it.each<[string, Partial<ServerSelectorV2Setup>]>([
+    ["a failed lookup", { getRunnerOptions: vi.fn().mockRejectedValue(new Error("ipc down")) }],
+    ["no lookup", {}],
+  ])("opens the server directly with no runner options (%s)", async (_name, over) => {
+    const onConnect = vi.fn().mockResolvedValue({});
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({ managedServers: ["https://team.example.com/"], onConnect, ...over })}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
+    await waitFor(() =>
+      expect(onConnect).toHaveBeenCalledWith("https://team.example.com/", expect.any(Function)),
+    );
+    expect(screen.queryByRole("radio")).toBeNull();
   });
 
   it("the runner step shows a direct connect's error", async () => {
@@ -362,6 +436,7 @@ describe("ServerSelectorV2", () => {
         setup={makeSetup({
           installed: true,
           managedServers: ["https://team.example.com/"],
+          getRunnerOptions: vi.fn().mockResolvedValue({ bundledCli: true }),
           onConnect: vi.fn().mockResolvedValue({ error: "unreachable" }),
         })}
       />,
@@ -388,11 +463,13 @@ describe("ServerSelectorV2", () => {
 
   it("the runner step connects to the preset, and Back returns to the landing", async () => {
     const onConnect = vi.fn().mockResolvedValue({});
+    const getRunnerOptions = vi.fn().mockResolvedValue({ bundledCli: true });
     const { unmount } = render(
       <ServerSelectorV2
         setup={makeSetup({
           installed: true,
           managedServers: ["https://team.example.com/"],
+          getRunnerOptions,
           onConnect,
         })}
       />,
@@ -405,7 +482,9 @@ describe("ServerSelectorV2", () => {
     unmount();
 
     render(
-      <ServerSelectorV2 setup={makeSetup({ managedServers: ["https://team.example.com/"] })} />,
+      <ServerSelectorV2
+        setup={makeSetup({ managedServers: ["https://team.example.com/"], getRunnerOptions })}
+      />,
     );
     fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
     fireEvent.click(await screen.findByRole("button", { name: "Back" }));
@@ -469,7 +548,14 @@ describe("ServerSelectorV2", () => {
   });
 
   it("can retry Arca or Continue anyway after Arca startup fails", async () => {
-    const onConnectRunner = vi.fn().mockResolvedValue({ ok: false, error: "Arca failed" });
+    const errorMessage = "Arca setup didn't complete.";
+    const errorAction = "Check Arca Companion, finish browser sign-in, and try again.";
+    const onConnectRunner = vi.fn().mockResolvedValue({
+      ok: false,
+      error: `${errorMessage} ${errorAction}`,
+      errorMessage,
+      errorAction,
+    });
     const onInstallCli = vi.fn();
     let finishConnect: (result: { error?: string }) => void = () => {};
     const onConnect = vi
@@ -488,13 +574,15 @@ describe("ServerSelectorV2", () => {
       onConnect,
       getRunnerOptions: vi.fn().mockResolvedValue({ remote: true, bundledCli: true }),
     });
-    expect(await screen.findByText("Arca failed")).toBeInTheDocument();
+    expect(await screen.findByText(errorMessage)).toBeInTheDocument();
+    expect(screen.getByText(errorAction)).toHaveClass("text-cyan-700");
     expect(onConnect).not.toHaveBeenCalled();
     const skip = screen.getByRole("button", { name: "Continue anyway" });
     expect(skip.nextElementSibling).toBe(screen.getByRole("button", { name: "Retry" }));
 
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-    expect(await screen.findByText("Arca failed")).toBeInTheDocument();
+    expect(await screen.findByText(errorMessage)).toBeInTheDocument();
+    expect(screen.getByText(errorAction)).toBeInTheDocument();
     expect(onConnectRunner).toHaveBeenCalledTimes(2);
     fireEvent.click(screen.getByRole("button", { name: "Continue anyway" }));
     await waitFor(() =>
@@ -502,7 +590,7 @@ describe("ServerSelectorV2", () => {
     );
     expect(screen.queryByRole("button", { name: "Continue anyway" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
-    expect(screen.queryByText("Arca failed")).not.toBeInTheDocument();
+    expect(screen.queryByText(errorMessage)).not.toBeInTheDocument();
 
     act(() => finishConnect({ error: "Server unavailable" }));
     expect(await screen.findByText("Server unavailable")).toBeInTheDocument();
@@ -518,15 +606,28 @@ describe("ServerSelectorV2", () => {
   it.each(["install", "laptop", "server"])(
     "does not offer Continue anyway after a %s failure",
     async (failure) => {
-      await installFromRunnerStep({
-        installed: false,
-        onInstallCli: vi.fn().mockResolvedValue({ ok: failure !== "install", error: "failed" }),
-        onConnectRunner: vi.fn().mockResolvedValue({ ok: failure !== "laptop", error: "failed" }),
-        onConnect: vi.fn().mockResolvedValue({ error: "failed" }),
-        getRunnerOptions: vi.fn().mockResolvedValue({ remote: failure === "server" }),
-      });
-      expect(await screen.findByText("failed")).toBeInTheDocument();
+      const onInstallCli = vi
+        .fn()
+        .mockResolvedValue({ ok: failure !== "install", error: "install failed" });
+      const onConnectRunner = vi
+        .fn()
+        .mockResolvedValue({ ok: failure !== "laptop", error: "laptop failed" });
+      const onConnect = vi.fn().mockResolvedValue({ error: "server failed" });
+      await installFromRunnerStep(
+        {
+          installed: false,
+          onInstallCli,
+          onConnectRunner,
+          onConnect,
+          getRunnerOptions: vi.fn().mockResolvedValue({ remote: true }),
+        },
+        failure === "server" ? undefined : /my laptop/i,
+      );
+      expect(await screen.findByText(`${failure} failed`)).toBeInTheDocument();
       expect(screen.queryByRole("button", { name: "Continue anyway" })).not.toBeInTheDocument();
+      // An earlier stage's failure stops the later ones.
+      expect(onConnectRunner).toHaveBeenCalledTimes(failure === "install" ? 0 : 1);
+      expect(onConnect).toHaveBeenCalledTimes(failure === "server" ? 1 : 0);
     },
   );
 
@@ -691,18 +792,32 @@ describe("ServerSelectorV2", () => {
       return {};
     });
     await installFromRunnerStep(
-      { installed: false, onInstallCli, onConnectRunner, onConnect },
-      undefined,
+      {
+        installed: false,
+        onInstallCli,
+        onConnectRunner,
+        onConnect,
+        getRunnerOptions: vi.fn().mockResolvedValue({ remote: true }),
+      },
+      /my laptop/i,
       "Install Omnigent",
     );
     await waitFor(() => expect(calls).toEqual(["install", "runner", "connect"]));
     expect(onConnectRunner).toHaveBeenCalledWith("https://team.example.com/", "local");
   });
 
-  it("still installs for explicit laptop setup on shells without runner support", async () => {
+  it("still installs for explicit laptop setup on shells without connectRunner", async () => {
     const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
     const onConnect = vi.fn().mockResolvedValue({});
-    await installFromRunnerStep({ installed: false, onInstallCli, onConnect });
+    await installFromRunnerStep(
+      {
+        installed: false,
+        onInstallCli,
+        onConnect,
+        getRunnerOptions: vi.fn().mockResolvedValue({ remote: true }),
+      },
+      /my laptop/i,
+    );
     await waitFor(() => expect(onConnect).toHaveBeenCalledOnce());
     expect(onInstallCli).toHaveBeenCalledOnce();
     expect(onInstallCli.mock.invocationCallOrder[0]).toBeLessThan(
@@ -889,6 +1004,7 @@ describe("onboarding parity", () => {
     const setup = makeSetup({
       installed: true,
       managedServers: ["http://team.example.com/"],
+      getRunnerOptions: vi.fn().mockResolvedValue({ bundledCli: true }),
       onConnectRunner: vi.fn().mockResolvedValue({ ok: true }),
     });
     render(<ServerSelectorV2 setup={setup} />);

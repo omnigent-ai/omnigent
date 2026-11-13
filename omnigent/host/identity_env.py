@@ -9,6 +9,8 @@ YAML/config machinery it pulls in.
 
 from __future__ import annotations
 
+import os
+
 # The server provisions the sandbox, generates the identity + launch token, and
 # injects all three so the host registers under the server-chosen identity
 # without persisting anything to the sandbox's config.yaml (managed sandboxes
@@ -18,3 +20,13 @@ from __future__ import annotations
 HOST_TOKEN_ENV_VAR = "OMNIGENT_HOST_TOKEN"
 HOST_ID_ENV_VAR = "OMNIGENT_HOST_ID"
 HOST_NAME_ENV_VAR = "OMNIGENT_HOST_NAME"
+
+# Set by the managed-sandbox host image/Pod spec, never on a person's own host.
+# Claude Code's devcontainer convention sets it too, so such a devcontainer is
+# treated as managed, like the git and Databricks credential gates already do.
+MANAGED_SANDBOX_ENV_VAR = "IS_SANDBOX"
+
+
+def in_managed_sandbox() -> bool:
+    """Return whether this process runs inside a server-managed sandbox host."""
+    return (os.environ.get(MANAGED_SANDBOX_ENV_VAR) or "").strip() == "1"

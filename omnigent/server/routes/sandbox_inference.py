@@ -266,7 +266,7 @@ def create_sandbox_inference_router(
                 result["status"] = "unsupported"
                 if reason:
                     result["error"] = reason
-            except Exception:  # noqa: BLE001 - optional preview must not block a default launch
+            except Exception:  # optional preview must not block a default launch
                 _logger.warning(
                     "AI Gateway model preview failed for %s/%s", provider, harness, exc_info=True
                 )

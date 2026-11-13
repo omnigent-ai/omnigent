@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
+import { orderSessionFamilies } from "@/lib/sessionFamilies";
 import {
   type ActiveChatOverride,
+  appendPinWrites,
   bareConversationId,
   computeNextActiveOverride,
   conversationDisplayLabel,
@@ -11,12 +13,15 @@ import {
   getConversationIconKind,
   groupConversations,
   getConversationAgentType,
+  customSortOrder,
   migratePinnedConversationIds,
+  moveCustomOrder,
   orderByPinnedTimestamp,
   pinOrderWrites,
   resolveSidebarDrop,
   sessionsListAcceptsDrop,
   sortConversations,
+  startCustomOrder,
   STATUS_BUCKETS,
   statusBucket,
   dateBucket,
@@ -191,6 +196,19 @@ describe("orderByPinnedTimestamp", () => {
     ]);
   });
 
+  it("uses the family pin position for every member without pinning each member", () => {
+    const member = pinned("peer", undefined, new Date(2026, 4, 14, 9));
+    member.family = {
+      id: "family",
+      representative_id: "representative",
+      pinned: true,
+      pinned_at: "500",
+    };
+    const other = pinned("other", 1000, new Date(2026, 4, 14, 9));
+    expect(orderByPinnedTimestamp([other, member]).map((row) => row.id)).toEqual(["peer", "other"]);
+    expect(member.labels["omnigent.pinned"]).toBeUndefined();
+  });
+
   it("does not mutate the input array", () => {
     const convA = pinned("conv_a", 2000, new Date(2026, 4, 14, 9));
     const convB = pinned("conv_b", 1000, new Date(2026, 4, 14, 8));
@@ -272,9 +290,36 @@ describe("pinOrderWrites", () => {
     ]);
   });
 
+  it("inserts a not-yet-pinned session below the row with below", () => {
+    expect(pinOrderWrites(pins(1000, 2000), "new", "conv_1", true)).toEqual([
+      { id: "new", pinnedAt: 2001 },
+    ]);
+    expect(pinOrderWrites(pins(1000, 2000), "new", "conv_0", true)).toEqual([
+      { id: "new", pinnedAt: 1500 },
+    ]);
+    // An existing pin still moves into the row's slot.
+    expect(pinOrderWrites(pins(1000, 2000, 3000), "conv_0", "conv_1", true)).toEqual(
+      pinOrderWrites(pins(1000, 2000, 3000), "conv_0", "conv_1"),
+    );
+  });
+
   it("is a no-op for a drop on itself or an unknown row", () => {
     expect(pinOrderWrites(pins(1000, 2000), "conv_0", "conv_0")).toEqual([]);
     expect(pinOrderWrites(pins(1000, 2000), "conv_0", "missing")).toEqual([]);
+  });
+
+  it("reorders family representatives without pinning their context rows", () => {
+    const rows = pins(100, 200, undefined);
+    const family = { id: "family", representative_id: "conv_1", pinned: true, pinned_at: "200" };
+    rows[1].family = family;
+    rows[2].family = family;
+    expect(pinOrderWrites(rows, "conv_0", "conv_1")).toEqual([{ id: "conv_0", pinnedAt: 201 }]);
+    rows[0].labels = { "omnigent.pinned": "200" };
+    expect(pinOrderWrites(rows, "new", "conv_1")).toEqual([
+      { id: "new", pinnedAt: 201 },
+      { id: "conv_1", pinnedAt: 202 },
+    ]);
+    expect(pinOrderWrites(rows, "conv_0", "conv_2")).toEqual([]);
   });
 
   it("produces values that orderByPinnedTimestamp sorts into the dragged order", () => {
@@ -289,6 +334,65 @@ describe("pinOrderWrites", () => {
       "conv_1",
       "conv_2",
     ]);
+  });
+
+  it("appends a new pin past every shown row's value with appendPinWrites", () => {
+    const rows = pins(1000, 2000, undefined);
+    rows[2].family = { id: "family", representative_id: "parent", pinned: true, pinned_at: "3000" };
+    expect(appendPinWrites(rows, "new")).toEqual([{ id: "new", pinnedAt: 3001 }]);
+    // A pin without a value sorts last, so it's numbered first.
+    expect(appendPinWrites(pins(1000, undefined), "new")).toEqual([
+      { id: "conv_1", pinnedAt: 1001 },
+      { id: "new", pinnedAt: 1002 },
+    ]);
+    expect(appendPinWrites([], "new")).toEqual([]);
+  });
+
+  it("keeps a valueless pin below a family shown without its representative when appending", () => {
+    // Shown order: conv_0 (1000), conv_1 (a family member, family at 3000), conv_2 (no value).
+    const rows = pins(1000, undefined, undefined);
+    rows[1].family = { id: "family", representative_id: "parent", pinned: true, pinned_at: "3000" };
+    const writes = appendPinWrites(rows, "new");
+    expect(writes).toEqual([
+      { id: "conv_2", pinnedAt: 3001 },
+      { id: "new", pinnedAt: 3002 },
+    ]);
+    const byId = new Map(writes.map((w) => [w.id, w.pinnedAt]));
+    const next = [...rows, conversation("new", null, new Date(2026, 4, 14, 8))].map((c) =>
+      byId.has(c.id) ? { ...c, labels: { "omnigent.pinned": String(byId.get(c.id)) } } : c,
+    );
+    expect(orderByPinnedTimestamp(next).map((c) => c.id)).toEqual([
+      "conv_0",
+      "conv_1",
+      "conv_2",
+      "new",
+    ]);
+  });
+
+  it("doesn't give a valueless nested family row a value when appending", () => {
+    const rows = pins(1000, undefined, undefined);
+    rows[1].family = { id: "family", representative_id: "parent", pinned: true };
+    expect(appendPinWrites(rows, "new")).toEqual([{ id: "new", pinnedAt: 1001 }]);
+    rows[0].family = rows[1].family;
+    rows[0].labels = {};
+    expect(appendPinWrites(rows.slice(0, 2), "new")).toEqual([]);
+  });
+
+  it("numbers valueless pins just below now when no shown row has a value", () => {
+    vi.useFakeTimers({ now: 5000 });
+    try {
+      expect(appendPinWrites(pins(undefined, undefined), "new")).toEqual([
+        { id: "conv_0", pinnedAt: 4998 },
+        { id: "conv_1", pinnedAt: 4999 },
+        { id: "new", pinnedAt: 5000 },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("falls back to a plain pin when the values are too large to step past", () => {
+    expect(appendPinWrites(pins(Number.MAX_SAFE_INTEGER), "new")).toEqual([]);
   });
 });
 
@@ -694,6 +798,16 @@ describe("statusBucket", () => {
     expect(statusBucket({ ...base, status: "idle" }, false, true)).toBe("Draft");
     expect(statusBucket({ ...base, status: "idle" }, false, false)).toBe("Done");
   });
+  it("puts a turn parked on a terminal prompt in Needs attention", () => {
+    const parked = { ...base, blocked_on: "permission prompt" };
+    expect(statusBucket({ ...parked, status: "running" }, false, false)).toBe("Needs attention");
+    expect(statusBucket({ ...parked, status: "idle" }, false, false)).toBe("Done");
+  });
+  it("keeps an ended turn with a running background shell in Working", () => {
+    const shells = { ...base, background_work_running: true };
+    expect(statusBucket({ ...shells, status: "idle" }, true, true)).toBe("Working");
+    expect(statusBucket({ ...shells, status: "failed" }, false, false)).toBe("Needs attention");
+  });
 });
 
 describe("dateBucket", () => {
@@ -790,4 +904,155 @@ it("orders equal-updated_at rows by id whether or not the order is frozen", () =
   // With the pointer outside, arrival order still must not show through.
   expect(first).toEqual(["c", "b", "a"]);
   expect(sortConversations([c, a, b], null).map((row) => row.id)).toEqual(["c", "b", "a"]);
+});
+
+it("keeps nested drafts at the representative's active or frozen sort position", () => {
+  const parent = { ...conversation("parent", "Parent", new Date(1000)), updated_at: 300 };
+  const other = { ...parent, id: "other", updated_at: 200 };
+  const draft = {
+    ...parent,
+    id: "temp:draft",
+    provisional: true,
+    family: { id: "family", representative_id: parent.id, pinned: false },
+  };
+  for (const frozen of [null, new Map([[parent.id, 100]])]) {
+    const rows = sortConversations(
+      [parent, other, draft],
+      { id: parent.id, updatedAt: 100 },
+      frozen,
+    );
+    expect(rows[0].id).toBe(other.id);
+  }
+  const tiedParent = { ...parent, id: "conv_a", created_at: 150, updated_at: 200 };
+  const tiedOther = { ...tiedParent, id: "conv_b", created_at: 160 };
+  const tiedDraft = {
+    ...draft,
+    created_at: 300,
+    family: { ...draft.family, representative_id: tiedParent.id },
+  };
+  const rows = [tiedParent, tiedOther, tiedDraft];
+  expect(sortConversations(rows, null).map((row) => row.id)).toEqual([
+    "conv_b",
+    "conv_a",
+    "temp:draft",
+  ]);
+  expect(
+    sortConversations(
+      rows,
+      null,
+      null,
+      "updated_at",
+      customSortOrder({ base: "updated", since: 100, ids: [] }),
+    ).map((row) => row.id),
+  ).toEqual(["conv_b", "conv_a", "temp:draft"]);
+});
+
+describe("Custom order", () => {
+  // Whole-second server timestamps, as the API returns them.
+  const row = (id: string, createdAt: number, updatedAt = createdAt): Conversation => ({
+    ...conversation(id, id, new Date(0)),
+    created_at: createdAt,
+    updated_at: updatedAt,
+  });
+  const ids = (rows: Conversation[]) => rows.map((c) => c.id);
+
+  it("starts from the automatic order on screen at the newest server time", () => {
+    const rows = [row("a", 10, 300), row("b", 20, 100), row("c", 30, 200)];
+    expect(startCustomOrder("updated", rows, null, null)).toEqual({
+      base: "updated",
+      since: 300,
+      ids: ["a", "c", "b"],
+    });
+    expect(startCustomOrder("created", rows, null, null).ids).toEqual(["c", "b", "a"]);
+    // A hover-frozen key is what the viewer sees, so it is what Custom keeps.
+    expect(startCustomOrder("updated", rows, null, new Map([["b", 400]])).ids).toEqual([
+      "b",
+      "a",
+      "c",
+    ]);
+    expect(startCustomOrder("created", [], null, null)).toEqual({
+      base: "created",
+      since: 0,
+      ids: [],
+    });
+  });
+
+  it("fixes saved rows, puts new sessions above them and history below", () => {
+    const order = customSortOrder({ base: "updated", since: 100, ids: ["s1", "s2"] });
+    const rows = [
+      row("history-tie", 100),
+      row("s2", 1, 900),
+      row("history", 50, 80),
+      row("new-older", 101, 999),
+      row("s1", 2, 3),
+      row("new-newer", 150),
+      row("history-active", 40, 999),
+    ];
+    expect(ids(sortConversations(rows, null, null, "updated_at", order))).toEqual([
+      "new-newer",
+      "new-older",
+      "s1",
+      "s2",
+      "history-active",
+      "history-tie",
+      "history",
+    ]);
+  });
+
+  it("keeps a family's custom slot through new members and representative promotion", () => {
+    const family = { id: "origin", representative_id: "a", pinned: false };
+    const a = { ...row("a", 1), family };
+    const b = { ...row("b", 200), family };
+    const x = row("x", 2);
+    const order = { base: "updated" as const, since: 100, ids: ["x", "origin"] };
+    const ordered = (rows: Conversation[]) =>
+      ids(
+        orderSessionFamilies(
+          sortConversations(rows, null, null, "updated_at", customSortOrder(order)),
+        ),
+      );
+    expect(ordered([a, b, x])).toEqual(["x", "a", "b"]);
+    const promoted = { ...b, family: { ...family, representative_id: "b" } };
+    expect(ordered([promoted, x])).toEqual(["x", "b"]);
+    expect(moveCustomOrder(order, [promoted, x], "b", "x", null, null)?.ids).toEqual([
+      "origin",
+      "x",
+    ]);
+  });
+
+  it("moves within a list and saves only through the deepest row it touches", () => {
+    const order = { base: "updated" as const, since: 100, ids: ["s1", "s2", "s3"] };
+    // s2 is saved but not loaded; h1..h3 are history loaded after Custom started.
+    const rows = [
+      row("n1", 200),
+      row("s1", 1),
+      row("s3", 3),
+      ...["h1", "h2", "h3"].map((id, index) => row(id, 50 - index, 90 - index)),
+    ];
+    expect(moveCustomOrder(order, rows, "s1", "s3", null, null)?.ids).toEqual([
+      "n1",
+      "s2",
+      "s3",
+      "s1",
+    ]);
+    expect(moveCustomOrder(order, rows, "s3", "n1", null, null)?.ids).toEqual([
+      "s3",
+      "n1",
+      "s1",
+      "s2",
+    ]);
+    const deep = moveCustomOrder(order, rows, "h2", "s1", null, null)!;
+    expect(deep.ids).toEqual(["n1", "h2", "s1", "s2", "s3", "h1"]);
+    // The saved order renders exactly as moved; unsaved h3 keeps following Updated.
+    expect(ids(sortConversations(rows, null, null, "updated_at", customSortOrder(deep)))).toEqual([
+      "n1",
+      "h2",
+      "s1",
+      "s3",
+      "h1",
+      "h3",
+    ]);
+    expect(moveCustomOrder(order, rows, "s1", "s1", null, null)).toBeNull();
+    expect(moveCustomOrder(order, rows, "s1", "deleted", null, null)).toBeNull();
+  });
 });

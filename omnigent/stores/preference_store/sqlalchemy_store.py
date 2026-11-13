@@ -17,6 +17,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
+from omnigent.configuration_profile import ConfigurationSave, ConfigurationSnapshot
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.compression import decode
 from omnigent.db.db_models import SqlPreference, current_workspace_id
@@ -45,6 +46,7 @@ from omnigent.server.auth import RESERVED_USER_LOCAL
 
 _PREFIX = "shared.v1."
 _META = _PREFIX + "meta"
+_CONFIGURATION = "configuration.v1"
 _VALUE = _PREFIX + "value."
 _RECEIPT = _PREFIX + "receipt."
 _CONFLICT = _PREFIX + "conflict."
@@ -220,29 +222,9 @@ class SqlAlchemyPreferenceStore:
         def write(session: Session) -> PreferenceResult:
             require_active_account(session, user_id)
             scope = self._scope(user_id)
-            values = {
-                "workspace_id": current_workspace_id(),
-                "user_id": self.identity(user_id).user_id,
-                "key": _META,
-                "value": _serialize(_Metadata(authority_id=self._authority)),
-            }
-            dialect = self._engine.dialect.name
-            if dialect == "mysql":
-                insert = (
-                    mysql_insert(SqlPreference).values(**values).on_duplicate_key_update(key=_META)
-                )
-            elif dialect == "sqlite":
-                insert = sqlite_insert(SqlPreference).values(**values).on_conflict_do_nothing()
-            else:
-                insert = pg_insert(SqlPreference).values(**values).on_conflict_do_nothing()
-            session.execute(insert)
-            raw = session.scalar(
-                select(type_coerce(SqlPreference.value, LargeBinary))
-                .where(*scope, SqlPreference.key == _META)
-                .with_for_update()
+            metadata = self._lock_record(
+                session, user_id, _META, _Metadata(authority_id=self._authority)
             )
-            assert raw is not None
-            metadata = _decode(raw, _Metadata)
             self._check_authority(metadata)
 
             def read_record(key: str, model: type[_Model]) -> _Model | None:
@@ -351,3 +333,85 @@ class SqlAlchemyPreferenceStore:
             return result
 
         return run_write_transaction(self._write_session, "apply_shared_preference", write)
+
+    def _lock_record(
+        self, session: Session, user_id: str | None, key: str, initial: _Model
+    ) -> _Model:
+        values = {
+            "workspace_id": current_workspace_id(),
+            "user_id": self.identity(user_id).user_id,
+            "key": key,
+            "value": _serialize(initial),
+        }
+        dialect = self._engine.dialect.name
+        if dialect == "mysql":
+            insert = mysql_insert(SqlPreference).values(**values).on_duplicate_key_update(key=key)
+        elif dialect == "sqlite":
+            insert = sqlite_insert(SqlPreference).values(**values).on_conflict_do_nothing()
+        else:
+            insert = pg_insert(SqlPreference).values(**values).on_conflict_do_nothing()
+        session.execute(insert)
+        raw = session.scalar(
+            select(type_coerce(SqlPreference.value, LargeBinary))
+            .where(*self._scope(user_id), SqlPreference.key == key)
+            .with_for_update()
+        )
+        assert raw is not None
+        return _decode(raw, type(initial))
+
+    def read_configuration(self, *, user_id: str | None) -> ConfigurationSnapshot:
+        with self._session("read_configuration_profile") as session:
+            raw = session.scalar(
+                select(type_coerce(SqlPreference.value, LargeBinary)).where(
+                    *self._scope(user_id), SqlPreference.key == _CONFIGURATION
+                )
+            )
+        snapshot = (
+            ConfigurationSnapshot(identity=self.identity(user_id))
+            if raw is None
+            else _decode(raw, ConfigurationSnapshot)
+        )
+        if snapshot.identity != self.identity(user_id):
+            raise OmnigentError("Configuration identity changed", code=ErrorCode.CONFLICT)
+        return snapshot
+
+    def save_configuration(
+        self, operation: ConfigurationSave, *, user_id: str | None
+    ) -> ConfigurationSnapshot:
+        if operation.identity != self.identity(user_id):
+            raise OmnigentError("Configuration identity mismatch", code=ErrorCode.FORBIDDEN)
+
+        def write(session: Session) -> ConfigurationSnapshot:
+            require_active_account(session, user_id)
+            current = self._lock_record(
+                session,
+                user_id,
+                _CONFIGURATION,
+                ConfigurationSnapshot(identity=self.identity(user_id)),
+            )
+            if current.identity != operation.identity:
+                raise OmnigentError("Configuration identity changed", code=ErrorCode.CONFLICT)
+            # Only the immediately accepted identical save can be retried without a new preview.
+            if current.configuration == operation.configuration and current.revision in (
+                operation.expected_revision,
+                operation.expected_revision + 1,
+            ):
+                return current
+            if current.revision != operation.expected_revision:
+                raise OmnigentError(
+                    "Saved configuration changed; preview it again before saving",
+                    code=ErrorCode.CONFLICT,
+                )
+            saved = ConfigurationSnapshot(
+                identity=current.identity,
+                revision=current.revision + 1,
+                configuration=operation.configuration,
+            )
+            session.execute(
+                update(SqlPreference)
+                .where(*self._scope(user_id), SqlPreference.key == _CONFIGURATION)
+                .values(value=_serialize(saved))
+            )
+            return saved
+
+        return run_write_transaction(self._write_session, "save_configuration_profile", write)

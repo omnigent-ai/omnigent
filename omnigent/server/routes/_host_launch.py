@@ -22,17 +22,22 @@ import functools
 import logging
 import os
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 
+from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
 from omnigent.entities import Conversation
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
 from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
 from omnigent.stores import ConversationStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
+
+if TYPE_CHECKING:
+    from omnigent.server.sandbox_profiles import SandboxProfileCatalog
 
 _logger = logging.getLogger(__name__)
 
@@ -170,6 +175,22 @@ def _deployment_is_sharded() -> bool:
     return _host_sharded
 
 
+def routed_slice_key(request: Request) -> str | None:
+    """Return the slice key that routed *request*, or ``None`` when unkeyed.
+
+    Ingress reads the slice-key header and falls back to the ``omnigent_slice_key``
+    query parameter when the header is empty.
+
+    :param request: The inbound request.
+    :returns: The key, e.g. ``"a1b2c3d4..."``, or ``None``.
+    """
+    return (
+        request.headers.get(OMNIGENT_SLICE_KEY_HEADER)
+        or request.query_params.get("omnigent_slice_key")
+        or None
+    )
+
+
 def host_absent_error(host: Host, *, sharded: bool | None = None) -> OmnigentError:
     """Classify a "host not on this replica" miss for a host-scoped route.
 
@@ -180,8 +201,8 @@ def host_absent_error(host: Host, *, sharded: bool | None = None) -> OmnigentErr
     dispatch. Tell the two apart from the host record the caller already loaded:
 
     - **sharded** deployment and still **live** (online + fresh heartbeat) → up
-      on some replica, just not here → :data:`~ErrorCode.WRONG_REPLICA` (400) so
-      the client re-addresses WITHOUT the key.
+      on some replica, just not here → :class:`WrongReplicaError` (400) so the
+      client re-addresses with the slice key the response names.
     - otherwise → genuinely unreachable here → ``CONFLICT`` (409).
 
     On a single-replica deployment the local registry is authoritative: an
@@ -202,7 +223,7 @@ def host_absent_error(host: Host, *, sharded: bool | None = None) -> OmnigentErr
     if sharded is None:
         sharded = _deployment_is_sharded()
     if sharded and host_is_live(host):
-        return OmnigentError("host is on another replica", code=ErrorCode.WRONG_REPLICA)
+        return WrongReplicaError("host is on another replica", host_id=host.host_id)
     return OmnigentError("host is offline", code=ErrorCode.CONFLICT)
 
 
@@ -216,6 +237,7 @@ def resolve_host_launch(
     conversation_store: ConversationStore,
     permission_store: PermissionStore | None,
     conversation: Conversation | None = None,
+    sandbox_profiles: SandboxProfileCatalog | None = None,
 ) -> HostLaunchTarget:
     """
     Resolve and authorize a host runner launch.
@@ -281,5 +303,14 @@ def resolve_host_launch(
         )
         if not allowed:
             raise HTTPException(status_code=404, detail="session not found")
+
+    if sandbox_profiles is not None:
+        sandbox_profiles.require_session_host(
+            session_id,
+            host_id,
+            bind=False,
+            sandbox_provider=host.sandbox_provider,
+            user_id=host.user_id,
+        )
 
     return HostLaunchTarget(host=host, conn=conn, conv=conv)

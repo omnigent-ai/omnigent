@@ -1,12 +1,35 @@
 import { describe, expect, it } from "vitest";
-import type { ImageContentBlock, MessageContentBlock } from "./blocks";
+import type { AnyBlock, ElicitationBlock, ImageContentBlock, MessageContentBlock } from "./blocks";
 import {
   attachmentLabel,
+  hasPendingOwnElicitation,
   imagePreview,
+  isPendingBlockingElicitation,
   isTextBlock,
   keyedAttachments,
+  slashCommandDisplayName,
+  slashCommandEchoText,
   structuredErrorFields,
 } from "./blocks";
+
+describe("slash command display names", () => {
+  it.each([
+    ["claude-native-ui:build-summary", "build-summary"],
+    ["codex-native-ui:build-summary", "build-summary"],
+    ["claude-native-ui:docs:review", "docs:review"],
+    ["dev-productivity:simplify", "dev-productivity:simplify"],
+    ["custom-native-ui:review", "custom-native-ui:review"],
+    ["effort", "effort"],
+    ["claude-native-ui:", "claude-native-ui:"],
+    ["", ""],
+  ])("displays %s as %s", (name, displayName) => {
+    expect(slashCommandDisplayName(name)).toBe(displayName);
+    expect(slashCommandEchoText(name, "")).toBe(`/${displayName}`);
+    expect(slashCommandEchoText(name, "src/main.ts --verbose")).toBe(
+      `/${displayName} src/main.ts --verbose`,
+    );
+  });
+});
 
 describe("structuredErrorFields", () => {
   it("keeps classified failures and informational notices intact", () => {
@@ -220,6 +243,39 @@ describe("isTextBlock", () => {
     expect(isTextBlock({ type: "input_file", filename: "notes.pdf" })).toBe(false);
     const block = { type: "input_text", text: { parts: ["hi"] } } as unknown as MessageContentBlock;
     expect(isTextBlock(block)).toBe(false);
+  });
+});
+
+describe("pending elicitation checks", () => {
+  const card: ElicitationBlock = {
+    type: "elicitation",
+    ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "resp_1", itemId: null },
+    elicitationId: "elic_1",
+    targetSessionId: null,
+    message: "Codex needs input",
+    phase: "codex_request_user_input",
+    policyName: "codex_native_request_user_input",
+    contentPreview: "{}",
+    requestedSchema: {},
+    url: null,
+    status: "pending",
+    response: null,
+  };
+
+  it("isPendingBlockingElicitation counts only a pending card the turn waits on", () => {
+    expect(isPendingBlockingElicitation(card)).toBe(true);
+    expect(isPendingBlockingElicitation({ ...card, isBlocking: false })).toBe(false);
+    expect(isPendingBlockingElicitation({ ...card, status: "responded" })).toBe(false);
+    const responseEnd = { type: "response_end", ctx: card.ctx, status: "pending", response: null };
+    expect(isPendingBlockingElicitation(responseEnd as AnyBlock)).toBe(false);
+  });
+
+  it("hasPendingOwnElicitation counts only this session's own blocking card", () => {
+    expect(hasPendingOwnElicitation([card], "conv_1")).toBe(true);
+    expect(hasPendingOwnElicitation([{ ...card, isBlocking: false }], "conv_1")).toBe(false);
+    expect(hasPendingOwnElicitation([{ ...card, targetSessionId: "conv_child" }], "conv_1")).toBe(
+      false,
+    );
   });
 });
 

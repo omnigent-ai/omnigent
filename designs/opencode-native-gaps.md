@@ -1,5 +1,10 @@
 # OpenCode-native: feature-gap closure plan
 
+> **Superseded.** This plan and its recon target OpenCode 1.17/1.18, which is no
+> longer supported. The current design is the OpenCode v2 spec,
+> [`designs/opencode-v2-native-harness.md`](opencode-v2-native-harness.md);
+> the user guide is [`docs/opencode-native.md`](../docs/opencode-native.md).
+
 **Status:** implemented (single PR) · **Owner:** Dhruv Gupta · **Harness:** `opencode-native`
 
 ## Implementation status (this PR)

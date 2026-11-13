@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -256,7 +257,11 @@ async def test_session_snapshot_reads_latest_items_then_returns_chronological() 
 async def test_session_snapshot_uses_child_spec_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Child snapshots expose their selected spec while parents keep the root spec."""
+    """Child snapshots expose their selected spec while parents keep the root spec.
+
+    Each snapshot reads the agent row once, off the event loop, and reuses
+    it for metadata and harness resolution.
+    """
     child_spec = AgentSpec(
         spec_version=1,
         name="executor",
@@ -296,12 +301,16 @@ async def test_session_snapshot_uses_child_spec_metadata(
         ),
     }
     conv_store = _ConversationStore([], conversations=conversations)
+    event_loop_thread = threading.get_ident()
     cache_loads: list[bool] = []
+    cache_loads_on_loop: list[bool] = []
+    agent_reads_on_loop: list[bool] = []
 
     class _AgentStore:
         @staticmethod
         def get(agent_id: str) -> Any:
             assert agent_id == "ag_advisor"
+            agent_reads_on_loop.append(threading.get_ident() == event_loop_thread)
             return type(
                 "StoredAgent",
                 (),
@@ -319,6 +328,7 @@ async def test_session_snapshot_uses_child_spec_metadata(
         def load(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
             assert (agent_id, bundle_location) == ("ag_advisor", "bundle")
             cache_loads.append(expand_env)
+            cache_loads_on_loop.append(threading.get_ident() == event_loop_thread)
             return type("LoadedAgent", (), {"spec": parent_spec})()
 
     monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
@@ -346,6 +356,82 @@ async def test_session_snapshot_uses_child_spec_metadata(
     assert child.context_window == 100_000
     assert child.harness == "codex"
     assert cache_loads == [True, True, True, True]
+    assert cache_loads_on_loop == [False, False, False, False]
+    assert agent_reads_on_loop == [False, False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("spec_config", "harness_override", "expected_harness"),
+    [
+        pytest.param({"harness": "claude-sdk"}, "grok", "grok", id="grok-override"),
+        pytest.param(
+            {"harness": "acp", "acp_agent": {"name": "Grok Build", "command": "grok"}},
+            None,
+            "acp",
+            id="spec-embedded-acp",
+        ),
+    ],
+)
+async def test_session_snapshot_does_not_claim_agent_model_for_own_auth_acp(
+    monkeypatch: pytest.MonkeyPatch,
+    spec_config: dict[str, Any],
+    harness_override: str | None,
+    expected_harness: str,
+) -> None:
+    """A self-authenticated ACP session must not inherit the spec's unrelated model pin.
+
+    Both routes into own-auth ACP are covered: a Grok override on a provider-routed
+    spec, and a spec whose own harness is the generic ACP wrap.
+    """
+    spec = AgentSpec(
+        spec_version=1,
+        name="polly",
+        executor=ExecutorSpec(config=spec_config, model="claude-opus-5", context_window=1_000_000),
+    )
+    conv = Conversation(
+        id="conv_acp",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_acp",
+        agent_id="ag_polly",
+        harness_override=harness_override,
+    )
+    store = _ConversationStore([], conversations={conv.id: conv})
+
+    class _AgentStore:
+        @staticmethod
+        def get(agent_id: str) -> Any:
+            return type(
+                "StoredAgent",
+                (),
+                {
+                    "id": agent_id,
+                    "name": "polly",
+                    "bundle_location": "bundle",
+                    "session_id": None,
+                    "operator_authored": False,
+                },
+            )()
+
+    class _AgentCache:
+        @staticmethod
+        def load(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
+            return type("LoadedAgent", (), {"spec": spec})()
+
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    snapshot = await _get_session_snapshot(
+        store,  # type: ignore[arg-type]
+        conv.id,
+        agent_store=_AgentStore(),  # type: ignore[arg-type]
+        agent_cache=_AgentCache(),  # type: ignore[arg-type]
+    )
+
+    assert snapshot.harness == expected_harness
+    assert snapshot.llm_model is None
+    assert snapshot.context_window is None
 
 
 @pytest.mark.asyncio
@@ -944,7 +1030,7 @@ async def test_session_snapshot_exit_report_still_fails_non_idle_session_of_conn
 
     assert snapshot.status == "failed"
     assert snapshot.last_task_error == {
-        "code": "runner_failed_to_start",
+        "code": "runner_process_crash",
         "message": _RUNNER_EXIT_ERROR,
     }
 
@@ -1033,21 +1119,127 @@ class _NotFoundRunnerClient:
 class _GatedRunnerClient:
     """Fake runner whose status GET blocks until released, so callers provably overlap."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, status: str = "running", status_code: int = 200) -> None:
         self.get_calls: list[str] = []
         self.arrived = asyncio.Event()
         self.release = asyncio.Event()
+        self.status = status
+        self.status_code = status_code
 
     async def get(self, url: str, timeout: float) -> Any:
         self.get_calls.append(url)
         self.arrived.set()
         await self.release.wait()
-        return SimpleNamespace(status_code=200, json=lambda: {"status": "running"})
+        return SimpleNamespace(status_code=self.status_code, json=lambda: {"status": self.status})
 
 
 def _use_runner_client(monkeypatch: pytest.MonkeyPatch, runner_client: object) -> None:
     monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: runner_client)
     monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("probe_http_status", [200, 404])
+@pytest.mark.parametrize(
+    ("probed_status", "published_status"),
+    [("running", "idle"), ("idle", "running"), ("idle", "waiting"), ("running", "failed")],
+)
+async def test_session_snapshot_preserves_status_published_during_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    probed_status: str,
+    published_status: str,
+    probe_http_status: int,
+) -> None:
+    """A late status reply cannot undo a turn edge or make completed work fail on disconnect."""
+    from omnigent.server.routes._sessions import helpers, orchestration
+
+    session_id = "52970ab86e2a4eeaa9804421091d5002"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        runner_id="runner_status_race",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+    )
+    conv_store = _ConversationStore([], conversations={session_id: conv})
+    _sessions_mod._session_status_cache.pop(session_id, None)
+    _sessions_mod._runner_status_probe_backoff.pop(session_id, None)
+    persisted: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        helpers.session_live_state,
+        "persist_live_status",
+        lambda key, status: persisted.append((key, status)),
+    )
+    monkeypatch.setattr(
+        helpers.session_live_state,
+        "persist_scheduled_run_completion",
+        lambda *args, **kwargs: None,
+    )
+    runner_client = _GatedRunnerClient(status=probed_status, status_code=probe_http_status)
+    _use_runner_client(monkeypatch, runner_client)
+    snapshot_task = asyncio.create_task(
+        _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    )
+    try:
+        await asyncio.wait_for(runner_client.arrived.wait(), timeout=1.0)
+        helpers._publish_status(
+            session_id, published_status, failure_origin="synthetic_native_failure"
+        )
+        runner_client.release.set()
+        snapshot = await asyncio.wait_for(snapshot_task, timeout=1.0)
+
+        assert snapshot.status == (
+            "running" if published_status == "waiting" else published_status
+        )
+        assert _sessions_mod._session_status_cache.get(session_id) == published_status
+        assert persisted == [(session_id, published_status)]
+        assert _sessions_mod._runner_status_probe_inflight.get(session_id) is None
+        assert _sessions_mod._runner_status_probe_backoff.get(session_id) is None
+        assert await orchestration._runner_disconnect_requires_failure(
+            session_id,
+            conv_store,  # type: ignore[arg-type]
+            origin="runner_offline_sweep",
+            snapshot=conv,
+        ) is (published_status in {"running", "waiting"})
+    finally:
+        runner_client.release.set()
+        await asyncio.gather(snapshot_task, return_exceptions=True)
+        _sessions_mod._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+async def test_session_status_edge_before_probe_task_starts_takes_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A queued probe cannot treat an intervening turn edge as its original cache state."""
+    from omnigent.server.routes._sessions import helpers, orchestration
+
+    session_id = "b9dfc503c89441fdbfcf9db877ae361b"
+    _sessions_mod._session_status_cache.pop(session_id, None)
+    _sessions_mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(helpers.session_live_state, "persist_live_status", lambda *args: None)
+    monkeypatch.setattr(
+        helpers.session_live_state,
+        "persist_scheduled_run_completion",
+        lambda *args, **kwargs: None,
+    )
+    runner_client = _GatedRunnerClient()
+    probe = asyncio.create_task(
+        orchestration._probe_runner_live_status(runner_client, session_id)  # type: ignore[arg-type]
+    )
+    try:
+        await asyncio.sleep(0)
+        assert not runner_client.arrived.is_set()
+        assert _sessions_mod._runner_status_probe_inflight.get(session_id) is not None
+        helpers._publish_status(session_id, "idle")
+        runner_client.release.set()
+        assert await asyncio.wait_for(probe, timeout=1.0) == "idle"
+        assert _sessions_mod._session_status_cache.get(session_id) == "idle"
+    finally:
+        runner_client.release.set()
+        await asyncio.gather(probe, return_exceptions=True)
+        _sessions_mod._session_status_cache.pop(session_id, None)
 
 
 @pytest.mark.asyncio
@@ -2351,7 +2543,10 @@ async def test_session_snapshot_fills_cold_claude_catalog_from_host(
 
     host_queries: list[str] = []
 
-    async def _fake_host_options(host_id: str) -> list[dict[str, object]] | None:
+    async def _fake_host_options(
+        host_id: str, harness: str = "claude-native"
+    ) -> list[dict[str, object]] | None:
+        assert harness == "claude-native"
         host_queries.append(host_id)
         return [{"id": "opus", "displayName": "Opus"}]
 
@@ -2386,6 +2581,167 @@ async def test_session_snapshot_fills_cold_claude_catalog_from_host(
     assert host_queries == ["host_abc"]
     assert [m.id for m in snapshot.model_options] == ["opus"]
     assert session_id in _mod._model_options_stale
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inherited_host", [False, True])
+@pytest.mark.parametrize("first_host_failure", [False, True], ids=["success", "retry"])
+async def test_session_snapshot_fills_cold_pi_catalog_from_host(
+    monkeypatch: pytest.MonkeyPatch,
+    inherited_host: bool,
+    first_host_failure: bool,
+) -> None:
+    """Cold Pi snapshots refill from direct or inherited hosts and retry failed lookups."""
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.schemas import SessionEventInput
+
+    session_id = "conv_pi_host_catalog"
+    _mod._session_status_cache.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+    _mod._pushed_model_options_cache.clear()
+
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    host_queries: list[tuple[str, str]] = []
+    release_host = asyncio.Event()
+    published: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._publish_model_options", published.append
+    )
+
+    async def _fake_host_options(
+        host_id: str, harness: str = "claude-native"
+    ) -> list[dict[str, object]] | None:
+        host_queries.append((host_id, harness))
+        await release_host.wait()
+        if first_host_failure and len(host_queries) == 1:
+            return None
+        return [{"id": "provider/test-model", "displayName": "Test Model"}]
+
+    monkeypatch.setattr(_mod, "_host_model_options_via_registry", _fake_host_options)
+
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="parent" if inherited_host else session_id,
+        parent_conversation_id="parent" if inherited_host else None,
+        kind="sub_agent" if inherited_host else "default",
+        agent_id="ag_test",
+        host_id=None if inherited_host else "host_abc",
+        labels={
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._PI_NATIVE_WRAPPER_LABEL_VALUE,
+        },
+    )
+    parent = Conversation(
+        id="parent",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="parent",
+        host_id="host_abc",
+        agent_id="ag_test",
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={session_id: conv, "parent": parent},
+    )
+
+    first = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+    )
+    assert first.model_options == []
+    filling = _mod._model_options_inflight[session_id]
+    second = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert second.model_options == []
+    assert _mod._model_options_inflight[session_id] is filling
+    release_host.set()
+    await asyncio.wait_for(filling, timeout=5)
+    assert session_id not in _mod._model_options_inflight
+    if first_host_failure:
+        assert session_id not in _mod._pushed_model_options_cache
+        assert published == []
+        release_host.clear()
+        retry = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+        assert retry.model_options == []
+        refilling = _mod._model_options_inflight[session_id]
+        assert refilling is not filling
+        release_host.set()
+        await asyncio.wait_for(refilling, timeout=5)
+        assert session_id not in _mod._model_options_inflight
+    assert published == [session_id]
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+    )
+    assert host_queries == [("host_abc", "pi-native")] * (2 if first_host_failure else 1)
+    assert [m.id for m in snapshot.model_options] == ["provider/test-model"]
+    # Not stale-marked: pi's picker reads only the pushed cache.
+    assert session_id not in _mod._model_options_stale
+
+    _mod._persist_external_model_options(
+        session_id,
+        conv,
+        SessionEventInput(type="external_model_options", data={"models": [{"id": "extension"}]}),
+    )
+    replaced = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert [model.id for model in replaced.model_options] == ["extension"]
+    assert session_id not in _mod._model_options_inflight
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("empty_push", [False, True], ids=["catalog", "cleared"])
+async def test_pi_host_fill_does_not_clobber_extension_push(
+    monkeypatch: pytest.MonkeyPatch,
+    empty_push: bool,
+) -> None:
+    """An accepted catalog or clear during host recovery wins, including later snapshots."""
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.schemas import SessionEventInput
+
+    session_id = "conv_pi_push_wins"
+    _mod._session_status_cache.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+    _mod._pushed_model_options_cache.clear()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="ag_test",
+        host_id="host_abc",
+        labels={_mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._PI_NATIVE_WRAPPER_LABEL_VALUE},
+    )
+    conv_store = _ConversationStore([], conversations={session_id: conv})
+    pushed_models = [] if empty_push else [{"id": "pushed"}]
+    host_queries: list[tuple[str, str]] = []
+
+    async def _fake_host_options(
+        host_id: str, harness: str = "claude-native"
+    ) -> list[dict[str, object]] | None:
+        host_queries.append((host_id, harness))
+        _mod._persist_external_model_options(
+            session_id,
+            conv,
+            SessionEventInput(type="external_model_options", data={"models": pushed_models}),
+        )
+        return [{"id": "from-host"}]
+
+    monkeypatch.setattr(_mod, "_host_model_options_via_registry", _fake_host_options)
+
+    await _mod._load_model_options_from_host(session_id, "host_abc", "pi-native")
+
+    expected_ids = [] if empty_push else ["pushed"]
+    assert [model["id"] for model in _mod._pushed_model_options_cache[session_id]] == expected_ids
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert [model.id for model in snapshot.model_options] == expected_ids
+    assert session_id not in _mod._model_options_inflight
+    assert host_queries == [("host_abc", "pi-native")]
 
 
 @pytest.mark.asyncio
@@ -3011,6 +3367,14 @@ _TRACEBACK_LINES = (
     *(f'  File "/venv/site-packages/pkg/module_{n}.py", line {n}, in call' for n in range(10)),
     "asyncio.exceptions.CancelledError",
 )
+_RUNNER_SHUTDOWN_LOG_LINES = (
+    "INFO  10-28 23:03:02.662 debug_logging                    _post              | "
+    "debug-log sink: first batch delivered to example.default.debug_logs (1 row(s))",
+    "DEBUG 10-28 23:03:02.663 runner._zygote                   _flush_child       | "
+    "flushing runner output",
+    "WARN  10-28 23:03:02.664 debug_logging                    _diag              | "
+    "debug-log sink: flush timed out",
+)
 
 
 def _runner_exit_report(summary: str, *tail_lines: str) -> str:
@@ -3018,23 +3382,50 @@ def _runner_exit_report(summary: str, *tail_lines: str) -> str:
     return "\n".join([summary, RUNNER_LOG_TAIL_HEADING, *tail_lines])
 
 
-def test_truncate_error_message_label_keeps_runner_exit_cause() -> None:
-    """A long runner-exit report keeps its summary and the tail's last line."""
+@pytest.mark.parametrize(
+    ("cause", "trailing_lines"),
+    [
+        pytest.param(_REJECTED_TUNNEL_ERROR, (), id="last-line"),
+        pytest.param(_REJECTED_TUNNEL_ERROR, _RUNNER_SHUTDOWN_LOG_LINES[:1], id="debug-upload"),
+        pytest.param(
+            _REJECTED_TUNNEL_ERROR, ("", *_RUNNER_SHUTDOWN_LOG_LINES), id="shutdown-logs"
+        ),
+        pytest.param(
+            "OSError: [Errno 28] No space left on device: '/tmp/runner-specs-example'",
+            _RUNNER_SHUTDOWN_LOG_LINES,
+            id="disk-full-traceback",
+        ),
+        pytest.param(
+            "ERROR 10-28 23:03:02.660 runner._zygote _child_main | runner child failed",
+            _RUNNER_SHUTDOWN_LOG_LINES,
+            id="error-record",
+        ),
+    ],
+)
+def test_truncate_error_message_label_keeps_runner_exit_cause(
+    cause: str, trailing_lines: tuple[str, ...]
+) -> None:
+    """Shutdown diagnostics must not displace the failure in a saved report."""
     summary = "runner process exited with code 1 (log on host: ~/logs/runner-a1.log)"
-    report = _runner_exit_report(summary, *_TRACEBACK_LINES, _REJECTED_TUNNEL_ERROR)
+    report = _runner_exit_report(summary, *_TRACEBACK_LINES, cause, *trailing_lines)
     assert len(report) > _LABEL_VALUE_MAX_LEN
 
     result = _truncate_error_message_label(report)
 
     # The traceback is dropped; the line naming the cause survives whole.
-    assert result == f"{summary}\n…\n{_REJECTED_TUNNEL_ERROR}"
+    assert result == f"{summary}\n…\n{cause}"
     assert len(result) <= _LABEL_VALUE_MAX_LEN
 
 
-def test_truncate_error_message_label_trims_an_oversized_last_line() -> None:
-    """An oversized last line is trimmed so the summary's start still fits."""
+@pytest.mark.parametrize("trailing_lines", [(), _RUNNER_SHUTDOWN_LOG_LINES])
+def test_truncate_error_message_label_trims_an_oversized_last_line(
+    trailing_lines: tuple[str, ...],
+) -> None:
+    """An oversized cause is trimmed so the summary's start still fits."""
     report = _runner_exit_report(
-        "runner process exited with code 1 (log on host: ~/x.log)", "error: " + "y" * 400
+        "runner process exited with code 1 (log on host: ~/x.log)",
+        "error: " + "y" * 400,
+        *trailing_lines,
     )
 
     result = _truncate_error_message_label(report)
@@ -3043,6 +3434,16 @@ def test_truncate_error_message_label_trims_an_oversized_last_line() -> None:
     assert result.startswith("runner process exited with code 1")
     assert "…\n…\nerror: yyy" in result
     assert result.endswith("y…")
+
+
+def test_truncate_error_message_label_keeps_last_log_when_no_cause_is_available() -> None:
+    summary = "runner process exited with code 1"
+    report = _runner_exit_report(summary, *_RUNNER_SHUTDOWN_LOG_LINES)
+
+    result = _truncate_error_message_label(report)
+
+    assert result == f"{summary}\n…\n{_RUNNER_SHUTDOWN_LOG_LINES[-1]}"
+    assert len(result) <= _LABEL_VALUE_MAX_LEN
 
 
 @pytest.mark.parametrize(
@@ -3118,7 +3519,10 @@ async def test_persist_error_labels_truncates_long_message() -> None:
 
 
 @pytest.mark.asyncio
-async def test_persist_error_labels_keeps_host_runner_exit_cause(tmp_path: Path) -> None:
+@pytest.mark.parametrize("trailing_lines", [(), _RUNNER_SHUTDOWN_LOG_LINES])
+async def test_persist_error_labels_keeps_host_runner_exit_cause(
+    tmp_path: Path, trailing_lines: tuple[str, ...]
+) -> None:
     """A host's runner-exit report still names its cause once stored.
 
     The live failure event carries the whole report, but a reloaded session
@@ -3128,7 +3532,9 @@ async def test_persist_error_labels_keeps_host_runner_exit_cause(tmp_path: Path)
     from omnigent.server.schemas import ErrorDetail
 
     log_path = tmp_path / "runner.log"
-    log_path.write_text("\n".join([*_TRACEBACK_LINES, _REJECTED_TUNNEL_ERROR]) + "\n")
+    log_path.write_text(
+        "\n".join([*_TRACEBACK_LINES, _REJECTED_TUNNEL_ERROR, *trailing_lines]) + "\n"
+    )
     captured: dict[str, dict[str, str]] = {}
 
     class _MockStore:

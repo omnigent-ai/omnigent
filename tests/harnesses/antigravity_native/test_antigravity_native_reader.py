@@ -58,8 +58,12 @@ from typing import Any, cast
 import httpx
 import pytest
 
-from omnigent.harnesses.antigravity_native import reader
-from omnigent.harnesses.antigravity_native.bridge import read_bridge_state
+from omnigent.harnesses.antigravity_native import bridge, reader
+from omnigent.harnesses.antigravity_native.bridge import (
+    agy_gemini_dir,
+    read_bridge_state,
+    write_tmux_target,
+)
 from omnigent.harnesses.antigravity_native.rpc import AntigravityRpcError
 from omnigent.harnesses.antigravity_native.steps import PendingInteraction
 
@@ -3617,6 +3621,466 @@ def test_detect_rotation_real_capture_shape() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Placeholder recovery: discovery adopts the TUI-minted cascade in place
+# ---------------------------------------------------------------------------
+
+
+def test_typed_root_cascade_picks_newest_user_input_root() -> None:
+    """The most recently typed-into root cascade is the recovery candidate."""
+    summaries = {
+        _BOUND_CASCADE: _summary(last_user_input_time="2026-06-23T17:34:54.152668Z"),
+        _OTHER_CASCADE: _summary(last_user_input_time="2026-06-23T17:50:29.232919Z"),
+    }
+    assert reader._typed_root_cascade(summaries) == _OTHER_CASCADE
+
+
+def test_typed_root_cascade_ignores_never_typed_cascades() -> None:
+    """A cascade without ``lastUserInputTime`` (the cold-start phantom or a bare
+    /clear mint) is never adopted: it is a conversation the TUI never shows."""
+    summaries = {
+        _BOUND_CASCADE: _summary(last_modified_time="2026-06-23T17:50:32.565300Z"),
+        _OTHER_CASCADE: _summary(),
+    }
+    assert reader._typed_root_cascade(summaries) is None
+
+
+def test_typed_root_cascade_ignores_subagent_children() -> None:
+    """A typed-into SUBAGENT conversation is not a recovery target."""
+    summaries = {
+        _OTHER_CASCADE: _child_summary(
+            parent_cascade_id=_BOUND_CASCADE,
+            last_user_input_time="2026-08-01T10:50:00.000000Z",
+        ),
+    }
+    assert reader._typed_root_cascade(summaries) is None
+
+
+def test_typed_root_cascade_ignores_non_cascade_trajectories() -> None:
+    """A non-cascade trajectory never qualifies, typed or not."""
+    summaries = {
+        _OTHER_CASCADE: _summary(
+            last_user_input_time="2026-06-23T17:50:29.232919Z",
+            trajectory_type="CORTEX_TRAJECTORY_TYPE_UNKNOWN",
+        ),
+    }
+    assert reader._typed_root_cascade(summaries) is None
+
+
+def test_typed_root_cascade_ignores_non_uuid_ids() -> None:
+    """A key that is not a UUID is never a candidate, however recently it was
+    typed into: the id becomes a file name and a ``--conversation`` argument."""
+    summaries = {
+        "../../outside-the-conversations-dir": _summary(
+            last_user_input_time="2026-06-23T17:50:29.232919Z"
+        ),
+        _OTHER_CASCADE: _summary(last_user_input_time="2026-06-23T17:34:54.152668Z"),
+    }
+    assert reader._typed_root_cascade(summaries) == _OTHER_CASCADE
+
+
+def _placeholder_bridge_dir(tmp_path: Path, *, with_pane: bool = True) -> Path:
+    """A bridge dir stuck on the launcher placeholder (cold-start gave up)."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir(exist_ok=True)
+    (bridge_dir / "state.json").write_text(
+        json.dumps({"session_id": _SESSION_ID, "conversation_id": "agy_conv_placeholder"}),
+        encoding="utf-8",
+    )
+    if with_pane:
+        socket = tmp_path / "tmux.sock"
+        socket.touch()
+        write_tmux_target(bridge_dir, socket_path=socket, tmux_target="main")
+    return bridge_dir
+
+
+def _own_conversation_db(bridge_dir: Path, cascade_id: str) -> None:
+    """Drop the ownership proof: the cascade's db in THIS session's Gemini dir."""
+    convs = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "conversations"
+    convs.mkdir(parents=True, exist_ok=True)
+    (convs / f"{cascade_id}.db").write_bytes(b"")
+
+
+def _typed_body(cascade_id: str) -> dict[str, Any]:
+    """A ``GetAllCascadeTrajectories`` body where ``cascade_id`` was typed into."""
+    return {
+        "trajectorySummaries": {
+            cascade_id: _summary(last_user_input_time="2026-06-23T17:50:29.232919Z"),
+        }
+    }
+
+
+def test_placeholder_recovery_adopts_typed_tui_cascade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A typed-into, locally-owned root cascade replaces the stale placeholder."""
+    bridge_dir = _placeholder_bridge_dir(tmp_path)
+    _own_conversation_db(bridge_dir, _CASCADE_ID)
+    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT)
+    monkeypatch.setattr(
+        reader, "get_all_cascade_trajectories", lambda _p: _typed_body(_CASCADE_ID)
+    )
+
+    assert reader._recover_placeholder_cascade(bridge_dir) == _CASCADE_ID
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == _CASCADE_ID
+    assert state.session_id == _SESSION_ID
+
+
+def test_placeholder_recovery_requires_an_advertised_local_pane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No advertised local pane means no scan: turns are typed through that
+    pane, and a blind port scan on a multi-agy host could reach a foreign agy."""
+    bridge_dir = _placeholder_bridge_dir(tmp_path, with_pane=False)
+
+    def _no_scan(_s: object, _t: object, **_kwargs: object) -> int | None:
+        raise AssertionError("recovery must not resolve a port without a local pane")
+
+    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", _no_scan)
+
+    assert reader._recover_placeholder_cascade(bridge_dir) is None
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == "agy_conv_placeholder"
+
+
+def test_placeholder_recovery_requires_the_advertised_socket_on_this_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An advertised pane whose socket is not on this host (a remote runner) is
+    not scanned either: nothing typed through it could have come from here."""
+    bridge_dir = _placeholder_bridge_dir(tmp_path)
+    (tmp_path / "tmux.sock").unlink()
+
+    def _no_scan(_s: object, _t: object, **_kwargs: object) -> int | None:
+        raise AssertionError("recovery must not resolve a port for a socket that is not local")
+
+    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", _no_scan)
+
+    assert reader._recover_placeholder_cascade(bridge_dir) is None
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == "agy_conv_placeholder"
+
+
+def test_placeholder_recovery_refuses_a_foreign_cascade_and_reports_it_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A typed cascade whose db is not in this session's Gemini dir is refused on
+    every scan (adopting a foreign agy's cascade would durably cross-bind the
+    session). The first miss is logged at DEBUG (usually agy's write lag), the
+    second at WARNING (a foreign agy), and later repeats at DEBUG again."""
+    bridge_dir = _placeholder_bridge_dir(tmp_path)
+    # No conversation db is written: the scan answer came from a foreign agy.
+    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT)
+    monkeypatch.setattr(
+        reader, "get_all_cascade_trajectories", lambda _p: _typed_body(_CASCADE_ID)
+    )
+    scan_log = reader._RecoveryScanLog()
+
+    with caplog.at_level(logging.DEBUG, logger=reader.__name__):
+        for _ in range(3):
+            assert reader._recover_placeholder_cascade(bridge_dir, scan_log=scan_log) is None
+
+    levels = [
+        record.levelname
+        for record in caplog.records
+        if "in this session's Gemini dir" in record.getMessage()
+    ]
+    assert levels == ["DEBUG", "WARNING", "DEBUG"]
+    assert scan_log.foreign_misses == {_CASCADE_ID: 3}
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == "agy_conv_placeholder"
+
+
+def test_placeholder_recovery_retries_after_a_failed_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed ``GetAllCascadeTrajectories`` leaves the placeholder untouched and
+    the next round adopts the typed cascade."""
+    bridge_dir = _placeholder_bridge_dir(tmp_path)
+    _own_conversation_db(bridge_dir, _CASCADE_ID)
+    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT)
+    scans = 0
+
+    def _flaky_scan(_port: int) -> dict[str, Any]:
+        nonlocal scans
+        scans += 1
+        if scans == 1:
+            raise httpx.ConnectError("agy not answering yet")
+        return _typed_body(_CASCADE_ID)
+
+    monkeypatch.setattr(reader, "get_all_cascade_trajectories", _flaky_scan)
+
+    assert reader._recover_placeholder_cascade(bridge_dir) is None
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == "agy_conv_placeholder"
+
+    assert reader._recover_placeholder_cascade(bridge_dir) == _CASCADE_ID
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == _CASCADE_ID
+
+
+def test_placeholder_recovery_noop_when_id_is_already_real(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-placeholder id in bridge state ends recovery before any probing."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "state.json").write_text(
+        json.dumps({"session_id": _SESSION_ID, "conversation_id": _CASCADE_ID}),
+        encoding="utf-8",
+    )
+
+    def _no_tmux(_bd: Path) -> dict[str, str] | None:
+        raise AssertionError("recovery must not probe once the id is real")
+
+    monkeypatch.setattr(reader, "read_tmux_info", _no_tmux)
+
+    assert reader._recover_placeholder_cascade(bridge_dir) is None
+
+
+def test_placeholder_recovery_keeps_waiting_without_a_typed_cascade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With only never-typed cascades on the port there is nothing to adopt yet."""
+    bridge_dir = _placeholder_bridge_dir(tmp_path)
+    _own_conversation_db(bridge_dir, _CASCADE_ID)
+    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT)
+    body = {
+        "trajectorySummaries": {
+            _CASCADE_ID: _summary(last_modified_time="2026-06-23T17:50:32.565300Z"),
+        }
+    }
+    monkeypatch.setattr(reader, "get_all_cascade_trajectories", lambda _p: body)
+
+    assert reader._recover_placeholder_cascade(bridge_dir) is None
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == "agy_conv_placeholder"
+
+
+@pytest.mark.parametrize(
+    ("session_id", "conversation_id"),
+    [
+        pytest.param(_SESSION_ID, _OTHER_CASCADE, id="cold-start-bound-a-real-id"),
+        pytest.param(
+            _SESSION_ID, "agy_conv_relaunch", id="recreated-terminal-reseeded-the-placeholder"
+        ),
+        pytest.param("conv_other_session", "agy_conv_placeholder", id="session-changed"),
+    ],
+)
+def test_placeholder_recovery_keeps_state_written_during_the_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, session_id: str, conversation_id: str
+) -> None:
+    """State that changed while the scan ran is kept: a racing cold-start's real
+    id, a recreated terminal's new placeholder, or another session. Nothing is adopted."""
+    bridge_dir = _placeholder_bridge_dir(tmp_path)
+    _own_conversation_db(bridge_dir, _CASCADE_ID)
+    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT)
+
+    def _scan_while_state_changes(_port: int) -> dict[str, Any]:
+        (bridge_dir / "state.json").write_text(
+            json.dumps({"session_id": session_id, "conversation_id": conversation_id}),
+            encoding="utf-8",
+        )
+        return _typed_body(_CASCADE_ID)
+
+    monkeypatch.setattr(reader, "get_all_cascade_trajectories", _scan_while_state_changes)
+
+    assert reader._recover_placeholder_cascade(bridge_dir) is None
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert (state.session_id, state.conversation_id) == (session_id, conversation_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_writes", [0, 1], ids=["first-write-ok", "first-write-fails"])
+async def test_discover_records_an_adoption_before_the_port_resolves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_writes: int
+) -> None:
+    """The adopted cascade reaches ``on_adopted`` once, right after it is persisted
+    and before port resolution; a failed state write is retried, not fatal."""
+    bridge_dir = _placeholder_bridge_dir(tmp_path)
+    _own_conversation_db(bridge_dir, _CASCADE_ID)
+    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT)
+    monkeypatch.setattr(
+        reader, "get_all_cascade_trajectories", lambda _p: _typed_body(_CASCADE_ID)
+    )
+    # No port ever confirms the cascade, so this discovery run cannot bind.
+    monkeypatch.setattr(reader, "_candidate_agy_rpc_ports", lambda: [_PORT])
+    monkeypatch.setattr(reader, "_conversation_matches", lambda _port, _cid: False)
+    monkeypatch.setattr(reader, "_sleep", _no_sleep)
+    monkeypatch.setattr(reader, "_PLACEHOLDER_RECOVERY_INTERVAL_S", 0.0)
+    real_write = bridge.write_bridge_state
+    write_failures = [OSError("Too many open files")] * failed_writes
+
+    def _write(bridge_path: Path, state: bridge.AntigravityNativeBridgeState) -> None:
+        if write_failures:
+            raise write_failures.pop()
+        real_write(bridge_path, state)
+
+    monkeypatch.setattr(bridge, "write_bridge_state", _write)
+    adopted: list[tuple[str, str | None]] = []
+
+    async def _on_adopted(cascade_id: str) -> None:
+        persisted = read_bridge_state(bridge_dir)
+        adopted.append((cascade_id, persisted.conversation_id if persisted else None))
+
+    result = await reader._discover(
+        bridge_dir, poll_interval_s=0.0, stop=_stop_after(2), on_adopted=_on_adopted
+    )
+
+    assert result is None
+    assert adopted == [(_CASCADE_ID, _CASCADE_ID)]
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == _CASCADE_ID
+
+
+@pytest.mark.asyncio
+async def test_discover_fallback_warning_waits_for_a_round_that_reaches_the_resolver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One ``ColdStartPortLog`` spans a discovery run: rounds that bail out before
+    the port resolver (no pane advertised yet) do not use up the WARNING, the
+    first round that resolves warns, and later rounds are demoted."""
+    bridge_dir = _placeholder_bridge_dir(tmp_path, with_pane=False)
+    warn_flags: list[bool] = []
+
+    def _resolver(
+        _s: object, _t: object, *, log: reader.ColdStartPortLog | None = None
+    ) -> int | None:
+        # Stand in for the resolver taking its fallback branch.
+        assert log is not None
+        warn_flags.append(not log.fallback_reported)
+        log.fallback_reported = True
+        return None
+
+    sleeps = 0
+
+    async def _advertise_pane_on_second_sleep(_seconds: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps == 2:
+            socket = tmp_path / "tmux.sock"
+            socket.touch()
+            write_tmux_target(bridge_dir, socket_path=socket, tmux_target="main")
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", _resolver)
+    monkeypatch.setattr(reader, "_PLACEHOLDER_RECOVERY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(reader, "_sleep", _advertise_pane_on_second_sleep)
+
+    assert await reader._discover(bridge_dir, poll_interval_s=0.0, stop=_stop_after(3)) is None
+    assert warn_flags == [True, False]
+
+
+def _recovering_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, _PostSink]:
+    """A placeholder bridge dir whose scan adopts the typed cascade and whose poll
+    mirrors one committed reply; returns the bridge dir and the event sink."""
+    bridge_dir = _placeholder_bridge_dir(tmp_path)
+    _own_conversation_db(bridge_dir, _CASCADE_ID)
+    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT)
+    monkeypatch.setattr(
+        reader, "get_all_cascade_trajectories", lambda _p: _typed_body(_CASCADE_ID)
+    )
+    text = _load("planner_response_text")
+    sink = _PostSink()
+    monkeypatch.setattr(
+        reader,
+        "stream_agent_state_updates",
+        _RaisingStream(httpx.ConnectError("stream disabled for poll test")),
+    )
+    monkeypatch.setattr(reader, "get_trajectory_steps", _StepScript([[text], [text]]))
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+    monkeypatch.setattr(reader, "_sleep", _no_sleep)
+    return bridge_dir, sink
+
+
+@pytest.mark.asyncio
+async def test_supervise_reader_recovers_placeholder_and_mirrors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """The reader escapes the placeholder deadlock: it adopts the TUI-minted
+    cascade, mirrors the typed turn, and records the adopted cascade for
+    ``--resume`` (no rotation-based first adoption will ever run for it)."""
+    bridge_dir, sink = _recovering_reader(tmp_path, monkeypatch)
+
+    class _RecordingClient:
+        def __init__(self) -> None:
+            self.patches: list[tuple[str, dict[str, object] | None]] = []
+
+        async def patch(self, url: str, json: dict[str, object] | None = None) -> httpx.Response:
+            self.patches.append((url, json))
+            return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
+
+    client = _RecordingClient()
+
+    async def _on_pending(_cascade_id: str, _port: int, _pending: PendingInteraction) -> None:
+        return None
+
+    await reader.supervise_reader(
+        bridge_dir,
+        _SESSION_ID,
+        client=cast(httpx.AsyncClient, client),
+        on_pending_interaction=cast(Any, _on_pending),
+        poll_interval_s=0.0,
+        stop=_stop_after(4),
+    )
+
+    # The adopted TUI cascade replaced the placeholder under the SAME session.
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == _CASCADE_ID
+    assert state.session_id == _SESSION_ID
+    # The reply was mirrored — the deadlock (nothing ever posted) is gone.
+    assert sink.item_types() == ["message"]
+    # The adopted cascade is recorded for --resume, like first-cascade adoption.
+    assert client.patches == [
+        (f"/v1/sessions/{_SESSION_ID}", {"external_session_id": _CASCADE_ID})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_supervise_reader_recovery_survives_a_failed_resume_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """Recording the adopted cascade for --resume is best-effort: a failing PATCH
+    is logged and the reader still binds the cascade and mirrors the turn."""
+    bridge_dir, sink = _recovering_reader(tmp_path, monkeypatch)
+
+    class _UnreachableClient:
+        async def patch(self, url: str, json: dict[str, object] | None = None) -> httpx.Response:
+            raise httpx.ConnectError("server unreachable")
+
+    async def _on_pending(_cascade_id: str, _port: int, _pending: PendingInteraction) -> None:
+        return None
+
+    await reader.supervise_reader(
+        bridge_dir,
+        _SESSION_ID,
+        client=cast(httpx.AsyncClient, _UnreachableClient()),
+        on_pending_interaction=cast(Any, _on_pending),
+        poll_interval_s=0.0,
+        stop=_stop_after(4),
+    )
+
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == _CASCADE_ID
+    assert sink.item_types() == ["message"]
+
+
+# ---------------------------------------------------------------------------
 # T-G: supervise_reader signals rotation; _rotate_session_for_cascade API;
 #      run_reader_with_bridge rebind loop
 # ---------------------------------------------------------------------------
@@ -3863,9 +4327,10 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
 ) -> None:
     """``_rotate_session_for_cascade`` runs claude's exact session-rotation sequence.
 
-    Asserts: GET old snapshot → POST /v1/sessions (agent_id + inherited labels) →
-    PATCH runner_id → POST terminal transfer → PATCH old runner_id="" — and that
-    bridge state is rewritten with the new session id + new cascade id. Crucially,
+    Asserts: GET old snapshot → POST /v1/sessions (agent_id, title, project + labels) →
+    PATCH runner_id → POST terminal transfer → PATCH old runner_id="" → the
+    ``/clear`` notice to the OLD session — and that bridge state is rewritten with
+    the new session id + new cascade id. Crucially,
     NO ``external_session_id`` PATCH is made: agy is one long-lived process hosting
     many cascades, so the new cascade is already live (reached via the rewritten
     bridge state, not a later ``--resume``), exactly as claude's
@@ -3883,6 +4348,8 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
         "agent_id": "agent_xyz",
         "runner_id": "runner_abc",
         "labels": {ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY: "bridge-123"},
+        "title": "Fix login flow",
+        "project_id": "proj_alpha",
     }
     calls: list[tuple[str, str, dict[str, object]]] = []
     async with _rotation_client(monkeypatch, calls=calls, snapshot=snapshot) as client:
@@ -3906,18 +4373,34 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
             f"/v1/sessions/{_SESSION_ID}/resources/terminals/terminal_antigravity_main/transfer",
         ),
         ("PATCH", f"/v1/sessions/{_SESSION_ID}"),  # release old runner
+        # The shared /clear notice to the OLD conversation.
+        ("POST", f"/v1/sessions/{_SESSION_ID}/events"),
+        ("POST", f"/v1/sessions/{_SESSION_ID}/events"),
+        ("POST", f"/v1/sessions/{_SESSION_ID}/events"),
     ]
+    event_bodies = [b for (_m, p, b) in calls if p == f"/v1/sessions/{_SESSION_ID}/events"]
+    assert [b.get("type") for b in event_bodies] == [
+        "external_session_status",
+        "external_conversation_item",
+        "external_session_superseded",
+    ]
+    assert event_bodies[1]["data"]["item_data"]["agent"] == "antigravity-native-ui"
+    assert event_bodies[2].get("data") == {"target_conversation_id": "conv_new"}
     # No external_session_id PATCH is made anywhere (the loop-bug source): every
     # PATCH body is a runner_id bind/release, never an external_session_id write.
     assert all("external_session_id" not in body for (_m, _p, body) in calls), (
         f"rotation must not PATCH external_session_id (claude parity); calls={calls!r}"
     )
-    # The create POST inherited the old agent_id + bridge-id label (so the new
-    # session resolves to the same bridge_dir).
+    # The create POST inherited the old agent_id, title, project + bridge-id label
+    # (so the new session resolves to the same bridge_dir).
     create_body = calls[1][2]
     assert create_body["agent_id"] == "agent_xyz"
     assert isinstance(create_body["labels"], dict)
     assert create_body["labels"][ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY] == "bridge-123"
+    assert create_body.get("title") == "Fix login flow"
+    assert create_body.get("project_id") == "proj_alpha"
+    assert create_body.get("workspace", "missing") is None
+    assert create_body.get("git", "missing") is None
     # The runner_id bind carried the old runner; the new session is owned by it.
     assert calls[2][2] == {"runner_id": "runner_abc"}
     # The terminal transfer targeted the new session (the SAME agy moves over).

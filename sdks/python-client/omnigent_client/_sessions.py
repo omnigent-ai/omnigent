@@ -24,7 +24,7 @@ from __future__ import annotations
 import builtins
 import json
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
@@ -36,7 +36,14 @@ from omnigent.server.schemas import ServerStreamEvent
 
 from ._agent_catalog import AgentCatalogEntry, RegisteredAgent, RegisteredAgentCatalog
 from ._child_status import child_summary_busy
-from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
+from ._errors import (
+    OmnigentError,
+    StaleCursorError,
+    raise_for_status,
+    require_json_object,
+    response_body,
+)
+from ._http import session_url
 from ._timeouts import _HOST_LAUNCH_READ_TIMEOUT_S, _SSE_TIMEOUT
 from ._types import PaginatedList
 
@@ -44,6 +51,10 @@ from ._types import PaginatedList
 # ``MAX_TREE_DEPTH`` and the REPL's ``_MAX_SUBAGENT_TREE_DEPTH`` so the SDK
 # rollup, the CLI ``↓`` tree, and the web Agents rail all walk the same depth.
 _DEFAULT_SUBTREE_DEPTH = 3
+# Rows asked for per ``descendants=true`` page (the server's page cap), and the
+# deepest tree the server returns that way; deeper walks go level by level.
+_DESCENDANTS_LIMIT = 1000
+_DESCENDANTS_MAX_DEPTH = 10
 
 # Adapter that validates a single SSE ``data:`` payload against the
 # typed discriminated union. Built once at module load — TypeAdapter
@@ -184,31 +195,48 @@ class Session:
         ``visibility="all", include_archived=True``. ``False`` for normal
         sessions.
     :param host_id: Host owning this session's runner, or ``None`` when unbound.
+    :param sandbox_status: Managed launch progress or failure details, when available.
+    :param sub_agent_name: For sub-agent sessions, the sub-agent type
+        name within the parent's spec tree, e.g. ``"summarizer"``.
+        ``None`` for top-level sessions.
+    :param kind: ``"default"`` for a top-level session or ``"sub_agent"``
+        for a child spawned by another session. ``"default"`` when an
+        older server omits the field.
+    :param parent_session_id: For sub-agent sessions, the parent
+        conversation's id, e.g. ``"conv_parent987"``. ``None`` for
+        top-level sessions.
+    :param root_conversation_id: Id of this session's spawn-tree root.
+        Equals ``id`` for top-level sessions; for sub-agents it points
+        at the top-level ancestor. ``None`` when the server omits it.
+    :param total_cost_usd: Cumulative LLM spend in USD for this session's
+        subtree, i.e. the session plus its sub-agents, e.g. ``0.42``.
+        It is not this session's own spend alone. ``None`` while the
+        session is unpriced (no turn has been priced yet) or when
+        ``usage_included`` is ``False``.
+    :param usage_by_model: Per-model breakdown of the same usage, keyed
+        by the raw harness model id. Each value is the server's
+        ``ModelUsage`` object as a dict (``input_tokens``,
+        ``output_tokens``, ``total_tokens``, cache buckets,
+        ``total_cost_usd``). ``None`` when nothing has been recorded or
+        when ``usage_included`` is ``False``.
+    :param usage_included: ``False`` when the snapshot was fetched with
+        ``include_usage=false``, so ``total_cost_usd`` and
+        ``usage_by_model`` are unknown rather than zero.
     :param runner_online: ``True`` iff a runner tunnel is currently
         registered for this session. ``None`` when liveness was not
-        requested (``include_liveness=False``) or the server has no
-        liveness lookup wired — never a stand-in for "offline".
+        requested, or the server has no liveness lookup wired; never a
+        stand-in for "offline".
     :param host_online: Whether the session's host tunnel is live.
-        ``None`` when liveness was not requested or the session has no
+        ``None`` when liveness was not requested, or the session has no
         host (CLI/local).
     :param host_resumable: Whether the session is bound to a dormant
         managed host the server can wake in place. Read from the host
         store rather than the liveness lookup, so the server sends it
         either way; ``None`` only when an older server omits it.
-    :param total_cost_usd: Cumulative priced cost over this session's
-        subtree, e.g. ``11.19``. ``None`` when never priced, and also
-        when usage was not requested (``usage_included=False``).
-    :param usage_by_model: Per-model breakdown of the same subtree
-        usage as raw dicts, keyed by harness model id. ``None`` when no
-        per-model usage was recorded, and also when usage was not
-        requested.
-    :param usage_included: ``False`` when the snapshot was fetched with
-        ``include_usage=False``. The usage fields above are then unknown
-        rather than zero, so a caller must not read them as spend.
     :param items_included: ``False`` when the snapshot was fetched with
-        ``include_items=False``. The server returns ``items=[]`` either
-        way, so an empty ``items`` means "none committed" only when this
-        is ``True``.
+        ``include_items=false``, or returned by a ``PATCH`` (which never
+        reads items). The server returns ``items=[]`` either way, so an
+        empty ``items`` means "none committed" only when this is ``True``.
     """
 
     id: str
@@ -231,12 +259,17 @@ class Session:
     external_session_id: str | None = None
     archived: bool = False
     host_id: str | None = None
-    runner_online: bool | None = None
-    host_online: bool | None = None
-    host_resumable: bool | None = None
+    sandbox_status: dict[str, Any] | None = None
+    sub_agent_name: str | None = None
+    kind: str = "default"
+    parent_session_id: str | None = None
+    root_conversation_id: str | None = None
     total_cost_usd: float | None = None
     usage_by_model: dict[str, dict[str, Any]] | None = None
     usage_included: bool = True
+    runner_online: bool | None = None
+    host_online: bool | None = None
+    host_resumable: bool | None = None
     items_included: bool = True
 
     @classmethod
@@ -255,7 +288,7 @@ class Session:
         raw_ltt = raw.get("last_total_tokens")
         raw_updated_at = raw.get("updated_at")
         raw_cost = raw.get("total_cost_usd")
-        usage_by_model_raw = raw.get("usage_by_model")
+        usage_raw = raw.get("usage_by_model")
         return cls(
             id=str(raw["id"]),
             agent_id=str(raw["agent_id"]),
@@ -276,14 +309,18 @@ class Session:
             last_task_error=raw.get("last_task_error"),
             external_session_id=raw.get("external_session_id"),
             archived=bool(raw.get("archived", False)),
-            host_id=raw.get("host_id"),
+            sub_agent_name=raw.get("sub_agent_name"),
+            kind=str(raw.get("kind") or "default"),
+            parent_session_id=raw.get("parent_session_id"),
+            root_conversation_id=raw.get("root_conversation_id"),
+            total_cost_usd=float(raw_cost) if raw_cost is not None else None,
+            usage_by_model=usage_raw if isinstance(usage_raw, dict) else None,
+            usage_included=bool(raw.get("usage_included", True)),
             runner_online=raw.get("runner_online"),
             host_online=raw.get("host_online"),
             host_resumable=raw.get("host_resumable"),
-            total_cost_usd=float(raw_cost) if raw_cost is not None else None,
-            usage_by_model=(usage_by_model_raw if isinstance(usage_by_model_raw, dict) else None),
-            # Older servers predate the indicator and always aggregate usage.
-            usage_included=bool(raw.get("usage_included", True)),
+            host_id=raw.get("host_id"),
+            sandbox_status=raw.get("sandbox_status"),
         )
 
 
@@ -415,6 +452,10 @@ class SessionsNamespace:
     is no replay; see the module docstring for the snapshot +
     live-tail reconnect contract.
 
+    Session and elicitation ids are opaque single path segments: a
+    method raises ``ValueError`` before sending anything when a
+    caller-supplied id is empty, a dot segment, or contains ``/``.
+
     :param http: Pre-built ``httpx.AsyncClient`` shared with the
         parent :class:`OmnigentClient`. Owned by the parent;
         this namespace must NOT close it.
@@ -513,6 +554,8 @@ class SessionsNamespace:
         reasoning_effort: str | None = None,
         workspace: str | None = None,
         host_id: str | None = None,
+        host_type: Literal["external", "managed"] = "external",
+        sandbox_provider: str | None = None,
     ) -> Session:
         """
         Create a new session bound to an already-registered agent.
@@ -535,6 +578,10 @@ class SessionsNamespace:
             the session, e.g. ``"/Users/corey/projects/myapp"``.
         :param host_id: Launch the runner on this host; read timeout is at least
             3660 seconds. Longer or unlimited client timeouts are retained.
+        :param host_type: Use ``managed`` to provision a fresh sandbox host.
+            Its optional workspace is a repository URL instead of a host path.
+        :param sandbox_provider: Explicit managed sandbox provider, e.g. ``modal``.
+            Only valid with ``host_type="managed"``; validated by the server.
         :returns: The newly created :class:`Session` snapshot.
         :raises OmnigentError: If the server returns a non-2xx status,
             or a host-targeted create times out before its outcome is known.
@@ -550,6 +597,10 @@ class SessionsNamespace:
             body["workspace"] = workspace
         if host_id is not None:
             body["host_id"] = host_id
+        if host_type != "external":
+            body["host_type"] = host_type
+        if sandbox_provider is not None:
+            body["sandbox_provider"] = sandbox_provider
         timeout = httpx.Timeout(self._http.timeout)
         if host_id is not None and timeout.read is not None:
             timeout.read = max(timeout.read, _HOST_LAUNCH_READ_TIMEOUT_S)
@@ -829,7 +880,7 @@ class SessionsNamespace:
             registered).
         """
         resp = await self._http.patch(
-            f"{self._base}/v1/sessions/{session_id}",
+            session_url(self._base, session_id),
             json={"runner_id": runner_id},
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -850,7 +901,7 @@ class SessionsNamespace:
             session does not exist).
         """
         resp = await self._http.patch(
-            f"{self._base}/v1/sessions/{session_id}",
+            session_url(self._base, session_id),
             json={"runner_id": ""},
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -879,7 +930,7 @@ class SessionsNamespace:
         """
         wire_effort = reasoning_effort if reasoning_effort is not None else "default"
         resp = await self._http.patch(
-            f"{self._base}/v1/sessions/{session_id}",
+            session_url(self._base, session_id),
             json={"reasoning_effort": wire_effort},
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -922,7 +973,7 @@ class SessionsNamespace:
         if silent:
             body["silent"] = True
         resp = await self._http.patch(
-            f"{self._base}/v1/sessions/{session_id}",
+            session_url(self._base, session_id),
             json=body,
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -954,7 +1005,7 @@ class SessionsNamespace:
             access, 404 when the session does not exist).
         """
         resp = await self._http.patch(
-            f"{self._base}/v1/sessions/{session_id}",
+            session_url(self._base, session_id),
             json={"archived": archived},
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -987,8 +1038,43 @@ class SessionsNamespace:
             exist).
         """
         resp = await self._http.patch(
-            f"{self._base}/v1/sessions/{session_id}",
+            session_url(self._base, session_id),
             json={"external_session_id": external_session_id},
+        )
+        raise_for_status(resp.status_code, response_body(resp))
+        return _session_from_patch(resp)
+
+    async def set_labels(
+        self,
+        session_id: str,
+        labels: dict[str, str],
+    ) -> Session:
+        """
+        Upsert guardrails labels on an existing session.
+
+        Calls ``PATCH /v1/sessions/{session_id}`` with
+        ``{"labels": {...}}``. The server merges rather than replaces:
+        every key in *labels* is written with its value and keys not
+        mentioned keep their current value, so a partial update never
+        drops other labels. Values are sent verbatim: an empty string is
+        stored as ``""`` rather than removing the key (the server clears
+        only its own project and pin keys on an empty value). An empty
+        mapping leaves the session unchanged.
+
+        :param session_id: Session/conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param labels: Label key/value pairs to write, e.g.
+            ``{"team": "platform"}``.
+        :returns: The updated :class:`Session` snapshot; its ``labels``
+            carry the merged result.
+        :raises OmnigentError: On non-2xx status (400 for a
+            server-reserved key, 403 for an advisor-owned
+            ``cost_control.*`` key without the bound runner's authority
+            on a multi-user server, 404 when the session does not exist).
+        """
+        resp = await self._http.patch(
+            session_url(self._base, session_id),
+            json={"labels": labels},
         )
         raise_for_status(resp.status_code, response_body(resp))
         return _session_from_patch(resp)
@@ -1027,7 +1113,7 @@ class SessionsNamespace:
         if after is not None:
             params["after"] = after
         resp = await self._http.get(
-            f"{self._base}/v1/sessions/{session_id}/items",
+            session_url(self._base, session_id, "items"),
             params=params,
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -1040,6 +1126,8 @@ class SessionsNamespace:
         *,
         limit: int = 100,
         after: str | None = None,
+        descendants: bool = False,
+        max_depth: int | None = None,
     ) -> PaginatedList:
         """
         List sub-agent (child) sessions under a parent session.
@@ -1056,6 +1144,11 @@ class SessionsNamespace:
         :param limit: Maximum number of children to return
             (1-1000, default 100).
         :param after: Cursor — return children after this session ID.
+        :param descendants: Ask for the whole subtree in one response
+            (breadth-first, each row's ``parent_session_id`` is its own
+            parent and ``depth`` is set). Servers without it ignore the
+            flag and return direct children, whose rows have no ``depth``.
+        :param max_depth: Levels to return with *descendants*.
         :returns: :class:`PaginatedList` with ``data``, ``has_more``,
             ``first_id``, and ``last_id``.  Pass ``result.last_id`` as
             ``after=`` to fetch the next page when ``result.has_more``.
@@ -1065,8 +1158,12 @@ class SessionsNamespace:
         params: dict[str, str | int] = {"limit": limit}
         if after is not None:
             params["after"] = after
+        if descendants:
+            params["descendants"] = "true"
+            if max_depth is not None:
+                params["max_depth"] = max_depth
         resp = await self._http.get(
-            f"{self._base}/v1/sessions/{session_id}/child_sessions",
+            session_url(self._base, session_id, "child_sessions"),
             params=params,
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -1079,11 +1176,16 @@ class SessionsNamespace:
         *,
         max_depth: int = _DEFAULT_SUBTREE_DEPTH,
         limit: int = 100,
+        expand: Callable[[Mapping[str, Any]], bool] | None = None,
     ) -> builtins.list[dict[str, Any]]:
         """List the whole sub-agent subtree under *session_id*, flattened.
 
-        :meth:`child_sessions` is one level deep; this recurses it breadth-first
-        to *max_depth*, mirroring web's ``useChildSessions`` per-node fetch.
+        Asks the server for the whole subtree (``descendants=true``, paged).
+        A server without that, or a spawn tree too big for it, answers with
+        one level instead; that page is reused as the first level of a
+        breadth-first walk of :meth:`child_sessions`, mirroring web's
+        ``useChildSessions`` per-node fetch. Either way the result is what
+        that walk returns, including *limit* children per parent.
         Each returned row is the raw ``ChildSessionSummary`` dict with an added
         ``parent_id`` recording the session it was queried under, so callers can
         reconstruct the hierarchy. *session_id* itself is not included.
@@ -1095,11 +1197,23 @@ class SessionsNamespace:
         :param max_depth: Levels to descend (1 = direct children only). Capped
             to match the CLI tree and the web Agents rail.
         :param limit: Per-level page size passed to :meth:`child_sessions`.
+        :param expand: Optional predicate over a returned row deciding whether
+            to fetch that row's own children. ``None`` descends into every row.
+            A poller passes one to skip subtrees it already knows have settled,
+            so their unchanged rows aren't re-fetched; *session_id* itself is
+            always expanded.
         :returns: Flattened list of child-session summary dicts, each carrying a
             ``parent_id`` key (empty when the session has no sub-agents).
         :raises OmnigentError: On non-2xx status (404 when the session does not
             exist).
         """
+        if max_depth <= 0:
+            return []
+        first: PaginatedList | None = None
+        if max_depth <= _DESCENDANTS_MAX_DEPTH:
+            rows, first = await _descendant_rows(self, session_id, max_depth)
+            if rows is not None:
+                return _limit_children_per_parent(rows, session_id, limit)
         nodes: list[dict[str, Any]] = []
         seen: set[str] = {session_id}
         frontier: list[str] = [session_id]
@@ -1107,7 +1221,12 @@ class SessionsNamespace:
         while frontier and depth < max_depth:
             next_frontier: list[str] = []
             for parent_id in frontier:
-                page = await self.child_sessions(parent_id, limit=limit)
+                if depth == 0 and first is not None:
+                    # An older server answered the descendants request with
+                    # this level; reuse it rather than asking again.
+                    page = PaginatedList(data=first.data[:limit], has_more=first.has_more)
+                else:
+                    page = await self.child_sessions(parent_id, limit=limit)
                 for row in page.data:
                     if not isinstance(row, dict):
                         continue
@@ -1115,8 +1234,10 @@ class SessionsNamespace:
                     if not isinstance(sid, str) or sid in seen:  # cycle / dupe guard
                         continue
                     seen.add(sid)
-                    nodes.append({**row, "parent_id": parent_id})
-                    next_frontier.append(sid)
+                    node = {**row, "parent_id": parent_id}
+                    nodes.append(node)
+                    if expand is None or expand(node):
+                        next_frontier.append(sid)
             frontier = next_frontier
             depth += 1
         return nodes
@@ -1155,6 +1276,7 @@ class SessionsNamespace:
         *,
         include_items: bool = True,
         include_liveness: bool = True,
+        include_live_status: bool = True,
         include_usage: bool = True,
         refresh_state: bool = False,
     ) -> Session:
@@ -1166,66 +1288,90 @@ class SessionsNamespace:
         queued inputs — clients use this on reconnect to reconcile
         state observed via :meth:`stream`.
 
-        An orchestrator polling a session's lifecycle can skip the three
-        expensive parts of the snapshot::
+        The ``include_*`` flags let a poller that reads only a few fields
+        (status, labels) skip the snapshot's expensive parts. Only flags set to
+        ``False`` are sent, so the default request is unchanged and older
+        servers, which ignore unknown parameters, still answer.
 
-            session = await client.sessions.get(
-                session_id,
-                include_items=False,
-                include_liveness=False,
-                include_usage=False,
-            )
-
-        Each flag that is skipped leaves its fields unknown rather than
-        empty: usage reads ``None`` with ``usage_included=False``,
-        liveness reads ``None``, and ``items_included`` is ``False``
-        beside the empty ``items`` the server returns either way.
+        A skipped flag leaves its fields unknown rather than empty: usage reads
+        ``None`` with ``usage_included=False``, liveness reads ``None``, and
+        ``items_included`` is ``False`` beside the empty ``items``.
 
         Two things ``status`` does not tell a poller. It is the session's
         current lifecycle state, not an outcome for one submitted turn, so
-        ``"idle"`` does not prove that the turn this caller sent is the one
-        that finished; correlate a specific turn through the stream or its
-        items. And a skipped liveness lookup is not evidence the runner
-        stopped: ``runner_online`` reads ``None`` whether the runner is up
-        or down.
+        ``"idle"`` does not prove the turn this caller sent is the one that
+        finished; correlate a specific turn through the stream or its items.
+        And a skipped liveness lookup is not evidence the runner stopped:
+        ``runner_online`` reads ``None`` whether the runner is up or down.
 
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
-        :param include_items: When ``False``, skip the committed-items
-            read, the most expensive part of the snapshot.
-        :param include_liveness: When ``False``, skip the runner/host
-            liveness lookup.
-        :param include_usage: When ``False``, skip the subtree usage
-            aggregation.
-        :param refresh_state: When ``True``, refresh runner-derived
-            overlays from the live session instead of serving cached
-            state. It drops the server's cached catalogs for this session,
-            which every client of it shares, so use it to recover from
-            stale state rather than on each poll.
+        :param include_items: ``False`` skips the committed-items read
+            (``items`` is then empty).
+        :param include_liveness: ``False`` skips the runner/host liveness
+            lookup (``runner_online`` / ``host_online`` are then unset).
+        :param include_live_status: ``False`` reports the cached status
+            instead of probing the bound runner.
+        :param include_usage: ``False`` skips the subtree usage read.
+        :param refresh_state: ``True`` refreshes runner-derived overlays from
+            the live session instead of serving cached state. It drops the
+            server's cached catalogs for this session, which every client of it
+            shares, so use it to recover from stale state rather than on each
+            poll.
         :returns: The current :class:`Session` snapshot.
         :raises OmnigentError: If the server returns a non-2xx
             status (404 when the session does not exist).
         """
-        # Only non-default flags go on the wire, so an existing caller's
-        # request is unchanged and an older server keeps its own defaults.
-        params: dict[str, str] = {}
-        if not include_items:
-            params["include_items"] = "false"
-        if not include_liveness:
-            params["include_liveness"] = "false"
-        if not include_usage:
-            params["include_usage"] = "false"
+        flags = {
+            "include_items": include_items,
+            "include_liveness": include_liveness,
+            "include_live_status": include_live_status,
+            "include_usage": include_usage,
+        }
+        params = {name: "false" for name, enabled in flags.items() if not enabled}
         if refresh_state:
             params["refresh_state"] = "true"
         resp = await self._http.get(
-            f"{self._base}/v1/sessions/{session_id}",
-            params=params,
+            session_url(self._base, session_id),
+            params=params or None,
         )
         raise_for_status(resp.status_code, response_body(resp))
         session = Session.from_dict(require_json_object(resp, "GET /v1/sessions/{session_id}"))
         # The server returns items=[] whether they were excluded or the
         # session has none, so the request is what tells the two apart.
         return replace(session, items_included=include_items)
+
+    async def delete(
+        self,
+        session_id: str,
+        *,
+        delete_branch: bool = False,
+    ) -> None:
+        """
+        Delete a session and the resources the server holds for it.
+
+        Calls ``DELETE /v1/sessions/{session_id}``. The server stops any
+        running turn, tears down runner-side resources, removes the
+        session's files and drops the conversation row, so a later
+        :meth:`get` raises a 404 :class:`OmnigentError`. Owner-only.
+
+        :param session_id: Session/conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param delete_branch: When ``True`` and the session has a
+            server-created git worktree, also remove that worktree and
+            delete its branch on the host (sent as
+            ``?delete_branch=true``). Ignored for sessions without a
+            worktree.
+        :raises OmnigentError: On non-2xx status (403 when the caller is
+            not the owner, 404 when the session does not exist, 409 when
+            ``delete_branch=True`` and the host is offline so worktree
+            cleanup cannot run).
+        """
+        resp = await self._http.delete(
+            session_url(self._base, session_id),
+            params={"delete_branch": "true"} if delete_branch else None,
+        )
+        raise_for_status(resp.status_code, response_body(resp))
 
     async def post_event(
         self,
@@ -1252,7 +1398,7 @@ class SessionsNamespace:
             status (404 when the session does not exist).
         """
         resp = await self._http.post(
-            f"{self._base}/v1/sessions/{session_id}/events",
+            session_url(self._base, session_id, "events"),
             json=event,
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -1291,7 +1437,7 @@ class SessionsNamespace:
             status (404 when the session does not exist).
         """
         resp = await self._http.post(
-            f"{self._base}/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+            session_url(self._base, session_id, "elicitations", elicitation_id, "resolve"),
             json=result,
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -1336,7 +1482,7 @@ class SessionsNamespace:
         if up_to_response_id is not None:
             body["up_to_response_id"] = up_to_response_id
         resp = await self._http.post(
-            f"{self._base}/v1/sessions/{source_session_id}/fork",
+            session_url(self._base, source_session_id, "fork"),
             json=body,
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -1449,7 +1595,7 @@ async def _stream_session_events(
     """
     async with http.stream(
         "GET",
-        f"{base_url}/v1/sessions/{session_id}/stream",
+        session_url(base_url, session_id, "stream"),
         timeout=_SSE_TIMEOUT,
     ) as resp:
         if resp.status_code >= 400:
@@ -1551,3 +1697,74 @@ def _try_parse_envelope(raw: str) -> ServerStreamEvent | None:
         # event in arrival order.
         _log.debug("Skipping unparseable session event: %s (%s)", raw[:200], exc)
         return None
+
+
+def _limit_children_per_parent(
+    rows: list[dict[str, Any]], root_id: str, limit: int
+) -> list[dict[str, Any]]:
+    """Keep what a level-by-level walk with page size *limit* would have seen.
+
+    The walk reads the first *limit* children of each node (newest first),
+    so it never reaches children it did not read or anything below them.
+
+    :param rows: Breadth-first ``descendants=true`` rows.
+    :param root_id: Session the subtree hangs off.
+    :param limit: Children kept per parent.
+    :returns: Kept rows, each with ``parent_id`` set to its parent.
+    """
+    reached = {root_id}
+    kept_per_parent: dict[str, int] = {}
+    kept: list[dict[str, Any]] = []
+    for row in rows:
+        parent_id, child_id = row.get("parent_session_id"), row.get("id")
+        if not isinstance(parent_id, str) or not isinstance(child_id, str):
+            continue
+        if parent_id not in reached:
+            continue
+        if kept_per_parent.get(parent_id, 0) >= limit:
+            continue
+        kept_per_parent[parent_id] = kept_per_parent.get(parent_id, 0) + 1
+        reached.add(child_id)
+        kept.append({**row, "parent_id": parent_id})
+    return kept
+
+
+async def _descendant_rows(
+    sessions: SessionsNamespace, session_id: str, max_depth: int
+) -> tuple[list[dict[str, Any]] | None, PaginatedList | None]:
+    """Read the subtree with ``descendants=true``, following its pages.
+
+    :param sessions: Namespace whose :meth:`~SessionsNamespace.child_sessions` is read.
+    :param session_id: Root parent session identifier.
+    :param max_depth: Levels to return.
+    :returns: ``(rows, None)`` when the server returned the subtree;
+        ``(None, page)`` when it answered with one level instead (a server
+        without the flag, or a tree too big for it), so the caller walks
+        levels starting from *page*; or ``(None, None)`` when a later page
+        could not continue, so the caller walks from scratch.
+    """
+    page = await sessions.child_sessions(
+        session_id, limit=_DESCENDANTS_LIMIT, descendants=True, max_depth=max_depth
+    )
+    rows = [row for row in page.data if isinstance(row, dict)]
+    if any(row.get("depth") is None for row in rows):
+        return None, page
+    while page.has_more and page.last_id:
+        try:
+            page = await sessions.child_sessions(
+                session_id,
+                limit=_DESCENDANTS_LIMIT,
+                after=page.last_id,
+                descendants=True,
+                max_depth=max_depth,
+            )
+        except StaleCursorError:
+            # The tree changed past what one read covers; restart the walk.
+            return None, None
+        more = [row for row in page.data if isinstance(row, dict)]
+        # A continuation is never empty or depth-less; either means this page
+        # is not part of the same subtree, so the pages cannot be stitched.
+        if not more or any(row.get("depth") is None for row in more):
+            return None, None
+        rows.extend(more)
+    return rows, None

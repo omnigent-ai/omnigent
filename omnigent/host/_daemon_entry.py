@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import logging
 import os
 import time
@@ -69,15 +70,33 @@ def main() -> None:
         # Both or neither — the CLI always passes exactly one; fail loud.
         parser.error("exactly one of --server <url> or --local is required")
 
+    from omnigent.cli_auth import (
+        PINNED_DATABRICKS_ORG_ENV_VAR,
+        pin_databricks_org_id,
+        pinned_databricks_org_id,
+    )
     from omnigent.host.daemon_lifecycle import (
         DAEMON_CONFIG_SIG_ENV_VAR,
         DaemonLifecycleLock,
         HostDaemonRecord,
+        daemon_target_server_url,
         normalize_daemon_target,
         write_daemon_record,
     )
+    from omnigent.util.server_url import is_workspace_hosted_url
 
-    daemon_target = normalize_daemon_target(None if args.local else args.server)
+    workspace_hosted = not args.local and is_workspace_hosted_url(args.server)
+    if workspace_hosted:
+        from omnigent.util.server_url import ServerUrl
+
+        pin_databricks_org_id(args.server, ServerUrl.from_api_base(args.server).org_id)
+    daemon_target = normalize_daemon_target(
+        None if args.local else args.server,
+        org_id=pinned_databricks_org_id(args.server) if workspace_hosted else None,
+    )
+    # The registry key carries the pinned workspace; the server URL must not,
+    # since request paths are appended to it.
+    server_url = None if args.local else daemon_target_server_url(daemon_target)
     set_host_exit_context(daemon_target=daemon_target)
     lifecycle_lock = DaemonLifecycleLock.for_target(daemon_target)
     claim = lifecycle_lock.try_acquire()
@@ -105,20 +124,26 @@ def main() -> None:
             pid=os.getpid(),
             target=daemon_target,
             mode=mode,
-            server_url=None if args.local else daemon_target,
+            server_url=server_url,
             log_path=str(log_path),
             started_at=int(time.time()),
             host_id=identity.host_id,
             config_sig=os.environ.get(DAEMON_CONFIG_SIG_ENV_VAR),
             workspace_id=workspace_id,
+            org_pin=os.environ.get(PINNED_DATABRICKS_ORG_ENV_VAR) if workspace_hosted else None,
         )
         write_daemon_record(record, update_legacy_pidfile=True)
 
+        server_still_ours = None
         if args.local:
             # The daemon owns the local server: start/reuse it, then connect.
-            from omnigent.host.local_server import ensure_local_omnigent_server
+            from omnigent.host.local_server import (
+                ensure_local_omnigent_server,
+                local_server_still_serves,
+            )
 
             server_url = ensure_local_omnigent_server().url
+            server_still_ours = functools.partial(local_server_still_serves, server_url)
         else:
             server_url = args.server
 
@@ -128,6 +153,7 @@ def main() -> None:
             server_url=server_url,
             daemon_target=daemon_target,
             lifecycle_lock=lifecycle_lock,
+            server_still_ours=server_still_ours,
         )
     finally:
         if workspace_lock is not None:

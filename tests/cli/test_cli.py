@@ -85,6 +85,7 @@ from omnigent.runner.identity import (
     RUNNER_WORKSPACE_ENV_VAR,
     token_bound_runner_id,
 )
+from omnigent.server.seeded_agents import SEEDED_AGENTS_ENV
 from omnigent.util.tunnel_limits import (
     RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
@@ -2374,6 +2375,9 @@ def test_server_command_reads_tunnel_token_and_does_not_spawn_runner(
         "  app_name: Must not leak into bare server config\n"
     )
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    # Keep the resolved server config off the real ~/.omnigent/config.yaml.
+    monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / "data" / "anchor"))
+    monkeypatch.delenv("OMNIGENT_CONFIG", raising=False)
 
     db_path = tmp_path / "chat.db"
     artifact_dir = tmp_path / "artifacts"
@@ -2410,6 +2414,115 @@ def test_server_command_reads_tunnel_token_and_does_not_spawn_runner(
     assert captured["create_app_kwargs"]["server_config"] == {
         "session_title_instructions": "Prefix titles with the current date."
     }
+
+
+def test_server_preserves_explicit_builtin_agent_through_startup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Built-in refresh must not replace a bundle supplied with ``--agent``."""
+    import uvicorn.server
+    from fastapi.testclient import TestClient
+
+    from omnigent.runtime import get_agent_cache
+
+    agent_dir = tmp_path / "polly"
+    agent_dir.mkdir()
+    _write_config(
+        agent_dir,
+        {
+            "spec_version": 1,
+            "name": "polly",
+            "description": "Explicitly registered bundle.",
+            "executor": {
+                "type": "omnigent",
+                "model": "test-codex-model",
+                "config": {"harness": "codex"},
+            },
+        },
+    )
+    observed: dict[str, Any] = {}
+
+    def run_app_lifespan(self: Any, **kwargs: Any) -> None:
+        with TestClient(self.config.app):
+            agent_store = self.config.app.state.agent_store
+            agent = agent_store.get_by_name("polly")
+            assert agent is not None
+            observed["spec"] = get_agent_cache().load(agent.id, agent.bundle_location).spec
+            assert agent_store.get_by_name("debby") is not None
+
+    monkeypatch.setattr(uvicorn.server.Server, "run", run_app_lifespan)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    result = CliRunner().invoke(
+        cli,
+        [
+            "server",
+            "--port",
+            "0",
+            "--database-uri",
+            f"sqlite:///{tmp_path / 'chat.db'}",
+            "--artifact-location",
+            str(tmp_path / "artifacts"),
+            "--agent",
+            str(agent_dir),
+        ],
+    )
+
+    assert result.exit_code == 0, result.exception or result.output
+    assert observed["spec"].executor.config["harness"] == "codex"
+    assert observed["spec"].executor.model == "test-codex-model"
+    assert observed["spec"].description == "Explicitly registered bundle."
+
+
+def test_server_with_agent_flag_hides_trimmed_builtins(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``--agent`` startup still hides trimmed built-ins, but never the explicit bundle."""
+    import uvicorn.server
+    from fastapi.testclient import TestClient
+
+    agent_dir = tmp_path / "polly"
+    agent_dir.mkdir()
+    _write_config(
+        agent_dir,
+        {
+            "spec_version": 1,
+            "name": "polly",
+            "executor": {
+                "type": "omnigent",
+                "model": "test-codex-model",
+                "config": {"harness": "codex"},
+            },
+        },
+    )
+    observed: dict[str, frozenset[str]] = {}
+
+    def run_app_lifespan(self: Any, **kwargs: Any) -> None:
+        with TestClient(self.config.app):
+            observed["suppressed"] = self.config.app.state.suppressed_agent_names
+
+    monkeypatch.setattr(uvicorn.server.Server, "run", run_app_lifespan)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv(SEEDED_AGENTS_ENV, "claude-native-ui")
+    result = CliRunner().invoke(
+        cli,
+        [
+            "server",
+            "--port",
+            "0",
+            "--database-uri",
+            f"sqlite:///{tmp_path / 'chat.db'}",
+            "--artifact-location",
+            str(tmp_path / "artifacts"),
+            "--agent",
+            str(agent_dir),
+        ],
+    )
+
+    assert result.exit_code == 0, result.exception or result.output
+    assert "debby" in observed["suppressed"]
+    assert "polly" not in observed["suppressed"]
 
 
 def test_server_explicit_config_overrides_omnigent_config_env(
@@ -2454,6 +2567,126 @@ def test_server_explicit_config_overrides_omnigent_config_env(
     assert result.exit_code == 0, result.output
     assert captured["config"] == str(explicit.resolve())
     bind_probe.assert_called_once_with("127.0.0.1", 44771)
+
+
+@pytest.mark.parametrize("config_source", ["environment", "data_dir"])
+def test_server_without_config_flag_serves_resolved_server_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    config_source: str,
+) -> None:
+    """Without ``-c``, the resolved server config supplies branding and title guidance."""
+    import uvicorn.server
+    from fastapi.testclient import TestClient
+
+    server_config_file = tmp_path / "server.yaml"
+    server_config_file.write_text("branding:\n  app_name: Resolved Server\n")
+    config_home = tmp_path / "config"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        "session_title_instructions: Prefix titles with the current date.\n"
+    )
+    if config_source == "environment":
+        monkeypatch.setenv("OMNIGENT_CONFIG", str(server_config_file))
+    else:
+        monkeypatch.delenv("OMNIGENT_CONFIG", raising=False)
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        server_config_file.rename(data_dir / "config.yaml")
+        monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(data_dir / "anchor"))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    observed: dict[str, Any] = {}
+    from omnigent.server import app as app_module
+
+    real_create_app = app_module.create_app
+
+    def spy_create_app(**kwargs: Any) -> Any:
+        observed["server_config"] = kwargs["server_config"]
+        return real_create_app(**kwargs)
+
+    def run_app_lifespan(self: Any, **kwargs: Any) -> None:
+        with TestClient(self.config.app) as client:
+            observed["branding"] = client.get("/v1/info").json()["branding"]
+
+    monkeypatch.setattr(app_module, "create_app", spy_create_app)
+    monkeypatch.setattr(uvicorn.server.Server, "run", run_app_lifespan)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "server",
+            "--port",
+            "0",
+            "--database-uri",
+            f"sqlite:///{tmp_path / 'chat.db'}",
+            "--artifact-location",
+            str(tmp_path / "artifacts"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.exception or result.output
+    assert observed["branding"]["app_name"] == "Resolved Server"
+    assert observed["server_config"]["session_title_instructions"] == (
+        "Prefix titles with the current date."
+    )
+
+
+@pytest.mark.parametrize(
+    ("server_config_line", "expected_instructions"),
+    [
+        pytest.param(
+            "session_title_instructions: Server guidance.\n",
+            "Server guidance.",
+            id="server-value-beats-user-value",
+        ),
+        pytest.param(
+            "session_title_instructions: null\n",
+            None,
+            id="server-null-disables-user-fallback",
+        ),
+    ],
+)
+def test_server_without_config_flag_prefers_server_title_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    server_config_line: str,
+    expected_instructions: str | None,
+) -> None:
+    """A title key present in the resolved server config blocks the user config fallback."""
+    import uvicorn.server
+
+    from omnigent.server import app as app_module
+
+    server_config_file = tmp_path / "server.yaml"
+    server_config_file.write_text(server_config_line)
+    config_home = tmp_path / "config"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text("session_title_instructions: User guidance.\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(server_config_file))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    observed: dict[str, Any] = {}
+    real_create_app = app_module.create_app
+
+    def spy_create_app(**kwargs: Any) -> Any:
+        observed["server_config"] = kwargs["server_config"]
+        return real_create_app(**kwargs)
+
+    monkeypatch.setattr(app_module, "create_app", spy_create_app)
+    monkeypatch.setattr(uvicorn.server.Server, "run", lambda self, **kwargs: None)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "server",
+            "--port",
+            "0",
+            "--database-uri",
+            f"sqlite:///{tmp_path / 'chat.db'}",
+            "--artifact-location",
+            str(tmp_path / "artifacts"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.exception or result.output
+    assert observed["server_config"]["session_title_instructions"] == expected_instructions
 
 
 @pytest.mark.parametrize("authority", [False, 123, [], {}, "", " ", "x" * 129])
@@ -3420,9 +3653,19 @@ def _upload_and_parse(agent_dir: Path) -> dict[str, Any]:
     :param agent_dir: The agent image directory.
     :returns: ``{server_name: MCPServerConfig}`` from the server-side spec.
     """
+    return _parse_bundle(_bundle(agent_dir))
+
+
+def _parse_bundle(bundle_bytes: bytes) -> dict[str, Any]:
+    """
+    Parse an already-built bundle the way the server parses an upload.
+
+    :param bundle_bytes: The bundle tarball bytes.
+    :returns: ``{server_name: MCPServerConfig}`` from the server-side spec.
+    """
     from omnigent.server.bundles import validate_agent_bundle
 
-    spec = validate_agent_bundle(_bundle(agent_dir), enforce_handler_allowlist=False)
+    spec = validate_agent_bundle(bundle_bytes, enforce_handler_allowlist=False)
     return {server.name: server for server in spec.mcp_servers}
 
 
@@ -3567,8 +3810,9 @@ def test_bundle_upload_rewrites_mcp_file_only_when_a_value_expands(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    MCP files whose headers and env are all literal ship byte-for-byte
-    (comments and formatting kept); a ``${VAR}`` header is resolved.
+    MCP files whose url, headers and env are all literal ship byte-for-byte
+    (comments and formatting kept); a ``${VAR}`` header is resolved. Each
+    fixture is a valid declaration for its transport (``env`` is stdio-only).
     """
     monkeypatch.setenv("SIDECAR_MCP_TOKEN", "tok-sidecar")
     _write_upload_agent(
@@ -3583,17 +3827,25 @@ def test_bundle_upload_rewrites_mcp_file_only_when_a_value_expands(
     )
     mcp_dir = tmp_path / "tools" / "mcp"
     mcp_dir.mkdir(parents=True, exist_ok=True)
-    literal_text = (
+    literal_http_text = (
         "# Hand-written sidecar; keep this comment.\n"
-        "name: literal\n"
+        "name: literal-http\n"
         "transport: http\n"
         "url: http://localhost:9000/mcp\n"
         "headers:\n"
         "  Authorization: Bearer literal-token  # not a secret\n"
+    )
+    (mcp_dir / "literal-http.yaml").write_text(literal_http_text, encoding="utf-8")
+    literal_stdio_text = (
+        "# Local server; keep this comment.\n"
+        "name: literal-stdio\n"
+        "transport: stdio\n"
+        "command: node\n"
+        "args: [server.js]\n"
         "env:\n"
         "  LOG_LEVEL: debug\n"
     )
-    (mcp_dir / "literal.yaml").write_text(literal_text, encoding="utf-8")
+    (mcp_dir / "literal-stdio.yaml").write_text(literal_stdio_text, encoding="utf-8")
     (mcp_dir / "templated.yaml").write_text(
         "# Token comes from the uploader's environment.\n"
         "name: templated\n"
@@ -3608,11 +3860,22 @@ def test_bundle_upload_rewrites_mcp_file_only_when_a_value_expands(
     bundle_bytes = _bundle(tmp_path)
 
     assert "config.yaml" not in resolved
-    assert "tools/mcp/literal.yaml" not in resolved
-    assert _bundle_member_text(bundle_bytes, "tools/mcp/literal.yaml") == literal_text
+    for name, text in (
+        ("tools/mcp/literal-http.yaml", literal_http_text),
+        ("tools/mcp/literal-stdio.yaml", literal_stdio_text),
+    ):
+        assert name not in resolved
+        assert _bundle_member_text(bundle_bytes, name) == text
     assert "tools/mcp/templated.yaml" in resolved
     templated = _extract_yaml_from_bundle(bundle_bytes, "tools/mcp/templated.yaml")
     assert templated["headers"] == {"Authorization": "Bearer tok-sidecar"}
+    # The server accepts the same bundle, so every fixture is a valid declaration.
+    servers = _parse_bundle(bundle_bytes)
+    assert set(servers) == {"inline", "literal-http", "literal-stdio", "templated"}
+    assert servers["literal-http"].url == "http://localhost:9000/mcp"
+    assert servers["literal-http"].headers == {"Authorization": "Bearer literal-token"}
+    assert servers["literal-stdio"].env == {"LOG_LEVEL": "debug"}
+    assert servers["templated"].headers == {"Authorization": "Bearer tok-sidecar"}
 
 
 def test_bundle_materializes_standalone_omnigent_yaml(tmp_path: Path) -> None:
@@ -7038,6 +7301,41 @@ def test_warn_missing_harness_dependencies_lists_all_gaps(
     err = capsys.readouterr().err
     assert "Node.js is too old" in err
     assert "tmux not found" in err
+
+
+@pytest.mark.parametrize(
+    ("args", "servers", "exit_code"),
+    [
+        pytest.param(["--server", "https://example.com"], ["https://example.com"], 3, id="remote"),
+        pytest.param(["--local"], [""], 3, id="local"),
+        pytest.param([], [], 2, id="missing-mode"),
+        pytest.param(["--local", "--server", "https://example.com"], [], 2, id="both-modes"),
+    ],
+)
+def test_host_service_entry_runs_the_service_host(
+    monkeypatch: pytest.MonkeyPatch,
+    args: list[str],
+    servers: list[str],
+    exit_code: int,
+) -> None:
+    """Verify the wrapper-launched service command reaches the service entry point."""
+    from omnigent import cli as cli_module
+
+    started: list[str] = []
+
+    def _run(server: str) -> int:
+        started.append(server)
+        return 3
+
+    monkeypatch.setattr("omnigent.host.service_entry.run", _run)
+
+    monkeypatch.setattr(sys, "argv", ["omnigent", "host-service-entry", *args])
+
+    with pytest.raises(SystemExit) as result:
+        cli_module.main()
+
+    assert result.value.code == exit_code
+    assert started == servers
 
 
 def test_click_subcommands_allowlist_covers_registered_commands() -> None:
