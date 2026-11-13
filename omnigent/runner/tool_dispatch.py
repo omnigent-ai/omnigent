@@ -8193,7 +8193,7 @@ async def _execute_os_env_tool(
         # Shell descendants can outlive a successful command. Retire the whole
         # tool helper until shell requests have their own complete lifetime boundary.
         completed = tool_name != SysOsShellTool.name() and not (
-            isinstance(result, dict) and result.get("timed_out")
+            isinstance(result, dict) and ("error" in result or result.get("timed_out"))
         )
     except Exception as exc:
         _logger.exception(

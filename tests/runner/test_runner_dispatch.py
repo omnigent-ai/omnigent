@@ -2784,14 +2784,21 @@ async def _os_env_helper_pid(
     from omnigent.inner.os_env import CallerProcessOSEnvironment
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
 
-    await _execute_os_env_tool(
-        "sys_os_read",
-        {"path": "note.txt"},
-        agent_spec=spec,
-        conversation_id=session_id,
-        resource_registry=registry,
+    assert spec.os_env is not None and spec.os_env.cwd is not None
+    note = Path(spec.os_env.cwd) / "note.txt"
+    if not note.exists():
+        note.write_text("ready\n")
+    read = json.loads(
+        await _execute_os_env_tool(
+            "sys_os_read",
+            {"path": "note.txt"},
+            agent_spec=spec,
+            conversation_id=session_id,
+            resource_registry=registry,
+        )
     )
-    assert spec.os_env is not None
+    assert "error" not in read
+    assert read["content"] == note.read_text()
     lease = await registry.lease_tool_environment(session_id, spec.os_env)
     assert lease is not None
     try:
@@ -2825,6 +2832,7 @@ async def _wait_until_dead(pid: int, timeout: float = 5.0) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_only
 async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
@@ -2846,17 +2854,17 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
 
             write = await _execute_os_env_tool(
                 "sys_os_write",
-                {"path": "note.txt", "content": "Привет 世界\nplanet\n"},
+                {"path": "created.txt", "content": "Привет 世界\nplanet\n"},
                 agent_spec=spec,
                 conversation_id="conv_runner_os_env_test",
                 resource_registry=registry,
             )
             assert json.loads(write)["created"] is True
-            assert root.joinpath("note.txt").read_text() == "Привет 世界\nplanet\n"
+            assert root.joinpath("created.txt").read_text() == "Привет 世界\nplanet\n"
 
             edit = await _execute_os_env_tool(
                 "sys_os_edit",
-                {"path": "note.txt", "oldText": "planet", "newText": "world"},
+                {"path": "created.txt", "oldText": "planet", "newText": "world"},
                 agent_spec=spec,
                 conversation_id="conv_runner_os_env_test",
                 resource_registry=registry,
@@ -2865,13 +2873,28 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
 
             read = await _execute_os_env_tool(
                 "sys_os_read",
-                {"path": "note.txt"},
+                {"path": "created.txt"},
                 agent_spec=spec,
                 conversation_id="conv_runner_os_env_test",
                 resource_registry=registry,
             )
             assert "Привет 世界" in read
             assert json.loads(read)["content"] == "Привет 世界\nworld\n"
+            assert (
+                await _os_env_helper_pid(registry, spec, "conv_runner_os_env_test") == helper_pid
+            )
+
+            error = await _execute_os_env_tool(
+                "sys_os_edit",
+                {"path": "created.txt", "oldText": "absent", "newText": "unused"},
+                agent_spec=spec,
+                conversation_id="conv_runner_os_env_test",
+                resource_registry=registry,
+            )
+            assert json.loads(error)["error"].startswith("Could not find oldText")
+            assert not _process_exists(helper_pid)
+            replacement = await _os_env_helper_pid(registry, spec, "conv_runner_os_env_test")
+            assert replacement != helper_pid
 
             shell = await _execute_os_env_tool(
                 "sys_os_shell",
@@ -2884,22 +2907,23 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
             assert shell_result["exit_code"] == 0
             cwd, pid = shell_result["stdout"].split()
             assert Path(cwd).resolve() == root.resolve()
-            # File calls stayed warm; the shell used that helper and then retired it.
-            assert int(pid) == helper_pid
-            assert not _process_exists(helper_pid)
-            replacement = await _os_env_helper_pid(registry, spec, "conv_runner_os_env_test")
-            assert replacement != helper_pid
+            # The shell used the replacement helper and then retired it.
+            assert int(pid) == replacement
+            assert not _process_exists(replacement)
+            after_shell = await _os_env_helper_pid(registry, spec, "conv_runner_os_env_test")
+            assert after_shell != replacement
 
         finally:
             await registry.cleanup_session("conv_runner_os_env_test")
-        assert not _process_exists(helper_pid)
+        assert not _process_exists(after_shell)
 
 
 @pytest.mark.asyncio
-async def test_runner_os_env_helper_restarts_and_keys_on_spec(
+@pytest.mark.posix_only
+async def test_runner_os_env_helper_restarts_replaces_workspace_and_times_out(
     tmp_path: Path,
 ) -> None:
-    """A crashed helper restarts; a changed spec, another session or a timeout gets a new one."""
+    """A crash, workspace change or timeout replaces the helper and closes the old one."""
     import signal
 
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
@@ -2926,35 +2950,9 @@ async def test_runner_os_env_helper_restarts_and_keys_on_spec(
         assert restarted != crashed
         assert await _os_env_helper_pid(registry, spec, "conv_a") == restarted
 
-        other_session = await _os_env_helper_pid(registry, spec, "conv_b")
-        assert other_session != restarted
-
         moved = await _os_env_helper_pid(registry, agent(tmp_path / "b"), "conv_a")
         assert moved != restarted
         assert not _process_exists(restarted)
-
-        # An env-only spec change at the same cwd replaces the helper in both directions.
-        passthrough_name = "TEST_HARMLESS_PASSTHROUGH"
-        env_spec = agent(tmp_path / "b")
-        assert env_spec.os_env is not None and env_spec.os_env.sandbox is not None
-        env_spec.os_env.sandbox.env_passthrough = [passthrough_name]
-        with_env = await _os_env_helper_pid(registry, env_spec, "conv_a")
-        assert with_env != moved
-        assert not _process_exists(moved)
-        moved = await _os_env_helper_pid(registry, agent(tmp_path / "b"), "conv_a")
-        assert moved != with_env
-        assert not _process_exists(with_env)
-
-        # The same spec whose cwd symlink now points elsewhere is a different workspace.
-        (tmp_path / "c").mkdir()
-        link = tmp_path / "link"
-        link.symlink_to(tmp_path / "b")
-        linked = await _os_env_helper_pid(registry, agent(link), "conv_a")
-        link.unlink()
-        link.symlink_to(tmp_path / "c")
-        retargeted = await _os_env_helper_pid(registry, agent(link), "conv_a")
-        assert retargeted != linked
-        moved = await _os_env_helper_pid(registry, agent(tmp_path / "b"), "conv_a")
 
         # A timed-out command's descendants may outlive it, so its helper is retired.
         timed_out = await _execute_os_env_tool(
@@ -2970,12 +2968,11 @@ async def test_runner_os_env_helper_restarts_and_keys_on_spec(
 
     finally:
         await registry.cleanup_session("conv_a")
-        await registry.cleanup_session("conv_b")
     assert not _process_exists(moved)
-    assert not _process_exists(other_session)
 
 
 @pytest.mark.asyncio
+@pytest.mark.posix_only
 async def test_runner_os_env_busy_helper_serves_concurrent_calls_and_cancellation_retires_it(
     tmp_path: Path,
 ) -> None:

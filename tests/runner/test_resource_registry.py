@@ -4093,10 +4093,19 @@ async def test_failed_tool_environment_replacement_keeps_the_old_one_owned(
     assert environment._closed
 
 
-async def test_tool_environment_is_rebuilt_when_its_sandbox_resolves_differently(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "changed_key",
+    [
+        "sandbox",
+        "session",
+        "environment",
+        pytest.param("cwd-symlink", marks=pytest.mark.posix_only),
+    ],
+)
+async def test_tool_environment_reuse_checks_session_spec_and_resolved_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_key: str
 ) -> None:
-    """An unchanged spec whose paths now resolve elsewhere gets a new environment."""
+    """Only an unchanged session, spec and resolved workspace/policy reuse the lease."""
     import omnigent.inner.os_env as os_env_module
     import omnigent.runner.resource_registry as registry_module
     from omnigent.inner.sandbox import resolve_sandbox
@@ -4104,7 +4113,7 @@ async def test_tool_environment_is_rebuilt_when_its_sandbox_resolves_differently
     monkeypatch.setattr(
         os_env_module,
         "create_os_environment",
-        lambda spec, **kwargs: _FakeOSEnvironment(spec=spec, cwd=Path(spec.cwd or ".")),
+        lambda spec, **kwargs: _FakeOSEnvironment(spec=spec, cwd=Path(spec.cwd or ".").resolve()),
     )
     masked = [tmp_path / "first"]
     monkeypatch.setattr(
@@ -4113,7 +4122,11 @@ async def test_tool_environment_is_rebuilt_when_its_sandbox_resolves_differently
         lambda spec, cwd: replace(resolve_sandbox(spec, cwd), mask_paths=list(masked)),
     )
     registry = SessionResourceRegistry()
-    spec = _agent_spec_with_sandbox_none(tmp_path).os_env
+    spec = _agent_spec_with_sandbox_none(tmp_path / "workspace").os_env
+    if changed_key == "cwd-symlink":
+        link = tmp_path / "link"
+        link.symlink_to(spec.cwd, target_is_directory=True)
+        spec = replace(spec, cwd=str(link))
 
     first = await registry.lease_tool_environment("conv", spec)
     assert first is not None
@@ -4122,9 +4135,41 @@ async def test_tool_environment_is_rebuilt_when_its_sandbox_resolves_differently
     assert again is first
     await again.release(reusable=True)
 
-    masked[0] = tmp_path / "retargeted"
-    rebuilt = await registry.lease_tool_environment("conv", spec)
+    changed_spec = spec
+    session_id = "conv"
+    if changed_key == "sandbox":
+        masked[0] = tmp_path / "retargeted"
+    elif changed_key == "session":
+        session_id = "other"
+    elif changed_key == "environment":
+        changed_spec = replace(
+            spec,
+            sandbox=replace(spec.sandbox, env_passthrough=["TEST_HARMLESS_PASSTHROUGH"]),
+        )
+    elif changed_key == "cwd-symlink":
+        target = tmp_path / "retargeted-workspace"
+        target.mkdir()
+        link.unlink()
+        link.symlink_to(target, target_is_directory=True)
+
+    rebuilt = await registry.lease_tool_environment(session_id, changed_spec)
     assert rebuilt is not None and rebuilt is not first
-    assert isinstance(first.environment, _FakeOSEnvironment) and first.environment._closed
+    assert isinstance(first.environment, _FakeOSEnvironment)
+    assert first.environment._closed is (changed_key != "session")
     await rebuilt.release(reusable=True)
+
+    if changed_key in {"session", "environment"}:
+        restored = await registry.lease_tool_environment("conv", spec)
+        assert restored is not None
+        if changed_key == "session":
+            assert restored is first
+        else:
+            assert restored is not first and restored is not rebuilt
+            assert isinstance(rebuilt.environment, _FakeOSEnvironment)
+            assert rebuilt.environment._closed
+        await restored.release(reusable=True)
+
     await registry.cleanup_session("conv")
+    await registry.cleanup_session("other")
+    assert first.environment._closed
+    assert isinstance(rebuilt.environment, _FakeOSEnvironment) and rebuilt.environment._closed
