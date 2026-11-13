@@ -70,7 +70,7 @@ from omnigent.spec.types import (
     PolicySpec,
 )
 from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.permission_store import MAX_GRANTS_PAGE_SIZE, PermissionStore
 
 
 class _PermissionListResponse(TypedDict):
@@ -288,7 +288,7 @@ def register_permissions_routes(
     async def list_permissions(
         request: Request,
         session_id: str,
-        limit: int = Query(default=100, ge=1, le=1000),
+        limit: int = Query(default=100, ge=1, le=MAX_GRANTS_PAGE_SIZE),
         after: str | None = Query(default=None, description="Cursor: user_id to start after"),
     ) -> _PermissionListResponse:
         """List permission grants on a session with cursor pagination.
