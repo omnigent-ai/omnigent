@@ -1,12 +1,12 @@
-// WIP(session_overview): first cut with the session total and per-model usage;
+// WIP(session_overview): first cut with the session total and per-model costs;
 // sub-agent costs come later.
 
-import { useSyncExternalStore } from "react";
+import { type ReactNode, useSyncExternalStore } from "react";
 import { XIcon } from "lucide-react";
-import { ModelUsageBreakdown } from "@/components/AgentInfo";
 import { Card, CardAction, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Spinner } from "@/components/ui/spinner";
-import { formatSessionCostUsd } from "@/lib/formatCost";
+import { formatSessionCostUsd, formatTokenCount } from "@/lib/formatCost";
 import { useChatStore } from "@/store/chatStore";
 
 // Tailwind's `xl` breakpoint: wide enough to dock the overview beside chat.
@@ -35,32 +35,87 @@ function SessionCostValue({ unavailable }: { unavailable: string }) {
   return loading ? <Spinner aria-label="Loading cost" className="size-3.5" /> : unavailable;
 }
 
-/** Desktop header chip with the session cost that shows and hides the overview. */
+/**
+ * Desktop header chip with the session cost. It toggles the docked overview, or
+ * opens `children` (the overview card) as a popover beneath it.
+ */
 export function SessionCostButton({
-  expanded,
-  onToggle,
+  docked,
+  open,
+  onOpenChange,
+  children,
 }: {
-  expanded: boolean;
-  onToggle: () => void;
+  docked: boolean;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  children?: ReactNode;
 }) {
-  return (
+  const chip = (
     <button
       type="button"
-      aria-pressed={expanded}
-      title={expanded ? "Hide session overview" : "Show session overview"}
+      aria-expanded={open}
       data-testid="header-session-cost"
-      className="hidden h-6 shrink-0 items-center rounded-[6px] px-2 font-mono text-xs tabular-nums text-muted-foreground hover:bg-muted hover:text-foreground md:inline-flex"
-      onClick={onToggle}
+      className="hidden h-6 shrink-0 items-center rounded-[6px] px-2 font-mono text-xs tabular-nums text-muted-foreground hover:bg-muted hover:text-foreground aria-expanded:bg-muted aria-expanded:text-foreground md:inline-flex"
+      // The popover trigger toggles the popover itself.
+      onClick={docked ? () => onOpenChange(!open) : undefined}
     >
       <SessionCostValue unavailable="—" />
       <span className="sr-only"> Session overview</span>
     </button>
   );
+  if (docked) return chip;
+  return (
+    <Popover open={open} onOpenChange={onOpenChange}>
+      <PopoverTrigger asChild>{chip}</PopoverTrigger>
+      <PopoverContent
+        align="end"
+        aria-label="Session overview"
+        className="w-64 bg-transparent p-0 shadow-none ring-0 max-md:hidden"
+      >
+        {children}
+      </PopoverContent>
+    </Popover>
+  );
 }
 
-/** Session cost and per-model token usage for the bound session. */
+/** One overview line: a label and its value, left empty while unknown. */
+function OverviewRow({
+  label,
+  title,
+  testId,
+  children,
+}: {
+  label: string;
+  /** Full text for a label that may truncate. */
+  title?: string;
+  testId?: string;
+  children?: ReactNode;
+}) {
+  return (
+    <div className="flex items-baseline justify-between gap-3">
+      <span className="min-w-0 truncate text-muted-foreground" title={title}>
+        {label}
+      </span>
+      <span className="flex shrink-0 items-center font-mono tabular-nums" data-testid={testId}>
+        {children}
+      </span>
+    </div>
+  );
+}
+
+/** Session cost, each model's cost and the total tokens for the bound session. */
 export function SessionOverview({ onClose }: { onClose: () => void }) {
   const usageByModel = useChatStore((s) => s.sessionUsageByModel);
+  // Most expensive model first; unpriced models last.
+  const models = Object.entries(usageByModel ?? {}).sort(
+    ([, a], [, b]) => (b.totalCostUsd ?? -1) - (a.totalCostUsd ?? -1),
+  );
+  const tokenCounts = models.map(([, usage]) => usage.totalTokens);
+  // A model without a count would make the sum partial, so show none.
+  const totalTokens =
+    tokenCounts.length > 0 && tokenCounts.every((count) => count != null)
+      ? tokenCounts.reduce((sum, count) => sum + count, 0)
+      : null;
   return (
     <Card size="sm">
       <CardHeader>
@@ -76,18 +131,17 @@ export function SessionOverview({ onClose }: { onClose: () => void }) {
           </button>
         </CardAction>
       </CardHeader>
-      <CardContent className="flex flex-col gap-3 text-sm">
-        <div className="flex items-baseline justify-between gap-3">
-          <span className="text-muted-foreground">Session cost</span>
-          <span
-            className="flex items-center font-mono tabular-nums"
-            data-testid="session-overview-cost"
-          >
-            <SessionCostValue unavailable="Unavailable" />
-          </span>
-        </div>
-        {usageByModel != null && Object.keys(usageByModel).length > 0 && (
-          <ModelUsageBreakdown usageByModel={usageByModel} />
+      <CardContent className="flex flex-col gap-2 text-sm">
+        <OverviewRow label="Session cost" testId="session-overview-cost">
+          <SessionCostValue unavailable="Unavailable" />
+        </OverviewRow>
+        {models.map(([model, usage]) => (
+          <OverviewRow key={model} label={model} title={model}>
+            {usage.totalCostUsd != null && formatSessionCostUsd(usage.totalCostUsd)}
+          </OverviewRow>
+        ))}
+        {totalTokens !== null && (
+          <OverviewRow label="Tokens">{formatTokenCount(totalTokens)}</OverviewRow>
         )}
       </CardContent>
     </Card>

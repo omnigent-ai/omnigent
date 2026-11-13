@@ -180,11 +180,7 @@ const MODEL_TOKEN_ROWS: readonly { key: keyof ModelUsage; label: string }[] = [
  *
  * @param usageByModel - Map of raw harness model id to its cumulative usage.
  */
-export function ModelUsageBreakdown({
-  usageByModel,
-}: {
-  usageByModel: Record<string, ModelUsage>;
-}) {
+function ModelUsageBreakdown({ usageByModel }: { usageByModel: Record<string, ModelUsage> }) {
   const [isOpen, setIsOpen] = useState(false);
   // Stable display order: most total tokens first, so the dominant model
   // leads. Falls back to 0 for models that haven't recorded a total yet.

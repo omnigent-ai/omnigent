@@ -652,7 +652,6 @@ export function ChatHeader({
         {/* Desktop (md+) action buttons. On mobile these collapse into
             the three-dot "Session actions" menu below. Fork is also
             available from the session menus and assistant messages. */}
-        {!pending && conversationId && sessionOverviewControl}
         {pending && <PendingHeaderActions isMobile={isMobile} />}
         {/* Agent info: tools & policies for the bound agent. Desktop-only
             popover; self-hides when the agent has neither configured. */}
@@ -858,6 +857,8 @@ export function ChatHeader({
             </TooltipContent>
           </Tooltip>
         )}
+        {/* Rightmost on desktop, so the docked session overview sits beneath it. */}
+        {!pending && conversationId && sessionOverviewControl}
         {/* Mobile-only session-actions kebab, rightmost in the cluster. Same
             menu the desktop breadcrumb hangs off its title. */}
         {isMobile && conversationMenu}
