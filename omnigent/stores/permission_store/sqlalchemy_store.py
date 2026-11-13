@@ -337,6 +337,36 @@ def delete_scheduled_task_grants(
     )
 
 
+def delete_deleted_task_grants(
+    session_maker: NamedManagedSessionMaker, scheduled_task_id: str, *, batch_size: int
+) -> int:
+    """Delete a deleted task's grants, one bounded batch per transaction.
+
+    Each batch first locks the task row and stops unless the task is deleted or gone,
+    so a live task, such as one a re-registered owner created, keeps its grants.
+    """
+
+    def task_is_deleted(session: Session) -> bool:
+        state = session.execute(
+            select(SqlScheduledTask.state)
+            .where(
+                SqlScheduledTask.workspace_id == current_workspace_id(),
+                SqlScheduledTask.id == scheduled_task_id,
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        return state is None or state == encode_scheduled_task_state("deleted")
+
+    return _delete_grants_in_batches(
+        session_maker,
+        "delete_deleted_task_grant_batch",
+        match=SqlScheduledTaskShare.scheduled_task_id == scheduled_task_id,
+        key_column=SqlScheduledTaskShare.user_id,
+        batch_size=batch_size,
+        proceed=task_is_deleted,
+    )
+
+
 def delete_deleted_account_grants(
     session_maker: NamedManagedSessionMaker, user_id: str, *, batch_size: int
 ) -> int:

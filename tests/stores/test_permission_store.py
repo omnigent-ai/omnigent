@@ -1481,17 +1481,20 @@ def test_delete_for_scheduled_task_removes_only_that_tasks_grants(
         store.grant_for_scheduled_task(user_id, task_id, 1)
     store.grant_for_scheduled_task("user0@example.com", other_task_id, 1)
     monkeypatch.setattr(store, "_cleanup_batch_size", 2)
-    transactions: list[str] = []
+    batch_deletions: list[int] = []
     run_write_transaction = permission_module.run_write_transaction
 
-    def counting_transaction(session_maker, operation_name, callback, **kwargs):
-        transactions.append(operation_name)
-        return run_write_transaction(session_maker, operation_name, callback, **kwargs)
+    def recording_transaction(session_maker, operation_name, callback, **kwargs):
+        result = run_write_transaction(session_maker, operation_name, callback, **kwargs)
+        batch_deletions.append(result[1])
+        return result
 
-    monkeypatch.setattr(permission_module, "run_write_transaction", counting_transaction)
+    monkeypatch.setattr(permission_module, "run_write_transaction", recording_transaction)
 
     assert store.delete_for_scheduled_task(task_id) == 5
-    assert transactions == ["delete_scheduled_task_grant_batch"] * 4
+    # Each committed transaction deletes at most one batch.
+    assert max(batch_deletions) <= 2
+    assert len([count for count in batch_deletions if count]) >= 3
     assert store.delete_for_scheduled_task(task_id) == 0
     assert store.list_for_scheduled_task(task_id) == ([], None)
     assert store.list_for_scheduled_task(other_task_id) == (

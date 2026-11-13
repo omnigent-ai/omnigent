@@ -56,7 +56,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.stores.permission_store.sqlalchemy_store import (
     delete_deleted_account_grants,
-    delete_scheduled_task_grants,
+    delete_deleted_task_grants,
     holds_scheduled_task_grants,
 )
 
@@ -556,8 +556,10 @@ class SqlAlchemyAccountStore:
         """Delete a deleted account's automation grants once its deletion has committed.
 
         Each bounded batch commits on its own. Held grants go first, as a re-registered
-        name must not inherit them; grants on its tombstoned tasks are already inert. A
-        failure is logged: registration finishes the held grants before reusing the name.
+        name must not inherit them; grants on its tombstoned tasks are already inert. The
+        owner's tasks are found by name, so only deleted ones are touched: a replacement
+        account's live tasks keep their grants. A failure is logged, and registration
+        finishes the held grants before reusing the name.
         """
         try:
             delete_deleted_account_grants(
@@ -567,7 +569,7 @@ class SqlAlchemyAccountStore:
             while True:
                 task_keys = self._owned_task_keys(user_id, after=after)
                 for _, task_id in task_keys:
-                    delete_scheduled_task_grants(
+                    delete_deleted_task_grants(
                         self._session_immediate, task_id, batch_size=self._cleanup_batch_size
                     )
                 if len(task_keys) < self._cleanup_batch_size:

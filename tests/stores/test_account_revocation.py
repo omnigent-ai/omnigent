@@ -399,6 +399,38 @@ def test_reregistration_finishes_an_interrupted_grant_cleanup(db_uri, monkeypatc
     assert held_grants() == 0
 
 
+def test_owned_task_cleanup_spares_a_replacement_accounts_live_task(db_uri, monkeypatch):
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    accounts.create_user_with_password("alice", "alice-hash")
+    for grantee in ("bob", "carol"):
+        permissions.ensure_user(grantee)
+    old_task = _create_task(db_uri, "alice")
+    permissions.grant_for_scheduled_task("carol", old_task, 1)
+    reached, resume = Event(), Event()
+    owned_task_keys = accounts._owned_task_keys
+
+    def paused_before_owned_tasks(*args, **kwargs):
+        reached.set()
+        assert resume.wait(10)
+        return owned_task_keys(*args, **kwargs)
+
+    # Pause after the held grants are gone and before the owned-task pass.
+    monkeypatch.setattr(accounts, "_owned_task_keys", paused_before_owned_tasks)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        deleting = pool.submit(accounts.delete_user, "alice")
+        try:
+            assert reached.wait(10)
+            accounts.create_user_with_password("alice", "replacement-hash")
+            new_task = _create_task(db_uri, "alice")
+            permissions.grant_for_scheduled_task("bob", new_task, 1)
+        finally:
+            resume.set()
+        assert deleting.result(timeout=10) is True
+    assert permissions.list_for_scheduled_task(old_task) == ([], None)
+    assert [grant.user_id for grant in permissions.list_for_scheduled_task(new_task)[0]] == ["bob"]
+
+
 def test_deletion_removes_all_preferences_only_for_user_in_workspace(db_uri: str) -> None:
     from sqlalchemy import select
     from sqlalchemy.orm import Session
