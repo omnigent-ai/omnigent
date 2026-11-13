@@ -232,14 +232,16 @@ async def test_repository_config_is_stored_opaquely(
 ) -> None:
     """The saved repository round-trips through create, get and rename untouched."""
     config = {"agent_id": "187b7cb7ac30abf4debfaa578d052ec6", "repository": repository}
+    # An unmarked new project gets the least-used color alongside its config.
+    stored = {**config, "color": "omni"}
     created = (
         await project_client.post("/v1/projects", json={"name": "Repo", "config": config})
     ).json()
-    assert created["config"] == config
+    assert created["config"] == stored
     fetched = (await project_client.get(f"/v1/projects/{created['id']}")).json()
-    assert fetched["config"] == config
+    assert fetched["config"] == stored
     renamed = await project_client.patch(f"/v1/projects/{created['id']}", json={"name": "Renamed"})
-    assert renamed.json()["config"] == config
+    assert renamed.json()["config"] == stored
 
 
 async def test_patch_replaces_config(project_client: httpx.AsyncClient) -> None:
