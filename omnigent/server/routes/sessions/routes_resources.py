@@ -29,7 +29,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from starlette.types import Receive, Scope, Send
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from omnigent.debug_logging import StageTimings, debug_event
 from omnigent.entities import (
@@ -2810,6 +2810,52 @@ def register_resources_routes(
             "token": token,
             "expires_at": expires_at,
         }
+
+    @router.post("/sessions/{session_id}/workspace/{service}/{method}", response_model=None)
+    async def call_workspace_api(
+        request: Request, session_id: str, service: str, method: str
+    ) -> Response:
+        """Serve the workspace API to any client, answered by the session's host.
+
+        Same read gate as the file routes; the API never takes absolute paths.
+        Unconfined sessions only, because the host applies no sandbox's hidden
+        paths. Refusals after authorization are Connect errors.
+        """
+        from connectrpc.code import Code
+        from connectrpc.errors import ConnectError
+
+        from omnigent.api.workspace.v1alpha1.workspace_connect import (
+            WorkspaceServiceASGIApplication,
+        )
+        from omnigent.host.frames import CAP_WORKSPACE_API
+        from omnigent.server.workspace_api import (
+            ConnectCallResponse,
+            HostTarget,
+            HostWorkspaceService,
+        )
+
+        flags = getattr(request.app.state, "feature_flags", FeatureFlags())
+        if not flags.enabled(Feature.WORKSPACE_API):
+            raise HTTPException(status_code=404, detail="The workspace API is disabled")
+        conv = await _authorize_browse_read(session_id, request)
+        host = (
+            host_registry.get(conv.host_id) if host_registry is not None and conv.host_id else None
+        )
+        reach = await _environment_reach_for_session(conv) if host is not None else None
+        target: HostTarget | ConnectError
+        if host is None or host_registry is None:
+            target = ConnectError(Code.UNAVAILABLE, "The session's host is not connected")
+        elif CAP_WORKSPACE_API not in host.hello.capabilities:
+            target = ConnectError(Code.UNIMPLEMENTED, "The session's host needs an update")
+        elif reach is None or not reach[1]:
+            target = ConnectError(
+                Code.FAILED_PRECONDITION, "The workspace API serves unconfined sessions only"
+            )
+        else:
+            target = HostTarget(host_registry, host, reach[2])
+        app = WorkspaceServiceASGIApplication(HostWorkspaceService(target))
+        # connectrpc types ASGI with asgiref's TypedDicts; Starlette's are plain mappings.
+        return ConnectCallResponse(cast("ASGIApp", app), f"/{service}/{method}")
 
     @router.get(
         "/sessions/{session_id}/resources/environments/{environment_id}/search",

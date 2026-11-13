@@ -49,6 +49,7 @@ class Feature(StrEnum):
     SESSION_OVERVIEW = "session_overview"
     PROJECT_REPOSITORY_CREATION = "project_repository_creation"
     WORKSPACE_DIRECT_ACCESS = "workspace_direct_access"
+    WORKSPACE_API = "workspace_api"
 
 
 @dataclass(frozen=True)
@@ -231,6 +232,13 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
             "Owners read a session's workspace straight from its host's local socket; "
             "the server and the host must both enable it"
         ),
+        owner="server",
+        review_by_release="0.27.0",
+        frontend_visible=False,
+    ),
+    FeatureDefinition(
+        feature=Feature.WORKSPACE_API,
+        description="Serve the workspace API through the server, answered by the session's host",
         owner="server",
         review_by_release="0.27.0",
         frontend_visible=False,

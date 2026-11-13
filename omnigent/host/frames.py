@@ -19,6 +19,7 @@ see.
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 from collections.abc import Iterator
@@ -95,6 +96,8 @@ CAP_TCP_EGRESS = "tcp_egress"
 CAP_WORKTREE_CREATE_BUDGET = "worktree_create_budget"
 # The host clones a git repository into a new directory (``host.clone_repository``):
 CAP_CLONE_REPOSITORY = "clone_repository"
+# The host answers ``host.workspace_call`` (the workspace API through the server).
+CAP_WORKSPACE_API = "workspace_api"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
@@ -115,6 +118,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_HARNESS_ACCOUNTS,
     CAP_HARNESS_LOGIN,
     CAP_CLONE_REPOSITORY,
+    CAP_WORKSPACE_API,
 ]
 
 # Server capabilities, advertised on the tunnel's WebSocket upgrade response (the
@@ -265,6 +269,8 @@ class HostFrameKind(str, Enum):
     DETECT_CREDENTIALS_RESULT = "host.detect_credentials_result"
     FS_REQUEST = "host.fs_request"
     FS_RESULT = "host.fs_result"
+    WORKSPACE_CALL = "host.workspace_call"
+    WORKSPACE_REPLY = "host.workspace_reply"
     FS_WRITE_REQUEST = "host.fs_write_request"
     MODEL_OPTIONS = "host.model_options"
     MODEL_OPTIONS_RESULT = "host.model_options_result"
@@ -1284,6 +1290,40 @@ class HostFsWriteFrame:
 
 
 @dataclass
+class HostWorkspaceCallFrame:
+    """Server → host: one workspace API call (``omnigent.api.workspace.v1alpha1``).
+
+    :param request_id: Correlates the call's replies.
+    :param workspace: The session's workspace on the host, chosen by the server.
+    :param method: Method name, e.g. ``"ReadFile"``.
+    :param request: The serialized request message.
+    """
+
+    request_id: str
+    workspace: str
+    method: str
+    request: bytes = b""
+
+
+@dataclass
+class HostWorkspaceReplyFrame:
+    """Host → server: one response message of a workspace call, or its end.
+
+    :param request_id: The call this answers.
+    :param message: A serialized response message, or ``None``.
+    :param done: Whether this is the call's last frame.
+    :param error_code: On a failed call's last frame, its Connect code, e.g. ``"not_found"``.
+    :param error_message: The failure's message.
+    """
+
+    request_id: str
+    message: bytes | None = None
+    done: bool = False
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+@dataclass
 class HostFsResultFrame:
     """Host → server: outcome of a workspace filesystem request (read or write).
 
@@ -1651,6 +1691,8 @@ HostFrame = (
     | HostDetectCredentialsResultFrame
     | HostFsRequestFrame
     | HostFsResultFrame
+    | HostWorkspaceCallFrame
+    | HostWorkspaceReplyFrame
     | HostFsWriteFrame
     | HostModelOptionsFrame
     | HostModelOptionsResultFrame
@@ -2197,6 +2239,29 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "workspace": frame.workspace,
                 "session_id": frame.session_id,
                 "params": frame.params,
+            }
+        )
+    if isinstance(frame, HostWorkspaceCallFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.WORKSPACE_CALL.value,
+                "request_id": frame.request_id,
+                "workspace": frame.workspace,
+                "method": frame.method,
+                "request": base64.b64encode(frame.request).decode(),
+            }
+        )
+    if isinstance(frame, HostWorkspaceReplyFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.WORKSPACE_REPLY.value,
+                "request_id": frame.request_id,
+                "message": None
+                if frame.message is None
+                else base64.b64encode(frame.message).decode(),
+                "done": frame.done,
+                "error_code": frame.error_code,
+                "error_message": frame.error_message,
             }
         )
     if isinstance(frame, HostFsResultFrame):
@@ -2785,6 +2850,22 @@ def _decode_known_host_frame(
             return _decode_fs_request(msg)
         case HostFrameKind.FS_RESULT:
             return _decode_fs_result(msg)
+        case HostFrameKind.WORKSPACE_CALL:
+            return HostWorkspaceCallFrame(
+                request_id=_required_str(msg, "request_id"),
+                workspace=_required_str(msg, "workspace"),
+                method=_required_str(msg, "method"),
+                request=base64.b64decode(_optional_nullable_str(msg, "request") or ""),
+            )
+        case HostFrameKind.WORKSPACE_REPLY:
+            message = _optional_nullable_str(msg, "message")
+            return HostWorkspaceReplyFrame(
+                request_id=_required_str(msg, "request_id"),
+                message=None if message is None else base64.b64decode(message),
+                done=_optional_bool(msg, "done"),
+                error_code=_optional_nullable_str(msg, "error_code"),
+                error_message=_optional_nullable_str(msg, "error_message"),
+            )
         case HostFrameKind.FS_WRITE_REQUEST:
             return _decode_fs_write_request(msg)
         case HostFrameKind.MODEL_OPTIONS:
