@@ -9,6 +9,7 @@ import {
   MaximizeIcon,
   MessagesSquareIcon,
   MinimizeIcon,
+  PinIcon,
   PlusIcon,
   TerminalIcon,
   XIcon,
@@ -71,6 +72,14 @@ import { useQuery } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { SUBAGENT_TAB_FALLBACK_LABEL, SubagentTabPane, useSubagentTabLabels } from "./SubagentTab";
+import {
+  SideChatRailTab,
+  type SideChatTabArrangement,
+  SideChatTabGroup,
+  sideChatTabDensity,
+  SideChatTabMenu,
+  SideChatTabsDragArea,
+} from "./SideChatTab";
 import { type SubagentPanelOpener, SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { useChatStore } from "@/store/chatStore";
@@ -1297,12 +1306,33 @@ function WorkspacePanelImpl({
     terminalShown,
   ]);
   const subagentTabLabels = useSubagentTabLabels(sideChats.tabs);
-  // Number only side chats so their labels stay put as sub-agent tabs open and close.
+  // Side chats keep their own number, so closing or moving one never renames another.
   const chatTabLabels: Record<string, string> = {};
-  let sideChatNumber = 0;
+  const chatTabCompactLabels: Record<string, string> = {};
   for (const tabId of sideChats.tabs) {
-    chatTabLabels[tabId] = subagentTabLabels[tabId] ?? `Side chat ${++sideChatNumber}`;
+    const number = sideChats.numbers[tabId];
+    chatTabLabels[tabId] = subagentTabLabels[tabId] ?? `Side chat ${number}`;
+    chatTabCompactLabels[tabId] = subagentTabLabels[tabId] ?? String(number);
   }
+  const pinnedSideChats = sideChats.pinned;
+  const unpinnedSideChats = sideChats.tabs.filter(
+    (id) => !pinnedSideChats.includes(id) && subagentSessionIdFromTab(id) === null,
+  );
+  const sideChatTabsDensity = sideChatTabDensity(sideChats.tabs.length);
+  const sideChatArrangement = (childId: string): SideChatTabArrangement | null => {
+    if (subagentSessionIdFromTab(childId) !== null) return null;
+    const pinned = pinnedSideChats.includes(childId);
+    const group = pinned ? pinnedSideChats : unpinnedSideChats;
+    const index = group.indexOf(childId);
+    return {
+      pinned,
+      canMoveLeft: index > 0,
+      canMoveRight: index < group.length - 1,
+      onPinnedChange: (next) => sideChats.setPinned(childId, next),
+      onMoveLeft: () => sideChats.move(childId, group[index - 1]),
+      onMoveRight: () => sideChats.move(childId, group[index + 1]),
+    };
+  };
   const railInertRef = useInertRef<HTMLElement>(inert ?? false, railRef);
   const selectedSideChat = sideChats.selected;
   const selectedSubagentId =
@@ -1495,19 +1525,33 @@ function WorkspacePanelImpl({
   const markPickerKeyboard = useCallback(() => {
     pickerInputRef.current = "keyboard";
   }, []);
+  const sideChatOption = (childId: string) => ({
+    key: `sidechat:${childId}`,
+    label: chatTabLabels[childId] ?? childId,
+    active: sideChatSelected && sideChats.selected === childId,
+    select: () => {
+      sideChats.select(childId);
+      onRightRailTabChange("sidechat");
+    },
+    disabled: false,
+  });
+  const panelOption = (tab: WorkspacePanelTab) => ({
+    key: tab,
+    label: WORKSPACE_PANEL_TABS[tab].label,
+    active:
+      selectedFilePath === null &&
+      selectedTerminalKey === null &&
+      !browserSelected &&
+      !sideChatSelected &&
+      rightRailTab === tab,
+    select: () => selectPermanentTab(tab),
+    disabled: false,
+  });
+  // Strip order: fixed pages, pinned side chats, then the other open tabs.
   const panelOptions = [
-    ...[...visiblePermanentTabs, ...visibleOpenPanels].map((tab) => ({
-      key: tab,
-      label: WORKSPACE_PANEL_TABS[tab].label,
-      active:
-        selectedFilePath === null &&
-        selectedTerminalKey === null &&
-        !browserSelected &&
-        !sideChatSelected &&
-        rightRailTab === tab,
-      select: () => selectPermanentTab(tab),
-      disabled: false,
-    })),
+    ...visiblePermanentTabs.map(panelOption),
+    ...pinnedSideChats.map(sideChatOption),
+    ...visibleOpenPanels.map(panelOption),
     ...openFiles.map((path) => ({
       key: `file:${path}`,
       label: path,
@@ -1532,17 +1576,29 @@ function WorkspacePanelImpl({
       },
       disabled: false,
     })),
-    ...sideChats.tabs.map((childId) => ({
-      key: `sidechat:${childId}`,
-      label: chatTabLabels[childId] ?? childId,
-      active: sideChatSelected && sideChats.selected === childId,
-      select: () => {
-        sideChats.select(childId);
-        onRightRailTabChange("sidechat");
-      },
-      disabled: false,
-    })),
+    ...sideChats.tabs.filter((id) => !pinnedSideChats.includes(id)).map(sideChatOption),
   ];
+  const renderSideChatRailTab = (childId: string) => {
+    const active = sideChatSelected && sideChats.selected === childId;
+    return (
+      <SideChatRailTab
+        key={childId}
+        id={childId}
+        label={chatTabLabels[childId] ?? childId}
+        compactLabel={chatTabCompactLabels[childId] ?? childId}
+        icon={subagentSessionIdFromTab(childId) === null ? MessagesSquareIcon : BotIcon}
+        active={active}
+        density={sideChatTabsDensity}
+        arrangement={sideChatArrangement(childId)}
+        tabRef={active ? activeSideChatRef : undefined}
+        onSelect={() => {
+          sideChats.select(childId);
+          onRightRailTabChange("sidechat");
+        }}
+        onClose={() => void closeSideChat(childId)}
+      />
+    );
+  };
   const renderTabTrigger = (tab: WorkspacePanelTab) => {
     const presentation = workspacePanelTabPresentation(WORKSPACE_PANEL_TABS[tab], {
       pending,
@@ -1877,156 +1933,125 @@ function WorkspacePanelImpl({
           {showOpenTabs && (
             <>
               {/* Open tabs fill the space before the pinned trailing controls. */}
-              <WorkspaceTabsScroller>
-                {visibleOpenPanels.map((tab) => {
-                  const { label, icon: Icon } = WORKSPACE_PANEL_TABS[tab];
-                  const active =
-                    rightRailTab === tab &&
-                    selectedFilePath === null &&
-                    selectedTerminalKey === null;
-                  return (
-                    <div
-                      key={tab}
-                      className={cn(
-                        "flex h-[24px] shrink-0 items-center gap-[6px] rounded-md px-2 text-ui font-medium leading-5 transition-colors",
-                        active
-                          ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
-                          : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
-                      )}
-                    >
-                      <button
-                        ref={active ? activePanelRef : null}
-                        type="button"
-                        role="tab"
-                        aria-label={label}
-                        aria-selected={active}
-                        className="flex items-center gap-1"
-                        onClick={() => selectPermanentTab(tab)}
-                        onAuxClick={(event) => {
-                          if (event.button === 1) {
-                            event.preventDefault();
-                            closePanel(tab);
-                          }
-                        }}
+              <SideChatTabsDragArea onMove={sideChats.move}>
+                <WorkspaceTabsScroller>
+                  <SideChatTabGroup ids={pinnedSideChats}>
+                    {pinnedSideChats.map(renderSideChatRailTab)}
+                  </SideChatTabGroup>
+                  {visibleOpenPanels.map((tab) => {
+                    const { label, icon: Icon } = WORKSPACE_PANEL_TABS[tab];
+                    const active =
+                      rightRailTab === tab &&
+                      selectedFilePath === null &&
+                      selectedTerminalKey === null;
+                    return (
+                      <div
+                        key={tab}
+                        className={cn(
+                          "flex h-[24px] shrink-0 items-center gap-[6px] rounded-md px-2 text-ui font-medium leading-5 transition-colors",
+                          active
+                            ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
+                            : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
+                        )}
                       >
-                        <Icon className="size-4" />
-                        {label}
-                      </button>
-                      <button
-                        type="button"
-                        aria-label={`Close ${label}`}
-                        className="flex size-4 items-center justify-center rounded hover:bg-muted"
-                        onClick={() => closePanel(tab)}
+                        <button
+                          ref={active ? activePanelRef : null}
+                          type="button"
+                          role="tab"
+                          aria-label={label}
+                          aria-selected={active}
+                          className="flex items-center gap-1"
+                          onClick={() => selectPermanentTab(tab)}
+                          onAuxClick={(event) => {
+                            if (event.button === 1) {
+                              event.preventDefault();
+                              closePanel(tab);
+                            }
+                          }}
+                        >
+                          <Icon className="size-4" />
+                          {label}
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`Close ${label}`}
+                          className="flex size-4 items-center justify-center rounded hover:bg-muted"
+                          onClick={() => closePanel(tab)}
+                        >
+                          <XIcon className="size-3" />
+                        </button>
+                      </div>
+                    );
+                  })}
+                  <FileTabsStrip
+                    openFiles={openFiles}
+                    activeFilePath={selectedFilePath}
+                    onFileSelect={openFileViewer}
+                    onCloseFile={closeFile}
+                  />
+                  <TerminalTabsStrip
+                    openTerminals={openTerminals}
+                    activeTerminalKey={selectedTerminalKey}
+                    closingKey={closingTerminalKey ?? null}
+                    canClose={isEditorLevel(permissionLevel)}
+                    labelFor={terminalLabelFor}
+                    onSelect={openTerminalTab}
+                    onClose={onCloseTerminal}
+                  />
+                  {showBrowserTab &&
+                    browsers.tabs.map((tabId, index) => (
+                      <div
+                        key={tabId}
+                        ref={
+                          browserSelected && browsers.selected === tabId ? activeBrowserRef : null
+                        }
+                        className={cn(
+                          "flex h-[24px] shrink-0 items-center gap-[6px] rounded-md px-2 text-ui font-medium leading-5 transition-colors",
+                          browserSelected && browsers.selected === tabId
+                            ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
+                            : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
+                        )}
                       >
-                        <XIcon className="size-3" />
-                      </button>
-                    </div>
-                  );
-                })}
-                <FileTabsStrip
-                  openFiles={openFiles}
-                  activeFilePath={selectedFilePath}
-                  onFileSelect={openFileViewer}
-                  onCloseFile={closeFile}
-                />
-                <TerminalTabsStrip
-                  openTerminals={openTerminals}
-                  activeTerminalKey={selectedTerminalKey}
-                  closingKey={closingTerminalKey ?? null}
-                  canClose={isEditorLevel(permissionLevel)}
-                  labelFor={terminalLabelFor}
-                  onSelect={openTerminalTab}
-                  onClose={onCloseTerminal}
-                />
-                {showBrowserTab &&
-                  browsers.tabs.map((tabId, index) => (
-                    <div
-                      key={tabId}
-                      ref={browserSelected && browsers.selected === tabId ? activeBrowserRef : null}
-                      className={cn(
-                        "flex h-[24px] shrink-0 items-center gap-[6px] rounded-md px-2 text-ui font-medium leading-5 transition-colors",
-                        browserSelected && browsers.selected === tabId
-                          ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
-                          : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
-                      )}
-                    >
-                      <button
-                        type="button"
-                        role="tab"
-                        aria-selected={browserSelected && browsers.selected === tabId}
-                        title={browsers.labelFor(tabId, index)}
-                        className="flex min-w-0 items-center gap-1"
-                        onAuxClick={(event) => {
-                          if (event.button === 1) {
-                            event.preventDefault();
-                            void closeBrowserTab(tabId);
-                          }
-                        }}
-                        onClick={() => {
-                          browsers.select(tabId);
-                          onRightRailTabChange("browser");
-                        }}
-                      >
-                        <GlobeIcon className="size-4 shrink-0" />
-                        <span className="max-w-44 truncate">{browsers.labelFor(tabId, index)}</span>
-                      </button>
-                      <button
-                        type="button"
-                        aria-label={`Close ${browsers.labelFor(tabId, index)}`}
-                        className="flex size-4 items-center justify-center rounded hover:bg-muted"
-                        onClick={() => void closeBrowserTab(tabId)}
-                      >
-                        <XIcon className="size-3" />
-                      </button>
-                    </div>
-                  ))}
-                {sideChats.tabs.map((childId) => {
-                  const active = sideChatSelected && sideChats.selected === childId;
-                  const label = chatTabLabels[childId] ?? childId;
-                  const TabIcon =
-                    subagentSessionIdFromTab(childId) === null ? MessagesSquareIcon : BotIcon;
-                  return (
-                    <div
-                      key={childId}
-                      ref={active ? activeSideChatRef : null}
-                      className={cn(
-                        "flex h-[24px] shrink-0 items-center gap-[6px] rounded-md px-2 text-ui font-medium leading-5 transition-colors",
-                        active
-                          ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
-                          : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
-                      )}
-                    >
-                      <button
-                        type="button"
-                        role="tab"
-                        aria-selected={active}
-                        className="flex items-center gap-1"
-                        onAuxClick={(event) => {
-                          if (event.button === 1) {
-                            event.preventDefault();
-                            closeSideChat(childId);
-                          }
-                        }}
-                        onClick={() => {
-                          sideChats.select(childId);
-                          onRightRailTabChange("sidechat");
-                        }}
-                      >
-                        <TabIcon className="size-4 shrink-0" />
-                        <span className="max-w-[16ch] truncate">{label}</span>
-                      </button>
-                      <button
-                        type="button"
-                        aria-label={`Close ${label}`}
-                        className="flex size-4 items-center justify-center rounded hover:bg-muted"
-                        onClick={() => closeSideChat(childId)}
-                      >
-                        <XIcon className="size-3" />
-                      </button>
-                    </div>
-                  );
-                })}
-              </WorkspaceTabsScroller>
+                        <button
+                          type="button"
+                          role="tab"
+                          aria-selected={browserSelected && browsers.selected === tabId}
+                          title={browsers.labelFor(tabId, index)}
+                          className="flex min-w-0 items-center gap-1"
+                          onAuxClick={(event) => {
+                            if (event.button === 1) {
+                              event.preventDefault();
+                              void closeBrowserTab(tabId);
+                            }
+                          }}
+                          onClick={() => {
+                            browsers.select(tabId);
+                            onRightRailTabChange("browser");
+                          }}
+                        >
+                          <GlobeIcon className="size-4 shrink-0" />
+                          <span className="max-w-44 truncate">
+                            {browsers.labelFor(tabId, index)}
+                          </span>
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`Close ${browsers.labelFor(tabId, index)}`}
+                          className="flex size-4 items-center justify-center rounded hover:bg-muted"
+                          onClick={() => void closeBrowserTab(tabId)}
+                        >
+                          <XIcon className="size-3" />
+                        </button>
+                      </div>
+                    ))}
+                  <SideChatTabGroup ids={unpinnedSideChats}>
+                    {unpinnedSideChats.map(renderSideChatRailTab)}
+                  </SideChatTabGroup>
+                  {sideChats.tabs
+                    .filter((id) => subagentSessionIdFromTab(id) !== null)
+                    .map(renderSideChatRailTab)}
+                </WorkspaceTabsScroller>
+              </SideChatTabsDragArea>
             </>
           )}
           {/* With no open tabs, "+" sits right after the nav tabs. */}
@@ -2247,35 +2272,50 @@ function WorkspacePanelImpl({
             {sideChats.tabs.map((childId) => {
               const active = sideChats.selected === childId;
               const label = chatTabLabels[childId] ?? childId;
+              const arrangement = sideChatArrangement(childId);
               return (
-                <div
+                <SideChatTabMenu
                   key={childId}
-                  className={cn(
-                    "flex h-8 shrink-0 items-center gap-1.5 rounded-md px-2 text-ui font-medium",
-                    active ? "bg-muted text-foreground" : "text-muted-foreground",
-                  )}
+                  label={label}
+                  arrangement={arrangement}
+                  onClose={() => void closeSideChat(childId)}
                 >
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={active}
-                    className="flex items-center gap-1"
-                    onClick={() => sideChats.select(childId)}
-                  >
-                    {subagentSessionIdFromTab(childId) !== null && (
-                      <BotIcon className="size-4 shrink-0" />
+                  <div
+                    data-side-chat-tab={childId}
+                    data-pinned={arrangement?.pinned || undefined}
+                    className={cn(
+                      "flex h-8 shrink-0 items-center gap-1.5 rounded-md px-2 text-ui font-medium",
+                      active ? "bg-muted text-foreground" : "text-muted-foreground",
                     )}
-                    <span className="max-w-[16ch] truncate">{label}</span>
-                  </button>
-                  <button
-                    type="button"
-                    aria-label={`Close ${label}`}
-                    className="flex size-6 items-center justify-center rounded"
-                    onClick={() => closeSideChat(childId)}
                   >
-                    <XIcon className="size-3.5" />
-                  </button>
-                </div>
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={active}
+                      aria-label={label}
+                      className="flex items-center gap-1"
+                      onClick={() => sideChats.select(childId)}
+                    >
+                      {subagentSessionIdFromTab(childId) !== null && (
+                        <BotIcon className="size-4 shrink-0" />
+                      )}
+                      {arrangement?.pinned && <PinIcon className="size-3.5 shrink-0" />}
+                      <span className="max-w-[16ch] truncate">
+                        {sideChatTabsDensity === "regular"
+                          ? label
+                          : (chatTabCompactLabels[childId] ?? label)}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={`Close ${label}`}
+                      className="flex size-6 items-center justify-center rounded"
+                      onClick={() => closeSideChat(childId)}
+                    >
+                      <XIcon className="size-3.5" />
+                    </button>
+                  </div>
+                </SideChatTabMenu>
               );
             })}
             {onNewSideChat && (

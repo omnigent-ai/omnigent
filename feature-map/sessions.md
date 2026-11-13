@@ -78,6 +78,11 @@ the header menu), and each place is a separate entry point.
   message or Resume. Only the session's owner can start side chats. A side
   chat started on one device appears as an existing side-chat tab on the
   owner's other devices. Selection and closing tabs stay local.
+- `side-chat-tabs`: each side chat keeps its number (closing Side chat 1 leaves
+  Side chat 2 named as before). A tab's right-click menu pins it to the left of
+  the strip or moves it left or right; dragging a tab also reorders it. With four
+  or more tabs, labels shrink to the number; from seven, only the selected tab
+  shows Close. Names, pins and order are kept per device across reloads.
 - `side-chat-settings`: choose a supported model or effort in the side-chat composer;
   selections apply to that chat's next turn independently of its parent, in the
   desktop panel and mobile drawer. Generic side chats allow selection before or
@@ -631,6 +636,15 @@ Workspace tab strip or mobile Side chats drawer. Discovery fetches up to 20 chat
 without changing the active panel or tab. Tabs closed on this device stay closed
 after reload; other devices keep their tabs. Side chats created before server
 discovery was added remain local to their original browser.
+**Side-chat tabs:** open several side chats, close Side chat 1 and check the
+rest keep their names; a new one is numbered after the highest open one. Right-click a
+tab for **Pin tab**, **Unpin tab**, **Move left**, **Move right** and **Close
+tab**. Pinned tabs follow the fixed pages, ahead of other open tabs, and show a
+pin button in place of Close; tabs move only within the pinned or unpinned group. Drag a tab
+with the mouse to reorder it. The mobile Side chats drawer offers the same
+menu. Open four or more side chats to see number-only labels
+and seven or more to see Close only on the selected tab; the full name stays in
+each tab's tooltip. Sub-agent tabs offer only Close tab and are not reordered.
 In the Electron desktop app, Cmd/Ctrl+W also closes the selected side-chat tab
 in a visible workspace rail. With no closable visible tab it returns to the
 new-session page; Cmd/Ctrl+Shift+W closes the window. Grid workspaces are

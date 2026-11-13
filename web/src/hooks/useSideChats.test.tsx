@@ -118,6 +118,7 @@ describe("side-chat soft tabs", () => {
     expect(readSessionWorkspaceState("session-a")).toEqual({
       openSideChats: ["conv_a1", "conv_a2"],
       selectedSideChatId: "conv_a2",
+      sideChatNumbers: { conv_a1: 1, conv_a2: 2 },
     });
 
     const other = renderHook(() => useSideChats("session-b"));
@@ -219,6 +220,7 @@ describe("sub-agent tabs", () => {
       openSideChats: ["conv_a"],
       openSubagentTabs: [subagentTab],
       selectedSideChatId: subagentTab,
+      sideChatNumbers: { conv_a: 1 },
     });
 
     // Closing a native side chat opened as a sub-agent must also survive discovery.
@@ -227,6 +229,7 @@ describe("sub-agent tabs", () => {
       openSideChats: ["conv_a"],
       closedSideChats: ["conv_child"],
       selectedSideChatId: "conv_a",
+      sideChatNumbers: { conv_a: 1 },
     });
   });
 
@@ -307,11 +310,16 @@ describe("side-chat tabs when storage writes fail", () => {
   });
 
   it.each([
-    ["closes a tab", (hook: SideChatsHook) => hook.close("conv_z"), ["conv_x"]],
-    ["opens a tab", (hook: SideChatsHook) => hook.open("conv_y"), ["conv_z", "conv_y", "conv_x"]],
+    ["closes a tab", (hook: SideChatsHook) => hook.close("conv_z"), ["conv_x"], { conv_x: 1 }],
+    [
+      "opens a tab",
+      (hook: SideChatsHook) => hook.open("conv_y"),
+      ["conv_z", "conv_y", "conv_x"],
+      { conv_z: 1, conv_y: 2, conv_x: 3 },
+    ],
   ])(
     "replay an unsaved change on top of what another window then %s",
-    (_change, otherWindowChange, sideChats) => {
+    (_change, otherWindowChange, sideChats, sideChatNumbers) => {
       const subagentTab = subagentTabId("conv_child");
       const first = renderHook(() => useSideChats("session-a"));
       act(() => first.result.current.open("conv_z"));
@@ -331,6 +339,7 @@ describe("side-chat tabs when storage writes fail", () => {
         ...(_change === "closes a tab" ? { closedSideChats: ["conv_z"] } : {}),
         openSubagentTabs: [subagentTab],
         selectedSideChatId: subagentTab,
+        sideChatNumbers,
       });
     },
   );
@@ -351,5 +360,90 @@ describe("side-chat tabs when storage writes fail", () => {
     setItem.mockRestore();
     act(() => result.current.open("conv_b"));
     expect(readSessionWorkspaceState("session-a").openSideChats).toEqual(["conv_a", "conv_b"]);
+  });
+});
+
+describe("side-chat names, pins and order", () => {
+  it("keeps each side chat's number when another closes or a draft starts", () => {
+    const { result } = renderHook(() => useSideChats("session-a"));
+    act(() => result.current.open("conv_a"));
+    act(() => result.current.open("conv_b"));
+    let pendingId = "";
+    act(() => {
+      pendingId = result.current.openPending();
+    });
+    act(() => result.current.close("conv_a"));
+    act(() => result.current.rekey(pendingId, "conv_c"));
+    act(() => result.current.open("conv_d"));
+
+    expect(result.current.tabs).toEqual(["conv_b", "conv_c", "conv_d"]);
+    expect(result.current.numbers).toEqual({ conv_b: 2, conv_c: 3, conv_d: 4 });
+    // Numbers come from the highest open tab, so they don't climb forever.
+    act(() => result.current.close("conv_d"));
+    act(() => result.current.open("conv_e"));
+    expect(result.current.numbers.conv_e).toBe(4);
+  });
+
+  it("numbers tabs saved before numbering in their saved order", () => {
+    writeSessionWorkspaceState("session-a", { openSideChats: ["conv_x", "conv_y"] });
+    const { result } = renderHook(() => useSideChats("session-a"));
+    expect(result.current.numbers).toEqual({ conv_x: 1, conv_y: 2 });
+  });
+
+  it("pins tabs to the front and unpins them to the start of the rest", () => {
+    const { result } = renderHook(() => useSideChats("session-a"));
+    for (const id of ["conv_a", "conv_b", "conv_c"]) act(() => result.current.open(id));
+    act(() => result.current.setPinned("conv_c", true));
+    act(() => result.current.setPinned("conv_b", true));
+    expect(result.current.tabs).toEqual(["conv_c", "conv_b", "conv_a"]);
+    expect(result.current.pinned).toEqual(["conv_c", "conv_b"]);
+
+    act(() => result.current.setPinned("conv_c", false));
+    expect(result.current.tabs).toEqual(["conv_b", "conv_c", "conv_a"]);
+    expect(result.current.pinned).toEqual(["conv_b"]);
+    // Pinning and moving never renames.
+    expect(result.current.numbers).toEqual({ conv_a: 1, conv_b: 2, conv_c: 3 });
+  });
+
+  it("keeps a pending tab's pin once it starts, and forgets a closed tab's pin", () => {
+    const { result } = renderHook(() => useSideChats("session-a"));
+    let pendingId = "";
+    act(() => {
+      pendingId = result.current.openPending();
+    });
+    act(() => result.current.setPinned(pendingId, true));
+    act(() => result.current.rekey(pendingId, "conv_started"));
+    expect(result.current.pinned).toEqual(["conv_started"]);
+
+    act(() => result.current.close("conv_started"));
+    act(() => result.current.open("conv_started"));
+    expect(result.current.pinned).toEqual([]);
+  });
+
+  it("moves tabs only within their pinned or unpinned group", () => {
+    const { result } = renderHook(() => useSideChats("session-a"));
+    for (const id of ["conv_a", "conv_b", "conv_c", "conv_d"]) act(() => result.current.open(id));
+    act(() => result.current.setPinned("conv_a", true));
+    act(() => result.current.move("conv_d", "conv_b"));
+    expect(result.current.tabs).toEqual(["conv_a", "conv_d", "conv_b", "conv_c"]);
+    act(() => result.current.move("conv_d", "conv_c"));
+    expect(result.current.tabs).toEqual(["conv_a", "conv_b", "conv_c", "conv_d"]);
+    // A pinned and an unpinned tab don't trade places.
+    act(() => result.current.move("conv_c", "conv_a"));
+    expect(result.current.tabs).toEqual(["conv_a", "conv_b", "conv_c", "conv_d"]);
+  });
+
+  it("restores pins, order and names after a reload", () => {
+    const first = renderHook(() => useSideChats("session-a"));
+    for (const id of ["conv_a", "conv_b", "conv_c"]) act(() => first.result.current.open(id));
+    act(() => first.result.current.setPinned("conv_b", true));
+    act(() => first.result.current.move("conv_c", "conv_a"));
+    act(() => first.result.current.close("conv_a"));
+    first.unmount();
+
+    const reloaded = renderHook(() => useSideChats("session-a"));
+    expect(reloaded.result.current.tabs).toEqual(["conv_b", "conv_c"]);
+    expect(reloaded.result.current.pinned).toEqual(["conv_b"]);
+    expect(reloaded.result.current.numbers).toEqual({ conv_b: 2, conv_c: 3 });
   });
 });

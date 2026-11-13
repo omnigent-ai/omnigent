@@ -1774,6 +1774,90 @@ describe("WorkspacePanel mobile side chats", () => {
   });
 });
 
+describe("WorkspacePanel side-chat tab arrangement", () => {
+  const rail = () => screen.getByRole("complementary", { name: "Workspace" });
+  // Open tabs in strip order: side chats by name, file tabs by path.
+  const tabNames = () =>
+    Array.from(
+      rail()
+        .querySelector("[data-workspace-tabs-viewport]")!
+        .querySelectorAll<HTMLElement>('[role="tab"], [aria-current]'),
+    ).map((tab) => tab.getAttribute("aria-label") ?? tab.getAttribute("title"));
+  const openSideChats = (ids: string[]) =>
+    writeSessionWorkspaceState("conv_ws", {
+      openSideChats: ids,
+      selectedSideChatId: ids.at(-1) ?? null,
+    });
+
+  it("keeps the other side chats' names when an earlier one closes", async () => {
+    vi.spyOn(sessionsApi, "stopSession").mockResolvedValue({ queued: false });
+    openSideChats(["conv_side_a", "conv_side_b", "conv_side_c"]);
+    renderWorkspace({ rightRailTab: "sidechat" });
+
+    fireEvent.click(within(rail()).getByRole("button", { name: "Close Side chat 1" }));
+
+    await waitFor(() => expect(tabNames()).toEqual(["Side chat 2", "Side chat 3"]));
+    expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_c");
+  });
+
+  it("pins a side chat ahead of the other open tabs from its context menu", async () => {
+    openSideChats(["conv_side_a", "conv_side_b"]);
+    renderWorkspace({ rightRailTab: "sidechat", openFiles: ["src/App.tsx"] });
+
+    fireEvent.contextMenu(within(rail()).getByRole("tab", { name: "Side chat 2" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Pin tab" }));
+
+    expect(tabNames()).toEqual(["Side chat 2", "src/App.tsx", "Side chat 1"]);
+    expect(readSessionWorkspaceState("conv_ws").pinnedSideChats).toEqual(["conv_side_b"]);
+    // A pinned tab trades its close button for an unpin button.
+    expect(within(rail()).queryByRole("button", { name: "Close Side chat 2" })).toBeNull();
+    fireEvent.click(within(rail()).getByRole("button", { name: "Unpin Side chat 2" }));
+    expect(readSessionWorkspaceState("conv_ws").pinnedSideChats).toBeUndefined();
+    expect(tabNames()).toEqual(["src/App.tsx", "Side chat 2", "Side chat 1"]);
+  });
+
+  it("moves a side chat left and right from its context menu", async () => {
+    openSideChats(["conv_side_a", "conv_side_b", "conv_side_c"]);
+    renderWorkspace({ rightRailTab: "sidechat" });
+
+    fireEvent.contextMenu(within(rail()).getByRole("tab", { name: "Side chat 3" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Move left" }));
+    expect(tabNames()).toEqual(["Side chat 1", "Side chat 3", "Side chat 2"]);
+
+    fireEvent.contextMenu(within(rail()).getByRole("tab", { name: "Side chat 1" }));
+    expect(await screen.findByRole("menuitem", { name: "Move left" })).toHaveAttribute(
+      "data-disabled",
+    );
+    fireEvent.click(screen.getByRole("menuitem", { name: "Move right" }));
+    expect(tabNames()).toEqual(["Side chat 3", "Side chat 1", "Side chat 2"]);
+    expect(readSessionWorkspaceState("conv_ws").openSideChats).toEqual([
+      "conv_side_c",
+      "conv_side_a",
+      "conv_side_b",
+    ]);
+  });
+
+  it.each([
+    [3, "Side chat 3", 3],
+    [5, "5", 5],
+    [8, "8", 1],
+  ])(
+    "packs %i side chats with visible labels like %j and %i close buttons",
+    (count, lastVisibleText, closeButtons) => {
+      openSideChats(Array.from({ length: count }, (_, index) => `conv_side_${index}`));
+      renderWorkspace({ rightRailTab: "sidechat" });
+
+      const tabs = within(rail()).getAllByRole("tab", { name: /^Side chat \d+$/ });
+      expect(tabs).toHaveLength(count);
+      expect(tabs.at(-1)).toHaveTextContent(new RegExp(`^${lastVisibleText}$`));
+      expect(tabs.at(-1)).toHaveAttribute("title", `Side chat ${count}`);
+      expect(within(rail()).getAllByRole("button", { name: /^Close Side chat/ })).toHaveLength(
+        closeButtons,
+      );
+    },
+  );
+});
+
 describe("WorkspacePanel sub-agent tabs", () => {
   const SUBAGENT_TAB = subagentTabId("conv_child");
 
@@ -1919,6 +2003,7 @@ describe("WorkspacePanel sub-agent tabs", () => {
     expect(readSessionWorkspaceState("conv_ws")).toEqual({
       openSideChats: ["conv_child"],
       selectedSideChatId: "conv_child",
+      sideChatNumbers: { conv_child: 1 },
     });
   });
 
