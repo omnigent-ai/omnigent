@@ -748,6 +748,7 @@ async def _recover_retry_session(
         runner_client, conv = await ensure_runner_connected(
             session_id=session_id,
             conv=conv,
+            request=request,
             app_state=request.app.state,
             conversation_store=conversation_store,
             runner_router=runner_router,
@@ -1889,6 +1890,7 @@ def register_events_routes(
                 conv=wake_conv,
                 app_state=_app_state,
                 conversation_store=conversation_store,
+                request=request,
             ):
                 _refreshed = await asyncio.to_thread(
                     conversation_store.get_conversation, session_id
@@ -1936,6 +1938,7 @@ def register_events_routes(
                     conv=wake_conv,
                     app_state=_app_state,
                     conversation_store=conversation_store,
+                    request=request,
                 ):
                     _refreshed = await asyncio.to_thread(
                         conversation_store.get_conversation, session_id
@@ -2052,6 +2055,7 @@ def register_events_routes(
             runner_client = await _get_runner_client(
                 target_session_id,
                 runner_router,
+                for_control=True,
             )
             interrupt_delivered = False
             if runner_client is not None:
@@ -2115,7 +2119,9 @@ def register_events_routes(
                 # A shared-runner chat owns its harness resources, while the
                 # parent owns the runner. Keep the persisted transcript.
                 try:
-                    cleanup_client = await _get_runner_client(session_id, runner_router)
+                    cleanup_client = await _get_runner_client(
+                        session_id, runner_router, for_control=True
+                    )
                     if cleanup_client is None:
                         raise ConnectionError("Side-chat runner is unavailable")
                     cleanup_resp = await cleanup_client.delete(
@@ -3127,6 +3133,7 @@ def register_events_routes(
             conv=conv,
             app_state=request.app.state,
             conversation_store=conversation_store,
+            request=request,
         ):
             # A resumable managed wake may have re-launched the runner and
             # updated liveness while this handler was holding an old row.
@@ -3329,6 +3336,7 @@ def register_events_routes(
                         conv=conv,
                         app_state=request.app.state,
                         conversation_store=conversation_store,
+                        request=request,
                     ):
                         conv_after_relaunch = await asyncio.to_thread(
                             conversation_store.get_conversation, session_id
@@ -3836,7 +3844,7 @@ def register_events_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             if runner_router is not None:
-                await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
+                await asyncio.to_thread(runner_router.require_runtime_support, conv)
             item_id = await _dispatch_skill_slash_command_to_runner(
                 session_id,
                 conv,
@@ -3968,6 +3976,8 @@ def register_events_routes(
         runner_client = await _get_runner_client(
             session_id,
             runner_router,
+            conversation=conv,
+            for_control=True,
         )
         # Hostless children stream on their ancestor's replica too. Reject a
         # routing miss before accepting a stream that would only send heartbeats.
@@ -4170,7 +4180,9 @@ def register_events_routes(
         # resources are gone with the runner anyway.
         runner_client: httpx.AsyncClient | None = None
         try:
-            runner_client = await _get_runner_client_for_resource_access(session_id)
+            runner_client = await _get_runner_client(
+                session_id, runner_router, conversation=conv, for_control=True
+            )
         except OmnigentError as exc:
             _logger.info(
                 "Skipping runner-side cleanup for %s; proceeding with server-side delete: %s",
