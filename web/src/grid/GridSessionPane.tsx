@@ -2,6 +2,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -10,9 +11,13 @@ import {
 import { createPortal } from "react-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { useDraggable, useDroppable } from "@dnd-kit/core";
+import { toast } from "sonner";
 import { cn } from "@/lib/utils";
-import { Maximize2Icon, XIcon } from "lucide-react";
+import { Maximize2Icon, PanelRightCloseIcon, PanelRightIcon, XIcon } from "lucide-react";
 import { SideChatPane } from "@/components/chat/SideChatPane";
+import { SideChatSettings } from "@/components/chat/SideChatSettings";
+import { ComposerPermissionPicker } from "@/components/composer/ComposerControls";
+import { HostBadge } from "@/components/HostBadge";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { Button } from "@/components/ui/button";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
@@ -32,7 +37,16 @@ import { terminalTabKey, useDeleteTerminal } from "@/hooks/useTerminals";
 import { useWorkspaceResources } from "@/shell/useWorkspaceResources";
 import { supportsBrowser } from "@/lib/nativeBridge";
 import { isNativeWrapper, nativeCodingAgentForSubagentWrapper } from "@/lib/nativeCodingAgents";
+import { isClaudeNativeSession } from "@/lib/claudePermissionMode";
+import { isCodexNativeSession } from "@/lib/codexPlanMode";
+import { modelPickerKindForConv } from "@/lib/composerCapabilities";
+import { permissionChip } from "@/lib/permissionModeCycle";
 import { isOwnerLevel } from "@/lib/permissionsApi";
+import { restoreReplyDraft, serializeReplyDraft, snapshotReplyDraft } from "@/lib/replyDraft";
+import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import type { Session } from "@/lib/types";
+import { useChatStore } from "@/store/chatStore";
+import { SidebarOpenButton } from "@/shell/SidebarOpenButton";
 import { retrySession } from "@/lib/sessionsApi";
 import { readTranscriptViewDefault } from "@/lib/transcriptViewPreferences";
 import { MainTerminalView } from "@/shell/MainTerminalView";
@@ -78,6 +92,8 @@ export function GridSessionPane({
   workspaceTarget,
   workspacePanel,
   onOpenWorkspace,
+  onToggleWorkspace,
+  onOpenSidebar,
 }: {
   sessionId: string;
   area?: string;
@@ -88,7 +104,10 @@ export function GridSessionPane({
   workspaceTarget: HTMLDivElement | null;
   workspacePanel: GridWorkspacePanelProps;
   onOpenWorkspace: () => void;
+  onToggleWorkspace: () => void;
+  onOpenSidebar?: () => void;
 }) {
+  useSharedSessionDraft(sessionId);
   const queryClient = useQueryClient();
   const { session, isLoading: sessionLoading } = useSession(sessionId);
   const state = useConversationEntryState(sessionId);
@@ -398,6 +417,9 @@ export function GridSessionPane({
               selected && "bg-brand-accent/10",
             )}
           >
+            {onOpenSidebar && (
+              <SidebarOpenButton onOpenSidebar={onOpenSidebar} componentId="grid.open_sidebar" />
+            )}
             <button
               type="button"
               ref={setActivatorNodeRef}
@@ -413,6 +435,20 @@ export function GridSessionPane({
               {title}
             </button>
             <ViewModeToggle hotkeyEnabled={selected && !workspacePanel.maximized} alwaysVisible />
+            {selected && (
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                aria-label={`${workspacePanel.open ? "Collapse" : "Expand"} grid workspace`}
+                onClick={onToggleWorkspace}
+              >
+                {workspacePanel.open ? (
+                  <PanelRightCloseIcon className="size-3.5" />
+                ) : (
+                  <PanelRightIcon className="size-3.5" />
+                )}
+              </Button>
+            )}
             <Button asChild variant="ghost" size="icon-xs">
               <Link
                 draggable={false}
@@ -434,7 +470,27 @@ export function GridSessionPane({
           <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
             <div ref={setChatRef} className={cn("h-full", showTerminal && "hidden")}>
               <RenderErrorBoundary name="chat" resetKey={sessionId}>
-                <SideChatPane childId={sessionId} fullSession readOnly={!canEdit} />
+                <SideChatPane
+                  childId={sessionId}
+                  fullSession
+                  readOnly={!canEdit}
+                  composerActions={
+                    session
+                      ? {
+                          leading: (
+                            <>
+                              <HostBadge sessionId={sessionId} appearance="composer" />
+                              <GridPermissionPicker
+                                session={session}
+                                permissionLevel={permissionLevel}
+                              />
+                            </>
+                          ),
+                          trailing: <SideChatSettings session={session} fullSession />,
+                        }
+                      : undefined
+                  }
+                />
               </RenderErrorBoundary>
             </div>
             {terminalFirst && (agentTerminal !== null || showTerminal || terminalOpened) && (
@@ -559,5 +615,78 @@ export function GridSessionPane({
           )}
       </FileViewerContext.Provider>
     </TerminalFirstContextProvider>
+  );
+}
+
+/** The cell's composer edits the same draft as the session's single-session composer. */
+function useSharedSessionDraft(sessionId: string) {
+  // Seeds before the composer's own effects, such as a failed-send restore, run.
+  useLayoutEffect(() => {
+    const saved = getSessionDraft(sessionId);
+    const { quotes, text } = restoreReplyDraft(saved?.text ?? "", saved?.replyDraft);
+    useChatStore.getState().updateSideChatComposer(sessionId, (current) => ({
+      ...current,
+      text,
+      quotes,
+      files: saved?.files ?? [],
+    }));
+    let synced = useChatStore.getState().sideChatComposers[sessionId];
+    return useChatStore.subscribe((state) => {
+      const composer = state.sideChatComposers[sessionId];
+      if (composer === synced) return;
+      synced = composer;
+      const draft = { quotes: composer?.quotes ?? [], text: composer?.text ?? "" };
+      setSessionDraft(sessionId, {
+        text: serializeReplyDraft(draft),
+        files: composer?.files ?? [],
+        replyDraft: snapshotReplyDraft(draft),
+        mentions: getSessionDraft(sessionId)?.mentions,
+      });
+    });
+  }, [sessionId]);
+}
+
+/** The cell session's permission mode; its owner can switch it as in the main composer. */
+function GridPermissionPicker({
+  session,
+  permissionLevel,
+}: {
+  session: Session;
+  permissionLevel: number | null;
+}) {
+  const state = useConversationEntryState(session.id);
+  const [busy, setBusy] = useState(false);
+  const kind = isCodexNativeSession(session)
+    ? "codex"
+    : modelPickerKindForConv(session) === "devin"
+      ? "devin"
+      : isClaudeNativeSession(session)
+        ? "claude"
+        : null;
+  if (kind === null) return null;
+  const chip = permissionChip(kind, state.claudePermissionMode, state.codexApprovalMode);
+  const owner = isOwnerLevel(permissionLevel);
+  return (
+    <ComposerPermissionPicker
+      label="Permission mode"
+      value={chip.label || "Permission mode"}
+      harness={state.sessionHarness}
+      selectedValue={chip.value}
+      options={chip.options}
+      disabled={!owner || busy}
+      disabledReason={owner ? undefined : "Only the session owner can change the permission mode"}
+      onSelect={(mode) => {
+        const store = useChatStore.getState();
+        setBusy(true);
+        (kind === "codex"
+          ? store.setCodexApprovalMode(mode, session.id)
+          : store.setClaudePermissionMode(mode, session.id)
+        )
+          .catch((error: unknown) =>
+            toast.error(error instanceof Error ? error.message : "Unable to change permissions"),
+          )
+          .finally(() => setBusy(false));
+      }}
+    />
   );
 }

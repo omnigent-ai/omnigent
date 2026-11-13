@@ -1,6 +1,15 @@
 // Shift+Tab steps through every option in the permission chip's menu order.
 
+import {
+  CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
+  claudePermissionModeLabel,
+} from "@/lib/claudePermissionMode";
+import {
+  CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS,
+  codexApprovalModeLabel,
+} from "@/lib/codexApprovalMode";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { DEVIN_NATIVE_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
 
 /** The key fields the cycle check reads from a React keyboard event. */
 export interface PermissionModeCycleKeyEvent {
@@ -41,4 +50,34 @@ export function nextCycledPermissionMode(
     return candidate;
   }
   return null;
+}
+
+/** Which vocabulary a session's permission chip uses. */
+export type PermissionChipKind = "claude" | "devin" | "codex";
+
+/** The chip's menu options, selected value and label for a session's current modes. */
+export function permissionChip(
+  kind: PermissionChipKind,
+  claudePermissionMode: string,
+  codexApprovalMode: string,
+): { options: readonly { value: string; label: string }[]; value: string; label: string } {
+  if (kind === "codex")
+    return {
+      options: CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS,
+      value: codexApprovalMode,
+      label: codexApprovalModeLabel(codexApprovalMode),
+    };
+  if (kind === "devin")
+    return {
+      options: DEVIN_NATIVE_PERMISSION_MODES,
+      value: claudePermissionMode,
+      label:
+        DEVIN_NATIVE_PERMISSION_MODES.find((mode) => mode.value === claudePermissionMode)?.label ??
+        claudePermissionMode,
+    };
+  return {
+    options: CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
+    value: claudePermissionMode,
+    label: claudePermissionModeLabel(claudePermissionMode),
+  };
 }

@@ -43,6 +43,7 @@ import type { Session } from "@/lib/types";
 export function SideChatSettings({
   session,
   draft,
+  fullSession = false,
 }: {
   session: Session;
   draft?: {
@@ -50,6 +51,8 @@ export function SideChatSettings({
     onChange: (updates: SideChatModelSettings) => void;
     disabled: boolean;
   };
+  /** A whole session (a grid cell), whose native settings the main composer also edits. */
+  fullSession?: boolean;
 }) {
   const queryClient = useQueryClient();
   const state = useConversationEntryState(session.id);
@@ -57,8 +60,9 @@ export function SideChatSettings({
   const sourceId = session.parentSessionId ?? parentIdFromLabels(session.labels);
   const nativeSession =
     nativeSide ||
-    session.harness === "codex-native" ||
-    session.labels?.["omnigent.wrapper"] === "codex-native-ui";
+    (!fullSession &&
+      (session.harness === "codex-native" ||
+        session.labels?.["omnigent.wrapper"] === "codex-native-ui"));
   const settingsSupported = !nativeSession || session.sideChatSettingsSupported === true;
   const settingsParentId = nativeSide && !draft ? sourceId : null;
   const healthSessions = useMemo(
@@ -235,7 +239,7 @@ export function SideChatSettings({
         }
       }}
       trigger={{
-        label: "Side chat model and effort",
+        label: fullSession ? "Model and effort" : "Side chat model and effort",
         model: compactModelTriggerLabel(modelLabel),
         effort: formatStatusEffortLabel(effort) ?? undefined,
         icon: (

@@ -1,7 +1,13 @@
 import type * as TerminalsModule from "@/hooks/useTerminals";
 import type * as SessionsApi from "@/lib/sessionsApi";
 import type * as FilesPanelModule from "@/shell/FilesPanel";
-import { type ComponentProps, type ReactElement, useContext, useState } from "react";
+import {
+  type ComponentProps,
+  type ReactElement,
+  type ReactNode,
+  useContext,
+  useState,
+} from "react";
 import {
   act,
   cleanup,
@@ -22,7 +28,10 @@ import { RearrangeableGrid } from "./GridWorkspace";
 import { splitGrid } from "./gridLayout";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
-import { retrySession } from "@/lib/sessionsApi";
+import { retrySession, updateSession } from "@/lib/sessionsApi";
+import { clearSessionDrafts, getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import type { Session } from "@/lib/types";
+import { useChatStore } from "@/store/chatStore";
 import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
 import { selectPullRequestInPanel } from "@/shell/PullRequestPanel";
 
@@ -53,6 +62,13 @@ const fixture = vi.hoisted(() => ({
 vi.mock("@/lib/sessionsApi", async (original) => ({
   ...(await original<typeof SessionsApi>()),
   retrySession: vi.fn(async () => ({ recovered: true })),
+  updateSession: vi.fn(async () => ({ labels: {} })),
+}));
+vi.mock("@/components/HostBadge", () => ({
+  HostBadge: ({ sessionId }: { sessionId: string }) => <span>Host for {sessionId}</span>,
+}));
+vi.mock("@/components/chat/SideChatSettings", () => ({
+  SideChatSettings: ({ session }: { session: Session }) => <span>Model for {session.title}</span>,
 }));
 vi.mock("@/components/blocks/TerminalView", () => ({
   TerminalView: ({
@@ -83,6 +99,7 @@ vi.mock("@/hooks/useSidebarData", () => ({
 vi.mock("@/hooks/useSession", () => ({
   useSession: (id: string) => ({
     session: {
+      id,
       title: id,
       agentId: `agent-${id}`,
       labels: fixture.labels,
@@ -93,7 +110,10 @@ vi.mock("@/hooks/useSession", () => ({
 }));
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: () => true }));
 vi.mock("@/hooks/useConversationEntryState", () => ({
-  useConversationEntryState: () => ({ terminalPending: fixture.terminalPending }),
+  useConversationEntryState: () => ({
+    terminalPending: fixture.terminalPending,
+    claudePermissionMode: "default",
+  }),
 }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: () => {},
@@ -123,7 +143,13 @@ vi.mock("./GridSessionsContext", () => ({
   gridTitle: () => "Test grid",
 }));
 vi.mock("@/components/chat/SideChatPane", () => ({
-  SideChatPane: ({ childId }: { childId: string }) => {
+  SideChatPane: ({
+    childId,
+    composerActions,
+  }: {
+    childId: string;
+    composerActions?: { leading?: ReactNode; trailing?: ReactNode };
+  }) => {
     const context = useContext(FileViewerContext)!;
     const terminal = useTerminalFirst();
     if (childId === fixture.failedChat) throw fixture.renderError;
@@ -155,6 +181,8 @@ vi.mock("@/components/chat/SideChatPane", () => ({
         <button type="button" onClick={() => context.openGithubTab(LINKED_PR)}>
           Open PR
         </button>
+        {composerActions?.leading}
+        {composerActions?.trailing}
       </>
     );
   },
@@ -210,7 +238,40 @@ afterEach(() => {
   fixture.failedChat = "";
   fixture.failedTerminal = "";
   fixture.discardEdits = null;
+  clearSessionDrafts();
   vi.restoreAllMocks();
+});
+
+it("keeps each cell's single-session draft and switches that session's permission mode", async () => {
+  fixture.labels = { "omnigent.wrapper": "claude-code-native-ui" };
+  setSessionDraft("second", { text: "Unsent idea", files: [] });
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <RearrangeableGrid
+          grid={{ id: "controls", layout: splitGrid("first", "first", "second", "right")! }}
+        />
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+  expect(useChatStore.getState().sideChatComposers.second?.text).toBe("Unsent idea");
+  act(() =>
+    useChatStore
+      .getState()
+      .updateSideChatComposer("second", (draft) => ({ ...draft, text: "Edited in the grid" })),
+  );
+  expect(getSessionDraft("second")?.text).toBe("Edited in the grid");
+
+  const second = within(screen.getByRole("region", { name: "second" }));
+  expect(second.getByText("Host for second")).toBeInTheDocument();
+  expect(second.getByText("Model for second")).toBeInTheDocument();
+  fireEvent.pointerDown(second.getByRole("button", { name: "Permission mode: Manual" }), {
+    button: 0,
+  });
+  fireEvent.click(screen.getByTestId("composer-permission-option-auto"));
+  await waitFor(() =>
+    expect(updateSession).toHaveBeenCalledWith("second", { claudePermissionMode: "auto" }),
+  );
 });
 
 it("opens agent-requested files only in the active workspace and respects navigation guards", () => {

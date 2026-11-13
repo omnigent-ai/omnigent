@@ -214,7 +214,8 @@ def test_session_grid_drag_persist_live_updates_and_close(
         # dnd-kit suppresses click propagation for 50 ms after a drop.
         grid_nav.get_by_role("link").dblclick(delay=75)
         rename = page.get_by_role("textbox", name="Rename grid")
-        page.get_by_role("heading", name="Grid · 2 sessions", exact=True).click()
+        expect(page).to_have_title("Grid session 0 + Grid session 1")
+        page.get_by_text("Transcript 0", exact=True).click()
         _move_cell(page, "grid-0", "grid-1")
         expect(grid_nav.get_by_role("link")).to_have_text("Grid session 1 + Grid session 0")
         _move_cell(page, "grid-0", "grid-1")
@@ -231,7 +232,8 @@ def test_session_grid_drag_persist_live_updates_and_close(
         grid_nav.get_by_role("link").click(button="right")
         page.get_by_role("menuitem", name="Rename", exact=True).click()
         rename.fill("Research monitor")
-        page.get_by_role("heading", name="Research grid · 2 sessions", exact=True).click()
+        expect(page).to_have_title("Research grid")
+        page.get_by_text("Transcript 0", exact=True).click()
         expect(grid_nav.get_by_role("link", name="Research monitor")).to_be_visible()
         # One grid-wide workspace follows clicks in any cell, keeping its width and tabs.
         for index in range(2):
@@ -243,15 +245,15 @@ def test_session_grid_drag_persist_live_updates_and_close(
             workspace.get_by_text(f"notes-{index}.md", exact=True).click()
             expect(workspace.get_by_test_id("file-viewer")).to_contain_text(f"Workspace {index}")
             expect(page).to_have_url(grid_url)
-        header = (
-            page.get_by_role("region", name="Session grid", exact=True).locator("header").first
-        )
-        header_box = header.bounding_box()
+        # No grid header: the cells start at the top and end at the workspace.
+        session_grid = page.get_by_test_id("session-grid")
+        session_grid_box = session_grid.bounding_box()
         panel_box = workspace.bounding_box()
-        assert header_box and panel_box
+        assert session_grid_box and panel_box
+        assert session_grid_box["y"] == 0
         assert panel_box["y"] == 0
         assert panel_box["height"] == page.viewport_size["height"]
-        assert abs(header_box["x"] + header_box["width"] - panel_box["x"]) < 2
+        assert abs(session_grid_box["x"] + session_grid_box["width"] - panel_box["x"]) < 2
         page.screenshot(path=str(artifacts / "shared-workspace.png"))
         first_cell = page.locator('[data-grid-session="grid-0"]')
         first_cell.get_by_text("Transcript 0", exact=True).click()
@@ -274,7 +276,8 @@ def test_session_grid_drag_persist_live_updates_and_close(
         other_area = other_cell.evaluate("node => node.style.gridArea")
         first_cell.evaluate("node => node.dataset.instance = 'preserved'")
         assert first_cell.locator("header").bounding_box()["height"] == 32
-        expect(first_cell.locator('header [data-size="icon-xs"]')).to_have_count(4)
+        # The active cell also carries the grid workspace toggle.
+        expect(first_cell.locator('header [data-size="icon-xs"]')).to_have_count(5)
         # Both cells use real xterm attaches, with independent input and view selection.
         first_cell.get_by_test_id("side-chat-input").fill("Keep this chat draft")
         for cell in (first_cell, other_cell):
@@ -362,7 +365,7 @@ def test_session_grid_drag_persist_live_updates_and_close(
         assert abs(panel_box["width"] - grid_box["width"]) < 2
         assert abs(panel_box["height"] - grid_box["height"]) < 2
         assert panel_box["y"] == 0
-        assert header.evaluate("node => !!node.closest('[inert]')")
+        assert session_grid.evaluate("node => !!node.closest('[inert]')")
         page.screenshot(path=str(artifacts / "workspace-maximized-in-grid.png"))
         first_workspace.get_by_role("button", name="Exit full screen", exact=True).click()
         workspace.get_by_role("separator").focus()
@@ -388,7 +391,7 @@ def test_session_grid_drag_persist_live_updates_and_close(
         assert workspace.bounding_box()["width"] == saved_width
         page.keyboard.press("ControlOrMeta+Alt+BracketRight")
         expect(page.get_by_role("button", name="Expand grid workspace")).to_be_visible()
-        assert header.bounding_box()["width"] > header_box["width"]
+        assert session_grid.bounding_box()["width"] > session_grid_box["width"]
         _drag_session(page, "grid-2", "grid-0", "bottom")
         for index in range(3):
             expect(

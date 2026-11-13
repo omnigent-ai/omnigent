@@ -141,7 +141,6 @@ import {
 import { shouldQueueSend } from "@/lib/messageQueue";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
-import { DEVIN_NATIVE_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
   composerInlineMentions,
@@ -341,17 +340,13 @@ import {
   type NativeModelPickerKind,
 } from "@/lib/composerCapabilities";
 
-import {
-  CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
-  claudePermissionModeLabel,
-  isClaudeNativeSession,
-} from "@/lib/claudePermissionMode";
-import {
-  CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS,
-  codexApprovalModeLabel,
-} from "@/lib/codexApprovalMode";
+import { isClaudeNativeSession } from "@/lib/claudePermissionMode";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
-import { isPermissionModeCycleKey, nextCycledPermissionMode } from "@/lib/permissionModeCycle";
+import {
+  isPermissionModeCycleKey,
+  nextCycledPermissionMode,
+  permissionChip,
+} from "@/lib/permissionModeCycle";
 import { getCliServerUrl } from "@/lib/host";
 import { useOmnigentAnalytics } from "@/lib/analyticsEmit";
 import { GoalDialog, CommandGoalDialog, GoalStatusPill, useGoalState } from "@/components/goal";
@@ -2857,21 +2852,15 @@ function ComposerImpl(
   const openComposerGithubTab = useOpenGithubTab();
   // Devin shares this control but not Claude's vocabulary: its rungs are
   // normal / accept-edits / smart / dangerous, cycled in the TUI.
-  const devinPermissionControl = modelPickerKind === "devin";
-  const permissionOptions = showClaudePermissionMode
-    ? devinPermissionControl
-      ? DEVIN_NATIVE_PERMISSION_MODES
-      : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
-    : CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS;
-  const permissionLabel = showClaudePermissionMode
-    ? devinPermissionControl
-      ? (DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === claudePermissionMode)?.label ??
-        claudePermissionMode)
-      : claudePermissionModeLabel(claudePermissionMode)
-    : codexApprovalModeLabel(codexApprovalMode);
-  const selectedPermissionMode = showClaudePermissionMode
-    ? claudePermissionMode
-    : codexApprovalMode;
+  const {
+    options: permissionOptions,
+    label: permissionLabel,
+    value: selectedPermissionMode,
+  } = permissionChip(
+    !showClaudePermissionMode ? "codex" : modelPickerKind === "devin" ? "devin" : "claude",
+    claudePermissionMode,
+    codexApprovalMode,
+  );
   const permissionControlInteractive =
     (showClaudePermissionMode || showCodexApprovalMode) &&
     !isReadOnly &&

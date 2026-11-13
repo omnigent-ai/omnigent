@@ -271,10 +271,12 @@ session, and drag another sidebar row over it. Hover **Split left/right/top/bott
 to preview, then drop. Split a remaining full-width or full-height pane again
 to reach three or four panes. Alternatively, use a row's menu or right-click
 menu → **Open in grid** and choose the pane and direction. Each pane has its own
-transcript and composer; terminal-capable sessions have a Chat/Terminal switch in
+transcript and composer, whose action row shows the session's host, permission mode, and
+harness/model picker; terminal-capable sessions have a Chat/Terminal switch in
 each cell header. The shortcut ⌘/Ctrl+Alt+\ switches
 only the active cell. Choices survive reloads and follow the session into full
-screen; drafts and terminal connections survive view changes. A managed session
+screen; drafts and terminal connections survive view changes. A cell's draft is the same draft
+as that session's single-session composer, so it carries over in both directions. A managed session
 whose sandbox never started shows its saved first message as **Not delivered**
 in its cell too, with **Copy message to new session**.
 Render failures in one chat or terminal show **Try again** in that view while
@@ -295,12 +297,15 @@ its Rename menu action to edit it inline.
 Enter or blur saves; Escape cancels. Grid names persist locally. Click anywhere
 in a cell (or focus its controls) to activate it: its outline and inverted header
 identify the session shown in Workspace. ⌘/Ctrl+Alt+Shift+] / [ activate the
-next / previous cell and focus its terminal or composer. The grid header button
-(⌘/Ctrl+Alt+] in a browser tab, ⇧⌘B / Ctrl+Shift+B in the desktop app) toggles the shared panel, and ⌃1–9 (Alt+1–9 on Windows/Linux) shows the active cell's Nth fixed tab; it spans the full app height beside the grid header and cells. Its width
-is saved per grid and stays fixed when switching sessions; the header shrinks
-with the cells when the panel opens.
+next / previous cell and focus its terminal or composer. The grid has no header:
+cells start at the top, and the window title shows the grid's name or its session titles.
+The active cell's titlebar button
+(⌘/Ctrl+Alt+] in a browser tab, ⇧⌘B / Ctrl+Shift+B in the desktop app) toggles the shared panel, and ⌃1–9 (Alt+1–9 on Windows/Linux) shows the active cell's Nth fixed tab; it spans the full app height beside the cells. Its width
+is saved per grid and stays fixed when switching sessions; the cells shrink
+when the panel opens. With the sidebar collapsed, the top-left cell's titlebar has the
+open-sidebar button.
 Files, tabs, and unsaved edits remain session-specific. Maximizing Workspace
-fills the grid area, including its header. Drag a cell titlebar onto another cell
+fills the grid area. Drag a cell titlebar onto another cell
 to swap positions. With exactly two sessions side by side, drop a titlebar
 near the whole grid's top/bottom edge to stack them. When stacked, use the
 left/right edge to place them side by side, including along the dragged cell's

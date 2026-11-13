@@ -10,6 +10,7 @@ import {
   useState,
   type ClipboardEvent,
   type KeyboardEvent,
+  type ReactNode,
 } from "react";
 import { MessagesSquareIcon, TriangleAlertIcon } from "lucide-react";
 import { toast } from "sonner";
@@ -170,6 +171,7 @@ export function SideChatPane({
   onStart,
   readOnly: restoredReadOnly = false,
   fullSession = false,
+  composerActions,
 }: {
   childId: string;
   selectionParentId?: string;
@@ -178,6 +180,8 @@ export function SideChatPane({
   readOnly?: boolean;
   /** Display an existing session with its complete history and scoped composer. */
   fullSession?: boolean;
+  /** Extra session controls for the composer's leading and trailing action groups. */
+  composerActions?: { leading?: ReactNode; trailing?: ReactNode };
 }) {
   const pending = isPendingSideChat(childId);
   const starting = useChatStore((s) => s.sideChatComposers[childId]?.starting ?? false);
@@ -525,6 +529,7 @@ export function SideChatPane({
                 starting={starting}
                 onStart={onStart ? startSideChat : undefined}
                 onSend={followSentMessage}
+                extraActions={composerActions}
               />
             )}
           </div>
@@ -555,6 +560,7 @@ function SideChatComposer({
   starting,
   onStart,
   onSend,
+  extraActions,
 }: {
   fullSession: boolean;
   childId: string;
@@ -570,6 +576,7 @@ function SideChatComposer({
   onStart?: (text: string) => Promise<void>;
   /** Called when a live tab sends or queues a follow-up. */
   onSend: () => void;
+  extraActions?: { leading?: ReactNode; trailing?: ReactNode };
 }) {
   const send = useChatStore((s) => s.send);
   const sendSlashCommand = useChatStore((s) => s.sendSlashCommand);
@@ -1092,6 +1099,7 @@ function SideChatComposer({
           // Menu rows preventDefault on mousedown so selecting one keeps focus.
           onBlur: () => setInputFocused(false),
           placeholder: fullSession ? "Reply to this session..." : "Ask a side question...",
+          rows: 1,
           disabled: !ready,
           "data-testid": "side-chat-input",
           onKeyDown: handleKeyDown,
@@ -1144,14 +1152,17 @@ function SideChatComposer({
         }}
         actions={{
           leading: pending ? null : (
-            <ComposerAddMenu
-              disabled={agentId === null}
-              onAttach={() => fileInputRef.current?.click()}
-              showGoal={false}
-              showPlan={false}
-              planActive={false}
-              testIdPrefix="side-chat"
-            />
+            <>
+              <ComposerAddMenu
+                disabled={agentId === null}
+                onAttach={() => fileInputRef.current?.click()}
+                showGoal={false}
+                showPlan={false}
+                planActive={false}
+                testIdPrefix="side-chat"
+              />
+              {extraActions?.leading}
+            </>
           ),
           trailing: (
             <>
@@ -1174,6 +1185,7 @@ function SideChatComposer({
                   }
                 />
               )}
+              {extraActions?.trailing}
               <ComposerMicButton
                 className="size-8 md:size-7"
                 disabled={!ready}

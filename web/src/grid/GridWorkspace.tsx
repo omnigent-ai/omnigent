@@ -19,14 +19,7 @@ import {
   useSensors,
 } from "@dnd-kit/core";
 import { sortableKeyboardCoordinates } from "@dnd-kit/sortable";
-import {
-  Grid2X2Icon,
-  MoreHorizontalIcon,
-  PanelRightCloseIcon,
-  PanelRightIcon,
-  PencilIcon,
-  Trash2Icon,
-} from "lucide-react";
+import { Grid2X2Icon, MoreHorizontalIcon, PencilIcon, Trash2Icon } from "lucide-react";
 import { CanvasWorkspace } from "@/canvas/CanvasWorkspace";
 import { usePaneCycleHotkey } from "@/hooks/usePaneCycleHotkey";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
@@ -68,12 +61,16 @@ export function GridSidebar({ onNavigate }: { onNavigate?: MouseEventHandler<HTM
   return <SavedGridSidebar onNavigate={onNavigate} />;
 }
 
-function SavedGridSidebar({ onNavigate }: { onNavigate?: MouseEventHandler<HTMLAnchorElement> }) {
-  const grids = useGridSessions()!;
+function useSessionTitles() {
   const { data } = useLoadedConversations();
-  const titles = new Map(
+  return new Map(
     data?.pages.flatMap((page) => page.data.map((session) => [session.id, session.title] as const)),
   );
+}
+
+function SavedGridSidebar({ onNavigate }: { onNavigate?: MouseEventHandler<HTMLAnchorElement> }) {
+  const grids = useGridSessions()!;
+  const titles = useSessionTitles();
   return (
     <section aria-label="Grids" className="mb-6">
       <div className="px-2 pb-2 text-xs font-medium text-muted-foreground">Grids</div>
@@ -82,12 +79,7 @@ function SavedGridSidebar({ onNavigate }: { onNavigate?: MouseEventHandler<HTMLA
           <GridSidebarRow
             key={grid.id}
             grid={grid}
-            title={
-              grid.name ||
-              gridSessionIds(grid.layout)
-                .map((id) => titles.get(id) || "Session")
-                .join(" + ")
-            }
+            title={gridTitle(grid, titles)}
             onNavigate={onNavigate}
           />
         ))}
@@ -193,6 +185,10 @@ export function RearrangeableGrid({
   const { layout } = grid;
   const sessionIds = gridSessionIds(layout);
   const { selectedSessionId: activeSessionId, selectSession } = useGridSessions()!;
+  const title = gridTitle(grid, useSessionTitles());
+  useEffect(() => {
+    document.title = title;
+  }, [title]);
   const workspaceKey = `grid:${grid.id}`;
   const [workspace, setWorkspace] = useState(() => {
     const saved = readSessionWorkspaceState(workspaceKey);
@@ -328,33 +324,11 @@ export function RearrangeableGrid({
           }}
           className="flex min-h-0 min-w-0 flex-1 flex-col pt-[var(--mac-titlebar-height,0px)]"
         >
-          <header className="flex h-12 shrink-0 items-center gap-2 px-4 py-3">
-            {onOpenSidebar && (
-              <SidebarOpenButton
-                size="icon-sm"
-                onOpenSidebar={onOpenSidebar}
-                componentId="grid.open_sidebar"
-              />
-            )}
-            <Grid2X2Icon className="size-4 shrink-0" />
-            <h1 className="truncate text-ui">{gridTitle(grid)}</h1>
-            <span className="flex-1" />
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              aria-label={`${workspace.open ? "Collapse" : "Expand"} grid workspace`}
-              // aria-expanded={workspace.open}
-              onClick={toggleWorkspace}
-              className="text-muted-foreground hover:text-foreground border-none"
-            >
-              {workspace.open ? <PanelRightCloseIcon /> : <PanelRightIcon />}
-            </Button>
-          </header>
           <div
-            className="relative grid min-h-0 min-w-0 flex-1 grid-cols-2 grid-rows-2 gap-2 overflow-auto p-2 pt-0"
+            className="relative grid min-h-0 min-w-0 flex-1 grid-cols-2 grid-rows-2 gap-2 overflow-auto p-2"
             data-testid="session-grid"
           >
-            {gridPanes(layout).map(({ sessionId, area }) => (
+            {gridPanes(layout).map(({ sessionId, area }, index) => (
               <GridSessionPane
                 key={sessionId}
                 sessionId={sessionId}
@@ -365,6 +339,9 @@ export function RearrangeableGrid({
                 workspaceTarget={workspaceTarget}
                 workspacePanel={workspacePanel}
                 onOpenWorkspace={() => openWorkspace(sessionId)}
+                onToggleWorkspace={toggleWorkspace}
+                // The first pane is the top-left one.
+                onOpenSidebar={index === 0 ? onOpenSidebar : undefined}
               />
             ))}
             {rearrangeTargetId && typeof layout !== "string" && (
