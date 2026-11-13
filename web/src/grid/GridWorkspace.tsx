@@ -22,6 +22,8 @@ import { sortableKeyboardCoordinates } from "@dnd-kit/sortable";
 import { Grid2X2Icon, MoreHorizontalIcon, PencilIcon, Trash2Icon } from "lucide-react";
 import { CanvasWorkspace } from "@/canvas/CanvasWorkspace";
 import { usePaneCycleHotkey } from "@/hooks/usePaneCycleHotkey";
+import { useQueries } from "@tanstack/react-query";
+import { sessionQueryOptions } from "@/hooks/useSession";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { Link, useParams } from "@/lib/routing";
@@ -185,7 +187,16 @@ export function RearrangeableGrid({
   const { layout } = grid;
   const sessionIds = gridSessionIds(layout);
   const { selectedSessionId: activeSessionId, selectSession } = useGridSessions()!;
-  const title = gridTitle(grid, useSessionTitles());
+  // The cells' own snapshots also name sessions the sidebar hasn't loaded (sub-agents, older pages).
+  const cellTitles = useQueries({
+    queries: sessionIds.map((id) => sessionQueryOptions(id)),
+    combine: (results) => results.map((result) => result.data?.title),
+  });
+  const titles = useSessionTitles();
+  sessionIds.forEach((id, index) => {
+    if (cellTitles[index]) titles.set(id, cellTitles[index]);
+  });
+  const title = gridTitle(grid, titles);
   useEffect(() => {
     // Leaving the grid restores the title the page had before it.
     const previous = document.title;

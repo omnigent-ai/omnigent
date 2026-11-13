@@ -1,6 +1,7 @@
 import type * as TerminalsModule from "@/hooks/useTerminals";
 import type * as SessionsApi from "@/lib/sessionsApi";
 import type * as FilesPanelModule from "@/shell/FilesPanel";
+import type * as GridSessionsModule from "./GridSessionsContext";
 import {
   type ComponentProps,
   type ReactElement,
@@ -32,6 +33,8 @@ import { retrySession, updateSession } from "@/lib/sessionsApi";
 import { clearSessionDrafts, getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import type { Session } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
+import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
+import { toast } from "sonner";
 import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
 import { selectPullRequestInPanel } from "@/shell/PullRequestPanel";
 
@@ -108,6 +111,10 @@ vi.mock("@/hooks/useSession", () => ({
     },
   }),
   useRootSessionId: (id: string) => id,
+  sessionQueryOptions: (id: string) => ({
+    queryKey: ["session", id],
+    queryFn: async () => ({ id, title: id }),
+  }),
 }));
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: () => true }));
 vi.mock("@/hooks/useConversationEntryState", () => ({
@@ -136,12 +143,12 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   useTerminals: () => ({ terminals: fixture.terminals }),
   useDeleteTerminal: () => ({}),
 }));
-vi.mock("./GridSessionsContext", () => ({
+vi.mock("./GridSessionsContext", async (original) => ({
+  ...(await original<typeof GridSessionsModule>()),
   useGridSessions: () => {
     const [selectedSessionId, selectSession] = useState("first");
     return { closePane: vi.fn(), selectedSessionId, selectSession };
   },
-  gridTitle: () => "Test grid",
 }));
 vi.mock("@/components/chat/SideChatPane", () => ({
   SideChatPane: ({
@@ -257,18 +264,38 @@ const twoCellGrid = () => (
 
 it("shares each cell's draft and tags with its single-session composer", () => {
   const mentions = { files: [{ path: "notes.md", isDir: false }], sessions: [] };
-  setSessionDraft("second", { text: "Unsent idea", files: [], mentions });
+  const file = new File(["log"], "build.log");
+  const replyDraft: StoredReplyDraft = {
+    version: 1,
+    quotes: [{ before: "About this:", text: "quoted line" }],
+    text: "Unsent idea",
+  };
+  setSessionDraft("second", {
+    text: serializeReplyDraft(replyDraft),
+    replyDraft,
+    files: [file],
+    mentions,
+  });
   const subagentTabDraft = { text: "Typed in a sub-agent tab", files: [] };
   useChatStore.getState().updateSideChatComposer("second", () => subagentTabDraft);
   const composer = () => useChatStore.getState().sideChatComposers.second;
   const view = render(twoCellGrid());
-  expect(composer()).toMatchObject({ text: "Unsent idea", mentions });
+  expect(composer()).toMatchObject({
+    text: "Unsent idea",
+    quotes: [{ before: "About this:", text: "quoted line" }],
+    files: [file],
+    mentions,
+  });
   act(() =>
     useChatStore
       .getState()
       .updateSideChatComposer("second", (draft) => ({ ...draft, text: "Edited in the grid" })),
   );
-  expect(getSessionDraft("second")).toMatchObject({ text: "Edited in the grid", mentions });
+  expect(getSessionDraft("second")).toMatchObject({
+    files: [file],
+    replyDraft: { ...replyDraft, text: "Edited in the grid" },
+    mentions,
+  });
   view.unmount();
   // Leaving the grid hands the shared composer entry back untouched.
   expect(composer()).toBe(subagentTabDraft);
@@ -290,7 +317,8 @@ it("shows each cell's session controls and targets that session's permission mod
   fixture.labels = { "omnigent.wrapper": "claude-code-native-ui" };
   document.title = "Single session";
   const view = render(twoCellGrid());
-  expect(document.title).toBe("Test grid");
+  // Named from the cells' snapshots; neither session is on a loaded sidebar page.
+  await waitFor(() => expect(document.title).toBe("first + second"));
   const second = within(screen.getByRole("region", { name: "second" }));
   // An inactive cell keeps the toggle's slot, so activating it never shifts the titlebar.
   expect(second.queryByRole("button", { name: /grid workspace$/ })).toBeNull();
@@ -304,6 +332,19 @@ it("shows each cell's session controls and targets that session's permission mod
   await waitFor(() =>
     expect(updateSession).toHaveBeenCalledWith("second", { claudePermissionMode: "auto" }),
   );
+  // A rejected switch reports why and frees the chip for another try.
+  const toastError = vi.spyOn(toast, "error").mockReturnValue("error");
+  vi.mocked(updateSession).mockRejectedValueOnce(new Error("Runner unavailable"));
+  const chip = () => second.getByRole("button", { name: "Permission mode: Manual" });
+  fireEvent.pointerDown(chip(), { button: 0 });
+  fireEvent.click(screen.getByTestId("composer-permission-option-plan"));
+  await waitFor(() => expect(toastError).toHaveBeenCalledWith("Runner unavailable"));
+  await waitFor(() => expect(chip()).toBeEnabled());
+  // Only the owner can switch modes.
+  fixture.permissionLevel = 2;
+  view.rerender(twoCellGrid());
+  expect(chip()).toBeDisabled();
+  fixture.permissionLevel = null;
   // Like the main composer, an unreachable session's chip can't switch modes.
   fixture.livenessKind = "host_offline";
   view.rerender(twoCellGrid());
