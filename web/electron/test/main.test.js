@@ -157,6 +157,8 @@ function loadNavigationHarness({
   managedServers = [],
   internalFeatures = false,
   cliPath = null,
+  cliStatus = () => ({ installed: false }),
+  openDialogResult = { canceled: true, filePaths: [] },
   hostConnectResult = { ok: true },
   serverAuthResult = { ok: true },
   managedServerNames = {},
@@ -201,6 +203,8 @@ function loadNavigationHarness({
     arcaSetups: [],
     arcaSetupCancels: 0,
     sshConnects: [],
+    serverAuth: [],
+    hostConnects: [],
   };
   const pickers = [];
   const findBars = [];
@@ -424,7 +428,7 @@ function loadNavigationHarness({
       { isSupported: () => notificationsSupported },
     ),
     clipboard: { writeText: (text) => clipboardWriteText(text) },
-    dialog: {},
+    dialog: { showOpenDialog: async () => openDialogResult },
     ipcMain: { handle: (name, fn) => ipc.set(name, fn), on: (name, fn) => ipc.set(name, fn) },
     nativeImage: { createFromPath: () => ({ isEmpty: () => true }) },
     nativeTheme: { shouldUseDarkColors: false, on: () => {} },
@@ -669,13 +673,20 @@ function loadNavigationHarness({
       cliCommandParts: require("../src/omnigent_cli").cliCommandParts,
       normalizeServerUrl: require("../src/omnigent_cli").normalizeServerUrl,
       localHostId: () => "host_test",
-      getCliStatus: () => ({ installed: false }),
+      getCliStatus: (configuredPath) => cliStatus(configuredPath),
+      localServerHealthy: async () => null,
     },
     "./server_manager": {
       shutdown: async () => {},
       onChange: () => {},
-      ensureServerAuth: async () => serverAuthResult,
-      ensureHostConnected: async () => hostConnectResult,
+      ensureServerAuth: async (...args) => {
+        calls.serverAuth.push(args);
+        return serverAuthResult;
+      },
+      ensureHostConnected: async (...args) => {
+        calls.hostConnects.push(args);
+        return hostConnectResult;
+      },
       restartHost: async () => ({ ok: true }),
       disconnectHost: async () => ({ ok: true }),
       startLocalServer: async () => ({ ok: false }),
@@ -2795,10 +2806,7 @@ describe("managed server preference wiring", () => {
       preloadSource,
       /getRunnerOptions:\s*\(url\)\s*=>\s*ipcRenderer\.invoke\("omnigent:get-runner-options",\s*url\)/,
     );
-    assert.match(
-      liveCode,
-      /ipcMain\.handle\("omnigent:get-runner-options"[\s\S]{0,120}!isSetupPageSender\(event\)[\s\S]{0,200}typeof url === "string" &&\s*databricksInternalFeaturesEnabled\(\) &&\s*isDatabricksManagedServerUrl\(url\);\s*return \{ remote: internal && arca\.resolveArcaPath\(\) !== null, bundledCli: internal \}/,
-    );
+    assert.match(liveCode, /getRunnerAvailability\s*=\s*exposeRunnerAvailability/);
   });
 
   it("wires the onboarding connect to the page, and signs in before connecting a laptop", () => {
@@ -2814,7 +2822,7 @@ describe("managed server preference wiring", () => {
     const handler = liveCode.slice(start, end);
     assert.match(
       handler,
-      /hostCliCommand\(target\)[\s\S]*serverManager\.ensureServerAuth\(cliCommand, target,[\s\S]*serverManager\.ensureHostConnected\(cliCommand, target\)/,
+      /resolvedCliPath\(\)[\s\S]*serverManager\.ensureServerAuth\(cliCommand, target,[\s\S]*serverManager\.ensureHostConnected\(cliCommand, target\)/,
     );
   });
 
@@ -2894,44 +2902,75 @@ describe("managed server preference wiring", () => {
   });
 });
 
-describe("managed local-host CLI wiring", () => {
-  it("selects isaac omni only behind the managed features flag and managed server gate", () => {
+describe("local-host CLI wiring", () => {
+  it("uses the configured or auto-detected CLI for identity availability and every host action", () => {
+    assert.match(liveCode, /host-get-identity[\s\S]{0,350}Boolean\(resolvedCliPath\(\)\)/);
     assert.match(
       liveCode,
-      /function hostCliCommand\(serverUrl\)[\s\S]{0,300}databricksInternalFeaturesEnabled\(\)[\s\S]{0,120}isDatabricksManagedServerUrl\(serverUrl\)[\s\S]{0,300}prefixArgs:\s*\["omni"\]/,
+      /host-control[\s\S]{0,450}const cliCommand = resolvedCliPath\(\)[\s\S]{0,1400}ensureServerAuth\(cliCommand, serverUrl\)[\s\S]{0,400}ensureHostConnected\(cliCommand, serverUrl\)[\s\S]{0,300}disconnectHost\(cliCommand, serverUrl\)/,
     );
   });
 
-  it("uses the selected command for identity availability and every host action", () => {
+  it("keeps CLI customization on the generic path", () => {
     assert.match(
       liveCode,
-      /host-get-identity[\s\S]{0,350}Boolean\(hostCliCommand\(senderServerUrl\(event\)\)\)/,
+      /omnigent:set-cli-path[\s\S]{0,300}return applyCliPath\(configuredPath\)/,
     );
-    assert.match(
-      liveCode,
-      /host-control[\s\S]{0,450}const cliCommand = hostCliCommand\(serverUrl\)[\s\S]{0,1400}ensureServerAuth\(cliCommand, serverUrl\)[\s\S]{0,400}ensureHostConnected\(cliCommand, serverUrl\)[\s\S]{0,300}disconnectHost\(cliCommand, serverUrl\)/,
-    );
-  });
-
-  it("disables CLI customization in main and explains managed policy in the setup dialog", () => {
-    assert.match(
-      liveCode,
-      /omnigent:set-cli-path[\s\S]{0,300}databricksInternalFeaturesEnabled\(\)[\s\S]{0,250}customizationDisabled:\s*true[\s\S]{0,80}accepted:\s*false/,
-    );
-    assert.match(
-      liveCode,
-      /omnigent:browse-cli-path[\s\S]{0,250}databricksInternalFeaturesEnabled\(\)\) return null/,
-    );
-    assert.match(
-      liveCode,
-      /omnigent:cli-reset-path[\s\S]{0,250}databricksInternalFeaturesEnabled\(\)[\s\S]{0,250}customizationDisabled:\s*true/,
-    );
+    assert.match(liveCode, /omnigent:browse-cli-path[\s\S]{0,350}dialog\.showOpenDialog/);
+    assert.match(liveCode, /omnigent:cli-reset-path[\s\S]{0,300}return clearCliPath\(\)/);
     assert.match(setupSource, /cliGear\.hidden = false/);
-    assert.match(setupSource, /cliManaged\.hidden = !cliCustomizationDisabled/);
-    assert.match(setupSource, /cliPathInput\.disabled = cliCustomizationDisabled/);
-    assert.match(setupSource, /cliBrowse\.disabled = cliCustomizationDisabled/);
-    assert.match(setupSource, /cliRedetect\.disabled = cliCustomizationDisabled/);
-    assert.match(setupSource, /Managed by your organization/);
+    assert.doesNotMatch(liveCode, /customizationDisabled/);
+    assert.doesNotMatch(setupSource, /cliCustomizationDisabled/);
+  });
+
+  it("keeps the generic CLI and path controls under managed features", async (t) => {
+    const serverUrl = "https://accounts.cloud.databricks.com/omnigent?o=123";
+    const configuredPath = "/opt/tools/omnigent";
+    const h = loadNavigationHarness({
+      serverUrl,
+      internalFeatures: true,
+      cliPath: configuredPath,
+      cliStatus: (pathOverride) => ({
+        installed: Boolean(pathOverride),
+        path: pathOverride ?? configuredPath,
+        version: null,
+        source: pathOverride ? "configured" : "candidate",
+        installCommand: "",
+      }),
+      openDialogResult: { canceled: false, filePaths: [configuredPath] },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const setupEvent = {
+      sender: h.webContents,
+      senderFrame: { url: `file://${h.api.SETUP_PAGE}` },
+    };
+
+    assert.deepEqual(
+      JSON.parse(
+        JSON.stringify(await h.ipc.get("omnigent:get-runner-options")(setupEvent, serverUrl)),
+      ),
+      { remote: false },
+    );
+    const status = await h.ipc.get("omnigent:get-cli-status")(setupEvent);
+    assert.equal(Object.hasOwn(status, "customizationDisabled"), false);
+    assert.equal(await h.ipc.get("omnigent:browse-cli-path")(setupEvent), configuredPath);
+    assert.equal(
+      (await h.ipc.get("omnigent:set-cli-path")(setupEvent, configuredPath)).accepted,
+      true,
+    );
+
+    const connectedEvent = { sender: h.webContents, senderFrame: { url: serverUrl } };
+    assert.equal(h.ipc.get("omnigent:host-get-identity")(connectedEvent).cliInstalled, true);
+    h.webContents.isDestroyed = () => false;
+    const connected = await h.ipc.get("omnigent:connect-runner")(setupEvent, serverUrl, "local");
+    assert.equal(connected.ok, true);
+    assert.equal(h.calls.serverAuth.at(-1)[0], configuredPath);
+    assert.equal(h.calls.hostConnects.at(-1)[0], configuredPath);
+
+    const reset = await h.ipc.get("omnigent:cli-reset-path")(connectedEvent);
+    assert.equal(Object.hasOwn(reset, "customizationDisabled"), false);
+    assert.equal(JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).omnigent_path, undefined);
   });
 });
 
@@ -4976,8 +5015,8 @@ describe("onboarding runner IPC", () => {
       typeError,
     );
     await assert.rejects(connect({ sender, senderFrame: setupFrame(h) }, 42, "local"), typeError);
-    assert.throws(
-      () => h.ipc.get("omnigent:get-runner-options")({ senderFrame: { url: server } }, server),
+    await assert.rejects(
+      h.ipc.get("omnigent:get-runner-options")({ senderFrame: { url: server } }, server),
       /only available to the setup page/,
     );
   });
@@ -4985,9 +5024,8 @@ describe("onboarding runner IPC", () => {
   it("offers no remote environment without the managed features flag, and refuses to connect one", async (t) => {
     const h = harness(t);
     const event = { sender: setupSender(), senderFrame: setupFrame(h) };
-    assert.deepEqual(plain(h.ipc.get("omnigent:get-runner-options")(event, server)), {
+    assert.deepEqual(plain(await h.ipc.get("omnigent:get-runner-options")(event, server)), {
       remote: false,
-      bundledCli: false,
     });
     const result = await h.ipc.get("omnigent:connect-runner")(event, server, "remote");
     assert.equal(result.ok, false);
@@ -5046,6 +5084,13 @@ describe("onboarding runner IPC", () => {
       );
       assert.equal(fs.existsSync(failed.settingsPath) ? recorded(failed) : undefined, undefined);
       const connected = harness(t, { ...options, ...result(true) });
+      if (runner === "remote") {
+        const available = await connected.ipc.get("omnigent:get-runner-options")(
+          event(connected),
+          url,
+        );
+        assert.deepEqual(plain(available), { remote: true });
+      }
       assert.equal(
         (await connected.ipc.get("omnigent:connect-runner")(event(connected), url, runner)).ok,
         true,

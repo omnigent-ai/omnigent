@@ -19,22 +19,6 @@ const SERVER = "https://app.example.com";
 const CLI_PATH = "/bin/omnigent";
 
 describe("ensureServerAuth", () => {
-  it("prepares managed-host credentials even when a legacy token passes the probe", async () => {
-    mock.method(cli, "probeServerAuth", async () => ({ authed: true, reachable: true }));
-    const login = mock.method(cli, "loginServer", async () => ({ ok: false, output: "SECRET" }));
-    const command = { executable: "/bin/isaac", prefixArgs: ["omni"], displayName: "Custom label" };
-    const result = await ensureServerAuth(command, "https://account.databricks.com/omnigent?o=123");
-    assert.equal(result.authError, true);
-    assert.equal(login.mock.callCount(), 1);
-    assert.doesNotMatch(result.error, /SECRET/);
-  });
-  it("does not infer managed-host auth from a cosmetic label", async () => {
-    mock.method(cli, "probeServerAuth", async () => ({ authed: true, reachable: true }));
-    const login = mock.method(cli, "loginServer", async () => ({ ok: true }));
-    const command = { executable: CLI_PATH, displayName: "isaac omni" };
-    assert.deepEqual(await ensureServerAuth(command, SERVER), { ok: true });
-    assert.equal(login.mock.callCount(), 0);
-  });
   afterEach(() => {
     mock.restoreAll();
   });
@@ -67,6 +51,20 @@ describe("ensureServerAuth", () => {
     assert.equal(onLogin.mock.callCount(), 0);
   });
 
+  it("also trusts the auth probe for a generic launcher descriptor", async () => {
+    mock.method(cli, "isLoopbackServer", () => false);
+    mock.method(cli, "probeServerAuth", async () => ({ authed: true, reachable: true }));
+    const login = mock.method(cli, "loginServer", async () => ({ ok: false, output: "" }));
+    const command = {
+      executable: "/opt/tools/launcher",
+      prefixArgs: ["omnigent"],
+      displayName: "launcher omnigent",
+    };
+
+    assert.deepEqual(await ensureServerAuth(command, SERVER), { ok: true });
+    assert.equal(login.mock.callCount(), 0);
+  });
+
   it("skips login (defers to the connect attempt) when the server is unreachable", async () => {
     mock.method(cli, "isLoopbackServer", () => false);
     mock.method(cli, "probeServerAuth", async () => ({ authed: false, reachable: false }));
@@ -92,21 +90,21 @@ describe("ensureServerAuth", () => {
     assert.deepEqual(login.mock.calls[0].arguments, [CLI_PATH, SERVER]);
   });
 
-  it("passes an isaac omni descriptor through login and names it in the safe error", async () => {
+  it("passes a launcher descriptor through login and names it in the safe error", async () => {
     mock.method(cli, "isLoopbackServer", () => false);
     mock.method(cli, "probeServerAuth", async () => ({ authed: false, reachable: true }));
     const login = mock.method(cli, "loginServer", async () => ({ ok: false, output: "SECRET" }));
     const command = {
-      executable: "/usr/local/bin/isaac",
-      prefixArgs: ["omni"],
-      displayName: "isaac omni",
+      executable: "/opt/tools/launcher",
+      prefixArgs: ["omnigent"],
+      displayName: "launcher omnigent",
     };
 
     const res = await ensureServerAuth(command, SERVER);
 
     assert.deepEqual(login.mock.calls[0].arguments, [command, SERVER]);
     assert.equal(res.authError, true);
-    assert.match(res.error, /isaac omni login https:\/\/app\.example\.com/);
+    assert.match(res.error, /launcher omnigent login https:\/\/app\.example\.com/);
     assert.doesNotMatch(res.error, /SECRET/);
   });
 

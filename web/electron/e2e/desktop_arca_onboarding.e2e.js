@@ -134,7 +134,6 @@ function fixturePolicy({ appRoot, arcaPath, serverUrl }) {
   });
   cli.localServerHealthy = async () => null;
   cli.resolveCliPath = () => null;
-  require(path.join(src, "isaac")).resolveIsaacPath = () => null;
   const arca = require(path.join(src, "arca"));
   arca.resolveArcaPath = () => arcaPath;
   arca.resolveArcaPathAsync = async () => arcaPath;

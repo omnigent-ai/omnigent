@@ -117,7 +117,7 @@ export function maybeMockSetup(params: URLSearchParams): ServerSelectorV2Setup |
     },
     getRunnerOptions: async (url) => {
       log("getRunnerOptions", url);
-      return { remote, bundledCli: remote };
+      return { remote };
     },
     onConnectRunner: (url, runner) => {
       log("onConnectRunner", { url, runner });

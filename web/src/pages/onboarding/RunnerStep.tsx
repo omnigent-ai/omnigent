@@ -28,7 +28,7 @@ export function RunnerStep({
 }: {
   /** Offer the remote environment, and pick it by default. */
   remoteAvailable: boolean;
-  /** Returning user (CLI installed) → "Open Omnigent"; new → "Install Omnigent". */
+  /** Whether this laptop already has the CLI. Remote runners need no local install. */
   installed?: boolean;
   /** A connect error to show above the actions. */
   error?: string;
@@ -113,7 +113,7 @@ export function RunnerStep({
       <OnboardingRail>
         <OnboardingBackButton onClick={onBack} disabled={connection !== null} />
         <InstallActionButton
-          installed={installed}
+          installed={runner === "remote" || installed}
           loading={connection !== null}
           onClick={() => onInstall(runner)}
         />
