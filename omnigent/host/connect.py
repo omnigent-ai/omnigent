@@ -852,6 +852,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # Keep host and spawned-runner routing decisions aligned when the
         # host-slice-key kill switch is explicitly disabled.
         "OMNIGENT_HOST_SLICE_KEY_ENABLED",
+        # Keep the native-terminal idle-poll backoff kill switch (a non-secret
+        # boolean) readable by spawned runners, where the watcher reads it.
+        "OMNIGENT_TERMINAL_IDLE_POLL_BACKOFF",
     }
     # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
     # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
@@ -1107,15 +1110,6 @@ def _write_runner_inference_config(session_id: str, inference_config: dict[str, 
         with contextlib.suppress(FileNotFoundError):
             os.unlink(temp_name)
     return path
-
-
-def _is_utf8_encodable(text: str) -> bool:
-    """Return whether ``text`` has no surrogate-escaped bytes, so it encodes as UTF-8."""
-    try:
-        text.encode("utf-8")
-    except UnicodeEncodeError:
-        return False
-    return True
 
 
 def _paginate_list_dir(
@@ -3204,9 +3198,11 @@ class HostProcess:
         # Walk every entry, classifying by target type. Per-entry
         # OSError → skip (e.g. dangling symlink) so the listing
         # surfaces real entries instead of failing wholesale.
+        from omnigent.workspace_fs import is_utf8_encodable
+
         entries: list[HostListDirEntry] = []
         for de in scanned:
-            if not _is_utf8_encodable(de.path):
+            if not is_utf8_encodable(de.path):
                 # A name that isn't valid UTF-8 comes back surrogate-escaped; it
                 # can't be sent as JSON or reopened by path, so skip it too.
                 continue

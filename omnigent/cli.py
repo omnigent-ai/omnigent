@@ -2131,6 +2131,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "goose",
         "hermes",
         "host",
+        "host-service-entry",
         "import",
         "integration",
         "_internal",
@@ -11129,6 +11130,19 @@ def host_enable(
             non_interactive=non_interactive or not _stdin_is_tty(),
         )
 
+    from omnigent.host.service import (
+        HostServiceError,
+        enable_user_host_service,
+        validate_user_host_service,
+    )
+
+    environment = _build_host_daemon_env(server_url=resolved_server)
+    try:
+        # Keep a running host if its replacement service cannot be defined.
+        validate_user_host_service(resolved_server, environment=environment)
+    except HostServiceError as exc:
+        raise click.ClickException(str(exc)) from exc
+
     target = _normalize_daemon_target(resolved_server)
     record = _find_daemon_record(target)
     if record is not None:
@@ -11141,13 +11155,8 @@ def host_enable(
         _record_daemon_stop_requested(record, reason="host_enable", force=False)
         _terminate_daemon(record, force=False)
 
-    from omnigent.host.service import HostServiceError, enable_user_host_service
-
     try:
-        service = enable_user_host_service(
-            resolved_server,
-            environment=_build_host_daemon_env(server_url=resolved_server),
-        )
+        service = enable_user_host_service(resolved_server, environment=environment)
     except HostServiceError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -11173,6 +11182,23 @@ def host_disable() -> None:
             _delete_daemon_record(record)
     click.echo("Disabled the Omnigent host user service.")
     click.echo(f"Removed service definition: {_display_path(service.path)}")
+
+
+# Top-level lifecycle commands pass through wrappers that validate host subcommands.
+@cli.command("host-service-entry", hidden=True)
+@click.option("--server", default=None, help="Remote Omnigent server URL.")
+@click.option("--local", is_flag=True, default=False, help="Run a local Omnigent server.")
+def host_service_entry(server: str | None, local: bool) -> None:
+    """Run the host under a service manager that launches it through a CLI wrapper.
+
+    :param server: Remote Omnigent server URL; ``None`` with ``--local``.
+    :param local: Run a local Omnigent server instead of a remote one.
+    """
+    if local == (server is not None):
+        raise click.UsageError("Pass exactly one of --server or --local.")
+    from omnigent.host.service_entry import run
+
+    raise SystemExit(run(server or ""))
 
 
 @host.command("status")
