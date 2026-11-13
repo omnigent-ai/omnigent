@@ -50,6 +50,7 @@ from omnigent.cli import (
     cli as cli_group,
 )
 from omnigent.host.local_server import LocalServerStartup
+from omnigent.telemetry.request_headers import client_user_agent
 
 
 @pytest.fixture(autouse=True)
@@ -3487,7 +3488,10 @@ def test_databricks_preflight_silent_sdk_refresh_skips_login(
 
     cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
 
-    assert requests[1]["headers"] == {"Authorization": "Bearer fresh-token"}
+    assert requests[1]["headers"] == {
+        "Authorization": "Bearer fresh-token",
+        "User-Agent": client_user_agent(),
+    }
     assert requests[1]["params"] == {"o": "123"}
     assert stored == [(_HOST_DATABRICKS_SERVER, "https://example.databricks.com", "123")]
 
@@ -3510,7 +3514,7 @@ def test_databricks_preflight_uses_cli_workspace_id_for_workspace_mount(
         "auth_type = databricks-cli\n"
         "[fresh]\n"
         "host = https://example.databricks.com\n"
-        "workspace_id = 1965859176160743\n"
+        "workspace_id = 4242424242424242\n"
         "auth_type = databricks-cli\n"
     )
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
@@ -3556,9 +3560,12 @@ def test_databricks_preflight_uses_cli_workspace_id_for_workspace_mount(
 
     cli._ensure_databricks_server_auth(server, non_interactive=True)
 
-    assert requests[1]["headers"] == {"Authorization": "Bearer fresh-token"}
-    assert requests[1]["params"] == {"o": "1965859176160743"}
-    assert stored == [(server, "https://example.databricks.com", "1965859176160743")]
+    assert requests[1]["headers"] == {
+        "Authorization": "Bearer fresh-token",
+        "User-Agent": client_user_agent(),
+    }
+    assert requests[1]["params"] == {"o": "4242424242424242"}
+    assert stored == [(server, "https://example.databricks.com", "4242424242424242")]
 
 
 def test_databricks_preflight_refresh_handles_duplicate_workspace_profiles(
@@ -4233,7 +4240,7 @@ def test_resolve_host_server_defaults_scheme_and_accepts_omnigent(
 ) -> None:
     """``host`` subcommands accept a schemeless ``/omnigent`` workspace URL.
 
-    The internal user guide's web URL omits the scheme and ends in
+    The user guide's web URL omits the scheme and ends in
     ``/omnigent``; host must default it to https before expansion, just
     like ``omnigent login``.
     """

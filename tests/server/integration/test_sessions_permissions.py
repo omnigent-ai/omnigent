@@ -24,6 +24,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.entities import SessionPermission
 from omnigent.host.frames import HostHelloFrame
 from omnigent.runtime import inflight_text, session_stream
 from omnigent.runtime.agent_cache import AgentCache
@@ -805,6 +806,40 @@ async def test_edit_grant_allows_post_but_blocks_permission_management(
     )
 
 
+async def test_move_to_managed_sandbox_requires_owner_access(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Moving a session onto a new sandbox is owner-only, like binding a
+    runner: an editor or a manager gets 403 and a user without access 404,
+    and none of them changes the session.
+    """
+    agent = await create_test_agent(auth_client, user="bryan")
+    session_id = (await _create_session_as(auth_client, agent["id"], "user-a"))["id"]
+    for target_user, level in (("user-b", LEVEL_EDIT), ("user-d", LEVEL_MANAGE)):
+        resp = await _grant_permission(
+            auth_client,
+            session_id,
+            granter="user-a",
+            target_user=target_user,
+            level=level,
+        )
+        assert resp.status_code == 200
+    owner = {"X-Forwarded-Email": "user-a"}
+    before = (await auth_client.get(f"/v1/sessions/{session_id}", headers=owner)).json()
+
+    for caller, expected_status in (("user-b", 403), ("user-d", 403), ("user-c", 404)):
+        resp = await auth_client.post(
+            f"/v1/sessions/{session_id}/managed-host",
+            json={},
+            headers={"X-Forwarded-Email": caller},
+        )
+        assert resp.status_code == expected_status, (caller, resp.text)
+
+    after = (await auth_client.get(f"/v1/sessions/{session_id}", headers=owner)).json()
+    for field in ("host_id", "workspace", "runner_id", "labels"):
+        assert after[field] == before[field], field
+
+
 async def test_archive_requires_owner_access(
     auth_client: httpx.AsyncClient,
 ) -> None:
@@ -1126,6 +1161,7 @@ async def test_single_user_local_can_access_own_session(
     identity, which gets an owner auto-grant on sessions it creates
     — the bare `omnigent run` / local web UI flow.
     """
+    assert (await local_auth_client.get("/v1/info")).json()["admin_view"] is False
     agent = await create_test_agent(local_auth_client, user="bryan")
 
     # Omit X-Forwarded-Email to trigger the "local" fallback —
@@ -1159,6 +1195,7 @@ async def test_admin_user_bypasses_permission_checks(
     server startup behavior (the CLI calls
     ``ensure_user("local", is_admin=True)``).
     """
+    assert (await auth_client.get("/v1/info")).json()["admin_view"] is True
     agent = await create_test_agent(auth_client, user="bryan")
     s1 = await _create_session_as(auth_client, agent["id"], "user-a")
     session_id = s1["id"]
@@ -1188,6 +1225,42 @@ async def test_admin_user_bypasses_permission_checks(
     assert resp.status_code == 200, (
         f"admin user should be able to list permissions, got {resp.status_code}."
     )
+
+    auth_client.cookies.set("omnigent_admin_view", "off")
+    headers = {"X-Forwarded-Email": "admin-user"}
+    session_url = f"/v1/sessions/{session_id}"
+    assert (await auth_client.get("/v1/sharing", headers=headers)).status_code == 403
+    assert (await auth_client.get(session_url, headers=headers)).status_code in (403, 404)
+    assert (
+        await auth_client.patch(session_url, headers=headers, json={"title": "Denied"})
+    ).status_code in (403, 404)
+    assert perm_store.is_admin("admin-user")
+
+    own = await _create_session_as(auth_client, agent["id"], "admin-user")
+    assert (
+        await auth_client.patch(
+            f"/v1/sessions/{own['id']}", headers=headers, json={"title": "Mine"}
+        )
+    ).status_code == 200
+    await _grant_permission(
+        auth_client, session_id, granter="user-a", target_user="admin-user", level=LEVEL_READ
+    )
+    assert (await auth_client.get(session_url, headers=headers)).json()[
+        "permission_level"
+    ] == LEVEL_READ
+    assert (
+        await auth_client.patch(session_url, headers=headers, json={"title": "Denied"})
+    ).status_code == 403
+
+    auth_client.cookies.set("omnigent_admin_view", "on")
+    assert (await auth_client.get("/v1/sharing", headers=headers)).status_code == 200
+    assert (
+        await auth_client.patch(session_url, headers=headers, json={"title": "Admin edit"})
+    ).status_code == 200
+    auth_client.cookies.set("omnigent_admin_view", "off")
+    assert (
+        await auth_client.patch(session_url, headers=headers, json={"title": "Denied"})
+    ).status_code == 403
 
 
 # ── Revoke nonexistent: idempotent 204 ──────────────────────
@@ -1441,6 +1514,59 @@ async def test_grant_upgrade_via_upsert(
     assert grant_map["user-b"] == LEVEL_MANAGE, (
         "After upgrade, user-b should have manage level in the store."
     )
+
+
+async def test_minimum_grant_preserves_access_strengthened_after_refresh(
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delayed Read invitation must retain Edit committed after its refresh."""
+    owner = "owner@example.com"
+    recipient = "recipient@example.com"
+    agent = await create_test_agent(auth_client, user=owner)
+    session = await _create_session_as(auth_client, agent["id"], owner)
+    session_id = session["id"]
+    refreshed = await _list_permissions(auth_client, session_id, user=owner)
+    assert refreshed.status_code == 200
+    assert all(p["user_id"] != recipient for p in refreshed.json()["permissions"])
+
+    original_grant = SqlAlchemyPermissionStore.grant
+
+    def grant_after_edit(
+        store: SqlAlchemyPermissionStore,
+        user_id: str,
+        conversation_id: str,
+        level: int,
+        *,
+        ensure_minimum: bool = False,
+    ) -> SessionPermission:
+        if user_id == recipient and ensure_minimum:
+            original_grant(store, user_id, conversation_id, LEVEL_EDIT)
+        return original_grant(
+            store, user_id, conversation_id, level, ensure_minimum=ensure_minimum
+        )
+
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "grant", grant_after_edit)
+    response = await auth_client.put(
+        f"/v1/sessions/{session_id}/permissions",
+        json={"user_id": recipient, "level": LEVEL_READ, "ensure_minimum": True},
+        headers={"X-Forwarded-Email": owner},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["level"] == LEVEL_EDIT
+    persisted = await _list_permissions(auth_client, session_id, user=owner)
+    assert persisted.status_code == 200
+    grants = {p["user_id"]: p["level"] for p in persisted.json()["permissions"]}
+    assert grants[recipient] == LEVEL_EDIT
+
+    replacement = await _grant_permission(
+        auth_client, session_id, granter=owner, target_user=recipient, level=LEVEL_READ
+    )
+    assert replacement.status_code == 200, replacement.text
+    assert replacement.json()["level"] == LEVEL_READ
+    persisted = await _list_permissions(auth_client, session_id, user=owner)
+    grants = {p["user_id"]: p["level"] for p in persisted.json()["permissions"]}
+    assert grants[recipient] == LEVEL_READ
 
 
 # ── Unauthenticated request: no header ────────────────────
@@ -2611,12 +2737,13 @@ async def test_w5_01_parent_session_id_allowed_with_access(
     assert grant_resp.status_code == 200
 
     # Bob can now create a child session referencing Alice's session.
-    # Use Alice's session-scoped agent (Bob has read access to Alice's
-    # owning session, so the agent access check passes).
+    # Use an agent Bob owns so this case isolates read access to the parent;
+    # managed separately requires edit on an agent's owning session.
+    bob_agent = await create_test_agent(auth_client, user="bob")
     resp = await auth_client.post(
         "/v1/sessions",
         json={
-            "agent_id": alice_session["agent_id"],
+            "agent_id": bob_agent["id"],
             "parent_session_id": alice_session_id,
         },
         headers={"X-Forwarded-Email": "bob"},
@@ -2728,7 +2855,7 @@ async def test_w7_2_session_scoped_agent_requires_access(
 async def test_w7_2_session_scoped_agent_allowed_with_access(
     auth_client: httpx.AsyncClient,
 ) -> None:
-    """Positive path: when Alice grants Bob read access to
+    """Positive path: when Alice grants Bob edit access to
     the owning session, Bob can use the session-scoped agent.
     """
     alice_session = await _create_bundled_session_as(
@@ -2737,13 +2864,13 @@ async def test_w7_2_session_scoped_agent_allowed_with_access(
     alice_agent_id = alice_session["agent_id"]
     alice_session_id = alice_session["id"]
 
-    # Alice grants Bob read access to the owning session.
+    # Alice grants Bob edit access to the owning session.
     grant_resp = await _grant_permission(
         auth_client,
         alice_session_id,
         granter="alice",
         target_user="bob",
-        level=LEVEL_READ,
+        level=LEVEL_EDIT,
     )
     assert grant_resp.status_code == 200
 
@@ -2754,7 +2881,7 @@ async def test_w7_2_session_scoped_agent_allowed_with_access(
         headers={"X-Forwarded-Email": "bob"},
     )
     assert resp.status_code == 201, (
-        f"Expected 201 when Bob has read access to Alice's owning session, "
+        f"Expected 201 when Bob has edit access to Alice's owning session, "
         f"got {resp.status_code}: {resp.text}"
     )
 
@@ -3184,6 +3311,159 @@ async def test_list_child_sessions_allows_read_grant(
         f"read-granted user-b should see the seeded child {child.id!r}, got {child_ids}"
     )
 
+    # Root -> grantless parent (``child``) -> running grandchild. READ on the
+    # root reaches the grandchild only through the chain, so the READ viewer
+    # must list it without settling it; the owner may settle it.
+    grandchild = conv_store.create_conversation(
+        agent_id=agent["id"],
+        kind="sub_agent",
+        title="coder:auth",
+        parent_conversation_id=child.id,
+    )
+    assert conv_store.set_runner_id(grandchild.id, f"runner_{grandchild.id}")
+    conv_store.set_session_live_status(grandchild.id, "running")
+    # Listing the grantless parent has no direct level, in both modes.
+    listing_id = child.id
+    listing_params = {"descendants": "true"} if descendants else None
+
+    resp = await auth_client.get(
+        f"/v1/sessions/{listing_id}/child_sessions",
+        params=listing_params,
+        headers={"X-Forwarded-Email": "user-b"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert grandchild.id in [row["id"] for row in resp.json()["data"]]
+    assert conv_store.get_conversation(grandchild.id).live_status == "running"  # type: ignore[union-attr]
+
+    # A direct OWNER grant on the child shows OWNER here, but user-b still
+    # inherits only READ through the root, so the grandchild must not settle.
+    # The grant API tops out at MANAGE, so seed OWNER in the store as ownership does.
+    perm_store = SqlAlchemyPermissionStore(db_uri)
+    perm_store.ensure_user("user-b")
+    perm_store.grant("user-b", child.id, LEVEL_OWNER)
+    resp = await auth_client.get(
+        f"/v1/sessions/{listing_id}/child_sessions",
+        params=listing_params,
+        headers={"X-Forwarded-Email": "user-b"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert grandchild.id in [row["id"] for row in resp.json()["data"]]
+    assert conv_store.get_conversation(grandchild.id).live_status == "running"  # type: ignore[union-attr]
+
+    resp = await auth_client.get(
+        f"/v1/sessions/{listing_id}/child_sessions",
+        params=listing_params,
+        headers={"X-Forwarded-Email": "user-a"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert conv_store.get_conversation(grandchild.id).live_status == "idle"  # type: ignore[union-attr]
+
+
+async def test_nested_parent_skips_owner_chain_without_settle_candidates(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A nested parent with only idle or live children makes no OWNER-chain check.
+
+    The parent-chain OWNER check runs only when a read finds an orphan
+    candidate (running/waiting, no local status, stale heartbeat). Counts
+    OWNER checks and permission-table statements for two reads of the same
+    nested parent: one with only idle and live children, one with a stale
+    running child as a positive control.
+
+    :param auth_client: Permission-enabled test client.
+    :param db_uri: Per-test SQLite database URI, used to seed children.
+    :param monkeypatch: Pytest fixture that wraps ``check_session_access``.
+    """
+    import time
+
+    from sqlalchemy import event
+    from sqlalchemy.engine import Engine
+
+    from omnigent.server.routes.sessions import routes_items
+
+    agent = await create_test_agent(auth_client, user="user-a")
+    root = await _create_session_as(auth_client, agent["id"], "user-a")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    now = int(time.time())
+    live_rid = f"runner_live_{root['id']}"
+    dead_rid = f"runner_dead_{root['id']}"
+    nested = conv_store.create_conversation(
+        kind="sub_agent",
+        title="worker:nested",
+        parent_conversation_id=root["id"],
+        agent_id=agent["id"],
+    )
+    for i in range(3):
+        idle = conv_store.create_conversation(
+            kind="sub_agent",
+            title=f"worker:idle-{i}",
+            parent_conversation_id=nested.id,
+            agent_id=agent["id"],
+        )
+        conv_store.set_session_live_status(idle.id, "idle")
+    live = conv_store.create_conversation(
+        kind="sub_agent",
+        title="worker:live",
+        parent_conversation_id=nested.id,
+        agent_id=agent["id"],
+        runner_id=live_rid,
+    )
+    conv_store.set_session_live_status(live.id, "running")
+    # Heartbeat after the live child exists so its runner_last_seen is fresh.
+    conv_store.touch_runner_liveness([live_rid], now)
+
+    owner_checks: list[int] = []
+    real_check = routes_items.check_session_access
+
+    def spy(user_id, session_id, level, *args, **kwargs):  # type: ignore[no-untyped-def]
+        owner_checks.append(level)
+        return real_check(user_id, session_id, level, *args, **kwargs)
+
+    monkeypatch.setattr(routes_items, "check_session_access", spy)
+
+    perm_statements: list[str] = []
+
+    def count_sql(conn, cursor, statement, params, context, executemany):  # type: ignore[no-untyped-def]
+        if "session_permissions" in statement:
+            perm_statements.append(statement)
+
+    async def list_nested() -> tuple[int, int]:
+        owner_checks.clear()
+        perm_statements.clear()
+        resp = await auth_client.get(
+            f"/v1/sessions/{nested.id}/child_sessions",
+            headers={"X-Forwarded-Email": "user-a"},
+        )
+        assert resp.status_code == 200, resp.text
+        return owner_checks.count(LEVEL_OWNER), len(perm_statements)
+
+    event.listen(Engine, "before_cursor_execute", count_sql)
+    try:
+        idle_live_owner, idle_live_perm = await list_nested()
+        assert idle_live_owner == 0, (
+            f"idle/live-only read ran {idle_live_owner} OWNER-chain check(s)"
+        )
+
+        # Positive control: a stale running child is a settle candidate.
+        dead = conv_store.create_conversation(
+            kind="sub_agent",
+            title="worker:orphan",
+            parent_conversation_id=nested.id,
+            agent_id=agent["id"],
+            runner_id=dead_rid,
+        )
+        conv_store.set_session_live_status(dead.id, "running")
+        conv_store.touch_runner_liveness([dead_rid], now - 3600)
+        cand_owner, cand_perm = await list_nested()
+        assert cand_owner >= 1, "candidate read must run the OWNER check"
+        assert cand_perm > idle_live_perm, (
+            f"candidate read ran {cand_perm} permission statements, idle/live {idle_live_perm}"
+        )
+    finally:
+        event.remove(Engine, "before_cursor_execute", count_sql)
+
 
 # ── SSE stream presence (who-is-viewing circles) ─────────────
 #
@@ -3502,10 +3782,12 @@ async def test_leave_rejects_a_sub_agent_session(
     await _grant_permission(
         auth_client, parent["id"], granter="bryan", target_user="carol", level=LEVEL_READ
     )
-    # Carol has read on the parent, so she may parent a child off it.
+    # Carol has read on the parent, so she may parent a child off it with
+    # an agent she owns; the leave behavior is the contract under test.
+    carol_agent = await create_test_agent(auth_client, user="carol")
     child_resp = await auth_client.post(
         "/v1/sessions",
-        json={"agent_id": parent["agent_id"], "parent_session_id": parent["id"]},
+        json={"agent_id": carol_agent["id"], "parent_session_id": parent["id"]},
         headers={"X-Forwarded-Email": "carol"},
     )
     assert child_resp.status_code == 201, f"child create failed: {child_resp.text}"
@@ -3566,10 +3848,11 @@ async def test_shared_parent_readiness_remains_private(
             headers={"X-Forwarded-Email": "bob"},
         )
     else:
+        bob_agent = await create_test_agent(auth_client, user="bob")
         response = await auth_client.post(
             "/v1/sessions",
             json={
-                "agent_id": parent["agent_id"],
+                "agent_id": bob_agent["id"],
                 "parent_session_id": parent["id"],
                 "harness_override": "jcode",
             },

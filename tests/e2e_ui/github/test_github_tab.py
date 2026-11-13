@@ -661,7 +661,7 @@ def test_post_top_level_pr_comment(
     tabs = panel.get_by_role("tablist", name="Pull request", exact=True)
     tabs.get_by_role("tab", name="Comments 30", exact=True).click()
     textbox = panel.get_by_role("textbox", name="New PR comment")
-    post_button = panel.get_by_role("button", name="Post comment", exact=True)
+    post_button = panel.get_by_role("button", name="Submit", exact=True)
     expect(textbox).to_be_in_viewport()
     expect(post_button).to_be_in_viewport()
     feed = panel.get_by_role("region", name="PR comments", exact=True)
@@ -705,7 +705,7 @@ def test_post_top_level_pr_comment(
     panel.get_by_role("tab", name="Preview", exact=True).click()
     expect(panel.get_by_text("Thanks for reviewing!", exact=True)).to_be_visible()
     page.screenshot(path=str(tmp_path / f"comment-{entry}-preview.png"))
-    panel.get_by_role("button", name="Post comment", exact=True).click()
+    panel.get_by_role("button", name="Submit", exact=True).click()
     expect(tabs.get_by_role("tab", name="Comments 31", exact=True)).to_be_visible()
     feed.evaluate("el => { el.scrollTop = el.scrollHeight; }")
     expect(panel.get_by_text("Thanks for reviewing!", exact=True)).to_be_visible()
@@ -800,8 +800,8 @@ def test_reply_to_inline_review_conversation(
         ],
         "has_more": False,
         "next_cursor": None,
-        "head_sha": "head",
-        "base_sha": "base",
+        "head_sha": "a" * 40,
+        "base_sha": "b" * 40,
     }
     info = {
         **_INFO,
@@ -813,7 +813,7 @@ def test_reply_to_inline_review_conversation(
             "review_thread_replies": True,
             "review_thread_creation": True,
         },
-        "pr": {**_INFO["pr"], "head_sha": "head", "base_sha": "base"},
+        "pr": {**_INFO["pr"], "head_sha": "a" * 40, "base_sha": "b" * 40},
     }
     thread_reads = []
     pending_reads: list[Route] = []
@@ -871,7 +871,7 @@ def test_reply_to_inline_review_conversation(
     page.route(re.compile(r"/resources/github(?:\?|$)"), read_info)
     page.route(
         re.compile(r"/resources/github/diff(?:\?|$)"),
-        lambda route: route.fulfill(json={**_PR_DIFF, "head_sha": "head", "base_sha": "base"}),
+        lambda route: route.fulfill(json={**_PR_DIFF, "head_sha": "a" * 40, "base_sha": "b" * 40}),
     )
     page.route(re.compile(r"/resources/github/review-threads/thread-1/replies$"), reply)
     page.route(re.compile(r"/resources/github/review-threads$"), create_thread)
@@ -881,8 +881,12 @@ def test_reply_to_inline_review_conversation(
     if entry == "canvas":
         from tests.e2e_ui.sessions.test_canvas_page import _stub_server_info
 
-        _stub_server_info(page, canvas=True, session_pull_requests=True)
+        _stub_server_info(
+            page, canvas=True, session_pull_requests=True, comment_anchor_metadata=True
+        )
     page.goto(f"{base_url}/{'canvas/' if entry == 'canvas' else ''}c/{session_id}")
+    main_composer = page.get_by_label("Message the agent", exact=True)
+    main_composer.fill("Please keep the public API stable.")
     panel = (
         page.get_by_test_id("github-panel-drawer")
         if mobile
@@ -1052,12 +1056,18 @@ def test_reply_to_inline_review_conversation(
     assert posts == [{"pr_url": pr_url, "body": "**This handles empty input.**"}]
     assert thread_reads
     fallback = panel.locator('[data-review-thread="outdated"]')
+    expect(fallback).to_have_count(0)
+    panel.get_by_role("button", name="More actions for removed.py", exact=True).click()
+    page.get_by_role("menuitem", name="Show earlier comments", exact=True).click()
     expect(fallback.get_by_role("button", expanded=False)).to_be_visible()
     fallback.get_by_role("button", expanded=False).click()
     expect(fallback.get_by_text("Original code context", exact=True)).to_be_visible()
     expect(fallback.get_by_text("Original context", exact=True)).to_be_visible()
     conversation.scroll_into_view_if_needed()
     page.screenshot(path=str(tmp_path / f"inline-{entry}-posted.png"))
+    panel.get_by_role("button", name="More actions for removed.py", exact=True).click()
+    page.get_by_role("menuitem", name="Hide earlier comments", exact=True).click()
+    expect(fallback).to_have_count(0)
 
     line = file.locator("diffs-container").first.locator(
         ":scope > [data-diff] > [data-code] > [data-gutter] "
@@ -1104,7 +1114,7 @@ def test_reply_to_inline_review_conversation(
     expect(draft.get_by_text("Separate conversation.", exact=True)).to_be_visible()
     draft.scroll_into_view_if_needed()
     page.screenshot(path=str(tmp_path / f"inline-{entry}-new-comment.png"))
-    draft.get_by_role("button", name="Post comment", exact=True).click()
+    draft.get_by_role("button", name="Submit", exact=True).click()
     created = file.locator('[data-review-thread="new-thread-1"]')
     expect(created.get_by_text("Separate conversation.", exact=True)).to_be_visible()
     expect(conversation.locator("li")).to_have_count(2)
@@ -1133,7 +1143,7 @@ def test_reply_to_inline_review_conversation(
     expect(draft.get_by_text("New conversation · Old lines 1–2", exact=True)).to_be_visible()
     expect(plus).to_have_count(0)
     draft.get_by_role("textbox", name="New review comment").fill("Consider these lines together.")
-    draft.get_by_role("button", name="Post comment", exact=True).click()
+    draft.get_by_role("button", name="Submit", exact=True).click()
     ranged = file.locator('[data-review-thread="new-thread-2"]')
     expect(ranged.get_by_text("Consider these lines together.", exact=True)).to_be_visible()
     assert (
@@ -1152,8 +1162,8 @@ def test_reply_to_inline_review_conversation(
                 "side": side,
                 "line": 2,
                 "start_line": start,
-                "head_sha": "head",
-                "base_sha": "base",
+                "head_sha": "a" * 40,
+                "base_sha": "b" * 40,
             },
         }
         for body, side, start in [
@@ -1163,6 +1173,91 @@ def test_reply_to_inline_review_conversation(
     ]
     ranged.scroll_into_view_if_needed()
     page.screenshot(path=str(tmp_path / f"inline-{entry}-range-posted.png"))
+
+    # Local comments use the session API; provider writes remain unchanged.
+    for side, body in [
+        ("deletions", "Keep the original guard."),
+        ("additions", "Handle empty input."),
+    ]:
+        file.locator(
+            f'[data-code][data-{side}] [data-column-number="2"] [data-line-number-content]'
+        ).click()
+        plus.click()
+        draft.get_by_role("button", name="Agent", exact=True).click()
+        draft.get_by_role("textbox", name="New review comment").fill(body)
+        destination = draft.get_by_role("group", name="Comment destination").bounding_box()
+        write_preview = draft.get_by_role("tablist").bounding_box()
+        assert destination and write_preview
+        assert abs(destination["height"] - write_preview["height"]) <= 1
+        page.screenshot(path=str(tmp_path / f"inline-{entry}-{side}-composer.png"))
+        tabs.get_by_role("tab", name="Summary", exact=True).click()
+        tabs.get_by_role("tab", name="Changes", exact=False).click()
+        expect(draft.get_by_role("button", name="Agent", exact=True)).to_have_attribute(
+            "aria-pressed", "true"
+        )
+        draft.get_by_role("button", name="Submit", exact=True).click()
+        expect(
+            file.get_by_role("region", name="Local review comment").filter(has_text=body)
+        ).to_be_visible()
+    assert len(new_posts) == 2
+    response = page.request.get(
+        f"{base_url}/v1/sessions/{session_id}/comments?include_pr_comments=true"
+    )
+    assert response.ok
+    local_comments = response.json()["comments"]
+    assert len(local_comments) == 2
+    assert {comment["anchor_metadata"]["side"] for comment in local_comments} == {"LEFT", "RIGHT"}
+    page.screenshot(path=str(tmp_path / f"inline-{entry}-local-review.png"))
+    tabs.get_by_role("tab", name="Summary", exact=True).click()
+    if mobile:
+        panel.get_by_role("button", name="Close", exact=True).click()
+    expect(page.get_by_role("button", name=re.compile("Open local review comment"))).to_have_count(
+        2
+    )
+    expect(main_composer).to_have_value("Please keep the public API stable.")
+    page.screenshot(path=str(tmp_path / f"inline-{entry}-local-review-in-chat.png"))
+    chip = page.get_by_role(
+        "button", name="Open local review comment src/app/main.py:2 (old)", exact=True
+    )
+    chip.hover()
+    expect(page.get_by_text("Keep the original guard.", exact=True).last).to_be_visible()
+    chip.click()
+    old_comment = next(c for c in local_comments if c["anchor_metadata"]["side"] == "LEFT")
+    target = panel.locator(f'[data-local-review-comment="{old_comment["id"]}"]')
+    expect(target).to_be_focused()
+    expect(target).to_be_in_viewport()
+    expect(target.get_by_role("button", name="Edit local comment", exact=True)).to_be_visible()
+    expect(target.get_by_role("button", name="Delete local comment", exact=True)).to_be_visible()
+    expect(
+        target.get_by_role("button", name=re.compile("Attach to agent|Mark addressed"))
+    ).to_have_count(0)
+    if mobile:
+        panel.get_by_role("button", name="Close", exact=True).click()
+    page.get_by_role(
+        "button", name="Delete local review comment src/app/main.py:2 (new)", exact=True
+    ).click()
+    expect(page.get_by_role("button", name=re.compile("Open local review comment"))).to_have_count(
+        1
+    )
+    response = page.request.get(
+        f"{base_url}/v1/sessions/{session_id}/comments?include_pr_comments=true"
+    )
+    assert response.ok
+    assert [comment["id"] for comment in response.json()["comments"]] == [old_comment["id"]]
+    chip.click()
+    expect(file.get_by_role("region", name="Local review comment")).to_have_count(1)
+    target.get_by_role("button", name="Delete local comment", exact=True).click()
+    expect(file.get_by_role("region", name="Local review comment")).to_have_count(0)
+    if mobile:
+        panel.get_by_role("button", name="Close", exact=True).click()
+    expect(page.get_by_role("button", name=re.compile("Open local review comment"))).to_have_count(
+        0
+    )
+    response = page.request.get(
+        f"{base_url}/v1/sessions/{session_id}/comments?include_pr_comments=true"
+    )
+    assert response.ok
+    assert response.json() == {"comments": [], "next_cursor": None}
 
 
 # Two additions match "added": the first on line 2, the second on line 4.
@@ -1275,11 +1370,25 @@ def test_changes_find_reveals_collapsed_and_filtered(
     page.screenshot(path=str(tmp_path / f"find-{entry}-reopened.png"))
 
 
+# README.md's hunk, so its viewed mark has a patch to be checked against.
+_README_PATCH = (
+    "diff --git a/README.md b/README.md\n"
+    "new file mode 100644\n"
+    "index 0000000..4c2d3e1\n"
+    "--- /dev/null\n"
+    "+++ b/README.md\n"
+    "@@ -0,0 +1,2 @@\n"
+    "+# Demo\n"
+    "+Adds the GitHub tab.\n"
+)
+
+
 @pytest.mark.parametrize("entry", ["rail", "composer-mobile"])
 def test_changes_viewed_progress_persists_and_resets(
     page: Page, seeded_session: tuple[str, str], tmp_path: Path, entry: str
 ) -> None:
-    """Viewed marks collapse files, survive a reload, and reset when the PR gets a new head."""
+    """Viewed marks collapse files and survive a reload. A new head keeps the mark on an
+    unchanged file and flags a changed one as "Changed since viewed"."""
     base_url, session_id = seeded_session
     mobile = entry == "composer-mobile"
     page.set_viewport_size({"width": 390 if mobile else 1280, "height": 900})
@@ -1287,6 +1396,11 @@ def test_changes_viewed_progress_persists_and_resets(
     pr_url = _INFO["pr"]["url"]
     # The PR's head moves mid-test, so every resource answers for the current head.
     head = {"sha": "head1"}
+    # head2 reworks main.py's hunk and leaves README.md's hunk as it was.
+    patches = {
+        "head1": _PR_DIFF["patch"] + _README_PATCH,
+        "head2": _PR_DIFF["patch"].replace("+added line", "+reworked line") + _README_PATCH,
+    }
 
     def info_at_head(route: Route) -> None:
         route.fulfill(
@@ -1314,7 +1428,14 @@ def test_changes_viewed_progress_persists_and_resets(
     )
     page.route(
         re.compile(r"/resources/github/diff(?:\?|$)"),
-        lambda r: r.fulfill(json={**_PR_DIFF, "head_sha": head["sha"], "base_sha": "base"}),
+        lambda r: r.fulfill(
+            json={
+                **_PR_DIFF,
+                "patch": patches[head["sha"]],
+                "head_sha": head["sha"],
+                "base_sha": "base",
+            }
+        ),
     )
 
     def open_changes() -> Locator:
@@ -1334,11 +1455,12 @@ def test_changes_viewed_progress_persists_and_resets(
     panel = open_changes()
     expect(panel.get_by_text("0 / 2 files viewed", exact=True)).to_be_visible(timeout=30_000)
     panel.get_by_role("checkbox", name="Viewed README.md").click()
+    panel.get_by_role("checkbox", name="Viewed src/app/main.py").click()
     expect(panel.get_by_role("checkbox", name="Viewed README.md")).to_be_checked()
-    expect(panel.get_by_text("1 / 2 files viewed", exact=True)).to_be_visible()
+    expect(panel.get_by_text("2 / 2 files viewed", exact=True)).to_be_visible()
     if not mobile:  # Mobile shows the count without the bar.
         expect(panel.get_by_role("progressbar", name="Files viewed")).to_have_attribute(
-            "aria-valuenow", "50"
+            "aria-valuenow", "100"
         )
     # Marking collapses the file's diff.
     expect(
@@ -1350,22 +1472,26 @@ def test_changes_viewed_progress_persists_and_resets(
     page.reload()
     panel = open_changes()
     expect(panel.get_by_role("checkbox", name="Viewed README.md")).to_be_checked(timeout=30_000)
-    expect(panel.get_by_text("1 / 2 files viewed", exact=True)).to_be_visible()
+    expect(panel.get_by_text("2 / 2 files viewed", exact=True)).to_be_visible()
 
-    # A new head starts with no marks and says so until the notice is dismissed.
+    # The new head changes main.py's hunk. README.md keeps its mark, and main.py loses its
+    # mark and is flagged until it is marked again.
     head["sha"] = "head2"
     page.reload()
     panel = open_changes()
-    expect(panel.get_by_text("0 / 2 files viewed", exact=True)).to_be_visible(timeout=30_000)
-    expect(panel.get_by_role("checkbox", name="Viewed README.md")).not_to_be_checked()
-    expect(panel.get_by_text(re.compile("viewed marks were reset"))).to_be_visible()
+    expect(panel.get_by_text("1 / 2 files viewed", exact=True)).to_be_visible(timeout=30_000)
+    expect(panel.get_by_role("checkbox", name="Viewed README.md")).to_be_checked()
+    expect(panel.get_by_role("checkbox", name="Viewed src/app/main.py")).not_to_be_checked()
+    expect(panel.get_by_text("Changed since viewed", exact=True)).to_have_count(1)
+    expect(panel.get_by_text(re.compile("changed files lost their viewed marks"))).to_be_visible()
     page.screenshot(path=str(tmp_path / f"viewed-{entry}-reset.png"), animations="disabled")
     panel.get_by_role("button", name="Dismiss", exact=True).click()
-    expect(panel.get_by_text(re.compile("viewed marks were reset"))).to_have_count(0)
+    expect(panel.get_by_text(re.compile("changed files lost their viewed marks"))).to_have_count(0)
 
-    # Hiding viewed files, once every file is viewed, shows the all-viewed state.
-    panel.get_by_role("checkbox", name="Viewed README.md").click()
+    # Marking the changed file on the new head clears its badge. Then hiding viewed files,
+    # once every file is viewed, shows the all-viewed state.
     panel.get_by_role("checkbox", name="Viewed src/app/main.py").click()
+    expect(panel.get_by_text("Changed since viewed", exact=True)).to_have_count(0)
     panel.get_by_role("checkbox", name="Hide viewed").click()
     expect(panel.get_by_text("All 2 files viewed", exact=True)).to_be_visible()
     if not mobile:
@@ -1489,3 +1615,165 @@ def test_changes_filter_copy_open(page: Page, seeded_session: tuple[str, str], e
     expect(page.get_by_role("menuitem", name="Open in GitHub")).to_have_attribute(
         "href", "https://example.com/fork/app/blob/head/README.md"
     )
+
+
+_COMMIT_ONE, _COMMIT_TWO = "1" * 40, "2" * 40
+# GET /resources/github/commits — oldest first; each commit's patch is served by sha below.
+_COMMITS = {
+    "object": "list",
+    "has_more": False,
+    "data": [
+        {
+            "object": "session.github.commit",
+            "sha": _COMMIT_ONE,
+            "title": "Add the parser",
+            "author": "Ada",
+            "date": "2026-11-01T10:00:00Z",
+        },
+        {
+            "object": "session.github.commit",
+            "sha": _COMMIT_TWO,
+            "title": "Wire the README",
+            "author": "Grace",
+            "date": "2026-11-02T10:00:00Z",
+        },
+    ],
+}
+_COMMIT_PATCHES = {
+    _COMMIT_ONE: _PR_DIFF["patch"],
+    _COMMIT_TWO: (
+        "diff --git a/README.md b/README.md\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/README.md\n"
+        "@@ -0,0 +1 @@\n"
+        "+# Demo\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("entry", ["rail"])
+def test_changes_commits_view_lists_and_opens_a_commit(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path, entry: str
+) -> None:
+    """Switch the Changes tab to Commits, open one commit, and step between commits.
+
+    Only the commit's own files are listed, the viewed controls are absent there, and
+    Back returns to the commit list. Back in Changes, **Changes since** narrows the tab to
+    the changes after a picked commit and the PR base restores them all. The commit list
+    and patches are stubbed routes.
+    """
+    base_url, session_id = seeded_session
+    pr_url = _INFO["pr"]["url"]
+    _stub_github(page)
+    # Commit history needs the Changes list pinned to a head, and the provider to support it.
+    page.route(
+        re.compile(r"/resources/github(?:\?|$)"),
+        lambda route: route.fulfill(
+            json={
+                **_INFO,
+                "tracking_available": True,
+                "selected_pr_url": pr_url,
+                "capabilities": {"commit_history": True},
+                "prs": [
+                    {
+                        "url": pr_url,
+                        "host": "example.com",
+                        "repository": "acme/app",
+                        "number": _PR_NUMBER,
+                        "relationship": "created",
+                    }
+                ],
+            }
+        ),
+    )
+    page.route(
+        re.compile(r"/resources/github/changes"),
+        lambda route: route.fulfill(json={**_CHANGES, "head_sha": "head", "base_sha": "base"}),
+    )
+    list_urls: list[str] = []
+    patch_urls: list[str] = []
+
+    def commit_list(route: Route) -> None:
+        list_urls.append(route.request.url)
+        route.fulfill(json=_COMMITS)
+
+    def commit_patch(route: Route) -> None:
+        patch_urls.append(route.request.url)
+        sha = re.search(r"commit_sha=([0-9a-f]+)", route.request.url)
+        assert sha is not None, route.request.url
+        route.fulfill(
+            json={"object": "session.github.pr_diff", "patch": _COMMIT_PATCHES[sha.group(1)]}
+        )
+
+    page.route(re.compile(r"/resources/github/commits"), commit_list)
+    # The whole-PR patch reports the head it describes, so viewed marks are available in Changes.
+    page.route(
+        re.compile(r"/resources/github/diff(?:\?|$)"),
+        lambda route: route.fulfill(json={**_PR_DIFF, "head_sha": "head", "base_sha": "base"}),
+    )
+    page.route(re.compile(r"/resources/github/commit-diff\?"), commit_patch)
+    compare_urls: list[str] = []
+
+    def changes_since_patch(route: Route) -> None:
+        compare_urls.append(route.request.url)
+        # After the first commit, only the second commit's changes reach the head.
+        route.fulfill(
+            json={"object": "session.github.pr_diff", "patch": _COMMIT_PATCHES[_COMMIT_TWO]}
+        )
+
+    page.route(re.compile(r"/resources/github/compare-diff\?"), changes_since_patch)
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+    panel = page.get_by_role("complementary", name="Workspace")
+    panel.get_by_role("tab", name="Pull Requests").click()
+    panel.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Changes").click()
+    files = panel.locator("[data-github-file]")
+    expect(files).to_have_count(2, timeout=30_000)
+    expect(panel.get_by_role("checkbox", name="Hide viewed")).to_be_visible()
+    expect(panel.get_by_role("checkbox", name="Viewed src/app/main.py")).to_be_visible()
+
+    panel.get_by_role("group", name="Show changes or commits").get_by_role(
+        "button", name="Commits", exact=True
+    ).click()
+    search = panel.get_by_role("searchbox", name="Search commits")
+    expect(panel.get_by_text("2 commits", exact=True)).to_be_visible()
+    search.fill("readme")
+    expect(panel.get_by_role("button", name=re.compile("Wire the README"))).to_be_visible()
+    expect(panel.get_by_role("button", name=re.compile("Add the parser"))).to_have_count(0)
+    search.fill("")
+    page.screenshot(path=str(tmp_path / f"commits-{entry}-list.png"), animations="disabled")
+
+    panel.get_by_role("button", name=re.compile("Add the parser")).click()
+    expect(files).to_have_count(1)
+    expect(files).to_have_attribute("data-github-file", "src/app/main.py")
+    expect(panel.get_by_role("checkbox", name="Hide viewed")).to_have_count(0)
+    expect(panel.get_by_role("checkbox", name="Viewed src/app/main.py")).to_have_count(0)
+    # The list is pinned to the head the Changes list shows; the patch names the selected commit.
+    assert "head_sha=head" in list_urls[0], list_urls
+    assert "/resources/github/commit-diff?" in patch_urls[-1], patch_urls
+    assert f"commit_sha={_COMMIT_ONE}" in patch_urls[-1], patch_urls
+    page.screenshot(path=str(tmp_path / f"commits-{entry}-diff.png"), animations="disabled")
+
+    panel.get_by_role("button", name="Next commit").click()
+    expect(files).to_have_attribute("data-github-file", "README.md")
+    panel.get_by_role("button", name="Back to commits").click()
+    expect(panel.get_by_text("2 commits", exact=True)).to_be_visible()
+
+    panel.get_by_role("group", name="Show changes or commits").get_by_role(
+        "button", name="Changes", exact=True
+    ).click()
+    expect(files).to_have_count(2)
+    panel.get_by_role("combobox", name="Changes since").click()
+    page.get_by_role("option", name=re.compile("Add the parser")).click()
+    expect(files).to_have_count(1)
+    expect(files).to_have_attribute("data-github-file", "README.md")
+    # The narrowed patch is pinned to the head the Changes list shows, after the picked commit.
+    assert "head_sha=head" in compare_urls[-1], compare_urls
+    assert f"from_sha={_COMMIT_ONE}" in compare_urls[-1], compare_urls
+    expect(panel.get_by_role("checkbox", name="Hide viewed")).to_have_count(0)
+    page.screenshot(path=str(tmp_path / f"commits-{entry}-since.png"), animations="disabled")
+    panel.get_by_role("combobox", name="Changes since").click()
+    page.get_by_role("option", name="PR base (all changes)").click()
+    expect(files).to_have_count(2)
+    expect(panel.get_by_role("checkbox", name="Hide viewed")).to_be_visible()

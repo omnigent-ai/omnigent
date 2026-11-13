@@ -1,0 +1,20 @@
+name: tcp-egress-public-ssh
+executor:
+  harness: claude-sdk
+prompt: |
+  Use sys_os_shell to run:
+    (sleep 5) | omnigent-egress-connect public_ssh
+  Report the command, exit code, stdout, and stderr. Expect a public SSH
+  identification line beginning SSH-2.0-. This only reads a banner; do not
+  authenticate, send credentials, or claim server identity was verified.
+  Keep stdin open for five seconds so the server can send its greeting.
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: auto
+    allow_network: false
+    tcp_egress:
+      - name: public_ssh
+        host: github.com
+        port: 22

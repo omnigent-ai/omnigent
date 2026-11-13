@@ -1,8 +1,10 @@
 import { SidebarDataContext } from "./useSidebarData";
 import {
+  ARCHIVED_PROJECT_NAMES_KEY,
   type Conversation,
   PINNED_CONVERSATIONS_KEY,
   type PinnedConversationsResult,
+  type ProjectSummary,
 } from "./useConversations";
 // App-level wiring for the `WS /v1/sessions/updates` push stream.
 //
@@ -13,16 +15,16 @@ import {
 //      and pushes it to the socket, and
 //   3. applies incoming snapshot/changed/removed frames back into that cache
 //      — patching field changes (status, runner, title, …) in place and
-//      falling back to a paced refetch for structural and
-//      membership-affecting filter changes the server's list shape can't
-//      reconstruct locally.
+//      falling back to a paced refetch of only the lists whose membership a
+//      change may have moved, which the server's list shape can't reconstruct
+//      locally.
 //
 // This replaces the old 4 s list poll; `useConversations` keeps low-rate
 // HTTP reconciliation so new sessions from other tabs / CLIs are still
 // discovered while the socket handles watched-row freshness.
 
 import { type ReactNode, useCallback, useContext, useEffect, useRef } from "react";
-import { type QueryClient, useQueryClient } from "@tanstack/react-query";
+import { hashKey, type QueryClient, useQueryClient } from "@tanstack/react-query";
 import { getCurrentUserId } from "@/lib/identity";
 import { useActiveConversationId } from "@/hooks/useActiveConversationId";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
@@ -30,9 +32,11 @@ import {
   isSessionArchiving,
   isSessionDeleting,
   markRecentlyCreated,
+  withMoveTombstone,
 } from "@/hooks/useConversations";
 import {
   type ConversationsInfiniteData,
+  type MembershipChange,
   type SessionListWireItem,
   collectConversationIds,
   filtersFromConversationQueryKey,
@@ -40,13 +44,19 @@ import {
   insertNewRowsIntoPages,
   mergeItemsIntoPages,
   nullsToUndefined,
+  parseProjectSessionsQueryKey,
   PROJECT_LABEL_KEY,
   removeIdsFromPages,
   settleOpenSessionRow,
   unmarkRecentlyCreated,
 } from "@/lib/sessionListCache";
 import { createListReconcileScheduler } from "@/lib/listReconcileScheduler";
-import { isModalHostResolved, resolveModalHost } from "@/lib/sessionHost";
+import {
+  type CachedList,
+  listReconcileTargets,
+  projectNamesResolver,
+} from "@/lib/listReconcileTargets";
+import { resolveModalHost, sessionRoutingHostId } from "@/lib/sessionHost";
 import { sessionVisibility } from "@/lib/sessionVisibility";
 import { type SessionUpdatesFrame, sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
 import { isTempConvId } from "@/lib/tempConversationId";
@@ -56,22 +66,33 @@ import { isTempConvId } from "@/lib/tempConversationId";
 // single frame can trigger.
 const DEBOUNCE_MS = 250;
 
+/** Query hash of the Archived view's project-picker scan. */
+const ARCHIVED_PROJECT_NAMES_HASH = hashKey(ARCHIVED_PROJECT_NAMES_KEY);
+
+/** Ids every page of a list holds. */
+function listIds(data: ConversationsInfiniteData | undefined): Set<string> {
+  return new Set(collectConversationIds([data]));
+}
+
 /**
  * Overlay wire items onto every cached `["conversations", ...]` variant.
  *
  * @param queryClient - The app QueryClient.
  * @param items - Wire items from a snapshot/changed frame.
  * @param activeId - The open session, which is never inserted when it is
- *   another user's.
- * @returns Top-level ids not found in any cached page and whether any
- *   patched row needs a server refetch to preserve filtered-query membership.
+ *   another user's, and never counts as a new session.
+ * @param snapshotArchived - Last streamed archived flag per session, so a
+ *   frozen Archived snapshot row reports its flip only once.
+ * @returns Query hashes of the lists the local patch couldn't settle, which
+ *   need a server refetch.
  */
 function applyItemsToCache(
   queryClient: QueryClient,
   items: SessionListWireItem[],
   activeId: string | undefined,
-  viewerId?: string | null,
-): { missingIds: string[]; needsRefetch: boolean } {
+  viewerId: string | null | undefined,
+  snapshotArchived: Map<string, boolean>,
+): Set<string> {
   // Frames are full rows with explicit nulls; convert null → undefined so a
   // cleared field overlays the cache in the same shape GET /v1/sessions
   // produces (absent), without tripping the permission_level === null sentinel.
@@ -80,7 +101,9 @@ function applyItemsToCache(
     if (isSessionDeleting(item.id)) continue;
     itemsById.set(
       item.id,
-      nullsToUndefined(isSessionArchiving(item.id) ? { ...item, archived: true } : item),
+      nullsToUndefined(
+        withMoveTombstone(isSessionArchiving(item.id) ? { ...item, archived: true } : item),
+      ),
     );
   }
   // The open session is always in the watch-set, so its row arrives with every
@@ -98,20 +121,53 @@ function applyItemsToCache(
         viewerId ?? null,
       ) === "shared");
   const foundAnywhere = new Set<string>();
-  let needsRefetch = false;
+  const lists: CachedList[] = [];
+  const changes = new Map<string, MembershipChange>();
+  const noteChanges = (listChanges: Map<string, MembershipChange>) => {
+    for (const [id, change] of listChanges) {
+      const seen = changes.get(id);
+      if (seen) for (const field of change.fields) seen.fields.add(field);
+      else changes.set(id, { row: change.row, fields: new Set(change.fields) });
+    }
+  };
+  // A frozen Archived snapshot row still says archived after a streamed unarchive.
+  // Report that flip only when the stream's archived value changes, not on every frame.
+  const noteSnapshotChanges = (listChanges: Map<string, MembershipChange>) => {
+    for (const [id, change] of listChanges) {
+      const fields = new Set(change.fields);
+      if (fields.has("archived") && snapshotArchived.get(id) === (change.row.archived === true)) {
+        fields.delete("archived");
+      }
+      if (fields.size > 0) noteChanges(new Map([[id, { row: change.row, fields }]]));
+    }
+  };
   const entries = queryClient.getQueriesData<ConversationsInfiniteData>({
     queryKey: ["conversations"],
   });
   for (const [key, data] of entries) {
-    if (key[4] === "archived") continue;
     const filters = filtersFromConversationQueryKey(key);
+    const snapshot =
+      queryClient.getQueryCache().find({ queryKey: key, exact: true })?.meta?.snapshot === true;
     const {
       data: merged,
       found,
-      needsRefetch: queryNeedsRefetch,
+      needsRefetch,
+      changes: listChanges,
     } = mergeItemsIntoPages(data, itemsById, filters);
     for (const id of found) foundAnywhere.add(id);
-    if (queryNeedsRefetch) needsRefetch = true;
+    if (snapshot) noteSnapshotChanges(listChanges);
+    else noteChanges(listChanges);
+    // The Archived scope is read for membership but never patched or inserted into.
+    if (key[4] === "archived") {
+      // A snapshot never refetches, so its frozen rows can't ask for one.
+      lists.push({
+        queryHash: hashKey(key),
+        filters,
+        ids: listIds(data),
+        needsRefetch: needsRefetch && !snapshot,
+      });
+      continue;
+    }
     // Surface a brand-new watched session (a create here or elsewhere, a share)
     // at the top now, instead of after the debounced refetch (which lags the
     // search index). An unfiled row is fully placed → mark it found so it skips
@@ -133,6 +189,7 @@ function applyItemsToCache(
       markRecentlyCreated(row);
     }
     if (next !== data) queryClient.setQueryData(key, next);
+    lists.push({ queryHash: hashKey(key), filters, ids: listIds(next), needsRefetch });
   }
   // Each project folder fetches its own ["project-sessions", <name>] list, so
   // streamed field updates (pending_elicitations_count → "Needs response",
@@ -143,14 +200,23 @@ function applyItemsToCache(
     queryKey: ["project-sessions"],
   });
   for (const [key, data] of projectEntries) {
+    const filters = filtersFromProjectQueryKey(key);
     const {
       data: next,
       found,
-      needsRefetch: queryNeedsRefetch,
-    } = mergeItemsIntoPages(data, itemsById, filtersFromProjectQueryKey(key));
+      needsRefetch,
+      changes: listChanges,
+    } = mergeItemsIntoPages(data, itemsById, filters);
     for (const id of found) foundAnywhere.add(id);
-    if (queryNeedsRefetch) needsRefetch = true;
+    noteChanges(listChanges);
     if (next !== data) queryClient.setQueryData(key, next);
+    lists.push({
+      queryHash: hashKey(key),
+      filters,
+      folder: parseProjectSessionsQueryKey(key).project,
+      ids: listIds(next),
+      needsRefetch,
+    });
   }
   queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (previous) => {
     if (!previous) return previous;
@@ -161,30 +227,66 @@ function applyItemsToCache(
         if (!item) return row;
         foundAnywhere.add(row.id);
         changed = true;
-        // Pin membership and pin timestamps reconcile through the pinned query.
+        // Keep optimistic standalone pins; family updates carry canonical labels.
         return {
           ...row,
           ...item,
-          labels: {
-            ...(item.labels ?? row.labels),
-            ["omnigent.pinned"]: row.labels["omnigent.pinned"],
-          },
+          labels:
+            row.family || item.family
+              ? (item.labels ?? row.labels)
+              : {
+                  ...(item.labels ?? row.labels),
+                  ["omnigent.pinned"]: row.labels["omnigent.pinned"],
+                },
         };
       })
-      .filter((row) => !row.archived);
+      .filter(
+        (row) => !row.archived && (row.family?.pinned || row.labels["omnigent.pinned"] != null),
+      );
     return changed ? { ...previous, conversations } : previous;
   });
   // The open session's fetched sidebar row sits outside every list, so a remote
   // change (archive, rename, an approval) reaches it only here.
   for (const item of itemsById.values()) settleOpenSessionRow(queryClient, item.id, item);
-  return {
-    // Sub-agent children are watched for their tree views, but no session list
-    // ever holds them, so their absence is not a sign of a new session.
-    missingIds: [...itemsById.values()]
-      .filter((item) => item.parent_session_id == null && !foundAnywhere.has(item.id))
-      .map((item) => item.id),
-    needsRefetch,
-  };
+
+  // A watched id absent from every page is a new session whose sort position
+  // can't be placed locally. Sub-agent children are watched for their tree
+  // views, but no list ever holds them. The open session's updated_at bumps on
+  // open before the initial list fetch returns, so it can look missing without
+  // being new; useSession covers it and ActiveChatOverride keeps it listed.
+  const newRows = new Map<string, Conversation>();
+  for (const item of itemsById.values()) {
+    if (item.parent_session_id != null || foundAnywhere.has(item.id) || item.id === activeId) {
+      continue;
+    }
+    newRows.set(item.id, {
+      object: "conversation",
+      title: null,
+      created_at: 0,
+      updated_at: 0,
+      labels: {},
+      permission_level: null,
+      ...item,
+    });
+  }
+  for (const item of itemsById.values()) {
+    if (item.archived !== undefined) snapshotArchived.set(item.id, item.archived === true);
+  }
+  const targets = listReconcileTargets({
+    lists,
+    changes,
+    newRows,
+    projectNamesOf: projectNamesResolver(queryClient.getQueryData<ProjectSummary[]>(["projects"])),
+    viewerId: viewerId ?? null,
+  });
+  for (const { row, fields } of changes.values()) {
+    // Archiving, unarchiving or refiling an archived session elsewhere can add
+    // or remove a project from the Archived view's picker.
+    if (fields.has("archived") || (fields.has("project") && row.archived === true)) {
+      targets.add(ARCHIVED_PROJECT_NAMES_HASH);
+    }
+  }
+  return targets;
 }
 
 /**
@@ -192,11 +294,12 @@ function applyItemsToCache(
  *
  * @param queryClient - The app QueryClient.
  * @param ids - Conversation ids to evict.
- * @returns `true` when at least one cached page changed.
+ * @returns Query hashes of the lists that dropped a row, which refetch to fill
+ *   the gap.
  */
-function removeIdsFromCache(queryClient: QueryClient, ids: string[]): boolean {
+function removeIdsFromCache(queryClient: QueryClient, ids: string[]): Set<string> {
   const idSet = new Set(ids);
-  let removedAny = false;
+  const removedFrom = new Set<string>();
   // Both the global lists and each project folder's own list (same page shape).
   for (const queryKey of [["conversations"], ["project-sessions"]]) {
     const entries = queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey });
@@ -204,11 +307,13 @@ function removeIdsFromCache(queryClient: QueryClient, ids: string[]): boolean {
       const { data: next, removed } = removeIdsFromPages(data, idSet);
       if (removed) {
         queryClient.setQueryData(key, next);
-        removedAny = true;
+        removedFrom.add(hashKey(key));
       }
     }
   }
-  return removedAny;
+  // A deleted archived session can take its project's last member with it.
+  if (removedFrom.size > 0) removedFrom.add(ARCHIVED_PROJECT_NAMES_HASH);
+  return removedFrom;
 }
 
 /**
@@ -237,6 +342,9 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
   // socket reconnects, so changes missed while disconnected are caught by
   // the post-reconnect snapshot.
   const commentsFingerprintsRef = useRef(new Map<string, string>());
+
+  // Last streamed archived flag per session, for the frozen Archived snapshot.
+  const snapshotArchivedRef = useRef(new Map<string, boolean>());
 
   // Last permission level streamed for the open session, so a change to it
   // (a share upgraded or revoked) reconciles list membership.
@@ -323,17 +431,33 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     if (!identityReady) return;
     let cacheUnsub: (() => void) | null = null;
     const tryResolveAndStart = (): boolean => {
-      const succeeded = queryClient
+      // Only the user's own unarchived, unfiltered list decides the modal host:
+      // shared, archived, search and project rows are not this user's home hosts.
+      const ownLists = queryClient
         .getQueryCache()
         .getAll()
-        .some(
+        .filter(
           (q) =>
             Array.isArray(q.queryKey) &&
             q.queryKey[0] === "conversations" &&
+            q.queryKey[1] === "" &&
+            q.queryKey[2] === false &&
+            q.queryKey[3] == null &&
+            (q.queryKey[4] == null || q.queryKey[4] === "mine") &&
             q.state.status === "success",
         );
-      if (!succeeded) return false;
-      resolveModalHost();
+      if (ownLists.length === 0) return false;
+      // The unfiltered list also holds shared rows; only the viewer's own count.
+      const viewerId = getCurrentUserId();
+      const ownHostIds = ownLists.flatMap((q) => {
+        const pages = (q.state.data as ConversationsInfiniteData | undefined)?.pages ?? [];
+        return pages.flatMap((page) =>
+          page.data
+            .filter((row) => sessionVisibility(row, viewerId) === "mine")
+            .map((row) => sessionRoutingHostId(row.host_id, row.labels)),
+        );
+      });
+      resolveModalHost(ownHostIds.filter((id): id is string => id !== null));
       sessionUpdatesSocket.start();
       return true;
     };
@@ -341,29 +465,34 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     // Otherwise wait for the first success, then start once and unsubscribe.
     if (!tryResolveAndStart()) {
       cacheUnsub = queryClient.getQueryCache().subscribe(() => {
-        if (isModalHostResolved() || tryResolveAndStart()) cacheUnsub?.();
+        if (tryResolveAndStart()) cacheUnsub?.();
       });
     }
 
     // Reconcile the session lists against the server when a frame shows a
-    // change no local patch can place. Paced so a busy stream can't stack
-    // refetch rounds against a slow server.
-    const reconciler = createListReconcileScheduler(() =>
-      Promise.all([
-        queryClient.invalidateQueries({
-          queryKey: ["conversations"],
-          predicate: (query) => query.meta?.snapshot !== true,
-        }),
-        // Converge each project folder's own list too (new/archived/relabeled
-        // members the local field-patch can't place).
-        queryClient.invalidateQueries({ queryKey: ["project-sessions"] }),
-        // Another client archiving/relabeling/deleting can add or remove a
-        // project from the Archived view's picker; only local mutations
-        // invalidate this scan otherwise.
-        queryClient.invalidateQueries({ queryKey: ["archived-project-names"] }),
-      ]),
+    // change no local patch can place: only the lists the frame named, or
+    // every list for changes the client can't attribute (a share changing, the
+    // periodic round while frames starve the polls). Paced so a busy stream
+    // can't stack refetch rounds against a slow server.
+    const reconciler = createListReconcileScheduler((scope) =>
+      scope === "all"
+        ? Promise.all([
+            queryClient.invalidateQueries({
+              queryKey: ["conversations"],
+              predicate: (query) => query.meta?.snapshot !== true,
+            }),
+            // Converge each project folder's own list too (new/archived/relabeled
+            // members the local field-patch can't place).
+            queryClient.invalidateQueries({ queryKey: ["project-sessions"] }),
+            // Another client archiving/relabeling/deleting can add or remove a
+            // project from the Archived view's picker; only local mutations
+            // invalidate this scan otherwise.
+            queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY }),
+          ])
+        : queryClient.invalidateQueries({
+            predicate: (query) => scope.has(query.queryHash) && query.meta?.snapshot !== true,
+          }),
     );
-    const scheduleInvalidate = () => reconciler.schedule();
 
     // See commentsFingerprintsRef: invalidate `["comments", id]` (prefix —
     // covers the per-file variants too) when a session's fingerprint moves.
@@ -408,11 +537,12 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           return;
         case "access_changed":
           // The server decides whether the session now belongs in Shared.
-          scheduleInvalidate();
+          reconciler.schedule();
           return;
         case "removed":
           for (const id of frame.ids) {
             commentsFingerprintsRef.current.delete(id);
+            snapshotArchivedRef.current.delete(id);
             // A revoked share or a deletion must not be re-injected by the
             // keep-alive once the refetch correctly leaves it out.
             unmarkRecentlyCreated(id);
@@ -437,7 +567,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
             void queryClient.cancelQueries({ queryKey: backfillKey, exact: true });
             queryClient.setQueryData<Conversation | null>(backfillKey, null);
           }
-          if (removeIdsFromCache(queryClient, frame.ids)) scheduleInvalidate();
+          reconciler.schedule(removeIdsFromCache(queryClient, frame.ids));
           return;
         case "snapshot":
         case "changed": {
@@ -463,24 +593,13 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           for (const parentId of parentIds) {
             void queryClient.invalidateQueries({ queryKey: childSessionsQueryKey(parentId) });
           }
-          const { missingIds, needsRefetch } = applyItemsToCache(
+          const targets = applyItemsToCache(
             queryClient,
             frame.items,
             activeIdRef.current,
             getCurrentUserId(),
+            snapshotArchivedRef.current,
           );
-          // A watched id absent from every page is a new session whose sort
-          // position we can't place locally. Membership-affecting deltas
-          // (archive/search/connected filters) need the same server-side
-          // reconciliation.
-          //
-          // Skip the active session: its updated_at bumps on open before the
-          // initial list fetch returns, so it lands in missingIds even though
-          // it isn't a genuinely new session. Its data is covered by
-          // useSession and it's pinned in the sidebar via ActiveChatOverride.
-          const sidebarMissingIds = activeIdRef.current
-            ? missingIds.filter((id) => id !== activeIdRef.current)
-            : missingIds;
           // Reconcile list membership when the open session's permission
           // changes (e.g. its owner shares it with the viewer directly, or
           // revokes a direct share while a link share remains), not on every
@@ -496,9 +615,10 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
             activePermissionRef.current = { id: active, level };
             if (activePermissionChanged) unmarkRecentlyCreated(active);
           }
-          if (sidebarMissingIds.length > 0 || needsRefetch || activePermissionChanged) {
-            scheduleInvalidate();
-          } else reconciler.noteActivity();
+          if (activePermissionChanged) reconciler.schedule();
+          else if (targets.size > 0) reconciler.schedule(targets);
+          // A targeted round doesn't count as the periodic full one.
+          reconciler.noteActivity();
           return;
         }
       }

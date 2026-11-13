@@ -19,7 +19,7 @@ import {
   type SidebarViewPreferences,
 } from "@/lib/sidebarViewPreferences";
 import { parseProjectSessionsQueryKey, recentlyCreatedSessions } from "@/lib/sessionListCache";
-import { customSortOrder, sidebarSortBy } from "@/shell/sidebarNav";
+import { customSortOrder, isPinOrderUnit, sidebarSortBy } from "@/shell/sidebarNav";
 import type { SessionFilter } from "@/lib/sessionFilterPreferences";
 import {
   dedupeSessionRows,
@@ -357,7 +357,9 @@ export function SidebarDataProvider({
     <SidebarConfigContext.Provider value={config}>
       <SidebarDataContext.Provider value={data}>
         <PinCapacityContext.Provider
-          value={(data.pinned.data?.conversations.length ?? 0) >= config.pinCap}
+          value={
+            (data.pinned.data?.conversations.filter(isPinOrderUnit).length ?? 0) >= config.pinCap
+          }
         >
           {children}
         </PinCapacityContext.Provider>
@@ -391,6 +393,16 @@ export function useSidebarData() {
 export function useLoadedConversations() {
   const { loadedData: data, serverLoadedRows: serverRows, all } = useSidebarData();
   return { data, serverRows, isLoading: data === undefined && all.isLoading };
+}
+
+/** Loaded rows when a SidebarDataProvider is mounted, else ``undefined``. */
+export function useOptionalLoadedConversations() {
+  return useContext(SidebarDataContext)?.loadedData;
+}
+
+/** The caller's own sessions when a SidebarDataProvider is mounted, else ``undefined``. */
+export function useOptionalMineSessions() {
+  return useContext(SidebarDataContext)?.mine;
 }
 
 /** Register the mounted sidebar's persisted selection; unmount releases its demand. */

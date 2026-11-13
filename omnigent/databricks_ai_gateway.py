@@ -64,7 +64,7 @@ def is_databricks_ai_gateway_url(base_url: str) -> bool:
 
     1. **Dedicated Unity Gateway subdomain** — ``ai-gateway`` is a full DNS label
        in the hostname (e.g. ``<id>.ai-gateway.cloud.databricks.com``). Used by
-       the standard ``isaac configure codex`` setup.
+       the standard Codex gateway setup.
     2. **Workspace-hosted gateway** — the hostname is a plain Databricks
        workspace (under a trusted parent domain) and the path starts with
        ``/ai-gateway/`` (e.g. ``<workspace>.cloud.databricks.com/ai-gateway/...``).

@@ -1,6 +1,7 @@
 """Tests for llms.adapters.databricks — payload building and validation."""
 
 import asyncio
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -17,6 +18,12 @@ def databricks_requests(monkeypatch: pytest.MonkeyPatch) -> list[httpx.Request]:
 
     def respond(request: httpx.Request) -> httpx.Response:
         requests.append(request)
+        if json.loads(request.content).get("stream"):
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                content='data: {"choices": []}\n\ndata: [DONE]\n\n',
+            )
         return httpx.Response(200, json={"choices": []})
 
     def make_client(**kwargs: Any) -> httpx.AsyncClient:
@@ -28,13 +35,20 @@ def databricks_requests(monkeypatch: pytest.MonkeyPatch) -> list[httpx.Request]:
 
 @pytest.mark.parametrize("api_key", [None, ""])
 @pytest.mark.parametrize(
-    "base_url", [None, "", "https://example.databricks.com/ai-gateway/mlflow/v1"]
+    "base_url,stream",
+    [
+        (None, False),
+        ("", False),
+        ("https://workspace.example.test/ai-gateway/mlflow/v1", False),
+        ("https://workspace.example.test/ai-gateway/mlflow/v1", True),
+    ],
 )
 def test_profile_auth_refreshes_with_default_or_gateway_url(
     monkeypatch: pytest.MonkeyPatch,
     databricks_requests: list[httpx.Request],
     api_key: str | None,
     base_url: str | None,
+    stream: bool,
 ) -> None:
     adapter = DatabricksAdapter()
     tokens = iter(["first-token", "refreshed-token"])
@@ -43,7 +57,7 @@ def test_profile_auth_refreshes_with_default_or_gateway_url(
     def get_config(profile: str | None) -> SimpleNamespace:
         profiles.append(profile)
         return SimpleNamespace(
-            host="https://example.databricks.com",
+            host="https://workspace.example.test",
             authenticate=lambda: {"Authorization": f"Bearer {next(tokens)}"},
         )
 
@@ -56,14 +70,19 @@ def test_profile_auth_refreshes_with_default_or_gateway_url(
 
     async def call_twice() -> None:
         for _ in range(2):
-            await adapter.chat_completions(
-                [], "test-model", None, False, {}, connection_params=connection
+            response = await adapter.chat_completions(
+                [], "test-model", None, stream, {}, connection_params=connection
             )
+            if stream:
+                assert not isinstance(response, dict)
+                assert [chunk async for chunk in response] == [{"choices": []}]
+            else:
+                assert response == {"choices": []}
 
     asyncio.run(call_twice())
     assert profiles == ["gateway-profile", "gateway-profile"]
     assert [str(request.url) for request in databricks_requests] == [
-        (base_url or "https://example.databricks.com/serving-endpoints") + "/chat/completions"
+        (base_url or "https://workspace.example.test/serving-endpoints") + "/chat/completions"
     ] * 2
     assert [request.headers["Authorization"] for request in databricks_requests] == [
         "Bearer first-token",
@@ -84,7 +103,7 @@ def test_gateway_url_fallback_keeps_selected_profile(
 
     def resolve(profile: str | None) -> WorkspaceCreds:
         profiles.append(profile)
-        return WorkspaceCreds("https://example.databricks.com", "fallback-token")
+        return WorkspaceCreds("https://workspace.example.test", "fallback-token")
 
     monkeypatch.setattr(adapter_mod, "resolve_databricks_workspace", resolve)
     asyncio.run(
@@ -96,7 +115,7 @@ def test_gateway_url_fallback_keeps_selected_profile(
             {},
             connection_params={
                 "profile": "gateway-profile",
-                "base_url": "https://example.databricks.com/ai-gateway/mlflow/v1",
+                "base_url": "https://workspace.example.test/ai-gateway/mlflow/v1",
             },
         )
     )
@@ -107,10 +126,10 @@ def test_gateway_url_fallback_keeps_selected_profile(
 @pytest.mark.parametrize(
     "base_url",
     [
-        "https://other.databricks.com/ai-gateway/mlflow/v1",
-        "http://example.databricks.com/ai-gateway/mlflow/v1",
-        "https://example.databricks.com:8443/ai-gateway/mlflow/v1",
-        "https://example.databricks.com@other.example/v1",
+        "https://other.example.test/ai-gateway/mlflow/v1",
+        "http://workspace.example.test/ai-gateway/mlflow/v1",
+        "https://workspace.example.test:8443/ai-gateway/mlflow/v1",
+        "https://workspace.example.test@other.example.test/v1",
     ],
 )
 def test_profile_token_is_not_sent_to_another_origin(
@@ -125,7 +144,7 @@ def test_profile_token_is_not_sent_to_another_origin(
         adapter,
         "_resolve_via_sdk",
         lambda profile: {
-            "base_url": "https://example.databricks.com/serving-endpoints",
+            "base_url": "https://workspace.example.test/serving-endpoints",
             "api_key": "workspace-token",
         },
     )
@@ -161,10 +180,13 @@ def test_explicit_gateway_key_does_not_resolve_workspace_credentials(
             None,
             False,
             {},
-            connection_params={"base_url": "https://proxy.example/v1", "api_key": "explicit-key"},
+            connection_params={
+                "base_url": "https://proxy.example.test/v1",
+                "api_key": "explicit-key",
+            },
         )
     )
-    assert str(databricks_requests[0].url) == "https://proxy.example/v1/chat/completions"
+    assert str(databricks_requests[0].url) == "https://proxy.example.test/v1/chat/completions"
     assert databricks_requests[0].headers["Authorization"] == "Bearer explicit-key"
 
 
@@ -255,7 +277,7 @@ def test_auto_resolve_used_when_no_connection_params(monkeypatch: Any) -> None:
     monkeypatch.setattr(
         adapter_mod,
         "resolve_databricks_workspace",
-        lambda profile: WorkspaceCreds(host="https://example.databricks.com", token="dapi-tok"),
+        lambda profile: WorkspaceCreds(host="https://workspace.example.test", token="dapi-tok"),
     )
 
     captured: list[dict[str, Any]] = []
@@ -294,6 +316,6 @@ def test_auto_resolve_used_when_no_connection_params(monkeypatch: Any) -> None:
     assert len(captured) == 1
     assert (
         captured[0]["connection_params"]["base_url"]
-        == "https://example.databricks.com/serving-endpoints"
+        == "https://workspace.example.test/serving-endpoints"
     )
     assert captured[0]["connection_params"]["api_key"] == "dapi-tok"

@@ -49,6 +49,7 @@ from omnigent.inner.databricks_executor import DatabricksCredentials
 from omnigent.models.model_resolver import ModelResolutionError
 from omnigent.spec import load as load_spec
 from omnigent.spec import validate as validate_spec
+from omnigent.telemetry.request_headers import client_user_agent
 
 # ── _is_url ──────────────────────────────────────────
 
@@ -3453,7 +3454,8 @@ def test_remote_headers_prefers_explicit_remote_token_env(monkeypatch: pytest.Mo
     )
 
     assert _remote_headers(server_url="https://srv.example.com", host_id=None) == {
-        "Authorization": "Bearer env-token"
+        "Authorization": "Bearer env-token",
+        "User-Agent": client_user_agent(),
     }
 
 
@@ -3483,7 +3485,7 @@ def test_remote_headers_falls_back_to_ambient_databricks_creds(
     headers = _remote_headers(server_url="https://srv.example.com", host_id=None)
 
     # The ambient token reached the Authorization header.
-    assert headers == {"Authorization": "Bearer ambient-token"}
+    assert headers == {"Authorization": "Bearer ambient-token", "User-Agent": client_user_agent()}
     # Ambient resolution: exactly one lookup, with no profile threaded
     # (None) — a non-None value here means profile plumbing came back.
     assert read_calls == [None]
@@ -3511,6 +3513,8 @@ def test_remote_headers_adds_org_id_header(monkeypatch: pytest.MonkeyPatch) -> N
     assert headers == {
         "Authorization": "Bearer rec-tok",
         "X-Databricks-Org-Id": "2850744067564480",
+        "X-Databricks-Omnigent-Slice-Key": "client_key",
+        "User-Agent": client_user_agent(),
     }
 
 
@@ -3531,7 +3535,11 @@ def test_remote_headers_omits_org_when_no_record(monkeypatch: pytest.MonkeyPatch
         server_url="https://single.databricks.com/api/2.0/omnigent", host_id=None
     )
 
-    assert headers == {"Authorization": "Bearer rec-tok"}
+    assert headers == {
+        "Authorization": "Bearer rec-tok",
+        "X-Databricks-Omnigent-Slice-Key": "client_key",
+        "User-Agent": client_user_agent(),
+    }
     assert "X-Databricks-Org-Id" not in headers
 
 
@@ -3543,8 +3551,8 @@ def test_remote_headers_keys_by_host_id_on_workspace_mount(
     The native attach WebSocket handshake (claude / codex / antigravity) and
     its reconnects build their headers here, so the host_id must surface as the
     routing header to reach the replica holding the runner's tunnel. It is
-    emitted only on a host-sharded mount; no host_id, or an unsharded server,
-    sends none.
+    emitted only on a host-sharded mount; no host_id sends the machine's own
+    key, and an unsharded server sends none.
     """
     monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
     monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
@@ -3556,8 +3564,11 @@ def test_remote_headers_keys_by_host_id_on_workspace_mount(
         _remote_headers(server_url=mount, host_id="host_abc")["X-Databricks-Omnigent-Slice-Key"]
         == "host_abc"
     )
-    # No host_id → no slice-key header on the same mount.
-    assert "X-Databricks-Omnigent-Slice-Key" not in _remote_headers(server_url=mount, host_id=None)
+    # No host_id → the machine's own key on the same mount.
+    assert (
+        _remote_headers(server_url=mount, host_id=None)["X-Databricks-Omnigent-Slice-Key"]
+        == "client_key"
+    )
     # Unsharded server → no slice-key header even with a host_id.
     assert "X-Databricks-Omnigent-Slice-Key" not in _remote_headers(
         server_url="http://127.0.0.1:6767", host_id="host_abc"
@@ -3568,7 +3579,7 @@ def test_server_headers_do_not_encode_runner_affinity() -> None:
     """Runner affinity is persisted by PATCH /v1/sessions, not headers."""
     headers = chat_module._server_headers(runner_id="runner_local_test")
 
-    assert headers == {}
+    assert headers == {"User-Agent": client_user_agent()}
 
 
 def test_run_chat_remote_dispatches_without_profile_plumbing(
@@ -4861,6 +4872,7 @@ def _fake_sessions_chat_cls(
     query_impl: Callable[[str], object],
     *,
     extra_turns: list[str] | None = None,
+    pending_status: str = "running",
 ) -> type:
     """
     Build a ``SessionsChat`` replacement whose ``query`` is ``query_impl``.
@@ -4877,6 +4889,8 @@ def _fake_sessions_chat_cls(
         successive ``await_turn()`` calls, simulating async orchestrator
         auto-wakes. When exhausted ``await_turn`` returns empty text and
         ``last_turn_saw_waiting`` returns ``False``.
+    :param pending_status: Snapshot status while extra turns remain, e.g.
+        ``"waiting"`` for a claude-native turn whose background agent runs.
     :returns: A class usable as a drop-in for ``SessionsChat``.
     """
     _extra = list(extra_turns or [])
@@ -4890,7 +4904,7 @@ def _fake_sessions_chat_cls(
             # Mirrors the real snapshot: "running" while sub-agents are pending
             # (the runner emits "waiting" → relay collapses to "running"),
             # "idle" when done.
-            return "running" if self._pending else "idle"
+            return pending_status if self._pending else "idle"
 
         async def refresh(self) -> None:
             pass  # status is derived from _pending; no fetch needed.
@@ -5078,6 +5092,36 @@ async def test_query_sessions_once_multi_turn_async_orchestrator(
     assert "direct answer" in result
     assert "<!-- POLLY_REVIEW_START -->" in result
     assert "Looks good." in result
+
+
+async def test_query_sessions_once_keeps_waiting_on_a_background_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A snapshot that reads ``waiting`` keeps headless ``-p`` going.
+
+    A claude-native turn that ends with a background agent running reads
+    ``waiting`` until the agent finishes and Claude reports on it. If this
+    fails, ``-p`` prints only the turn that launched the agent.
+    """
+    monkeypatch.setattr(
+        "omnigent_client.SessionsChat",
+        _fake_sessions_chat_cls(
+            _return_text,
+            extra_turns=["", "The audit found nothing."],
+            pending_status="waiting",
+        ),
+    )
+    client = _FakeAPClient([], list_items_must_not_be_called=True)
+    result = await _query_sessions_once(
+        client=client,
+        agent_name="claude-native-ui",
+        tool_handler=None,
+        prompt="audit this in the background",
+        session_bundle=b"bundle-bytes",
+        session_bundle_filename="agent.tar.gz",
+        runner_id="runner_test",
+    )
+    assert result == "direct answer\n\nThe audit found nothing."
 
 
 async def _never_return(_prompt: str) -> QueryResult:

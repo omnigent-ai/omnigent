@@ -22,13 +22,14 @@ import logging
 import secrets
 import time
 import weakref
+from dataclasses import replace
 from typing import Any, cast
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from packaging.version import InvalidVersion, Version
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from omnigent.db.utils import now_epoch
 from omnigent.debug_logging import (
@@ -738,11 +739,17 @@ class LaunchRunnerRequest(BaseModel):
         as the session's ``git_branch`` for display and opt-in cleanup.
         ``None`` binds ``workspace`` directly. ``host_id`` is always
         present (it is in the path), so no host check is needed here.
+    :param session_env_handoff_id: Opaque, non-secret ID of the launching
+        CLI's local forwarded-environment file, relayed to the host so only
+        this launch's runner consumes it. ``None`` when nothing is forwarded.
     """
 
     session_id: str
     workspace: str
     git: SessionGitOptions | None = None
+    session_env_handoff_id: str | None = Field(
+        default=None, max_length=64, pattern=r"^[A-Za-z0-9_-]+$"
+    )
 
 
 async def _resolve_agent_spec_cwd(
@@ -1116,11 +1123,21 @@ def create_hosts_router(
             sandbox_profiles=getattr(request.app.state, "sandbox_profiles", None),
         )
         conn = target.conn
-        if agent_store is not None and agent_cache is not None:
-            from omnigent.server.mcp_compatibility import require_session_registry_mcp_support
+        if target.conv.family_id is not None and flags.enabled(Feature.SIBLING_SESSIONS):
+            from omnigent.server.session_families import require_sibling_destination
 
             await asyncio.to_thread(
-                require_session_registry_mcp_support,
+                require_sibling_destination,
+                request,
+                target.conv.host_id,
+                host_id=host_id,
+                host_type="external",
+            )
+        if agent_store is not None and agent_cache is not None:
+            from omnigent.server.runtime_compatibility import require_session_runtime_support
+
+            await asyncio.to_thread(
+                require_session_runtime_support,
                 target.conv,
                 conn.hello.capabilities,
                 component="host",
@@ -1225,18 +1242,31 @@ def create_hosts_router(
                     stage="runner_launch",
                 ),
             )
-            if host_profile is not None:
-                if profile_binding is not None:
-                    restored = await asyncio.to_thread(
-                        conversation_store.rollback_profiled_host,
-                        profile_binding,
-                        expected_host_id=host_id,
-                        expected_runner_id=runner_id,
+            if profile_binding is not None:
+                restored = await asyncio.to_thread(
+                    conversation_store.rollback_profiled_host,
+                    profile_binding,
+                    expected_host_id=host_id,
+                    expected_runner_id=runner_id,
+                )
+                if not restored and host_profile is None:
+                    # The runner can bind before the host write fails. Clear only
+                    # this attempt while retaining the current host and workspace.
+                    current = await asyncio.to_thread(
+                        conversation_store.get_conversation, body.session_id
                     )
-                    if not restored:
-                        await _rollback_worktree()
-                        return
-            else:
+                    if current is not None and current.runner_id == runner_id:
+                        with contextlib.suppress(ValueError):
+                            await asyncio.to_thread(
+                                conversation_store.clear_runner_id,
+                                body.session_id,
+                                expected_binding=current,
+                            )
+                            restored = True
+                if not restored:
+                    await _rollback_worktree()
+                    return
+            elif host_profile is None:
                 await asyncio.to_thread(conversation_store.clear_host_binding, body.session_id)
             try:
                 if worktree is not None or (body.git is not None and body.git.existing_worktree):
@@ -1276,6 +1306,34 @@ def create_hosts_router(
                         status_code=400,
                         detail="session already has a runner bound",
                     )
+                target = replace(target, conv=current)
+                if current.family_id is not None and flags.enabled(Feature.SIBLING_SESSIONS):
+                    from omnigent.server.session_families import require_sibling_destination
+
+                    await asyncio.to_thread(
+                        require_sibling_destination,
+                        request,
+                        current.host_id,
+                        host_id=host_id,
+                        host_type="external",
+                    )
+
+            legacy_continuation = (
+                profile_catalog is not None
+                and target.conv.host_id == target.host.host_id
+                and target.host.sandbox_provider is not None
+                and target.host.sandbox_provider
+                in profile_catalog.managed_providers(target.host.sandbox_provider)
+            )
+            if host_profile is None and (
+                legacy_continuation
+                or (target.conv.family_id is not None and flags.enabled(Feature.SIBLING_SESSIONS))
+            ):
+                # Capture the binding after any preceding launch has finished.
+                profile_binding = await asyncio.to_thread(
+                    conversation_store.get_profile_host_binding,
+                    body.session_id,
+                )
 
             if body.git is not None:
                 if body.git.existing_worktree:
@@ -1392,6 +1450,17 @@ def create_hosts_router(
                         workspace,
                         git_branch,
                     )
+                from omnigent.server.routes._sessions.helpers import (
+                    _drop_claude_launch_args_from_another_host,
+                )
+
+                bound = await asyncio.to_thread(
+                    conversation_store.get_conversation, body.session_id
+                )
+                if bound is not None:
+                    await asyncio.to_thread(
+                        _drop_claude_launch_args_from_another_host, conversation_store, bound
+                    )
 
             persist_task = asyncio.create_task(persist_binding())
             try:
@@ -1433,6 +1502,7 @@ def create_hosts_router(
                 workspace=workspace,
                 session_id=body.session_id,
                 harness=harness,
+                mcp_disabled_servers_active_harnesses=host_registry.mcp_disabled_servers_active_harnesses(),
                 inference_config=(
                     target.conv.inference_snapshot["runtime_config"]
                     if target.conv.inference_snapshot
@@ -1443,6 +1513,7 @@ def create_hosts_router(
                     if profile_binding is not None and profile_binding.runner_id is not None
                     else ()
                 ),
+                session_env_handoff_id=body.session_env_handoff_id,
             )
         )
         try:

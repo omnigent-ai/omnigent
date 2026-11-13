@@ -15,6 +15,7 @@ import gc
 import hashlib
 import json
 import logging
+import math
 import os
 import shutil
 import signal
@@ -32,6 +33,7 @@ from fastapi import FastAPI
 from omnigent._platform import IS_WINDOWS, normalize_interactive_shells
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.inner import _proc
+from omnigent.runner.busy_check import RunnerBusyCheck
 from omnigent.runner.identity import RUNNER_AUTH_REJECTED_EXIT_CODE
 from omnigent.runner.transports.ws_tunnel.serve import (
     RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX,
@@ -492,7 +494,7 @@ def _invalidate_auth_token_factory(factory: Callable[[], str | None]) -> bool:
 
 
 class _InitialAuthTokenFactory:
-    """Use a host bearer until rejection, then lazily resolve runner auth."""
+    """Use a host bearer until rejection or a successful proactive refresh."""
 
     def __init__(self, token: str, server_url: str) -> None:
         """
@@ -506,11 +508,66 @@ class _InitialAuthTokenFactory:
         self._retry_discovery_at = 0.0
         self._no_credential_logged = False
         self._lock = threading.Lock()
+        # Serializes renewal resolution, which runs outside ``_lock``.
+        self._renewal_lock = threading.Lock()
 
     def __call__(self) -> str | None:
         """Return the host bearer or a token from the lazy local fallback."""
         with self._lock:
             return self._call_locked()
+
+    def refresh(self) -> str | None:
+        """Resolve renewal credentials without losing a usable bootstrap on failure.
+
+        Resolution runs outside :attr:`_lock`: a reconnect that still has the
+        usable bootstrap must not wait on a slow provider, including one whose
+        renewal was cancelled. A failure keeps the bootstrap and, unlike a real
+        rejection, emits no re-login error.
+        """
+        with self._lock:
+            if self._initial_token is None:
+                return self._call_locked()
+            discovered = self._fallback_factory
+        with self._renewal_lock:
+            fallback, token = self._resolve_fallback(discovered)
+        with self._lock:
+            # Keep a source a concurrent rejection installed meanwhile.
+            if self._fallback_factory is discovered:
+                self._fallback_factory = fallback
+            if token:
+                self._initial_token = None
+                self._no_credential_logged = False
+        return token
+
+    def _resolve_fallback(
+        self, factory: Callable[[], str | None] | None
+    ) -> tuple[Callable[[], str | None] | None, str | None]:
+        """Discover the runner-local credential source if needed and ask it for a token.
+
+        Reads only state fixed at construction, so :meth:`refresh` runs it unlocked.
+
+        :param factory: The source discovered earlier, or ``None`` to discover one.
+        :returns: The source to keep (``None`` when none exists) and its token.
+        """
+        if factory is None:
+            factory = _make_auth_token_factory(
+                self._server_url,
+                _allow_initial_token=False,
+                _proxy_bearer=self._last_initial_token,
+            )
+        token = factory() if factory is not None else None
+        # Managed mint cannot renew itself when its proxy bearer expires —
+        # the injected host bearer before a first mint, or the minted JWT
+        # once a session outlives it. Re-resolve SDK/OIDC in the same call
+        # so the request that hit the failure still gets a credential.
+        if token is None and getattr(factory, "proxy_auth_failed", False):
+            factory = _make_auth_token_factory(
+                self._server_url,
+                _allow_initial_token=False,
+                _allow_delegated_mint=False,
+            )
+            token = factory() if factory is not None else None
+        return factory, token
 
     def _call_locked(self) -> str | None:
         """Body of :meth:`__call__`, run under :attr:`_lock`.
@@ -519,26 +576,9 @@ class _InitialAuthTokenFactory:
         """
         if self._initial_token is not None:
             return self._initial_token
-        if self._fallback_factory is None:
-            if time.monotonic() < self._retry_discovery_at:
-                return None
-            self._fallback_factory = _make_auth_token_factory(
-                self._server_url,
-                _allow_initial_token=False,
-                _proxy_bearer=self._last_initial_token,
-            )
-        token = self._fallback_factory() if self._fallback_factory is not None else None
-        # Managed mint cannot renew itself when its proxy bearer expires —
-        # the injected host bearer before a first mint, or the minted JWT
-        # once a session outlives it. Re-resolve SDK/OIDC in the same call
-        # so the request that hit the failure still gets a credential.
-        if token is None and getattr(self._fallback_factory, "proxy_auth_failed", False):
-            self._fallback_factory = _make_auth_token_factory(
-                self._server_url,
-                _allow_initial_token=False,
-                _allow_delegated_mint=False,
-            )
-            token = self._fallback_factory() if self._fallback_factory is not None else None
+        if self._fallback_factory is None and time.monotonic() < self._retry_discovery_at:
+            return None
+        self._fallback_factory, token = self._resolve_fallback(self._fallback_factory)
         if self._fallback_factory is None:
             self._retry_discovery_at = time.monotonic() + _AUTH_DISCOVERY_RETRY_INTERVAL_S
             if not self._no_credential_logged:
@@ -627,8 +667,8 @@ def _make_auth_token_factory(
     """Build a callable that mints fresh auth tokens.
 
     Resolution order:
-      1. Host's current bearer, when injected for runner bootstrap. This is
-         used until rejection; local refreshable auth resolves lazily.
+      1. Host's current bearer, when injected for runner bootstrap. Local
+         refreshable auth resolves on rejection or proactive tunnel renewal.
       2. Host-delegated runner token, when the host launch marker and
          binding token are present.
       3. Stored OIDC token from ``~/.omnigent/auth_tokens.json``
@@ -1974,6 +2014,28 @@ async def _run_tunnel_from_env() -> None:
         callback = getattr(app.state, "has_active_work", None)
         return event_dispatcher.has_pending or (callable(callback) and bool(callback()))
 
+    def _last_work_progress() -> float | None:
+        """Return the newest work progress, independently of tunnel polling.
+
+        Covers session events the app published (any turn, however short) and
+        native forwarding (a mirrored sub-agent still streaming while its parent
+        is idle). Request frames are left out: browsing a session is not work.
+
+        :returns: Monotonic time of the newest progress, or ``None`` if none yet.
+        """
+        published = getattr(app.state, "last_event_published_at", None)
+        published_at = published() if callable(published) else None
+        stamps: list[float] = [
+            stamp
+            for stamp in (
+                event_dispatcher.last_dispatch_at,
+                native_forwarder_last_post_at(),
+                published_at if isinstance(published_at, float) else None,
+            )
+            if stamp is not None
+        ]
+        return max(stamps, default=None)
+
     # Human-readable reason for why the runner is shutting down, recorded
     # by whichever path wins the shutdown race and logged on the way out so
     # the runner log explains the exit instead of just stopping.
@@ -2041,6 +2103,23 @@ async def _run_tunnel_from_env() -> None:
                 extra={"session_id": runner_primary_session_id()},
             )
             direct_attach_listener = None
+
+    def _has_sandbox_work() -> bool:
+        """Return whether the runner is doing agent work, ignoring pane viewing.
+
+        :returns: ``True`` while a turn, dispatch or native turn is active.
+        """
+        callback = getattr(app.state, "has_sandbox_work", None)
+        if not callable(callback):
+            return _has_active_work()
+        return event_dispatcher.has_pending or bool(callback())
+
+    # Each pong tells the server whether to keep a managed sandbox warm: while
+    # the runner works, and for its idle timeout after (0: while connected), so
+    # the sandbox lives as long as an idle runner would, but viewing alone does
+    # not count.
+    sandbox_busy = RunnerBusyCheck(_has_sandbox_work, _last_work_progress)
+    keep_warm_grace_s = idle_timeout_s if idle_timeout_s > 0 else math.inf
     tunnel_task = asyncio.create_task(
         serve_tunnel(
             cast("_ASGIApp", app),  # FastAPI is ASGI-compatible; cast narrows for mypy
@@ -2053,6 +2132,7 @@ async def _run_tunnel_from_env() -> None:
             event_dispatcher=event_dispatcher,
             on_reconnect=getattr(app.state, "catch_up_scan", None),
             on_activity=_mark_activity,
+            report_keep_warm=lambda: sandbox_busy.keep_warm(keep_warm_grace_s),
             shutdown_event=tunnel_shutdown_event,
             on_graceful_shutdown=getattr(app.state, "drain_session_streams", None),
             direct_attach_port=(
@@ -2362,6 +2442,9 @@ def main() -> None:
     # hangup cannot kill the runner while they run.
     _ignore_finish_work_signal_until_handled()
     from omnigent.process_logging import configure_process_logging
+    from omnigent.telemetry.request_headers import set_client_component
+
+    set_client_component("runner")
 
     configure_process_logging("runner", force=True)
     _install_crash_logging()
