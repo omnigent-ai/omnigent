@@ -383,12 +383,7 @@ async def _read_native_delivery_receipt(
 
     def same_session() -> bool:
         current = read_bridge_state(bridge_dir)
-        return (
-            current is not None
-            and current.session_id == state.session_id
-            and current.thread_id == state.thread_id
-            and current.socket_path == state.socket_path
-        )
+        return current is not None and _codex_binding_matches(current, state)
 
     try:
         async with asyncio.timeout(_DELIVERY_RECEIPT_TIMEOUT_SECONDS):

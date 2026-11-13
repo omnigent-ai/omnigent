@@ -41,8 +41,10 @@ from omnigent.server.schemas import CreateResponseRequest
         "missing-item-id",
         "wrong-item-type",
         "session-before-read",
+        "home-before-read",
         "thread-during-read",
         "socket-during-read",
+        "home-during-read",
         "read-failure",
         "read-timeout",
         "cancel-read",
@@ -123,6 +125,8 @@ async def test_native_receipt_requires_exact_delivery_identity(
                 state = replace(state, active_turn_id="turn_newer")
                 if receipt_kind in {"session-before-read", "reply-timeout-session-replaced"}:
                     state = replace(state, session_id="conv_other")
+                elif receipt_kind == "home-before-read":
+                    state = replace(state, codex_home=str(tmp_path / "replacement-home"))
                 write_bridge_state(tmp_path, state)
                 if receipt_kind == "explicit-rejection":
                     await websocket.send(
@@ -156,6 +160,10 @@ async def test_native_receipt_requires_exact_delivery_identity(
                     write_bridge_state(tmp_path, replace(state, thread_id="thread_other"))
                 elif receipt_kind == "socket-during-read":
                     write_bridge_state(tmp_path, replace(state, socket_path="ws://127.0.0.1:9"))
+                elif receipt_kind == "home-during-read":
+                    write_bridge_state(
+                        tmp_path, replace(state, codex_home=str(tmp_path / "replacement-home"))
+                    )
             await websocket.send(json.dumps({"id": request["id"], "result": result}))
 
     async with serve(handle, "127.0.0.1", 0) as server:
@@ -204,6 +212,7 @@ async def test_native_receipt_requires_exact_delivery_identity(
     assert requests.count(method) == 1
     should_probe = receipt_kind not in {
         "session-before-read",
+        "home-before-read",
         "no-server-id",
         "explicit-rejection",
         "reply-timeout-session-replaced",
