@@ -1898,45 +1898,43 @@ function WorkspacePanelImpl({
           tabIndex={-1}
           className="workspace-tab-strip shrink-0 flex items-center overflow-x-hidden border-b border-border px-2 py-3"
         >
-          {/* Spans the strip so dnd-kit's screen-reader text follows the trailing
-            controls, outside the tabs scroller and out of document.body. */}
-          <SideChatTabsDragArea onMove={sideChats.move}>
-            {visiblePermanentTabs.length > 0 && (
-              <Tabs
-                className={cn("shrink-0", showOpenTabs && "@max-[400px]/rail:hidden")}
-                // Soft tabs own their highlight. A vanished shell falls back to a
-                // fixed page, so only live shell selections suppress its highlight.
-                value={
-                  pending
-                    ? "__pending__"
-                    : selectedFilePath !== null ||
-                        browserSelected ||
-                        sideChatSelected ||
-                        terminalShown
-                      ? "__tab__"
-                      : (rightRailTab ?? "__empty__")
-                }
-                onValueChange={(value) => selectPermanentTab(value as RightRailTab)}
-                componentId="chat.right_rail.tabs"
-              >
-                <TabsList variant="pill" className="gap-1">
-                  {visiblePermanentTabs.map(renderTabTrigger)}
-                </TabsList>
-              </Tabs>
-            )}
-            {/* The divider follows the fixed panel icons' visibility. */}
-            {visiblePermanentTabs.length > 0 && (
-              <div
-                aria-hidden
-                className={cn(
-                  "mx-2 h-[14px] w-px shrink-0 self-center bg-border-strong",
-                  showOpenTabs && "@max-[400px]/rail:hidden",
-                )}
-              />
-            )}
-            {showOpenTabs && (
-              <>
-                {/* Open tabs fill the space before the pinned trailing controls. */}
+          {visiblePermanentTabs.length > 0 && (
+            <Tabs
+              className={cn("shrink-0", showOpenTabs && "@max-[400px]/rail:hidden")}
+              // Soft tabs own their highlight. A vanished shell falls back to a
+              // fixed page, so only live shell selections suppress its highlight.
+              value={
+                pending
+                  ? "__pending__"
+                  : selectedFilePath !== null ||
+                      browserSelected ||
+                      sideChatSelected ||
+                      terminalShown
+                    ? "__tab__"
+                    : (rightRailTab ?? "__empty__")
+              }
+              onValueChange={(value) => selectPermanentTab(value as RightRailTab)}
+              componentId="chat.right_rail.tabs"
+            >
+              <TabsList variant="pill" className="gap-1">
+                {visiblePermanentTabs.map(renderTabTrigger)}
+              </TabsList>
+            </Tabs>
+          )}
+          {/* The divider follows the fixed panel icons' visibility. */}
+          {visiblePermanentTabs.length > 0 && (
+            <div
+              aria-hidden
+              className={cn(
+                "mx-2 h-[14px] w-px shrink-0 self-center bg-border-strong",
+                showOpenTabs && "@max-[400px]/rail:hidden",
+              )}
+            />
+          )}
+          {showOpenTabs && (
+            <>
+              {/* Open tabs fill the space before the pinned trailing controls. */}
+              <SideChatTabsDragArea onMove={sideChats.move}>
                 <WorkspaceTabsScroller>
                   <SideChatTabGroup ids={pinnedSideChats}>
                     {pinnedSideChats.map(renderSideChatRailTab)}
@@ -2054,86 +2052,86 @@ function WorkspacePanelImpl({
                     .filter((id) => subagentSessionIdFromTab(id) !== null)
                     .map(renderSideChatRailTab)}
                 </WorkspaceTabsScroller>
-              </>
-            )}
-            {/* With no open tabs, "+" sits right after the nav tabs. */}
-            {!pending && !showOpenTabs && newTabMenu("start")}
-            {/* The picker and fullscreen toggle form the trailing control group,
+              </SideChatTabsDragArea>
+            </>
+          )}
+          {/* With no open tabs, "+" sits right after the nav tabs. */}
+          {!pending && !showOpenTabs && newTabMenu("start")}
+          {/* The picker and fullscreen toggle form the trailing control group,
             pinned right outside the scrolling viewport; "+" joins it once tabs exist. */}
-            <div className="ml-auto flex shrink-0 items-center gap-1 pl-1">
-              {showOpenTabs && newTabMenu("end")}
-              {panelOptions.length > 0 && (
-                <DropdownMenu
-                  onOpenChange={(isOpen) => {
-                    if (isOpen) markPickerKeyboard();
+          <div className="ml-auto flex shrink-0 items-center gap-1 pl-1">
+            {showOpenTabs && newTabMenu("end")}
+            {panelOptions.length > 0 && (
+              <DropdownMenu
+                onOpenChange={(isOpen) => {
+                  if (isOpen) markPickerKeyboard();
+                }}
+              >
+                <WorkspaceTabTooltip label="Select panel">
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      className="size-6 shrink-0"
+                      aria-label="Select panel"
+                      disabled={pending}
+                    >
+                      <ChevronDownIcon className="size-4" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                </WorkspaceTabTooltip>
+                <DropdownMenuContent
+                  align="end"
+                  className="max-w-[min(32rem,calc(100vw-2rem))]"
+                  onPointerDown={markPickerPointer}
+                  // A press that began on the trigger selects on release, with no
+                  // pointerdown inside the menu.
+                  onPointerUp={markPickerPointer}
+                  onPointerDownOutside={markPickerPointer}
+                  onKeyDown={markPickerKeyboard}
+                  // Restoring focus after a mouse pick reopens the trigger's tooltip and
+                  // leaves it hanging; keyboard picks keep Radix's focus restore.
+                  onCloseAutoFocus={(event) => {
+                    if (pickerInputRef.current === "pointer") event.preventDefault();
                   }}
                 >
-                  <WorkspaceTabTooltip label="Select panel">
-                    <DropdownMenuTrigger asChild>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon-xs"
-                        className="size-6 shrink-0"
-                        aria-label="Select panel"
-                        disabled={pending}
-                      >
-                        <ChevronDownIcon className="size-4" />
-                      </Button>
-                    </DropdownMenuTrigger>
-                  </WorkspaceTabTooltip>
-                  <DropdownMenuContent
-                    align="end"
-                    className="max-w-[min(32rem,calc(100vw-2rem))]"
-                    onPointerDown={markPickerPointer}
-                    // A press that began on the trigger selects on release, with no
-                    // pointerdown inside the menu.
-                    onPointerUp={markPickerPointer}
-                    onPointerDownOutside={markPickerPointer}
-                    onKeyDown={markPickerKeyboard}
-                    // Restoring focus after a mouse pick reopens the trigger's tooltip and
-                    // leaves it hanging; keyboard picks keep Radix's focus restore.
-                    onCloseAutoFocus={(event) => {
-                      if (pickerInputRef.current === "pointer") event.preventDefault();
-                    }}
-                  >
-                    <SuppressBrowserView />
-                    <DropdownMenuLabel>Panels</DropdownMenuLabel>
-                    {panelOptions.map((option) => (
-                      <DropdownMenuItem
-                        key={option.key}
-                        onSelect={option.select}
-                        disabled={option.disabled}
-                        title={option.label}
-                        aria-current={option.active ? "true" : undefined}
-                      >
-                        <span className="min-w-0 flex-1 truncate">{option.label}</span>
-                        {option.active && <CheckIcon className="size-4" aria-hidden />}
-                      </DropdownMenuItem>
-                    ))}
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              )}
-              <WorkspaceTabTooltip label={maximized ? "Exit full screen" : "Full screen"}>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  aria-label={maximized ? "Exit full screen" : "Full screen"}
-                  aria-pressed={maximized}
-                  onClick={onToggleMaximized}
-                  disabled={pending}
-                  size="icon-xs"
-                  className="flex size-6 text-muted-foreground hover:text-foreground"
-                >
-                  {maximized ? (
-                    <MinimizeIcon className="size-4" />
-                  ) : (
-                    <MaximizeIcon className="size-4" />
-                  )}
-                </Button>
-              </WorkspaceTabTooltip>
-            </div>
-          </SideChatTabsDragArea>
+                  <SuppressBrowserView />
+                  <DropdownMenuLabel>Panels</DropdownMenuLabel>
+                  {panelOptions.map((option) => (
+                    <DropdownMenuItem
+                      key={option.key}
+                      onSelect={option.select}
+                      disabled={option.disabled}
+                      title={option.label}
+                      aria-current={option.active ? "true" : undefined}
+                    >
+                      <span className="min-w-0 flex-1 truncate">{option.label}</span>
+                      {option.active && <CheckIcon className="size-4" aria-hidden />}
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            )}
+            <WorkspaceTabTooltip label={maximized ? "Exit full screen" : "Full screen"}>
+              <Button
+                type="button"
+                variant="ghost"
+                aria-label={maximized ? "Exit full screen" : "Full screen"}
+                aria-pressed={maximized}
+                onClick={onToggleMaximized}
+                disabled={pending}
+                size="icon-xs"
+                className="flex size-6 text-muted-foreground hover:text-foreground"
+              >
+                {maximized ? (
+                  <MinimizeIcon className="size-4" />
+                ) : (
+                  <MaximizeIcon className="size-4" />
+                )}
+              </Button>
+            </WorkspaceTabTooltip>
+          </div>
         </div>
         {/* Single content slot: an open shell or file tab, else the selected tab's view. */}
         <div

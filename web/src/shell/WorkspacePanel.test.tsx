@@ -1383,17 +1383,16 @@ describe("WorkspacePanel tab-strip layout (regression)", () => {
     expect(divider).not.toHaveClass("ml-auto");
   });
 
-  it("keeps the drag live region in the toolbar after the trailing controls", () => {
-    // A live region portalled to document.body broke double-click word selection
-    // in the Markdown editor; inside the scroller it would offset the trailing "+".
+  it("renders the drag live region before the app, outside the Workspace", () => {
+    // After the app it broke double-click word selection in the Markdown editor;
+    // inside the Workspace it would be a second status region there.
     declaresShell();
     renderWorkspace({ openFiles: ["src/App.tsx"] });
     const toolbar = screen.getByRole("toolbar", { name: "Workspace tabs" });
     const liveRegion = screen.getByRole("status");
-    expect(toolbar).toContainElement(liveRegion);
-    const trailing = screen.getByRole("button", { name: "Open new" }).closest(".ml-auto")!;
+    expect(toolbar).not.toContainElement(liveRegion);
     expect(
-      trailing.compareDocumentPosition(liveRegion) & Node.DOCUMENT_POSITION_FOLLOWING,
+      liveRegion.compareDocumentPosition(toolbar) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
   });
 

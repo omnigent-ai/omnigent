@@ -217,6 +217,20 @@ export const closestInSameGroup: CollisionDetection = (args) => {
   });
 };
 
+let announcementHost: HTMLElement | null = null;
+
+/**
+ * dnd-kit's screen-reader text goes before the app: after it, double-click stops
+ * selecting words in the Markdown editor; inside the Workspace it adds a second status.
+ */
+function dragAnnouncementHost(): HTMLElement {
+  if (!announcementHost?.isConnected) {
+    announcementHost = document.createElement("div");
+    document.body.prepend(announcementHost);
+  }
+  return announcementHost;
+}
+
 /** Drag context for the strip's side-chat tabs; `onMove` gets the dragged and target ids. */
 export function SideChatTabsDragArea({
   onMove,
@@ -230,7 +244,12 @@ export function SideChatTabsDragArea({
     if (over && active.id !== over.id) onMove(String(active.id), String(over.id));
   };
   return (
-    <DndContext sensors={sensors} collisionDetection={closestInSameGroup} onDragEnd={onDragEnd}>
+    <DndContext
+      sensors={sensors}
+      collisionDetection={closestInSameGroup}
+      onDragEnd={onDragEnd}
+      accessibility={{ container: dragAnnouncementHost() }}
+    >
       {children}
     </DndContext>
   );
