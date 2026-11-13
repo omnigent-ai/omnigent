@@ -7,6 +7,7 @@ configuration — all without launching real uvicorn.
 
 from __future__ import annotations
 
+import errno
 import socket
 from unittest.mock import MagicMock, patch
 
@@ -146,6 +147,59 @@ def test_pick_free_port_uses_requested_interface(
         resolve.assert_called_once_with(host, 0, type=socket.SOCK_STREAM)
         socket_factory.assert_called_once_with(family, socket.SOCK_STREAM, socket.IPPROTO_TCP)
         listener.bind.assert_called_once_with(address)
+
+
+@pytest.mark.parametrize("failure_stage", ["socket", "bind"])
+def test_pick_free_port_tries_remaining_addresses(failure_stage: str) -> None:
+    """An unavailable IPv6 candidate must not prevent a usable IPv4 bind."""
+    answers = [
+        (socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("::1", 0, 0, 0)),
+        (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", 0)),
+    ]
+    unavailable = MagicMock()
+    usable = MagicMock()
+    usable.__enter__.return_value.getsockname.return_value = ("127.0.0.1", 45678)
+    if failure_stage == "socket":
+        first_attempt = OSError(errno.EAFNOSUPPORT, "IPv6 unavailable")
+    else:
+        first_attempt = unavailable
+        unavailable.__enter__.return_value.bind.side_effect = OSError(
+            errno.EADDRNOTAVAIL, "IPv6 address unavailable"
+        )
+    with (
+        patch("omnigent.runner.transports.tcp.socket.getaddrinfo", return_value=answers),
+        patch(
+            "omnigent.runner.transports.tcp.socket.socket",
+            side_effect=[first_attempt, usable],
+        ) as socket_factory,
+    ):
+        assert _pick_free_port("server.example.test") == 45678
+        assert socket_factory.call_count == 2
+        usable.__enter__.return_value.bind.assert_called_once_with(("127.0.0.1", 0))
+        if failure_stage == "bind":
+            unavailable.__exit__.assert_called_once()
+
+
+def test_pick_free_port_reports_failure_after_all_addresses_fail() -> None:
+    answers = [
+        (socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("::1", 0, 0, 0)),
+        (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", 0)),
+    ]
+    errors = [OSError(errno.EADDRNOTAVAIL, "IPv6 unavailable"), OSError(errno.EACCES, "denied")]
+    with (
+        patch("omnigent.runner.transports.tcp.socket.getaddrinfo", return_value=answers),
+        patch("omnigent.runner.transports.tcp.socket.socket", side_effect=errors) as allocate,
+    ):
+        with pytest.raises(OSError) as raised:
+            _pick_free_port("server.example.test")
+        assert raised.value is errors[-1]
+        assert allocate.call_count == 2
+
+
+def test_pick_free_port_rejects_empty_resolution() -> None:
+    with patch("omnigent.runner.transports.tcp.socket.getaddrinfo", return_value=[]):
+        with pytest.raises(OSError, match="No TCP addresses resolved"):
+            _pick_free_port("server.example.test")
 
 
 def test_runner_tcp_subprocess_defaults() -> None:

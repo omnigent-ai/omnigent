@@ -46,13 +46,21 @@ def _pick_free_port(host: str = "127.0.0.1") -> int:
     between our close and uvicorn's bind).
     """
     addresses = socket.getaddrinfo(host, 0, type=socket.SOCK_STREAM)
-    family, socktype, protocol, _, address = addresses[0]
-    with socket.socket(family, socktype, protocol) as listener:
-        listener.bind(address)
-        port = listener.getsockname()[1]
-    if not isinstance(port, int):
-        raise RuntimeError(f"expected an integer TCP port, got {port!r}")
-    return port
+    last_error: OSError | None = None
+    for family, socktype, protocol, _, address in addresses:
+        try:
+            with socket.socket(family, socktype, protocol) as listener:
+                listener.bind(address)
+                port = listener.getsockname()[1]
+        except OSError as exc:
+            last_error = exc
+            continue
+        if not isinstance(port, int):
+            raise RuntimeError(f"expected an integer TCP port, got {port!r}")
+        return port
+    if last_error is not None:
+        raise last_error
+    raise OSError(f"No TCP addresses resolved for {host!r}")
 
 
 @dataclass
