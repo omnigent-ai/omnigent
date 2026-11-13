@@ -120,7 +120,9 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         feature=Feature.GRID_SESSIONS_DISPLAY_UI,
         description="Local session grids with up to four live conversations",
         owner="web",
-        review_by_release="0.20.0",
+        # On by default; remove the flag and its off path in 0.25.0.
+        review_by_release="0.25.0",
+        default_enabled=True,
     ),
     FeatureDefinition(
         feature=Feature.SPLITTABLE_TERMINAL_VIEW_UI,
