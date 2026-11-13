@@ -176,6 +176,13 @@ to customize.
   **Start a new session for each match**. With `automations_v2` on a server
   supporting sub-hour schedules, use Repeat → Interval
   for a connected host or a continued sandbox session.
+- **MCP services:** when the server's MCP registry is on and `/v1/info` reports
+  `scheduled_task_mcp_services`, an MCPs chip follows Run on, Agent, and
+  Permissions. It opens the new-chat service list and its sign-in. A new
+  automation starts from the services last picked for a new chat. Create stays
+  disabled while a picked service needs sign-in or the list can't load. An edit
+  that keeps a continued session locks the chip, since that session keeps its
+  services.
 - **Editing:** open Edit automation from a row menu or a task's detail page;
   the same workspace and sandbox Repository controls apply. Unrelated edits
   preserve a continued session when the repository is unchanged or a legacy

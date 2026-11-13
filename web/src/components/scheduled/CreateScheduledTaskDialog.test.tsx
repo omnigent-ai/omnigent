@@ -6415,20 +6415,21 @@ describe("CreateScheduledTaskDialog MCP services", () => {
   };
   const linear: RegistryService = { ...github, id: "linear", title: "Linear", connected: false };
 
+  const registryInfo = {
+    ...SERVER_INFO_OFFLINE_FALLBACK,
+    features: { automations_v2: true },
+    scheduled_task_harness_settings: true,
+    scheduled_task_mcp_services: true,
+    enabled_connections: ["mcp"],
+  };
+
   function renderWithRegistry(ui: React.ReactElement) {
-    return render(
-      <CapabilitiesProvider
-        info={{
-          ...SERVER_INFO_OFFLINE_FALLBACK,
-          features: { automations_v2: true },
-          scheduled_task_harness_settings: true,
-          scheduled_task_mcp_services: true,
-          enabled_connections: ["mcp"],
-        }}
-      >
-        {ui}
-      </CapabilitiesProvider>,
-    );
+    const view = render(<CapabilitiesProvider info={registryInfo}>{ui}</CapabilitiesProvider>);
+    return {
+      ...view,
+      rerender: (next: React.ReactElement) =>
+        view.rerender(<CapabilitiesProvider info={registryInfo}>{next}</CapabilitiesProvider>),
+    };
   }
 
   beforeEach(() => {
@@ -6537,5 +6538,41 @@ describe("CreateScheduledTaskDialog MCP services", () => {
     expect(trigger).toHaveTextContent("Session's MCPs");
     // An unsigned service it can't add to the session does not block saving.
     expect(screen.queryByTestId("task-mcp-services-blocked")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("mcpServices");
+  });
+
+  it.each([
+    ["loading", () => new Promise<never>(() => {}), null],
+    ["failed", () => Promise.reject(new Error("down")), "Could not load MCP services"],
+  ])("blocks saving while the catalog is %s", async (_, response, message) => {
+    vi.mocked(registryRequest).mockImplementation(response);
+    renderWithRegistry(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ mcpServices: ["github"] })}
+      />,
+    );
+    if (message === null) {
+      // The reason waits for the catalog, but saving is held until then.
+      await waitFor(() => expect(registryRequest).toHaveBeenCalled());
+      expect(screen.queryByTestId("task-mcp-services-blocked")).not.toBeInTheDocument();
+    } else {
+      expect(await screen.findByTestId("task-mcp-services-blocked")).toHaveTextContent(message);
+    }
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+  });
+
+  it("closes the MCP menu when the dialog is reopened", async () => {
+    const view = renderWithRegistry(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
+    await mcpSwitch("GitHub");
+    expect(screen.getByTestId("task-mcp-services-menu")).toBeInTheDocument();
+    view.rerender(<CreateScheduledTaskDialog open={false} onOpenChange={vi.fn()} />);
+    view.rerender(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
+    expect(await screen.findByTestId("task-mcp-services-trigger")).toBeInTheDocument();
+    expect(screen.queryByTestId("task-mcp-services-menu")).not.toBeInTheDocument();
   });
 });

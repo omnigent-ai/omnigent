@@ -453,6 +453,7 @@ export function CreateScheduledTaskDialog({
     setAgentMenuOpen(false);
     setScheduleMenuOpen(false);
     setEndingMenuOpen(false);
+    setMcpMenuOpen(false);
     selectOpenCountRef.current = 0;
     nestedMenuOpenCountRef.current = 0;
     nestedMenuClosedAtRef.current = 0;
