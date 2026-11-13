@@ -2542,6 +2542,7 @@ async def test_session_snapshot_fills_cold_claude_catalog_from_host(
     async def _fake_host_options(
         host_id: str, harness: str = "claude-native"
     ) -> list[dict[str, object]] | None:
+        assert harness == "claude-native"
         host_queries.append(host_id)
         return [{"id": "opus", "displayName": "Opus"}]
 
