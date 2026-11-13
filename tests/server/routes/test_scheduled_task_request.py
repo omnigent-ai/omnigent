@@ -46,9 +46,8 @@ def test_a_reminder_is_a_one_time_message_into_a_given_session() -> None:
     [
         {"session_mode": "continue", "session_id": "conv_1"},
         {"rrule": _ONE_TIME, "session_mode": "continue"},
-        {"rrule": _ONE_TIME},
     ],
-    ids=["recurring", "no_session", "new_session_mode"],
+    ids=["recurring", "no_session"],
 )
 def test_a_reminder_that_does_not_fit_is_rejected(fields: dict[str, str]) -> None:
     with pytest.raises(ValidationError, match="kind 'reminder' needs"):

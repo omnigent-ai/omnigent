@@ -151,7 +151,8 @@ def test_a_reminder_round_trips(store: SqlAlchemyScheduledTaskStore) -> None:
     [
         {"rrule": "FREQ=MINUTELY"},
         {"session_id": None},
-        {"session_mode": "new", "session_id": None},
+        # Keeps the session, so only the session mode disqualifies it.
+        {"session_mode": "new"},
     ],
     ids=["recurring", "no_session", "new_session_mode"],
 )
@@ -173,7 +174,8 @@ def test_create_rejects_an_unknown_kind(store: SqlAlchemyScheduledTaskStore) -> 
     [
         {"rrule": "FREQ=MINUTELY"},
         {"session_id": None},
-        {"session_mode": "new", "session_id": None},
+        # Keeps the session, so only the session mode disqualifies it.
+        {"session_mode": "new"},
     ],
     ids=["recurs", "leaves_its_session", "new_session_mode"],
 )
