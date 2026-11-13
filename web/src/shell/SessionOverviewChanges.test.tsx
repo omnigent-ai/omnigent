@@ -16,8 +16,12 @@ vi.mock("@/hooks/useSessionWorktrees", () => ({
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   useWorkspaceChangedFiles: (id: string) => useWorkspaceChangedFilesMock(id),
 }));
+vi.mock("./SessionOverviewSubagents", () => ({ SessionOverviewSubagents: () => null }));
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
 
 const GIT: SessionWorktreesResult = {
   status: "ok",
@@ -55,7 +59,9 @@ describe("SessionOverviewChanges", () => {
     ["hides unknown lines", GIT, [untracked], "Files changed1", null],
     ["hides a clean git workspace", GIT, [], null, null],
     ["hides a non-git workspace", { status: "not_git" }, [tracked], null, null],
-    ["hides an unknown workspace", undefined, [tracked], null, null],
+    ["hides a loading workspace", undefined, [tracked], null, null],
+    ["hides an unknown workspace", { status: "unknown" }, [tracked], null, null],
+    ["hides an empty worktree list", { status: "ok", worktrees: [] }, [tracked], null, null],
   ] as const)("%s", (_, worktrees, files, filesRow, linesRow) => {
     useSessionWorktreesMock.mockReturnValue({ data: worktrees });
     useWorkspaceChangedFilesMock.mockReturnValue({ data: { available: true, data: files } });
@@ -68,8 +74,6 @@ describe("SessionOverviewChanges", () => {
   });
 
   it("reads nothing when the workspace isn't browsable", () => {
-    useSessionWorktreesMock.mockClear();
-    useWorkspaceChangedFilesMock.mockClear();
     render(<SessionOverview onClose={() => {}} />);
 
     expect(screen.queryByText("Files changed")).toBeNull();
