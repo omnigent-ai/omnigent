@@ -222,6 +222,7 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="New project repository linking: clone on a host or save for sandboxes",
         owner="web",
         review_by_release="0.25.0",
+        default_enabled=True,
     ),
 )
 
