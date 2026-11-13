@@ -1907,7 +1907,19 @@ async def test_failed_launch_rolls_back_only_new_relay(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "mode", ["plain", "disable-hooks", "wrapped", "delimiter", "mismatch", "unreadable"]
+    "mode",
+    [
+        "plain",
+        "no-caller",
+        "disable-hooks",
+        "wrapped",
+        "delimiter",
+        "mismatch",
+        "unreadable",
+        "legacy",
+        "invalid-generation",
+        "missing-boundary",
+    ],
 )
 async def test_cli_caller_settings_finalize_under_terminal_policy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
@@ -1933,12 +1945,14 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
     if mode == "unreadable":
         settings_file.write_text("{")
     monkeypatch.chdir(tmp_path)
-    if mode == "wrapped":
+    if mode in {"wrapped", "legacy"}:
         monkeypatch.setattr(
             "omnigent.harnesses.claude_native.main.resolve_claude_launch",
             lambda command, args: ("claude-wrapper", ["claude", "--", *args]),
         )
     caller_args = ("--settings", str(settings_file), '--settings={"env":{"ORDER":"inline"}}')
+    if mode == "no-caller":
+        caller_args = ()
     if mode == "delimiter":
         caller_args = ("--", *caller_args)
     body = _claude_terminal_request(
@@ -1946,15 +1960,30 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
         command="claude",
         bridge_dir=bridge_dir,
     )
-    boundary = (bridge_dir / "claude-settings-boundary.json").read_text()
+    generation = body["claude_settings_generation"]
+    baseline_path = bridge_dir / f"claude-settings-{generation}.json"
+    boundary = baseline_path.with_suffix(".boundary.json").read_text()
     assert str(settings_file) not in boundary
     assert "ORDER" not in boundary
     if mode == "mismatch":
         body["spec"]["args"].append("changed-after-preparation")
+    if mode == "invalid-generation":
+        body["claude_settings_generation"] = "../previous-launch"
+    if mode == "missing-boundary":
+        baseline_path.with_suffix(".boundary.json").unlink()
     # The CLI has not consumed files before the runner selects its policy.
-    assert str(settings_file) in body["spec"]["args"]
-    baseline = json.loads((bridge_dir / "claude-settings.json").read_text())
+    assert (str(settings_file) in body["spec"]["args"]) == (mode != "no-caller")
+    baseline = json.loads(baseline_path.read_text())
     assert "FROM_FILE" not in baseline.get("env", {})
+    if mode == "legacy":
+        # An older client cannot refresh the previous launch's boundary metadata.
+        body.pop("claude_settings_generation")
+        legacy_path = bridge_dir / "claude-settings.json"
+        legacy_path.write_text(json.dumps(baseline))
+        (bridge_dir / "claude-settings-boundary.json").write_text(boundary)
+        body["spec"]["args"] = [
+            str(legacy_path) if arg == str(baseline_path) else arg for arg in body["spec"]["args"]
+        ] + ["--resume", "older-client-session"]
     finalized = []
     original = bridge.finalize_claude_caller_settings
 
@@ -1992,7 +2021,7 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
             response = await client.post(
                 f"/v1/sessions/{session_id}/resources/terminals", json=body
             )
-            if mode in {"disable-hooks", "mismatch"}:
+            if mode in {"disable-hooks", "mismatch", "invalid-generation", "missing-boundary"}:
                 assert response.status_code == 500, response.text
                 assert response.json()["error"]["code"] == "terminal_launch_failed"
                 assert not finalized
@@ -2000,8 +2029,11 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
             else:
                 assert response.status_code == 200, response.text
                 assert len(finalized) == 1
-                settings = json.loads((bridge_dir / "claude-settings.json").read_text())
-                if mode == "delimiter":
+                final_args = finalized[0]
+                settings_index = max(i for i, arg in enumerate(final_args) if arg == "--settings")
+                settings = json.loads(Path(final_args[settings_index + 1]).read_text())
+                assert json.loads(baseline_path.read_text()) == baseline
+                if mode in {"delimiter", "legacy", "no-caller"}:
                     assert finalized[0] == body["spec"]["args"]
                     assert settings == baseline
                 else:

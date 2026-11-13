@@ -597,7 +597,8 @@ _TERMINAL_FAILURE_TAIL_LINES = 12
 _TERMINAL_FAILURE_TAIL_CHARS = 800
 _TERMINAL_FAILURE_TAIL_PREFIX = " Last terminal output:\n"
 _INVOCATION_SETTINGS_FILE = "claude-settings.json"
-_SETTINGS_BOUNDARY_FILE = "claude-settings-boundary.json"
+_SETTINGS_GENERATION = re.compile(r"[0-9a-f]{32}")
+_GENERATED_SETTINGS_FILE = re.compile(r"claude-settings-([0-9a-f]{32})(?:-[0-9a-f]{32})?\.json")
 _CALLER_SETTINGS_MAX_BYTES = 1024 * 1024
 
 ToolExecutor = Callable[[str, _JsonObject], Awaitable[object]]
@@ -3235,7 +3236,11 @@ def augment_claude_args(
         args, caller_settings = _pop_caller_settings(args, workspace=workspace)
         if caller_settings:
             hook_settings = _merge_caller_settings(hook_settings, caller_settings, bridge_dir)
-    settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
+    settings_path = (
+        _generation_settings_path(bridge_dir, secrets.token_hex(16))
+        if defer_caller_settings
+        else bridge_dir / _INVOCATION_SETTINGS_FILE
+    )
     _write_invocation_settings(settings_path, hook_settings, active_harnesses=active_harnesses)
     from omnigent.onboarding.ambient import claude_code_managed_mcp_present
 
@@ -3390,6 +3395,7 @@ _CLAUDE_REQUIRED_VALUE_FLAGS = frozenset(
     {
         "--add-dir",
         "--agent",
+        "--agent-name",
         "--agents",
         "--allowedTools",
         "--allowed-tools",
@@ -3524,28 +3530,46 @@ def _pop_caller_settings(
     return kept, found
 
 
+def _generation_settings_path(bridge_dir: Path, generation: str) -> Path:
+    """Constrain launch metadata to generated names in the trusted bridge directory."""
+    if not isinstance(generation, str) or not _SETTINGS_GENERATION.fullmatch(generation):
+        raise ValueError("Claude settings launch generation is invalid")
+    return bridge_dir / f"claude-settings-{generation}.json"
+
+
 def record_claude_settings_boundary(
     bridge_dir: Path, args: list[str], *, claude_args_start: int
-) -> None:
+) -> str:
     """Record the framework-resolved Claude boundary without persisting argument values."""
+    generation = None
+    for arg in reversed(args):
+        path = Path(arg)
+        match = _GENERATED_SETTINGS_FILE.fullmatch(path.name)
+        if match and path == _generation_settings_path(bridge_dir, match[1]):
+            generation = match[1]
+            break
+    if generation is None:
+        raise ValueError("Claude settings launch baseline is missing")
+    settings_path = _generation_settings_path(bridge_dir, generation)
     _write_json_file(
-        bridge_dir / _SETTINGS_BOUNDARY_FILE,
+        settings_path.with_suffix(".boundary.json"),
         {
             "start": claude_args_start,
             "digest": hashlib.sha256(json.dumps(args).encode()).hexdigest(),
         },
     )
+    return generation
 
 
-def _claude_settings_boundary(bridge_dir: Path, args: list[str]) -> int:
+def _claude_settings_boundary(bridge_dir: Path, args: list[str], generation: str) -> int:
     """Require a recorded launch boundary to match the actual terminal arguments."""
     _ensure_secure_dir(bridge_dir)
-    try:
-        boundary = json.loads(
-            _read_caller_settings(bridge_dir / _SETTINGS_BOUNDARY_FILE, nofollow=True)
+    boundary = json.loads(
+        _read_caller_settings(
+            _generation_settings_path(bridge_dir, generation).with_suffix(".boundary.json"),
+            nofollow=True,
         )
-    except FileNotFoundError:
-        return 0
+    )
     if not isinstance(boundary, dict):
         raise ValueError("Claude settings launch boundary is invalid")
     start = boundary.get("start")
@@ -3573,27 +3597,50 @@ def _write_invocation_settings(
     _write_json_file(path, settings)
 
 
+def _replace_framework_settings(args: list[str], baseline: Path, output: Path) -> None:
+    """Rewrite framework flag operands while leaving settings-shaped prompt values literal."""
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            break
+        if arg in _CLAUDE_REQUIRED_VALUE_FLAGS:
+            index += 2
+        elif arg == "--settings" and index + 1 < len(args):
+            if args[index + 1] == str(baseline):
+                args[index + 1] = str(output)
+            index += 2
+        else:
+            index += 1
+
+
 async def finalize_claude_caller_settings(
     instance: TerminalInstance,
     *,
     bridge_dir: Path,
+    generation: str | None = None,
     active_harnesses: Collection[str] | None = None,
 ) -> None:
     """Merge deferred settings using the new terminal's actual filesystem view.
 
     ``bridge_dir`` must be framework-derived. Caller files use the instance's
     existing helper under an active sandbox; unsandboxed panes use bounded reads.
-    The separate framework baseline is opened without following a symlink.
+    A supplied generation binds immutable baseline and boundary metadata. Older
+    clients omit it and keep their argv unchanged, without consulting old metadata.
     """
     from omnigent.host.harness_startup import env_wrapper_chdir
     from omnigent.inner.terminal import terminal_pane_environment
 
-    start = await asyncio.to_thread(_claude_settings_boundary, bridge_dir, instance.args)
+    if generation is None:
+        return
+    settings_path = _generation_settings_path(bridge_dir, generation)
+    start = await asyncio.to_thread(
+        _claude_settings_boundary, bridge_dir, instance.args, generation
+    )
     prefix, args = instance.args[:start], instance.args[start:]
     environment = instance.os_env
     if environment is None:
         raise ValueError("caller settings require the terminal filesystem environment")
-    settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
     workspace = environment.cwd
     chdir = env_wrapper_chdir(
         instance.command,
@@ -3655,7 +3702,9 @@ async def finalize_claude_caller_settings(
         if not isinstance(baseline, dict):
             raise ValueError("required bridge settings are unavailable under the terminal policy")
         settings = _merge_caller_settings(baseline, callers, bridge_dir)
-        _write_invocation_settings(settings_path, settings, active_harnesses=active_harnesses)
+        output_path = bridge_dir / f"claude-settings-{generation}-{secrets.token_hex(16)}.json"
+        _write_invocation_settings(output_path, settings, active_harnesses=active_harnesses)
+        _replace_framework_settings(kept, settings_path, output_path)
     instance.args = [*prefix, *kept]
 
 
@@ -7376,7 +7425,9 @@ def bridge_dir_from_launch_args(args: Sequence[str]) -> Path | None:
         else:
             continue
         path = Path(value)
-        if path.is_absolute() and path.name == _INVOCATION_SETTINGS_FILE:
+        if path.is_absolute() and (
+            path.name == _INVOCATION_SETTINGS_FILE or _GENERATED_SETTINGS_FILE.fullmatch(path.name)
+        ):
             found = path.parent
     return found
 

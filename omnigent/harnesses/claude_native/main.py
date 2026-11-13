@@ -7071,13 +7071,16 @@ def _claude_terminal_request(
         claude_args_start += len(env_args) + 1
     from omnigent.harnesses.claude_native.bridge import record_claude_settings_boundary
 
-    record_claude_settings_boundary(bridge_dir, args, claude_args_start=claude_args_start)
+    generation = record_claude_settings_boundary(
+        bridge_dir, args, claude_args_start=claude_args_start
+    )
     return {
         "terminal": _TERMINAL_NAME,
         "session_key": _TERMINAL_SESSION_KEY,
         "spec": spec,
         # Boolean opt-in; the runner derives the bridge dir from session_id.
         "bridge_inject_dir": True,
+        "claude_settings_generation": generation,
     }
 
 

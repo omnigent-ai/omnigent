@@ -9964,12 +9964,24 @@ async def _auto_create_claude_terminal(
 
         configured_prefix = launch_args[: len(launch_args) - len(claude_args)]
         claude_args_start = 0
-        if Path(launch_command).name not in {"claude", "claude.exe"}:
-            if configured_prefix[:1] == ["--"]:
-                claude_args_start = 1
-            elif configured_prefix[:2] == ["claude", "--"]:
-                claude_args_start = 2
-        record_claude_settings_boundary(
+        command_name = Path(launch_command).name.removesuffix(".exe")
+        if command_name in {
+            "sh",
+            "bash",
+            "dash",
+            "zsh",
+            "ksh",
+            "fish",
+            "pwsh",
+            "powershell",
+            "cmd",
+        }:
+            # Shell payloads are opaque; only the appended Claude argv has a known boundary.
+            claude_args_start = len(configured_prefix)
+        elif command_name not in {"claude", "env"}:
+            if "--" in configured_prefix:
+                claude_args_start = configured_prefix.index("--") + 1
+        settings_generation = record_claude_settings_boundary(
             bridge_dir, launch_args, claude_args_start=claude_args_start
         )
         # Validate the binary this terminal will actually spawn: ``launch_command``
@@ -10032,6 +10044,7 @@ async def _auto_create_claude_terminal(
             await finalize_claude_caller_settings(
                 instance,
                 bridge_dir=bridge_dir,
+                generation=settings_generation,
                 active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
             )
 

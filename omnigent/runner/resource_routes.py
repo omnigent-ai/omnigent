@@ -619,6 +619,7 @@ def register_resource_routes(
                     await finalize_claude_caller_settings(
                         instance,
                         bridge_dir=bridge_dir_for_bridge_id(bridge_id),
+                        generation=body.get("claude_settings_generation"),
                         active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
                     )
 

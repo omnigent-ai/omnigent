@@ -1390,6 +1390,8 @@ async def _auto_create_claude_terminal_for_test(
     [
         ("claude-wrapper", ["--"]),
         ("claude-wrapper", ["claude", "--"]),
+        ("claude-wrapper", ["--profile", "work", "--"]),
+        ("sh", ["-c", 'shift; exec claude "$@"', "shell-name", "--"]),
         (
             "claude-wrapper",
             ["--", "--settings", '{"env":{"ORDER":"configured","CONFIG_ONLY":"yes"}}'],
@@ -1400,6 +1402,8 @@ async def _auto_create_claude_terminal_for_test(
     ids=[
         "configured-wrapper",
         "configured-subcommand-wrapper",
+        "configured-wrapper-options",
+        "configured-shell-payload",
         "wrapper-claude-settings",
         "configured-claude-settings",
         "configured-env-chdir-settings",
@@ -1442,16 +1446,15 @@ async def test_auto_create_claude_settings_preserve_configured_argument_boundary
         )
         try:
             await kwargs["prepare_terminal"](created.instance)
-            settings = json.loads(
-                (
-                    bridge.bridge_dir_for_conversation_id(session_id) / "claude-settings.json"
-                ).read_text()
-            )
+            settings_index = created.instance.args.index("--settings") + 1
+            settings = json.loads(Path(created.instance.args[settings_index]).read_text())
             assert settings["env"]["ORDER"] == "caller"
             assert settings["hooks"]["UserPromptSubmit"]
             if command == "claude-wrapper":
                 boundary = prefix.index("--") + 1
                 assert created.instance.args[:boundary] == prefix[:boundary]
+            if command == "sh":
+                assert created.instance.args[: len(prefix)] == prefix
             if "--settings" in prefix:
                 assert settings["env"]["CONFIG_ONLY"] == "yes"
             assert created.instance.args.count("--settings") == 1

@@ -300,7 +300,6 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
-            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             """Record the launch and return a terminal resource view."""
             captured["terminal_name"] = terminal_name
@@ -1181,7 +1180,6 @@ async def test_auto_create_kiro_terminal_launches_required_terminal_with_isolate
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
-            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             del parent_os_env
             captured["terminal_name"] = terminal_name
@@ -1404,7 +1402,6 @@ async def test_auto_create_pi_terminal_inherits_agent_sandbox(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
-            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             """Record the spec + parent_os_env and return a resource view."""
             del terminal_name, session_key
@@ -1860,7 +1857,6 @@ async def test_auto_create_native_terminal_inherits_agent_sandbox(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
-            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             """Record the spec + parent_os_env and end the builder here."""
             del session_id, session_key, resource_role
@@ -2982,7 +2978,6 @@ async def _run_auto_create_cursor_terminal(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
-            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             """Record the spec and return a terminal resource view."""
             del terminal_name, session_key, resource_role

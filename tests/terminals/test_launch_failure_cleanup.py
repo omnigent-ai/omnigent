@@ -409,3 +409,73 @@ async def test_preparation_uses_new_instance_once_before_spawn(
             assert terminal_registry.list_for_conversation("settings") == []
     finally:
         await terminal_registry.shutdown()
+
+
+@requires_tmux
+async def test_overlapping_claude_preparations_keep_immutable_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.claude_native import bridge
+
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    caller_hooks = [{"hooks": [{"type": "command", "command": "printf synthetic"}]}] * 2
+    args = bridge.augment_claude_args(
+        ("--settings", json.dumps({"hooks": {"UserPromptSubmit": caller_hooks}})),
+        bridge_dir=bridge_dir,
+        defer_caller_settings=True,
+    )
+    generation = bridge.record_claude_settings_boundary(bridge_dir, args, claude_args_start=0)
+    original_args = tuple(args)
+    baseline_path = bridge_dir / f"claude-settings-{generation}.json"
+    baseline_text = baseline_path.read_text()
+    baseline = json.loads(baseline_text)
+    spec = _spec(tmp_path)
+    spec.args = args
+    created = _capture_instances(monkeypatch)
+    first_spawning = asyncio.Event()
+    release_first = asyncio.Event()
+    outputs = []
+
+    async def prepare(instance):
+        await bridge.finalize_claude_caller_settings(
+            instance, bridge_dir=bridge_dir, generation=generation
+        )
+        outputs.append(Path(instance.args[instance.args.index("--settings") + 1]))
+
+    async def launch(instance, *, cwd=None):
+        instance.running = True
+        if instance is created[0]:
+            first_spawning.set()
+            await release_first.wait()
+
+    monkeypatch.setattr(TerminalInstance, "launch", launch)
+    monkeypatch.setattr(TerminalInstance, "is_alive", AsyncMock(return_value=True))
+    terminal_registry = TerminalRegistry()
+    first = asyncio.create_task(
+        terminal_registry.launch("settings", "claude", "main", spec, prepare_terminal=prepare)
+    )
+    try:
+        await asyncio.wait_for(first_spawning.wait(), timeout=5)
+        winner = await terminal_registry.launch(
+            "settings", "claude", "main", spec, prepare_terminal=prepare
+        )
+        release_first.set()
+        assert await first is winner
+        assert winner is created[1]
+        assert len(set(outputs)) == 2
+        assert baseline_path.read_text() == baseline_text
+        assert tuple(spec.args) == original_args
+        for path in outputs:
+            settings = json.loads(path.read_text())
+            assert settings["hooks"]["UserPromptSubmit"] == (
+                caller_hooks + baseline["hooks"]["UserPromptSubmit"]
+            )
+    finally:
+        release_first.set()
+        if not first.done():
+            first.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await first
+        await terminal_registry.shutdown()

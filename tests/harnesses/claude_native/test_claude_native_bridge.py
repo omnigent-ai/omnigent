@@ -129,7 +129,8 @@ def _composer_pane(draft: str = "") -> str:
 
 
 def _load_invocation_settings(args: list[str]) -> dict[str, Any]:
-    settings_path = Path(args[args.index("--settings") + 1])
+    index = max(index for index, arg in enumerate(args) if arg == "--settings")
+    settings_path = Path(args[index + 1])
     return json.loads(settings_path.read_text(encoding="utf-8"))
 
 
@@ -5027,7 +5028,12 @@ async def _finalize_test_claude_args(args, *, bridge_dir, os_env_spec, active_ha
     )
     try:
         await claude_native_bridge.finalize_claude_caller_settings(
-            created.instance, bridge_dir=bridge_dir, active_harnesses=active_harnesses
+            created.instance,
+            bridge_dir=bridge_dir,
+            generation=claude_native_bridge.record_claude_settings_boundary(
+                bridge_dir, args, claude_args_start=0
+            ),
+            active_harnesses=active_harnesses,
         )
         return created.instance.args
     finally:
@@ -5180,7 +5186,7 @@ def test_augment_claude_args_preserves_settings_like_option_values(tmp_path: Pat
     assert settings["hooks"]["PreToolUse"]
 
 
-@pytest.mark.parametrize("flag", ["--system-prompt", "--name"])
+@pytest.mark.parametrize("flag", ["--system-prompt", "--name", "--agent-name"])
 def test_pop_caller_settings_preserves_option_values(flag: str) -> None:
     literal = '--settings={"env":{"EXAMPLE_KEY":"value"}}'
     args = [flag, literal]
@@ -5300,8 +5306,19 @@ async def test_caller_settings_reuses_existing_terminal_filesystem_view(
         "omnigent.inner.os_env.create_os_environment",
         Mock(side_effect=AssertionError("must reuse the terminal environment")),
     )
-    await claude_native_bridge.finalize_claude_caller_settings(instance, bridge_dir=tmp_path)
+    baseline = instance.args[
+        max(i for i, arg in enumerate(instance.args) if arg == "--settings") + 1
+    ]
+    instance.args.extend(["--agent-name", baseline])
+    await claude_native_bridge.finalize_claude_caller_settings(
+        instance,
+        bridge_dir=tmp_path,
+        generation=claude_native_bridge.record_claude_settings_boundary(
+            tmp_path, instance.args, claude_args_start=0
+        ),
+    )
     settings = _load_invocation_settings(instance.args)
+    assert instance.args[-2:] == ["--agent-name", baseline]
     assert settings["env"]["SETTINGS_VIEW"] == "overlay"
     environment.read.assert_awaited_once_with(
         str(tmp_path / chdir / path.name if chdir else path),
@@ -5354,14 +5371,15 @@ async def test_caller_settings_follow_terminal_filesystem_policy(
         ap_server_url="https://example.test",
     )
 
+    settings_path = Path(args[max(i for i, arg in enumerate(args) if arg == "--settings") + 1])
     original_read = claude_native_bridge._read_caller_settings
 
     def unexpected_runner_read(path: Path, *, nofollow: bool = False) -> str:
         assert (
             path
             in {
-                bridge_dir / "claude-settings.json",
-                bridge_dir / "claude-settings-boundary.json",
+                settings_path,
+                settings_path.with_suffix(".boundary.json"),
             }
             and nofollow
         )
@@ -5384,7 +5402,7 @@ async def test_caller_settings_follow_terminal_filesystem_policy(
             ),
         ),
     )
-    settings = json.loads((bridge_dir / "claude-settings.json").read_text())
+    settings = _load_invocation_settings(args)
     assert settings["env"]["PERMITTED"] == "yes"
     assert settings["env"]["ORDER"] == "inline"
     assert "DENIED" not in settings["env"]
@@ -18469,7 +18487,17 @@ async def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, 
         call.kwargs == {"executor": "claude-native", "active_harnesses": active}
         for call in hook.call_args_list
     )
-    assert args == original_args
+    settings_index = args.index("--settings") + 1
+    current_path = Path(args[settings_index])
+    assert args[:settings_index] + args[settings_index + 1 :] == (
+        original_args[:settings_index] + original_args[settings_index + 1 :]
+    )
+    if deferred:
+        assert current_path != settings_path
+        assert settings_path.read_bytes() == original
+    else:
+        assert current_path == settings_path
+    settings_path = current_path
     if active and saved:
         assert json.loads(settings_path.read_bytes()) == {
             **json.loads(original),

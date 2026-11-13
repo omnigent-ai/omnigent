@@ -304,6 +304,7 @@ async def test_claude_settings_prepare_reads_shared_terminal_overlay(
         bridge_dir=bridge_dir,
         defer_caller_settings=True,
     )
+    generation = bridge.record_claude_settings_boundary(bridge_dir, args, claude_args_start=0)
     terminals = TerminalRegistry()
     resources = SessionResourceRegistry(terminal_registry=terminals, runner_workspace=tmp_path)
     environment = resources._resolve_primary("settings", None, os_env_spec=cow_spec)
@@ -315,7 +316,9 @@ async def test_claude_settings_prepare_reads_shared_terminal_overlay(
     async def prepare(instance):
         assert instance.os_env.copy_on_write_environment is environment.copy_on_write_environment
         assert not instance.running
-        await bridge.finalize_claude_caller_settings(instance, bridge_dir=bridge_dir)
+        await bridge.finalize_claude_caller_settings(
+            instance, bridge_dir=bridge_dir, generation=generation
+        )
         prepared.append(instance)
 
     async def launch(instance, *, cwd=None):
@@ -334,7 +337,8 @@ async def test_claude_settings_prepare_reads_shared_terminal_overlay(
             resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
             prepare_terminal=prepare,
         )
-        settings = json.loads((bridge_dir / "claude-settings.json").read_text())
+        settings_index = prepared[0].args.index("--settings") + 1
+        settings = json.loads(Path(prepared[0].args[settings_index]).read_text())
         assert settings["env"]["SETTINGS_VIEW"] == "overlay"
         assert json.loads(settings_file.read_text())["env"]["SETTINGS_VIEW"] == "host"
     finally:
