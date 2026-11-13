@@ -1863,45 +1863,36 @@ def test_git_line_counts_modified(tmp_path: Path) -> None:
 
 
 def test_git_line_counts_untracked_is_none(tmp_path: Path) -> None:
-    """An untracked new file (absent from `git diff HEAD`) reports no counts.
+    """An untracked new file (absent from `git diff HEAD`) reports no diff counts.
 
     Counts come only from numstat; git doesn't diff untracked files, so the UI
-    omits the counter for them — matching VS Code / Cursor's source-control view.
+    omits the counter for them. Untracked text files count ``untracked_lines``.
     """
-    _init_git_with_commit(tmp_path, "committed.py", "x\n")
-    (tmp_path / "new.py").write_text("one\ntwo\nthree\n")
-
-    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
-    rec = next(r for r in reg.list_changed_files("any-conv", limit=100) if r["path"] == "new.py")
-    assert rec["status"] == "created"
-    assert rec["lines_added"] is None, rec
-    assert rec["lines_removed"] is None, rec
-
-
-def test_git_untracked_lines_count_text_files_only(tmp_path: Path) -> None:
-    """Untracked text files report their own lines; tracked files keep ``lines_added``."""
     _init_git_with_commit(tmp_path, "tracked.py", "x\n")
     (tmp_path / "tracked.py").write_text("x\ny\n")
-    (tmp_path / "text.py").write_text("one\ntwo\nthree")
+    (tmp_path / "new.py").write_text("one\ntwo\nthree")
     (tmp_path / "empty.txt").write_text("")
     (tmp_path / "blob.bin").write_bytes(b"a\0b\n")
-    os.symlink("text.py", tmp_path / "link.py")
+    os.symlink("new.py", tmp_path / "link.py")
 
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
     records = {r["path"]: r for r in reg.list_changed_files("any-conv", limit=100)}
     assert {path: r.get("untracked_lines") for path, r in records.items()} == {
         "tracked.py": None,
-        "text.py": 3,
+        "new.py": 3,
         "empty.txt": 0,
         "blob.bin": None,
         "link.py": None,
     }
     assert "untracked_lines" not in records["tracked.py"]
-    assert records["text.py"]["lines_added"] is None
+    rec = records["new.py"]
+    assert rec["status"] == "created"
+    assert rec["lines_added"] is None, rec
+    assert rec["lines_removed"] is None, rec
 
 
 def test_git_untracked_lines_never_read_through_links_or_fifos(tmp_path: Path) -> None:
-    """A directory swapped for a symlink after ``git status`` must not redirect the read."""
+    """Symlinks swapped in after ``git status`` (even the root) and ``..`` never redirect reads."""
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "secret.txt").write_text("a\nb\n")
@@ -1910,11 +1901,16 @@ def test_git_untracked_lines_never_read_through_links_or_fifos(tmp_path: Path) -
     (workspace / "real" / "new.txt").write_text("a\nb\n")
     os.symlink(outside, workspace / "swapped")
     os.mkfifo(workspace / "pipe")
-    paths = ["real/new.txt", "swapped/secret.txt", "pipe"]
+    paths = ["real/new.txt", "swapped/secret.txt", "pipe", "../outside/secret.txt"]
     records = [{"path": path, "bytes": 4} for path in paths]
 
     _count_untracked_lines(workspace, records, set(paths))
-    assert [r["untracked_lines"] for r in records] == [2, None, None]
+    assert [r["untracked_lines"] for r in records] == [2, None, None, None]
+
+    os.symlink(outside, tmp_path / "swapped_root")
+    swapped_root = [{"path": "secret.txt", "bytes": 4}]
+    _count_untracked_lines(tmp_path / "swapped_root", swapped_root, {"secret.txt"})
+    assert swapped_root[0]["untracked_lines"] is None
 
 
 def test_git_untracked_lines_read_past_short_reads(tmp_path: Path, monkeypatch) -> None:
