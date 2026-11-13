@@ -5752,18 +5752,14 @@ def inject_slash_command(
     switch = _begin_model_switch(bridge_dir, command)
     paste_attempted = False
     try:
-        # Clear any draft the user is mid-typing; otherwise the command below
-        # concatenates with their text and Enter submits
-        # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
-        # not interrupt an in-flight generation.
+        # Clear the user's draft so the command is not appended to it.
+        # Unlike Escape, this leaves an in-flight generation running.
         _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
         # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
         paste_attempted = True
         _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
-        # Same delivery hazards as inject_user_message: a coalesced or dropped
-        # Enter leaves the command drafted while the persisted session value
-        # claims it applied. Wait for the command to render, submit, verify it
-        # left the box; an unidentifiable draft falls through to a blind submit.
+        # A dropped Enter can leave the command drafted: wait for rendering, submit,
+        # and verify it left the box. An unidentifiable draft gets a blind submit.
         needle = _submit_needle(command)
         draft_seen = False
         deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
