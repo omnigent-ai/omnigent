@@ -191,7 +191,7 @@ def test_inject_user_message_waits_for_session_store(tmp_path, monkeypatch, init
     assert sum(1 for args in calls if args[-1] == "Enter") == 1
 
 
-@pytest.mark.parametrize("initial", ["missing", "empty", "schema", "invalid"])
+@pytest.mark.parametrize("initial", ["missing", "empty", "schema", "messages-only", "invalid"])
 def test_inject_user_message_does_not_send_when_store_is_unready(
     tmp_path, monkeypatch, initial
 ) -> None:
@@ -203,6 +203,9 @@ def test_inject_user_message_does_not_send_when_store_is_unready(
     elif initial == "schema":
         with sqlite3.connect(db) as con:
             con.executescript(b._SESSIONS_DDL)
+    elif initial == "messages-only":
+        with sqlite3.connect(db) as con:
+            con.executescript(b._MESSAGES_DDL)
     elif initial == "invalid":
         db.write_text("not a database")
     before = db.read_bytes() if db.exists() else None
