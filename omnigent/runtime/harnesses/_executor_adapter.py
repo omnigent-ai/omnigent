@@ -846,10 +846,9 @@ class ExecutorAdapter(HarnessApp):
             if injection is None:
                 # None signals a sentinel or protocol change; bail to avoid spinning.
                 return
-            content = (
-                _normalize_message_content(injection.input, preserve_content_blocks=True)
-                if executor.preserves_message_content_blocks()
-                else _extract_user_text(injection.input)
+            content = _extract_injection_content(
+                injection.input,
+                preserve_content_blocks=executor.preserves_message_content_blocks(),
             )
             if not content:
                 _logger.warning(
@@ -1688,18 +1687,29 @@ def _extract_last_user_message(
     return last_user_text
 
 
-def _extract_user_text(
+def _extract_injection_content(
     input_value: str | list[dict[str, Any]],
-) -> str:
-    """Extract concatenated text from an injection input for ``enqueue_session_message``."""
-    if isinstance(input_value, str):
-        return input_value
-    parts: list[str] = []
-    for block in input_value:
-        text_value = block.get("text")
-        if isinstance(text_value, str):
-            parts.append(text_value)
-    return "\n".join(parts)
+    *,
+    preserve_content_blocks: bool,
+) -> str | list[dict[str, Any]]:
+    """Extract only the newest user input, preserving blocks for capable executors."""
+    content: Any = input_value
+    if isinstance(input_value, list) and any(_is_role_keyed_message(item) for item in input_value):
+        newest_user = next(
+            (
+                item
+                for item in reversed(input_value)
+                if _is_role_keyed_message(item) and item.get("role") == "user"
+            ),
+            None,
+        )
+        # A textless newest message must never replay an older user request.
+        content = newest_user.get("content") if newest_user is not None else None
+    if preserve_content_blocks:
+        return _normalize_message_content(content, preserve_content_blocks=True)
+    if isinstance(content, str):
+        return content
+    return _join_text_blocks(content) if isinstance(content, list) else ""
 
 
 def _translate_input_to_messages(
@@ -1767,7 +1777,7 @@ def _extract_role_keyed_messages(
         if include_tool_history and item_type == "function_call_output":
             messages.append(_tool_result_message(item))
             continue
-        if item_type != "message" or "role" not in item:
+        if not _is_role_keyed_message(item):
             continue
         role = item["role"]
         content = _normalize_message_content(
@@ -1854,9 +1864,18 @@ def _normalize_message_content(
     )
     if has_multimodal:
         return content
+    return _join_text_blocks(content)
 
+
+def _is_role_keyed_message(item: Any) -> bool:
+    """Whether *item* is a conversation-shaped ``message`` item that carries a ``role``."""
+    return isinstance(item, dict) and item.get("type") == "message" and "role" in item
+
+
+def _join_text_blocks(blocks: list[Any]) -> str:
+    """Join the ``text`` of dict content blocks with newlines, skipping non-text blocks."""
     parts: list[str] = []
-    for block in content:
+    for block in blocks:
         if not isinstance(block, dict):
             continue
         text_value = block.get("text")
