@@ -83,7 +83,15 @@ def _wrapper_command(environment: Mapping[str, str]) -> list[str] | None:
             f"Cannot find {executable!r} from {WRAPPER_COMMAND_ENV} on PATH; "
             "the host service launches through it."
         )
-    return [os.path.abspath(resolved), *arguments]
+    # Resolve parent traversal through symlinks, preserving the wrapper's final symlink.
+    try:
+        parent = os.path.realpath(os.path.dirname(resolved), strict=True)
+    except OSError as exc:
+        raise HostServiceError(f"Cannot resolve wrapper directory for {executable!r}.") from exc
+    absolute = os.path.join(parent, os.path.basename(resolved))
+    if shutil.which(absolute) is None:
+        raise HostServiceError(f"Cannot execute the resolved wrapper {absolute!r}.")
+    return [absolute, *arguments]
 
 
 def _service_command(server_url: str | None, environment: Mapping[str, str]) -> list[str]:

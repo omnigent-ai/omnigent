@@ -291,22 +291,40 @@ def test_service_refuses_unusable_wrapper(
 
 
 @pytest.mark.parametrize("by_path", [False, True], ids=["path-lookup", "absolute-path"])
-def test_wrapper_command_keeps_quoted_words(tmp_path: Path, by_path: bool) -> None:
+@pytest.mark.parametrize(
+    "symlink_parent", [False, True], ids=["direct", "symlink-parent-traversal"]
+)
+def test_wrapper_command_keeps_quoted_words(
+    tmp_path: Path, by_path: bool, symlink_parent: bool
+) -> None:
     wrapper = tmp_path / "tool $dir" / "my wrapper"
     wrapper.parent.mkdir()
     wrapper.write_text("#!/bin/sh\n")
     wrapper.chmod(0o755)
-    executable = shlex.quote(str(wrapper) if by_path else wrapper.name)
+    selected = wrapper
+    if symlink_parent:
+        nested = wrapper.parent / "nested"
+        nested.mkdir()
+        alias = tmp_path / "alias"
+        alias.symlink_to(nested, target_is_directory=True)
+        link = wrapper.with_name("wrapper link")
+        link.symlink_to(wrapper)
+        wrapper = link
+        selected = alias / ".." / link.name
+    executable = shlex.quote(str(selected) if by_path else selected.name)
 
     command = service._service_command(
         None,
         {
-            "PATH": str(wrapper.parent),
+            "PATH": str(selected.parent),
             "OMNIGENT_WRAPPER_COMMAND": f"{executable} 'omni cli' --flag",
         },
     )
 
     assert command == [str(wrapper), "omni cli", "--flag", "host-service-entry", "--local"]
+    assert shutil.which(command[0]) == command[0]
+    if symlink_parent:
+        assert Path(command[0]).is_symlink()
 
 
 def test_systemd_unit_escapes_specifiers_and_literal_dollars() -> None:
