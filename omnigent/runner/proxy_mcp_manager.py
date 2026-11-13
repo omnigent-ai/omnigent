@@ -22,6 +22,7 @@ When to use each implementation:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -35,6 +36,8 @@ import httpx
 from omnigent.debug_logging import debug_event
 from omnigent.runner import pending_approvals
 from omnigent.runner.mcp_execution_registry import (
+    MCP_ATTACH_ONLY_PARAM,
+    MCP_INITIAL_STEP,
     MCP_OPERATION_ID_PARAM,
     RUNNER_MCP_EXECUTION_DETACHED_CODE,
     McpExecutionRegistry,
@@ -48,6 +51,10 @@ _logger = logging.getLogger(__name__)
 
 _EventPublisher = Callable[[str, _JsonObject], None]
 _SERVER_RECONNECT_WAIT_S = 120.0
+# A gateway in front of the server can sever a long-held request with one of
+# these statuses; a 5xx after at least the floor is a sever, not a fast failure.
+_GATEWAY_SEVER_STATUSES = frozenset({502, 503, 504})
+_HELD_REQUEST_SEVER_FLOOR_S = 10.0
 
 
 def _json_object(value: object) -> _JsonObject | None:
@@ -404,16 +411,25 @@ class ProxyMcpManager:
                     ),
                 )
 
+        # Requests that reattach after a gateway sever share the severed request's budget.
+        reattach_deadline: float | None = None
+
+        def _operation_params() -> _JsonObject:
+            params: _JsonObject = {
+                "name": wire_name,
+                "arguments": arguments,
+                MCP_OPERATION_ID_PARAM: operation_id,
+            }
+            if reattach_deadline is not None:
+                params[MCP_ATTACH_ONLY_PARAM] = True
+            return params
+
         def _initial_payload() -> _JsonObject:
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "method": "tools/call",
-                "params": {
-                    "name": wire_name,
-                    "arguments": arguments,
-                    MCP_OPERATION_ID_PARAM: operation_id,
-                },
+                "params": _operation_params(),
             }
 
         async def _wait_to_reattach(
@@ -421,8 +437,12 @@ class ProxyMcpManager:
             cause: BaseException | None = None,
             *,
             response: httpx.Response | None = None,
+            deadline: float | None = None,
         ) -> None:
             started = monotonic()
+            wait_s = _SERVER_RECONNECT_WAIT_S
+            if deadline is not None:
+                wait_s = max(0.0, min(wait_s, deadline - started))
             trigger = type(cause).__name__ if cause is not None else "detached_response"
             registry = self._execution_registry
             if registry is None or not registry.has_operation(self._session_id, operation_id):
@@ -442,7 +462,7 @@ class ProxyMcpManager:
             try:
                 await pending_approvals.wait_for_server_reconnect(
                     request_generation,
-                    timeout_seconds=_SERVER_RECONNECT_WAIT_S,
+                    timeout_seconds=wait_s,
                 )
             except TimeoutError as reconnect_exc:
                 _record_failure(
@@ -456,8 +476,23 @@ class ProxyMcpManager:
                 raise RuntimeError(
                     f"MCP proxy call for tool {tool_name!r} in session "
                     f"{self._session_id!r} lost its server and no replacement "
-                    f"connected within {_SERVER_RECONNECT_WAIT_S:.0f}s"
+                    f"connected within {wait_s:.0f}s"
                 ) from reconnect_exc
+
+        def _call_budget_spent(
+            cause: BaseException | None, *, request_generation: int, started: float
+        ) -> RuntimeError:
+            _record_failure(
+                cause,
+                phase="call_budget",
+                request_generation=request_generation,
+                started=started,
+            )
+            return RuntimeError(
+                f"MCP proxy call for tool {tool_name!r} in session {self._session_id!r} "
+                f"did not finish within {MCP_PROXY_CALL_TIMEOUT_S:.0f}s after a gateway "
+                "severed its request; completion is unknown"
+            )
 
         payload = _initial_payload()
         approval_retries = 0
@@ -467,8 +502,19 @@ class ProxyMcpManager:
             started = monotonic()
             failure_phase = "transport"
             resp: httpx.Response | None = None
+            request_deadline = started + MCP_PROXY_CALL_TIMEOUT_S
+            read_timeout = MCP_PROXY_CALL_TIMEOUT_S
+            # The read timeout bounds each read; a reattach must also finish in time.
+            total_timeout: float | None = None
+            if reattach_deadline is not None:
+                request_deadline = reattach_deadline
+                read_timeout = total_timeout = reattach_deadline - started
+                if read_timeout <= 0:
+                    raise _call_budget_spent(
+                        None, request_generation=request_generation, started=started
+                    )
             try:
-                resp = await self._omnigent_client.post(
+                post_request = self._omnigent_client.post(
                     url,
                     json=payload,
                     headers={"X-Omnigent-Session-Id": self._session_id} if managed else {},
@@ -478,11 +524,13 @@ class ProxyMcpManager:
                     # immediately and no longer holds this call for a child turn.
                     timeout=httpx.Timeout(
                         connect=10.0,
-                        read=MCP_PROXY_CALL_TIMEOUT_S,
+                        read=read_timeout,
                         write=10.0,
                         pool=10.0,
                     ),
                 )
+                async with asyncio.timeout(total_timeout):
+                    resp = await post_request
                 failure_phase = "http_status"
                 resp.raise_for_status()
                 failure_phase = "response_decode"
@@ -499,7 +547,11 @@ class ProxyMcpManager:
                         "MCP gateway transport failed; completion is unknown. "
                         "Call was not retried."
                     ) from exc
-                await _wait_to_reattach(request_generation, exc)
+                if reattach_deadline is not None and monotonic() >= reattach_deadline:
+                    raise _call_budget_spent(
+                        exc, request_generation=request_generation, started=started
+                    ) from exc
+                await _wait_to_reattach(request_generation, exc, deadline=reattach_deadline)
                 # Reattach the new server generation to the same runner-owned
                 # operation. A fresh JSON-RPC id distinguishes this transport
                 # attempt; the operation id prevents external work from replaying.
@@ -507,6 +559,37 @@ class ProxyMcpManager:
                 payload = cast("_JsonObject", {**payload, "id": request_id})
                 continue
             except Exception as exc:
+                if isinstance(exc, TimeoutError) and reattach_deadline is not None:
+                    raise _call_budget_spent(
+                        exc, request_generation=request_generation, started=started
+                    ) from exc
+                held_s = monotonic() - started
+                registry = self._execution_registry
+                # Only a step this runner holds can be reattached, and the retry is
+                # attach-only so no runner starts it again. The server consumes an
+                # approval on first use, so an approved reply is never re-sent.
+                if (
+                    isinstance(exc, httpx.HTTPStatusError)
+                    and exc.response.status_code in _GATEWAY_SEVER_STATUSES
+                    and held_s >= _HELD_REQUEST_SEVER_FLOOR_S
+                    and not managed
+                    and approval_retries == 0
+                    and monotonic() < request_deadline
+                    and registry is not None
+                    and registry.can_attach(self._session_id, operation_id, MCP_INITIAL_STEP)
+                ):
+                    with suppress(Exception):
+                        _logger.warning(
+                            "MCP proxy request for operation %s was severed with HTTP %d "
+                            "after %.0fs; reattaching",
+                            operation_id,
+                            exc.response.status_code,
+                            held_s,
+                        )
+                    reattach_deadline = request_deadline
+                    request_id += 1
+                    payload = _initial_payload()
+                    continue
                 _record_failure(
                     exc,
                     phase=failure_phase,
@@ -528,7 +611,9 @@ class ProxyMcpManager:
                 code = err.get("code")
                 msg = err.get("message", "")
                 if code == RUNNER_MCP_EXECUTION_DETACHED_CODE:
-                    await _wait_to_reattach(request_generation, response=resp)
+                    await _wait_to_reattach(
+                        request_generation, response=resp, deadline=reattach_deadline
+                    )
                     request_id += 1
                     payload = cast("_JsonObject", {**payload, "id": request_id})
                     continue
@@ -574,6 +659,7 @@ class ProxyMcpManager:
                     if self._publish_event is not None
                     else (lambda _s, _e: None)
                 )
+                approval_started = monotonic()
                 try:
                     verdict = await pending_approvals.wait_for_user_verdict(
                         elicitation_id=elicitation_id,
@@ -588,6 +674,10 @@ class ProxyMcpManager:
                     request_id += 1
                     payload = _initial_payload()
                     continue
+                finally:
+                    # Policy approval waits do not spend a reattached execution's budget.
+                    if reattach_deadline is not None:
+                        reattach_deadline += monotonic() - approval_started
 
                 request_id += 1
                 payload = {
@@ -595,9 +685,7 @@ class ProxyMcpManager:
                     "id": request_id,  # MRTR retry MUST use a different id
                     "method": "tools/call",
                     "params": {
-                        "name": wire_name,
-                        "arguments": arguments,
-                        MCP_OPERATION_ID_PARAM: operation_id,
+                        **_operation_params(),
                         "requestState": request_state,
                         "inputResponses": {
                             elicitation_id: _input_response(

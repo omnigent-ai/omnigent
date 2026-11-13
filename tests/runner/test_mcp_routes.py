@@ -9,6 +9,7 @@ summarizer, harness forwarding — is driven through the real HTTP handler.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -22,7 +23,10 @@ from fastapi import FastAPI
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner import mcp_routes
-from omnigent.runner.mcp_execution_registry import McpExecutionRegistry
+from omnigent.runner.mcp_execution_registry import (
+    MCP_ATTACH_UNAVAILABLE_MESSAGE,
+    McpExecutionRegistry,
+)
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.native.orchestration import ResolvedSpec
 from omnigent.runner.resource_registry import SessionResourceRegistry
@@ -508,6 +512,73 @@ async def test_retained_operation_with_changed_params_is_a_conflict() -> None:
     assert status == 200
     assert body["error"]["code"] == -32000
     assert "parameters changed" in body["error"]["message"]
+    assert len(manager.calls) == 1
+
+
+async def test_attach_only_retry_never_runs_on_a_runner_without_the_step() -> None:
+    original_manager, rebound_manager = _FakeMcpManager(), _FakeMcpManager()
+    original, rebound = Harness(mcp_manager=original_manager), Harness(mcp_manager=rebound_manager)
+    original.spec_cache[SESSION] = rebound.spec_cache[SESSION] = _spec()
+    call = _call("jira__search", arguments={"q": 1})
+    await original.execute({**call, "_omnigent_operation": {"id": "op-3", "step": "initial"}})
+    attach = {**call, "_omnigent_operation": {"id": "op-3", "step": "initial", "attach": True}}
+
+    status, body = await rebound.execute(attach)
+
+    assert status == 200
+    assert body["error"] == {"code": -32000, "message": MCP_ATTACH_UNAVAILABLE_MESSAGE}
+    assert rebound_manager.calls == []
+    assert await original.execute(attach) == (200, {"result": {"output": "tool-output"}})
+    assert len(original_manager.calls) == 1
+
+
+class _GatedMcpManager(_FakeMcpManager):
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+
+    async def call_tool(self, spec: AgentSpec, tool_name: str, arguments: Any, *, session_id: str):
+        await self.release.wait()
+        return await super().call_tool(spec, tool_name, arguments, session_id=session_id)
+
+
+async def test_attach_only_retry_does_not_replay_an_input_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _GatedMcpManager()
+    manager.call_error = McpElicitationRequired(
+        input_requests={"r1": {"message": "approve?"}},
+        request_state="state-1",
+        tool_name="jira__search",
+        arguments={},
+    )
+    h = Harness(mcp_manager=manager)
+    h.spec_cache[SESSION] = _spec()
+    waiters = 0
+    execute = h.registry.execute
+
+    async def _counted_execute(**kwargs: Any) -> Any:
+        nonlocal waiters
+        waiters += 1
+        return await execute(**kwargs)
+
+    monkeypatch.setattr(h.registry, "execute", _counted_execute)
+    call = _call("jira__search")
+    operation = {"id": "op-4", "step": "initial"}
+    initial = asyncio.create_task(h.execute({**call, "_omnigent_operation": operation}))
+    while waiters < 1:
+        await asyncio.sleep(0)
+    attach_operation = {**operation, "attach": True}
+    attach = asyncio.create_task(h.execute({**call, "_omnigent_operation": attach_operation}))
+    while waiters < 2:
+        await asyncio.sleep(0)
+    manager.release.set()
+
+    (_, initial_body), (status, attach_body) = await asyncio.gather(initial, attach)
+
+    assert "input_required" in initial_body["result"]
+    assert status == 200
+    assert attach_body["error"] == {"code": -32000, "message": MCP_ATTACH_UNAVAILABLE_MESSAGE}
     assert len(manager.calls) == 1
 
 

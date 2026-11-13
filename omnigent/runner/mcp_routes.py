@@ -35,9 +35,11 @@ from omnigent.runner.app_support import (
     _SpecEntry,
 )
 from omnigent.runner.mcp_execution_registry import (
+    MCP_ATTACH_UNAVAILABLE_MESSAGE,
     McpExecutionConflict,
     McpExecutionRegistry,
     McpExecutionResult,
+    requests_input,
 )
 from omnigent.runner.native import (
     _forward_harness_response,
@@ -76,6 +78,13 @@ def _get_runner_llm_client() -> LLMClient:
 
         _runner_llm_client = LLMClient()
     return _runner_llm_client
+
+
+def _attach_unavailable_response() -> JSONResponse:
+    return JSONResponse(
+        status_code=200,
+        content={"error": {"code": -32000, "message": MCP_ATTACH_UNAVAILABLE_MESSAGE}},
+    )
 
 
 def register_mcp_routes(
@@ -141,6 +150,13 @@ def register_mcp_routes(
                     },
                 )
 
+            # An attach-only retry must never start the tool on a runner without the step.
+            attach_only = operation.get("attach") is True
+            if attach_only and not mcp_execution_registry.can_attach(
+                session_id, operation_id, operation_step
+            ):
+                return _attach_unavailable_response()
+
             nested_body = cast("_JsonObject", {**body, "_omnigent_operation": None})
             nested_body.pop("_omnigent_operation")
 
@@ -170,6 +186,8 @@ def register_mcp_routes(
                     status_code=200,
                     content={"error": {"code": -32000, "message": str(exc)}},
                 )
+            if attach_only and requests_input(retained):
+                return _attach_unavailable_response()
             return JSONResponse(status_code=retained.status_code, content=retained.content)
 
         if method == "tools/list":

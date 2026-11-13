@@ -101,6 +101,9 @@ from omnigent.policies.types import (
 )
 from omnigent.runner.launch_failure import RUNNER_PROCESS_CRASH
 from omnigent.runner.mcp_execution_registry import (
+    MCP_ATTACH_ONLY_PARAM,
+    MCP_ATTACH_UNAVAILABLE_MESSAGE,
+    MCP_INITIAL_STEP,
     MCP_OPERATION_ID_PARAM,
     RUNNER_MCP_EXECUTION_DETACHED_CODE,
     RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
@@ -13411,16 +13414,21 @@ async def _handle_mcp_tools_call(
     ):
         return _mcp_error_response(rpc_id, -32000, "Invalid runner MCP operation id")
     operation_id = cast("str | None", operation_id_value)
+    attach_only = operation_id is not None and params.get(MCP_ATTACH_ONLY_PARAM) is True
     is_retry = request_state_str is not None
 
     def _runner_execute_body(
         execute_params: dict[str, Any],
         *,
         step: str,
+        attach: bool = False,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"method": "tools/call", "params": execute_params}
         if operation_id is not None:
-            body["_omnigent_operation"] = {"id": operation_id, "step": step}
+            operation: dict[str, Any] = {"id": operation_id, "step": step}
+            if attach:
+                operation["attach"] = True
+            body["_omnigent_operation"] = operation
         return body
 
     _logger.debug(
@@ -13638,6 +13646,8 @@ async def _handle_mcp_tools_call(
             ),
             None,
         )
+    if attach_only and (execute_tool is not None or registry_config is not None):
+        return _mcp_error_response(rpc_id, -32000, MCP_ATTACH_UNAVAILABLE_MESSAGE)
     if execute_tool is not None:
         exec_data = await execute_tool(arguments)
     elif registry_config is not None:
@@ -13670,7 +13680,8 @@ async def _handle_mcp_tools_call(
                 f"/v1/sessions/{session_id}/mcp/execute",
                 json=_runner_execute_body(
                     {"name": namespaced_name, "arguments": arguments},
-                    step="initial",
+                    step=MCP_INITIAL_STEP,
+                    attach=attach_only,
                 ),
                 # ``sys_session_send`` returns a launch handle immediately; this
                 # timeout now protects ordinary runner proxy hangs.
