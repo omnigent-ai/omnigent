@@ -1350,6 +1350,7 @@ async def _auto_create_claude_terminal_for_test(
     registry: object,
     publish_event: object | None = None,
     harness_config: dict[str, object] | None = None,
+    diagnostic_follower: object | None = None,
 ) -> None:
     """
     Run ``_auto_create_claude_terminal`` with host config and diagnostics stubbed.
@@ -1373,7 +1374,11 @@ async def _auto_create_claude_terminal_for_test(
         "omnigent.config.load_effective_config", lambda **_kwargs: harness_config or {}
     )
     monkeypatch.setattr(orchestration, "resolve_cli_binary", lambda _: None)
-    monkeypatch.setattr(diagnostics, "ClaudeDebugLogFollower", lambda _: Mock())
+    monkeypatch.setattr(
+        diagnostics,
+        "ClaudeDebugLogFollower",
+        lambda _: diagnostic_follower if diagnostic_follower is not None else Mock(),
+    )
     await orchestration._auto_create_claude_terminal(
         session_id,
         registry,
@@ -1721,11 +1726,14 @@ async def test_auto_create_claude_terminal_cleans_routers_when_preparation_fails
     ],
     ids=["failed", "cancelled"],
 )
-async def test_auto_create_claude_terminal_seed_cleanup_attempts_both_shutdowns(
+@pytest.mark.parametrize("failure_stage", ["seed", "launch"])
+async def test_auto_create_claude_terminal_cleanup_attempts_both_shutdowns(
     bridge_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
     shutdown_error: BaseException,
     propagated: type[BaseException],
+    failure_stage: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A failed or cancelled router shutdown does not skip the other one.
@@ -1744,8 +1752,16 @@ async def test_auto_create_claude_terminal_seed_cleanup_attempts_both_shutdowns(
     subagent_router = object()
     turn_router = object()
     shutdowns: list[str] = []
+    original_error = ValueError("terminal preparation failed")
+    follower = Mock()
 
     async def failing_subagent_shutdown(_session_id: str, _router: object) -> None:
+        if failure_stage == "launch":
+            follower.close.assert_called_once_with("conv_cleanup_failure")
+            assert any(
+                record.exc_info and record.exc_info[1] is original_error
+                for record in caplog.records
+            )
         shutdowns.append("subagent")
         raise shutdown_error
 
@@ -1753,7 +1769,8 @@ async def test_auto_create_claude_terminal_seed_cleanup_attempts_both_shutdowns(
         shutdowns.append("turn")
 
     def failing_seed(_workspace: Path, env: dict[str, str] | None = None) -> None:
-        raise ValueError("config is not a JSON object")
+        if failure_stage == "seed":
+            raise original_error
 
     monkeypatch.setattr(
         orchestration,
@@ -1770,14 +1787,23 @@ async def test_auto_create_claude_terminal_seed_cleanup_attempts_both_shutdowns(
     )
     registry = Mock(spec=SessionResourceRegistry)
     registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
+    registry.launch_required_terminal.side_effect = original_error
 
     with pytest.raises(propagated):
         await _auto_create_claude_terminal_for_test(
-            monkeypatch, session_id="conv_cleanup_failure", workspace=bridge_dir, registry=registry
+            monkeypatch,
+            session_id="conv_cleanup_failure",
+            workspace=bridge_dir,
+            registry=registry,
+            diagnostic_follower=follower,
         )
 
     assert shutdowns == ["subagent", "turn"]
-    registry.launch_required_terminal.assert_not_called()
+    if failure_stage == "seed":
+        registry.launch_required_terminal.assert_not_called()
+        follower.close.assert_not_called()
+    else:
+        registry.launch_required_terminal.assert_awaited_once()
 
 
 @pytest.mark.parametrize(

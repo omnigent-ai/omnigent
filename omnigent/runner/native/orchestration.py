@@ -9899,10 +9899,7 @@ async def _auto_create_claude_terminal(
             raise cancelled from error
 
     try:
-        # First-message model routing. Advertised in the same bridge dir the
-        # ``UserPromptSubmit`` hook is pointed at (so the hook needs no env of its
-        # own), and live before the terminal launches because the hook can fire on
-        # the very first prompt the user types.
+        # Publish routing before launch so the first prompt hook can reach it.
         _claude_turn_router = _start_turn_router_for_native_session(
             session_id,
             bridge_dir=bridge_dir,
@@ -9910,13 +9907,8 @@ async def _auto_create_claude_terminal(
             server_client=server_client,
             turn_routing=launch_metadata.turn_routing,
         )
-        # Crash recovery for a blocked-but-never-replayed prompt is not wired here:
-        # the pending record on disk is the seam if it ever is, and the recovery's
-        # default readiness probe waits on a codex bridge thread.
-        # Only an auto-harness session's spawns can be re-routed across harness
-        # families, so only it needs the routed-spawn note and the pre-approval for
-        # the three Omnigent tools that carry out the re-route. A pinned session's
-        # argv must stay byte-identical.
+        # Cross-family spawn routing needs extra tools only for auto-harness sessions.
+        # Crash recovery is not wired here; its default readiness probe uses Codex.
         routed_spawn_note, routed_spawn_tools = _routed_spawn_launch_args(
             launch_metadata.auto_harness,
             router_started=subagent_router_dir is not None,
@@ -9986,23 +9978,14 @@ async def _auto_create_claude_terminal(
             claude_args_start = len(configured_prefix)
             if "--" in configured_prefix:
                 claude_args_start = configured_prefix.index("--") + 1
-        # Validate the binary this terminal will actually spawn: ``launch_command``
-        # already reflects the OMNIGENT_CLAUDE_PATH / config overrides, and a bare
-        # name resolves against this process's inherited PATH (same lookup tmux's
-        # pane shell and omnigent.inner.terminal perform). Mirrors
-        # ``_preflight_local_tools`` on the local-CLI path.
+        # Validate the configured executable using the same PATH lookup as tmux.
         resolved_claude = resolve_cli_binary(launch_command)
         if resolved_claude is not None:
             validate_claude_hook_interpreter_compatibility(resolved_claude)
 
         claude_terminal_env_unset = _claude_terminal_env_unset(claude_config)
 
-        # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
-        # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
-        # and ``parent_os_env`` below, launch_terminal falls back to
-        # _default_sandbox_for_platform (linux_bwrap), overriding the YAML config.
-        # ``agent_os_env`` was already resolved above for ``prepare_bridge_dir``,
-        # so the terminal process and the bridge's sys_os_* tools agree.
+        # Carry the resolved agent sandbox and filesystem into terminal creation.
         env_spec = TerminalEnvSpec(
             os_env=OSEnvSpec(
                 type="caller_process",
@@ -10021,23 +10004,11 @@ async def _auto_create_claude_terminal(
                 ),
                 **claude_terminal_relay_env(bridge_dir),
             },
-            # Names to strip (see ``_claude_terminal_env_unset``). Dropping
-            # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers
-            # inherit this env and several build ``WorkspaceClient`` without pinning
-            # ``auth_type``: a set profile makes the SDK prefer that profile's cached
-            # OAuth token over the MCP's explicit token, 400ing against the wrong
-            # workspace. Claude itself ignores the var (routing is
-            # ``ANTHROPIC_BASE_URL`` / ``apiKeyHelper``), so this affects only MCPs;
-            # ones needing a specific profile must set it in their own per-MCP env.
+            # Remove auth variables that override the selected provider credentials.
             env_unset=claude_terminal_env_unset,
             scrollback=50000,
-            # Keep the private tmux server alive if the `claude` CLI exits (e.g. a
-            # sub-agent worker whose CLI exits right after rendering its prompt on
-            # some hosts — #540). Without this, that exit reaps the server and every
-            # later control command (send-keys / model / effort / interrupt / stop)
-            # fails with "no server running", and the delegated message is silently
-            # lost. With it, the dead pane persists (capturable for diagnostics) and
-            # the watcher reports the exit deterministically via `#{pane_dead}`.
+            # Keep tmux alive after CLI exit so controls work and the watcher can
+            # report the dead pane through #{pane_dead}.
             keep_alive_after_exit=True,
         )
         from omnigent.harnesses.claude_native.bridge import finalize_claude_caller_settings
@@ -10093,19 +10064,21 @@ async def _auto_create_claude_terminal(
             prepare_terminal=prepare_claude,
         )
     except (Exception, asyncio.CancelledError) as launch_error:
-        await cleanup_owned_routers(launch_error)
-        # Preserve the original failure even if diagnostic cleanup is cancelled.
-        if not isinstance(launch_error, asyncio.CancelledError):
-            _logger.exception(
-                "Claude terminal tmux launch failed: session=%s elapsed_ms=%.0f",
-                session_id,
-                (time.monotonic() - started_at) * 1000,
-                extra={"session_id": session_id},
-            )
-        from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
+        try:
+            # Log before either cleanup can be cancelled.
+            if not isinstance(launch_error, asyncio.CancelledError):
+                _logger.exception(
+                    "Claude terminal tmux launch failed: session=%s elapsed_ms=%.0f",
+                    session_id,
+                    (time.monotonic() - started_at) * 1000,
+                    extra={"session_id": session_id},
+                )
+            from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
 
-        with contextlib.suppress(Exception):
-            await asyncio.to_thread(ClaudeDebugLogFollower(bridge_dir).close, session_id)
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(ClaudeDebugLogFollower(bridge_dir).close, session_id)
+        finally:
+            await cleanup_owned_routers(launch_error)
         raise
     timings.mark("tmux_launch")
     if reset_pick_after_launch:
