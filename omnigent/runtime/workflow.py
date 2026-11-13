@@ -1503,13 +1503,18 @@ def _apply_codex_provider_env(
     _bind_codex_gateway_credential(env, spec)
 
 
-def _bind_codex_gateway_credential(env: dict[str, str], spec: AgentSpec) -> None:
-    """Use a host-bound placeholder for an explicitly brokered Codex gateway."""
+def _codex_broker_gateway_enabled(spec: AgentSpec) -> bool:
     locked = spec.executor.config.get("broker_gateway", False)
     if not isinstance(locked, bool):
         raise OmnigentError(
             "executor.config.broker_gateway must be a boolean", code=ErrorCode.INVALID_INPUT
         )
+    return locked
+
+
+def _bind_codex_gateway_credential(env: dict[str, str], spec: AgentSpec) -> None:
+    """Use a host-bound placeholder for an explicitly brokered Codex gateway."""
+    locked = _codex_broker_gateway_enabled(spec)
     base_url = env.get("HARNESS_CODEX_GATEWAY_BASE_URL")
     sandbox = spec.os_env.sandbox if spec.os_env is not None else None
     proxy = sandbox.credential_proxy if sandbox is not None else None
@@ -1611,6 +1616,7 @@ def _build_codex_spawn_env(
     :returns: A dict of env-var overrides for
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """
+    brokered_gateway = _codex_broker_gateway_enabled(spec)
     if spec.os_env is not None:
         from omnigent.inner.sandbox import validate_harness_sandbox
 
@@ -1620,7 +1626,7 @@ def _build_codex_spawn_env(
                 "Codex",
                 cwd=cwd,
                 supports_egress_rules=True,
-                supports_credential_proxy=True,
+                supports_credential_proxy=brokered_gateway,
             )
         except ValueError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc

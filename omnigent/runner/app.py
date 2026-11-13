@@ -855,6 +855,16 @@ class _CopyOnWriteSetupError(ValueError):
     """Distinguish disposable-workspace refusal from other launch validation."""
 
 
+def _agent_start_policy_failure(exc: Exception) -> JSONResponse:
+    return JSONResponse(
+        status_code=403,
+        content={
+            "error": "agent_start_policy_unevaluable",
+            "detail": _client_safe_error_detail(exc, context="agent start policy"),
+        },
+    )
+
+
 def _copy_on_write_setup_failure(session_id: str, exc: ValueError) -> JSONResponse:
     _logger.warning("copy_on_write setup failed for %s", session_id, exc_info=exc)
     return JSONResponse(
@@ -2899,13 +2909,7 @@ def create_runner_app(
         exc: AgentStartPolicyError,
     ) -> JSONResponse:
         del request
-        return JSONResponse(
-            status_code=403,
-            content={
-                "error": "agent_start_policy_unevaluable",
-                "detail": _client_safe_error_detail(exc, context="agent start policy"),
-            },
-        )
+        return _agent_start_policy_failure(exc)
 
     @app.exception_handler(OmnigentError)
     async def _handle_omnigent_error(
@@ -3267,13 +3271,7 @@ def create_runner_app(
                         reason=exc.reason,
                     ),
                 )
-                return JSONResponse(
-                    status_code=403,
-                    content={
-                        "error": "agent_start_policy_unevaluable",
-                        "detail": str(exc),
-                    },
-                )
+                return _agent_start_policy_failure(exc)
             spec_entry = _rewrap_like(spec_entry, spec, _resolved_spec_workdir(spec_entry))
             await _ensure_session_subagent_router(
                 session_id,
@@ -6676,13 +6674,7 @@ def create_runner_app(
                 harness_name, spawn_env = launch.harness, launch.spawn_env
                 selected_spec_entry = launch.spec_entry
             except AgentStartPolicyError as exc:
-                return JSONResponse(
-                    status_code=403,
-                    content={
-                        "error": "agent_start_policy_unevaluable",
-                        "detail": _client_safe_error_detail(exc, context="agent start policy"),
-                    },
-                )
+                return _agent_start_policy_failure(exc)
             except SessionAgentMissingError:
                 return JSONResponse(
                     status_code=410,
@@ -9650,6 +9642,7 @@ async def _resolve_harness_launch(
                 else:
                     sub_spec = _unwrap_resolved_spec(sub_entry)
                     needs_start_gate = needs_start_gate or sub_spec is not spec
+                    spec_entry = sub_entry
                     spec = sub_spec
                     workdir = _resolved_spec_workdir(sub_entry)
             raw_harness = (

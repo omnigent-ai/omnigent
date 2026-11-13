@@ -13340,6 +13340,8 @@ async def test_cross_path_resolution_contract(
     path: str,
     expected: dict[str, Any],
     caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Pin the resolution behaviour matrix across all three dispatch paths.
 
@@ -13362,10 +13364,41 @@ async def test_cross_path_resolution_contract(
     """
     conv = f"conv_contract_{scenario}_{path}"
     calls: list[str] = []
+    resolver = _contract_resolver_for(scenario, calls)
+    selected_entries = []
+    child_stream = scenario == "child_present" and path != "background"
+    if child_stream:
+        from omnigent.runner import app as runner_module
+        from omnigent.spec.types import LocalToolInfo
+
+        parent = _contract_root_spec(with_child=True)
+        parent.sub_agents[0].local_tools = [
+            LocalToolInfo(name="bundle_probe", path="bundle_probe.py", language="python")
+        ]
+        (tmp_path / "bundle_probe.py").write_text(
+            "from omnigent_client import tool\n"
+            "@tool\n"
+            "def bundle_probe() -> str:\n"
+            "    return 'workspace tool loaded'\n"
+        )
+
+        async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+            calls.append(agent_id)
+            return parent
+
+        resolve_launch = runner_module._resolve_harness_launch
+
+        async def record_selection(**kwargs: Any) -> Any:
+            launch = await resolve_launch(**kwargs)
+            selected_entries.append(launch.spec_entry)
+            return launch
+
+        monkeypatch.setattr(runner_module, "_resolve_harness_launch", record_selection)
     recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
     app = create_runner_app(
         process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording)),
-        spec_resolver=_contract_resolver_for(scenario, calls),
+        spec_resolver=resolver,
+        runner_workspace=tmp_path,
         server_client=_ContractSnapshotClient(conv),  # type: ignore[arg-type]
     )
     async with _runner_test_client(app) as http:
@@ -13392,6 +13425,26 @@ async def test_cross_path_resolution_contract(
             )
             result["terminal_status"] = statuses[-1] if statuses else None
     result["resolver_calls"] = len(calls)
+
+    if child_stream:
+        from omnigent.runner.native.orchestration import (
+            ResolvedSpec,
+            _resolved_workdir_for_spec,
+        )
+        from omnigent.runner.tool_dispatch import execute_tool
+
+        [selected] = selected_entries
+        assert isinstance(selected, ResolvedSpec) and selected.workdir is None
+        output = await execute_tool(
+            tool_name="bundle_probe",
+            arguments="{}",
+            agent_spec=selected.spec,
+            conversation_id=conv,
+            runner_workspace=tmp_path,
+            local_tool_workdir=_resolved_workdir_for_spec(selected, tmp_path),
+        )
+        assert output.startswith("Error:")
+        assert output != "workspace tool loaded"
 
     if scenario == "cache_holds_child" and path != "background":
         assert "no workdir resolved" not in caplog.text
