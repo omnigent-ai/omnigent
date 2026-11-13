@@ -83,11 +83,13 @@ Canonical `executor.harness` ids:
 | Pi | `pi` | `pi-native` |
 | Grok Build | `grok` | — |
 | Jcode | `jcode` | — |
+| MiniMax Code | `minimax` | — |
 | OpenAI | `openai-agents`, `open-responses` | — |
 | Custom ACP agent | `acp:<slug>` | — |
 
 Aliases such as `claude`, `opencode`, `devin`, `agy`, `github-copilot`,
-`kimi-code`, `qwen-code`, `grok-build` and `native-goose` resolve to these ids.
+`kimi-code`, `qwen-code`, `grok-build`, `mcode`, `minimax-code` and
+`native-goose` resolve to these ids.
 
 Set the Databricks profile under `executor.auth`. The older top-level
 `executor.profile` shorthand is legacy and should not be used in new specs.
@@ -376,21 +378,26 @@ executor:
   model: <provider>/<model-id> # optional; omit for Hermes' configured default
 ```
 
-### Grok Build and Jcode
+### Grok Build, Jcode, and MiniMax Code
 
-`harness: grok` (alias `grok-build`) and `harness: jcode` are builtin ACP CLI
-harnesses: Omnigent drives `grok agent stdio` or `jcode acp` through the same
-generic ACP wrap as `acp:<slug>`. By default each CLI owns its auth and model
-selection (`grok login --device-auth`, or a provider in `~/.jcode/config.toml`),
-so a `model` override is refused. When Omnigent's inference config binds
-`jcode` to an OpenAI-compatible Chat Completions provider, Omnigent writes a
-session-private Jcode config instead and forwards `model`. Jcode is not offered
-Omnigent's MCP tools. See the README's *Grok Build and Jcode* section for install
-steps.
+`harness: grok` (alias `grok-build`), `harness: jcode`, and `harness: minimax`
+(aliases `mcode`, `minimax-code`) are builtin ACP CLI harnesses: Omnigent
+drives `grok agent stdio`, `jcode acp`, or `mcode acp` through the same generic
+ACP wrap as `acp:<slug>`. By default each CLI owns its auth and model selection
+(`grok login --device-auth`, a provider in `~/.jcode/config.toml`, or
+`mcode login`), so a `model` override is refused. When Omnigent's inference
+config binds `jcode` to an OpenAI-compatible Chat Completions provider,
+Omnigent writes a session-private Jcode config instead and forwards `model`.
+Jcode is not offered Omnigent's MCP tools. Install MiniMax Code with
+`curl -fsSL https://filecdn.minimax.chat/public/install.sh | bash`, then
+authenticate once with `mcode login`. Run `mcode provider` to configure a
+custom provider or API key; MiniMax Code reads that saved configuration
+itself. See the README's *Grok Build, Jcode, and MiniMax Code* section for
+install steps.
 
 ```yaml
 executor:
-  harness: grok                # or: jcode
+  harness: grok                # or: jcode, minimax
 ```
 
 ## Qwen Code
