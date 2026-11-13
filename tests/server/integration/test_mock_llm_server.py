@@ -14,6 +14,7 @@ from tests.server.integration.mock_llm_server import (
     _state,
     create_message,
     create_response,
+    gate_release,
     sse_text_response,
     truncate_sse,
 )
@@ -145,6 +146,16 @@ def test_responses_stream_uses_scripted_token_usage(
     events = [
         json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")
     ]
+    if queued_response.get("stream"):
+        deltas = [e for e in events if e.get("type") == "response.output_text.delta"]
+        assert "".join(e["delta"] for e in deltas) == queued_response["text"]
+        item = next(e for e in events if e.get("type") == "response.output_item.added")
+        assert all(
+            e["item_id"] == item["item"]["id"]
+            and e["output_index"] == item["output_index"]
+            and e["sequence_number"] > item["sequence_number"]
+            for e in deltas
+        )
     expected_usage = usage or {"input_tokens": 10, "output_tokens": 5}
     expected_usage = {
         **expected_usage,
@@ -491,3 +502,20 @@ async def test_chunk_delay_paces_messages_sse_event_by_event(clean_mock_state: N
     assert len(chunks) > 1
     for chunk in chunks:
         assert _count_events(chunk) == 1
+
+
+async def test_gate_release_picks_a_labelled_gate_ahead_of_older_ones(
+    clean_mock_state: None,
+) -> None:
+    held = QueuedResponse(block=True)
+    labelled = QueuedResponse(block=True, gate="continuation")
+    for queued in (held, labelled):
+        queued._pending.set()
+        _state.pending_gates.append(queued)
+
+    assert await gate_release(gate="continuation") == {"released": True}
+    assert await gate_release(gate="continuation") == {"released": False}
+    assert not held._gate.is_set()
+    assert labelled._gate.is_set()
+    assert await gate_release() == {"released": True}
+    assert held._gate.is_set()

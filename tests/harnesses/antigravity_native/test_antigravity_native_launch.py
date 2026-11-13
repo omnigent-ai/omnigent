@@ -19,6 +19,15 @@ from omnigent.harnesses.antigravity_native.launch import (
     should_skip_permissions,
 )
 
+
+@pytest.fixture(autouse=True)
+def isolate_provider_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    for key in ("GEMINI_API_KEY", "GOOGLE_GEMINI_BASE_URL"):
+        monkeypatch.delenv(key, raising=False)
+        monkeypatch.delenv(f"OMNIGENT_{key}", raising=False)
+
+
 _SKIP_FLAG = "--dangerously-skip-permissions"
 
 # ---------------------------------------------------------------------------

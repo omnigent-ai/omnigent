@@ -67,6 +67,13 @@ class AgentStore(ABC):
         """
         ...
 
+    def get_many(self, agent_ids: builtins.list[str]) -> dict[str, Agent]:
+        """Batch-fetch agent metadata, omitting missing ids.
+
+        Does not require ``session_id`` resolution; use ``get`` for session authorization.
+        """
+        return {agent_id: agent for agent_id in set(agent_ids) if (agent := self.get(agent_id))}
+
     @abstractmethod
     def get_by_name(self, name: str) -> Agent | None:
         """

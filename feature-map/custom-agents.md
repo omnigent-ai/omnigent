@@ -30,15 +30,16 @@ and deletes owned agents.
 
 ## Driving it with the repro environment
 
-Preconditions: follow [Verify Omnigent](skills/verify-omnigent/SKILL.md). Enable
-`OMNIGENT_FEATURES=custom_agents_settings_ui` before starting the isolated server.
+Preconditions: follow [Verify Omnigent](skills/verify-omnigent/SKILL.md). The
+`custom_agents_settings_ui` release flag is on by default; do not disable it.
 The server must advertise `agent_install: true` and `agent_detail: true`.
 Deletion on a detail page also needs the response to include `user_owned`. Editing
 requires `user_owned: true` and `agent_config_edit: true`.
 
 - Desktop and mobile: open Settings through navigation and select Custom agents.
-  Confirm Customize contains Harnesses and Custom agents, and General no longer
-  contains Harnesses. Confirm server cards and the empty owned state; capture
+  Confirm Customize contains Custom agents, and Harnesses while the deployment
+  offers at least one harness, and General no longer contains Harnesses.
+  Confirm server cards and the empty owned state; capture
   both viewport sizes.
 - Create: enter a unique name, a configured model, instructions, and an MCP
   server. Save, verify the summary, reload, and verify persistence through
@@ -56,19 +57,21 @@ requires `user_owned: true` and `agent_config_edit: true`.
   transports cannot be changed; managed servers are read-only.
   Cancel a dirty draft and choose Keep editing, then cancel/discard it. Confirm
   Custom agents also asks before leaving a dirty draft, and no edit modal opens.
-  Change the same agent in another tab before saving: the first draft remains
-  visible with Reload latest. Confirm reload, then verify the newer value.
+  With revision headers available, change the same agent in another tab before
+  saving: the first draft remains visible with Reload latest. Confirm reload, then verify the newer value.
   `tests/e2e_ui/sessions/test_custom_agent_edit.py` covers desktop and mobile
-  persistence and conflict recovery against the real API; it enables only the UI
-  release flag in the info response. Cold desktop bookmarks and mobile list entry
-  are covered. Manually check desktop list entry and normal Settings navigation.
+  persistence with and without revision headers, and conflict recovery against the
+  real API. It enables the UI release flag and independently strips response
+  `ETag`, request `If-Match`, or both.
+  Cold desktop bookmarks and mobile list entry are covered. Manually check desktop list entry and normal Settings navigation.
 - Delete: cancel once and verify the agent remains, then delete and verify the
   list and API omit it. For an agent used by a session, verify the initial
   deletion reports the count and waits for Remove anyway. Only that action
   should force removal.
 - Gating: remove the feature flag, restart the isolated server, and reload.
-  Customize must disappear, Harnesses must return to General, and Custom agents
-  URLs must show General.
+  Customize must disappear, Harnesses must return to General (while the
+  deployment offers at least one harness), and Custom agents URLs must show
+  General.
   Repeat against a server without the installation capability. With the feature
   and installation enabled but `agent_detail` absent or false, every Custom
   agents URL must show an update notice with no agent requests or management
@@ -91,7 +94,8 @@ requires `user_owned: true` and `agent_config_edit: true`.
 - Saving an existing owned name replaces its entire configuration and affects
   sessions using it. Use a unique name when creating a separate agent.
 - Owned previews load the configuration endpoint and ETag; summaries never prefill it.
-  Missing revision headers prevent saving. Unchanged fields are omitted from PATCH.
+  Missing revision headers allow saving without a stale-draft check; the last
+  successful save of a field wins. Unchanged fields are omitted from PATCH.
 - Global browser history and settings navigation can discard a draft; Cancel and
   the form's Custom agents button confirm first, and refresh/close warns.
   Model/harness incompatibilities are reported on save.

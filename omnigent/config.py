@@ -4,11 +4,24 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from copy import deepcopy
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypeAlias
 
 import yaml
+
+from omnigent.preferences import (
+    PreferenceContext,
+    PreferenceKey,
+    PreferenceKind,
+    PreferenceLayer,
+    PreferenceScope,
+    ResolvedPreference,
+    preferences_from_config,
+    resolve_preferences,
+)
 
 _log = logging.getLogger(__name__)
 _cwd_missing_warned = False
@@ -58,57 +71,167 @@ def load_local_config(path: Path | None = None) -> _Config:
         return raw
 
 
+def _ignored_project_harness_keys(cfg: _Config) -> list[str]:
+    """Name project harness overrides without exposing their command or arguments."""
+    harness = cfg.get("harness")
+    if not isinstance(harness, dict):
+        return []
+    return sorted(f"harness.{name}" for name in harness if name != "default")
+
+
 def _merge_effective_config(
     global_cfg: _Config,
     local_cfg: _Config,
 ) -> _Config:
-    """Merge global+local config, deep-merging the ``harness`` mapping.
+    """Merge project defaults while retaining user-owned harness launch settings.
 
-    A flat ``{**global, **local}`` would make a local ``harness`` mapping
-    replace the global one entirely, dropping the user's global
-    per-harness overrides. So the ``harness`` key is merged one level deep
-    (per-harness sub-keys, local winning per-field) while every other key
-    stays a shallow replace (local wins outright). See
-    :mod:`omnigent.harness_startup_config` for the ``harness:`` shape.
+    A project may select the default harness. Server selection, executables and
+    arguments come from user configuration or explicit command-line options.
 
     :param global_cfg: User-level config (``~/.omnigent/config.yaml``).
     :param local_cfg: Project-level config (``.omnigent/config.yaml``).
     :returns: The merged effective config dict.
     """
-    merged: _Config = {**global_cfg, **local_cfg}
+    merged: _Config = {
+        **global_cfg,
+        **{key: value for key, value in local_cfg.items() if key not in {"server", "harness"}},
+    }
     g_harness = global_cfg.get("harness")
     l_harness = local_cfg.get("harness")
-    # Only deep-merge when BOTH are mappings. A scalar on either side is
-    # an explicit whole-value override (legacy scalar form, or a project
-    # that intentionally pins the whole harness key), so the shallow
-    # ``{**global, **local}`` result already in ``merged`` is correct.
-    if isinstance(g_harness, dict) and isinstance(l_harness, dict):
-        combined: _Config = {**g_harness, **l_harness}
-        # Per-harness sub-keys (anything but ``default``): merge one level
-        # deep so a local per-harness entry augments rather than replaces
-        # the global one (local fields win per-field).
-        for key in set(g_harness) | set(l_harness):
-            if key == "default":
-                continue
-            g_entry = g_harness.get(key)
-            l_entry = l_harness.get(key)
-            if isinstance(g_entry, dict) and isinstance(l_entry, dict):
-                combined[key] = {**g_entry, **l_entry}
-        merged["harness"] = combined
+    ignored = _ignored_project_harness_keys(local_cfg)
+    if ignored and l_harness != g_harness:
+        _log.warning(
+            "Ignoring project harness launch overrides: %s. "
+            "Move these settings to user config %s.",
+            ", ".join(ignored),
+            global_config_path(),
+        )
+    if isinstance(l_harness, str):
+        l_harness = {"default": l_harness}
+    if isinstance(l_harness, dict) and "default" in l_harness:
+        trusted = g_harness if isinstance(g_harness, dict) else {}
+        merged["harness"] = {**trusted, "default": l_harness["default"]}
     return merged
 
 
-def load_effective_config(*, workspace: str | Path | None = None) -> _Config:
-    """Merge global and project config, with project values taking precedence.
+@dataclass(frozen=True)
+class ResolvedConfig:
+    config: _Config
+    preferences: Mapping[PreferenceKey, ResolvedPreference] = field(default_factory=dict)
 
-    The ``harness`` mapping is deep-merged (per-harness sub-keys, local
-    winning per-field) so a project's per-harness overrides augment —
-    rather than replace — the user's global ones. Every other key is a
-    shallow replace. When supplied, *workspace* selects the project config
-    directory instead of the process cwd.
+
+def resolve_effective_config(
+    global_cfg: _Config,
+    local_cfg: _Config,
+    *,
+    preference_context: PreferenceContext | None = None,
+    preference_layers: Sequence[PreferenceLayer] = (),
+) -> ResolvedConfig:
+    """Resolve legacy config, or explicitly adopted workspace preferences.
+
+    Without a context, preserve legacy merging exactly. Supplying a context is
+    an explicit adoption boundary: global portable values are no longer inputs.
+    Callers must complete import/migration before opting in; this function does
+    not infer user intent from YAML or write resolved values back to it.
+
+    Project YAML remains an override, while commands, credentials, and unrelated
+    settings retain their existing merge rules. Plugin choices remain in the
+    provenance map for native adapters; they are not written into global YAML.
+    """
+    if preference_context is None:
+        if preference_layers:
+            raise ValueError("preference layers require an authenticated context")
+        return ResolvedConfig(_merge_effective_config(global_cfg, local_cfg))
+    if any(layer.scope == PreferenceScope.PROJECT for layer in preference_layers):
+        raise ValueError("project preferences must come from the selected project config")
+    project = PreferenceLayer(
+        PreferenceScope.PROJECT,
+        preference_context.identity,
+        {
+            key: value
+            for key, value in preferences_from_config(local_cfg).items()
+            if key.kind != PreferenceKind.HARNESS_ARGS
+        },
+    )
+    resolved = resolve_preferences(preference_context, (*preference_layers, project))
+    resolved = {
+        key: item
+        for key, item in resolved.items()
+        if item.source in (PreferenceScope.SESSION, PreferenceScope.PROJECT)
+        or not _project_masks_preference(local_cfg, key)
+    }
+    config = _without_portable_preferences(_merge_effective_config(global_cfg, local_cfg))
+    _apply_preferences(config, resolved)
+    return ResolvedConfig(config, resolved)
+
+
+def _project_masks_preference(cfg: _Config, key: PreferenceKey) -> bool:
+    """Apply explicit project replacements to lower scopes by canonical key."""
+    if key.kind == PreferenceKind.MODEL:
+        return key.name in cfg
+    if key.kind != PreferenceKind.HARNESS:
+        # Harness launch arguments are user-owned, matching _merge_effective_config.
+        return False
+    harness = cfg.get("harness")
+    return isinstance(harness, str) or (isinstance(harness, dict) and "default" in harness)
+
+
+def _apply_preferences(
+    config: _Config, resolved: Mapping[PreferenceKey, ResolvedPreference]
+) -> None:
+    """Project requested values into the existing launch-config shape."""
+    for key, preference in resolved.items():
+        if key.kind == PreferenceKind.MODEL:
+            assert isinstance(key.name, str)
+            config[key.name] = preference.value
+        elif key.kind in (PreferenceKind.HARNESS, PreferenceKind.HARNESS_ARGS):
+            harness = config.setdefault("harness", {})
+            assert isinstance(harness, dict)
+            if key.kind == PreferenceKind.HARNESS:
+                harness["default"] = preference.value
+            else:
+                entry = harness.get(key.name)
+                entry = dict(entry) if isinstance(entry, dict) else {}
+                assert isinstance(preference.value, tuple)
+                entry["args"] = list(preference.value)
+                harness[key.name] = entry
+
+
+def _without_portable_preferences(cfg: _Config) -> _Config:
+    """Keep local-only settings without mutating either source dictionary."""
+    config = deepcopy(cfg)
+    for name in ("model", "opencode_model"):
+        config.pop(name, None)
+    harness = config.get("harness")
+    if isinstance(harness, dict):
+        harness.pop("default", None)
+        for entry in harness.values():
+            if isinstance(entry, dict):
+                entry.pop("args", None)
+    else:
+        config.pop("harness", None)
+    return config
+
+
+def load_effective_config(
+    *,
+    workspace: str | Path | None = None,
+    preference_context: PreferenceContext | None = None,
+    preference_layers: Sequence[PreferenceLayer] = (),
+) -> _Config:
+    """Merge global and project config, preserving user-owned launch settings.
+
+    Project values take precedence except for server selection and harness
+    executables and arguments. When supplied, *workspace* selects the project
+    config directory instead of the process cwd.
     """
     local_path = Path(workspace) / _LOCAL_CONFIG_RELPATH if workspace is not None else None
-    return _merge_effective_config(load_global_config(), load_local_config(local_path))
+    return resolve_effective_config(
+        load_global_config(),
+        load_local_config(local_path),
+        preference_context=preference_context,
+        preference_layers=preference_layers,
+    ).config
 
 
 def save_global_config(
@@ -204,6 +327,7 @@ __all__ = [
     "load_effective_config",
     "load_global_config",
     "load_local_config",
+    "resolve_effective_config",
     "save_global_config",
     "set_github_account_preference",
 ]

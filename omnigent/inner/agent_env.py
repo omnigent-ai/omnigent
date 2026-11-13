@@ -11,6 +11,8 @@ harness added is filtered by construction rather than by remembering.
 The model is not "no credentials ever". It is:
 
     shared safe base  +  this harness's own config/provider families
+                      +  exact names the host owner forwarded through
+                         ``OMNIGENT_RUNNER_ENV_PASSTHROUGH``
                       +  whatever the spec declared in
                          ``os_env.sandbox.env_passthrough``
 
@@ -20,11 +22,17 @@ and stops seeing every *other* provider's.
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Iterable, Mapping
 
 from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
-from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
+from omnigent.databricks_ai_gateway import CI_CONTEXT_ENV, ci_request_tags
+from omnigent.runner.identity import (
+    OMNIGENT_SESSION_ENV_VAR,
+    RUNNER_AUTH_SECRET_ENV_VARS,
+    RUNNER_SESSION_ENV_NAMES_ENV_VAR,
+)
 
 # Desktop access requires an explicit grant outside the sandbox.
 DESKTOP_SESSION_ENV_VARS: frozenset[str] = frozenset(
@@ -63,6 +71,9 @@ BASE_ALLOW_EXACT: frozenset[str] = frozenset(
         # without it a corporate-CA user upgrading would hit TLS failures from
         # every harness that does not happen to own a NODE_ prefix of its own.
         "NODE_EXTRA_CA_CERTS",
+        # git's CA paths, for git builds that ignore SSL_CERT_FILE.
+        "GIT_SSL_CAINFO",
+        "GIT_SSL_CAPATH",
         # ssh-agent socket path, so an agent's git-over-SSH and SSH-cert
         # tooling authenticates. A path to a unix socket, not a bearer token:
         # reaching the agent still requires the user's own ssh-agent to be
@@ -72,9 +83,11 @@ BASE_ALLOW_EXACT: frozenset[str] = frozenset(
         # The user's URL-opener command, so an agent's CLI logins open URLs the
         # way the user configured (e.g. forwarded to a laptop from a remote box).
         "BROWSER",
-        # Config locations, not bearer tokens: agent tools use the host's CLI login.
+        # Config locations and hosts let agent tools use the host's CLI login.
         "GH_CONFIG_DIR",
         "GLAB_CONFIG_DIR",
+        "GITLAB_HOST",
+        "GLAB_HOST",
         OMNIGENT_SESSION_ENV_VAR,
         # Windows system / profile constants (SYSTEMROOT is mandatory for
         # Winsock init, USERPROFILE for Path.home(), etc.); no-ops on POSIX
@@ -105,19 +118,47 @@ def clean_agent_env(
         ``os_env.sandbox.env_passthrough``. This is the documented escape hatch
         for an agent that authenticates from a variable outside its own family.
     :param source: Environment to filter. Defaults to ``os.environ``; injectable
-        for tests.
-    :returns: A filtered copy; desktop-session variables require ``extra_allowed``.
+        for tests. Its ``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` names are also
+        allowed, subject to the deny rules.
+    :returns: A filtered copy without runner-auth secrets that also keeps the
+        variables the launching CLI forwarded for this session; desktop-session
+        variables require ``extra_allowed``.
     """
     env_source = os.environ if source is None else source
     prefixes = BASE_ALLOW_PREFIXES + tuple(allow_prefixes)
+    operator_names = {
+        name.strip()
+        for name in env_source.get("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "").split(",")
+        if name.strip()
+    }
     extra = set(extra_allowed)
-    exact = BASE_ALLOW_EXACT | set(allow_exact) | extra
-    denied = set(deny_exact) | (DESKTOP_SESSION_ENV_VARS - extra)
-    return {
+    exact = (
+        BASE_ALLOW_EXACT
+        | set(allow_exact)
+        | extra
+        | operator_names
+        | forwarded_session_env_names(env_source)
+    )
+    denied = set(deny_exact) | RUNNER_AUTH_SECRET_ENV_VARS | (DESKTOP_SESSION_ENV_VARS - extra)
+    filtered = {
         key: value
         for key, value in env_source.items()
         if key not in denied and (key in exact or key.startswith(prefixes))
     }
+    if CI_CONTEXT_ENV not in denied and (tags := ci_request_tags(env_source)):
+        filtered[CI_CONTEXT_ENV] = json.dumps(tags, separators=(",", ":"))
+    return filtered
+
+
+def forwarded_session_env_names(source: Mapping[str, str] | None = None) -> frozenset[str]:
+    """Names of the variables the launching CLI forwarded to this runner.
+
+    :param source: Runner environment to read. Defaults to ``os.environ``.
+    :returns: Forwarded names, never including Omnigent's own variables.
+    """
+    env = os.environ if source is None else source
+    names = env.get(RUNNER_SESSION_ENV_NAMES_ENV_VAR, "").split(",")
+    return frozenset(name for name in names if name and not name.upper().startswith("OMNIGENT"))
 
 
 def strip_desktop_session_env(env: Mapping[str, str]) -> dict[str, str]:
