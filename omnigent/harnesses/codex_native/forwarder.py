@@ -49,6 +49,7 @@ from omnigent.harnesses.codex_native.bridge import (
     clear_certificate_failure,
     codex_config_revision,
     codex_home_for_bridge_dir,
+    fail_pending_mcp_startup,
     pending_mcp_servers,
     read_bridge_state,
     read_certificate_failure,
@@ -2976,6 +2977,21 @@ async def supervise_forwarder(
                     await close()
                 except BaseException as exc:  # noqa: BLE001 - finish all closers, even on cancellation.
                     cleanup_errors.append(exc)
+            # After the closers, so a cancellation here cannot skip them; the HTTP
+            # client is still open. Skipped when the stream itself was cancelled:
+            # the session is being torn down, not stranded.
+            if not isinstance(stream_error, asyncio.CancelledError):
+                try:
+                    await _fail_mcp_startup_on_forwarder_exit(
+                        ap_client, session_id=target.session_id, bridge_dir=bridge_dir
+                    )
+                except asyncio.CancelledError as exc:
+                    cleanup_errors.append(exc)
+                except Exception:  # best effort, like the closers above.
+                    _logger.warning(
+                        "Codex forwarder could not fail the pending MCP startup round",
+                        exc_info=True,
+                    )
             for error in cleanup_errors[1 if stream_error is None else 0 :]:
                 _logger.warning(
                     "Codex forwarder cleanup failed",
@@ -3358,6 +3374,9 @@ async def _subscribe_until_ready(
     reconnects keep it so no live turn replaces the bridge's recovery cursor
     before the replay lands.
 
+    If Codex cannot list turns, retry without history so live notifications
+    can still be mirrored. Items preceding that subscription remain unreplayed.
+
     :param client: Codex app-server client.
     :param ap_client: Omnigent HTTP client used for replayed items.
     :param session_id: Omnigent conversation id.
@@ -3387,6 +3406,7 @@ async def _subscribe_until_ready(
         and bridge_state.pending_shell_command_id is not None
     )
     saw_not_ready = False
+    history_unavailable = False
     resume_timeout = _SUBSCRIBE_RESUME_TIMEOUT_SECONDS
     replay_owed = replay_from_turn_id is not None or shell_pending
     async with (
@@ -3396,7 +3416,9 @@ async def _subscribe_until_ready(
             async with _conversation_item_delivery_scope(session_id):
                 received_live_items = client.is_subscribed_to_thread(thread_id)
                 params: _JsonObject = {"threadId": thread_id}
-                if not saw_not_ready and replay_from_turn_id is None and not shell_pending:
+                if history_unavailable or (
+                    not saw_not_ready and replay_from_turn_id is None and not shell_pending
+                ):
                     params["excludeTurns"] = True
                 timed_out = False
                 try:
@@ -3411,6 +3433,19 @@ async def _subscribe_until_ready(
                     raise
                 # App-server error envelopes are surfaced as RuntimeError.
                 except Exception as exc:
+                    if (
+                        not params.get("excludeTurns")
+                        and isinstance(exc, CodexAppServerResponseError)
+                        and exc.code == -32601
+                        and exc.message == "list_turns is not supported yet"
+                    ):
+                        history_unavailable = True
+                        _logger.warning(
+                            "Codex cannot list turns for thread %s; subscribing without history. "
+                            "Items before this subscription cannot be replayed.",
+                            thread_id,
+                        )
+                        continue
                     if not _is_thread_not_ready_error(exc):
                         _logger.warning(
                             "failed to subscribe to Codex thread %s", thread_id, exc_info=True
@@ -3431,6 +3466,7 @@ async def _subscribe_until_ready(
                         forwarder_state=forwarder_state,
                         received_live_items=received_live_items,
                         replay_from_turn_id=replay_from_turn_id,
+                        replay_history=not history_unavailable,
                     )
                     return
             if timed_out:
@@ -3473,6 +3509,7 @@ async def _finish_subscription(
     forwarder_state: _CodexForwarderState | None,
     received_live_items: bool,
     replay_from_turn_id: str | None,
+    replay_history: bool,
 ) -> None:
     """
     Sync thread metadata from a successful resume and replay its snapshot.
@@ -3493,6 +3530,7 @@ async def _finish_subscription(
     :param received_live_items: Whether this connection was already
         subscribed (and so received live items) before the resume.
     :param replay_from_turn_id: Interrupted turn to replay from, if any.
+    :param replay_history: Whether Codex returned history for reconciliation.
     :returns: None.
     """
     if forwarder_state is not None:
@@ -3529,6 +3567,10 @@ async def _finish_subscription(
             thread_id=thread_id,
             forwarder_state=forwarder_state,
         )
+    # An excluded history is not evidence that a saved turn or shell finished.
+    # Keep its recovery cursor until an authoritative lifecycle event arrives.
+    if not replay_history:
+        return
     if forwarder_state is not None and received_live_items:
         forwarder_state.resume_echo_thread_ids.add(thread_id)
     try:
@@ -5807,6 +5849,43 @@ async def _settle_mcp_startup(
     await _post_mcp_startup(client, session_id, servers)
 
 
+_MCP_STARTUP_FORWARDER_EXIT_ERROR = "Codex app-server connection ended before MCP startup finished"
+# The runner stops the app-server only after the forwarder returns, so this
+# best-effort post gets one short attempt instead of the default retries.
+_MCP_STARTUP_FORWARDER_EXIT_POST_TIMEOUT_SECONDS = 5.0
+
+
+async def _fail_mcp_startup_on_forwarder_exit(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+) -> None:
+    """
+    Fail the still-``starting`` MCP servers when the forwarder stops.
+
+    The settle timer and idle signal both live in this forwarder, and the
+    runner stops the app-server once it exits, so nothing else would ever
+    resolve the round and the web band would spin until a relaunch.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: None.
+    """
+    servers, changed = fail_pending_mcp_startup(bridge_dir, _MCP_STARTUP_FORWARDER_EXIT_ERROR)
+    if not changed:
+        return
+    _logger.warning("Codex MCP startup round failed: forwarder stopped mid-startup")
+    await _post_mcp_startup(
+        client,
+        session_id,
+        servers,
+        max_attempts=1,
+        timeout=_MCP_STARTUP_FORWARDER_EXIT_POST_TIMEOUT_SECONDS,
+    )
+
+
 def _is_thread_idle_status_event(method: str, params: _JsonObject) -> bool:
     """
     Return whether an event reports the thread going idle.
@@ -5919,6 +5998,9 @@ async def _post_mcp_startup(
     client: httpx.AsyncClient,
     session_id: str,
     servers: dict[str, dict[str, str | None]],
+    *,
+    max_attempts: int | None = _POST_MAX_ATTEMPTS,
+    timeout: float | None = None,
 ) -> None:
     """
     Post the current per-MCP-server startup map to Omnigent.
@@ -5927,6 +6009,8 @@ async def _post_mcp_startup(
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param servers: Full startup map, e.g.
         ``{"safe": {"status": "starting", "error": None}}``.
+    :param max_attempts: Maximum POST attempts, e.g. ``1``.
+    :param timeout: Optional per-request timeout in seconds, e.g. ``5.0``.
     :returns: None.
     """
     response = await _post_session_event(
@@ -5934,6 +6018,8 @@ async def _post_mcp_startup(
         session_id,
         event_type=_EXTERNAL_MCP_STARTUP_TYPE,
         data={"servers": servers},
+        max_attempts=max_attempts,
+        timeout=timeout,
     )
     _log_failed_session_event_post(_EXTERNAL_MCP_STARTUP_TYPE, response)
 

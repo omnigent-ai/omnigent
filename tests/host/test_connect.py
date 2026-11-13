@@ -49,6 +49,8 @@ from omnigent.host.frames import (
     SERVER_CAP_TMUX_READINESS,
     SERVER_CAPABILITIES_HEADER,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostCloneRepositoryFrame,
+    HostCloneRepositoryResultFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -106,6 +108,7 @@ from omnigent.host.identity import HostIdentity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.host.session_env import session_env_handoff
+from omnigent.onboarding import harness_install
 from omnigent.onboarding.harness_install import READINESS_CLI_PROBE_TIMEOUT_S
 from omnigent.onboarding.harness_login import CodexDeviceLogin
 from omnigent.runner.identity import (
@@ -1569,14 +1572,14 @@ async def test_handle_launch_does_not_ask_to_install_a_resolvable_pi_that_never_
     monkeypatch.delenv("OMNIGENT_PI_PATH", raising=False)
     monkeypatch.delenv("HARNESS_PI_PATH", raising=False)
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
-    original_run = subprocess.run
+    original_run = harness_install.run_isolated
 
     def _unanswered_version(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         if argv[1:] != ["--version"]:
             return original_run(argv, **kwargs)
         raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
 
-    monkeypatch.setattr(subprocess, "run", _unanswered_version)
+    monkeypatch.setattr(harness_install, "run_isolated", _unanswered_version)
     host = _make_host_process()
     proc = Mock(spec=subprocess.Popen, pid=1234)
     proc.poll.return_value = None
@@ -1606,7 +1609,7 @@ async def test_handle_launch_bound_preflight_waits_only_the_readiness_probe_budg
     """A bound launch lets an unanswered CLI through within the readiness probe budget."""
     probe_timeouts: list[object] = []
     original_which = shutil.which
-    original_run = subprocess.run
+    original_run = harness_install.run_isolated
 
     def _resolve_claude(name: str, *args: object, **kwargs: object) -> str | None:
         return "/usr/bin/claude" if name == "claude" else original_which(name, *args, **kwargs)
@@ -1621,7 +1624,7 @@ async def test_handle_launch_bound_preflight_waits_only_the_readiness_probe_budg
     proc = Mock(spec=subprocess.Popen, pid=1234)
     proc.poll.return_value = None
     monkeypatch.setattr(shutil, "which", _resolve_claude)
-    monkeypatch.setattr(subprocess, "run", _unanswered_version)
+    monkeypatch.setattr(harness_install, "run_isolated", _unanswered_version)
     monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
     monkeypatch.setattr(
         host, "_spawn_runner_proc", Mock(return_value=(proc, tmp_path / "runner.log"))
@@ -3170,6 +3173,64 @@ async def test_fast_capability_discovery_is_included_in_hello(
     assert len(tunnel.sent) == 1
     assert hello.configured_harnesses == {"codex-native": True}
     assert hello.gateway_inference == {"codex-native": True}
+
+
+@pytest.mark.parametrize("serving", [True, False])
+async def test_hello_advertises_the_workspace_socket_only_while_it_runs(
+    monkeypatch: pytest.MonkeyPatch, serving: bool
+) -> None:
+    """The server can mint direct-access tokens only for a host that serves the socket."""
+    host = _make_host_process()
+
+    async def _discover() -> None:
+        host._capabilities_initialized = True
+
+    monkeypatch.setattr(host, "_initialize_capabilities", _discover)
+    if serving:
+        host._workspace_socket = SimpleNamespace(  # type: ignore[assignment]
+            path=Path("/tmp/omnigent-workspace-x/workspace.sock"), token_key="key-abc"
+        )
+    tunnel = _BlockingTunnel()
+    serve_task = asyncio.create_task(host._serve_frames(tunnel))  # type: ignore[arg-type]
+    try:
+        await asyncio.wait_for(tunnel.first_send.wait(), timeout=1.0)
+    finally:
+        await _cancel(serve_task)
+
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    if serving:
+        assert hello.workspace_socket == "/tmp/omnigent-workspace-x/workspace.sock"
+        assert hello.workspace_token_key == "key-abc"
+    else:
+        assert hello.workspace_socket is None
+        assert hello.workspace_token_key is None
+
+
+@pytest.mark.parametrize(
+    ("features", "enabled"),
+    [("workspace_direct_access", True), ("", False), ("not_a_feature", False)],
+)
+async def test_workspace_direct_access_follows_omnigent_features(
+    monkeypatch: pytest.MonkeyPatch, features: str, enabled: bool
+) -> None:
+    """The host opens its socket only when enabled, and an invalid list never stops the host."""
+    from omnigent.host.connect import _workspace_direct_access_enabled
+
+    monkeypatch.setenv("OMNIGENT_FEATURES", features)
+
+    assert _workspace_direct_access_enabled() is enabled
+
+
+async def test_workspace_socket_without_its_extra_leaves_the_host_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Enabling direct access without `omnigent[workspace-api]` turns it off, not the host."""
+    monkeypatch.setenv("OMNIGENT_FEATURES", "workspace_direct_access")
+    # None in sys.modules makes the import fail as if connectrpc weren't installed.
+    monkeypatch.setitem(sys.modules, "omnigent.host.workspace_service", None)
+
+    assert await _make_host_process()._start_workspace_socket() is None
 
 
 async def test_slow_capability_discovery_blocks_registration_and_frame_dispatch(
@@ -5775,6 +5836,40 @@ def test_handle_list_dir_pagination_last_page_has_more_false(
     assert result.status == "ok"
     assert len(result.entries) == 2
     assert result.has_more is False
+
+
+async def test_dispatch_clone_repository_keeps_orphan_reaper_paused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The clone worker owns its git exit status until it finishes."""
+    host = _make_host_process()
+    started = threading.Event()
+    release = threading.Event()
+    destination = str(tmp_path / "app")
+
+    def _clone(frame: HostCloneRepositoryFrame) -> HostCloneRepositoryResultFrame:
+        started.set()
+        if not release.wait(timeout=1.0):
+            raise AssertionError("test did not release the clone worker")
+        return HostCloneRepositoryResultFrame(
+            request_id=frame.request_id, status="ok", path=frame.path
+        )
+
+    monkeypatch.setattr("omnigent.host.connect.clone_repository", _clone)
+    tunnel = _FakeTunnel()
+    request = HostCloneRepositoryFrame(
+        request_id="clone-1", url="https://git.example.com/team/app.git", path=destination
+    )
+    dispatch = asyncio.create_task(host._dispatch_host_frame(tunnel, request))  # type: ignore[arg-type]
+    assert await asyncio.to_thread(started.wait, 1.0)
+    assert host._owned_subprocess_ops == 1
+
+    release.set()
+    await dispatch
+    assert host._owned_subprocess_ops == 0
+    assert decode_host_frame(tunnel.sent[0]) == HostCloneRepositoryResultFrame(
+        request_id="clone-1", status="ok", path=destination
+    )
 
 
 # ── host.create_dir handler ─────────────────────────────
@@ -11483,15 +11578,71 @@ def test_github_commit_ops_are_served_on_host(
     assert patch.payload == {"object": "session.github.pr_diff", "patch": "commit-patch"}
 
 
+def _host_with_tracked_pr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gh: Callable[..., tuple[int, str, str]]
+) -> tuple[HostProcess, str]:
+    """A host whose session tracks one PR, with every ``gh`` call going to ``gh``."""
+    from omnigent.runner import github_resource
+    from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    url = "https://github.com/example/one/pull/42"
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(url)], relationship="created", source="test"
+    )
+    return _make_host_process(), url
+
+
+def test_github_merge_on_host_runs_as_the_confirmed_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tunneled merge-as runs with the confirmed account's own token."""
+    from omnigent.host.frames import HostFsWriteFrame
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.delenv("IS_SANDBOX", raising=False)
+    calls: list[tuple[list[str], object]] = []
+
+    def gh(argv: list[str], **kwargs: object) -> tuple[int, str, str]:
+        calls.append((argv, kwargs.get("token")))
+        if argv[:2] == ["auth", "token"]:
+            return 0, f"token-{argv[3]}", ""
+        return 0, "", ""
+
+    host, url = _host_with_tracked_pr(tmp_path, monkeypatch, gh)
+    try:
+        merged = host._handle_fs_write(
+            HostFsWriteFrame(
+                request_id="merge",
+                op="github_merge_as",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={
+                    "pr_url": url,
+                    "merge_method": "rebase",
+                    "expected_head": "a" * 40,
+                    "account": "personal",
+                },
+            )
+        )
+    finally:
+        _cleanup_host(host)
+
+    assert merged.status == "ok", merged
+    argv, token = calls[-1]
+    assert argv[:2] == ["pr", "merge"]
+    assert argv[-3:] == ["--rebase", "--match-head-commit", "a" * 40]
+    assert token == "token-personal"
+
+
 def test_github_merge_ops_are_served_on_host(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The host reads merge options and merges a tracked PR when the runner is offline."""
     from omnigent.host.frames import HostFsRequestFrame, HostFsWriteFrame
     from omnigent.runner import github_resource
-    from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 
-    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(github_resource, "_pr_token", lambda *_a: None)
     calls: list[list[str]] = []
 
@@ -11505,12 +11656,7 @@ def test_github_merge_ops_are_served_on_host(
             )
         return 0, "", ""
 
-    monkeypatch.setattr(github_resource, "_gh", gh)
-    url = "https://github.com/example/one/pull/42"
-    SessionPrRegistry("session").record(
-        [PullRequestRef.from_url(url)], relationship="created", source="test"
-    )
-    host = _make_host_process()
+    host, url = _host_with_tracked_pr(tmp_path, monkeypatch, gh)
     try:
         options = host._handle_fs_request(
             HostFsRequestFrame(

@@ -122,6 +122,7 @@ from .executor import (
     TurnComplete,
     classify_tool_result,
     describe_exception,
+    pending_interruption_marker,
 )
 from .hook_scripts.subagent_router import HOOK_TIMEOUT_HEADROOM_S as _ROUTER_HOOK_HEADROOM_S
 from .hook_scripts.subagent_router import REQUEST_TIMEOUT_S as _ROUTER_REQUEST_TIMEOUT_S
@@ -170,9 +171,8 @@ CodexToolExecutor: TypeAlias = Callable[
     Awaitable[CodexToolResult] | CodexToolResult,
 ]
 
-# When the app-server is silent for this long we emit a warning,
-# but keep waiting — a long-running tool or model call can legitimately
-# block events far longer than any fixed deadline.
+# Warn when model/tool progress stops, even if unrelated notifications arrive.
+# Keep waiting: a tool or model call can legitimately exceed any fixed deadline.
 _TURN_EVENT_WARN_SECONDS = 600.0
 # The idle wait polls on this shorter interval so a fatal gateway error the
 # stderr loop sets mid-wait is acted on promptly, rather than only when the
@@ -180,6 +180,8 @@ _TURN_EVENT_WARN_SECONDS = 600.0
 # warning cadence is unchanged.
 _TURN_EVENT_POLL_SECONDS = 5.0
 _TURN_COMPLETED_DRAIN_SECONDS = 1.0
+# Leaves room under the harness adapter's 2s interrupt settle budget for the turn to end.
+_TURN_INTERRUPT_TIMEOUT_S = 1.5
 # Wall-clock budget for the ``codex --version`` probe. A broken codex
 # build that blocks (e.g. on stdin) must not stall session startup — on
 # timeout the probe kills the process and reports the version as unknown.
@@ -1489,20 +1491,11 @@ def materialize_codex_provider_config(
             os.chmod(config_path, 0o600)
         return argv_overrides
 
-    for provider_name, effective_provider in gateway_providers.items():
+    for provider_name in gateway_providers:
         if provider_name in CODEX_BUILTIN_PROVIDERS:
             continue
         if provider_name not in providers:
             providers[provider_name] = tomlkit.inline_table()
-        provider_config = providers[provider_name]
-        name = effective_provider.get("name")
-        # Hook-trust writes validate inactive providers too, without CLI name overlays.
-        if isinstance(provider_config, MutableMapping) and isinstance(name, str) and name.strip():
-            configured_name = provider_config.get("name")
-            if "name" not in provider_config or (
-                isinstance(configured_name, str) and not configured_name.strip()
-            ):
-                provider_config["name"] = name
 
     policy = retry_policy if retry_policy is not None else RetryPolicy()
     for provider_name, provider_config in list(providers.items()):
@@ -1524,6 +1517,17 @@ def materialize_codex_provider_config(
         effective = resolved if isinstance(resolved, Mapping) else provider_config
         base_url = effective.get("base_url")
         if isinstance(base_url, str) and is_databricks_ai_gateway_url(base_url):
+            configured_name = provider_config.get("name")
+            # Config writes validate inactive gateways even when discovery failed.
+            if "name" not in provider_config or (
+                isinstance(configured_name, str) and not configured_name.strip()
+            ):
+                resolved_name = effective.get("name")
+                provider_config["name"] = (
+                    resolved_name
+                    if isinstance(resolved_name, str) and resolved_name.strip()
+                    else provider_name
+                )
             headers = provider_config.get("http_headers")
             effective_headers = effective.get("http_headers")
             attributed = with_gateway_attribution(
@@ -2709,23 +2713,34 @@ def _build_initial_prompt(
     return "\n".join(lines)
 
 
-def _prompt_for_turn(messages: list[Message], *, is_new_thread: bool) -> str | list[CodexParams]:
+def _prompt_for_turn(
+    messages: list[Message], *, is_new_thread: bool, after_interrupt: bool = False
+) -> str | list[CodexParams]:
     """
     Choose the prompt payload for a Codex turn.
 
     A fresh Codex thread must receive the full replayable
     transcript so the harness can preserve parent history on
     sub-agent calls. Resumed threads should only receive the
-    latest user message.
+    latest user message, preceded by the runner's interruption
+    marker when the thread's previous turn was interrupted.
 
     :param messages: Conversation history.
     :param is_new_thread: ``True`` when starting a fresh Codex
         thread.
+    :param after_interrupt: ``True`` when the resumed thread's
+        previous turn was interrupted and no input has followed.
     :returns: A string prompt or a list of content block dicts.
     """
     if is_new_thread:
         return _build_initial_prompt(messages)
-    return _extract_latest_user_content(messages)
+    latest_user_content = _extract_latest_user_content(messages)
+    marker = pending_interruption_marker(messages) if after_interrupt else None
+    if marker is None:
+        return latest_user_content
+    if isinstance(latest_user_content, list):
+        return [{"type": "input_text", "text": marker}, *latest_user_content]
+    return f"{marker}\n\n{latest_user_content}"
 
 
 def _to_codex_input_items(
@@ -3070,6 +3085,9 @@ class _CodexAppServerSession:
         self._native_progress_observed = False
         self._reader_started_turn: str | None = None
         self._reader_completed_turn: str | None = None
+        self._interrupted_turn_id: str | None = None
+        # Whether the next turn's input must carry the runner's interruption marker.
+        self._interruption_marker_pending = False
         self._next_id = 1
         self._started = False
         self._starting = False
@@ -4067,7 +4085,10 @@ class _CodexAppServerSession:
                 if message.get("role") == "user":
                     message["content"] = goal_objective
                     break
-        prompt = _prompt_for_turn(prompt_messages, is_new_thread=is_new_thread)
+        after_interrupt = self._interruption_marker_pending
+        prompt = _prompt_for_turn(
+            prompt_messages, is_new_thread=is_new_thread, after_interrupt=after_interrupt
+        )
         if isinstance(prompt, list):
             turn_input = _to_codex_input_items(prompt)
         else:
@@ -4116,6 +4137,8 @@ class _CodexAppServerSession:
             "turn/start",
             turn_params,
         )
+        if after_interrupt:
+            self._interruption_marker_pending = False
         if effort_via_turn_start:
             self._applied_effort = reasoning_effort
         raw_active_turn_id = start_response.get("result", {}).get("turn", {}).get("id")
@@ -4154,8 +4177,34 @@ class _CodexAppServerSession:
         pending_tool_results: dict[str, _PendingToolResult] = {}
         observed_builtin_tool_ids: set[str] = set()
         completed_builtin_tool_ids: set[str] = set()
+        active_builtin_tools: dict[str, str] = {}
         final_response = ""
         observed_turn_id: str | None = None
+        last_progress_at = time.monotonic()
+        last_event_at = last_progress_at
+        last_warning_at = last_progress_at
+
+        def _warn_if_idle() -> None:
+            nonlocal last_warning_at
+            now = time.monotonic()
+            if now - max(last_progress_at, last_warning_at) < _TURN_EVENT_WARN_SECONDS:
+                return
+            last_warning_at = now
+            pending_tools = [
+                {"call_id": call_id, "name": pending.name, "status": pending.status.value}
+                for call_id, pending in pending_tool_results.items()
+            ]
+            logger.warning(
+                "Codex turn %s has been idle for %ds without model/tool progress "
+                "(thread_id=%s last_event_age_s=%d active_builtin_tools=%s "
+                "pending_tool_results=%s); still waiting.",
+                active_turn_id,
+                int(now - last_progress_at),
+                self.thread_id,
+                int(now - last_event_at),
+                active_builtin_tools,
+                pending_tools,
+            )
 
         def _event_turn_matches(params: CodexParams) -> bool:
             nonlocal active_turn_id, observed_turn_id
@@ -4199,9 +4248,8 @@ class _CodexAppServerSession:
 
         try:
             while True:
+                _warn_if_idle()
                 event_task = asyncio.ensure_future(self._events.get())
-                idle_seconds = 0.0
-                seconds_since_warn = 0.0
                 fatal_gateway_error: _CodexGatewayError | None = None
                 # Poll on the shorter of the two intervals so a fatal gateway
                 # error set mid-wait is acted on promptly; when a test shrinks
@@ -4220,31 +4268,7 @@ class _CodexAppServerSession:
                         if self._fatal_gateway_error is not None:
                             fatal_gateway_error = self._fatal_gateway_error
                             break
-                        idle_seconds += poll_interval
-                        seconds_since_warn += poll_interval
-                        if seconds_since_warn < _TURN_EVENT_WARN_SECONDS:
-                            continue
-                        seconds_since_warn = 0.0
-                        pending_tool_summaries = [
-                            {
-                                "call_id": call_id,
-                                "name": pending.name,
-                                "status": pending.status.value,
-                                "error": pending.error,
-                            }
-                            for call_id, pending in pending_tool_results.items()
-                        ]
-                        logger.warning(
-                            "Codex turn %s has been idle for %ds "
-                            "(thread_id=%s recent_events=%s recent_stderr=%s "
-                            "pending_tool_results=%s); still waiting.",
-                            active_turn_id,
-                            int(idle_seconds),
-                            self.thread_id,
-                            self._format_recent_events(),
-                            self._recent_stderr[-8:],
-                            pending_tool_summaries,
-                        )
+                        _warn_if_idle()
                 except BaseException:
                     event_task.cancel()
                     with suppress(BaseException):
@@ -4269,6 +4293,7 @@ class _CodexAppServerSession:
                 if isinstance(message, HarnessTransportClosedError):
                     raise message
 
+                last_event_at = time.monotonic()
                 self._record_event(message)
                 raw_method = message.get("method")
                 method: str | None = raw_method if isinstance(raw_method, str) else None
@@ -4280,12 +4305,22 @@ class _CodexAppServerSession:
                     item = params.get("item", {})
                     if not isinstance(item, dict):
                         continue
+                    if item.get("type") in ("reasoning", "agentMessage"):
+                        last_progress_at = time.monotonic()
                     request = _codex_builtin_tool_request(item)
                     if request is not None:
                         call_id = request.metadata["call_id"]
                         if isinstance(call_id, str) and call_id not in observed_builtin_tool_ids:
                             observed_builtin_tool_ids.add(call_id)
+                            active_builtin_tools[call_id] = request.name
+                            last_progress_at = time.monotonic()
                             yield request
+                    continue
+
+                if method == "item/commandExecution/outputDelta":
+                    # Late output from a previous command must never adopt its turn ID.
+                    if params.get("turnId") == active_turn_id and params.get("delta"):
+                        last_progress_at = time.monotonic()
                     continue
 
                 if method == "item/tool/call":
@@ -4299,6 +4334,7 @@ class _CodexAppServerSession:
                     # under an empty key.
                     if not isinstance(raw_call_id, str) or not isinstance(raw_tool_name, str):
                         continue
+                    last_progress_at = time.monotonic()
                     call_id: str = raw_call_id
                     tool_name: str = raw_tool_name
                     tool_args = params.get("arguments", {})
@@ -4333,6 +4369,7 @@ class _CodexAppServerSession:
                         int(message["id"]),
                         _dynamic_tool_result_payload(result),
                     )
+                    last_progress_at = time.monotonic()
                     yield ToolCallComplete(
                         name=tool_name,
                         status=classification.status,
@@ -4352,6 +4389,7 @@ class _CodexAppServerSession:
                         continue
                     if not raw_delta:
                         continue
+                    last_progress_at = time.monotonic()
                     item_id: str = raw_item_id
                     delta: str = raw_delta
                     prior = message_buffers.get(item_id)
@@ -4365,6 +4403,7 @@ class _CodexAppServerSession:
                     raw_reasoning_delta = params.get("delta")
                     if not isinstance(raw_reasoning_delta, str) or not raw_reasoning_delta:
                         continue
+                    last_progress_at = time.monotonic()
                     # Each reasoning paragraph streams as its own item, so a
                     # new itemId marks a paragraph boundary. Surface it as a
                     # reasoning_started marker: downstream reducers flush the
@@ -4390,12 +4429,16 @@ class _CodexAppServerSession:
                     item_type: str | None = (
                         raw_item_type if isinstance(raw_item_type, str) else None
                     )
+                    if item_type in ("reasoning", "agentMessage"):
+                        last_progress_at = time.monotonic()
                     builtin_completion = _codex_builtin_tool_completion(item)
                     if builtin_completion is not None:
                         call_id = builtin_completion.metadata["call_id"]
                         if not isinstance(call_id, str) or call_id in completed_builtin_tool_ids:
                             continue
                         completed_builtin_tool_ids.add(call_id)
+                        active_builtin_tools.pop(call_id, None)
+                        last_progress_at = time.monotonic()
                         # The start remains a live in-progress observation. Re-emit
                         # its completed form here because the relay deliberately
                         # persists only completed function calls.
@@ -4443,6 +4486,7 @@ class _CodexAppServerSession:
                         if not isinstance(raw_dyn_call_id, str):
                             continue
                         pending_tool_results.pop(raw_dyn_call_id, None)
+                        last_progress_at = time.monotonic()
                         continue
 
                 if method == "thread/tokenUsage/updated":
@@ -4488,7 +4532,7 @@ class _CodexAppServerSession:
                         self._certificate_failure = None
                     if not final_response:
                         final_response = _latest_buffered_agent_message(message_buffers)
-                    if not final_response:
+                    if not final_response and _codex_turn_status(turn) != "interrupted":
                         final_response = await self._drain_turn_completed_tail(
                             active_turn_id=active_turn_id,
                             message_buffers=message_buffers,
@@ -4598,15 +4642,28 @@ class _CodexAppServerSession:
         return True
 
     async def interrupt_turn(self) -> bool:
-        if self.thread_id is None or self.active_turn_id is None:
+        turn_id = self.active_turn_id
+        if self.thread_id is None:
             return False
-        await self._request(
-            "turn/interrupt",
-            {
-                "threadId": self.thread_id,
-                "turnId": self.active_turn_id,
-            },
-        )
+        # Arming without an active turn is harmless: the marker is sent only if history holds it.
+        self._interruption_marker_pending = True
+        if turn_id is None:
+            return False
+        if turn_id in (self._interrupted_turn_id, self._reader_completed_turn):
+            return True
+        self._interrupted_turn_id = turn_id
+        try:
+            await self._request(
+                "turn/interrupt",
+                {
+                    "threadId": self.thread_id,
+                    "turnId": turn_id,
+                },
+            )
+        except BaseException:
+            if self._interrupted_turn_id == turn_id:
+                self._interrupted_turn_id = None
+            raise
         return True
 
     async def _interrupt_failed_turn(self, cause: str) -> None:
@@ -5244,16 +5301,17 @@ class CodexExecutor(Executor):
     def supports_live_message_queue(self) -> bool:
         return True
 
+    def resumes_after_interrupt(self) -> bool:
+        return True
+
     async def interrupt_session(self, session_key: str) -> bool:
         state = self._session_states.get(session_key)
         if state is None or state.app_session is None:
             return False
-        # Best-effort interrupt to halt the in-flight turn; a failure just
-        # falls through to the close below.
         try:
-            await asyncio.wait_for(
+            return await asyncio.wait_for(
                 state.app_session.interrupt_turn(),
-                timeout=0.5,
+                timeout=_TURN_INTERRUPT_TIMEOUT_S,
             )
         except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
             logger.warning(
@@ -5261,11 +5319,8 @@ class CodexExecutor(Executor):
                 session_key,
                 exc,
             )
-        # Always drop the session (resets thread_id) so the next turn starts a
-        # fresh thread and replays full history. A resumed thread sends only
-        # the latest user message, which would bypass the runner's
-        # "[System: interrupted]" marker and silently continue the abandoned
-        # request. See claude_sdk_executor.interrupt_session for the rationale.
+        # The turn may still be running, so drop the thread; the next turn starts
+        # a fresh one and replays history, including the interruption marker.
         try:
             await self.close_session(session_key)
             return True
