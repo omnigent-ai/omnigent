@@ -168,6 +168,23 @@ def test_bridge_state_preserves_native_working_directory(tmp_path: Path) -> None
     assert updated.cwd == str(tmp_path)
 
 
+@pytest.mark.parametrize("changed_field", ["session_id", "thread_id", "socket_path", "codex_home"])
+def test_shell_submission_requires_its_original_binding(
+    tmp_path: Path, changed_field: str
+) -> None:
+    """A stale sender cannot install a pending shell marker in a replacement binding."""
+    _seed_active_turn(tmp_path, None)
+    original = read_bridge_state(tmp_path)
+    assert original is not None
+    replacement = replace(original, **{changed_field: f"replacement_{changed_field}"})
+    write_bridge_state(tmp_path, replacement)
+
+    assert (
+        codex_native_bridge.mark_shell_command_pending(tmp_path, original, "old_request") is False
+    )
+    assert read_bridge_state(tmp_path) == replacement
+
+
 @pytest.mark.parametrize("native_turn", [None, "turn_agent", "turn_shell"])
 def test_shell_reconciliation_requires_idle_or_the_original_parent(
     tmp_path: Path, native_turn: str | None
@@ -189,7 +206,8 @@ def test_shell_reconciliation_requires_idle_or_the_original_parent(
 
 
 @pytest.mark.parametrize(
-    "changed_field", ["pending_shell_command_id", "session_id", "thread_id", "socket_path"]
+    "changed_field",
+    ["pending_shell_command_id", "session_id", "thread_id", "socket_path", "codex_home"],
 )
 def test_shell_reconciliation_does_not_clear_a_newer_submission_or_session(
     tmp_path: Path, changed_field: str

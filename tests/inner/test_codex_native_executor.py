@@ -1708,6 +1708,46 @@ def test_shell_reconciliation_requires_a_core_fence_refusal(
     assert read_bridge_state(tmp_path) == pending
 
 
+@pytest.mark.parametrize("observed_shell", [False, True])
+def test_shell_fence_preserves_replacement_home_markers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, observed_shell: bool
+) -> None:
+    """The old peer's idle response cannot settle shell work in a replacement home."""
+    _seed_bridge(tmp_path, active_turn_id="turn_shell" if observed_shell else None)
+    initial = read_bridge_state(tmp_path)
+    assert initial is not None
+    pending = replace(
+        initial,
+        active_shell_turn_id="turn_shell" if observed_shell else None,
+        pending_shell_command_id=None if observed_shell else "pending_shell",
+    )
+    write_bridge_state(tmp_path, pending)
+    replacement = replace(pending, codex_home=str(tmp_path / "replacement-home"))
+
+    class _ReplacedHomeClient(_FakeCodexNativeClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            type(self).requests.append((method, params))
+            assert method == "turn/steer" and params["input"] == []
+            write_bridge_state(tmp_path, replacement)
+            raise CodexAppServerResponseError(
+                {"code": -32600, "message": "no active turn to steer"}
+            )
+
+    _ReplacedHomeClient.requests = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _ReplacedHomeClient
+    )
+    events = _collect_turn_events(
+        CodexNativeExecutor(bridge_dir=tmp_path), "retain this follow-up"
+    )
+
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert events[0].undelivered is True
+    assert events[0].preserve_session is True
+    assert read_bridge_state(tmp_path) == replacement
+    assert len(_ReplacedHomeClient.requests) == 1
+
+
 def test_accepted_shell_remains_delivered_when_the_native_thread_changes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
