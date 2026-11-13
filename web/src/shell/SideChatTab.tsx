@@ -230,13 +230,7 @@ export function SideChatTabsDragArea({
     if (over && active.id !== over.id) onMove(String(active.id), String(over.id));
   };
   return (
-    <DndContext
-      sensors={sensors}
-      collisionDetection={closestInSameGroup}
-      onDragEnd={onDragEnd}
-      // Keep dnd-kit's screen-reader live region out of the one-row tab strip.
-      accessibility={{ container: document.body }}
-    >
+    <DndContext sensors={sensors} collisionDetection={closestInSameGroup} onDragEnd={onDragEnd}>
       {children}
     </DndContext>
   );
