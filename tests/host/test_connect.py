@@ -4984,7 +4984,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
         "OMNIGENT_LOG_LEVEL": "DEBUG",
         "OMNIGENT_LOG_TO_STDERR": "1",
         "OMNIGENT_LOG_TTY_FD": "9",
-        "OMNIGENT_WRAPPER_COMMAND": "isaac omni",
+        "OMNIGENT_WRAPPER_COMMAND": "example-wrapper omni",
         "OMNIGENT_DEBUG_LOG_CLIENT_SECRET_COMMAND": "credential-helper --format raw",
         "OMNIGENT_MCP_AUTH_STATUS_FILE": "/srv/omnigent/mcp-auth-status.json",
     }
@@ -5065,7 +5065,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
     assert env["OMNIGENT_LOG_TO_STDERR"] == "1"
     assert env["OMNIGENT_LOG_TTY_FD"] == "9"
     # Runner-side CLI hints name the wrapper the user runs.
-    assert env["OMNIGENT_WRAPPER_COMMAND"] == "isaac omni"
+    assert env["OMNIGENT_WRAPPER_COMMAND"] == "example-wrapper omni"
     # Non-harness secrets are stripped — the point of the allowlist.
     assert "DATABRICKS_TOKEN" not in env
     assert "AWS_SECRET_ACCESS_KEY" not in env

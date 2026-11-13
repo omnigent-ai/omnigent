@@ -4,11 +4,8 @@ The native Claude terminal is normally spawned as ``claude <args>`` -- the
 ``command`` defaults to ``"claude"`` in both launch paths:
 :func:`omnigent.harnesses.claude_native.main._claude_terminal_request` (local CLI) and
 ``_auto_create_claude_terminal`` in :mod:`omnigent.runner.app` (managed-host
-runner). Downstream integrations need to launch that *same* Claude Code process
-through a wrapper binary so the wrapper's process-level setup -- auth, telemetry,
-cost controls, enforcement hooks, plugin management -- is always applied. A typical
-wrapper is ``isaac``, which wraps Claude and Codex with that
-tooling; running ``isaac claude`` instead of bare ``claude`` keeps it in force.
+runner). Downstream integrations can launch that *same* Claude Code process
+through a wrapper binary so the wrapper's process-level setup remains applied.
 
 Rather than hardcode the binary at each site, both paths route the
 ``(command, args)`` pair through :func:`resolve_claude_launch`. By default this
@@ -21,20 +18,20 @@ interface and registers it as a setuptools entry point in the
 
     # the plugin package's pyproject.toml
     [project.entry-points."omnigent.claude_launcher"]
-    isaac = "isaac_omni_launcher:IsaacClaudeLauncher"
+    example = "example_launcher:ExampleClaudeLauncher"
 
-    # isaac_omni_launcher.py
+    # example_launcher.py
     from omnigent.claude_launcher import ClaudeLauncher
 
-    class IsaacClaudeLauncher(ClaudeLauncher):
+    class ExampleClaudeLauncher(ClaudeLauncher):
         def launch(self, command, args):
-            return "isaac", ["claude", "--", *args]
+            return "example-wrapper", [command, "--", *args]
 
 Any caller attaches a plugin by ``pip install``-ing such a package into the
 environment the runner runs in -- no Omnigent code change, no in-tree import
 path. At launch time, the ``OMNIGENT_CLAUDE_LAUNCHER`` environment variable
-selects *which* registered launcher to use, by entry-point name (e.g.
-``OMNIGENT_CLAUDE_LAUNCHER=isaac``). Unset -> default launch. The selected
+selects *which* registered launcher to use, by entry-point name. Unset means the
+command is launched unchanged. The selected
 launcher receives the fully-augmented argv (MCP config, hook settings and skill
 flags injected by :func:`augment_claude_args`), so a launcher that merely wraps
 the command preserves the Omnigent bridge unchanged.
@@ -122,8 +119,7 @@ def _load_launcher(name: str) -> ClaudeLauncher | None:
     """
     Resolve and instantiate the launcher registered under *name* via entry points.
 
-    :param name: Entry-point name from :data:`CLAUDE_LAUNCHER_ENV_VAR`, e.g.
-        ``"isaac"``.
+    :param name: Entry-point name from :data:`CLAUDE_LAUNCHER_ENV_VAR`.
     :returns: A :class:`ClaudeLauncher` instance, or ``None`` when no matching
         entry point is registered, it fails to load/instantiate, or it does not
         implement :class:`ClaudeLauncher`.

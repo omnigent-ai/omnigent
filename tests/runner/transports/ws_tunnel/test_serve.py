@@ -789,7 +789,7 @@ async def test_serve_tunnel_reauth_hint_uses_wrapper_command(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", "isaac omni")
+    monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", "example-wrapper omni")
 
     async def _serve_once(app: Any, **_kwargs: Any) -> None:
         """Raise 401.
@@ -811,11 +811,14 @@ async def test_serve_tunnel_reauth_hint_uses_wrapper_command(
 
     with pytest.raises(
         RuntimeError,
-        match=r"run `isaac omni login https://example.databricksapps\.com` to re-authenticate",
+        match=(
+            r"run `example-wrapper omni login https://accounts\.cloud\.databricks\.com` "
+            r"to re-authenticate"
+        ),
     ):
         await serve_tunnel(
             _noop_app,
-            server_url="https://example.databricksapps.com",
+            server_url="https://accounts.cloud.databricks.com",
             runner_id="runner_env_hint",
             runner_version="0.1.0",
             auth_token="tok-expired",
@@ -974,7 +977,7 @@ async def test_serve_tunnel_auth_redirect_hint_uses_wrapper_command(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", "isaac omni")
+    monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", "example-wrapper omni")
 
     async def _serve_once(app: Any, **_kwargs: Any) -> None:
         """Redirect every upgrade to the OAuth login page.
@@ -996,10 +999,11 @@ async def test_serve_tunnel_auth_redirect_hint_uses_wrapper_command(
     monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
     monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
 
+    server_url = "https://accounts.cloud.databricks.com"
     with pytest.raises(RuntimeError) as exc_info:
         await serve_tunnel(
             _noop_app,
-            server_url="https://example.databricksapps.com",
+            server_url=server_url,
             runner_id="runner_redirect_env_hint",
             runner_version="0.1.0",
         )
@@ -1007,8 +1011,8 @@ async def test_serve_tunnel_auth_redirect_hint_uses_wrapper_command(
     message = str(exc_info.value)
     assert message.startswith(serve_module.RUNNER_TUNNEL_REJECTION_PREFIX)
     # Both hints name the wrapper the user actually runs, not the naked binary.
-    assert "`isaac omni login https://example.databricksapps.com` to re-authenticate" in message
-    assert "run `isaac omni setup` to configure credentials" in message
+    assert f"`example-wrapper omni login {server_url}` to re-authenticate" in message
+    assert "run `example-wrapper omni setup` to configure credentials" in message
     assert "`omnigent " not in message
 
 

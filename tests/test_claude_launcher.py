@@ -63,23 +63,28 @@ def test_identity_returns_fresh_list(monkeypatch):
 
 
 def test_plugin_wraps_command(monkeypatch):
-    cls = _launcher_cls(lambda command, args: ("isaac", ["claude", "--omni", "--", *args]))
-    _register(monkeypatch, _FakeEntryPoint("isaac", cls))
-    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "isaac")
+    cls = _launcher_cls(
+        lambda command, args: ("example-wrapper", [command, "--mode", "custom", "--", *args])
+    )
+    _register(monkeypatch, _FakeEntryPoint("example", cls))
+    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "example")
     command, args = resolve_claude_launch("claude", ["--mcp-config", "{}"])
-    assert command == "isaac"
-    assert args == ["claude", "--omni", "--", "--mcp-config", "{}"]
+    assert command == "example-wrapper"
+    assert args == ["claude", "--mode", "custom", "--", "--mcp-config", "{}"]
 
 
 def test_plugin_selected_by_name_among_several(monkeypatch):
     _register(
         monkeypatch,
         _FakeEntryPoint("other", _launcher_cls(lambda command, args: ("nope", []))),
-        _FakeEntryPoint("isaac", _launcher_cls(lambda command, args: ("isaac", ["--", *args]))),
+        _FakeEntryPoint(
+            "example",
+            _launcher_cls(lambda command, args: ("example-wrapper", ["--", *args])),
+        ),
     )
-    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "isaac")
+    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "example")
     command, args = resolve_claude_launch("claude", ["--x"])
-    assert command == "isaac"
+    assert command == "example-wrapper"
     assert args == ["--", "--x"]
 
 
@@ -90,8 +95,8 @@ def test_plugin_receives_default_command_and_args(monkeypatch):
         seen["command"], seen["args"] = command, args
         return command, args
 
-    _register(monkeypatch, _FakeEntryPoint("isaac", _launcher_cls(record)))
-    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "isaac")
+    _register(monkeypatch, _FakeEntryPoint("example", _launcher_cls(record)))
+    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "example")
     resolve_claude_launch("claude", ["--x"])
     assert seen == {"command": "claude", "args": ["--x"]}
 
@@ -99,7 +104,7 @@ def test_plugin_receives_default_command_and_args(monkeypatch):
 def test_unknown_name_falls_back(monkeypatch):
     _register(
         monkeypatch,
-        _FakeEntryPoint("isaac", _launcher_cls(lambda command, args: ("isaac", []))),
+        _FakeEntryPoint("example", _launcher_cls(lambda command, args: ("example-wrapper", []))),
     )
     monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "nonexistent")
     assert resolve_claude_launch("claude", ["--x"]) == ("claude", ["--x"])
@@ -107,13 +112,13 @@ def test_unknown_name_falls_back(monkeypatch):
 
 def test_enumerate_error_falls_back(monkeypatch):
     _register(monkeypatch, raise_on_enumerate=RuntimeError("boom"))
-    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "isaac")
+    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "example")
     assert resolve_claude_launch("claude", ["--x"]) == ("claude", ["--x"])
 
 
 def test_load_error_falls_back(monkeypatch):
-    _register(monkeypatch, _FakeEntryPoint("isaac", ImportError("missing dep")))
-    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "isaac")
+    _register(monkeypatch, _FakeEntryPoint("example", ImportError("missing dep")))
+    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "example")
     assert resolve_claude_launch("claude", ["--x"]) == ("claude", ["--x"])
 
 
@@ -123,17 +128,17 @@ def test_instantiate_error_falls_back(monkeypatch):
             raise RuntimeError("ctor boom")
 
         def launch(self, command, args):
-            return "isaac", ["--", *args]
+            return "example-wrapper", ["--", *args]
 
-    _register(monkeypatch, _FakeEntryPoint("isaac", _Bad))
-    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "isaac")
+    _register(monkeypatch, _FakeEntryPoint("example", _Bad))
+    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "example")
     assert resolve_claude_launch("claude", ["--x"]) == ("claude", ["--x"])
 
 
 def test_not_a_claude_launcher_falls_back(monkeypatch):
     # A class that does NOT implement ClaudeLauncher must be rejected.
-    _register(monkeypatch, _FakeEntryPoint("isaac", object))
-    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "isaac")
+    _register(monkeypatch, _FakeEntryPoint("example", object))
+    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "example")
     assert resolve_claude_launch("claude", ["--x"]) == ("claude", ["--x"])
 
 
@@ -141,8 +146,8 @@ def test_plugin_raises_falls_back(monkeypatch):
     def boom(command, args):
         raise RuntimeError("boom")
 
-    _register(monkeypatch, _FakeEntryPoint("isaac", _launcher_cls(boom)))
-    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "isaac")
+    _register(monkeypatch, _FakeEntryPoint("example", _launcher_cls(boom)))
+    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "example")
     assert resolve_claude_launch("claude", ["--x"]) == ("claude", ["--x"])
 
 
@@ -158,6 +163,6 @@ def test_plugin_raises_falls_back(monkeypatch):
     ],
 )
 def test_malformed_return_falls_back(monkeypatch, bad):
-    _register(monkeypatch, _FakeEntryPoint("isaac", _launcher_cls(lambda command, args: bad)))
-    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "isaac")
+    _register(monkeypatch, _FakeEntryPoint("example", _launcher_cls(lambda command, args: bad)))
+    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "example")
     assert resolve_claude_launch("claude", ["--x"]) == ("claude", ["--x"])

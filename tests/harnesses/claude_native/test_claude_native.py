@@ -353,20 +353,20 @@ def test_claude_terminal_request_launcher_plugin_wraps(tmp_path, monkeypatch) ->
 
     Exercises the local-CLI wiring of :func:`resolve_claude_launch`: with a
     launcher plugin selected, the terminal spec runs the wrapped command
-    (here ``isaac -- <augmented args>``) while the Omnigent bridge
+    (here ``example-wrapper -- <augmented args>``) while the Omnigent bridge
     (``--mcp-config`` / ``--settings``) survives intact in the passed-through
     argv.
     """
 
     from omnigent.claude_launcher import ClaudeLauncher
 
-    class _IsaacLauncher(ClaudeLauncher):
+    class _ExampleLauncher(ClaudeLauncher):
         def launch(self, command, args):
-            return "isaac", ["--", *args]
+            return "example-wrapper", ["--", *args]
 
-    entry_point = SimpleNamespace(name="isaac", load=lambda: _IsaacLauncher)
+    entry_point = SimpleNamespace(name="example", load=lambda: _ExampleLauncher)
     monkeypatch.setattr(importlib.metadata, "entry_points", lambda *, group: [entry_point])
-    monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "isaac")
+    monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "example")
     monkeypatch.chdir(tmp_path)
     body = claude_native._claude_terminal_request(
         ("--resume", "s", "--append-system-prompt", "Review like a staff engineer."),
@@ -375,8 +375,8 @@ def test_claude_terminal_request_launcher_plugin_wraps(tmp_path, monkeypatch) ->
         append_system_prompt="Claude Code is running in the session terminal.",
     )
     spec = body["spec"]
-    assert spec["command"] == "isaac"
-    # Claude's argv is now passed through isaac after the ``--`` separator.
+    assert spec["command"] == "example-wrapper"
+    # Claude's argv is passed through the wrapper after the ``--`` separator.
     assert spec["args"][0] == "--"
     assert spec["args"][1:3] == ["--resume", "s"]
     # Omnigent's prompt joins the caller's flag, so the launch carries the caller's prompt once.
@@ -11458,7 +11458,7 @@ def test_tool_use_result_regression_old_flatten_would_crash_resume() -> None:
     Pin the resume crash to the old ``toolUseResult = output`` flatten.
 
     Claude Code ``JSON.parse``s ``toolUseResult`` for its ``TaskOutput``
-    renderer at resume time. A real ``isaac review`` result whose text
+    renderer at resume time. A real wrapper review result whose text
     starts with ``<retrieval_status>...`` is not valid JSON, so the old
     verbatim flatten crashed the TUI at boot with "Unrecognized token
     '<'" before the input prompt rendered — the failure the user hit.

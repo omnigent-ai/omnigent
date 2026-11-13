@@ -2219,7 +2219,7 @@ WRAPPER_BYPASS_ENV = "OMNIGENT_WRAPPER_BYPASS"
 def _wrapper_guard_error(env: Mapping[str, str], prog: str) -> str | None:
     """Return the block message when a naked ``omni`` call is refused, else ``None``.
 
-    A deployment that wraps the CLI (e.g. ``isaac omni``) sets
+    A deployment that wraps the CLI (e.g. ``example-wrapper omni``) sets
     ``OMNIGENT_REQUIRE_WRAPPER`` so direct calls are refused; the wrapper sets
     ``OMNIGENT_WRAPPER_BYPASS`` around its own invocation to pass through, and
     ``OMNIGENT_WRAPPER_COMMAND`` names the command to suggest instead.
@@ -2273,7 +2273,7 @@ def main() -> None:
 
     install_crash_handler(app_name="omnigent", repo="omnigent-ai/omnigent")
 
-    # Operators can force all use through a wrapper (e.g. `isaac omni`) by
+    # Operators can force all use through a wrapper (e.g. `example-wrapper omni`) by
     # setting OMNIGENT_REQUIRE_WRAPPER; the wrapper sets OMNIGENT_WRAPPER_BYPASS
     # to pass through. Refuse naked calls before any work happens.
     _enforce_wrapper_guard()
