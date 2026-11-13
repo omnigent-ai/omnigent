@@ -2244,9 +2244,11 @@ async def test_pre_resolved_elicitation_tombstones_prune_expired_and_excess(
         _harness_pre_resolved_elicitations.clear()
 
 
+@pytest.mark.parametrize("tool_name", ["Bash", "AskUserQuestion"])
 async def test_permission_request_hook_clears_index_on_client_disconnect(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
 ) -> None:
     """
     When the upstream client (Claude) closes its HTTP connection
@@ -2256,7 +2258,8 @@ async def test_permission_request_hook_clears_index_on_client_disconnect(
 
     A severed connection is ambiguous (TUI answered vs proxy cut an
     idle long-poll), so the clear waits out the grace instead of
-    wiping a card the hook's retry is about to re-park.
+    wiping a card the hook's retry is about to re-park. A question
+    without a hook-supplied id can never re-park, so it keeps this grace.
 
     The disconnect is simulated by patching the polling helper rather
     than wiring a real TCP teardown through the in-process ASGI
@@ -2294,7 +2297,7 @@ async def test_permission_request_hook_clears_index_on_client_disconnect(
     pending_elicitations.reset_for_tests()
     agent = await create_test_agent(client, "test-permission-disconnect")
     session_id = await _create_session(client, agent["id"])
-    payload = await _claude_permission_payload()
+    payload = await _claude_permission_payload(tool_name=tool_name)
 
     async def _drain_until_resolved() -> None:
         """
@@ -2480,16 +2483,20 @@ async def test_permission_hook_repark_within_grace_keeps_card_pending(
     pending_elicitations.reset_for_tests()
 
 
+@pytest.mark.parametrize("tool_name", ["Bash", "AskUserQuestion"])
 async def test_permission_hook_verdict_during_gap_honored_on_repark(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
 ) -> None:
     """
     A web verdict that lands between a severed long-poll and its retry
     is handed to the retry via the pre-resolved tombstone.
 
     Without it the retry would re-publish and fail-ask later — the
-    user's click silently dropped, the sub-agent still blocked.
+    user's click silently dropped, the sub-agent still blocked. The
+    severed wait's deferred clear ends with the verdict instead of
+    later reporting the answered prompt as unanswered.
     """
     from omnigent.runtime import pending_elicitations
 
@@ -2515,8 +2522,9 @@ async def test_permission_hook_verdict_during_gap_honored_on_repark(
     pending_elicitations.reset_for_tests()
     agent = await create_test_agent(client, "test-permission-gap-verdict")
     session_id = await _create_session(client, agent["id"])
+    collector = await start_session_stream_collector(session_id)
     payload = {
-        **(await _claude_permission_payload()),
+        **(await _claude_permission_payload(tool_name=tool_name)),
         "_omnigent_elicitation_id": _REATTACH_ELICITATION_ID,
     }
 
@@ -2545,10 +2553,16 @@ async def test_permission_hook_verdict_during_gap_honored_on_repark(
     # "allow" proves the gap verdict was honored; an empty body here
     # would mean the tombstone was dropped and the click lost.
     assert body["hookSpecificOutput"]["decision"]["behavior"] == "allow"
-    # Drain the severed poll's deferred clear so it doesn't outlive the
-    # test's event loop (it no-ops the index either way).
+    # The question's grace is unpatched, so this finishes only if the verdict ended it.
     for task in set(sessions_route._deferred_elicitation_clear_tasks):
         await asyncio.wait_for(task, timeout=5.0)
+    resolved = []
+    while not collector.queue.empty():
+        event = collector.queue.get_nowait()
+        if event.get("type") == "response.elicitation_resolved":
+            resolved.append(event)
+    await collector.stop()
+    assert [event.get("reason") for event in resolved] == [None], resolved
     pending_elicitations.reset_for_tests()
 
 

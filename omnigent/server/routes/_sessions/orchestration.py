@@ -584,11 +584,8 @@ async def _publish_and_wait_for_harness_elicitation(
         if tombstone is not None:
             # Verdict from the un-parked gap; None = terminal answered (fail-ask).
             return tombstone.result
-        severed = _harness_severed_elicitations.get(elicitation_id)
-        if severed is not None and severed.session_id == session_id:
-            # This wait now owns the card; wake the severed wait's deferred clear.
-            _harness_severed_elicitations.pop(elicitation_id, None)
-            severed.resolved_elsewhere.set()
+        # This wait now owns the card.
+        _release_severed_harness_elicitation(session_id, elicitation_id)
         event = ElicitationRequestEvent(
             type="response.elicitation_request",
             elicitation_id=elicitation_id,
@@ -688,6 +685,23 @@ async def _publish_and_wait_for_harness_elicitation(
                     elicitation_id,
                     settled_action,
                 )
+
+
+def _release_severed_harness_elicitation(session_id: str, elicitation_id: str) -> None:
+    """
+    Take a card from the severed wait keeping it and wake that wait's deferred clear.
+
+    The woken clear finds its record gone and exits without publishing.
+
+    :param session_id: Session that owns the elicitation, e.g. ``"conv_abc123"``.
+    :param elicitation_id: Correlation id whose severed wait may hold the
+        card, e.g. ``"elicit_claude_0f3a..."``.
+    :returns: None.
+    """
+    severed = _harness_severed_elicitations.get(elicitation_id)
+    if severed is not None and severed.session_id == session_id:
+        _harness_severed_elicitations.pop(elicitation_id, None)
+        severed.resolved_elsewhere.set()
 
 
 def _schedule_deferred_elicitation_clear(
@@ -2808,6 +2822,8 @@ async def _resolve_elicitation(
         # Nothing parked (severed long-poll mid-retry, or a runner-side
         # id that just ages out) — tombstone the verdict so a re-park
         # returns it; consume is session-checked, so no cross-session use.
+        # The resolved fan-out below clears the card, so a severed wait no longer holds it.
+        _release_severed_harness_elicitation(session_id, elicitation_id)
         result_payload = {k: v for k, v in data.items() if k != "elicitation_id"}
         try:
             pre_resolved = ElicitationResult.model_validate(result_payload)
