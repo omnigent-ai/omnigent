@@ -35,7 +35,7 @@ function inputs(overrides: Partial<Parameters<typeof projectPrefillStep>[1]> = {
 /** Run the machine from the start until it settles (or stalls). */
 function runToDone(stepInputs: ReturnType<typeof inputs>) {
   let state = initialPrefillState("Alpha");
-  const writes: Record<string, string | boolean> = {};
+  const writes: Record<string, string | boolean | string[]> = {};
   for (let i = 0; i < 10; i++) {
     const step = projectPrefillStep(state, stepInputs);
     if (step === null) break;
@@ -126,6 +126,27 @@ describe("projectPrefill config seeding", () => {
     expect(writes.selectSandbox).toBe(true);
     expect(writes.hostId).toBeUndefined();
     expect(state.phase).toBe("settled");
+  });
+
+  it("seeds a stored sandbox default's repositories with the sandbox", () => {
+    const repos = ["https://github.com/example/app#main"];
+    const selected = runToDone(
+      inputs({
+        config: { hostId: SANDBOX_HOST_CHOICE, sandboxWorkspaces: repos },
+        managedSandboxesEnabled: true,
+      }),
+    );
+    expect(selected.writes.selectSandbox).toBe(true);
+    expect(selected.writes.sandboxWorkspaces).toEqual(repos);
+    // Without the sandbox pick, the repositories are not seeded either.
+    const unselected = runToDone(
+      inputs({
+        config: { hostId: SANDBOX_HOST_CHOICE, sandboxWorkspaces: repos },
+        managedSandboxesEnabled: true,
+        selectedHostId: "host_1",
+      }),
+    );
+    expect(unselected.writes.sandboxWorkspaces).toBeUndefined();
   });
 
   it("drops a stored sandbox default when the server no longer offers sandboxes", () => {

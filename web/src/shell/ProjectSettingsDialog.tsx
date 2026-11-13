@@ -1,6 +1,7 @@
 // Project settings dialog: edits the stored defaults (`config`) the new-session
-// composer prefills (host, workspace, agent, worktree and base branch, and a model
-// and effort for native harnesses), shown with the project's last start applied.
+// composer prefills (host, workspace or sandbox repositories, agent, worktree and
+// base branch, and a model and effort for native harnesses), shown with the
+// project's last start applied.
 
 import { ChevronDownIcon } from "lucide-react";
 import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
@@ -39,6 +40,12 @@ import {
   nativeCodingAgentForAvailableAgent,
 } from "@/lib/nativeCodingAgents";
 import type { ProjectConfig } from "@/lib/projectsApi";
+import type { LastSandboxRepo } from "@/lib/repoPreferences";
+import {
+  MAX_SANDBOX_REPOS,
+  composeSandboxWorkspaces,
+  splitSandboxWorkspace,
+} from "@/lib/sandboxRepositories";
 import {
   clearProjectLaunchDefaults,
   projectConfigWithLaunch,
@@ -46,10 +53,20 @@ import {
 } from "@/lib/projectLaunchPreferences";
 import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
 import { AgentHarnessPicker } from "./NewChatDialog";
+import { SandboxRepositoryPicker } from "./SandboxRepositoryPicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 
 /** Select sentinel for "no default" — Radix Select can't hold an empty value. */
 const NONE = "__none__";
+
+/** Stored sandbox repositories as picker rows; the config is untyped JSON. */
+function sandboxReposFromConfig(config: ProjectConfig): LastSandboxRepo[] {
+  if (!Array.isArray(config.sandbox_workspaces)) return [];
+  return config.sandbox_workspaces
+    .filter((workspace): workspace is string => typeof workspace === "string")
+    .map((workspace) => splitSandboxWorkspace(workspace))
+    .filter((repo) => repo.url !== "");
+}
 
 /** A labeled row: label + optional hint on the left, the control on the right. */
 function Field({
@@ -126,11 +143,27 @@ export function ProjectSettingsDialog({
   // can only fail on create.
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
   const sandboxProvider = info !== "loading" ? info.sandbox_provider : null;
+  const sandboxCapabilities =
+    info !== "loading" && sandboxProvider
+      ? info.sandbox_provider_capabilities?.[sandboxProvider]
+      : undefined;
+  // A provider that checks out a fixed list of repositories offers only those,
+  // as the automation dialog does.
+  const sandboxRepoCatalog = sandboxCapabilities?.repo_catalog ?? [];
+  const maxSandboxRepos = sandboxCapabilities?.multi_repo === true ? MAX_SANDBOX_REPOS : 1;
 
   // Draft fields. Seeded from the stored config each time the dialog opens (or
   // the fetched config arrives); local until saved.
   const [hostId, setHostId] = useState<string>(NONE);
   const [workspace, setWorkspace] = useState("");
+  // Repositories a sandbox default clones, in place of a host working directory.
+  const [sandboxRepos, setSandboxRepos] = useState<LastSandboxRepo[]>([]);
+  // A URL typed into the repository picker but not yet added; saving would drop it.
+  const [pendingRepoUrl, setPendingRepoUrl] = useState("");
+  const sandboxRepoPending =
+    hostId === SANDBOX_HOST_CHOICE &&
+    sandboxRepoCatalog.length === 0 &&
+    pendingRepoUrl.trim() !== "";
   // Worktree default for the project. The toggle seeds from the project's
   // stored value when set, else from the user-global "always use a worktree"
   // default (Settings › Git). On save it stays "inherit" (stores nothing) while
@@ -194,6 +227,8 @@ export function ProjectSettingsDialog({
     const c: ProjectConfig = projectConfigWithLaunch(stored ?? {}, launch);
     setHostId(c.host_id ?? NONE);
     setWorkspace(c.workspace ?? "");
+    setSandboxRepos(sandboxReposFromConfig(c));
+    setPendingRepoUrl("");
     setUseWorktree(c.use_worktree ?? readAlwaysUseWorktree());
     setBaseBranch(c.base_branch ?? "");
     setAgentId(c.agent_id ?? null);
@@ -207,7 +242,7 @@ export function ProjectSettingsDialog({
     e.preventDefault();
     // Guard against submitting a blank draft seeded from a failed load, which
     // the server would read as "clear the stored defaults".
-    if (loadFailed) return;
+    if (loadFailed || sandboxRepoPending) return;
     // A last-start agent that no longer exists saves as the stored agent, even
     // before the fallback effect below has re-rendered the field.
     const savedAgentId = launchAgentGone ? (stored?.agent_id ?? null) : agentId;
@@ -227,6 +262,10 @@ export function ProjectSettingsDialog({
       hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE ? trimOrUndef(workspace) : undefined;
     if (ws) config.workspace = ws;
     else delete config.workspace;
+    const sandboxWorkspaces =
+      hostId === SANDBOX_HOST_CHOICE ? composeSandboxWorkspaces(sandboxRepos) : [];
+    if (sandboxWorkspaces.length > 0) config.sandbox_workspaces = sandboxWorkspaces;
+    else delete config.sandbox_workspaces;
     if (savedAgentId) config.agent_id = savedAgentId;
     else delete config.agent_id;
     // Store the worktree choice only when it overrides the user-global default;
@@ -275,8 +314,8 @@ export function ProjectSettingsDialog({
     hostId !== SANDBOX_HOST_CHOICE &&
     !onlineHosts.some((h) => h.host_id === hostId);
   // The filesystem browser needs a concrete, online host to list against — so
-  // it's only offered when a real host is the default (not sandbox / no-default
-  // / an offline stored host). Otherwise the field is a plain path input.
+  // it's only offered when a real host is the default (not no-default / an
+  // offline stored host). Otherwise the field is a plain path input.
   const browsableHostId =
     hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE && !storedHostMissing ? hostId : null;
 
@@ -437,72 +476,132 @@ export function ProjectSettingsDialog({
             </Select>
           </Field>
 
-          <Field
-            label="Working directory"
-            hint={
-              hostId === NONE
-                ? "Pick a host first"
-                : browsableHostId
-                  ? "Browse the host or type a path"
-                  : "Absolute path on the host"
-            }
-            htmlFor="project-settings-workspace"
-          >
-            {hostId === NONE ? (
-              // Mirror the new-session composer: the working directory can only
-              // be chosen once a host is selected (the file browser lists
-              // against a concrete host, and a path is host-relative anyway).
-              <p
-                className="rounded-md border border-dashed px-3 py-2 text-muted-foreground text-ui"
-                data-testid="project-settings-workspace"
-              >
-                Pick a host first
-              </p>
-            ) : browsableHostId ? (
-              // Browsing uses the shared full-screen picker; navigation is
-              // provisional until the user confirms a folder.
-              <div
-                className="relative flex flex-col gap-1.5"
-                data-testid="project-settings-workspace"
-              >
-                <button
-                  type="button"
-                  onClick={() => setWorkspaceOpen(true)}
-                  aria-expanded={workspaceOpen}
+          {hostId === SANDBOX_HOST_CHOICE ? (
+            <Field
+              label={maxSandboxRepos > 1 ? "Repositories" : "Repository"}
+              hint="Cloned into each new sandbox"
+              htmlFor="project-settings-sandbox-repository"
+            >
+              {sandboxRepoCatalog.length > 0 ? (
+                <Select
+                  value={sandboxRepos[0]?.url ?? NONE}
+                  // The catalog picks the first repository; keep its branch
+                  // and any other repositories stored with it.
+                  onValueChange={(url) =>
+                    setSandboxRepos((current) =>
+                      url === NONE
+                        ? []
+                        : [
+                            { url, branch: current[0]?.url === url ? current[0].branch : "" },
+                            ...current.slice(1).filter((repo) => repo.url !== url),
+                          ],
+                    )
+                  }
+                  onOpenChange={onDropdownOpenChange}
                   disabled={isLoading}
-                  className="flex h-8 w-full items-center justify-between gap-2 rounded-md border border-input bg-transparent px-3 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  <span className={workspace ? "truncate" : "truncate text-muted-foreground"}>
-                    {workspace || "Browse…"}
-                  </span>
-                  <ChevronDownIcon
-                    className={`size-4 shrink-0 opacity-50 transition-transform ${
-                      workspaceOpen ? "rotate-180" : ""
-                    }`}
-                  />
-                </button>
-                <WorkspacePickerDialog
-                  open={workspaceOpen}
-                  onOpenChange={setWorkspaceOpen}
-                  hostId={browsableHostId}
-                  initialPath={workspace}
-                  onConfirm={setWorkspace}
+                  <SelectTrigger
+                    id="project-settings-sandbox-repository"
+                    className="w-full"
+                    data-testid="project-settings-sandbox-repository"
+                  >
+                    <SelectValue placeholder="Provider default" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value={NONE}>Provider default</SelectItem>
+                    {/* Keep a stored repository the catalog no longer lists, so
+                        opening and saving the dialog doesn't drop it. */}
+                    {sandboxRepos[0] !== undefined &&
+                      !sandboxRepoCatalog.some((repo) => repo.url === sandboxRepos[0].url) && (
+                        <SelectItem value={sandboxRepos[0].url}>{sandboxRepos[0].url}</SelectItem>
+                      )}
+                    {sandboxRepoCatalog.map((repo) => (
+                      <SelectItem key={repo.url} value={repo.url}>
+                        {repo.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              ) : (
+                <SandboxRepositoryPicker
+                  selections={sandboxRepos}
+                  onChange={setSandboxRepos}
+                  maxRepos={maxSandboxRepos}
+                  enabled={open}
+                  testIdPrefix="project-settings-sandbox-repo"
+                  pendingUrl={pendingRepoUrl}
+                  onPendingUrlChange={setPendingRepoUrl}
                 />
-              </div>
-            ) : (
-              // A host is picked but not browsable (sandbox / offline stored
-              // host) — fall back to typing an absolute path.
-              <input
-                id="project-settings-workspace"
-                data-testid="project-settings-workspace"
-                className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
-                placeholder="/path/to/repo"
-                value={workspace}
-                onChange={(e) => setWorkspace(e.target.value)}
-                disabled={isLoading}
-              />
-            )}
-          </Field>
+              )}
+            </Field>
+          ) : (
+            <Field
+              label="Working directory"
+              hint={
+                hostId === NONE
+                  ? "Pick a host first"
+                  : browsableHostId
+                    ? "Browse the host or type a path"
+                    : "Absolute path on the host"
+              }
+              htmlFor="project-settings-workspace"
+            >
+              {hostId === NONE ? (
+                // Mirror the new-session composer: the working directory can only
+                // be chosen once a host is selected (the file browser lists
+                // against a concrete host, and a path is host-relative anyway).
+                <p
+                  className="rounded-md border border-dashed px-3 py-2 text-muted-foreground text-ui"
+                  data-testid="project-settings-workspace"
+                >
+                  Pick a host first
+                </p>
+              ) : browsableHostId ? (
+                // Browsing uses the shared full-screen picker; navigation is
+                // provisional until the user confirms a folder.
+                <div
+                  className="relative flex flex-col gap-1.5"
+                  data-testid="project-settings-workspace"
+                >
+                  <button
+                    type="button"
+                    onClick={() => setWorkspaceOpen(true)}
+                    aria-expanded={workspaceOpen}
+                    disabled={isLoading}
+                    className="flex h-8 w-full items-center justify-between gap-2 rounded-md border border-input bg-transparent px-3 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <span className={workspace ? "truncate" : "truncate text-muted-foreground"}>
+                      {workspace || "Browse…"}
+                    </span>
+                    <ChevronDownIcon
+                      className={`size-4 shrink-0 opacity-50 transition-transform ${
+                        workspaceOpen ? "rotate-180" : ""
+                      }`}
+                    />
+                  </button>
+                  <WorkspacePickerDialog
+                    open={workspaceOpen}
+                    onOpenChange={setWorkspaceOpen}
+                    hostId={browsableHostId}
+                    initialPath={workspace}
+                    onConfirm={setWorkspace}
+                  />
+                </div>
+              ) : (
+                // A host is picked but not browsable (an offline stored host) —
+                // fall back to typing an absolute path.
+                <input
+                  id="project-settings-workspace"
+                  data-testid="project-settings-workspace"
+                  className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                  placeholder="/path/to/repo"
+                  value={workspace}
+                  onChange={(e) => setWorkspace(e.target.value)}
+                  disabled={isLoading}
+                />
+              )}
+            </Field>
+          )}
 
           <Field
             label="Random worktree"
@@ -673,6 +772,11 @@ export function ProjectSettingsDialog({
               disabled so your existing defaults aren't overwritten.
             </p>
           )}
+          {sandboxRepoPending && (
+            <p className="text-destructive text-ui" role="alert">
+              Add or clear the repository URL before saving.
+            </p>
+          )}
           {updateConfig.isError && (
             <p className="text-destructive text-ui" role="alert">
               {(updateConfig.error as Error).message}
@@ -692,7 +796,7 @@ export function ProjectSettingsDialog({
               type="submit"
               data-testid="project-settings-save"
               loading={updateConfig.isPending}
-              disabled={isLoading || loadFailed}
+              disabled={isLoading || loadFailed || sandboxRepoPending}
             >
               Save
             </Button>
