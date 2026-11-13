@@ -537,8 +537,8 @@ def test_runner_resource_attach_recreates_dead_qwen_terminal(
     with pytest.raises(RuntimeError, match="bridge stopped"):
         with TestClient(app).websocket_connect(
             "/v1/sessions/conv_abc/resources/terminals/terminal_qwen_main/attach"
-        ):
-            pass
+        ) as socket:
+            socket.receive()
 
     assert auto_create_sessions == ["conv_abc"]
     assert attach_sockets[0] == str(fresh_dir / "qwen-main.sock")
@@ -547,8 +547,8 @@ def test_runner_resource_attach_recreates_dead_qwen_terminal(
     with pytest.raises(RuntimeError, match="bridge stopped"):
         with TestClient(app).websocket_connect(
             "/v1/sessions/conv_abc/resources/terminals/terminal_qwen_main/attach"
-        ):
-            pass
+        ) as socket:
+            socket.receive()
 
     assert auto_create_sessions == ["conv_abc"]
     assert attach_sockets[1] == str(fresh_dir / "qwen-main.sock")
