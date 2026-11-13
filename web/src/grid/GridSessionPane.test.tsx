@@ -30,7 +30,6 @@ import { splitGrid } from "./gridLayout";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { retrySession, updateSession } from "@/lib/sessionsApi";
-import type { Session } from "@/lib/types";
 import { toast } from "sonner";
 import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
 import { selectPullRequestInPanel } from "@/shell/PullRequestPanel";
@@ -73,14 +72,6 @@ vi.mock("@/components/HostBadge", () => ({
     </span>
   ),
 }));
-vi.mock("@/components/chat/SideChatSettings", () => ({
-  SideChatSettings: ({ session, fullSession }: { session: Session; fullSession?: boolean }) => (
-    <span>
-      Model for {session.title}
-      {fullSession && " (whole session)"}
-    </span>
-  ),
-}));
 vi.mock("@/components/blocks/TerminalView", () => ({
   TerminalView: ({
     sessionId,
@@ -112,6 +103,7 @@ vi.mock("@/hooks/useSession", () => ({
     session: {
       id,
       title: id,
+      llmModel: "snapshot-model",
       agentId: `agent-${id}`,
       labels: fixture.labels,
       permissionLevel: fixture.permissionLevel,
@@ -128,6 +120,9 @@ vi.mock("@/hooks/useConversationEntryState", () => ({
   useConversationEntryState: () => ({
     terminalPending: fixture.terminalPending,
     claudePermissionMode: "default",
+    codexModelOptions: [],
+    llmModel: "live-model",
+    sessionReasoningEffort: "high",
   }),
 }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
@@ -278,9 +273,11 @@ it("shows each cell's session controls and targets that session's permission mod
   // An inactive cell keeps the toggle's slot, so activating it never shifts the titlebar.
   expect(second.queryByRole("button", { name: /grid workspace$/ })).toBeNull();
   expect(second.getByLabelText(/grid workspace$/)).toHaveStyle({ visibility: "hidden" });
-  // Host switching stays full screen; the model picker edits the whole session.
+  // Host and model are read-only here (switch them full screen); live state beats the snapshot.
   expect(second.getByText("Host for second (status only)")).toBeInTheDocument();
-  expect(second.getByText("Model for second (whole session)")).toBeInTheDocument();
+  expect(second.getByTestId("grid-model-status")).toHaveAccessibleName(
+    "Session · live-model · High",
+  );
   fireEvent.pointerDown(second.getByRole("button", { name: "Permission mode: Manual" }), {
     button: 0,
   });

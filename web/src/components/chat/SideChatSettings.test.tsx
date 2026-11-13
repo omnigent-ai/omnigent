@@ -587,39 +587,6 @@ it.each([false, true])(
   },
 );
 
-it("shows a grid session's native Codex model and pins it instead of live Smart Routing", async () => {
-  const session = {
-    ...child,
-    harness: "codex-native",
-    labels: { "omnigent.wrapper": "codex-native-ui" },
-  } as Session;
-  // The main composer turned routing on in the live entry, not the query cache.
-  const entry = conversationRegistry.acquire("side");
-  entry.setState({ costControlModeOverride: "on" });
-  render(
-    <QueryClientProvider client={cache}>
-      <SideChatSettings session={session} fullSession />
-    </QueryClientProvider>,
-  );
-  const user = userEvent.setup();
-  await user.click(screen.getByRole("button", { name: "Model and effort" }));
-  await user.click(screen.getByTestId("side-chat-model-edit"));
-  await user.click(screen.getByRole("menuitemcheckbox", { name: "Model B" }));
-  await waitFor(() =>
-    expect(sessionsApi.updateSession).toHaveBeenCalledWith(
-      "side",
-      expect.objectContaining({ modelOverride: "model-b", costControlModeOverride: "off" }),
-    ),
-  );
-  // The shared entry follows, so the full-screen composer shows the pinned model.
-  await waitFor(() =>
-    expect(entry.getState()).toMatchObject({
-      sessionModelOverride: "model-b",
-      costControlModeOverride: "off",
-    }),
-  );
-});
-
 it("hides unsupported custom native effort", () => {
   render(
     <QueryClientProvider client={cache}>
