@@ -4,17 +4,20 @@
 through `omnigent-egress-connect`, with direct networking disabled. They are
 configuration references, not runnable end-to-end Claude SDK demos.
 
-Both files select the Claude SDK harness and set `allow_network: false`. That
-restriction applies to the whole Claude CLI process, including its model
-provider connections. Configuring model credentials with `omnigent setup` or
-passing `--model` does not grant network access. Running these files with a
-network-based provider therefore fails to reach the model; it cannot perform
-the prompted connector checks. An unwrapped CLI fallback is not supported.
+Both files select the Claude SDK harness. Its preparation path does not start
+the parent TCP-egress broker, so these configurations are rejected before the
+Claude CLI launches. They cannot perform the prompted connector checks.
+Configuring model credentials with `omnigent setup` or passing `--model` does
+not supply that broker. An unwrapped CLI fallback is not supported.
+
+Both files also set `allow_network: false`, which blocks ordinary model-provider
+connections from the whole CLI process. Supporting the broker alone would not
+grant those connections.
 
 Named TCP routes grant access only through the connector. They do not authorize
 ordinary provider HTTPS requests. Supporting these examples as agent-driven
-demos requires a separately supported model transport compatible with the
-requested confinement. Do not enable unrestricted networking to make the
+demos requires Claude SDK integration with the parent broker and a model
+transport compatible with the requested confinement. Do not enable unrestricted networking to make the
 network-denial checks appear to pass.
 
 ## Local connector verification
@@ -43,8 +46,8 @@ a compatible execution environment.
 `public-ssh.yaml` grants `github.com:22` and describes reading an SSH greeting
 without authentication. The broker requires every DNS answer to be public;
 networks that block port 22 prevent the connection. A greeting does not verify
-the remote server's identity. This template has the same model-connectivity
-limitation as the local example.
+the remote server's identity. This template has the same broker and model transport
+requirements as the local example.
 
 `sandbox.type: auto` selects Seatbelt on macOS and Bubblewrap on Linux; Linux
 requires `bwrap` and enabled user namespaces. Opaque TCP routes cannot use ports

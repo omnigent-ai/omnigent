@@ -192,9 +192,9 @@ def test_harness_rejects_invalid_nested_credential_policy(
         '{"sandbox": false}',
         '{"sandbox": []}',
         '{"cwd": []}',
-        '{"fork": "false"}',
+        '{"fork": "/private/host/scan"}',
         '{"start_in_scratch": "false"}',
-        '{"sandbx": {"type": "linux_bwrap"}}',
+        '{"/private/host/scan": true}',
         '{"sandbox": {"allow_network": "false"}}',
         '{"sandbox": {"cwd_hidden_scan_overflow": "erorr"}}',
         '{"sandbox": {"cwd_hidden_scan_max_entries": 0}}',
@@ -210,8 +210,12 @@ def test_shared_decoder_rejects_malformed_os_policy(
     payload: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("TEST_HARNESS_OS_ENV", payload)
-    with pytest.raises(HarnessSandboxValidationError):
+    with pytest.raises(HarnessSandboxValidationError) as error:
         resolve_harness_os_env("TEST_HARNESS_OS_ENV")
+    assert "/private/host/scan" not in error.value.client_message
+    if "/private/host/scan" in payload:
+        assert "/private/host/scan" in str(error.value)
+        assert error.value.__cause__ is not None
 
 
 @pytest.mark.parametrize("harness_name", _HARNESSES)
