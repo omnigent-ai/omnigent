@@ -19,6 +19,16 @@ from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_ex
 from tests._helpers.live_server import isolated_process_env, terminate_process
 
 
+def host_tunnel_registered(client: httpx.Client, host_id: str) -> bool:
+    """Whether a host request reaches *host_id* through the server's live tunnel.
+
+    The hosts table reports "online" before the tunnel registers, and creating a
+    session on the host in that window fails with ``wrong_replica``.
+    """
+    response = client.get(f"/v1/hosts/{host_id}/filesystem", params={"limit": 1}, timeout=10)
+    return response.status_code == 200
+
+
 @dataclass
 class Host:
     proc: subprocess.Popen[bytes]
@@ -41,7 +51,9 @@ class Host:
                 if response.status_code == 200:
                     for row in response.json().get("hosts", []):
                         if row.get("host_id") == self.host_id and row.get("status") == "online":
-                            return row
+                            if host_tunnel_registered(client, self.host_id):
+                                return row
+                            last = "online in the hosts table; tunnel not yet registered"
             except httpx.HTTPError as exc:
                 last = str(exc)
             time.sleep(poll_interval)
