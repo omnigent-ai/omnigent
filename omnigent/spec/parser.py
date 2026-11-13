@@ -2908,7 +2908,7 @@ def _parse_inline_mcp_servers(
         elif url is not None:
             transport = "http"
         else:
-            # Databricks-managed server or unknown shape — no local
+            # Managed server or unknown shape — no local
             # endpoint to display; skip.
             continue
         raw_args = val.get("args", [])

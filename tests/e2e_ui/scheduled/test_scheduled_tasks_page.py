@@ -467,9 +467,11 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     )
 
 
+@pytest.mark.parametrize("native_ios", [False, True], ids=["browser", "ios-safe-area"])
 def test_scheduled_task_row_run_controls(
     page: Page,
     live_server: str,
+    native_ios: bool,
 ) -> None:
     """Run controls: relative next-run label, and Run now → a run is recorded.
 
@@ -478,8 +480,31 @@ def test_scheduled_task_row_run_controls(
     POST /v1/scheduled-tasks/{id}/run path (the ⋯-menu action) end-to-end and
     confirms the run row is written, without ever dispatching an agent turn. The
     completion pill was removed from the row UI, so completion is asserted via the
-    server-side run record rather than a visible badge.
+    server-side run record rather than a visible badge. The iOS case also keeps
+    the confirmation toast below the status-bar safe area.
     """
+    if native_ios:
+        page.set_viewport_size({"width": 420, "height": 912})
+        page.add_init_script("""
+            window.omnigentNative = {
+              kind: "ios",
+              setBadgeCount: function () {},
+              notify: function () { return Promise.resolve(false); },
+              onNotificationActivated: function () { return function () {}; },
+              onNativeInsets: function () { return function () {}; },
+              onSidebarDrag: function () { return function () {}; },
+              onViewModeChanged: function () { return function () {}; },
+              setViewMode: function () {},
+              setServerSwitcherHidden: function () {},
+              setSidebarOpen: function () {},
+            };
+        """)
+        cdp = page.context.new_cdp_session(page)
+        cdp.send(
+            "Emulation.setSafeAreaInsetsOverride",
+            {"insets": {"top": 59, "left": 0, "bottom": 34, "right": 0}},
+        )
+
     agent_id = _builtin_agent_id(live_server, "hello_world")
     scheduled_time = datetime.now(UTC) + timedelta(hours=2)
     task_id = _create_task(
@@ -505,6 +530,27 @@ def test_scheduled_task_row_run_controls(
     row.hover()
     row.get_by_test_id("task-row-menu").click()
     page.get_by_test_id("task-run-now").click()
+
+    toast = page.get_by_test_id("toast")
+    expect(toast).to_contain_text("Run triggered, it will start shortly")
+    if native_ios:
+        expect(toast).to_have_attribute("data-mounted", "true")
+        minimum_toast_top = 59 + 16 - 1
+        page.wait_for_function(
+            """expectedTop => {
+              const toast = document.querySelector('[data-testid="toast"]');
+              return toast !== null && toast.getBoundingClientRect().top >= expectedTop;
+            }""",
+            arg=minimum_toast_top,
+            timeout=5_000,
+        )
+        toast_box = toast.bounding_box()
+        assert toast_box is not None
+        assert toast_box["y"] >= minimum_toast_top, (
+            f"toast starts at y={toast_box['y']:.0f}, inside the 59px status-bar "
+            "safe area or without its normal 16px gap"
+        )
+        assert toast_box["y"] + toast_box["height"] <= 912
 
     # The manual fire runs through the shared fire path and records a run row.
     # With no online host it resolves to a ``failed`` run. Poll the history until
@@ -861,15 +907,9 @@ def test_scheduled_task_edit_switches_the_harness(
 
 
 # ── Permission-mode selector ───────────────────────────────────────────────
-#
-# The dialog renders a Permission-mode select alongside Model/Effort, gated on
-# the same ``permissionMode`` capability (Claude Code). Modes that skip approval
-# (``dontAsk`` / ``bypassPermissions``) are not offered, since nobody is there to
-# answer a prompt during an unattended run. Left on
-# "Default" the field is omitted (agent default); a concrete pick persists
-# ``permission_mode``, which the fire path turns into the runner's
-# ``--permission-mode`` launch arg. Like the sibling tests these are LLM-free:
-# they exercise only the dialog, REST, and the rendered row.
+# Claude Code's picker offers every launch mode, including ``dontAsk`` and
+# ``bypassPermissions``; "Default" omits ``permission_mode``. LLM-free: these
+# exercise only the dialog, REST, and the rendered row.
 
 
 @pytest.mark.usefixtures("online_host")
@@ -931,9 +971,10 @@ def test_scheduled_task_edit_prefills_permission_mode(
 ) -> None:
     """The edit dialog prefills the Permission control from the loaded task.
 
-    Seeds a Claude Code task carrying ``permission_mode="acceptEdits"``, opens its
-    Edit dialog, and asserts ``task-permission-trigger`` renders the stored pick
-    ("Accept edits"), not the "Default" sentinel.
+    Seeds a Claude Code task carrying ``permission_mode="bypassPermissions"`` (a
+    launch-only mode, valid for automations), opens its Edit dialog, and asserts
+    ``task-permission-trigger`` renders the stored pick ("Bypass permissions"),
+    not the "Default" sentinel.
     """
     claude_agent_id = _builtin_agent_id(live_server, "claude-native-ui")
     _create_task(
@@ -941,7 +982,7 @@ def test_scheduled_task_edit_prefills_permission_mode(
         claude_agent_id,
         "Permission prefill",
         "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
-        permission_mode="acceptEdits",
+        permission_mode="bypassPermissions",
     )
 
     _open_automations_page(page, live_server)
@@ -955,7 +996,7 @@ def test_scheduled_task_edit_prefills_permission_mode(
     dialog = page.get_by_test_id("create-scheduled-task-dialog")
     expect(dialog).to_be_visible(timeout=30_000)
     expect(page.get_by_test_id("task-permission-control")).to_be_visible()
-    expect(page.get_by_test_id("task-permission-trigger")).to_have_text("Accept edits")
+    expect(page.get_by_test_id("task-permission-trigger")).to_have_text("Bypass permissions")
 
 
 @pytest.mark.usefixtures("online_host")

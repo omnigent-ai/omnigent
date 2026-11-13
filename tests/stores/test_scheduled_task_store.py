@@ -13,6 +13,8 @@ from typing import Any
 import pytest
 
 from omnigent.db.db_models import current_workspace_id, workspace_scope
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server.scheduled.schedule import next_scheduled_time
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
 pytestmark = pytest.mark.usefixtures("frozen_recurrence_clock")
@@ -56,6 +58,7 @@ def test_create_returns_scheduled_task_with_all_fields(
         model_override="claude-opus-4-7",
         reasoning_effort="high",
         permission_mode="acceptEdits",
+        mcp_services=("github", "linear"),
         session_mode="continue",
         session_id=_uid("conv_abc"),
         workspace="/home/alice/repo",
@@ -75,6 +78,7 @@ def test_create_returns_scheduled_task_with_all_fields(
     assert task.model_override == "claude-opus-4-7"
     assert task.reasoning_effort == "high"
     assert task.permission_mode == "acceptEdits"
+    assert task.mcp_services == ("github", "linear")
     assert task.session_mode == "continue"
     assert task.session_id == _uid("conv_abc")
     assert task.workspace == "/home/alice/repo"
@@ -872,6 +876,85 @@ def test_update_omitting_overrides_leaves_them_unchanged(
     assert updated.permission_mode == "acceptEdits"
 
 
+def test_update_mcp_services_replaces_clears_and_keeps(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """A tuple replaces the services, ``()`` clears them, and omission keeps them."""
+    store.create(
+        scheduled_task_id=_uid("st_mcp"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        mcp_services=("github",),
+    )
+    kept = store.update(_uid("st_mcp"), name="renamed")
+    assert kept is not None
+    assert kept.mcp_services == ("github",)
+    replaced = store.update(_uid("st_mcp"), mcp_services=("slack", "linear"))
+    assert replaced is not None
+    assert replaced.mcp_services == ("slack", "linear")
+    cleared = store.update(_uid("st_mcp"), mcp_services=())
+    assert cleared is not None
+    assert cleared.mcp_services == ()
+    fetched = store.get(_uid("st_mcp"))
+    assert fetched is not None
+    assert fetched.mcp_services == ()
+
+
+def test_mcp_services_longer_than_the_column_are_rejected_on_every_write(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """SQLite does not enforce VARCHAR widths, so the store checks the encoded length."""
+    fits = ("x" * 4092,)  # JSON-encodes to exactly 4,096 characters
+    too_long = ("x" * 4093,)
+    common = {
+        "name": "n",
+        "prompt": "p",
+        "rrule": "FREQ=MINUTELY",
+        "user_id": "u",
+        "agent_id": _uid("ag"),
+        "timezone": "UTC",
+    }
+    created = store.create(scheduled_task_id=_uid("st_mcp_fit"), mcp_services=fits, **common)
+    assert created.mcp_services == fits
+    with pytest.raises(OmnigentError, match="Too many MCP services"):
+        store.create(scheduled_task_id=_uid("st_mcp_long"), mcp_services=too_long, **common)
+    assert store.get(_uid("st_mcp_long")) is None
+    with pytest.raises(OmnigentError, match="Too many MCP services"):
+        store.update(_uid("st_mcp_fit"), mcp_services=too_long)
+    kept = store.get(_uid("st_mcp_fit"))
+    assert kept is not None
+    assert kept.mcp_services == fits
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ({"agent_id": _uid("ag_b")}, {"mcp_services": ("github",)}),
+        ({"mcp_services": ("github",)}, {"agent_id": _uid("ag_b")}),
+    ],
+    ids=["agent-then-services", "services-then-agent"],
+)
+def test_update_from_a_stale_snapshot_conflicts_on_agent_or_mcp_changes(
+    store: SqlAlchemyScheduledTaskStore, first: dict[str, Any], second: dict[str, Any]
+) -> None:
+    """Services are validated against an agent, so neither may change under the other."""
+    snapshot = _session_task(store, "st_stale_mcp")
+    applied = store.update(snapshot.id, expected_schedule=snapshot, **first)
+    assert applied is not None
+
+    with pytest.raises(OmnigentError, match="Reload and try again") as raised:
+        store.update(snapshot.id, expected_schedule=snapshot, **second)
+
+    assert raised.value.code == ErrorCode.CONFLICT
+    saved = store.get(snapshot.id)
+    assert saved is not None
+    assert (saved.agent_id, saved.mcp_services) == (applied.agent_id, applied.mcp_services)
+
+
 def test_update_last_run_conversation_id_can_be_cleared_to_null(
     store: SqlAlchemyScheduledTaskStore,
 ) -> None:
@@ -1294,6 +1377,38 @@ def test_list_latest_run_status_is_workspace_scoped(
         }
 
 
+# ── has_active_run (workers of a live automation run) ─────────────────────────
+
+
+@pytest.mark.parametrize("status", ["starting", "running"])
+def test_has_active_run_counts_starting_and_running(
+    store: SqlAlchemyScheduledTaskStore, status: str
+) -> None:
+    """A claimed run records its session while still starting, before the prompt is sent."""
+    _seed_running_run(store, "active_other")
+    store.create_run(
+        run_id=_uid(f"run_active_{status}"),
+        scheduled_task_id=_uid("task_active_other"),
+        status=status,
+        scheduled_at=200,
+        conversation_id=_uid(f"conv_active_{status}"),
+    )
+    assert store.has_active_run(_uid("task_active_other"), _uid(f"conv_active_{status}"))
+
+
+def test_has_active_run_false_once_finished_or_for_another_task(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Only this task's live run counts, not a finished one or another task's."""
+    run_id = _seed_running_run(store, "active_fin")
+    _seed_running_run(store, "active_peer")
+    assert store.has_active_run(_uid("task_active_fin"), _uid("conv_active_fin"))
+    assert not store.has_active_run(_uid("task_active_peer"), _uid("conv_active_fin"))
+    assert not store.has_active_run(_uid("task_active_fin"), _uid("conv_absent"))
+    store.update_run(run_id, status="succeeded", finished_at=202)
+    assert not store.has_active_run(_uid("task_active_fin"), _uid("conv_active_fin"))
+
+
 # ── get_running_run_by_conversation (event-hook reverse lookup) ───────────────
 
 
@@ -1362,6 +1477,32 @@ def test_get_running_run_by_conversation_is_workspace_scoped(
         assert found is not None and found.id == _uid("run_ws")
 
 
+@pytest.mark.parametrize(("status", "starting"), [("starting", True), ("running", False)])
+def test_has_starting_run_for_conversation_finds_only_its_unsettled_startup(
+    store: SqlAlchemyScheduledTaskStore, status: str, starting: bool
+) -> None:
+    with workspace_scope(11):
+        store.create(
+            scheduled_task_id=_uid("task_startup"),
+            name="startup",
+            prompt="p",
+            rrule="FREQ=MINUTELY",
+            user_id="a",
+            agent_id=_uid("ag"),
+            timezone="UTC",
+        )
+        store.create_run(
+            run_id=_uid("run_startup"),
+            scheduled_task_id=_uid("task_startup"),
+            status=status,
+            scheduled_at=100,
+            conversation_id=_uid("conv_startup"),
+        )
+        assert store.has_starting_run_for_conversation(_uid("conv_startup")) is starting
+        assert store.has_starting_run_for_conversation(_uid("conv_other")) is False
+    assert store.has_starting_run_for_conversation(_uid("conv_startup")) is False
+
+
 def _due_task(store: SqlAlchemyScheduledTaskStore, seed: str = "dispatch"):
     store.configure_dispatch(True)
     task = store.create(
@@ -1426,6 +1567,9 @@ def test_dispatch_rejects_edited_snapshot(store: SqlAlchemyScheduledTaskStore, e
             lease_seconds=120,
         )
         is None
+    )
+    assert not store.skip_scheduled_occurrence(
+        task, now=task.next_run_at, next_run_at=task.next_run_at + 3600
     )
     assert store.get(task.id) == updated
     assert store.list_runs(task.id)[0] == []
@@ -1503,12 +1647,84 @@ def test_dispatch_mutations_require_workspace_scope(store: SqlAlchemyScheduledTa
         )
         is None
     )
+    assert not store.skip_scheduled_occurrence(task, now=now, next_run_at=now + 3600)
     with workspace_scope(task.workspace_id):
         run = store.claim_scheduled_run(
             task, now=now, next_run_at=now + 3600, host_id=task.host_id, lease_seconds=120
         )
     assert store.renew_starting_run(run.id, now=lambda: now + 30, lease_seconds=120) is None
     assert store.transition_starting_run(run, now=lambda: now + 30, status="failed") is None
+
+
+def test_skipping_an_occurrence_advances_the_schedule_without_a_run(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    from dataclasses import replace
+
+    task = _due_task(store)
+    now = task.next_run_at
+    with pytest.raises(ValueError, match="later than now"):
+        store.skip_scheduled_occurrence(task, now=now, next_run_at=now)
+    # Nothing to skip before the occurrence is due, or once the task isn't active.
+    assert store.skip_scheduled_occurrence(task, now=now - 1, next_run_at=now + 3600) is False
+    paused = replace(task, state="paused")
+    assert store.skip_scheduled_occurrence(paused, now=now, next_run_at=now + 3600) is False
+    assert store.skip_scheduled_occurrence(task, now=now, next_run_at=now + 3600) is True
+    assert store.get(task.id).next_run_at == now + 3600
+    assert store.list_runs(task.id)[0] == []
+    # The listed snapshot is now stale, so neither a second skip nor a claim of it acts.
+    assert store.skip_scheduled_occurrence(task, now=now, next_run_at=now + 7200) is False
+    claimed = store.claim_scheduled_run(
+        task, now=now, next_run_at=now + 7200, host_id=task.host_id, lease_seconds=120
+    )
+    assert claimed is None
+    assert store.get(task.id).next_run_at == now + 3600
+    assert store.list_runs(task.id)[0] == []
+
+
+@pytest.mark.parametrize(
+    ("now", "poll_in"),
+    [
+        (1_800_000_000 + 30 * 60, 120),
+        # The hourly schedule's next occurrence is sooner than two minutes out, so it wins.
+        (1_800_000_000 + 3600 - 30, 30),
+    ],
+    ids=["half-past", "just-before-the-hour"],
+)
+def test_an_edit_that_changes_trigger_status_moves_the_next_poll(
+    store: SqlAlchemyScheduledTaskStore,
+    monkeypatch: pytest.MonkeyPatch,
+    now: int,
+    poll_in: int,
+) -> None:
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: now)
+    trigger_prompt = "This automation watches Slack and starts one Omnigent session per message."
+    store.configure_dispatch(True)
+    store.configure_trigger_polling(120)
+    task = store.create(
+        _uid("trigger"),
+        "trigger",
+        trigger_prompt,
+        "FREQ=HOURLY",
+        None,
+        _uid("agent"),
+        "UTC",
+        host_id=_uid("host"),
+        session_mode="continue",
+    )
+    assert task.next_run_at == now + poll_in
+    # Without its opening sentence, the task follows its hourly schedule again.
+    plain = store.update(task.id, prompt="Check the channel.")
+    assert plain.next_run_at == next_scheduled_time(plain, now)
+    trigger = store.update(task.id, prompt=trigger_prompt)
+    assert trigger.next_run_at == now + poll_in
+    # Starting a new session each run also makes it an ordinary automation.
+    plain = store.update(task.id, session_mode="new")
+    assert plain.next_run_at == next_scheduled_time(plain, now)
+    trigger = store.update(task.id, session_mode="continue")
+    assert trigger.next_run_at == now + poll_in
 
 
 def test_startup_lease_renewal_expiry_and_conditional_reconciliation(
@@ -2304,6 +2520,7 @@ def test_adopt_session_records_only_an_unchanged_continue_task_without_one(
         ("model_override", "claude-opus"),
         ("reasoning_effort", "high"),
         ("permission_mode", "acceptEdits"),
+        ("mcp_services", ("github",)),
         ("project_id", _uid("proj")),
     ):
         edited = _session_task(store, f"st_adopt_edit_{name}", session_mode="continue")

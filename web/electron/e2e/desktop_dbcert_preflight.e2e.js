@@ -1,8 +1,7 @@
 "use strict";
 
-// Real SPA → preload → main → CLI process → session API. The external dbcert
-// sign-in and machine policy are fixtures; cloud allocation stays gated locally.
-// This does not exercise macOS SSO or Companion's credential transfer.
+// Real SPA → preload → main → CLI process → session API. The dbcert sign-in
+// and machine policy are fixtures. This does not exercise macOS SSO.
 const { it } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Collection
 from typing import TYPE_CHECKING
 
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
 from omnigent.host.frames import CAP_MCP_REGISTRY
 
 if TYPE_CHECKING:
@@ -84,9 +84,9 @@ def require_registry_mcp_runtime(
     runner = tunnel_registry.get(runner_id) if runner_id and tunnel_registry is not None else None
     if host is None and runner is None and host_id and runner_router is not None:
         if runner_router.host_is_on_another_replica(host_id):
-            raise OmnigentError(
+            raise WrongReplicaError(
                 "MCP registry support must be checked on the host's server replica",
-                code=ErrorCode.WRONG_REPLICA,
+                host_id=host_id,
             )
     for component, connection in (("host", host), ("runner", runner)):
         if connection is not None:
