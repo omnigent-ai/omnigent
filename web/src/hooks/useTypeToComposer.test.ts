@@ -1,11 +1,12 @@
 import { cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type * as NativeBridgeModule from "@/lib/nativeBridge";
 
 let embedded = false;
 vi.mock("@/lib/embedded", () => ({ useIsEmbedded: () => embedded }));
 let nativeShell = false;
 vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/nativeBridge")>()),
+  ...(await importOriginal<typeof NativeBridgeModule>()),
   isNativeShell: () => nativeShell,
 }));
 
