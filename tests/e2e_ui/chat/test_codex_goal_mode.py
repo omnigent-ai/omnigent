@@ -146,3 +146,13 @@ def test_codex_goal_mode_processes_first_message_with_untrusted_hooks(
     page.keyboard.press("Escape")
     page.get_by_test_id("composer-attach").click()
     expect(goal_toggle).to_contain_text("Goal")
+    page.keyboard.press("Escape")
+
+    with page.expect_response(_goal_response(session.session_id, "GET")):
+        _send(page, "/goal")
+    expect(page.get_by_test_id("goal-empty")).to_be_visible(timeout=30_000)
+    page.keyboard.press("Escape")
+    page.get_by_placeholder("Send a message…").fill("/go")
+    with page.expect_response(_goal_response(session.session_id, "GET")):
+        page.get_by_test_id("slash-menu-item-goal").click()
+    expect(page.get_by_test_id("goal-empty")).to_be_visible(timeout=30_000)

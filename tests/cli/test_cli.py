@@ -2375,6 +2375,9 @@ def test_server_command_reads_tunnel_token_and_does_not_spawn_runner(
         "  app_name: Must not leak into bare server config\n"
     )
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    # Keep the resolved server config off the real ~/.omnigent/config.yaml.
+    monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / "data" / "anchor"))
+    monkeypatch.delenv("OMNIGENT_CONFIG", raising=False)
 
     db_path = tmp_path / "chat.db"
     artifact_dir = tmp_path / "artifacts"
@@ -2564,6 +2567,126 @@ def test_server_explicit_config_overrides_omnigent_config_env(
     assert result.exit_code == 0, result.output
     assert captured["config"] == str(explicit.resolve())
     bind_probe.assert_called_once_with("127.0.0.1", 44771)
+
+
+@pytest.mark.parametrize("config_source", ["environment", "data_dir"])
+def test_server_without_config_flag_serves_resolved_server_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    config_source: str,
+) -> None:
+    """Without ``-c``, the resolved server config supplies branding and title guidance."""
+    import uvicorn.server
+    from fastapi.testclient import TestClient
+
+    server_config_file = tmp_path / "server.yaml"
+    server_config_file.write_text("branding:\n  app_name: Resolved Server\n")
+    config_home = tmp_path / "config"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        "session_title_instructions: Prefix titles with the current date.\n"
+    )
+    if config_source == "environment":
+        monkeypatch.setenv("OMNIGENT_CONFIG", str(server_config_file))
+    else:
+        monkeypatch.delenv("OMNIGENT_CONFIG", raising=False)
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        server_config_file.rename(data_dir / "config.yaml")
+        monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(data_dir / "anchor"))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    observed: dict[str, Any] = {}
+    from omnigent.server import app as app_module
+
+    real_create_app = app_module.create_app
+
+    def spy_create_app(**kwargs: Any) -> Any:
+        observed["server_config"] = kwargs["server_config"]
+        return real_create_app(**kwargs)
+
+    def run_app_lifespan(self: Any, **kwargs: Any) -> None:
+        with TestClient(self.config.app) as client:
+            observed["branding"] = client.get("/v1/info").json()["branding"]
+
+    monkeypatch.setattr(app_module, "create_app", spy_create_app)
+    monkeypatch.setattr(uvicorn.server.Server, "run", run_app_lifespan)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "server",
+            "--port",
+            "0",
+            "--database-uri",
+            f"sqlite:///{tmp_path / 'chat.db'}",
+            "--artifact-location",
+            str(tmp_path / "artifacts"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.exception or result.output
+    assert observed["branding"]["app_name"] == "Resolved Server"
+    assert observed["server_config"]["session_title_instructions"] == (
+        "Prefix titles with the current date."
+    )
+
+
+@pytest.mark.parametrize(
+    ("server_config_line", "expected_instructions"),
+    [
+        pytest.param(
+            "session_title_instructions: Server guidance.\n",
+            "Server guidance.",
+            id="server-value-beats-user-value",
+        ),
+        pytest.param(
+            "session_title_instructions: null\n",
+            None,
+            id="server-null-disables-user-fallback",
+        ),
+    ],
+)
+def test_server_without_config_flag_prefers_server_title_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    server_config_line: str,
+    expected_instructions: str | None,
+) -> None:
+    """A title key present in the resolved server config blocks the user config fallback."""
+    import uvicorn.server
+
+    from omnigent.server import app as app_module
+
+    server_config_file = tmp_path / "server.yaml"
+    server_config_file.write_text(server_config_line)
+    config_home = tmp_path / "config"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text("session_title_instructions: User guidance.\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(server_config_file))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    observed: dict[str, Any] = {}
+    real_create_app = app_module.create_app
+
+    def spy_create_app(**kwargs: Any) -> Any:
+        observed["server_config"] = kwargs["server_config"]
+        return real_create_app(**kwargs)
+
+    monkeypatch.setattr(app_module, "create_app", spy_create_app)
+    monkeypatch.setattr(uvicorn.server.Server, "run", lambda self, **kwargs: None)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "server",
+            "--port",
+            "0",
+            "--database-uri",
+            f"sqlite:///{tmp_path / 'chat.db'}",
+            "--artifact-location",
+            str(tmp_path / "artifacts"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.exception or result.output
+    assert observed["server_config"]["session_title_instructions"] == expected_instructions
 
 
 @pytest.mark.parametrize("authority", [False, 123, [], {}, "", " ", "x" * 129])
@@ -2760,6 +2883,56 @@ def test_server_with_explicit_port_does_not_check_canonical_server(
     assert captured["uvicorn_kwargs"]["port"] == 44770
     assert "Starting omnigent server on 127.0.0.1:44770" in result.output
     assert bind_probes == [("127.0.0.1", 44770)]
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1", "[::1]"])
+def test_server_accounts_url_matches_bind_host(
+    host: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Accounts callbacks keep IPv6 brackets while the listener receives a bare host."""
+    import uvicorn.server
+
+    observed = {}
+
+    def capture_server(self: Any, **kwargs: Any) -> None:
+        observed["host"] = self.config.host
+        observed["url"] = os.environ["OMNIGENT_ACCOUNTS_BASE_URL"]
+
+    monkeypatch.setattr(uvicorn.server.Server, "run", capture_server)
+    listener = Mock(return_value=contextlib.nullcontext(Mock()))
+    monkeypatch.setattr("omnigent.cli._bind_server_listener", listener)
+    monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "accounts")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    accounts_env = {
+        "OMNIGENT_ACCOUNTS_BASE_URL": None,
+        "OMNIGENT_ACCOUNTS_COOKIE_SECRET": None,
+    }
+    original_accounts_env = {name: os.environ.get(name) for name in accounts_env}
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "server",
+            "--host",
+            host,
+            "--port",
+            "44770",
+            "--no-open",
+            "--database-uri",
+            f"sqlite:///{tmp_path / 'chat.db'}",
+            "--artifact-location",
+            str(tmp_path / "artifacts"),
+        ],
+        env=accounts_env,
+    )
+
+    assert {name: os.environ.get(name) for name in accounts_env} == original_accounts_env
+    assert result.exit_code == 0, result.exception or result.output
+    expected_host = host.strip("[]")
+    authority = f"[{expected_host}]" if ":" in expected_host else expected_host
+    assert observed == {"host": expected_host, "url": f"http://{authority}:44770"}
+    listener.assert_called_once_with(expected_host, 44770)
 
 
 def test_server_command_explicit_occupied_port_fails() -> None:
@@ -7178,6 +7351,41 @@ def test_warn_missing_harness_dependencies_lists_all_gaps(
     err = capsys.readouterr().err
     assert "Node.js is too old" in err
     assert "tmux not found" in err
+
+
+@pytest.mark.parametrize(
+    ("args", "servers", "exit_code"),
+    [
+        pytest.param(["--server", "https://example.com"], ["https://example.com"], 3, id="remote"),
+        pytest.param(["--local"], [""], 3, id="local"),
+        pytest.param([], [], 2, id="missing-mode"),
+        pytest.param(["--local", "--server", "https://example.com"], [], 2, id="both-modes"),
+    ],
+)
+def test_host_service_entry_runs_the_service_host(
+    monkeypatch: pytest.MonkeyPatch,
+    args: list[str],
+    servers: list[str],
+    exit_code: int,
+) -> None:
+    """Verify the wrapper-launched service command reaches the service entry point."""
+    from omnigent import cli as cli_module
+
+    started: list[str] = []
+
+    def _run(server: str) -> int:
+        started.append(server)
+        return 3
+
+    monkeypatch.setattr("omnigent.host.service_entry.run", _run)
+
+    monkeypatch.setattr(sys, "argv", ["omnigent", "host-service-entry", *args])
+
+    with pytest.raises(SystemExit) as result:
+        cli_module.main()
+
+    assert result.value.code == exit_code
+    assert started == servers
 
 
 def test_click_subcommands_allowlist_covers_registered_commands() -> None:
