@@ -30,10 +30,9 @@ comes first).
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
-from collections.abc import Awaitable, Callable, Iterator, MutableMapping
+from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any, TypeAlias
 
 import httpx
@@ -46,29 +45,9 @@ from omnigent.databricks_ai_gateway import (
     with_gateway_attribution_pairs,
 )
 from omnigent.telemetry.surface import harness_client_surface
+from omnigent.util.uvicorn_server import NoSignalServer
 
 logger = logging.getLogger(__name__)
-
-
-class _NoSignalServer(uvicorn.Server):
-    """
-    uvicorn Server that never installs process signal handlers.
-
-    ``uvicorn.Server.serve()`` replaces the process's SIGINT/SIGTERM
-    handlers for its whole lifetime when run on the main thread. The
-    harness subprocess already runs its own uvicorn server whose
-    graceful shutdown is driven by SIGTERM (see
-    ``omnigent/runtime/harnesses/_runner.py``); a second
-    signal-capturing server would steal those handlers and break the
-    harness's shutdown path. The shim is stopped explicitly via
-    :meth:`ClaudeGatewayShim.aclose` (or dies with the process), so it
-    needs no signal handling of its own.
-    """
-
-    @contextlib.contextmanager
-    def capture_signals(self) -> Iterator[None]:
-        """No-op replacement for uvicorn's signal-handler swap."""
-        yield
 
 
 # Databricks-hosted Claude model ids that default to
@@ -238,7 +217,7 @@ class ClaudeGatewayShim:
             lifespan="off",  # plain ASGI callable; no lifespan protocol
             interface="asgi3",  # bound methods defeat uvicorn's auto-detection
         )
-        server = _NoSignalServer(config)
+        server = NoSignalServer(config)
         self._server = server
         self._serve_task = asyncio.create_task(server.serve(), name="claude-gateway-shim-serve")
         deadline = asyncio.get_running_loop().time() + _START_TIMEOUT_SECONDS

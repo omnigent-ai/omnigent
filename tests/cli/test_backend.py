@@ -50,6 +50,7 @@ from omnigent.cli import (
     cli as cli_group,
 )
 from omnigent.host.local_server import LocalServerStartup
+from omnigent.telemetry.request_headers import client_user_agent
 
 
 @pytest.fixture(autouse=True)
@@ -3487,7 +3488,10 @@ def test_databricks_preflight_silent_sdk_refresh_skips_login(
 
     cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
 
-    assert requests[1]["headers"] == {"Authorization": "Bearer fresh-token"}
+    assert requests[1]["headers"] == {
+        "Authorization": "Bearer fresh-token",
+        "User-Agent": client_user_agent(),
+    }
     assert requests[1]["params"] == {"o": "123"}
     assert stored == [(_HOST_DATABRICKS_SERVER, "https://example.databricks.com", "123")]
 
@@ -3556,7 +3560,10 @@ def test_databricks_preflight_uses_cli_workspace_id_for_workspace_mount(
 
     cli._ensure_databricks_server_auth(server, non_interactive=True)
 
-    assert requests[1]["headers"] == {"Authorization": "Bearer fresh-token"}
+    assert requests[1]["headers"] == {
+        "Authorization": "Bearer fresh-token",
+        "User-Agent": client_user_agent(),
+    }
     assert requests[1]["params"] == {"o": "4242424242424242"}
     assert stored == [(server, "https://example.databricks.com", "4242424242424242")]
 

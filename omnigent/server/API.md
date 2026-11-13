@@ -672,8 +672,8 @@ already uploaded or registered an agent. The response is the full
     child (`parent_session_id`) create, is a 422; an id that names an
     existing host, or whose `managed-<first 8 hex>` name one of the
     caller's hosts already uses, is a 409 `already_exists`, raised
-    before the session is created. JSON creates only: the multipart
-    bundle create does not take it.
+    before the session is created. The multipart bundle create takes
+    it in `metadata` the same way.
     Provisioning runs in the BACKGROUND: the create returns
     immediately with `host_id` / `workspace` null, and they appear
     on `GET /v1/sessions/{id}` once the sandbox host registers. A
@@ -1496,6 +1496,55 @@ binding wins: the sandbox is torn down without failing the session, and
 held messages are marked not sent. A request the server refuses
 restores the previous binding and labels, and releases the claim. Files
 don't move with the session; the transcript does.
+
+### Rewind Session
+
+```
+POST /v1/sessions/{session_id}/rewind
+Content-Type: application/json
+
+{"item_id": "msg_abc123"}
+
+200 OK — {"session_id": "conv_new", "prompt": "<the prompt's text>",
+  "attachments": [{"type": "input_image", "file_id": "file_new",
+  "filename": "diagram.png"}]}
+
+400 Bad Request — the session's harness is not claude-sdk or
+  claude-native, item_id is not one of its user prompts, it is a
+  sub-agent or side-chat session, a turn is running or a message is
+  still reaching its runner, or the kept history has a file the
+  session's harness cannot open
+400 Bad Request, code `wrong_replica` — its runner is connected to
+  another server replica; retry so the request reaches that replica
+403/404 — the caller does not own the session
+409 Conflict — the session is already moving to a new session (a
+  /clear or /rewind in progress), or its host went away during the
+  rewind; retry once it settles
+503 Service Unavailable — neither its runner nor its host can take
+  the new session
+```
+
+Continues a Claude session from just before one of its prompts. The
+server forks the session with only the items positioned before
+`item_id` (rewinding to the first prompt keeps none), binds the fork to
+the source's host, workspace and live runner (host only when the runner
+is offline, so the next message relaunches it there), and keeps the
+source's title, labels, model, effort and launch arguments. A
+claude-native fork rebuilds Claude's transcript from the kept items.
+The source keeps its full history and gets a notice linking to the fork;
+live viewers follow via `session.superseded` with `reason: "rewind"`.
+Clients put `prompt` back in the composer, with `attachments`: the
+prompt's files as the fork's own copies (a fork copies every source
+file), readable from the fork's `resources/files/{file_id}/content`. An
+image or document the prompt carried inline (no stored file, e.g. after
+an import) comes back as its `image_url` or `file_data` data URI
+instead, with `file_id: null`, for the client to upload on send.
+`attachments_incomplete: true` means some attachments could not be restored,
+including missing files or failed lookups. Clients should warn the user to
+attach them again before sending; the new session is still usable.
+Rewinding never rolls back files on disk. `GET /v1/info` reports
+`session_rewind: true`, which also means
+`GET /v1/sessions/{id}/items?type=message` filters items by type.
 
 ### Read Fork Repository Branch Suggestions
 

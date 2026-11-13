@@ -29,7 +29,7 @@ import { useMobilePanelHeaderTarget } from "./MobilePanelDrawer";
 import { PullRequestCommentComposer } from "./PullRequestCommentComposer";
 import { usePullRequestReviewThreads } from "@/hooks/usePullRequestReviewThreads";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { skipToken, useQuery, useQueryClient } from "@tanstack/react-query";
+import { skipToken, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import {
   ArrowLeftIcon,
   CopyIcon,
@@ -999,6 +999,18 @@ interface PullRequestPanelView {
 
 const DEFAULT_PANEL_VIEW: PullRequestPanelView = { showingDetails: false, subtab: "summary" };
 
+export function selectPullRequestInPanel(
+  queryClient: QueryClient,
+  conversationId: string,
+  prUrl: string,
+) {
+  queryClient.setQueryData<PullRequestPanelView>(["pull-request-panel-view", conversationId], {
+    selected: prUrl,
+    showingDetails: true,
+    subtab: "summary",
+  });
+}
+
 export function PullRequestPanel({
   conversationId,
   active = true,
@@ -1018,11 +1030,13 @@ export function PullRequestPanel({
     gcTime: 30 * 60_000,
   });
   // Keep interactions synchronous; the shared entry restores the view on navigation.
-  const [localView, setLocalView] = useState({ conversationId, view: cachedView });
-  if (localView.conversationId !== conversationId) {
-    setLocalView({ conversationId, view: cachedView });
+  const [localView, setLocalView] = useState({ conversationId, cachedView, view: cachedView });
+  const cacheChanged =
+    localView.conversationId !== conversationId || localView.cachedView !== cachedView;
+  if (cacheChanged) {
+    setLocalView({ conversationId, cachedView, view: cachedView });
   }
-  const view = localView.conversationId === conversationId ? localView.view : cachedView;
+  const view = cacheChanged ? cachedView : localView.view;
   const selected = view.selected;
   const showingDetails = view.showingDetails;
   const activeTab = view.subtab;
@@ -1037,7 +1051,7 @@ export function PullRequestPanel({
           ...update,
         }),
       );
-      setLocalView({ conversationId, view: next! });
+      setLocalView((current) => ({ ...current, conversationId, view: next! }));
     },
     [queryClient, conversationId],
   );

@@ -108,6 +108,7 @@ import {
   type TerminalInfo,
 } from "@/hooks/useTerminals";
 import { useWorkspaceResources } from "./useWorkspaceResources";
+import { relativizeToWorkspace } from "@/hooks/useWorkspaceChangedFiles";
 import { useUiOpenFile } from "@/hooks/useUiOpenFile";
 import { citedFilePosition } from "./filePositionState";
 import { cn } from "@/lib/utils";
@@ -140,6 +141,7 @@ import {
   type FileNavigationGuard,
 } from "./FileViewerContext";
 import { revealFolderInFilesPanel } from "./FilesPanel";
+import { selectPullRequestInPanel } from "./PullRequestPanel";
 import type { ChangedSort } from "./FlatFileList";
 import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { isMobileViewport, Sidebar } from "./Sidebar";
@@ -162,6 +164,7 @@ import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDi
 import { resolveDefaultShell } from "./preferredShell";
 import { WorkspacePanel } from "./WorkspacePanel";
 import { SessionRail } from "./SessionRail";
+import { SessionCostButton, SessionOverview, useIsWideViewport } from "./SessionOverview";
 import type { RightRailTab } from "./railTabs";
 
 /**
@@ -605,6 +608,7 @@ function AppShellImpl() {
   const workspaceTabListRef = useRef<HTMLDivElement>(null);
   const focusWorkspaceTabsOnOpenRef = useRef(false);
   const rightPanelOpenRef = useRef(rightPanelOpen);
+  const localFileUrlRef = useRef<URLSearchParams | null>(null);
   rightPanelOpenRef.current = rightPanelOpen;
   const [rightPanelVisibilityAnimating, setRightPanelVisibilityAnimating] = useState(false);
   const rightPanelMotionTimerRef = useRef<number | null>(null);
@@ -646,6 +650,7 @@ function AppShellImpl() {
     [],
   );
   const [shareOpen, setShareOpen] = useState(false);
+  const [sharedFilePath, setSharedFilePath] = useState<string | undefined>();
   const [forkOpen, setForkOpen] = useState(false);
   const [forkSourceSessionId, setForkSourceSessionId] = useState<string | null>(null);
   const [forkHostSessionId, setForkHostSessionId] = useState<string | null>(null);
@@ -983,6 +988,8 @@ function AppShellImpl() {
     subagentsPanelOpen,
     shellsPanelOpen,
     rightPanelOpen,
+    rightPanelMaximized,
+    sidebarOpen,
   };
   const railSelectionRef = useRef(railSelection);
   railSelectionRef.current = railSelection;
@@ -1014,6 +1021,9 @@ function AppShellImpl() {
           (prev) => {
             const params = new URLSearchParams(prev);
             params.set("file", filePath);
+            if (now.rightPanelMaximized) params.set("fullscreen", "1");
+            else params.delete("fullscreen");
+            localFileUrlRef.current = params;
             return params;
           },
           { replace: true },
@@ -1308,6 +1318,8 @@ function AppShellImpl() {
     restoredWorkspace.conversationId !== conversationId ||
     restoredWorkspace.canvasMode !== canvasMode
   ) {
+    setShareOpen(false);
+    setSharedFilePath(undefined);
     setExecutionLogsKey(null);
     setFilesPanelOpen(false);
     setSubagentsPanelOpen(false);
@@ -1437,6 +1449,126 @@ function AppShellImpl() {
     cancelRightPanelVisibilityMotion();
     if (restoredWorkspace?.exitedMaximized) restoreSidebarAfterMaximize();
   }, [restoredWorkspace]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const fileNavigationGuardsRef = useRef(new Set<FileNavigationGuard>());
+  const registerNavigationGuard = useCallback((guard: FileNavigationGuard) => {
+    fileNavigationGuardsRef.current.add(guard);
+    return () => {
+      fileNavigationGuardsRef.current.delete(guard);
+    };
+  }, []);
+  const guardFileNavigation = useCallback(
+    (path: string | null, options: OpenFileOptions | undefined, commit: () => void) => {
+      const guards = [...fileNavigationGuardsRef.current];
+      const navigate = (index: number) => {
+        const guard = guards[index];
+        if (guard) guard(path, options, () => navigate(index + 1));
+        else commit();
+      };
+      navigate(0);
+    },
+    [],
+  );
+  const urlFilePath = searchParams.get("file") || null;
+  const urlFileFullscreen = searchParams.get("fullscreen") === "1";
+  const fullscreenRestoreRef = useRef<typeof restoredWorkspace>(null);
+  const visibleFileUrlRef = useRef(searchParams);
+  const fileLinkLocationRef = useRef(location);
+  fileLinkLocationRef.current = location;
+  const guardedFileLinkRef = useRef<{
+    locationKey: string;
+    restoredParams: URLSearchParams | null;
+  } | null>(null);
+  useEffect(
+    () => () => {
+      guardedFileLinkRef.current = null;
+    },
+    [],
+  );
+  if (urlFilePath === selectedFilePath && urlFileFullscreen === rightPanelMaximized) {
+    visibleFileUrlRef.current = searchParams;
+  }
+  // Honor incoming links even when the current session is already open.
+  useEffect(() => {
+    const sessionJustRestored = fullscreenRestoreRef.current !== restoredWorkspace;
+    fullscreenRestoreRef.current = restoredWorkspace;
+    const localFileUrl = localFileUrlRef.current;
+    localFileUrlRef.current = null;
+    // Local actions already established the rail selection and visibility motion.
+    if (
+      !sessionJustRestored &&
+      localFileUrl &&
+      (localFileUrl.get("file") || null) === urlFilePath &&
+      (localFileUrl.get("fullscreen") === "1") === urlFileFullscreen
+    ) {
+      if (guardedFileLinkRef.current?.restoredParams === localFileUrl) {
+        guardedFileLinkRef.current.locationKey = location.key;
+      } else {
+        guardedFileLinkRef.current = null;
+      }
+      return;
+    }
+    guardedFileLinkRef.current = null;
+    const applyIncomingLink = () => {
+      if (conversationId && urlFilePath) {
+        setSelectedFilePath(urlFilePath);
+        setSelectedTerminalKey(null);
+        setOpenFiles((prev) => (prev.includes(urlFilePath) ? prev : [...prev, urlFilePath]));
+        setRightRailTab((prev) => (prev === "files" || prev === "changes" ? prev : "files"));
+        setRightPanelOpenImmediately(true);
+        setFilesPanelOpen(false);
+        setSubagentsPanelOpen(false);
+        setShellsPanelOpen(false);
+        setSideChatsPanelOpen(false);
+        setContentSearchPanelOpen(false);
+        setExecutionLogsKey(null);
+        if (!terminalFirst) setPanelInitialKeyState(null);
+      }
+      const maximized = !!conversationId && !!urlFilePath && urlFileFullscreen;
+      const currentLayout = railSelectionRef.current;
+      if (maximized && !currentLayout.rightPanelMaximized) {
+        if (!sessionJustRestored || !restoredWorkspace?.exitedMaximized) {
+          sidebarOpenBeforeMaximizeRef.current = currentLayout.sidebarOpen;
+        }
+        setSidebarOpen(false);
+      } else if (!maximized && currentLayout.rightPanelMaximized) {
+        restoreSidebarAfterMaximize();
+      }
+      setRightPanelMaximized(maximized);
+    };
+    if (!sessionJustRestored && conversationId && urlFilePath && urlFilePath !== selectedFilePath) {
+      const request = { locationKey: location.key, restoredParams: null as URLSearchParams | null };
+      guardedFileLinkRef.current = request;
+      let committed = false;
+      guardFileNavigation(urlFilePath, undefined, () => {
+        if (
+          guardedFileLinkRef.current !== request ||
+          fileLinkLocationRef.current.key !== request.locationKey
+        )
+          return;
+        committed = true;
+        guardedFileLinkRef.current = null;
+        if (request.restoredParams) {
+          localFileUrlRef.current = searchParams;
+          setSearchParams(searchParams, { replace: true });
+        }
+        applyIncomingLink();
+      });
+      if (!committed) {
+        const currentParams = new URLSearchParams(visibleFileUrlRef.current);
+        if (selectedFilePath) currentParams.set("file", selectedFilePath);
+        else currentParams.delete("file");
+        if (selectedFilePath && rightPanelMaximized) currentParams.set("fullscreen", "1");
+        else currentParams.delete("fullscreen");
+        request.restoredParams = currentParams;
+        localFileUrlRef.current = currentParams;
+        setSearchParams(currentParams, { replace: true });
+      }
+    } else {
+      applyIncomingLink();
+    }
+    // Sidebar and maximize state are captured only when the URL request changes.
+  }, [conversationId, urlFilePath, urlFileFullscreen, restoredWorkspace]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Session metadata can arrive after the restore effect above. Once the
   // terminal-first label is known, apply URL state first, then the per-tab
@@ -1582,6 +1714,8 @@ function AppShellImpl() {
         (prev) => {
           const next = new URLSearchParams(prev);
           next.set("file", path);
+          if (rightPanelMaximized) next.set("fullscreen", "1");
+          else next.delete("fullscreen");
           next.delete("comment"); // stale comment belongs to the previous file
           // A citation's cited line rides along so the viewer can land on it;
           // a plain open clears any previous citation's line.
@@ -1591,33 +1725,22 @@ function AppShellImpl() {
           else next.delete("column");
           if (position?.endLine != null) next.set("endLine", String(position.endLine));
           else next.delete("endLine");
+          localFileUrlRef.current = next;
           return next;
         },
         { replace: true },
       );
     },
-    [setPanelInitialKey, terminalFirst, setSearchParams, conversationId, setRightPanelOpenAnimated],
+    [
+      setPanelInitialKey,
+      terminalFirst,
+      setSearchParams,
+      conversationId,
+      setRightPanelOpenAnimated,
+      rightPanelMaximized,
+    ],
   );
 
-  const fileNavigationGuardsRef = useRef(new Set<FileNavigationGuard>());
-  const registerNavigationGuard = useCallback((guard: FileNavigationGuard) => {
-    fileNavigationGuardsRef.current.add(guard);
-    return () => {
-      fileNavigationGuardsRef.current.delete(guard);
-    };
-  }, []);
-  const guardFileNavigation = useCallback(
-    (path: string | null, options: OpenFileOptions | undefined, commit: () => void) => {
-      const guards = [...fileNavigationGuardsRef.current];
-      const navigate = (index: number) => {
-        const guard = guards[index];
-        if (guard) guard(path, options, () => navigate(index + 1));
-        else commit();
-      };
-      navigate(0);
-    },
-    [],
-  );
   // Mobile Back returns to Content search only for the conversation and file
   // its result committed; any other file navigation clears it.
   const contentSearchFileRef = useRef<string | null>(null);
@@ -1654,6 +1777,8 @@ function AppShellImpl() {
         next.delete("line");
         next.delete("column");
         next.delete("endLine");
+        next.delete("fullscreen");
+        localFileUrlRef.current = next;
         return next;
       },
       { replace: true },
@@ -1665,11 +1790,14 @@ function AppShellImpl() {
       (prev) => {
         const params = new URLSearchParams(prev);
         params.set("file", selectedFilePath);
+        if (rightPanelMaximized) params.set("fullscreen", "1");
+        else params.delete("fullscreen");
+        localFileUrlRef.current = params;
         return params;
       },
       { replace: true },
     );
-  }, [selectedFilePath, setSearchParams]);
+  }, [selectedFilePath, rightPanelMaximized, setSearchParams]);
 
   // Toggle the right (Workspace) sidebar — shared by the header's collapse
   // button and the ⌘⌥]/Ctrl+Alt+] hotkey so they can't drift. Beyond flipping the
@@ -1887,7 +2015,27 @@ function AppShellImpl() {
       restoreSidebarAfterMaximize();
     }
     setRightPanelMaximized((prev) => !prev);
-  }, [rightPanelMaximized, sidebarOpen, restoreSidebarAfterMaximize, setSidebarOpen]);
+    if (selectedFilePath) {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          next.set("file", selectedFilePath);
+          if (rightPanelMaximized) next.delete("fullscreen");
+          else next.set("fullscreen", "1");
+          localFileUrlRef.current = next;
+          return next;
+        },
+        { replace: true },
+      );
+    }
+  }, [
+    rightPanelMaximized,
+    sidebarOpen,
+    restoreSidebarAfterMaximize,
+    setSidebarOpen,
+    selectedFilePath,
+    setSearchParams,
+  ]);
 
   // ⌘B / ⇧⌘B in the desktop app (⌘⌥[ / ⌘⌥] in a browser) toggle the left and
   // right sidebars. Bound here where both panels' open-state lives. A grid route
@@ -1950,6 +2098,10 @@ function AppShellImpl() {
     setSelectedFilePath(null);
     setFileViewerCommentsOpen(false);
     clearFileViewerUrl();
+    if (rightPanelMaximized) {
+      setRightPanelMaximized(false);
+      restoreSidebarAfterMaximize();
+    }
     if (contentSearchFileRef.current === `${conversationId}\n${selectedFilePath}`) {
       setContentSearchPanelOpen(true);
     } else {
@@ -1978,6 +2130,13 @@ function AppShellImpl() {
       return null;
     });
   }, [clearFileViewerUrl]);
+  const closeFileViewerToScope = useCallback(() => {
+    showScopeView();
+    if (rightPanelMaximized) {
+      setRightPanelMaximized(false);
+      restoreSidebarAfterMaximize();
+    }
+  }, [showScopeView, rightPanelMaximized, restoreSidebarAfterMaximize]);
 
   // Close a single file tab. If the closed tab was the active one, activate
   // its neighbor (prefer the previous tab, else the next); when no tabs
@@ -1994,6 +2153,10 @@ function AppShellImpl() {
           if (next.length === 0) {
             setFileViewerCommentsOpen(false);
             clearFileViewerUrl();
+            if (rightPanelMaximized) {
+              setRightPanelMaximized(false);
+              restoreSidebarAfterMaximize();
+            }
             return null;
           }
           const neighbor = next[idx - 1] ?? next[idx] ?? next[0];
@@ -2005,6 +2168,7 @@ function AppShellImpl() {
               params.delete("line"); // stale citation belongs to the closed file
               params.delete("column");
               params.delete("endLine");
+              localFileUrlRef.current = params;
               return params;
             },
             { replace: true },
@@ -2014,7 +2178,7 @@ function AppShellImpl() {
         return next;
       });
     },
-    [clearFileViewerUrl, setSearchParams],
+    [clearFileViewerUrl, setSearchParams, rightPanelMaximized, restoreSidebarAfterMaximize],
   );
 
   // Switch the workspace rail's tab. The side effect (closing any open
@@ -2444,28 +2608,33 @@ function AppShellImpl() {
 
   // Composer links open the mobile drawer or reveal the desktop Pull Requests tab.
   // Deselect files/shells so the chosen panel owns its content slot.
-  const openGithubTab = useCallback(() => {
-    if (isMobileViewport()) {
-      openGithubPanel();
-      return;
-    }
-    setSelectedFilePath(null);
-    setSelectedTerminalKey(null);
-    if (!terminalFirst) setPanelInitialKey(null);
-    setExecutionLogsKey(null);
-    setFilesPanelOpen(false);
-    setSubagentsPanelOpen(false);
-    selectRightRailTab("github");
-    setRightPanelOpenAnimated(true);
-    if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
-  }, [
-    conversationId,
-    terminalFirst,
-    setPanelInitialKey,
-    openGithubPanel,
-    selectRightRailTab,
-    setRightPanelOpenAnimated,
-  ]);
+  const openGithubTab = useCallback(
+    (prUrl?: string) => {
+      if (prUrl && conversationId) selectPullRequestInPanel(queryClient, conversationId, prUrl);
+      if (isMobileViewport()) {
+        openGithubPanel();
+        return;
+      }
+      setSelectedFilePath(null);
+      setSelectedTerminalKey(null);
+      if (!terminalFirst) setPanelInitialKey(null);
+      setExecutionLogsKey(null);
+      setFilesPanelOpen(false);
+      setSubagentsPanelOpen(false);
+      selectRightRailTab("github");
+      setRightPanelOpenAnimated(true);
+      if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
+    },
+    [
+      conversationId,
+      queryClient,
+      terminalFirst,
+      setPanelInitialKey,
+      openGithubPanel,
+      selectRightRailTab,
+      setRightPanelOpenAnimated,
+    ],
+  );
 
   function openMainExecutionLog() {
     // Mobile FAB → "Execution logs" jumps straight to the main thread.
@@ -2510,6 +2679,23 @@ function AppShellImpl() {
   // Sourced from the same environment query that gates the files panel.
   const workspaceRoot = environmentQuery.data?.root ?? null;
   const workspaceHome = environmentQuery.data?.home ?? null;
+  const relativeFilePath = relativizeToWorkspace(selectedFilePath, workspaceRoot);
+  const shareableFilePath =
+    relativeFilePath &&
+    !/^(?:[/\\~]|[a-z]:)/i.test(relativeFilePath) &&
+    !relativeFilePath.split(/[/\\]/).includes("..")
+      ? relativeFilePath
+      : null;
+  const shareFile = useMemo(
+    () =>
+      canShare && shareableFilePath
+        ? () => {
+            setSharedFilePath(shareableFilePath);
+            setShareOpen(true);
+          }
+        : undefined,
+    [canShare, shareableFilePath],
+  );
   const fileViewerContextValue = useMemo(
     () => ({
       openFile: openFileViewer,
@@ -2730,6 +2916,29 @@ function AppShellImpl() {
     !executionLogsOpen &&
     !filesPanelOpen,
   );
+  // WIP(session_overview): docks beside chat when a wide window leaves the right side
+  // free; otherwise the header cost opens it over chat.
+  const sessionOverviewEnabled =
+    serverConversationId !== undefined && isFeatureEnabled(serverInfo, "session_overview");
+  const wideViewport = useIsWideViewport();
+  const sessionOverviewDocked =
+    wideViewport &&
+    !workspacePanelVisible &&
+    !panelOpen &&
+    !executionLogsOpen &&
+    !filesPanelOpen &&
+    !canvasMode;
+  const [sessionOverviewDockedOpen, setSessionOverviewDockedOpen] = useState(true);
+  const [sessionOverviewOverlayOpen, setSessionOverviewOverlayOpen] = useState(false);
+  const sessionOverviewOpen =
+    sessionOverviewEnabled &&
+    (sessionOverviewDocked ? sessionOverviewDockedOpen : sessionOverviewOverlayOpen);
+  const toggleSessionOverview = useCallback(() => {
+    const setOpen = sessionOverviewDocked
+      ? setSessionOverviewDockedOpen
+      : setSessionOverviewOverlayOpen;
+    setOpen((open) => !open);
+  }, [sessionOverviewDocked]);
   useEffect(() => {
     if (!workspacePanelVisible || !focusWorkspaceTabsOnOpenRef.current) return;
     focusWorkspaceTabsOnOpenRef.current = false;
@@ -2861,6 +3070,14 @@ function AppShellImpl() {
               >
                 {!extensionOwnsHeader && (
                   <ChatHeader
+                    sessionOverviewControl={
+                      sessionOverviewEnabled && (
+                        <SessionCostButton
+                          expanded={sessionOverviewOpen}
+                          onToggle={toggleSessionOverview}
+                        />
+                      )
+                    }
                     // Real docked state — deliberately NOT `|| sidebarPeek`. Peek
                     // is a transient card floating over the collapsed layout (the
                     // docked sidebar stays w-0), so the header must keep its
@@ -2890,7 +3107,10 @@ function AppShellImpl() {
                     forkDisabledReason={forkDisabledReason}
                     shareDisabled={shareDisabled}
                     shareDisabledReason={shareDisabledReason}
-                    onShare={() => setShareOpen(true)}
+                    onShare={() => {
+                      setSharedFilePath(undefined);
+                      setShareOpen(true);
+                    }}
                     onFork={() => forkDialogContextValue.openForkDialog()}
                     hasAgentInfo={hasAgentInfo}
                     onAgentInfo={() => setAgentInfoOpen(true)}
@@ -2948,7 +3168,24 @@ function AppShellImpl() {
                       </ShellCommandContext.Provider>
                     </RenderErrorBoundary>
                   </SubagentPanelOpenerContext.Provider>
+                  {sessionOverviewOpen && !sessionOverviewDocked && (
+                    <aside
+                      aria-label="Session overview"
+                      className="absolute right-2 top-12 z-20 w-64 max-md:hidden"
+                    >
+                      <SessionOverview onClose={toggleSessionOverview} />
+                    </aside>
+                  )}
                 </GridSessionMain>
+
+                {sessionOverviewOpen && sessionOverviewDocked && (
+                  <aside
+                    aria-label="Session overview"
+                    className="flex w-64 shrink-0 flex-col overflow-y-auto px-2 pb-3 pt-12"
+                  >
+                    <SessionOverview onClose={toggleSessionOverview} />
+                  </aside>
+                )}
 
                 {/* Debug-mode execution-logs rail — desktop only, hidden when a
               push panel is open (the panel itself becomes the focus). Only
@@ -3006,8 +3243,10 @@ function AppShellImpl() {
                     openFiles={openFiles}
                     openFileViewer={openFileViewer}
                     onCloseFile={closeFile}
-                    onShowScopeView={showScopeView}
+                    onShowScopeView={closeFileViewerToScope}
                     onCommentsOpenChange={setFileViewerCommentsOpen}
+                    onShareFile={shareFile}
+                    shareDisabledReason={shareDisabledReason}
                     openTerminalTab={openTerminalTab}
                     openTerminals={openTerminals}
                     selectedTerminalKey={selectedTerminalKey}
@@ -3074,7 +3313,9 @@ function AppShellImpl() {
           </div>
           {conversationId && (
             <PermissionsModal
+              key={`${conversationId}:${sharedFilePath ?? ""}`}
               sessionId={conversationId}
+              filePath={sharedFilePath}
               workspace={activeSession?.workspace ?? activeConv?.workspace}
               open={shareOpen}
               onOpenChange={setShareOpen}
