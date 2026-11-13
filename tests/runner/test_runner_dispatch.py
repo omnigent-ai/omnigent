@@ -1741,11 +1741,14 @@ async def test_runner_policy_changes_replace_retained_worker(
 
 
 @pytest.mark.asyncio
-async def test_runner_stream_emits_failed_when_tool_spec_resolver_fails() -> None:
-    """Streaming spec resolver failures emit ``response.failed`` SSE.
+async def test_runner_stream_reuses_launch_spec_when_resolver_later_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Local tools retain the selected launch spec when its resolver later fails."""
+    from unittest.mock import AsyncMock
 
-    :returns: None.
-    """
+    dispatch_tool = AsyncMock(return_value="mocked tool result")
+    monkeypatch.setattr("omnigent.runner.tool_dispatch.dispatch_tool_locally", dispatch_tool)
     chunks = [
         (
             "event: response.created\ndata: "
@@ -1756,9 +1759,16 @@ async def test_runner_stream_emits_failed_when_tool_spec_resolver_fails() -> Non
             '"item":{"type":"function_call","status":"action_required",'
             '"name":"sys_os_read","call_id":"call_1","arguments":"{}"}}\n\n'
         ),
+        'event: response.completed\ndata: {"type":"response.completed",'
+        '"response":{"id":"resp_1","status":"completed"}}\n\n',
     ]
 
     recording = _RecordingHarnessClient(chunks)
+    spec = AgentSpec(
+        spec_version=1,
+        name="tool-resolution-agent",
+        executor=ExecutorSpec(type="omnigent", config={"harness": _TEST_HARNESS_NAME}),
+    )
 
     async def _failing_spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """
@@ -1770,11 +1780,7 @@ async def test_runner_stream_emits_failed_when_tool_spec_resolver_fails() -> Non
         """
         if recording.posted_bodies:
             raise RuntimeError(f"stream spec resolver unavailable for {agent_id}")
-        return AgentSpec(
-            spec_version=1,
-            name="tool-resolution-agent",
-            executor=ExecutorSpec(type="omnigent", config={"harness": _TEST_HARNESS_NAME}),
-        )
+        return spec
 
     app = create_runner_app(
         process_manager=cast(
@@ -1799,14 +1805,10 @@ async def test_runner_stream_emits_failed_when_tool_spec_resolver_fails() -> Non
 
     assert response.status_code == 200
     assert "event: response.created" in response.text
-    assert "event: response.failed" in response.text
-    # The exception class (a safe, generic label) is still surfaced as the
-    # error ``type``; the failure message is a fixed client-safe string. The
-    # raw resolver exception text must not leak into the SSE stream (it is
-    # logged on the runner instead).
-    assert "RuntimeError" in response.text
-    assert "Failed to resolve the agent spec for this turn." in response.text
-    assert "stream spec resolver unavailable for ag_stream" not in response.text
+    assert "event: response.completed" in response.text
+    assert "event: response.failed" not in response.text
+    dispatch_tool.assert_awaited_once()
+    assert dispatch_tool.call_args.kwargs["agent_spec"] is spec
 
 
 # ── Harness error-response detail → stream subscribers ───
@@ -13253,7 +13255,7 @@ def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
             },
             id="child_missing-background-parent",
         ),
-        # Resolver failures reject both streaming paths before dispatch.
+        # Selection failures are JSON; failures for a selected harness use SSE.
         pytest.param(
             "resolver_raises",
             "no_harness",
@@ -13263,8 +13265,8 @@ def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
         pytest.param(
             "resolver_raises",
             "known_harness",
-            {"status": 503, "error": "spec_resolver_failed", "instructions": None},
-            id="resolver_raises-known_harness-503",
+            {"status": 200, "error": None, "instructions": None},
+            id="resolver_raises-known_harness-sse",
         ),
         pytest.param(
             "resolver_raises",

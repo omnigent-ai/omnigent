@@ -1,7 +1,9 @@
 """Tool denials must not block session init or discard sandbox transforms."""
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from unittest.mock import AsyncMock, Mock
 
 import httpx
@@ -11,6 +13,7 @@ from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.policies import FunctionPolicy
 from omnigent.runner import app as runner_app_module
 from omnigent.runner import create_runner_app
+from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.policy import (
     AGENT_START_TOOL,
     AgentStartPolicyError,
@@ -28,6 +31,7 @@ from omnigent.spec.types import (
     Phase,
     PhaseSelector,
 )
+from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient, _sse
 from tests.runner.helpers import NullServerClient
 
 _START_ARGS = {"harness": "claude-sdk", "sandbox": {"type": "none"}}
@@ -131,6 +135,171 @@ async def test_start_probe_keeps_real_tool_enforcement() -> None:
         await gate.evaluate_tool_call("sys_session_send", {"agent": "child"})
     ).action == "allow"
     assert (await gate.evaluate_tool_call("shell", {"command": "ls"})).action == "deny"
+
+
+async def test_direct_stream_selection_builds_policy_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _spec(_force_bwrap())
+    build_environment = Mock(return_value={"SELECTED_ENV": "trusted"})
+    monkeypatch.setattr(runner_app_module, "_build_spawn_env_from_spec", build_environment)
+    manager = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=manager,
+        spec_resolver=AsyncMock(return_value=spec),
+        server_client=NullServerClient(),
+    )
+    async with _runner_client(app) as client:
+        response = await client.post(
+            f"/v1/sessions/{_SESSION_ID}/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "agent",
+                "content": [],
+                "harness": "openai-agents",
+                "harness_override": "pi",
+                "spawn_env": {"SELECTED_ENV": "untrusted"},
+            },
+        )
+    assert response.status_code == 200, response.text
+    selected_spec, selected_harness = build_environment.call_args.args
+    assert selected_harness == "openai-agents"
+    assert selected_spec.os_env.sandbox.type == "linux_bwrap"
+    assert selected_spec.os_env.sandbox.allow_network is False
+    assert spec.os_env.sandbox.type == "none"
+    assert manager.get_client_calls == [
+        (_SESSION_ID, "openai-agents", {"SELECTED_ENV": "trusted"})
+    ]
+
+
+@pytest.mark.parametrize(
+    "cache_state",
+    ["same-harness", "original-harness", "replaced-entry", "background", "native-selection"],
+)
+async def test_cached_harness_selection_preserves_single_policy_transform(
+    monkeypatch: pytest.MonkeyPatch, cache_state: str
+) -> None:
+    monkeypatch.setattr(runner_app_module, "_session_inboxes_ref", {})
+    declared = _spec()
+    resolver = AsyncMock(return_value=declared)
+
+    def transform(spec: AgentSpec, harness: str) -> AgentSpec:
+        assert spec is declared
+        return replace(spec, name=f"{spec.name}-{harness}", instructions=f"Policy for {harness}.")
+
+    gate = AsyncMock(side_effect=transform)
+    build_environment = Mock(side_effect=lambda spec, *args, **kwargs: {"POLICY_NAME": spec.name})
+    register_routes = Mock(wraps=runner_app_module.register_mcp_routes)
+    monkeypatch.setattr(runner_app_module, "_apply_agent_start_gate", gate)
+    monkeypatch.setattr(runner_app_module, "_build_spawn_env_from_spec", build_environment)
+    monkeypatch.setattr(runner_app_module, "register_mcp_routes", register_routes)
+    dispatch_tool = AsyncMock(return_value="mocked tool result")
+    monkeypatch.setattr("omnigent.runner.tool_dispatch.dispatch_tool_locally", dispatch_tool)
+    schemas = AsyncMock(return_value=McpSchemasResult([], set(), {}))
+    monkeypatch.setattr(runner_app_module.ProxyMcpManager, "schemas_for", schemas)
+    launch_terminal = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner_app_module, "_launch_native_terminal", launch_terminal)
+    worker = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "response"}}),
+            _sse(
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "status": "action_required",
+                        "name": "sys_os_read",
+                        "call_id": "call",
+                        "arguments": "{}",
+                    },
+                }
+            ),
+            _sse(
+                {
+                    "type": "response.completed",
+                    "response": {"id": "response", "status": "completed"},
+                }
+            ),
+        ]
+    )
+    manager = _FakeProcessManager(worker)
+    app = create_runner_app(
+        process_manager=manager,
+        spec_resolver=resolver,
+        server_client=NullServerClient(),
+    )
+    harness = {
+        "original-harness": "claude-sdk",
+        "native-selection": "opencode-native",
+    }.get(cache_state, "pi")
+    async with _runner_client(app) as client:
+        initialized = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": _SESSION_ID,
+                "agent_id": "agent",
+                "session_init": {
+                    "protocol_version": 2,
+                    "server_version": "0.6.0.dev0",
+                    "session_id": _SESSION_ID,
+                    "agent_id": "agent",
+                    "snapshot": {
+                        "created_at": 1,
+                        "updated_at": 1,
+                        "labels": {},
+                        "harness_override": "pi",
+                    },
+                },
+            },
+        )
+        assert initialized.status_code == 201, initialized.text
+        gate.assert_awaited_once_with(declared, "pi")
+        cache = register_routes.call_args.kwargs["_session_spec_cache"]
+        original_cached = cache[_SESSION_ID]
+        if cache_state == "replaced-entry":
+            cache[_SESSION_ID] = replace(cache[_SESSION_ID], name="external-cache-entry")
+        query = "" if cache_state == "background" else "?stream=true"
+        response = await client.post(
+            f"/v1/sessions/{_SESSION_ID}/events{query}",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "agent",
+                "harness": harness,
+                "has_mcp_servers": cache_state == "original-harness",
+            },
+        )
+        if cache_state == "background":
+            task = app.state.active_turns.get(_SESSION_ID)
+            if task is not None:
+                await asyncio.wait_for(task, timeout=5)
+    assert response.status_code == (202 if cache_state == "background" else 200), response.text
+    assert manager.get_client_calls[-1] == (
+        _SESSION_ID,
+        harness,
+        {"POLICY_NAME": f"{declared.name}-{harness}"},
+    )
+    selected = build_environment.call_args.args[0]
+    assert f"Policy for {harness}." in worker.posted_bodies[-1]["instructions"]
+    dispatch_tool.assert_awaited_once()
+    assert dispatch_tool.call_args.kwargs["agent_spec"] is selected
+    assert dispatch_tool.call_args.kwargs["effective_harness"] == harness
+    if cache_state == "original-harness":
+        assert schemas.call_args.args[0] is selected
+        assert cache[_SESSION_ID] is original_cached
+    if cache_state == "native-selection":
+        launch_terminal.assert_awaited_once()
+        context = launch_terminal.call_args.args[1]
+        assert context.agent_spec is selected
+        assert context.ensure_comment_relay.keywords["effective_spec_entry"] is selected
+        assert launch_terminal.call_args.kwargs["resolve_agent_spec"] is None
+    if cache_state in {"same-harness", "background"}:
+        gate.assert_awaited_once_with(declared, "pi")
+        resolver.assert_awaited_once()
+    else:
+        assert gate.await_args_list[1].args == (declared, harness)
+        assert resolver.await_count >= 2
 
 
 @pytest.mark.parametrize("action", ["DENY", "ASK"])
