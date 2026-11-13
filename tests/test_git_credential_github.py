@@ -6,6 +6,7 @@ import io
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from unittest.mock import Mock
 
 import httpx
 import pytest
@@ -28,7 +29,8 @@ def test_get_prints_credentials_for_github(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, token_file: bool
 ) -> None:
     cred = {"connected": True, "username": "x-access-token", "token": "T"}
-    monkeypatch.setattr(h, "_fetch", lambda *a, **k: cred)
+    fetch = Mock(return_value=cred)
+    monkeypatch.setattr(h, "_fetch", fetch)
     monkeypatch.setattr(sys, "stdin", io.StringIO("protocol=https\nhost=github.com\n\n"))
     out = io.StringIO()
     monkeypatch.setattr(sys, "stdout", out)
@@ -37,6 +39,7 @@ def test_get_prints_credentials_for_github(
     credential = ["--host-token-file", str(path)] if token_file else ["--host-token", "tok"]
     rc = h.main(["--server", "http://s", "--host-id", "hid", *credential, "get"])
     assert rc == 0
+    fetch.assert_called_once_with("http://s", "hid", "tok")
     assert "username=x-access-token" in out.getvalue()
     assert "password=T" in out.getvalue()
 

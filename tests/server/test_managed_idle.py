@@ -133,32 +133,70 @@ async def test_busy_host_is_not_suspended(stack, monkeypatch):
     assert stack.store.sandbox_operation(stack.host.host_id)["phase"] == "active"
 
 
-async def test_wake_waits_for_inflight_suspend(stack, monkeypatch):
+@pytest.mark.parametrize("launch_requested", [False, True], ids=["wake", "launch"])
+async def test_wake_waits_for_inflight_suspend(stack, monkeypatch, launch_requested):
+    send_direct = stack.registry.send_text_direct
     quiesce_reply(stack, monkeypatch)
-    entered, release = threading.Event(), threading.Event()
+    entered, release, waiting = threading.Event(), threading.Event(), threading.Event()
+    resume = stack.launcher.resume
+    claim = stack.store.claim_sandbox_operation
 
     def stop(sandbox_id):
         entered.set()
         assert release.wait(5)
         stack.launcher.stopped = sandbox_id
 
+    def resume_after_stop(sandbox_id):
+        assert stack.launcher.stopped == sandbox_id
+        resume(sandbox_id)
+
+    def observe_claim(host_id, token, purpose, **kwargs):
+        result = claim(host_id, token, purpose, **kwargs)
+        if purpose in {"wake", "launch"} and result is None:
+            waiting.set()
+        return result
+
     monkeypatch.setattr(stack.launcher, "stop", stop)
+    monkeypatch.setattr(stack.launcher, "resume", resume_after_stop)
+    monkeypatch.setattr(stack.store, "claim_sandbox_operation", observe_claim)
+    frame = launch_frame(stack) if launch_requested else None
     suspend = asyncio.create_task(stack.coordinator.suspend_if_idle(stack.connection))
     wake = None
     try:
         assert await asyncio.to_thread(entered.wait, 5)
-        wake = asyncio.create_task(
-            resume_managed_host(stack.host.host_id, stack.store, stack.config)
-        )
-        await asyncio.sleep(0)
+        if frame is not None:
+            monkeypatch.setattr(stack.registry, "send_text_direct", send_direct)
+            wake = asyncio.get_running_loop().create_future()
+            stack.connection.pending_launches[frame.request_id] = wake
+            stack.registry.idle_launch_dispatcher = stack.coordinator.dispatch
+            stack.registry.send_text(stack.connection, encode_host_frame(frame))
+        else:
+            wake = asyncio.create_task(
+                resume_managed_host(stack.host.host_id, stack.store, stack.config)
+            )
+        assert await asyncio.to_thread(waiting.wait, 5)
         assert stack.launcher.resumed == []
-        assert stack.store.claim_sandbox_operation(stack.host.host_id, "other", "wake") is None
     finally:
         release.set()
     assert await suspend
     assert wake is not None
-    await wake
+    if frame is not None:
+        await poll_until_async(
+            lambda: (
+                (target := stack.registry.get(stack.host.host_id)) is not None
+                and frame.request_id in target.pending_guarded_launches
+            )
+        )
+        target = stack.registry.get(stack.host.host_id)
+        assert target is not stack.connection
+        assert decode_host_frame(target.outbound_queue.get_nowait().data) == frame
+        target.pending_guarded_launches[frame.request_id].set_result({"status": "ok"})
+        assert await wake == {"status": "ok"}
+        await asyncio.gather(*stack.coordinator.tasks)
+    else:
+        await wake
     assert stack.launcher.resumed == ["actor"]
+    assert stack.store.sandbox_operation(stack.host.host_id)["phase"] == "active"
 
 
 async def test_cancelled_suspend_keeps_gate_closed_while_thread_finishes(stack, monkeypatch):
@@ -213,6 +251,23 @@ def launch_frame(stack):
     return HostLaunchRunnerFrame(
         request_id="request", binding_token=token, workspace="/work", session_id=conversation.id
     )
+
+
+async def test_launch_without_quiescence_capability_uses_direct_send(stack):
+    stack.connection.hello.capabilities = []
+    frame = launch_frame(stack)
+    original = asyncio.get_running_loop().create_future()
+    stack.connection.pending_launches[frame.request_id] = original
+    stack.registry.idle_launch_dispatcher = stack.coordinator.dispatch
+
+    stack.registry.send_text(stack.connection, encode_host_frame(frame))
+
+    assert decode_host_frame(stack.connection.outbound_queue.get_nowait().data) == frame
+    assert stack.connection.pending_launches[frame.request_id] is original
+    assert not stack.connection.pending_guarded_launches
+    assert not stack.coordinator.tasks
+    assert stack.store.sandbox_operation(stack.host.host_id) is None
+    assert stack.launcher.resumed == []
 
 
 async def test_caller_timeout_does_not_release_launch_gate(stack):
