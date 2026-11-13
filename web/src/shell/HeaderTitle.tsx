@@ -4,7 +4,9 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { useRenameConversation } from "@/hooks/useConversations";
 import { useRenameSessionHotkey } from "@/hooks/useRenameSessionHotkey";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { INLINE_RENAME_FIELD_PROPS } from "@/lib/inlineRename";
 import { cn } from "@/lib/utils";
+import { startSidebarRename } from "./sidebarRename";
 
 /**
  * The breadcrumb title as a click-to-rename control (desktop).
@@ -18,7 +20,10 @@ import { cn } from "@/lib/utils";
 export function HeaderTitle({ conversationId, title }: { conversationId: string; title: string }) {
   const rename = useRenameConversation();
   const [editing, setEditing] = useState(false);
-  useRenameSessionHotkey(() => setEditing(true), !editing && !rename.isPending);
+  // The shortcut prefers the session's sidebar row, where users rename several in a row.
+  useRenameSessionHotkey(() => {
+    if (!startSidebarRename(conversationId)) setEditing(true);
+  }, !editing && !rename.isPending);
 
   if (!editing) {
     return (
@@ -104,6 +109,7 @@ function HeaderTitleInput({
   return (
     <input
       ref={inputRef}
+      {...INLINE_RENAME_FIELD_PROPS}
       type="text"
       aria-label="Session name"
       data-testid="header-title-input"

@@ -36,7 +36,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native import owner_claim
 from omnigent.process_logging import redact_log_text
 from omnigent.runner.identity import strip_runner_auth_secrets
-from omnigent.util.tmux_compat import MIN_TMUX_VERSION, MIN_TMUX_VERSION_HINT, tmux_version
+from omnigent.util.tmux_compat import tmux_unavailable_reason
 
 if TYPE_CHECKING:
     from omnigent.terminals.program_status import ProgramStatusReader
@@ -61,6 +61,7 @@ from .sandbox import (
     with_additional_write_roots,
     with_denied_unix_sockets,
 )
+from .tcp_egress import TcpEgressBroker, apply_tcp_egress_env, start_tcp_egress_broker
 from .terminal_clipboard import TerminalClipboardBridge
 from .terminal_lifecycle import (
     TERMINAL_INSTANCE_ID_ENV,
@@ -330,6 +331,9 @@ _EXIT_STATUS_POLL_SECONDS = 0.01
 _PANE_EXIT_STATUS_FORMAT = "#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}"
 # Avoid adding probe pressure while the host cannot start another process.
 _TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS = 1.0
+# A watcher whose last capture is older than this has stalled or stopped, so its
+# view of the screen no longer says whether the pane is producing output.
+_SCREEN_WATCH_STALE_SECONDS = 10.0
 
 # Process creation can fail temporarily while the host is under resource
 # pressure. Only those errno values leave terminal liveness unknown; permanent
@@ -379,6 +383,16 @@ def _tmux_process_start_error(cmd: list[str], exc: OSError) -> RuntimeError:
         return _TmuxProcessStartError(detail)
     return RuntimeError(detail)
 
+
+# has-session stderr when tmux answered but the session no longer exists, or when
+# the socket is still there but its server is gone (``kill-server``, ``killall tmux``).
+_TMUX_SESSION_KILLED_MARKERS = (
+    "no current target",
+    "can't find session",
+    "session not found",
+    "no such session",
+    "no server running on",
+)
 
 # Unrecognized failures leave liveness unknown and are retried.
 _TMUX_TARGET_GONE_STDERR_MARKERS = (
@@ -668,6 +682,7 @@ def _clone_sandbox_spec(sandbox: OSEnvSandboxSpec | None) -> OSEnvSandboxSpec | 
         ),
         egress_rules=list(sandbox.egress_rules) if sandbox.egress_rules is not None else None,
         git_ssh=list(sandbox.git_ssh) if sandbox.git_ssh is not None else None,
+        tcp_egress=list(sandbox.tcp_egress) if sandbox.tcp_egress is not None else None,
     )
 
 
@@ -827,25 +842,9 @@ class TmuxUnavailableError(OmnigentError, RuntimeError):
 
 def _require_supported_tmux() -> None:
     """Fail before terminal setup when tmux is missing, unknown, or too old."""
-    tmux = shutil.which("tmux")
-    if tmux is None:
-        raise TmuxUnavailableError(
-            "tmux is not installed or not on PATH. Native terminals need tmux "
-            f"{MIN_TMUX_VERSION_HINT} or newer: install it (macOS: `brew install tmux`), "
-            "or restart the Omnigent host from a shell where `tmux -V` works."
-        )
-    version = tmux_version(tmux)
-    if version is None:
-        raise TmuxUnavailableError(
-            "Could not determine the installed tmux version; managed terminals require "
-            f"tmux {MIN_TMUX_VERSION_HINT} or newer"
-        )
-    if version < MIN_TMUX_VERSION:
-        detected = f"{version[0]}.{version[1]}"
-        raise TmuxUnavailableError(
-            f"tmux {detected} is too old; managed terminals require "
-            f"tmux {MIN_TMUX_VERSION_HINT} or newer"
-        )
+    reason = tmux_unavailable_reason()
+    if reason is not None:
+        raise TmuxUnavailableError(reason)
 
 
 def _process_alive(pid: int) -> bool:
@@ -1036,7 +1035,7 @@ def build_terminal_os_env_spec(
         if sandbox.requires_network_enforcement:
             raise ValueError(
                 "sandbox_override is not allowed on a terminal whose "
-                "effective sandbox declares egress_rules or git_ssh: overriding "
+                "effective sandbox declares egress_rules, git_ssh, or tcp_egress: overriding "
                 "to 'none' would drop hard network "
                 "enforcement while network policy remains as inert "
                 "decoration on the policy."
@@ -1133,6 +1132,9 @@ class TerminalInstance:
     _egress_tmpdir: Path | None = field(default=None, repr=False)
     _git_ssh_broker: GitSshBroker | None = field(default=None, repr=False)
     _git_ssh_tmpdir: Path | None = field(default=None, repr=False)
+    _tcp_egress_broker: TcpEgressBroker | None = field(default=None, repr=False)
+    _tcp_egress_tmpdir: Path | None = field(default=None, repr=False)
+    _resource_cleanup_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
     _clipboard_bridge: TerminalClipboardBridge | None = field(default=None, init=False, repr=False)
     _idle_task: asyncio.Task[None] | None = field(default=None, repr=False)
     # Threaded idle-watcher state. Mirrors :attr:`_idle_task` but for
@@ -1153,6 +1155,11 @@ class TerminalInstance:
     _last_pane_snapshot: str | None = field(default=None, repr=False)
     _last_exit_snapshot: str | None = field(default=None, repr=False)
     _last_capture_at: float | None = field(default=None, repr=False)
+    # Monotonic stamps from the threaded idle watcher: when it started, its
+    # latest capture, and the latest capture that agent output changed.
+    _screen_watch_started_at: float | None = field(default=None, repr=False)
+    _screen_watched_at: float | None = field(default=None, repr=False)
+    _screen_changed_at: float | None = field(default=None, repr=False)
     _probe_failures: deque[dict[str, object]] = field(
         default_factory=lambda: deque(maxlen=2 * _IDLE_EXIT_FAILURE_THRESHOLD),
         init=False,
@@ -1214,6 +1221,33 @@ class TerminalInstance:
             ``False`` when none was ever observed.
         """
         return time.monotonic() - self._last_client_interaction_at < window_s
+
+    def screen_changed_within(self, window_s: float) -> bool | None:
+        """
+        Whether agent output changed the screen in the last *window_s* seconds.
+
+        tmux's ``window_activity`` advances on any output, including title
+        updates and repaints that leave the screen as it was, so an idle TUI
+        with a title spinner reads as busy forever. The native pane reaper
+        reads the idle watcher's own screen diff instead when it can.
+
+        :param window_s: Recency window in seconds, e.g. ``120.0``.
+        :returns: ``None`` when the watcher has not watched for the whole window
+            or its last capture is stale, so the caller must fall back to tmux's
+            clock; otherwise whether the screen changed within the window.
+        """
+        now = time.monotonic()
+        started_at = self._screen_watch_started_at
+        watched_at = self._screen_watched_at
+        if (
+            started_at is None
+            or watched_at is None
+            or now - started_at < window_s
+            or now - watched_at > _SCREEN_WATCH_STALE_SECONDS
+        ):
+            return None
+        changed_at = self._screen_changed_at
+        return changed_at is not None and now - changed_at < window_s
 
     def last_pane_text(self) -> str | None:
         """Return the last visible pane text captured for diagnostics.
@@ -1465,6 +1499,17 @@ class TerminalInstance:
         """Return tmux's observed signal, without attributing who sent it."""
         return self._last_exit_signal
 
+    def session_killed_by_tmux(self) -> bool:
+        """Whether tmux reported this terminal's session, or its whole server, gone.
+
+        With ``keep_alive_after_exit`` an inner-CLI exit leaves a dead pane, so a
+        missing session or server means a tmux kill command (or a killed tmux) ended it.
+        """
+        error = (self._last_session_probe_error or "").lower()
+        return self.keep_alive_after_exit and any(
+            marker in error for marker in _TMUX_SESSION_KILLED_MARKERS
+        )
+
     def _remember_exit_status(self, fields: str) -> None:
         """Record the exit code from a ``#{pane_dead} #{pane_dead_status}`` row.
 
@@ -1592,7 +1637,7 @@ class TerminalInstance:
         try:
             await self._launch_impl(cwd=cwd)
         except BaseException:
-            self._stop_network_brokers()
+            await asyncio.to_thread(self._stop_network_brokers)
             raise
 
     async def _launch_impl(self, *, cwd: Path | None = None) -> None:
@@ -1643,18 +1688,16 @@ class TerminalInstance:
                 sandbox_for_launcher = self._bootstrap_egress_proxy(sandbox_for_launcher, env)
             if sandbox_for_launcher.git_ssh:
                 sandbox_for_launcher = self._bootstrap_git_ssh(sandbox_for_launcher, env)
+            if sandbox_for_launcher.tcp_egress:
+                sandbox_for_launcher = self._bootstrap_tcp_egress(sandbox_for_launcher, env)
             cli_path = shutil.which(self.command) or self.command
-            try:
-                if sandbox_for_launcher.copy_on_write_namespace:
-                    host_cwd = "/"
-                    launcher_path = create_exec_launcher(
-                        cli_path, sandbox_for_launcher, cwd=effective_cwd
-                    )
-                else:
-                    launcher_path = create_exec_launcher(cli_path, sandbox_for_launcher)
-            except Exception:
-                self._stop_git_ssh()
-                raise
+            if sandbox_for_launcher.copy_on_write_namespace:
+                host_cwd = "/"
+                launcher_path = create_exec_launcher(
+                    cli_path, sandbox_for_launcher, cwd=effective_cwd
+                )
+            else:
+                launcher_path = create_exec_launcher(cli_path, sandbox_for_launcher)
             inner_cmd = [launcher_path, *self.args]
         else:
             inner_cmd = [self.command, *self.args]
@@ -1751,7 +1794,6 @@ class TerminalInstance:
         except BaseException:
             if self._clipboard_bridge is not None:
                 await asyncio.to_thread(self._clipboard_bridge.close)
-            self._stop_git_ssh()
             raise
 
         self.running = True
@@ -1940,6 +1982,28 @@ class TerminalInstance:
             cleanup_private_tmpdir(self._git_ssh_tmpdir)
             self._git_ssh_tmpdir = None
 
+    def _bootstrap_tcp_egress(self, sandbox: SandboxPolicy, env: dict[str, str]) -> SandboxPolicy:
+        routes = sandbox.tcp_egress
+        assert routes is not None
+        self._tcp_egress_tmpdir = create_private_tmpdir()
+        sandbox = with_additional_write_roots(sandbox, [self._tcp_egress_tmpdir])
+        self._tcp_egress_broker = start_tcp_egress_broker(routes, self._tcp_egress_tmpdir)
+        apply_tcp_egress_env(env, self._tcp_egress_broker)
+        return replace(sandbox, tcp_egress_socket_path=str(self._tcp_egress_broker.socket_path))
+
+    def _stop_tcp_egress(self) -> None:
+        if self._tcp_egress_broker is not None:
+            try:
+                self._tcp_egress_broker.stop()
+            except Exception:
+                logger.exception(
+                    "TCP egress broker stop failed for terminal %s:%s", self.name, self.session_key
+                )
+            self._tcp_egress_broker = None
+        if self._tcp_egress_tmpdir is not None:
+            cleanup_private_tmpdir(self._tcp_egress_tmpdir)
+            self._tcp_egress_tmpdir = None
+
     def _stop_network_brokers(self) -> None:
         if self._egress_handle is not None:
             try:
@@ -1953,6 +2017,7 @@ class TerminalInstance:
             cleanup_private_tmpdir(self._egress_tmpdir)
             self._egress_tmpdir = None
         self._stop_git_ssh()
+        self._stop_tcp_egress()
 
     async def close(self) -> None:
         """Kill the tmux session and clean up."""
@@ -1971,36 +2036,43 @@ class TerminalInstance:
                 )
         except Exception as exc:  # noqa: BLE001 - diagnostics cannot prevent cleanup.
             logger.debug("Terminal cleanup telemetry failed (%s)", type(exc).__name__)
-        # Cancel both idle-watcher variants first so they don't race
-        # the socket teardown. Order doesn't matter — they're
-        # independent.
-        await self._stop_idle_watcher()
-        self._stop_idle_watcher_thread()
+        try:
+            # Cancel both idle-watcher variants first so they don't race
+            # the socket teardown. Order doesn't matter — they're
+            # independent.
+            await self._stop_idle_watcher()
+            self._stop_idle_watcher_thread()
 
-        # The watcher and is_alive() both set ``running=False`` when they
-        # observe a failure. A private socket can still belong to a live tmux
-        # server (or a remain-on-exit pane), so cleanup must not trust that
-        # advisory flag before issuing kill-server.
-        if self.running or self.socket_path.exists():
-            with contextlib.suppress(RuntimeError):
-                await self._tmux("kill-server")
-        self.running = False
+            # The watcher and is_alive() both set ``running=False`` when they
+            # observe a failure. A private socket can still belong to a live tmux
+            # server (or a remain-on-exit pane), so cleanup must not trust that
+            # advisory flag before issuing kill-server.
+            if self.running or self.socket_path.exists():
+                with contextlib.suppress(RuntimeError):
+                    await self._tmux("kill-server")
+            self.running = False
 
-        if self._clipboard_bridge is not None:
-            await asyncio.to_thread(self._clipboard_bridge.close)
+            if self._clipboard_bridge is not None:
+                await asyncio.to_thread(self._clipboard_bridge.close)
 
-        if self.os_env is not None:
-            self.os_env.close()
+        finally:
+            if self._resource_cleanup_task is None or self._resource_cleanup_task.done():
+                self._resource_cleanup_task = asyncio.create_task(
+                    asyncio.to_thread(self._close_resources)
+                )
+            await asyncio.shield(self._resource_cleanup_task)
 
-        # Stop the egress proxy + clean up its scratch tmpdir.
-        # Order: stop first so the proxy isn't listening on a
-        # socket inside a soon-to-be-deleted dir, then remove the
-        # tmpdir.
-        self._stop_network_brokers()
-
-        # Clean up the private dir (contains socket + fork).
-        if self.private_dir.exists():
-            shutil.rmtree(self.private_dir, ignore_errors=True)
+    def _close_resources(self) -> None:
+        """Finish revocation and file cleanup even if the async owner times out."""
+        try:
+            self._stop_network_brokers()
+        finally:
+            try:
+                if self.os_env is not None:
+                    self.os_env.close()
+            finally:
+                if self.private_dir.exists():
+                    shutil.rmtree(self.private_dir, ignore_errors=True)
 
     def start_idle_watcher(
         self,
@@ -2280,6 +2352,7 @@ class TerminalInstance:
         interval = poll_interval_s if poll_interval_s is not None else _IDLE_POLL_INTERVAL_SECONDS
         consecutive_capture_failures = 0
         self._probe_failures.clear()
+        self._screen_watch_started_at = time.monotonic()
         while True:
             # ``Event.wait`` doubles as the poll-interval sleep, so
             # ``stop_event.set()`` from :meth:`close` returns within
@@ -2358,6 +2431,12 @@ class TerminalInstance:
                 time.monotonic() - self._last_client_interaction_at
             ) < _CLIENT_INTERACTION_WINDOW_SECONDS
             idle_fired = detector.tick(snapshot, suppress_activity=suppress)
+            # The change stamp lands first, so a reader never pairs a fresh capture
+            # with the previous change time.
+            watched_at = time.monotonic()
+            if detector.changed_this_tick:
+                self._screen_changed_at = watched_at
+            self._screen_watched_at = watched_at
             # Activity edge first: a tick can both change the pane and
             # (much later) cross the idle threshold, but never both in
             # the same tick — a change resets the idle timer.

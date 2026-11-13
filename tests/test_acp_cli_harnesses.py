@@ -241,7 +241,7 @@ def test_spawn_env_names_a_row_auth_variable(monkeypatch: pytest.MonkeyPatch) ->
     assert "HARNESS_ACP_ENV_PASSTHROUGH" not in env
 
 
-def test_grok_row_passes_through_its_api_key() -> None:
+def test_grok_row_passes_through_its_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     """The real Grok row must forward the key its auth hint advertises.
 
     ``XAI_API_KEY`` is the documented API-key path for Grok Build, and an
@@ -251,6 +251,21 @@ def test_grok_row_passes_through_its_api_key() -> None:
     assert "XAI_API_KEY" in row.install.auth_hint
     env = _build_acp_cli_spawn_env(_spec("grok"), harness="grok")
     assert "XAI_API_KEY" in env["HARNESS_ACP_ENV_PASSTHROUGH"].split(",")
+
+    from omnigent.inner.acp_executor import AcpExecutor
+    from omnigent.inner.acp_harness import _build_acp_executor
+
+    for name in ("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "HARNESS_ACP_OS_ENV", "HARNESS_ACP_ENV_UNSET"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("XAI_API_KEY", "example-xai-value")
+    monkeypatch.setenv("UNRELATED_API_KEY", "example-unrelated-value")
+    executor = _build_acp_executor()
+    assert isinstance(executor, AcpExecutor)
+    child_env = executor._build_spawn_env()
+    assert child_env.get("XAI_API_KEY") == "example-xai-value"
+    assert "UNRELATED_API_KEY" not in child_env
 
 
 # ---------------------------------------------------------------------------
