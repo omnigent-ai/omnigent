@@ -69,6 +69,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, Protocol
+from zoneinfo import ZoneInfoNotFoundError
 
 from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
@@ -116,6 +117,7 @@ from omnigent.server.scheduled.harness_settings import (
     scheduled_agent_harness,
     validate_scheduled_permission_mode,
 )
+from omnigent.server.scheduled.name_template import render_session_name
 from omnigent.server.scheduled.schedule import (
     continued_sandbox_host_id,
     is_trigger_automation,
@@ -404,10 +406,10 @@ class _NewRunRecorder:
                 await self._deps.startup_inputs.record_launch_failure(conv.id, reason)
 
 
-def _scheduled_session_title(task: ScheduledTask) -> str:
+def _scheduled_session_title(task: ScheduledTask, session_name: str) -> str:
     if is_trigger_automation(task):
-        return f"[automation job] {task.name}"
-    return task.name
+        return f"[automation job] {session_name}"
+    return session_name
 
 
 # Follows the prompt in every message a fire sends. No one watches a run, so a
@@ -680,13 +682,14 @@ async def _run_fire(
             )
             return
 
-        recorder = _NewRunRecorder(deps, task, int(time.time()))
+        scheduled_at = int(time.time())
+        recorder = _NewRunRecorder(deps, task, scheduled_at)
         try:
             with (
                 account_authority_scope(task.user_id, task.account_generation),
                 host_owner_scope(task.user_id, task.account_generation),
             ):
-                await _run_fire_for_task(deps, task, fire_dispatch, recorder)
+                await _run_fire_for_task(deps, task, fire_dispatch, recorder, scheduled_at)
         except Exception:
             _logger.exception("scheduled fire: task %s failed", task.id)
         finally:
@@ -699,6 +702,7 @@ async def _run_fire_for_task(
     task: ScheduledTask,
     fire_dispatch: _FireDispatch,
     recorder: _FireRecorder,
+    scheduled_at: int,
 ) -> None:
     """Run a task, routed by ``execution_target``, recording progress on *recorder*.
 
@@ -814,6 +818,7 @@ async def _run_fire_for_task(
             labels=_session_labels(
                 task, session_mcp_selection(deps.app_state), recorder.managed_host_id
             ),
+            scheduled_at=scheduled_at,
         )
         log_session_created(conv.id)
     except _CannotLaunchScheduledFire as exc:
@@ -1762,10 +1767,12 @@ def _session_labels(
 
 
 async def _create_session(
-    deps: FireDeps, task: ScheduledTask, *, labels: dict[str, str]
+    deps: FireDeps, task: ScheduledTask, *, labels: dict[str, str], scheduled_at: int
 ) -> Conversation:
     # Host operations and database threads can commit after caller cancellation.
-    creation = asyncio.create_task(_create_session_resources(deps, task, labels=labels))
+    creation = asyncio.create_task(
+        _create_session_resources(deps, task, labels=labels, scheduled_at=scheduled_at)
+    )
     try:
         return await asyncio.shield(creation)
     except asyncio.CancelledError:
@@ -1787,7 +1794,7 @@ async def _create_session(
 
 
 async def _create_session_resources(
-    deps: FireDeps, task: ScheduledTask, *, labels: dict[str, str]
+    deps: FireDeps, task: ScheduledTask, *, labels: dict[str, str], scheduled_at: int
 ) -> Conversation:
     """Create a conversation bound to the task's agent, carrying the stored spec."""
     from omnigent.server.routes._host_worktree import (
@@ -1828,6 +1835,14 @@ async def _create_session_resources(
         labels[SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY] = worktree_root_fingerprint(workspace)
         workspace = worktree.workspace or worktree.worktree_path
         labels[WORKTREE_ROOT_LABEL_KEY] = worktree_root_fingerprint(worktree.worktree_path)
+    try:
+        session_name = render_session_name(task.name, scheduled_at, task.timezone)
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        session_name = task.name
+        _logger.warning("scheduled fire: task %s name rendering failed: %.160s", task.id, exc)
+    except Exception as exc:
+        session_name = task.name
+        _logger.exception("scheduled fire: task %s name rendering failed: %.160s", task.id, exc)
     conv: Conversation | None = None
     try:
         if task.source_session_id is not None:
@@ -1838,12 +1853,13 @@ async def _create_session_resources(
                 launch_args=launch_args,
                 workspace=workspace,
                 git_branch=worktree.branch if worktree else None,
+                session_name=session_name,
             )
         else:
             conv = await asyncio.to_thread(
                 deps.conversation_store.create_conversation,
                 agent_id=task.agent_id,
-                title=_scheduled_session_title(task),
+                title=_scheduled_session_title(task, session_name),
                 host_id=task.host_id,
                 workspace=workspace,
                 git_branch=worktree.branch if worktree else None,
@@ -1898,6 +1914,7 @@ async def _copy_source_session_for_run(
     launch_args: list[str] | None,
     workspace: str | None,
     git_branch: str | None,
+    session_name: str,
 ) -> Conversation:
     """Start a run's session as a copy of the task's source session.
 
@@ -1972,7 +1989,7 @@ async def _copy_source_session_for_run(
             file_store=deps.file_store,
             artifact_store=deps.artifact_store,
             source_id=task.source_session_id,
-            title=_scheduled_session_title(task),
+            title=_scheduled_session_title(task, session_name),
             agent_id=task.agent_id,
             created_by=task.user_id or RESERVED_USER_LOCAL,
             project_id=project_id,
@@ -2956,7 +2973,9 @@ class ClaimedRunExecutor:
                     error_code="owner_identity_unavailable",
                 )
                 return
-            await _run_fire_for_task(self._deps, task, self._fire_dispatch, recorder)
+            await _run_fire_for_task(
+                self._deps, task, self._fire_dispatch, recorder, lease.run.scheduled_at
+            )
 
     async def _fail_revoked_fire(self, task: ScheduledTask, recorder: _FireRecorder) -> None:
         # A deleted owner's identity is revoked too; disable the task as the

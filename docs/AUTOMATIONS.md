@@ -100,6 +100,24 @@ their existing authorization rules.
 
 New automations default to the **Omnigent Automation** project, which is created or reused when you save. Choose another project or remove the selection to opt out. Run sessions and their workers inherit the project, keeping automated work together in the sidebar. Existing automations keep their selected project.
 
+## Session names
+
+The stored name keeps its template in Automations; each session title expands
+placeholders at worker start in the automation's timezone. Month and weekday
+names are English, and the prompt is never templated.
+
+Tokens are case-sensitive: `YYYY` (year), `MMMM` / `MMM` (month name), `MM`
+(month number), `DD` (day), `dddd` / `ddd` (weekday), `HH` (hour), and `mm`
+(minute). `Mon` is an alias for `MMM`. Minutes need `HH` in the same
+placeholder; use `{{HH:mm}}` (`MM` means month). Separate whole tokens with
+spaces or `-` / `/` / `.` / `:` / `,` / `_`; compact runs like `{{YYYYMMDD}}`
+are invalid, so use adjacent placeholders: `{{YYYY}}{{MM}}{{DD}}`. Write `\{{`
+for a literal `{{`.
+
+Names without `{{` stay unchanged. Invalid templates return HTTP 400 on create
+or rename with the supported-token list. If a stored name cannot render, the
+whole literal name is used and the run continues.
+
 ## Schedules are RRULEs, not cron
 
 Persisted RRULEs have a 512-character storage limit. The parser also applies a
@@ -150,7 +168,7 @@ Two timing caveats are worth knowing:
 
 1. **The row is re-read.** The armed timer is never trusted. A task deleted or paused between arming and firing is a no-op.
 2. **The launch target is resolved.** A `managed_sandbox` task checks that managed launches are available; its fresh sandbox is provisioned during launch. For `connected_host`, a task with no pinned `host_id` uses the owner's most-recently-active live host, chosen at fire time. A task with no pinned `workspace` starts the runner in that host's home directory, which is what makes chat-only, research, and MCP-only automations possible. A pinned host that is missing or offline -- or an owner with no live host at all -- records a **failed** run rather than a running one (`error_code` `host_offline`, `host_not_found`, or `no_online_host`).
-3. **A session is created**, bound to the task's agent and carrying any `model_override`, `reasoning_effort`, and supported `permission_mode`. Connected-host sessions carry the resolved workspace and host; managed-sandbox sessions are bound to their new sandbox during launch. If the task has a project, the session is filed into it; a project deleted since the task was saved leaves the session unfiled instead of failing the run, and is cleared from the task. Sessions the agent starts with `sys_session_create` placement `same_host` or `managed`, such as a trigger template's per-item sessions, are filed in the same project as the session that started them, unless the call names a `project_name`. Unless the call names its own `permission_mode`, they also start in the task's `permission_mode` when their agent's harness supports it, with the same launch options as the run's own session. This applies only to sessions started from a session the automation created: the run's own session while its run is live, or a continue task's kept session that one of its runs created. It also requires that the task isn't deleted. A pre-existing session picked for a continue task, a fork of an automation's session, a new-session run whose turn has ended, a task without a mode, or a mode their harness lacks leaves them in their agent's default. If `max_cost_usd` is set, a per-session cost-budget policy is attached before the prompt is dispatched. An explicit permission override fails the run before creating a session if its harness cannot be resolved (`permission_harness_unresolved`) or the harness does not support the saved mode (`permission_mode_unsupported`).
+3. **A session is created**, with date placeholders in its name rendered at worker start in the task's timezone, bound to the task's agent and carrying any `model_override`, `reasoning_effort`, and supported `permission_mode`. Connected-host sessions carry the resolved workspace and host; managed-sandbox sessions are bound to their new sandbox during launch. If the task has a project, the session is filed into it; a project deleted since the task was saved leaves the session unfiled instead of failing the run, and is cleared from the task. Sessions the agent starts with `sys_session_create` placement `same_host` or `managed`, such as a trigger template's per-item sessions, are filed in the same project as the session that started them, unless the call names a `project_name`. Unless the call names its own `permission_mode`, they also start in the task's `permission_mode` when their agent's harness supports it, with the same launch options as the run's own session. This applies only to sessions started from a session the automation created: the run's own session while its run is live, or a continue task's kept session that one of its runs created. It also requires that the task isn't deleted. A pre-existing session picked for a continue task, a fork of an automation's session, a new-session run whose turn has ended, a task without a mode, or a mode their harness lacks leaves them in their agent's default. If `max_cost_usd` is set, a per-session cost-budget policy is attached before the prompt is dispatched. An explicit permission override fails the run before creating a session if its harness cannot be resolved (`permission_harness_unresolved`) or the harness does not support the saved mode (`permission_mode_unsupported`).
 4. **Ownership is granted.** The new session gets a `LEVEL_OWNER` grant for the task's owner (a reserved local user in single-user and OSS deployments). Without the grant the run would be invisible.
 5. **The runner launches and the prompt is dispatched**, so the agent actually works. A seeded prompt with no launched runner would just sit in history. A `managed_sandbox` fire saves the prompt in the session first, records the run, and then provisions the sandbox in the background. The prompt is delivered when the sandbox host connects, even after a server restart or on another replica. A launch failure fails the run with `error_code` `launch_failed`.
 
