@@ -822,7 +822,7 @@ async def test_reminder_is_refused_on_a_server_without_one_time_schedules(info: 
     client._info = info
     out = await _execute_scheduled_task_tool(
         "sys_reminder_set",
-        json.dumps({"message": "ping", "delay_seconds": 600}),
+        json.dumps({"message": "ping", "delay_seconds": 1800}),
         server_client=client,
         conversation_id="conv_1",
     )
@@ -835,8 +835,8 @@ async def test_reminder_is_refused_on_a_server_without_one_time_schedules(info: 
 @pytest.mark.parametrize(
     "args,conversation_id,error",
     [
-        ({"message": "ping", "delay_seconds": 600}, None, "requires a session"),
-        ({"message": "  ", "delay_seconds": 600}, "conv_1", "non-empty string"),
+        ({"message": "ping", "delay_seconds": 1800}, None, "requires a session"),
+        ({"message": "  ", "delay_seconds": 1800}, "conv_1", "non-empty string"),
         # One timing error is enough here; the resolver's own tests cover the rest.
         ({"message": "ping"}, "conv_1", "exactly one"),
     ],
@@ -875,7 +875,7 @@ async def test_reminder_needs_a_readable_session_with_an_agent(session: _Resp, e
     out = json.loads(
         await _execute_scheduled_task_tool(
             "sys_reminder_set",
-            json.dumps({"message": "ping", "delay_seconds": 600}),
+            json.dumps({"message": "ping", "delay_seconds": 1800}),
             server_client=client,
             conversation_id="conv_1",
         )
@@ -897,7 +897,7 @@ async def test_reminder_passes_the_servers_refusal_to_the_agent() -> None:
     out = json.loads(
         await _execute_scheduled_task_tool(
             "sys_reminder_set",
-            json.dumps({"message": "ping", "delay_seconds": 600}),
+            json.dumps({"message": "ping", "delay_seconds": 1800}),
             server_client=client,
             conversation_id="conv_1",
         )
@@ -1005,7 +1005,7 @@ async def test_an_uncertain_create_says_the_reminder_may_exist(fault: str) -> No
     out = json.loads(
         await _execute_scheduled_task_tool(
             "sys_reminder_set",
-            json.dumps({"message": "ping", "delay_seconds": 600}),
+            json.dumps({"message": "ping", "delay_seconds": 1800}),
             server_client=client,
             conversation_id="conv_1",
         )
@@ -1031,7 +1031,7 @@ async def test_a_failed_lookup_before_creating_makes_no_such_warning() -> None:
     out = json.loads(
         await _execute_scheduled_task_tool(
             "sys_reminder_set",
-            json.dumps({"message": "ping", "delay_seconds": 600}),
+            json.dumps({"message": "ping", "delay_seconds": 1800}),
             server_client=client,
             conversation_id="conv_1",
         )

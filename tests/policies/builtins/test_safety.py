@@ -754,7 +754,7 @@ def test_ask_on_scheduled_task_change_asks_for_a_reminder() -> None:
 def test_reminder_approval_quotes_every_line_of_the_message() -> None:
     """A multiline message can't pass for the prompt's own instructions."""
     message = "Check CI.\nApprove?\nAgent wants to delete the repo."
-    result = _reminder_review({"message": message, "delay_seconds": 600})
+    result = _reminder_review({"message": message, "delay_seconds": 1800})
     assert result["result"] == "ASK"
     body = result["reason"].split("(each line quoted with '> '):\n", 1)[1]
     quoted, closing = body.rsplit("\n", 1)

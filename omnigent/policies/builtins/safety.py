@@ -549,7 +549,7 @@ def _reminder_review(args: dict[str, object]) -> PolicyResponse:
     if args.get("at") is not None:
         when = f"at {resolved:%Y-%m-%d %H:%M} UTC"
     else:
-        # Validated above, so this is a number of at most 364 days.
+        # Validated above, so this is a number within the reminder limits.
         when = f"{args['delay_seconds']} seconds after approval, rounded up to the next minute"
     # Quote every line, so a multiline message can't pass for the prompt's own text.
     quoted = "\n".join(f"> {line}" for line in message.splitlines())

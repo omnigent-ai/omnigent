@@ -21,7 +21,7 @@ from omnigent.tools.builtins.scheduled_tasks import (
 )
 
 _NOW = datetime(2026, 11, 10, 22, 15, 30, tzinfo=UTC)
-_JUNE_2027 = datetime(2027, 6, 1, tzinfo=UTC)
+_DECEMBER_2027 = datetime(2027, 12, 15, tzinfo=UTC)
 _WHOLE_MINUTE = datetime(2026, 11, 10, 22, 15, tzinfo=UTC)
 
 
@@ -34,14 +34,14 @@ def test_delay_rounds_up_to_the_next_minute() -> None:
 @pytest.mark.parametrize(
     "now,args,expected",
     [
-        # Exactly one minute from a whole minute.
-        (_WHOLE_MINUTE, {"delay_seconds": 60}, _WHOLE_MINUTE + timedelta(minutes=1)),
+        # Exactly 15 minutes from a whole minute.
+        (_WHOLE_MINUTE, {"delay_seconds": 900}, _WHOLE_MINUTE + timedelta(minutes=15)),
         # Exactly the largest delay from a whole minute.
-        (_WHOLE_MINUTE, {"delay_seconds": 364 * 86400}, _WHOLE_MINUTE + timedelta(days=364)),
+        (_WHOLE_MINUTE, {"delay_seconds": 90 * 86400}, _WHOLE_MINUTE + timedelta(days=90)),
         # The largest delay from mid-minute rounds up past the limit and is still
         # accepted; the limit applies before rounding.
-        (_NOW, {"delay_seconds": 364 * 86400}, datetime(2027, 11, 9, 22, 16, tzinfo=UTC)),
-        (_WHOLE_MINUTE, {"at": "2026-11-10T22:16:00Z"}, _WHOLE_MINUTE + timedelta(minutes=1)),
+        (_NOW, {"delay_seconds": 90 * 86400}, datetime(2027, 2, 8, 22, 16, tzinfo=UTC)),
+        (_WHOLE_MINUTE, {"at": "2026-11-10T22:30:00Z"}, _WHOLE_MINUTE + timedelta(minutes=15)),
     ],
 )
 def test_exact_limits_are_accepted(now: datetime, args: dict[str, object], expected: datetime):
@@ -78,15 +78,17 @@ def test_at_is_converted_to_utc() -> None:
         ({"delay_seconds": True}, "must be a number"),
         ({"delay_seconds": "60"}, "must be a number"),
         ({"delay_seconds": float("nan")}, "finite"),
-        ({"delay_seconds": 10}, "at least one minute"),
-        ({"delay_seconds": 364 * 86400 + 1}, "at most 364 days"),
-        ({"at": "2026-11-10T22:00:00Z"}, "at least one minute"),
-        ({"at": "2027-11-10T22:15:00Z"}, "at most 364 days"),
+        ({"delay_seconds": 10}, "at least 15 minutes"),
+        # Rounds up to 22:30, 14.5 minutes away.
+        ({"delay_seconds": 840}, "at least 15 minutes"),
+        ({"delay_seconds": 90 * 86400 + 1}, "at most 90 days"),
+        ({"at": "2026-11-10T22:00:00Z"}, "at least 15 minutes"),
+        ({"at": "2027-02-08T22:16:00Z"}, "at most 90 days"),
         # Values that would overflow a float or a timedelta before the range check.
-        ({"delay_seconds": 10**400}, "at most 364 days"),
-        ({"delay_seconds": -(10**400)}, "at least one minute"),
-        ({"delay_seconds": -1e300}, "at least one minute"),
-        ({"delay_seconds": 1e300}, "at most 364 days"),
+        ({"delay_seconds": 10**400}, "at most 90 days"),
+        ({"delay_seconds": -(10**400)}, "at least 15 minutes"),
+        ({"delay_seconds": -1e300}, "at least 15 minutes"),
+        ({"delay_seconds": 1e300}, "at most 90 days"),
         ({"at": "0001-01-01T00:00:00+05:00"}, "outside the supported date range"),
         ({"at": "9999-12-31T23:59:59-05:00"}, "outside the supported date range"),
         ({"at": "9999-12-31T23:59:59.9999991Z"}, "outside the supported date range"),
@@ -95,7 +97,7 @@ def test_at_is_converted_to_utc() -> None:
         ({"at": "2026-11-12T23:00:00.0000000-00:00:00.0000001"}, "whole minutes"),
         ({"at": "2026-11-12T23:00:00+05:30:15"}, "whole minutes"),
         # Rounding up would overflow here, but the limit is checked first.
-        ({"at": "9999-12-31T23:59:59Z"}, "at most 364 days"),
+        ({"at": "9999-12-31T23:59:59Z"}, "at most 90 days"),
     ],
 )
 def test_invalid_times_are_rejected(args: dict[str, object], error: str) -> None:
@@ -107,13 +109,13 @@ def test_invalid_times_are_rejected(args: dict[str, object], error: str) -> None
 @pytest.mark.parametrize(
     "created,delay",
     [
-        (_NOW, timedelta(minutes=2)),
+        (_NOW, timedelta(minutes=15)),
         # Crosses a year boundary.
         (datetime(2026, 12, 31, 23, 50, tzinfo=UTC), timedelta(minutes=20)),
-        # Same calendar date as creation, a few minutes earlier, next year.
-        (_NOW, timedelta(days=364) - timedelta(minutes=30)),
+        # The largest delay.
+        (_NOW, timedelta(days=90)),
         # A leap day, which a yearly rule reaches only every fourth year.
-        (_JUNE_2027, datetime(2028, 2, 29, 9, tzinfo=UTC) - _JUNE_2027),
+        (_DECEMBER_2027, datetime(2028, 2, 29, 9, tzinfo=UTC) - _DECEMBER_2027),
     ],
 )
 def test_rule_fires_once_at_the_requested_minute(created: datetime, delay: timedelta) -> None:

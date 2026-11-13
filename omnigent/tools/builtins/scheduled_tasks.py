@@ -24,14 +24,17 @@ from typing import Any
 
 from omnigent.tools.base import Tool
 
-# A reminder must fire after the task exists; rounding up to the minute adds up to
+# Shorter waits belong to sys_timer_set. Rounding up to the minute can add up to
 # another minute.
-MIN_REMINDER_DELAY = timedelta(seconds=60)
+MIN_REMINDER_DELAY = timedelta(minutes=15)
 # The end of an ISO-8601 time with "Z" or a whole-minute offset such as "-08:00".
 _WHOLE_MINUTE_OFFSET = re.compile(r"(?:[Zz]|[+-]\d{2}(?::?\d{2})?)$")
-# Below one year, so the rule's month, day and time occur only once after creation.
-MAX_REMINDER_DELAY = timedelta(days=364)
+# Well under a year, so the rule's month, day and time occur only once after creation.
+MAX_REMINDER_DELAY = timedelta(days=90)
 REMINDER_NAME_CHARS = 60
+_TOO_SOON = (
+    f"A reminder must be at least {MIN_REMINDER_DELAY.seconds // 60} minutes in the future."
+)
 
 _RRULE_DESC = (
     "RFC 5545 recurrence rule, e.g. 'FREQ=DAILY;BYHOUR=9;BYMINUTE=0' (daily at "
@@ -479,7 +482,7 @@ def resolve_reminder_time(args: dict[str, Any], now: datetime) -> datetime | str
         if delay > MAX_REMINDER_DELAY.total_seconds():
             return f"A reminder can be at most {MAX_REMINDER_DELAY.days} days away."
         if delay < 0:
-            return "A reminder must be at least one minute in the future."
+            return _TOO_SOON
         when = now + timedelta(seconds=delay)
         sub_microsecond = False
     try:
@@ -496,7 +499,7 @@ def resolve_reminder_time(args: dict[str, Any], now: datetime) -> datetime | str
         # Only an 'at' near the ends of the datetime range gets here.
         return "'at' is outside the supported date range."
     if when < now + MIN_REMINDER_DELAY:
-        return "A reminder must be at least one minute in the future."
+        return _TOO_SOON
     return when
 
 
@@ -549,17 +552,17 @@ class SysReminderSetTool(Tool):
             "offline, say), or the session was deleted, the run fails and the "
             "reminder is not retried. Give either "
             "'at' (an ISO-8601 time with a UTC offset) or 'delay_seconds'. The "
-            "requested time may be at most 364 days away, and is rounded up to the "
-            "next minute, which can add less than a minute; the result must be at "
-            "least a minute away. Write the message for your future self: "
+            f"requested time may be at most {MAX_REMINDER_DELAY.days} days away, and "
+            "is rounded up to the next minute, which can add less than a minute; the "
+            f"result must be at least {MIN_REMINDER_DELAY.seconds // 60} minutes away. "
+            "Write the message for your future self: "
             "say what to check or do. The Automations page doesn't list "
             "reminders; sys_scheduled_task_list does. Cancel one with "
             "sys_scheduled_task_delete and the returned "
             "scheduled_task_id. Works in top-level sessions you own on a "
             "connected host, not in sub-agent sessions, side chats, managed sandboxes, or "
             "sessions running in a permission mode that skips approval. For "
-            "a short wait inside an active turn, sys_timer_set (when enabled) is "
-            "lighter."
+            "a shorter wait inside an active turn, use sys_timer_set (when enabled)."
         )
 
     def get_schema(self) -> dict[str, Any]:
