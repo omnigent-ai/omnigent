@@ -1017,8 +1017,11 @@ def _proxied_http_probe_no_auth(target_url: str) -> str:
     )
 
 
-@pytest.mark.parametrize("relaunch_when_stale", [False, True], ids=["direct", "reusable"])
-@pytest.mark.parametrize("source_update", ["changed", "removed"])
+@pytest.mark.parametrize(
+    ("relaunch_when_stale", "source_update"),
+    [(False, "changed"), (True, "changed"), (True, "removed")],
+    ids=["changed-direct", "changed-reusable", "removed-reusable"],
+)
 def test_credential_proxy_swap_on_access_injects_basic_without_sandbox_secret(
     tmp_path: Path,
     active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],

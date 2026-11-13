@@ -3318,28 +3318,42 @@ async def test_runner_os_env_surrogate_path_is_httpx_transport_safe(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("registered", [False, True], ids=["standalone", "registered"])
 async def test_runner_os_env_error_is_httpx_transport_safe(
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    registered: bool,
 ) -> None:
-    """OS-tool exception results stay readable and UTF-8 encodable."""
+    """OS-tool exceptions remain transport-safe and retire their failed environment."""
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
 
-    class _FailingEnvironment:
+    class _ReadEnvironment:
+        def __init__(self) -> None:
+            self.cwd = tmp_path.resolve()
+            self.close_count = 0
+
         async def read(self, *, path: str, offset: int, limit: object) -> dict[str, object]:
             del path, offset, limit
-            raise RuntimeError("ошибка для recording-\udcff.txt")
+            if self is environments[0]:
+                raise RuntimeError("ошибка для recording-\udcff.txt")
+            return {"content": "recovered"}
 
         def close(self) -> None:
-            return None
+            self.close_count += 1
+
+    environments: list[_ReadEnvironment] = []
+
+    def create_environment(*args: object, **kwargs: object) -> _ReadEnvironment:
+        environment = _ReadEnvironment()
+        environments.append(environment)
+        return environment
 
     caplog.set_level(logging.CRITICAL + 1, logger="omnigent.runner.tool_dispatch")
-    environment = _FailingEnvironment()
     monkeypatch.setattr(
         "omnigent.inner.os_env.create_os_environment",
-        lambda *args, **kwargs: environment,
+        create_environment,
     )
     spec = AgentSpec(
         spec_version=1,
@@ -3350,22 +3364,42 @@ async def test_runner_os_env_error_is_httpx_transport_safe(
         ),
     )
 
-    result = await _execute_os_env_tool(
-        "sys_os_read",
-        {"path": "recording-\udcff.txt"},
-        agent_spec=spec,
-        conversation_id="conv_runner_surrogate_error",
-    )
+    registry = SessionResourceRegistry()
+    session_id = "conv_runner_surrogate_error"
+    try:
+        result = await _execute_os_env_tool(
+            "sys_os_read",
+            {"path": "recording-\udcff.txt"},
+            agent_spec=spec,
+            conversation_id=session_id,
+            resource_registry=registry if registered else None,
+        )
 
-    assert "ошибка" in result
-    assert "\\udcff" in result
-    assert json.loads(result) == {"error": "ошибка для recording-\udcff.txt"}
-    request = httpx.Request(
-        "POST",
-        "https://harness.test/v1/sessions/test/events",
-        json={"type": "tool_result", "output": result},
-    )
-    request.content.decode("utf-8")
+        assert "ошибка" in result
+        assert "\\udcff" in result
+        assert json.loads(result) == {"error": "ошибка для recording-\udcff.txt"}
+        request = httpx.Request(
+            "POST",
+            "https://harness.test/v1/sessions/test/events",
+            json={"type": "tool_result", "output": result},
+        )
+        request.content.decode("utf-8")
+        assert len(environments) == 1
+        assert environments[0].close_count == 1
+
+        retry = await _execute_os_env_tool(
+            "sys_os_read",
+            {"path": "recording-\udcff.txt"},
+            agent_spec=spec,
+            conversation_id=session_id,
+            resource_registry=registry if registered else None,
+        )
+        assert json.loads(retry) == {"content": "recovered"}
+        assert len(environments) == 2
+        assert environments[1].close_count == (0 if registered else 1)
+    finally:
+        await registry.cleanup_session(session_id)
+    assert [environment.close_count for environment in environments] == [1, 1]
 
 
 @pytest.mark.asyncio
