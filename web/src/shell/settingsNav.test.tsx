@@ -57,12 +57,12 @@ import {
   useTrackSettingsReturn,
 } from "./settingsNav";
 
-function renderBody(opts: { onNavClick?: () => void } = {}) {
+function renderBody(opts: { onNavClick?: () => void; harnessesOffered?: boolean } = {}) {
   const onNavClick = opts.onNavClick ?? vi.fn();
   render(
     <TooltipProvider>
       <MemoryRouter initialEntries={["/settings/appearance"]}>
-        <SettingsSidebarBody onNavClick={onNavClick} />
+        <SettingsSidebarBody onNavClick={onNavClick} harnessesOffered={opts.harnessesOffered} />
       </MemoryRouter>
     </TooltipProvider>,
   );
@@ -181,6 +181,22 @@ describe("settingsNavGroups", () => {
 });
 
 describe("SettingsSidebarBody", () => {
+  it.each([
+    { customAgents: false, harnessesOffered: true },
+    { customAgents: false, harnessesOffered: false },
+    { customAgents: true, harnessesOffered: true },
+    { customAgents: true, harnessesOffered: false },
+  ])(
+    "lists Harnesses only while the deployment offers one: %o",
+    ({ customAgents, harnessesOffered }) => {
+      mocks.customAgentsEnabled = customAgents;
+      mocks.agentInstall = customAgents;
+      renderBody({ harnessesOffered });
+      expect(!!screen.queryByTestId("settings-nav-harnesses")).toBe(harnessesOffered);
+      expect(!!screen.queryByTestId("settings-nav-custom-agents")).toBe(customAgents);
+    },
+  );
+
   it.each([
     [true, true, false, true],
     [true, false, false, false],

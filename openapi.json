@@ -2356,6 +2356,14 @@
             ],
             "title": "Max Cost Usd"
           },
+          "mcp_services": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 40,
+            "title": "Mcp Services",
+            "type": "array"
+          },
           "model_override": {
             "anyOf": [
               {
@@ -7276,6 +7284,11 @@
             "title": "Scheduled Task Inbox",
             "type": "boolean"
           },
+          "scheduled_task_mcp_services": {
+            "default": true,
+            "title": "Scheduled Task Mcp Services",
+            "type": "boolean"
+          },
           "scheduled_task_projects": {
             "default": false,
             "title": "Scheduled Task Projects",
@@ -7299,6 +7312,11 @@
           "scheduled_task_subhour": {
             "default": true,
             "title": "Scheduled Task Subhour",
+            "type": "boolean"
+          },
+          "scheduled_task_trigger_headers": {
+            "default": true,
+            "title": "Scheduled Task Trigger Headers",
             "type": "boolean"
           },
           "scheduled_task_worktrees": {
@@ -7366,6 +7384,11 @@
           "session_pull_requests": {
             "default": false,
             "title": "Session Pull Requests",
+            "type": "boolean"
+          },
+          "session_rewind": {
+            "default": false,
+            "title": "Session Rewind",
             "type": "boolean"
           },
           "session_search_scope": {
@@ -11432,6 +11455,120 @@
         "title": "SessionResponse",
         "type": "object"
       },
+      "SessionRewindAttachment": {
+        "description": "A file the chosen `/rewind` prompt attached, as the rewound session holds it.\n\nExactly one of *file_id*, *image_url* and *file_data* is set.",
+        "properties": {
+          "file_data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A document the prompt carried inline instead of as a stored file, as a base64 `data:` URI, e.g. `\"data:application/pdf;base64,...\"`; uploaded on send like *image_url*.",
+            "title": "File Data"
+          },
+          "file_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The rewound session's copy of the file, e.g. `\"file_abc\"`; read it from `/v1/sessions/{session_id}/resources/files/{file_id}`.",
+            "title": "File Id"
+          },
+          "filename": {
+            "description": "The attachment's name, e.g. `\"diagram.png\"`.",
+            "title": "Filename",
+            "type": "string"
+          },
+          "image_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "An image the prompt carried inline instead of as a stored file, as a `data:image/...` URI (e.g. from a session imported from another harness); the client uploads it on send like any attachment.",
+            "title": "Image Url"
+          },
+          "type": {
+            "description": "The prompt's content block type, `\"input_file\"` or `\"input_image\"`.",
+            "enum": [
+              "input_file",
+              "input_image"
+            ],
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "filename"
+        ],
+        "title": "SessionRewindAttachment",
+        "type": "object"
+      },
+      "SessionRewindRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `POST /v1/sessions/{session_id}/rewind`.",
+        "properties": {
+          "item_id": {
+            "description": "The session's user prompt to rewind to, e.g. `\"msg_abc123\"`. The new session keeps only the history before it.",
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "item_id"
+        ],
+        "title": "SessionRewindRequest",
+        "type": "object"
+      },
+      "SessionRewindResponse": {
+        "description": "Result of `POST /v1/sessions/{session_id}/rewind`.",
+        "properties": {
+          "attachments": {
+            "description": "The prompt's attachments, in prompt order, for the client to put back in the composer; empty when it had none.",
+            "items": {
+              "$ref": "#/components/schemas/SessionRewindAttachment"
+            },
+            "title": "Attachments",
+            "type": "array"
+          },
+          "attachments_incomplete": {
+            "default": false,
+            "description": "Some attachments could not be restored; warn the user to attach them again before sending.",
+            "title": "Attachments Incomplete",
+            "type": "boolean"
+          },
+          "prompt": {
+            "description": "Text of the chosen prompt, for the client to put back in the composer, e.g. `\"Add a test for the parser\"`.",
+            "title": "Prompt",
+            "type": "string"
+          },
+          "session_id": {
+            "description": "The rewound session that continues the work, e.g. `\"conv_new\"`. The source session gets a notice linking to it.",
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "prompt"
+        ],
+        "title": "SessionRewindResponse",
+        "type": "object"
+      },
       "SessionRoutingDecisionItem": {
         "description": "`routing_decision` item: common fields plus `RoutingDecisionData`.",
         "properties": {
@@ -11914,9 +12051,12 @@
             "type": "string"
           },
           "reason": {
-            "const": "clear",
             "default": "clear",
-            "description": "Why the session was superseded. Currently always `\"clear\"` (a Claude Code `/clear`); kept as a field so the client can branch on future supersession causes.",
+            "description": "Why the session was superseded: `\"clear\"` (a `/clear`) or `\"rewind\"` (a `/rewind` onto a truncated fork).",
+            "enum": [
+              "clear",
+              "rewind"
+            ],
             "title": "Reason",
             "type": "string"
           },
@@ -13497,6 +13637,21 @@
               }
             ],
             "title": "Max Cost Usd"
+          },
+          "mcp_services": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 40,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mcp Services"
           },
           "model_override": {
             "anyOf": [
@@ -19923,6 +20078,24 @@
               "title": "Order",
               "type": "string"
             }
+          },
+          {
+            "description": "Only items of this type, e.g. `\"message\"`; `None` lists every type. An unknown type is a 422.",
+            "in": "query",
+            "name": "type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^(message|function_call|function_call_output|error|reasoning|compaction|native_tool|resource_event|routing_decision|slash_command|terminal_command)$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Type"
+            }
           }
         ],
         "responses": {
@@ -23662,6 +23835,60 @@
         "summary": "Get Session Resource",
         "tags": [
           "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/rewind": {
+      "post": {
+        "description": "Rewind a Claude session to just before one of its prompts.\n\nForks the session with the history before `body.item_id` onto the\nsame host, workspace and runner, links the source to the fork, and\nredirects live viewers there. The source keeps its full history. A\nclaude-native fork rebuilds Claude's transcript from the kept items.\nAdvertised by `GET /v1/info` `session_rewind`.\n\n**Parameters**\n\n- `body` \u2014 The prompt to rewind to.\n\n**Returns:** The new session id and the chosen prompt's text.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 for a harness without `/rewind`, an item that is not one of the session's prompts, a sub-agent, or a running turn; 403/404 when the caller does not own the session; 503 when neither its runner nor its host can take the fork.",
+        "operationId": "rewind_session_v1_sessions__session_id__rewind_post",
+        "parameters": [
+          {
+            "description": "Session to rewind, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionRewindRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionRewindResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rewind Session",
+        "tags": [
+          "sessions"
         ]
       }
     },

@@ -12,7 +12,7 @@ from alembic import command
 from omnigent.db.utils import _build_alembic_config, clear_engine_cache
 
 _REVISION = "fcc79fe2b985"
-_PREVIOUS = "a7d4c2e9f610"
+_PREVIOUS = "a8be64286ffc"
 
 
 def _migrate(uri: str, engine: sa.Engine, revision: str, *, down: bool = False) -> None:
