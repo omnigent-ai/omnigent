@@ -12076,7 +12076,7 @@ async def _inherited_mcp_labels(
     uses for a custom server, or a runtime without registry support) is dropped
     whole, so the worker still starts.
     """
-    from omnigent.server.mcp_compatibility import registry_services, require_registry_mcp_runtime
+    from omnigent.server.runtime_compatibility import registry_services, require_runtime_support
 
     selection = session_mcp_selection(request.app.state)
     services = selection.selected_services(source_labels)
@@ -12085,7 +12085,7 @@ async def _inherited_mcp_labels(
     inherited = selection.session_labels(services)
     try:
         await asyncio.to_thread(selection.validate, request, services, spec=spec, user_id=user_id)
-        require_registry_mcp_runtime(
+        require_runtime_support(
             registry_services(selected_mcp_spec(spec, inherited)),
             host_id=host_id,
             runner_id=runner_id,
