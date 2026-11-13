@@ -140,6 +140,60 @@ def test_incomplete_or_oversized_reviews_are_rejected(review: str) -> None:
         )
 
 
+def test_pipes_inside_code_spans_do_not_split_test_rows() -> None:
+    review = _REVIEW.replace(
+        "| tests/test_parser.py::test_empty | Empty input | Unit | Keep |"
+        " Guards the regression. |",
+        "| `tests/test_parser.py::test_empty` | Successful `cd` survives `|| exit` before newline"
+        " | Observer component | keep | Escaped \\| stays text. |",
+    )
+
+    result = _HELPERS["compose_review"](
+        review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+    )
+
+    assert (
+        "| `tests/test_parser.py::test_empty` | Successful `cd` survives "
+        "`\\|\\| exit` before newline"
+        " | Observer component | keep | Escaped \\| stays text. |"
+    ) in result
+
+
+def test_lone_backtick_falls_back_to_the_plain_split_and_keeps_delimiters() -> None:
+    row = (
+        "| `tests/test_parser.py::test_empty` | A lone ` backtick in input stays literal | Unit |"
+        " keep | Asserts the `literal` token. |"
+    )
+    review = _REVIEW.replace(
+        "| tests/test_parser.py::test_empty | Empty input | Unit | Keep |"
+        " Guards the regression. |",
+        row,
+    )
+
+    result = _HELPERS["compose_review"](
+        review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+    )
+
+    assert row in result
+
+
+def test_even_backslashes_before_pipe_keep_the_cell_intact() -> None:
+    row = (
+        r"| tests/test_parser.py::test_empty | Escaped \\| stays text | Unit | Keep | Guards it. |"
+    )
+    review = _REVIEW.replace(
+        "| tests/test_parser.py::test_empty | Empty input | Unit | Keep |"
+        " Guards the regression. |",
+        row,
+    )
+
+    result = _HELPERS["compose_review"](
+        review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+    )
+
+    assert row in result
+
+
 def test_multi_file_review_rejects_missing_path_even_if_mentioned_in_prose() -> None:
     review = (
         _REVIEW.replace("tests/test_parser.py::test_empty", "test_empty")

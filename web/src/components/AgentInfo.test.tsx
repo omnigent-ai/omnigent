@@ -96,11 +96,13 @@ const versionEnv = vi.hoisted(() => ({
   enabledConnections: [] as string[],
   serverVersion: null as string | null,
   hostVersion: undefined as string | null | undefined,
+  features: {} as Record<string, boolean>,
 }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
     server_version: versionEnv.serverVersion,
     enabled_connections: versionEnv.enabledConnections,
+    features: versionEnv.features,
   }),
 }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
@@ -118,6 +120,7 @@ import {
 afterEach(() => {
   cleanup();
   versionEnv.enabledConnections = [];
+  versionEnv.features = {};
   copyTextMock.mockClear();
   createMcpMutate.mockClear();
   updateMcpMutate.mockClear();
@@ -438,7 +441,7 @@ describe("AgentInfoButton session cost row", () => {
   // composer status line). It reads from the shared chat store, so reset
   // the field between cases to keep them independent.
   beforeEach(() => {
-    useChatStore.setState({ sessionCostUsd: null });
+    useChatStore.setState({ sessionCostUsd: null, sessionUsageByModel: null });
   });
 
   it("shows the formatted session cost in the popover when priced", () => {
@@ -468,6 +471,33 @@ describe("AgentInfoButton session cost row", () => {
     // The rest of the popover still renders (agent name proves it opened).
     expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
     expect(screen.queryByTestId("agent-info-session-cost")).toBeNull();
+  });
+
+  it("leaves desktop cost to the session overview but keeps it in the mobile dialog", () => {
+    versionEnv.features = { session_overview: true };
+    useChatStore.setState({
+      sessionCostUsd: 1.234,
+      sessionUsageByModel: {
+        "model-a": {
+          inputTokens: 1,
+          outputTokens: null,
+          totalTokens: 1,
+          cacheReadInputTokens: null,
+          cacheCreationInputTokens: null,
+          totalCostUsd: 1.234,
+        },
+      },
+    });
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_cost");
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+    expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-info-session-cost")).toBeNull();
+    expect(screen.queryByTestId("agent-info-usage-by-model")).toBeNull();
+    cleanup();
+
+    renderContent("conv_cost");
+    expect(screen.getByTestId("agent-info-session-cost")).toHaveTextContent("$1.23");
+    expect(screen.getByTestId("agent-info-usage-by-model")).toBeInTheDocument();
   });
 });
 

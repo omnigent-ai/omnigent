@@ -25,6 +25,13 @@ export interface ProjectConfig {
   host_id?: string;
   /** Default working directory / repo path on that host. */
   workspace?: string;
+  /**
+   * Repository the project was created with. A connected-host project has it
+   * checked out at `workspace`; a sandbox project clones it into each new session.
+   */
+  repository?: { url: string; branch?: string };
+  /** Sandbox provider a sandbox project runs on, e.g. "modal". */
+  sandbox_provider?: string;
   /** Default agent id for new sessions. */
   agent_id?: string;
   /** Chosen emoji icon (a unicode grapheme, e.g. "🔥"). Unset → default folder. */

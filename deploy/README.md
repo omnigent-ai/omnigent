@@ -410,6 +410,21 @@ token cannot open a new connection. Renewal also extends the validity of any
 leaked copy of that token. This setting does not change sandbox lifetime or
 Mac/Arca user-login credentials.
 
+**Stopping archived sessions' sandboxes.** Set `sandbox.stop_on_archive: true`
+(off by default) to stop a session's sandbox when the session is archived, after
+its runner is stopped. It is a per-provider setting: in a `providers:` list, a
+value next to `providers` is every entry's default, and an entry can override it.
+The sandbox is stopped, not deleted, so unarchiving the session and sending a
+message resumes the same sandbox. It applies only to providers that can resume
+a stopped sandbox (`capabilities.resume_stopped`) and implement `stop()`; on a
+provider whose `stop()` raises `SandboxCapabilityError`, the option has no
+effect (the server logs that at debug level). Only a sandbox no other session
+uses is stopped: another session on the same host, or a side chat or sub-agent
+of the session, keeps it running even when archived, and so does a scheduled
+task run's sandbox. Deleting the session still terminates the sandbox, and so does
+the reaper below once a stopped sandbox's host passes its offline limit; the
+next message then starts a fresh sandbox instead.
+
 The optional reaper runs once for the whole `sandbox:` deployment, including
 multi-provider configurations. It queries managed host rows directly and
 detaches a sandbox generation only after its host has stayed offline past
@@ -724,8 +739,8 @@ host; it does not fall back to `app_name`.
 
 Limit and order what New Chat offers, and choose where a fresh chat starts, with
 two optional keys in the same server config as `branding:` (`omnigent server -c
-config.yaml`, or `/data/config.yaml` in the Docker stack). A plain `omnigent
-server` without `-c` does not read them. Takes effect on the next server start.
+config.yaml`, `OMNIGENT_CONFIG`, or `<data_dir>/config.yaml` — `/data/config.yaml`
+in the Docker stack). Takes effect on the next server start.
 
 ```yaml
 restrict_to_agent_names: [polly, claude-native-ui]  # New Chat offers only these, in this order
