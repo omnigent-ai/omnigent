@@ -318,3 +318,18 @@ async def test_child_sessions_settles_hostless_child_after_parent_host_hold_expi
     row = next(c for c in resp.json()["data"] if c["id"] == child_id)
     assert row["busy"] is False
     assert row["current_task_status"] == "completed"
+
+
+async def test_child_sessions_leaves_child_with_fresh_runner(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A child whose runner is fresh reads in-flight from the persisted status
+    even on a replica whose status cache has no entry for it."""
+    parent_id, child_id = _seed_running_child(db_uri, runner_fresh=True)
+
+    resp = await client.get(f"/v1/sessions/{parent_id}/child_sessions")
+    assert resp.status_code == 200
+    row = next(c for c in resp.json()["data"] if c["id"] == child_id)
+    assert row["busy"] is True
+    assert row["current_task_status"] == "in_progress"
