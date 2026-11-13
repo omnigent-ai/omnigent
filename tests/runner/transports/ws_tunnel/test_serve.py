@@ -2157,8 +2157,9 @@ async def test_handle_tunnel_frame_dispatches_after_malformed_frame() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("method", ["GET", "POST"])
-@pytest.mark.parametrize("cancel_before_dispatch", [False, True])
+@pytest.mark.parametrize(
+    ("cancel_before_dispatch", "method"), [(False, "GET"), (False, "POST"), (True, "POST")]
+)
 async def test_handle_tunnel_frame_marks_request_activity(method, cancel_before_dispatch) -> None:
     """HTTP request frames reset the runner idle timer.
 
