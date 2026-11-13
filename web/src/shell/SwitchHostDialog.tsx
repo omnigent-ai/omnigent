@@ -138,8 +138,8 @@ function SupportedSwitchHostDialog({
   const [browsing, setBrowsing] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  // After release, a failed launch leaves the session unbound.
-  const [stranded, setStranded] = useState(false);
+  const [moveState, setMoveState] = useState<"initial" | "stopped" | "released">("initial");
+  const stranded = moveState !== "initial";
 
   // Sandbox rows appear only when the server can launch a sandbox and move a
   // session onto it; "loading" keeps them hidden until the boot probe resolves.
@@ -170,10 +170,7 @@ function SupportedSwitchHostDialog({
   // submit and blank the select, which renders the chosen item's label.
   const [originHostId] = useState(currentHostId);
 
-  // Only online hosts can accept a runner, and moving to the host the
-  // session is already on is a no-op — until a half-finished switch
-  // leaves it unbound, when the origin is a target like any other and
-  // moving back is the quickest way out.
+  // A completed stop or release makes the online origin a recovery target too.
   const targetHosts = useMemo(
     () =>
       (hosts ?? []).filter(
@@ -248,7 +245,7 @@ function SupportedSwitchHostDialog({
       setWorkspace("");
       setBrowsing(false);
       setError(null);
-      setStranded(false);
+      setMoveState("initial");
       setSubmitting(false);
       prevHostId.current = null;
       userEditedRef.current = false;
@@ -294,11 +291,22 @@ function SupportedSwitchHostDialog({
     if (!canSwitch) return;
     setSubmitting(true);
     setError(null);
+    let stopped = false;
     let released = false;
     try {
       const originHost = hosts?.find((host) => host.host_id === currentHostId);
       if (originHost?.status !== "offline") {
-        await stopSession(sessionId);
+        try {
+          await stopSession(sessionId);
+        } catch (e) {
+          const detail = e instanceof Error ? e.message : "Couldn't stop the old session.";
+          throw new Error(
+            `${detail} Check the original host and stop the session there, then try again.`,
+            { cause: e },
+          );
+        }
+        stopped = true;
+        setMoveState("stopped");
       }
       // Drop the model override alongside the runner binding. A model id is
       // host-bound — the catalog depends on that machine's credentials — so
@@ -309,7 +317,7 @@ function SupportedSwitchHostDialog({
       await updateSession(sessionId, { runnerId: "", modelOverride: null, silent: true });
       // From here the session is unbound until the launch lands.
       released = true;
-      setStranded(true);
+      setMoveState("released");
       if (sandboxSelected) {
         // The launch's own events report progress from here, but its first ones
         // may go to another replica's stream; the response shows where it is.
@@ -347,9 +355,9 @@ function SupportedSwitchHostDialog({
       void queryClient.invalidateQueries({ queryKey: terminalsQueryKey(sessionId) });
     } catch (e) {
       setError(e instanceof Error ? e.message : "Couldn't switch hosts. Try again.");
-      // A failed launch may have repointed or cleared the host; refetch so the
-      // picker reflects where the session is bound now.
-      if (released) void queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
+      // Stop or launch may have changed the session before a later request failed.
+      if (stopped || released)
+        void queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
     } finally {
       setSubmitting(false);
     }
@@ -541,9 +549,10 @@ function SupportedSwitchHostDialog({
                 {stranded ? (
                   <>
                     <span className="text-destructive">
-                      The session left its old host but didn't start on the new one, so it isn't
-                      running anywhere. Pick a host — including the one it came from — and try
-                      again.
+                      {moveState === "stopped"
+                        ? "The old session stopped, but the move didn't finish. "
+                        : "The session left its old host, but we could not confirm the move completed. Check its current host before retrying. "}
+                      Pick a host — including the one it came from — and try again.
                     </span>
                     <span className="text-muted-foreground">{error}</span>
                   </>

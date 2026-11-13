@@ -346,7 +346,11 @@ describe("SwitchHostDialog", () => {
     const button = await screen.findByTestId("switch-host-button");
     await waitFor(() => expect(button).not.toBeDisabled());
     fireEvent.click(button);
-    expect(await screen.findByText("Old runner could not be stopped")).toBeInTheDocument();
+    const error = await screen.findByTestId("switch-host-error");
+    expect(error).toHaveTextContent("Old runner could not be stopped");
+    expect(error).toHaveTextContent(
+      "Check the original host and stop the session there, then try again.",
+    );
     expect(updateSessionMock).not.toHaveBeenCalled();
     expect(launchRunnerMock).not.toHaveBeenCalled();
   });
@@ -390,27 +394,51 @@ describe("SwitchHostDialog", () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: terminalsQueryKey("conv_1") });
   });
 
-  it("offers the origin host again when the launch fails after the release", async () => {
-    launchRunnerMock.mockRejectedValue(new Error("host is offline"));
-    renderDialog();
+  it.each(["release", "launch"] as const)(
+    "offers the origin host again when %s fails after stopping",
+    async (failure) => {
+      const failedRequest = failure === "release" ? updateSessionMock : launchRunnerMock;
+      failedRequest.mockRejectedValueOnce(new Error("move request failed"));
+      const client = renderDialog();
+      const invalidate = vi.spyOn(client, "invalidateQueries");
 
-    // Moving to the host it is already on is a no-op, so the origin starts
-    // out of the list.
-    expect(screen.queryByTestId("switch-host-option-host_old")).toBeNull();
-    expect(screen.getByTestId("switch-host-option-host_new")).toBeInTheDocument();
+      // Moving to the host it is already on is a no-op, so the origin starts
+      // out of the list.
+      expect(screen.queryByTestId("switch-host-option-host_old")).toBeNull();
+      expect(screen.getByTestId("switch-host-option-host_new")).toBeInTheDocument();
 
-    const button = await screen.findByTestId("switch-host-button");
-    await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
-    fireEvent.click(button);
+      const button = await screen.findByTestId("switch-host-button");
+      await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
+      fireEvent.click(button);
 
-    // Released but not re-bound: the session is on no host at all, so the
-    // origin becomes a real target and the copy has to say what happened
-    // rather than read as two unrelated outages.
-    const error = await screen.findByTestId("switch-host-error");
-    expect(error.textContent).toContain("isn't running anywhere");
-    expect(error.textContent).toContain("host is offline");
-    expect(screen.getByTestId("switch-host-option-host_old")).toBeInTheDocument();
-  });
+      // A confirmed stop makes the origin a recovery target even if release fails.
+      const error = await screen.findByTestId("switch-host-error");
+      expect(error).toHaveTextContent(
+        failure === "release"
+          ? "The old session stopped"
+          : "Check its current host before retrying.",
+      );
+      expect(error).not.toHaveTextContent("isn't running anywhere");
+      if (failure === "release") {
+        expect(error).not.toHaveTextContent("left its old host");
+        expect(launchRunnerMock).not.toHaveBeenCalled();
+      }
+      expect(error).toHaveTextContent("move request failed");
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", "conv_1"] });
+      expect(screen.getByTestId("switch-host-option-host_old")).toBeInTheDocument();
+
+      fireEvent.change(screen.getByTestId("mock-host-select"), { target: { value: "host_old" } });
+      fireEvent.click(button);
+      await waitFor(() =>
+        expect(launchRunnerMock).toHaveBeenLastCalledWith(
+          "host_old",
+          "conv_1",
+          "/Users/alice/repo",
+        ),
+      );
+      expect(stopSessionMock).toHaveBeenCalledTimes(2);
+    },
+  );
 
   it("enables the switch for a typed tilde path without opening the browser", async () => {
     // The reported journey: type "~/git/omnigent" into the field and stop —
@@ -767,7 +795,7 @@ describe("SwitchHostDialog", () => {
       fireEvent.click(screen.getByTestId("switch-host-button"));
 
       const error = await screen.findByTestId("switch-host-error");
-      expect(error).toHaveTextContent("isn't running anywhere");
+      expect(error).toHaveTextContent("Check its current host before retrying.");
       expect(error).toHaveTextContent("is not configured on this server");
       expect(screen.getByTestId("switch-host-option-host_old")).toBeInTheDocument();
     });
