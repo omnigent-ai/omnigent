@@ -9,6 +9,7 @@ import pytest
 from omnigent.harnesses.diagnostics import (
     bounded_diagnostic_tail,
     detect_sign_in_prompt,
+    launcher_install_in_progress,
     launcher_install_prompt,
     launcher_password_prompt,
     sanitize_diagnostic_text,
@@ -427,3 +428,59 @@ def test_launcher_install_prompt_requires_an_unanswered_confirmation(
 ) -> None:
     """A launcher waiting to install its agent requires a terminal answer."""
     assert launcher_install_prompt(screen) is expected
+
+
+@pytest.mark.parametrize(
+    ("screen", "expected"),
+    [
+        ("Updating Claude Code from 2.1.314 to 2.1.316", True),
+        (
+            "Updating Claude Code from 2.1.314 to\n2.1.316\n"
+            "Generating claude-code MCP client config...",
+            True,
+        ),
+        ("No Claude Code installation found; installing it now.", True),
+        ("No Claude Code installation found;\ninstalling it now.", True),
+        (
+            "No Claude Code installation found; installing it now.\n"
+            "╭─ Error ─╮\n│ Claude Code exited with code 1 │\n╰─────────╯",
+            False,
+        ),
+        (
+            "Updating Claude Code from 2.1.314 to 2.1.316\n"
+            "╭─ Error ─╮\n│ Claude Code exited with code 127 │\n╰─────────╯",
+            False,
+        ),
+        (
+            "Updating Claude Code from 2.1.314 to 2.1.316\nClaude Code exited with\ncode 127",
+            False,
+        ),
+        (
+            "Updating Claude Code from 2.1.314 to 2.1.316\n"
+            "╭─ Error ─────────────╮\n│ Claude Code exited │\n"
+            "│ with code 127      │\n╰────────────────────╯",
+            False,
+        ),
+        ("Generating claude-code MCP client config...", False),
+        ("", False),
+        (None, False),
+    ],
+    ids=[
+        "update-banner",
+        "update-banner-wrapped",
+        "install-banner",
+        "install-banner-wrapped",
+        "exit-box-after-install",
+        "exit-box-after-update",
+        "wrapped-exit-box",
+        "bordered-wrapped-exit-box",
+        "no-banner",
+        "empty",
+        "none",
+    ],
+)
+def test_launcher_install_in_progress_requires_a_banner_without_an_exit(
+    screen: str | None, expected: bool
+) -> None:
+    """A launcher is installing Claude Code while its banner shows and no start has failed."""
+    assert launcher_install_in_progress(screen) is expected
