@@ -614,33 +614,58 @@ def claude_managed_gateway_routes(paths: tuple[Path, ...] | None = None) -> str 
     return base_url
 
 
+@dataclass(frozen=True)
+class ClaudeManagedModelPicker:
+    """A managed replacement picker and any explicitly configured default."""
+
+    options: tuple[tuple[str, str], ...]
+    disabled_models: tuple[str, ...] = ()
+    default_model: str | None = None
+
+
 def claude_managed_model_picker(
     paths: tuple[Path, ...] | None = None,
-) -> tuple[tuple[str, str], ...]:
-    """Read a replacement model picker from Claude Code's managed settings."""
-    for path in CLAUDE_CODE_MANAGED_SETTINGS_PATHS if paths is None else paths:
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+) -> ClaudeManagedModelPicker | None:
+    """Read a managed replacement picker, preserving an explicitly empty list.
+
+    The first readable object decides; a lower-precedence file cannot replace
+    its picker. No valid replacement picker returns ``None``.
+    """
+    payload = read_claude_managed_settings(paths)
+    if payload is None:
+        return None
+    picker = payload.get("modelPicker")
+    if not isinstance(picker, dict) or picker.get("replaceBuiltInOptions") is not True:
+        return None
+    options = picker.get("options")
+    if not isinstance(options, list):
+        return None
+    enabled: list[tuple[str, str]] = []
+    disabled: list[str] = []
+    for option in options:
+        if not isinstance(option, dict):
             continue
-        if not isinstance(payload, dict):
+        model = option.get("model")
+        if not isinstance(model, str) or not model.strip():
             continue
-        picker = payload.get("modelPicker")
-        if not isinstance(picker, dict) or picker.get("replaceBuiltInOptions") is not True:
-            return ()
-        options = picker.get("options")
-        if not isinstance(options, list):
-            return ()
-        return tuple(
-            (model.strip(), label.strip())
-            for option in options
-            if isinstance(option, dict)
-            and isinstance((model := option.get("model")), str)
-            and model.strip()
-            and isinstance((label := option.get("label", model)), str)
-            and label.strip()
-        )
-    return ()
+        model = model.strip()
+        if option.get("disabled") is True:
+            disabled.append(model)
+            continue
+        label = option.get("label", model)
+        if isinstance(label, str) and label.strip():
+            enabled.append((model, label.strip()))
+    raw_env = payload.get("env")
+    env = raw_env if isinstance(raw_env, dict) else {}
+    default_model = next(
+        (
+            value.strip()
+            for value in (env.get("ANTHROPIC_MODEL"), payload.get("model"))
+            if isinstance(value, str) and value.strip()
+        ),
+        None,
+    )
+    return ClaudeManagedModelPicker(tuple(enabled), tuple(disabled), default_model)
 
 
 def claude_managed_gateway_display_name(paths: tuple[Path, ...] | None = None) -> str | None:
