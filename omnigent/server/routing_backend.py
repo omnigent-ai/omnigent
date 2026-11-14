@@ -132,6 +132,7 @@ async def route_with_fallback(
     available_models: dict[str, list[str]],
     *,
     gateway_backed: bool,
+    judge_models: dict[str, list[str]] | None = None,
 ) -> RoutedCall | None:
     """Call the deployment's router, falling back to the judge when it fails.
 
@@ -146,6 +147,8 @@ async def route_with_fallback(
     :param available_models: Harness id → candidate model ids.
     :param gateway_backed: Whether every harness family involved resolves
         AI-Gateway-backed inference (see :func:`select_router`).
+    :param judge_models: The narrower menu the built-in judge picks from, or
+        ``None`` to offer it *available_models* too.
     :returns: The answer, or ``None`` when no backend is configured at all.
     :raises Exception: Whatever the client that answered last raised — the
         external one only when there is no judge to fall back to, so each
@@ -154,9 +157,11 @@ async def route_with_fallback(
     choice = select_router(backends, gateway_backed=gateway_backed)
     if choice is None:
         return None
+    judged = available_models if judge_models is None else judge_models
     if choice.source != "databricks-aigw" or backends.local is None:
+        offered = judged if choice.source == "oss-llm" else available_models
         return RoutedCall(
-            result=await choice.client.route(message, available_models),
+            result=await choice.client.route(message, offered),
             source=choice.source,
             client=choice.client,
         )
@@ -176,7 +181,7 @@ async def route_with_fallback(
             getattr(choice.client, "last_error", None),
         )
     return RoutedCall(
-        result=await backends.local.route(message, available_models),
+        result=await backends.local.route(message, judged),
         source="oss-llm",
         client=backends.local,
     )
