@@ -9929,7 +9929,7 @@ async def test_patch_model_override_surfaces_a_refused_native_forward(
             status_code=503,
             body=json.dumps(
                 {
-                    "error": "claude_native_model_unconfirmed",
+                    "error": "claude_native_model_failed",
                     "detail": "the terminal did not confirm the switch to opus within 10s",
                 }
             ),

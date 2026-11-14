@@ -16,11 +16,10 @@ What is scored:
   it blocks the prompt, the model is switched while nothing is running, and the
   runner replays the captured prompt. The block notice must appear **once** —
   twice means the replay itself was routed again.
-* **The switch actually lands.** The apply layer types ``/model <id>``, so the
-  pane must report the switch before the replay runs. Claude Code answers that
-  form by also rewriting the ``model`` key in the developer's own
-  settings file. The guard restores its model key asynchronously; this check
-  waits for the full settings snapshot, including the saved default, to match.
+* **The switch actually lands.** The apply layer selects the model through
+  Claude's session-only picker action, and the pane must confirm it before
+  replay. Session-only selection leaves the saved default unchanged. This
+  check compares the full settings snapshot, including that default.
 * **One decision, one turn.** A leaked replay shows up as two user messages for
   one thing typed.
 * **The second prompt fast-skips.** Turn 2 must issue **zero** routing calls —

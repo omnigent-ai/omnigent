@@ -164,9 +164,10 @@ def _draft(pane: str) -> str | None:
     continuation_prefix = " " * (indent + 2)
     if any(row.strip() and not row.startswith(continuation_prefix) for row in box.rows[1:]):
         return None
-    return "\n".join(
-        [first[1:].removeprefix(" "), *(row[len(continuation_prefix) :] for row in box.rows[1:])]
-    )
+    text = first[1:]
+    if text.startswith((" ", "\u00a0")):
+        text = text[1:]
+    return "\n".join([text, *(row[len(continuation_prefix) :] for row in box.rows[1:])])
 
 
 def _known_claude_id(model: str) -> str | None:

@@ -1435,15 +1435,23 @@ def build_native_controls(
             safe_detail = _client_safe_error_detail(exc, context="claude-native model change")
             if isinstance(exc, ClaudeModelSwitchRefused):
                 safe_detail = str(exc)
+            error_code = (
+                "claude_native_model_unsupported"
+                if isinstance(exc, ClaudeModelSwitchRefused) and exc.unsupported
+                else "claude_native_model_failed"
+            )
+            detail = _claude_model_change_blocked_detail(exc) or safe_detail
+            if isinstance(exc, ClaudeModelSwitchRefused) and exc.model_may_have_changed:
+                error_code = "claude_native_model_unconfirmed"
+                detail = (
+                    "Claude may have changed the session model, but the selection could not "
+                    "be confirmed. Check the terminal's current model before retrying."
+                )
             return JSONResponse(
                 status_code=503,
                 content={
-                    "error": (
-                        "claude_native_model_unsupported"
-                        if isinstance(exc, ClaudeModelSwitchRefused) and exc.unsupported
-                        else "claude_native_model_failed"
-                    ),
-                    "detail": _claude_model_change_blocked_detail(exc) or safe_detail,
+                    "error": error_code,
+                    "detail": detail,
                     **({"waiting_on_person": True} if _claude_waits_on_person(exc) else {}),
                 },
             )

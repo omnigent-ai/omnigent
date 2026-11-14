@@ -1801,6 +1801,11 @@ async def _post_claude_control(
 ) -> httpx.Response:
     """Exercise the existing events boundary with an explicit picker result."""
     isolate_provider_resolution(monkeypatch, config_home)
+
+    def relay_unavailable(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError("Model-control test comment relay is unavailable")
+
+    monkeypatch.setattr(claude_native_bridge, "start_tool_relay", relay_unavailable)
     native_create_calls: list[object] = []
     launch_calls: list[str] = []
 
@@ -1849,7 +1854,12 @@ async def _post_claude_control(
 async def test_events_model_change_requires_the_same_immediate_picker_receipt(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, pane_status: str
 ) -> None:
+    from omnigent.runner.app import _session_event_queues_ref
+
     calls: list[str] = []
+
+    async def drain_creation_events(_client: httpx.AsyncClient) -> None:
+        _drain_session_event_queue(_session_event_queues_ref.get(_BOOT_SESSION_ID))
 
     def select(_bridge: Path, *, model: str, timeout_s: float, ready_timeout_s: float) -> Any:
         calls.append(model)
@@ -1860,10 +1870,17 @@ async def test_events_model_change_requires_the_same_immediate_picker_receipt(
             model, model, model, model, "native-session"
         )
 
-    response = await _post_claude_control(monkeypatch, tmp_path, select, pane_status=pane_status)
+    response = await _post_claude_control(
+        monkeypatch,
+        tmp_path,
+        select,
+        pane_status=pane_status,
+        before_control=drain_creation_events,
+    )
 
     assert response.status_code == 204, response.text
     assert calls == ["claude-opus-4-7"]
+    assert _drain_session_event_queue(_session_event_queues_ref.get(_BOOT_SESSION_ID)) == []
 
 
 @pytest.mark.parametrize("receipt_kind", ["absent", "different-target"])
@@ -1922,10 +1939,17 @@ async def test_events_model_change_refuses_unsupported_queued_or_unconfirmed_sta
     response = await _post_claude_control(monkeypatch, tmp_path, refuse, pane_status="running")
 
     assert response.status_code == 503, response.text
-    assert response.json()["error"] == (
-        "claude_native_model_unsupported" if phase == "preflight" else "claude_native_model_failed"
-    )
-    assert "inspect the terminal" in response.json()["detail"]
+    if phase in {"commit", "status"}:
+        assert response.json()["error"] == "claude_native_model_unconfirmed"
+        assert "may have changed" in response.json()["detail"]
+        assert "Check the terminal's current model before retrying" in response.json()["detail"]
+    else:
+        assert response.json()["error"] == (
+            "claude_native_model_unsupported"
+            if phase == "preflight"
+            else "claude_native_model_failed"
+        )
+        assert "inspect the terminal" in response.json()["detail"]
 
 
 @pytest.mark.parametrize("selected", ["private/model-b[large]", "private-claude-opus[1m]"])

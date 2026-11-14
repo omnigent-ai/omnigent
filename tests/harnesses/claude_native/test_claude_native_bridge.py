@@ -36,6 +36,7 @@ import pytest
 
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.claude_native import hook as claude_native_hook
+from omnigent.harnesses.claude_native import model_switch as claude_model_switch
 from omnigent.harnesses.claude_native.bridge import (
     _BACKGROUND_TASK_FIELD_MAX_CHARS,
     _LOGIN_GUIDANCE,
@@ -13484,13 +13485,16 @@ def test_composer_box_reads_every_row_of_the_input_box(
 class _SessionModelComposer(_EditableComposer):
     """Editable composer with the recorded local model and status overlays."""
 
-    def __init__(self, *, draft: str = "", busy: bool = False) -> None:
+    def __init__(
+        self, *, draft: str = "", busy: bool = False, prompt_separator: str = " "
+    ) -> None:
         super().__init__(draft, cursor=len(draft))
         self.options = ["claude-sonnet-5-5", "private-glm[1m]"]
         self.model = self.options[0]
         self.highlight = 0
         self.overlay: str | None = None
         self.busy = busy
+        self.prompt_separator = prompt_separator
         self.sends: list[tuple[str, ...]] = []
         self.status_queries = 0
         self.session = "native-session"
@@ -13544,9 +13548,9 @@ class _SessionModelComposer(_EditableComposer):
                 f"   Model: {self.model}\n"
                 "   Esc to cancel\n"
             )
-        return ("Working…\n" if self.busy else "") + super()._capture_pane(
-            socket_path, tmux_target
-        )
+        pane = super()._capture_pane(socket_path, tmux_target)
+        pane = pane.replace("\n❯ ", f"\n❯{self.prompt_separator}", 1)
+        return ("Working…\n" if self.busy else "") + pane
 
 
 def _session_model_bridge(tmp_path: Path, composer: _SessionModelComposer) -> Path:
@@ -13582,13 +13586,83 @@ def _session_model_bridge(tmp_path: Path, composer: _SessionModelComposer) -> Pa
     return bridge_dir
 
 
+# Claude Code 2.1.323 renders one nonbreaking prompt separator.
+_CAPTURED_EMPTY_NBSP_COMPOSER = (
+    "                                                            ◐ medium · /effort\n"
+    "────────────────────────────────────────────────────────────────────────────────\n"
+    "❯\u00a0\n"
+    "────────────────────────────────────────────────────────────────────────────────\n"
+    "\n"
+    "  ⏸ manual mode on\n"
+)
+
+
+def test_model_draft_reads_the_captured_empty_nbsp_composer() -> None:
+    assert claude_native_bridge._composer_box(_CAPTURED_EMPTY_NBSP_COMPOSER) == (
+        claude_native_bridge._ComposerBox(["❯\u00a0"], framed=True)
+    )
+    assert claude_model_switch._draft(_CAPTURED_EMPTY_NBSP_COMPOSER) == ""
+
+
+@pytest.mark.parametrize(
+    "prompt_separator", [" ", "\u00a0"], ids=["separator-space", "separator-nbsp"]
+)
+@pytest.mark.parametrize(
+    "draft",
+    [
+        "",
+        "/model",
+        "/status",
+        "\u00a0",
+        "\u00a0owned",
+        " owned",
+        "\towned",
+        "\nowned",
+        "owned\n",
+        "owned \u00a0",
+    ],
+    ids=[
+        "empty",
+        "model-command",
+        "status-command",
+        "one-nbsp",
+        "leading-nbsp",
+        "leading-space",
+        "leading-tab",
+        "leading-newline",
+        "trailing-newline",
+        "trailing-space-nbsp",
+    ],
+)
+def test_model_draft_preserves_text_after_one_prompt_separator(
+    prompt_separator: str, draft: str
+) -> None:
+    composer = _SessionModelComposer(draft=draft, prompt_separator=prompt_separator)
+
+    assert claude_model_switch._draft(composer._capture_pane("", "")) == draft
+
+
+@pytest.mark.parametrize("prefix", ["\t", "\u2009"], ids=["tab", "thin-space"])
+def test_model_draft_does_not_consume_other_prompt_whitespace(prefix: str) -> None:
+    pane = _composer_pane("/model").replace("❯ ", f"❯{prefix}", 1)
+
+    assert claude_model_switch._draft(pane) == prefix + "/model"
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prompt_separator", [" ", "\u00a0"], ids=["separator-space", "separator-nbsp"]
+)
 @pytest.mark.parametrize("busy", [False, True], ids=["idle", "busy"])
 @pytest.mark.parametrize("delivery", ["direct", "routed-pending"])
 async def test_model_command_selects_session_only_then_reads_fresh_status(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, busy: bool, delivery: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    busy: bool,
+    delivery: str,
+    prompt_separator: str,
 ) -> None:
-    composer = _SessionModelComposer(busy=busy)
+    composer = _SessionModelComposer(busy=busy, prompt_separator=prompt_separator)
     bridge_dir = _session_model_bridge(tmp_path, composer)
     composer.install(monkeypatch)
 
@@ -13803,6 +13877,57 @@ def test_model_command_clears_only_the_exact_owned_blocked_draft(
     assert not any(args[-1] == "Space" for args in composer.sends)
 
 
+@pytest.mark.parametrize(
+    "prompt_separator", [" ", "\u00a0"], ids=["separator-space", "separator-nbsp"]
+)
+@pytest.mark.parametrize(
+    ("draft", "owned"),
+    [
+        ("\u00a0blocked prompt", "blocked prompt"),
+        (" blocked prompt", "blocked prompt"),
+        ("  blocked prompt", "blocked prompt"),
+        ("\nblocked prompt", "blocked prompt"),
+        ("blocked\nprompt", "blocked prompt"),
+        ("blocked prompt ", "blocked prompt"),
+        ("blocked prompt\u00a0", "blocked prompt"),
+        ("blocked prompt\n", "blocked prompt"),
+        ("blocked prompt extra", "blocked prompt"),
+        ("blocked prompt", "\u00a0blocked prompt"),
+    ],
+    ids=[
+        "leading-nbsp",
+        "leading-space",
+        "two-leading-spaces",
+        "leading-newline",
+        "internal-newline",
+        "trailing-space",
+        "trailing-nbsp",
+        "trailing-newline",
+        "trailing-text",
+        "claimed-padding",
+    ],
+)
+def test_model_command_refuses_whitespace_normalized_draft_ownership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prompt_separator: str,
+    draft: str,
+    owned: str,
+) -> None:
+    composer = _SessionModelComposer(draft=draft, prompt_separator=prompt_separator)
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused):
+        claude_native_bridge.inject_model_command(
+            bridge_dir, model="private-glm[1m]", owned_draft=owned
+        )
+
+    assert composer.sends == []
+    assert composer.text == draft
+    assert composer.model == "claude-sonnet-5-5"
+
+
 @pytest.mark.parametrize("owned", ["blocked prompt ", "blocked prompt\n", "different prompt"])
 def test_model_command_does_not_normalize_draft_ownership(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owned: str
@@ -13990,6 +14115,30 @@ def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouch
             False,
         ),
         ("Private/Model-B", "Private/Model-B", "Private/Model-B", {}, "private/model-b", False),
+        (
+            "opus",
+            "opus",
+            "system.ai.claude-opus-5-5[1m]",
+            {"ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-5-5[1m]"},
+            "claude-opus-5-4[1m]",
+            False,
+        ),
+        (
+            "opus",
+            "opus",
+            "system.ai.claude-opus-5-5[1m]",
+            {"ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-5-5[1m]"},
+            "claude-opus-5-4",
+            False,
+        ),
+        (
+            "opus",
+            "opus",
+            "system.ai.claude-opus-5-5",
+            {"ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-5-5"},
+            "claude-opus-5-5[1m]",
+            False,
+        ),
     ],
     ids=[
         "pinned-alias",
@@ -13999,6 +14148,9 @@ def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouch
         "exact-private-id",
         "private-prefix-is-not-public",
         "private-case-is-exact",
+        "different-public-generation",
+        "unmarked-different-public-generation",
+        "marked-status-for-plain-public-pin",
     ],
 )
 def test_model_command_verifies_alias_context_and_private_model_identity(

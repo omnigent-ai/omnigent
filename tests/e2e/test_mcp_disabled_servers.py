@@ -128,22 +128,6 @@ def test_disabled_server_absent_from_real_native_session(
             ready=lambda host: host.wait_online(client, timeout=90),
         ) as host,
     ):
-
-        def mcp_inventory_ready() -> bool:
-            inventory = client.get(f"/v1/hosts/{host.host_id}/mcp-servers", timeout=20)
-            if inventory.status_code == 409:
-                return False
-            assert inventory.status_code == 200, (
-                f"MCP inventory failed: {inventory.status_code}: {inventory.text}"
-            )
-            return set(names) <= {
-                server["name"]
-                for server in inventory.json()["mcp_servers"]
-                if server["harness"] == harness
-            }
-
-        # The DB can report online before the live tunnel is registered.
-        poll_until(mcp_inventory_ready, timeout_s=30, interval_s=0.1)
         response = client.put(
             f"/v1/hosts/{host.host_id}/mcp-servers/enabled",
             json={

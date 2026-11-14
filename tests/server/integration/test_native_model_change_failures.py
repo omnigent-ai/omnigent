@@ -139,6 +139,7 @@ async def _tunneled_runner(app: FastAPI) -> AsyncIterator[tuple[httpx.AsyncClien
 class _ClaudePane:
     bridge_dir: Path
     confirm: bool = True
+    model_may_have_changed: bool = False
     commands: list[str] = field(default_factory=list)
 
     def report_model(self, model: str) -> None:
@@ -150,9 +151,12 @@ class _ClaudePane:
         assert bridge_dir == self.bridge_dir
         self.commands.append(model)
         if not self.confirm:
+            if self.model_may_have_changed:
+                self.report_model(model)
             raise claude_bridge.ClaudeModelSwitchRefused(
                 "Claude's fresh status did not confirm the session-only model selection.",
                 phase="status",
+                model_may_have_changed=self.model_may_have_changed,
             )
         self.report_model(model)
         return claude_bridge.ClaudeModelSwitchResult(model, model, model, model, "native-session")
@@ -209,6 +213,16 @@ class _NativeSession:
         assert f"status {runner_status}" in self.errors[0]["message"]
         self.assert_model(self.previous_model)
 
+    def assert_unconfirmed(self, response: httpx.Response) -> None:
+        assert response.status_code == 503, response.text
+        assert "may have changed the session model" in response.text
+        assert "Check the terminal's current model before retrying" in response.text
+        reply = self.runner_replies[-1]
+        assert reply.status_code == 503
+        assert reply.json()["error"] == "claude_native_model_unconfirmed"
+        assert self.errors == []
+        assert self.notices == []
+
 
 @pytest.fixture
 async def native_session(
@@ -253,6 +267,11 @@ async def native_session(
     claude = None
     codex = None
     if is_claude:
+
+        def relay_unavailable(*_args: Any, **_kwargs: Any) -> None:
+            raise OSError("Model-control test comment relay is unavailable")
+
+        monkeypatch.setattr(claude_bridge, "start_tool_relay", relay_unavailable)
         monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path / "claude")
         bridge_dir = claude_bridge.bridge_dir_for_bridge_id(session_id)
         bridge_dir.mkdir(parents=True)
@@ -434,6 +453,50 @@ async def test_claude_model_confirmation_controls_public_patch_and_rollback(
         assert "did not confirm" in session.errors[0]["message"]
 
 
+@pytest.mark.parametrize("phase", ["commit", "status"])
+@pytest.mark.parametrize("applied", [False, True], ids=["previous-model", "requested-model"])
+async def test_unconfirmed_claude_model_change_keeps_intent_without_claiming_an_outcome(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    applied: bool,
+) -> None:
+    session = native_session
+    assert session.claude is not None
+    pane = session.claude
+
+    def select(_bridge_dir: Path, *, model: str, **_kwargs: Any) -> None:
+        pane.commands.append(model)
+        if applied:
+            pane.report_model(model)
+        raise claude_bridge.ClaudeModelSwitchRefused(
+            "The session-only selection could not be confirmed.",
+            phase=phase,
+            model_may_have_changed=True,
+        )
+
+    monkeypatch.setattr(claude_bridge, "inject_model_command", select)
+    response = await _pick_model(client, session)
+
+    session.assert_unconfirmed(response)
+    assert len(session.runner_replies) == 1
+    assert pane.commands == [session.requested_model]
+    saved = session.store.get_conversation(session.session_id)
+    assert saved.model_override == session.requested_model
+    assert saved.reasoning_effort == "high"
+    assert claude_bridge.read_claude_status_model(pane.bridge_dir) == (
+        session.requested_model if applied else session.previous_model
+    )
+    assert [
+        item
+        for item in session.store.list_items(session.session_id).data
+        if item.type == "error" and item.data.code == "model_change_not_applied"
+    ] == []
+    assert session.tunnel.dispatch_errors == []
+
+
+@pytest.mark.parametrize("unconfirmed", [False, True], ids=["refused", "unconfirmed"])
 @pytest.mark.parametrize(
     "newer_model",
     ["claude-sonnet-4-6", "claude-opus-4-7", None],
@@ -444,11 +507,13 @@ async def test_refused_model_change_preserves_newer_silent_selection(
     native_session: _NativeSession,
     monkeypatch: pytest.MonkeyPatch,
     newer_model: str | None,
+    unconfirmed: bool,
 ) -> None:
-    """A late refusal cannot overwrite model metadata saved by a newer launch."""
+    """A late model reply cannot overwrite metadata saved by a newer launch."""
     session = native_session
     assert session.claude is not None
     session.claude.confirm = False
+    session.claude.model_may_have_changed = unconfirmed
     monkeypatch.setattr(claude_bridge, "inject_model_command", session.claude.select)
     async with _held_model_reply(client, session) as (first, release_refusal):
         newer = await client.patch(
@@ -462,30 +527,37 @@ async def test_refused_model_change_preserves_newer_silent_selection(
         release_refusal.set()
         refused = await asyncio.wait_for(first, timeout=5)
 
-    assert refused.status_code == 503, refused.text
-    assert "Please check the current selection and try again" in refused.text
-    assert session.runner_replies[0].json()["error"] == "claude_native_model_failed"
-    assert session.errors[0]["code"] == "model_change_not_applied"
+    if unconfirmed:
+        session.assert_unconfirmed(refused)
+    else:
+        assert refused.status_code == 503, refused.text
+        assert "Please check the current selection and try again" in refused.text
+        assert session.runner_replies[0].json()["error"] == "claude_native_model_failed"
+        assert session.errors[0]["code"] == "model_change_not_applied"
     saved = session.store.get_conversation(session.session_id)
     assert saved.model_override == newer_model
     assert saved.reasoning_effort == "high"
     assert claude_bridge.read_claude_status_model(session.claude.bridge_dir) == (
-        newer_model or session.previous_model
+        newer_model or (session.requested_model if unconfirmed else session.previous_model)
     )
+    assert session.claude.commands == [session.requested_model]
     assert session.tunnel.dispatch_errors == []
 
 
+@pytest.mark.parametrize("unconfirmed", [False, True], ids=["refused", "unconfirmed"])
 @pytest.mark.parametrize("reported_setting", ["model", "effort"])
 async def test_refused_model_change_preserves_concurrent_terminal_report(
     client: httpx.AsyncClient,
     native_session: _NativeSession,
     monkeypatch: pytest.MonkeyPatch,
     reported_setting: str,
+    unconfirmed: bool,
 ) -> None:
-    """Restoring a refused selection retains the terminal's newer model or effort report."""
+    """A late model reply retains the terminal's newer model or effort report."""
     session = native_session
     assert session.claude is not None
     session.claude.confirm = False
+    session.claude.model_may_have_changed = unconfirmed
     monkeypatch.setattr(claude_bridge, "inject_model_command", session.claude.select)
     async with _held_model_reply(client, session) as (first, release_refusal):
         event = (
@@ -502,20 +574,28 @@ async def test_refused_model_change_preserves_concurrent_terminal_report(
         refused = await asyncio.wait_for(first, timeout=5)
 
     assert refused.status_code == 503, refused.text
+    if unconfirmed:
+        session.assert_unconfirmed(refused)
     saved = session.store.get_conversation(session.session_id)
-    assert saved.model_override == session.previous_model
+    assert saved.model_override == (
+        session.requested_model if unconfirmed else session.previous_model
+    )
     assert saved.reported_model == ("claude-sonnet-4-6" if reported_setting == "model" else None)
     assert saved.reasoning_effort == ("low" if reported_setting == "effort" else "high")
+    assert session.claude.commands == [session.requested_model]
+    assert session.tunnel.dispatch_errors == []
 
 
+@pytest.mark.parametrize("unconfirmed", [False, True], ids=["refused", "unconfirmed"])
 @pytest.mark.parametrize("prior_model", ["claude-opus-4-6", None], ids=["override", "default"])
 async def test_refused_claude_model_change_keeps_effort_applied_by_the_same_patch(
     client: httpx.AsyncClient,
     native_session: _NativeSession,
     monkeypatch: pytest.MonkeyPatch,
     prior_model: str | None,
+    unconfirmed: bool,
 ) -> None:
-    """A model refusal restores its prior override while retaining the applied effort."""
+    """The applied effort survives a refused or unconfirmed model selection."""
     session = native_session
     assert session.claude is not None
     if prior_model is None:
@@ -527,8 +607,13 @@ async def test_refused_claude_model_change_keeps_effort_applied_by_the_same_patc
 
     def refuse_model(_bridge_dir: Path, *, model: str, **_kwargs: Any) -> None:
         commands.append(model)
+        if unconfirmed:
+            assert session.claude is not None
+            session.claude.report_model(model)
         raise claude_bridge.ClaudeModelSwitchRefused(
-            "Fresh status did not confirm model selection"
+            "Fresh status did not confirm model selection",
+            phase="status",
+            model_may_have_changed=unconfirmed,
         )
 
     monkeypatch.setattr(claude_bridge, "inject_slash_command", inject)
@@ -539,22 +624,27 @@ async def test_refused_claude_model_change_keeps_effort_applied_by_the_same_patc
     )
 
     assert refused.status_code == 503, refused.text
+    if unconfirmed:
+        session.assert_unconfirmed(refused)
     assert commands == ["/effort low", session.requested_model]
     assert [reply.status_code for reply in session.runner_replies] == [204, 503]
     saved = session.store.get_conversation(session.session_id)
-    assert saved.model_override == prior_model
+    assert saved.model_override == (session.requested_model if unconfirmed else prior_model)
     assert saved.reasoning_effort == "low"
-    assert (
-        claude_bridge.read_claude_status_model(session.claude.bridge_dir) == session.previous_model
+    assert claude_bridge.read_claude_status_model(session.claude.bridge_dir) == (
+        session.requested_model if unconfirmed else session.previous_model
     )
+    assert session.tunnel.dispatch_errors == []
 
 
+@pytest.mark.parametrize("unconfirmed", [False, True], ids=["refused", "unconfirmed"])
 async def test_refused_model_change_keeps_the_new_replicas_same_selection(
     client: httpx.AsyncClient,
     native_session: _NativeSession,
     monkeypatch: pytest.MonkeyPatch,
+    unconfirmed: bool,
 ) -> None:
-    """A stale refusal cannot restore over the same model confirmed on another replica."""
+    """A stale model reply retains the same selection confirmed on another replica."""
     import time
 
     from omnigent.server.routes.sessions import routes_events
@@ -562,6 +652,7 @@ async def test_refused_model_change_keeps_the_new_replicas_same_selection(
     session = native_session
     assert session.claude is not None
     session.claude.confirm = False
+    session.claude.model_may_have_changed = unconfirmed
     monkeypatch.setattr(claude_bridge, "inject_model_command", session.claude.select)
     monkeypatch.setattr(routes_events, "last_liveness_stamp", lambda _runner: None)
     async with _held_model_reply(client, session) as (first, release_refusal):
@@ -579,6 +670,14 @@ async def test_refused_model_change_keeps_the_new_replicas_same_selection(
         session.store.get_conversation(session.session_id).model_override
         == session.requested_model
     )
+    assert session.runner_replies[0].json()["error"] == (
+        "claude_native_model_unconfirmed" if unconfirmed else "claude_native_model_failed"
+    )
+    if unconfirmed:
+        assert session.errors == []
+        assert session.notices == []
+    assert session.claude.commands == [session.requested_model]
+    assert session.tunnel.dispatch_errors == []
 
 
 @pytest.mark.parametrize("screen", [_QUESTION, _PERMISSION], ids=["question", "permission"])

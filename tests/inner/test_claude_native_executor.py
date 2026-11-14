@@ -1320,6 +1320,8 @@ async def test_run_turn_applies_routed_model_before_message_under_one_lock(
     if clear_during_switch:
         assert len(events) == 1 and isinstance(events[0], ExecutorError)
         assert events[0].undelivered is True
+        assert "no longer active after /clear" in events[0].message
+        assert events[0].preserve_session is False
     else:
         assert events == [TurnComplete(response=None)]
 

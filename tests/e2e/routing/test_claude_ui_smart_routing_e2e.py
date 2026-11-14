@@ -170,7 +170,7 @@ def test_claude_session_create_routes_the_model_and_then_the_spawn(
         "the spawn's task text never reached the router"
     )
 
-    # The guard restores the saved default after Claude's session-local switch.
+    # Session-only selection leaves the saved default unchanged.
     wait_for(
         lambda: (
             True

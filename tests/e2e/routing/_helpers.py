@@ -467,9 +467,9 @@ def rollout_turn_contexts(session_id: str) -> list[dict[str, Any]]:
 def claude_settings_snapshot(path: Path, *, include_model: bool = False) -> str:
     """Snapshot the launched Claude settings file, optionally including its model.
 
-    Hook registration lives in the per-session bridge dir. The model guard
-    restores Claude Code's temporary ``model`` writes asynchronously; callers
-    checking that restoration include the model and wait for the snapshot.
+    Hook registration lives in the per-session bridge dir. Session-only
+    selection leaves the saved default unchanged; callers include the model
+    when checking that default alongside the other settings.
 
     :param path: Settings path resolved from the launch environment and workspace.
     :param include_model: Include the saved default in the snapshot.
