@@ -60,6 +60,7 @@ export type FeatureKey =
   | "usage_page"
   | "harness_install"
   | "canvas"
+  | "webfonts"
   | "arca_shutdown_warnings"
   | "import_review"
   | "sidebar_grouping_ui"
