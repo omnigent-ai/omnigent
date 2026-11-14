@@ -1,7 +1,8 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import type { MouseEvent, ReactNode } from "react";
+import type { ComponentType, MouseEvent, ReactNode } from "react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AgentCosts } from "@/hooks/useAgentCosts";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 import { writeOpenSubagentsInPanel } from "@/lib/subagentPanelPreferences";
@@ -9,26 +10,36 @@ import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { SubagentsGraphView } from "./SubagentsGraphView";
 
 // The real canvas exhausts jsdom's memory; this stand-in renders one button per
-// node and forwards clicks the way React Flow's `onNodeClick` does.
+// node, forwards clicks the way React Flow's `onNodeClick` does, and renders each
+// node's component beside it.
 interface StubNode {
   id: string;
+  type: string;
   data: { sessionId: string };
 }
 vi.mock("@xyflow/react", () => ({
   ReactFlow: ({
     nodes,
+    nodeTypes,
     onNodeClick,
   }: {
     nodes: StubNode[];
+    nodeTypes: Record<string, ComponentType<{ data: StubNode["data"] }>>;
     onNodeClick: (event: MouseEvent, node: StubNode) => void;
     children?: ReactNode;
   }) => (
     <div>
-      {nodes.map((node) => (
-        <button key={node.id} type="button" onClick={(event) => onNodeClick(event, node)}>
-          {node.data.sessionId}
-        </button>
-      ))}
+      {nodes.map((node) => {
+        const NodeComponent = nodeTypes[node.type];
+        return (
+          <div key={node.id} data-testid={`graph-node-${node.id}`}>
+            <button type="button" onClick={(event) => onNodeClick(event, node)}>
+              {node.data.sessionId}
+            </button>
+            <NodeComponent data={node.data} />
+          </div>
+        );
+      })}
     </div>
   ),
   Background: () => null,
@@ -117,5 +128,29 @@ describe("SubagentsGraphView node clicks", () => {
 
     expect(opener).toHaveBeenCalledWith("conv_root");
     expect(screen.getByTestId("current-path").textContent).toBe("/c/conv_root");
+  });
+
+  it("shows each node's cost, marking estimates, and drops one that becomes unknown", () => {
+    const graph = (costs: AgentCosts) => (
+      <MemoryRouter initialEntries={["/c/conv_root"]}>
+        <SubagentsGraphView conversationId="conv_root" rootSessionId="conv_root" costs={costs} />
+      </MemoryRouter>
+    );
+    const costOf = (id: string) =>
+      screen.getByTestId(`graph-node-${id}`).querySelector('[data-testid="subagent-cost"]')
+        ?.textContent ?? null;
+    const { rerender } = render(
+      graph(
+        new Map([
+          ["conv_root", { costUsd: 1.5, estimated: false }],
+          ["conv_child", { costUsd: 0.25, estimated: true }],
+        ]),
+      ),
+    );
+    expect([costOf("conv_root"), costOf("conv_child")]).toEqual(["$1.50", "~$0.25"]);
+
+    // A later poll updates the same graph in place.
+    rerender(graph(new Map([["conv_root", { costUsd: 2, estimated: false }]])));
+    expect([costOf("conv_root"), costOf("conv_child")]).toEqual(["$2.00", null]);
   });
 });

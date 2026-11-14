@@ -9,6 +9,7 @@ import pytest
 
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas, execute_tool
+from omnigent.session_host import SessionRoutingTransport
 from omnigent.spec.types import AgentSpec
 
 
@@ -374,7 +375,8 @@ async def test_message_timeout_is_not_retried(failure, after_routing):
         raise httpx.ReadTimeout("uncertain")
 
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(timeout), base_url="http://server"
+        transport=SessionRoutingTransport(transport=httpx.MockTransport(timeout)),
+        base_url="http://server",
     ) as client:
         result = await execute_tool(
             tool_name="sys_session_message",
@@ -563,7 +565,8 @@ async def test_message_routing_lookup_and_keyless_delivery(outcome):
         return httpx.Response(202, json={"queued": True})
 
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(respond), base_url="http://server"
+        transport=SessionRoutingTransport(transport=httpx.MockTransport(respond)),
+        base_url="http://server",
     ) as client:
         result = json.loads(
             await execute_tool(
@@ -573,16 +576,14 @@ async def test_message_routing_lookup_and_keyless_delivery(outcome):
                 conversation_id=uuid4().hex,
             )
         )
+    # One lookup after the refusal; hop_limit walks 16 parent hops. A failed lookup
+    # falls back to one keyless attempt, which a timeout leaves uncertain.
     assert len(lookups) == (16 if outcome == "hop_limit" else 1)
-    if outcome.startswith("lookup_"):
-        assert result["error"] == "Message not delivered: target host could not be resolved"
-        assert len(requests) == 1
+    assert len(requests) == 2
+    if outcome in {"send_timeout", "hop_limit"}:
+        assert "do not automatically resend" in result["error"]
     else:
-        assert len(requests) == 2
-        if outcome == "success":
-            assert result == {"queued": True}
-        else:
-            assert "do not automatically resend" in result["error"]
+        assert result == {"queued": True}
 
 
 @pytest.mark.asyncio
@@ -677,9 +678,11 @@ async def test_message_content_validation_is_distinct_from_invalid_id(message):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("target_kind", ["root", "child", "side_chat"])
-async def test_managed_message_resolves_host_after_wrong_replica(target_kind):
-    from omnigent.runner.session_requests import REQUEST_HOST_EXTENSION
+async def test_managed_message_resolves_host_after_wrong_replica(target_kind, monkeypatch):
+    from omnigent import session_host
+    from omnigent.session_host import REQUEST_HOST_EXTENSION
 
+    monkeypatch.setattr(session_host, "_session_hosts", {})
     destination = "1234567890123456"
     parent = "1234567890123457"
     requests = []
@@ -702,7 +705,8 @@ async def test_managed_message_resolves_host_after_wrong_replica(target_kind):
         return httpx.Response(202, json={"queued": True})
 
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(respond), base_url="http://server"
+        transport=SessionRoutingTransport(transport=httpx.MockTransport(respond)),
+        base_url="http://server",
     ) as client:
         result = json.loads(
             await execute_tool(
@@ -719,12 +723,11 @@ async def test_managed_message_resolves_host_after_wrong_replica(target_kind):
         *[("GET", f"/v1/sessions/{session_id}") for session_id in lookup_ids],
         ("POST", f"/v1/sessions/{destination}/events"),
     ]
-    for request in (requests[0], requests[-1]):
-        assert request.headers[ORCHESTRATION_SOURCE_HEADER] == parent
-        assert json.loads(request.content) == {
-            "type": "session_message",
-            "data": {"message": "Work"},
-        }
+    assert requests[-1].headers[ORCHESTRATION_SOURCE_HEADER] == parent
+    assert json.loads(requests[-1].content) == {
+        "type": "session_message",
+        "data": {"message": "Work"},
+    }
 
 
 @pytest.mark.asyncio
@@ -790,6 +793,55 @@ async def test_managed_create_routes_to_reserved_host_through_auth_retry(monkeyp
     headers, body = requests[-1]
     assert headers.get(OMNIGENT_SLICE_KEY_HEADER.lower()) == body.get("host_id")
     assert ("host_id" in body) is supported
+
+
+@pytest.mark.asyncio
+async def test_managed_create_caches_the_new_session_host_for_its_first_message(monkeypatch):
+    from omnigent import session_host
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, open_server_client
+
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
+    monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", "sender-host")
+    monkeypatch.setattr(session_host, "_session_hosts", {})
+    child = uuid4().hex
+    created_hosts: list[str] = []
+    message_keys: list[tuple[str, str | None]] = []
+
+    def respond(request):
+        if request.url.path == "/v1/info":
+            return httpx.Response(
+                200, json={"request_managed_sandbox_host_id": True, "sibling_sessions": True}
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions/orchestrated":
+            host_id = json.loads(request.content)["host_id"]
+            created_hosts.append(host_id)
+            return httpx.Response(201, json={"id": child, "host_id": host_id})
+        key = request.headers.get(OMNIGENT_SLICE_KEY_HEADER)
+        message_keys.append((request.url.path, key))
+        if key != created_hosts[0]:
+            return httpx.Response(400, json={"error": {"code": "wrong_replica"}})
+        return httpx.Response(202, json={"queued": True})
+
+    async with open_server_client("http://sharded", transport=httpx.MockTransport(respond)) as c:
+        created = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": "worker", "placement": "managed"}),
+                server_client=c,
+                conversation_id=uuid4().hex,
+            )
+        )
+        message = json.loads(
+            await execute_tool(
+                tool_name="sys_session_message",
+                arguments=json.dumps({"session_id": child, "message": "Work"}),
+                server_client=c,
+                conversation_id=uuid4().hex,
+            )
+        )
+    assert created["conversation_id"] == child, created
+    assert message == {"queued": True}
+    assert message_keys == [(f"/v1/sessions/{child}/events", created_hosts[0])]
 
 
 _PROJECT_ID = "ab" * 16
@@ -1265,11 +1317,11 @@ async def test_pr_link_routes_to_target_and_requires_capability(
 ):
     from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, open_server_client
     from omnigent.runner._entry import _RunnerDatabricksAuth
-    from omnigent.runner.session_requests import REQUEST_HOST_EXTENSION
 
     monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
     monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", "source-route")
     requests = []
+    sent_keys = []
     delivered = []
     source = uuid4().hex
     target = uuid4().hex if explicit_target else source
@@ -1285,7 +1337,12 @@ async def test_pr_link_routes_to_target_and_requires_capability(
         if request.method == "GET":
             assert request.url.path == f"/v1/sessions/{target}"
             return httpx.Response(200, json={"host_id": host})
-        if legacy_host and request.extensions[REQUEST_HOST_EXTENSION]:
+        # The owning replica serves its host's key; a legacy one serves only unkeyed requests.
+        # Record the key as sent: a retry re-addresses the same request object.
+        key = request.headers.get(OMNIGENT_SLICE_KEY_HEADER)
+        sent_keys.append(key)
+        accepted = key is None if legacy_host else key == (host or "source-route")
+        if not accepted:
             return httpx.Response(400, json={"error": {"code": "wrong_replica"}})
         delivered.append(request)
         return httpx.Response(200, json={"prs": []})
@@ -1316,14 +1373,15 @@ async def test_pr_link_routes_to_target_and_requires_capability(
         assert not posts
         return
     assert result == {"prs": []}
-    assert len(posts) == (2 if legacy_host else 1)
     assert len(delivered) == 1
-    assert [r.extensions.get(REQUEST_HOST_EXTENSION) for r in posts] == (
-        [host, ""] if legacy_host else [host]
-    )
-    assert [r.headers.get(OMNIGENT_SLICE_KEY_HEADER) for r in posts] == (
-        [host, None] if legacy_host else [host or "source-route"]
-    )
+    # The first attempt uses the runner's key. A refusal re-resolves the host, and a
+    # legacy replica takes the unkeyed retry.
+    if host is None:
+        assert sent_keys == ["source-route"]
+    elif legacy_host:
+        assert sent_keys == ["source-route", host, None]
+    else:
+        assert sent_keys == ["source-route", host]
     assert all(r.headers[ORCHESTRATION_SOURCE_HEADER] == source for r in posts)
     assert all(r.headers["Authorization"] == "Bearer test-token" for r in posts)
     assert posts[0].url.path == f"/v1/sessions/{target}/resources/github/prs/orchestrated"
