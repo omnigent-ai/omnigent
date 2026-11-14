@@ -748,12 +748,25 @@ class Lab:
         self._host = self._spawn("host", argv, env)
         assert self.observer is not None
         observer, host = self.observer, self._host
+        deadline = time.monotonic() + _STARTUP_TIMEOUT_S
+        timeout_detail = (
+            f"timed out after {_STARTUP_TIMEOUT_S}s waiting for the host daemon to answer an RPC"
+        )
 
         def _ready() -> bool | None:
             if not host.running:
                 raise RuntimeError(f"host daemon exited:\n{host.log_tail()}")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(timeout_detail)
             # The online DB row is committed before the tunnel enters the registry.
-            response = observer.get(f"/v1/hosts/{self.host_id}/filesystem", params={"limit": 1})
+            response = observer.get(
+                f"/v1/hosts/{self.host_id}/filesystem",
+                params={"limit": 1},
+                timeout=min(2.0, remaining),
+            )
+            if time.monotonic() >= deadline:
+                raise TimeoutError(timeout_detail)
             return True if response.status_code == 200 else None
 
         wait_for(_ready, timeout=_STARTUP_TIMEOUT_S, what="the host daemon to answer an RPC")

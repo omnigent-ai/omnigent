@@ -21,6 +21,10 @@ from tests.e2e.resilience.lab.lab import Lab, LabConfig
         pytest.param("server-runner", "rpc-delay", id="server-runner"),
         pytest.param("server-runner", "unrelated-host", id="server-runner-unrelated-host"),
         pytest.param("server-runner", "deadline", id="server-runner-deadline"),
+        pytest.param("lab", "remaining-budget", id="lab-rpc-remaining-budget"),
+        pytest.param("lab", "late-success", id="lab-rpc-late-success"),
+        pytest.param("server-runner", "remaining-budget", id="server-runner-rpc-remaining-budget"),
+        pytest.param("server-runner", "late-success", id="server-runner-rpc-late-success"),
     ],
 )
 def test_host_startup_waits_for_rpc_when_online_row_precedes_tunnel(
@@ -32,6 +36,7 @@ def test_host_startup_waits_for_rpc_when_online_row_precedes_tunnel(
     clock = SimpleNamespace(now=0.0)
     spawned_env = {}
     request_timeouts = []
+    rpc_timeouts = []
 
     def respond(request: httpx.Request) -> httpx.Response:
         nonlocal rpc_attempted, rpc_ready
@@ -49,15 +54,20 @@ def test_host_startup_waits_for_rpc_when_online_row_precedes_tunnel(
             return httpx.Response(200, json={"data": []})
         assert request.url.path == f"/v1/hosts/{host_id}/filesystem"
         assert request.url.params["limit"] == "1"
+        rpc_timeouts.append(request.extensions["timeout"])
         if scenario == "deadline":
             rpc_ready = True
             return httpx.Response(200, json={"data": []})
         if not rpc_attempted:
             rpc_attempted = True
+            if scenario in {"remaining-budget", "late-success"}:
+                clock.now = 0.75
             return httpx.Response(
                 409, json={"error": {"code": "conflict", "message": "host is offline"}}
             )
         rpc_ready = True
+        if scenario == "late-success":
+            clock.now = 1.1
         return httpx.Response(200, json={"object": "list", "data": [], "has_more": False})
 
     with ExitStack() as resources:
@@ -72,7 +82,13 @@ def test_host_startup_waits_for_rpc_when_online_row_precedes_tunnel(
             monkeypatch.setattr(lab, "_host_side_env", dict)
             monkeypatch.setattr(lab, "_spawn", lambda *_: Mock(running=True))
             lab.observer = observer
-            lab._start_host()
+            if scenario in {"remaining-budget", "late-success"}:
+                monkeypatch.setattr("tests.e2e.resilience.lab.lab._STARTUP_TIMEOUT_S", 1.0)
+                monkeypatch.setattr(
+                    "tests.e2e.resilience.lab.lab.time",
+                    SimpleNamespace(monotonic=lambda: clock.now, sleep=lambda _: None),
+                )
+            start_host = lab._start_host
         else:
             stack = ServerRunner(
                 tmp_path / "stack",
@@ -100,14 +116,23 @@ def test_host_startup_waits_for_rpc_when_online_row_precedes_tunnel(
                 "tests._helpers.server_runner.time",
                 SimpleNamespace(monotonic=lambda: clock.now, sleep=lambda _: None),
             )
+            start_host = stack.start_host
+        if scenario in {"deadline", "late-success"}:
+            error = TimeoutError if helper == "lab" else AssertionError
+            with pytest.raises(error, match=r"host daemon|never became ready"):
+                start_host()
             if scenario == "deadline":
-                with pytest.raises(AssertionError, match="never became ready"):
-                    stack.start_host()
                 assert not rpc_ready, "No host RPC may start after the readiness deadline"
                 assert request_timeouts[0]["read"] <= 1.0
-                return
-            stack.start_host()
-        assert rpc_ready, "Host startup returned before the host could answer an RPC"
+            else:
+                assert rpc_ready, "The deadline must reject the late successful RPC"
+        else:
+            start_host()
+            assert rpc_ready, "Host startup returned before the host could answer an RPC"
+        if scenario in {"remaining-budget", "late-success"}:
+            assert len(rpc_timeouts) == 2
+            assert 0 < rpc_timeouts[0]["read"] <= 1.0
+            assert 0 < rpc_timeouts[1]["read"] <= 0.25
         if helper == "server-runner":
             assert spawned_env["OMNIGENT_HOST_ID"] == host_id
             assert spawned_env["OMNIGENT_HOST_NAME"]

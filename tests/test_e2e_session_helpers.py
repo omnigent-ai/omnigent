@@ -231,6 +231,11 @@ def test_pending_tool_poll_waits_for_this_turn(monkeypatch, previous_call) -> No
             ("synthetic-inline-escaped-tail",),
             id="decoded-string",
         ),
+        pytest.param(
+            {"details": "Bearer synthetic-bearer-tail"},
+            ("synthetic-bearer-tail",),
+            id="bearer-only-leaf",
+        ),
         *[
             pytest.param(
                 {"details": f"{label}=synthetic-assignment-tail"}
