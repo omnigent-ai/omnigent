@@ -806,3 +806,101 @@ def test_fresh_terminal_turn_reports_running_before_first_model_output(
         assert snapshot.get("status") == "idle"
         bridge = read_bridge_state(session.bridge)
         assert bridge is not None and bridge.active_turn_id is None
+
+
+def test_codex_approval_mode_change_queues_until_turn_settles(
+    codex_effort_rig: _Rig,
+) -> None:
+    """Mid-turn picks do not interrupt Codex; only the latest applies afterward."""
+    rig = codex_effort_rig
+    with _session(rig, _STANDARD_MODEL, "medium") as session:
+        marker = f"APPROVAL_QUEUE_{uuid.uuid4().hex}"
+        prompt = f"Reply with exactly one word: {marker}"
+        _json(rig.model.post("/mock/reset"))
+        _json(
+            rig.model.post(
+                "/mock/configure",
+                json={
+                    "key": marker,
+                    "match": marker,
+                    "responses": [{"text": marker, "block": True, "gate": marker}],
+                },
+            )
+        )
+        _json(
+            rig.api.post(
+                f"/v1/sessions/{session.id}/events",
+                json={
+                    "type": "message",
+                    "data": {"role": "user", "content": [{"type": "input_text", "text": prompt}]},
+                },
+            )
+        )
+        active_turn_id = None
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            state = read_bridge_state(session.bridge)
+            snapshot = _json(rig.api.get(f"/v1/sessions/{session.id}"))
+            assert snapshot.get("status") != "failed", snapshot.get("status_error")
+            if (
+                state is not None
+                and state.active_turn_id is not None
+                and _json(rig.model.get("/gate/pending"))["pending"]
+            ):
+                active_turn_id = state.active_turn_id
+                break
+            time.sleep(0.1)
+        assert active_turn_id is not None, session.tmux("capture-pane", "-p")
+
+        try:
+            for mode in ("full-access", "approve-for-me"):
+                response = rig.api.patch(
+                    f"/v1/sessions/{session.id}", json={"approval_mode": mode}
+                )
+                assert response.status_code == 200, response.text
+                assert response.json()["labels"]["omnigent.codex_native.approval_mode"] == mode
+                state = read_bridge_state(session.bridge)
+                assert state is not None and state.active_turn_id == active_turn_id
+                pane = session.tmux("capture-pane", "-p")
+                assert "Permissions updated to " not in pane
+                assert "Permission selection requested: " not in pane
+            assert _json(rig.model.get("/gate/pending"))["pending"]
+        finally:
+            while _json(rig.model.post("/gate/release"))["released"]:
+                pass
+
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            items = _json(rig.api.get(f"/v1/sessions/{session.id}/items", params={"limit": 100}))[
+                "data"
+            ]
+            snapshot = _json(rig.api.get(f"/v1/sessions/{session.id}"))
+            assert snapshot.get("status") != "failed", snapshot.get("status_error")
+            state = read_bridge_state(session.bridge)
+            pane = session.tmux("capture-pane", "-p")
+            replied = any(
+                item.get("role") == "assistant" and marker in json.dumps(item.get("content"))
+                for item in items
+            )
+            if (
+                replied
+                and state is not None
+                and state.active_turn_id is None
+                and (
+                    "Permissions updated to Approve for me" in pane
+                    or "Permission selection requested: Approve for me" in pane
+                )
+            ):
+                break
+            time.sleep(0.2)
+        else:
+            pytest.fail(
+                f"Queued approval mode did not settle with the turn.\n{pane}\n"
+                f"{rig.stack.log_tail()}"
+            )
+        assert "Permissions updated to Full Access" not in pane
+        assert "Permission selection requested: Full Access" not in pane
+        assert any(
+            item.get("role") == "user" and prompt in json.dumps(item.get("content"))
+            for item in items
+        )

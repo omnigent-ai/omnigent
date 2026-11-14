@@ -4011,8 +4011,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const previous = get().codexApprovalMode;
     // Pinned for the same reason as `setCostControlMode` — see there.
     const patchSet = setterFor(conversationId);
-    // Optimistic, then reconciled against the mode the server confirms the
-    // Codex thread landed on.
+    // Optimistic, then reconciled with the mode the server applied or queued.
     patchSet({ codexApprovalMode: mode });
     try {
       const session = await updateSession(conversationId, { codexApprovalMode: mode });

@@ -12023,12 +12023,14 @@ async def test_patch_collaboration_mode_rejects_non_codex_session(
     assert "collaboration_mode is only supported" in resp.text
 
 
+@pytest.mark.parametrize("queued", [False, True], ids=["applied", "queued"])
 async def test_patch_approval_mode_forwards_and_persists_label(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    queued: bool,
 ) -> None:
     """
-    PATCH ``approval_mode`` drives the Codex ``/permissions`` popup and records it.
+    PATCH ``approval_mode`` applies or queues the Codex preset and records it.
 
     The web picker writes through the sessions PATCH route. The server forwards a
     harness-agnostic ``codex_approval_mode_change`` event so the runner keys the
@@ -12049,7 +12051,10 @@ async def test_patch_approval_mode_forwards_and_persists_label(
         if request.content:
             body = json.loads(request.content)
         captured.append(_ForwardedEffort(url=str(request.url), body=body))
-        return httpx.Response(200, json={"approval_mode": "full-access"})
+        return httpx.Response(
+            202 if queued else 200,
+            json={"approval_mode": "full-access", **({"queued": True} if queued else {})},
+        )
 
     async with _runtime_runner(_handler):
         agent = await create_test_agent(client)
@@ -12085,6 +12090,23 @@ async def test_patch_approval_mode_forwards_and_persists_label(
     ]
     assert len(mode_events) == 1
     assert mode_events[0]["approval_mode"] == "full-access"
+    if queued:
+        corrected = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "external_codex_approval_mode_change",
+                "data": {"approval_mode": "ask-for-approval"},
+            },
+        )
+        assert corrected.status_code == 202, corrected.text
+        snapshot = await client.get(f"/v1/sessions/{session['id']}")
+        assert snapshot.json()["labels"]["omnigent.codex_native.approval_mode"] == (
+            "ask-for-approval"
+        )
+        mode_events = [
+            event for _, event in published if event["type"] == "session.codex_approval_mode"
+        ]
+        assert mode_events[-1]["approval_mode"] == "ask-for-approval"
 
 
 @pytest.mark.parametrize("runner_status", [None, 503], ids=["no_runner", "runner_rejects"])

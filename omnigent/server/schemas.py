@@ -2722,10 +2722,10 @@ class UpdateSessionRequest(BaseModel):
         presets (the set is codex-version-dependent, so an older build may not
         offer every one). Only valid for sessions stamped with the codex-native
         wrapper label. The runner applies it by driving Codex's ``/permissions``
-        popup and confirms the switch echoed before returning, so a failure to
-        reach the mode surfaces as an error. The confirmed mode is stored on the
-        read-back label only (Codex owns the durable approval state), so it is
-        not written to ``terminal_launch_args``. Omitted leaves unchanged.
+        popup when idle, or queues it behind the active turn. The requested mode
+        is stored on the read-back label only (Codex owns the durable approval
+        state), so it is not written to ``terminal_launch_args``. Omitted leaves
+        unchanged.
     :param cost_control_mode_override: Per-session cost-control
         switch: ``"on"`` activates the spec's configured cost-control
         mode, ``"off"`` disables cost control for this session.
