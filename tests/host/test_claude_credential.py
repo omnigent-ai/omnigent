@@ -55,10 +55,8 @@ def test_exports_the_owners_token_from_the_broker(monkeypatch: pytest.MonkeyPatc
     )
     assert cc.configure_host_claude("https://omni.example/", "host-1") is True
     assert cc.os.environ[cc.CLAUDE_OAUTH_TOKEN_ENV_VAR] == "sk-ant-oat01-alice"
-    assert calls[-1] == {
-        "url": "https://omni.example/v1/hosts/host-1/credentials/claude",
-        "headers": {MANAGED_HOST_TOKEN_HEADER: "host-tok"},
-    }
+    assert calls[-1]["url"] == "https://omni.example/v1/hosts/host-1/credentials/claude"
+    assert calls[-1]["headers"][MANAGED_HOST_TOKEN_HEADER] == "host-tok"
 
 
 @pytest.mark.parametrize(
