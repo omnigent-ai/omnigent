@@ -17,6 +17,7 @@ from omnigent.onboarding.sandboxes.base import (
 )
 from omnigent.onboarding.sandboxes.daytona import (
     HOST_IMAGE_ENV_VAR,
+    OUTBOUND_PROXY_URL_ENV_VAR,
     SANDBOX_ENV_PASSTHROUGH_ENV_VAR,
     DaytonaSandboxLauncher,
 )
@@ -289,6 +290,7 @@ class _CreateParams:
     :param labels: Sandbox labels.
     :param auto_stop_interval: Idle auto-stop minutes (0 = disabled).
     :param resources: The ``Resources`` instance passed.
+    :param outbound_proxy_url: Sandbox HTTP(S) proxy URL, or ``None``.
     """
 
     image: str
@@ -296,6 +298,7 @@ class _CreateParams:
     labels: dict[str, str]
     auto_stop_interval: int
     resources: _FakeResources
+    outbound_proxy_url: str | None
 
 
 @dataclass
@@ -438,6 +441,7 @@ def fake_daytona(monkeypatch: pytest.MonkeyPatch) -> _FakeDaytonaState:
     # that assert the no-injection default.
     monkeypatch.delenv(SANDBOX_ENV_PASSTHROUGH_ENV_VAR, raising=False)
     monkeypatch.delenv(HOST_IMAGE_ENV_VAR, raising=False)
+    monkeypatch.delenv(OUTBOUND_PROXY_URL_ENV_VAR, raising=False)
     return _install_fake_daytona(monkeypatch)
 
 
@@ -482,6 +486,7 @@ def test_provision_defaults_official_image_and_disables_autostop(
     # would stop the session host mid-conversation.
     assert create.params.auto_stop_interval == 0
     assert create.params.env_vars is None
+    assert create.params.outbound_proxy_url is None
     assert create.params.labels == {"omnigent-name": "managed-abc"}
     assert create.params.resources == _FakeResources(cpu=2, memory=4)
     # Cold creates pull + snapshot the image (minutes); the SDK's 60s
@@ -506,6 +511,19 @@ def test_provision_image_resolution_order(
     first, second = fake_daytona.create_calls
     assert first.params.image == "docker.io/explicit/img:2"
     assert second.params.image == "docker.io/env/override:1"
+
+
+def test_provision_outbound_proxy_url_from_server_env(
+    fake_daytona: _FakeDaytonaState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The server env's proxy URL (credentials included) is forwarded verbatim."""
+    proxy_url = "https://user:pass@proxy.example.com:28431"
+    monkeypatch.setenv(OUTBOUND_PROXY_URL_ENV_VAR, proxy_url)
+
+    DaytonaSandboxLauncher().provision("a")
+
+    [create] = fake_daytona.create_calls
+    assert create.params.outbound_proxy_url == proxy_url
 
 
 def test_provision_env_passthrough_resolves_from_server_env(
