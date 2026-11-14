@@ -11,7 +11,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import psutil
 import pytest
@@ -188,10 +188,14 @@ async def test_validator_preserves_selected_environment_wrapper_and_policy(
     env_wrapped: bool,
     fork_executable: str | None,
 ) -> None:
+    monkeypatch.setattr(terminal_module, "tmux_unavailable_reason", lambda: None)
     instance = _instance(tmp_path)
     instance.command = "env" if env_wrapped else "claude"
     selected_command = "selected-wrapper" if sandboxed and env_wrapped else "claude"
     selected_prefix = ["claude", "--"] if sandboxed and env_wrapped else []
+    if env_wrapped:
+        which = Mock(return_value=selected_command)
+        monkeypatch.setattr(validation.shutil, "which", which)
     if fork_executable is not None:
         instance.os_env.cwd = instance.private_dir / "workspace"
         instance.os_env.cwd.mkdir()
@@ -271,22 +275,40 @@ async def test_validator_preserves_selected_environment_wrapper_and_policy(
         assert startup_targets == [str(runner_tools / "claude")]
         selected_command = startup_targets[0]
     launches = []
+    payloads = []
 
-    def launcher(command, cloned, *, cwd):
+    def launcher(command, cloned, *, cwd, target_environment_path=None):
         launches.append((command, cloned))
         assert cwd == str(selected_cwd)
+        if env_wrapped:
+            assert target_environment_path is not None
+            payloads.append(json.loads(Path(target_environment_path).read_text()))
+        else:
+            assert target_environment_path is None
         return str(tmp_path / "launcher")
 
     async def doctor(command, args, *, cwd, env):
-        assert command == (str(tmp_path / "launcher") if sandboxed else selected_command)
+        assert command == (
+            str(tmp_path / "launcher") if sandboxed or env_wrapped else selected_command
+        )
         assert args[: len(selected_prefix)] == selected_prefix
         assert cwd == (Path("/") if sandboxed else selected_cwd)
         assert env["PATH"] == selected_path
         if env_wrapped:
-            assert env["PRIVATE_KEY"] == "wrapper-value"
+            assert "PRIVATE_KEY" not in env
+            payload = payloads[-1]
+            selected_env = dict(env) if payload["inherit"] else {}
+            for name in payload["unset"]:
+                selected_env.pop(name, None)
+            selected_env.update(payload["variables"])
+            selected_env.update(payload["overrides"])
+            assert selected_env["PRIVATE_KEY"] == "wrapper-value"
+            assert selected_env["CLAUDE_CONFIG_DIR"] == env["CLAUDE_CONFIG_DIR"]
+            assert "EXCLUDED" not in selected_env
         else:
             assert "PRIVATE_KEY" not in env
-        assert "EXCLUDED" not in env and env["CLAUDE_CONFIG_DIR"] != "/caller-config"
+        assert ("EXCLUDED" not in env) is sandboxed
+        assert env["CLAUDE_CONFIG_DIR"] != "/caller-config"
         if "--help" in args:
             return _HELP, ""
         candidate = Path(args[args.index("--settings") + 1])
@@ -316,12 +338,17 @@ async def test_validator_preserves_selected_environment_wrapper_and_policy(
         )
         assert doctor_mock.await_count == 4
     if fork_executable is not None:
-        which.assert_called_once_with(selected_command, path=selected_path)
-    assert len(launches) == (4 if sandboxed and not rejected else 0)
+        assert which.call_args == call(selected_command, path=selected_path)
+    assert len(launches) == (4 if (sandboxed or env_wrapped) and not rejected else 0)
     assert [command for command, _ in launches] == (
-        [selected_command] * 4 if sandboxed and not rejected else []
+        [selected_command] * 4 if (sandboxed or env_wrapped) and not rejected else []
     )
     for _, cloned in launches:
+        if not sandboxed:
+            assert not cloned.active
+            assert cloned.backend_type == "none"
+            assert "PRIVATE_KEY" not in cloned.spawn_env_allowlist
+            continue
         assert not cloned.allow_network
         assert len(cloned.write_roots) == 1 and not cloned.write_files
         assert cloned.mask_paths == (
@@ -338,14 +365,23 @@ async def test_validator_preserves_selected_environment_wrapper_and_policy(
         assert cloned.copy_on_write_namespace == policy.copy_on_write_namespace
         assert cloned.copy_on_write_roots == policy.copy_on_write_roots
         assert "EXCLUDED" not in cloned.spawn_env_allowlist
-        assert ("PRIVATE_KEY" in cloned.spawn_env_allowlist) == env_wrapped
+        assert "PRIVATE_KEY" not in cloned.spawn_env_allowlist
     assert policy.allow_network and instance.socket_path in policy.deny_unix_socket_paths
     assert policy.spawn_env_allowlist == ["PATH"]
     assert not instance.socket_path.exists()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["unknown-wrapper", "unsupported-env", "missing-environment"])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "unknown-wrapper",
+        "wrapped-unknown-command",
+        "unsupported-env",
+        "unsupported-nested-env",
+        "missing-environment",
+    ],
+)
 async def test_validator_refuses_unavailable_launch_context_without_starting_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
@@ -355,6 +391,12 @@ async def test_validator_refuses_unavailable_launch_context_without_starting_it(
     if mode == "unsupported-env":
         instance.command = "env"
         prefix = ["--unsupported-option", "claude"]
+    elif mode == "unsupported-nested-env":
+        instance.command = "env"
+        prefix = ["EXAMPLE=outer", "env", "--unsupported-option", "claude"]
+    elif mode == "wrapped-unknown-command":
+        instance.command = "env"
+        prefix = ["EXAMPLE=wrapper-value", "selected-wrapper", "--"]
     elif mode == "missing-environment":
         instance.os_env = None
     doctor = AsyncMock()
@@ -363,10 +405,10 @@ async def test_validator_refuses_unavailable_launch_context_without_starting_it(
         await validation.validate_caller_settings(instance, {}, wrapper_prefix=prefix)
     assert error.value.reason is (
         validation.CallerSettingsErrorReason.SANDBOX_REQUIRED
-        if mode == "unknown-wrapper"
+        if mode in {"unknown-wrapper", "wrapped-unknown-command"}
         else validation.CallerSettingsErrorReason.VALIDATION_UNAVAILABLE
     )
-    if mode == "unknown-wrapper":
+    if mode in {"unknown-wrapper", "wrapped-unknown-command"}:
         assert "requires an active sandbox" in error.value.client_message
     doctor.assert_not_awaited()
 

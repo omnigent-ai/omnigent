@@ -28,6 +28,7 @@ from omnigent.inner._subprocess_lifecycle import (
     terminate_subprocess,
 )
 from omnigent.inner.sandbox import (
+    SandboxPolicy,
     create_exec_launcher,
     set_temp_env,
     with_additional_read_roots,
@@ -237,6 +238,21 @@ def _doctor_identity(stdout: str) -> tuple[str, ...]:
     return tuple(identity)
 
 
+def _validation_executable(command: str, environment: Mapping[str, str], cwd: Path) -> str:
+    """Select the wrapped executable without applying its environment to the host."""
+    search_path = os.pathsep.join(
+        str(path if path.is_absolute() else cwd / path)
+        for entry in environment.get("PATH", os.defpath).split(os.pathsep)
+        for path in (Path(entry),)
+    )
+    if os.path.dirname(command) and not os.path.isabs(command):
+        command = str(cwd / command)
+    executable = shutil.which(command, path=search_path)
+    if executable is None:
+        raise _ValidationUnavailable
+    return executable
+
+
 async def validate_caller_settings(
     instance: TerminalInstance,
     settings: Mapping[str, object],
@@ -251,24 +267,30 @@ async def validate_caller_settings(
     """
     if instance.os_env is None:
         raise CallerSettingsError(CallerSettingsErrorReason.VALIDATION_UNAVAILABLE)
-    env: dict[str, str] = terminal_pane_environment(
+    bootstrap_env: dict[str, str] = terminal_pane_environment(
         inherit_env=instance.inherit_env, env=instance.env, env_unset=instance.env_unset
     )
     sandbox = instance.sandbox_policy
     if sandbox is not None and sandbox.active and sandbox.spawn_env_allowlist is not None:
-        env = {name: value for name, value in env.items() if name in sandbox.spawn_env_allowlist}
+        bootstrap_env = {
+            name: value
+            for name, value in bootstrap_env.items()
+            if name in sandbox.spawn_env_allowlist
+        }
     command, prefix, cwd = instance.command, list(wrapper_prefix), instance.os_env.cwd
+    wrapper = None
+    selected_env: dict[str, str] = bootstrap_env
     if sandbox is not None and sandbox.active and Path(command).name != "env":
         command = shutil.which(command) or command
     if Path(command).name == "env":
-        wrapper = env_wrapper_launch(command, prefix, env)
+        wrapper = env_wrapper_launch(command, prefix, bootstrap_env)
         if wrapper is None:
             raise CallerSettingsError(CallerSettingsErrorReason.VALIDATION_UNAVAILABLE)
         command, prefix = wrapper.command, wrapper.args
-        env = dict(env) if wrapper.environment.inherit else {}
+        selected_env = dict(bootstrap_env) if wrapper.environment.inherit else {}
         for name in wrapper.environment.unset:
-            env.pop(name, None)
-        env.update(wrapper.environment.variables)
+            selected_env.pop(name, None)
+        selected_env.update(wrapper.environment.variables)
         if wrapper.chdir is not None:
             cwd = cwd / wrapper.chdir
     if not (sandbox is not None and sandbox.active) and (
@@ -276,6 +298,8 @@ async def validate_caller_settings(
     ):
         raise CallerSettingsError(CallerSettingsErrorReason.SANDBOX_REQUIRED)
     try:
+        if wrapper is not None:
+            command = _validation_executable(command, selected_env, cwd)
         async with asyncio.timeout(_VALIDATION_TIMEOUT):
             with tempfile.TemporaryDirectory(
                 prefix="claude-settings-check-", dir=instance.private_dir.parent
@@ -300,7 +324,9 @@ async def validate_caller_settings(
                         if private_workspace:
                             # A fork lives below the private parent; mount only its workspace.
                             roots = [*(policy.read_roots or []), cwd.resolve()]
-                            executable = shutil.which(command, path=env.get("PATH", os.defpath))
+                            executable = shutil.which(
+                                command, path=selected_env.get("PATH", os.defpath)
+                            )
                             if executable is not None:
                                 for path in (Path(executable), Path(executable).resolve()):
                                     roots.extend(
@@ -361,8 +387,7 @@ async def validate_caller_settings(
                     ):
                         run_dir = scratch / str(index)
                         run_dir.mkdir(mode=0o700)
-                        run_env: dict[str, str] = {
-                            **env,
+                        isolated_env = {
                             "HOME": str(run_dir / "home"),
                             "USERPROFILE": str(run_dir / "home"),
                             "XDG_CONFIG_HOME": str(run_dir / "config"),
@@ -376,19 +401,47 @@ async def validate_caller_settings(
                             "NO_COLOR": "1",
                             "FORCE_COLOR": "0",
                         }
-                        set_temp_env(run_env, run_dir)
+                        set_temp_env(isolated_env, run_dir)
+                        run_env = {**bootstrap_env, **isolated_env}
                         launch_command = command
                         host_cwd = cwd
-                        if policy is not None:
+                        launcher_policy = policy
+                        launcher_options = {"cwd": str(cwd)}
+                        if wrapper is not None:
+                            target_environment = run_dir / "target-environment.json"
+                            fd = os.open(
+                                target_environment, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                            )
+                            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                                json.dump(
+                                    {
+                                        "inherit": wrapper.environment.inherit,
+                                        "unset": wrapper.environment.unset,
+                                        "variables": wrapper.environment.variables,
+                                        "overrides": isolated_env,
+                                    },
+                                    stream,
+                                )
+                            launcher_options["target_environment_path"] = str(target_environment)
+                            if launcher_policy is None:
+                                launcher_policy = SandboxPolicy(
+                                    backend_type="none",
+                                    active=False,
+                                    read_roots=None,
+                                    write_roots=[],
+                                    write_files=[],
+                                    allow_network=True,
+                                )
+                        if launcher_policy is not None:
                             launcher = Path(
                                 create_exec_launcher(
                                     command,
-                                    with_spawn_env_allowlist(policy, list(run_env)),
-                                    cwd=str(cwd),
+                                    with_spawn_env_allowlist(launcher_policy, list(run_env)),
+                                    **launcher_options,
                                 )
                             )
                             launch_command = str(launcher)
-                            if policy.copy_on_write_namespace:
+                            if launcher_policy.copy_on_write_namespace:
                                 host_cwd = Path("/")
                         args = [*prefix, "--bare", "--setting-sources", ""]
                         if document is None:
