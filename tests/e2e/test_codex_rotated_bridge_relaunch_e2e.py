@@ -28,6 +28,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
 )
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from tests._helpers.host import routable_host
 from tests._helpers.native_session import create_native_session
 from tests._helpers.server_runner import server_runner
 from tests._helpers.session import send_user_text
@@ -127,13 +128,7 @@ def test_rotated_codex_session_relaunches_into_its_bridge_directory(
         ) as client,
     ):
         stack.start_host(env=native_env, cwd=_REPO)
-        host = _wait(
-            lambda: next(
-                (h for h in _get(client, "/v1/hosts")["hosts"] if h["status"] == "online"),
-                None,
-            ),
-            "isolated host registration",
-        )
+        host = _wait(lambda: routable_host(client), "isolated host registration")
         created = create_native_session(
             client,
             stack.base_url,

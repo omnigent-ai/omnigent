@@ -53,6 +53,7 @@ import yaml
 
 from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from tests._helpers.compat import apply_runner_env, runner_executable
+from tests._helpers.host import wait_for_routable_host
 from tests.e2e.conftest import (
     POLL_INTERVAL_S,
     configure_mock_llm,
@@ -187,18 +188,7 @@ def _wait_for_host_online(client: httpx.Client, host_id: str, timeout: float = 4
     :param timeout: Max seconds to wait.
     :raises AssertionError: If the host never appears online.
     """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            resp = client.get("/v1/hosts")
-            if resp.status_code == 200:
-                for host in resp.json().get("hosts", []):
-                    if host["host_id"] == host_id and host["status"] == "online":
-                        return
-        except httpx.ConnectError:
-            pass
-        time.sleep(POLL_INTERVAL_S)
-    raise AssertionError(f"Host {host_id!r} did not appear online within {timeout}s")
+    wait_for_routable_host(client, timeout=timeout, host_id=host_id, poll_interval=POLL_INTERVAL_S)
 
 
 def _launch_runner_for_session(

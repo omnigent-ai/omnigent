@@ -58,6 +58,7 @@ import httpx
 import pytest
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, RUNNER_PARENT_PID_ENV_VAR
+from tests._helpers.host import wait_for_routable_host
 from tests.e2e.conftest import lookup_agent_id, register_inline_agent
 from tests.e2e.omnigent.test_host_ctrl_c_stop_server import (
     _connect_env,
@@ -371,16 +372,7 @@ def _online_host_id(client: httpx.Client, *, host_id: str, timeout: float) -> st
     :returns: The online host's ``host_id``.
     :raises AssertionError: If no host comes online within *timeout*.
     """
-    elapsed = 0.0
-    while elapsed < timeout:
-        resp = client.get("/v1/hosts")
-        if resp.status_code == 200:
-            for host in resp.json().get("hosts", []):
-                if host.get("host_id") == host_id and host.get("status") == "online":
-                    return host_id
-        _POLL_PAUSE.wait(0.5)
-        elapsed += 0.5
-    raise AssertionError(f"host {host_id} did not come online within {timeout}s")
+    return str(wait_for_routable_host(client, timeout=timeout, host_id=host_id)["host_id"])
 
 
 def _proc_ppid(pid: int) -> int | None:

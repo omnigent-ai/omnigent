@@ -46,6 +46,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+from tests._helpers.host import routable_host
 from tests.e2e_ui.conftest import _BUILD_OUTPUT, _REPO_ROOT, _find_free_port
 
 _HOST_NAME = "old-host-0-6-0-e2e"
@@ -142,13 +143,11 @@ async def _old_host(base_url: str) -> AsyncIterator[str]:
         serve_task = asyncio.create_task(_serve_old_host(ws))
         try:
             rest_host_id: str | None = None
-            async with httpx.AsyncClient(trust_env=False) as client:
+            with httpx.Client(trust_env=False) as client:
                 for _ in range(100):
-                    resp = await client.get(f"{base_url}/v1/hosts")
-                    hosts = resp.json().get("hosts", [])
-                    match = next(
-                        (h for h in hosts if h["name"] == _HOST_NAME and h["status"] == "online"),
-                        None,
+                    # The fake answers the tunnel probe on this loop, so poll from a thread.
+                    match = await asyncio.to_thread(
+                        routable_host, client, base_url=base_url, name=_HOST_NAME
                     )
                     if match is not None:
                         rest_host_id = match["host_id"]

@@ -23,6 +23,7 @@ import pytest
 import yaml
 
 from omnigent.harnesses.antigravity_native.bridge import bridge_dir_for_bridge_id, read_tmux_info
+from tests._helpers.host import routable_host
 from tests._helpers.https_server import enable_https
 from tests._helpers.native_session import create_native_session
 
@@ -296,12 +297,7 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
 
             def online_host():
                 try:
-                    response = client.get("/v1/hosts")
-                    if response.status_code == 200:
-                        return next(
-                            (h for h in response.json()["hosts"] if h["status"] == "online"),
-                            None,
-                        )
+                    return routable_host(client)
                 except httpx.HTTPError:
                     # Connection failures are expected while the server starts.
                     return None
@@ -544,9 +540,7 @@ def test_saved_credential_error_visible_through_fresh_daemon(tmp_path, page, bui
         with httpx.Client(base_url=base_url, timeout=30) as client:
 
             def online_host():
-                response = client.get("/v1/hosts")
-                response.raise_for_status()
-                return next((h for h in response.json()["hosts"] if h["status"] == "online"), None)
+                return routable_host(client)
 
             host = _wait(online_host, "fresh host did not connect")
             # Readiness is cached; launch must revalidate changed saved credentials.

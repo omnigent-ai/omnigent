@@ -42,6 +42,7 @@ import pytest
 
 from omnigent.host.daemon_lifecycle import HostDaemonRecord
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, RUNNER_PARENT_PID_ENV_VAR
+from tests._helpers.host import host_tunnel_registered
 from tests._helpers.session import bundle_files, post_session_bundle
 from tests.e2e.omnigent.test_host_ctrl_c_stop_server import (
     _connect_env,
@@ -290,7 +291,9 @@ def _online_host_id(client: httpx.Client, *, host_id: str, timeout: float) -> st
     elapsed = 0.0
     while elapsed < timeout:
         resp = client.get(f"/v1/hosts/{host_id}")
-        if resp.status_code == 200 and resp.json().get("status") == "online":
+        online = resp.status_code == 200 and resp.json().get("status") == "online"
+        # The row reads online before the tunnel registers; sessions need the tunnel.
+        if online and host_tunnel_registered(client, host_id):
             return host_id
         _POLL_PAUSE.wait(0.5)
         elapsed += 0.5

@@ -37,6 +37,8 @@ from typing import Any
 import httpx
 import pytest
 
+from tests._helpers.host import routable_host
+
 pytestmark = pytest.mark.skipif(
     os.name != "posix", reason="boots POSIX server/host daemons with fake CLIs"
 )
@@ -306,10 +308,12 @@ class _CatalogRig:
         )
 
         def _online() -> bool:
-            hosts = self._get_json(f"{self.base_url}/v1/hosts").get("hosts", [])
-            online = [h for h in hosts if h.get("status") == "online"]
-            if online:
-                self.host_id = str(online[0]["host_id"])
+            try:
+                row = routable_host(self._client, base_url=self.base_url)
+            except httpx.HTTPError:
+                return False
+            if row is not None:
+                self.host_id = str(row["host_id"])
                 return True
             return False
 

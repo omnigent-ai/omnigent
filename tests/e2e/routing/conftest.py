@@ -37,6 +37,7 @@ import pytest
 import yaml
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from tests._helpers.host import routable_host
 from tests._helpers.live_server import find_free_port
 from tests.e2e.routing._helpers import POLL_INTERVAL_S, wait_for
 from tests.e2e.routing._mock_router import MockRouter, serve_mock_router
@@ -307,11 +308,8 @@ def routing_host(
     def _online() -> str | None:
         if proc.poll() is not None:
             return None
-        resp = routing_client.get("/v1/hosts")
-        if resp.status_code != 200:
-            return None
-        online = [h for h in resp.json().get("hosts", []) if h.get("status") == "online"]
-        return str(online[0]["host_id"]) if online else None
+        row = routable_host(routing_client)
+        return str(row["host_id"]) if row else None
 
     try:
         host_id = wait_for(

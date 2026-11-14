@@ -23,6 +23,7 @@ import yaml
 from playwright.sync_api import Page, expect
 
 from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
+from tests._helpers.host import routable_host
 from tests.e2e_ui.conftest import _register_extra_agent
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -118,11 +119,8 @@ def _wait_for_host_online(base_url: str, host_id: str, timeout: float = 45.0) ->
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            resp = httpx.get(f"{base_url}/v1/hosts", timeout=5.0)
-            if resp.status_code == 200:
-                for host in resp.json().get("hosts", []):
-                    if host["host_id"] == host_id and host["status"] == "online":
-                        return
+            if routable_host(httpx, base_url=base_url, host_id=host_id) is not None:
+                return
         except httpx.HTTPError:
             # The server may still be starting.
             pass
