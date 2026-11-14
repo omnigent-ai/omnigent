@@ -166,6 +166,11 @@ import { WorkspacePanel } from "./WorkspacePanel";
 import { SessionRail } from "./SessionRail";
 import { SessionCostButton, SessionOverview, useIsWideViewport } from "./SessionOverview";
 import type { RightRailTab } from "./railTabs";
+import {
+  CHAT_VIEW_STORAGE_VALUE,
+  panelKeyStorageKey,
+  resolveTerminalViewKey,
+} from "./sessionWorkspaceRestore";
 
 /**
  * Top-level layout. The sidebar and right panels are responsive:
@@ -205,24 +210,6 @@ import type { RightRailTab } from "./railTabs";
  * appears once there's more than one agent (the root has at least one child).
  */
 
-// `null` in panel state means Chat view, but an absent sessionStorage entry
-// means "use the configured default." Keep an explicit marker so choosing Chat
-// can override a Terminal default when the user returns to that conversation.
-const CHAT_VIEW_STORAGE_VALUE = "__chat__";
-
-/**
- * Resolve the terminal-view target for `?view=terminal`.
- *
- * The URL param names only the SURFACE (chat vs terminal), never which
- * terminal, so restoring straight from it would rewrite a rail-opened shell
- * to the agent pane. The precise target lives in the per-session store, which
- * the panel setter writes alongside the param — prefer it, and fall back to
- * the agent terminal for a deep link that carries no stored target.
- *
- * :param stored: Per-session stored panel key (null when absent).
- * :param agentKey: The session's agent-terminal key (or the no-target sentinel).
- * :returns: The terminal key the view should open on.
- */
 /**
  * The rail open-state a session restores to: its saved choice, else the Appearance
  * default. A deep link to a file, a comment or the Agents tab reveals the rail
@@ -244,10 +231,6 @@ function restoredRailOpen(
       (canvasMode ? false : readDefaultWorkspacePanelOpen())) ||
     hasWorkspaceUrlSignal
   );
-}
-
-function resolveTerminalViewKey(stored: string | null, agentKey: string): string {
-  return stored !== null && stored !== CHAT_VIEW_STORAGE_VALUE ? stored : agentKey;
 }
 
 /**
@@ -1286,7 +1269,7 @@ function AppShellImpl() {
     (key: string | null) => {
       setPanelInitialKeyState(key);
       if (conversationId) {
-        const storageKey = `omnigent.web.panel-key:${conversationId}`;
+        const storageKey = panelKeyStorageKey(conversationId);
         sessionStorage.setItem(storageKey, key === null ? CHAT_VIEW_STORAGE_VALUE : key);
       }
       if (terminalFirst) {
@@ -1348,7 +1331,7 @@ function AppShellImpl() {
       const persisted = readSessionWorkspaceState(conversationId);
       const showAgents = searchParams.get("panel") === "agents";
 
-      const storageKey = `omnigent.web.panel-key:${conversationId}`;
+      const storageKey = panelKeyStorageKey(conversationId);
       const stored = sessionStorage.getItem(storageKey);
       const requestedView = terminalFirst ? searchParams.get("view") : null;
       const terminalKey =
@@ -1576,7 +1559,7 @@ function AppShellImpl() {
   useEffect(() => {
     if (!conversationId || !terminalFirst) return;
     const requestedView = searchParams.get("view");
-    const stored = sessionStorage.getItem(`omnigent.web.panel-key:${conversationId}`);
+    const stored = sessionStorage.getItem(panelKeyStorageKey(conversationId));
     const terminalKey =
       agentTerminal === null ? PANEL_NO_TERMINAL_KEY : terminalTabKey(agentTerminal);
     if (requestedView === "chat") {
@@ -1635,7 +1618,7 @@ function AppShellImpl() {
       return;
     }
     setPanelInitialKeyState(null);
-    sessionStorage.setItem(`omnigent.web.panel-key:${conversationId}`, CHAT_VIEW_STORAGE_VALUE);
+    sessionStorage.setItem(panelKeyStorageKey(conversationId), CHAT_VIEW_STORAGE_VALUE);
     setSelectedFilePath(null);
     setSelectedTerminalKey(null);
     setExecutionLogsKey(null);
