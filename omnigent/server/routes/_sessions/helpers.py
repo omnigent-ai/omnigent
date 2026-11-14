@@ -257,6 +257,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_background_tasks_cache,
     _session_blocked_on_cache,
     _session_mcp_startup_cache,
+    _session_recovery_tokens,
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
@@ -5215,6 +5216,7 @@ def _publish_status(
         _session_active_response_cache.pop(session_id, None)
         return
     previous_status = _session_status_cache.get(session_id)
+    _session_recovery_tokens.pop(session_id, None)
     _session_status_cache[session_id] = status
     _set_blocked_on(session_id, blocked_on)
     # Only a ``waiting`` edge names background agents; any other edge ends that wait.
@@ -5480,6 +5482,7 @@ async def _persist_session_status_error_labels(
     :param item_id: Persisted item a ``runner_rejected_event`` failure refers to, so
         a client whose POST answer was lost can match the refusal to its own send.
     """
+    _session_recovery_tokens.pop(session_id, None)
     # Structured fields are optional (present only when the runner classified
     # the failure). Always write all keys — empty when absent — because the
     # label store is upsert-only and a stale title/cause from a prior failure
@@ -5507,14 +5510,20 @@ async def _persist_session_status_error_labels(
             _LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY: "",
         }
     )
-    try:
-        await asyncio.to_thread(conversation_store.set_labels, session_id, updates)
-    except Exception:  # noqa: BLE001
-        _logger.exception(
-            "Failed to persist session status error labels for %s",
-            session_id,
-            extra={"session_id": session_id},
-        )
+
+    def write_labels() -> None:
+        try:
+            conversation_store.set_labels(session_id, updates)
+        except Exception:  # noqa: BLE001
+            _logger.exception(
+                "Failed to persist session status error labels for %s",
+                session_id,
+                extra={"session_id": session_id},
+            )
+
+    await asyncio.wrap_future(
+        session_live_state.submit("session_status_error_labels", write_labels)
+    )
 
 
 def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | None:
