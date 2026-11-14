@@ -543,6 +543,10 @@ def test_configured_harness_map_covers_all_spellings(
         "antigravity",
         "agy",
         "google-antigravity",
+        # Cline CLI + native spellings — all gate on the cline binary.
+        "cline",
+        "cline-native",
+        "native-cline",
         # Kimi Code CLI + alias.
         "kimi",
         "kimi-code",

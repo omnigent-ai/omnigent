@@ -90,6 +90,22 @@ class AcpCliHarness:
 # Keyed by canonical harness id. Keep keys sorted; each row's registrations
 # derive from here (see the module docstring for the full list).
 ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
+    # Cline (https://cline.bot) drives ``cline --acp``. Ships via npm as a
+    # platform binary and authenticates through its own ``cline auth`` (Cline
+    # OAuth, ChatGPT subscription, or a provider API key stored in
+    # ``~/.cline``); Omnigent stores no credential.
+    "cline": AcpCliHarness(
+        install=HarnessInstallSpec(
+            "Cline",
+            "cline",
+            "cline",
+            login_args=("auth",),
+            auth_hint=(
+                "run `cline auth` (Cline OAuth, ChatGPT subscription, or a provider API key)"
+            ),
+        ),
+        args=("--acp",),
+    ),
     # Grok Build (xAI's ``grok`` CLI) drives ``grok agent stdio``. Ships via a
     # curl installer (not npm) and authenticates through its own ``grok login``
     # (xAI OAuth, device-code capable) or ``XAI_API_KEY``; Omnigent stores no

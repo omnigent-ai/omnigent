@@ -17,6 +17,7 @@ from typing import TypeVar, cast
 from omnigent._wrapper_labels import (
     ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
     CLAUDE_NATIVE_WRAPPER_VALUE,
+    CLINE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
     CURSOR_NATIVE_WRAPPER_VALUE,
     DEVIN_NATIVE_WRAPPER_VALUE,
@@ -194,6 +195,15 @@ CURSOR_NATIVE_CODING_AGENT = NativeCodingAgent(
     terminal_name="cursor",
 )
 
+CLINE_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="cline",
+    display_name="Cline",
+    agent_name="cline-native-ui",
+    harness="cline-native",
+    wrapper_label=CLINE_NATIVE_WRAPPER_VALUE,
+    terminal_name="cline",
+)
+
 KIRO_NATIVE_CODING_AGENT = NativeCodingAgent(
     key="kiro",
     display_name="Kiro",
@@ -317,6 +327,7 @@ _BUILTIN_NATIVE_PROVIDERS: tuple[NativeHarnessProvider, ...] = tuple(
         PI_NATIVE_CODING_AGENT,
         OPENCODE_NATIVE_CODING_AGENT,
         CURSOR_NATIVE_CODING_AGENT,
+        CLINE_NATIVE_CODING_AGENT,
         KIRO_NATIVE_CODING_AGENT,
         GOOSE_NATIVE_CODING_AGENT,
         ANTIGRAVITY_NATIVE_CODING_AGENT,
@@ -444,6 +455,26 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         shell_tool_prompt=_SHELL_PROMPT,
         instruction_delivery=_ID.NOT_DELIVERED,
         workspace_file_mentions=True,
+    ),
+    # cline-native drives ``cline hub`` — a workspace daemon speaking JSON
+    # command/event frames over WebSocket. Events broadcast to subscribers
+    # (assistant.delta/finished, tool.*, usage.updated, run.*); approvals are
+    # native via approval.requested -> approval.respond routed through the
+    # native-permission-request hook; run.abort interrupts; session.resume
+    # warm-reattaches; auth is cline's own (~/.cline). NATIVE_SERVER, so
+    # shell_tool_* stay None.
+    "cline-native": _C(
+        _IM.NATIVE_SERVER,
+        _EL.HOOK,
+        _RS.WARM_REATTACH,
+        _EF.NONE,
+        _MF.MULTI,
+        _AU.OWN_AUTH,
+        subagents=False,
+        interrupt=True,
+        streaming=True,
+        fork_history=_FH.NONE,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     "antigravity-native": _C(
         _IM.NATIVE_TUI,
@@ -784,6 +815,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "antigravity-native",
             "claude-native",
             "claude-sdk",
+            "cline-native",
             "codex",
             "codex-native",
             "copilot",
@@ -817,6 +849,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "antigravity": "omnigent.inner.antigravity_harness",
         "antigravity-native": "omnigent.inner.antigravity_native_harness",
         "claude-native": "omnigent.inner.claude_native_harness",
+        "cline-native": "omnigent.inner.cline_native_harness",
         "claude-sdk": "omnigent.inner.claude_sdk_harness",
         "codex": "omnigent.inner.codex_harness",
         "codex-native": "omnigent.inner.codex_native_harness",
@@ -857,6 +890,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "kimi-code": "kimi",
         "native-agy": "antigravity-native",
         "native-antigravity": "antigravity-native",
+        "native-cline": "cline-native",
         "native-devin": "devin-native",
         "native-goose": "goose-native",
         "native-hermes": "hermes-native",
@@ -905,6 +939,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         PI_NATIVE_CODING_AGENT,
         OPENCODE_NATIVE_CODING_AGENT,
         CURSOR_NATIVE_CODING_AGENT,
+        CLINE_NATIVE_CODING_AGENT,
         KIRO_NATIVE_CODING_AGENT,
         GOOSE_NATIVE_CODING_AGENT,
         ANTIGRAVITY_NATIVE_CODING_AGENT,

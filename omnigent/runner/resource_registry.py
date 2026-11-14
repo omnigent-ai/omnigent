@@ -81,6 +81,7 @@ QWEN_NATIVE_TERMINAL_ROLE = "qwen-native"
 KIMI_NATIVE_TERMINAL_ROLE = "kimi-native"
 HERMES_NATIVE_TERMINAL_ROLE = "hermes-native"
 DEVIN_NATIVE_TERMINAL_ROLE = "devin-native"
+CLINE_NATIVE_TERMINAL_ROLE = "cline-native"
 
 #: Terminal roles whose PTY-activity watcher drives the session's working
 #: status (pane activity → ``running``, quiescence → ``idle``), not just the

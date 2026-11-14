@@ -427,6 +427,7 @@ columns name one journey test per harness; "—" means none exists yet.
 | Harness | CLI | Mock | Chat render test | Other journey test | Dev skill |
 |---|---|---|---|---|---|
 | `antigravity-native` | `omnigent antigravity` or `omnigent agy` | no | — | tests/e2e/test_antigravity_native_isolated_hooks_e2e.py::test_dispatched_agy_session_loads_user_hooks | [antigravity-native-e2e-dev](../.claude/skills/antigravity-native-e2e-dev/SKILL.md) |
+| `cline-native` | `omnigent cline` | no | — | tests/test_cline_native.py::test_assistant_finished_maps_message | — |
 | `claude-native` | `omnigent claude` | yes | tests/e2e_ui/messages/test_native_claude_render_parity.py::test_native_claude_message_render_parity | tests/e2e/test_claude_native_cli_resume_e2e.py::test_claude_native_cli_resume_restores_history | — |
 | `codex-native` | `omnigent codex` | yes | tests/e2e_ui/messages/test_native_codex_render_parity.py::test_native_codex_message_render_parity | tests/e2e/test_codex_native_cli_resume_e2e.py::test_codex_native_cli_resume_restores_history | — |
 | `cursor-native` | `omnigent cursor` | no | tests/e2e_ui/messages/test_native_cursor_render_parity.py::test_native_cursor_message_render_parity | tests/e2e/test_cursor_native_cli_e2e.py::test_cursor_native_cli_smoke | — |

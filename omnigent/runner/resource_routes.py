@@ -119,6 +119,7 @@ def register_resource_routes(
     *,
     _antigravity_terminal_ensure_locks: dict[str, asyncio.Lock],
     _claude_terminal_ensure_locks: dict[str, asyncio.Lock],
+    _cline_terminal_ensure_locks: dict[str, asyncio.Lock],
     _codex_terminal_ensure_locks: dict[str, asyncio.Lock],
     _cursor_terminal_ensure_locks: dict[str, asyncio.Lock],
     _devin_terminal_ensure_locks: dict[str, asyncio.Lock],
@@ -380,6 +381,7 @@ def register_resource_routes(
             _ensure_locks = _require_full_native_lock_coverage(
                 {
                     "claude": _claude_terminal_ensure_locks,
+                    "cline": _cline_terminal_ensure_locks,
                     "codex": _codex_terminal_ensure_locks,
                     "pi": _pi_terminal_ensure_locks,
                     "cursor": _cursor_terminal_ensure_locks,
@@ -496,6 +498,7 @@ def register_resource_routes(
 
             elif terminal_name in (
                 "cursor",
+                "cline",
                 "kimi",
                 "devin",
                 "goose",

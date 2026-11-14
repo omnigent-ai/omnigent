@@ -2126,6 +2126,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "debug",
         "devin",
         "diagnose",
+        "cline",
         "doctor",
         "extensions",
         "goose",
@@ -8286,6 +8287,12 @@ _NATIVE_TERMINAL_DISPATCH_SPECS: dict[str, _NativeTerminalDispatchSpec] = {
         module="omnigent.harnesses.cursor_native.main",
         function="run_cursor_native",
         args_param="extra_args",
+    ),
+    "cline": _NativeTerminalDispatchSpec(
+        module="omnigent.harnesses.cline_native.main",
+        function="run_cline_native",
+        args_param="extra_args",
+        prompt_param="prompt",
     ),
     "kimi": _NativeTerminalDispatchSpec(
         module="omnigent.harnesses.kimi_native.main",
