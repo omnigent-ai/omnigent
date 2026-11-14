@@ -82,6 +82,8 @@ _ITEM_TYPE_PATTERN = f"^({'|'.join(ITEM_TYPE_TO_DATA_CLS)})$"
 
 #: Most items a notebook export reads; a longer session's notebook says it stops early.
 _MAX_EXPORT_ITEMS = 20_000
+#: Items a notebook export reads per store page.
+_EXPORT_PAGE_SIZE = 1000
 
 
 def _is_settle_candidate(conv: Conversation) -> bool:
@@ -342,7 +344,7 @@ def register_items_routes(
         while True:
             page = conversation_store.list_items(
                 session_id,
-                limit=min(1000, _MAX_EXPORT_ITEMS - len(items)),
+                limit=min(_EXPORT_PAGE_SIZE, _MAX_EXPORT_ITEMS - len(items)),
                 after=after,
                 order="asc",
             )

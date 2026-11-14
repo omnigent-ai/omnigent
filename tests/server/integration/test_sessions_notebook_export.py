@@ -116,6 +116,27 @@ async def test_says_when_the_session_is_longer_than_the_export(
     assert not any("1,500 rows" in cell["source"] for cell in cells)
 
 
+async def test_pairs_a_call_with_its_output_across_store_pages(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = await _session(client)
+    # Two items a page: the shell call ends the first page, its output starts the second.
+    monkeypatch.setattr(routes_items, "_EXPORT_PAGE_SIZE", 2)
+
+    response = await client.get(f"/v1/sessions/{session_id}/export", params={"format": "ipynb"})
+
+    header, *cells = response.json()["cells"]
+    assert "continues past" not in header["source"]
+    assert [cell["source"] for cell in cells[:3]] == [
+        "**User**\n\nCount the rows",
+        "%%bash\nwc -l sales.csv",
+        "**Assistant**\n\n1,500 rows plus a header.",
+    ]
+    assert cells[1]["outputs"] == [
+        {"output_type": "stream", "name": "stdout", "text": "1501 sales.csv\n"}
+    ]
+
+
 @pytest.mark.parametrize(
     ("path", "params", "status"),
     [

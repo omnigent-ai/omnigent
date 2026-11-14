@@ -15,16 +15,23 @@ import re
 import shlex
 import urllib.parse
 from collections import deque
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from datetime import UTC, datetime
 from typing import Any
+
+from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 
 #: Largest tool output kept in a cell, in characters; longer output is cut with a note.
 MAX_OUTPUT_CHARS = 100_000
 #: Largest image kept as a cell output, in base64 characters.
 MAX_IMAGE_CHARS = 2_000_000
 
-_SHELLS = {"bash", "sh", "zsh"}
+# ``bash -lc '…'``, as Codex wraps each command: the shell and its literal script.
+_SHELL_WRAPPER = re.compile(
+    r"\A\s*(?:(?:/[\w.+-]+)*/)?(?P<shell>bash|sh|zsh)\s+-(?:c|lc|ic)\s+'(?P<script>[^']*)'\s*\Z"
+)
+_SHELL_MAGICS = {"bash": "%%bash", "sh": "%%sh", "zsh": "%%script zsh"}
+_SHELL_SCRIPT_FLAGS = {"-c", "-lc", "-ic"}
 # Codex's and other harnesses' shell tools beyond each harness's declared one.
 _EXTRA_SHELL_TOOLS = frozenset({"exec_command", "run_command"})
 # ``python3 - <<'EOF'`` … ``EOF``: Python fed on stdin. Only a quoted delimiter
@@ -41,7 +48,6 @@ _PYTHON_C = re.compile(
 # Argument names shell tools use for the directory a command runs in.
 _WORKING_DIRECTORY_KEYS = ("workdir", "cwd", "directory")
 _SQL_ARGUMENT_KEYS = ("sql", "query", "statement")
-_MCP_IMAGE_MARKER = "__omnigent_mcp_image_result__"
 _INLINE_IMAGE_TYPES = ("png", "jpeg", "gif", "webp")
 # URL characters kept as is in the header link; ``<>()[]`` and spaces are encoded.
 _URL_SAFE = ":/?#@!$&'*+,;=%~-._"
@@ -60,27 +66,35 @@ def _shell_tool_names() -> frozenset[str]:
     return SHELL_TOOLS | plugin_names | _EXTRA_SHELL_TOOLS
 
 
-def _shell_command(arguments: Mapping[str, Any]) -> str | None:
-    """The command a shell tool ran: ``command`` or ``cmd``, a string or an argv list."""
+def _shell_command(arguments: Mapping[str, Any]) -> tuple[str, str] | None:
+    """
+    The cell magic and script for what a shell tool ran: ``command`` or ``cmd``,
+    a string or an argv list, e.g. ``("%%bash", "ls")``.
+    """
     command = arguments.get("command", arguments.get("cmd"))
     if isinstance(command, list) and command and all(isinstance(part, str) for part in command):
+        # ``["bash", "-lc", script]`` hands the shell its script verbatim.
+        shell = command[0].rsplit("/", 1)[-1]
+        if len(command) == 3 and shell in _SHELL_MAGICS and command[1] in _SHELL_SCRIPT_FLAGS:
+            return (_SHELL_MAGICS[shell], command[2]) if command[2].strip() else None
         command = shlex.join(command)
-    return command if isinstance(command, str) and command.strip() else None
+    if not isinstance(command, str) or not command.strip():
+        return None
+    return _unwrap_shell(command)
 
 
-def _unwrap_shell(command: str) -> str:
-    """``/bin/zsh -lc 'pwd'`` → ``pwd``: the command a login-shell wrapper runs."""
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        return command
-    if (
-        len(tokens) == 3
-        and tokens[0].rsplit("/", 1)[-1] in _SHELLS
-        and tokens[1] in {"-c", "-lc", "-ic"}
-    ):
-        return tokens[2]
-    return command
+def _unwrap_shell(command: str) -> tuple[str, str]:
+    """
+    ``/bin/zsh -lc 'pwd'`` → ``("%%script zsh", "pwd")``: a login-shell wrapper's
+    script and the cell magic that runs it in the same shell.
+
+    Only a single-quoted script with nothing after it is unwrapped, since its
+    text reaches the shell unchanged; anything else is kept whole.
+    """
+    wrapped = _SHELL_WRAPPER.match(command)
+    if wrapped is None:
+        return "%%bash", command
+    return _SHELL_MAGICS[wrapped.group("shell")], wrapped.group("script")
 
 
 def _python_source(command: str) -> str | None:
@@ -116,25 +130,73 @@ def _sql_query(name: str, arguments: Mapping[str, Any]) -> str | None:
     return None
 
 
-# Where ``$`` is literal: fenced blocks, inline code, link destinations,
-# autolinks and bare URLs (ASCII only, so a URL ends where unspaced text resumes).
+# Where ``$`` is literal: fenced and inline code, link destinations, autolinks
+# and bare URLs (ASCII only, so a URL ends where unspaced text resumes).
 _MARKDOWN_CODE = re.compile(
-    r"(```.*?```|~~~.*?~~~|`[^`\n]*`|\]\([^()\s\]]*\)|<https?://[^<>\s]*>"
-    r"|https?://[A-Za-z0-9\-._~:/?#@!$&'*+,;=%]+)",
+    r"```.*?```|~~~.*?~~~|`[^`\n]*`"
+    r"|\]\([^()\s\]]*\)|<https?://[^<>\s]*>|https?://[A-Za-z0-9\-._~:/?#@!$&'*+,;=%]+",
     re.DOTALL,
 )
+_LIST_ITEM = re.compile(r" {0,3}(?:[-*+]|\d+[.)])(?:\s|\Z)")
+_HEADING = re.compile(r" {0,3}#{1,6}(?:\s|\Z)")
+_THEMATIC_BREAK = re.compile(r" {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*\Z")
+# The ``===`` or ``---`` line under a paragraph that makes it a heading.
+_SETEXT_UNDERLINE = re.compile(r" {0,3}(?:=+|-+)[ \t]*\Z")
 _DOLLAR = re.compile(r"\\?\$")
 # JupyterLab typesets ``\$`` and ``&#36;`` as math too; an entity in its own
 # element is the form both it and nbconvert show as a plain dollar sign.
 _LITERAL_DOLLAR = "<span>&#36;</span>"
 
 
+def _indented_code_spans(text: str, fences: list[tuple[int, int]]) -> Iterator[tuple[int, int]]:
+    """
+    Spans of *text*'s indented code blocks, as CommonMark reads them: indented
+    lines that start a block (after a blank line, a heading, a rule or a fence)
+    outside a list. An indented line in a list or a paragraph is not code.
+
+    :param fences: Spans of *text*'s fenced code blocks, whose lines are skipped.
+    """
+    offset = 0
+    in_code = in_list = previous_blank = False
+    can_start = True
+    for raw in text.split("\n"):
+        end = offset + len(raw)
+        line = raw.removesuffix("\r")
+        if any(start <= offset < stop for start, stop in fences):
+            # The block after a fence may be indented code.
+            in_code = in_list = False
+            can_start = True
+        elif not line.strip():
+            previous_blank = can_start = True
+        elif line.startswith(("    ", "\t")):
+            in_code = in_code or (can_start and not in_list)
+            if in_code:
+                yield offset, end
+            previous_blank = can_start = False
+        else:
+            in_code = False
+            boundary = bool(
+                _HEADING.match(line)
+                or _THEMATIC_BREAK.match(line)
+                or (not previous_blank and not in_list and _SETEXT_UNDERLINE.match(line))
+            )
+            in_list = not boundary and (
+                bool(_LIST_ITEM.match(line)) or (in_list and not previous_blank)
+            )
+            can_start = boundary
+            previous_blank = False
+        offset = end + 1
+
+
 def _markdown_text(text: str) -> str:
     """*text* for a Markdown cell, ``$`` outside code kept from rendering as LaTeX."""
-    segments = _MARKDOWN_CODE.split(text)
-    return "".join(
-        segment if index % 2 else _DOLLAR.sub(_LITERAL_DOLLAR, segment)
-        for index, segment in enumerate(segments)
+    literal = bytearray(len(text))
+    spans = [match.span() for match in _MARKDOWN_CODE.finditer(text)]
+    fences = [(start, end) for start, end in spans if text.startswith(("```", "~~~"), start)]
+    for start, end in [*spans, *_indented_code_spans(text, fences)]:
+        literal[start:end] = b"\x01" * (end - start)
+    return _DOLLAR.sub(
+        lambda match: match.group() if literal[match.start()] else _LITERAL_DOLLAR, text
     )
 
 
@@ -192,11 +254,11 @@ def _tool_outputs(output: str) -> list[dict[str, Any]]:
         if isinstance(exit_code, int) and exit_code != 0:
             outputs.append(_stream("stderr", f"[exit code: {exit_code}]\n"))
         return outputs
-    if isinstance(parsed, dict) and parsed.get(_MCP_IMAGE_MARKER):
+    # Only the exact image envelope; text that merely looks like one stays text.
+    image_result = decode_mcp_image_result(parsed)
+    if image_result is not None:
         outputs = []
-        for block in parsed.get("content") or []:
-            if not isinstance(block, Mapping):
-                continue
+        for block in image_result.content:
             if block.get("type") == "text" and block.get("text"):
                 outputs.append(_stream("stdout", str(block["text"])))
             elif block.get("type") == "image":
@@ -238,6 +300,7 @@ class _NotebookBuilder:
         self._pending_terminal: deque[dict[str, Any]] = deque()
         self._shell_tools = _shell_tool_names()
         self.tools_used: dict[str, int] = {}
+        self.magics_used: set[str] = set()
 
     def markdown(self, source: str) -> None:
         self.cells.append(
@@ -270,9 +333,9 @@ class _NotebookBuilder:
         call_id = item.get("call_id")
         if call_id:
             self._calls_seen.add(str(call_id))
-        command = _shell_command(arguments) if name in self._shell_tools else None
-        if command is not None:
-            command = _unwrap_shell(command)
+        shell = _shell_command(arguments) if name in self._shell_tools else None
+        if shell is not None:
+            magic, command = shell
             directory = next(
                 (
                     value
@@ -285,11 +348,13 @@ class _NotebookBuilder:
             if python is not None:
                 self.code(python, call_id)
             elif directory is not None:
-                # ``%%bash`` runs in its own process, so the ``cd`` stays in this cell;
+                # The cell's own shell process keeps the ``cd`` in this cell;
                 # without the directory the command doesn't run at all.
-                self.code(f"%%bash\ncd {shlex.quote(directory)} || exit 1\n{command}", call_id)
+                self.code(f"{magic}\ncd {shlex.quote(directory)} || exit 1\n{command}", call_id)
+                self.magics_used.add(magic)
             else:
-                self.code(f"%%bash\n{command}", call_id)
+                self.code(f"{magic}\n{command}", call_id)
+                self.magics_used.add(magic)
             return
         query = _sql_query(name, arguments)
         if query is not None:
@@ -415,8 +480,13 @@ def session_notebook(
         builder.markdown(
             "## Reproducing this notebook\n\n"
             "The code cells repeat what the agent ran. Running them again may need the "
-            "same workspace files, credentials and data sources. The session used these "
-            f"tools:\n\n{tools}"
+            "same workspace files, credentials and data sources"
+            + (
+                ", and zsh for the `%%script zsh` cells"
+                if "%%script zsh" in builder.magics_used
+                else ""
+            )
+            + f". The session used these tools:\n\n{tools}"
         )
 
     return {

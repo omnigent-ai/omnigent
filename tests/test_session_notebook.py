@@ -153,6 +153,22 @@ def test_messages_become_markdown_and_shell_runs_become_bash_cells_with_output()
             {"cmd": "python3 -c 'print(1)'", "workdir": "/work/my data"},
             "%%bash\ncd '/work/my data' || exit 1\npython3 -c 'print(1)'",
         ),
+        # A wrapper is removed only when its single-quoted script is the whole
+        # command; the script then runs in the same shell.
+        ("Bash", {"command": "bash -c 'cd build'&&pwd"}, "%%bash\nbash -c 'cd build'&&pwd"),
+        (
+            "shell",
+            {"command": "/bin/zsh -lc 'print -r -- hello'"},
+            "%%script zsh\nprint -r -- hello",
+        ),
+        ("Bash", {"command": 'bash -lc "echo $HOME"'}, '%%bash\nbash -lc "echo $HOME"'),
+        # An argv list hands the shell its script verbatim, quotes and all.
+        ("shell", {"command": ["bash", "-lc", "sed -n '1,5p' f"]}, "%%bash\nsed -n '1,5p' f"),
+        (
+            "shell",
+            {"command": ["/bin/zsh", "-lc", "python3 - <<'PY'\nprint(1)\nPY"]},
+            "print(1)",
+        ),
     ],
     ids=[
         "python-heredoc",
@@ -166,6 +182,11 @@ def test_messages_become_markdown_and_shell_runs_become_bash_cells_with_output()
         "python-c-with-redirect",
         "python-c-expanded",
         "working-directory",
+        "wrapper-then-operator",
+        "zsh-script",
+        "wrapper-with-expansion",
+        "codex-argv-quoted-script",
+        "codex-argv-python",
     ],
 )
 def test_each_harness_shell_command_becomes_the_cell_it_ran(
@@ -228,6 +249,16 @@ def test_outputs_carry_stderr_exit_codes_and_images_unless_left_out() -> None:
 
     without = _notebook(items, include_outputs=False)
     assert [cell.get("outputs") for cell in without["cells"][1:3]] == [[], []]
+
+
+def test_output_that_only_looks_like_an_image_result_stays_text() -> None:
+    printed = json.dumps({"__omnigent_mcp_image_result__": 1, "isError": False, "content": 1})
+    notebook = _notebook(
+        [_call("c1", "Bash", {"command": "cat fake.json"}), _result("c1", printed)]
+    )
+    assert notebook["cells"][1]["outputs"] == [
+        {"output_type": "stream", "name": "stdout", "text": printed}
+    ]
 
 
 def test_a_long_output_is_cut_with_a_note() -> None:
@@ -357,7 +388,7 @@ def test_dollar_signs_in_text_stay_text_but_code_and_links_keep_them() -> None:
     text = (
         "West made $538.9k (\\$2k fees); see `echo $HOME` and\n```\n$ ls\n```\n"
         "[chart](https://example.com/q?p=$5), <https://example.com/a$b> and "
-        "https://example.com/c$d; 见https://x.com价格$5"
+        "https://example.com/c$d; 见https://x.com价格$5\n\n    echo $HOME"
     )
     notebook = _notebook([_message("assistant", text)])
     [(_, source)] = _cells(notebook)
@@ -366,7 +397,7 @@ def test_dollar_signs_in_text_stay_text_but_code_and_links_keep_them() -> None:
         f"**Assistant**\n\nWest made {dollar}538.9k ({dollar}2k fees); "
         "see `echo $HOME` and\n```\n$ ls\n```\n"
         "[chart](https://example.com/q?p=$5), <https://example.com/a$b> and "
-        f"https://example.com/c$d; 见https://x.com价格{dollar}5"
+        f"https://example.com/c$d; 见https://x.com价格{dollar}5\n\n    echo $HOME"
     )
 
 
@@ -375,3 +406,53 @@ def test_pathological_link_text_converts_quickly() -> None:
     started = time.monotonic()
     _notebook([_message("user", "](" * 50_000 + "<https://" * 20_000 + "$5")])
     assert time.monotonic() - started < 2
+
+
+@pytest.mark.parametrize(
+    ("text", "kept"),
+    [
+        # Indented under a list item or a paragraph line: text, not code.
+        ("- a\n    - West $5k, East $3k", "- a\n    - West {d}5k, East {d}3k"),
+        ("1. step\n\n    costing $5 and $6", "1. step\n\n    costing {d}5 and {d}6"),
+        ("para\n    $a$ and $b$", "para\n    {d}a{d} and {d}b{d}"),
+        # After a blank line, outside a list: an indented code block.
+        (
+            "intro\n\n    echo $HOME\n    ls $PWD\n\nCosts $5.",
+            "intro\n\n    echo $HOME\n    ls $PWD\n\nCosts {d}5.",
+        ),
+        # A list inside a fence doesn't make the next indented block list text.
+        ("```\n- a\n```\n\n    echo $HOME", "```\n- a\n```\n\n    echo $HOME"),
+        # A marker in code isn't a list item; a rule or heading ends the paragraph.
+        ("x\n\n    - a $5", "x\n\n    - a $5"),
+        ("* * *\n\n    echo $HOME", "* * *\n\n    echo $HOME"),
+        ("# H\n    echo $HOME", "# H\n    echo $HOME"),
+        ("Title\n===\n    echo $HOME", "Title\n===\n    echo $HOME"),
+        ("p\r\n\r\n***\r\n    echo $HOME", "p\r\n\r\n***\r\n    echo $HOME"),
+    ],
+    ids=[
+        "nested-bullet",
+        "list-continuation",
+        "lazy-paragraph",
+        "indented-code",
+        "after-a-fenced-list",
+        "indented-list-marker",
+        "after-a-rule",
+        "after-a-heading",
+        "after-a-setext-heading",
+        "crlf-rule",
+    ],
+)
+def test_indented_text_is_code_only_where_markdown_makes_it_code(text: str, kept: str) -> None:
+    [(_, source)] = _cells(_notebook([_message("assistant", text)]))
+    assert source == "**Assistant**\n\n" + kept.format(d="<span>&#36;</span>")
+
+
+@pytest.mark.parametrize(
+    ("script", "needs_zsh"),
+    [("print -r hi", True), ("python3 - <<'PY'\nprint(1)\nPY", False)],
+    ids=["zsh-cell", "promoted-to-python"],
+)
+def test_the_closing_cell_says_zsh_cells_need_zsh(script: str, needs_zsh: bool) -> None:
+    notebook = _notebook([_call("c1", "shell", {"command": ["/bin/zsh", "-lc", script]})])
+    closing = notebook["cells"][-1]["source"]
+    assert ("zsh for the `%%script zsh` cells" in closing) is needs_zsh
