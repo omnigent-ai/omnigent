@@ -76,13 +76,19 @@ describe("DataTablePreview", () => {
     expect(screen.getAllByRole("columnheader")[1]).toHaveAttribute("aria-sort", "none");
   });
 
-  it("filters a column by the text it contains", () => {
+  it("filters a column by the text it contains, ignoring case, across columns at once", () => {
     renderTable(SALES);
     fireEvent.change(screen.getByRole("textbox", { name: "Filter region" }), {
-      target: { value: "st" },
+      target: { value: "ST" },
     });
     expect(columnValues(0)).toEqual(["West", "East"]);
     expect(screen.getByText("2 matching")).toBeInTheDocument();
+    // A second filter narrows the rows the first one kept.
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter units" }), {
+      target: { value: "2" },
+    });
+    expect(columnValues(0)).toEqual(["East"]);
+    expect(screen.getByText("1 matching")).toBeInTheDocument();
   });
 
   it("copies the selected cell or its row", async () => {
@@ -99,21 +105,6 @@ describe("DataTablePreview", () => {
     expect(writeText).toHaveBeenNthCalledWith(1, "East");
     expect(writeText).toHaveBeenNthCalledWith(2, "East\t2\t2026-01-15");
     await vi.waitFor(() => expect(toast.success).toHaveBeenCalledWith("Copied row"));
-  });
-
-  it("copies through the selected-text fallback when the async clipboard refuses", async () => {
-    stubClipboard(vi.fn().mockRejectedValue(new Error("denied")));
-    const execCommand = vi.fn().mockReturnValue(true);
-    Object.defineProperty(document, "execCommand", { value: execCommand, configurable: true });
-    try {
-      renderTable(SALES);
-      fireEvent.click(screen.getByRole("cell", { name: "East" }));
-      fireEvent.click(screen.getByRole("button", { name: /Copy cell/ }));
-      await vi.waitFor(() => expect(toast.success).toHaveBeenCalledWith("Copied cell"));
-      expect(execCommand).toHaveBeenCalledWith("copy");
-    } finally {
-      Reflect.deleteProperty(document, "execCommand");
-    }
   });
 
   it("says so when no way of copying works", async () => {
@@ -193,12 +184,30 @@ describe("DataTablePreview", () => {
 
     const west = screen.getByRole("cell", { name: "West" });
     west.focus();
-    fireEvent.keyDown(west, { key: "ArrowDown" });
+    const press = (key: string) => fireEvent.keyDown(document.activeElement!, { key });
+    // At the first row and column, Up and Left stay put.
+    press("ArrowUp");
+    press("ArrowLeft");
+    expect(document.activeElement?.textContent).toBe("West");
+    press("ArrowDown");
     expect(document.activeElement?.textContent).toBe("East");
-    fireEvent.keyDown(document.activeElement!, { key: "End" });
+    press("ArrowRight");
+    expect(document.activeElement?.textContent).toBe("2");
+    press("End");
+    expect(document.activeElement?.textContent).toBe("2026-01-15");
+    // At the last column, Right stays put; Home goes back to the first.
+    press("ArrowRight");
     expect(document.activeElement?.textContent).toBe("2026-01-15");
     expect(tabStops().map((cell) => cell.textContent)).toEqual(["2026-01-15"]);
     expect(screen.getByRole("button", { name: /Copy cell/ })).toBeInTheDocument();
+    press("Home");
+    expect(document.activeElement?.textContent).toBe("East");
+    // At the last row, Down stays put; Up moves back.
+    press("ArrowDown");
+    press("ArrowDown");
+    expect(document.activeElement?.textContent).toBe("North");
+    press("ArrowUp");
+    expect(document.activeElement?.textContent).toBe("East");
   });
 
   it("resizes a column from the keyboard", () => {

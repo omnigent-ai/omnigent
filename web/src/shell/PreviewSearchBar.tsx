@@ -117,12 +117,21 @@ export function PreviewSearchBar({
     const rect = visibleMatchRect(range, scroller);
     if (rect.width === 0 && rect.height === 0) return;
     const box = scroller.getBoundingClientRect();
+    // A sticky header (a data table's column names) covers the top of the scroller,
+    // so a match under it isn't shown; a match in the header itself is.
+    const sticky = scroller.querySelector("[data-preview-sticky]");
+    const belowHeader =
+      sticky && !sticky.contains(range.startContainer)
+        ? Math.max(box.top, sticky.getBoundingClientRect().bottom)
+        : box.top;
+    // A header taller than what's left of the scroller can't be scrolled past.
+    const top = box.bottom - belowHeader >= rect.height ? belowHeader : box.top;
     // A wide table also scrolls sideways; center the match on each axis it is off.
-    const shownVertically = rect.top >= box.top && rect.bottom <= box.bottom;
+    const shownVertically = rect.top >= top && rect.bottom <= box.bottom;
     const shownHorizontally = rect.left >= box.left && rect.right <= box.right;
     if (shownVertically && shownHorizontally) return;
     scroller.scrollBy({
-      top: shownVertically ? 0 : rect.top - box.top - box.height / 2 + rect.height / 2,
+      top: shownVertically ? 0 : rect.top - top - (box.bottom - top) / 2 + rect.height / 2,
       left: shownHorizontally ? 0 : rect.left - box.left - box.width / 2 + rect.width / 2,
       behavior: "smooth",
     });

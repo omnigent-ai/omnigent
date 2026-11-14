@@ -942,6 +942,13 @@ function FileViewerBody({
   const [deepLinkBiasPath, setDeepLinkBiasPath] = useState<string | null>(() =>
     initialCommentIdRef.current ? path : null,
   );
+  // The bias belongs to one visit: opening another file (or conversation) ends
+  // it, so coming back to the file opens on the user's own preference.
+  const [biasVisit, setBiasVisit] = useState({ conversationId, path });
+  if (biasVisit.conversationId !== conversationId || biasVisit.path !== path) {
+    setBiasVisit({ conversationId, path });
+    setDeepLinkBiasPath(null);
+  }
 
   // Switch a markdown file to the rich-text editor — the surface where text-
   // selection commenting works. Used by the preview's "switch to edit mode"
@@ -2073,6 +2080,9 @@ function FileViewerBody({
               sender.mutate({ comment_ids: addressableCommentIds });
             }}
             onClickComment={(comment) => {
+              // A data table can't show comment anchors, so picking a comment
+              // opens Source as a ?comment= link does; the toggle still reaches the table.
+              if (isDataTablePath(path)) setDeepLinkBiasPath(path);
               handleSetActiveSelection({
                 start_index: comment.start_index,
                 end_index: comment.end_index,
