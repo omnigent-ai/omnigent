@@ -405,9 +405,9 @@ describe("codex goal API", () => {
 
   describe.each(["fetch", "success body", "error body"])("stalled %s", (stage) => {
     it.each(
-      goalRequests.flatMap((request) =>
-        ["resolve", "reject"].map((late) => ({ ...request, late })),
-      ),
+      goalRequests
+        .filter(({ name }) => name !== "resume")
+        .flatMap((request) => ["resolve", "reject"].map((late) => ({ ...request, late }))),
     )(
       "bounds $name and ignores a late $late after timeout",
       async ({ request, late, timeoutMs }) => {

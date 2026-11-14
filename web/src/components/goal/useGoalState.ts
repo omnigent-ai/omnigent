@@ -90,7 +90,7 @@ export function useGoalState(
         activeBinding.current === binding && version > lastSuccessfulVersion.current;
       try {
         const response = await getGoal(binding.conversationId, { strict });
-        if (response.available === false) return;
+        if (response.available === false) return false;
         if (isCurrent()) {
           lastSuccessfulVersion.current = version;
           setSnapshot((current) => {
@@ -111,10 +111,13 @@ export function useGoalState(
         if (activeBinding.current === binding && lastSuccessfulVersion.current < version)
           throw error;
       }
+      return true;
     },
     [binding],
   );
-  const refreshGoal = useCallback(() => readGoal(true), [readGoal]);
+  const refreshGoal = useCallback(async () => {
+    await readGoal(true);
+  }, [readGoal]);
 
   useEffect(() => {
     let cancelled = false;
@@ -137,13 +140,15 @@ export function useGoalState(
         return;
       }
       inFlight = true;
+      let available = false;
       try {
-        await readGoal(false);
-        pollDelay = GOAL_POLL_INTERVAL_MS;
+        available = await readGoal(false);
       } catch {
         // Keep the last snapshot; opening the dialog surfaces read failures.
-        pollDelay = Math.min(pollDelay * 2, GOAL_POLL_MAX_DELAY_MS);
       } finally {
+        pollDelay = available
+          ? GOAL_POLL_INTERVAL_MS
+          : Math.min(pollDelay * 2, GOAL_POLL_MAX_DELAY_MS);
         inFlight = false;
         schedule();
       }

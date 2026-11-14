@@ -65,8 +65,24 @@ Strict reads also leave an idle backend stopped.
 
 Older server or runner responses may omit `available`; its absence makes
 no new availability claim. In particular, an unmarked background
-`goal: null` cannot distinguish an unavailable backend from deletion.
-Explicit strict reads keep their existing response/error contract.
+`goal: null` cannot distinguish an unavailable backend from deletion, so
+the browser retains its accepted state.
+
+This server rejects an older runner's unmarked null on strict reads with
+503, even when the native goal is genuinely empty. This read error does
+not disable goal creation or editing, but a native-terminal clear can
+leave Chat's accepted indicator stale. Inspect the native goal; to restore
+automatic absence detection, update the session's owning runner to report
+availability, reconnect it on the existing host/workspace binding, then
+refresh. Repeating refresh against the same legacy response cannot resolve
+the ambiguity. A successful intentional mutation in the current Chat view
+publishes its result.
+
+An older server may ignore the strict header. For compatibility, the
+browser still accepts its unmarked strict null; this can clear accepted
+state without confirming native availability. Strict absence confirmation
+therefore requires an availability-aware server and runner.
+
 The availability field belongs only to GET; write responses retain their
 existing schemas.
 

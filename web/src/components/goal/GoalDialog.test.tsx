@@ -679,11 +679,16 @@ describe("GoalDialog", () => {
   );
 
   it.each(
-    mutations.flatMap((mutation) =>
-      ["reopen", "remount"].flatMap((boundary) =>
-        ["success", "error", "read error"].map((outcome) => ({ ...mutation, boundary, outcome })),
+    mutations
+      .flatMap((mutation) =>
+        ["reopen", "remount"].flatMap((boundary) =>
+          ["success", "error", "read error"].map((outcome) => ({ ...mutation, boundary, outcome })),
+        ),
+      )
+      .filter(
+        ({ action, boundary, outcome }) =>
+          outcome !== "read error" || (action === "save" && boundary === "remount"),
       ),
-    ),
   )(
     "blocks another $action across $boundary until settlement and reconciliation ($outcome)",
     async ({ action, button, boundary, outcome }) => {

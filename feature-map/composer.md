@@ -164,16 +164,24 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   while untouched fields follow current goal state. Reopening or switching
   sessions discards old drafts, including when the opening read fails.
   Pending reads and updates from an earlier dialog or session cannot replace
-  the current goal fields. Failed background reads keep the last goal and slow
-  retries; returning to the tab retries immediately.
+  the current goal fields. Failed or unavailable background reads keep the last
+  goal and back off up to sixty seconds; returning to the tab retries immediately.
   Automatic refresh runs while the runner is online and Chat is visible;
   polling and focus reads retain the last snapshot, drafts and read error when
   the native goal is unavailable, without waking an idle-reaped thread. A
   confirmed native response with no goal still clears the accepted goal. Legacy
   background replies without availability cannot confirm an absent goal.
-  Explicit dialog and reconciliation reads require a live response
-  and surface runner errors. Dialog reads and updates remain available while
-  runner status is offline or unknown. A new runner connection invalidates
+  Explicit dialog and reconciliation reads require a live response with current
+  servers and runners, and surface runner errors. A newer server rejects an
+  older runner's ambiguous null even when the native goal is empty. A native
+  terminal clear can then leave the indicator stale. Inspect the native goal;
+  update and reconnect the session's owning runner on its existing host/workspace
+  binding, then refresh to restore automatic absence detection. Repeating the
+  same legacy response cannot resolve the ambiguity. Goal creation and editing
+  remain available. An older server may ignore the strict header; its unmarked
+  strict null remains accepted for compatibility and can clear the indicator
+  without confirming native availability. Dialog reads and updates remain
+  available while runner status is offline or unknown. A new runner connection invalidates
   earlier callbacks while retaining this session's accepted goal; a failed
   reconnect read leaves that goal visible. Reconnect
   preserves edited fields and visible errors in the same open dialog. A pending

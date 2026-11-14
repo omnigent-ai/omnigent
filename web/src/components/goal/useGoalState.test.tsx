@@ -530,72 +530,85 @@ describe("useGoalState", () => {
     }
   });
 
-  it("backs off through a repeated sixty-second cap and resets polling after recovery", async () => {
-    vi.useFakeTimers();
-    mockGetGoal.mockResolvedValueOnce({ goal: GOAL }).mockRejectedValue(new Error("offline"));
-    const { result } = renderHook(() => useGoalState("conv", true));
-    await act(async () => {});
-    expect(mockGetGoal).toHaveBeenCalledTimes(1);
-
-    // Each timer boundary must settle before the next clock advance.
-    /* oxlint-disable no-await-in-loop */
-    for (const [index, delay] of [5_000, 10_000, 20_000, 40_000, 60_000, 60_000].entries()) {
-      await act(() => vi.advanceTimersByTimeAsync(delay - 1));
-      expect(mockGetGoal).toHaveBeenCalledTimes(index + 1);
-      expect(result.current.goal).toEqual(GOAL);
-      await act(() => vi.advanceTimersByTimeAsync(1));
-      expect(mockGetGoal).toHaveBeenCalledTimes(index + 2);
-      expect(result.current.goal).toEqual(GOAL);
-    }
-    /* oxlint-enable no-await-in-loop */
-    const pausedGoal = { ...GOAL, status: "paused" as const };
-    mockGetGoal.mockResolvedValue({ goal: pausedGoal });
-    await act(() => vi.advanceTimersByTimeAsync(59_999));
-    expect(mockGetGoal).toHaveBeenCalledTimes(7);
-    expect(result.current.goal).toEqual(GOAL);
-    await act(() => vi.advanceTimersByTimeAsync(1));
-    expect(result.current.goal).toEqual(pausedGoal);
-    expect(mockGetGoal).toHaveBeenCalledTimes(8);
-    await act(() => vi.advanceTimersByTimeAsync(4_999));
-    expect(mockGetGoal).toHaveBeenCalledTimes(8);
-    await act(() => vi.advanceTimersByTimeAsync(1));
-    expect(mockGetGoal).toHaveBeenCalledTimes(9);
-  });
-
-  it("retries on focus and visibility during backoff without overlapping a pending read", async () => {
-    vi.useFakeTimers();
-    const recovery = deferredGoalRead();
-    mockGetGoal
-      .mockRejectedValueOnce(new Error("offline"))
-      .mockRejectedValueOnce(new Error("still offline"))
-      .mockReturnValueOnce(recovery.promise)
-      .mockResolvedValue({ goal: GOAL });
-    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
-    try {
+  it.each(["error", "unavailable"])(
+    "backs off through a repeated sixty-second cap and resets polling after recovery (%s)",
+    async (failure) => {
+      vi.useFakeTimers();
+      mockGetGoal.mockResolvedValueOnce({ goal: GOAL });
+      if (failure === "unavailable") mockGetGoal.mockResolvedValue({ available: false });
+      else mockGetGoal.mockRejectedValue(new Error("offline"));
       const { result } = renderHook(() => useGoalState("conv", true));
       await act(async () => {});
-      await act(() => vi.advanceTimersByTimeAsync(1_000));
-      await act(async () => window.dispatchEvent(new Event("focus")));
-      expect(mockGetGoal).toHaveBeenCalledTimes(2);
+      expect(mockGetGoal).toHaveBeenCalledTimes(1);
 
-      visibility.mockReturnValue("hidden");
-      await act(async () => document.dispatchEvent(new Event("visibilitychange")));
-      await act(() => vi.advanceTimersByTimeAsync(20_000));
-      expect(mockGetGoal).toHaveBeenCalledTimes(2);
-      visibility.mockReturnValue("visible");
-      await act(async () => document.dispatchEvent(new Event("visibilitychange")));
-      await act(async () => window.dispatchEvent(new Event("focus")));
-      await act(() => vi.advanceTimersByTimeAsync(60_000));
-      expect(mockGetGoal).toHaveBeenCalledTimes(3);
-
-      await act(async () => recovery.resolve({ goal: GOAL }));
+      // Each timer boundary must settle before the next clock advance.
+      /* oxlint-disable no-await-in-loop */
+      for (const [index, delay] of [5_000, 10_000, 20_000, 40_000, 60_000, 60_000].entries()) {
+        await act(() => vi.advanceTimersByTimeAsync(delay - 1));
+        expect(mockGetGoal).toHaveBeenCalledTimes(index + 1);
+        expect(result.current.goal).toEqual(GOAL);
+        await act(() => vi.advanceTimersByTimeAsync(1));
+        expect(mockGetGoal).toHaveBeenCalledTimes(index + 2);
+        expect(result.current.goal).toEqual(GOAL);
+      }
+      /* oxlint-enable no-await-in-loop */
+      const pausedGoal = { ...GOAL, status: "paused" as const };
+      mockGetGoal.mockResolvedValue({ goal: pausedGoal });
+      await act(() => vi.advanceTimersByTimeAsync(59_999));
+      expect(mockGetGoal).toHaveBeenCalledTimes(7);
       expect(result.current.goal).toEqual(GOAL);
-      await act(() => vi.advanceTimersByTimeAsync(5_000));
-      expect(mockGetGoal).toHaveBeenCalledTimes(4);
-    } finally {
-      visibility.mockRestore();
-    }
-  });
+      await act(() => vi.advanceTimersByTimeAsync(1));
+      expect(result.current.goal).toEqual(pausedGoal);
+      expect(mockGetGoal).toHaveBeenCalledTimes(8);
+      await act(() => vi.advanceTimersByTimeAsync(4_999));
+      expect(mockGetGoal).toHaveBeenCalledTimes(8);
+      await act(() => vi.advanceTimersByTimeAsync(1));
+      expect(mockGetGoal).toHaveBeenCalledTimes(9);
+    },
+  );
+
+  it.each(["error", "unavailable"])(
+    "retries on focus and visibility during backoff without overlapping a pending read (%s)",
+    async (failure) => {
+      vi.useFakeTimers();
+      const recovery = deferredGoalRead();
+      if (failure === "unavailable") {
+        mockGetGoal
+          .mockResolvedValueOnce({ available: false })
+          .mockResolvedValueOnce({ available: false });
+      } else {
+        mockGetGoal
+          .mockRejectedValueOnce(new Error("offline"))
+          .mockRejectedValueOnce(new Error("still offline"));
+      }
+      mockGetGoal.mockReturnValueOnce(recovery.promise).mockResolvedValue({ goal: GOAL });
+      const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+      try {
+        const { result } = renderHook(() => useGoalState("conv", true));
+        await act(async () => {});
+        await act(() => vi.advanceTimersByTimeAsync(1_000));
+        await act(async () => window.dispatchEvent(new Event("focus")));
+        expect(mockGetGoal).toHaveBeenCalledTimes(2);
+
+        visibility.mockReturnValue("hidden");
+        await act(async () => document.dispatchEvent(new Event("visibilitychange")));
+        await act(() => vi.advanceTimersByTimeAsync(20_000));
+        expect(mockGetGoal).toHaveBeenCalledTimes(2);
+        visibility.mockReturnValue("visible");
+        await act(async () => document.dispatchEvent(new Event("visibilitychange")));
+        await act(async () => window.dispatchEvent(new Event("focus")));
+        await act(() => vi.advanceTimersByTimeAsync(60_000));
+        expect(mockGetGoal).toHaveBeenCalledTimes(3);
+
+        await act(async () => recovery.resolve({ goal: GOAL }));
+        expect(result.current.goal).toEqual(GOAL);
+        await act(() => vi.advanceTimersByTimeAsync(5_000));
+        expect(mockGetGoal).toHaveBeenCalledTimes(4);
+      } finally {
+        visibility.mockRestore();
+      }
+    },
+  );
 
   it("ignores a previous session's reads and dialog updates", async () => {
     let resolveRead!: (response: { goal: Goal | null }) => void;
