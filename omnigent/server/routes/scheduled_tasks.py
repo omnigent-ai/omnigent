@@ -1469,7 +1469,9 @@ def create_scheduled_tasks_router(
             typed_prompt = body.prompt or ""
             _refuse_workflow_reuse(await _workflow_reuse_problem(typed_prompt, body.session_mode))
             await _require_runnable_workflow(request, typed_prompt, owner)
-        _validate_name_template_or_400(body.name)
+        if body.kind != "reminder":
+            # A reminder continues its session, so its name is never rendered.
+            _validate_name_template_or_400(body.name)
         await _validate_rrule_or_400(
             body.rrule, allow_single_fire=one_time_schedules_supported(request)
         )
