@@ -224,7 +224,7 @@ async def test_session_init_readiness_is_explicit_and_backward_compatible(
         "conv_init",
         _conversation(),
         object(),  # type: ignore[arg-type]
-        object(),  # type: ignore[arg-type]
+        SimpleNamespace(require_spawn_activated=lambda _session_id: None),  # type: ignore[arg-type]
         initializer=_Initializer(),  # type: ignore[arg-type]
     )
 

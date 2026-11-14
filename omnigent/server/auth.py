@@ -28,18 +28,27 @@ and closed over by route factories — no per-request import cost.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import ipaddress
+import json
 import logging
 import os
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from starlette.requests import HTTPConnection
+from starlette.routing import compile_path
+
+from omnigent.errors import ERROR_CODE_HEADER, ErrorCode, OmnigentError
+from omnigent.runner.identity import RUNNER_TOKEN_SCOPE
+from omnigent.stores.conversation_store import RUNNER_CREATOR_LABEL_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +130,255 @@ def delegated_path_allowed(path: str) -> bool:
         if path == prefix or path.startswith(prefix + "/"):
             return True
     return False
+
+
+# Remove legacy owner-wide issuance in 0.21.0, after the 0.20.x upgrade window.
+LEGACY_RUNNER_TOKENS_ENV = "OMNIGENT_ALLOW_LEGACY_RUNNER_TOKENS"
+
+_RUNNER_CONFINEMENT_KEY = "omnigent.runner_confinement"
+_RUNNER_OPEN_PATHS = frozenset({"/health", "/api/version", "/v1/info"})
+_RUNNER_SESSION_CAPABILITIES = tuple(
+    (frozenset(methods.split()), compile_path("/v1/sessions/{session_id}" + suffix)[0])
+    for methods, suffix in (
+        ("GET PATCH", ""),
+        ("GET", "/items"),
+        ("GET", "/child_sessions"),
+        ("GET", "/spawns/epoch"),
+        ("POST", "/spawns"),
+        ("GET", "/spawns/{nonce:uuid}"),
+        ("POST", "/spawns/{nonce:uuid}/input"),
+        ("POST", "/spawns/{nonce:uuid}/abort"),
+        ("GET", "/agent"),
+        ("GET", "/agent/contents"),
+        ("GET", "/agent/mcp-servers"),
+        ("POST", "/mcp"),
+        ("POST", "/events"),
+        ("POST", "/ui/open-file"),
+        ("GET", "/labels"),
+        ("GET", "/owner"),
+        ("POST", "/agent-title"),
+        ("POST", "/auto-title"),
+        ("POST", "/model-override/reset"),
+        ("POST", "/fork"),
+        ("GET POST", "/comments"),
+        ("PATCH DELETE", "/comments/{comment_id}"),
+        ("POST", "/comments/send"),
+        ("POST", "/hooks/permission-request"),
+        ("POST", "/hooks/codex-elicitation-request"),
+        ("POST", "/hooks/antigravity-elicitation-request"),
+        ("POST", "/hooks/cursor-permission-request"),
+        ("POST", "/hooks/native-permission-request"),
+        ("POST", "/hooks/pi-extension-ui"),
+        ("POST", "/hooks/route-subagent"),
+        ("POST", "/hooks/route-turn"),
+        ("GET POST", "/policies"),
+        ("GET PATCH DELETE", "/policies/{policy_id}"),
+        ("POST", "/policies/evaluate"),
+        ("POST", "/browser/action_request"),
+        ("POST", "/browser/action_claim/{action_id}"),
+        ("POST", "/browser/action_result/{action_id}"),
+        ("POST", "/elicitations/{elicitation_id}/resolve"),
+        ("GET", "/elicitations/{elicitation_id}"),
+        ("GET PUT DELETE", "/codex_goal"),
+        ("PATCH", "/codex_goal/status"),
+        ("GET", "/resources"),
+        ("GET", "/resources/environments"),
+        ("GET", "/resources/environments/{environment_id}"),
+        ("GET POST", "/resources/terminals"),
+        ("GET DELETE", "/resources/terminals/{terminal_id}"),
+        ("POST", "/resources/terminals/{terminal_id}/transfer"),
+        ("WEBSOCKET", "/resources/terminals/{terminal_id}/attach"),
+        ("GET POST", "/resources/files"),
+        ("GET DELETE", "/resources/files/{file_id}"),
+        ("GET", "/resources/files/{file_id}/content"),
+        ("POST", "/resources/files:copy"),
+        ("GET", "/resources/environments/{environment_id}/filesystem"),
+        (
+            "GET PUT PATCH DELETE",
+            "/resources/environments/{environment_id}/filesystem/{path:path}",
+        ),
+        ("GET", "/resources/environments/{environment_id}/content-search"),
+        ("GET", "/resources/environments/{environment_id}/search"),
+        ("GET", "/resources/environments/{environment_id}/search/{path:path}"),
+        ("GET", "/resources/environments/{environment_id}/changes"),
+        ("GET", "/resources/environments/{environment_id}/diff/{path:path}"),
+        ("POST", "/resources/environments/{environment_id}/shell"),
+        ("GET", "/resources/github"),
+        ("GET", "/resources/github/changes"),
+        ("GET", "/resources/github/diff"),
+        ("GET", "/resources/github/diff/{path:path}"),
+        ("POST", "/resources/github/prs"),
+        ("POST", "/resources/github/prs/orchestrated"),
+        ("POST", "/resources/github/preferences"),
+        ("GET POST", "/resources/github/labels"),
+        ("GET", "/resources/{resource_id}"),
+    )
+)
+_SESSION_ID_HEADER = "X-Omnigent-Session-Id"
+# Inspect the target plus at most 32 parent edges; deeper unbound sessions
+# need an explicit runner binding before a confined bearer can access them.
+_RUNNER_SCOPE_MAX_DEPTH = 32
+
+
+class _ScopedConversation(Protocol):
+    @property
+    def runner_id(self) -> str | None: ...
+
+    @property
+    def labels(self) -> dict[str, str]: ...
+
+    @property
+    def parent_conversation_id(self) -> str | None: ...
+
+
+def runner_session_in_scope(
+    runner_id: str,
+    session_id: str,
+    get_conversation: Callable[[str], _ScopedConversation | None],
+) -> bool:
+    """Check the nearest runner binding or active creator grant on the parent chain.
+
+    Inspect at most 32 parent edges; nearer bindings override ancestor grants.
+    """
+    seen: set[str] = set()
+    current: str | None = session_id
+    while current and current not in seen and len(seen) <= _RUNNER_SCOPE_MAX_DEPTH:
+        seen.add(current)
+        conv = get_conversation(current)
+        if conv is None:
+            return False
+        if conv.runner_id:
+            return conv.runner_id == runner_id
+        if conv.labels.get(RUNNER_CREATOR_LABEL_KEY) == runner_id:
+            return True
+        current = conv.parent_conversation_id
+    return False
+
+
+@dataclass(frozen=True)
+class RunnerTokenConfinement:
+    """Limits of a request authenticated by a runner-confined bearer.
+
+    :param runner_id: Runner the bearer was minted for.
+    :param session_in_scope: ``(runner_id, session_id) -> bool`` lookup wired
+        by the app; ``None`` admits no session (fail closed).
+    """
+
+    runner_id: str
+    session_in_scope: Callable[[str, str], bool] | None
+    cursor_secret: bytes | None = field(default=None, repr=False)
+
+    def child_cursor(
+        self, parent_id: str, cursor: str | None, *, decode: bool = False
+    ) -> str | None:
+        """Keep bounded child-page continuation positions private, even on empty pages."""
+        if cursor is None:
+            return None
+        from cryptography.fernet import Fernet, InvalidToken
+
+        if self.cursor_secret is None:
+            raise OmnigentError(
+                "runner pagination is unavailable", code=ErrorCode.RUNNER_SCOPE_DENIED
+            )
+        key = hmac.digest(self.cursor_secret, b"omnigent.runner.child-cursor.v1", hashlib.sha256)
+        cipher = Fernet(base64.urlsafe_b64encode(key))
+        if not decode:
+            return cipher.encrypt(
+                json.dumps([self.runner_id, parent_id, cursor]).encode()
+            ).decode()
+        try:
+            if len(cursor) > 2048:
+                raise ValueError("invalid cursor length")
+            runner_id, parent, position = json.loads(cipher.decrypt(cursor.encode(), ttl=3600))
+            if runner_id == self.runner_id and parent == parent_id and isinstance(position, str):
+                return position
+        except (InvalidToken, ValueError, TypeError):
+            pass
+        raise OmnigentError(
+            "restart child pagination without a cursor", code=ErrorCode.STALE_CURSOR
+        )
+
+    def allows_session(self, session_id: str) -> bool:
+        """Whether the bearer may act on *session_id*."""
+        return self.session_in_scope is not None and self.session_in_scope(
+            self.runner_id, session_id
+        )
+
+    def allows_request(self, connection: HTTPConnection) -> bool:
+        """Fail-closed allowlist of the routes a runner calls for its sessions.
+
+        Admin, account, host, scheduling, and session-listing routes are all
+        outside it, whatever the owner's own authority.
+        """
+        path = connection.url.path
+        method = (
+            "WEBSOCKET" if connection.scope["type"] == "websocket" else connection.scope["method"]
+        )
+        if path in _RUNNER_OPEN_PATHS:
+            return method == "GET"
+        if path == "/v1/policy-registry":
+            return method == "GET"
+        segments = path.split("/")
+        if len(segments) < 3 or segments[:2] != ["", "v1"]:
+            return False
+        family, rest = segments[2], segments[3:]
+        if family == "sessions":
+            if not rest:
+                # Creation is further confined by the create route itself.
+                return method == "POST"
+            # Agent writes and recursive deletion can affect other runners.
+            for methods, pattern in _RUNNER_SESSION_CAPABILITIES:
+                match = pattern.fullmatch(path)
+                if method in methods and match is not None:
+                    return self.allows_session(match["session_id"])
+            return False
+        if family == "runners":
+            return (
+                len(rest) == 2
+                and rest[0] == self.runner_id
+                and (method, rest[1])
+                in {
+                    ("GET", "status"),
+                    ("GET", "token"),
+                    ("POST", "token"),
+                    ("WEBSOCKET", "tunnel"),
+                }
+            )
+        if family == "mcp":
+            session_id = connection.headers.get(_SESSION_ID_HEADER)
+            return (
+                method == "POST"
+                and len(rest) == 1
+                and bool(rest[0])
+                and bool(session_id)
+                and self.allows_session(session_id)
+            )
+        return False
+
+
+def runner_token_confinement(connection: HTTPConnection) -> RunnerTokenConfinement | None:
+    """Return the confinement of a runner-bearer request, or ``None``.
+
+    Set while authenticating the request, so call it after the route has
+    resolved the caller (e.g. after ``require_user``).
+    """
+    confinement = connection.scope.get(_RUNNER_CONFINEMENT_KEY)
+    return confinement if isinstance(confinement, RunnerTokenConfinement) else None
+
+
+def require_runner_session_scope(connection: HTTPConnection, session_id: str) -> None:
+    """Reject a runner-confined caller acting on a session outside its scope.
+
+    For session ids carried in a request body rather than the path.
+
+    :raises OmnigentError: 403 when the session is outside the bearer's scope.
+    """
+    confinement = runner_token_confinement(connection)
+    if confinement is not None and not confinement.allows_session(session_id):
+        raise OmnigentError(
+            "runner credential is not authorized for this session",
+            code=ErrorCode.RUNNER_SCOPE_DENIED,
+        )
 
 
 # Explicit single-user marker. Set by the managed local-server spawn
@@ -417,27 +675,36 @@ class AuthProvider(ABC):
     When ``None`` is returned, the route helpers respond with 401.
     """
 
+    # A capability hint; issuance also requires the wired built-in validator.
+    runner_token_scope: str | None = None
+
     @abstractmethod
     def get_user_id(self, request: HTTPConnection) -> str | None:
         """Return the authenticated user ID, or ``None``."""
         ...
 
-    def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:  # noqa: ARG002
-        """
-        Mint a short-lived bearer a managed-sandbox runner presents as *user_id*.
+    def mint_runner_token(
+        self,
+        user_id: str,  # noqa: ARG002
+        ttl_seconds: int,  # noqa: ARG002
+        *,
+        runner_id: str | None = None,  # noqa: ARG002
+    ) -> str | None:
+        """Mint a runner bearer for *user_id*, confined to *runner_id* when given.
 
-        A managed runner runs in a sandbox with no logged-in user
-        credential of its own, so the server mints one for its HTTP
-        callbacks when auth is enabled (see the
-        ``POST /v1/runners/{id}/token`` endpoint). Default: ``None`` — no
-        minting (single-user / no-auth, or a provider whose identity is
-        asserted externally and can't be minted server-side, e.g.
-        header/proxy auth). The runner then authenticates with its tunnel
-        binding token alone.
+        Only the wired built-in validator supports scoped issuance. Until 0.21.0, calls
+        without *runner_id* retain the legacy owner-wide contract when
+        ``OMNIGENT_ALLOW_LEGACY_RUNNER_TOKENS`` is enabled (default).
+        Default: ``None`` — no minting (single-user / no-auth, or a
+        provider whose identity is asserted externally and can't be minted
+        server-side, e.g. header/proxy auth). The runner then authenticates
+        with its tunnel binding token alone.
 
         :param user_id: The session owner the runner acts as, e.g.
             ``"alice@example.com"``.
         :param ttl_seconds: Token lifetime in seconds.
+        :param runner_id: Runner the bearer is confined to, e.g.
+            ``"runner_0123456789abcdef"``; omitted for legacy issuance.
         :returns: A bearer token string, or ``None`` when this provider
             cannot mint one.
         """
@@ -504,6 +771,7 @@ class UnifiedAuthProvider(AuthProvider):
         header_strip_prefix: str | None = None,
     ) -> None:
         self._source = source
+        self.runner_token_scope = RUNNER_TOKEN_SCOPE if source in ("accounts", "oidc") else None
         self._oidc_config = oidc_config
         self._accounts_config = accounts_config
         self._local_single_user = (
@@ -524,6 +792,22 @@ class UnifiedAuthProvider(AuthProvider):
         # Accounts JWTs validate generation and revocation on every request.
         # OIDC and machine principals retain their independent lifecycle.
         self._account_check: Callable[[str, str], bool] | None = None
+        # Set by create_app. Until then runner bearers reach no session.
+        self._runner_session_check: Callable[[str, str], bool] | None = None
+
+    def set_runner_session_check(self, check: Callable[[str, str], bool]) -> None:
+        """Wire the ``(runner_id, session_id) -> bool`` runner-scope lookup."""
+        self._runner_session_check = check
+
+    @property
+    def runner_confinement_ready(self) -> bool:
+        """Whether the built-in scope validator has its session lookup wired."""
+        config = self._oidc_config if self._source == "oidc" else self._accounts_config
+        return (
+            self.runner_token_scope == RUNNER_TOKEN_SCOPE
+            and config is not None
+            and self._runner_session_check is not None
+        )
 
     def set_grant_revocation_check(self, check: Callable[[str], bool]) -> None:
         """Wire the device-grant revocation lookup.
@@ -621,23 +905,36 @@ class UnifiedAuthProvider(AuthProvider):
             return self._check_cookie(request)
         return self._check_header(request)
 
-    def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:
+    def mint_runner_token(
+        self, user_id: str, ttl_seconds: int, *, runner_id: str | None = None
+    ) -> str | None:
         """
-        Mint a short-lived owner JWT for a managed-sandbox runner.
+        Mint a short-lived delegated runner JWT, scoped when *runner_id* is supplied.
 
-        Accounts / OIDC modes sign a session JWT in the same HS256 format
+        Accounts / OIDC modes sign a JWT in the same HS256 format
         :meth:`_check_cookie` validates, so the runner can present it as
         ``Authorization: Bearer <jwt>`` on its HTTP callbacks and resolve
-        to *user_id*. Header/proxy mode returns ``None`` — identity there
-        is asserted by the upstream proxy and can't be minted server-side.
+        to *user_id*. Its ``scope``/``runner_id`` claims confine it to the
+        routes and sessions of *runner_id* (see
+        :meth:`RunnerTokenConfinement.allows_request`). Header/proxy mode
+        returns ``None`` — identity there is asserted by the upstream proxy
+        and can't be minted server-side.
+
+        Omitting *runner_id* preserves owner-wide issuance through 0.20.x,
+        unless ``OMNIGENT_ALLOW_LEGACY_RUNNER_TOKENS=0``. Remove in 0.21.0.
 
         :param user_id: The session owner the runner acts as, e.g.
             ``"alice@example.com"``.
         :param ttl_seconds: Token lifetime in seconds.
+        :param runner_id: Runner the bearer is confined to, or ``None`` for legacy issuance.
         :returns: An HS256-signed JWT, or ``None`` for header mode, an
-            empty/reserved user, or a missing cookie config.
+            empty/reserved user or runner id, or a missing cookie config.
         """
-        if not user_id or user_id in _RESERVED_USERS:
+        if not user_id or user_id in _RESERVED_USERS or runner_id == "":
+            return None
+        if runner_id is None and not env_var_is_truthy(LEGACY_RUNNER_TOKENS_ENV, default=True):
+            return None
+        if runner_id is not None and not self.runner_confinement_ready:
             return None
         if self._source not in ("oidc", "accounts"):
             return None
@@ -653,6 +950,11 @@ class UnifiedAuthProvider(AuthProvider):
             ttl_seconds,
             self._source,
             account_generation=account_generation(user_id),
+            extra_claims=(
+                {"scope": RUNNER_TOKEN_SCOPE, "runner_id": runner_id}
+                if runner_id is not None
+                else None
+            ),
         )
 
     def _check_cookie(self, request: HTTPConnection) -> str | None:
@@ -718,15 +1020,34 @@ class UnifiedAuthProvider(AuthProvider):
         # a hit on one path would replay past both checks on every other.
         grant_id = payload.get("grant_id")
         scope = payload.get("scope")
+        runner_scoped = scope == RUNNER_TOKEN_SCOPE
         # Only client-credentials tokens (scope without a grant) are machine
-        # principals. Every user-backed credential carries the account generation.
-        if self._account_check is not None and not (scope is not None and grant_id is None):
+        # principals. Every user-backed credential, runner bearers included,
+        # carries the account generation.
+        machine_principal = scope is not None and grant_id is None and not runner_scoped
+        if self._account_check is not None and not machine_principal:
             generation = payload.get("account_generation")
             if not isinstance(generation, str) or not self._account_check(user_id, generation):
                 return None
             from omnigent.db.account_authority import bind_account_authority
 
             bind_account_authority(user_id, generation)
+
+        if runner_scoped:
+            runner_id = payload.get("runner_id")
+            if not isinstance(runner_id, str) or not runner_id:
+                return None
+            confinement = RunnerTokenConfinement(
+                runner_id, self._runner_session_check, cookie_config.cookie_secret
+            )
+            if not confinement.allows_request(request):
+                raise OmnigentError(
+                    "runner credential is not authorized for this request",
+                    code=ErrorCode.RUNNER_SCOPE_DENIED,
+                )
+            # Routes whose target session arrives in the body read this back.
+            request.scope[_RUNNER_CONFINEMENT_KEY] = confinement
+            return user_id
 
         if grant_id is not None or scope is not None:
             # A ``grant_id`` names a revocable stored grant, so it is checked
@@ -881,7 +1202,23 @@ class AccountAuthenticationMiddleware:
 
         with account_authority_scope(None, None):
             connection = HTTPConnection(scope)
-            identity = await asyncio.to_thread(self._authenticate, connection)
+            try:
+                identity = await asyncio.to_thread(self._authenticate, connection)
+            except OmnigentError as exc:
+                if exc.code != ErrorCode.RUNNER_SCOPE_DENIED:
+                    raise
+                if scope["type"] == "websocket":
+                    await send({"type": "websocket.close", "code": 1008, "reason": exc.message})
+                else:
+                    from starlette.responses import JSONResponse
+
+                    response = JSONResponse(
+                        status_code=exc.http_status,
+                        content={"error": {"code": exc.code, "message": exc.message}},
+                        headers={ERROR_CODE_HEADER: exc.code},
+                    )
+                    await response(scope, receive, send)
+                return
             scope[_CONNECTION_IDENTITY_KEY] = identity
             try:
                 self._auth_provider.get_user_id(connection)

@@ -2776,9 +2776,10 @@ async def test_sandbox_move_failing_partway_restores_the_session_binding(
     deleted: list[str] = []
 
     def delete_one_label_then_fail(conversation_id: str, key: str) -> None:
-        if deleted:
-            raise RuntimeError("label store unavailable")
-        deleted.append(key)
+        if key in _STALE_SANDBOX_LABELS:
+            if deleted:
+                raise RuntimeError("label store unavailable")
+            deleted.append(key)
         delete_label(conversation_id, key)
 
     monkeypatch.setattr(env.conv_store, "delete_label", delete_one_label_then_fail)

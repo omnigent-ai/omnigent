@@ -41,6 +41,7 @@ from omnigent.spec.types import (
     Phase,
     PhaseSelector,
 )
+from omnigent.stores.conversation_store import RUNNER_CREATOR_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -150,6 +151,37 @@ guardrails: {}
 
 
 # ── Declared policies + label seeding ──────────────────
+
+
+@pytest.mark.parametrize("existing_runner", [None, "bound-runner"])
+def test_label_defaults_preserve_server_owned_runner_labels(
+    conversation_store: SqlAlchemyConversationStore,
+    existing_runner: str | None,
+) -> None:
+    labels = {RUNNER_CREATOR_LABEL_KEY: existing_runner} if existing_runner else {}
+    conv = conversation_store.create_conversation(labels=labels)
+    spec = AgentSpec(
+        spec_version=1,
+        name="label-defaults",
+        guardrails=GuardrailsSpec(
+            labels={
+                RUNNER_CREATOR_LABEL_KEY: LabelDef(initial="other-runner"),
+                "team": LabelDef(initial="research"),
+            }
+        ),
+    )
+
+    engine = build_policy_engine(
+        spec=spec,
+        conversation_id=conv.id,
+        conversation_store=conversation_store,
+    )
+
+    expected = {**labels, "team": "research"}
+    assert engine.labels == expected
+    persisted = conversation_store.get_conversation(conv.id)
+    assert persisted is not None
+    assert persisted.labels == expected
 
 
 def test_build_propagates_declared_policies_in_yaml_order(

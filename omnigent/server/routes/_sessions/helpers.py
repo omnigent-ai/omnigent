@@ -126,6 +126,7 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
+    RunnerTokenConfinement,
     effective_admin,
 )
 from omnigent.server.host_registry import (
@@ -1661,6 +1662,8 @@ def _targeted_elicitation_event(
 def _ancestor_session_ids(
     conv_store: ConversationStore,
     session_id: str,
+    *,
+    allows_session: Callable[[str], bool] | None = None,
 ) -> list[str]:
     """
     Return ancestor session ids for a session, nearest parent first.
@@ -1668,6 +1671,7 @@ def _ancestor_session_ids(
     :param conv_store: Store used to read conversation parent links.
     :param session_id: Session to walk upward from, e.g.
         ``"conv_child123"``.
+    :param allows_session: Stop before the first ancestor outside the caller's scope.
     :returns: Ancestor ids in parent-to-root order. Empty when the
         session is top-level or missing.
     """
@@ -1677,6 +1681,8 @@ def _ancestor_session_ids(
     while current is not None and current.parent_conversation_id is not None:
         parent_id = current.parent_conversation_id
         if parent_id in seen:
+            break
+        if allows_session is not None and not allows_session(parent_id):
             break
         ancestors.append(parent_id)
         seen.add(parent_id)
@@ -1693,6 +1699,8 @@ def _publish_elicitation_request_to_ancestors(
     conv_store: ConversationStore,
     session_id: str,
     event: dict[str, Any],
+    *,
+    confinement: RunnerTokenConfinement | None = None,
 ) -> None:
     """
     Mirror a child elicitation request into each ancestor stream.
@@ -1702,8 +1710,13 @@ def _publish_elicitation_request_to_ancestors(
         e.g. ``"conv_child123"``.
     :param event: Event whose ``elicitation_id`` selects the child's current
         entry; mirrored as-is only when it has no id.
+    :param confinement: Runner scope to apply to each ancestor, when present.
     """
-    ancestor_ids = _ancestor_session_ids(conv_store, session_id)
+    ancestor_ids = _ancestor_session_ids(
+        conv_store,
+        session_id,
+        allows_session=confinement.allows_session if confinement is not None else None,
+    )
     if not ancestor_ids:
         return
     elicitation_id = event.get("elicitation_id")
@@ -1726,6 +1739,8 @@ def _publish_elicitation_resolved_to_ancestors(
     elicitation_id: str,
     action: str | None = None,
     reason: str | None = None,
+    *,
+    confinement: RunnerTokenConfinement | None = None,
 ) -> None:
     """
     Mirror an elicitation-resolved event into each ancestor stream.
@@ -1739,8 +1754,13 @@ def _publish_elicitation_resolved_to_ancestors(
         mirrors; see :func:`_publish_elicitation_resolved`.
     :param reason: Optional no-verdict reason carried through to the
         mirrors; see :func:`_publish_elicitation_resolved`.
+    :param confinement: Runner scope to apply to each ancestor, when present.
     """
-    ancestor_ids = _ancestor_session_ids(conv_store, session_id)
+    ancestor_ids = _ancestor_session_ids(
+        conv_store,
+        session_id,
+        allows_session=confinement.allows_session if confinement is not None else None,
+    )
     with _ancestor_elicitation_mirror_lock:
         if pending_elicitations.lookup(elicitation_id, conversation_id=session_id) is not None:
             return  # The child re-asked under this id; its request mirror owns the card.
@@ -1791,6 +1811,8 @@ def _descendant_sessions(
 def _pending_elicitation_snapshot_for_session(
     conv_store: ConversationStore,
     conv: Conversation,
+    *,
+    confinement: RunnerTokenConfinement | None = None,
 ) -> list[dict[str, Any]]:
     """
     Return pending elicitation events visible from a session snapshot.
@@ -1812,7 +1834,17 @@ def _pending_elicitation_snapshot_for_session(
     :returns: Pending elicitation event dicts suitable for
         :class:`SessionResponse.pending_elicitations`.
     """
-    events = pending_elicitations.snapshot_for(conv.id)
+
+    def visible(event: dict[str, Any]) -> bool:
+        params = event.get("params", {})
+        target = params.get("target_session_id") if isinstance(params, dict) else None
+        return (
+            confinement is None
+            or not isinstance(target, str)
+            or confinement.allows_session(target)
+        )
+
+    events = [event for event in pending_elicitations.snapshot_for(conv.id) if visible(event)]
     if not (set(pending_elicitations.pending_session_ids()) - {conv.id}):
         return events
     seen = {
@@ -1821,7 +1853,11 @@ def _pending_elicitation_snapshot_for_session(
         if isinstance(event.get("elicitation_id"), str)
     }
     for child in _descendant_sessions(conv_store, conv.id):
+        if confinement is not None and not confinement.allows_session(child.id):
+            continue
         for event in pending_elicitations.snapshot_for(child.id):
+            if not visible(event):
+                continue
             elicitation_id = event.get("elicitation_id")
             if isinstance(elicitation_id, str) and elicitation_id in seen:
                 continue
@@ -7944,6 +7980,8 @@ async def _stop_session_via_runner(*args: Any, **kwargs: Any) -> bool:
 async def _stop_session_via_runner_impl(
     session_id: str,
     runner_router: Any,
+    *,
+    conversation: Conversation | None = None,
 ) -> bool:
     """
     Forward a ``stop_session`` request to the bound runner, surfacing
@@ -7982,8 +8020,12 @@ async def _stop_session_via_runner_impl(
     """
     from omnigent.runtime import get_runner_client
 
-    runner_client = await _get_runner_client(session_id, runner_router, for_control=True)
-    if runner_client is None:
+    if conversation is not None and runner_router is None:
+        return False
+    runner_client = await _get_runner_client(
+        session_id, runner_router, for_control=True, conversation=conversation
+    )
+    if runner_client is None and conversation is None:
         runner_client = cast("httpx.AsyncClient | None", get_runner_client())
     if runner_client is None:
         return False

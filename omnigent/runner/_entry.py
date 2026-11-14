@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Generator
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, cast
@@ -34,7 +35,7 @@ from omnigent._platform import IS_WINDOWS, normalize_interactive_shells
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.inner import _proc
 from omnigent.runner.busy_check import RunnerBusyCheck
-from omnigent.runner.identity import RUNNER_AUTH_REJECTED_EXIT_CODE
+from omnigent.runner.identity import RUNNER_AUTH_REJECTED_EXIT_CODE, RUNNER_CREDENTIAL_PROTOCOL
 from omnigent.runner.transports.ws_tunnel.serve import (
     RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX,
     RUNNER_TUNNEL_REJECTION_PREFIX,
@@ -351,7 +352,15 @@ class _RunnerDatabricksAuth(ThreadedAuth):
             (which pass only the factory) need no change.
         """
         self._factory = factory
+        self._last_bearer: str | None = None
         self._server_url = server_url or os.environ.get(_RUNNER_SERVER_URL_ENV_VAR)
+
+    @property
+    def runner_confined(self) -> bool:
+        """Whether account-wide tools are unavailable with the current bearer."""
+        from omnigent.runner.identity import runner_bearer_is_confined
+
+        return runner_bearer_is_confined(self._last_bearer)
 
     def auth_flow(
         self,
@@ -394,6 +403,9 @@ class _RunnerDatabricksAuth(ThreadedAuth):
             )
         if self._factory is not None:
             token, declined = _call_factory_with_declined(self._factory)
+            # A transient refresh failure does not change the established scope.
+            if token or declined:
+                self._last_bearer = token
             if not token:
                 if declined:
                     # The mint declined (400/404 no-auth, intermediary 5xx, or a
@@ -408,6 +420,7 @@ class _RunnerDatabricksAuth(ThreadedAuth):
                         return
                     token = self._factory()
                     if token:
+                        self._last_bearer = token
                         request.headers["Authorization"] = f"Bearer {token}"
                         yield request
                     return
@@ -420,6 +433,7 @@ class _RunnerDatabricksAuth(ThreadedAuth):
             _invalidate_auth_token_factory(self._factory)
             token = self._factory()
             if token:
+                self._last_bearer = token
                 request.headers["Authorization"] = f"Bearer {token}"
                 yield request
 
@@ -442,6 +456,10 @@ def _is_login_redirect_or_unauthorized(response: httpx.Response) -> bool:
     :returns: ``True`` when the response indicates the request should
         be retried with a fresh token, ``False`` otherwise.
     """
+    from omnigent.errors import ERROR_CODE_HEADER, ErrorCode
+
+    if response.headers.get(ERROR_CODE_HEADER) == ErrorCode.RUNNER_SCOPE_DENIED:
+        return False
     if response.status_code in (401, 403):
         # Databricks Apps returns 403 "Invalid Token" for an expired bearer
         # in addition to the 302→/oidc/ bounce; treat both as re-auth signals.
@@ -559,8 +577,13 @@ class _InitialAuthTokenFactory:
         # Managed mint cannot renew itself when its proxy bearer expires —
         # the injected host bearer before a first mint, or the minted JWT
         # once a session outlives it. Re-resolve SDK/OIDC in the same call
-        # so the request that hit the failure still gets a credential.
-        if token is None and getattr(factory, "proxy_auth_failed", False):
+        # so the request that hit the failure still gets a credential. Scoped
+        # factories recover proxy admission internally and must stay installed.
+        if (
+            token is None
+            and getattr(factory, "proxy_auth_failed", False)
+            and not getattr(factory, "uses_scoped_credentials", False)
+        ):
             factory = _make_auth_token_factory(
                 self._server_url,
                 _allow_initial_token=False,
@@ -667,10 +690,10 @@ def _make_auth_token_factory(
     """Build a callable that mints fresh auth tokens.
 
     Resolution order:
-      1. Host's current bearer, when injected for runner bootstrap. Local
-         refreshable auth resolves on rejection or proactive tunnel renewal.
-      2. Host-delegated runner token, when the host launch marker and
+      1. Host-delegated runner token, when the host launch marker and
          binding token are present.
+      2. Host's current bearer when delegated minting is unsupported. Local
+         refreshable auth resolves on rejection or proactive tunnel renewal.
       3. Stored OIDC token from ``~/.omnigent/auth_tokens.json``
          (populated by ``omnigent login``), keyed by ``server_url``.
       4. Databricks OAuth token (refreshed via the SDK) — host-keyed
@@ -748,13 +771,6 @@ def _make_auth_token_factory(
         if _allow_initial_token
         else ""
     )
-    if initial_token and resolved_server_url:
-        _logger.info(
-            "using host-provided bearer for runner bootstrap",
-            extra={"session_id": runner_primary_session_id()},
-        )
-        return _InitialAuthTokenFactory(initial_token, resolved_server_url)
-
     # Prefer the host-launched runner's owner-bound capability so user
     # credentials stay out of the runner and credential discovery is skipped.
     delegated_auth = os.environ.get(RUNNER_DELEGATED_AUTH_ENV_VAR, "").strip() == "1"
@@ -764,12 +780,19 @@ def _make_auth_token_factory(
     refused_binding_token: str | None = None
     if _allow_delegated_mint and delegated_auth and resolved_server_url and binding_token:
         delegated_factory = _make_managed_mint_factory(
-            resolved_server_url, binding_token, proxy_bearer=_proxy_bearer
+            resolved_server_url, binding_token, proxy_bearer=_proxy_bearer or initial_token or None
         )
         if delegated_factory is not None:
             return delegated_factory
         if _proxy_bearer is None:
             refused_binding_token = binding_token
+
+    if initial_token and resolved_server_url:
+        _logger.info(
+            "using host-provided bearer for runner bootstrap",
+            extra={"session_id": runner_primary_session_id()},
+        )
+        return _InitialAuthTokenFactory(initial_token, resolved_server_url)
 
     sdk_token_source: _ReusedDatabricksTokenSource | None = None
 
@@ -850,60 +873,29 @@ def _make_managed_mint_factory(
     *,
     proxy_bearer: str | None = None,
 ) -> Callable[[], str | None] | None:
-    """Build a token factory that mints a managed runner's owner JWT.
+    """Build a factory for the server's negotiated runner credential protocol.
 
-    For a server-managed sandbox runner with no user credential of its
-    own: mint a short-lived owner JWT from ``POST /v1/runners/{id}/token``,
-    authenticated by the runner's tunnel binding token, and cache it in
-    memory. The cached token is reused until it nears expiry, then
-    re-minted — so a managed session runs arbitrarily long without its
-    auth expiring (no fixed session-length cap), and no long-lived
-    credential is ever written to the sandbox environment.
+    The binding token authorizes minting, while an optional separate bearer
+    admits the mint request through an Apps proxy. The same factory supplies
+    cached short-lived credentials to HTTP callbacks and the WebSocket tunnel.
 
-    The same factory feeds both the WS tunnel bearer and the httpx
-    callback client (see :func:`_make_auth_token_factory` callers), so one
-    credential authenticates every runner->server surface.
+    Once scoped credentials are selected, failures retain that protocol and
+    factory. Proxy-auth recovery only renews admission and retries the scoped
+    mint; no recovered owner credential is returned to callback callers.
+    Before scoped selection, definitive refusals preserve the legacy fallback.
+    Transient failures keep the factory installed so later calls can retry.
 
-    :param server_url: Omnigent server base URL, e.g.
-        ``"https://omnigent.example.com"``.
-    :param binding_token: The runner's tunnel binding token (the sandbox's
-        only credential), presented to the mint endpoint.
-    :param proxy_bearer: Optional bearer to include on the mint request so
-        an Apps proxy lets it through. Used when a host-injected initial
-        bearer is available (the minted JWT takes over on subsequent
-        refreshes).
-    :returns: A sync callable returning a fresh owner JWT, or ``None`` only
-        when the server *definitively* will not mint for this runner (HTTP
-        400 no-auth/header mode, 404 older server without the endpoint, or a
-        Databricks Apps OAuth redirect before the request reaches the app) —
-        the runner then uses the legacy credential path. A *transient* probe
-        failure still installs the factory, which re-mints on the next
-        callback (so a blip at boot does not leave the runner unauthenticated
-        until process restart). A probe 5xx (an intermediary answering for
-        the mint endpoint) installs the factory with ``declined`` latched:
-        callbacks go out bare, and a rejected bare request clears the latch
-        and re-mints once the server recovers. If a post-install mint gets a
-        definitive refusal, the factory latches ``declined`` and returns
-        ``None`` thereafter, and :class:`_RunnerDatabricksAuth` falls back to
-        bare requests. A post-install 401/403 with no still-valid cache
-        latches ``proxy_auth_failed`` instead, which
-        :class:`_InitialAuthTokenFactory` answers by re-resolving SDK/OIDC.
-        A bearer-less 401/403 latches a recoverable ``declined``.
+    :param server_url: Omnigent server base URL.
+    :param binding_token: Runner binding credential presented to the mint endpoint.
+    :param proxy_bearer: Optional initial bearer admitting the mint through a proxy.
+    :returns: Credential factory, or ``None`` on a legacy bootstrap refusal.
     """
     from omnigent.runner.identity import token_bound_runner_id
 
     runner_id = token_bound_runner_id(binding_token)
     mint_url = f"{server_url.rstrip('/')}/v1/runners/{runner_id}/token"
 
-    # Construction probe. Decline to install the factory ONLY when the
-    # server definitively will not mint for this runner — HTTP 400 (no auth
-    # provider / header mode), 404 (an older server without the endpoint),
-    # or an Apps OAuth redirect that happens before the request reaches
-    # Omnigent. Every other outcome installs the factory: a success seeds
-    # the cache; a transient failure (network blip, timeout) installs it
-    # anyway so the next callback re-mints; a 5xx from an intermediary
-    # installs it with declined latched so callbacks go bare but can
-    # recover via reset_decline once the server is reachable again.
+    # Probe once, retaining scoped selection even when its first mint fails.
     factory = _ManagedMintTokenFactory(
         mint_url, server_url, binding_token, proxy_bearer=proxy_bearer
     )
@@ -914,33 +906,59 @@ def _make_managed_mint_factory(
         # the latch and re-mints once the server is reachable again —
         # dropping the factory here would lose that recovery path.
         return factory
-    # A probe 401/403 still drops the factory, leaving the boot-time app and
-    # tunnel clients bare; host launches bind the session before the runner starts.
+    if factory.uses_scoped_credentials:
+        return factory
+    # Before scoped selection, retain the legacy bootstrap fallback on refusal.
     if factory.declined or factory.proxy_auth_failed:
         return None
     return factory
 
 
+@dataclass
+class _RunnerCredentialNegotiation:
+    """Choose a protocol once; refreshes never broaden a scoped credential."""
+
+    protocol: str | None = RUNNER_CREDENTIAL_PROTOCOL
+    selected: bool = False
+
+    def select(self, client: httpx.Client, url: str, headers: dict[str, str]) -> str | None:
+        """Use explicit server capabilities, or retain scoped requests on older servers."""
+        if self.selected:
+            return self.protocol
+        response = client.get(url, headers=headers)
+        if response.status_code in (404, 405):
+            # Older servers commit to this request protocol only after a mint succeeds.
+            return self.protocol
+        response.raise_for_status()
+        try:
+            protocols = response.json()["protocols"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError("invalid runner credential protocol advertisement") from exc
+        if not isinstance(protocols, list) or not all(isinstance(p, str) for p in protocols):
+            raise RuntimeError("invalid runner credential protocol advertisement")
+        if RUNNER_CREDENTIAL_PROTOCOL in protocols:
+            self.protocol = RUNNER_CREDENTIAL_PROTOCOL
+        elif "legacy" in protocols:
+            self.protocol = None
+        else:
+            raise RuntimeError(
+                "server advertises no supported runner credential protocol; "
+                "update the runner or auth provider configuration"
+            )
+        self.selected = True
+        return self.protocol
+
+
 class _ManagedMintTokenFactory:
-    """Callable that mints (and caches) a managed runner's owner JWT.
+    """Cache runner credentials and preserve the negotiated protocol on renewal.
 
-    Each call returns the cached JWT until it nears expiry, then re-mints
-    via :func:`_mint_managed_owner_token`. When a mint gets a *definitive*
-    refusal (HTTP 400 no-auth/header mode, 404 older server, an Apps OAuth
-    redirect, or a 5xx from an intermediary before any successful mint), the
-    :attr:`declined` latch is set and every subsequent call returns
-    ``None`` without touching the network —
-    :meth:`_RunnerDatabricksAuth.auth_flow` reads the latch to send bare
-    requests instead of failing closed. The latch matters when the
-    construction probe loses a boot race (a connection error installs the
-    factory, then the first real mint learns the server never mints).
+    Scoped factories fail closed while minting is unavailable. A proxy 401/403
+    with no usable cache triggers one admission-credential renewal and re-mint;
+    the recovered admission credential is never returned to callback callers.
 
-    A mint 401/403 with no still-valid cached token latches
-    :attr:`proxy_auth_failed` instead: the credential presented to the proxy
-    died (the seeded host bearer, or the minted JWT once a session outlives
-    it), so callers should re-resolve SDK/OIDC rather than send bare requests.
-    A bearer-less 401/403 may precede session binding, so it latches a
-    recoverable :attr:`declined` and :attr:`declined_without_proxy_bearer`.
+    Legacy factories may latch ``declined`` on definitive refusal or an initial
+    intermediary error so callers can send bare requests. Their proxy-auth
+    failure latch instead permits the compatibility wrapper to resolve user auth.
     """
 
     def __init__(
@@ -960,12 +978,16 @@ class _ManagedMintTokenFactory:
             first successful mint so the proxy sees a valid credential on
             every subsequent refresh.
         """
+        self._negotiation = _RunnerCredentialNegotiation()
         self._mint_url = mint_url
         self._server_url = server_url
         self._binding_token = binding_token
         self._proxy_bearer = proxy_bearer
         self._cached_token: str | None = None
         self._cached_expires_at = 0.0
+        self._protocol_failure: tuple[str, httpx.Response] | None = None
+        self._admission_factory: Callable[[], str | None] | None = None
+        self._proxy_recovery_retry_at = 0.0
         # Serializes mint/latch state across concurrent callbacks so a
         # decline reset and a re-mint cannot interleave into duplicate
         # mints or a declined-latch alongside a freshly cached token.
@@ -984,44 +1006,80 @@ class _ManagedMintTokenFactory:
         self.declined_without_proxy_bearer = False
 
     def __call__(self) -> str | None:
-        """Return a fresh owner JWT, or ``None``.
+        """Return the cached or newly minted credential, or ``None`` on failure.
 
-        :returns: The cached or freshly-minted JWT; ``None`` after a
-            definitive server decline, a 5xx with no prior successful mint,
-            or a 401/403 with no proxy bearer (sets :attr:`declined`), after
-            a mint 401/403 with no still-valid cached token (sets
-            :attr:`proxy_auth_failed`), or on a transient mint failure with
-            no still-valid cached token.
+        Scoped failures keep callbacks closed. Legacy refusals may also set
+        ``declined`` so callers can use their compatibility behavior.
         """
         with self._lock:
             return self._call_locked()
 
-    def _call_locked(self) -> str | None:
+    @property
+    def uses_scoped_credentials(self) -> bool:
+        """Whether renewal must retain the scoped request protocol.
+
+        Acceptance by an older server does not verify the returned token's scope.
+        """
+        return (
+            self._negotiation.selected and self._negotiation.protocol == RUNNER_CREDENTIAL_PROTOCOL
+        )
+
+    def _call_locked(self, *, recover_proxy_auth: bool = True) -> str | None:
         """Body of :meth:`__call__`, run under :attr:`_lock`.
 
+        :param recover_proxy_auth: Allow one proxy credential renewal for this call.
         :returns: See :meth:`__call__`.
         """
         if self.declined:
             return None
+        if self._protocol_failure is not None:
+            message, response = self._protocol_failure
+            raise httpx.HTTPStatusError(message, request=response.request, response=response)
         now = time.time()
         if (
             self._cached_token is not None
             and now < self._cached_expires_at - _MANAGED_MINT_REFRESH_SKEW_S
         ):
             return self._cached_token
+        if (
+            recover_proxy_auth
+            and self.proxy_auth_failed
+            and self.uses_scoped_credentials
+            and time.monotonic() < self._proxy_recovery_retry_at
+        ):
+            return self._still_valid_cached_token(now)
         try:
             token, expires_at = _mint_managed_owner_token(
                 self._mint_url,
                 self._server_url,
                 self._binding_token,
                 proxy_bearer=self._proxy_bearer,
+                negotiation=self._negotiation,
             )
         except httpx.HTTPStatusError as exc:
             response = exc.response
+            if response.status_code == 426:
+                message = (
+                    "runner credential protocol is incompatible with the server; "
+                    "upgrade the runner before restarting it"
+                )
+                try:
+                    error = response.json().get("error", {})
+                    if error.get("code") == "runner_upgrade_required" and isinstance(
+                        error.get("message"), str
+                    ):
+                        message = error["message"]
+                except (ValueError, AttributeError):
+                    pass
+                self._protocol_failure = (message, response)
+                raise httpx.HTTPStatusError(
+                    message, request=exc.request, response=response
+                ) from exc
+            login_redirect = response.is_redirect and _is_login_redirect_or_unauthorized(response)
             if (
                 response.status_code in (400, 404)
                 or response.is_server_error
-                or (response.is_redirect and _is_login_redirect_or_unauthorized(response))
+                or (login_redirect and not self.uses_scoped_credentials)
             ):
                 # Only treat as a definitive refusal if we have never
                 # successfully minted. A 400/404 mid-session (e.g. during an
@@ -1029,14 +1087,14 @@ class _ManagedMintTokenFactory:
                 # mints for this runner. A 5xx with no cache means an
                 # intermediary (e.g. an Apps relay's Bad Gateway page) is
                 # answering for the mint endpoint; latch declined so
-                # callbacks go out bare instead of failing closed forever.
-                if self._cached_token is None:
+                # legacy callbacks can go bare; scoped callbacks stay closed.
+                if self._cached_token is None and not self.uses_scoped_credentials:
                     self.declined = True
                     self.declined_by_server_error = response.is_server_error
                     return None
                 return self._still_valid_cached_token(now)
-            if response.status_code in (401, 403):
-                if self._proxy_bearer is None:
+            if response.status_code in (401, 403) or login_redirect:
+                if self._proxy_bearer is None and not self.uses_scoped_credentials:
                     # A successful mint would have promoted a bearer, so
                     # nothing expired: the server will not mint for us yet.
                     self.declined = True
@@ -1050,6 +1108,8 @@ class _ManagedMintTokenFactory:
                 cached = self._still_valid_cached_token(now)
                 if cached is None:
                     self.proxy_auth_failed = True
+                    if recover_proxy_auth and self.uses_scoped_credentials:
+                        return self._recover_proxy_auth_locked()
                 return cached
             return self._still_valid_cached_token(now)
         except (httpx.HTTPError, ValueError, KeyError, OSError):
@@ -1057,12 +1117,35 @@ class _ManagedMintTokenFactory:
             # it is still valid; otherwise report "no token" and let the
             # tunnel's / HTTP client's on-401 retry drive the next mint.
             return self._still_valid_cached_token(now)
+        self.proxy_auth_failed = False
+        self._proxy_recovery_retry_at = 0.0
         self._cached_token = token
         self._cached_expires_at = expires_at
         # Promote the minted JWT to proxy bearer so subsequent refreshes
         # through the Apps proxy are authenticated with a valid credential.
         self._proxy_bearer = token
         return token
+
+    def _recover_proxy_auth_locked(self) -> str | None:
+        """Reuse the admission source and bound discovery after failed recovery."""
+        try:
+            try:
+                if self._admission_factory is None:
+                    self._admission_factory = _make_auth_token_factory(
+                        self._server_url,
+                        _allow_initial_token=False,
+                        _allow_delegated_mint=False,
+                    )
+                admission_token = self._admission_factory() if self._admission_factory else None
+            except (ValueError, OSError, ImportError, httpx.HTTPError):
+                return None
+            if not admission_token:
+                return None
+            self._proxy_bearer = admission_token
+            return self._call_locked(recover_proxy_auth=False)
+        finally:
+            if self.proxy_auth_failed:
+                self._proxy_recovery_retry_at = time.monotonic() + _AUTH_DISCOVERY_RETRY_INTERVAL_S
 
     def call_with_declined(self) -> tuple[str | None, bool]:
         """Return ``(token, declined)`` as one atomic snapshot.
@@ -1120,6 +1203,7 @@ def _mint_managed_owner_token(
     binding_token: str,
     *,
     proxy_bearer: str | None = None,
+    negotiation: _RunnerCredentialNegotiation | None = None,
 ) -> tuple[str, float]:
     """Mint one managed-runner owner JWT from the server.
 
@@ -1132,6 +1216,7 @@ def _mint_managed_owner_token(
         in front of the Omnigent server. The proxy requires a valid
         ``Authorization`` header even on unauthenticated-to-Omnigent
         endpoints; the binding token alone is not enough to pass it.
+    :param negotiation: Protocol selection retained across this factory's refreshes.
     :returns: ``(jwt, expires_at_epoch_seconds)``.
     :raises httpx.HTTPError: On network failure or a non-2xx response.
     :raises KeyError: If the response is missing the expected fields.
@@ -1141,6 +1226,7 @@ def _mint_managed_owner_token(
     from omnigent.cli_auth import databricks_request_headers
     from omnigent.runner.identity import (
         OMNIGENT_INTERNAL_WS_ORIGIN,
+        RUNNER_CREDENTIAL_PROTOCOL_HEADER,
         RUNNER_TUNNEL_TOKEN_HEADER,
     )
 
@@ -1150,10 +1236,17 @@ def _mint_managed_owner_token(
         **databricks_request_headers(server_url, bearer_token=proxy_bearer),
     }
     with httpx.Client(timeout=10.0, trust_env=not is_loopback_url(server_url)) as client:
+        negotiation = negotiation or _RunnerCredentialNegotiation()
+        protocol = negotiation.select(client, mint_url, headers)
+        if protocol is not None:
+            headers[RUNNER_CREDENTIAL_PROTOCOL_HEADER] = protocol
         response = client.post(mint_url, headers=headers)
         response.raise_for_status()
         payload = response.json()
-    return payload["token"], float(payload["expires_at"])
+    token, expires_at = payload["token"], float(payload["expires_at"])
+    # Keep the accepted request protocol; old servers may still issue a legacy token.
+    negotiation.selected = True
+    return token, expires_at
 
 
 def _runner_tunnel_binding_token_from_env() -> str | None:

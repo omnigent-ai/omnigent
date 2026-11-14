@@ -208,20 +208,22 @@ def test_read_relay_policy_config_returns_none_when_session_id_absent(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("instruction_spec", "env_denylist", "expected_env_unset"),
+    ("instruction_spec", "env_denylist", "expected_env_unset", "confined"),
     [
-        ("missing", None, []),
+        ("missing", None, [], False),
         (
             "missing",
             " OPENAI_API_KEY,ANTHROPIC_AUTH_TOKEN,OPENAI_API_KEY, ",
             ["ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"],
+            False,
         ),
-        ("empty", None, []),
-        ("raw", None, []),
-        ("resolved", None, []),
-        ("resolved-replace", None, []),
-        ("sdk-missing-replace", None, []),
-        ("resolved-sdk-empty-replace", None, []),
+        ("empty", None, [], False),
+        ("raw", None, [], False),
+        ("resolved", None, [], False),
+        ("resolved-replace", None, [], False),
+        ("sdk-missing-replace", None, [], False),
+        ("resolved-sdk-empty-replace", None, [], False),
+        ("resolved", None, [], True),
     ],
 )
 async def test_auto_create_pi_terminal_launches_required_terminal(
@@ -229,6 +231,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     monkeypatch: pytest.MonkeyPatch,
     env_denylist: str | None,
     expected_env_unset: list[str],
+    confined: bool,
     instruction_spec: str,
 ) -> None:
     """Launch a required terminal with session-local authored instructions.
@@ -240,7 +243,16 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     import omnigent.harnesses.pi_native.credentials as pi_native_credentials
     import omnigent.harnesses.pi_native.main as pi_native
     import omnigent.runner.app as runner_app_mod
+    from omnigent.server.oidc import mint_session_token
 
+    token = mint_session_token(
+        "alice",
+        b"test-only-secret" * 3,
+        1800,
+        "accounts",
+        extra_claims={"scope": "runner", "runner_id": "runner_test"} if confined else None,
+    )
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: lambda: token)
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
     if env_denylist is None:
         monkeypatch.delenv("OMNIGENT_PI_ENV_UNSET", raising=False)
@@ -278,7 +290,6 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     async def _supervise(bridge_dir: Path, url: str) -> None:
         supervised.append((bridge_dir, url))
 
-    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: lambda: "tok")
     monkeypatch.setattr(
         "omnigent.harnesses.pi_native.auth_refresh.supervise_pi_auth_refresh", _supervise
     )
@@ -376,6 +387,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     )
     tool_names = {tool["name"] for tool in config["tools"]}
     assert {"list_comments", "sys_session_list"} <= tool_names
+    assert ("sys_agent_list" in tool_names) is not confined
     # The fresh terminal is surfaced on the live stream for the Terminal toggle.
     assert any(evt.get("type") == "session.resource.created" for evt in published)
     task = runner_app_mod._AUTO_FORWARDER_TASKS.pop("47f049b9d13df4db397c7f46859b825f")

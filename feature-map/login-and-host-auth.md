@@ -54,6 +54,28 @@ be able to write resources without a separate Omnigent account.
   fails with the login command instead. States: missing Databricks SDK extra,
   missing Databricks CLI, first browser login followed by host registration,
   and a saved login reused on the next invocation.
+- `delegated-runner-credentials`: accounts/OIDC runners announcing `scoped-v1` use
+  credentials confined to their own session tree. Legacy issuance remains
+  enabled through 0.20.x unless disabled by the operator; removal is planned
+  for 0.21.0. Scheduled-task tools, `sys_agent_list`, `sys_project_list`,
+  `sys_project_update`, and `sys_session_share` are hidden, global session listing
+  is empty, and host readiness is unavailable.
+  Hosts and interactive user clients keep their own authority. States: own
+  callback succeeds, another runner's session is denied, permission denials do
+  not renew credentials, shared-agent writes and session deletion are denied,
+  forks retain their source project, child and descendant listings hide foreign
+  branches behind opaque cursors, sidebar families require interactive credentials,
+  and native approval cards and cleanup stay within the runner's scope.
+  Strict mode rejects incompatible runners
+  until they are upgraded. New named child spawns on supporting servers reserve
+  before first-input admission; failed pending attempts can be aborted, while
+  admitted or uncertain work is retained. Abandoned reservations become eligible
+  for expiry after 24 hours without extending the lifetime on retries.
+  Header/proxy
+  providers decline minting without interrupting binding-token callbacks.
+  Credential discovery prefers advertised scoped support; legacy custom
+  providers work only when legacy issuance is advertised. A scoped selection
+  persists through renewal, and a refused scoped request never retries legacy.
 - `desktop-ssh-connect`: in the desktop app (macOS and Linux), **Connect a host**
   connects a machine the user reaches over SSH. The app runs the system `ssh`
   with the user's config, runs `omnigent login` there with the sign-in callback
@@ -141,6 +163,9 @@ menu, and **Sign out of <server>** in the sidebar server picker.
 application's provider and stores, then use its authenticated REST client to
 create a project, rename it, reorder projects, and read the result back.
 This entry point has no CLI login step.
+
+**Delegated runner:** a host launches a session on an accounts/OIDC server;
+SDK tools, native relays, and Pi discovery use the delegated capability.
 
 ## Driving it with the repro environment
 
@@ -264,6 +289,29 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   foreground positional `host <url> --no-open`; `host --server`, background
   host/start, system services, and desktop/mobile onboarding are separate entry
   points and are not proved by that recording.
+- **`delegated-runner-credentials` (own environment):**
+  `tests/e2e/test_managed_runner_http_auth.py::test_managed_runner_callback_authenticates_end_to_end`
+  uses a real accounts server and runner outbound auth client. Its callback succeeds;
+  account and host requests receive scope-denied errors. Component coverage:
+  `tests/server/test_account_revocation.py::test_runner_token_is_confined_to_its_runner_sessions`
+  checks rebound children and approvals;
+  `tests/runner/test_comment_relay.py::test_relay_refreshes_tools_when_bearer_becomes_confined`
+  checks native tool discovery after renewal.
+  `tests/server/test_accounts.py::test_mint_runner_token_round_trips_to_owner`
+  covers accounts and OIDC minting; the tunnel route tests cover compatibility
+  and strict-mode negotiation. This does not run a live OIDC
+  provider, every harness, or an older deployed runner. The header-mode repro
+  environment cannot establish accounts/OIDC confinement.
+  Pending-child component coverage:
+  `tests/server/integration/test_sessions_subagent_context.py::test_pending_child_http_protocol`
+  runs the runner tool through the registered app routes, real capability probe,
+  isolated stores and mocked authenticated runner identity.
+  `tests/stores/test_session_spawn_store.py::test_abort_and_first_input_cannot_both_win`
+  covers admission versus explicit abort or expiry;
+  `tests/stores/test_session_spawn_store.py::test_global_pending_expiry_is_bounded_and_survives_revocation`
+  covers expiry after parent/account revocation with shared files preserved.
+  These are isolated protocol checks, not live identity-provider or vendor-runtime
+  evidence.
 - **`embedded-resource-write` (in-process app and real stores):**
   `tests/server/test_external_account_authority.py::test_custom_auth_project_routes_without_users`.
   Run with plain `uv run pytest`; it constructs `create_app` with a custom

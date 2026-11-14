@@ -67,6 +67,12 @@ from omnigent.models.model_override import (
 from omnigent.native.native_coding_agents import public_agent_name
 from omnigent.policies.builtins.safety import scheduled_task_review_error
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+from omnigent.runner.pending_spawns import (
+    PendingSpawnAttempt,
+    PendingSpawnError,
+    PendingSpawnNameConflict,
+    prepare_pending_spawn,
+)
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
@@ -462,6 +468,25 @@ _SCHEDULED_TASK_TOOLS = frozenset(
     }
 )
 
+_ACCOUNT_WIDE_TOOLS = _SCHEDULED_TASK_TOOLS | {
+    "sys_agent_list",
+    "sys_session_share",
+    "sys_project_list",
+    "sys_project_update",
+}
+
+
+def runner_uses_confined_bearer(server_client: httpx.AsyncClient | None) -> bool:
+    """Read the last authenticated bearer's capability without refreshing it."""
+    auth = getattr(server_client, "auth", None)
+    return getattr(auth, "runner_confined", False) is True
+
+
+def strip_account_tool_schemas(schemas: list[_JsonObject]) -> list[_JsonObject]:
+    """Hide tools requiring account-wide authority from confined runners."""
+    return _strip_tool_schemas(schemas, _ACCOUNT_WIDE_TOOLS)
+
+
 # Priority 5m: Embedded-browser tools.
 # Runner dispatch POSTs a blocking action request to the server, which parks a
 # Future + publishes ``browser.action_request`` on the session stream; the
@@ -547,19 +572,25 @@ def strip_browser_tool_schemas(schemas: list[_JsonObject]) -> list[_JsonObject]:
     :param schemas: Tool schemas in either supported shape.
     :returns: The same list minus any ``browser_*`` entries.
     """
+    return _strip_tool_schemas(schemas, _BROWSER_TOOLS)
+
+
+def _strip_tool_schemas(schemas: list[_JsonObject], names: frozenset[str]) -> list[_JsonObject]:
     kept: list[_JsonObject] = []
     for schema in schemas:
         name: object = schema.get("name")
         if not isinstance(name, str):
             function = _string_object_dict(schema.get("function"))
             name = function.get("name") if function is not None else None
-        if isinstance(name, str) and name in _BROWSER_TOOLS:
+        if isinstance(name, str) and name in names:
             continue
         kept.append(schema)
     return kept
 
 
-def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]:
+def build_native_relay_tool_schemas(
+    spec: AgentSpec | None, *, runner_confined: bool = False
+) -> list[_JsonObject]:
     """Build the flat Omnigent tool surface for native harness bridges.
 
     Returns the same tool set the claude-native / codex-native relay advertises
@@ -576,6 +607,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     :param spec: The session's resolved agent spec. ``None`` falls back to the
         always-on read/discovery surface (never the opt-in spawn writes, whose
         gate can't be evaluated without the spec), mirroring the relay.
+    :param runner_confined: Hide tools requiring account-wide credentials.
     :returns: Flat tool schemas for native bridges.
     """
     from omnigent.tools.builtins.agents import (
@@ -656,7 +688,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
         if function is not None:
             _append(function)
 
-    return schemas
+    return strip_account_tool_schemas(schemas) if runner_confined else schemas
 
 
 # sys_agent_list: locally-authored agent config YAMLs live under this
@@ -1996,6 +2028,7 @@ async def _teardown_failed_child(
     child_session_id: str,
     *,
     created_child: bool,
+    pending_attempt: PendingSpawnAttempt | None = None,
 ) -> str | None:
     """Undo a failed named-send spawn so it leaves no phantom behind.
 
@@ -2015,6 +2048,18 @@ async def _teardown_failed_child(
     """
     from omnigent.runner import subagent_work as _subagent_work
 
+    if pending_attempt is not None:
+        if await pending_attempt.abort(server_client):
+            _subagent_work.unregister_child_session(child_session_id)
+            _subagent_work.unregister_subagent_work(child_session_id)
+            return None
+        return f"Warning: {pending_attempt.retained_message()} Work handle retained."
+    if runner_uses_confined_bearer(server_client):
+        return (
+            f"Warning: retained child session {child_session_id!r} and its work handle. "
+            "This server cannot confirm that the child accepted no input; "
+            "inspect its status before retrying the send."
+        )
     entry = _subagent_work.get_subagent_work(child_session_id)
     _subagent_work.unregister_child_session(child_session_id)
     _subagent_work.unregister_subagent_work(child_session_id)
@@ -2132,6 +2177,13 @@ async def _build_subagent_message_content(
     if mapping is None:
         return CopyResult(error="Error: file copy response missing 'mapping'")
 
+    return _subagent_content_from_mapping(message, file_ids, mapping)
+
+
+def _subagent_content_from_mapping(
+    message: str, file_ids: list[str], mapping: _JsonObject
+) -> CopyResult:
+    content: list[_JsonObject] = [{"type": "input_text", "text": str(message)}]
     for old_id in file_ids:
         entry = _string_object_dict(mapping.get(old_id))
         if entry is None:
@@ -2706,6 +2758,7 @@ async def _execute_subagent_tool(
             return existing
     assert not isinstance(existing, str)
     created_child = False
+    pending_attempt: PendingSpawnAttempt | None = None
     child_wrapper_label: str | None = None
     work_id = _subagent_work.new_subagent_work_id()
     if existing is not None:
@@ -2960,111 +3013,145 @@ async def _execute_subagent_tool(
             except ValueError as exc:
                 return f"Error: invalid 'reasoning_effort' from {effort_source}: {exc}"
 
-        # Best-effort retry for auto-ordinal name collisions: a 409 means
-        # another runner (or a restart race) already created a child with
-        # this ordinal. Bump and retry. Not watertight — the server's
-        # (parent, title) check is SELECT-then-INSERT with no DB unique
-        # constraint, so truly concurrent creates can still race past it.
-        _max_ordinal_retries = 5 if _auto_ordinal else 0
-        _create_timeout_exc: httpx.ReadTimeout | None = None
-        resp: httpx.Response | None = None
-        try:
-            for _ordinal_attempt in range(_max_ordinal_retries + 1):
-                resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
-                if (
-                    resp.status_code == 409
-                    and _auto_ordinal
-                    and _ordinal_attempt < _max_ordinal_retries
-                ):
-                    ordinal = _subagent_work.next_subagent_ordinal(
-                        conversation_id,
-                        str(sub_agent_name),
-                    )
-                    session_name = f"{sub_agent_name}-{ordinal}"
-                    create_body["title"] = f"{sub_agent_name}:{session_name}"
-                    continue
-                break
-        except httpx.ReadTimeout as _exc:
-            _create_timeout_exc = _exc
-        if _create_timeout_exc is not None:
-            # The read deadline elapsed after the server may have committed the
-            # child session — child_session_id is unknown to us, but the
-            # (parent, agent, title) triple is. Reconcile: look up the created
-            # child by its expected title so we can reap its process cluster.
-            # Guard the entire reconcile path against further transport errors
-            # (the server may still be wedged) so any failure still returns
-            # the descriptive string instead of propagating.
-            _reap_warning: str = ""
+        if runner_uses_confined_bearer(server_client):
             try:
-                _leaked = await _find_existing_child_session(
-                    server_client=server_client,
-                    conversation_id=conversation_id,
-                    agent=str(sub_agent_name),
-                    title=str(session_name),
-                )
-                if isinstance(_leaked, dict):
-                    _leaked_id = _leaked.get("id") or _leaked.get("session_id")
-                    if isinstance(_leaked_id, str) and _leaked_id:
-                        _reap_warning = (
-                            await _teardown_failed_child(
-                                server_client,
-                                _leaked_id,
-                                created_child=True,
-                            )
-                            or ""
+                for attempt_index in range(6 if _auto_ordinal else 1):
+                    try:
+                        pending_attempt = await prepare_pending_spawn(
+                            server_client,
+                            parent_id=conversation_id,
+                            create=create_body,
+                            file_ids=file_ids,
+                            cost_budget=cost_budget,
                         )
-            except Exception:  # noqa: BLE001 — reconcile is best-effort; any transport error still returns the descriptive string
-                pass
-            _suffix = f" {_reap_warning}" if _reap_warning else ""
-            return (
-                f"Error: timed out waiting for child session create response "
-                f"({sub_agent_name!r} / {session_name!r}); the server may have "
-                f"committed the session — reaping any orphaned cluster.{_suffix} "
-                "Retry the same send to continue in a fresh child."
-            )
-        if resp is None or resp.status_code >= 400:
-            status = resp.status_code if resp is not None else 0
-            text = resp.text[:200] if resp is not None else "(no response)"
-            return f"Error: failed to create child session: {status} {text}"
-        child_data = _string_object_dict(resp.json())
-        if child_data is None:
-            return "Error: server returned malformed child session data"
-        child_session_id = child_data.get("session_id") or child_data.get("id")
-        if not isinstance(child_session_id, str) or not child_session_id:
-            return "Error: server did not return child session_id"
-        child_wrapper_label = _session_wrapper_label(child_data)
-        created_child = True
-
-        # Attach a subagent_cost_budget policy to the child when requested.
-        # Non-fatal: the child session is still usable without the budget.
-        if cost_budget is not None:
-            policy_body = {
-                "name": "__subagent_cost_budget",
-                "type": "python",
-                "handler": "omnigent.policies.builtins.cost.subagent_cost_budget",
-                "factory_params": cost_budget,  # Dict with max_cost_usd and/or ask_thresholds_usd
-                "enabled": True,
-            }
+                        break
+                    except PendingSpawnNameConflict:
+                        if not _auto_ordinal or attempt_index == 5:
+                            raise
+                        ordinal = _subagent_work.next_subagent_ordinal(
+                            conversation_id, str(sub_agent_name)
+                        )
+                        session_name = f"{sub_agent_name}-{ordinal}"
+                        create_body["title"] = f"{sub_agent_name}:{session_name}"
+            except PendingSpawnError as exc:
+                return f"Error: failed to prepare child session: {exc}"
+        if pending_attempt is not None:
+            assert pending_attempt.child_id is not None
+            child_session_id = pending_attempt.child_id
+            child_wrapper_label = _session_wrapper_label(pending_attempt.data or {})
+            created_child = True
+        else:
+            # Best-effort retry for auto-ordinal name collisions: a 409 means
+            # another runner (or a restart race) already created a child with
+            # this ordinal. Bump and retry. Not watertight — the server's
+            # (parent, title) check is SELECT-then-INSERT with no DB unique
+            # constraint, so truly concurrent creates can still race past it.
+            _max_ordinal_retries = 5 if _auto_ordinal else 0
+            _create_timeout_exc: httpx.ReadTimeout | None = None
+            resp: httpx.Response | None = None
             try:
-                pol_resp = await server_client.post(
-                    f"{_session_url(child_session_id)}/policies",
-                    json=policy_body,
-                    timeout=10.0,
-                )
-                if pol_resp.status_code >= 400:
-                    _logger.warning(
-                        "failed to set subagent_cost_budget policy on child %s: %s %s",
-                        child_session_id,
-                        pol_resp.status_code,
-                        pol_resp.text[:200],
+                for _ordinal_attempt in range(_max_ordinal_retries + 1):
+                    resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
+                    if (
+                        resp.status_code == 409
+                        and _auto_ordinal
+                        and _ordinal_attempt < _max_ordinal_retries
+                    ):
+                        ordinal = _subagent_work.next_subagent_ordinal(
+                            conversation_id,
+                            str(sub_agent_name),
+                        )
+                        session_name = f"{sub_agent_name}-{ordinal}"
+                        create_body["title"] = f"{sub_agent_name}:{session_name}"
+                        continue
+                    break
+            except httpx.ReadTimeout as _exc:
+                _create_timeout_exc = _exc
+            if _create_timeout_exc is not None:
+                if runner_uses_confined_bearer(server_client):
+                    return (
+                        "Error: timed out waiting for child session creation; "
+                        f"the outcome of dispatch {work_id!r} is unknown. "
+                        "The server may have created the child. Inspect the parent's "
+                        "child sessions before retrying; automatic cleanup is unavailable."
                     )
-            except httpx.HTTPError:
-                _logger.warning(
-                    "failed to set subagent_cost_budget policy on child %s",
-                    child_session_id,
-                    exc_info=True,
+                # The read deadline elapsed after the server may have committed the
+                # child session — child_session_id is unknown to us, but the
+                # (parent, agent, title) triple is. Reconcile: look up the created
+                # child by its expected title so we can reap its process cluster.
+                # Guard the entire reconcile path against further transport errors
+                # (the server may still be wedged) so any failure still returns
+                # the descriptive string instead of propagating.
+                _reap_warning: str = ""
+                try:
+                    _leaked = await _find_existing_child_session(
+                        server_client=server_client,
+                        conversation_id=conversation_id,
+                        agent=str(sub_agent_name),
+                        title=str(session_name),
+                    )
+                    if isinstance(_leaked, dict):
+                        _leaked_id = _leaked.get("id") or _leaked.get("session_id")
+                        if isinstance(_leaked_id, str) and _leaked_id:
+                            _reap_warning = (
+                                await _teardown_failed_child(
+                                    server_client,
+                                    _leaked_id,
+                                    created_child=True,
+                                )
+                                or ""
+                            )
+                except Exception:  # noqa: BLE001 — reconcile is best-effort; any transport error still returns the descriptive string
+                    pass
+                _suffix = f" {_reap_warning}" if _reap_warning else ""
+                return (
+                    f"Error: timed out waiting for child session create response "
+                    f"({sub_agent_name!r} / {session_name!r}); the server may have "
+                    f"committed the session — reaping any orphaned cluster.{_suffix} "
+                    "Retry the same send to continue in a fresh child."
                 )
+            if resp is None or resp.status_code >= 400:
+                status = resp.status_code if resp is not None else 0
+                text = resp.text[:200] if resp is not None else "(no response)"
+                return f"Error: failed to create child session: {status} {text}"
+            child_data = _string_object_dict(resp.json())
+            if child_data is None:
+                return "Error: server returned malformed child session data"
+            child_session_id = child_data.get("session_id") or child_data.get("id")
+            if not isinstance(child_session_id, str) or not child_session_id:
+                return "Error: server did not return child session_id"
+            child_wrapper_label = _session_wrapper_label(child_data)
+            created_child = True
 
+            # Attach a subagent_cost_budget policy to the child when requested.
+            # Non-fatal: the child session is still usable without the budget.
+            if cost_budget is not None:
+                policy_body = {
+                    "name": "__subagent_cost_budget",
+                    "type": "python",
+                    "handler": "omnigent.policies.builtins.cost.subagent_cost_budget",
+                    "factory_params": cost_budget,
+                    "enabled": True,
+                }
+                try:
+                    pol_resp = await server_client.post(
+                        f"{_session_url(child_session_id)}/policies",
+                        json=policy_body,
+                        timeout=10.0,
+                    )
+                    if pol_resp.status_code >= 400:
+                        _logger.warning(
+                            "failed to set subagent_cost_budget policy on child %s: %s %s",
+                            child_session_id,
+                            pol_resp.status_code,
+                            pol_resp.text[:200],
+                        )
+                except httpx.HTTPError:
+                    _logger.warning(
+                        "failed to set subagent_cost_budget policy on child %s",
+                        child_session_id,
+                        exc_info=True,
+                    )
     # Publish session.created on the parent's SSE stream so the
     # REPL debug panel and any client subscribers discover the
     # child session. SSE-only (transient); durability comes from
@@ -3141,18 +3228,27 @@ async def _execute_subagent_tool(
     # On copy failure we surface the error to the parent and post no
     # event — but first undo the registrations made above so a failed
     # spawn doesn't leak a phantom child.
-    copy_result = await _build_subagent_message_content(
-        message,
-        file_ids,
-        child_session_id=child_session_id,
-        parent_session_id=conversation_id,
-        server_client=server_client,
-    )
+    if pending_attempt is not None:
+        mapping = _string_object_dict((pending_attempt.data or {}).get("files"))
+        copy_result = (
+            _subagent_content_from_mapping(message, file_ids, mapping)
+            if mapping is not None
+            else CopyResult(error="Error: pending spawn has no file mapping")
+        )
+    else:
+        copy_result = await _build_subagent_message_content(
+            message,
+            file_ids,
+            child_session_id=child_session_id,
+            parent_session_id=conversation_id,
+            server_client=server_client,
+        )
     if copy_result.error is not None:
         teardown_warning = await _teardown_failed_child(
             server_client,
             child_session_id,
             created_child=created_child,
+            pending_attempt=pending_attempt,
         )
         if teardown_warning is not None:
             return f"{copy_result.error}\n{teardown_warning}"
@@ -3164,27 +3260,44 @@ async def _execute_subagent_tool(
     # post_event forwards it to the runner and starts the child
     # turn.
     try:
-        msg_resp = await _post_child_message_event(
-            server_client,
-            child_session_id,
-            content=message_content,
-            created_by=dispatch_created_by,
-        )
-    except httpx.HTTPError as exc:
+        if pending_attempt is not None:
+            await pending_attempt.admit(server_client, message_content)
+            msg_resp = None
+        else:
+            msg_resp = await _post_child_message_event(
+                server_client,
+                child_session_id,
+                content=message_content,
+                created_by=dispatch_created_by,
+            )
+    except asyncio.CancelledError:
+        if pending_attempt is not None:
+            await asyncio.shield(
+                _teardown_failed_child(
+                    server_client,
+                    child_session_id,
+                    created_child=created_child,
+                    pending_attempt=pending_attempt,
+                )
+            )
+        raise
+    except (httpx.HTTPError, PendingSpawnError) as exc:
         teardown_warning = await _teardown_failed_child(
             server_client,
             child_session_id,
             created_child=created_child,
+            pending_attempt=pending_attempt,
         )
         error = f"Error: failed to send message to child: {type(exc).__name__}: {exc}"
         if teardown_warning is not None:
             return f"{error}\n{teardown_warning}"
         return error
-    if msg_resp.status_code >= 400:
+    if msg_resp is not None and msg_resp.status_code >= 400:
         teardown_warning = await _teardown_failed_child(
             server_client,
             child_session_id,
             created_child=created_child,
+            pending_attempt=pending_attempt,
         )
         error = (
             f"Error: failed to send message to child: {msg_resp.status_code} {msg_resp.text[:200]}"
@@ -5579,7 +5692,7 @@ async def _host_harnesses_or_none(
     server_client: httpx.AsyncClient,
 ) -> _JsonObject | None:
     """Return the bound host's reported harness readiness, best-effort."""
-    if not host_id:
+    if not host_id or runner_uses_confined_bearer(server_client):
         return None
     try:
         resp = await server_client.get(f"/v1/hosts/{host_id}", timeout=30.0)
@@ -6548,6 +6661,7 @@ async def _session_list_via_rest(
     sessions_page = (
         _DiscoveryPage([], False)
         if cursor_state["sessions"][0] == _DISCOVERY_END
+        or runner_uses_confined_bearer(server_client)
         else await _collect_global_sessions(
             server_client,
             agent_name,
@@ -7408,6 +7522,13 @@ async def execute_tool(
     if error is not None:
         return json.dumps({"error": error})
     assert args is not None
+    if tool_name in _ACCOUNT_WIDE_TOOLS and runner_uses_confined_bearer(server_client):
+        return json.dumps(
+            {
+                "error": f"{tool_name} requires interactive user credentials; "
+                "it is unavailable to a runner-confined bearer"
+            }
+        )
     # MCP dispatch resolves the target against the spec inside the MCP
     # manager; every other branch is gated on the spec's granted surface.
     if mcp_manager is None:

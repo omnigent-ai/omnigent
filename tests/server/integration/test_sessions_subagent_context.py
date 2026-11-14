@@ -21,6 +21,7 @@ no runner bound, no LLM):
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 from collections.abc import AsyncIterator
@@ -888,3 +889,513 @@ async def test_codex_subagent_child_routes_like_its_parent_across_replicas(
             await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
         with contextlib.suppress(Exception):
             await communicator.wait(timeout=budget(2.0))
+
+
+async def test_pending_named_child_preparation_reuses_validation_without_persistence(
+    replica_lag_client: httpx.AsyncClient,
+    replica_lag_app: FastAPI,
+    replica_lag_store: _ReplicaLagConversationStore,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import Mock
+
+    from starlette.requests import Request
+
+    from omnigent.errors import OmnigentError
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.schemas import SessionCreateRequest
+
+    parent_id, agent_id = await _upload_bundled_agent_session(
+        replica_lag_client, headers={"X-Forwarded-Email": _OWNER}, sub_agents=["worker"]
+    )
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    cache = AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "prepare_cache")
+    create = Mock(side_effect=AssertionError("preparation must not persist a child"))
+    monkeypatch.setattr(replica_lag_store, "create_conversation", create)
+    record_profile = AsyncMock(side_effect=AssertionError("preparation must not bind a profile"))
+    monkeypatch.setattr(orchestration, "record_profile", record_profile)
+    request = Request({"type": "http", "app": replica_lag_app, "headers": []})
+    payload = {
+        "agent_id": agent_id,
+        "parent_session_id": parent_id,
+        "sub_agent_name": "worker",
+        "title": "worker:pending",
+    }
+
+    async def prepare(values):
+        return await orchestration._create_session_from_existing_agent(
+            replica_lag_store,
+            SqlAlchemyAgentStore(db_uri),
+            None,
+            SessionCreateRequest.model_validate(values),
+            request,
+            agent_cache=cache,
+            user_id=_OWNER,
+            permission_store=SqlAlchemyPermissionStore(db_uri),
+            artifact_store=artifacts,
+            _prepare_named_child=True,
+        )
+
+    prepared = await prepare(payload)
+    assert isinstance(prepared, orchestration.PreparedNamedChild)
+    assert prepared.create_arguments["parent_conversation_id"] == parent_id
+    assert prepared.create_arguments["agent_id"] == agent_id
+    assert prepared.create_arguments["sub_agent_name"] == "worker"
+    with pytest.raises(OmnigentError, match="named child"):
+        await prepare({**payload, "workspace": "/caller-selected"})
+    with pytest.raises(OmnigentError):
+        await prepare({**payload, "sub_agent_name": "undeclared"})
+    create.assert_not_called()
+    record_profile.assert_not_awaited()
+    assert replica_lag_store.list_child_conversation_ids_by_parent([parent_id]) == {parent_id: []}
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        None,
+        "agent-version",
+        "extra-file",
+        "late-file",
+        "late-binding",
+        "late-owner",
+        "late-parent-grant",
+        "late-agent-version",
+    ],
+)
+async def test_pending_child_activation_revalidates_prepared_state(
+    replica_lag_client: httpx.AsyncClient,
+    replica_lag_app: FastAPI,
+    replica_lag_store: _ReplicaLagConversationStore,
+    db_uri: str,
+    tmp_path: Path,
+    change: str | None,
+) -> None:
+    from unittest.mock import Mock
+    from uuid import uuid4
+
+    from starlette.requests import Request
+
+    from omnigent.db.db_models import (
+        SqlConversationMetadata,
+        SqlSessionPermission,
+        current_workspace_id,
+    )
+    from omnigent.server.host_registry import HostRegistry
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.schemas import SessionCreateRequest
+    from omnigent.server.session_spawn_activation import SessionSpawnActivator
+    from omnigent.server.session_spawns import SessionSpawnCoordinator
+    from omnigent.server.startup_inputs import ManagedStartupInputs, initial_input_id
+    from omnigent.stores.conversation_store import PENDING_INPUT_RESPONSE_ID
+    from omnigent.stores.session_spawn_store import (
+        SpawnAuthorityError,
+        SpawnConflictError,
+        SpawnIdentity,
+        SpawnPhase,
+    )
+
+    parent_id, agent_id = await _upload_bundled_agent_session(
+        replica_lag_client, headers={"X-Forwarded-Email": _OWNER}, sub_agents=["worker"]
+    )
+    replica_lag_store.set_runner_id(parent_id, "creator-runner")
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    files = SqlAlchemyFileStore(db_uri)
+    agents = SqlAlchemyAgentStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    cache = AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "activation_cache")
+    request = Request({"type": "http", "app": replica_lag_app, "headers": []})
+    prepared = await orchestration._create_session_from_existing_agent(
+        replica_lag_store,
+        agents,
+        None,
+        SessionCreateRequest(
+            agent_id=agent_id,
+            parent_session_id=parent_id,
+            sub_agent_name="worker",
+            title="worker:pending",
+        ),
+        request,
+        agent_cache=cache,
+        user_id=_OWNER,
+        permission_store=permissions,
+        artifact_store=artifacts,
+        _prepare_named_child=True,
+    )
+    assert isinstance(prepared, orchestration.PreparedNamedChild)
+    startup = ManagedStartupInputs(replica_lag_store, HostRegistry())
+    startup.dispatch = AsyncMock()
+    activate = SessionSpawnActivator(
+        replica_lag_app, replica_lag_store, agents, cache, permissions, files, artifacts
+    )
+
+    async def activate_then_change(receipt, child):
+        checked = await activate(receipt, child)
+        if change == "late-file":
+            files.create("late.txt", 1, session_id=receipt.child_id)
+        elif change == "late-binding":
+            with replica_lag_store._session_immediate("inject_changed_spawn_binding") as session:
+                metadata = session.get(
+                    SqlConversationMetadata, (current_workspace_id(), receipt.child_id)
+                )
+                metadata.runner_id = "replacement-runner"
+        elif change == "late-owner":
+            permissions.revoke(_OWNER, receipt.child_id)
+        elif change == "late-agent-version":
+            agent = agents.get(agent_id)
+            agents.update(agent_id, agent.bundle_location, created_by=_OWNER)
+        elif change == "late-parent-grant":
+            assert permissions.resolve_access(_OWNER, parent_id).user_grant_level is not None
+            SqlAlchemyPermissionStore(db_uri).revoke(_OWNER, parent_id)
+            assert permissions.resolve_access(_OWNER, parent_id).user_grant_level is not None
+        return checked
+
+    coordinator = SessionSpawnCoordinator(
+        replica_lag_store,
+        startup,
+        activate=activate_then_change,
+        check_current_access=activate.check_parent_access,
+        cleanup_blob=Mock(),
+        artifact_store=artifacts,
+    )
+    identity = SpawnIdentity("creator-runner", parent_id, _OWNER)
+    source = files.create("note.txt", 4, session_id=parent_id)
+    artifacts.put(source.blob_key or source.id, b"note")
+    spawns = coordinator.spawns
+    receipt = spawns.reserve(
+        identity,
+        uuid4().hex,
+        epoch=spawns.current_epoch(identity),
+        title="worker:pending",
+        create_payload=prepared.to_payload(),
+        source_file_ids=(source.id,),
+        max_file_bytes=1024,
+    )
+    first = NewConversationItem(
+        stable_id=initial_input_id(receipt.child_id),
+        type="message",
+        status="in_progress",
+        response_id=PENDING_INPUT_RESPONSE_ID,
+        created_by=_OWNER,
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "first"}]),
+    )
+    receipt = spawns.admit(
+        identity, receipt.nonce, first.model_dump(mode="json"), epoch=receipt.epoch
+    )
+    try:
+        await coordinator.advance(replica_lag_app, receipt)
+        if change == "agent-version":
+            agent = agents.get(agent_id)
+            agents.update(agent_id, agent.bundle_location, created_by=_OWNER)
+        elif change == "extra-file":
+            files.create("unexpected.txt", 1, session_id=receipt.child_id)
+        if change is not None:
+            with pytest.raises((SpawnConflictError, SpawnAuthorityError)):
+                await coordinator.advance(replica_lag_app, receipt)
+            assert replica_lag_store.spawn_activation_pending(receipt.child_id)
+            if change not in (
+                "late-file",
+                "late-binding",
+                "late-parent-grant",
+                "late-agent-version",
+            ):
+                with replica_lag_store._session("inspect_absent_failed_spawn_owner") as session:
+                    assert (
+                        session.get(
+                            SqlSessionPermission,
+                            (current_workspace_id(), _OWNER, receipt.child_id),
+                        )
+                        is None
+                    )
+            if change == "late-parent-grant":
+                with pytest.raises(SpawnAuthorityError):
+                    spawns.get(identity, receipt.nonce, epoch=receipt.epoch)
+            else:
+                assert (
+                    spawns.get(identity, receipt.nonce, epoch=receipt.epoch).phase
+                    == SpawnPhase.ACTIVATE
+                )
+        else:
+            await coordinator.advance(replica_lag_app, receipt)
+            assert not replica_lag_store.spawn_activation_pending(receipt.child_id)
+            child = replica_lag_store.get_conversation(receipt.child_id)
+            await activate(receipt, child)
+            items = replica_lag_store.list_items(receipt.child_id).data
+            assert len([item for item in items if item.type == "resource_event"]) == 1
+        startup.dispatch.assert_not_awaited()
+        assert len(replica_lag_store.list_pending_inputs(receipt.child_id)) == 1
+    finally:
+        await startup.shutdown()
+
+
+@pytest.mark.parametrize(
+    "outcome", ["admit", "budget", "runner", "abort", "changed-source", "unconfined", "rebound"]
+)
+async def test_pending_child_http_protocol(
+    replica_lag_client: httpx.AsyncClient,
+    replica_lag_app: FastAPI,
+    replica_lag_store: _ReplicaLagConversationStore,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    from uuid import uuid4
+
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.server.auth import (
+        RunnerTokenConfinement,
+        UnifiedAuthProvider,
+        runner_session_in_scope,
+    )
+    from omnigent.server.host_registry import HostRegistry
+    from omnigent.server.routes.sessions import routes_spawns
+    from omnigent.server.session_spawn_activation import SessionSpawnActivator
+    from omnigent.server.session_spawns import SessionSpawnCoordinator
+    from omnigent.server.startup_inputs import ManagedStartupInputs, initial_input_id
+    from omnigent.stores.session_spawn_store import SpawnIdentity
+
+    parent_id, agent_id = await _upload_bundled_agent_session(
+        replica_lag_client, headers={"X-Forwarded-Email": _OWNER}, sub_agents=["worker"]
+    )
+    replica_lag_store.set_runner_id(parent_id, "creator-runner")
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    files = SqlAlchemyFileStore(db_uri)
+    agents = SqlAlchemyAgentStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    cache = AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "protocol_cache")
+    startup = ManagedStartupInputs(replica_lag_store, HostRegistry())
+    startup.dispatch = AsyncMock()
+    coordinator = SessionSpawnCoordinator(
+        replica_lag_store,
+        startup,
+        activate=SessionSpawnActivator(
+            replica_lag_app, replica_lag_store, agents, cache, permissions, files, artifacts
+        ),
+        cleanup_blob=artifacts.delete,
+        artifact_store=artifacts,
+    )
+    assert (await replica_lag_client.get("/v1/info")).json()["pending_child_spawn_v1"] is False
+    replica_lag_app.state.session_spawns = coordinator
+    assert (await replica_lag_client.get("/v1/info")).json()["pending_child_spawn_v1"] is True
+    original_get_user = UnifiedAuthProvider.get_user_id
+
+    def authenticated_runner(provider, request):
+        owner = original_get_user(provider, request)
+        if outcome != "unconfined" and request.headers.get("x-spawn-test-runner") == "1":
+            confinement = RunnerTokenConfinement(
+                "creator-runner",
+                lambda runner, session: runner_session_in_scope(
+                    runner, session, replica_lag_store.get_runner_scope
+                ),
+                b"isolated-spawn-test-cursor-secret",
+            )
+            if not confinement.allows_request(request):
+                raise OmnigentError("Test runner scope denied", code=ErrorCode.RUNNER_SCOPE_DENIED)
+            request.scope["omnigent.runner_confinement"] = confinement
+        return owner
+
+    monkeypatch.setattr(UnifiedAuthProvider, "get_user_id", authenticated_runner)
+    source = files.create("note.txt", 4, session_id=parent_id)
+    artifacts.put(source.blob_key or source.id, b"note")
+    headers = {"X-Forwarded-Email": _OWNER, "X-Omnigent-Client": "cli", "X-Spawn-Test-Runner": "1"}
+    path = f"/v1/sessions/{parent_id}/spawns"
+    if outcome == "runner":
+        from types import SimpleNamespace
+
+        from omnigent.runner import subagent_work
+        from omnigent.runner.tool_dispatch import execute_tool
+        from omnigent.stores.session_spawn_store import SpawnPhase, SpawnState
+
+        auth = httpx.Auth()
+        auth.runner_confined = True
+        inbox = asyncio.Queue()
+        subagent_work._session_inboxes_ref[parent_id] = inbox
+        child_id = None
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=replica_lag_app),
+                base_url="http://test",
+                headers=headers,
+                auth=auth,
+            ) as runner_client:
+                output = await execute_tool(
+                    tool_name="sys_session_send",
+                    arguments=json.dumps(
+                        {
+                            "agent": "worker",
+                            "title": "protocol",
+                            "args": {
+                                "input": "first",
+                                "file_ids": [source.id],
+                                "cost_budget": {"max_cost_usd": 2.0},
+                            },
+                        }
+                    ),
+                    server_client=runner_client,
+                    conversation_id=parent_id,
+                    agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="worker")]),
+                    session_inbox=inbox,
+                )
+            assert not output.startswith("Error"), output
+            child_id = json.loads(output)["conversation_id"]
+            [receipt] = coordinator.spawns.list_work(SpawnState.ADMITTED, SpawnPhase.MATERIALIZE)
+            assert receipt.child_id == child_id
+            assert replica_lag_store.get_conversation(child_id) is None
+            assert subagent_work.get_subagent_work(child_id) is not None
+            await coordinator.advance(replica_lag_app, receipt)
+            await coordinator.advance(replica_lag_app, receipt)
+            [first] = replica_lag_store.list_pending_inputs(child_id)
+            assert first.data.content == [
+                {"type": "input_text", "text": "first"},
+                {"type": "input_file", "file_id": receipt.file_mapping[source.id]},
+            ]
+            from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+
+            [policy] = SqlAlchemyPolicyStore(db_uri).list_for_session(child_id)
+            assert policy.factory_params == {"max_cost_usd": 2.0}
+            startup.dispatch.assert_not_awaited()
+            import time
+
+            from omnigent.runtime.policies import builder
+
+            builder._SESSION_POLICY_SPECS_CACHE[child_id] = ([], time.monotonic())
+
+            async def dispatch_with_budget(context, session_id, event):
+                [spec] = builder._load_session_policy_specs(
+                    session_id, SqlAlchemyPolicyStore(db_uri)
+                )
+                assert spec.name == "__subagent_cost_budget"
+                assert spec.function.arguments == {"max_cost_usd": 2.0}
+                assert await context.claim(replica_lag_store, session_id)
+                return {"accepted": True, "pending_id": "test-pending"}
+
+            startup.dispatch = AsyncMock(side_effect=dispatch_with_budget)
+            await startup._deliver_scoped(replica_lag_app, child_id, first)
+            startup.dispatch.assert_awaited_once()
+        finally:
+            subagent_work._session_inboxes_ref.pop(parent_id, None)
+            if child_id is not None:
+                subagent_work.unregister_child_session(child_id)
+                subagent_work.unregister_subagent_work(child_id)
+            await startup.shutdown()
+        return
+    epoch_response = await replica_lag_client.get(f"{path}/epoch", headers=headers)
+    if outcome == "unconfined":
+        assert epoch_response.status_code == 403
+        return
+    assert epoch_response.status_code == 200, epoch_response.text
+    epoch = epoch_response.json()["epoch"]
+    nonce = uuid4().hex
+    payload = {
+        "epoch": epoch,
+        "nonce": nonce,
+        "create": {
+            "parent_session_id": parent_id,
+            "agent_id": agent_id,
+            "sub_agent_name": "worker",
+            "title": "worker:protocol",
+        },
+        "file_ids": [source.id],
+    }
+    if outcome == "budget":
+        payload["cost_budget"] = {"max_cost_usd": 2.0, "ask_thresholds_usd": [1.0]}
+    if outcome == "changed-source":
+        original_validate = routes_spawns.validate_spawn_attachments
+
+        async def validate_then_change(*args):
+            await original_validate(*args)
+            files.delete(source.id, session_id=parent_id)
+
+        monkeypatch.setattr(routes_spawns, "validate_spawn_attachments", validate_then_change)
+    if outcome == "rebound":
+        replica_lag_store.replace_runner_id(
+            parent_id, "replacement-runner", expected_runner_id="creator-runner"
+        )
+    try:
+        prepared = await replica_lag_client.post(path, headers=headers, json=payload)
+        if outcome in ("changed-source", "rebound"):
+            assert prepared.status_code == (409 if outcome == "changed-source" else 403)
+            return
+        assert prepared.status_code == 201, prepared.text
+        child_id = prepared.json()["child_id"]
+        assert prepared.json()["state"] == "pending"
+        assert replica_lag_store.get_conversation(child_id) is None
+        repeated = await replica_lag_client.post(path, headers=headers, json=payload)
+        assert repeated.status_code == 201, repeated.text
+        assert repeated.json() == prepared.json()
+        rejected_nonce = uuid4().hex
+        collision = await replica_lag_client.post(
+            path, headers=headers, json={**payload, "nonce": rejected_nonce}
+        )
+        assert collision.status_code == 409
+        assert collision.json() == {
+            "epoch": epoch,
+            "nonce": rejected_nonce,
+            "state": "rejected",
+            "reason": "name_conflict",
+        }
+        rejected = await replica_lag_client.get(
+            f"{path}/{rejected_nonce}", headers=headers, params={"epoch": epoch}
+        )
+        assert rejected.json()["state"] == "unknown"
+        attempt = f"{path}/{nonce}"
+        reconciled = await replica_lag_client.get(
+            attempt, headers=headers, params={"epoch": epoch}
+        )
+        assert reconciled.json() == prepared.json()
+        event = {
+            "epoch": epoch,
+            "input": {
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "first"}]},
+            },
+        }
+        if outcome in ("admit", "budget"):
+            admitted = await replica_lag_client.post(
+                f"{attempt}/input", headers=headers, json=event
+            )
+            assert admitted.status_code == 202, admitted.text
+            assert admitted.json()["state"] == "admitted"
+            repeated_input = await replica_lag_client.post(
+                f"{attempt}/input", headers=headers, json=event
+            )
+            assert repeated_input.json() == admitted.json()
+        aborted = await replica_lag_client.post(
+            f"{attempt}/abort", headers=headers, json={"epoch": epoch}
+        )
+        assert aborted.status_code == 200, aborted.text
+        assert aborted.json()["state"] == (
+            "admitted" if outcome in ("admit", "budget") else "aborted"
+        )
+        if outcome in ("admit", "budget"):
+            receipt = coordinator.spawns.get(
+                SpawnIdentity("creator-runner", parent_id, _OWNER), nonce, epoch=epoch
+            )
+            await coordinator.advance(replica_lag_app, receipt)
+            await coordinator.advance(replica_lag_app, receipt)
+            [first] = replica_lag_store.list_pending_inputs(child_id)
+            assert first.id == initial_input_id(child_id)
+            assert first.created_by == _OWNER
+            assert first.data.startup_options is not None
+            assert not replica_lag_store.spawn_activation_pending(child_id)
+            if outcome == "budget":
+                from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+
+                [policy] = SqlAlchemyPolicyStore(db_uri).list_for_session(child_id)
+                assert policy.factory_params == payload["cost_budget"]
+                assert policy.name == "__subagent_cost_budget"
+                assert policy.enabled
+        else:
+            rejected = await replica_lag_client.post(
+                f"{attempt}/input", headers=headers, json=event
+            )
+            assert rejected.status_code == 409
+            assert replica_lag_store.get_conversation(child_id) is None
+            assert files.list(session_id=child_id).data == []
+        assert artifacts.exists(source.blob_key or source.id)
+        startup.dispatch.assert_not_awaited()
+    finally:
+        await startup.shutdown()

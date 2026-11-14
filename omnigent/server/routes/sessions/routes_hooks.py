@@ -315,6 +315,7 @@ def register_hooks_routes(
         await _require_access(
             user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
+        await asyncio.to_thread(conversation_store.require_spawn_activated, session_id)
         try:
             payload = await request.json()
         except json.JSONDecodeError as exc:
@@ -806,6 +807,7 @@ def register_hooks_routes(
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
+        await asyncio.to_thread(conversation_store.require_spawn_activated, session_id)
         is_read_only = permission_store is not None and (
             access.level is None or access.level < LEVEL_EDIT
         )
@@ -1306,6 +1308,7 @@ def register_hooks_routes(
         await _require_access(
             user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
+        await asyncio.to_thread(conversation_store.require_spawn_activated, session_id)
         try:
             payload = await request.json()
         except json.JSONDecodeError as exc:
@@ -1397,6 +1400,7 @@ def register_hooks_routes(
         await _require_access(
             user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
+        await asyncio.to_thread(conversation_store.require_spawn_activated, session_id)
         try:
             payload = await request.json()
         except json.JSONDecodeError as exc:
@@ -1496,6 +1500,7 @@ def register_hooks_routes(
         await _require_access(
             user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
+        await asyncio.to_thread(conversation_store.require_spawn_activated, session_id)
         try:
             payload = await request.json()
         except json.JSONDecodeError as exc:
@@ -1613,6 +1618,7 @@ def register_hooks_routes(
         await _require_access(
             user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
+        await asyncio.to_thread(conversation_store.require_spawn_activated, session_id)
         try:
             payload = await request.json()
         except json.JSONDecodeError as exc:
@@ -1725,6 +1731,7 @@ def register_hooks_routes(
         await _require_access(
             user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
+        await asyncio.to_thread(conversation_store.require_spawn_activated, session_id)
         try:
             payload = await request.json()
         except json.JSONDecodeError as exc:
@@ -1857,6 +1864,7 @@ def register_hooks_routes(
         await _require_access(
             user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
+        await asyncio.to_thread(conversation_store.require_spawn_activated, session_id)
         try:
             payload = await request.json()
         except json.JSONDecodeError as exc:
@@ -1990,6 +1998,7 @@ def register_hooks_routes(
         await _require_access(
             user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
+        await asyncio.to_thread(conversation_store.require_spawn_activated, session_id)
         try:
             payload = await request.json()
         except json.JSONDecodeError as exc:

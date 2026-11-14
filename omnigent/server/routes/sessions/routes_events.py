@@ -102,6 +102,8 @@ from omnigent.server.auth import (
     LEVEL_READ,
     AuthProvider,
     effective_admin,
+    require_runner_session_scope,
+    runner_token_confinement,
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -355,7 +357,7 @@ _retry_recovery_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
 )
 # One shared Resume attempt per session, split by caller for side chats; see
 # _retry_session_single_flight.
-_RetryFlight = tuple[str, str | None]
+_RetryFlight = tuple[str, str | None, str | None]
 _retry_recovery_tasks: WorkspaceScopedCache[_RetryFlight, asyncio.Task[dict[str, bool | str]]] = (
     WorkspaceScopedCache()
 )
@@ -783,6 +785,7 @@ async def _recover_retry_session(
         suppress_recovery_turn=was_connected or bool(saved_inputs),
         require_success=True,
         trigger="retry_session",
+        confinement=runner_token_confinement(request),
     )
 
     if _is_native_terminal_session(conv):
@@ -843,7 +846,12 @@ async def _retry_session_single_flight(
     concurrent requests.
     """
     is_side_chat = conversation is not None and _side_chat_source_id(conversation) is not None
-    flight: _RetryFlight = (session_id, user_id if is_side_chat else None)
+    confinement = runner_token_confinement(request)
+    flight: _RetryFlight = (
+        session_id,
+        user_id if is_side_chat else None,
+        confinement.runner_id if confinement else None,
+    )
     lock = _retry_recovery_lock(session_id)
     async with lock:
         task = _retry_recovery_tasks.get(flight)
@@ -1329,6 +1337,8 @@ def register_events_routes(
                 _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             ),
         )
+        if body.type not in (_INTERRUPT_TYPE, _STOP_SESSION_TYPE):
+            await asyncio.to_thread(conversation_store.require_spawn_activated, session_id)
         native_harness = (
             await asyncio.to_thread(
                 _native_pane_harness, conv, agent_store=agent_store, agent_cache=agent_cache
@@ -1974,6 +1984,9 @@ def register_events_routes(
                 initializer=getattr(_app_state, "runner_session_initializer", None),
                 suppress_recovery_turn=True,
                 trigger="native_control",
+                confinement=runner_token_confinement(request)
+                if isinstance(request, Request)
+                else None,
             )
             await _ensure_runner_relay_ready(
                 session_id,
@@ -1992,6 +2005,10 @@ def register_events_routes(
             startup = getattr(request.app.state, "startup_inputs", None)
             if startup is not None:
                 await startup.cancel(session_id)
+                if await asyncio.to_thread(
+                    conversation_store.spawn_activation_pending, session_id
+                ):
+                    return {"queued": False}
         stop_codex_side_chat = (
             body.type == _STOP_SESSION_TYPE
             and _is_codex_native_subagent(conv)
@@ -2039,6 +2056,8 @@ def register_events_routes(
                         code=ErrorCode.INVALID_INPUT,
                     )
                 target_session_id = conv.parent_conversation_id
+                # Interrupts are HTTP-only; the tunnel event allowlist excludes them.
+                require_runner_session_scope(cast(Request, request), target_session_id)
                 interrupt_payload.update(
                     codex_side_thread_id=child_thread_id,
                     codex_side_turn_id=response_id.removeprefix("codex_"),
@@ -2089,6 +2108,9 @@ def register_events_routes(
                 )
             return {"queued": False}
         if body.type == _STOP_SESSION_TYPE:
+            stop_confinement = (
+                runner_token_confinement(request) if isinstance(request, Request) else None
+            )
             # Fence the cancelled turn, same as interrupt.
             _interrupt_fenced_sessions.add(session_id)
             # Harness-agnostic forward: the runner kills the external
@@ -2099,8 +2121,26 @@ def register_events_routes(
             # non-2xx / unreachable runner (503) rather than swallowing
             # it, letting the web UI show the stop didn't land instead
             # of closing the dialog as if it succeeded.
+            stop_snapshot: Conversation | None = None
             try:
-                stop_delivered = await _stop_session_via_runner(session_id, runner_router)
+                if stop_confinement is None:
+                    stop_delivered = await _stop_session_via_runner(session_id, runner_router)
+                else:
+                    stop_snapshot = await asyncio.to_thread(
+                        conversation_store.get_conversation, session_id
+                    )
+                    if (
+                        stop_snapshot is None
+                        or stop_snapshot.runner_id not in (None, stop_confinement.runner_id)
+                        or not await asyncio.to_thread(stop_confinement.allows_session, session_id)
+                    ):
+                        raise OmnigentError(
+                            "runner credential is not authorized for this session",
+                            code=ErrorCode.RUNNER_SCOPE_DENIED,
+                        )
+                    stop_delivered = await _stop_session_via_runner(
+                        session_id, runner_router, conversation=stop_snapshot
+                    )
             except Exception:
                 # Stop didn't land: the turn keeps running, so lift the
                 # fence or its remaining output is dropped forever.
@@ -2117,9 +2157,18 @@ def register_events_routes(
                 # A shared-runner chat owns its harness resources, while the
                 # parent owns the runner. Keep the persisted transcript.
                 try:
-                    cleanup_client = await _get_runner_client(
-                        session_id, runner_router, for_control=True
-                    )
+                    if stop_confinement is None:
+                        cleanup_client = await _get_runner_client(
+                            session_id, runner_router, for_control=True
+                        )
+                    else:
+                        assert stop_snapshot is not None
+                        cleanup_client = await _get_runner_client(
+                            session_id,
+                            runner_router,
+                            for_control=True,
+                            conversation=stop_snapshot,
+                        )
                     if cleanup_client is None:
                         raise ConnectionError("Side-chat runner is unavailable")
                     cleanup_resp = await cleanup_client.delete(
@@ -2147,6 +2196,7 @@ def register_events_routes(
                     stop_conv.runner_id,
                     stop_host_registry,
                     conversation_store,
+                    confinement=stop_confinement,
                 )
                 if not host_stopped:
                     host_conn = (
@@ -2232,7 +2282,15 @@ def register_events_routes(
             # to the runner for runner-side (policy) elicitations.
             # The dedicated URL endpoint (``.../elicitations/{eid}/
             # resolve``) routes through the same helper.
-            await _resolve_elicitation(session_id, body.data, runner_router, conversation_store)
+            await _resolve_elicitation(
+                session_id,
+                body.data,
+                runner_router,
+                conversation_store,
+                confinement=runner_token_confinement(request)
+                if isinstance(request, Request)
+                else None,
+            )
             # Apply any policy writes deferred by the relay tool-call ASK gate
             # (e.g. a cost-budget checkpoint) now that the verdict is in.
             await _apply_pending_policy_ask_writes(
@@ -2276,6 +2334,8 @@ def register_events_routes(
                 conversation_store,
                 session_id,
                 _mcp_elicit_payload,
+                # MCP elicitations are also excluded from the tunnel event allowlist.
+                confinement=runner_token_confinement(cast(Request, request)),
             )
             return {"queued": False, "elicitation_id": elicit_id}
         if body.type == _COMPACT_TYPE:
@@ -2553,6 +2613,9 @@ def register_events_routes(
                     conversation_store,
                     session_id,
                     elicitation_id,
+                    confinement=runner_token_confinement(request)
+                    if isinstance(request, Request)
+                    else None,
                 )
             return {"queued": False}
         if body.type in (_EXTERNAL_SESSION_STATUS_TYPE, _SUBAGENT_STATUS_TYPE):
@@ -3757,6 +3820,9 @@ def register_events_routes(
                 initializer=initializer,
                 suppress_recovery_turn=True,
                 trigger="web_message",
+                confinement=runner_token_confinement(request)
+                if isinstance(request, Request)
+                else None,
             )
         await _ensure_runner_relay_ready(
             session_id,

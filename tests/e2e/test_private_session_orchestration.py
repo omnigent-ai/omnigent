@@ -63,6 +63,14 @@ def test_private_manager_launch_send_read_and_sharing(
                 set_fallback_mock_llm(
                     mock, key="_policy_llm_", text='{"action":"allow","reason":""}'
                 )
+                # Guardian can share the agent's model; its review prompt selects
+                # the synthetic assessment without consuming agent responses.
+                configure_mock_llm(
+                    mock,
+                    [],
+                    key="codex-auto-review",
+                    match="The Codex agent has requested the following action:",
+                )
                 set_fallback_mock_llm(
                     mock,
                     key="codex-auto-review",
@@ -112,7 +120,13 @@ def test_private_manager_launch_send_read_and_sharing(
                     return response.json()["data"]
 
                 def wait_text(session, text):
-                    return poll_until(lambda: text in json.dumps(items(session)), timeout_s=90)
+                    try:
+                        return poll_until(lambda: text in json.dumps(items(session)), timeout_s=90)
+                    except AssertionError as exc:
+                        raise AssertionError(
+                            f"Missing {text!r}; items={items(session)!r}; "
+                            f"initial message tool result={tool_results('before-switch')!r}"
+                        ) from exc
 
                 def send(session, text):
                     response = client.post(

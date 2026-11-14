@@ -796,7 +796,10 @@ async def test_a_session_archives_itself_and_stops_once_its_turn_ends(
     store = SqlAlchemyConversationStore(db_uri)
     torn_down: list[str] = []
 
-    async def record_teardown(session_id: str, _store, _runner_router) -> list[str]:
+    async def record_teardown(
+        session_id: str, _store, _runner_router, *, confinement=None
+    ) -> list[str]:
+        assert confinement is None
         torn_down.append(session_id)
         return []
 

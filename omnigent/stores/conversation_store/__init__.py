@@ -136,6 +136,8 @@ SIDE_CHAT_LABEL_KEY = "omnigent.side_chat"
 # Server-owned routing ancestry; it does not require a workspace or own a runner.
 SIDE_CHAT_SOURCE_LABEL_KEY = "omnigent.side_chat.source_id"
 
+# Temporary permission for a runner-created session awaiting its first binding.
+RUNNER_CREATOR_LABEL_KEY = "omnigent.runner.creator"
 # Items a generic side chat copies from its parent get ids starting with the side
 # chat's own first 12 id characters, so any device can hide exactly that history.
 # A side chat's own items get random ids, which match by chance once in 16**12.
@@ -259,6 +261,15 @@ _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     _SANDBOX_REPO_LABEL_KEY,
     _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY,
 }
+
+
+@dataclass(frozen=True)
+class RunnerSessionScope:
+    """Only the binding, parent and creator grant needed for runner authorization."""
+
+    runner_id: str | None
+    parent_conversation_id: str | None
+    labels: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -680,6 +691,30 @@ class ConversationStore(ABC):
             ``None``.
         """
         ...
+
+    def spawn_activation_pending(self, conversation_id: str) -> bool:
+        """Whether a reserved child still awaits its required activation checks."""
+        del conversation_id
+        return False
+
+    def require_spawn_activated(self, conversation_id: str) -> None:
+        """Refuse runtime effects until pending-child activation is durable."""
+        from omnigent.errors import ErrorCode, OmnigentError
+
+        if self.spawn_activation_pending(conversation_id):
+            raise OmnigentError("Child activation is pending", code=ErrorCode.CONFLICT)
+
+    def get_runner_scope(self, conversation_id: str) -> RunnerSessionScope | None:
+        """Look up runner authorization state; stores may avoid hydrating full sessions."""
+        conversation = self.get_conversation(conversation_id)
+        if conversation is None:
+            return None
+        creator = conversation.labels.get(RUNNER_CREATOR_LABEL_KEY)
+        return RunnerSessionScope(
+            conversation.runner_id,
+            conversation.parent_conversation_id,
+            {RUNNER_CREATOR_LABEL_KEY: creator} if creator is not None else {},
+        )
 
     @abstractmethod
     def find_conversation_by_external_session_id(

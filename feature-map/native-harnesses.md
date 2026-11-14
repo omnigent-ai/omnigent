@@ -171,6 +171,9 @@ implements them separately, so a fix for one harness does not reach the others.
   session's pane is neither rewound nor stopped: it keeps the full
   conversation, a message sent there resumes it, and otherwise it closes on
   idle reap. Unlike a native `/clear`, the terminal does not move to the new session.
+- `native-clear`: Claude, Codex and Antigravity `/clear` move the terminal to a
+  replacement session. The old conversation points to it, and reconnecting
+  Claude during unfinished cleanup retains the same replacement and its children.
 - `idle-reap`: a finished native pane left alone past the idle window closes
   with its forwarder, helper server and tool relay; the next message brings it
   back with the conversation. Kimi is exempt; live work and open prompts stay.
@@ -282,6 +285,14 @@ Real-provider history compatibility requires a separate live check.
 
 **CLI:** run `omnigent <name>` from the matrix below; add `--resume` with or
 without a session ID to resume.
+
+**Native clear and recovery:** for Claude, Codex and Antigravity, type `/clear`
+in the session's Terminal view. Repeat from `omnigent claude`, `omnigent codex`
+and `omnigent agy`. Confirm the new conversation receives the next message and
+the old conversation points to it. If a connection interruption left Claude's
+cleanup unfinished, resume that saved conversation with `omnigent claude
+--resume <session-id>`; it must keep the same replacement. Start a child in the
+replacement and confirm finishing the old conversation's cleanup leaves it running.
 
 **Picker visibility:** open Settings → Appearance → **Show in agent pickers**.
 The row summarizes what is shown ("Showing 15 of 17. Hidden: …"). Press
@@ -433,6 +444,17 @@ columns name one journey test per harness; "—" means none exists yet.
 | `qwen-native` | `omnigent qwen` | no | — | tests/e2e/test_qwen_native_subagent_wake_e2e.py::test_qwen_native_subagent_completion_wakes_parent | — |
 
 ## Driving it with the repro environment
+
+- **`native-clear` (component coverage):**
+  `tests/harnesses/claude_native/forwarder/test_session_lifecycle.py::test_clear_replay_rekeys_before_notifications_and_detach`
+  covers interrupted cleanup and retry ordering;
+  `tests/harnesses/claude_native/forwarder/test_session_lifecycle.py::test_clear_cleanup_retry_preserves_replacement_subagent_worker`
+  checks the replacement's child survives cleanup.
+  `tests/harnesses/claude_native/test_claude_native_hook.py::test_clear_session_start_hook_rotates_before_printing_conversation_url`,
+  `tests/harnesses/codex_native/test_codex_native.py::test_forwarder_rotation_redirects_viewers_of_the_cleared_session`
+  and `tests/harnesses/antigravity_native/test_antigravity_native_reader.py::test_rotate_session_for_cascade_mirrors_claude_sequence`
+  cover the native entry points. These component checks do not prove a live
+  provider, every CLI version or a managed-deployment reconnect.
 
 Preconditions: a running instance (`verify-env start`, then `verify-env
 doctor`) and the built web UI. Only Claude and Codex are configured with the

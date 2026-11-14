@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import httpx
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Query, Request, WebSocket
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
@@ -28,9 +28,11 @@ from pydantic import BaseModel
 from sqlalchemy.exc import StatementError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
+from starlette.requests import HTTPConnection
 from starlette.responses import Response
 from starlette.routing import Match, Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
+from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from omnigent._platform import resolve_repo_symlink
 from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
@@ -269,6 +271,7 @@ class ServerInfoResponse(BaseModel):
     databricks_features: bool
     managed_sandboxes_enabled: bool
     durable_initial_input: bool = False
+    pending_child_spawn_v1: bool = False
     sandbox_provider: str | None
     sandbox_providers: list[str]
     # UI-relevant capability flags per launchable provider, e.g.
@@ -696,7 +699,7 @@ _NO_RESPONSE_RETURNED = "No response returned."
 _HTTP_CLIENT_CLOSED_REQUEST = 499
 
 
-def _session_id_from_request(request: Request) -> str | None:
+def _session_id_from_request(request: HTTPConnection) -> str | None:
     """Best-effort session id parsed from a ``/v1/sessions/<id>/…`` request path.
 
     Threaded into exception-handler logs so a 500 on a session route carries its
@@ -711,7 +714,7 @@ def _session_id_from_request(request: Request) -> str | None:
 
 
 def _error_audit_extra(
-    request: Request,
+    request: HTTPConnection,
     *,
     phase: str = "error",
     **attributes: str,
@@ -726,7 +729,7 @@ def _error_audit_extra(
     """
     route = request.scope.get("route")
     operation = getattr(route, "name", None) or "unmatched"
-    attributes.setdefault("method", request.method)
+    attributes.setdefault("method", request.scope.get("method", "WEBSOCKET"))
     attributes.setdefault("route", getattr(route, "path", None) or "<unmatched>")
     request_id = getattr(request.state, "audit_request_id", None)
     if isinstance(request_id, str):
@@ -2422,6 +2425,8 @@ def create_app(
                 await managed_sandbox_reaper.start()
 
         session_pull_requests.install_refresher(pull_request_refresher)
+        if session_spawn_recovery is not None:
+            session_spawn_recovery.start(app_inst)
         try:
             with monitor_event_loop():
                 yield
@@ -2451,6 +2456,8 @@ def create_app(
             await cancel_managed_launch_tasks(
                 drain_s=sandbox_config.shutdown_drain_s if sandbox_config is not None else 0.0
             )
+            if session_spawn_recovery is not None:
+                await session_spawn_recovery.shutdown()
             if startup_inputs is not None:
                 await startup_inputs.shutdown()
             await background_title_coordinator.shutdown()
@@ -2499,6 +2506,41 @@ def create_app(
         else None
     )
     app.state.startup_inputs = startup_inputs
+    from omnigent.server.session_spawn_activation import SessionSpawnActivator
+    from omnigent.server.session_spawns import SessionSpawnCoordinator, SessionSpawnRecovery
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    session_spawn_coordinator = None
+    session_spawn_recovery = None
+    if (
+        startup_inputs is not None
+        and isinstance(conversation_store, SqlAlchemyConversationStore)
+        and (permission_store is None or isinstance(permission_store, SqlAlchemyPermissionStore))
+        and agent_cache is not None
+        and file_store is not None
+        and artifact_store is not None
+    ):
+        session_spawn_coordinator = SessionSpawnCoordinator(
+            conversation_store,
+            startup_inputs,
+            activate=SessionSpawnActivator(
+                app,
+                conversation_store,
+                agent_store,
+                agent_cache,
+                permission_store,
+                file_store,
+                artifact_store,
+                router=runner_router,
+                projects=project_store,
+            ),
+            cleanup_blob=artifact_store.delete,
+            artifact_store=artifact_store,
+        )
+        session_spawn_recovery = SessionSpawnRecovery(session_spawn_coordinator)
+    app.state.session_spawns = session_spawn_coordinator
+    app.state.session_spawn_recovery = session_spawn_recovery
     app.state.permission_store = permission_store
     app.state.host_store = host_store
     app.state.scheduled_task_store = scheduled_task_store
@@ -3033,18 +3075,26 @@ def create_app(
             )
 
     @app.exception_handler(OmnigentError)
-    async def _handle_omnigent_error(
-        request: Request,
+    async def _handle_connection_error(
+        request: Request | WebSocket,
         exc: OmnigentError,
-    ) -> JSONResponse:
-        """
-        Convert application errors to structured JSON responses.
+    ) -> JSONResponse | None:
+        """Close rejected WebSockets; render HTTP failures as structured JSON."""
+        if isinstance(request, WebSocket):
+            _record_omnigent_error(request, exc)
+            if (
+                request.application_state != WebSocketState.DISCONNECTED
+                and request.client_state != WebSocketState.DISCONNECTED
+            ):
+                with suppress(WebSocketDisconnect):
+                    await request.close(
+                        code=1008 if exc.http_status < 500 else 1011, reason=str(exc.code)
+                    )
+            return None
+        return await _handle_omnigent_error(request, exc)
 
-        :param request: The incoming request; its path supplies the session id
-            threaded into the error log.
-        :param exc: The application error.
-        :returns: A JSON response with the error code and message.
-        """
+    def _record_omnigent_error(request: HTTPConnection, exc: OmnigentError) -> None:
+        """Retain audit attribution and error logs across HTTP and WebSocket failures."""
         # Stamp attribution onto the per-request audit-envelope row (table-only,
         # one per request) for EVERY code, so the 4xx we deliberately don't log
         # to the ERROR stream are still queryable by owner/impact/phase. The
@@ -3105,12 +3155,32 @@ def create_app(
                     error_phase=exc.phase.value,
                 ),
             )
+
+    async def _handle_omnigent_error(
+        request: Request,
+        exc: OmnigentError,
+    ) -> JSONResponse:
+        """
+        Convert application errors to structured JSON responses.
+
+        :param request: The incoming request; its path supplies the session id
+            threaded into the error log.
+        :param exc: The application error.
+        :returns: A JSON response with the error code and message.
+        """
+        _record_omnigent_error(request, exc)
+        from omnigent.errors import ERROR_CODE_HEADER
+
         error = (
             _wrong_replica_error_body(request, exc)
             if isinstance(exc, WrongReplicaError)
             else {"code": exc.code, "message": exc.message}
         )
-        return JSONResponse(status_code=exc.http_status, content={"error": error})
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": error},
+            headers={ERROR_CODE_HEADER: exc.code},
+        )
 
     @app.exception_handler(RequestValidationError)
     async def _handle_validation_error(
@@ -3871,6 +3941,9 @@ def create_app(
                 "databricks_features": databricks_features,
                 "managed_sandboxes_enabled": managed_sandboxes_enabled,
                 "durable_initial_input": startup_inputs is not None,
+                "pending_child_spawn_v1": isinstance(
+                    app.state.session_spawns, SessionSpawnCoordinator
+                ),
                 "sandbox_provider": sandbox_provider,
                 "sandbox_providers": sandbox_providers,
                 "sandbox_provider_capabilities": sandbox_provider_capabilities,
@@ -5158,6 +5231,7 @@ def create_app(
                             runner_session_initializer,
                             generation=connection.generation,
                             store_slots=store_slots,
+                            confinement=connection.confinement,
                         )
                 except Exception as exc:
                     if tunnel_registry.get(runner_id) is not connection:
@@ -5204,11 +5278,26 @@ def create_app(
             for conv, client in roots:
                 recoveries.create_task(recover_root(conv, client), name=f"recover-root-{conv.id}")
 
-    def _mint_managed_runner_token(runner_id: str, ttl_seconds: int) -> str | None:
+    def _mint_managed_runner_token(
+        runner_id: str, ttl_seconds: int, *, confined: bool = False
+    ) -> str | None:
         assert runner_account_store is not None and auth_provider is not None
         return runner_account_store.with_runner_authority(
-            runner_id, lambda owner: auth_provider.mint_runner_token(owner, ttl_seconds)
+            runner_id,
+            lambda owner: (
+                auth_provider.mint_runner_token(owner, ttl_seconds, runner_id=runner_id)
+                if confined
+                else auth_provider.mint_runner_token(owner, ttl_seconds)
+            ),
         )
+
+    def _runner_session_check(runner_id: str, session_id: str) -> bool:
+        from omnigent.server.auth import runner_session_in_scope
+
+        return runner_session_in_scope(runner_id, session_id, conversation_store.get_runner_scope)
+
+    if isinstance(auth_provider, UnifiedAuthProvider):
+        auth_provider.set_runner_session_check(_runner_session_check)
 
     def _resolve_managed_runner_owner(runner_id: str) -> str | None:
         """Owner for a delegated runner, by its bound session.
@@ -5243,12 +5332,18 @@ def create_app(
             auth_provider=auth_provider,
             runner_exit_reports=runner_exit_reports,
             resolve_managed_runner_owner=_resolve_managed_runner_owner,
+            runner_session_check=_runner_session_check,
             admit_managed_runner=(
                 sandbox_profiles.admit_runner_connection if sandbox_profiles is not None else None
             ),
             mint_managed_runner_token=(
                 _mint_managed_runner_token if runner_account_store is not None else None
             ),
+            mint_scoped_managed_runner_token=(
+                lambda runner_id, ttl: _mint_managed_runner_token(runner_id, ttl, confined=True)
+            )
+            if runner_account_store is not None
+            else None,
         ),
         prefix="/v1",
         tags=["runners"],

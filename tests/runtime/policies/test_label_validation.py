@@ -15,13 +15,45 @@ writes still land atomically.
 
 from __future__ import annotations
 
+import pytest
+
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.spec.types import LabelDef
+from omnigent.stores.conversation_store import RUNNER_CREATOR_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 
 # ── Engine-level filtering ────────────────────────────
+
+
+@pytest.mark.parametrize("existing_runner", [None, "bound-runner"])
+@pytest.mark.parametrize("declared", [False, True])
+def test_policy_writes_preserve_server_owned_runner_labels(
+    conversation_store: SqlAlchemyConversationStore,
+    existing_runner: str | None,
+    declared: bool,
+) -> None:
+    labels = {RUNNER_CREATOR_LABEL_KEY: existing_runner} if existing_runner else {}
+    conv = conversation_store.create_conversation(labels=labels)
+    engine = PolicyEngine(
+        policies=[],
+        label_defs={RUNNER_CREATOR_LABEL_KEY: LabelDef(values=["other-runner"])}
+        if declared
+        else {},
+        ask_timeout=30,
+        conversation_id=conv.id,
+        initial_labels=labels,
+        conversation_store=conversation_store,
+    )
+
+    engine.apply_label_writes({RUNNER_CREATOR_LABEL_KEY: "other-runner", "team": "research"})
+
+    expected = {**labels, "team": "research"}
+    assert engine.labels == expected
+    persisted = conversation_store.get_conversation(conv.id)
+    assert persisted is not None
+    assert persisted.labels == expected
 
 
 def _build_engine_with_defs(

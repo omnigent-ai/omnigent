@@ -1,34 +1,15 @@
-"""Guards against sub-agent dispatch ``ReadTimeout`` and ``sys_session_close`` tombstone
-both leak the spawned child OS-process cluster: the runner's session-DELETE
-reaper is never reached on either path, so orphaned harness / tmux /
-``claude_native_bridge`` clusters accumulate and eventually saturate the host.
+"""Failed named sends preserve uncertain work under confined credentials.
 
-Both tests drive the REAL runner dispatch entry point
-(:func:`omnigent.runner.tool_dispatch.execute_tool`) against an
-``httpx.MockTransport`` standing in for the Omnigent server, exactly as the
-sibling ``tests/runner/test_runner_dispatch.py`` cases do. The mock injects
-the report's fault (a create-time ``ReadTimeout`` after the server commits
-child creation) and records every ``DELETE`` (the reaper) so the tests can
-assert on what the dispatch code actually did.
-
-Acceptance criteria:
-
-1. After a create-timeout where the child turn never started, the dispatch
-   MUST reach the runner session-DELETE reaper for the created child --
-   otherwise its harness / ``omnigent-terminal-*`` tmux / ``claude_native_bridge``
-   cluster is orphaned.
-2. ``sys_session_close`` MUST reap the target's cluster (call the runner
-   reaper -- a ``DELETE``, or an archive-equivalent ``PATCH archived=true``
-   that schedules ``_spawn_archive_stop``), not merely PATCH ``closed=true``.
-
-These tests fail when the reaper is never called (leaking build) and pass once the
-timeout / tombstone paths properly wire to the session-DELETE lifecycle.
+Local transports cover legacy cleanup, scoped timeout retention and explicit
+session close. No runner process or external server is started.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import httpx
@@ -41,26 +22,47 @@ PARENT_ID = "conv_parent"
 CHILD_ID = "conv_child_leaked"
 
 
+@asynccontextmanager
+async def _pending_spawn_client(
+    parent: str,
+    child: str,
+    handler: Callable[[httpx.Request], httpx.Response],
+) -> AsyncIterator[tuple[httpx.AsyncClient, asyncio.Queue]]:
+    def route(request: httpx.Request) -> httpx.Response:
+        method, path = request.method, request.url.path
+        if method == "GET" and path == "/v1/info":
+            return httpx.Response(200, json={"pending_child_spawn_v1": True})
+        if method == "GET" and path == f"/v1/sessions/{parent}":
+            return httpx.Response(200, json={"id": parent, "agent_id": "parent-agent"})
+        if method == "GET" and path == f"/v1/sessions/{parent}/spawns/epoch":
+            return httpx.Response(200, json={"epoch": 1})
+        return handler(request)
+
+    auth = httpx.Auth()
+    auth.runner_confined = True
+    inbox = asyncio.Queue()
+    subagent_work._session_inboxes_ref[parent] = inbox
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(route), base_url="http://server", auth=auth
+        ) as client:
+            yield client, inbox
+    finally:
+        subagent_work._session_inboxes_ref.pop(parent, None)
+        subagent_work.unregister_child_session(child)
+        subagent_work.unregister_subagent_work(child)
+
+
 @pytest.mark.asyncio
-async def test_create_timeout_reaps_orphaned_child() -> None:
-    """Facet 1 -- the create-timeout path must not leak the child cluster.
-
-    The child-session create (``POST /v1/sessions``) commits server-side, then
-    the caller's read deadline elapses -> ``httpx.ReadTimeout`` with no child
-    id bound to the caller. The report's acceptance criterion (1): the dispatch
-    must still reap the created child via the runner session-DELETE lifecycle,
-    so no residual harness / tmux / bridge process remains.
-
-    On the leaking build the create ``POST`` has a bare ``timeout=30.0`` with
-    no ``ReadTimeout`` recovery and ``child_session_id`` is only bound after a
-    successful response, so ``_teardown_failed_child`` (the DELETE reaper) can
-    never fire -- the ReadTimeout propagates and ZERO DELETEs are issued.
-    """
+@pytest.mark.parametrize("confined", [False, True])
+async def test_create_timeout_cleanup_respects_confined_credentials(confined: bool) -> None:
+    """Legacy cleanup remains; confined timeouts never reconcile by mutable title."""
     deletes: list[str] = []
     created_ids: list[str] = []
     # Becomes True once the POST raises ReadTimeout, so the reconcile lookup
     # (child_sessions GET after the timeout) can return the committed session.
     post_committed: list[bool] = [False]
+    timeout_reconciliations: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -81,6 +83,7 @@ async def test_create_timeout_reaps_orphaned_child() -> None:
         if method == "GET" and path == f"/v1/sessions/{PARENT_ID}/child_sessions":
             if not post_committed[0]:
                 return httpx.Response(200, json={"data": []})
+            timeout_reconciliations.append(path)
             return httpx.Response(
                 200,
                 json={
@@ -108,8 +111,10 @@ async def test_create_timeout_reaps_orphaned_child() -> None:
 
     inbox: asyncio.Queue = asyncio.Queue()
     subagent_work._session_inboxes_ref[PARENT_ID] = inbox
+    auth = httpx.Auth()
+    auth.runner_confined = confined
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler), base_url="http://server"
+        transport=httpx.MockTransport(handler), base_url="http://server", auth=auth
     ) as server_client:
         try:
             output = await execute_tool(
@@ -133,6 +138,11 @@ async def test_create_timeout_reaps_orphaned_child() -> None:
     assert isinstance(output, str) and output.startswith("Error"), (
         f"a create-timeout must return a handled error, not propagate ReadTimeout (got {output!r})"
     )
+    if confined:
+        assert not deletes
+        assert not timeout_reconciliations
+        assert "unknown" in output and "automatic cleanup is unavailable" in output
+        return
     # Acceptance criterion (1): the created child's cluster must be reaped.
     assert deletes, (
         "create-timeout leaked the child: the dispatch never called the runner "
@@ -216,3 +226,290 @@ async def test_tombstone_close_reaps_cluster() -> None:
         f"({patches}) -- it set no archived=true and issued no runner DELETE, "
         "so the child's harness / tmux / bridge cluster is never reaped"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("created_child", [False, True])
+async def test_confined_failed_send_retains_work_without_cleanup(created_child: bool) -> None:
+    from omnigent.runner._entry import _RunnerDatabricksAuth
+    from omnigent.runner.tool_dispatch import _teardown_failed_child
+    from omnigent.server.oidc import mint_session_token
+
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        return httpx.Response(200)
+
+    tokens: list[str | None] = [
+        mint_session_token(
+            "alice",
+            b"test-only-secret" * 3,
+            1800,
+            "accounts",
+            extra_claims={"scope": "runner", "runner_id": "runner_test"},
+        )
+    ]
+    auth = _RunnerDatabricksAuth(lambda: tokens[0])
+    entry = subagent_work.register_subagent_work(
+        parent_session_id=PARENT_ID,
+        child_session_id=CHILD_ID,
+        agent="researcher",
+        title="task-1",
+    )
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handle), base_url="http://server", auth=auth
+        ) as client:
+            await client.get(f"/v1/sessions/{PARENT_ID}")
+            assert auth.runner_confined
+            requests.clear()
+            tokens[0] = None
+            with pytest.raises(httpx.RequestError, match="refresh returned no token"):
+                await client.post(f"/v1/sessions/{CHILD_ID}/events", json={"type": "message"})
+            assert auth.runner_confined
+            warning = await _teardown_failed_child(client, CHILD_ID, created_child=created_child)
+        assert warning is not None and CHILD_ID in warning and "retained" in warning
+        assert subagent_work.get_subagent_work(CHILD_ID) is entry
+        assert requests == []
+    finally:
+        subagent_work.unregister_subagent_work(CHILD_ID)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "prepare-lost",
+        "prepare-unknown",
+        "input-lost",
+        "input-rejected",
+        "abort-lost",
+        "input-unknown",
+        "input-cancelled",
+        "mapping",
+    ],
+)
+async def test_pending_spawn_preserves_exact_receipt_and_work(fault: str | None) -> None:
+    from uuid import uuid4
+
+    parent, child, source, copied = (uuid4().hex for _ in range(4))
+    path = f"/v1/sessions/{parent}/spawns"
+    receipt = {}
+    calls = []
+    inputs = []
+    prepares = []
+    state = "pending"
+
+    def handle(request):
+        nonlocal state
+        route, method = request.url.path, request.method
+        calls.append((method, route))
+        if method == "GET" and route == f"/v1/sessions/{parent}/child_sessions":
+            assert not prepares, "Never reconcile a pending spawn by title"
+            return httpx.Response(200, json={"data": []})
+        if method == "POST" and route == path:
+            payload = json.loads(request.content)
+            prepares.append(payload)
+            assert subagent_work.get_subagent_work(child) is None
+            assert payload["cost_budget"] == {"max_cost_usd": 2.0}
+            assert payload["file_ids"] == [source]
+            receipt.update(
+                {
+                    "epoch": 1,
+                    "nonce": payload["nonce"],
+                    "child_id": child,
+                    "files": {
+                        source: {
+                            "new_id": copied,
+                            "content_type": "image/png",
+                            "filename": "photo.png",
+                        }
+                    },
+                    "labels": {},
+                }
+            )
+            if fault == "mapping":
+                receipt["files"] = {}
+            if fault in ("prepare-lost", "prepare-unknown"):
+                raise httpx.ReadTimeout("lost prepare response", request=request)
+            return httpx.Response(201, json={**receipt, "state": state})
+        if method == "GET" and route == f"{path}/{receipt['nonce']}":
+            assert request.url.params["epoch"] == "1"
+            if fault == "input-unknown":
+                return httpx.Response(503)
+            return httpx.Response(
+                200, json={**receipt, "state": "unknown" if fault == "prepare-unknown" else state}
+            )
+        if method == "POST" and route == f"{path}/{receipt['nonce']}/input":
+            assert subagent_work.get_subagent_work(child) is not None
+            inputs.append(json.loads(request.content))
+            if fault == "input-cancelled":
+                raise asyncio.CancelledError()
+            if fault in ("input-rejected", "abort-lost"):
+                return httpx.Response(503)
+            state = "admitted"
+            if fault in ("input-lost", "input-unknown"):
+                raise httpx.ReadTimeout("lost input response", request=request)
+            return httpx.Response(202, json={**receipt, "state": state})
+        if method == "POST" and route == f"{path}/{receipt['nonce']}/abort":
+            if fault == "input-unknown":
+                return httpx.Response(503)
+            if state == "pending":
+                state = "aborted"
+            if fault == "abort-lost":
+                raise httpx.ReadTimeout("lost abort response", request=request)
+            return httpx.Response(200, json={**receipt, "state": state})
+        raise AssertionError(f"Unexpected request: {method} {route}")
+
+    async with _pending_spawn_client(parent, child, handle) as (client, inbox):
+        call = execute_tool(
+            tool_name="sys_session_send",
+            arguments=json.dumps(
+                {
+                    "agent": "researcher",
+                    "title": "task",
+                    "args": {
+                        "input": "first",
+                        "file_ids": [source],
+                        "cost_budget": {"max_cost_usd": 2.0},
+                    },
+                }
+            ),
+            server_client=client,
+            conversation_id=parent,
+            agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
+            session_inbox=inbox,
+        )
+        if fault == "input-cancelled":
+            with pytest.raises(asyncio.CancelledError):
+                await call
+            output = "cancelled"
+        else:
+            output = await call
+        assert len(prepares) == 1
+        assert len(inputs) == (0 if fault in ("mapping", "prepare-unknown") else 1)
+        if inputs:
+            assert inputs[0]["input"]["data"]["content"] == [
+                {"type": "input_text", "text": "first"},
+                {"type": "input_image", "file_id": copied},
+            ]
+        if fault in (None, "prepare-lost", "input-lost"):
+            assert json.loads(output)["conversation_id"] == child
+            assert state == "admitted"
+            assert subagent_work.get_subagent_work(child) is not None
+        elif fault == "input-unknown":
+            assert "Retain" in output
+            assert subagent_work.get_subagent_work(child) is not None
+        else:
+            assert output.startswith("Error") or output == "cancelled"
+            assert subagent_work.get_subagent_work(child) is None
+            if fault != "prepare-unknown":
+                assert state == "aborted"
+        assert not any(method == "DELETE" for method, _ in calls)
+        assert ("POST", "/v1/sessions") not in calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["retry", "explicit", "exhausted", "generic", "mismatch"])
+async def test_pending_spawn_retries_only_definite_auto_name_rejection(outcome: str) -> None:
+    from uuid import uuid4
+
+    parent, child = uuid4().hex, uuid4().hex
+    path = f"/v1/sessions/{parent}/spawns"
+    prepares = []
+    reconciles = []
+
+    def handle(request):
+        route, method = request.url.path, request.method
+        if method == "GET" and route == f"/v1/sessions/{parent}/child_sessions":
+            assert not prepares
+            return httpx.Response(200, json={"data": []})
+        if method == "POST" and route == path:
+            payload = json.loads(request.content)
+            prepares.append(payload)
+            if outcome == "retry" and len(prepares) == 2:
+                return httpx.Response(
+                    201,
+                    json={
+                        "epoch": 1,
+                        "nonce": payload["nonce"],
+                        "child_id": child,
+                        "state": "pending",
+                        "files": {},
+                        "labels": {},
+                    },
+                )
+            rejection = {
+                "epoch": 1,
+                "nonce": payload["nonce"],
+                "state": "rejected",
+                "reason": "name_conflict",
+            }
+            if outcome == "generic":
+                rejection = {"error": "conflict"}
+            elif outcome == "mismatch":
+                rejection["nonce"] = uuid4().hex
+            return httpx.Response(409, json=rejection)
+        latest = prepares[-1]
+        if method == "GET" and route == f"{path}/{latest['nonce']}":
+            reconciles.append(route)
+            return httpx.Response(
+                200, json={"epoch": 1, "nonce": latest["nonce"], "state": "unknown"}
+            )
+        if method == "POST" and route == f"{path}/{latest['nonce']}/input":
+            assert outcome == "retry"
+            return httpx.Response(
+                202,
+                json={
+                    "epoch": 1,
+                    "nonce": latest["nonce"],
+                    "child_id": child,
+                    "state": "admitted",
+                },
+            )
+        raise AssertionError(f"Unexpected request: {method} {route}")
+
+    arguments = {"agent": "researcher", "args": {"input": "first"}}
+    if outcome == "explicit":
+        arguments["title"] = "named"
+    async with _pending_spawn_client(parent, child, handle) as (client, inbox):
+        output = await execute_tool(
+            tool_name="sys_session_send",
+            arguments=json.dumps(arguments),
+            server_client=client,
+            conversation_id=parent,
+            agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
+            session_inbox=inbox,
+        )
+        assert len(prepares) == {"retry": 2, "exhausted": 6}.get(outcome, 1)
+        assert len({item["nonce"] for item in prepares}) == len(prepares)
+        assert len({item["create"]["title"] for item in prepares}) == len(prepares)
+        assert len(reconciles) == (1 if outcome in ("generic", "mismatch") else 0)
+        if outcome == "retry":
+            assert json.loads(output)["conversation_id"] == child
+        else:
+            assert output.startswith("Error")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status,payload", [(503, {}), (401, {}), (200, []), (200, {"pending_child_spawn_v1": "true"})]
+)
+async def test_pending_spawn_discovery_failure_never_falls_back(status, payload):
+    from uuid import uuid4
+
+    from omnigent.runner.pending_spawns import PendingSpawnError, prepare_pending_spawn
+
+    def handle(request):
+        assert request.method == "GET" and request.url.path == "/v1/info"
+        return httpx.Response(status, json=payload)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://server"
+    ) as client:
+        with pytest.raises(PendingSpawnError, match="Could not determine"):
+            await prepare_pending_spawn(
+                client, parent_id=uuid4().hex, create={}, file_ids=[], cost_budget=None
+            )

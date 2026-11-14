@@ -17,6 +17,7 @@ import secrets
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 import httpx
@@ -148,6 +149,8 @@ from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
+    RunnerTokenConfinement,
+    runner_token_confinement,
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -544,6 +547,7 @@ async def _publish_and_wait_for_harness_elicitation(
     :returns: Web verdict, or ``None`` on terminal-side resolution,
         timeout, or disconnect.
     """
+    confinement = runner_token_confinement(request) if isinstance(request, Request) else None
     if elicitation_id is None:
         elicitation_id = f"elicit_{secrets.token_hex(16)}"
     future: asyncio.Future[ElicitationResult] = asyncio.get_running_loop().create_future()
@@ -592,6 +596,7 @@ async def _publish_and_wait_for_harness_elicitation(
                 conversation_store,
                 session_id,
                 event_payload,
+                confinement=confinement,
             )
         disconnect_task = asyncio.create_task(
             _poll_request_disconnect(request),
@@ -661,6 +666,7 @@ async def _publish_and_wait_for_harness_elicitation(
                 elicitation_id,
                 conversation_store,
                 native_delivery_attempt=delivery["attempt"] if delivery is not None else None,
+                confinement=confinement,
             )
         elif published_request:
             _publish_elicitation_resolved(session_id, elicitation_id, action=settled_action)
@@ -671,6 +677,7 @@ async def _publish_and_wait_for_harness_elicitation(
                     session_id,
                     elicitation_id,
                     settled_action,
+                    confinement=confinement,
                 )
 
 
@@ -680,6 +687,7 @@ def _schedule_deferred_elicitation_clear(
     conversation_store: ConversationStore | None,
     *,
     native_delivery_attempt: str | None = None,
+    confinement: RunnerTokenConfinement | None = None,
 ) -> None:
     """
     Clear one elicitation's approval card after the re-park grace, unless
@@ -701,6 +709,7 @@ def _schedule_deferred_elicitation_clear(
         ancestor streams, or ``None`` to keep it session-local.
     :param native_delivery_attempt: Only expire this delivery attempt, never
         a newer attempt or a card already confirmed by the recorder.
+    :param confinement: Retained caller scope for delayed ancestor cleanup.
     """
 
     async def _clear_after_grace() -> None:
@@ -733,6 +742,7 @@ def _schedule_deferred_elicitation_clear(
                 session_id,
                 elicitation_id,
                 reason="unanswered",
+                confinement=confinement,
             )
 
     clear_coroutine = _clear_after_grace()
@@ -749,6 +759,8 @@ async def _best_effort_stop(
     session_id: str,
     conversation_store: ConversationStore,
     runner_router: Any,
+    *,
+    confinement: RunnerTokenConfinement | None = None,
 ) -> list[str]:
     """Stop a running session before a destructive lifecycle action.
 
@@ -772,7 +784,17 @@ async def _best_effort_stop(
         clean them up too; empty when the lookup failed.
     """
     try:
-        descendant_ids = await _collect_descendant_conversation_ids(conversation_store, session_id)
+        if confinement is None:
+            descendant_ids = await _collect_descendant_conversation_ids(
+                conversation_store, session_id
+            )
+        else:
+            scoped_tree = await _bounded_archive_session_ids(
+                [session_id], conversation_store, side_chats="ignore"
+            )
+            if scoped_tree is None:
+                return []
+            descendant_ids = scoped_tree[1:]
         status = _session_status_with_child_rollup(session_id, descendant_ids)
         own_status = _session_status_from_cache(session_id)
     except Exception:  # noqa: BLE001
@@ -795,7 +817,16 @@ async def _best_effort_stop(
 
     async def _stop(target_id: str) -> None:
         try:
-            await _stop_session_via_runner(target_id, runner_router)
+            if confinement is None:
+                await _stop_session_via_runner(target_id, runner_router)
+            else:
+                target = await asyncio.to_thread(conversation_store.get_conversation, target_id)
+                if (
+                    target is not None
+                    and target.runner_id in (None, confinement.runner_id)
+                    and await asyncio.to_thread(confinement.allows_session, target_id)
+                ):
+                    await _stop_session_via_runner(target_id, runner_router, conversation=target)
         except Exception:  # noqa: BLE001
             _logger.debug(
                 "Best-effort stop failed for %s; proceeding anyway",
@@ -852,12 +883,80 @@ _SELF_ARCHIVE_TURN_WAIT_S = 60 * 60
 _RUNNER_STOP_STATUS_BATCH_SIZE = 200
 
 
+# Charge roots, page queries, returned rows and per-node checks against fixed work.
+_SCOPED_ARCHIVE_WORK_LIMIT = 1024
+_SCOPED_ARCHIVE_PAGE_SIZE = 128
+
+
+async def _bounded_archive_session_ids(
+    session_ids: list[str],
+    conversation_store: ConversationStore,
+    *,
+    side_chats: Literal["include", "reject", "ignore"],
+    confinement: RunnerTokenConfinement | None = None,
+) -> list[str] | None:
+    """Enumerate a bounded tree; incomplete discovery or unauthorized dependents fail closed."""
+    if len(session_ids) > _SCOPED_ARCHIVE_WORK_LIMIT:
+        return None
+    remaining = _SCOPED_ARCHIVE_WORK_LIMIT - len(session_ids)
+    found = list(dict.fromkeys(session_ids))
+    seen = set(found)
+    for session_id in found:
+        if remaining <= 0:
+            return None
+        remaining -= 1
+        if confinement is not None and not await asyncio.to_thread(
+            confinement.allows_session, session_id
+        ):
+            return None
+        for relation in ("child", "side-chat"):
+            if relation == "side-chat" and side_chats == "ignore":
+                continue
+            child_after: tuple[int, str] | None = None
+            side_after: str | None = None
+            while True:
+                if remaining <= 1:
+                    return None
+                limit = min(_SCOPED_ARCHIVE_PAGE_SIZE, remaining - 1)
+                if relation == "child":
+                    page = await asyncio.to_thread(
+                        conversation_store.list_child_conversation_ids_page,
+                        session_id,
+                        after=child_after,
+                        limit=limit,
+                    )
+                    ids = [child_id for child_id, _created in page]
+                    if page:
+                        child_after = (page[-1][1], page[-1][0])
+                else:
+                    ids = await asyncio.to_thread(
+                        conversation_store.list_side_chat_ids,
+                        session_id,
+                        after=side_after,
+                        limit=1 if side_chats == "reject" else limit,
+                    )
+                    if ids and side_chats == "reject":
+                        return None
+                    if ids:
+                        side_after = ids[-1]
+                remaining -= 1 + len(ids)
+                for dependent_id in ids:
+                    if dependent_id not in seen:
+                        seen.add(dependent_id)
+                        found.append(dependent_id)
+                if len(ids) < limit:
+                    break
+    return found
+
+
 async def _stop_host_runner_intentionally(
     session_id: str,
     host_id: str,
     runner_id: str,
     host_registry: Any,
     conversation_store: ConversationStore,
+    *,
+    confinement: RunnerTokenConfinement | None = None,
 ) -> bool:
     """Carry stop intent to the active sessions sharing the terminated runner.
 
@@ -872,32 +971,67 @@ async def _stop_host_runner_intentionally(
     async with lock:
         statuses: dict[str, str | None] = {}
         after: str | None = None
+        remaining = _SCOPED_ARCHIVE_WORK_LIMIT
         try:
             while True:
+                limit = _RUNNER_STOP_STATUS_BATCH_SIZE
+                if confinement is not None:
+                    if remaining <= 1:
+                        return False
+                    limit = min(limit, remaining - 1)
                 batch = await asyncio.to_thread(
                     conversation_store.list_runner_session_statuses,
                     runner_id,
                     after=after,
-                    limit=_RUNNER_STOP_STATUS_BATCH_SIZE,
+                    limit=limit,
                 )
+                remaining -= 1 + len(batch)
                 statuses.update(batch)
-                if len(batch) < _RUNNER_STOP_STATUS_BATCH_SIZE:
+                if len(batch) < limit:
                     break
                 after = batch[-1][0]
         except Exception:  # noqa: BLE001
-            # Keep Stop available during a store outage; only known sessions can
-            # inherit intent, so unseen cold sessions keep normal disconnect handling.
+            # Owner stops can use partial results; a scoped stop must know all occupants.
             _logger.warning(
-                "Cannot load all sessions for intentionally stopped runner %s; "
-                "using partial results and live relays",
+                "Cannot load all sessions for intentionally stopped runner %s; %s",
                 runner_id,
+                "leaving the runner up"
+                if confinement is not None
+                else "using partial results and live relays",
                 exc_info=True,
                 extra={"session_id": session_id},
             )
+            if confinement is not None:
+                return False
         for related_id, handle in _runner_relay_tasks.items():
+            if confinement is not None:
+                if remaining <= 0:
+                    return False
+                remaining -= 1
             if handle.runner_id == runner_id and not handle.task.done():
                 statuses.setdefault(related_id, None)
         statuses.setdefault(session_id, None)
+        if confinement is not None:
+            # Root ownership alone cannot authorize stopping every runtime on this runner.
+            if (
+                await _bounded_archive_session_ids(
+                    list(statuses),
+                    conversation_store,
+                    side_chats="include",
+                    confinement=confinement,
+                )
+                is None
+            ):
+                return False
+            current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if (
+                current is None
+                or current.runner_id != runner_id
+                or current.host_id != host_id
+                or runner_id != confinement.runner_id
+                or not await asyncio.to_thread(confinement.allows_session, session_id)
+            ):
+                return False
         marked: set[str] = set()
         stop_targets: set[str] = set()
         completed_stop_relays: dict[str, tuple[_RelayHandle, int]] = {}
@@ -975,6 +1109,7 @@ async def _archive_stop(
     runner_router: Any,
     host_registry: Any,
     *,
+    confinement: RunnerTokenConfinement | None = None,
     delete_worktree: bool = False,
     host_store: HostStore | None = None,
     sandbox_config: ManagedSandboxDeployment | None = None,
@@ -1044,19 +1179,49 @@ async def _archive_stop(
     # possibly on another replica) — it's live again, so leave its runner alone.
     if conv is None or not conv.archived:
         return
+
+    async def still_authorized() -> bool:
+        if confinement is None:
+            return True
+        current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        return (
+            current is not None
+            and current.archived
+            and current.runner_id == conv.runner_id
+            and current.host_id == conv.host_id
+            and current.workspace == conv.workspace
+            and current.git_branch == conv.git_branch
+            and await asyncio.to_thread(confinement.allows_session, session_id)
+        )
+
+    if not await still_authorized():
+        return
     # Past the point of no return: unregister so a late cancel (an Undo racing
     # this teardown) can't interrupt it mid-stop and strand the intentional-
     # stop marker below, which would exclude the session from child recovery.
     _pending_archive_stops.pop(session_id, None)
 
-    await _facade._best_effort_stop(session_id, conversation_store, runner_router)
+    await _facade._best_effort_stop(
+        session_id, conversation_store, runner_router, confinement=confinement
+    )
+    if not await still_authorized():
+        return
+    if delete_worktree and confinement is not None:
+        # Check directory dependents before stopping its shared runtime.
+        if (
+            await _bounded_archive_session_ids(
+                [session_id], conversation_store, side_chats="reject", confinement=confinement
+            )
+            is None
+        ):
+            return
     # Idle native workers retain processes too. Release only this session's
     # resources so children sharing an ancestor's runner leave the ancestor up.
     try:
         runner_client = await _facade._get_runner_client(
             session_id, runner_router, conversation=conv, for_control=True
         )
-        if runner_client is not None:
+        if runner_client is not None and await still_authorized():
             # Tunnel transports ignore HTTPX timeouts; bound headers and body consumption.
             response = await asyncio.wait_for(
                 runner_client.delete(
@@ -1075,14 +1240,20 @@ async def _archive_stop(
     if conv.host_id and conv.runner_id:
         try:
             # A sub-agent riding an ancestor's runner leaves it up for the owner.
-            if await _owns_host_runner(conv, conversation_store):
-                await _stop_host_runner_intentionally(
+            owns_runner = await _owns_host_runner(conv, conversation_store)
+            if not owns_runner and confinement is not None:
+                return
+            if owns_runner and await still_authorized():
+                stopped = await _stop_host_runner_intentionally(
                     session_id,
                     conv.host_id,
                     conv.runner_id,
                     host_registry,
                     conversation_store,
+                    confinement=confinement,
                 )
+                if confinement is not None and not stopped:
+                    return
         except Exception:  # noqa: BLE001
             _logger.debug(
                 "Archive host-runner teardown failed for %s",
@@ -1090,11 +1261,26 @@ async def _archive_stop(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
+            if confinement is not None:
+                return
+    if not await still_authorized():
+        return
+    if delete_worktree and confinement is not None:
+        # Bindings and dependents can change while the runner teardown awaits.
+        if (
+            await _bounded_archive_session_ids(
+                [session_id], conversation_store, side_chats="reject", confinement=confinement
+            )
+            is None
+        ):
+            return
     # Runs after the runner teardown so the agent isn't left in a deleted cwd.
     if delete_worktree and conv.git_branch and conv.workspace and conv.host_id:
         from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
 
         try:
+            if not await still_authorized():
+                return
             await _facade._remove_session_worktree_best_effort(
                 host_id=conv.host_id,
                 worktree_path=conv.workspace,
@@ -1115,7 +1301,7 @@ async def _archive_stop(
                 extra={"session_id": session_id},
             )
     # Last: the worktree cleanup above needs the sandbox's host online.
-    if host_store is not None:
+    if host_store is not None and await still_authorized():
         await stop_archived_session_sandbox(conv, host_store, conversation_store, sandbox_config)
 
 
@@ -1173,6 +1359,7 @@ def _spawn_archive_stop(
     runner_router: Any,
     host_registry: Any = None,
     *,
+    confinement: RunnerTokenConfinement | None = None,
     delete_worktree: bool = False,
     host_store: HostStore | None = None,
     sandbox_config: ManagedSandboxDeployment | None = None,
@@ -1231,6 +1418,7 @@ def _spawn_archive_stop(
             conversation_store,
             runner_router,
             host_registry,
+            confinement=confinement,
             delete_worktree=delete_worktree,
             host_store=host_store,
             sandbox_config=sandbox_config,
@@ -2503,6 +2691,8 @@ async def _resolve_native_delivery(
     elicitation_id: str,
     data: dict[str, Any],
     conversation_store: ConversationStore | None,
+    *,
+    confinement: RunnerTokenConfinement | None = None,
 ) -> bool:
     """Accept one delivery attempt while keeping its card pending for the native receipt."""
     entry = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
@@ -2562,7 +2752,11 @@ async def _resolve_native_delivery(
     session_stream.publish(session_id, waiting)
     if conversation_store is not None:
         await asyncio.to_thread(
-            _publish_elicitation_request_to_ancestors, conversation_store, session_id, waiting
+            _publish_elicitation_request_to_ancestors,
+            conversation_store,
+            session_id,
+            waiting,
+            confinement=confinement,
         )
     return True
 
@@ -2572,6 +2766,8 @@ async def _resolve_elicitation(
     data: dict[str, Any],
     runner_router: RunnerRouter | None,
     conversation_store: ConversationStore | None = None,
+    *,
+    confinement: RunnerTokenConfinement | None = None,
 ) -> None:
     """
     Resolve one outstanding elicitation from an approval payload.
@@ -2624,8 +2820,19 @@ async def _resolve_elicitation(
     # matches, no resolved event published) rather than 500-ing the
     # client — the runner forward still fires so the runner can reject.
     elicitation_id = data.get("elicitation_id", "")
+    if confinement is not None and isinstance(elicitation_id, str):
+        owner = _harness_elicitation_owners.get(elicitation_id)
+        entry = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+        params = entry[1].get("params", {}) if entry is not None else {}
+        target = params.get("target_session_id") if isinstance(params, dict) else None
+        for target_id in (owner, target):
+            if isinstance(target_id, str) and not confinement.allows_session(target_id):
+                raise OmnigentError(
+                    "runner credential cannot resolve an approval outside its scope",
+                    code=ErrorCode.RUNNER_SCOPE_DENIED,
+                )
     if isinstance(elicitation_id, str) and await _resolve_native_delivery(
-        session_id, elicitation_id, data, conversation_store
+        session_id, elicitation_id, data, conversation_store, confinement=confinement
     ):
         return
     harness_future = _harness_elicitation_registry.get(elicitation_id)
@@ -2724,6 +2931,7 @@ async def _resolve_elicitation(
                 session_id,
                 elicitation_id,
                 data.get("action"),
+                confinement=confinement,
             )
     # Runner-side elicitations (policy approvals, scaffold dispatch)
     # resolve when the canonical approval event reaches the runner.
@@ -5719,6 +5927,8 @@ async def ensure_runner_connected(
         out (propagated from ``_maybe_relaunch_managed_sandbox``).
     """
 
+    await asyncio.to_thread(conversation_store.require_spawn_activated, session_id)
+
     from omnigent.server.routes import sessions as _facade
 
     async def _reread() -> Conversation:
@@ -6548,6 +6758,7 @@ async def _ensure_runner_session_initialized(
     conversation_store: ConversationStore,
     initializer: RunnerSessionInitializer | None = None,
     *,
+    confinement: RunnerTokenConfinement | None = None,
     suppress_recovery_turn: bool = False,
     require_success: bool = False,
     trigger: str = "session_ensure",
@@ -6604,6 +6815,7 @@ async def _ensure_runner_session_initialized(
     :returns: ``True`` when a current runner explicitly confirmed its native
         terminal is ready; ``False`` for legacy or non-native responses.
     """
+    await asyncio.to_thread(conversation_store.require_spawn_activated, session_id)
     try:
         if initializer is not None:
             resp = await initializer.initialize(
@@ -6670,12 +6882,16 @@ async def _ensure_runner_session_initialized(
     # Legacy callers leave descendant restoration to the runner-connect hook.
     if initializer is not None:
         if suppress_recovery_turn and not require_success:
-            schedule_child_restoration(conv, runner_client, conversation_store, initializer)
+            schedule_child_restoration(
+                conv, runner_client, conversation_store, initializer, confinement=confinement
+            )
         else:
             await _ensure_runner_relay_ready(
                 session_id, conv.runner_id, runner_client, conversation_store, conversation=conv
             )
-            await restore_active_children(conv, runner_client, conversation_store, initializer)
+            await restore_active_children(
+                conv, runner_client, conversation_store, initializer, confinement=confinement
+            )
     try:
         payload = resp.json()
     except ValueError:
@@ -8812,6 +9028,7 @@ async def _dispatch_session_event_to_runner_impl(
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
     """
+    await asyncio.to_thread(conversation_store.require_spawn_activated, session_id)
     if runner_router is not None:
         await asyncio.to_thread(runner_router.require_runtime_support, conv)
     if body.type == "message":
@@ -12310,6 +12527,34 @@ async def _inherited_mcp_labels(
     return inherited
 
 
+@dataclass(frozen=True)
+class PreparedNamedChild:
+    """Validated child creation data, frozen by the pending-spawn receipt codec."""
+
+    create_arguments: dict[str, Any]
+    sandbox_profile: dict[str, Any] | None
+    selected_harness: str | None
+    request_body: dict[str, Any]
+    agent_version: int
+    agent_bundle_location: str
+    client_surface: str
+
+    def to_payload(self) -> dict[str, Any]:
+        from omnigent.server.startup_inputs import STARTUP_LABEL
+
+        arguments = dict(self.create_arguments)
+        arguments["labels"] = {**(arguments.get("labels") or {}), STARTUP_LABEL: "pending"}
+        return {
+            "arguments": arguments,
+            "request": self.request_body,
+            "sandbox_profile": self.sandbox_profile,
+            "selected_harness": self.selected_harness,
+            "agent_version": self.agent_version,
+            "agent_bundle_location": self.agent_bundle_location,
+            "client_surface": self.client_surface,
+        }
+
+
 async def _create_session_from_existing_agent(
     conversation_store: ConversationStore,
     agent_store: AgentStore,
@@ -12328,7 +12573,8 @@ async def _create_session_from_existing_agent(
     created_by_project_id: str | None = None,
     created_by_scheduled_task_id: str | None = None,
     created_by_labels: Mapping[str, str] | None = None,
-) -> tuple[SessionResponse, Conversation, SessionCreateInput]:
+    _prepare_named_child: bool = False,
+) -> tuple[SessionResponse, Conversation, SessionCreateInput] | PreparedNamedChild:
     """
     Create a session bound to an already-registered agent.
 
@@ -12374,6 +12620,43 @@ async def _create_session_from_existing_agent(
         resolve_project_session_create,
         server_sandbox_providers,
     )
+
+    prepared_request = (
+        body.model_dump(mode="json", exclude_unset=True) if _prepare_named_child else {}
+    )
+    if _prepare_named_child:
+        allowed = {
+            "agent_id",
+            "parent_session_id",
+            "title",
+            "sub_agent_name",
+            "labels",
+            "harness_override",
+            "model_override",
+            "reasoning_effort",
+        }
+        if (
+            not body.parent_session_id
+            or not body.sub_agent_name
+            or not body.title
+            or agent_cache is None
+            or body.model_fields_set - allowed
+            or created_by_session_id is not None
+        ):
+            raise OmnigentError(
+                "Pending spawn requires a named child with inherited placement",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        await _require_access(
+            user_id, body.parent_session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        spawn_parent = await asyncio.to_thread(
+            conversation_store.get_conversation, body.parent_session_id
+        )
+        if spawn_parent is None or spawn_parent.agent_id != body.agent_id:
+            raise OmnigentError(
+                "Pending spawn must use its parent's agent", code=ErrorCode.INVALID_INPUT
+            )
 
     project_resolution = await resolve_project_session_create(
         body=body,
@@ -13100,27 +13383,40 @@ async def _create_session_from_existing_agent(
                 "harness_override": harness_override,
             }
         )
-        with creation_stage("create_persistence_ms"):
-            conv = conversation_store.create_conversation(
-                agent_id=agent.id,
-                title=body.title,
-                parent_conversation_id=body.parent_session_id,
-                runner_id=inherited_runner_id,
-                kind="sub_agent" if body.parent_session_id else "default",
-                sub_agent_name=body.sub_agent_name,
-                host_id=body.host_id,
-                workspace=canonical_workspace,
-                git_branch=git_branch,
-                terminal_launch_args=validated_launch_args,
-                project_id=project_id,
-                labels=initial_labels or None,
-                model_override=model_override,
-                reasoning_effort=reasoning_effort,
-                cost_control_mode_override=cost_control_mode_override,
-                subagent_routing_override=subagent_routing_override,
-                harness_override=harness_override,
-                **snapshot_kwargs,
+        create_arguments: dict[str, Any] = dict(
+            agent_id=agent.id,
+            title=body.title,
+            parent_conversation_id=body.parent_session_id,
+            runner_id=inherited_runner_id,
+            kind="sub_agent" if body.parent_session_id else "default",
+            sub_agent_name=body.sub_agent_name,
+            host_id=body.host_id,
+            workspace=canonical_workspace,
+            git_branch=git_branch,
+            terminal_launch_args=validated_launch_args,
+            project_id=project_id,
+            labels=initial_labels or None,
+            model_override=model_override,
+            reasoning_effort=reasoning_effort,
+            cost_control_mode_override=cost_control_mode_override,
+            subagent_routing_override=subagent_routing_override,
+            harness_override=harness_override,
+            **snapshot_kwargs,
+        )
+        if _prepare_named_child:
+            if inference_snapshot is None and _parent_for_routing is not None:
+                create_arguments["inference_snapshot"] = _parent_for_routing.inference_snapshot
+            return PreparedNamedChild(
+                create_arguments,
+                sandbox_profile,
+                selected_harness,
+                prepared_request,
+                agent.version,
+                agent.bundle_location,
+                client_surface,
             )
+        with creation_stage("create_persistence_ms"):
+            conv = conversation_store.create_conversation(**create_arguments)
             if body.sibling_source_id is not None:
                 from omnigent.server.session_families import complete_sibling_creation
 
@@ -14939,6 +15235,7 @@ async def _get_session_snapshot(
             _pending_elicitation_snapshot_for_session,
             conv_store,
             conv,
+            confinement=runner_token_confinement(request) if request is not None else None,
         ),
         subtree_usage=subtree_usage,
         viewer_id=viewer_id,
@@ -14947,7 +15244,7 @@ async def _get_session_snapshot(
         harness=harness,
         agent=agent,
     )
-    if request is not None:
+    if request is not None and runner_token_confinement(request) is None:
         from omnigent.server.session_families import project_families
 
         _, families = await asyncio.to_thread(

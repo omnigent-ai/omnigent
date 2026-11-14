@@ -387,7 +387,7 @@ async def test_scheduled_restoration_is_shared_only_within_one_generation(
     release = asyncio.Event()
     completed: list[int] = []
 
-    async def restore(*_: Any, generation: int) -> None:
+    async def restore(*_: Any, generation: int, confinement: Any = None) -> None:
         started.put_nowait(generation)
         await release.wait()
         completed.append(generation)
@@ -1026,3 +1026,92 @@ async def test_rebinding_joins_old_initialization_without_blocking_siblings(
             await asyncio.gather(old, return_exceptions=True)
             if destination is not None:
                 await asyncio.gather(destination, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_scoped_recovery_preserves_foreign_binding(recovery_tree: Any) -> None:
+    from omnigent.server.auth import RunnerTokenConfinement, runner_session_in_scope
+
+    store, parent, child, relay, _, initializer = recovery_tree
+    excluded = child()
+    allowed = child()
+    store.replace_runner_id(allowed.id, parent.runner_id)
+    confinement = RunnerTokenConfinement(
+        "new", lambda runner, sid: runner_session_in_scope(runner, sid, store.get_conversation)
+    )
+    initialized: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        initialized.append(json.loads(request.content)["session_id"])
+        return httpx.Response(201)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://runner"
+    ) as client:
+        await restore_active_children(parent, client, store, initializer, confinement=confinement)
+
+    assert initialized == [allowed.id]
+    assert store.get_conversation(excluded.id).runner_id == "old"
+    assert [call.args[0] for call in relay.call_args_list] == [allowed.id]
+
+
+@pytest.mark.asyncio
+async def test_scoped_recovery_rechecks_binding_after_initialization(recovery_tree: Any) -> None:
+    from omnigent.server.auth import RunnerTokenConfinement, runner_session_in_scope
+
+    store, parent, child, relay, _, initializer = recovery_tree
+    row = child()
+    store.replace_runner_id(row.id, parent.runner_id)
+    confinement = RunnerTokenConfinement(
+        "new", lambda runner, sid: runner_session_in_scope(runner, sid, store.get_conversation)
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content)["session_id"] == row.id
+        store.replace_runner_id(row.id, "other")
+        return httpx.Response(201)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://runner"
+    ) as client:
+        await restore_active_children(parent, client, store, initializer, confinement=confinement)
+
+    assert store.get_conversation(row.id).runner_id == "other"
+    relay.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_scheduled_restoration_keeps_scoped_and_trusted_work_separate(
+    recovery_tree: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server import child_session_recovery as recovery
+    from omnigent.server.auth import RunnerTokenConfinement
+
+    store, parent, _, _, _, initializer = recovery_tree
+    confinement = RunnerTokenConfinement("new", lambda _runner, _sid: True)
+    pending: dict[object, asyncio.Task[None]] = {}
+    started: asyncio.Queue[Any] = asyncio.Queue()
+    release = asyncio.Event()
+
+    async def restore(*_: Any, generation: int, confinement: Any = None) -> None:
+        started.put_nowait(confinement)
+        await release.wait()
+
+    monkeypatch.setattr(recovery, "_restoration_tasks", pending)
+    monkeypatch.setattr(recovery, "restore_active_children", restore)
+    async with httpx.AsyncClient() as client:
+        try:
+            recovery.schedule_child_restoration(
+                parent, client, store, initializer, confinement=confinement
+            )
+            assert await asyncio.wait_for(started.get(), 5) is confinement
+            recovery.schedule_child_restoration(parent, client, store, initializer)
+            assert await asyncio.wait_for(started.get(), 5) is None
+            recovery.schedule_child_restoration(
+                parent, client, store, initializer, confinement=confinement
+            )
+            assert len(pending) == 2
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.gather(*pending.values()), 5)
+    assert not pending

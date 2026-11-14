@@ -4321,15 +4321,17 @@ def _rotation_client(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("filed", [False, True])
 async def test_rotate_session_for_cascade_mirrors_claude_sequence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    filed: bool,
 ) -> None:
     """``_rotate_session_for_cascade`` runs claude's exact session-rotation sequence.
 
     Asserts: GET old snapshot → POST /v1/sessions (agent_id, title, project + labels) →
-    PATCH runner_id → POST terminal transfer → PATCH old runner_id="" → the
-    ``/clear`` notice to the OLD session — and that bridge state is rewritten with
+    PATCH runner_id → POST terminal transfer → the ``/clear`` notice →
+    PATCH old runner_id="" — and that bridge state is rewritten with
     the new session id + new cascade id. Crucially,
     NO ``external_session_id`` PATCH is made: agy is one long-lived process hosting
     many cascades, so the new cascade is already live (reached via the rewritten
@@ -4348,8 +4350,9 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
         "agent_id": "agent_xyz",
         "runner_id": "runner_abc",
         "labels": {ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY: "bridge-123"},
+        "id": _SESSION_ID,
         "title": "Fix login flow",
-        "project_id": "proj_alpha",
+        "project_id": "proj_alpha" if filed else None,
     }
     calls: list[tuple[str, str, dict[str, object]]] = []
     async with _rotation_client(monkeypatch, calls=calls, snapshot=snapshot) as client:
@@ -4372,11 +4375,11 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
             "POST",
             f"/v1/sessions/{_SESSION_ID}/resources/terminals/terminal_antigravity_main/transfer",
         ),
-        ("PATCH", f"/v1/sessions/{_SESSION_ID}"),  # release old runner
         # The shared /clear notice to the OLD conversation.
         ("POST", f"/v1/sessions/{_SESSION_ID}/events"),
         ("POST", f"/v1/sessions/{_SESSION_ID}/events"),
         ("POST", f"/v1/sessions/{_SESSION_ID}/events"),
+        ("PATCH", f"/v1/sessions/{_SESSION_ID}"),  # release after notifications
     ]
     event_bodies = [b for (_m, p, b) in calls if p == f"/v1/sessions/{_SESSION_ID}/events"]
     assert [b.get("type") for b in event_bodies] == [
@@ -4398,15 +4401,17 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
     assert isinstance(create_body["labels"], dict)
     assert create_body["labels"][ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY] == "bridge-123"
     assert create_body.get("title") == "Fix login flow"
-    assert create_body.get("project_id") == "proj_alpha"
-    assert create_body.get("workspace", "missing") is None
-    assert create_body.get("git", "missing") is None
+    assert create_body.get("project_id") == ("proj_alpha" if filed else None)
+    assert create_body.get("native_clear_source_id") == (_SESSION_ID if filed else None)
+    if filed:
+        assert create_body.get("workspace", "missing") is None
+        assert create_body.get("git", "missing") is None
     # The runner_id bind carried the old runner; the new session is owned by it.
     assert calls[2][2] == {"runner_id": "runner_abc"}
     # The terminal transfer targeted the new session (the SAME agy moves over).
     assert calls[3][2] == {"target_session_id": "conv_new"}
     # Old runner released.
-    assert calls[4][2] == {"runner_id": ""}
+    assert calls[-1][2] == {"runner_id": ""}
     # Bridge state was rewritten to the new session + new cascade (the reader
     # rebinds to the new cascade on the SAME agy via this shared bridge_dir).
     state = read_bridge_state(bridge_dir)

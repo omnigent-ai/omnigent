@@ -142,6 +142,7 @@ class _CommentRelayBinding:
     relay: ClaudeNativeToolRelay
     spec_entry: _SpecEntry | None
     bridge_dir: Path
+    runner_confined: bool = False
 
 
 def _require_full_native_lock_coverage(

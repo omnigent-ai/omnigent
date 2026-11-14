@@ -247,6 +247,7 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
             "project_id": "proj_alpha",
             "workspace": None,
             "git": None,
+            "native_clear_source_id": "conv_old",
         },
     ) in requests
     assert (

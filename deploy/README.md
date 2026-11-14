@@ -768,3 +768,78 @@ Run service.yaml, a Helm chart, an HF Spaces config) plus a README
 that explains how to point that platform at `docker/Dockerfile`.
 
 Update this top-level README with a row in the table above.
+
+
+### Delegated runner credentials
+
+- During the **0.20.x compatibility window**, accounts/OIDC runners sending
+  `X-Omnigent-Runner-Credential-Protocol: scoped-v1` receive credentials confined
+  to their runner's sessions. Older runners receive legacy owner-wide credentials
+  by default. **Legacy issuance retains the original cross-runner/account
+  exposure.** Upgrade/restart runners, then set
+  `OMNIGENT_ALLOW_LEGACY_RUNNER_TOKENS=0` on the server. Legacy issuance is
+  deprecated and scheduled for removal in **0.21.0**.
+- Updated runners first read `GET /v1/runners/{id}/token` with their binding
+  token. The server advertises protocols from its provider and issuer wiring
+  plus the legacy setting; discovery issues no credentials. Runners prefer
+  `scoped-v1`, selecting a headerless legacy request only when `legacy` is
+  advertised and scoped issuance is unavailable. Strict mode excludes legacy.
+  The selected protocol persists through refresh: a scoped request or refusal
+  never triggers a legacy retry. A protocol refusal is retained until the runner
+  restarts, so later callbacks do not repeatedly request the refused credential.
+  Malformed or unsupported advertisements stop
+  minting. A 404/405 from an older server preserves the existing scoped request.
+- Supporting servers never issue legacy credentials in response to `scoped-v1`.
+  Unknown protocols, unwired accounts/OIDC validators and legacy minting custom
+  providers receive HTTP 426 (`runner_upgrade_required`). Missing protocols also
+  receive 426 when legacy issuance is disabled. Header/proxy and non-minting
+  providers return HTTP 400 without a bearer; runners continue using their tunnel
+  binding token. Pre-protocol servers ignore the header and can still return
+  owner-wide credentials until upgraded. Existing legacy bearers retain authority
+  until expiry; account password rotation or deletion revokes both bearer types.
+- Scoped denials return HTTP 403 (`runner_scope_denied`) without token renewal.
+  An explicit route/method allowlist admits session callbacks and local resources.
+  Account-wide discovery, scheduling, browser SSE, sharing/project changes,
+  agent-bundle/MCP configuration writes and recursive session deletion are denied.
+  Owner-uploaded agents remain reusable and readable by known ID, including their
+  bundle contents, across the owner's runners; their definitions are read-only
+  to confined bearers.
+- Servers advertising `pending_child_spawn_v1` reserve new named children before
+  accepting their first input. A failed spawn can abort only its exact pending
+  reservation; admitted or uncertain work is retained for reconciliation.
+  Reservations become eligible for automatic expiry 24 hours after creation,
+  including after parent or account access is revoked; retries do not renew that
+  deadline. Admission committed before expiry wins and is never expired. Cleanup
+  preserves shared files and does not stop hosts, runners or other sessions.
+  Older or unsupported servers retain the conservative fallback: uncertain child
+  sessions require owner inspection and cleanup. Generic runner deletion remains
+  denied. Payload cleanup tombstones and materialization markers are retained;
+  there is no automatic tombstone garbage collection.
+- Custom `AuthProvider`s retain their two-argument `mint_runner_token` contract
+  for callers without a protocol header. Declaring `runner_token_scope` alone
+  does not enable scoped issuance. Built-in accounts/OIDC custom managed-token
+  issuers must pair their legacy callback with `mint_scoped_managed_runner_token`
+  under the same saved-authority lock.
+- JSON creation by known owner-agent ID permits an unbound top-level session for
+  native `/clear`, with no host launch. Multipart uploads require an in-scope
+  parent. Bootstrap scope is consumed before binding, transfer or detach.
+  `/clear` sends finalization events before detach. Claude journals the old/new
+  pair before consuming its hook cursor and retries bridge re-key, finalization
+  notifications, and detach in the background, including after restart. For
+  recorded rotations, required notification failures retain the journal and
+  postpone detach; retries may repeat notifications. Ordinary authentication or
+  proxy failures remain retryable, while a marked scope denial or missing old
+  session ends cleanup. Creation interrupted before journal publication is not
+  covered; this does not guarantee exactly-once replacement creation.
+  A missing journal or an unrecoverable detach failure still needs owner repair
+  with `PATCH /v1/sessions/{id}` and
+  `{"runner_id": ""}`, or restore a failed initial binding using
+  `{"runner_id": "<runner-id>"}`. Inherited scope stops after 32 parent edges;
+  deeper unbound sessions need an explicit owner binding. A nearer conflicting
+  binding always takes precedence.
+
+Confined child lists use encrypted cursors, bound to the runner and parent and
+valid for one hour. Treat `first_id` and `last_id` as opaque continuation tokens.
+A bounded page may be empty with `has_more=true` after children move to another
+runner; continue with `last_id` (`after`) or `first_id` (`before`). Owner lists
+keep their ordinary session-ID cursors.

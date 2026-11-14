@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from collections.abc import Iterator, Mapping
@@ -50,6 +51,8 @@ from omnigent.db.db_models import (
     SqlPreference,
     SqlProject,
     SqlSessionPermission,
+    SqlSessionSpawn,
+    SqlSessionSpawnMaterialization,
     SqlUser,
     SqlUserDailyCost,
     current_workspace_id,
@@ -109,6 +112,7 @@ from omnigent.stores.conversation_store import (
     PENDING_INPUT_RESPONSE_ID,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
+    RUNNER_CREATOR_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SIDE_CHAT_COPY_ID_PREFIX_LEN,
     ConversationAlreadyExistsError,
@@ -118,6 +122,7 @@ from omnigent.stores.conversation_store import (
     CreatedSession,
     DailyCostState,
     ProfileHostBinding,
+    RunnerSessionScope,
     SessionActivity,
     SessionConnectivity,
     SpawnTreeUsage,
@@ -141,6 +146,14 @@ from omnigent.stores.sandbox_profile_store import (
     profile_labels,
     reject_profile_labels,
     same_profile_identity,
+)
+from omnigent.stores.session_spawn_store import (
+    SessionSpawnStore,
+    SpawnConflictError,
+    SpawnPhase,
+    SpawnReceipt,
+    SpawnState,
+    SpawnWorkRef,
 )
 from omnigent.util.session_lifecycle import title_without_closed_marker
 
@@ -1068,6 +1081,63 @@ class SqlAlchemyConversationStore(ConversationStore):
                 {"id": uuid_to_bytes(conversation_id)},
             )
 
+    def _check_spawn_creation_id(
+        self, conversation_id: str, claim: SpawnReceipt | None = None
+    ) -> None:
+        """Only an admitted attempt can create its reserved ID; markers fence reuse."""
+        with self._session("validate_spawn_creation_claim") as session:
+            reservation = session.scalar(
+                select(SqlSessionSpawn).where(
+                    SqlSessionSpawn.workspace_id == current_workspace_id(),
+                    SqlSessionSpawn.child_id == conversation_id,
+                )
+            )
+            if claim is not None:
+                require_active_account(
+                    session,
+                    claim.identity.owner_id,
+                    generation=claim.identity.account_generation,
+                )
+                if (
+                    reservation is None
+                    or reservation.state != SpawnState.ADMITTED
+                    or reservation.phase != SpawnPhase.MATERIALIZE
+                    or reservation.nonce != claim.nonce
+                    or reservation.epoch != claim.epoch
+                    or reservation.creator_runner_id != claim.identity.runner_id
+                    or reservation.parent_id != claim.identity.parent_id
+                    or reservation.owner_id != claim.identity.owner_id
+                    or reservation.account_generation != claim.identity.account_generation
+                    or reservation.request_digest != claim.request_digest
+                    or uuid_to_bytes(conversation_id).hex() != claim.child_id
+                ):
+                    raise SpawnConflictError("Child ID lacks a matching admitted spawn claim")
+                return
+            if reservation is not None:
+                raise SpawnConflictError("Child ID is reserved by a spawn attempt")
+        with self._conv_session("check_spawn_materialization_marker") as session:
+            if (
+                session.get(
+                    SqlSessionSpawnMaterialization, (current_workspace_id(), conversation_id)
+                )
+                is not None
+            ):
+                raise SpawnConflictError("Child ID has already been materialized")
+
+    def spawn_was_deleted(self, receipt: SpawnReceipt | SpawnWorkRef) -> bool:
+        """A permanent matching marker proves that an absent AP child cannot return."""
+        with self._conv_session("check_deleted_child_spawn") as session:
+            marker = session.get(
+                SqlSessionSpawnMaterialization, (current_workspace_id(), receipt.child_id)
+            )
+            if marker is None or (
+                marker.creator_runner_id != receipt.identity.runner_id
+                or marker.epoch != receipt.epoch
+                or marker.nonce != receipt.nonce
+            ):
+                return False
+            return session.get(SqlConversation, (current_workspace_id(), receipt.child_id)) is None
+
     def create_conversation(
         self,
         kind: str = "default",
@@ -1090,6 +1160,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         subagent_routing_override: str | None = None,
         harness_override: str | None = None,
         side_chat_parent_id: str | None = None,
+        _spawn_claim: SpawnReceipt | None = None,
+        _spawn_first_input: NewConversationItem | None = None,
     ) -> Conversation:
         """
         Create a new conversation in the database.
@@ -1156,6 +1228,42 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         now = now_epoch()
         new_id = conversation_id if conversation_id is not None else generate_conversation_id()
+        if conversation_id is not None or _spawn_claim is not None:
+            self._check_spawn_creation_id(new_id, _spawn_claim)
+        if _spawn_claim is not None and (
+            parent_conversation_id is None
+            or uuid_to_bytes(parent_conversation_id).hex() != _spawn_claim.identity.parent_id
+        ):
+            raise SpawnConflictError("Spawn child must retain its reserved parent")
+        if parent_conversation_id is not None:
+            self.require_spawn_activated(parent_conversation_id)
+        if side_chat_parent_id is not None:
+            self.require_spawn_activated(side_chat_parent_id)
+        first_input_json = None
+        encoded_first_input = None
+        if _spawn_claim is not None:
+            if (
+                _spawn_first_input is None
+                or _spawn_first_input.type not in ("message", "slash_command")
+                or _spawn_first_input.stable_id is None
+                or _spawn_first_input.response_id != PENDING_INPUT_RESPONSE_ID
+                or _spawn_first_input.status != "in_progress"
+                or _spawn_first_input.created_by != _spawn_claim.identity.owner_id
+                or _spawn_first_input.replaces_pending_id is not None
+            ):
+                raise SpawnConflictError("Spawn requires its durable first input")
+            first_input_json = strip_nul_bytes(
+                json.dumps(_spawn_first_input.model_dump(exclude_none=True), sort_keys=True)
+            )
+            encoded_first_input = self._encode_item_data_batch(
+                [
+                    strip_nul_bytes(
+                        json.dumps(_spawn_first_input.data.model_dump(exclude_none=True))
+                    )
+                ]
+            )[0]
+        elif _spawn_first_input is not None:
+            raise SpawnConflictError("Prepared first input requires an admitted spawn claim")
         encoded_kind = encode_conversation_kind(kind)
         encoded_terminal_launch_args = (
             json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
@@ -1187,7 +1295,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                             f"parent conversation {parent_conversation_id!r} does not exist"
                         )
                     root_id = parent_row.root_conversation_id
-                if inference_snapshot is None:
+                if inference_snapshot is None and _spawn_claim is None:
                     parent_meta = self._get_meta(parent_conversation_id)
                     encoded_inference_snapshot = (
                         parent_meta.inference_snapshot if parent_meta else None
@@ -1197,6 +1305,68 @@ class SqlAlchemyConversationStore(ConversationStore):
                 title = f"untitled:{new_id}"
 
             def insert_conversation(ap_sess: Session) -> SqlConversation:
+                if _spawn_claim is not None:
+                    create_digest = hashlib.sha256(
+                        json.dumps(
+                            [
+                                encoded_kind,
+                                title,
+                                parent_conversation_id,
+                                agent_id,
+                                runner_id,
+                                sub_agent_name,
+                                host_id,
+                                workspace,
+                                git_branch,
+                                encoded_terminal_launch_args,
+                                project_id,
+                                encoded_inference_snapshot,
+                                encoded_overrides,
+                                prepared_labels,
+                                side_chat_parent_id,
+                                first_input_json,
+                            ],
+                            sort_keys=True,
+                        ).encode()
+                    ).digest()
+                    marker = ap_sess.get(
+                        SqlSessionSpawnMaterialization, (current_workspace_id(), new_id)
+                    )
+                    existing = ap_sess.get(SqlConversation, (current_workspace_id(), new_id))
+                    if marker is not None:
+                        if (
+                            marker.creator_runner_id != _spawn_claim.identity.runner_id
+                            or marker.epoch != _spawn_claim.epoch
+                            or marker.nonce != _spawn_claim.nonce
+                            or marker.create_digest != create_digest
+                        ):
+                            raise SpawnConflictError(
+                                "Materialized child does not match this attempt"
+                            )
+                        if existing is None:
+                            raise SpawnConflictError(
+                                "Materialized child was deleted; retain the attempt"
+                            )
+                        if (
+                            existing.parent_conversation_id != parent_conversation_id
+                            or existing.agent_id != agent_id
+                        ):
+                            raise SpawnConflictError("Materialized child identity changed")
+                        return existing
+                    if existing is not None:
+                        raise SpawnConflictError(
+                            "Reserved child ID already belongs to another session"
+                        )
+                    ap_sess.add(
+                        SqlSessionSpawnMaterialization(
+                            child_id=new_id,
+                            creator_runner_id=_spawn_claim.identity.runner_id,
+                            epoch=_spawn_claim.epoch,
+                            nonce=_spawn_claim.nonce,
+                            create_digest=create_digest,
+                            created_at=now,
+                        )
+                    )
                 # Application-level (parent, title) uniqueness — there is no DB
                 # unique constraint. Only children are scoped; top-level sessions
                 # (NULL parent) may reuse titles freely. The SELECT seeks this
@@ -1235,6 +1405,23 @@ class SqlAlchemyConversationStore(ConversationStore):
                     session_overrides=encoded_overrides,
                 )
                 ap_sess.add(row)
+                if _spawn_first_input is not None:
+                    first_values: dict[str, Any] = {
+                        "workspace_id": current_workspace_id(),
+                        "id": _spawn_first_input.stable_id,
+                        "conversation_id": new_id,
+                        "position": 0,
+                        "response_id": PENDING_INPUT_RESPONSE_ID,
+                        "created_at": now,
+                        "status": encode_item_status(_spawn_first_input.status),
+                        "type": encode_item_type(_spawn_first_input.type),
+                        "data": encoded_first_input,
+                        "created_by": _spawn_first_input.created_by,
+                    }
+                    if self._item_search_text(_spawn_first_input) is not None:
+                        first_values["search_text"] = ""
+                    ap_sess.execute(insert(SqlConversationItem), [first_values])
+                    row.next_position = 1
                 if prepared_labels:
                     _upsert_prepared_labels(ap_sess, new_id, prepared_labels, now)
                 return row
@@ -1246,6 +1433,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
 
             def insert_metadata(meta_sess: Session) -> SqlConversationMetadata:
+                if _spawn_claim is not None:
+                    require_active_account(
+                        meta_sess,
+                        _spawn_claim.identity.owner_id,
+                        generation=_spawn_claim.identity.account_generation,
+                    )
                 lock_host_for_binding(meta_sess, host_id)
                 previous = (
                     meta_sess.get(SqlConversationMetadata, (current_workspace_id(), new_id))
@@ -1253,6 +1446,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     else None
                 )
                 if previous is not None:
+                    if _spawn_claim is not None:
+                        return previous
                     # ponytail: keep the binding so replacement can resume after a crash.
                     if previous.host_id != host_id:
                         raise OmnigentError(
@@ -1284,8 +1479,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                     insert_metadata,
                 )
             except OmnigentError:
-                self._discard_unbound_conversation(new_id)
+                if _spawn_claim is None:
+                    self._discard_unbound_conversation(new_id)
                 raise
+            if _spawn_claim is not None:
+                current = self.get_conversation(new_id)
+                if current is None:
+                    raise SpawnConflictError(
+                        "Materialized child disappeared before acknowledgment"
+                    )
+                return current
             return _to_conversation(row, meta, prepared_labels)
         except IntegrityError as exc:
             # Translate a caller-supplied-id PK collision into a clean exception
@@ -1314,6 +1517,52 @@ class SqlAlchemyConversationStore(ConversationStore):
                     f"conversation id {conversation_id!r} already exists"
                 ) from exc
             raise
+
+    def spawn_activation_pending(self, conversation_id: str) -> bool:
+        with self._session("check_child_spawn_activation") as session:
+            phase = session.scalar(
+                select(SqlSessionSpawn.phase).where(
+                    SqlSessionSpawn.workspace_id == current_workspace_id(),
+                    SqlSessionSpawn.child_id == conversation_id,
+                )
+            )
+        return phase is not None and phase not in (SpawnPhase.DISPATCH, SpawnPhase.READY)
+
+    def get_runner_scope(
+        self, conversation_id: str, *, _metadata_session: Session | None = None
+    ) -> RunnerSessionScope | None:
+        """Read three full primary keys across the conversation and metadata databases."""
+        with self._conv_session("select_runner_scope_conversation") as session:
+            row = session.execute(
+                select(SqlConversation.parent_conversation_id).where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id == conversation_id,
+                )
+            ).one_or_none()
+            if row is None:
+                return None
+            parent_id = row.parent_conversation_id
+            creator = session.scalar(
+                select(SqlConversationLabel.value).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id == conversation_id,
+                    SqlConversationLabel.key == RUNNER_CREATOR_LABEL_KEY,
+                )
+            )
+        binding_query = select(SqlConversationMetadata.runner_id).where(
+            SqlConversationMetadata.workspace_id == current_workspace_id(),
+            SqlConversationMetadata.id == conversation_id,
+        )
+        if _metadata_session is not None:
+            runner_id = _metadata_session.scalar(binding_query.with_for_update())
+        else:
+            with self._session("select_runner_scope_binding") as metadata_session:
+                runner_id = metadata_session.scalar(binding_query)
+        return RunnerSessionScope(
+            runner_id,
+            parent_id,
+            {RUNNER_CREATOR_LABEL_KEY: creator} if creator is not None else {},
+        )
 
     def _discard_unbound_conversation(self, conversation_id: str) -> None:
         """Undo an unpublished conversation when metadata admission was rejected."""
@@ -4238,6 +4487,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         :returns: The updated conversation and requested model-setting change
             flags, or ``None`` if the conversation does not exist.
         """
+        self.require_spawn_activated(conversation_id)
         now = now_epoch()
         encoded_terminal_launch_args = (
             json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
@@ -4588,7 +4838,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``False`` if the row was already pinned or doesn't
             exist.
         """
+        self.require_spawn_activated(conversation_id)
         from sqlalchemy import update
+
+        # Labels and bindings may live in separate databases. Revoke bootstrap
+        # access first so a failed binding write cannot restore old authority.
+        self.delete_label(conversation_id, RUNNER_CREATOR_LABEL_KEY)
 
         def write(session: Session) -> bool:
             stmt = (
@@ -4883,6 +5138,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             exists for ``conversation_id``.
         :raises ValueError: If *expected_binding* or *expected_runner* no longer matches.
         """
+        self.require_spawn_activated(conversation_id)
+
+        self.delete_label(conversation_id, RUNNER_CREATOR_LABEL_KEY)
 
         def write(session: Session) -> SqlConversationMetadata:
             meta = session.get(
@@ -4951,6 +5209,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         :raises ConversationNotFoundError: If no conversation row
             exists for ``conversation_id``.
         """
+        self.require_spawn_activated(conversation_id)
+
+        self.delete_label(conversation_id, RUNNER_CREATOR_LABEL_KEY)
 
         def write(session: Session) -> SqlConversationMetadata:
             meta = session.get(
@@ -5011,7 +5272,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         :raises ConversationNotFoundError: If no conversation row
             exists for ``conversation_id``.
         """
+        self.require_spawn_activated(conversation_id)
 
+        self.delete_label(conversation_id, RUNNER_CREATOR_LABEL_KEY)
         if expected_host_id is not None:
             expected_host_id = uuid_to_bytes(expected_host_id).hex()
 
@@ -5200,7 +5463,30 @@ class SqlAlchemyConversationStore(ConversationStore):
             return
         _upsert_prepared_labels(session, conversation_id, profile_labels(snapshot), now_epoch())
 
-    def accept_sandbox_profile(self, conversation_id: str, snapshot: dict[str, Any]) -> None:
+    def accept_sandbox_profile(
+        self,
+        conversation_id: str,
+        snapshot: dict[str, Any],
+        *,
+        _spawn_claim: SpawnReceipt | None = None,
+    ) -> None:
+        if _spawn_claim is None:
+            self.require_spawn_activated(conversation_id)
+        else:
+            with self._session("authorize_child_spawn_profile") as session:
+                row = SessionSpawnStore._find(
+                    session, _spawn_claim.identity, _spawn_claim.epoch, _spawn_claim.nonce
+                )
+                if (
+                    row is None
+                    or row.child_id != conversation_id
+                    or row.child_id != _spawn_claim.child_id
+                    or row.request_digest != _spawn_claim.request_digest
+                    or row.state != SpawnState.ADMITTED
+                    or row.phase != SpawnPhase.ACTIVATE
+                    or (_spawn_claim.create_payload or {}).get("sandbox_profile") != snapshot
+                ):
+                    raise SpawnConflictError("Profile requires the matching activation claim")
         run_write_transaction(
             self._conv_session_immediate,
             "accept_sandbox_profile",
@@ -5231,6 +5517,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         profile_snapshot: dict[str, Any] | None = None,
     ) -> None:
         """Validate the source before accepting labels and transferring its binding."""
+        self.require_spawn_activated(conversation_id)
         host_id = uuid_to_bytes(host_id).hex()
 
         def write(session: Session) -> None:
@@ -5309,6 +5596,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         expected_binding: ProfileHostBinding | None = None,
         replace_stale_runner: bool = False,
     ) -> ProfileHostBinding:
+        self.require_spawn_activated(conversation_id)
         host_id = uuid_to_bytes(host_id).hex()
 
         def write(session: Session) -> ProfileHostBinding:
@@ -5551,6 +5839,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``host_id`` is being set on a row with no ``workspace``
             and the caller did not supply one).
         """
+        self.require_spawn_activated(conversation_id)
 
         def write(session: Session) -> SqlConversationMetadata:
             lock_host_for_binding(session, host_id)
@@ -5794,6 +6083,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         lets a subclass inject one (MAS's WHS-homed store injects the WHS node id)."""
         from omnigent.stores.conversation_store import ConversationNotFoundError
 
+        self._check_spawn_creation_id(conversation_id)
+        if parent_conversation_id is not None:
+            self.require_spawn_activated(parent_conversation_id)
         now = now_epoch()
         encoded_overrides = _encode_session_overrides(
             {
@@ -6153,6 +6445,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         ``conversation_id``. The public method generates a fresh id; this seam
         lets a subclass inject one (MAS's WHS-homed store injects the WHS node id
         so a forked session keeps a single identity across storage backends)."""
+        self._check_spawn_creation_id(conversation_id)
+        self.require_spawn_activated(source_conversation_id)
         now = now_epoch()
         new_conv_id = conversation_id
         creating_clone = cloned_agent_bundle_location is not None

@@ -444,6 +444,114 @@ async def test_cancelled_worker_leaves_unsent_input_for_restart(startup_env: _En
 
 
 @pytest.mark.parametrize("control", ["interrupt", "stop_session"])
+async def test_pending_child_stop_survives_activation_and_mutations_remain_fenced(
+    startup_env: _Env, control: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.entities.conversation import MessageData, NewConversationItem
+    from omnigent.server.routes.sessions import routes_events
+    from omnigent.server.session_spawns import SessionSpawnCoordinator
+    from omnigent.server.startup_inputs import initial_input_id
+    from omnigent.stores.conversation_store import PENDING_INPUT_RESPONSE_ID
+    from omnigent.stores.session_spawn_store import SpawnActivationCheck, SpawnIdentity, SpawnPhase
+
+    env = startup_env
+    startup = env.app.state.startup_inputs
+    startup.dispatch = AsyncMock()
+    stop_runner = AsyncMock()
+    monkeypatch.setattr(routes_events, "_stop_session_via_runner", stop_runner)
+    parent = env.conv_store.create_conversation(title="parent", runner_id="creator-runner")
+    identity = SpawnIdentity("creator-runner", parent.id, "local")
+    coordinator = SessionSpawnCoordinator(
+        env.conv_store,
+        startup,
+        activate=AsyncMock(
+            return_value=SpawnActivationCheck(identity.runner_id, None, None, {}, None)
+        ),
+        cleanup_blob=Mock(),
+        artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
+    )
+    spawns = coordinator.spawns
+    receipt = spawns.reserve(
+        identity,
+        uuid4().hex,
+        epoch=spawns.current_epoch(identity),
+        title="worker",
+        max_file_bytes=1024,
+        create_payload={
+            "arguments": {
+                "title": "worker",
+                "parent_conversation_id": parent.id,
+                "runner_id": identity.runner_id,
+                "kind": "sub_agent",
+                "sub_agent_name": "worker",
+                "labels": {STARTUP_LABEL: "pending"},
+            }
+        },
+    )
+    first = NewConversationItem(
+        stable_id=initial_input_id(receipt.child_id),
+        type="message",
+        status="in_progress",
+        response_id=PENDING_INPUT_RESPONSE_ID,
+        created_by=identity.owner_id,
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "first"}]),
+    )
+    receipt = spawns.admit(
+        identity, receipt.nonce, first.model_dump(mode="json"), epoch=receipt.epoch
+    )
+    await coordinator.advance(env.app, receipt)
+    assert env.conv_store.spawn_activation_pending(receipt.child_id)
+
+    changed = await env.client.patch(f"/v1/sessions/{receipt.child_id}", json={"title": "changed"})
+    assert changed.status_code == 409, changed.text
+    copied = await env.client.post(
+        f"/v1/sessions/{receipt.child_id}/resources/files:copy",
+        json={"source_session_id": parent.id, "file_ids": [uuid4().hex]},
+    )
+    assert copied.status_code == 409, copied.text
+    for endpoint in ("policies/evaluate", "hooks/route-turn", "hooks/route-subagent"):
+        hook = await env.client.post(f"/v1/sessions/{receipt.child_id}/{endpoint}", json={})
+        assert hook.status_code == 409, hook.text
+    from fastapi import APIRouter
+
+    from omnigent.server.routes.session_policies import create_session_policies_router
+    from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+
+    policies = SqlAlchemyPolicyStore(env.conv_store.storage_location)
+    policy_router = APIRouter(prefix="/v1")
+    policy_router.include_router(create_session_policies_router(policies, env.conv_store))
+    env.app.router.routes[0:0] = policy_router.routes
+    policy_path = f"/v1/sessions/{receipt.child_id}/policies"
+    for method, path, body in (
+        (
+            "POST",
+            policy_path,
+            {
+                "name": "budget",
+                "type": "python",
+                "handler": "omnigent.policies.builtins.cost.subagent_cost_budget",
+            },
+        ),
+        ("PATCH", f"{policy_path}/{uuid4().hex}", {"enabled": False}),
+        ("DELETE", f"{policy_path}/{uuid4().hex}", None),
+    ):
+        policy_change = await env.client.request(method, path, json=body)
+        assert policy_change.status_code == 409, policy_change.text
+    assert policies.list_for_session(receipt.child_id) == []
+    assert env.conv_store.get_conversation(receipt.child_id).title == "worker"
+    response = await env.client.post(
+        f"/v1/sessions/{receipt.child_id}/events", json={"type": control}
+    )
+    assert response.status_code == 202, response.text
+    assert env.conv_store.list_pending_inputs(receipt.child_id) == []
+    stop_runner.assert_not_awaited()
+    await coordinator.advance(env.app, receipt)
+    await coordinator.advance(env.app, receipt)
+    assert spawns.get(identity, receipt.nonce, epoch=receipt.epoch).phase == SpawnPhase.READY
+    startup.dispatch.assert_not_awaited()
+
+
+@pytest.mark.parametrize("control", ["interrupt", "stop_session"])
 async def test_stop_before_host_ready_cancels_all_saved_inputs(
     startup_env: _Env, control: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

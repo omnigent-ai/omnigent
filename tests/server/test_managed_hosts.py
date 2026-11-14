@@ -77,6 +77,7 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import Host, HostStore
+from omnigent.stores.permission_store import PermissionStore
 from tests.server.helpers import (
     FakeSandboxLauncher,
     HostStartInvocation,
@@ -2580,6 +2581,7 @@ def _capability_probe_app(
     sandbox_config: ManagedSandboxDeployment | None,
     *,
     host_store: HostStore | None = None,
+    permission_store: PermissionStore | None = None,
 ) -> FastAPI:
     """
     Build a real app wired with *sandbox_config* to probe ``GET /v1/info``.
@@ -2592,8 +2594,11 @@ def _capability_probe_app(
     :param sandbox_config: The sandbox config under test, or ``None``
         when managed hosts are not configured.
     :param host_store: Optional managed-host store for lifespan tests.
+    :param permission_store: Optional permission backend for capability checks.
     :returns: The assembled FastAPI app.
     """
+    from omnigent.server.auth import UnifiedAuthProvider
+
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     return create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
@@ -2602,6 +2607,10 @@ def _capability_probe_app(
         artifact_store=artifact_store,
         agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
         host_store=host_store,
+        permission_store=permission_store,
+        auth_provider=UnifiedAuthProvider(source="header")
+        if permission_store is not None
+        else None,
         sandbox_config=sandbox_config,
     )
 
@@ -2687,9 +2696,11 @@ async def test_info_reports_managed_sandboxes_capability(
     assert body["sandbox_provider"] == expected_provider
 
 
+@pytest.mark.parametrize("permissions", ["none", "sql", "custom"])
 async def test_info_reports_enabled_for_injected_custom_launcher(
     db_uri: str,
     tmp_path: Path,
+    permissions: str,
 ) -> None:
     """
     The embedding seam: a directly-constructed config (custom launcher
@@ -2705,12 +2716,23 @@ async def test_info_reports_enabled_for_injected_custom_launcher(
             token_ttl_s=3600,
         )
     )
-    app = _capability_probe_app(db_uri, tmp_path, config)
+    from unittest.mock import Mock
+
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    permission_store = None
+    if permissions == "sql":
+        permission_store = SqlAlchemyPermissionStore(db_uri)
+    elif permissions == "custom":
+        permission_store = Mock(spec=PermissionStore, storage_location=db_uri)
+    app = _capability_probe_app(db_uri, tmp_path, config, permission_store=permission_store)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.get("/v1/info")
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["managed_sandboxes_enabled"] is True
+    assert body["pending_child_spawn_v1"] is (permissions != "custom")
+    assert (app.state.session_spawn_recovery is not None) is (permissions != "custom")
     # No provider set on the injected config → the UI keeps the generic
     # label rather than inventing a name.
     assert body["sandbox_provider"] is None

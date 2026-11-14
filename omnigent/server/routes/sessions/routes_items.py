@@ -27,6 +27,7 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
+    runner_token_confinement,
 )
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
@@ -328,6 +329,9 @@ def register_items_routes(
         matches :func:`list_session_items` so existing client code
         can reuse the same cursor logic.
 
+        Confined runners receive opaque cursors valid for one hour. Filtering
+        may leave an empty page with ``has_more=true``; continue using its cursor.
+
         :param request: Inbound HTTP request; carries the caller
             identity used to authorize READ on the parent session.
         :param session_id: Parent session/conversation identifier,
@@ -386,27 +390,45 @@ def register_items_routes(
         title_filter: str | None = None
         if tool and session_name:
             title_filter = f"{tool}:{session_name}"
-        page = await asyncio.to_thread(
-            conversation_store.list_conversations,
-            limit=limit,
-            after=after,
-            before=before,
-            kind="sub_agent",
-            parent_conversation_id=session_id,
-            order=order,
-            sort_by="created_at",
-            title=title_filter,
-        )
-        await _settle_children(request, page.data, may_settle)
+        confinement = runner_token_confinement(request)
+        if confinement is not None:
+            after = confinement.child_cursor(session_id, after, decode=True)
+            before = confinement.child_cursor(session_id, before, decode=True)
+        try:
+            page = await asyncio.to_thread(
+                conversation_store.list_conversations,
+                limit=limit,
+                after=after,
+                before=before,
+                kind="sub_agent",
+                parent_conversation_id=session_id,
+                order=order,
+                sort_by="created_at",
+                title=title_filter,
+            )
+        except StaleCursorError:
+            if confinement is not None:
+                raise StaleCursorError("") from None
+            raise
+        children = page.data
+        if confinement is not None:
+            children = await asyncio.to_thread(
+                lambda: [child for child in children if confinement.allows_session(child.id)]
+            )
+        await _settle_children(request, children, may_settle)
         data = await _child_session_summaries_from_conversations(
-            page.data,
+            children,
             session_id,
             conversation_store,
         )
         return PaginatedList(
             data=data,
-            first_id=page.first_id,
-            last_id=page.last_id,
+            first_id=confinement.child_cursor(session_id, page.first_id)
+            if confinement
+            else page.first_id,
+            last_id=confinement.child_cursor(session_id, page.last_id)
+            if confinement
+            else page.last_id,
             has_more=page.has_more,
         )
 
@@ -436,6 +458,10 @@ def register_items_routes(
         :raises StaleCursorError: If *after* is not a row of the subtree, or
             the tree outgrew one read since the page it came from.
         """
+        confinement = runner_token_confinement(request)
+        public_after = after
+        if confinement is not None:
+            after = confinement.child_cursor(parent.id, after, decode=True)
         page = await asyncio.to_thread(
             conversation_store.list_spawn_tree,
             parent.root_conversation_id or parent.id,
@@ -446,7 +472,7 @@ def register_items_routes(
             if after is not None:
                 # The tree outgrew one read since the first page: this cursor
                 # cannot continue, so the client restarts.
-                raise StaleCursorError(after)
+                raise StaleCursorError(public_after or "")
             return None
         # Rows come in the store's one-level listing order, so grouping keeps
         # each parent's children in the order a per-level walk reads them.
@@ -478,9 +504,22 @@ def register_items_routes(
         if after is not None:
             position = next((i for i, c in enumerate(ordered) if c.id == after), None)
             if position is None:
-                raise StaleCursorError(after)
+                raise StaleCursorError(public_after or "")
             start = position + 1
         window = ordered[start : start + limit]
+        first_id = window[0].id if window else None
+        last_id = window[-1].id if window else None
+        if confinement is not None:
+
+            def visible_window() -> list[Conversation]:
+                # Hide foreign branches so summaries cannot disclose their parent ids.
+                visible = {parent.id}
+                for child in ordered[: start + limit]:
+                    if parent_ids[child.id] in visible and confinement.allows_session(child.id):
+                        visible.add(child.id)
+                return [child for child in window if child.id in visible]
+
+            window = await asyncio.to_thread(visible_window)
         await _settle_children(request, window, may_settle)
         summaries = await _child_session_summaries_from_conversations(
             window, parent.id, conversation_store, parent_ids=parent_ids
@@ -488,8 +527,8 @@ def register_items_routes(
         data = [s.model_copy(update={"depth": depths[s.id]}) for s in summaries]
         return PaginatedList(
             data=data,
-            first_id=data[0].id if data else None,
-            last_id=data[-1].id if data else None,
+            first_id=confinement.child_cursor(parent.id, first_id) if confinement else first_id,
+            last_id=confinement.child_cursor(parent.id, last_id) if confinement else last_id,
             has_more=start + limit < len(ordered),
         )
 

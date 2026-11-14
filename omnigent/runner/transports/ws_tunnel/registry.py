@@ -39,7 +39,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
 from itertools import count
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 from weakref import WeakValueDictionary
 
 import httpx
@@ -55,6 +55,9 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     WSCloseFrame,
     WSFrame,
 )
+
+if TYPE_CHECKING:
+    from omnigent.server.auth import RunnerTokenConfinement
 
 _logger = logging.getLogger(__name__)
 _connection_generations = count(1)
@@ -116,6 +119,7 @@ class RunnerSession:
         disabled (single-user mode). Used to enforce runner
         ownership: only the owner (or an admin) may bind sessions
         to this runner.
+    :param confinement: Authenticated runner scope carried into reconnect recovery.
     :param generation: Process-unique connection generation for initialization readiness.
     :param superseded: Whether a newer tunnel replaced this connection, retained
         after that replacement disconnects so delayed cleanup cannot own its outage.
@@ -140,6 +144,7 @@ class RunnerSession:
     connected_at: float
     last_frame_at: float
     owner: str | None
+    confinement: RunnerTokenConfinement | None = field(default=None, kw_only=True)
     last_frame_monotonic: float = field(default_factory=time.monotonic, kw_only=True)
     generation: int = field(default_factory=lambda: next(_connection_generations))
     superseded: bool = field(default=False, init=False)
@@ -316,6 +321,7 @@ class TunnelRegistry:
         hello: HelloFrame,
         *,
         owner: str | None = None,
+        confinement: RunnerTokenConfinement | None = None,
     ) -> RunnerSession:
         """Add a new session.
 
@@ -345,6 +351,7 @@ class TunnelRegistry:
             connected_at=now,
             last_frame_at=now,
             owner=owner,
+            confinement=confinement,
             last_frame_monotonic=time.monotonic(),
         )
         with self._lock:

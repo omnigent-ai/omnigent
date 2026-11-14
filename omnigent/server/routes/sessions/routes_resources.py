@@ -59,6 +59,7 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
+    require_runner_session_scope,
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostConnection, HostRegistry
@@ -441,6 +442,8 @@ def register_resources_routes(
                 permission_store,
                 conversation_store,
             )
+            if request.method not in ("GET", "HEAD"):
+                await asyncio.to_thread(conversation_store.require_spawn_activated, session_id)
             # _require_access_and_level already fetched the conversation for
             # non-admin callers — reuse it to avoid a second DB round-trip.
             if access.conversation is not None:
@@ -1794,6 +1797,7 @@ def register_resources_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
         await _validate_session(target_session_id, request, LEVEL_OWNER)
+        require_runner_session_scope(request, target_session_id)
 
         user_id = _get_user_id(request, auth_provider)
         # Sub-agents inherit their parent's host; check the host the terminal runs on.
@@ -2382,6 +2386,7 @@ def register_resources_routes(
                 "Source session is not an ancestor of this session",
                 code=ErrorCode.FORBIDDEN,
             )
+        require_runner_session_scope(request, body.source_session_id)
 
         # Validate every source file WITHOUT reading a blob, enforcing the copy
         # limits before any blob is read. Summing StoredFile.bytes here means

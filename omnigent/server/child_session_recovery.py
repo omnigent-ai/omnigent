@@ -15,6 +15,7 @@ from omnigent.entities import Conversation
 from omnigent.harness_plugins import native_agents
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.runner.launch_failure import RUNNER_PROCESS_CRASH
+from omnigent.server.auth import RunnerTokenConfinement
 from omnigent.server.runner_session_init import RunnerSessionInitializer, is_session_agent_removed
 from omnigent.stores.conversation_store import ConversationNotFoundError, ConversationStore
 from omnigent.util.session_lifecycle import is_session_closed
@@ -27,7 +28,7 @@ _child_recovery_locks: WorkspaceScopedCache[str, asyncio.Lock] = WorkspaceScoped
     WeakValueDictionary
 )
 
-_restoration_tasks: WorkspaceScopedCache[tuple[str, str, int], asyncio.Task[None]] = (
+_restoration_tasks: WorkspaceScopedCache[tuple[str, str, int, str | None], asyncio.Task[None]] = (
     WorkspaceScopedCache()
 )
 
@@ -37,17 +38,21 @@ def schedule_child_restoration(
     client: httpx.AsyncClient,
     store: ConversationStore,
     initializer: RunnerSessionInitializer,
+    *,
+    confinement: RunnerTokenConfinement | None = None,
 ) -> None:
     """Restore children after parent readiness without delaying its next message."""
     if parent.runner_id is None:
         return
     generation = initializer.generation_for(parent.runner_id, client)
-    key = (parent.id, parent.runner_id, generation)
+    key = (parent.id, parent.runner_id, generation, confinement.runner_id if confinement else None)
     existing = _restoration_tasks.get(key)
     if existing is not None and not existing.done():
         return
     task = asyncio.create_task(
-        restore_active_children(parent, client, store, initializer, generation=generation),
+        restore_active_children(
+            parent, client, store, initializer, generation=generation, confinement=confinement
+        ),
         name=f"restore-children-{parent.id}",
     )
     _restoration_tasks[key] = task
@@ -117,6 +122,7 @@ async def restore_active_children(
     *,
     generation: int | None = None,
     store_slots: asyncio.Semaphore | None = None,
+    confinement: RunnerTokenConfinement | None = None,
 ) -> None:
     """Rebind and initialize interrupted descendants on their recovered parent's runner."""
     from omnigent.runtime import get_runner_router
@@ -141,6 +147,13 @@ async def restore_active_children(
         async with store_slots:
             return await asyncio.to_thread(fn, *args, **kwargs)
 
+    async def scope_allows(row: Conversation) -> bool:
+        # Trusted reconnects retain owner-authorized cross-runner recovery.
+        return confinement is None or (
+            row.runner_id in (None, confinement.runner_id)
+            and await store_call(confinement.allows_session, row.id)
+        )
+
     async def ownership_allows(row: Conversation) -> bool:
         if runner_owner is None:
             return True
@@ -148,7 +161,7 @@ async def restore_active_children(
         # Internal children without an owner grant inherit from their restored ancestor.
         return session_owner is None or session_owner == runner_owner
 
-    if not await ownership_allows(parent):
+    if not await scope_allows(parent) or not await ownership_allows(parent):
         return
     # Include idle ancestors only when needed to host an interrupted descendant.
     tree: dict[str, Conversation] = {parent.id: parent}
@@ -264,6 +277,8 @@ async def restore_active_children(
                 or (mirror_only and not is_parent_owned_subagent(child))
             ):
                 return False
+            if not await scope_allows(owner) or not await scope_allows(child):
+                return False
             if not mirror_only and not await ownership_allows(child):
                 return False
             initializer.require_generation(runner_id, client, generation)
@@ -300,6 +315,16 @@ async def restore_active_children(
                         return False  # nothing to restore; already logged as expected
                     response.raise_for_status()
                 initializer.require_generation(runner_id, client, generation)
+                if confinement is not None:
+                    current = await store_call(store.get_conversation, child.id)
+                    if (
+                        current is None
+                        or current.runner_id != child.runner_id
+                        or current.parent_conversation_id != child.parent_conversation_id
+                        or not await scope_allows(current)
+                    ):
+                        return False
+                    child = current
                 _ensure_runner_relay(child.id, parent.runner_id, client, store, conversation=child)
                 # Only execution status can clear the interruption. Initialization
                 # may return before a native continuation emits its first running edge.

@@ -15,10 +15,11 @@ from collections.abc import Mapping
 import httpx
 
 from omnigent.entities.conversation import USER_SESSION_TITLE_MAX_CHARS
+from omnigent.errors import ERROR_CODE_HEADER, ErrorCode
 
 _logger = logging.getLogger(__name__)
 
-_PROJECT_CREATE_FIELDS = ("project_id", "workspace", "git")
+_PROJECT_CREATE_FIELDS = ("project_id", "workspace", "git", "native_clear_source_id")
 
 
 def clear_replacement_create_body(
@@ -48,6 +49,9 @@ def clear_replacement_create_body(
     project_id = old_session.get("project_id")
     if isinstance(project_id, str) and project_id:
         body |= {"project_id": project_id, "workspace": None, "git": None}
+        source_id = old_session.get("id")
+        if isinstance(source_id, str) and source_id:
+            body["native_clear_source_id"] = source_id
     return body
 
 
@@ -96,13 +100,23 @@ def supersession_notice_text(
     )
 
 
+def supersession_authority_is_gone(response: httpx.Response) -> bool:
+    """Distinguish permanent session denial from retryable proxy/authentication failures."""
+    return response.status_code == 404 or (
+        response.status_code == 403
+        and response.headers.get(ERROR_CODE_HEADER) == ErrorCode.RUNNER_SCOPE_DENIED
+    )
+
+
 async def post_clear_supersession(
     client: httpx.AsyncClient,
     *,
     old_session_id: str,
     new_session_id: str,
     agent_name: str,
-) -> None:
+    detach_runner: bool = False,
+    require_notifications: bool = False,
+) -> bool:
     """
     Notify the superseded session that a ``/clear`` rotated it away.
 
@@ -129,15 +143,19 @@ async def post_clear_supersession(
     :param new_session_id: Rotated-to conversation id, e.g. ``"conv_new"``.
     :param agent_name: Agent name to stamp on the notice message — an
         assistant ``message`` item requires one.
-    :returns: None.
+    :param detach_runner: Clear the old runner binding after all notifications.
+    :param require_notifications: Retain authority for journal replay if any notification fails.
+    :returns: Whether required notifications and detachment completed. Marked scope
+        denial or a missing old session also completes cleanup because authority is gone.
     """
     if old_session_id == new_session_id:
         # Defensive: never address the notice/redirect at the live session.
         # The caller resolves the old id from the pre-rotation forwarder
         # state, but if that ever collapses to the new id, posting here
         # would dump the "you were cleared" banner onto the active chat.
-        return
+        return True
     events_path = f"/v1/sessions/{urllib.parse.quote(old_session_id, safe='')}/events"
+    notifications_complete = True
     try:
         status_resp = await client.post(
             events_path,
@@ -148,6 +166,7 @@ async def post_clear_supersession(
         )
         status_resp.raise_for_status()
     except httpx.HTTPError:
+        notifications_complete = False
         _logger.warning(
             "Failed to post /clear supersession idle status; old_session=%s new_session=%s",
             old_session_id,
@@ -163,6 +182,7 @@ async def post_clear_supersession(
                 "type": "external_conversation_item",
                 "data": {
                     "item_type": "message",
+                    "source_id": f"native-clear:{old_session_id}:{new_session_id}",
                     "item_data": {
                         "role": "assistant",
                         "agent": agent_name,
@@ -173,6 +193,7 @@ async def post_clear_supersession(
         )
         item_resp.raise_for_status()
     except httpx.HTTPError:
+        notifications_complete = False
         _logger.warning(
             "Failed to post /clear supersession notice; old_session=%s new_session=%s",
             old_session_id,
@@ -190,6 +211,7 @@ async def post_clear_supersession(
         )
         event_resp.raise_for_status()
     except httpx.HTTPError:
+        notifications_complete = False
         _logger.warning(
             "Failed to post /clear supersession redirect event; old_session=%s new_session=%s",
             old_session_id,
@@ -197,3 +219,26 @@ async def post_clear_supersession(
             exc_info=True,
             extra={"session_id": old_session_id},
         )
+
+    if require_notifications and not notifications_complete:
+        return False
+    if not detach_runner:
+        return True
+    # Detach last: a confined runner cannot reach the old session once unbound.
+    try:
+        detach_resp = await client.patch(
+            f"/v1/sessions/{urllib.parse.quote(old_session_id, safe='')}",
+            json={"runner_id": ""},
+        )
+        if supersession_authority_is_gone(detach_resp):
+            return True
+        detach_resp.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "Failed to detach superseded session after /clear; old_session=%s",
+            old_session_id,
+            exc_info=True,
+            extra={"session_id": old_session_id},
+        )
+        return False
+    return True

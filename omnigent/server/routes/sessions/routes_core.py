@@ -96,7 +96,11 @@ from omnigent.server.auth import (
     LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
+    RUNNER_CREATOR_LABEL_KEY,
     AuthProvider,
+    RunnerTokenConfinement,
+    require_runner_session_scope,
+    runner_token_confinement,
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -333,6 +337,103 @@ ClearSessionIntoFreshSession = Callable[
 _SESSION_LIST_BATCH_SIZE = 1000
 
 
+def _runner_created_labels(
+    labels: dict[str, str], confinement: RunnerTokenConfinement | None
+) -> dict[str, str]:
+    """Record which runner created a session; never trust a caller-sent value.
+
+    Native rotations copy an old session's labels into the new create, so a
+    stale creator label is dropped rather than rejected.
+    """
+    stamped = {key: value for key, value in labels.items() if key != RUNNER_CREATOR_LABEL_KEY}
+    if confinement is not None:
+        stamped[RUNNER_CREATOR_LABEL_KEY] = confinement.runner_id
+    return stamped
+
+
+def _require_runner_confined_placement(
+    request: Request,
+    *,
+    host_id: str | None,
+    host_type: str,
+    sandbox_provider: str | None,
+    project_id: str | None,
+    inherited_project_id: str | None = None,
+) -> None:
+    """Keep a runner bearer's new sessions off every host but its own runner.
+
+    Sub-agents and rotations inherit or later bind the creating runner.
+    Validated forks and native rotations may retain their source's project filing.
+    """
+    if runner_token_confinement(request) is None:
+        return
+    if (
+        host_id is not None
+        or host_type != "external"
+        or sandbox_provider
+        or (project_id is not None and project_id != inherited_project_id)
+    ):
+        raise OmnigentError(
+            "runner credential cannot place a session on a host",
+            code=ErrorCode.RUNNER_SCOPE_DENIED,
+        )
+
+
+async def _runner_clear_project_id(
+    request: Request,
+    body: SessionCreateRequest | ProjectSessionCreateRequest,
+    conversation_store: ConversationStore,
+) -> str | None:
+    """Allow filing a native replacement only in its bound source's project."""
+    confinement = runner_token_confinement(request)
+    if confinement is None or body.native_clear_source_id is None:
+        return None
+    require_runner_session_scope(request, body.native_clear_source_id)
+    source = await asyncio.to_thread(
+        conversation_store.get_conversation, body.native_clear_source_id
+    )
+    if (
+        source is None
+        or source.runner_id != confinement.runner_id
+        or body.project_id is None
+        or body.agent_id != source.agent_id
+        or body.parent_session_id is not None
+        or body.sibling_source_id is not None
+        or ORCHESTRATION_SOURCE_HEADER in request.headers
+        or not {"workspace", "git"} <= body.model_fields_set
+        or body.workspace is not None
+        or body.git is not None
+        or body.workspaces is not None
+    ):
+        raise OmnigentError(
+            "native replacement must retain its bound source's project and runner",
+            code=ErrorCode.RUNNER_SCOPE_DENIED,
+        )
+    if source.project_id is None:
+        raise OmnigentError("Source project is no longer available", code=ErrorCode.NOT_FOUND)
+    if body.project_id != source.project_id:
+        raise OmnigentError(
+            "native replacement must retain its bound source's project",
+            code=ErrorCode.RUNNER_SCOPE_DENIED,
+        )
+    return source.project_id
+
+
+async def _require_runner_scoped_agent(
+    request: Request, agent_id: str | None, user_id: str | None, agent_store: AgentStore
+) -> None:
+    """Refuse binding another user's session agent with a runner bearer.
+
+    An admin owner would otherwise pass the session check on any session.
+    The owner's own uploads are shared across their sessions, so they pass.
+    """
+    if agent_id is None or runner_token_confinement(request) is None:
+        return
+    agent = await asyncio.to_thread(agent_store.get, agent_id)
+    if agent is not None and agent.session_id is not None and agent.created_by != user_id:
+        require_runner_session_scope(request, agent.session_id)
+
+
 def _require_attachment_compatible_history(
     session_id: str,
     target_agent: Agent,
@@ -410,6 +511,7 @@ async def _wake_runner_for_model_change(
         initializer=getattr(request.app.state, "runner_session_initializer", None),
         suppress_recovery_turn=True,
         require_success=True,
+        confinement=runner_token_confinement(request),
     )
     if not terminal_ready:
         outcome = await _ensure_native_terminal_ready(
@@ -1511,6 +1613,21 @@ def register_core_routes(
             # message survives in each entry's `msg`.
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
+        inherited_project_id = await _runner_clear_project_id(request, body, conversation_store)
+        _require_runner_confined_placement(
+            request,
+            host_id=body.host_id,
+            host_type=body.host_type,
+            sandbox_provider=body.sandbox_provider,
+            project_id=body.project_id,
+            inherited_project_id=inherited_project_id,
+        )
+        if body.parent_session_id is not None:
+            require_runner_session_scope(request, body.parent_session_id)
+        await _require_runner_scoped_agent(request, body.agent_id, user_id, agent_store)
+        created_labels = _runner_created_labels(body.labels, runner_token_confinement(request))
+        if created_labels != body.labels:
+            body = body.model_copy(update={"labels": created_labels})
         explicit_host = request.url.path.endswith("/sessions/orchestrated/host")
         if explicit_host and (
             body.host_type != "external" or not body.host_id or not body.workspace
@@ -1651,8 +1768,17 @@ def register_core_routes(
             else:
                 body.sibling_source_id = sibling_source.id
                 body.project_id = sibling_source.project_id
+        # Header-derived placement must respect the runner's confinement too.
+        _require_runner_confined_placement(
+            request,
+            host_id=body.host_id,
+            host_type=body.host_type,
+            sandbox_provider=body.sandbox_provider,
+            project_id=body.project_id,
+            inherited_project_id=inherited_project_id,
+        )
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
-        resp, conv, resolved_body = await _create_session_from_existing_agent(
+        created = await _create_session_from_existing_agent(
             conversation_store,
             agent_store,
             runner_router,
@@ -1673,6 +1799,8 @@ def register_core_routes(
             ),
             created_by_labels=source.labels if source is not None else None,
         )
+        assert isinstance(created, tuple)
+        resp, conv, resolved_body = created
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
         # Without this, the runner doesn't know this session exists
@@ -1914,6 +2042,26 @@ def register_core_routes(
             parent_session_id=parsed_metadata.parent_session_id,
             host_type=parsed_metadata.host_type,
         )
+        _require_runner_confined_placement(
+            request,
+            host_id=parsed_metadata.host_id,
+            host_type=parsed_metadata.host_type,
+            sandbox_provider=parsed_metadata.sandbox_provider,
+            project_id=parsed_metadata.project_id,
+        )
+        if parsed_metadata.parent_session_id is not None:
+            require_runner_session_scope(request, parsed_metadata.parent_session_id)
+        elif runner_token_confinement(request) is not None:
+            # A top-level upload would add the bundle to the owner's agent catalog.
+            raise OmnigentError(
+                "runner credential can upload agents only for sub-agent sessions",
+                code=ErrorCode.RUNNER_SCOPE_DENIED,
+            )
+        created_labels = _runner_created_labels(
+            parsed_metadata.labels, runner_token_confinement(request)
+        )
+        if created_labels != parsed_metadata.labels:
+            parsed_metadata = parsed_metadata.model_copy(update={"labels": created_labels})
         from omnigent.server.routes._session_create_validation import (
             resolve_project_session_create,
             server_sandbox_providers,
@@ -3634,6 +3782,7 @@ def register_core_routes(
         await _require_access(
             user_id, session_id, required_level, permission_store, conversation_store
         )
+        await asyncio.to_thread(conversation_store.require_spawn_activated, session_id)
         # A session shared with edit access must not let collaborators refile,
         # rename, pin or archive the owner's other sessions through agent tools.
         # Only those tools name a calling session, so other PATCHes are unaffected.
@@ -3659,6 +3808,28 @@ def register_core_routes(
                     f"To fork this session instead, run: omnigent run --fork {session_id}",
                     code=ErrorCode.FORBIDDEN,
                 )
+        confinement = runner_token_confinement(request)
+        if confinement is not None and (set_project or set_share_workspace):
+            raise OmnigentError(
+                "runner credential cannot change project placement or sharing",
+                code=ErrorCode.RUNNER_SCOPE_DENIED,
+            )
+        if confinement is not None and body.runner_id not in (None, "", confinement.runner_id):
+            # Rebinding to another runner would execute this session's turns there.
+            raise OmnigentError(
+                "runner credential can only bind its own runner",
+                code=ErrorCode.RUNNER_SCOPE_DENIED,
+            )
+        if body.labels and RUNNER_CREATOR_LABEL_KEY in body.labels:
+            body = body.model_copy(
+                update={
+                    "labels": {
+                        key: value
+                        for key, value in body.labels.items()
+                        if key != RUNNER_CREATOR_LABEL_KEY
+                    }
+                }
+            )
         if body.labels:
             _reject_server_reserved_label_seed(body.labels)
             # Advisor-owned cost_control.* labels are written only by the
@@ -4215,6 +4386,7 @@ def register_core_routes(
                         _runner_client,
                         conversation_store,
                         request.app.state.runner_session_initializer,
+                        confinement=confinement,
                     )
         else:
             conv = conv_for_collaboration_mode
@@ -4630,6 +4802,7 @@ def register_core_routes(
                 conversation_store,
                 runner_router,
                 getattr(request.app.state, "host_registry", None),
+                confinement=confinement,
                 delete_worktree=body.delete_worktree,
                 host_store=getattr(request.app.state, "host_store", None),
                 sandbox_config=getattr(request.app.state, "sandbox_config", None),
@@ -4870,6 +5043,14 @@ def register_core_routes(
                 "Source session has no agent binding — cannot fork.",
                 code=ErrorCode.INVALID_INPUT,
             )
+        _require_runner_confined_placement(
+            request,
+            host_id=body.host_id,
+            host_type=body.host_type,
+            sandbox_provider=body.sandbox_provider,
+            project_id=None,
+        )
+        await _require_runner_scoped_agent(request, body.agent_id, user_id, agent_store)
 
         sandbox_profile = await prepare_profile(
             request, body, user_id=user_id, inherited_session_id=source_id
@@ -5111,6 +5292,9 @@ def register_core_routes(
             dropped_label_keys_set.update(
                 key for key in source.labels if key.startswith(MCP_SELECTION_PREFIX)
             )
+        # The fork's creator is this caller, never the source's creating runner.
+        if RUNNER_CREATOR_LABEL_KEY in source.labels:
+            dropped_label_keys_set.add(RUNNER_CREATOR_LABEL_KEY)
         dropped_label_keys: frozenset[str] = frozenset(dropped_label_keys_set)
 
         # DANGEROUS codex full-bypass. The source's bypass label is always
@@ -5162,6 +5346,7 @@ def register_core_routes(
         if body.side_chat:
             extra_labels[SIDE_CHAT_LABEL_KEY] = "1"
             extra_labels[SIDE_CHAT_SOURCE_LABEL_KEY] = source_id
+        extra_labels = _runner_created_labels(extra_labels, runner_token_confinement(request))
 
         # A managed fork's chosen sandbox host id is born with the row, as on a
         # create: the caller routes the fork by it until its host binds, so no
@@ -5275,6 +5460,15 @@ def register_core_routes(
                 raise
         else:
             fork_project_id = fork_resolution.project_id
+
+        _require_runner_confined_placement(
+            request,
+            host_id=body.host_id,
+            host_type=body.host_type,
+            sandbox_provider=body.sandbox_provider,
+            project_id=fork_project_id,
+            inherited_project_id=source.project_id,
+        )
 
         # The deep-copied items reference the source's session-scoped file
         # resources by raw file_id (attachment blocks are persisted

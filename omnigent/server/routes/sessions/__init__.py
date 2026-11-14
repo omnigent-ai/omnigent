@@ -913,6 +913,7 @@ def create_sessions_router(
     from omnigent.server.routes.sessions.routes_items import register_items_routes
     from omnigent.server.routes.sessions.routes_permissions import register_permissions_routes
     from omnigent.server.routes.sessions.routes_resources import register_resources_routes
+    from omnigent.server.routes.sessions.routes_spawns import register_spawn_routes
     from omnigent.server.routes.sessions.routes_ui import register_ui_routes
 
     if pull_request_refresher is None:
@@ -937,6 +938,7 @@ def create_sessions_router(
         pull_request_refresher=pull_request_refresher,
     )
 
+    register_spawn_routes(router, auth_provider=auth_provider)
     register_hooks_routes(
         router,
         conversation_store=conversation_store,

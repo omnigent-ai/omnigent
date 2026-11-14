@@ -67,6 +67,8 @@ class PaginatedList(BaseModel):
     :param last_id: ID of the last item in the page, or ``None``
         if the page is empty, e.g. ``"resp_xyz789"``.
     :param has_more: Whether more items exist beyond this page.
+
+    Confined child lists use opaque cursors, including on empty filtered pages.
     """
 
     object: str = "list"
@@ -1783,6 +1785,8 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] = Field(default_factory=dict)
     sibling_source_id: str | None = None
+    # Native rotations name the bound source to inherit filing without placement.
+    native_clear_source_id: SkipJsonSchema[str | None] = None
     parent_session_id: str | None = None
     sub_agent_name: str | None = None
     host_type: Literal["external", "managed"] = "external"
@@ -3559,7 +3563,12 @@ class AgentCostList(BaseModel):
 
 
 class ChildSessionList(BaseModel):
-    """Paginated list of child sessions; ``data`` is a page of ``ChildSessionSummary``."""
+    """A bounded child-session page.
+
+    Confined runners receive opaque, runner/parent-bound cursors valid for one
+    hour. Continue through empty pages while ``has_more`` is true. Owner calls
+    retain ordinary session-ID cursors.
+    """
 
     object: Literal["list"] = "list"
     data: list[ChildSessionSummary] = Field(default_factory=list)

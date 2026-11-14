@@ -10,7 +10,7 @@ from fastapi import Request
 
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import LEVEL_OWNER
+from omnigent.server.auth import LEVEL_OWNER, runner_token_confinement
 from omnigent.server.feature_flags import Feature
 from omnigent.server.schemas import SessionFamily
 from omnigent.server.session_orchestration import require_owned_session
@@ -38,6 +38,10 @@ def authorize_sibling_source(
     host_id: str | None,
     host_type: str,
 ) -> Conversation:
+    if runner_token_confinement(request) is not None:
+        raise OmnigentError(
+            "runner credential cannot create sidebar families", code=ErrorCode.RUNNER_SCOPE_DENIED
+        )
     if not request.app.state.feature_flags.enabled(Feature.SIBLING_SESSIONS):
         raise OmnigentError("Nested agents are disabled", code=ErrorCode.FORBIDDEN)
     if parent_id is not None or permissions is None or user_id is None:

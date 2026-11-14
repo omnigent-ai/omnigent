@@ -264,6 +264,69 @@ def test_set_runner_id_lands_in_omnigent_db(
     assert runner_ids == ["runner_xyz"]
 
 
+@pytest.mark.parametrize(
+    "operation", ["set_runner_id", "replace_runner_id", "clear_runner_id", "clear_host_binding"]
+)
+def test_runner_binding_consumes_bootstrap_permission(
+    store: SqlAlchemyConversationStore, operation: str
+) -> None:
+    from omnigent.stores.conversation_store import RUNNER_CREATOR_LABEL_KEY
+
+    conv = store.create_conversation(
+        title="bootstrap", labels={RUNNER_CREATOR_LABEL_KEY: "runner_xyz", "keep": "value"}
+    )
+    scope = store.get_runner_scope(conv.id)
+    assert scope is not None
+    assert scope.runner_id is None
+    assert scope.labels == {RUNNER_CREATOR_LABEL_KEY: "runner_xyz"}
+    if operation == "set_runner_id":
+        assert store.set_runner_id(conv.id, "runner_xyz")
+    elif operation == "replace_runner_id":
+        store.replace_runner_id(conv.id, "runner_xyz")
+    elif operation == "clear_runner_id":
+        store.clear_runner_id(conv.id)
+    else:
+        store.clear_host_binding(conv.id)
+    fetched = store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.labels == {"keep": "value"}
+    assert fetched.runner_id == (
+        "runner_xyz" if operation in ("set_runner_id", "replace_runner_id") else None
+    )
+    scope = store.get_runner_scope(conv.id)
+    assert scope is not None
+    assert scope.runner_id == fetched.runner_id
+    assert scope.labels == {}
+    child = store.create_conversation(parent_conversation_id=conv.id)
+    assert store.get_runner_scope(child.id).parent_conversation_id == conv.id
+    assert store.get_runner_scope("00000000000000000000000000000000") is None
+
+
+def test_failed_initial_binding_keeps_bootstrap_revoked(
+    store: SqlAlchemyConversationStore,
+) -> None:
+    from sqlalchemy import event
+
+    from omnigent.server.auth import runner_session_in_scope
+    from omnigent.stores.conversation_store import RUNNER_CREATOR_LABEL_KEY
+
+    conv = store.create_conversation(labels={RUNNER_CREATOR_LABEL_KEY: "runner_xyz"})
+
+    def fail_binding(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("UPDATE omnigent_conversation_metadata"):
+            raise RuntimeError("binding unavailable")
+
+    event.listen(store._engine, "before_cursor_execute", fail_binding)
+    try:
+        with pytest.raises(RuntimeError, match="binding unavailable"):
+            store.set_runner_id(conv.id, "runner_xyz")
+    finally:
+        event.remove(store._engine, "before_cursor_execute", fail_binding)
+    assert not runner_session_in_scope("runner_xyz", conv.id, store.get_conversation)
+    assert store.set_runner_id(conv.id, "runner_xyz")
+    assert runner_session_in_scope("runner_xyz", conv.id, store.get_conversation)
+
+
 def test_set_session_state_lands_in_omnigent_db(
     omnigent_db: Path, store: SqlAlchemyConversationStore
 ) -> None:

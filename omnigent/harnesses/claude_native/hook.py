@@ -610,24 +610,20 @@ def _create_clear_replacement_session(
     transfer_resp.raise_for_status()
 
     write_active_session_id(bridge_dir, new_session_id)
-    clear_resp = client.patch(
-        f"{ap_server_url}/v1/sessions/{url_component(old_session_id)}",
-        json={
-            "runner_id": "",
-            # Re-key the superseded session onto a DISTINCT "-cleared" bridge id
-            # so its later resume gets its own isolated dir instead of the new
-            # session's live one (which would double-mirror the transcript and
-            # trip the executor guard). Mirrors the async forwarder rotation;
-            # ``_auto_create_claude_terminal`` recognises this marker.
-            "labels": {BRIDGE_ID_LABEL_KEY: f"{old_session_id}-cleared"},
-        },
-    )
-    if clear_resp.status_code >= 400:
+    import httpx
+
+    from omnigent.harnesses.claude_native.clear_recovery import record_clear_supersession
+
+    record_clear_supersession(bridge_dir, old_session_id, new_session_id)
+    try:
+        clear_resp = client.patch(
+            f"{ap_server_url}/v1/sessions/{url_component(old_session_id)}",
+            json={"labels": {BRIDGE_ID_LABEL_KEY: f"{old_session_id}-cleared"}},
+        )
+        clear_resp.raise_for_status()
+    except (httpx.HTTPError, ConnectionError) as exc:
         print(
-            (
-                "omnigent claude clear hook: failed to clear old runner binding: "
-                f"{clear_resp.status_code} {clear_resp.text}"
-            ),
+            f"omnigent claude clear hook: failed to re-key old bridge; cleanup will retry: {exc}",
             file=sys.stderr,
         )
     return new_session_id

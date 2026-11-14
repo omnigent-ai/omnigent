@@ -3047,3 +3047,53 @@ async def test_child_sessions_descendants_breaks_timestamp_ties_like_a_walk(
     kept = _limit_children_per_parent(body["data"], session["id"], 1)
     walked = await _walk_levels(client, session["id"], 3, limit=1)
     assert [(row["id"], row["parent_id"]) for row in kept] == walked
+
+
+@pytest.mark.parametrize("native_delivery", [False, True])
+@pytest.mark.parametrize("parent_allowed", [False, True])
+async def test_approval_resolution_mirrors_only_within_runner_scope(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    native_delivery: bool,
+    parent_allowed: bool,
+) -> None:
+    """Both approval delivery paths retain the caller's ancestor scope."""
+    from omnigent.runtime import pending_elicitations
+    from omnigent.server.auth import RunnerTokenConfinement
+    from omnigent.server.routes._sessions.orchestration import _resolve_elicitation
+
+    parent = await _create_parent_session(client, agent_name="scoped-approval")
+    store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=store,
+        parent_id=parent["id"],
+        title="helper:approval",
+        agent_id=parent["agent_id"],
+    )
+    event = {
+        "type": "response.elicitation_request",
+        "elicitation_id": "approval",
+        "params": {"mode": "form", "message": "Approve operation"},
+    }
+    if native_delivery:
+        event["params"]["native_delivery"] = {"state": "ready", "attempt": "first"}
+    pending_elicitations.record_publish(child.id, event)
+    published = []
+    publish = session_stream.publish
+
+    def record(session_id, payload):
+        published.append(session_id)
+        return publish(session_id, payload)
+
+    monkeypatch.setattr(session_stream, "publish", record)
+    allowed = {child.id, parent["id"]} if parent_allowed else {child.id}
+    await _resolve_elicitation(
+        child.id,
+        {"elicitation_id": "approval", "action": "accept"},
+        None,
+        store,
+        confinement=RunnerTokenConfinement("runner", lambda _runner, session: session in allowed),
+    )
+    assert child.id in published
+    assert (parent["id"] in published) is parent_allowed

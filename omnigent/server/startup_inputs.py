@@ -94,6 +94,52 @@ def input_content(item: ConversationItem) -> list[dict[str, Any]]:
     return data.get("content", [])
 
 
+def prepare_startup_input(
+    session_id: str,
+    event: SessionEventInput,
+    *,
+    user_id: str | None,
+    headers: Headers,
+    first: bool = True,
+) -> NewConversationItem:
+    """Normalize a queued input without persisting or dispatching it."""
+    from omnigent.server.background_session_titles import background_session_titles_enabled
+    from omnigent.server.routes._sessions.helpers import _build_new_item
+
+    try:
+        SessionStartupInput.model_validate(event.model_dump())
+    except ValueError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+    raw_id = event.data.get("stable_id")
+    input_id = (
+        initial_input_id(session_id)
+        if first
+        else (
+            raw_id
+            if isinstance(raw_id, str) and re.fullmatch(r"[0-9a-f]{32}", raw_id)
+            else uuid4().hex
+        )
+    )
+    if event.type == "slash_command":
+        event = event.model_copy(
+            update={"data": {"agent": "pending", "arguments": "", **event.data}}
+        )
+    item = _build_new_item(event, PENDING_INPUT_RESPONSE_ID, created_by=user_id).model_copy(
+        update={"stable_id": input_id, "status": "in_progress"}
+    )
+    item.data = item.data.model_copy(
+        update={
+            "startup_options": StartupInputOptions(
+                model_override=event.model_override,
+                tools=event.tools,
+                background_titles_enabled=background_session_titles_enabled(headers),
+                scheduled_run=current_scheduled_run(),
+            )
+        }
+    )
+    return item
+
+
 async def restore_pending_inputs(store: ConversationStore, session_id: str) -> None:
     """Restore native receipt matching after an AP restart, without submitting again."""
     for item in await asyncio.to_thread(store.list_pending_inputs, session_id):
@@ -186,42 +232,10 @@ class ManagedStartupInputs:
         headers: Headers,
         first: bool = True,
     ) -> ConversationItem:
-        from omnigent.server.background_session_titles import background_session_titles_enabled
-        from omnigent.server.routes._sessions.helpers import (
-            _build_new_item,
-            _stable_id_reuse_is_exact_retry,
-        )
+        from omnigent.server.routes._sessions.helpers import _stable_id_reuse_is_exact_retry
 
-        try:
-            SessionStartupInput.model_validate(event.model_dump())
-        except ValueError as exc:
-            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
-        raw_id = event.data.get("stable_id")
-        input_id = (
-            initial_input_id(session_id)
-            if first
-            else (
-                raw_id
-                if isinstance(raw_id, str) and re.fullmatch(r"[0-9a-f]{32}", raw_id)
-                else uuid4().hex
-            )
-        )
-        if event.type == "slash_command":
-            event = event.model_copy(
-                update={"data": {"agent": "pending", "arguments": "", **event.data}}
-            )
-        item = _build_new_item(event, PENDING_INPUT_RESPONSE_ID, created_by=user_id).model_copy(
-            update={"stable_id": input_id, "status": "in_progress"}
-        )
-        item.data = item.data.model_copy(
-            update={
-                "startup_options": StartupInputOptions(
-                    model_override=event.model_override,
-                    tools=event.tools,
-                    background_titles_enabled=background_session_titles_enabled(headers),
-                    scheduled_run=current_scheduled_run(),
-                )
-            }
+        item = prepare_startup_input(
+            session_id, event, user_id=user_id, headers=headers, first=first
         )
         saved = await asyncio.to_thread(self.conversations.append, session_id, [item])
         if saved[0].deduplicated and not _stable_id_reuse_is_exact_retry(saved[0], item):
@@ -454,12 +468,35 @@ class ManagedStartupInputs:
 
         task.add_done_callback(remove_worker)
 
+    async def resume_session(self, app: Any, session_id: str) -> bool:
+        """Schedule an admitted first input on its existing runner, if still queued."""
+        if await asyncio.to_thread(self.conversations.spawn_activation_pending, session_id):
+            return False
+        conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
+        if conv is None or conv.labels.get(STARTUP_LABEL) in (
+            "failed",
+            "cancelled",
+            STARTUP_WITHDRAWN,
+        ):
+            return False
+        items = await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
+        head = next((item for item in items if item.status != "failed"), None)
+        key = (current_workspace_id(), session_id)
+        if head is None or head.status != "in_progress" or key in self._deliveries:
+            return False
+        self._deliveries[key] = asyncio.create_task(
+            self._deliver(app, session_id, head), name=f"startup-input-{session_id}"
+        )
+        return True
+
     async def _recover_session(
         self, app: Any, session_id: str, connection: HostConnection
     ) -> bool:
         """Advance one session's startup here; return whether work is in flight."""
         conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
         if conv is None or conv.host_id != connection.host_id:
+            return False
+        if await asyncio.to_thread(self.conversations.spawn_activation_pending, session_id):
             return False
         from omnigent.server.managed_hosts import is_move_claim, move_claim_is_live
 
@@ -555,6 +592,8 @@ class ManagedStartupInputs:
                 or current.status != "in_progress"
             ):
                 return
+            if await asyncio.to_thread(self.conversations.spawn_activation_pending, session_id):
+                return
             options = (
                 item.data.startup_options
                 if isinstance(item.data, (MessageData, SlashCommandData))
@@ -584,6 +623,10 @@ class ManagedStartupInputs:
                 input_id=item.id,
                 dispatch_id=dispatch_id,
             )
+            if item.id == initial_input_id(session_id):
+                from omnigent.runtime.policies.builder import invalidate_session_policy_specs_cache
+
+                invalidate_session_policy_specs_cache(session_id)
             response = await self.dispatch(context, session_id, event)
             if response.get("denied"):
                 raise ValueError(str(response.get("reason", "Input denied by policy")))

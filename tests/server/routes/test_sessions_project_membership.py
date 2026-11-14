@@ -19,6 +19,7 @@ edit/read access to.
 
 from __future__ import annotations
 
+import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
@@ -201,13 +202,26 @@ def test_unfile_unknown_session_404(db_uri: str) -> None:
     assert resp.status_code == 404
 
 
-def test_fork_inherits_source_project(db_uri: str) -> None:
+@pytest.mark.parametrize("confined", [False, True])
+def test_fork_inherits_source_project(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, confined: bool
+) -> None:
     """A fork of a filed session lands in the same project as its source."""
     _ensure_agent(db_uri)
     conv = SqlAlchemyConversationStore(db_uri).create_conversation(title="s", agent_id=AGENT_ID)
     client = TestClient(_single_user_app(db_uri))
     project = client.post("/v1/projects", json={"name": "Work"}).json()
     client.patch(f"/v1/sessions/{conv.id}", json={"project_id": project["id"]})
+
+    if confined:
+        from omnigent.server.auth import RunnerTokenConfinement
+
+        monkeypatch.setattr(
+            "omnigent.server.routes.sessions.routes_core.runner_token_confinement",
+            lambda _: RunnerTokenConfinement(
+                "runner", lambda _runner, session: session == conv.id
+            ),
+        )
 
     resp = client.post(f"/v1/sessions/{conv.id}/fork", json={})
     assert resp.status_code == 201
