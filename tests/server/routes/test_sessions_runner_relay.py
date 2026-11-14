@@ -3768,6 +3768,84 @@ async def test_offline_sweep_keeps_the_flag_a_reconnected_runner_reported(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lookup", ["status", "binding"])
+@pytest.mark.parametrize("live_status", ["running", "waiting"])
+@pytest.mark.parametrize("reconnect", [False, True], ids=["offline", "reconnected"])
+async def test_offline_sweep_preserves_runner_reconnected_during_lookup(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    lookup: str,
+    live_status: str,
+    reconnect: bool,
+) -> None:
+    """A stale store read cannot fail work on a runner that reconnected locally."""
+    from omnigent.runtime import session_stream
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.schemas import ErrorDetail
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(runner_id="runner-reconnect-during-sweep")
+    store.set_session_live_status(conv.id, live_status)
+    snapshot = store.get_conversation(conv.id)
+    assert snapshot is not None
+    if lookup == "binding":
+        sessions_module._session_status_cache[conv.id] = live_status
+    online: set[str] = set()
+
+    class _Router:
+        def runner_is_online(self, runner_id: str) -> bool:
+            return runner_id in online
+
+    entered = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    method_name = "get_conversation" if lookup == "status" else "get_runner_liveness"
+    read = getattr(store, method_name)
+
+    def paused_read(*args: Any, **kwargs: Any) -> Any:
+        result = read(*args, **kwargs)
+        loop.call_soon_threadsafe(entered.set)
+        if not release.wait(timeout=_TASK_TIMEOUT_S):
+            raise AssertionError("test did not release the offline lookup")
+        return result
+
+    monkeypatch.setattr(store, method_name, paused_read)
+    monkeypatch.setattr(orchestration, "get_server_runner_router", lambda: _Router())
+    session_live_state.configure(store)
+    error = ErrorDetail(code="runner_disconnected", message="Synthetic runner disconnect")
+    sweep = None
+    try:
+        with capture_debug_rows("server") as rows:
+            sweep = asyncio.create_task(
+                sessions_module._mark_runner_sessions_offline([snapshot], error, store)
+            )
+            await asyncio.wait_for(entered.wait(), timeout=_TASK_TIMEOUT_S)
+            if reconnect:
+                online.add("runner-reconnect-during-sweep")
+            release.set()
+            await asyncio.wait_for(sweep, timeout=_TASK_TIMEOUT_S)
+        session_live_state.submit("drain", lambda: None).result(timeout=_TASK_TIMEOUT_S)
+        refreshed = store.get_conversation(conv.id)
+        assert refreshed is not None
+        assert refreshed.live_status == (live_status if reconnect else "failed")
+        assert sessions_module._last_task_error_from_labels(refreshed.labels) == (
+            None if reconnect else {"code": error.code, "message": error.message}
+        )
+        failed_rows = [row for row in rows if row["event_name"] == "session_turn_failed"]
+        assert len(failed_rows) == (0 if reconnect else 1)
+    finally:
+        release.set()
+        if sweep is not None and not sweep.done():
+            sweep.cancel()
+            await asyncio.gather(sweep, return_exceptions=True)
+        session_live_state.configure(None)
+        sessions_module._session_status_cache.pop(conv.id, None)
+        session_stream.close(conv.id)
+
+
+@pytest.mark.asyncio
 async def test_persist_error_labels_records_passed_owner_runner_despite_rebind(
     db_uri: str,
 ) -> None:

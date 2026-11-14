@@ -4845,6 +4845,14 @@ async def _mark_runner_sessions_offline_once(
             or _session_status_cache.get(conv.id) != decision_status
         ):
             continue
+        # A reconnect can finish while the old sweep waits for a status or binding read.
+        router = get_server_runner_router()
+        if (
+            conv.runner_id is not None
+            and router is not None
+            and router.runner_is_online(conv.runner_id)
+        ):
+            continue
         if binding_unavailable:
             retry.append(conv)
             continue
