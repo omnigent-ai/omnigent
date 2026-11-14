@@ -38,6 +38,7 @@ import io
 import json
 import tarfile
 import threading
+import time
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,6 +63,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
+from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
 from omnigent.runner.transports.ws_tunnel.serve import dispatch_via_asgi
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.runtime import (
@@ -258,13 +260,21 @@ async def _send_hello_and_wait(
     await communicator.send_input(
         {"type": "websocket.receive", "text": encode_frame(hello)},
     )
-    registry = app.state.tunnel_registry
+    # Hang guard only: loaded CI workers have stalled this wait past 8s.
+    session = await _wait_for_registration(
+        app.state.tunnel_registry, runner_id, timeout_s=budget(10.0)
+    )
+    assert session is not None, f"runner {runner_id!r} did not register after its hello"
 
-    async def _registered() -> None:
-        while registry.get(runner_id) is None:
-            await asyncio.sleep(0.01)
 
-    await asyncio.wait_for(_registered(), timeout=budget(2.0))
+async def _wait_for_registration(
+    registry: TunnelRegistry, runner_id: str, *, timeout_s: float
+) -> RunnerSession | None:
+    """Wait for *runner_id* to register, re-checking once the hang guard expires."""
+    # A loop stall can span the deadline after the runner registered; the timeout
+    # then fires before the waiter observes it, so read the registry once more.
+    session = await registry.wait_for_runner(runner_id, timeout_s=timeout_s)
+    return session or registry.get(runner_id)
 
 
 async def _forward_requests_to_runner(
@@ -2982,3 +2992,20 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
                 await reconnect.send_input({"type": "websocket.disconnect", "code": 1000})
             with contextlib.suppress(asyncio.TimeoutError, Exception):
                 await reconnect.wait(timeout=budget(2.0))
+
+
+async def test_registration_wait_sees_a_runner_registered_just_before_a_loop_stall() -> None:
+    """A loop stall spanning the hang guard does not hide a runner that registered."""
+    registry = TunnelRegistry()
+    hello = HelloFrame(
+        runner_version="0.1.0-test", frame_protocol_version=1, harnesses=[], envs=[]
+    )
+
+    def register_then_stall() -> None:
+        registry.register("runner-stalled", AsyncMock(), hello)
+        time.sleep(0.2)  # Holds the loop past the 0.05s deadline below.
+
+    asyncio.get_running_loop().call_later(0.015, register_then_stall)
+    session = await _wait_for_registration(registry, "runner-stalled", timeout_s=0.05)
+    assert session is not None
+    assert session is registry.get("runner-stalled")
