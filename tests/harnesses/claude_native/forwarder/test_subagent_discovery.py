@@ -8,6 +8,7 @@ import errno
 import json
 import logging
 import os
+import tracemalloc
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -1066,19 +1067,103 @@ def test_transient_read_failure_is_not_memoized_as_an_empty_scan(
         tool_use_id="toolu_child",
     )
     subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
-    real_read_text = Path.read_text
+    real_open = Path.open
     failures_left = [1]
 
-    def flaky_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+    def flaky_open(self: Path, *args: Any, **kwargs: Any) -> Any:
         if self == transcript_path and failures_left[0]:
             failures_left[0] -= 1
             raise OSError(errno.EIO, "transient read failure")
-        return real_read_text(self, *args, **kwargs)
+        return real_open(self, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_text", flaky_read_text)
+    monkeypatch.setattr(Path, "open", flaky_open)
 
     assert forwarder._subagent_parents_by_tool_use(transcript_path, subagents_dir) == {}
     assert transcript_path not in forwarder._SPAWN_TOOL_USE_ID_CACHE
     assert forwarder._subagent_parents_by_tool_use(transcript_path, subagents_dir) == {
         "toolu_child": None
+    }
+
+
+@pytest.mark.parametrize("include_sidechains", [False, True])
+def test_spawn_scan_streams_large_transcripts_and_tolerates_partial_records(
+    tmp_path: Path, include_sidechains: bool
+) -> None:
+    transcript_path = tmp_path / "session.jsonl"
+    large_record = json.dumps(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "x" * 65536}]}}
+    )
+    with transcript_path.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(_spawn_record("toolu_first", "first", sidechain=False)) + "\n")
+        for _ in range(256):
+            handle.write(large_record + "\n")
+        handle.write("malformed JSON\n[]\n")
+        handle.write(json.dumps(_spawn_record("toolu_child", "child", sidechain=True)) + "\n")
+        handle.write(json.dumps(_spawn_record("toolu_last", "last", sidechain=False)) + "\n")
+    with transcript_path.open("ab") as handle:
+        handle.write(b'{"type":"assistant","message":{"content":"partial \xf0\x9f')
+
+    tracemalloc.start()
+    try:
+        tool_use_ids = forwarder._tool_use_ids_in_transcript(
+            transcript_path, include_sidechains=include_sidechains
+        )
+        _, peak_bytes = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    expected = {"toolu_first", "toolu_last"}
+    if include_sidechains:
+        expected.add("toolu_child")
+    assert tool_use_ids == expected
+    assert peak_bytes < 4 * 1024 * 1024, "spawn discovery retained the whole 16 MiB transcript"
+
+
+def test_spawn_scan_leaves_concurrent_appends_for_the_next_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(_spawn_record("toolu_first", "first", sidechain=False)) + "\n",
+        encoding="utf-8",
+    )
+    real_loads = json.loads
+    appended = False
+
+    def append_during_parse(value: str, *args: Any, **kwargs: Any) -> Any:
+        nonlocal appended
+        if not appended:
+            appended = True
+            with transcript_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(_spawn_record("toolu_later", "later", sidechain=False)) + "\n"
+                )
+        return real_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr(forwarder.json, "loads", append_during_parse)
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False) == {
+        "toolu_first"
+    }
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False) == {
+        "toolu_first",
+        "toolu_later",
+    }
+
+
+@pytest.mark.parametrize("separator", ["\x85", "\u2028", "\u2029"], ids=["nel", "ls", "ps"])
+def test_spawn_scan_accepts_unicode_separators_inside_json_strings(
+    tmp_path: Path, separator: str
+) -> None:
+    """JSON string separators belong to the record rather than delimit records."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            _spawn_record("toolu_unicode", f"before{separator}after", sidechain=False),
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False) == {
+        "toolu_unicode"
     }
