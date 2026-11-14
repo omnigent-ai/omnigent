@@ -64,7 +64,9 @@ def test_pages_go_by_name_and_filter_by_name(store: WorkflowStore) -> None:
     after = None
     while True:
         page, has_more = store.list_page(user_id=ALICE, limit=2, after=after)
-        assert all(workflow.steps is None for workflow in page)
+        assert all(
+            [step["id"] for step in workflow.steps] == ["build", "test"] for workflow in page
+        )
         names += [workflow.name for workflow in page]
         if not has_more:
             break
@@ -135,3 +137,18 @@ def test_a_workflow_deletes_once_and_only_for_its_owner(store: WorkflowStore) ->
     assert store.delete(saved.id, user_id=ALICE) is True
     assert store.delete(saved.id, user_id=ALICE) is False
     assert store.get(saved.id, user_id=ALICE) is None
+
+
+def test_a_draft_becomes_runnable_when_its_plan_is_saved(store: WorkflowStore) -> None:
+    draft = store.create(user_id=ALICE, name="draft", description="Plan a release.", steps=[])
+    assert draft.steps == []
+    assert store.get(draft.id, user_id=ALICE) == draft
+    page, _ = store.list_page(user_id=ALICE, limit=10)
+    assert page == [draft]
+
+    renamed = store.update(draft.id, user_id=ALICE, name="release")
+    assert renamed is not None and renamed.steps == []
+    saved = store.update(draft.id, user_id=ALICE, steps=STEPS)
+    assert saved is not None and saved.steps
+    assert store.get(draft.id, user_id=ALICE) == saved
+    assert store.list_page(user_id=ALICE, limit=10)[0] == [saved]

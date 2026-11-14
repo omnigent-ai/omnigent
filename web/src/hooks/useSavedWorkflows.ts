@@ -12,6 +12,8 @@ export interface SavedWorkflow {
   name: string;
   /** What it does and what a run needs, e.g. `"…Give it: the test suite."`. */
   description: string;
+  /** A draft has no saved plan and cannot run yet. */
+  is_draft?: boolean;
 }
 
 // The menu lists the user's workflows by name; more than this many need a search page.
@@ -20,7 +22,7 @@ const NO_WORKFLOWS: readonly SavedWorkflow[] = [];
 const SAVED_WORKFLOWS_KEY = ["saved-workflows"];
 
 /**
- * The user's saved workflows, by name, for Run a workflow. Empty on servers
+ * The user's workflows, including drafts, by name. Empty on servers
  * without saved workflows.
  *
  * @param enabled - Whether to load them now, e.g. while the session offers workflows.
@@ -44,7 +46,12 @@ export function useSavedWorkflows({ enabled = true }: { enabled?: boolean } = {}
       });
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
       const body = (await res.json()) as { data?: SavedWorkflow[] };
-      return (body.data ?? []).map(({ id, name, description }) => ({ id, name, description }));
+      return (body.data ?? []).map(({ id, name, description, is_draft }) => ({
+        id,
+        name,
+        description,
+        is_draft,
+      }));
     },
     staleTime: 30_000,
     enabled: enabled && supported,

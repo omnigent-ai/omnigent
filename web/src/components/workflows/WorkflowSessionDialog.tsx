@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { MonitorCloudIcon, WorkflowIcon } from "lucide-react";
 
@@ -63,7 +63,13 @@ import {
   isValidSandboxWorkspaceLength,
 } from "@/lib/sandboxRepositories";
 import { createSession } from "@/lib/sessionsApi";
-import { REVIEW_PLAN_FIRST, createWorkflowPrompt, runSavedWorkflowPrompt } from "@/lib/workflow";
+import type { Session } from "@/lib/types";
+import {
+  REVIEW_PLAN_FIRST,
+  createWorkflowPrompt,
+  editWorkflowPlanPrompt,
+  runSavedWorkflowPrompt,
+} from "@/lib/workflow";
 import { ForkRunConfig, HostLabel, type ForkRunConfigValue } from "@/shell/ForkSessionDialog";
 import { ConnectHostInstructions } from "@/shell/NewChatDialog";
 import { SandboxRepositoryPicker } from "@/shell/SandboxRepositoryPicker";
@@ -74,7 +80,9 @@ import { setPendingInitialPrompt } from "@/store/chatStore";
 
 /** What the dialog starts a session for: running a saved workflow, or drafting a new one. */
 export type WorkflowSessionRequest =
-  { kind: "run"; workflow: SavedWorkflow } | { kind: "create"; name: string; description: string };
+  | { kind: "run"; workflow: SavedWorkflow }
+  | { kind: "plan"; workflow: SavedWorkflow }
+  | { kind: "create"; name: string; description: string };
 
 export interface WorkflowSessionDialogProps {
   /** Keep it set while the dialog closes so the content doesn't blank. */
@@ -92,7 +100,7 @@ export interface WorkflowSessionDialogProps {
  * effort and permission fields it reuses.
  */
 export function WorkflowSessionDialog({ request, open, onOpenChange }: WorkflowSessionDialogProps) {
-  const name = request?.kind === "run" ? request.workflow.name : request?.name;
+  const name = request?.kind === "create" ? request.name : request?.workflow.name;
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
@@ -112,7 +120,7 @@ export function WorkflowSessionDialog({ request, open, onOpenChange }: WorkflowS
         </DialogHeader>
         {request && (
           <WorkflowSessionForm
-            key={request.kind === "run" ? request.workflow.id : `create:${request.name}`}
+            key={request.kind === "create" ? `create:${request.name}` : request.workflow.id}
             request={request}
             onClose={() => onOpenChange(false)}
           />
@@ -239,12 +247,15 @@ function writeSessionChoices(scope: string, choices: SessionChoices): void {
   }
 }
 
-function WorkflowSessionForm({
+export function WorkflowSessionForm({
   request,
   onClose,
+  onStarted,
 }: {
   request: WorkflowSessionRequest;
   onClose: () => void;
+  /** Embed the real session instead of navigating to its full chat page. */
+  onStarted?: (session: Session, initialPrompt: string | null) => Promise<void>;
 }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -407,12 +418,18 @@ function WorkflowSessionForm({
   // A run's optional additional instructions, which follow its run request; or
   // the whole first message of the session that drafts a workflow.
   const [instructions, setInstructions] = useState(() =>
-    request.kind === "run" ? "" : createWorkflowPrompt(request.name, request.description),
+    request.kind === "run"
+      ? ""
+      : request.kind === "plan"
+        ? editWorkflowPlanPrompt(request.workflow)
+        : createWorkflowPrompt(request.name, request.description),
   );
   // A saved workflow runs without a plan review unless asked.
   const [reviewPlanFirst, setReviewPlanFirst] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Retrying a failed workflow link reuses the session that was already launched.
+  const launched = useRef<{ session: Session; prompt: string | null } | null>(null);
   const targetReady = sandboxSelected
     ? profileError === null && !reposInvalid && !repoUrlPending && agentUnsupported === null
     : hostOnline && workspacePath !== null;
@@ -439,42 +456,52 @@ function WorkflowSessionForm({
     const modelOverride = pinnedValue(runConfig.modelOverride);
     const reasoningEffort = pinnedValue(runConfig.reasoningEffort);
     try {
-      const session = await createSession(agent.id, [], {
-        // The drafting session is named for the workflow it creates.
-        title: request.kind === "create" ? `Create workflow: ${request.name}` : undefined,
-        ...(sandboxSelected
-          ? {
-              sandbox: {
-                provider: sandboxProvider,
-                profileId: profileSelection?.id,
-                profileRevision: profileSelection?.revision,
-                workspaces: composeSandboxWorkspaces(sandboxRepos),
-                // Some servers have the client name the new sandbox's host.
-                hostId:
-                  info !== "loading" && info.request_managed_sandbox_host_id
-                    ? randomUUID().replace(/-/g, "")
-                    : undefined,
-              },
-              initialInput: serverSendsText
-                ? {
-                    type: "message",
-                    data: { role: "user", content: [{ type: "input_text", text }] },
-                  }
+      const session =
+        launched.current?.session ??
+        (await createSession(agent.id, [], {
+          // The drafting session is named for the workflow it creates.
+          title:
+            request.kind === "create"
+              ? `Create workflow: ${request.name}`
+              : request.kind === "plan"
+                ? `Plan workflow: ${request.workflow.name}`
                 : undefined,
-            }
-          : { hostId: hostId ?? undefined, workspace: workspacePath ?? undefined }),
-        labels: {
-          ...nativeWrapperLabelsForAgent(agent),
-          ...(runConfig.codexBypassSandbox ? { [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" } : {}),
-        },
-        terminalLaunchArgs: runConfig.terminalLaunchArgs?.length
-          ? runConfig.terminalLaunchArgs
-          : undefined,
-        modelOverride,
-        reasoningEffort,
-      });
+          ...(sandboxSelected
+            ? {
+                sandbox: {
+                  provider: sandboxProvider,
+                  profileId: profileSelection?.id,
+                  profileRevision: profileSelection?.revision,
+                  workspaces: composeSandboxWorkspaces(sandboxRepos),
+                  // Some servers have the client name the new sandbox's host.
+                  hostId:
+                    info !== "loading" && info.request_managed_sandbox_host_id
+                      ? randomUUID().replace(/-/g, "")
+                      : undefined,
+                },
+                initialInput: serverSendsText
+                  ? {
+                      type: "message",
+                      data: { role: "user", content: [{ type: "input_text", text }] },
+                    }
+                  : undefined,
+              }
+            : { hostId: hostId ?? undefined, workspace: workspacePath ?? undefined }),
+          labels: {
+            ...nativeWrapperLabelsForAgent(agent),
+            ...(runConfig.codexBypassSandbox
+              ? { [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
+              : {}),
+          },
+          terminalLaunchArgs: runConfig.terminalLaunchArgs?.length
+            ? runConfig.terminalLaunchArgs
+            : undefined,
+          modelOverride,
+          reasoningEffort,
+        }));
       // Otherwise the session page sends it as the first message once the session is ready.
-      if (!serverSendsText) setPendingInitialPrompt(session.id, { text, skill: null, files: [] });
+      if (!onStarted && !serverSendsText)
+        setPendingInitialPrompt(session.id, { text, skill: null, files: [] });
       writeSessionChoices(scope, {
         target,
         workspaces:
@@ -495,8 +522,13 @@ function WorkflowSessionForm({
         });
       }
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
-      onClose();
-      navigate(`/c/${session.id}`);
+      if (onStarted) {
+        launched.current ??= { session, prompt: serverSendsText ? null : text };
+        await onStarted(launched.current.session, launched.current.prompt);
+      } else {
+        onClose();
+        navigate(`/c/${session.id}`);
+      }
     } catch (e) {
       // A profile can change under the dialog; reload them so the next try sees it.
       if (sandboxSelected)
@@ -686,28 +718,30 @@ function WorkflowSessionForm({
           />
         )}
 
-        <Field
-          label={request.kind === "run" ? "Additional instructions" : "Instructions"}
-          htmlFor={instructionsId}
-        >
-          <Textarea
-            id={instructionsId}
-            value={instructions}
-            placeholder={
-              request.kind === "run"
-                ? "Optional. Instructions to customize the workflow."
-                : undefined
-            }
-            onChange={(event) => setInstructions(event.currentTarget.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) void run();
-            }}
-            rows={4}
-            className="min-h-24 resize-y text-sm focus-visible:ring-0"
-            data-testid="workflow-session-instructions"
-            componentId={`workflows.${flow}.instructions`}
-          />
-        </Field>
+        {request.kind !== "plan" && (
+          <Field
+            label={request.kind === "run" ? "Additional instructions" : "Instructions"}
+            htmlFor={instructionsId}
+          >
+            <Textarea
+              id={instructionsId}
+              value={instructions}
+              placeholder={
+                request.kind === "run"
+                  ? "Optional. Instructions to customize the workflow."
+                  : undefined
+              }
+              onChange={(event) => setInstructions(event.currentTarget.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) void run();
+              }}
+              rows={4}
+              className="min-h-24 resize-y text-sm focus-visible:ring-0"
+              data-testid="workflow-session-instructions"
+              componentId={`workflows.${flow}.instructions`}
+            />
+          </Field>
+        )}
 
         {request.kind === "run" && (
           <div className="space-y-1">
@@ -752,7 +786,7 @@ function WorkflowSessionForm({
           data-testid="workflow-session-submit"
           componentId={`workflows.${flow}.submit`}
         >
-          {request.kind === "run" ? "Run" : "Create"}
+          {request.kind === "run" ? "Run" : request.kind === "plan" ? "Start planning" : "Create"}
         </Button>
       </DialogFooter>
     </>

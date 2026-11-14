@@ -1,7 +1,6 @@
 /**
- * A saved workflow's page (`/workflows/:workflowId`), laid out like an
- * automation's: its name and description, Run, Create automation and Delete,
- * its steps as a graph, and the sessions that ran it, newest first.
+ * A workflow's plan, its planning conversation, and the sessions that ran it.
+ * Drafts become runnable when the user saves the agent's proposed plan.
  */
 
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -10,13 +9,17 @@ import {
   ChevronLeftIcon,
   ClockIcon,
   Loader2Icon,
+  MessageSquareIcon,
   PlayIcon,
+  SaveIcon,
   Trash2Icon,
+  WorkflowIcon,
 } from "lucide-react";
 
 import { PageScroll } from "@/components/PageScroll";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { showToast } from "@/components/ui/toast";
 import {
   type WorkflowSessionRequest,
@@ -35,13 +38,21 @@ import {
 } from "@/components/workflows/WorkflowStepsGraph";
 import { useNow } from "@/hooks/useNow";
 import { useDeleteWorkflow } from "@/hooks/useSavedWorkflows";
-import { useWorkflow, useWorkflowRuns, WorkflowNotFoundError } from "@/hooks/useWorkflow";
+import {
+  useWorkflow,
+  useWorkflowRuns,
+  useSaveWorkflowPlan,
+  WorkflowNotFoundError,
+} from "@/hooks/useWorkflow";
+import { useSessionJournal } from "@/hooks/useSessionJournal";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { WorkflowPlanningChat } from "@/components/workflows/WorkflowPlanningChat";
 import { automationPagePath } from "@/lib/automationFromSession";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { Link, useNavigate, useParams } from "@/lib/routing";
 import { formatRunTimestamp } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
-import type { StepState } from "@/lib/sessionJournal";
+import { currentPlan, planSteps, type StepState } from "@/lib/sessionJournal";
 import {
   describeWorkflowRun,
   runStepProgress,
@@ -67,6 +78,11 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const [sessionRequest, setSessionRequest] = useState<WorkflowSessionRequest | null>(null);
   const [sessionOpen, setSessionOpen] = useState(false);
   const [automationOpen, setAutomationOpen] = useState(false);
+  const [plannerOpen, setPlannerOpen] = useState<boolean | null>(null);
+  const showPlanner = plannerOpen ?? workflow?.is_draft ?? false;
+  const isMobile = useIsMobileViewport();
+  const journal = useSessionJournal(workflow?.planning_session_id ?? undefined, showPlanner);
+  const savePlan = useSaveWorkflowPlan(workflowId);
 
   if (isLoading) {
     return (
@@ -110,121 +126,225 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
 
   const summary = { id: workflow.id, name: workflow.name, description: workflow.description };
   const runList = runs.data?.pages.flatMap((page) => page.runs) ?? [];
+  const proposal = showPlanner ? currentPlan(journal.entries) : null;
+  const proposedSteps = proposal ? planSteps(proposal) : null;
+  const stepSignature = (steps: typeof workflow.steps) =>
+    JSON.stringify(
+      steps.map(({ id, name, goal, depends_on }) => [id, name, goal ?? null, depends_on]),
+    );
+  const hasChanges =
+    !!proposedSteps?.length && stepSignature(proposedSteps) !== stepSignature(workflow.steps);
+  const isDraft = workflow.is_draft ?? workflow.steps.length === 0;
+  const canRun = !isDraft && !hasChanges;
 
   return (
-    <PageScroll contentClassName="px-6" data-testid="workflow-detail-page">
-      <BackLink />
+    <div className="relative flex h-full min-h-0 flex-1 overflow-hidden">
+      <PageScroll className="min-w-0" contentClassName="px-6" data-testid="workflow-detail-page">
+        <BackLink />
 
-      <div className="mt-4 flex items-start justify-between gap-4">
-        <h1
-          className="min-w-0 break-words text-2xl font-semibold"
-          data-testid="workflow-detail-title"
-        >
-          {workflow.name}
-        </h1>
-        <div className="flex shrink-0 items-center gap-2">
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            aria-label="Delete workflow"
-            data-testid="workflow-detail-delete"
-            disabled={deleteWorkflow.isPending}
-            onClick={() =>
-              deleteWorkflow.mutate(workflow.id, {
-                onSuccess: () => navigate("/workflows"),
-                onError: () => showToast(`Couldn’t delete “${workflow.name}”.`),
-              })
-            }
-          >
-            <Trash2Icon className="size-4" />
-          </Button>
-          <Button
-            variant="outline"
-            data-testid="workflow-detail-create-automation"
-            onClick={() => setAutomationOpen(true)}
-          >
-            <ClockIcon className="size-4" />
-            Create automation
-          </Button>
-          <Button
-            data-testid="workflow-detail-run"
-            onClick={() => {
-              setSessionRequest({ kind: "run", workflow: summary });
-              setSessionOpen(true);
-            }}
-          >
-            <PlayIcon className="size-4" />
-            Run
-          </Button>
-        </div>
-      </div>
-      <WorkflowDescription text={workflow.description} />
-
-      <section className="mt-6">
-        <h2 className="mb-2 text-sm font-medium text-muted-foreground">Steps</h2>
-        <WorkflowStepsGraph steps={workflow.steps} title={workflow.name} />
-      </section>
-
-      <hr className="my-6 border-border" />
-
-      <h2 className="mb-2 text-sm font-medium text-muted-foreground">Runs</h2>
-      {runs.isLoading ? (
-        <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
-          <Loader2Icon className="size-4 animate-spin" />
-          Loading runs…
-        </div>
-      ) : runs.isError ? (
-        <p className="pb-2 text-sm text-muted-foreground" data-testid="workflow-runs-error">
-          Couldn’t load runs.
-        </p>
-      ) : runList.length === 0 && !runs.hasNextPage ? (
-        <p className="pb-2 text-sm text-muted-foreground" data-testid="workflow-runs-empty">
-          No runs yet.
-        </p>
-      ) : (
-        <>
-          <ul className="flex flex-col gap-1" data-testid="workflow-runs">
-            {runList.map((run) => (
-              <WorkflowRunRow
-                key={run.id}
-                run={run}
-                now={now}
-                workflowId={workflowId}
-                workflowName={workflow.name}
-              />
-            ))}
-          </ul>
-          {runs.hasNextPage && (
+        <div className="mt-4 flex flex-wrap items-start justify-between gap-4">
+          <div className="min-w-0">
+            <h1
+              className="min-w-0 break-words text-2xl font-semibold"
+              data-testid="workflow-detail-title"
+            >
+              {workflow.name}
+            </h1>
+            {isDraft && (
+              <span className="mt-2 inline-flex rounded-full bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground">
+                Draft
+              </span>
+            )}
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              variant="outline"
+              onClick={() => setPlannerOpen(!showPlanner)}
+              aria-expanded={showPlanner}
+            >
+              <MessageSquareIcon className="size-4" />
+              Plan with agent
+            </Button>
             <Button
               variant="ghost"
-              size="sm"
-              className="mt-2"
-              data-testid="workflow-runs-more"
-              disabled={runs.isFetchingNextPage}
-              onClick={() => void runs.fetchNextPage()}
+              size="icon-sm"
+              aria-label="Delete workflow"
+              data-testid="workflow-detail-delete"
+              disabled={deleteWorkflow.isPending}
+              onClick={() =>
+                deleteWorkflow.mutate(workflow.id, {
+                  onSuccess: () => navigate("/workflows"),
+                  onError: () => showToast(`Couldn’t delete “${workflow.name}”.`),
+                })
+              }
             >
-              {runs.isFetchingNextPage ? "Loading…" : "Load more"}
+              <Trash2Icon className="size-4" />
             </Button>
-          )}
-        </>
-      )}
+            <Button
+              variant="outline"
+              data-testid="workflow-detail-create-automation"
+              disabled={!canRun}
+              onClick={() => setAutomationOpen(true)}
+            >
+              <ClockIcon className="size-4" />
+              Create automation
+            </Button>
+            <Button
+              data-testid="workflow-detail-run"
+              disabled={!canRun}
+              onClick={() => {
+                setSessionRequest({ kind: "run", workflow: summary });
+                setSessionOpen(true);
+              }}
+            >
+              <PlayIcon className="size-4" />
+              Run
+            </Button>
+          </div>
+        </div>
+        <WorkflowDescription text={workflow.description} />
 
-      <WorkflowSessionDialog
-        request={sessionRequest}
-        open={sessionOpen}
-        onOpenChange={setSessionOpen}
-      />
-      <CreateScheduledTaskDialog
-        open={automationOpen}
-        onOpenChange={setAutomationOpen}
-        initialName={workflow.name}
-        lockedWorkflow={summary}
-        onCreated={(task) => {
-          showToast("Automation created");
-          navigate(automationPagePath(info, task));
-        }}
-      />
-    </PageScroll>
+        <section className="mt-6">
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <div>
+              <h2 className="text-sm font-medium">Plan</h2>
+              <p className="text-xs text-muted-foreground" role="status">
+                {hasChanges
+                  ? "Unsaved proposal · Save to enable Run"
+                  : isDraft
+                    ? "No saved plan yet"
+                    : "Saved plan"}
+              </p>
+            </div>
+            {hasChanges && (
+              <Button
+                size="sm"
+                disabled={savePlan.isPending}
+                loading={savePlan.isPending}
+                onClick={() => {
+                  if (!proposedSteps) return;
+                  setPlannerOpen(true);
+                  savePlan.mutate(proposedSteps, { onSuccess: () => showToast("Plan saved") });
+                }}
+              >
+                <SaveIcon className="size-4" /> Save plan
+              </Button>
+            )}
+          </div>
+          {savePlan.isError && (
+            <p role="alert" className="mb-3 text-sm text-destructive">
+              Couldn’t save the plan. {savePlan.error.message}
+            </p>
+          )}
+          {showPlanner && journal.error && (
+            <p role="alert" className="mb-3 text-sm text-destructive">
+              Couldn’t load the latest proposal. Reopen the chat to try again.
+            </p>
+          )}
+          {(proposedSteps ?? workflow.steps).length > 0 ? (
+            <WorkflowStepsGraph steps={proposedSteps ?? workflow.steps} title={workflow.name} />
+          ) : (
+            <div className="flex min-h-64 flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-border px-6 text-center">
+              <WorkflowIcon className="size-8 text-muted-foreground/50" />
+              <h3 className="text-sm font-medium">Let’s shape the plan</h3>
+              <p className="max-w-sm text-sm text-muted-foreground">
+                Describe the outcome in chat. Your agent’s proposed steps will appear here as you
+                work together.
+              </p>
+              {!showPlanner && (
+                <Button variant="outline" size="sm" onClick={() => setPlannerOpen(true)}>
+                  Plan with agent
+                </Button>
+              )}
+            </div>
+          )}
+        </section>
+
+        {!isDraft && (
+          <>
+            <hr className="my-6 border-border" />
+
+            <h2 className="mb-2 text-sm font-medium text-muted-foreground">Runs</h2>
+            {runs.isLoading ? (
+              <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
+                <Loader2Icon className="size-4 animate-spin" />
+                Loading runs…
+              </div>
+            ) : runs.isError ? (
+              <p className="pb-2 text-sm text-muted-foreground" data-testid="workflow-runs-error">
+                Couldn’t load runs.
+              </p>
+            ) : runList.length === 0 && !runs.hasNextPage ? (
+              <p className="pb-2 text-sm text-muted-foreground" data-testid="workflow-runs-empty">
+                No runs yet.
+              </p>
+            ) : (
+              <>
+                <ul className="flex flex-col gap-1" data-testid="workflow-runs">
+                  {runList.map((run) => (
+                    <WorkflowRunRow
+                      key={run.id}
+                      run={run}
+                      now={now}
+                      workflowId={workflowId}
+                      workflowName={workflow.name}
+                    />
+                  ))}
+                </ul>
+                {runs.hasNextPage && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="mt-2"
+                    data-testid="workflow-runs-more"
+                    disabled={runs.isFetchingNextPage}
+                    onClick={() => void runs.fetchNextPage()}
+                  >
+                    {runs.isFetchingNextPage ? "Loading…" : "Load more"}
+                  </Button>
+                )}
+              </>
+            )}
+          </>
+        )}
+
+        <WorkflowSessionDialog
+          request={sessionRequest}
+          open={sessionOpen}
+          onOpenChange={setSessionOpen}
+        />
+        <CreateScheduledTaskDialog
+          open={automationOpen}
+          onOpenChange={setAutomationOpen}
+          initialName={workflow.name}
+          lockedWorkflow={summary}
+          onCreated={(task) => {
+            showToast("Automation created");
+            navigate(automationPagePath(info, task));
+          }}
+        />
+      </PageScroll>
+      {showPlanner &&
+        (isMobile ? (
+          <Dialog open onOpenChange={setPlannerOpen}>
+            <DialogContent
+              showCloseButton={false}
+              aria-describedby={undefined}
+              className="flex h-[90dvh] flex-col gap-0 overflow-hidden p-0"
+            >
+              <DialogTitle className="sr-only">Plan with agent</DialogTitle>
+              <WorkflowPlanningChat workflow={workflow} onClose={() => setPlannerOpen(false)} />
+            </DialogContent>
+          </Dialog>
+        ) : (
+          <aside
+            aria-label="Workflow planning chat"
+            className="w-[42%] min-w-96 max-w-xl shrink-0 border-l border-border bg-background pt-[calc(var(--omnigent-header-height)+var(--omnigent-inset-top))] pb-[var(--omnigent-inset-bottom)]"
+          >
+            <WorkflowPlanningChat workflow={workflow} onClose={() => setPlannerOpen(false)} />
+          </aside>
+        ))}
+    </div>
   );
 }
 

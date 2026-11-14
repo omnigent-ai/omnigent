@@ -46,7 +46,17 @@ describe("ComposerAddMenu's Run a workflow", () => {
   });
 
   it("lists the saved workflows to search and run", async () => {
-    const { onRunSavedWorkflow, onWorkflow } = renderMenu({ savedWorkflows });
+    const { onRunSavedWorkflow, onWorkflow } = renderMenu({
+      savedWorkflows: [
+        ...savedWorkflows,
+        {
+          id: "c".repeat(32),
+          name: "Unfinished workflow",
+          description: "Still planning.",
+          is_draft: true,
+        },
+      ],
+    });
     runAWorkflow();
     const names = () =>
       screen.getAllByTestId("composer-saved-workflow").map((row) => row.textContent);

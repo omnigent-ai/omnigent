@@ -3411,6 +3411,7 @@ class WorkflowSummary(BaseModel):
     :param description: What the workflow is for.
     :param created_at: Unix epoch seconds when it was saved.
     :param updated_at: Unix epoch seconds of the last write.
+    :param is_draft: Derived from whether the saved plan has no steps.
     """
 
     id: str
@@ -3419,6 +3420,7 @@ class WorkflowSummary(BaseModel):
     description: str
     created_at: int
     updated_at: int
+    is_draft: bool = False
 
 
 class WorkflowObject(WorkflowSummary):
@@ -3426,9 +3428,11 @@ class WorkflowObject(WorkflowSummary):
     A saved workflow with its steps, the plan a run copies into a journal.
 
     :param steps: The workflow's graph.
+    :param planning_session_id: The conversation for proposing revisions, separate from runs.
     """
 
     steps: list[WorkflowStep]
+    planning_session_id: str | None = None
 
 
 class WorkflowList(BaseModel):
@@ -3520,15 +3524,15 @@ class CreateWorkflowRequest(BaseModel):
     :param name: One line of at most 80 characters, unique among the caller's
         workflows.
     :param description: What the workflow is for, at most 2,000 characters.
-    :param steps: The graph: unique step IDs, dependencies inside it, no
-        cycles, at most 100 steps.
+    :param steps: Empty or omitted to create a draft. Otherwise a graph with unique
+        step IDs, dependencies inside it, no cycles, and at most 100 steps.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str
     description: str
-    steps: list[WorkflowStep]
+    steps: list[WorkflowStep] = Field(default_factory=list)
 
 
 class UpdateWorkflowRequest(BaseModel):
@@ -3538,6 +3542,7 @@ class UpdateWorkflowRequest(BaseModel):
     :param name: A new name.
     :param description: A new description.
     :param steps: New steps, replacing the old ones.
+    :param planning_session_id: The private owned session for iterating on the plan.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -3545,6 +3550,7 @@ class UpdateWorkflowRequest(BaseModel):
     name: str | None = None
     description: str | None = None
     steps: list[WorkflowStep] | None = None
+    planning_session_id: str | None = None
 
 
 class WorkflowDeleted(BaseModel):
