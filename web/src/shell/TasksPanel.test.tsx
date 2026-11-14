@@ -240,15 +240,8 @@ describe("TasksPanel", () => {
     expect(steps.map((step) => step.dataset.state)).toEqual(["done", "ready", "ready", "waiting"]);
     expect(within(steps[1]).getByRole("img", { name: "Ready" }).textContent).toBe("2");
     expect(within(steps[1]).getByText("Ready")).toBeTruthy();
-    // batch and pool can run at the same time, so a gap separates them.
     expect(screen.getByTestId("tasks-progress").dataset.links).toBe("true");
     const segments = screen.getAllByTestId("tasks-progress-segment");
-    expect(segments.map((segment) => segment.dataset.linked === "true")).toEqual([
-      false,
-      true,
-      false,
-      true,
-    ]);
     // Hovering batch arcs it to profile, which it waits on, and ship, which waits on it.
     fireEvent.pointerEnter(segments[1]);
     expect(screen.getAllByTestId("tasks-progress-arc")).toHaveLength(2);

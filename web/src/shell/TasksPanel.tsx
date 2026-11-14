@@ -41,7 +41,6 @@ import {
   failedUpstream,
   finishedTaskCount,
   isRestart,
-  linkedToPrevious,
   planName,
   planTally,
   planWorkflowId,
@@ -699,8 +698,8 @@ export function TaskCardDetails({
   );
 }
 
-/** Past this many tasks, the strip has no room for links between its segments. */
-const MAX_LINKED_TASKS = 40;
+/** Past this many tasks, the strip is too crowded for dependency arcs. */
+const MAX_HOVER_ARC_TASKS = 40;
 /** How high a hover arc rises above the strip at most, in pixels. */
 const ARC_HEIGHT = 14;
 
@@ -710,10 +709,8 @@ const CARD_MENU_BUTTON =
 
 /**
  * One segment per task; hovering one shows a card with which task it is, where
- * it stands and, given `menuActionFor`, its ⋯ menu. A plan links neighboring
- * segments when one task waits on the other, so a gap means the two can run at
- * the same time, and hovering one of its segments draws arcs to the tasks it
- * waits on and the tasks that wait on it.
+ * it stands and, given `menuActionFor`, its ⋯ menu. Hovering a plan's segment
+ * draws arcs to the tasks it waits on and the tasks that wait on it.
  */
 export function ProgressStrip({
   progress,
@@ -733,14 +730,12 @@ export function ProgressStrip({
     progress.filter((item) => item.state === "done").map((item) => item.step.id),
   );
   const blocked = failedUpstream(progress);
-  const links =
-    fromPlan && progress.length <= MAX_LINKED_TASKS
-      ? linkedToPrevious(progress.map((item) => item.step))
-      : null;
+  const showDependencyArcs = fromPlan && progress.length <= MAX_HOVER_ARC_TASKS;
   const roomy = progress.length <= 24;
   const gap = roomy ? 6 : 4;
   const [hovered, setHovered] = useState<number | null>(null);
-  const focusIndex = links && hovered !== null && hovered < progress.length ? hovered : null;
+  const focusIndex =
+    showDependencyArcs && hovered !== null && hovered < progress.length ? hovered : null;
   // The tasks the hovered one waits on, and the tasks that wait on it.
   const related = new Set<number>();
   if (focusIndex !== null) {
@@ -766,13 +761,13 @@ export function ProgressStrip({
       className={cn(
         "relative flex h-4 items-center",
         // A plan's strip keeps room above it for the hover arcs.
-        links ? "mt-px -mb-[5px]" : "-my-[5px]",
-        !links && (progress.length > 16 ? "gap-px" : "gap-[3px]"),
+        showDependencyArcs ? "mt-px -mb-[5px]" : "-my-[5px]",
+        !showDependencyArcs && (progress.length > 16 ? "gap-px" : "gap-[3px]"),
       )}
       // In pixels, so the arcs' calc() lands on each segment's center.
-      style={links ? { columnGap: gap } : undefined}
+      style={showDependencyArcs ? { columnGap: gap } : undefined}
       data-testid="tasks-progress"
-      data-links={links ? "true" : undefined}
+      data-links={showDependencyArcs ? "true" : undefined}
       onPointerLeave={() => setHovered(null)}
     >
       {focusIndex !== null && (
@@ -829,19 +824,8 @@ export function ProgressStrip({
                 onBlur={() => setHovered(null)}
                 className="group relative flex h-full min-w-0 flex-1 cursor-pointer items-center focus-visible:outline-none"
                 data-testid="tasks-progress-segment"
-                data-linked={links?.[index] || undefined}
                 data-dimmed={!lit(index) || undefined}
               >
-                {links?.[index] && (
-                  <span
-                    aria-hidden
-                    className={cn(
-                      "absolute top-1/2 right-full h-0.5 -translate-y-1/2 bg-border-strong transition-opacity duration-150",
-                      !(lit(index) && lit(index - 1)) && "opacity-30",
-                    )}
-                    style={{ width: gap }}
-                  />
-                )}
                 <span
                   className={cn(
                     "h-1.5 w-full rounded-full transition-[height,opacity] duration-150 group-hover:h-2 group-focus-visible:h-2 group-focus-visible:ring-2 group-focus-visible:ring-ring/50",
