@@ -1833,7 +1833,7 @@ describe("NewChatLandingScreen create flow", () => {
     } as unknown as Response);
     setAgents([agent({ skills: [{ name: "workflow", description: "Plan and run a workflow" }] })]);
 
-    renderLanding();
+    renderLanding([], { features: { workflows: true } });
     await waitForWorkspaceSeed();
     typeMessage("Add retries");
     fireEvent.pointerDown(screen.getByRole("button", { name: "Add" }), { button: 0 });

@@ -155,7 +155,7 @@ def _server_message(response: httpx.Response) -> str:
 def _journal_error(response: httpx.Response, conversation_id: str) -> str:
     """Distinguish a missing session from other route errors, including disabled workflows."""
     message = _server_message(response)
-    if response.status_code == 404 and message == "Session not found":
+    if response.status_code == 404 and message in {"Session not found", "Conversation not found"}:
         return _error("session_not_found", conversation_id=conversation_id)
     return _error(message)
 

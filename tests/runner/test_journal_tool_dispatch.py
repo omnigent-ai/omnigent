@@ -231,6 +231,7 @@ async def test_an_older_server_without_the_journal_says_so(body: dict[str, objec
         "Workflows are disabled on this server",
         "Session journals are not available on this server",
         "Session not found",
+        "Conversation not found",
     ],
 )
 @pytest.mark.parametrize("operation", ["read", "write", "request_input"])
@@ -248,7 +249,7 @@ async def test_journal_404s_preserve_the_servers_reason(message: str, operation:
         result = await _run(client, tool, args)
     assert result == (
         {"error": "session_not_found", "conversation_id": SESSION}
-        if message == "Session not found"
+        if message in {"Session not found", "Conversation not found"}
         else {"error": message}
     )
 
