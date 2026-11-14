@@ -625,6 +625,13 @@ add a second layer just to satisfy a checklist. Keep the original reproduction
 source and output available for that audit. You do not implement the fix or run
 its before/after proof.
 
+**Check assertions before cleanup destroys their evidence.** Read temporary
+files and inspect live state before their owning fixture or context exits.
+A failing run may stop before the assertion, hiding an unrelated test defect.
+Where feasible, use a passing control to exercise the same assertion and cleanup
+path, then rerun the original failing case. Record both results and any untested
+assertion path in `evidence`; a mocked control does not prove the product fix.
+
 **Checkpoint the handoff before long finishing work.** As soon as Step 2 settles
 the overall verdict, atomically write the complete Output JSON object to
 `.omnigent/repro-handoff.json` in the workspace (create `.omnigent/` if needed;
