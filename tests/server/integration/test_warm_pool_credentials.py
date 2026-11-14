@@ -20,6 +20,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from omnigent.connections.claude import ClaudeConnectionStore
 from omnigent.connections.databricks import DatabricksConnectionStore
 from omnigent.connections.github import GithubConnectionStore
 from omnigent.db.utils import now_epoch
@@ -207,8 +208,8 @@ class _WarmCluster:
         assert payload["pod_uid"] == member["pod"].metadata.uid
         host = self.host_store.resolve_launch_token(payload["host_id"], payload["token"])
         assert host is not None and host.sandbox_id == handle.encode()
-        # The actual payload must already authenticate to both brokers at delivery.
-        for provider in ("github", "databricks"):
+        # The actual payload must already authenticate to every broker at delivery.
+        for provider in ("github", "databricks", "claude"):
             response = self.credential(payload, provider)
             assert response.status_code == 200
             assert response.json()["owner"] == host.user_id
@@ -262,6 +263,7 @@ async def test_warm_activation_keeps_owner_brokers_across_refresh_wake_and_delet
     cipher = _MemoryCipher()
     github_store = GithubConnectionStore(db_uri, cipher)
     databricks_store = DatabricksConnectionStore(db_uri, cipher)
+    claude_store = ClaudeConnectionStore(db_uri, cipher)
     expiry = now_epoch() + 3600
     for index, owner in enumerate(("alice", "bob")):
         github_store.upsert(
@@ -279,6 +281,7 @@ async def test_warm_activation_keeps_owner_brokers_across_refresh_wake_and_delet
                 f"db-{owner}", f"db-refresh-{owner}", expiry, None, "all-apis"
             ),
         )
+        claude_store.upsert(owner, oauth_token=f"sk-ant-oat01-{owner}")
     github_client = SimpleNamespace(
         refresh_token=AsyncMock(
             return_value=GitHubTokenSet("gh-alice-rotated", "gh-new-refresh", expiry, None, "repo")
@@ -294,6 +297,7 @@ async def test_warm_activation_keeps_owner_brokers_across_refresh_wake_and_delet
     app = FastAPI()
     app.state.github_store, app.state.github_client = github_store, github_client
     app.state.databricks_store, app.state.databricks_client = databricks_store, databricks_client
+    app.state.claude_store, app.state.claude_client = claude_store, None
     app.include_router(create_host_credentials_router(host_store), prefix="/v1")
     cluster = _WarmCluster(monkeypatch, host_store)
     deployment = ManagedSandboxDeployment.single(
@@ -330,12 +334,15 @@ async def test_warm_activation_keeps_owner_brokers_across_refresh_wake_and_delet
             databricks = cluster.credential(payload, "databricks").json()
             assert databricks["token"] == f"db-{owner}"
             assert databricks["workspace_host"] == f"https://{owner}.cloud.databricks.com"
+            claude = cluster.credential(payload, "claude").json()
+            assert claude["token"] == f"sk-ant-oat01-{owner}"
             command = json.dumps(payload["prepare_command"])
             assert "configure_clone_credentials" in command
             assert payload["token"] not in command
             assert f"gh-{owner}" not in json.dumps(payload)
             assert f"db-{owner}" not in json.dumps(payload)
-        for provider in ("github", "databricks"):
+            assert f"sk-ant-oat01-{owner}" not in json.dumps(payload)
+        for provider in ("github", "databricks", "claude"):
             assert (
                 cluster.credential({**alice, "token": bob["token"]}, provider).status_code == 401
             )
@@ -380,13 +387,13 @@ async def test_warm_activation_keeps_owner_brokers_across_refresh_wake_and_delet
         assert resumed["token"] != alice["token"] and resumed["pod_uid"] != alice["pod_uid"]
         host = host_store.get_host(alice_launch.host_id)
         assert host is not None and host.sandbox_id == assigned_handle
-        for provider in ("github", "databricks"):
+        for provider in ("github", "databricks", "claude"):
             assert cluster.credential(alice, provider).status_code == 401
             assert cluster.credential(resumed, provider).json()["owner"] == "alice"
 
         await terminate_managed_host(host, host_store, deployment)
         assert host_store.get_host(alice_launch.host_id) is None
         assert len(cluster.members) == 1
-        for provider in ("github", "databricks"):
+        for provider in ("github", "databricks", "claude"):
             assert cluster.credential(resumed, provider).status_code == 401
             assert cluster.credential(bob, provider).json()["owner"] == "bob"

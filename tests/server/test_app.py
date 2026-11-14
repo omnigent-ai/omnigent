@@ -3291,3 +3291,41 @@ async def test_mcp_launch_gate_and_hidden_info(db_uri, runtime_init, tmp_path, m
         "off": (None, None),
         "on": (enabled, enabled),
     }[mode]
+
+
+class _PlaintextCipher:
+    """Context-ignoring stand-in for the credential store's KMS cipher."""
+
+    def encrypt(self, plaintext: str, *, context: object) -> str:
+        del context
+        return plaintext
+
+    def decrypt(self, ciphertext: str, *, context: object) -> str:
+        del context
+        return ciphertext
+
+
+@pytest.mark.asyncio
+async def test_claude_connect_is_listed_and_mounted_when_configured(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    """Enabling Claude connect adds its Settings panel and its connection routes."""
+    from omnigent.connections.claude import ClaudeConnectionStore
+    from omnigent.server.claude_connection import ClaudeConnectConfig
+
+    app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "claude-connect",
+        claude_config=ClaudeConnectConfig(),
+        claude_store=ClaudeConnectionStore(db_uri, _PlaintextCipher()),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        info = (await client.get("/v1/info")).json()
+        status = (await client.get("/v1/connections/claude/status")).json()
+
+    assert info["enabled_connections"] == ["claude"]
+    assert status["connected"] is False

@@ -9,7 +9,9 @@ result (``complete``), and which non-secret fields to surface (``status_fields``
 callback), same-origin ``return_to`` sanitising, and the four endpoints under
 ``/connections/{provider}/``. Adding a provider is a hooks object plus a
 registry entry (see :mod:`omnigent.server.connections_registry`), not another
-copy of this flow.
+copy of this flow. Providers without an OAuth redirect (a pasted token) reuse
+the shared ``status`` / ``disconnect`` endpoints through
+:func:`add_status_and_disconnect_routes`.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.parse import urlencode
@@ -104,6 +107,62 @@ def redirect_with_status(provider: str, return_to: str, status: str) -> Redirect
     )
 
 
+def connection_user_resolver(auth_provider: AuthProvider | None) -> Callable[[Request], str]:
+    """Return a ``(request) -> user_id`` resolver for connection routes.
+
+    Requires an authenticated caller in multi-user mode; single-user/local mode
+    resolves to the reserved local user.
+    """
+
+    def current_user(request: Request) -> str:
+        user_id = require_user(request, auth_provider)
+        return user_id if user_id is not None else RESERVED_USER_LOCAL
+
+    return current_user
+
+
+def connection_status(connection: Any | None, status_fields: dict[str, Any]) -> dict[str, object]:
+    """Build the shared ``status`` body for *connection*. Never carries tokens."""
+    return {
+        "enabled": True,
+        "connected": connection is not None,
+        "connected_at": connection.created_at if connection is not None else None,
+        **status_fields,
+    }
+
+
+def add_status_and_disconnect_routes(
+    router: APIRouter,
+    *,
+    provider: str,
+    store: Any,
+    status_fields: Callable[[Any | None], dict[str, Any]],
+    current_user: Callable[[Request], str],
+) -> None:
+    """Mount ``/connections/{provider}/status`` and ``/disconnect`` on *router*.
+
+    :param router: The provider's router.
+    :param provider: URL segment, e.g. ``"github"``.
+    :param store: Connection store exposing ``get(user_id)`` and ``delete(user_id)``.
+    :param status_fields: Non-secret, provider-specific ``status`` fields.
+    :param current_user: Resolves the calling user, see :func:`connection_user_resolver`.
+    """
+
+    @router.get(f"/connections/{provider}/status")
+    async def status(request: Request) -> dict[str, object]:
+        """Return the caller's connection status. Never surfaces tokens."""
+        user_id = current_user(request)
+        connection = await asyncio.to_thread(store.get, user_id)
+        return connection_status(connection, status_fields(connection))
+
+    @router.post(f"/connections/{provider}/disconnect")
+    async def disconnect(request: Request) -> dict[str, bool]:
+        """Remove the caller's connection."""
+        user_id = current_user(request)
+        removed = await asyncio.to_thread(store.delete, user_id)
+        return {"disconnected": removed}
+
+
 def create_connection_router(
     hooks: ConnectionHooks,
     *,
@@ -122,25 +181,18 @@ def create_connection_router(
     store = hooks.store
     router = APIRouter()
     key = hooks.signing_key()
-
-    def _current_user(request: Request) -> str:
-        user_id = require_user(request, auth_provider)
-        return user_id if user_id is not None else RESERVED_USER_LOCAL
+    _current_user = connection_user_resolver(auth_provider)
 
     def _verify_state(state: str) -> dict:
         return jwt.decode(state, key, algorithms=[_STATE_ALG])
 
-    @router.get(f"/connections/{provider}/status")
-    async def status(request: Request) -> dict[str, object]:
-        """Return the caller's connection status. Never surfaces tokens."""
-        user_id = _current_user(request)
-        connection = await asyncio.to_thread(store.get, user_id)
-        return {
-            "enabled": True,
-            "connected": connection is not None,
-            "connected_at": connection.created_at if connection is not None else None,
-            **hooks.status_fields(connection),
-        }
+    add_status_and_disconnect_routes(
+        router,
+        provider=provider,
+        store=store,
+        status_fields=lambda connection: hooks.status_fields(connection),
+        current_user=_current_user,
+    )
 
     @router.get(f"/connections/{provider}/connect")
     async def connect(request: Request, return_to: str | None = None) -> RedirectResponse:
@@ -204,13 +256,6 @@ def create_connection_router(
             _logger.warning("%s connect failed for %s: %s", provider, user_id, exc)
             return redirect_with_status(provider, return_to, "error")
         return redirect_with_status(provider, return_to, "connected")
-
-    @router.post(f"/connections/{provider}/disconnect")
-    async def disconnect(request: Request) -> dict[str, bool]:
-        """Remove the caller's connection."""
-        user_id = _current_user(request)
-        removed = await asyncio.to_thread(store.delete, user_id)
-        return {"disconnected": removed}
 
     if extra_routes is not None:
         extra_routes(router)

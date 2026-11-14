@@ -1779,6 +1779,8 @@ def create_app(
     github_store: Any | None = None,  # GithubConnectionStore — GitHub App integration
     databricks_config: Any | None = None,  # DatabricksConfig — Databricks Connect
     databricks_store: Any | None = None,  # DatabricksConnectionStore — Databricks Connect
+    claude_config: Any | None = None,  # ClaudeConnectConfig — Claude subscription connect
+    claude_store: Any | None = None,  # ClaudeConnectionStore — Claude subscription connect
     mcp_registry: Any | None = None,
     mcp_gateway_backend: McpGatewayBackend | None = None,
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
@@ -1906,6 +1908,12 @@ def create_app(
         (:class:`omnigent.connections.github.GithubConnectionStore`).
         Required alongside ``github_config`` to enable the integration;
         wired together by ``create_app``'s caller.
+    :param claude_config: Enables per-user Claude subscription connections
+        (:class:`omnigent.server.claude_connection.ClaudeConnectConfig`).
+        ``None`` keeps the Claude panel hidden and its routes unmounted.
+    :param claude_store: Persistence for per-user Claude subscription tokens
+        (:class:`omnigent.connections.claude.ClaudeConnectionStore`). Required
+        alongside ``claude_config`` to enable the integration.
     :param sharing_mode: Server policy for creating new session
         permission grants (see :class:`SharingMode`): ``ON`` allows
         grants at any level plus public/workspace read, ``READ_ONLY``
@@ -2584,6 +2592,7 @@ def create_app(
     _connection_inputs = {
         "github": (github_config, github_store),
         "databricks": (databricks_config, databricks_store),
+        "claude": (claude_config, claude_store),
     }
     for _provider in connection_providers():
         _cfg, _store = _connection_inputs.get(_provider.name, (None, None))
@@ -3810,7 +3819,7 @@ def create_app(
         # and its connection store are present.
         enabled_connections = [
             provider
-            for provider in ("github", "databricks")
+            for provider in ("github", "databricks", "claude")
             if getattr(app.state, f"{provider}_config", None) is not None
             and getattr(app.state, f"{provider}_store", None) is not None
         ]
