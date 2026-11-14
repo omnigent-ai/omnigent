@@ -13,6 +13,7 @@ from pathlib import Path
 
 import httpx
 
+from omnigent.host.identity_env import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR
 from omnigent.runner.identity import token_bound_runner_id
 from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
 from tests._helpers.compat import (
@@ -54,6 +55,7 @@ class ServerRunner:
         self.database_uri = database_uri or f"sqlite:///{root / 'chat.db'}"
         self.artifact_location = artifact_location or root / "artifacts"
         self.runner_id = token_bound_runner_id(binding_token)
+        self.host_id = secrets.token_hex(16)
         self._token = binding_token
         self._resources = resources
         self._client = resources.enter_context(httpx.Client(trust_env=False))
@@ -130,28 +132,41 @@ class ServerRunner:
                 )
             try:
                 if runner:
-                    self._client.get(f"{self.base_url}/health", timeout=2.0).raise_for_status()
-                response = self._client.get(url, timeout=2.0)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._client.get(
+                        f"{self.base_url}/health", timeout=min(2.0, remaining)
+                    ).raise_for_status()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                response = self._client.get(url, timeout=min(2.0, remaining))
                 last = f"HTTP {response.status_code}: {response.text[:300]}"
+                if time.monotonic() >= deadline:
+                    break
                 if response.status_code == 200:
                     if host:
                         # A persisted online row can precede tunnel registration.
                         for row in response.json().get("hosts", []):
-                            if row.get("status") != "online":
+                            if row.get("status") != "online" or row.get("host_id") != self.host_id:
                                 continue
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                break
                             rpc = self._client.get(
                                 f"{self.base_url}/v1/hosts/{row['host_id']}/filesystem",
                                 params={"limit": 1},
-                                timeout=2.0,
+                                timeout=min(2.0, remaining),
                             )
-                            if rpc.status_code == 200:
+                            if rpc.status_code == 200 and time.monotonic() < deadline:
                                 return
                             last = f"Host RPC HTTP {rpc.status_code}: {rpc.text[:300]}"
                     elif not runner or response.json().get("online") is True:
                         return
             except (httpx.HTTPError, ValueError) as exc:
                 last = f"{type(exc).__name__}: {exc}"
-            time.sleep(self._poll_interval)
+            time.sleep(min(self._poll_interval, max(0.0, deadline - time.monotonic())))
         raise AssertionError(f"{url} never became ready: {last}\n{self.log_tail()}")
 
     def start_server(self, *, wait_ready: bool = True) -> None:
@@ -194,13 +209,19 @@ class ServerRunner:
         env: Mapping[str, str | None] | None = None,
         cwd: Path | None = None,
     ) -> None:
-        """Start a host daemon and wait until its tunnel answers an RPC."""
+        """Start this stack's host and wait until its tunnel answers an RPC."""
         assert self.host is None, "host already started"
+        if env is not None and {HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR} & env.keys():
+            raise ValueError("Host identity is owned by the isolated stack")
         self.host = self._spawn(
             "host",
             ["-m", "omnigent.host._daemon_entry", "--server", self.base_url],
             self.runner_home,
-            env or {},
+            {
+                **(env or {}),
+                HOST_ID_ENV_VAR: self.host_id,
+                HOST_NAME_ENV_VAR: f"server-runner-{self.host_id[:8]}",
+            },
             cwd=cwd,
         )
         self._wait_ready(host=True)

@@ -33,13 +33,13 @@ _SENSITIVE_RESPONSE_KEY_PATTERN = re.compile(
     r"authorization|token|secret|password|passwd|credential|api[\s_.-]*key",
     re.IGNORECASE,
 )
-_SENSITIVE_RESPONSE_ASSIGNMENT_PATTERN = re.compile(
-    rf"(?:{_SENSITIVE_RESPONSE_KEY_PATTERN.pattern})[\w.-]*[\"']?\s*[:=]",
-    re.IGNORECASE,
-)
+_MAX_DIAGNOSTIC_RESPONSE_BYTES = 16 * 1024
 
 
 def _redacted_response_text(response: httpx.Response) -> str:
+    if len(response.content) > _MAX_DIAGNOSTIC_RESPONSE_BYTES:
+        return "[Response body omitted: too large]"
+
     def redact(value: Any) -> Any:
         if isinstance(value, dict):
             result = {}
@@ -51,7 +51,7 @@ def _redacted_response_text(response: httpx.Response) -> str:
         if isinstance(value, list):
             return [redact(item) for item in value]
         if isinstance(value, str):
-            if _SENSITIVE_RESPONSE_ASSIGNMENT_PATTERN.search(value):
+            if _SENSITIVE_RESPONSE_KEY_PATTERN.search(value):
                 return "[REDACTED]"
             redacted = redact_log_text(value, include_whitespace_credentials=True)
             return "[REDACTED]" if redacted != value else value

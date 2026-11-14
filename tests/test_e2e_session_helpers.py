@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -205,6 +207,17 @@ def test_pending_tool_poll_waits_for_this_turn(monkeypatch, previous_call) -> No
             id="credential-key",
         ),
         pytest.param(
+            {"credentials synthetic-key-tail": "synthetic-key-value-tail"},
+            ("synthetic-key-tail", "synthetic-key-value-tail"),
+            id="non-assignment-credentials-key",
+        ),
+        pytest.param(
+            {"password/synthetic-key-tail": "synthetic-key-value-tail"},
+            ("synthetic-key-tail", "synthetic-key-value-tail"),
+            id="non-assignment-password-key",
+        ),
+        pytest.param(None, ("synthetic-validation-tail",), id="metadata-validation"),
+        pytest.param(
             {
                 'password="\\"synthetic-escaped-key-tail"': {
                     "value": "synthetic-escaped-key-value-tail"
@@ -232,16 +245,25 @@ def test_pending_tool_poll_waits_for_this_turn(monkeypatch, previous_call) -> No
     ],
 )
 def test_native_create_failure_keeps_bounded_redacted_response(
-    sensitive_fields: dict, credential_tails: tuple[str, ...]
+    sensitive_fields: dict | None, credential_tails: tuple[str, ...]
 ) -> None:
+    message = "host did not respond to workspace stat"
+    if sensitive_fields is None:
+        from omnigent.errors import OmnigentError
+        from omnigent.server.routes._sessions.helpers import _parse_session_create_metadata
+
+        with pytest.raises(OmnigentError) as validation:
+            _parse_session_create_metadata(json.dumps({"api_token": credential_tails[0]}))
+        message = validation.value.message
+        assert "input_value" in message and credential_tails[0] in message
     credential = "synthetic-credential-" * 200
     payload = {
         "error": {
             "code": "invalid_input",
-            "message": "host did not respond to workspace stat",
+            "message": message,
             "api_key": credential,
-            **sensitive_fields,
-            "detail": "diagnostic-after-credential",
+            **(sensitive_fields or {}),
+            "detail": "diagnostic-after-redaction",
             "context": "x" * 3000 + "outside-diagnostic-limit",
         }
     }
@@ -259,8 +281,9 @@ def test_native_create_failure_keeps_bounded_redacted_response(
     assert error.response.json() == payload
     note = "\n".join(error.__notes__)
     assert "invalid_input" in note
-    assert "host did not respond to workspace stat" in note
-    assert "diagnostic-after-credential" in note
+    if sensitive_fields is not None:
+        assert message in note
+    assert "diagnostic-after-redaction" in note
     assert "[REDACTED]" in note
     assert "synthetic-credential-" not in note
     assert all(tail not in note for tail in credential_tails)
@@ -274,6 +297,10 @@ def test_native_create_failure_keeps_bounded_redacted_response(
         pytest.param('upstream password="synthetic-omitted-tail', id="plain-text"),
         pytest.param('{"password":"\\"synthetic-omitted-tail"} trailing', id="invalid-json"),
         pytest.param("[" * 1100 + '"synthetic-omitted-tail"' + "]" * 1100, id="deep-json"),
+        pytest.param(
+            json.dumps({"message": "password" * 4096 + "synthetic-omitted-tail"}),
+            id="repeated-sensitive-label",
+        ),
     ],
 )
 def test_native_create_failure_keeps_http_error_when_diagnostic_body_is_omitted(body: str) -> None:
