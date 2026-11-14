@@ -242,7 +242,17 @@ def register_items_routes(
 
     # ── GET /sessions/{session_id}/export ────────────────────────
 
-    @router.get("/sessions/{session_id}/export", response_model=None)
+    @router.get(
+        "/sessions/{session_id}/export",
+        response_model=None,
+        response_class=Response,
+        responses={
+            200: {
+                "description": "The notebook as an attachment.",
+                "content": {"application/x-ipynb+json": {"schema": {"type": "object"}}},
+            }
+        },
+    )
     async def export_session(
         request: Request,
         session_id: str,

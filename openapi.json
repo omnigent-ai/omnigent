@@ -7082,6 +7082,11 @@
             "title": "Session Move Source Checks",
             "type": "boolean"
           },
+          "session_notebook_export": {
+            "default": false,
+            "title": "Session Notebook Export",
+            "type": "boolean"
+          },
           "session_organize_source_checks": {
             "default": false,
             "title": "Session Organize Source Checks",
@@ -19536,11 +19541,13 @@
         "responses": {
           "200": {
             "content": {
-              "application/json": {
-                "schema": {}
+              "application/x-ipynb+json": {
+                "schema": {
+                  "type": "object"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "The notebook as an attachment."
           },
           "422": {
             "content": {

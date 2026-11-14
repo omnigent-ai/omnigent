@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -103,37 +104,54 @@ def test_messages_become_markdown_and_shell_runs_become_bash_cells_with_output()
 
 
 @pytest.mark.parametrize(
-    ("name", "command", "source"),
+    ("name", "arguments", "source"),
     [
         # Claude Code's tool, with Python fed on stdin.
         (
             "Bash",
-            "python3 - <<'EOF'\nimport pandas as pd\nprint(pd.__version__)\nEOF",
+            {"command": "python3 - <<'EOF'\nimport pandas as pd\nprint(pd.__version__)\nEOF"},
             "import pandas as pd\nprint(pd.__version__)",
         ),
         # Codex wraps each command in a login shell.
-        ("shell", "/bin/zsh -lc 'python3 -c \"print(42)\"'", "print(42)"),
-        ("run_shell_command", "ls -la", "%%bash\nls -la"),
-        ("Bash", "/bin/bash -lc 'pwd'", "%%bash\npwd"),
+        ("shell", {"command": "/bin/zsh -lc 'python3 -c \"print(42)\"'"}, "print(42)"),
+        ("run_shell_command", {"command": "ls -la"}, "%%bash\nls -la"),
+        ("Bash", {"command": "/bin/bash -lc 'pwd'"}, "%%bash\npwd"),
         # Codex can send the command as an argv list.
-        ("shell", ["bash", "-lc", "git status"], "%%bash\ngit status"),
+        ("shell", {"command": ["bash", "-lc", "git status"]}, "%%bash\ngit status"),
         # A redirect after the heredoc, or an unquoted delimiter the shell
         # expands, changes what runs, so the cell keeps the whole command.
         (
             "Bash",
-            "python3 - <<'EOF' > out.txt\nprint(1)\nEOF",
+            {"command": "python3 - <<'EOF' > out.txt\nprint(1)\nEOF"},
             "%%bash\npython3 - <<'EOF' > out.txt\nprint(1)\nEOF",
         ),
         (
             "Bash",
-            "python3 - <<EOF\nprint('$HOME')\nEOF",
+            {"command": "python3 - <<EOF\nprint('$HOME')\nEOF"},
             "%%bash\npython3 - <<EOF\nprint('$HOME')\nEOF",
         ),
         # A second heredoc after the Python one is more shell, not Python.
         (
             "Bash",
-            "python3 - <<'EOF'\nprint(1)\nEOF\ncat <<'EOF'\nhi\nEOF",
+            {"command": "python3 - <<'EOF'\nprint(1)\nEOF\ncat <<'EOF'\nhi\nEOF"},
             "%%bash\npython3 - <<'EOF'\nprint(1)\nEOF\ncat <<'EOF'\nhi\nEOF",
+        ),
+        # The same for ``-c``: a redirect, or a program the shell expands.
+        (
+            "Bash",
+            {"command": "python3 -c 'print(1)'>out.txt"},
+            "%%bash\npython3 -c 'print(1)'>out.txt",
+        ),
+        (
+            "Bash",
+            {"command": "python3 -c \"print('$HOME')\""},
+            "%%bash\npython3 -c \"print('$HOME')\"",
+        ),
+        # A command run in its own directory runs there again.
+        (
+            "exec_command",
+            {"cmd": "python3 -c 'print(1)'", "workdir": "/work/my data"},
+            "%%bash\ncd '/work/my data' || exit 1\npython3 -c 'print(1)'",
         ),
     ],
     ids=[
@@ -145,12 +163,15 @@ def test_messages_become_markdown_and_shell_runs_become_bash_cells_with_output()
         "heredoc-with-redirect",
         "unquoted-heredoc",
         "heredoc-then-more-shell",
+        "python-c-with-redirect",
+        "python-c-expanded",
+        "working-directory",
     ],
 )
 def test_each_harness_shell_command_becomes_the_cell_it_ran(
-    name: str, command: str | list[str], source: str
+    name: str, arguments: dict[str, Any], source: str
 ) -> None:
-    notebook = _notebook([_call("c1", name, {"command": command})])
+    notebook = _notebook([_call("c1", name, arguments)])
     assert _cells(notebook) == [("code", source)]
 
 
@@ -230,6 +251,13 @@ def test_nothing_is_dropped_silently() -> None:
                 "model": "o3",
                 "summary": [{"type": "summary_text", "text": "Group by region first."}],
             },
+            # The Claude bridge's thinking: plain content, no summary.
+            {
+                "type": "reasoning",
+                "model": "claude",
+                "summary": [],
+                "content": [{"type": "reasoning_text", "text": "Let me think."}],
+            },
             {"type": "routing_decision", "model": "databricks-gpt-5-5", "applied": False},
             _result("c_unknown", "orphaned output"),
             {
@@ -272,6 +300,7 @@ def test_nothing_is_dropped_silently() -> None:
     assert _cells(notebook) == [
         ("markdown", "*(The model's encrypted reasoning isn't included.)*"),
         ("markdown", "*Reasoning:*\n\nGroup by region first."),
+        ("markdown", "*(The model's full reasoning isn't included.)*"),
         ("markdown", "*The model router would have picked `databricks-gpt-5-5`.*"),
         ("markdown", "*(Output of a tool call that isn't in this export.)*"),
         ("markdown", "*Error: The query timed out.*"),
@@ -324,12 +353,25 @@ def test_the_header_link_cannot_break_out_of_its_markdown() -> None:
     assert link == "- **Link:** https://omnigent.example/c/a%29%5Bx%5D%28%3Cimg%3E"
 
 
-def test_dollar_signs_in_text_stay_text_but_code_keeps_them() -> None:
-    text = "West made $538.9k (\\$2k fees); see `echo $HOME` and\n```\n$ ls\n```"
+def test_dollar_signs_in_text_stay_text_but_code_and_links_keep_them() -> None:
+    text = (
+        "West made $538.9k (\\$2k fees); see `echo $HOME` and\n```\n$ ls\n```\n"
+        "[chart](https://example.com/q?p=$5), <https://example.com/a$b> and "
+        "https://example.com/c$d; 见https://x.com价格$5"
+    )
     notebook = _notebook([_message("assistant", text)])
     [(_, source)] = _cells(notebook)
     dollar = "<span>&#36;</span>"
     assert source == (
         f"**Assistant**\n\nWest made {dollar}538.9k ({dollar}2k fees); "
-        "see `echo $HOME` and\n```\n$ ls\n```"
+        "see `echo $HOME` and\n```\n$ ls\n```\n"
+        "[chart](https://example.com/q?p=$5), <https://example.com/a$b> and "
+        f"https://example.com/c$d; 见https://x.com价格{dollar}5"
     )
+
+
+def test_pathological_link_text_converts_quickly() -> None:
+    """Link-protection patterns can't rescan the text after every failed match."""
+    started = time.monotonic()
+    _notebook([_message("user", "](" * 50_000 + "<https://" * 20_000 + "$5")])
+    assert time.monotonic() - started < 2

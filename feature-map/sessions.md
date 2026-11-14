@@ -854,9 +854,8 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_sidebar_delete.py::test_delete_session_removes_row_and_from_store`,
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_delete_removes_sessions`
 - **`export`, header menu (own environment):**
-  `tests/e2e_ui/sessions/test_export_chat_menu.py::test_header_session_menu_offers_export`,
   `tests/e2e_ui/sessions/test_export_chat_menu.py::test_header_export_downloads_transcript`
-  (transcript and notebook) seed the transcript into the spawned server's
+  (transcript and notebook) seeds the transcript into the spawned server's
   database; run them with plain `uv run pytest`, outside `verify-env run`. The
   notebook's cell mapping is covered by `tests/test_session_notebook.py`, the
   endpoint by `tests/server/integration/test_sessions_notebook_export.py` and the

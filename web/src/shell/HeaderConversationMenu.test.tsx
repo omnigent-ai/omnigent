@@ -130,6 +130,8 @@ function menuTree(
   // A QueryClientProvider is required: the menu reads useQueryClient() to hand
   // the post-archive Undo toast a client for unarchiving.
   queryClient = new QueryClient(),
+  // An older server doesn't advertise notebook export.
+  notebookExport = true,
 ) {
   return (
     <QueryClientProvider client={queryClient}>
@@ -137,6 +139,7 @@ function menuTree(
         info={{
           ...FALLBACK_SERVER_INFO,
           archive_worktree_cleanup: true,
+          session_notebook_export: notebookExport,
           ...(capability === "missing" ? {} : { sibling_sessions: capability }),
         }}
       >
@@ -361,16 +364,22 @@ describe("HeaderConversationMenu", () => {
     expect(mocks.toastError).not.toHaveBeenCalled();
   });
 
-  it("surfaces an export failure as a toast and downloads nothing", async () => {
-    mocks.exportTranscript.mockRejectedValueOnce(new Error("boom"));
-    renderMenu();
-    openMenu();
+  it.each([
+    ["Export", () => mocks.exportTranscript, "Export failed"],
+    ["Export as notebook (.ipynb)", () => mocks.exportNotebook, "Notebook export failed"],
+  ] as const)(
+    "surfaces a failed %s as a toast and downloads nothing",
+    async (item, exporter, message) => {
+      exporter().mockRejectedValueOnce(new Error("boom"));
+      renderMenu();
+      openMenu();
 
-    fireEvent.click(screen.getByRole("menuitem", { name: "Export" }));
+      fireEvent.click(screen.getByRole("menuitem", { name: item }));
 
-    await waitFor(() => expect(mocks.toastError).toHaveBeenCalledWith("Export failed"));
-    expect(mocks.triggerDownload).not.toHaveBeenCalled();
-  });
+      await waitFor(() => expect(mocks.toastError).toHaveBeenCalledWith(message));
+      expect(mocks.triggerDownload).not.toHaveBeenCalled();
+    },
+  );
 
   it("downloads the session as <session-id>.ipynb from Export as notebook", async () => {
     const notebook = new Blob(['{"nbformat":4}'], { type: "application/x-ipynb+json" });
@@ -390,15 +399,12 @@ describe("HeaderConversationMenu", () => {
     expect(mocks.toastError).not.toHaveBeenCalled();
   });
 
-  it("surfaces a notebook export failure as a toast and downloads nothing", async () => {
-    mocks.exportNotebook.mockRejectedValueOnce(new Error("boom"));
-    renderMenu();
+  it("leaves Export as notebook out against a server that can't export notebooks", () => {
+    render(menuTree({}, true, undefined, false));
     openMenu();
 
-    fireEvent.click(screen.getByRole("menuitem", { name: "Export as notebook (.ipynb)" }));
-
-    await waitFor(() => expect(mocks.toastError).toHaveBeenCalledWith("Notebook export failed"));
-    expect(mocks.triggerDownload).not.toHaveBeenCalled();
+    expect(screen.getByRole("menuitem", { name: "Export" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /notebook/i })).not.toBeInTheDocument();
   });
 
   it("opens a full-history fork from the session menu", () => {

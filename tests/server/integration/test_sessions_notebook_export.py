@@ -62,6 +62,8 @@ async def test_exports_the_session_as_a_notebook_attachment(client: httpx.AsyncC
     )
 
     assert response.status_code == 200, response.text
+    # The web shows the menu item only on servers that advertise the export.
+    assert (await client.get("/v1/info")).json()["session_notebook_export"] is True
     assert response.headers["content-type"].startswith("application/x-ipynb+json")
     assert response.headers["content-disposition"] == f'attachment; filename="{session_id}.ipynb"'
     notebook = response.json()

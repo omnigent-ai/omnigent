@@ -25,7 +25,6 @@ MAX_OUTPUT_CHARS = 100_000
 MAX_IMAGE_CHARS = 2_000_000
 
 _SHELLS = {"bash", "sh", "zsh"}
-_PYTHONS = {"python", "python3"}
 # Codex's and other harnesses' shell tools beyond each harness's declared one.
 _EXTRA_SHELL_TOOLS = frozenset({"exec_command", "run_command"})
 # ``python3 - <<'EOF'`` … ``EOF``: Python fed on stdin. Only a quoted delimiter
@@ -34,6 +33,13 @@ _PYTHON_HEREDOC = re.compile(
     r"\A\s*(?:python3?)\s+-\s*<<\s*(['\"])(\w+)\1[ \t]*\n(?P<body>.*?)\n\2\s*\Z",
     re.DOTALL,
 )
+# ``python3 -c '…'``: only a quoted program the shell passes through unchanged
+# (single quotes, or double quotes with nothing to expand) and nothing after it.
+_PYTHON_C = re.compile(
+    r"""\A\s*(?:(?:/[\w.+-]+)*/)?python3?\s+-c\s+(?:'(?P<single>[^']*)'|"(?P<double>[^"$`\\]*)")\s*\Z"""
+)
+# Argument names shell tools use for the directory a command runs in.
+_WORKING_DIRECTORY_KEYS = ("workdir", "cwd", "directory")
 _SQL_ARGUMENT_KEYS = ("sql", "query", "statement")
 _MCP_IMAGE_MARKER = "__omnigent_mcp_image_result__"
 _INLINE_IMAGE_TYPES = ("png", "jpeg", "gif", "webp")
@@ -89,12 +95,13 @@ def _python_source(command: str) -> str | None:
         if any(line.strip() == heredoc.group(2) for line in body.splitlines()):
             return None
         return body
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        return None
-    if len(tokens) == 3 and tokens[0].rsplit("/", 1)[-1] in _PYTHONS and tokens[1] == "-c":
-        return tokens[2]
+    inline = _PYTHON_C.match(command)
+    if inline:
+        return (
+            inline.group("single")
+            if inline.group("single") is not None
+            else inline.group("double")
+        )
     return None
 
 
@@ -109,8 +116,13 @@ def _sql_query(name: str, arguments: Mapping[str, Any]) -> str | None:
     return None
 
 
-# Fenced blocks and inline code spans, where ``$`` is literal.
-_MARKDOWN_CODE = re.compile(r"(```.*?```|~~~.*?~~~|`[^`\n]*`)", re.DOTALL)
+# Where ``$`` is literal: fenced blocks, inline code, link destinations,
+# autolinks and bare URLs (ASCII only, so a URL ends where unspaced text resumes).
+_MARKDOWN_CODE = re.compile(
+    r"(```.*?```|~~~.*?~~~|`[^`\n]*`|\]\([^()\s\]]*\)|<https?://[^<>\s]*>"
+    r"|https?://[A-Za-z0-9\-._~:/?#@!$&'*+,;=%]+)",
+    re.DOTALL,
+)
 _DOLLAR = re.compile(r"\\?\$")
 # JupyterLab typesets ``\$`` and ``&#36;`` as math too; an entity in its own
 # element is the form both it and nbconvert show as a plain dollar sign.
@@ -261,9 +273,21 @@ class _NotebookBuilder:
         command = _shell_command(arguments) if name in self._shell_tools else None
         if command is not None:
             command = _unwrap_shell(command)
-            python = _python_source(command)
+            directory = next(
+                (
+                    value
+                    for key in _WORKING_DIRECTORY_KEYS
+                    if isinstance(value := arguments.get(key), str) and value.strip()
+                ),
+                None,
+            )
+            python = _python_source(command) if directory is None else None
             if python is not None:
                 self.code(python, call_id)
+            elif directory is not None:
+                # ``%%bash`` runs in its own process, so the ``cd`` stays in this cell;
+                # without the directory the command doesn't run at all.
+                self.code(f"%%bash\ncd {shlex.quote(directory)} || exit 1\n{command}", call_id)
             else:
                 self.code(f"%%bash\n{command}", call_id)
             return
@@ -364,6 +388,8 @@ def session_notebook(
                 builder.markdown(f"*Reasoning:*\n\n{_markdown_text(summary)}")
             elif item.get("encrypted_content"):
                 builder.markdown("*(The model's encrypted reasoning isn't included.)*")
+            elif item.get("content"):
+                builder.markdown("*(The model's full reasoning isn't included.)*")
         elif item_type == "routing_decision":
             verb = "picked" if item.get("applied", True) else "would have picked"
             builder.markdown(f"*The model router {verb} `{item.get('model', '')}`.*")

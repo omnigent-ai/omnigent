@@ -3,10 +3,9 @@
 The chat-header session actions menu is the only in-app place to act on a
 conversation; without an Export item a conversation cannot be saved as a
 local file from the UI (the CLI ``omnigent session export`` is the only
-path). The first test pins the Export affordance in the kebab menu; the
-second drives the full journey — click Export, receive a file download
-whose content preserves the transcript: both turns in order, the code
-block, and the link.
+path). The test drives the full journey for each format — click the item,
+receive a file download whose content preserves the transcript: both turns
+in order, the code block, and the link.
 
 Content markers are single-line and quote-free so they survive any export
 format unchanged (a JSONL export JSON-escapes newlines and quotes).
@@ -85,17 +84,6 @@ def _open_session_menu(page: Page, base_url: str, session_id: str) -> None:
     expect(trigger).to_be_visible(timeout=30_000)
     trigger.click()
     expect(page.get_by_role("menu")).to_be_visible()
-
-
-def test_header_session_menu_offers_export(
-    page: Page,
-    transcript_session: tuple[str, str],
-) -> None:
-    """The session kebab menu contains an Export action."""
-    base_url, session_id = transcript_session
-    _open_session_menu(page, base_url, session_id)
-    expect(page.get_by_role("menuitem", name="Export", exact=True)).to_be_visible()
-    expect(page.get_by_role("menuitem", name="Export as notebook (.ipynb)")).to_be_visible()
 
 
 @pytest.mark.parametrize(

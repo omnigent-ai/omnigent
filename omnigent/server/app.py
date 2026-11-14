@@ -269,6 +269,8 @@ class ServerInfoResponse(BaseModel):
     databricks_features: bool
     managed_sandboxes_enabled: bool
     durable_initial_input: bool = False
+    # ``GET /v1/sessions/{id}/export?format=ipynb`` exists; older servers omit it.
+    session_notebook_export: bool = False
     sandbox_provider: str | None
     sandbox_providers: list[str]
     # UI-relevant capability flags per launchable provider, e.g.
@@ -3871,6 +3873,7 @@ def create_app(
                 "databricks_features": databricks_features,
                 "managed_sandboxes_enabled": managed_sandboxes_enabled,
                 "durable_initial_input": startup_inputs is not None,
+                "session_notebook_export": True,
                 "sandbox_provider": sandbox_provider,
                 "sandbox_providers": sandbox_providers,
                 "sandbox_provider_capabilities": sandbox_provider_capabilities,

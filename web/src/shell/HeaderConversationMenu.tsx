@@ -173,6 +173,7 @@ export function HeaderConversationMenu({
   const canPin = !isIndentedSibling(conversation);
   const isArchived = conversation.archived === true;
   const canAddAgent = !isArchived && info !== "loading" && info.sibling_sessions;
+  const canExportNotebook = info !== "loading" && info.session_notebook_export === true;
   const addAgentPath = `/?sibling=${encodeURIComponent(conversation.id)}`;
   const label = conversationDisplayLabel(conversation);
   // Mobile taps need a bigger target than the dense desktop row.
@@ -404,14 +405,16 @@ export function HeaderConversationMenu({
         <DownloadIcon className="size-3.5" />
         Export
       </DropdownMenuItem>
-      <DropdownMenuItem
-        data-testid="header-export-notebook"
-        className={itemClass}
-        onSelect={() => void exportNotebook()}
-      >
-        <NotebookIcon className="size-3.5" />
-        Export as notebook (.ipynb)
-      </DropdownMenuItem>
+      {canExportNotebook && (
+        <DropdownMenuItem
+          data-testid="header-export-notebook"
+          className={itemClass}
+          onSelect={() => void exportNotebook()}
+        >
+          <NotebookIcon className="size-3.5" />
+          Export as notebook (.ipynb)
+        </DropdownMenuItem>
+      )}
       {hasAgentInfo && onAgentInfo && (
         <DropdownMenuItem
           data-testid="header-agent-info"
