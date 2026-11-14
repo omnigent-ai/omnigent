@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import hashlib
 import json
 import math
@@ -13697,6 +13698,16 @@ async def _child_session_summaries_from_conversations(
     ]
 
 
+# Refusals for a server-held ASK; callers map them to HTTP statuses.
+MCP_TOOL_CALL_DECLINED_MESSAGE = "Tool call denied by user"
+MCP_TOOL_CALL_NOT_APPROVED_MESSAGE = "Tool call was not approved in time"
+MCP_TOOL_CALL_TOO_LONG_TO_REVIEW_MESSAGE = (
+    "This call needs approval but is too long to show on the approval card"
+)
+# Matches the content preview ``_hold_native_ask_gate`` shows on the card.
+MCP_HELD_ASK_PREVIEW_CHARS = 1024
+
+
 async def _handle_mcp_tools_call(
     rpc_id: int | str | None,
     session_id: str,
@@ -13709,6 +13720,8 @@ async def _handle_mcp_tools_call(
     request: Request | None = None,
     execute_tool: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
     credential_user: str | None = None,
+    hold_ask_on_server: bool = False,
+    hold_ask_label: str | None = None,
 ) -> Response:
     """
     Handle a ``tools/call`` JSON-RPC request for the MCP proxy endpoint.
@@ -13749,6 +13762,11 @@ async def _handle_mcp_tools_call(
         authenticated caller for direct calls, or ``None`` when unknown.
     :param credential_user: Authenticated caller whose registry grant is used;
         independent of the initiating policy actor.
+    :param hold_ask_on_server: Resolve a first-call ASK by parking on the
+        server until a human answers the approval card, for callers with no
+        runner waiting to retry, e.g. a user-started code cell run.
+    :param hold_ask_label: Prefix for a held ASK's approval message naming
+        who started the call, e.g. ``"Python cell run by alice@example.com"``.
     :returns: A JSON-RPC 2.0 response carrying the tool result as MCP
         ``content`` blocks, an ``InputRequiredResult`` on ASK, or an
         error response when the call is denied, the runner is
@@ -13921,7 +13939,54 @@ async def _handle_mcp_tools_call(
                 f"Denied by policy: {call_result.reason or 'no reason given'}",
             )
 
-        if call_result.action == PolicyAction.ASK:
+        if call_result.action == PolicyAction.ASK and hold_ask_on_server:
+            # No runner parks on this call, so the server holds the approval
+            # card and waits for the verdict; timeout and disconnect fail closed.
+            if request is None:
+                return _mcp_error_response(rpc_id, -32000, MCP_TOOL_CALL_NOT_APPROVED_MESSAGE)
+            reviewed = {"name": namespaced_name, "arguments": arguments}
+            # The approval card previews this much; never ask approval for unseen input.
+            if len(json.dumps(reviewed)) > MCP_HELD_ASK_PREVIEW_CHARS:
+                return _mcp_error_response(
+                    rpc_id, -32000, MCP_TOOL_CALL_TOO_LONG_TO_REVIEW_MESSAGE
+                )
+            reason = call_result.reason or "Approval required"
+            try:
+                approved = await _hold_native_ask_gate(
+                    request,
+                    session_id=session_id,
+                    phase=Phase.TOOL_CALL,
+                    data=reviewed,
+                    engine=engine,
+                    result=dataclasses.replace(
+                        call_result,
+                        reason=f"{hold_ask_label}: {reason}" if hold_ask_label else reason,
+                    ),
+                    conversation_store=conversation_store,
+                )
+            except ElicitationDeclinedError:
+                return _mcp_error_response(rpc_id, -32000, MCP_TOOL_CALL_DECLINED_MESSAGE)
+            if not approved:
+                return _mcp_error_response(rpc_id, -32000, MCP_TOOL_CALL_NOT_APPROVED_MESSAGE)
+            # The gate applied the ASK's deferred writes. State may have changed while
+            # the card waited, and an approval never overrides a denial.
+            _engine, approved_result = await _evaluate_policy_with_fresh_engine(
+                session_id, spec, conversation_store, conv, call_ctx
+            )
+            if approved_result.action == PolicyAction.DENY:
+                return _mcp_error_response(
+                    rpc_id,
+                    -32000,
+                    f"Denied by policy: {approved_result.reason or 'no reason given'}",
+                )
+            approved_data = (
+                approved_result.data
+                if approved_result.action == PolicyAction.ALLOW
+                else call_result.data
+            )
+            if approved_data is not None:
+                arguments = cast("dict[str, object]", approved_data)
+        elif call_result.action == PolicyAction.ASK:
             # Emit elicitation SSE event (for REPL approval UI) and return
             # InputRequiredResult per the MCP MRTR spec so the runner can
             # park on the approval Future and retry when the user decides.
@@ -13958,13 +14023,14 @@ async def _handle_mcp_tools_call(
                 request_state=request_state,
                 session_id=session_id,
             )
-        # ALLOW — apply labels now that we know the action is not ASK.
-        if call_result.set_labels:
-            await asyncio.to_thread(engine.apply_label_writes, call_result.set_labels)
-        # If the policy returned transformed arguments (e.g.
-        # PII-redacted args), use them instead of the originals.
-        if call_result.data is not None:
-            arguments = cast("dict[str, object]", call_result.data)
+        else:
+            # ALLOW — apply labels now that we know the action is not ASK.
+            if call_result.set_labels:
+                await asyncio.to_thread(engine.apply_label_writes, call_result.set_labels)
+            # If the policy returned transformed arguments (e.g.
+            # PII-redacted args), use them instead of the originals.
+            if call_result.data is not None:
+                arguments = cast("dict[str, object]", call_result.data)
 
     # ── Server-side sys_advise_models intercept ──────────────────────────
     # After policy evaluation (DENY/ASK handled above); arguments may have
@@ -14171,7 +14237,9 @@ async def _handle_mcp_tools_call(
         extra={"session_id": session_id},
     )
 
-    if result_policy.action == PolicyAction.ASK and (
+    if result_policy.action == PolicyAction.ASK and hold_ask_on_server:
+        output = "[Result withheld: result review approval is not supported for this call]"
+    elif result_policy.action == PolicyAction.ASK and (
         execute_tool is not None or registry_config is not None
     ):
         output = "[Result withheld: MCP gateway result-review approval is not supported]"

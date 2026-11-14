@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 vi.mock("@/pages/CanvasPage", () => ({ CanvasPage: () => <div>canvas board</div> }));
+vi.mock("@/lib/cellRunsApi", () => ({ runSessionCell: vi.fn() }));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import type { TerminalInfo } from "@/lib/terminals";
@@ -35,6 +36,8 @@ import { EmbeddedProvider } from "@/lib/embedded";
 import { RoutingProvider, reactRouterRouting, type RoutingApi } from "@/lib/routing";
 import { FileViewerContext, useFileViewer } from "./FileViewerContext";
 import { ShellCommandContext, ShellCommandDraftContext } from "./ShellCommandContext";
+import { CellRunContext } from "./CellRunContext";
+import { runSessionCell } from "@/lib/cellRunsApi";
 import { resetDesktopCommandsForTests } from "@/lib/desktopCommands";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
@@ -6826,6 +6829,51 @@ describe("shell command drafts", () => {
         expect(screen.getByTestId("command-drafts")).toHaveTextContent(`terminal_${terminal}_u-1`),
       );
       expect(createShell).toHaveBeenCalledTimes(2);
+    },
+  );
+});
+
+describe("code cell runs", () => {
+  function CellRunProbe() {
+    const action = useContext(CellRunContext);
+    return action ? (
+      <button type="button" onClick={() => void action.run("print(1)")}>
+        Run probe
+      </button>
+    ) : null;
+  }
+
+  it.each([
+    { enabled: true, permission: 2, offered: true },
+    { enabled: true, permission: 1, offered: false },
+    { enabled: false, permission: 4, offered: false },
+  ])(
+    "binds runs to the open session for editors (enabled=$enabled, permission=$permission)",
+    ({ enabled, permission, offered }) => {
+      vi.mocked(runSessionCell).mockClear().mockResolvedValue({
+        status: "completed",
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        stdoutTruncated: false,
+        stderrTruncated: false,
+        durationMs: 1,
+        error: null,
+      });
+      mockConversations([{ id: "conv_cells", permission_level: permission }]);
+      render(
+        <CapabilitiesProvider info={serverInfo({ features: { code_cell_runs: enabled } })}>
+          {sessionShellTree(new QueryClient(), "/c/conv_cells", <CellRunProbe />)}
+        </CapabilitiesProvider>,
+      );
+      const button = screen.queryByRole("button", { name: "Run probe" });
+      if (!offered) {
+        expect(button).toBeNull();
+        return;
+      }
+      expect(runSessionCell).not.toHaveBeenCalled();
+      fireEvent.click(button!);
+      expect(runSessionCell).toHaveBeenCalledExactlyOnceWith("conv_cells", "print(1)");
     },
   );
 });

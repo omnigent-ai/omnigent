@@ -892,6 +892,7 @@ function renderItem(
             className="chat-markdown text-message"
             allowWorkspaceImages
             allowShellCommands
+            allowCellRuns
             mode={isTextStreaming || keepsStreamingMode(item) ? "streaming" : "static"}
             isStreaming={isTextStreaming}
           >
