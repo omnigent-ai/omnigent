@@ -1813,3 +1813,31 @@ def test_claude_terminal_env_keeps_a_user_api_timeout(
         assert terminal_env["API_TIMEOUT_MS"] == "600000"
     else:
         assert "API_TIMEOUT_MS" not in terminal_env
+
+
+def test_claude_terminal_env_lifts_the_default_output_token_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The launch env sets the largest per-model output cap, so no model's default is lowered."""
+    monkeypatch.delenv("CLAUDE_CODE_MAX_OUTPUT_TOKENS", raising=False)
+    assert build_native_claude_terminal_env(None)["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "128000"
+
+
+@pytest.mark.parametrize("source", ["ambient", "provider"])
+def test_claude_terminal_env_keeps_a_user_output_token_cap(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    """A user's own CLAUDE_CODE_MAX_OUTPUT_TOKENS wins over the lifted default."""
+    config = None
+    if source == "ambient":
+        monkeypatch.setenv("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "32000")
+    else:
+        monkeypatch.delenv("CLAUDE_CODE_MAX_OUTPUT_TOKENS", raising=False)
+        config = ClaudeNativeUcodeConfig(env={"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "32000"})
+
+    terminal_env = build_native_claude_terminal_env(config)
+
+    if source == "provider":
+        assert terminal_env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "32000"
+    else:
+        assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in terminal_env
