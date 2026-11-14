@@ -173,7 +173,25 @@ function codexGoalFromWire(wire: CodexGoalWire): CodexGoal {
 }
 
 function isCodexGoalResponseWire(wire: unknown): wire is CodexGoalResponseWire {
-  return !!wire && typeof wire === "object" && "goal" in wire;
+  if (!wire || typeof wire !== "object" || !("goal" in wire)) return false;
+  const goal = wire.goal as Partial<CodexGoalWire> | null;
+  return (
+    goal === null ||
+    (typeof goal === "object" &&
+      !Array.isArray(goal) &&
+      typeof goal.thread_id === "string" &&
+      typeof goal.objective === "string" &&
+      typeof goal.status === "string" &&
+      [goal.tokens_used, goal.time_used_seconds].every(
+        (value) => typeof value === "number" && Number.isFinite(value),
+      ) &&
+      [goal.token_budget, goal.created_at, goal.updated_at].every(
+        (value) =>
+          value === undefined ||
+          value === null ||
+          (typeof value === "number" && Number.isFinite(value)),
+      ))
+  );
 }
 
 /**

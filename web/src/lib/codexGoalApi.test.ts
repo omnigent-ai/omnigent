@@ -153,6 +153,40 @@ describe("codex goal API", () => {
     expect(response).not.toHaveProperty("available");
   });
 
+  it.each([undefined, null, 0, 1.5])(
+    "accepts unknown statuses, fractional time, and optional numbers %s",
+    async (optionalNumber) => {
+      const goal = {
+        thread_id: WIRE_GOAL.thread_id,
+        objective: WIRE_GOAL.objective,
+        status: "futureNativeStatus",
+        tokens_used: 0,
+        time_used_seconds: 0.5,
+        ...(optionalNumber === undefined
+          ? {}
+          : {
+              token_budget: optionalNumber,
+              created_at: optionalNumber,
+              updated_at: optionalNumber,
+            }),
+      };
+      mockAuthenticatedFetch.mockResolvedValueOnce(mockJsonResponse({ goal }));
+
+      await expect(getCodexGoal("conv")).resolves.toEqual({
+        goal: {
+          threadId: goal.thread_id,
+          objective: goal.objective,
+          status: goal.status,
+          tokenBudget: optionalNumber ?? null,
+          tokensUsed: 0,
+          timeUsedSeconds: 0.5,
+          createdAt: optionalNumber ?? null,
+          updatedAt: optionalNumber ?? null,
+        },
+      });
+    },
+  );
+
   it.each([undefined, true])("rejects unavailable strict reads with strict=%s", async (strict) => {
     mockAuthenticatedFetch.mockResolvedValueOnce(
       mockJsonResponse({ goal: null, available: false }),
@@ -191,6 +225,43 @@ describe("codex goal API", () => {
         status: 502,
         code: "codex_native_goal_failed",
         message: "Could not read Codex goal: server returned a malformed response.",
+      });
+    },
+  );
+
+  it.each([
+    undefined,
+    true,
+    1,
+    "bad",
+    [],
+    {},
+    ...["thread_id", "objective", "status"].map((field) => ({ ...WIRE_GOAL, [field]: null })),
+    ...["tokens_used", "time_used_seconds", "token_budget", "created_at", "updated_at"].flatMap(
+      (field) => ["bad", {}, NaN, Infinity].map((value) => ({ ...WIRE_GOAL, [field]: value })),
+    ),
+    { ...WIRE_GOAL, tokens_used: undefined },
+    { ...WIRE_GOAL, time_used_seconds: undefined },
+  ])("rejects a malformed nested read goal %j", async (goal) => {
+    mockAuthenticatedFetch.mockResolvedValueOnce(mockJsonResponse({ goal }));
+
+    const response = getCodexGoal("conv");
+
+    await expect(response).rejects.toBeInstanceOf(ApiError);
+    await expect(response).rejects.toMatchObject({
+      status: 502,
+      code: "codex_native_goal_failed",
+    });
+  });
+
+  it.each(goalRequests.filter(({ name }) => ["save", "pause"].includes(name)))(
+    "rejects a malformed nested mutation goal for $name",
+    async ({ request }) => {
+      mockAuthenticatedFetch.mockResolvedValueOnce(mockJsonResponse({ goal: [] }));
+
+      await expect(request()).rejects.toMatchObject({
+        status: 502,
+        code: "codex_native_goal_failed",
       });
     },
   );

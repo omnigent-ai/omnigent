@@ -562,15 +562,20 @@ async def test_get_goal_preserves_unavailable_runner_payloads(
 
 
 @pytest.mark.parametrize("goal", [None, _goal()])
+@pytest.mark.parametrize("strict", [False, True])
 async def test_get_goal_preserves_confirmed_runner_availability(
     client: httpx.AsyncClient,
     codex_session: str,
     monkeypatch: pytest.MonkeyPatch,
     goal: dict[str, Any] | None,
+    strict: bool,
 ) -> None:
     _StagedForward(monkeypatch, _result(200, {"goal": goal, "available": True}))
 
-    response = await client.get(f"/v1/sessions/{codex_session}/codex_goal")
+    response = await client.get(
+        f"/v1/sessions/{codex_session}/codex_goal",
+        headers={"X-Omnigent-Codex-Goal-Read": "strict"} if strict else {},
+    )
 
     assert response.status_code == 200, response.text
     assert response.json()["available"] is True
@@ -622,20 +627,38 @@ async def test_get_goal_strict_transport_failure_is_unavailable(
     assert "Could not read Codex goal" in resp.json()["error"]["message"]
 
 
-async def test_get_goal_returns_an_absent_goal(
-    client: httpx.AsyncClient, codex_session: str, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("strict", [False, True])
+async def test_get_goal_preserves_legacy_null_only_for_background_reads(
+    client: httpx.AsyncClient,
+    codex_session: str,
+    monkeypatch: pytest.MonkeyPatch,
+    strict: bool,
 ) -> None:
     _StagedForward(monkeypatch, _result(200, {"goal": None}))
-    resp = await client.get(f"/v1/sessions/{codex_session}/codex_goal")
-    assert resp.status_code == 200, resp.text
-    assert resp.json() == {"goal": None}
+    resp = await client.get(
+        f"/v1/sessions/{codex_session}/codex_goal",
+        headers={"X-Omnigent-Codex-Goal-Read": "strict"} if strict else {},
+    )
+    if strict:
+        assert resp.status_code == 503, resp.text
+        assert resp.json()["error"]["code"] == "codex_native_goal_failed"
+    else:
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"goal": None}
 
 
+@pytest.mark.parametrize("strict", [False, True])
 async def test_get_goal_returns_the_runner_goal(
-    client: httpx.AsyncClient, codex_session: str, monkeypatch: pytest.MonkeyPatch
+    client: httpx.AsyncClient,
+    codex_session: str,
+    monkeypatch: pytest.MonkeyPatch,
+    strict: bool,
 ) -> None:
     _StagedForward(monkeypatch, _result(200, {"goal": _goal(token_budget=5000)}))
-    resp = await client.get(f"/v1/sessions/{codex_session}/codex_goal")
+    resp = await client.get(
+        f"/v1/sessions/{codex_session}/codex_goal",
+        headers={"X-Omnigent-Codex-Goal-Read": "strict"} if strict else {},
+    )
     assert resp.status_code == 200, resp.text
     assert resp.json()["goal"]["objective"] == "keep tests green"
     assert resp.json()["goal"]["token_budget"] == 5000

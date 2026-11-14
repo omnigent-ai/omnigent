@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GoalDialog, parseGoalBudget, type GoalDialogProps } from "./GoalDialog";
 import { useGoalState } from "./useGoalState";
 import type { Goal } from "@/lib/goalApi";
+import * as basePath from "@/lib/basePath";
 import * as host from "@/lib/host";
 import * as identity from "@/lib/identity";
 import { clearGoal, getGoal, setGoal, updateGoalStatus } from "@/lib/goalApi";
@@ -285,41 +286,54 @@ describe("GoalDialog", () => {
     },
   );
 
-  it.each(["reopen", "session switch"])(
-    "discards old drafts on %s even when the new read fails",
-    async (boundary) => {
-      const { props, rerender } = renderDialog();
-      await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
-      fireEvent.change(screen.getByTestId("goal-objective"), {
-        target: { value: "Cancelled objective" },
-      });
-      fireEvent.change(screen.getByTestId("goal-token-budget"), { target: { value: "123" } });
-      fireEvent.click(screen.getByTestId("goal-mode-paused"));
-      mockRefreshGoal.mockRejectedValueOnce(new Error("runner unavailable"));
+  it.each([
+    "reopen",
+    "session switch",
+    "server switch",
+    "anonymous embed switch",
+    "base path switch",
+  ])("discards old drafts on %s even when the new read fails", async (boundary) => {
+    const server = vi.spyOn(host, "getOmnigentServerIdentity").mockReturnValue("server-a");
+    const secondFetcher = vi.fn<() => Promise<Response>>();
+    const config = vi
+      .spyOn(host, "getOmnigentHostConfig")
+      .mockReturnValue({ fetcher: vi.fn<() => Promise<Response>>() });
+    const path = vi.spyOn(basePath, "getBasePath").mockReturnValue("/first");
+    if (boundary === "anonymous embed switch") server.mockReturnValue(null);
+    const { props, rerender } = renderDialog();
+    await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
+    fireEvent.change(screen.getByTestId("goal-objective"), {
+      target: { value: "Cancelled objective" },
+    });
+    fireEvent.change(screen.getByTestId("goal-token-budget"), { target: { value: "123" } });
+    fireEvent.click(screen.getByTestId("goal-mode-paused"));
+    mockRefreshGoal.mockRejectedValueOnce(new Error("runner unavailable"));
 
-      const nextGoal = {
-        ...ACTIVE_GOAL,
-        objective: boundary === "reopen" ? "Updated while closed" : "Another session",
-        tokenBudget: 777,
-      };
-      const nextId = boundary === "reopen" ? props.conversationId : "conv_other";
-      if (boundary === "reopen") rerender(<GoalDialog {...props} open={false} />);
-      rerender(<GoalDialog {...props} goal={nextGoal} conversationId={nextId} />);
+    const nextGoal = {
+      ...ACTIVE_GOAL,
+      objective: boundary === "reopen" ? "Updated while closed" : "Another session",
+      tokenBudget: 777,
+    };
+    const nextId = boundary === "session switch" ? "conv_other" : props.conversationId;
+    if (boundary === "reopen") rerender(<GoalDialog {...props} open={false} />);
+    if (boundary === "server switch") server.mockReturnValue("server-b");
+    if (boundary === "anonymous embed switch") config.mockReturnValue({ fetcher: secondFetcher });
+    if (boundary === "base path switch") path.mockReturnValue("/second");
+    rerender(<GoalDialog {...props} goal={nextGoal} conversationId={nextId} />);
 
-      await screen.findByText("Could not read goal: runner unavailable");
-      expect(screen.getByTestId("goal-objective")).toHaveValue(nextGoal.objective);
-      expect(screen.getByTestId("goal-token-budget")).toHaveValue(nextGoal.tokenBudget);
-      expect(screen.getByTestId("goal-mode-active")).toHaveAttribute("aria-checked", "true");
-      fireEvent.click(screen.getByTestId("goal-save"));
-      await waitFor(() =>
-        expect(mockSetGoal).toHaveBeenCalledWith(nextId, {
-          objective: nextGoal.objective,
-          tokenBudget: nextGoal.tokenBudget,
-          status: "active",
-        }),
-      );
-    },
-  );
+    await screen.findByText("Could not read goal: runner unavailable");
+    expect(screen.getByTestId("goal-objective")).toHaveValue(nextGoal.objective);
+    expect(screen.getByTestId("goal-token-budget")).toHaveValue(nextGoal.tokenBudget);
+    expect(screen.getByTestId("goal-mode-active")).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(screen.getByTestId("goal-save"));
+    await waitFor(() =>
+      expect(mockSetGoal).toHaveBeenCalledWith(nextId, {
+        objective: nextGoal.objective,
+        tokenBudget: nextGoal.tokenBudget,
+        status: "active",
+      }),
+    );
+  });
 
   it("does not restore a deleted goal after reopening with a failed read", async () => {
     const { props, rerender } = renderDialog();

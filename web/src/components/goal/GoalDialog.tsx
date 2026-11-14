@@ -494,7 +494,7 @@ function useGoalDialogState({
   const [loading, setLoading] = useState(false);
   const [readError, setReadError] = useState<string | null>(null);
   const [operationError, setOperationError] = useState<string | null>(null);
-  const draftSession = useRef<string | null | undefined>(undefined);
+  const draftOwner = useRef<{ apiScope: GoalApiScope; mutationKey: string } | undefined>(undefined);
   const dirtyFields = useRef(new Set<"objective" | "tokenBudget" | "mode">());
   const dialogBinding = useRef<object | null>(null);
   const currentGoalOwner = useRef({ apiScope, mutationKey, refreshGoal });
@@ -524,11 +524,14 @@ function useGoalDialogState({
 
   useEffect(() => {
     if (!open) {
-      draftSession.current = undefined;
+      draftOwner.current = undefined;
       return;
     }
-    if (draftSession.current !== conversationId) {
-      draftSession.current = conversationId;
+    if (
+      draftOwner.current?.apiScope !== apiScope ||
+      draftOwner.current?.mutationKey !== mutationKey
+    ) {
+      draftOwner.current = { apiScope, mutationKey };
       dirtyFields.current.clear();
     }
     if (!dirtyFields.current.has("objective")) setObjective(goal?.objective ?? "");
@@ -536,7 +539,7 @@ function useGoalDialogState({
       setTokenBudget(goal?.tokenBudget?.toString() ?? "");
     }
     if (!dirtyFields.current.has("mode")) setModeDraftState(goalModeDraftForGoal(goal));
-  }, [conversationId, goal, open]);
+  }, [apiScope, goal, mutationKey, open]);
 
   useEffect(() => {
     const binding = dialogBinding.current;

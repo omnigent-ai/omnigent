@@ -541,10 +541,11 @@ def register_codex_session_routes(
                 502,
                 detail="Could not read Codex goal: runner returned a malformed response.",
             )
-        if (
-            require_live
-            and isinstance(goal_response, CodexGoalReadResponse)
-            and not goal_response.available
+        if require_live and (
+            (isinstance(goal_response, CodexGoalReadResponse) and not goal_response.available)
+            or (
+                not isinstance(goal_response, CodexGoalReadResponse) and goal_response.goal is None
+            )
         ):
             return _codex_goal_error(
                 503,
