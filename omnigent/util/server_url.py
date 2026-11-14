@@ -34,6 +34,18 @@ WORKSPACE_API_PATH = "/api/2.0/omnigent"
 WORKSPACE_UI_PATH = "/omnigent"
 
 
+def format_host_port(host: str, port: int) -> str:
+    """Format a URL authority or TCP endpoint, bracketing IPv6 literals.
+
+    :param host: DNS name, IPv4 address, or bare or bracketed IPv6 address.
+    :param port: TCP port number.
+    :returns: An authority such as ``"[::1]:6767"``.
+    """
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"{host}:{port}"
+
+
 def is_workspace_hosted_url(base_url: str) -> bool:
     """Whether *base_url* is a host-sharded deployment mount.
 

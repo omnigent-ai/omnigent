@@ -34,7 +34,8 @@ from omnigent._platform import IS_WINDOWS, normalize_interactive_shells
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.inner import _proc
 from omnigent.runner.busy_check import RunnerBusyCheck
-from omnigent.runner.identity import RUNNER_AUTH_REJECTED_EXIT_CODE
+from omnigent.runner.identity import RUNNER_AUTH_REJECTED_EXIT_CODE, RUNNER_SLICE_KEY_ENV_VAR
+from omnigent.runner.session_requests import remember_session_host
 from omnigent.runner.transports.ws_tunnel.serve import (
     RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX,
     RUNNER_TUNNEL_REJECTION_PREFIX,
@@ -385,7 +386,7 @@ class _RunnerDatabricksAuth(ThreadedAuth):
         # none recorded. Set once here; it persists across the retry yield.
         if self._server_url:
             from omnigent.cli_auth import databricks_request_headers
-            from omnigent.runner.session_requests import REQUEST_HOST_EXTENSION
+            from omnigent.session_host import REQUEST_HOST_EXTENSION
 
             request.headers.update(
                 databricks_request_headers(
@@ -1673,6 +1674,8 @@ def create_app(
         )
 
     server_client = _server_client_factory()
+    # The runner already knows the host of its own session.
+    remember_session_host(runner_primary_session_id(), os.environ.get(RUNNER_SLICE_KEY_ENV_VAR))
 
     mcp_manager = RunnerMcpManager(
         stdio_cwd=runner_workspace,

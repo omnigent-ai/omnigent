@@ -123,6 +123,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     # Gates the automation dialog's Session control; older servers reject the fields.
     assert data["scheduled_task_session_modes"] is True
     assert data["scheduled_task_subhour"] is True
+    # The one_time_automations release feature is off by default.
+    assert data["scheduled_task_one_time"] is False
     # Lets the trigger form save its header; older servers would send it to the model.
     assert data["scheduled_task_trigger_headers"] is True
     assert data["automation_trigger_poll_minutes"] == 10
