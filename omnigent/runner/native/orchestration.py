@@ -216,7 +216,11 @@ def _readvertise_live_claude_tmux_target(
 
     expected = {"socket_path": str(instance.socket_path), "tmux_target": instance.tmux_target}
     try:
-        advertised = read_tmux_target(bridge_dir)
+        try:
+            advertised = read_tmux_target(bridge_dir)
+        except (OSError, ValueError):
+            # The registered pane remains authoritative when its file cannot be read.
+            advertised = None
         if advertised == expected:
             return
         published = terminal_registry.publish_if_registered(

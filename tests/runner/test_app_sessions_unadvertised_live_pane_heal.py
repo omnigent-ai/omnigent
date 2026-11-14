@@ -50,6 +50,7 @@ def _inject_requiring_advertisement(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("advertisement_state", ["missing", "undecodable", "read-error"])
 @pytest.mark.parametrize(
     ("event", "expected_command"),
     [
@@ -63,6 +64,7 @@ async def test_live_unadvertised_pane_is_readvertised_before_inject(
     tmp_path: Path,
     event: dict[str, Any],
     expected_command: str,
+    advertisement_state: str,
 ) -> None:
     """Restore a live pane's missing advertisement before injecting, without recreating it."""
     conv_id = "e5f60718293a4b5c6d7e8f901a2b3c4d"
@@ -75,7 +77,22 @@ async def test_live_unadvertised_pane_is_readvertised_before_inject(
     auto_create_calls.clear()
     bridge_dir = bridge_dir_for_conversation_id(conv_id)
     instance = _plant_live_claude_pane(registry, conv_id, tmp_path, bridge_dir)
-    (bridge_dir / _TMUX_FILE).unlink()
+    if advertisement_state == "missing":
+        (bridge_dir / _TMUX_FILE).unlink()
+    elif advertisement_state == "undecodable":
+        (bridge_dir / _TMUX_FILE).write_bytes(b"\xff")
+    else:
+        original_read = claude_native_bridge.read_tmux_target
+        reads = 0
+
+        def fail_first_read(path: Path) -> dict[str, str] | None:
+            nonlocal reads
+            reads += 1
+            if reads == 1:
+                raise PermissionError("synthetic unreadable advertisement")
+            return original_read(path)
+
+        monkeypatch.setattr(claude_native_bridge, "read_tmux_target", fail_first_read)
 
     captured: list[tuple[str, dict[str, str]]] = []
     monkeypatch.setattr(
@@ -222,8 +239,9 @@ async def test_live_advertised_pane_advertisement_is_left_untouched(
     )
 
 
+@pytest.mark.parametrize("read_error", [False, True], ids=["missing", "unreadable"])
 def test_repair_does_not_overwrite_a_replacement_pane(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, read_error: bool
 ) -> None:
     """A repair paused after its missing-file check must not publish over a successor.
 
@@ -249,6 +267,8 @@ def test_repair_does_not_overwrite_a_replacement_pane(
             bridge_dir, socket_path=pane_b.socket_path, tmux_target=pane_b.tmux_target
         )
         replacement.append(pane_b)
+        if read_error:
+            raise PermissionError("synthetic unreadable advertisement")
         return missing
 
     monkeypatch.setattr(claude_native_bridge, "read_tmux_target", _read_then_replace_pane)

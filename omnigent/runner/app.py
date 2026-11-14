@@ -5044,7 +5044,13 @@ def create_runner_app(
         from omnigent.harnesses.claude_native.bridge import has_pending_user_prompt
 
         bridge_dir = await _claude_prompt_bridge_dir(session_id)
-        if await asyncio.to_thread(has_pending_user_prompt, bridge_dir):
+        try:
+            pending = await asyncio.to_thread(has_pending_user_prompt, bridge_dir)
+        except (OSError, UnicodeError):
+            # Repair the target before retrying the prompt probe; do not bypass a decision.
+            await _ensure_native_terminal_for_turn(session_id, "claude-native")
+            pending = await asyncio.to_thread(has_pending_user_prompt, bridge_dir)
+        if pending:
             return bridge_dir
         return None
 
