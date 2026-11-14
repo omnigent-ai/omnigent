@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -309,6 +310,7 @@ def test_the_watcher_restores_the_default_on_its_own(
     real_settle = default_model_guard.settle_default_model
     calls: list[Path] = []
     registered_during_settle = False
+    settled_after_registration = threading.Event()
     if at_give_up:
         monkeypatch.setattr(default_model_guard, "_WATCH_MAX_FAILURES", 0)
 
@@ -326,6 +328,8 @@ def test_the_watcher_restores_the_default_on_its_own(
             registered_during_settle = True
             default_model_guard.begin_model_switch(path, "haiku", state_dir=state_dir)
             _write(path, {"model": "haiku"})
+        elif not pending:
+            settled_after_registration.set()
         return pending
 
     monkeypatch.setattr(default_model_guard, "settle_default_model", settle_failing_once)
@@ -335,9 +339,7 @@ def test_the_watcher_restores_the_default_on_its_own(
     default_model_guard.begin_model_switch(settings, "sonnet", state_dir=state)
 
     _write(settings, {"model": "sonnet"})
-    deadline = time.monotonic() + 5
-    while _read(settings) != {"model": "opus"} and time.monotonic() < deadline:
-        time.sleep(0.05)
+    assert settled_after_registration.wait(timeout=5)
 
     assert _read(settings) == {"model": "opus"}
     with default_model_guard._watchers_lock:
