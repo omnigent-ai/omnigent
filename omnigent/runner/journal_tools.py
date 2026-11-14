@@ -25,6 +25,7 @@ import random
 import re
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 from weakref import WeakKeyDictionary
@@ -52,27 +53,42 @@ from omnigent.tools.builtins.journal import (
 )
 
 JOURNAL_TOOL_NAMES: frozenset[str] = frozenset(tool.name() for tool in JOURNAL_TOOLS)
-_server_workflow_flags: WeakKeyDictionary[httpx.AsyncClient, bool] = WeakKeyDictionary()
 
 
-async def server_workflows_enabled(
-    server_client: httpx.AsyncClient | None, *, refresh: bool = False
-) -> bool:
-    """Cache the server's startup flag; reconnects refresh without discarding known state."""
+@dataclass
+class _ServerWorkflowFlag:
+    enabled: bool
+    stale: bool = False
+
+
+_server_workflow_flags: WeakKeyDictionary[httpx.AsyncClient, _ServerWorkflowFlag] = (
+    WeakKeyDictionary()
+)
+
+
+def invalidate_server_workflow_flag(server_client: httpx.AsyncClient | None) -> None:
+    """Refresh lazily after reconnect, retaining the last success if the probe fails."""
+    if server_client is not None and (cached := _server_workflow_flags.get(server_client)):
+        cached.stale = True
+
+
+async def server_workflows_enabled(server_client: httpx.AsyncClient | None) -> bool:
+    """Cache the server's startup flag until reconnect without discarding known state."""
     if server_client is None:
         return False
-    if not refresh and server_client in _server_workflow_flags:
-        return _server_workflow_flags[server_client]
+    cached = _server_workflow_flags.get(server_client)
+    if cached is not None and not cached.stale:
+        return cached.enabled
     try:
         response = await server_client.get("/v1/info")
         if response.status_code != 200:
-            return _server_workflow_flags.get(server_client, False)
+            return cached.enabled if cached is not None else False
         info = response.json()
     except (httpx.HTTPError, ValueError):
-        return _server_workflow_flags.get(server_client, False)
+        return cached.enabled if cached is not None else False
     features = info.get("features") if isinstance(info, dict) else None
     enabled = isinstance(features, dict) and features.get("workflows") is True
-    _server_workflow_flags[server_client] = enabled
+    _server_workflow_flags[server_client] = _ServerWorkflowFlag(enabled)
     return enabled
 
 
@@ -134,6 +150,14 @@ def _server_message(response: httpx.Response) -> str:
     if response.status_code == 422 and detail is not None:
         return f"invalid_entry: {json.dumps(detail, ensure_ascii=False)[:500]}"
     return response.text[:500]
+
+
+def _journal_error(response: httpx.Response, conversation_id: str) -> str:
+    """Distinguish a missing session from other route errors, including disabled workflows."""
+    message = _server_message(response)
+    if response.status_code == 404 and message == "Session not found":
+        return _error("session_not_found", conversation_id=conversation_id)
+    return _error(message)
 
 
 def _idempotency_key(call_id: str | None) -> str:
@@ -237,10 +261,8 @@ async def _write(
         return _error(f"{tool_name} failed: {response}")
     if _is_unrouted(response):
         return _error(f"{tool_name}: {_UNSUPPORTED}")
-    if response.status_code == 404:
-        return _error("session_not_found", conversation_id=conversation_id)
     if response.status_code >= 400:
-        return _error(_server_message(response))
+        return _journal_error(response, conversation_id)
     entry = response.json()
     _publish(publish_event, conversation_id, entry)
     result: dict[str, Any] = {"id": entry["id"], "position": entry["position"]}
@@ -286,10 +308,8 @@ async def _request_input(
             return _error(f"{tool_name} failed: {response}")
         if _is_unrouted(response):
             return _error(f"{tool_name}: this Omnigent server can't ask questions for workflows")
-        if response.status_code == 404:
-            return _error("session_not_found", conversation_id=conversation_id)
         if response.status_code >= 400:
-            return _error(_server_message(response))
+            return _journal_error(response, conversation_id)
         requested = response.json()
         _publish(publish_event, conversation_id, requested["entry"])
         try:
@@ -401,12 +421,10 @@ async def _get(
         return _error(f"sys_journal_read failed: {exc}")
     if _is_unrouted(response):
         return _error(f"sys_journal_read: {_UNSUPPORTED}")
-    if response.status_code == 404:
-        return _error("session_not_found", conversation_id=target)
     if response.status_code in (401, 403):
         return _error("session_out_of_tree", conversation_id=target)
     if response.status_code >= 400:
-        return _error(_server_message(response))
+        return _journal_error(response, target)
     body = response.json()
     return body if isinstance(body, dict) else _error("sys_journal_read: malformed response")
 

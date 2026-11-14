@@ -108,7 +108,10 @@ from omnigent.runner.background_titles import (
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMPT_CHARS
 from omnigent.runner.background_work_reports import BackgroundWorkReporter
 from omnigent.runner.codex.goal import CodexGoalRunner
-from omnigent.runner.journal_tools import server_workflows_enabled
+from omnigent.runner.journal_tools import (
+    invalidate_server_workflow_flag,
+    server_workflows_enabled,
+)
 from omnigent.runner.launch_failure import (
     TERMINAL_CLOSED_OUTSIDE_OMNIGENT,
     FailureDiagnosis,
@@ -9118,7 +9121,7 @@ def create_runner_app(
 
     async def _catch_up_scan() -> None:
         global _server_accepts_inferred_status, _server_accepts_input_only_failures
-        await server_workflows_enabled(server_client, refresh=True)
+        invalidate_server_workflow_flag(server_client)
         # The new connection may reach an older server; it must accept inferred status
         # and input-only failures anew.
         _server_accepts_inferred_status = False

@@ -273,20 +273,28 @@ class SessionJournalStore:
 
     @staticmethod
     def _newest_status_row(
-        session: Session, conversation_id: str, step: str
+        session: Session,
+        conversation_id: str,
+        step: str,
+        *,
+        start_position: int | None = None,
+        end_position: int | None = None,
     ) -> SqlSessionJournalEntry | None:
-        """The step's newest status entry in the session, or ``None``."""
+        """The step's newest status, optionally within ``[start_position, end_position)``."""
+        entries = SqlSessionJournalEntry
+        statement = select(entries).where(
+            entries.workspace_id == current_workspace_id(),
+            entries.conversation_id == conversation_id,
+            entries.kind == _STATUS_KIND,
+            entries.step == step,
+        )
+        if start_position is not None:
+            statement = statement.where(entries.position >= start_position)
+        if end_position is not None:
+            statement = statement.where(entries.position < end_position)
         return session.execute(
             _using(
-                select(SqlSessionJournalEntry)
-                .where(
-                    SqlSessionJournalEntry.workspace_id == current_workspace_id(),
-                    SqlSessionJournalEntry.conversation_id == conversation_id,
-                    SqlSessionJournalEntry.kind == _STATUS_KIND,
-                    SqlSessionJournalEntry.step == step,
-                )
-                .order_by(SqlSessionJournalEntry.position.desc())
-                .limit(1),
+                statement.order_by(entries.position.desc()).limit(1),
                 "ix_session_journal_entries_kind_step",
             )
         ).scalar_one_or_none()
@@ -602,21 +610,42 @@ class SessionJournalStore:
         return plans
 
     def plan_step_statuses(self, plans: Sequence[JournalEntry]) -> list[dict[str, JournalEntry]]:
-        """For each plan, its steps' newest status entries in its session.
+        """For each plan, its steps' newest status entries before the next plan.
 
-        One kind-and-step lookup per step, the reads behind the Tasks tab's step
-        summary, for a page of plans at once.
+        One kind lookup per plan and one kind-and-step lookup per step keep
+        runs with reused step IDs separate, including replans outside this page.
 
         :param plans: Plan entries, e.g. a page of a workflow's runs.
         :returns: One ``{step: entry}`` per plan, in order, e.g. the ``done``
             status of ``"tests"``; a step with no status yet is left out.
         """
         statuses: list[dict[str, JournalEntry]] = []
+        entries = SqlSessionJournalEntry
         with self._session("read_plan_step_statuses") as session:
             for plan in plans:
+                next_position = session.execute(
+                    _using(
+                        select(entries.position)
+                        .where(
+                            entries.workspace_id == current_workspace_id(),
+                            entries.conversation_id == plan.conversation_id,
+                            entries.kind == _PLAN_KIND,
+                            entries.position > plan.position,
+                        )
+                        .order_by(entries.position)
+                        .limit(1),
+                        "ix_session_journal_entries_kind",
+                    )
+                ).scalar_one_or_none()
                 current: dict[str, JournalEntry] = {}
                 for step in plan.content.get("steps", []):
-                    row = self._newest_status_row(session, plan.conversation_id, step["id"])
+                    row = self._newest_status_row(
+                        session,
+                        plan.conversation_id,
+                        step["id"],
+                        start_position=plan.position,
+                        end_position=next_position,
+                    )
                     if row is not None:
                         current[step["id"]] = self._entries([row])[0]
                 statuses.append(current)

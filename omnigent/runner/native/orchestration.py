@@ -9915,10 +9915,15 @@ async def _auto_create_claude_terminal(
         # Reuse the bridge's owned directory across retries and terminal transfers.
         # Its dead-owner cleanup also reclaims these generated skill links.
         bundle_dir = bridge_dir / "skill-bundle"
+        spec = _unwrap_resolved_spec(agent_spec)
         _ensure_orchestrator_skills_in_bundle(
             bundle_dir,
             agent_spec,
-            workflows_enabled=await server_workflows_enabled(server_client),
+            workflows_enabled=(
+                isinstance(spec, AgentSpec)
+                and spec.tool_groups.journal
+                and await server_workflows_enabled(server_client)
+            ),
         )
     claude_args = augment_claude_args(
         base_claude_args,

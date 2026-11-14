@@ -419,8 +419,13 @@ def test_a_workflows_runs_page_newest_first_across_sessions(
         journal.list_workflow_runs("nope")
 
 
-def test_plan_step_statuses_reads_each_steps_newest_status(journal: SessionJournalStore) -> None:
-    plan = journal.append(SESSION, "plan", _plan("a", "b", "c"), idempotency_key="k0").entry
+@pytest.mark.parametrize("next_workflow", [None, WORKFLOW, OTHER_WORKFLOW])
+def test_plan_step_statuses_reads_each_steps_newest_status(
+    journal: SessionJournalStore, next_workflow: str | None
+) -> None:
+    plan = journal.append(
+        SESSION, "plan", _plan("a", "b", "c"), idempotency_key="k0", workflow_id=WORKFLOW
+    ).entry
     for key, step, status in (("k1", "a", "started"), ("k2", "a", "done"), ("k3", "b", "failed")):
         journal.append(
             SESSION, "status", {"status": status, "text": "x"}, idempotency_key=key, step=step
@@ -433,6 +438,26 @@ def test_plan_step_statuses_reads_each_steps_newest_status(journal: SessionJourn
         {},
     ]
     assert statuses[0]["a"].kind == "status" and statuses[0]["a"].step == "a"
+
+    later = journal.append(
+        SESSION,
+        "plan",
+        _plan("a", "b", "c"),
+        idempotency_key="k5",
+        workflow_id=next_workflow,
+    ).entry
+    assert journal.plan_step_statuses([later]) == [{}]
+    journal.append(SESSION, "status", {"status": "started"}, idempotency_key="k6", step="a")
+    journal.append(
+        SESSION, "status", {"status": "done", "text": "Finished c"}, idempotency_key="k7", step="c"
+    )
+
+    # A run page may omit the following plan, especially when it is a replan.
+    assert journal.plan_step_statuses([plan, other]) == statuses
+    assert [
+        {step: entry.content["status"] for step, entry in current.items()}
+        for current in journal.plan_step_statuses([later, other, plan])
+    ] == [{"a": "started", "c": "done"}, {}, {"a": "done", "b": "failed"}]
 
 
 def test_an_automation_runs_start_plan_is_its_first(journal: SessionJournalStore) -> None:

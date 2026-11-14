@@ -18,6 +18,7 @@ from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.journal_tools import (
     JOURNAL_TOOL_NAMES,
     execute_journal_tool,
+    invalidate_server_workflow_flag,
     server_workflows_enabled,
 )
 from omnigent.runner.tool_dispatch import (
@@ -130,6 +131,8 @@ async def test_failed_workflow_flag_probes_retry_and_preserve_last_success(failu
         return httpx.Response(503)
 
     async with _client(respond) as client:
+        invalidate_server_workflow_flag(client)
+        assert not requests
         assert await server_workflows_enabled(client) is False
         unavailable = False
         assert await server_workflows_enabled(client) is True
@@ -137,12 +140,19 @@ async def test_failed_workflow_flag_probes_retry_and_preserve_last_success(failu
         unavailable = True
         assert await server_workflows_enabled(client) is True
         assert len(requests) == 2
-        assert await server_workflows_enabled(client, refresh=True) is True
+        invalidate_server_workflow_flag(client)
+        assert len(requests) == 2
+        assert await server_workflows_enabled(client) is True
         assert len(requests) == 3
         unavailable, enabled = False, False
-        assert await server_workflows_enabled(client, refresh=True) is False
+        assert await server_workflows_enabled(client) is False
         assert await server_workflows_enabled(client) is False
         assert len(requests) == 4
+        enabled = True
+        invalidate_server_workflow_flag(client)
+        assert len(requests) == 4
+        assert await server_workflows_enabled(client) is True
+        assert len(requests) == 5
 
 
 async def _run(client: httpx.AsyncClient, tool: str, args: dict[str, object], **kwargs) -> dict:
@@ -213,6 +223,34 @@ async def test_an_older_server_without_the_journal_says_so(body: dict[str, objec
         read = await _run(client, "sys_journal_read", {})
     assert write["error"] == "sys_journal_write_note: this Omnigent server has no session journal"
     assert read["error"] == "sys_journal_read: this Omnigent server has no session journal"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Workflows are disabled on this server",
+        "Session journals are not available on this server",
+        "Session not found",
+    ],
+)
+@pytest.mark.parametrize("operation", ["read", "write", "request_input"])
+async def test_journal_404s_preserve_the_servers_reason(message: str, operation: str) -> None:
+    tool, args = {
+        "read": ("sys_journal_read", {}),
+        "write": ("sys_journal_write_note", {"body": "hi"}),
+        "request_input": (
+            "sys_workflow_request_input",
+            {"step": "deploy", "questions": [_QUESTION]},
+        ),
+    }[operation]
+    response = httpx.Response(404, json={"error": {"code": "not_found", "message": message}})
+    async with _client(lambda request: response) as client:
+        result = await _run(client, tool, args)
+    assert result == (
+        {"error": "session_not_found", "conversation_id": SESSION}
+        if message == "Session not found"
+        else {"error": message}
+    )
 
 
 async def test_invalid_arguments_never_reach_the_server() -> None:
