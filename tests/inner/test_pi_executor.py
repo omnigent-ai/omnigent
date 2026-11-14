@@ -583,7 +583,10 @@ class TestBuildModelsJson(unittest.TestCase):
         self.assertTrue(
             p["databricks"]["baseUrl"].startswith("https://host.example.com/serving-endpoints")
         )
-        self.assertIn("/anthropic", p["databricks-anthropic"]["baseUrl"])
+        self.assertEqual(
+            p["databricks-anthropic"]["baseUrl"],
+            "https://host.example.com/ai-gateway/anthropic",
+        )
 
     def test_base_urls_can_come_from_ucode_state(self):
         result = _build_models_json(
@@ -4823,11 +4826,12 @@ def test_models_json_attributes_only_unity_gateway_providers(
     providers = _build_models_json("https://dbc-1.cloud.databricks.com", "tok")["providers"]
 
     attributed = {name for name, provider in providers.items() if "headers" in provider}
-    assert attributed == {"databricks-openai", "databricks-mlflow"}
-    assert providers["databricks-openai"]["headers"] == {
-        "Databricks-Custom-Coding-Agent": "pi",
-        "Databricks-Custom-Client-Surfaces": "omnigent",
-    }
+    assert attributed == {"databricks-openai", "databricks-mlflow", "databricks-anthropic"}
+    for name in attributed:
+        assert providers[name]["headers"] == {
+            "Databricks-Custom-Coding-Agent": "pi",
+            "Databricks-Custom-Client-Surfaces": "omnigent",
+        }
 
 
 def test_models_json_unknown_gpt_metadata_fails_toward_responses() -> None:

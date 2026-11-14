@@ -919,7 +919,7 @@ def _build_models_json(
     elif is_generic_provider:
         codex_gateway_url = openai_base_url
         mlflow_gateway_url = openai_base_url
-    claude_base_url = (base_urls or {}).get("claude") or f"{h}/serving-endpoints/anthropic"
+    claude_base_url = (base_urls or {}).get("claude") or f"{h}/ai-gateway/anthropic"
     _openai_responses_compat: _JsonObject = {
         "supportsDeveloperRole": False,
         "supportsStore": False,
