@@ -1965,6 +1965,15 @@ describe("FileViewer markdown preview/edit/source modes", () => {
     expect(viewModeOf()).toBe("preview");
   });
 
+  it("keeps a Markdown comment link's pull toward its editor across a visit elsewhere", () => {
+    // Only a data table's pull ends on leaving; Markdown keeps its deep-link bias.
+    const view = renderViewer({ open: true, path: "notes.md", initialSearch: "comment=c1" });
+    expect(viewModeOf()).toBe("editor");
+    view.rerender(viewerTree({ open: true, path: "other.py", initialSearch: "comment=c1" }));
+    view.rerender(viewerTree({ open: true, path: "notes.md", initialSearch: "comment=c1" }));
+    expect(viewModeOf()).toBe("editor");
+  });
+
   it("guards unsaved edits when leaving the markdown editor, switching only after Discard", () => {
     renderViewer({ open: true, path: "notes.md" });
     selectMode("Edit");

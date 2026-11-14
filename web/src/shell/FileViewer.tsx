@@ -942,12 +942,13 @@ function FileViewerBody({
   const [deepLinkBiasPath, setDeepLinkBiasPath] = useState<string | null>(() =>
     initialCommentIdRef.current ? path : null,
   );
-  // The bias belongs to one visit: opening another file (or conversation) ends
-  // it, so coming back to the file opens on the user's own preference.
+  // A data table's pull toward Source (from a picked comment) belongs to one
+  // visit: opening another file or conversation ends it, so coming back opens the
+  // table again. Other files keep their deep-link bias as before.
   const [biasVisit, setBiasVisit] = useState({ conversationId, path });
   if (biasVisit.conversationId !== conversationId || biasVisit.path !== path) {
     setBiasVisit({ conversationId, path });
-    setDeepLinkBiasPath(null);
+    if (deepLinkBiasPath !== null && isDataTablePath(deepLinkBiasPath)) setDeepLinkBiasPath(null);
   }
 
   // Switch a markdown file to the rich-text editor — the surface where text-

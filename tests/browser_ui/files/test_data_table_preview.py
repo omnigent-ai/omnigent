@@ -45,10 +45,13 @@ def _scroller(table: Locator) -> Locator:
     return table.locator("xpath=ancestor::*[@data-preview-scroll][1]")
 
 
-def test_a_csv_opens_as_a_sortable_filterable_table(
+def test_a_csv_opens_as_a_table_with_a_sticky_header_and_resizable_columns(
     page: Page, seeded_session: BrowserSession
 ) -> None:
-    """The table keeps its header in view, resizes, sorts, filters, and hands over to Source."""
+    """In a real layout the header stays in view, a column resizes, and Source opens Monaco.
+
+    Sorting and filtering are covered by the component tests.
+    """
     table = _open_table(page, seeded_session, 1500, 900)
     viewer = page.locator('[data-testid="file-viewer"]:visible')
     expect(viewer.get_by_test_id("data-table-summary")).to_contain_text(
@@ -70,11 +73,6 @@ def test_a_csv_opens_as_a_sortable_filterable_table(
     page.mouse.move(handle["x"] + 120, handle["y"] + handle["height"] / 2, steps=5)
     page.mouse.up()
     assert units.bounding_box()["width"] > width_before + 100, "dragging didn't widen the column"
-
-    table.get_by_role("button", name="Sort by units").click()
-    expect(table.get_by_role("columnheader").nth(1)).to_have_attribute("aria-sort", "ascending")
-    table.get_by_role("textbox", name="Filter region").fill("Region 01")
-    expect(viewer.get_by_text("10 matching")).to_be_visible()
 
     viewer.get_by_role("button", name="View source").click()
     expect(viewer.locator(".monaco-editor")).to_be_visible(timeout=30_000)
