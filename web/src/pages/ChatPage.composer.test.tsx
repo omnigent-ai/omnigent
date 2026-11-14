@@ -29,7 +29,12 @@ import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { handleSessionEvent, useChatStore, type ChatState } from "@/store/chatStore";
 import { useSessionTasksActions } from "@/store/sessionTasksActions";
-import { REVIEW_PLAN_FIRST } from "@/lib/workflow";
+import {
+  continuePlanMessage,
+  REVIEW_PLAN_FIRST,
+  stopPlanMessage,
+  taskActionMessage,
+} from "@/lib/workflow";
 import {
   clearSessionDrafts,
   getSessionDraft,
@@ -6831,17 +6836,11 @@ describe("Composer workflow entry point", () => {
     const taskAction = (action: "run" | "continue" | "proceed", name: string) =>
       act(() => useSessionTasksActions.getState().taskAction.conv_test?.(action, name));
     taskAction("continue", "Run the tests");
-    expect(onSend).toHaveBeenLastCalledWith(
-      'Continue the task "Run the tests", then go on with the rest of the plan.',
-    );
+    expect(onSend).toHaveBeenLastCalledWith(taskActionMessage("continue", "Run the tests"));
     taskAction("run", "Ship it");
-    expect(onSend).toHaveBeenLastCalledWith(
-      'Run the task "Ship it", then go on with the rest of the plan.',
-    );
+    expect(onSend).toHaveBeenLastCalledWith(taskActionMessage("run", "Ship it"));
     taskAction("proceed", "Approve the deploy");
-    expect(onSend).toHaveBeenLastCalledWith(
-      `It's fine to continue the task "Approve the deploy". Mark it started and go ahead with it (or mark it done if its work is already done), then go on with the rest of the plan.`,
-    );
+    expect(onSend).toHaveBeenLastCalledWith(taskActionMessage("proceed", "Approve the deploy"));
 
     rerender(
       <TooltipProvider>
@@ -6867,9 +6866,7 @@ describe("Composer workflow entry point", () => {
     const continuePlan = (planName: string | null) =>
       act(() => useSessionTasksActions.getState().continuePlan.conv_test?.(planName));
     continuePlan("Ship the fix");
-    expect(onSend).toHaveBeenLastCalledWith(
-      'Continue the plan "Ship the fix" from where you left off, and work through the tasks that are left.',
-    );
+    expect(onSend).toHaveBeenLastCalledWith(continuePlanMessage("Ship the fix"));
 
     rerender(
       <TooltipProvider>
@@ -6884,22 +6881,40 @@ describe("Composer workflow entry point", () => {
     error.mockRestore();
   });
 
-  it("lets the Tasks tab stop the agent only while it works", () => {
-    setComposerState({ conversationId: "conv_test", sessionHarness: "openai-agents", skills: [] });
-    const onStop = vi.fn();
-    const { rerender } = renderWithWorkflows(
-      <Composer {...composerProps({ onStop, isWorking: true })} />,
-    );
-    act(() => useSessionTasksActions.getState().stopWork.conv_test?.());
-    expect(onStop).toHaveBeenCalledTimes(1);
+  it.each([true, false])(
+    "asks the main agent to stop the workflow without clearing a draft (main turn active: %s)",
+    (isWorking) => {
+      setComposerState({
+        conversationId: "conv_test",
+        sessionHarness: "openai-agents",
+        skills: [],
+      });
+      const onStop = vi.fn();
+      const onSend = vi.fn();
+      const error = vi.spyOn(toast, "error");
+      const { rerender } = renderWithWorkflows(
+        <Composer {...composerProps({ onStop, onSend, isWorking })} />,
+      );
+      fireEvent.change(textarea(), { target: { value: "An unsent note" } });
+      act(() => useSessionTasksActions.getState().stopWork.conv_test?.());
+      expect(onSend).toHaveBeenCalledWith(stopPlanMessage(null));
+      expect(onStop).not.toHaveBeenCalled();
+      expect(textarea().value).toBe("An unsent note");
 
-    rerender(
-      <TooltipProvider>
-        <Composer {...composerProps({ onStop, isWorking: false })} />
-      </TooltipProvider>,
-    );
-    expect(useSessionTasksActions.getState().stopWork.conv_test).toBeUndefined();
-  });
+      rerender(
+        <TooltipProvider>
+          <Composer {...composerProps({ onStop, onSend, isWorking, unreachable: true })} />
+        </TooltipProvider>,
+      );
+      act(() => useSessionTasksActions.getState().stopWork.conv_test?.());
+      expect(error).toHaveBeenCalledWith(
+        "The session is offline. Reconnect it to stop the workflow.",
+      );
+      expect(onSend).toHaveBeenCalledOnce();
+      expect(onStop).not.toHaveBeenCalled();
+      error.mockRestore();
+    },
+  );
 
   it("opens the dialog for the Tasks tab's empty state", async () => {
     setComposerState({

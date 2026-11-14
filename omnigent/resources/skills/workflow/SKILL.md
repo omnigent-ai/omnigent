@@ -162,9 +162,8 @@ When the user asks to review the plan before the work starts:
   or with **Continue** in the Tasks tab, write `started` on it before you work
   on it again, or `done` if its work is already done, for example by another
   step. Don't leave a step you acted on waiting for the user.
-- If the user asks you to stop and wait for them, write `needs_input` on every
-  ready step, with text like "Paused at your request", then ask once whether
-  to go on, with `sys_workflow_request_input` on the next of them.
+- If the user asks you to stop, follow "Stop and resume" below. Do not ask
+  for confirmation or create a workflow question just to pause.
 - When something you can't clear yourself stops a step, such as CI being down
   or a review you're waiting on, the user decides how to go on. If it may clear
   by itself, such as a flaky check, retry once first. Then ask with
@@ -173,9 +172,6 @@ When the user asks to review the plan before the work starts:
   recommendation.
 - Write `failed` when a step's own work failed. The text says why in a few
   words.
-- If the user stops you, leave the step you were on `started`; the Tasks tab
-  shows it as stopped while you're idle. A stop isn't the step failing, so
-  don't write `failed` for it. Write a note if it helps to say what's left.
 - When you resume, check your `needs_input` steps, the steps running in other
   sessions and the steps waiting for something on its way first, and write a
   new status for any that can go ahead.
@@ -192,6 +188,37 @@ When the user asks to review the plan before the work starts:
   approved, or `failed` if rejected.
 - Keep entries short, and point to files, PRs and sessions instead of pasting
   them.
+
+## Stop and resume
+
+The workflow's Stop and Continue controls send you instructions. Stopping your
+own turn is not enough: delegated work can keep running independently.
+
+- On Stop, stop starting new work and cancel this run's timers, retries and
+  queued follow-ups that could restart it. Scope the stop to this workflow
+  run; leave unrelated work and the automation's recurring schedule alone.
+- Tell every subagent and other Omnigent session working on this run to stop
+  its own background tasks, agents and sessions recursively. Use the harness's
+  agent/task controls, `sys_session_send` for your child sessions and
+  `sys_session_message` for independent sessions. Send the recursive stop
+  request before terminating a worker or the call waiting for it, so it can
+  stop its descendants too. Stop the background work you own as well.
+- Keep this main session available to coordinate cleanup. Verify that the
+  workers and their descendants stopped; a queued message is not confirmation.
+  Have each worker report back after stopping its descendants. If another
+  session requested your stop, report the result to it even though your plan
+  is unfinished. Report any work you could not stop. Record worker/session IDs,
+  completed results and what remains in a journal note before ending your turn.
+- Leave unfinished steps that were started as `started`, and unstarted steps
+  unstarted. A user stop is neither success nor failure. Wait for an explicit
+  Continue without asking another question or restarting on a timer.
+- On Continue, Run or Retry, read the journal and check each worker's current
+  state. Resume or restart previously stopped background tasks, subagents and
+  other Omnigent sessions needed for the remaining work. Tell each worker to
+  do the same recursively for its required descendants. Reuse live workers,
+  preserve completed results and avoid duplicate work. If a worker cannot
+  resume, start a replacement with the recorded context or do its remaining
+  work here. Restore the monitoring needed to finish the workflow.
 
 ## Running another workflow as a step
 

@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { type JournalEntry, pausedLabel, type StepProgress } from "@/lib/sessionJournal";
 import { cn } from "@/lib/utils";
 
-/** What a plan's run button does: stop the agent, or continue the plan. */
+/** What a plan's run button asks of its main agent: stop or continue the work. */
 export type PlanRunControl = "play" | "stop";
 
 /**
@@ -23,7 +23,7 @@ export function planRunControl(
 
 /**
  * A plan's play or stop button, in the Tasks tab's header and on a workflow
- * run's row: stop interrupts the agent, and play asks it to continue the plan.
+ * run's row: asks the main agent to stop or resume the plan and its workers.
  */
 export function PlanRunButton({
   control,

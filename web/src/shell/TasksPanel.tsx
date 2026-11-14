@@ -383,7 +383,7 @@ export interface TaskMenuAction {
  * A task's menu action for its state, when the viewer can take it.
  *
  * @param onTaskAction Asks the agent to run, continue or retry the task; absent when the viewer can't send.
- * @param onStop Stops the agent; absent unless it works.
+ * @param onStop Asks the main agent to stop the workflow and its workers; absent unless work is active.
  */
 export function taskMenuAction(
   item: StepProgress,
@@ -1158,6 +1158,7 @@ export function TasksPanel({
   const saveWorkflow = useSessionTasksActions((state) => state.saveWorkflow[conversationId]);
   const taskAction = useSessionTasksActions((state) => state.taskAction[conversationId]);
   const stopWork = useSessionTasksActions((state) => state.stopWork[conversationId]);
+  const stopActiveWork = tasks.sessionWorking ? stopWork : undefined;
   const continuePlan = useSessionTasksActions((state) => state.continuePlan[conversationId]);
   const entries = tasks.journalSupported ? journal.entries : NO_ENTRIES;
   const names = new Map(progress.map((item) => [item.step.id, item.step.name]));
@@ -1264,7 +1265,7 @@ export function TasksPanel({
               }
               onContinuePlan={continuePlan && (() => continuePlan(planName(plan)))}
               onTaskAction={taskAction}
-              onStop={stopWork}
+              onStop={stopActiveWork}
             />
             <TaskList
               progress={progress}
@@ -1273,7 +1274,7 @@ export function TasksPanel({
               flashStep={flashStep}
               onShowInChat={showInChat}
               onTaskAction={taskAction}
-              onStop={stopWork}
+              onStop={stopActiveWork}
             />
           </>
         )}

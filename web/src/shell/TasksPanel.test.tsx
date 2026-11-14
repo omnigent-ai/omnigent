@@ -633,16 +633,26 @@ describe("TasksPanel", () => {
     }
   });
 
-  it("keeps a started task running while a background task it started runs on", () => {
+  it("keeps Stop available while background work runs after the main turn ends", () => {
     showJournal([journalPlan(0, ["deploy"]), status(1, "deploy", "started")]);
-    renderPanel();
-    const step = () => screen.getByTestId("tasks-row");
-    expect(step().dataset.state).toBe("stopped");
-    // The agent's turn ended, but the deploy it left running is still going.
-    setSession({ backgroundTaskCount: 1 });
-    expect(step().dataset.state).toBe("running");
-    setSession({ backgroundTaskCount: 0 });
-    expect(step().dataset.state).toBe("stopped");
+    const stop = vi.fn();
+    const withdraw = registerStopWork("conv", stop);
+    try {
+      renderPanel();
+      const step = () => screen.getByTestId("tasks-row");
+      expect(step().dataset.state).toBe("stopped");
+      expect(screen.queryByTestId("plan-stop")).toBeNull();
+      // The agent's turn ended, but the deploy it left running is still going.
+      setSession({ backgroundTaskCount: 1 });
+      expect(step().dataset.state).toBe("running");
+      fireEvent.click(screen.getByTestId("plan-stop"));
+      expect(stop).toHaveBeenCalledOnce();
+      setSession({ backgroundTaskCount: 0 });
+      expect(step().dataset.state).toBe("stopped");
+      expect(screen.queryByTestId("plan-stop")).toBeNull();
+    } finally {
+      act(withdraw);
+    }
   });
 
   it("shows a task waiting for you in pink, and counts it in the summary", () => {
@@ -720,13 +730,22 @@ describe("TasksPanel", () => {
       vi.mocked(useChildSessions).mockReturnValue({
         children: [{ id: "child", busy: true, labels }] as ChildSessionInfo[],
       } as never);
-    busy({ "omnigent.side_chat": "1", "omnigent.fork.source_id": "conv" });
-    const { unmount } = renderPanel();
-    expect(screen.getByTestId("tasks-row").dataset.state).toBe("stopped");
-    unmount();
-    busy({});
-    renderPanel();
-    expect(screen.getByTestId("tasks-row").dataset.state).toBe("running");
+    const stop = vi.fn();
+    const withdraw = registerStopWork("conv", stop);
+    try {
+      busy({ "omnigent.side_chat": "1", "omnigent.fork.source_id": "conv" });
+      const { unmount } = renderPanel();
+      expect(screen.getByTestId("tasks-row").dataset.state).toBe("stopped");
+      expect(screen.queryByTestId("plan-stop")).toBeNull();
+      unmount();
+      busy({});
+      renderPanel();
+      expect(screen.getByTestId("tasks-row").dataset.state).toBe("running");
+      fireEvent.click(screen.getByTestId("plan-stop"));
+      expect(stop).toHaveBeenCalledOnce();
+    } finally {
+      act(withdraw);
+    }
   });
 
   it("marks where a task restarted in its history", () => {

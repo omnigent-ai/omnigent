@@ -1,10 +1,18 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type * as SessionsApi from "@/lib/sessionsApi";
 
-import { RunPlanButton } from "./RunTasks";
+import { RunPlanButton, useRunTaskMenus } from "./RunTasks";
 
 const api = vi.hoisted(() => ({ interrupt: vi.fn(), sendUserMessage: vi.fn() }));
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
@@ -46,18 +54,76 @@ describe("RunPlanButton", () => {
     );
     expect(api.sendUserMessage).toHaveBeenCalledWith(
       "sess_1",
-      'Continue the plan "Triage flaky tests" from where you left off, and work through the tasks that are left.',
+      expect.stringContaining('Continue the plan "Triage flaky tests" from where you left off'),
     );
+    expect(api.sendUserMessage.mock.calls[0]![1]).toContain("Resume or restart");
+    expect(api.sendUserMessage.mock.calls[0]![1]).toContain("Omnigent sessions");
+    expect(api.sendUserMessage.mock.calls[0]![1]).toContain("recursively");
     expect(api.interrupt).not.toHaveBeenCalled();
   });
 
-  it("interrupts a running run's session, and says why when it can't", async () => {
-    api.interrupt.mockRejectedValueOnce(new Error("The session is offline."));
+  it("asks a running run's main agent to stop all of its workers recursively", async () => {
+    api.sendUserMessage.mockResolvedValue({ queued: true });
+    const { invalidate } = renderButton("stop");
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+
+    await waitFor(() =>
+      expect(api.sendUserMessage).toHaveBeenCalledWith(
+        "sess_1",
+        expect.stringContaining('Stop the plan "Triage flaky tests"'),
+      ),
+    );
+    const message = api.sendUserMessage.mock.calls[0]![1] as string;
+    expect(message).toContain("background tasks, subagents, and other Omnigent sessions");
+    expect(message).toContain("recursively");
+    expect(message).toContain("verify");
+    expect(api.interrupt).not.toHaveBeenCalled();
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["workflow-runs", "wf_1"] });
+  });
+
+  it("reports a stop message that could not reach the agent", async () => {
+    api.sendUserMessage.mockRejectedValueOnce(new Error("The session is offline."));
     renderButton("stop");
     fireEvent.click(screen.getByRole("button", { name: "Stop" }));
 
     await waitFor(() => expect(toastError).toHaveBeenCalledWith("The session is offline."));
-    expect(api.interrupt).toHaveBeenCalledWith("sess_1");
-    expect(api.sendUserMessage).not.toHaveBeenCalled();
+    expect(api.interrupt).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Stop" })).toBeEnabled();
+  });
+
+  it("reports a denied stop message without interrupting the main agent", async () => {
+    api.sendUserMessage.mockResolvedValueOnce({ queued: false, denied: true });
+    renderButton("stop");
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("A policy blocked the message."));
+    expect(api.interrupt).not.toHaveBeenCalled();
+  });
+
+  it("uses the same coordinated stop from a run's task menus", async () => {
+    api.sendUserMessage.mockResolvedValue({ queued: true });
+    const client = new QueryClient();
+    const { result } = renderHook(() => useRunTaskMenus("sess_1", []), {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    });
+    const menu = result.current?.({
+      step: { id: "review", name: "Review changes", goal: null, depends_on: [] },
+      state: "running",
+      status: null,
+      startedAt: 1,
+      native: false,
+      activeForm: null,
+    });
+    expect(menu?.action).toBe("stop");
+    await act(async () => menu?.onSelect());
+
+    expect(api.sendUserMessage).toHaveBeenCalledWith(
+      "sess_1",
+      expect.stringContaining("Stop the plan"),
+    );
+    expect(api.sendUserMessage.mock.calls[0]![1]).toContain("recursively");
+    expect(api.interrupt).not.toHaveBeenCalled();
   });
 });

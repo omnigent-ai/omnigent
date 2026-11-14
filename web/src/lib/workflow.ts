@@ -86,6 +86,9 @@ const TASK_ACTION_VERBS: Record<Exclude<TaskAction, "proceed">, string> = {
   retry: "Retry",
 };
 
+const RESUME_WORKFLOW_WORK =
+  "Resume or restart any previously stopped background tasks, subagents, and other Omnigent sessions needed for the remaining work. Tell each worker to resume or restart its own required tasks, agents, and sessions recursively. Check their current state first: reuse work that is still running, preserve completed results, and do not duplicate work. Restore any monitoring needed to finish the workflow.";
+
 /**
  * The message that asks the agent to run, continue, go ahead with or retry a
  * task, then go on with the rest of the plan rather than stop after that task.
@@ -94,10 +97,11 @@ const TASK_ACTION_VERBS: Record<Exclude<TaskAction, "proceed">, string> = {
  * @returns e.g. `Run the task "Share the review files", then go on with the rest of the plan.`
  */
 export function taskActionMessage(action: TaskAction, taskName: string): string {
-  if (action === "proceed") {
-    return `It's fine to continue the task "${taskName}". Mark it started and go ahead with it (or mark it done if its work is already done), then go on with the rest of the plan.`;
-  }
-  return `${TASK_ACTION_VERBS[action]} the task "${taskName}", then go on with the rest of the plan.`;
+  const request =
+    action === "proceed"
+      ? `It's fine to continue the task "${taskName}". Mark it started and go ahead with it (or mark it done if its work is already done), then go on with the rest of the plan.`
+      : `${TASK_ACTION_VERBS[action]} the task "${taskName}", then go on with the rest of the plan.`;
+  return `${request}\n\n${RESUME_WORKFLOW_WORK}`;
 }
 
 /**
@@ -109,7 +113,13 @@ export function taskActionMessage(action: TaskAction, taskName: string): string 
  */
 export function continuePlanMessage(planName: string | null): string {
   const plan = planName ? `the plan "${planName}"` : "the plan";
-  return `Continue ${plan} from where you left off, and work through the tasks that are left.`;
+  return `Continue ${plan} from where you left off, and work through the tasks that are left.\n\n${RESUME_WORKFLOW_WORK}`;
+}
+
+/** Keep the main agent available to stop delegated work and record how to resume it. */
+export function stopPlanMessage(planName: string | null): string {
+  const plan = planName ? `the plan "${planName}"` : "the plan";
+  return `Stop ${plan} now. Stop all background tasks, subagents, and other Omnigent sessions working on this workflow run. Tell each worker to stop its own background tasks, agents, and Omnigent sessions recursively, verify their shutdown, and report back before it stops. Cancel this run's timers and queued follow-ups that could restart the work. Keep this main session available while you coordinate and verify that the work has stopped; report anything you could not stop. Preserve completed results and record the worker/session IDs and what remains so the workflow can resume. Leave unfinished steps that were started as started, not done or failed. Do not ask for confirmation or resume the workflow until I explicitly tell you to continue.`;
 }
 
 /**

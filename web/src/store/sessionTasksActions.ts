@@ -9,7 +9,7 @@ interface SessionTasksActionsState {
   saveWorkflow: Readonly<Partial<Record<string, (planName: string) => void>>>;
   /** Per session: how its composer asks the agent to continue the plan, given its name. */
   continuePlan: Readonly<Partial<Record<string, (planName: string | null) => void>>>;
-  /** Per session: how its composer stops the agent, offered only while it works. */
+  /** Per session: how its composer asks the main agent to stop the workflow and its workers. */
   stopWork: Readonly<Partial<Record<string, () => void>>>;
   /** Per session: how its composer asks the agent to run, continue or retry a task, given its name. */
   taskAction: Readonly<Partial<Record<string, (action: TaskAction, taskName: string) => void>>>;
@@ -24,7 +24,7 @@ interface SessionTasksActionsState {
 /**
  * Actions that cross surfaces for a session's tasks: the composer registers
  * how to start a workflow, save one, run or continue a task, continue the plan
- * and stop the agent,
+ * and ask the main agent to stop the workflow's workers,
  * so the Tasks tab can offer them, and the chat's task preview asks the shell to
  * open the Tasks tab.
  */
@@ -85,7 +85,7 @@ export function registerContinuePlan(
 }
 
 /**
- * Offer a session's "stop the agent" action to its Tasks tab while the agent works.
+ * Offer coordinated stopping even when only background tasks or other agents are working.
  *
  * @returns A function that withdraws the action, unless another took its place.
  */

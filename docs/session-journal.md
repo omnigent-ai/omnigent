@@ -211,13 +211,21 @@ that haven't started, says **Can't start** and names the failed task until it
 runs again, here and in a run's graph; when only those tasks are left, the chat
 preview names the failure
 ("Failed: Run the tests"). While the agent works, a running task's menu has
-**Stop**, which stops the agent as the composer's Stop does. It waits for you while a question or permission prompt in the chat
-waits for your answer. A task's history marks a restart after the task was done
+**Stop**, which asks the main agent to stop the workflow's background tasks,
+subagents and other Omnigent sessions. Each worker is told to stop its own
+tasks, agents and sessions recursively. The main agent verifies the stop,
+preserves results and records what remains; it reports anything it could not
+stop. This is a message requesting coordinated cleanup; the composer's Stop
+still interrupts the current turn. A task waits for you while a question or
+permission prompt in the chat waits for your answer. Its history marks a restart after the task was done
 or failed. Tasks waiting for you are pink, and an idle list
 with tasks the agent could still run says "Stopped" ("Run ended" after an
 automation run), so it never looks about to run. Then a play button at the top,
-beside "Updated …", asks the agent to continue the plan from where it left off,
-and while the agent works a stop button there stops it. A run's row on a
+beside "Updated …", asks the agent to continue the plan from where it left off.
+Continue, Run and Retry also ask it to resume or restart needed background
+tasks, agents and Omnigent sessions recursively, checking their state to avoid
+duplicating live or completed work. The header's Stop remains available while
+background tasks or child agents run after the main turn ends. A run's row on a
 workflow's or an automation's page has the same buttons, and its strip and its
 graph the same task menus, which message the run's session. A summary line and a strip
 count the tasks in each state, and stay at the top as you scroll: hover a

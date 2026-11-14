@@ -11,39 +11,81 @@ import {
   parseSavedWorkflowMessage,
   savedWorkflowMessage,
   saveWorkflowMessage,
+  stopPlanMessage,
   taskActionMessage,
   workflowMessage,
 } from "./workflow";
 
 describe("continuePlanMessage", () => {
   it("asks the agent to pick the plan back up, by name when it has one", () => {
-    expect(continuePlanMessage("Triage flaky tests")).toBe(
+    expect(continuePlanMessage("Triage flaky tests")).toContain(
       'Continue the plan "Triage flaky tests" from where you left off, and work through the tasks that are left.',
     );
-    expect(continuePlanMessage(null)).toBe(
+    expect(continuePlanMessage(null)).toContain(
       "Continue the plan from where you left off, and work through the tasks that are left.",
     );
   });
+
+  it("restores stopped workers and their descendants without duplicating existing work", () => {
+    const message = continuePlanMessage(null);
+    expect(message).toContain("Resume or restart");
+    expect(message).toContain("background tasks, subagents, and other Omnigent sessions");
+    expect(message).toContain("recursively");
+    expect(message).toContain("reuse work that is still running");
+    expect(message).toContain("preserve completed results");
+    expect(message).toContain("do not duplicate work");
+  });
+});
+
+describe("stopPlanMessage", () => {
+  it.each(["Triage flaky tests", null])(
+    "asks the main agent to stop the entire worker tree: %s",
+    (name) => {
+      const message = stopPlanMessage(name);
+      expect(message).toContain(name ? `Stop the plan "${name}" now.` : "Stop the plan now.");
+      expect(message).toContain("background tasks, subagents, and other Omnigent sessions");
+      expect(message).toContain("this workflow run");
+      expect(message).toContain(
+        "its own background tasks, agents, and Omnigent sessions recursively",
+      );
+      expect(message).toContain("verify that the work has stopped");
+      expect(message).toContain("report anything you could not stop");
+      expect(message).toContain("record the worker/session IDs");
+      expect(message).toContain("not done or failed");
+      expect(message).toContain("until I explicitly tell you to continue");
+    },
+  );
 });
 
 describe("taskActionMessage", () => {
   it("asks to run, continue or retry the task by name, then the rest of the plan", () => {
-    expect(taskActionMessage("run", "Share the files")).toBe(
+    expect(taskActionMessage("run", "Share the files")).toContain(
       'Run the task "Share the files", then go on with the rest of the plan.',
     );
-    expect(taskActionMessage("continue", "Review #6109")).toBe(
+    expect(taskActionMessage("continue", "Review #6109")).toContain(
       'Continue the task "Review #6109", then go on with the rest of the plan.',
     );
-    expect(taskActionMessage("retry", "Run the tests")).toBe(
+    expect(taskActionMessage("retry", "Run the tests")).toContain(
       'Retry the task "Run the tests", then go on with the rest of the plan.',
     );
   });
 
   it("tells the agent it may go ahead with a task waiting for the user", () => {
-    expect(taskActionMessage("proceed", "Approve the deploy")).toBe(
+    expect(taskActionMessage("proceed", "Approve the deploy")).toContain(
       `It's fine to continue the task "Approve the deploy". Mark it started and go ahead with it (or mark it done if its work is already done), then go on with the rest of the plan.`,
     );
   });
+
+  it.each(["run", "continue", "retry", "proceed"] as const)(
+    "%s restores the workers needed for the remaining work",
+    (action) => {
+      const message = taskActionMessage(action, "Review changes");
+      expect(message).toContain("Resume or restart");
+      expect(message).toContain("Omnigent sessions");
+      expect(message).toContain("recursively");
+      expect(message).toContain("do not duplicate work");
+    },
+  );
 });
 
 describe("workflowMessage", () => {

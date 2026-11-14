@@ -7,10 +7,10 @@ import { FullscreenIcon } from "@/components/ai-elements/MermaidBlock";
 import { Button } from "@/components/ui/button";
 import { useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import type { StepProgress } from "@/lib/sessionJournal";
-import { interrupt, sendUserMessage } from "@/lib/sessionsApi";
+import { sendUserMessage } from "@/lib/sessionsApi";
 import { Link, useNavigate } from "@/lib/routing";
 import { cn } from "@/lib/utils";
-import { continuePlanMessage, taskActionMessage } from "@/lib/workflow";
+import { continuePlanMessage, stopPlanMessage, taskActionMessage } from "@/lib/workflow";
 import { PlanRunButton, type PlanRunControl } from "@/shell/PlanRunButton";
 import { ProgressStrip, taskMenuAction, type TaskMenuAction } from "@/shell/TasksPanel";
 import { openTasksTab } from "@/store/sessionTasksActions";
@@ -19,7 +19,7 @@ import { openTasksTab } from "@/store/sessionTasksActions";
 type RunRefreshKeys = readonly (readonly unknown[])[];
 
 /**
- * Messages or stops a run's session from a page other than its chat, then
+ * Messages a run's session from a page other than its chat, then
  * refreshes the lists that show the run.
  */
 function useRunSession(sessionId: string, refreshKeys: RunRefreshKeys) {
@@ -43,10 +43,6 @@ function useRunSession(sessionId: string, refreshKeys: RunRefreshKeys) {
         const result = await sendUserMessage(sessionId, text);
         if (result.denied) toast.error("A policy blocked the message.");
       }),
-    stop: () =>
-      void act(async () => {
-        await interrupt(sessionId);
-      }),
   };
 }
 
@@ -67,7 +63,7 @@ export function useRunTaskMenus(
     taskMenuAction(
       item,
       (action, taskName) => session.send(taskActionMessage(action, taskName)),
-      session.stop,
+      () => session.send(stopPlanMessage(null)),
     );
 }
 
@@ -104,9 +100,8 @@ export function RunTimeline({
 }
 
 /**
- * A run's play or stop button, from a page other than its chat: stop
- * interrupts the run's session, and play asks it to continue the plan. The
- * lists that show the run refresh once the session takes it.
+ * Asks a run's main agent to stop or resume its work, including its workers.
+ * The lists that show the run refresh once the session takes the message.
  */
 export function RunPlanButton({
   sessionId,
@@ -116,7 +111,7 @@ export function RunPlanButton({
   className,
 }: {
   sessionId: string;
-  /** The plan's name for the play message, e.g. the workflow's. */
+  /** The plan's name for the control message, e.g. the workflow's. */
   planName: string | null;
   control: PlanRunControl;
   refreshKeys: RunRefreshKeys;
@@ -129,7 +124,7 @@ export function RunPlanButton({
       disabled={session.pending}
       className={cn("z-10", className)}
       onClick={() =>
-        control === "stop" ? session.stop() : session.send(continuePlanMessage(planName))
+        session.send(control === "stop" ? stopPlanMessage(planName) : continuePlanMessage(planName))
       }
     />
   );

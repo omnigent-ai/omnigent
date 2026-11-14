@@ -24,6 +24,7 @@ import type * as IdentityModule from "@/lib/identity";
 import type * as RoutingModule from "@/lib/routing";
 import { sessionJournalKey, type JournalEntry, type StepProgress } from "@/lib/sessionJournal";
 import { sendUserMessage } from "@/lib/sessionsApi";
+import { taskActionMessage } from "@/lib/workflow";
 import type * as SessionsApi from "@/lib/sessionsApi";
 import { openTasksTab } from "@/store/sessionTasksActions";
 import type * as TasksActions from "@/store/sessionTasksActions";
@@ -452,7 +453,7 @@ describe("WorkflowDetailPage", () => {
     await waitFor(() =>
       expect(sendUserMessage).toHaveBeenCalledWith(
         session,
-        'Retry the task "Fix the test", then go on with the rest of the plan.',
+        taskActionMessage("retry", "Fix the test"),
       ),
     );
     await waitFor(() => expect(screen.queryByTestId("tasks-progress-card")).toBeNull());

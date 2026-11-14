@@ -372,6 +372,7 @@ import {
   offersWorkflow,
   savedWorkflowMessage,
   saveWorkflowMessage,
+  stopPlanMessage,
   type TaskAction,
   taskActionMessage,
   workflowMessage,
@@ -3222,13 +3223,12 @@ function ComposerImpl(
     if (isReadOnly || composerSessionId === null) return;
     return registerContinuePlan(composerSessionId, (planName) => continuePlanRef.current(planName));
   }, [isReadOnly, composerSessionId]);
-  // While the agent works, a running task's ⋯ menu can stop it, as Stop here does.
-  const stopRef = useRef(onStop);
-  stopRef.current = onStop;
+  // The Tasks tab knows whether work remains active in background tasks or other agents.
+  const stopRef = useRef<() => void>(() => undefined);
   useEffect(() => {
-    if (!isWorking || isReadOnly || composerSessionId === null) return;
+    if (isReadOnly || composerSessionId === null) return;
     return registerStopWork(composerSessionId, () => stopRef.current());
-  }, [isWorking, isReadOnly, composerSessionId]);
+  }, [isReadOnly, composerSessionId]);
   // The built-ins this session offers; a gated-off one leaves a same-named
   // custom command to run as a skill.
   const offeredBuiltinCommands = useMemo(
@@ -4356,6 +4356,11 @@ function ComposerImpl(
     const reason = blockedReasonFor("continue the plan");
     if (reason) toast.error(reason);
     else sendWorkflowMessage(continuePlanMessage(planName));
+  };
+  stopRef.current = () => {
+    const reason = blockedReasonFor("stop the workflow");
+    if (reason) toast.error(reason);
+    else sendWorkflowMessage(stopPlanMessage(null));
   };
 
   const handleSubmit = (e: FormEvent) => {
