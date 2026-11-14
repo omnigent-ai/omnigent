@@ -749,18 +749,14 @@ class Lab:
         assert self.observer is not None
         observer, host = self.observer, self._host
 
-        def _online() -> bool | None:
+        def _ready() -> bool | None:
             if not host.running:
                 raise RuntimeError(f"host daemon exited:\n{host.log_tail()}")
-            response = observer.get("/v1/hosts")
-            if response.status_code != 200:
-                return None
-            for row in response.json().get("hosts", []):
-                if row.get("host_id") == self.host_id and row.get("status") == "online":
-                    return True
-            return None
+            # The online DB row is committed before the tunnel enters the registry.
+            response = observer.get(f"/v1/hosts/{self.host_id}/filesystem", params={"limit": 1})
+            return True if response.status_code == 200 else None
 
-        wait_for(_online, timeout=_STARTUP_TIMEOUT_S, what="the host daemon to register")
+        wait_for(_ready, timeout=_STARTUP_TIMEOUT_S, what="the host daemon to answer an RPC")
 
     def _start_runner(self) -> None:
         from omnigent.runner.identity import token_bound_runner_id

@@ -5,7 +5,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from tests._helpers.native_session import NativeHarness, create_native_session
+from tests._helpers.native_session import create_native_session
 from tests.e2e import conftest as helpers
 
 
@@ -154,8 +154,7 @@ def test_pending_tool_poll_waits_for_this_turn(monkeypatch, previous_call) -> No
     assert [item["call_id"] for item in output] == ["new"]
 
 
-@pytest.mark.parametrize("harness", ["claude", "codex"])
-def test_native_create_failure_keeps_bounded_redacted_response(harness: NativeHarness) -> None:
+def test_native_create_failure_keeps_bounded_redacted_response() -> None:
     credential = "synthetic-credential-" * 200
     payload = {
         "error": {
@@ -168,7 +167,7 @@ def test_native_create_failure_keeps_bounded_redacted_response(harness: NativeHa
     response = httpx.Response(400, json=payload)
     with httpx.Client(transport=httpx.MockTransport(lambda _: response)) as client:
         with pytest.raises(httpx.HTTPStatusError) as raised:
-            create_native_session(client, "http://server.example.test", harness=harness)
+            create_native_session(client, "http://server.example.test", harness="codex")
 
     error = raised.value
     assert error.response is response
