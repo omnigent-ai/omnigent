@@ -470,7 +470,7 @@ async def test_goal_read_after_idle_reap_does_not_wake_codex(
     )
 
     if strict:
-        assert response.status_code == 502, response.text
+        assert response.status_code == 503, response.text
         assert response.json()["error"] == "codex_native_goal_failed"
     else:
         assert response.status_code == 200, response.text
