@@ -64,17 +64,7 @@ export function decodeBase64(content: string): Uint8Array {
   return bytes;
 }
 
-/**
- * Decode a data file's content as the server sent it.
- *
- * The server sends UTF-8 text as is and anything else as base64, so a
- * Latin-1 export arrives as base64. A byte-order mark picks UTF-16; otherwise
- * strict UTF-8 is tried before falling back to Windows-1252.
- *
- * @param content - The file content, e.g. ``"a,b\n1,2"``.
- * @param encoding - How the server encoded it: ``"utf-8"`` or ``"base64"``.
- * @returns The text, without a byte-order mark, and the encoding used.
- */
+/** Decode text or base64 bytes; a BOM selects UTF-16, otherwise try UTF-8 then Windows-1252. */
 export function decodeDataFile(
   content: string,
   encoding: "utf-8" | "base64",
@@ -180,25 +170,28 @@ function parseRecords(
   let fields: string[] = [];
   let field = "";
   let fieldHasChars = false;
+  // The field being read reached the name limit; it takes nothing more.
+  let fieldFull = false;
   let inQuotes = false;
   let recordHasContent = false;
   // Whether the field being read is kept: past *keepFields*, it is only counted.
   const keepingField = () => keeping && fields.length < keepFields;
   // Append to the field being read while the record's text fits what's left of the budget.
+  // *chars* is one character (a surrogate pair is never split). Once a field or
+  // record is cut, nothing after the cut is kept, so what shows is a prefix.
   const append = (chars: string) => {
-    if (!keepingField()) return;
-    let kept = chars;
+    if (!keepingField() || fieldFull || recordOverflowed) return;
     // A header name is kept only up to the name limit, so its excess costs nothing.
-    if (records.length === 0 && field.length + kept.length > DATA_TABLE_MAX_NAME_CHARS) {
-      kept = kept.slice(0, Math.max(0, DATA_TABLE_MAX_NAME_CHARS - field.length));
+    if (records.length === 0 && field.length + chars.length > DATA_TABLE_MAX_NAME_CHARS) {
       textCut = true;
-      if (kept === "") return;
+      fieldFull = true;
+      return;
     }
-    if (recordChars + field.length + kept.length > keepChars - keptChars) {
+    if (recordChars + field.length + chars.length > keepChars - keptChars) {
       recordOverflowed = true;
       return;
     }
-    field += kept;
+    field += chars;
   };
 
   const endRecord = () => {
@@ -223,6 +216,7 @@ function parseRecords(
     }
     fields = [];
     field = "";
+    fieldFull = false;
     fieldCount = 0;
     recordChars = 0;
     recordOverflowed = false;
@@ -231,7 +225,12 @@ function parseRecords(
   };
 
   for (let i = 0; i < text.length; i++) {
-    const char = text[i];
+    // A surrogate pair is read as one character, so a cut can't split it.
+    const code = text.charCodeAt(i);
+    const next = text.charCodeAt(i + 1);
+    const pair = code >= 0xd800 && code <= 0xdbff && next >= 0xdc00 && next <= 0xdfff;
+    const char = pair ? text.slice(i, i + 2) : text[i];
+    if (pair) i += 1;
     if (inQuotes) {
       if (char === '"') {
         if (text[i + 1] === '"') {
@@ -257,6 +256,7 @@ function parseRecords(
       }
       fieldCount += 1;
       field = "";
+      fieldFull = false;
       fieldHasChars = false;
       recordHasContent = true;
     } else if (char === "\n" || char === "\r") {
@@ -283,13 +283,37 @@ export function cellNumber(value: string): number {
   return trimmed.endsWith("%") ? number / 100 : number;
 }
 
+const PHANTOM_LEAP_DAY = "1900-02-29";
+const MARCH_1_1900 = Date.UTC(1900, 2, 1);
+const DAY_MS = 86_400_000;
+
 /**
  * A date cell's time in milliseconds. A date or time without an offset is read
  * as UTC, so a date sorts as the midnight starting it whatever the viewer's zone.
  */
+
 function cellDate(value: string): number {
+  return dateSortKey(value)[0];
+}
+
+/**
+ * A date cell's sort key: its time in milliseconds, then a tie-breaker. Excel's
+ * phantom 1900-02-29 takes the last millisecond of Feb 28, its time of day
+ * breaking the tie, so it sorts after Feb 28 and before Mar 1.
+ */
+function dateSortKey(value: string): [number, number] {
   const trimmed = value.trim();
-  if (!DATE_PATTERN.test(trimmed)) return Number.NaN;
+  if (!DATE_PATTERN.test(trimmed)) return [Number.NaN, 0];
+  if (trimmed.startsWith(PHANTOM_LEAP_DAY)) {
+    const [sameTimeOnMarch1] = dateSortKey(`1900-03-01${trimmed.slice(PHANTOM_LEAP_DAY.length)}`);
+    // Clamped so an offset can't push it past Mar 1 or before Feb 28.
+    const timeOfDay = Math.min(Math.max(sameTimeOnMarch1 - MARCH_1_1900, 0), DAY_MS - 1);
+    return [MARCH_1_1900 - 1, 1 + timeOfDay];
+  }
+  return [isoTime(trimmed), 0];
+}
+
+function isoTime(trimmed: string): number {
   const iso = trimmed.replace(" ", "T");
   if (!iso.includes("T")) return Date.parse(`${iso}T00:00Z`);
   return Date.parse(/(Z|[+-]\d{2}:?\d{2})$/.test(iso) ? iso : `${iso}Z`);
@@ -328,12 +352,21 @@ export function compareCells(a: string, b: string, type: DataColumnType): number
   const bEmpty = b.trim() === "";
   if (aEmpty || bEmpty) return Number(aEmpty) - Number(bEmpty);
   if (type === "number") return compareValues(cellNumber(a), cellNumber(b));
-  if (type === "date") return compareValues(cellDate(a), cellDate(b));
+  if (type === "date") {
+    const [left, leftTie] = dateSortKey(a);
+    const [right, rightTie] = dateSortKey(b);
+    return compareValues(left, right) || compareValues(leftTie, rightTie);
+  }
   return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
 }
 
 function textLength(cells: string[]): number {
   return cells.reduce((total, cell) => total + cell.length, 0);
+}
+
+/** *text* without a trailing high surrogate, which a cut can leave without its pair. */
+function withoutHalfCharacter(text: string): string {
+  return /[\uD800-\uDBFF]$/.test(text) ? text.slice(0, -1) : text;
 }
 
 /**
@@ -391,7 +424,7 @@ export function tableFromRecords(
   let textCut = textCutEarlier;
   const columns = Array.from({ length: width }, (_, index) => {
     const name = header[index] ?? "";
-    const cut = name.slice(0, DATA_TABLE_MAX_NAME_CHARS);
+    const cut = withoutHalfCharacter(name.slice(0, DATA_TABLE_MAX_NAME_CHARS));
     textCut ||= cut.length < name.length;
     // A blank name still needs a label, which counts against the budget too.
     const label = cut.trim() === "" ? `column ${index + 1}` : cut;

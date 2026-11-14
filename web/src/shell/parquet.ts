@@ -186,7 +186,7 @@ export async function readParquet(
   );
   const values = valuesToRead(metadata, nested, columns.length - nested.size);
   // Past the limit (or on a footer count that isn't a number) the nested columns
-  // aren't read: they show a note, and the flat columns still show.
+  // aren't read: their cells show a placeholder, and the flat columns still fill in.
   const skipNested = !(values <= maxValues);
   const readColumns = columns
     .map((column) => column.name)

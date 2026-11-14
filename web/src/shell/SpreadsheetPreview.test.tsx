@@ -11,7 +11,9 @@ function base64Fixture(name: string): string {
 }
 
 function renderSpreadsheet(content: string, path: string, truncated = false) {
-  return render(<SpreadsheetPreview content={content} path={path} truncated={truncated} />);
+  return render(
+    <SpreadsheetPreview content={content} encoding="base64" path={path} truncated={truncated} />,
+  );
 }
 
 describe("SpreadsheetPreview", () => {

@@ -12,6 +12,7 @@ import {
   isDataTablePath,
   parseDataTable,
   tableFromRecords,
+  type DataTable,
 } from "./dataTable";
 
 /** Base64 of raw bytes, as the server sends a file that isn't UTF-8. */
@@ -134,6 +135,18 @@ describe("parseDataTable", () => {
     const kept = table?.rows[0]?.[0] ?? "";
     expect(kept.endsWith("x…")).toBe(true);
   });
+
+  // Text after the cut follows the emoji, so a cut that freed room for it would show.
+  it.each([
+    ["a row", `h\n${"x".repeat(DATA_TABLE_MAX_CHARS - 2)}😀yz\n`, (t: DataTable) => t.rows[0][0]],
+    ["a column name", `${"x".repeat(999)}😀yz,b\n1,2\n`, (t: DataTable) => t.header[0]],
+  ])(
+    "cuts %s before a character it can't keep whole, and keeps nothing after",
+    (_l, text, pick) => {
+      const kept = pick(parseDataTable(text, "data.csv")!);
+      expect(kept).toMatch(/^x+$/);
+    },
+  );
 
   it("keeps generated column labels within the text budget", () => {
     const table = parseDataTable(
@@ -319,6 +332,16 @@ describe("inferColumnType and compareCells", () => {
         compareCells(a, b, "date"),
       ),
     ).toEqual(["2025-12-31T23:00:00Z", "2026-01-15", "2026-03-01", ""]);
+  });
+
+  it("sorts Excel's phantom 1900-02-29 between Feb 28 and Mar 1", () => {
+    expect(
+      ["1900-03-01", "1900-02-29 12:00:00", "1900-02-28 23:00:00", "1900-02-29"].sort((a, b) =>
+        compareCells(a, b, "date"),
+      ),
+    ).toEqual(["1900-02-28 23:00:00", "1900-02-29", "1900-02-29 12:00:00", "1900-03-01"]);
+    // An offset can't move it past Mar 1.
+    expect(compareCells("1900-02-29T23:00:00-12:00", "1900-03-01", "date")).toBeLessThan(0);
   });
 
   it("orders a date before a time later that day, whatever the viewer's time zone", () => {

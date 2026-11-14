@@ -240,7 +240,7 @@ export interface ElapsedFormat {
 /** ``"[mm]:ss"`` → minutes with seconds; ``null`` for a format that isn't elapsed. */
 export function elapsedFormat(code: string): ElapsedFormat | null {
   const bare = bareFormat(code);
-  const unit = /\[(h+|m+|s+)\]/i.exec(bare)?.[1]?.[0]?.toLowerCase();
+  const unit = bare.match(/\[(h+|m+|s+)\]/i)?.[1]?.[0]?.toLowerCase();
   if (unit !== "h" && unit !== "m" && unit !== "s") return null;
   return { unit, seconds: unit === "s" || /s/i.test(bare.replace(/\[[^\]]*\]/g, "")) };
 }
@@ -300,7 +300,8 @@ export function excelSerialToText(serial: number, date1904: boolean, timeOnly = 
   const day = !date1904 && Math.floor(rounded) === PHANTOM_LEAP_DAY ? "1900-02-29" : isoDay;
   if (timeOnly) return time;
   if (Number.isInteger(serial)) return day;
-  return serial < 1 ? time : `${day} ${time}`;
+  // The 1900 system's day zero isn't a date Excel names; the 1904 system's is.
+  return serial < 1 && !date1904 ? time : `${day} ${time}`;
 }
 
 /**

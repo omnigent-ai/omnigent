@@ -362,7 +362,7 @@ function PreviewWithSearch({
   /** Workspace path of the previewed file, for resolving relative links. */
   path: string | null;
   kind: "markdown" | "notebook" | "table" | "spreadsheet";
-  /** How the server sent *content*; only a data table decodes base64. */
+  /** How the server sent *content*; a data table or spreadsheet decodes base64. */
   encoding?: "utf-8" | "base64";
   truncated: boolean;
   searchOpen: boolean;
@@ -410,6 +410,7 @@ function PreviewWithSearch({
     kind === "spreadsheet" ? (
       <SpreadsheetPreview
         content={content}
+        encoding={encoding}
         path={path ?? ""}
         truncated={truncated}
         rootRef={previewRef}
@@ -1004,7 +1005,7 @@ export function CodeViewer({
     );
   }
   // Before the binary notice: a data file in another encoding, or a workbook or
-  // Parquet file, arrives as base64.
+  // Parquet file, usually arrives as base64 (but may arrive as UTF-8 text).
   if (isSpreadsheetPreview && fileQuery.data) {
     return (
       <PreviewWithSearch
@@ -1012,6 +1013,7 @@ export function CodeViewer({
         content={content}
         path={path}
         kind="spreadsheet"
+        encoding={fileQuery.data.encoding}
         truncated={truncated}
         searchOpen={searchOpen}
         onSearchHandled={handleSearchHandled}

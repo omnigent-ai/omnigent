@@ -1339,6 +1339,14 @@ describe("CodeViewer data-file routing", () => {
     }
   });
 
+  it("reads a workbook the server sent as UTF-8 text because its bytes allowed it", async () => {
+    // A stored workbook whose every byte is ASCII, so the file API returns it as text.
+    const workbook = readFileSync("src/shell/__fixtures__/ascii-stored.xlsx", "utf8");
+    renderViewer(workbook, true, "plain.xlsx", { viewMode: "preview", encoding: "utf-8" });
+    expect(await screen.findByRole("cell", { name: "pens" })).toBeDefined();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("opens an Excel workbook on its table even in source mode", async () => {
     const workbook = readFileSync("src/shell/__fixtures__/sales.xlsx").toString("base64");
     renderViewer(workbook, true, "sales.xlsx", { viewMode: "source", encoding: "base64" });
