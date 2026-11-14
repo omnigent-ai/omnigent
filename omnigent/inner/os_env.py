@@ -539,7 +539,6 @@ class _HelperProcessClient:
     ) -> OpResult:
         self._stop_locked()
         if allow_retry and not self._closed:
-            self._ensure_started_locked()
             return self._request_locked(payload, allow_retry=False)
         return {"error": f"os_env helper failed: {exc}"}
 

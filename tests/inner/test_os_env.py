@@ -22,7 +22,7 @@ from unittest.mock import Mock
 import pytest
 
 from omnigent.inner._proc import process_alive
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.datamodel import CredentialProxySpec, OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import (
     CallerProcessOSEnvironment,
     _child_shell_env,
@@ -648,6 +648,33 @@ def _helper_env(
     return os_env
 
 
+@pytest.mark.parametrize("declares_stability", [False, True])
+def test_reused_helper_requires_declared_launch_stability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, declares_stability: bool
+) -> None:
+    """A live helper is reusable only when its backend declares a stable fingerprint."""
+    os_env = _helper_env(tmp_path, "none", relaunch_when_stale=True)
+    helper = os_env._helper
+    process = Mock()
+    process.poll.return_value = None
+    helper._proc = process
+    helper._launch = (lambda: "stable", "stable" if declares_stability else None)
+    start = Mock()
+    monkeypatch.setattr(helper, "_start_locked", start)
+    try:
+        with helper._lock:
+            helper._ensure_started_locked()
+        if declares_stability:
+            start.assert_not_called()
+            process.terminate.assert_not_called()
+            assert helper._proc is process
+        else:
+            start.assert_called_once_with()
+            process.terminate.assert_called_once_with()
+    finally:
+        os_env.close()
+
+
 @pytest.mark.posix_only
 @pytest.mark.parametrize("backend", _HELPER_BACKENDS)
 def test_reused_helper_refreshes_effective_parent_environment(
@@ -927,6 +954,34 @@ def test_read_is_answered_by_a_new_helper_when_the_first_dies_before_replying(
         assert os_env._helper._proc is not dead_helper
         if first_scratch_dir is not None:
             assert not first_scratch_dir.exists()
+
+        os_env.close()
+        os_env = _helper_env(workspace, backend, relaunch_when_stale=True)
+        helper = os_env._helper
+        # Empty sources exercise credential refresh without an upstream.
+        helper.sandbox.credential_proxy = CredentialProxySpec(entries=[])
+        start_helper = helper._start_locked
+        started_helpers: list[subprocess.Popen[str]] = []
+        started_scratch_dirs: list[Path | None] = []
+
+        def start_with_lost_first_reply() -> None:
+            start_helper()
+            assert helper._proc is not None
+            started_helpers.append(helper._proc)
+            started_scratch_dirs.append(helper._tmpdir)
+            if len(started_helpers) == 1:
+                _fail_next_request(os_env, delivered=True)
+
+        monkeypatch.setattr(helper, "_start_locked", start_with_lost_first_reply)
+        result = asyncio.run(os_env.read("notes.txt"))
+        assert result.get("content") == "kept\n", result
+        assert len(started_helpers) == 2
+        assert helper._proc is started_helpers[-1] and helper._proc is not started_helpers[0]
+        first_scratch_dir = started_scratch_dirs[0]
+        if first_scratch_dir is not None:
+            assert not first_scratch_dir.exists()
+        if helper._tmpdir is not None:
+            assert not (helper._tmpdir / "helper-config.json").exists()
     finally:
         os_env.close()
     assert all(not path.exists() for path in created_scratch_dirs)

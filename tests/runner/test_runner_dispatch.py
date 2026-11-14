@@ -3318,6 +3318,85 @@ async def test_runner_os_env_surrogate_path_is_httpx_transport_safe(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("shared_copy_on_write", [True, False], ids=["shared-cow", "fork"])
+async def test_runner_os_env_dispatch_preserves_shared_and_fork_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    shared_copy_on_write: bool,
+) -> None:
+    """Shared overlays borrow the primary owner; fork calls own separate environments."""
+    from unittest.mock import AsyncMock, Mock, call
+
+    from omnigent.entities import DEFAULT_ENVIRONMENT_ID
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, WritePathSpec
+    from omnigent.inner.os_env import OSEnvironment
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+
+    primary = Mock(spec=OSEnvironment)
+    primary.read = AsyncMock(return_value={"content": "primary"})
+    disposable = [Mock(spec=OSEnvironment) for _ in range(2)]
+    for index, environment in enumerate(disposable):
+        environment.read = AsyncMock(return_value={"content": f"fork-{index}"})
+    create_environment = Mock(side_effect=disposable)
+    monkeypatch.setattr("omnigent.inner.os_env.create_os_environment", create_environment)
+    registry = Mock(spec=SessionResourceRegistry)
+    registry.resolve_environment.return_value = primary
+    registry.lease_tool_environment = AsyncMock(side_effect=AssertionError("unexpected lease"))
+    skills_dir = tmp_path / "skills"
+    registry.codex_skills_dir.return_value = skills_dir
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            fork=not shared_copy_on_write,
+            sandbox=OSEnvSandboxSpec(
+                type="none",
+                write_paths=[WritePathSpec(".", copy_on_write=shared_copy_on_write)],
+            ),
+        ),
+    )
+    session_id = "conv_dispatch_ownership"
+    results = [
+        json.loads(
+            await _execute_os_env_tool(
+                "sys_os_read",
+                {"path": "notes.txt"},
+                agent_spec=spec,
+                conversation_id=session_id,
+                resource_registry=registry,
+            )
+        )
+        for _ in range(2)
+    ]
+
+    registry.lease_tool_environment.assert_not_awaited()
+    primary.close.assert_not_called()
+    if shared_copy_on_write:
+        assert results == [{"content": "primary"}] * 2
+        assert (
+            registry.resolve_environment.call_args_list
+            == [call(session_id, DEFAULT_ENVIRONMENT_ID, spec)] * 2
+        )
+        assert primary.read.await_count == 2
+        create_environment.assert_not_called()
+        for environment in disposable:
+            environment.read.assert_not_awaited()
+            environment.close.assert_not_called()
+    else:
+        assert results == [{"content": f"fork-{index}"} for index in range(2)]
+        registry.resolve_environment.assert_not_called()
+        primary.read.assert_not_awaited()
+        assert (
+            create_environment.call_args_list
+            == [call(spec.os_env, additional_read_roots=[skills_dir])] * 2
+        )
+        for environment in disposable:
+            environment.read.assert_awaited_once()
+            environment.close.assert_called_once_with()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("registered", [False, True], ids=["standalone", "registered"])
 async def test_runner_os_env_error_is_httpx_transport_safe(
     caplog: pytest.LogCaptureFixture,
