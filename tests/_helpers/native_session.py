@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
@@ -28,18 +29,19 @@ from tests._helpers.session import bundle_files, post_session_bundle
 
 NativeHarness = Literal["antigravity", "claude", "codex", "cursor", "goose", "kiro", "hermes"]
 
+_SENSITIVE_RESPONSE_KEY_PATTERN = re.compile(
+    r"authorization|token|secret|password|passwd|credential|api[\s_.-]*key",
+    re.IGNORECASE,
+)
+
 
 def _redacted_response_text(response: httpx.Response) -> str:
     def redact(value: Any) -> Any:
         if isinstance(value, dict):
             result = {}
             for key, item in value.items():
-                # Reuse the label policy without parsing a credential's escaped quotes.
-                probe = f"{key}=redaction-probe"
-                result[key] = (
-                    "[REDACTED]"
-                    if redact_log_text(probe, include_whitespace_credentials=True) != probe
-                    else redact(item)
+                result[redact(key)] = (
+                    "[REDACTED]" if _SENSITIVE_RESPONSE_KEY_PATTERN.search(key) else redact(item)
                 )
             return result
         if isinstance(value, list):

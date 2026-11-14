@@ -184,6 +184,36 @@ def test_pending_tool_poll_waits_for_this_turn(monkeypatch, previous_call) -> No
             id="sensitive-object",
         ),
         pytest.param(
+            {
+                "passwd": "synthetic-passwd-tail",
+                "DATABASE_PASSWD": "synthetic-prefixed-passwd-tail",
+            },
+            ("synthetic-passwd-tail", "synthetic-prefixed-passwd-tail"),
+            id="passwd-label",
+        ),
+        pytest.param(
+            {
+                "credentials": {"value": "synthetic-credentials-tail"},
+                "providerCredentials": [{"value": "synthetic-credentials-list-tail"}],
+            },
+            ("synthetic-credentials-tail", "synthetic-credentials-list-tail"),
+            id="credentials-container",
+        ),
+        pytest.param(
+            {"password=synthetic-key-tail": "synthetic-key-value-tail"},
+            ("synthetic-key-tail", "synthetic-key-value-tail"),
+            id="credential-key",
+        ),
+        pytest.param(
+            {
+                'password="\\"synthetic-escaped-key-tail"': {
+                    "value": "synthetic-escaped-key-value-tail"
+                }
+            },
+            ("synthetic-escaped-key-tail", "synthetic-escaped-key-value-tail"),
+            id="escaped-credential-key",
+        ),
+        pytest.param(
             {"details": ['password="\\"synthetic-inline-escaped-tail"']},
             ("synthetic-inline-escaped-tail",),
             id="decoded-string",
