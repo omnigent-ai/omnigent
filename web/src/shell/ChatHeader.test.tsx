@@ -711,8 +711,10 @@ describe("ChatHeader — Chat/Terminal switcher wiring", () => {
 });
 
 describe("ChatHeader — floating mobile controls", () => {
-  it("adds glass to the mobile sidebar and shared action container", () => {
+  it.each(["iOS", "Android", "browser"])("shares protected mobile glass on %s", (platform) => {
     isMobileMock.mockReturnValue(true);
+    isIOSShellMock.mockReturnValue(platform === "iOS");
+    isAndroidShellMock.mockReturnValue(platform === "Android");
     const onOpenSidebar = vi.fn();
     renderHeader({ sidebarOpen: false, conversationId: "conv-1", canShare: true, onOpenSidebar });
 
@@ -725,11 +727,14 @@ describe("ChatHeader — floating mobile controls", () => {
           .closest("[data-mobile-header-group]")
           ?.querySelector<HTMLElement>(".glass-surface"))!;
       expect(surface.parentElement).toHaveAttribute("aria-hidden", "true");
+      expect(surface.parentElement).toHaveClass("omni-glass-layer");
       expect(surface).toHaveClass("glass-surface--fallback");
       expect(surface).toHaveClass("[&>.glass-surface\\_\\_sheen]:opacity-0");
       expect(surface.querySelector(".glass-surface__sheen")).not.toBeNull();
       expect(surface.style.getPropertyValue("--glass-frost")).toBe("0");
-      expect(surface.style.background).toBe("var(--omni-glass-background, hsl(0 0% 100% / 0%))");
+      expect(surface.style.background).toBe(
+        "var(--omni-glass-background, color-mix(in srgb, var(--card-solid) 88%, transparent))",
+      );
       expect(surface.style.backdropFilter).toBe(
         "blur(var(--omni-glass-blur, 8px)) saturate(calc(var(--glass-saturation, 1) * 1.4)) brightness(var(--omni-glass-brightness, 1.04))",
       );

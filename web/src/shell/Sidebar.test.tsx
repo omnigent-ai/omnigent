@@ -3923,7 +3923,9 @@ describe("Sidebar mobile overlay background", () => {
       const aside = screen.getByRole("complementary", { name: "Conversations" });
       const surface = aside.querySelector<HTMLElement>(".omni-glass-surface")!;
       expect(surface).not.toBeNull();
-      expect(surface.style.background).toBe("var(--omni-glass-background, hsl(0 0% 100% / 0%))");
+      expect(surface.style.background).toBe(
+        "var(--omni-glass-background, color-mix(in srgb, var(--card-solid) 94%, transparent))",
+      );
       expect(surface.style.backdropFilter).toContain("32px");
     } finally {
       matchMedia.mockRestore();
