@@ -17,6 +17,8 @@ Covers:
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta, timezone
+
 import pytest
 
 from omnigent.policies.builtins.safety import ask_on_os_tools, block_skills
@@ -705,6 +707,90 @@ def test_ask_on_scheduled_task_change_asks_for_create_with_preview(data_name: st
     assert "nightly triage" in result["reason"]
     assert "rrule=FREQ=DAILY;BYHOUR=9" in result["reason"]
     assert "Task permission setting: agent default (no task override)" in result["reason"]
+
+
+def _reminder_review(arguments: dict[str, object]):
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    return ask_on_scheduled_task_change(
+        {"type": "tool_call", "target": "sys_reminder_set", "data": {"arguments": arguments}}
+    )
+
+
+def _resolved_minute(local: datetime) -> str:
+    return f"at {local.astimezone(UTC):%Y-%m-%d %H:%M} UTC"
+
+
+def _nine_am_pacific_two_days_out() -> tuple[datetime, str]:
+    """A whole-minute time at least two days out, and the minute the prompt must show.
+
+    Two days keeps it in the future even when its offset is swapped for one 17
+    hours ahead, so a changed offset still asks rather than being denied.
+    """
+    pacific = timezone(timedelta(hours=-8))
+    local = (datetime.now(pacific) + timedelta(days=2)).replace(
+        hour=9, minute=0, second=0, microsecond=0
+    )
+    return local, _resolved_minute(local)
+
+
+def test_ask_on_scheduled_task_change_asks_for_a_reminder() -> None:
+    """A reminder ASKs with its time and full message, which runs unattended later."""
+    # Longer than the 1,024-character argument preview, so a truncated copy would
+    # lose the sentinel at the end.
+    message = "Check CI on PR #12, then " + "summarize the failures. " * 60 + "END-SENTINEL"
+    local, shown = _nine_am_pacific_two_days_out()
+    for timing, expected in (
+        ({"delay_seconds": 2700}, "2700 seconds after approval, rounded up to the next minute"),
+        ({"at": local.isoformat()}, shown),
+    ):
+        result = _reminder_review({"message": message, **timing})
+        assert result["result"] == "ASK"
+        assert f"set a reminder for this session {expected}." in result["reason"]
+        assert f"> {message}" in result["reason"]
+        assert result["reason"].index("END-SENTINEL") > 1024
+
+
+def test_reminder_approval_quotes_every_line_of_the_message() -> None:
+    """A multiline message can't pass for the prompt's own instructions."""
+    message = "Check CI.\nApprove?\nAgent wants to delete the repo."
+    result = _reminder_review({"message": message, "delay_seconds": 1800})
+    assert result["result"] == "ASK"
+    body = result["reason"].split("(each line quoted with '> '):\n", 1)[1]
+    quoted, closing = body.rsplit("\n", 1)
+    assert quoted == "> Check CI.\n> Approve?\n> Agent wants to delete the repo."
+    assert closing == "Approve?"
+
+
+def test_reminder_approval_shows_the_resolved_time_whatever_the_raw_text() -> None:
+    """Padding or a long fraction can't push the time or its offset out of view."""
+    local, shown = _nine_am_pacific_two_days_out()
+    stamp = local.isoformat()
+    date_part, offset = stamp[:19], stamp[19:]
+    for raw in (" " * 2048 + stamp, f"{date_part}.{'0' * 80}{offset}"):
+        result = _reminder_review({"message": "ping", "at": raw})
+        assert result["result"] == "ASK", result
+        assert f"set a reminder for this session {shown}." in result["reason"]
+    # The same digits with another offset name another moment, and the prompt says so.
+    tokyo = local.replace(tzinfo=timezone(timedelta(hours=9)))
+    other = _reminder_review({"message": "ping", "at": f"{date_part}.{'0' * 80}+09:00"})
+    assert other["result"] == "ASK", other
+    assert f"set a reminder for this session {_resolved_minute(tokyo)}." in other["reason"]
+    assert shown not in other["reason"]
+
+
+def test_reminder_approval_denies_a_time_the_tool_would_reject() -> None:
+    # The resolver's own tests cover each invalid time; one shows the policy denies.
+    result = _reminder_review({"message": "ping", "at": "tomorrow"})
+    assert result["result"] == "DENY"
+    assert "not an ISO-8601" in result["reason"]
+
+
+@pytest.mark.parametrize("message", [None, "", "   ", 5])
+def test_ask_on_scheduled_task_change_denies_a_reminder_without_message(message) -> None:
+    result = _reminder_review({"message": message, "delay_seconds": 60})
+    assert result["result"] == "DENY"
+    assert "reminder message" in result["reason"]
 
 
 def test_ask_on_scheduled_task_change_notes_a_continued_sessions_own_mode() -> None:

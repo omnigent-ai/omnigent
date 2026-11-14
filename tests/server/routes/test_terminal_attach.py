@@ -568,16 +568,29 @@ async def test_attach_terminal_read_grant_only_allows_read_only_proxy() -> None:
 
 
 @pytest.mark.parametrize(
-    ("runner_id", "host_live_elsewhere", "expected_code"),
+    ("runner_id", "host_live_elsewhere", "expected_code", "runtime_failure"),
     [
-        ("runner_reconnecting", True, WS_CLOSE_WRONG_REPLICA),
-        ("runner_reconnecting", False, 1013),
-        (None, False, WS_CLOSE_INTERNAL_ERROR),
+        ("runner_reconnecting", True, WS_CLOSE_WRONG_REPLICA, None),
+        ("runner_reconnecting", False, 1013, None),
+        (None, False, WS_CLOSE_INTERNAL_ERROR, None),
+        ("old_runner", False, WS_CLOSE_INTERNAL_ERROR, "capability"),
+        ("old_runner", False, WS_CLOSE_INTERNAL_ERROR, "bundle"),
     ],
-    ids=["wrong_replica", "runner_tunnel_not_connected", "no_runner_pinned"],
+    ids=[
+        "wrong_replica",
+        "runner_tunnel_not_connected",
+        "no_runner_pinned",
+        "capability",
+        "bundle",
+    ],
 )
 async def test_attach_terminal_tunnel_factory_failure_close_code(
-    app: FastAPI, runner_id: str | None, host_live_elsewhere: bool, expected_code: int
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    runner_id: str | None,
+    host_live_elsewhere: bool,
+    expected_code: int,
+    runtime_failure: str | None,
 ) -> None:
     """
     A tunnel-factory failure closes with a code matching its cause: 4400
@@ -605,6 +618,22 @@ async def test_attach_terminal_tunnel_factory_failure_close_code(
         host_registry=HostRegistry(),
         host_store=_HostLiveness(),
     )
+    if runtime_failure:
+        from unittest.mock import Mock
+
+        from omnigent.errors import ErrorCode, OmnigentError
+        from omnigent.server.runtime_compatibility import RuntimeSupportError
+
+        failure = (
+            RuntimeSupportError("Cannot load /example/agent.yaml", code=ErrorCode.CONFLICT)
+            if runtime_failure == "bundle"
+            else OmnigentError("TCP egress support", code=ErrorCode.RUNNER_CAPABILITY_MISMATCH)
+        )
+        monkeypatch.setattr(
+            router,
+            "client_for_existing_conversation",
+            Mock(side_effect=failure),
+        )
     set_runner_ws_factory(make_tunnel_ws_factory(router, tunnels))
 
     with (
@@ -616,6 +645,10 @@ async def test_attach_terminal_tunnel_factory_failure_close_code(
         ws.receive_bytes()
 
     assert exc_info.value.code == expected_code
+    if runtime_failure:
+        assert failure.code in exc_info.value.reason
+        assert "upgrade host/runner" in exc_info.value.reason
+        assert "/example/agent.yaml" not in exc_info.value.reason
 
 
 async def test_attach_terminal_await_launch_waits_for_waking_runner(

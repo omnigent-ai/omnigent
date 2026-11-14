@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import pathlib
+import shlex
 import shutil
 import sys
 import tempfile
@@ -50,8 +51,9 @@ from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, NamedTuple, Protocol, TypeAlias, cast
+from urllib.parse import urlsplit
 
-from omnigent._platform import resolve_cli_binary, stable_user_id
+from omnigent._platform import IS_WINDOWS, resolve_cli_binary, stable_user_id
 from omnigent.cli_invocation import cli_invocation
 from omnigent.databricks_ai_gateway import (
     CLAUDE_CODE_AGENT,
@@ -82,6 +84,7 @@ from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, validate_effort
 from ._subprocess_lifecycle import close_anyio_subprocess_transport
 from .async_utils import run_sync_on_thread
 from .claude_gateway_shim import DATABRICKS_CLAUDE_ADAPTIVE_THINKING_PREFIXES, ClaudeGatewayShim
+from .claude_sdk_key_file import PrivateStaticKeyFile
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
     Executor,
@@ -99,9 +102,11 @@ from .executor import (
     ToolCallRequest,
     ToolCallStatus,
     ToolSpec,
+    TurnCancelled,
     TurnComplete,
     classify_tool_result,
     describe_exception,
+    is_interruption_marker,
     without_tool_history,
 )
 from .native_attachments import framework_notices, unresolved_attachment_marker
@@ -447,6 +452,8 @@ _CONNECT_TIMEOUT_SECONDS = 60.0
 _QUERY_START_TIMEOUT_SECONDS = 30.0
 _MCP_STATUS_TIMEOUT_SECONDS = 10.0
 _MCP_RECONNECT_TIMEOUT_SECONDS = 30.0
+# Leaves room under the harness adapter's 2s interrupt settle budget for the turn to end.
+_INTERRUPT_TIMEOUT_SECONDS = 1.5
 # When the response stream is quiet for this long we emit a warning,
 # but keep waiting — a long-running native tool can legitimately block
 # the stream far longer than any fixed deadline.
@@ -1065,6 +1072,7 @@ class _ManagedMcpRelay:
 class _ClaudeClientState:
     client: _ClaudeClient
     model: str | None
+    static_key_file: PrivateStaticKeyFile | None = None
     loop: asyncio.AbstractEventLoop | None = None
     task: asyncio.Task[None] | None = None
     effort: str | None = None
@@ -1080,6 +1088,10 @@ class _ClaudeClientState:
     mcp_relay: _ManagedMcpRelay | None = None
     # This client's own sandbox launcher, which exposes the managed config and its relay.
     cli_launcher: str | None = None
+    # Set once the current query has been interrupted; cleared when the next query starts.
+    interrupted: bool = False
+    # Whether the next query must carry the runner's interruption marker.
+    interruption_marker_pending: bool = False
 
 
 def _recording_consents(
@@ -1100,10 +1112,15 @@ def _recording_consents(
 
 
 async def _close_managed_mcp_relay(state: _ClaudeClientState) -> None:
-    """Release a gone CLI's relay and launcher; the relay's shutdown blocks briefly."""
+    """Release a gone CLI's auxiliary resources; relay shutdown blocks briefly."""
     relay, launcher = state.mcp_relay, state.cli_launcher
+    key_file, state.static_key_file = state.static_key_file, None
     state.mcp_relay = state.cli_launcher = None
-    await asyncio.to_thread(_release_client_cli, relay, launcher)
+    try:
+        if key_file is not None:
+            key_file.close()
+    finally:
+        await asyncio.to_thread(_release_client_cli, relay, launcher)
 
 
 def _release_client_cli(relay: _ManagedMcpRelay | None, launcher: str | None) -> None:
@@ -1536,7 +1553,9 @@ class _GatewayModelVocabulary(NamedTuple):
 _EMPTY_GATEWAY_VOCABULARY = _GatewayModelVocabulary(alias_pins={}, model_overrides={})
 
 
-def _gateway_model_vocabulary(base_url: str, auth_command: str | None) -> _GatewayModelVocabulary:
+def _gateway_model_vocabulary(
+    base_url: str, auth_command: str | None, api_key: str | None = None
+) -> _GatewayModelVocabulary:
     """Read Claude Code's model vocabulary off a gateway's model listing.
 
     Claude Code resolves a family alias — ``opus`` / ``sonnet`` / ``haiku`` /
@@ -1561,6 +1580,8 @@ def _gateway_model_vocabulary(base_url: str, auth_command: str | None) -> _Gatew
     :param base_url: The gateway's ``ANTHROPIC_BASE_URL``.
     :param auth_command: The gateway ``apiKeyHelper`` command; minted into the
         bearer the listing is fetched with.
+    :param api_key: Optional literal key from the Windows static-key helper.
+        When provided, gateway discovery uses it instead of the helper command.
     :returns: The pins and rewrites the listing supports. Empty — leaving
         today's behavior — when the gateway lists no Claude models or the
         listing cannot be fetched.
@@ -1571,7 +1592,8 @@ def _gateway_model_vocabulary(base_url: str, auth_command: str | None) -> _Gatew
         kind=GATEWAY_KIND,
         family=ANTHROPIC_FAMILY,
         base_url=base_url,
-        auth_command=auth_command,
+        api_key=api_key or None,
+        auth_command=None if api_key else auth_command,
         detail="claude-sdk gateway transport",
     )
     try:
@@ -1628,6 +1650,88 @@ def _claude_settings_payload(
     if disable_claude_ai_connectors:
         settings["disableClaudeAiConnectors"] = True
     return json.dumps(settings, separators=(",", ":")) if settings else None
+
+
+# The helper carries only a path; the client owns the private credential file.
+_STATIC_API_KEY_HELPER_CODE = (
+    "import base64,pathlib,sys;sys.stdout.buffer.write("
+    "pathlib.Path(base64.b64decode(sys.argv[1]).decode()).read_bytes())"
+)
+
+# Characters that would be reinterpreted by cmd.exe (``%`` / ``!`` expansion)
+# or by POSIX sh (``$`` / backtick / backslash-escape) inside double quotes.
+_UNSAFE_HELPER_PATH_CHARS = frozenset('"%!$`\n\r')
+
+
+def _static_printf_secret(command: str | None) -> str | None:
+    """Return the literal key iff *command* is Omnigent's static-key helper form.
+
+    Only an exact ``printf %s <shlex.quote(key)>`` round-trip is recognized,
+    so a user-supplied command that merely *looks* similar (e.g.
+    ``printf %s "$TOKEN"``, which a shell would expand, or anything with
+    trailing shell syntax) is never treated as a static key.
+
+    :param command: An apiKeyHelper command, e.g. ``"printf %s sk-dummy"``.
+    :returns: The literal key, or ``None`` when *command* is not that form.
+    """
+    if not command or not command.startswith("printf %s "):
+        return None
+    try:
+        parts = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if len(parts) != 3 or parts[0] != "printf" or parts[1] != "%s" or not parts[2]:
+        return None
+    secret = parts[2]
+    if command != f"printf %s {shlex.quote(secret)}":
+        return None
+    return secret
+
+
+def _windows_static_key_helper_command(
+    python_executable: str | None, key_path: pathlib.Path
+) -> str | None:
+    """Build a Windows helper whose only operand encodes the private file path.
+
+    :param python_executable: Interpreter path; shell-expanding paths are rejected.
+    :param key_path: Client-owned credential file, never the credential itself.
+    :returns: A command carrying only code and a path, or None for an unsafe interpreter.
+    """
+    if not python_executable:
+        return None
+    if any(ch in _UNSAFE_HELPER_PATH_CHARS for ch in python_executable):
+        return None
+    if "\\\\" in python_executable:
+        return None
+    encoded_path = base64.b64encode(str(key_path).encode("utf-8")).decode("ascii")
+    return f'"{python_executable}" -I -S -c "{_STATIC_API_KEY_HELPER_CODE}" {encoded_path}'
+
+
+def _platform_safe_api_key_helper(
+    command: str | None,
+    *,
+    is_windows: bool | None = None,
+    python_executable: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Defer supported Windows static helpers until their client owns a key file.
+
+    :param command: Generated static helper or a dynamic command.
+    :param is_windows: Platform override for tests.
+    :param python_executable: Interpreter override for tests.
+    :returns: Unchanged command, or (None, static key) for deferred setup.
+    """
+    windows = IS_WINDOWS if is_windows is None else is_windows
+    if not windows or not command:
+        return command, None
+    secret = _static_printf_secret(command)
+    if secret is None:
+        return command, None
+    interpreter = sys.executable if python_executable is None else python_executable
+    if _windows_static_key_helper_command(interpreter, pathlib.Path("key")) is None:
+        raise RuntimeError(
+            "Claude SDK static API-key helper needs a safe Python interpreter path on Windows"
+        )
+    return None, secret
 
 
 def _claude_user_settings_env(cwd: str | None = None) -> dict[str, str]:
@@ -2421,6 +2525,7 @@ class ClaudeSDKExecutor(Executor):
         session_key: str,
         options: SdkOptions,
         model: str | None,
+        static_api_key: str | None = None,
     ) -> _ClaudeClient:
         state = self._clients.get(session_key)
         if state is None:
@@ -2437,7 +2542,29 @@ class ClaudeSDKExecutor(Executor):
                     original_stderr(line)
 
             options.stderr = _tee_stderr
-            client = sdk.ClaudeSDKClient(options)
+            key_file = None
+            try:
+                if static_api_key is not None:
+                    interpreter = sys.executable
+                    if (
+                        _windows_static_key_helper_command(interpreter, pathlib.Path("key"))
+                        is None
+                    ):
+                        raise RuntimeError("Claude SDK helper interpreter is unavailable")
+                    key_file = PrivateStaticKeyFile(static_api_key)
+                    settings = json.loads(getattr(options, "settings", None) or "{}")
+                    helper = _windows_static_key_helper_command(interpreter, key_file.path)
+                    if helper is None:
+                        raise RuntimeError("Claude SDK helper interpreter is unavailable")
+                    settings["apiKeyHelper"] = helper
+                    options.settings = json.dumps(settings, separators=(",", ":"))
+                client = sdk.ClaudeSDKClient(options)
+            except BaseException:
+                options.stderr = original_stderr
+                if key_file is not None:
+                    key_file.close()
+                raise
+            connected = False
             try:
                 # CLAUDECODE must be absent (not just empty) in the child
                 # env — otherwise the claude cli reports a nested-session
@@ -2466,13 +2593,20 @@ class ClaudeSDKExecutor(Executor):
                 with ExitStack() as env_stack:
                     env_stack.enter_context(_unset_env_var("CLAUDECODE"))
                     env_stack.enter_context(_unset_env_var("ANTHROPIC_API_KEY"))
+                    if static_api_key is not None:
+                        # Harness transport commands can contain the literal static key.
+                        for name in (
+                            "HARNESS_CLAUDE_SDK_API_KEY_HELPER",
+                            "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND",
+                        ):
+                            env_stack.enter_context(_unset_env_var(name))
                     if isinstance(sdk_env, dict) and "CLAUDE_CODE_USE_GATEWAY" in sdk_env:
                         env_stack.enter_context(
                             _unset_env_var("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS")
                         )
                     await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT_SECONDS)
+                connected = True
             except TimeoutError as exc:
-                await self._force_close_client(client)
                 tail = "\n".join(line.rstrip() for line in connect_stderr[-40:])
                 detail = tail or "(no CLI stderr captured)"
                 logger.warning(
@@ -2491,7 +2625,6 @@ class ClaudeSDKExecutor(Executor):
                 # the error message is useful rather than just "Command failed
                 # with exit code 1; Check stderr output for details".
                 await asyncio.sleep(0.1)
-                await self._force_close_client(client)
                 tail = "\n".join(line.rstrip() for line in connect_stderr[-40:])
                 detail = tail or "(no CLI stderr captured)"
                 logger.error(
@@ -2507,12 +2640,19 @@ class ClaudeSDKExecutor(Executor):
                 # directly to the original callback and ``connect_stderr``
                 # can be GC'd instead of growing for the session lifetime.
                 options.stderr = original_stderr
+                if not connected:
+                    try:
+                        await self._force_close_client(client)
+                    finally:
+                        if key_file is not None:
+                            key_file.close()
             current_task: asyncio.Task[None] | None = cast(
                 "asyncio.Task[None] | None", asyncio.current_task()
             )
             state = _ClaudeClientState(
                 client=client,
                 model=model,
+                static_key_file=key_file,
                 loop=asyncio.get_running_loop(),
                 task=current_task,
                 effort=getattr(options, "effort", None),
@@ -2680,6 +2820,26 @@ class ClaudeSDKExecutor(Executor):
         # the loop tears down.
         await self._force_close_client(state.client)
 
+    def _provider_auth_hint(self) -> str:
+        """Say where to fix a credential Claude Code could not authenticate with.
+
+        A Databricks profile gets the exact re-login command; other modes use
+        :func:`_claude_auth_remediation`.
+
+        :returns: One sentence, e.g. ``"Check your selected ~/.databrickscfg
+            profile; re-authenticate with `databricks auth login --profile oss`."``
+        """
+        if self._gateway_uses_databricks_profile:
+            if self._databricks_profile:
+                login = f"databricks auth login --profile {shlex.quote(self._databricks_profile)}"
+            else:
+                # No named profile: the token is minted with ``--host``, and this
+                # path's base URL is always ``<workspace host>/ai-gateway/anthropic``.
+                base_url = urlsplit(self._extra_env.get("ANTHROPIC_BASE_URL", ""))
+                login = f"databricks auth login --host {base_url.scheme}://{base_url.netloc}"
+            return f"Check your selected ~/.databrickscfg profile; re-authenticate with `{login}`."
+        return _claude_auth_remediation(databricks_profile=False, gateway=bool(self._gateway))
+
     def _evict_client_on_cancel(self, session_key: str) -> None:
         state = self._clients.pop(session_key, None)
         if state is None:
@@ -2729,23 +2889,24 @@ class ClaudeSDKExecutor(Executor):
         state = self._clients.get(session_key)
         if state is None:
             return False
-        # Interrupt is best-effort and fast; a failure just falls through to
-        # the close below.
+        state.interruption_marker_pending = True
+        if state.interrupted:
+            return True
+        state.interrupted = True
         try:
-            await asyncio.wait_for(state.client.interrupt(), timeout=0.5)
+            await asyncio.wait_for(state.client.interrupt(), timeout=_INTERRUPT_TIMEOUT_SECONDS)
+            return True
+        except asyncio.CancelledError:
+            state.interrupted = False
+            raise
         except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
             logger.warning(
                 "Claude SDK interrupt failed for session %s: %s",
                 session_key,
                 exc,
             )
-        # Always drop the live session after an interrupt. Its transcript
-        # still holds the abandoned prompt, and resumed turns send only the
-        # latest user message (see _build_prompt), so the runner's
-        # "[System: interrupted]" marker would never reach the model. Closing
-        # forces the next turn to rebuild full history (marker included) in a
-        # fresh session — the abandoned request is then visible-but-superseded
-        # rather than silently continued.
+        # The turn may still be running, so drop the session; the next turn
+        # replays history, including the interruption marker, in a fresh one.
         try:
             await self.close_session(session_key)
             return True
@@ -2922,6 +3083,9 @@ class ClaudeSDKExecutor(Executor):
     def supports_tool_boundary_interrupt(self) -> bool:
         return True
 
+    def resumes_after_interrupt(self) -> bool:
+        return True
+
     def max_context_tokens(self) -> int | None:
         return None  # SDK manages its own context
 
@@ -2936,7 +3100,11 @@ class ClaudeSDKExecutor(Executor):
         return "default"
 
     async def _apply_gateway_model_vocabulary(
-        self, env: dict[str, str], auth_command: str | None
+        self,
+        env: dict[str, str],
+        auth_command: str | None,
+        *,
+        static_api_key: str | None = None,
     ) -> dict[str, str]:
         """
         Pin the family aliases in *env* and report Claude Code's id rewrites.
@@ -2955,6 +3123,8 @@ class ClaudeSDKExecutor(Executor):
         :param env: The child-process env dict, mutated in place with the pins.
         :param auth_command: The gateway ``apiKeyHelper`` command used to mint
             a bearer for the model listing.
+        :param static_api_key: Literal key when Windows rewrites a static
+            helper; gateway listing then does not execute the child-only helper.
         :returns: Canonical-to-served rewrites for the ``modelOverrides``
             setting. Empty off the gateway or when discovery found nothing.
         """
@@ -2963,7 +3133,7 @@ class ClaudeSDKExecutor(Executor):
             return {}
         if self._gateway_vocabulary is None:
             self._gateway_vocabulary = await run_sync_on_thread(
-                _gateway_model_vocabulary, base_url, auth_command
+                _gateway_model_vocabulary, base_url, auth_command, static_api_key
             )
         for var, model_id in self._gateway_vocabulary.alias_pins.items():
             env.setdefault(var, model_id)
@@ -3398,7 +3568,11 @@ class ClaudeSDKExecutor(Executor):
         await self._evict_terminated_client(session_key)
         resume_session = session_key in self._clients
         prompt = (
-            self._build_prompt(messages, resume_session=True)
+            self._build_prompt(
+                messages,
+                resume_session=True,
+                after_interrupt=self._clients[session_key].interruption_marker_pending,
+            )
             if resume_session
             else await self._fresh_session_prompt(messages, cfg)
         )
@@ -3509,11 +3683,15 @@ class ClaudeSDKExecutor(Executor):
         env = dict(self._extra_env)
         env["CLAUDE_AGENT_SDK_CLIENT_APP"] = "omnigent"
         api_key_helper = env.pop(_CLAUDE_API_KEY_HELPER_ENV_KEY, None)
+        # Windows uses a Python helper instead of POSIX printf.
+        api_key_helper, static_api_key = _platform_safe_api_key_helper(api_key_helper)
         # Teach Claude Code this gateway's spellings so no model surface routes
         # to an id the gateway rejects: pins for the family aliases, rewrites
         # for the canonical ids the CLI names itself (the refusal-fallback).
         # No-op off the gateway transport.
-        model_overrides = await self._apply_gateway_model_vocabulary(env, api_key_helper)
+        model_overrides = await self._apply_gateway_model_vocabulary(
+            env, api_key_helper, static_api_key=static_api_key
+        )
         # Translate the spec's host-skill filter into the SDK
         # options. Falls back to ``"all"`` semantics when the
         # field is malformed (the parser already validates, so
@@ -3713,10 +3891,7 @@ class ClaudeSDKExecutor(Executor):
         system_diagnostics: list[str] = []
         terminal_error: str | None = None
         terminal_auth_failure = False
-        auth_remediation = _claude_auth_remediation(
-            databricks_profile=self._gateway_uses_databricks_profile,
-            gateway=bool(self._gateway),
-        )
+        auth_remediation = self._provider_auth_hint()
         compaction_occurred: bool = False
         claude_session_id: str | None = None
         compaction_transcript_path: pathlib.Path | None = None
@@ -3849,6 +4024,7 @@ class ClaudeSDKExecutor(Executor):
                 session_key=session_key,
                 options=options,
                 model=model,
+                **({"static_api_key": static_api_key} if static_api_key is not None else {}),
             )
         except BaseException:
             await asyncio.to_thread(_release_client_cli, mcp_relay, cli_launcher)
@@ -3894,12 +4070,17 @@ class ClaudeSDKExecutor(Executor):
                 if message.get("role") != "user":
                     break
                 notice_messages.insert(0, message)
+                if is_interruption_marker(message):
+                    break
         self._pending_framework_context[session_key] = "\n\n".join(
             notice
             for message in notice_messages
             if message.get("role") == "user"
             for notice in framework_notices(message.get("content"))
         )
+        client_state = self._clients.get(session_key)
+        if client_state is not None:
+            client_state.interrupted = False
         try:
             try:
                 sdk_prompt: str | AsyncIterator[_JsonObject]
@@ -3917,6 +4098,8 @@ class ClaudeSDKExecutor(Executor):
                 raise TimeoutError(
                     f"Claude SDK query start timed out after {int(_QUERY_START_TIMEOUT_SECONDS)}s"
                 ) from exc
+            if client_state is not None:
+                client_state.interruption_marker_pending = False
             message_stream = client.receive_response()
             try:
                 while True:
@@ -4025,7 +4208,13 @@ class ClaudeSDKExecutor(Executor):
                         _am_model = concrete_reported_model(getattr(assistant_msg, "model", None))
                         if _am_model is not None:
                             observed_model = _am_model
-                        if got_stream_events:
+                        if getattr(assistant_msg, "error", None):
+                            # A failed API call (e.g. an apiKeyHelper that printed no
+                            # token) arrives as a ``<synthetic>`` message whose text is
+                            # the error, not a reply. The is_error ResultMessage that
+                            # follows fails the turn.
+                            pass
+                        elif got_stream_events:
                             # StreamEvents already emitted text. Emit the
                             # ToolCallRequest here, once the full
                             # ``tool_block.input`` has assembled — see the
@@ -4140,14 +4329,26 @@ class ClaudeSDKExecutor(Executor):
                                 self._agent_name,
                                 failure_text,
                             )
-                            terminal_auth_failure = is_claude_auth_failure_text(failure_text)
+                            error_status = getattr(result_msg, "api_error_status", None)
+                            # A rejected credential can arrive with text that names no auth
+                            # failure (an apiKeyHelper that minted no token), so the status
+                            # counts too.
+                            rejected = error_status in {401, 403}
+                            terminal_auth_failure = rejected or is_claude_auth_failure_text(
+                                failure_text
+                            )
                             # Keep the next step in the message too: the REPL and
                             # SDK stream render only code/message.
-                            terminal_error = (
-                                f"{failure_text.rstrip(_TRAILING_PUNCTUATION)}. {auth_remediation}"
-                                if terminal_auth_failure
-                                else failure_text
-                            )
+                            failure_line = failure_text.rstrip(_TRAILING_PUNCTUATION)
+                            if rejected:
+                                terminal_error = (
+                                    "Claude SDK provider authentication failed"
+                                    f" (status={error_status}): {failure_line}. {auth_remediation}"
+                                )
+                            elif terminal_auth_failure:
+                                terminal_error = f"{failure_line}. {auth_remediation}"
+                            else:
+                                terminal_error = failure_text
                         elif not response_text and result_msg.result:
                             response_text = result_msg.result
                         raw_usage = getattr(result_msg, "usage", None)
@@ -4338,6 +4539,14 @@ class ClaudeSDKExecutor(Executor):
         if turn_usage is None:
             turn_usage = _usage_from_observed_call(last_call_usage, observed_model or model)
 
+        if client_state is not None and client_state.interrupted:
+            # The CLI's result for an interrupted query is not a turn outcome. Its compaction
+            # never reaches the server, so drop the compacted client and replay history next turn.
+            if compaction_occurred:
+                self._evict_client_on_cancel(session_key)
+            yield TurnCancelled()
+            return
+
         if terminal_error:
             if compaction_occurred and claude_session_id:
                 compaction_event = _build_compaction_complete_event()
@@ -4433,6 +4642,7 @@ class ClaudeSDKExecutor(Executor):
         *,
         resume_session: bool,
         history_token_budget: int | None = None,
+        after_interrupt: bool = False,
     ) -> str | list[_JsonObject]:
         """
         Build the prompt for the SDK.
@@ -4457,13 +4667,17 @@ class ClaudeSDKExecutor(Executor):
             history may use, e.g. ``100000``. The newest prior messages
             that fit are kept behind a marker counting the omitted ones;
             ``None`` replays every prior message.
+        :param after_interrupt: ``True`` when the resumed session's
+            interruption marker has not been delivered yet.
         :returns: A plain string prompt, or a list of Anthropic
             API content block dicts when multimodal blocks are
             present in the latest user message.
         """
         if resume_session:
             # The live session already holds its tool items; only a fresh one replays them.
-            return ClaudeSDKExecutor._extract_trailing_user_content(without_tool_history(messages))
+            return ClaudeSDKExecutor._extract_trailing_user_content(
+                without_tool_history(messages), after_interrupt=after_interrupt
+            )
 
         if not _has_replayable_history(messages):
             return ClaudeSDKExecutor._extract_latest_user_content(messages)
@@ -4551,6 +4765,8 @@ class ClaudeSDKExecutor(Executor):
     @staticmethod
     def _extract_trailing_user_content(
         messages: list[Message],
+        *,
+        after_interrupt: bool = False,
     ) -> str | list[_JsonObject]:
         """
         Extract the trailing run of consecutive user messages for the SDK.
@@ -4572,6 +4788,8 @@ class ClaudeSDKExecutor(Executor):
         survive.
 
         :param messages: Conversation history.
+        :param after_interrupt: ``True`` when an interruption marker in
+            the run has not been delivered yet, so it is sent too.
         :returns: A string prompt, or a list of Anthropic content
             block dicts when the trailing run is multimodal.
         """
@@ -4590,6 +4808,11 @@ class ClaudeSDKExecutor(Executor):
                     # Compaction may emit no assistant text; keep it out of later prompts.
                     if not trailing:
                         return "/compact"
+                    break
+                # The live session already received the user input before an interruption.
+                if is_interruption_marker(msg):
+                    if after_interrupt:
+                        trailing.append(msg)
                     break
                 trailing.append(msg)
             else:

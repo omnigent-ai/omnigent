@@ -165,6 +165,9 @@ _STDERR_CHUNK_LIMIT = 65536
 _CODEX_STATE_DB_GLOB = "state_*.sqlite"
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
 _MAX_WEBSOCKET_MESSAGE_SIZE_BYTES = 128 << 20
+# Disable local keepalive so host stalls do not tear down Codex. A live but
+# deadlocked app-server will no longer time out.
+_APP_SERVER_PING_INTERVAL_SECONDS: float | None = None
 # hooks.json filename written into the private CODEX_HOME registering the
 # Omnigent policy hook. Codex discovers it as a ``user``-layer hook
 # source on every config load (see codex hooks ``discover_handlers``).
@@ -1334,6 +1337,7 @@ class CodexAppServerClient:
                 self._ws_url,
                 max_size=_MAX_WEBSOCKET_MESSAGE_SIZE_BYTES,
                 compression=None,
+                ping_interval=_APP_SERVER_PING_INTERVAL_SECONDS,
             )
         else:
             self._ws = await websockets.unix_connect(
@@ -1341,6 +1345,7 @@ class CodexAppServerClient:
                 uri=_UDS_WEBSOCKET_HANDSHAKE_URI,
                 max_size=_MAX_WEBSOCKET_MESSAGE_SIZE_BYTES,
                 compression=None,
+                ping_interval=_APP_SERVER_PING_INTERVAL_SECONDS,
             )
         # Fresh queue per connection so a previous stream's end marker
         # cannot end this connection's consumers.
@@ -1538,9 +1543,12 @@ class CodexAppServerClient:
 
         :returns: None.
         """
-        assert self._ws is not None
+        ws = self._ws
+        assert ws is not None
+        cancelled = False
+        failure: Exception | None = None
         try:
-            async for raw in self._ws:
+            async for raw in ws:
                 if not isinstance(raw, str):
                     continue
                 decoded: object = json.loads(raw)
@@ -1569,7 +1577,34 @@ class CodexAppServerClient:
                         future.set_result(message)
                     continue
                 await self._events.put(message)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        except ConnectionClosed:
+            raise
+        except Exception as exc:
+            failure = exc
+            raise
         finally:
+            # Cancellation is our own close(); anything else ends the forwarder,
+            # so record why the stream stopped.
+            if failure is not None:
+                _logger.warning(
+                    "Codex app-server reader failed with the socket still open",
+                    exc_info=(type(failure), failure, failure.__traceback__),
+                    extra=debug_event("codex_app_server_reader_failed"),
+                )
+            elif not cancelled:
+                _logger.warning(
+                    "Codex app-server connection closed: code=%s reason=%r",
+                    ws.close_code,
+                    ws.close_reason,
+                    extra=debug_event(
+                        "codex_app_server_connection_closed",
+                        close_code=ws.close_code,
+                        close_reason=ws.close_reason,
+                    ),
+                )
             # Wake iter_events() consumers: no further events can arrive.
             self._events.put_nowait(None)
 

@@ -29,7 +29,7 @@ import { useMobilePanelHeaderTarget } from "./MobilePanelDrawer";
 import { PullRequestCommentComposer } from "./PullRequestCommentComposer";
 import { usePullRequestReviewThreads } from "@/hooks/usePullRequestReviewThreads";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { skipToken, useQuery, useQueryClient } from "@tanstack/react-query";
+import { skipToken, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import {
   ArrowLeftIcon,
   CopyIcon,
@@ -644,9 +644,9 @@ function PullRequestCheckCounts({
   );
 }
 
-/** The Summary tab body: reviewers beside labels, then CI checks with the Merge button, then
- *  the PR description, with dividers between. When the token can't read check runs, the
- *  Checks area says so instead of counts. */
+/** The Summary tab body: reviewers beside labels (stacked when narrow), then CI checks with the
+ *  Merge button, then the PR description, with dividers between. When the token can't read
+ *  check runs, the Checks area says so instead of counts. */
 function PullRequestSummaryTab({
   reviewers,
   labels,
@@ -672,10 +672,18 @@ function PullRequestSummaryTab({
     // Blocks carry their own padding so the dividers between them span the full width.
     <div>
       {showPeople && (
-        <div className="flex">
+        <div className="flex @max-[480px]:flex-col">
           {showReviewers && <div className="min-w-0 flex-1 p-3">{reviewers}</div>}
-          {showReviewers && labels && <Separator orientation="vertical" />}
-          {labels && <div className="min-w-0 flex-1 p-3">{labels}</div>}
+          {labels && (
+            <div
+              className={cn(
+                "min-w-0 flex-1 p-3",
+                showReviewers && "border-l @max-[480px]:border-t @max-[480px]:border-l-0",
+              )}
+            >
+              {labels}
+            </div>
+          )}
         </div>
       )}
       {showPeople && showStatus && <Separator />}
@@ -999,6 +1007,18 @@ interface PullRequestPanelView {
 
 const DEFAULT_PANEL_VIEW: PullRequestPanelView = { showingDetails: false, subtab: "summary" };
 
+export function selectPullRequestInPanel(
+  queryClient: QueryClient,
+  conversationId: string,
+  prUrl: string,
+) {
+  queryClient.setQueryData<PullRequestPanelView>(["pull-request-panel-view", conversationId], {
+    selected: prUrl,
+    showingDetails: true,
+    subtab: "summary",
+  });
+}
+
 export function PullRequestPanel({
   conversationId,
   active = true,
@@ -1018,11 +1038,13 @@ export function PullRequestPanel({
     gcTime: 30 * 60_000,
   });
   // Keep interactions synchronous; the shared entry restores the view on navigation.
-  const [localView, setLocalView] = useState({ conversationId, view: cachedView });
-  if (localView.conversationId !== conversationId) {
-    setLocalView({ conversationId, view: cachedView });
+  const [localView, setLocalView] = useState({ conversationId, cachedView, view: cachedView });
+  const cacheChanged =
+    localView.conversationId !== conversationId || localView.cachedView !== cachedView;
+  if (cacheChanged) {
+    setLocalView({ conversationId, cachedView, view: cachedView });
   }
-  const view = localView.conversationId === conversationId ? localView.view : cachedView;
+  const view = cacheChanged ? cachedView : localView.view;
   const selected = view.selected;
   const showingDetails = view.showingDetails;
   const activeTab = view.subtab;
@@ -1037,7 +1059,7 @@ export function PullRequestPanel({
           ...update,
         }),
       );
-      setLocalView({ conversationId, view: next! });
+      setLocalView((current) => ({ ...current, conversationId, view: next! }));
     },
     [queryClient, conversationId],
   );

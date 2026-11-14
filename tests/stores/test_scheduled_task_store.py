@@ -118,6 +118,122 @@ def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
     assert task.host_id is None
     assert task.delegation_ref is None
     assert task.state == "active"
+    assert task.kind == "automation"
+
+
+_REMINDER_RULE = "FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=14;BYHOUR=15;BYMINUTE=0;BYSECOND=0;COUNT=1"
+
+
+def _reminder_fields(**overrides: Any) -> dict[str, Any]:
+    fields: dict[str, Any] = {
+        "name": "Reminder: check CI",
+        "prompt": "check CI",
+        "rrule": _REMINDER_RULE,
+        "user_id": "u",
+        "agent_id": _uid("ag"),
+        "timezone": "UTC",
+        "session_mode": "continue",
+        "session_id": _uid("conv"),
+        "kind": "reminder",
+    }
+    fields.update(overrides)
+    return fields
+
+
+def test_a_reminder_round_trips(store: SqlAlchemyScheduledTaskStore) -> None:
+    created = store.create(scheduled_task_id=_uid("st_reminder"), **_reminder_fields())
+    assert created.kind == "reminder"
+    assert store.get(created.id).kind == "reminder"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"rrule": "FREQ=MINUTELY"},
+        {"session_id": None},
+        # Keeps the session, so only the session mode disqualifies it.
+        {"session_mode": "new"},
+    ],
+    ids=["recurring", "no_session", "new_session_mode"],
+)
+def test_create_refuses_a_reminder_that_does_not_fit(
+    store: SqlAlchemyScheduledTaskStore, overrides: dict[str, Any]
+) -> None:
+    with pytest.raises(ValueError, match="a reminder needs"):
+        store.create(scheduled_task_id=_uid("st_bad_reminder"), **_reminder_fields(**overrides))
+    assert store.list() == []
+
+
+def test_create_rejects_an_unknown_kind(store: SqlAlchemyScheduledTaskStore) -> None:
+    with pytest.raises(ValueError, match=r"scheduled_tasks\.kind"):
+        store.create(scheduled_task_id=_uid("st_bad_kind"), **_reminder_fields(kind="trigger"))
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        {"rrule": "FREQ=MINUTELY"},
+        {"session_id": None},
+        # Keeps the session, so only the session mode disqualifies it.
+        {"session_mode": "new"},
+    ],
+    ids=["recurs", "leaves_its_session", "new_session_mode"],
+)
+def test_an_edit_that_stops_a_reminder_fitting_makes_it_an_automation(
+    store: SqlAlchemyScheduledTaskStore, edit: dict[str, Any]
+) -> None:
+    task_id = store.create(scheduled_task_id=_uid("st_demote"), **_reminder_fields()).id
+    assert store.update(task_id, name="renamed").kind == "reminder"
+    assert store.update(task_id, **edit).kind == "automation"
+    # Restoring the old shape does not make it a reminder again.
+    restored = store.update(
+        task_id, rrule=_REMINDER_RULE, session_mode="continue", session_id=_uid("conv")
+    )
+    assert restored.kind == "automation"
+
+
+@pytest.mark.parametrize(
+    "arrival", ["on_time", "one_second_early", "at_the_minute", "late", "late_and_exhausted"]
+)
+def test_first_run_at_is_checked_against_the_saved_schedule(
+    store: SqlAlchemyScheduledTaskStore, monkeypatch: pytest.MonkeyPatch, arrival: str
+) -> None:
+    from datetime import UTC, datetime
+
+    from omnigent.stores.scheduled_task_store import (
+        ScheduledTaskFirstRunMismatchError,
+        sqlalchemy_store,
+    )
+    from omnigent.tools.builtins.scheduled_tasks import reminder_rrule
+
+    store.configure_dispatch(True)
+    fire_at = 1_800_000_000 + 7200 - (1_800_000_000 + 7200) % 60
+    when = datetime.fromtimestamp(fire_at, UTC)
+    rule = reminder_rrule(when)
+    if arrival == "late_and_exhausted":
+        # Ends at the requested minute, so a late create leaves no run at all.
+        rule = rule.replace(";COUNT=1", f";UNTIL={when.strftime('%Y%m%dT%H%M%SZ')}")
+    # A run must fall strictly after creation, so a task created at its minute is late.
+    created_at = {
+        "on_time": fire_at - 7200,
+        "one_second_early": fire_at - 1,
+        "at_the_minute": fire_at,
+    }.get(arrival, fire_at + 1)
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: created_at)
+    fields = _reminder_fields(rrule=rule, kind="automation", first_run_at=fire_at)
+    if arrival in ("on_time", "one_second_early"):
+        task = store.create(scheduled_task_id=_uid("st_first_run"), **fields)
+        assert task.next_run_at == fire_at
+        return
+    with pytest.raises(ScheduledTaskFirstRunMismatchError) as caught:
+        store.create(scheduled_task_id=_uid("st_first_run"), **fields)
+    assert caught.value.expected == fire_at
+    # A late COUNT=1 rule would move to the same minute a year later; nothing is saved.
+    if arrival != "late_and_exhausted":
+        assert caught.value.actual is not None and caught.value.actual > fire_at
+    else:
+        assert caught.value.actual is None
+    assert store.list() == []
 
 
 # ── state enum ────────────────────────────────────────────────────────────────

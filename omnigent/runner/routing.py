@@ -216,6 +216,7 @@ class RunnerRouter:
         if conv is None:
             raise OmnigentError("conversation not found", code=ErrorCode.NOT_FOUND)
         if conv.runner_id:
+            self.require_runtime_support(conv)
             return self._routed_pinned_runner(conv, conv.runner_id, harness=harness)
         raise OmnigentError(
             f"conversation {conversation_id!r} is not bound to a runner; "
@@ -245,6 +246,25 @@ class RunnerRouter:
         :raises OmnigentError: If the conversation is missing, the
             pinned runner is offline, or no online runner is available.
         """
+        return self._client_for_session(
+            conversation_id, conversation=conversation, check_runtime=True
+        )
+
+    def client_for_session_control(
+        self, conversation_id: str, *, conversation: Conversation | None = None
+    ) -> RoutedRunner:
+        """Route control and observation without admitting execution."""
+        return self._client_for_session(
+            conversation_id, conversation=conversation, check_runtime=False
+        )
+
+    def _client_for_session(
+        self,
+        conversation_id: str,
+        *,
+        conversation: Conversation | None,
+        check_runtime: bool,
+    ) -> RoutedRunner:
         conv = conversation
         if conv is not None and conv.id != conversation_id:
             raise ValueError(
@@ -262,6 +282,8 @@ class RunnerRouter:
                     conv.runner_id,
                     f"runner {conv.runner_id!r} is offline for conversation {conversation_id!r}",
                 )
+            if check_runtime:
+                self.require_runtime_support(conv)
             return RoutedRunner(
                 runner_id=conv.runner_id,
                 client=self._client_for_runner(conv.runner_id),
@@ -277,8 +299,8 @@ class RunnerRouter:
         """
         Return the pinned runner client for an already-started conversation.
 
-        Used by server surfaces like terminal listing and interrupt
-        forwarding that know the conversation but do not know the
+        Used by terminal attachment and background requests that
+        know the conversation but do not know the
         harness kind. Unpinned or missing conversations return
         ``None`` so callers can fall back to local test/in-process
         behavior.
@@ -299,6 +321,7 @@ class RunnerRouter:
                 conv.runner_id,
                 f"runner {conv.runner_id!r} is offline for conversation {conversation_id!r}",
             )
+        self.require_runtime_support(conv)
         return RoutedRunner(
             runner_id=conv.runner_id,
             client=self._client_for_runner(conv.runner_id),
@@ -325,21 +348,14 @@ class RunnerRouter:
         connection = self._registry.get(runner_id)
         return connection is not None and capability in connection.hello.capabilities
 
-    def require_mcp_registry_support(self, conversation: Conversation) -> None:
-        """Validate the connected runner before sending it a registry-backed agent."""
-        from omnigent.host.frames import CAP_MCP_REGISTRY
-
+    def require_runtime_support(self, conversation: Conversation) -> None:
+        """Validate the connected runner before sending it a restricted agent."""
         connection = self._registry.get(conversation.runner_id) if conversation.runner_id else None
-        if (
-            connection is None
-            or CAP_MCP_REGISTRY in connection.hello.capabilities
-            or self._agent_store is None
-            or self._agent_cache is None
-        ):
+        if connection is None or self._agent_store is None or self._agent_cache is None:
             return
-        from omnigent.server.mcp_compatibility import require_session_registry_mcp_support
+        from omnigent.server.runtime_compatibility import require_session_runtime_support
 
-        require_session_registry_mcp_support(
+        require_session_runtime_support(
             conversation,
             connection.hello.capabilities,
             component="runner",

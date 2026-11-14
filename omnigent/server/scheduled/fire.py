@@ -117,7 +117,12 @@ from omnigent.server.scheduled.harness_settings import (
     scheduled_agent_harness,
     validate_scheduled_permission_mode,
 )
-from omnigent.server.scheduled.schedule import continued_sandbox_host_id, is_trigger_automation
+from omnigent.server.scheduled.rrule import is_one_time_rule
+from omnigent.server.scheduled.schedule import (
+    continued_sandbox_host_id,
+    is_trigger_automation,
+    strip_trigger_header,
+)
 from omnigent.server.scheduled.source_session import (
     SourceCopyIncompleteError,
     SourceHistoryUnsupportedError,
@@ -315,6 +320,11 @@ class _FireRecorder(Protocol):
         """The run's ID, known before the run row exists for legacy timers."""
         ...
 
+    @property
+    def managed_host_id(self) -> str | None:
+        """The sandbox host id this fire's managed session is created with and launched under."""
+        ...
+
     async def check(self) -> None:
         """Raise before an external action if the fire may no longer proceed."""
         ...
@@ -351,6 +361,16 @@ class _NewRunRecorder:
         # Chosen now so the session can name its run before the row is written.
         self._run_id = _new_id()
         self._session_id: str | None = None
+        # No run row carries an id, so a fresh managed fire chooses one here.
+        self._fresh_host_id = uuid.uuid4().hex
+
+    @property
+    def managed_host_id(self) -> str | None:
+        if self._task.execution_target != "managed_sandbox":
+            return None
+        if self._task.session_mode == "continue":
+            return continued_sandbox_host_id(self._task.id, self._task.workspace_id)
+        return self._fresh_host_id
 
     @property
     def run_id(self) -> str:
@@ -399,14 +419,9 @@ class _NewRunRecorder:
         if start is None:
             return
         # Started only after the run exists, so a fast launch failure has a
-        # running run to fail. A continue task keeps one sandbox host.
-        host_id = (
-            continued_sandbox_host_id(task.id, task.workspace_id)
-            if task.session_mode == "continue"
-            else None
-        )
+        # running run to fail.
         try:
-            start(conv, task, host_id, _LEGACY_LAUNCH_ERRORS)
+            start(conv, task, self.managed_host_id, _LEGACY_LAUNCH_ERRORS)
         except Exception as exc:
             _logger.exception(
                 "scheduled fire: managed launch did not start for task %s (session %s)",
@@ -455,7 +470,7 @@ UNATTENDED_RUN_NOTE = (
 
 def _prompt_event(prompt: str) -> SessionEventInput:
     """Build the user-message event that carries a task's prompt to the runner."""
-    text = f"{prompt.rstrip()}\n\n{UNATTENDED_RUN_NOTE}"
+    text = f"{strip_trigger_header(prompt).rstrip()}\n\n{UNATTENDED_RUN_NOTE}"
     return SessionEventInput(
         type="message",
         data={"role": "user", "content": [{"type": "input_text", "text": text}]},
@@ -747,7 +762,9 @@ async def _run_fire_for_task(
         )
         return
 
-    if task.continues_session:
+    if task.continues_session and not is_one_time_rule(task.rrule):
+        # A one-time task, such as a reminder, belongs to its session: with the
+        # session gone it fails instead of running in a new one without its context.
         task = await _release_replaceable_session(deps, task)
     if task.continues_session:
         await _continue_session(
@@ -831,7 +848,9 @@ async def _run_fire_for_task(
             deps,
             effective,
             labels={
-                **_session_labels(task, session_mcp_selection(deps.app_state)),
+                **_session_labels(
+                    task, session_mcp_selection(deps.app_state), recorder.managed_host_id
+                ),
                 SCHEDULED_TASK_RUN_LABEL_KEY: recorder.run_id,
             },
         )
@@ -983,12 +1002,13 @@ async def _source_session_problem(deps: FireDeps, task: ScheduledTask) -> tuple[
 async def _release_replaceable_session(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
     """Drop a continued session that was deleted or never started, so this run starts a new one.
 
-    Only a session that no longer exists, or the task's sandbox session whose
-    first launch failed, is replaced: nothing ever ran in the latter. One the
-    owner archived or that no longer fits the task still fails the run, so a
-    change they made is never undone silently. The new session is recorded like a
-    first run's, and a managed sandbox is provisioned again when the earlier
-    session's workspace is gone (see :func:`_continued_host_binding`).
+    Not called for one-time (``COUNT=1``) tasks, which fail instead. Only a
+    session that no longer exists, or the task's sandbox session whose first
+    launch failed, is replaced: nothing ever ran in the latter. One the owner
+    archived or that no longer fits the task still fails the run, so a change
+    they made is never undone silently. The new session is recorded like a first
+    run's, and a managed sandbox is provisioned again when the earlier session's
+    workspace is gone (see :func:`_continued_host_binding`).
     """
     session_id = task.session_id
     assert session_id is not None  # guarded by the caller
@@ -1057,7 +1077,7 @@ async def _continue_session(
         reason, error_code = problem
         _logger.warning("scheduled fire: task %s cannot continue its session: %s", task.id, reason)
         await recorder.finish(
-            "failed", error=f"{reason}; {_NEW_SESSION_HINT}", error_code=error_code
+            "failed", error=f"{reason}; {_recovery_hint(task)}", error_code=error_code
         )
         return
     assert conv is not None
@@ -1099,7 +1119,7 @@ async def _continue_session(
             "failed",
             conversation_id=session_id,
             error="the session already has a cost cap this automation did not set; remove it "
-            f"from the session's policies, or {_NEW_SESSION_HINT}",
+            f"from the session's policies, or {_recovery_hint(task)}",
             error_code="continued_session_budget_conflict",
         )
         return
@@ -1179,6 +1199,14 @@ async def _undo_run_label(
 
 
 _NEW_SESSION_HINT = "edit the automation to start a new session on its next run"
+# A one-time task, such as a reminder, has no next run to change.
+_ONE_TIME_HINT = "it has no later run; set a new reminder or create a new automation"
+
+
+def _recovery_hint(task: ScheduledTask) -> str:
+    """What the owner can do about a continued run that failed."""
+    return _ONE_TIME_HINT if is_one_time_rule(task.rrule) else _NEW_SESSION_HINT
+
 
 UNATTENDED_PERMISSION_ERROR_CODE = "permission_mode_not_allowed"
 
@@ -1807,16 +1835,17 @@ def _sandbox_workspaces(task: ScheduledTask) -> list[str]:
 
 
 def _session_labels(
-    task: ScheduledTask, mcp_selection: SessionMcpSelection | None = None
+    task: ScheduledTask,
+    mcp_selection: SessionMcpSelection | None = None,
+    managed_host_id: str | None = None,
 ) -> dict[str, str]:
     """Labels a fired session starts with.
 
     The task's MCP services become the deployment's selection labels, so every
-    run starts with the same services. A continue task's sandbox session records
-    the host id it routes by, so a relaunched sandbox keeps connecting to the
-    replica that owns that id. A task with no services writes no selection
-    labels, even ones a deployment would use to encode an empty selection, so a
-    copied session keeps its own.
+    run starts with the same services. A managed fire's session records the
+    sandbox host id it was launched under, so the host routes by that id from
+    its first connection and a relaunch keeps the same replica. A task with no
+    services writes no selection labels, so a copied session keeps its own.
     """
     selection_labels = (
         (mcp_selection or session_mcp_selection(None)).session_labels(task.mcp_services)
@@ -1828,10 +1857,10 @@ def _session_labels(
         SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id,
         **managed_repo_labels(_sandbox_workspaces(task)),
     }
-    if task.execution_target == "managed_sandbox" and task.session_mode == "continue":
+    if task.execution_target == "managed_sandbox" and managed_host_id is not None:
         from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
 
-        labels[REQUESTED_HOST_ID_LABEL_KEY] = continued_sandbox_host_id(task.id, task.workspace_id)
+        labels[REQUESTED_HOST_ID_LABEL_KEY] = managed_host_id
     return labels
 
 
@@ -2769,6 +2798,10 @@ class _ClaimedRunRecorder:
     def run_id(self) -> str:
         return self._lease.run.id
 
+    @property
+    def managed_host_id(self) -> str | None:
+        return self._lease.run.host_id
+
     async def check(self) -> None:
         await self._lease.check()
 
@@ -3036,7 +3069,12 @@ class ClaimedRunExecutor:
                 )
                 await recorder.finish(
                     "failed",
-                    error="Could not act as the automation's owner. The next run tries again.",
+                    error="Could not act as the automation's owner. "
+                    + (
+                        "It has no later run, so set it again."
+                        if is_one_time_rule(task.rrule)
+                        else "The next run tries again."
+                    ),
                     error_code="owner_identity_unavailable",
                 )
                 return

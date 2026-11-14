@@ -677,7 +677,7 @@ const WORKER_SETTINGS_PATTERN = new RegExp(
 );
 
 function workerSettingsMatch(prompt: string) {
-  const parts = splitTriggerPrompt(prompt);
+  const parts = splitTriggerPrompt(stripTriggerHeader(prompt));
   if (parts.systemPrompt === null) return null;
   const manager = parts.systemPrompt.split(triggerPromptHeadings(parts.systemPrompt).posting)[0];
   const matches = [...manager.matchAll(WORKER_SETTINGS_PATTERN)];
@@ -764,8 +764,8 @@ function taskSessionPromptOpening(source: TriggerSource): string {
 }
 
 /**
- * Whether `prompt` was rendered from a trigger template. A saved task doesn't
- * record its template, so the edit form recognizes the prompt's opening line.
+ * Whether `prompt` was rendered from a trigger template: it has a trigger
+ * header, or (for tasks saved before headers) the rendered opening line.
  */
 export function isTriggerPrompt(prompt: string): boolean {
   return triggerPromptSource(prompt) !== null;
@@ -773,12 +773,229 @@ export function isTriggerPrompt(prompt: string): boolean {
 
 /** The service a rendered trigger prompt watches, from its opening line; null otherwise. */
 export function triggerPromptSource(prompt: string): TriggerSource | null {
-  return TRIGGER_SOURCES.find((source) => prompt.startsWith(triggerPromptOpening(source))) ?? null;
+  const body = stripTriggerHeader(prompt);
+  return TRIGGER_SOURCES.find((source) => body.startsWith(triggerPromptOpening(source))) ?? null;
 }
 
 /** Whether a trigger prompt sends every match to one task session. */
 export function isTaskSessionTriggerPrompt(prompt: string): boolean {
-  return TRIGGER_SOURCES.some((source) => prompt.startsWith(taskSessionPromptOpening(source)));
+  const body = stripTriggerHeader(prompt);
+  return TRIGGER_SOURCES.some((source) => body.startsWith(taskSessionPromptOpening(source)));
+}
+
+/** Who each worker session is and where it starts. */
+export interface TriggerWorkerConfig extends TriggerWorkerSettings {
+  placement: WorkerPlacement;
+}
+
+/**
+ * Everything the trigger form edits; saved as the prompt's first line. An
+ * absent `taskSessionMode` means each match starts its own session.
+ */
+export interface TriggerConfig extends TriggerFields {
+  source: TriggerSource;
+  taskSessionMode?: TriggerTaskSessionMode;
+  worker: TriggerWorkerConfig;
+}
+
+const TRIGGER_HEADER_VERSION = 1;
+// Keep in sync with _TRIGGER_HEADER in omnigent/server/scheduled/schedule.py,
+// which strips this line before the prompt reaches the model.
+const TRIGGER_HEADER_PATTERN = /^<!-- omnigent-trigger v(\d+) ([^\n]*) -->\n/;
+
+/** The prompt without its trigger header line, if it has one. */
+export function stripTriggerHeader(prompt: string): string {
+  return prompt.replace(TRIGGER_HEADER_PATTERN, "");
+}
+
+/** Whether `prompt` starts with a trigger header line, readable or not. */
+export function hasTriggerHeader(prompt: string): boolean {
+  return TRIGGER_HEADER_PATTERN.test(prompt);
+}
+
+/** `config` with its keys in one fixed order, so equal configs serialize equally. */
+/** A config as the header stores it: settings at their defaults are left out. */
+type SavedTriggerConfig = Omit<TriggerConfig, "worker"> & {
+  worker: Omit<TriggerWorkerConfig, "permissionMode"> & { permissionMode?: string };
+};
+
+function canonicalConfig(config: TriggerConfig): SavedTriggerConfig {
+  return {
+    source: config.source,
+    event: config.event,
+    scope: config.scope,
+    ...(config.scopeOperator !== undefined ? { scopeOperator: config.scopeOperator } : {}),
+    conditions: config.conditions.map(({ field, operator, value, name }) => ({
+      field,
+      operator,
+      value,
+      ...(name !== undefined ? { name } : {}),
+    })),
+    ...(config.target !== undefined ? { target: config.target } : {}),
+    instructions: config.instructions,
+    linkBack: config.linkBack,
+    ...(config.linkBackTouched !== undefined ? { linkBackTouched: config.linkBackTouched } : {}),
+    ...(config.taskSessionMode === "continue" ? { taskSessionMode: config.taskSessionMode } : {}),
+    worker: {
+      placement: config.worker.placement,
+      agentId: config.worker.agentId,
+      model: config.worker.model,
+      effort: config.worker.effort,
+      ...(config.worker.permissionMode ? { permissionMode: config.worker.permissionMode } : {}),
+    },
+  };
+}
+
+/**
+ * Detects edits made outside the form: a hash of the config and the body it
+ * rendered. Change detection only (cyrb53), not a security boundary.
+ */
+function triggerFingerprint(config: TriggerConfig, body: string): string {
+  const text = `${JSON.stringify(canonicalConfig(config))}\n${body}`;
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    h1 = Math.imul(h1 ^ code, 2654435761);
+    h2 = Math.imul(h2 ^ code, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(16).padStart(14, "0");
+}
+
+/** What a saved config doesn't hold: the link, polling interval and task-session title. */
+export type TriggerConfigContext = Pick<
+  TriggerPromptContext,
+  "sessionLink" | "pollingIntervalMinutes" | "taskSessionTitle"
+>;
+
+/** The prompt the model receives for `config`, without the header line. */
+export function renderTriggerConfigPrompt(
+  config: TriggerConfig,
+  ctx: TriggerConfigContext,
+): string {
+  const { source, worker, taskSessionMode, ...fields } = config;
+  return renderTriggerPrompt(source, fields, {
+    ...ctx,
+    placement: worker.placement,
+    agentId: worker.agentId,
+    model: worker.model || undefined,
+    effort: worker.effort || undefined,
+    permissionMode: worker.permissionMode || undefined,
+    taskSessionMode,
+  });
+}
+
+/** A worker config's settings, without where the workers start. */
+export function triggerWorkerSettingsOf(worker: TriggerWorkerConfig): TriggerWorkerSettings {
+  const { placement: _placement, ...settings } = worker;
+  return settings;
+}
+
+/**
+ * The saved prompt for a trigger: a one-line header holding `config`, which
+ * the edit form reads back, then the rendered prompt the model receives.
+ */
+export function encodeTriggerPrompt(config: TriggerConfig, ctx: TriggerConfigContext): string {
+  const body = renderTriggerConfigPrompt(config, ctx);
+  const header = { ...canonicalConfig(config), fingerprint: triggerFingerprint(config, body) };
+  // Escaping < and > keeps a value such as "-->" from ending the comment early.
+  const json = JSON.stringify(header).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
+  return `<!-- omnigent-trigger v${TRIGGER_HEADER_VERSION} ${json} -->\n${body}`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function decodeCondition(value: unknown, template: TriggerTemplate): TriggerCondition | null {
+  if (!isRecord(value) || typeof value.value !== "string") return null;
+  if (value.name !== undefined && typeof value.name !== "string") return null;
+  const field = template.fields.find((candidate) => candidate.id === value.field);
+  const operator = value.operator as TriggerOperator;
+  if (field === undefined || !field.operators.includes(operator)) return null;
+  return {
+    field: field.id,
+    operator,
+    value: value.value,
+    ...(value.name !== undefined ? { name: value.name } : {}),
+  };
+}
+
+function decodeWorker(value: unknown): TriggerWorkerConfig | null {
+  if (!isRecord(value)) return null;
+  const { placement, agentId, model, effort, permissionMode } = value;
+  if (placement !== "same_host" && placement !== "managed") return null;
+  if (agentId !== null && typeof agentId !== "string") return null;
+  if (typeof model !== "string" || typeof effort !== "string") return null;
+  if (permissionMode !== undefined && typeof permissionMode !== "string") return null;
+  return { placement, agentId, model, effort, permissionMode: permissionMode ?? "" };
+}
+
+/**
+ * The trigger form state saved in `prompt`'s header, or null when the prompt
+ * has no header, one this version can't read, or one whose fingerprint shows
+ * the header or body was edited outside the form, so it opens as free text.
+ */
+export function decodeTriggerPrompt(prompt: string): TriggerConfig | null {
+  const match = TRIGGER_HEADER_PATTERN.exec(prompt);
+  if (match === null || Number(match[1]) !== TRIGGER_HEADER_VERSION) return null;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(match[2]);
+  } catch {
+    return null;
+  }
+  if (!isRecord(raw) || !TRIGGER_SOURCES.includes(raw.source as TriggerSource)) return null;
+  const source = raw.source as TriggerSource;
+  const template = TRIGGER_TEMPLATES[source];
+  const {
+    event,
+    scope,
+    scopeOperator,
+    conditions,
+    target,
+    instructions,
+    linkBack,
+    linkBackTouched,
+    taskSessionMode,
+  } = raw;
+  if (
+    typeof event !== "string" ||
+    !template.events.some((candidate) => candidate.id === event) ||
+    typeof scope !== "string" ||
+    (scopeOperator !== undefined &&
+      scopeOperator !== "is" &&
+      scopeOperator !== "in" &&
+      scopeOperator !== "contains") ||
+    !Array.isArray(conditions) ||
+    (target !== undefined && typeof target !== "string") ||
+    typeof instructions !== "string" ||
+    typeof linkBack !== "boolean" ||
+    (linkBackTouched !== undefined && typeof linkBackTouched !== "boolean") ||
+    (taskSessionMode !== undefined && taskSessionMode !== "new" && taskSessionMode !== "continue")
+  ) {
+    return null;
+  }
+  const decodedConditions = conditions.map((condition) => decodeCondition(condition, template));
+  const worker = decodeWorker(raw.worker);
+  if (decodedConditions.some((condition) => condition === null) || worker === null) return null;
+  const config: TriggerConfig = {
+    source,
+    event,
+    scope,
+    ...(scopeOperator !== undefined ? { scopeOperator } : {}),
+    conditions: decodedConditions as TriggerCondition[],
+    ...(target !== undefined ? { target } : {}),
+    instructions,
+    linkBack,
+    ...(linkBackTouched !== undefined ? { linkBackTouched } : {}),
+    ...(taskSessionMode === "continue" ? { taskSessionMode } : {}),
+    worker,
+  };
+  const body = prompt.slice(match[0].length);
+  return raw.fingerprint === triggerFingerprint(config, body) ? config : null;
 }
 
 /**

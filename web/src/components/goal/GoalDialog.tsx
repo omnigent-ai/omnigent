@@ -557,7 +557,8 @@ export function GoalDialog({
           </DialogTitle>
         </DialogHeader>
 
-        <div className="min-h-0 space-y-3 overflow-y-auto">
+        {/* Leave room for focus rings inside the scrollable region. */}
+        <div className="-m-1 min-h-0 space-y-3 overflow-y-auto p-1">
           <GoalSummary loading={loading} goal={goal} />
           <GoalEditor
             objective={state.objective}

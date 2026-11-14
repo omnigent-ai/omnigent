@@ -1035,16 +1035,65 @@ def test_session_metadata_host_type_defaults_external() -> None:
     assert SessionCreateMetadata().host_type == "external"
 
 
-def test_session_metadata_managed_rejects_host_id() -> None:
+_MANAGED_HOST_ID = "0123456789abcdef0123456789abcdef"
+
+
+def test_session_metadata_managed_accepts_requested_host_id() -> None:
     """
-    Multipart ``host_type="managed"`` + a caller-supplied ``host_id`` is
-    a contradiction (the server provisions the host) — mirrors the JSON
-    path's contract.
+    Multipart ``host_type="managed"`` + ``host_id`` names the new sandbox
+    host, the same as the JSON create: it moves to ``requested_host_id``
+    and survives a dump-and-revalidate.
     """
     from omnigent.server.schemas import SessionCreateMetadata
 
-    with pytest.raises(ValidationError, match="host_id must not be set"):
-        SessionCreateMetadata(host_type="managed", host_id="host_abc")
+    meta = SessionCreateMetadata(host_type="managed", host_id=_MANAGED_HOST_ID)
+    assert meta.host_id is None
+    assert meta.requested_host_id == _MANAGED_HOST_ID
+    again = SessionCreateMetadata.model_validate_json(meta.model_dump_json())
+    assert again.requested_host_id == _MANAGED_HOST_ID
+
+
+def test_session_metadata_without_host_id_leaves_requested_host_id_unset() -> None:
+    """The absent-field path is unchanged: no requested host id is set."""
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    meta = SessionCreateMetadata(host_type="managed")
+    assert meta.requested_host_id is None
+    assert meta.host_id is None
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        pytest.param(
+            {"host_type": "managed", "host_id": "host_abc"},
+            "32 lowercase hex characters",
+            id="malformed",
+        ),
+        pytest.param(
+            {"host_type": "managed", "host_id": _MANAGED_HOST_ID.upper()},
+            "32 lowercase hex characters",
+            id="uppercase",
+        ),
+        pytest.param(
+            {"host_type": "managed", "host_id": _MANAGED_HOST_ID, "parent_session_id": "conv_p"},
+            "managed child session",
+            id="parent",
+        ),
+        pytest.param(
+            {"requested_host_id": _MANAGED_HOST_ID},
+            "only applies to host_type 'managed'",
+            id="external",
+        ),
+    ],
+)
+def test_session_metadata_rejects_invalid_requested_host_id(
+    kwargs: dict[str, Any], message: str
+) -> None:
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    with pytest.raises(ValidationError, match=message):
+        SessionCreateMetadata(**kwargs)
 
 
 def test_session_metadata_managed_rejects_path_workspace() -> None:

@@ -415,6 +415,8 @@ class _OfflineRunnerRouter:
             code=ErrorCode.RUNNER_UNAVAILABLE,
         )
 
+    client_for_session_control = client_for_session_resources
+
 
 def _assert_worktree_offline_conflict(resp: httpx.Response) -> None:
     """Assert the Option B 409 body for offline worktree cleanup.

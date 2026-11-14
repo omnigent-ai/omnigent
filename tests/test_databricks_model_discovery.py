@@ -312,18 +312,24 @@ def test_family_shim_warns_and_delegates_to_the_catalog() -> None:
     assert families == {"opus": "system.ai.claude-opus-5"}
 
 
-def _discover_codex(model_services: list[dict[str, object]]) -> tuple[str, ...]:
-    """Run codex discovery against a canned ``system.ai`` model-services page."""
-    from omnigent.models.databricks_model_discovery import discover_databricks_codex_models
+def _uc_models_transport(model_services: list[dict[str, object]]) -> httpx.MockTransport:
+    """Return a mock transport serving a single ``schemas/system.ai`` page."""
 
     def _handler(request: httpx.Request) -> httpx.Response:
         assert request.url.params["parent"] == "schemas/system.ai"
         return httpx.Response(200, json={"model_services": model_services}, request=request)
 
+    return httpx.MockTransport(_handler)
+
+
+def _discover_codex(model_services: list[dict[str, object]]) -> tuple[str, ...]:
+    """Run codex discovery against a canned ``system.ai`` model-services page."""
+    from omnigent.models.databricks_model_discovery import discover_databricks_codex_models
+
     return discover_databricks_codex_models(
         "https://workspace.example.com",
         "token",
-        transport=httpx.MockTransport(_handler),
+        transport=_uc_models_transport(model_services),
     )
 
 
@@ -468,3 +474,54 @@ def test_select_servable_model_matches_legacy_spelling() -> None:
     assert select_servable_model("gpt-5.6-luna", servable) == "system.ai.gpt-5-6-luna"
     # A model the workspace does not serve is left for the caller to pass through.
     assert select_servable_model("databricks-gpt-9-9", servable) is None
+
+
+def test_discover_gemini_models_uses_supported_api_types_with_prefix_fallback() -> None:
+    """Gemini discovery honors declared Gemini wire types and falls back on legacy listings."""
+    from omnigent.models.databricks_model_discovery import discover_databricks_gemini_models
+
+    model_services: list[dict[str, object]] = [
+        # Non-gemini-* Google models advertising native Gemini wire routes.
+        {
+            "name": "model-services/system.ai.google-model-1",
+            "supported_api_types": ["gemini/v1beta/models", "mlflow/v1/chat/completions"],
+        },
+        {
+            "name": "model-services/system.ai.google-model-2",
+            "supported_api_types": [" Gemini/v1beta "],
+        },
+        {
+            "name": "model-services/system.ai.google-model-3",
+            "supported_api_types": ["gemini"],
+        },
+        # Gemini-named model serving only OpenAI/MLflow routes must be excluded.
+        {
+            "name": "model-services/system.ai.gemini-3-1-pro",
+            "supported_api_types": ["mlflow/v1/chat/completions", "mlflow/v1/responses"],
+        },
+        # Legacy entries without supported_api_types fall back to the gemini- prefix.
+        {"name": "model-services/system.ai.gemini-2-5-flash"},
+        {"name": "model-services/system.ai.gemini-2-5-pro", "supported_api_types": []},
+        {"name": "model-services/system.ai.gemini-2-5-lite", "supported_api_types": None},
+        {"name": "model-services/system.ai.claude-opus-5"},
+        # Malformed non-list supported_api_types is rejected rather than treated as legacy.
+        {
+            "name": "model-services/system.ai.gemini-9-9",
+            "supported_api_types": "gemini/v1beta/models",
+        },
+    ]
+
+    discovered = discover_databricks_gemini_models(
+        "https://workspace.example.com",
+        "token",
+        transport=_uc_models_transport(model_services),
+    )
+
+    assert discovered == (
+        "system.ai.gemini-2-5-flash",
+        "system.ai.gemini-2-5-lite",
+        "system.ai.gemini-2-5-pro",
+        "system.ai.google-model-1",
+        "system.ai.google-model-2",
+        "system.ai.google-model-3",
+    )

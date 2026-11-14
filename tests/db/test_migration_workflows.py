@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import sqlalchemy as sa
 from alembic import command
 
@@ -22,9 +23,13 @@ def _migrate(uri: str, engine: sa.Engine, revision: str, *, down: bool = False) 
         (command.downgrade if down else command.upgrade)(config, revision)
 
 
-def test_upgrade_matches_the_model_and_downgrade_drops_the_table(tmp_path: Path) -> None:
+@pytest.mark.parametrize("previous_revision", ["base", "9a2c7e6b4f10", "27d16059fab9"])
+def test_upgrade_matches_the_model_and_downgrade_drops_the_table(
+    tmp_path: Path, previous_revision: str
+) -> None:
     uri = f"sqlite:///{tmp_path / 'workflows.db'}"
     engine = sa.create_engine(uri)
+    _migrate(uri, engine, previous_revision)
     _migrate(uri, engine, "head")
     inspector = sa.inspect(engine)
 

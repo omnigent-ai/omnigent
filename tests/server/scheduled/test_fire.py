@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import threading
 import time
 from collections.abc import Mapping, Sequence
@@ -68,6 +69,9 @@ from omnigent.stores.conversation_store import (
     SessionActivity,
 )
 from tests.server.helpers import build_agent_bundle
+
+# The trigger form's saved state; see encodeTriggerPrompt in web/.../triggerTemplates.ts.
+TRIGGER_HEADER = '<!-- omnigent-trigger v1 {"source":"jira","instructions":"--\\u003e"} -->\n'
 
 # ── Fakes ──────────────────────────────────────────────────────────────────
 
@@ -718,13 +722,19 @@ async def test_delete_between_on_fire_and_run_fire_is_noop() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("session_mode", ["new", "continue"])
 @pytest.mark.parametrize("trigger", [False, True])
-async def test_active_creates_session_grant_and_run(session_mode: str, trigger: bool) -> None:
+@pytest.mark.parametrize("header", ["", TRIGGER_HEADER])
+async def test_active_creates_session_grant_and_run(
+    session_mode: str, trigger: bool, header: str
+) -> None:
     perm = FakePermissionStore()
     conv_store = FakeConversationStore()
     task = _task(
-        prompt="This automation watches Jira and starts one Omnigent session"
-        if trigger
-        else "Do the work.",
+        prompt=header
+        + (
+            "This automation watches Jira and starts one Omnigent session"
+            if trigger
+            else "Do the work."
+        ),
         session_mode=session_mode,
     )
     store = FakeScheduledTaskStore(rows={"task_1": task})
@@ -1562,10 +1572,11 @@ async def test_connected_host_dispatch_uses_resolved_local_owner(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("header", ["", TRIGGER_HEADER])
 async def test_sent_prompt_tells_the_agent_no_one_is_watching(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, header: str
 ) -> None:
-    """The message a fire sends ends with the unattended-run note; the task keeps its prompt."""
+    """The message a fire sends drops the trigger header and ends with the unattended-run note."""
     import omnigent.server.routes.sessions as sessions_routes
 
     sent: list[SessionEventInput] = []
@@ -1585,7 +1596,7 @@ async def test_sent_prompt_tells_the_agent_no_one_is_watching(
     monkeypatch.setattr(
         sessions_routes, "_dispatch_session_event_to_runner", _dispatch_session_event_to_runner
     )
-    task = _task(prompt="Merge the open Dependabot PRs.\n")
+    task = _task(prompt=f"{header}Merge the open Dependabot PRs.\n")
 
     await fire_mod._send_prompt(
         _deps(FakeScheduledTaskStore(rows={"task_1": task})),
@@ -1602,7 +1613,7 @@ async def test_sent_prompt_tells_the_agent_no_one_is_watching(
             }
         ]
     ]
-    assert task.prompt == "Merge the open Dependabot PRs.\n"
+    assert task.prompt == f"{header}Merge the open Dependabot PRs.\n"
 
 
 @pytest.mark.asyncio
@@ -2346,6 +2357,14 @@ async def test_managed_fire_saves_prompt_then_launches_fresh_sandbox(
 
     assert calls == ["enqueue", "launch"] * 2
     assert len({saved["session_id"] for saved in startup.enqueued}) == 2
+    # Each fresh fire picks its sandbox host id, records it on its session, and launches under it.
+    launched_host_ids = [call.kwargs["host_id"] for call in managed_launch.await_args_list]
+    assert all(re.fullmatch(r"[0-9a-f]{32}", host_id) for host_id in launched_host_ids)
+    assert len(set(launched_host_ids)) == 2
+    from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
+
+    labels = [created["labels"] for created in conversations.created]
+    assert [label[REQUESTED_HOST_ID_LABEL_KEY] for label in labels] == launched_host_ids
     for saved in startup.enqueued:
         assert saved["user_id"] == RESERVED_USER_LOCAL
         assert saved["event"].data["content"] == [
@@ -2421,9 +2440,14 @@ async def test_managed_fire_does_not_block_next_fire_while_provisioning(
     )
 
     try:
-        for _ in range(2):
+        for launched in (1, 2):
             assert await run_now(0, "task_1") is True
             await _drain()
+            # The launch task reads the host row before it calls the launcher, so poll for it.
+            for _ in range(200):
+                if managed_launch.await_count == launched:
+                    break
+                await asyncio.sleep(0.005)
         assert managed_launch.await_count == 2
         assert [run["status"] for run in store.runs] == ["running"] * 2
     finally:
@@ -3239,6 +3263,29 @@ async def test_continue_starts_a_new_session_when_the_old_one_was_deleted() -> N
     assert [conv.id for conv in launched] == [new_session_id]
     assert [run["status"] for run in store.runs] == ["running"]
     assert store.runs[0].get("error_code") is None
+
+
+@pytest.mark.asyncio
+async def test_a_one_time_task_fails_instead_of_replacing_its_deleted_session() -> None:
+    """A reminder belongs to its session: with the session gone, nothing runs elsewhere."""
+    conv_store = _ExistingConversationStore()  # conv_prev is gone
+    reminder = _continuing_task(
+        rrule="FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=12;BYHOUR=23;BYMINUTE=0;BYSECOND=0;COUNT=1"
+    )
+    store = FakeScheduledTaskStore(rows={"task_1": reminder})
+
+    launched = await _fire_once(_deps(store, conversation_store=conv_store))
+
+    assert launched == []
+    assert conv_store.created == []
+    assert store.released == []
+    assert store.adopted == []
+    assert [(run["status"], run.get("error_code")) for run in store.runs] == [
+        ("failed", "continued_session_missing")
+    ]
+    # It has no next run, so the hint for recurring tasks would mislead.
+    assert "next run" not in store.runs[0]["error"]
+    assert "set a new reminder" in store.runs[0]["error"]
 
 
 @pytest.mark.asyncio

@@ -32,6 +32,7 @@ import uuid
 import weakref
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
@@ -68,6 +69,7 @@ from omnigent.native.native_coding_agents import public_agent_name
 from omnigent.policies.builtins.safety import scheduled_task_review_error
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.journal_tools import JOURNAL_TOOL_NAMES, execute_journal_tool
+from omnigent.runner.session_requests import remember_session_host
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
@@ -87,6 +89,12 @@ from omnigent.tools.builtins.os_env import (
     SysOsReadTool,
     SysOsShellTool,
     SysOsWriteTool,
+)
+from omnigent.tools.builtins.scheduled_tasks import (
+    reminder_name,
+    reminder_prompt,
+    reminder_rrule,
+    resolve_reminder_time,
 )
 from omnigent.tools.builtins.session_message import (
     SysSessionMessageTool,
@@ -454,12 +462,14 @@ _POLICY_TOOLS = frozenset({"sys_add_policy", "sys_policy_registry"})
 
 # Priority 5l.1: Scheduled-task management — the runner proxies the Omnigent
 # server's /v1/scheduled-tasks REST endpoints (same posture as _POLICY_TOOLS).
+# sys_reminder_set creates a one-time task that continues the calling session.
 _SCHEDULED_TASK_TOOLS = frozenset(
     {
         "sys_scheduled_task_create",
         "sys_scheduled_task_list",
         "sys_scheduled_task_update",
         "sys_scheduled_task_delete",
+        "sys_reminder_set",
     }
 )
 
@@ -1530,6 +1540,48 @@ def _subagent_message_from_args(args: _JsonObject) -> str | None:
     return None
 
 
+async def _get_session_metadata(
+    server_client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    timeout: float,
+    include_items: bool = False,
+    include_usage: bool = False,
+    include_liveness: bool = False,
+    include_live_status: bool = False,
+) -> httpx.Response:
+    """
+    Read a session snapshot via ``GET /v1/sessions/{id}``, light by default.
+
+    The defaults skip every costly optional part of the snapshot: the
+    transcript page, the spawn-tree usage aggregate, the runner/host
+    liveness lookup, and the live-status probe of the bound runner (so
+    ``status`` comes from the server's cached or persisted value). Opt in
+    only to the parts the caller reads.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param session_id: Session to read, e.g. ``"conv_abc123"``.
+    :param timeout: Request timeout in seconds.
+    :param include_items: Return the latest committed ``items``.
+    :param include_usage: Return ``total_cost_usd`` / ``usage_by_model``.
+    :param include_liveness: Return ``runner_online`` / ``host_online``.
+    :param include_live_status: Probe the bound runner for ``status`` on a
+        server status-cache miss.
+    :returns: The raw server response; callers map its status code.
+    """
+    flags = {
+        "include_items": include_items,
+        "include_usage": include_usage,
+        "include_liveness": include_liveness,
+        "include_live_status": include_live_status,
+    }
+    return await server_client.get(
+        _session_url(session_id),
+        params={name: "true" if enabled else "false" for name, enabled in flags.items()},
+        timeout=timeout,
+    )
+
+
 async def _session_turn_actor(
     *,
     server_client: httpx.AsyncClient,
@@ -1537,7 +1589,7 @@ async def _session_turn_actor(
 ) -> str | None:
     """Return the parent turn actor label for runner-originated callbacks."""
     try:
-        resp = await server_client.get(f"{_session_url(conversation_id)}", timeout=10.0)
+        resp = await _get_session_metadata(server_client, conversation_id, timeout=10.0)
     except (httpx.HTTPError, ValueError, RuntimeError):
         return None
     if resp.status_code != 200:
@@ -1870,7 +1922,7 @@ async def _inherited_parent_model(
     if not harness_supports_model_override(child_harness):
         return None
     try:
-        resp = await server_client.get(f"{_session_url(conversation_id)}", timeout=10.0)
+        resp = await _get_session_metadata(server_client, conversation_id, timeout=10.0)
     except (httpx.HTTPError, ValueError, RuntimeError):
         return None
     if resp.status_code != 200:
@@ -2663,10 +2715,7 @@ async def _execute_subagent_tool(
     parent_agent_id = _runner_app.get_session_agent_id(conversation_id)
     if parent_agent_id is None:
         try:
-            sess_resp = await server_client.get(
-                f"{_session_url(conversation_id)}",
-                timeout=10.0,
-            )
+            sess_resp = await _get_session_metadata(server_client, conversation_id, timeout=10.0)
             if sess_resp.status_code == 200:
                 parent_agent_id = sess_resp.json().get("agent_id")
         except (httpx.HTTPError, RuntimeError):
@@ -3013,6 +3062,7 @@ async def _execute_subagent_tool(
         child_session_id = child_data.get("session_id") or child_data.get("id")
         if not isinstance(child_session_id, str) or not child_session_id:
             return "Error: server did not return child session_id"
+        remember_session_host(child_session_id, _optional_string(child_data.get("host_id")))
         child_wrapper_label = _session_wrapper_label(child_data)
         created_child = True
 
@@ -3230,7 +3280,7 @@ async def _send_to_existing_session(
     from omnigent.runner import subagent_work as _subagent_work
 
     try:
-        snap = await server_client.get(f"{_session_url(target_session_id)}", timeout=30.0)
+        snap = await _get_session_metadata(server_client, target_session_id, timeout=30.0)
     except Exception as exc:  # noqa: BLE001
         return f"Error: sys_session_send failed to look up session: {exc}"
     if snap.status_code == 404:
@@ -3843,8 +3893,11 @@ async def _execute_session_create(
                             "no session was created."
                         }
                     )
+            # Sent only when /v1/info reports the server accepts host_id; older servers reject it.
             host_id = (
-                uuid.uuid4().hex if info_data.get("request_managed_sandbox_host_id") else None
+                uuid.uuid4().hex
+                if info_data.get("request_managed_sandbox_host_id") is True
+                else None
             )
             if host_id is not None:
                 body["host_id"] = host_id
@@ -3903,6 +3956,8 @@ async def _execute_session_create(
         if placement != "child":
             return json.dumps(unconfirmed_creation)
         return json.dumps({"error": "server did not return a child session id"})
+    # A managed create is addressed to host_id; the session stays there, so cache it now.
+    remember_session_host(data["id"], _optional_string(data.get("host_id")) or host_id)
     if placement != "child":
         handle: dict[str, object] = {
             "conversation_id": data["id"],
@@ -5159,6 +5214,189 @@ async def _project_id_for_name(
     return project_id
 
 
+def _reminder_may_exist(tool_name: str, problem: str, *, details: str | None = None) -> str:
+    """An error for a create that may have been saved, so a retry doesn't duplicate it."""
+    error: dict[str, str] = {
+        "error": f"{tool_name}: {problem}. It may still have been created: check "
+        "sys_scheduled_task_list for a 'Reminder: ...' automation before setting it again."
+    }
+    if details is not None:
+        error["details"] = details
+    return json.dumps(error)
+
+
+_REMINDER_SESSION_PARAMS = {
+    "include_items": "false",
+    "include_usage": "false",
+    "include_liveness": "false",
+    "include_live_status": "false",
+}
+
+
+async def _reminder_schedule_mismatch(
+    server_client: httpx.AsyncClient, task: _JsonObject, when: datetime
+) -> str | None:
+    """
+    An error for a reminder the server scheduled at another time, or ``None``.
+
+    The server already refuses a mismatched ``first_run_at``; this guards against
+    one that ignored it. The wrong task is deleted, and its id is reported if the
+    delete fails, so a reminder never silently fires a year late.
+    """
+    raw_next = task.get("next_run_at")
+    try:
+        scheduled = datetime.fromisoformat(raw_next) if isinstance(raw_next, str) else None
+    except ValueError:
+        scheduled = None
+    if scheduled is not None and scheduled == when:
+        return None
+    task_id = task.get("id")
+    problem = (
+        f"sys_reminder_set: the server scheduled the reminder for {raw_next}, "
+        f"not {when.isoformat()}"
+    )
+    task_url = _scheduled_task_url(task_id)
+    if task_url is None:
+        return json.dumps({"error": f"{problem}; it returned no task id to delete"})
+    try:
+        deleted = await server_client.delete(task_url, timeout=30.0)
+        removed = deleted.status_code < 400
+    except Exception:  # noqa: BLE001
+        removed = False
+    if removed:
+        return json.dumps({"error": f"{problem}, so it was deleted; set it again"})
+    return json.dumps(
+        {
+            "error": f"{problem}, and deleting it failed; delete it with "
+            "sys_scheduled_task_delete",
+            "scheduled_task_id": task_id,
+        }
+    )
+
+
+async def _execute_reminder_set(
+    args: _JsonObject,
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str | None,
+) -> str:
+    """
+    Create a one-time scheduled task that sends a message into this session.
+
+    The task continues the calling session with the session's own agent, so the
+    reminder arrives as a new turn there. It needs a server whose scheduler counts
+    ``COUNT`` from creation, which ``/v1/info`` advertises as
+    ``scheduled_task_one_time``; elsewhere the call is refused before anything is
+    created.
+
+    :param args: Parsed ``sys_reminder_set`` arguments: ``message`` plus ``at`` or
+        ``delay_seconds``.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: The calling session, e.g. ``"conv_abc123"``.
+    :returns: Tool output JSON with the new ``scheduled_task_id`` and fire time.
+    """
+    tool_name = "sys_reminder_set"
+    if conversation_id is None:
+        return json.dumps({"error": f"{tool_name} requires a session"})
+    message = args.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return json.dumps({"error": f"{tool_name}: message must be a non-empty string"})
+    when = resolve_reminder_time(args, datetime.now(UTC))
+    if isinstance(when, str):
+        return json.dumps({"error": f"{tool_name}: {when}"})
+    try:
+        info = await server_client.get("/v1/info", timeout=30.0)
+        if info.status_code >= 400 or info.json().get("scheduled_task_one_time") is not True:
+            return json.dumps(
+                {
+                    "error": f"{tool_name}: this Omnigent server does not support one-time "
+                    "reminders; use sys_timer_set if it is enabled, or a recurring "
+                    "sys_scheduled_task_create task"
+                }
+            )
+        # Only the agent id is needed, so skip the transcript, usage and live probes.
+        session = await server_client.get(
+            _session_url(conversation_id), params=_REMINDER_SESSION_PARAMS, timeout=30.0
+        )
+        if session.status_code >= 400:
+            return json.dumps(
+                {
+                    "error": f"{tool_name}: could not read this session "
+                    f"(server returned {session.status_code})",
+                    "details": session.text[:1000],
+                }
+            )
+        snapshot = _string_object_dict(session.json()) or {}
+        agent_id = snapshot.get("agent_id")
+        if not isinstance(agent_id, str) or not agent_id:
+            return json.dumps({"error": f"{tool_name}: this session has no agent to remind"})
+        if snapshot.get("side_chat_parent_id"):
+            # A side chat runs on its source's runner, which a reminder can't wake
+            # once it has stopped, so the reminder could fail unseen.
+            return json.dumps(
+                {
+                    "error": f"{tool_name}: reminders can't be set from a side chat; "
+                    "set it in the session the side chat belongs to"
+                }
+            )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"{tool_name} failed: {exc}"})
+    try:
+        resp = await server_client.post(
+            "/v1/scheduled-tasks",
+            json={
+                "name": reminder_name(message),
+                "prompt": reminder_prompt(message, when),
+                "rrule": reminder_rrule(when),
+                "timezone": "UTC",
+                "agent_id": agent_id,
+                # A continued session keeps its own permission mode.
+                "permission_mode": None,
+                "session_mode": "continue",
+                "session_id": conversation_id,
+                "kind": "reminder",
+                # The server refuses the task unless its first run is this minute,
+                # so a request that arrives late can't move to next year's match.
+                "first_run_at": int(when.timestamp()),
+            },
+            timeout=30.0,
+            headers={
+                ORCHESTRATION_SOURCE_HEADER: conversation_id,
+                "x-omnigent-automation-source": "agent",
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        # The server may have saved the reminder before its response was lost.
+        return _reminder_may_exist(tool_name, f"the request to create the reminder failed ({exc})")
+    if resp.status_code >= 500:
+        # A gateway can answer 502 or 504 after the server saved the task.
+        return _reminder_may_exist(
+            tool_name, f"the server returned {resp.status_code}", details=resp.text[:1000]
+        )
+    if resp.status_code >= 400:
+        return json.dumps(
+            {"error": f"server returned {resp.status_code}", "details": resp.text[:1000]}
+        )
+    try:
+        task = _string_object_dict(resp.json()) or {}
+    except ValueError:
+        # Accepted, but the body can't be read: the reminder likely exists.
+        return _reminder_may_exist(tool_name, "the server's reply to the create was unreadable")
+    mismatch = await _reminder_schedule_mismatch(server_client, task, when)
+    if mismatch is not None:
+        return mismatch
+    return json.dumps(
+        {
+            "status": "scheduled",
+            "scheduled_task_id": task.get("id"),
+            "fire_at": when.isoformat(),
+            "next_run_at": task.get("next_run_at"),
+            "message": message,
+            "cancel_with": "sys_scheduled_task_delete",
+        }
+    )
+
+
 async def _execute_scheduled_task_tool(
     tool_name: str,
     arguments: str,
@@ -5190,6 +5428,10 @@ async def _execute_scheduled_task_tool(
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
     if not isinstance(args, dict):
         return json.dumps({"error": f"{tool_name}: arguments must be an object"})
+    if tool_name == "sys_reminder_set":
+        return await _execute_reminder_set(
+            args, server_client=server_client, conversation_id=conversation_id
+        )
     if tool_name in ("sys_scheduled_task_create", "sys_scheduled_task_update"):
         action = "create" if tool_name == "sys_scheduled_task_create" else "update"
         error = scheduled_task_review_error(args, action=action)
@@ -5222,7 +5464,11 @@ async def _execute_scheduled_task_tool(
                     }
                 )
         if tool_name == "sys_scheduled_task_list":
-            resp = await server_client.get("/v1/scheduled-tasks", timeout=30.0)
+            # Includes reminders, which the list leaves out by default, so an agent
+            # can find one to cancel.
+            resp = await server_client.get(
+                "/v1/scheduled-tasks", params={"kind": "all"}, timeout=30.0
+            )
         elif tool_name == "sys_scheduled_task_create":
             payload = {k: args[k] for k in _SCHEDULED_TASK_CREATE_FIELDS if k in args}
             refusal = await _scheduled_task_session_fields_refusal(
@@ -5628,10 +5874,9 @@ async def _session_get_info_via_rest(
             {"error": "sys_session_get_info requires a non-empty 'session_id' string"}
         )
     try:
-        resp = await server_client.get(
-            f"{_session_url(raw_target)}",
-            params={"include_items": "false", "include_liveness": "false"},
-            timeout=30.0,
+        # ``status`` is projected, so keep the live-status probe on a cache miss.
+        resp = await _get_session_metadata(
+            server_client, raw_target, timeout=30.0, include_live_status=True
         )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_get_info failed: {exc}"})
@@ -6208,12 +6453,8 @@ async def _spawn_family(
     if conversation_id in _spawn_family_cache:
         return _spawn_family_cache[conversation_id]
     try:
-        resp = await server_client.get(
-            f"{_session_url(conversation_id)}",
-            # Only the routing fields are read, so skip the history and
-            # runner-liveness work the full snapshot would do.
-            params={"include_items": "false", "include_liveness": "false"},
-            timeout=_SPAWN_FAMILY_TIMEOUT_S,
+        resp = await _get_session_metadata(
+            server_client, conversation_id, timeout=_SPAWN_FAMILY_TIMEOUT_S
         )
     except Exception:  # noqa: BLE001 — discovery must not fail on this read
         return None
@@ -6288,10 +6529,8 @@ async def _agent_list_host_readiness(
                 if len(seen) >= _AGENT_READINESS_MAX_DEPTH:
                     return None
                 seen.add(conversation_id)
-                response = await server_client.get(
-                    f"{_session_url(conversation_id)}",
-                    params={"include_items": "false", "include_liveness": "false"},
-                    timeout=_AGENT_READINESS_TIMEOUT_S,
+                response = await _get_session_metadata(
+                    server_client, conversation_id, timeout=_AGENT_READINESS_TIMEOUT_S
                 )
                 if response.status_code != 200:
                     return None
@@ -6640,13 +6879,7 @@ async def _rename_current_session_via_rest(
     # rename would corrupt sibling addressing. Refuse explicitly, matching
     # the old seed-gated endpoint's response for child sessions.
     try:
-        info_response = await server_client.get(
-            f"{_session_url(conversation_id)}",
-            # Skip the transcript and the runner/host liveness lookup — the
-            # probe only needs parent_session_id.
-            params={"include_items": "false", "include_liveness": "false"},
-            timeout=30.0,
-        )
+        info_response = await _get_session_metadata(server_client, conversation_id, timeout=30.0)
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_rename failed: {exc}"})
     if info_response.status_code >= 400:
@@ -7033,7 +7266,7 @@ async def _session_parent_id(
     :returns: The parent session id, or ``None``.
     """
     try:
-        snap = await server_client.get(f"{_session_url(conversation_id)}", timeout=30.0)
+        snap = await _get_session_metadata(server_client, conversation_id, timeout=30.0)
     except Exception:  # noqa: BLE001
         return None
     if snap.status_code != 200:
@@ -7140,7 +7373,7 @@ async def _fetch_close_target(
         otherwise) suitable for returning verbatim to the LLM.
     """
     try:
-        snap = await server_client.get(f"{_session_url(target_id)}", timeout=30.0)
+        snap = await _get_session_metadata(server_client, target_id, timeout=30.0)
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_close failed: {exc}"})
     if snap.status_code == 404:
@@ -7185,8 +7418,8 @@ async def _close_tree_scope_error(
         ``session_not_a_sub_agent``).
     """
     try:
-        caller_snap = await server_client.get(
-            f"{_session_url(caller_conversation_id)}", timeout=30.0
+        caller_snap = await _get_session_metadata(
+            server_client, caller_conversation_id, timeout=30.0
         )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_close failed: {exc}"})
@@ -7325,7 +7558,7 @@ async def _fetch_peek_meta(
         payloads (all empty/``None`` on any miss).
     """
     try:
-        snap = await server_client.get(f"{_session_url(target_id)}", timeout=30.0)
+        snap = await _get_session_metadata(server_client, target_id, timeout=30.0)
     except Exception:  # noqa: BLE001
         return _PeekMeta(agent=None, title=None, pending_elicitations=[])
     if snap.status_code != 200:
@@ -8251,9 +8484,8 @@ async def _execute_rest_tool(
             # Bind to the parent's runner so event forwarding works.
             if conversation_id is not None:
                 try:
-                    parent_resp = await server_client.get(
-                        f"{_session_url(conversation_id)}",
-                        timeout=10.0,
+                    parent_resp = await _get_session_metadata(
+                        server_client, conversation_id, timeout=10.0
                     )
                     if parent_resp.status_code == 200:
                         parent_runner = parent_resp.json().get("runner_id")
@@ -9672,7 +9904,7 @@ async def _cancel_evicted_native_subagent(
     if server_client is None:
         return "Error: sys_cancel_task requires server access for sub-agent tasks"
     try:
-        resp = await server_client.get(f"{_session_url(task_id)}", timeout=10.0)
+        resp = await _get_session_metadata(server_client, task_id, timeout=10.0)
     except (httpx.HTTPError, ValueError) as exc:
         return f"Error: sys_cancel_task lookup failed: {type(exc).__name__}: {exc}"
     if resp.status_code != 200:

@@ -95,6 +95,7 @@ def test_nested_sandbox_keeps_source_directory(
 
     page.get_by_test_id("new-chat-landing-host-chip").click()
     page.get_by_test_id("new-chat-landing-host-other-host").click()
+    expect(page.get_by_test_id("new-chat-landing-host-menu")).to_have_count(0)
     expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_have_attribute(
         "aria-label", f"Working directory: {other_directory}"
     )
@@ -106,6 +107,7 @@ def test_nested_sandbox_keeps_source_directory(
     page.get_by_test_id("new-chat-landing-host-chip").click()
     expect(page.get_by_test_id("new-chat-landing-host-menu")).to_be_visible()
     page.get_by_test_id(f"new-chat-landing-host-{chat.host_id}").click()
+    expect(page.get_by_test_id("new-chat-landing-host-menu")).to_have_count(0)
     expect(directory).to_have_attribute("aria-label", f"Working directory: {source_directory}")
     expect(worktree).to_have_attribute("aria-label", "Existing worktree branch: feature/research")
     worktree.click()

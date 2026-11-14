@@ -24,6 +24,7 @@ import httpx
 
 from omnigent.inner import _proc
 from omnigent.scheduled_context import add_scheduled_run_header
+from omnigent.util.server_url import format_host_port
 
 
 def _is_tcp_listening(host: str, port: int) -> bool:
@@ -35,8 +36,8 @@ def _is_tcp_listening(host: str, port: int) -> bool:
         return False
 
 
-def _pick_free_port() -> int:
-    """Bind 127.0.0.1:0 to let the OS pick a free port; close and return it.
+def _pick_free_port(host: str = "127.0.0.1") -> int:
+    """Bind the requested interface on port zero; close and return the port.
 
     Standard "port allocation" trick — the OS guarantees the port
     is free at the moment of bind. There's a TOCTOU window before
@@ -44,13 +45,22 @@ def _pick_free_port() -> int:
     (no other process is racing for the same port in the millisecond
     between our close and uvicorn's bind).
     """
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    if not isinstance(port, int):
-        raise RuntimeError(f"expected an integer TCP port, got {port!r}")
-    return port
+    addresses = socket.getaddrinfo(host, 0, type=socket.SOCK_STREAM)
+    last_error: OSError | None = None
+    for family, socktype, protocol, _, address in addresses:
+        try:
+            with socket.socket(family, socktype, protocol) as listener:
+                listener.bind(address)
+                port = listener.getsockname()[1]
+        except OSError as exc:
+            last_error = exc
+            continue
+        if not isinstance(port, int):
+            raise RuntimeError(f"expected an integer TCP port, got {port!r}")
+        return port
+    if last_error is not None:
+        raise last_error
+    raise OSError(f"No TCP addresses resolved for {host!r}")
 
 
 @dataclass
@@ -84,9 +94,13 @@ class RunnerTCPSubprocess:
     extra_env: dict[str, str] | None = None
     _process: subprocess.Popen[bytes] | None = None
 
+    def __post_init__(self) -> None:
+        if self.host.startswith("[") and self.host.endswith("]"):
+            self.host = self.host[1:-1]
+
     def __enter__(self) -> RunnerTCPSubprocess:
         if self.port == 0:
-            self.port = _pick_free_port()
+            self.port = _pick_free_port(self.host)
         cmd = [
             sys.executable,
             "-P",
@@ -135,7 +149,7 @@ class RunnerTCPSubprocess:
     @property
     def base_url(self) -> str:
         """The base URL httpx clients should use to reach this subprocess."""
-        return f"http://{self.host}:{self.port}"
+        return f"http://{format_host_port(self.host, self.port)}"
 
     def _kill(self) -> None:
         if self._process is None or self._process.poll() is not None:

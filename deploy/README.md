@@ -739,8 +739,8 @@ host; it does not fall back to `app_name`.
 
 Limit and order what New Chat offers, and choose where a fresh chat starts, with
 two optional keys in the same server config as `branding:` (`omnigent server -c
-config.yaml`, or `/data/config.yaml` in the Docker stack). A plain `omnigent
-server` without `-c` does not read them. Takes effect on the next server start.
+config.yaml`, `OMNIGENT_CONFIG`, or `<data_dir>/config.yaml` — `/data/config.yaml`
+in the Docker stack). Takes effect on the next server start.
 
 ```yaml
 restrict_to_agent_names: [polly, claude-native-ui]  # New Chat offers only these, in this order

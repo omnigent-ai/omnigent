@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -64,6 +65,7 @@ def _patch_inject_tmux(monkeypatch, calls: list[tuple[str, ...]]) -> None:
     )
     monkeypatch.setattr(b, "_session_alive", lambda *_a, **_k: True)
     monkeypatch.setattr(b, "_settle_pane", lambda *_a, **_k: None)
+    monkeypatch.setattr(b, "_pane_accepts_input", lambda *_a, **_k: True)
     # Pane already shows the needle so the commit-wait returns immediately.
     monkeypatch.setattr(b, "_capture_pane", lambda *_a, **_k: "do something now")
     monkeypatch.setattr(b.time, "sleep", lambda *_a, **_k: None)
@@ -96,6 +98,7 @@ def test_inject_user_message_single_delivery_when_store_confirms(tmp_path, monke
     calls: list[tuple[str, ...]] = []
     _patch_inject_tmux(monkeypatch, calls)
     monkeypatch.setattr(b, "_state_db_path", lambda _bd: tmp_path / "state.db")
+    monkeypatch.setattr(b, "_await_session_ready", lambda *_args: True)
     # Baseline 0, then a new row (id=1) confirms delivery on the first check.
     ids = iter([0, 1])
     monkeypatch.setattr(b, "_max_message_id", lambda _p: next(ids))
@@ -106,39 +109,210 @@ def test_inject_user_message_single_delivery_when_store_confirms(tmp_path, monke
     assert sum(1 for a in calls if a[-1] == "Enter") == 1
 
 
-def test_inject_user_message_retries_once_when_first_not_confirmed(tmp_path, monkeypatch) -> None:
-    """No new store row after delivery #1 → re-deliver once, then confirm."""
+def test_inject_user_message_waits_without_keys_for_delayed_persistence(
+    tmp_path, monkeypatch
+) -> None:
+    """Accepted input may be queued before persistence, even with a modal open."""
     calls: list[tuple[str, ...]] = []
     settle_calls: list[tuple] = []
     _patch_inject_tmux(monkeypatch, calls)
     monkeypatch.setattr(b, "_settle_pane", lambda *a, **k: settle_calls.append((a, k)))
-    monkeypatch.setattr(b, "_DELIVERY_CONFIRM_TIMEOUT_S", 0.0)  # first confirm fails fast
+    monkeypatch.setattr(b, "_DELIVERY_CONFIRM_TIMEOUT_S", 1.0)
     monkeypatch.setattr(b, "_state_db_path", lambda _bd: tmp_path / "state.db")
-    # baseline=0 → confirm#1 sees 0 (fail) → confirm#2 sees 1 (success after retry).
+    monkeypatch.setattr(b, "_await_session_ready", lambda *_args: True)
+    # baseline=0 → no immediate persistence → queued input eventually persists.
     seq = iter([0, 0, 1])
     monkeypatch.setattr(b, "_max_message_id", lambda _p: next(seq))
 
     b.inject_user_message(tmp_path, content="do something now")
 
-    # Two deliveries: two settles, two pastes, two Enters (one per attempt).
-    assert len(settle_calls) == 2
-    assert sum(1 for a in calls if a[0] == "load-buffer") == 2
-    assert sum(1 for a in calls if a[-1] == "Enter") == 2
+    assert len(settle_calls) == 1
+    assert sum(1 for a in calls if a[0] == "load-buffer") == 1
+    assert sum(1 for a in calls if a[-1] == "Enter") == 1
 
 
 def test_inject_user_message_raises_when_never_confirmed(tmp_path, monkeypatch) -> None:
-    """Store row never appears after two deliveries → raise (FIFO-safe failure)."""
+    """Dropped and accepted-but-unpersisted inputs both remain ambiguous."""
     calls: list[tuple[str, ...]] = []
     _patch_inject_tmux(monkeypatch, calls)
     monkeypatch.setattr(b, "_DELIVERY_CONFIRM_TIMEOUT_S", 0.0)
     monkeypatch.setattr(b, "_state_db_path", lambda _bd: tmp_path / "state.db")
+    monkeypatch.setattr(b, "_await_session_ready", lambda *_args: True)
     monkeypatch.setattr(b, "_max_message_id", lambda _p: 0)  # never advances
 
-    with pytest.raises(RuntimeError, match="did not accept"):
+    with pytest.raises(b.HermesDeliveryUnconfirmed, match="delivery is unconfirmed"):
         b.inject_user_message(tmp_path, content="do something now")
 
-    # Both attempts ran (two pastes) before giving up.
-    assert sum(1 for a in calls if a[0] == "load-buffer") == 2
+    assert sum(1 for a in calls if a[0] == "load-buffer") == 1
+    assert sum(1 for a in calls if a[-1] == "Enter") == 1
+
+
+@pytest.mark.parametrize("initial", ["missing", "empty", "partial-schema"])
+def test_inject_user_message_waits_for_session_store(tmp_path, monkeypatch, initial) -> None:
+    """Wait for schema readiness; Hermes can create its first row after the paste."""
+    calls: list[tuple[str, ...]] = []
+    _patch_inject_tmux(monkeypatch, calls)
+    db = tmp_path / "state #1.db"
+    if initial == "empty":
+        db.touch()
+    elif initial == "partial-schema":
+        with sqlite3.connect(db) as con:
+            con.executescript(b._SESSIONS_DDL)
+    monkeypatch.setattr(b, "_state_db_path", lambda _bd: db)
+    initialized = False
+
+    def initialize_store(_seconds: float) -> None:
+        nonlocal initialized
+        if initialized:
+            return
+        assert calls == [], "no paste before store readiness"
+        with sqlite3.connect(db) as con:
+            con.executescript(b._SESSIONS_DDL + b._MESSAGES_DDL)
+        initialized = True
+
+    def tmux(_socket, *args) -> None:
+        assert initialized
+        calls.append(args)
+        if args[-1] == "Enter":
+            with sqlite3.connect(db) as con:
+                assert con.execute("SELECT COUNT(*) FROM sessions").fetchone() == (0,)
+                con.execute(
+                    "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+                    ("session", "cli", 0.0),
+                )
+                con.execute(
+                    "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                    ("session", "user", "do something now"),
+                )
+
+    monkeypatch.setattr(
+        b, "time", SimpleNamespace(monotonic=b.time.monotonic, sleep=initialize_store)
+    )
+    monkeypatch.setattr(b, "_run_tmux", tmux)
+    b.inject_user_message(tmp_path, content="do something now", timeout_s=1.0)
+    assert sum(1 for args in calls if args[-1] == "Enter") == 1
+
+
+@pytest.mark.parametrize("initial", ["missing", "empty", "schema", "messages-only", "invalid"])
+def test_inject_user_message_does_not_send_when_store_is_unready(
+    tmp_path, monkeypatch, initial
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    _patch_inject_tmux(monkeypatch, calls)
+    db = tmp_path / "state.db"
+    if initial == "empty":
+        db.touch()
+    elif initial == "schema":
+        with sqlite3.connect(db) as con:
+            con.executescript(b._SESSIONS_DDL)
+    elif initial == "messages-only":
+        with sqlite3.connect(db) as con:
+            con.executescript(b._MESSAGES_DDL)
+    elif initial == "invalid":
+        db.write_text("not a database")
+    before = db.read_bytes() if db.exists() else None
+    monkeypatch.setattr(b, "_state_db_path", lambda _bd: db)
+    elapsed = 0.0
+    sleeps: list[float] = []
+
+    def advance(seconds: float) -> None:
+        nonlocal elapsed
+        assert calls == [], "no paste while waiting for the store"
+        sleeps.append(seconds)
+        elapsed += seconds
+
+    monkeypatch.setattr(b, "time", SimpleNamespace(monotonic=lambda: elapsed, sleep=advance))
+    timeout = b._DELIVERY_POLL_INTERVAL_S * 2.5
+    with pytest.raises(RuntimeError, match="no message was sent"):
+        b.inject_user_message(tmp_path, content="do something now", timeout_s=timeout)
+    assert len(sleeps) == 3
+    assert elapsed == pytest.approx(timeout)
+    assert calls == []
+    assert (db.read_bytes() if db.exists() else None) == before
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Hermes native requires a Unix TTY")
+@pytest.mark.parametrize(
+    "canonical,echo,ready",
+    [(True, True, False), (False, True, False), (True, False, False), (False, False, True)],
+)
+def test_pane_accepts_input_checks_real_tty_modes(monkeypatch, canonical, echo, ready):
+    import os
+    import pty
+    import termios
+
+    master, slave = pty.openpty()
+    try:
+        attrs = termios.tcgetattr(slave)
+        attrs[3] = (attrs[3] & ~(termios.ICANON | termios.ECHO)) | (
+            (termios.ICANON if canonical else 0) | (termios.ECHO if echo else 0)
+        )
+        termios.tcsetattr(slave, termios.TCSANOW, attrs)
+        monkeypatch.setattr(
+            b.subprocess,
+            "run",
+            lambda *_a, **_k: SimpleNamespace(returncode=0, stdout=os.ttyname(slave) + "\n"),
+        )
+        assert b._pane_accepts_input("/s", "t") is ready
+    finally:
+        os.close(slave)
+        os.close(master)
+
+
+@pytest.mark.parametrize("result", ["missing", "failed", "not-tty"])
+def test_pane_accepts_input_requires_available_tty(tmp_path, monkeypatch, result):
+    path = tmp_path / "not-tty"
+    path.write_text("static startup banner")
+    monkeypatch.setattr(
+        b.subprocess,
+        "run",
+        lambda *_a, **_k: SimpleNamespace(
+            returncode=1 if result == "failed" else 0,
+            stdout="" if result == "missing" else str(path),
+        ),
+    )
+    assert not b._pane_accepts_input("/s", "t")
+
+
+def test_inject_user_message_waits_for_cooked_startup_before_any_keys(tmp_path, monkeypatch):
+    calls = []
+    _patch_inject_tmux(monkeypatch, calls)
+    monkeypatch.setattr(b, "_state_db_path", lambda _bd: None)
+    elapsed = 0.0
+
+    def advance(seconds):
+        nonlocal elapsed
+        assert not calls, "startup must receive neither clearing keys nor message bytes"
+        elapsed += seconds
+
+    monkeypatch.setattr(b, "time", SimpleNamespace(monotonic=lambda: elapsed, sleep=advance))
+    monkeypatch.setattr(b, "_pane_accepts_input", lambda *_a, **_k: False)
+    with pytest.raises(b.HermesInputNotSent, match="input is not ready; no message was sent"):
+        b.inject_user_message(tmp_path, content="do something now", timeout_s=0.5)
+    assert elapsed == pytest.approx(0.5)
+    assert calls == []
+
+
+def test_inject_user_message_sends_once_after_raw_input_becomes_ready(tmp_path, monkeypatch):
+    calls = []
+    _patch_inject_tmux(monkeypatch, calls)
+    monkeypatch.setattr(b, "_state_db_path", lambda _bd: None)
+    ready = False
+
+    def input_ready(*_args, **_kwargs):
+        return ready
+
+    def advance(_seconds):
+        nonlocal ready
+        if not ready:
+            assert not calls
+            ready = True
+
+    monkeypatch.setattr(b, "_pane_accepts_input", input_ready)
+    monkeypatch.setattr(b.time, "sleep", advance)
+    b.inject_user_message(tmp_path, content="do something now")
+    assert sum(1 for a in calls if a[0] == "paste-buffer") == 1
+    assert sum(1 for a in calls if a[-1] == "Enter") == 1
 
 
 def test_inject_user_message_requires_content(tmp_path) -> None:
@@ -383,15 +557,16 @@ def test_write_policy_hook_config_merges_user_model(tmp_path, monkeypatch) -> No
     import yaml
 
     (user_hermes / "config.yaml").write_text(
-        yaml.dump({"model": "claude-sonnet-4-20250514", "providers": {"anthropic": {}}})
+        yaml.dump({"_config_version": 12, "model": "test-model", "providers": {"test": {}}})
     )
 
     monkeypatch.setattr(b.Path, "home", staticmethod(lambda: tmp_path))
 
     hermes_home = b.write_policy_hook_config(bridge_dir, "http://localhost:6767", "s2")
     config = json.loads((hermes_home / "config.yaml").read_text())
-    assert config["model"] == "claude-sonnet-4-20250514"
-    assert config["providers"] == {"anthropic": {}}
+    assert config["_config_version"] == 12
+    assert config["model"] == "test-model"
+    assert config["providers"] == {"test": {}}
     assert config["hooks_auto_accept"] is True
 
 
@@ -620,3 +795,60 @@ def test_inject_relay_into_policy_hook_returns_false_when_wrapper_absent(
     from omnigent.harnesses.hermes_native.bridge import inject_relay_into_policy_hook
 
     assert inject_relay_into_policy_hook(tmp_path, "http://x", "tok", "http://ap", "sid") is False
+
+
+def test_input_ready_subprocess_uses_remaining_budget(monkeypatch):
+    elapsed = 0.0
+    budgets = []
+
+    def advance(seconds):
+        nonlocal elapsed
+        elapsed += seconds
+
+    def probe(_socket, _target, *, timeout_s):
+        budgets.append(timeout_s)
+        return False
+
+    monkeypatch.setattr(b, "time", SimpleNamespace(monotonic=lambda: elapsed, sleep=advance))
+    monkeypatch.setattr(b, "_pane_accepts_input", probe)
+    with pytest.raises(RuntimeError, match="no message was sent"):
+        b._await_input_ready("/s", "t", timeout_s=0.5)
+    assert budgets == pytest.approx([0.5, 0.3, 0.1])
+    assert elapsed == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("failed_command", ["load-buffer", "paste-buffer", "Enter"])
+@pytest.mark.parametrize("exception", [RuntimeError, OSError])
+def test_delivery_command_failure_preserves_transfer_boundary(
+    tmp_path, monkeypatch, failed_command, exception
+):
+    calls = []
+    _patch_inject_tmux(monkeypatch, calls)
+    monkeypatch.setattr(b, "_state_db_path", lambda _bd: None)
+
+    def run(_socket, *args):
+        calls.append(args)
+        if args[0] == failed_command or args[-1] == failed_command:
+            raise exception("terminal command timed out")
+
+    monkeypatch.setattr(b, "_run_tmux", run)
+    error = (
+        b.HermesInputNotSent if failed_command == "load-buffer" else b.HermesDeliveryUnconfirmed
+    )
+    with pytest.raises(error):
+        b.inject_user_message(tmp_path, content="do something now")
+    assert sum(1 for args in calls if args[0] == "paste-buffer") == (
+        failed_command != "load-buffer"
+    )
+    assert sum(1 for args in calls if args[-1] == "Enter") == (failed_command == "Enter")
+    assert not list(tmp_path.glob("paste_*.bin"))
+
+
+@pytest.mark.parametrize("budget", [0.4, 30.0])
+def test_pane_readiness_subprocess_timeout_is_bounded(monkeypatch, budget):
+    def timeout(command, **kwargs):
+        assert kwargs["timeout"] == min(budget, b._TMUX_SEND_TIMEOUT_S)
+        raise b.subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(b.subprocess, "run", timeout)
+    assert b._pane_accepts_input("/s", "t", timeout_s=budget) is False

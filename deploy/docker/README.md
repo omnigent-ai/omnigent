@@ -140,7 +140,14 @@ earlier boot keeps its database row, so sessions bound to it keep working and
 their history is untouched; only the new-session picker omits it. The native
 CLI harness rows are always seeded, even when trimmed, because transcript
 imports bind to them. Adding a name back to the allowlist brings it straight
-back on the next restart.
+back on the next restart. A built-in an older release seeded under a name this
+release no longer packages (for example `devin`) is trimmed the same way.
+If its stored bundle cannot be read, the row stays visible because startup
+cannot rule out operator ownership.
+
+Settings → Harnesses follows the allowlist too: it leaves out a native harness
+whose agent is trimmed, unless an agent users can still pick runs on it, and
+drops Harnesses from Settings when no harness is left.
 
 Trimming is not access control: a hidden agent can still be read and launched
 by its id through the API.

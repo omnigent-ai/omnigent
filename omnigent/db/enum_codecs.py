@@ -5,10 +5,10 @@ Several low-cardinality closed-set columns (``conversations.kind``,
 ``account_tokens.kind``, ``policies.type``, ``policies.scope``,
 ``hosts.status``, ``agents.kind``, ``scheduled_tasks.state``,
 ``scheduled_tasks.execution_target``,
-``scheduled_task_runs.status``, ``session_journal_entries.kind``) are stored as
-integer codes rather
-than their string names — smaller rows and a tighter ``CHECK`` than a
-free ``VARCHAR``. The string names remain the
+``scheduled_task_runs.status``, ``session_journal_entries.kind``,
+``inbox_items.status``) are stored as integer codes rather than their string
+names — smaller rows and a tighter ``CHECK`` than a free ``VARCHAR``.
+The string names remain the
 contract for entities, the HTTP API, the web client, and the SDKs; the
 integer form never leaves the store row↔entity boundary. These codecs are
 the single place that translates between the two.
@@ -120,6 +120,11 @@ SCHEDULED_TASK_EXECUTION_TARGET: dict[str, int] = {
     "managed_sandbox": 2,
 }
 
+SCHEDULED_TASK_KIND: dict[str, int] = {
+    "automation": 1,
+    "reminder": 2,
+}
+
 SCHEDULED_TASK_SESSION_MODE: dict[str, int] = {
     "new": 1,
     "continue": 2,
@@ -142,6 +147,14 @@ JOURNAL_ENTRY_KIND: dict[str, int] = {
     "dispatch_result": 4,
     "plan": 5,
     "plan_status": 6,
+}
+
+# Proactive-agent Inbox items (``inbox_items``).
+INBOX_ITEM_STATUS: dict[str, int] = {
+    "unread": 1,
+    "read": 2,
+    "done": 3,
+    "dismissed": 4,
 }
 
 
@@ -345,6 +358,16 @@ def encode_scheduled_task_execution_target(name: str) -> int:
 def decode_scheduled_task_execution_target(code: int) -> str:
     """Decode a ``scheduled_tasks.execution_target`` int code to its name."""
     return _decode(SCHEDULED_TASK_EXECUTION_TARGET, code, field="scheduled_tasks.execution_target")
+
+
+def encode_scheduled_task_kind(name: str) -> int:
+    """Encode a ``scheduled_tasks.kind`` name to its int code."""
+    return _encode(SCHEDULED_TASK_KIND, name, field="scheduled_tasks.kind")
+
+
+def decode_scheduled_task_kind(code: int) -> str:
+    """Decode a ``scheduled_tasks.kind`` int code to its name."""
+    return _decode(SCHEDULED_TASK_KIND, code, field="scheduled_tasks.kind")
 
 
 def encode_scheduled_task_session_mode(name: str) -> int:

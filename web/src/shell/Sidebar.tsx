@@ -22,6 +22,7 @@ import {
   useProjectFolderPageSize,
 } from "@/lib/projectFolderPaginationPreferences";
 import { useSessionRowQuickActions } from "@/lib/sessionRowQuickActionsPreferences";
+import { useCuratedOutHarnesses } from "@/hooks/useCuratedOutHarnesses";
 import { useInertRef } from "@/hooks/useInertRef";
 import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
 import { useSidebarDisplayPagination } from "@/hooks/useSidebarDisplayPagination";
@@ -222,9 +223,8 @@ import { isInClosedSidebar, registerSidebarRename } from "./sidebarRename";
 import { hasSessionDraft, useHasSessionDraft, useSessionDraftIds } from "@/lib/sessionDrafts";
 import { useNow } from "@/hooks/useNow";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
-import { getSessionState, type SessionState } from "@/hooks/useSessionState";
-import { useSessionErrorStates } from "@/hooks/useSessionErrors";
-import type { LatestSessionError } from "@/lib/sessionError";
+import type { SessionState } from "@/hooks/useSessionState";
+import { useSessionBadgeStates } from "@/hooks/useSessionBadgeStates";
 import { useChatStore } from "@/store/chatStore";
 import {
   isConversationUnseen,
@@ -232,8 +232,10 @@ import {
   markConversationRead,
   markConversationUnread,
   useConversationReadState,
+  useReadStateSnapshot,
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
+import { collectUnreadInboxItems } from "@/lib/inbox";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -314,6 +316,7 @@ import { isRowFullyVisible } from "./sidebarRowVisibility";
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { useHarnessLabels } from "@/lib/agentLabels";
 import {
+  NATIVE_CODING_AGENTS,
   nativeCodingAgentForSession,
   nativeCodingAgentForWrapper,
   type NativeCodingAgentIconKind,
@@ -895,7 +898,19 @@ function SidebarImpl({
         : availableTab === "shared"
           ? sidebarData.shared
           : sidebarData.all;
-  const inboxCount = sidebarData.inboxCount;
+  const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
+  // Unread sessions as the Inbox lists them; like its row dot, the open session
+  // counts only when marked unread.
+  const unreadInboxCount = useReadStateSnapshot(
+    () =>
+      collectUnreadInboxItems(
+        sidebarData.inboxRows,
+        (id, updatedAt, status) =>
+          isConversationUnseen(id, updatedAt, status) &&
+          (id !== activeConversationId || isExplicitlyUnread(id)),
+      ).length,
+  );
+  const inboxCount = sidebarData.inboxCount + unreadInboxCount;
   const inboxCountIncomplete = sidebarData.inboxCountIncomplete;
 
   // The scrollable list container — used as the IntersectionObserver root for
@@ -943,6 +958,8 @@ function SidebarImpl({
   // for the settings section nav (see settingsNav.tsx) — entering settings
   // shouldn't replace the whole sidebar.
   const { inSettings } = useSettingsRoute();
+  // Fetched only in Settings, whose nav drops Harnesses when none is offered.
+  const curatedOutHarnesses = useCuratedOutHarnesses(inSettings);
   // Remember the pre-settings location so the Back row returns to the
   // conversation the user was viewing, not the home page. Tracked here since
   // the sidebar stays mounted across the transition into settings.
@@ -1321,7 +1338,10 @@ function SidebarImpl({
           />
         )}
         {inSettings ? (
-          <SettingsSidebarBody onNavClick={onNavClick} />
+          <SettingsSidebarBody
+            onNavClick={onNavClick}
+            harnessesOffered={curatedOutHarnesses.size < NATIVE_CODING_AGENTS.length}
+          />
         ) : (
           <>
             {/* sidebar-header-row is the hook for the macOS Electron shell. It
@@ -1809,7 +1829,7 @@ function ProjectFolder({
     growFrom.current = { height: listRef.current?.offsetHeight ?? 0, count: visibleCount };
     return display.loadMore();
   };
-  const errors = useSessionErrorStates(conversations);
+  const states = useSessionBadgeStates(conversations);
   const startingConversationId = useChatStore((s) =>
     s.status === "streaming" || s.terminalPending ? s.conversationId : null,
   );
@@ -1819,7 +1839,7 @@ function ProjectFolder({
   const isHidden = (_row: unknown, index: number) => index !== heldIndex;
   const marker = projectMarkerState(
     conversations.filter(isHidden),
-    errors.filter(isHidden),
+    states.filter(isHidden),
     startingConversationId,
   );
   // "Show more" carries the badge of the rows it hides, as a collapsed header does.
@@ -1827,7 +1847,7 @@ function ProjectFolder({
     expanded && visibleCount < conversations.length
       ? projectMarkerState(
           conversations.slice(visibleCount),
-          errors.slice(visibleCount),
+          states.slice(visibleCount),
           startingConversationId,
         )
       : null;
@@ -3474,6 +3494,7 @@ function ConversationList({
                           <>
                             <ProjectHeaderActions
                               hostId={defaultProjectHostId}
+                              hosts={hosts}
                               hostsLoading={hostsLoading}
                               onOrderChange={(manual) => {
                                 const ranks = new Map(
@@ -3779,7 +3800,7 @@ function UngroupDropZone() {
 /** Surface the most actionable state across a collapsed project's loaded rows. */
 function projectMarkerState(
   conversations: Conversation[],
-  errors: readonly (LatestSessionError | null)[],
+  states: readonly (SessionState | null)[],
   startingConversationId: string | null,
 ): SessionState | null {
   let awaiting = 0;
@@ -3790,7 +3811,7 @@ function projectMarkerState(
   let disconnected = false;
   let unseen = false;
   for (const [i, c] of conversations.entries()) {
-    const state = getSessionState(c, errors[i]);
+    const state = states[i];
     if (state?.kind === "awaiting") {
       awaiting += state.count;
       terminalReason ??= state.terminalReason;
@@ -4262,6 +4283,7 @@ function SessionFilterMenu({
 
 function ProjectHeaderActions({
   hostId,
+  hosts,
   hostsLoading,
   onOrderChange,
   manualOrder,
@@ -4276,6 +4298,7 @@ function ProjectHeaderActions({
   onEnterSelectionMode,
 }: {
   hostId: string | null;
+  hosts: Host[];
   hostsLoading: boolean;
   onOrderChange: (manual: boolean) => void;
   manualOrder: boolean;
@@ -4300,7 +4323,12 @@ function ProjectHeaderActions({
 
   return (
     <div className="flex items-center gap-0.5">
-      <NewProjectButton onCreated={onProjectCreated} hostId={hostId} hostsLoading={hostsLoading} />
+      <NewProjectButton
+        onCreated={onProjectCreated}
+        hostId={hostId}
+        hosts={hosts}
+        hostsLoading={hostsLoading}
+      />
       {showMenu && (
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
@@ -5787,9 +5815,8 @@ function ConversationRowImpl({
   // "Mark as unread" is offered on any row not already showing the dot.
   const canMarkUnread = !hasUnseenMessages;
   // Approvals and failures outrank the unread dot without clearing read state.
-  const errorConversations = useMemo(() => [conversation], [conversation]);
-  const [latestError] = useSessionErrorStates(errorConversations);
-  const derivedState = getSessionState(conversation, latestError);
+  const badgeConversations = useMemo(() => [conversation], [conversation]);
+  const [derivedState] = useSessionBadgeStates(badgeConversations);
   // The bound session's launch/relaunch window: a send is in flight (local
   // status "streaming") or the runner is auto-creating the PTY
   // (`terminalPending`), but the server hasn't confirmed `running` yet — a
