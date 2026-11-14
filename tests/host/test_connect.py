@@ -75,6 +75,7 @@ from omnigent.host.frames import (
     HostLaunchRunnerResultFrame,
     HostListDirFrame,
     HostListDirResultFrame,
+    HostListWorktreesFrame,
     HostMcpServersFrame,
     HostMcpServersResultFrame,
     HostMcpToolsFrame,
@@ -87,6 +88,7 @@ from omnigent.host.frames import (
     HostProbeAccountsResultFrame,
     HostRefreshHarnessesFrame,
     HostRefreshHarnessesResultFrame,
+    HostRemoveWorktreeFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
@@ -3312,36 +3314,55 @@ async def test_connection_auth_overlaps_capability_discovery(
     assert host._owned_subprocess_ops == 0
 
 
-async def test_cancelled_readiness_probe_keeps_orphan_reaper_paused(
+@pytest.mark.parametrize("operation", ["readiness", "create", "remove", "list"])
+async def test_cancelled_subprocess_worker_keeps_orphan_reaper_paused(
     monkeypatch: pytest.MonkeyPatch,
+    operation: str,
 ) -> None:
     """Cancellation cannot release subprocess ownership before its worker exits."""
+    from tests._helpers.polling import poll_until_async
+
     host = _make_host_process()
     probe_started = threading.Event()
     probe_release = threading.Event()
 
-    def _configured() -> dict[str, bool]:
+    def _work(**_kwargs: object) -> dict[str, bool]:
         probe_started.set()
-        if not probe_release.wait(timeout=1.0):
-            raise AssertionError("test did not release readiness probe")
+        if not probe_release.wait(timeout=5.0):
+            raise AssertionError("test did not release host worker")
         return {"claude-native": True}
 
-    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", _configured)
-    probe_task = asyncio.create_task(host._probe_configured_harnesses(startup=True))
-    assert await asyncio.to_thread(probe_started.wait, 1.0)
-    assert host._owned_subprocess_ops == 1
-
-    probe_task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await probe_task
-    assert host._owned_subprocess_ops == 1
-    assert len(host._host_subprocess_tasks) == 1
-
-    probe_release.set()
-    for _ in range(100):
-        if host._owned_subprocess_ops == 0:
-            break
-        await asyncio.sleep(0.01)
+    if operation == "readiness":
+        monkeypatch.setattr("omnigent.host.connect.configured_harness_map", _work)
+        request = host._probe_configured_harnesses(startup=True)
+    elif operation == "create":
+        monkeypatch.setattr("omnigent.host.connect.create_worktree", _work)
+        request = host._handle_create_worktree(
+            HostCreateWorktreeFrame(request_id="create", repo_path="/repo", branch_name="topic")
+        )
+    elif operation == "remove":
+        monkeypatch.setattr("omnigent.host.connect.remove_worktree", _work)
+        request = host._handle_remove_worktree(
+            HostRemoveWorktreeFrame(request_id="remove", worktree_path="/worktree")
+        )
+    else:
+        monkeypatch.setattr("omnigent.host.connect.list_worktrees", _work)
+        request = host._handle_list_worktrees(
+            HostListWorktreesFrame(request_id="list", repo_path="/repo")
+        )
+    probe_task = asyncio.create_task(request)
+    try:
+        assert await asyncio.to_thread(probe_started.wait, 5.0)
+        assert host._owned_subprocess_ops == 1
+        probe_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await probe_task
+        assert host._owned_subprocess_ops == 1
+        assert len(host._host_subprocess_tasks) == 1
+    finally:
+        probe_release.set()
+        await asyncio.gather(probe_task, return_exceptions=True)
+        await poll_until_async(lambda: host._owned_subprocess_ops == 0)
     assert host._owned_subprocess_ops == 0
     assert host._host_subprocess_tasks == set()
 

@@ -4708,19 +4708,15 @@ class HostProcess:
             frame.timeout_s if frame.timeout_s is not None else _LEGACY_SERVER_CREATE_BUDGET_S
         )
         try:
-            # Pause the orphan reaper: create_worktree runs git via
-            # subprocess.run, whose children are direct children of this host
-            # but not tracked runners — the reaper must not wait() them out
-            # from under subprocess (#1782).
-            with self._host_subprocess_op():
-                created = await asyncio.to_thread(
-                    create_worktree,
+            created = await self._run_host_subprocess_in_thread(
+                lambda: create_worktree(
                     repo_path=frame.repo_path,
                     branch_name=frame.branch_name,
                     base_branch=frame.base_branch,
                     existing_branch=frame.existing_branch,
                     timeout_s=timeout_s,
                 )
+            )
         except WorktreeError as exc:
             return HostCreateWorktreeResultFrame(
                 request_id=frame.request_id,
@@ -4770,15 +4766,13 @@ class HostProcess:
             ``status: "failed"`` with an error message.
         """
         try:
-            # Pause the orphan reaper while remove_worktree runs git — see
-            # _handle_create_worktree above and _reap_orphans_once (#1782).
-            with self._host_subprocess_op():
-                await asyncio.to_thread(
-                    remove_worktree,
+            await self._run_host_subprocess_in_thread(
+                lambda: remove_worktree(
                     worktree_path=frame.worktree_path,
                     branch=frame.branch,
                     delete_branch=frame.delete_branch,
                 )
+            )
         except WorktreeError as exc:
             return HostRemoveWorktreeResultFrame(
                 request_id=frame.request_id,
@@ -4810,14 +4804,12 @@ class HostProcess:
             ``status: "failed"`` with an error message.
         """
         try:
-            # Pause the orphan reaper while git runs — see
-            # _handle_create_worktree above and _reap_orphans_once.
-            with self._host_subprocess_op():
-                worktrees = await asyncio.to_thread(
-                    list_worktrees,
+            worktrees = await self._run_host_subprocess_in_thread(
+                lambda: list_worktrees(
                     repo_path=frame.repo_path,
                     for_cleanup=frame.for_cleanup,
                 )
+            )
         except WorktreeError as exc:
             return HostListWorktreesResultFrame(
                 request_id=frame.request_id,
