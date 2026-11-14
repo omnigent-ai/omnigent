@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 from click import ClickException
 
+from omnigent.onboarding.credential_tool import persistent_configuration_command
 from omnigent.onboarding.setup import ProfileSpec
 from omnigent.onboarding.ucode_setup import (
     build_ucode_configure_command,
@@ -95,7 +96,7 @@ def test_build_ucode_configure_command_supports_uvx_prefix() -> None:
         workspace_urls=("https://one.example.databricks.com",),
     )
 
-    assert command == [
+    original = [
         "/usr/bin/uvx",
         "--from",
         "git+https://github.com/databricks/ucode@304e4a29c5ca73b3bfaaf1911e38d0080833fda4",
@@ -107,6 +108,7 @@ def test_build_ucode_configure_command_supports_uvx_prefix() -> None:
         "claude,codex,pi",
         "--enable-fable",
     ]
+    assert command == persistent_configuration_command(original)
 
 
 def test_model_gateway_workspace_urls_excludes_mcp_only_workspaces(
