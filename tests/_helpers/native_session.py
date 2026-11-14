@@ -33,6 +33,10 @@ _SENSITIVE_RESPONSE_KEY_PATTERN = re.compile(
     r"authorization|token|secret|password|passwd|credential|api[\s_.-]*key",
     re.IGNORECASE,
 )
+_SENSITIVE_RESPONSE_ASSIGNMENT_PATTERN = re.compile(
+    rf"(?:{_SENSITIVE_RESPONSE_KEY_PATTERN.pattern})[\w.-]*[\"']?\s*[:=]",
+    re.IGNORECASE,
+)
 
 
 def _redacted_response_text(response: httpx.Response) -> str:
@@ -47,6 +51,8 @@ def _redacted_response_text(response: httpx.Response) -> str:
         if isinstance(value, list):
             return [redact(item) for item in value]
         if isinstance(value, str):
+            if _SENSITIVE_RESPONSE_ASSIGNMENT_PATTERN.search(value):
+                return "[REDACTED]"
             redacted = redact_log_text(value, include_whitespace_credentials=True)
             return "[REDACTED]" if redacted != value else value
         return value

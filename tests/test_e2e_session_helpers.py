@@ -218,6 +218,17 @@ def test_pending_tool_poll_waits_for_this_turn(monkeypatch, previous_call) -> No
             ("synthetic-inline-escaped-tail",),
             id="decoded-string",
         ),
+        *[
+            pytest.param(
+                {"details": f"{label}=synthetic-assignment-tail"}
+                if location == "leaf"
+                else {f"{label}=synthetic-assignment-tail": "synthetic-assignment-tail"},
+                ("synthetic-assignment-tail",),
+                id=f"{label}-assignment-{location}",
+            )
+            for label in ("passwd", "credentials", "api.key")
+            for location in ("key", "leaf")
+        ],
     ],
 )
 def test_native_create_failure_keeps_bounded_redacted_response(
