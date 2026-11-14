@@ -637,6 +637,14 @@ Cross-harness journeys:
   terminal while a question is pending, send an unrelated Chat message, then
   answer the question and verify that the held message arrives once.
 
+- **`steer`, Claude plan approval:**
+  `tests/harnesses/claude_native/test_claude_native_pending_prompt.py` covers
+  wrapped exit-plan headings and the three-choice "ready to execute" dialog.
+  Chat messages and settings wait for an explicit answer without typing into
+  the plan choices. In a Claude session, request a plan, send a Chat follow-up
+  while approval is open, then answer in Terminal and confirm the follow-up
+  arrives once. Repeat from a locally launched `omnigent claude` session.
+
 - **Antigravity permission choices (Chat and Inbox):**
   `tests/e2e_ui/approvals/test_agy_permission_full_prompt.py::test_agy_permission_persist_request_round_trip`
   uses a recorded permission prompt and the real server to check both choices
