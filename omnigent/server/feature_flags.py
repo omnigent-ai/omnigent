@@ -44,11 +44,13 @@ class Feature(StrEnum):
     WORKSPACE_CONTENT_SEARCH = "workspace_content_search"
     GRID_SESSIONS_DISPLAY_UI = "grid_sessions_display_ui"
     AUTOMATIONS_V2 = "automations_v2"
+    ONE_TIME_AUTOMATIONS = "one_time_automations"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
     SIDEBAR_WINDOWED_ROWS = "sidebar_windowed_rows"
     SESSION_OVERVIEW = "session_overview"
     PROJECT_REPOSITORY_CREATION = "project_repository_creation"
     WORKSPACE_DIRECT_ACCESS = "workspace_direct_access"
+    WORKSPACE_API_SERVER_ACCESS = "workspace_api_server_access"
 
 
 @dataclass(frozen=True)
@@ -119,6 +121,17 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         owner="server",
         review_by_release="0.20.0",
         default_enabled=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.ONE_TIME_AUTOMATIONS,
+        description=(
+            "Create one-time (COUNT=1) automations, including sys_reminder_set reminders. "
+            "Every database scheduler sharing the database must already accept them; "
+            "an older one pauses them as invalid"
+        ),
+        owner="server",
+        review_by_release="0.24.0",
+        frontend_visible=False,
     ),
     FeatureDefinition(
         feature=Feature.GRID_SESSIONS_DISPLAY_UI,
@@ -231,6 +244,13 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
             "Owners read a session's workspace straight from its host's local socket; "
             "the server and the host must both enable it"
         ),
+        owner="server",
+        review_by_release="0.27.0",
+        frontend_visible=False,
+    ),
+    FeatureDefinition(
+        feature=Feature.WORKSPACE_API_SERVER_ACCESS,
+        description="Serve the workspace API through the server, answered by the session's host",
         owner="server",
         review_by_release="0.27.0",
         frontend_visible=False,

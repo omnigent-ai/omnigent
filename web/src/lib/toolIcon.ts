@@ -9,6 +9,7 @@
 import {
   Ban,
   Bot,
+  CalendarClock,
   Code2,
   FileSearchCorner,
   FileText,
@@ -60,6 +61,7 @@ export function iconForTool(fullName: string, nativeToolType?: string): LucideIc
   if (name.startsWith("sys_cancel_")) return Ban;
   if (name === "sys_timer_set") return Timer;
   if (name === "sys_timer_cancel") return Ban;
+  if (name === "sys_reminder_set") return CalendarClock;
   return Wrench;
 }
 

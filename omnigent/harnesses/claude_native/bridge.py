@@ -4917,10 +4917,12 @@ def inject_user_message(
     temp file) + ``paste-buffer -p`` so interior newlines ride as raw CR
     inside the paste markers and Claude Code's TUI keeps multi-line
     input as data rather than submitting on each newline
-    (anthropics/claude-code#52126). A trailing newline inside the paste
-    absorbs any trailing backslash — otherwise ``\`` + the submit
+    (anthropics/claude-code#52126). A message ending in ``\`` gets a
+    trailing newline inside the paste — otherwise ``\`` + the submit
     ``Enter`` reads as a line-continuation and the message sits unsent.
-    ``Enter`` is a separate tmux call. The file-based buffer
+    No other message gets one: Claude Code collapses a paste holding
+    three or more line breaks into a ``[Pasted text #N +X lines]``
+    placeholder. ``Enter`` is a separate tmux call. The file-based buffer
     path (not ``send-keys`` argv) matters: tmux caps a single
     client→server command at ~16KB, so a large message — e.g. a PR diff
     in a sub-agent dispatch — failed with "command too long".
@@ -5077,6 +5079,18 @@ def _paste_and_submit(
             "Answer the pending Claude question or permission request before sending a message.",
             nothing_typed=True,
         )
+    delivery_diagnostics.set_stage("encoding")
+    # Trailing line breaks add nothing before the submit Enter, and a third CR
+    # collapses the paste into a placeholder.
+    payload = _paste_payload_bytes(text).rstrip(b"\r")
+    if not payload:
+        raise RuntimeError(
+            "The message has no text to paste into Claude Code (only line breaks or "
+            "control characters). The message was not delivered."
+        )
+    if payload.endswith(b"\\"):
+        # Append a CR only when a trailing backslash would consume the submit Enter.
+        payload += b"\r"
     tail_needle = _submit_tail_needle(text) if needle else ""
     delivery_diagnostics.set_stage("pasting")
     # Clear stale text first, or the paste lands inside the person's draft and
@@ -5084,7 +5098,12 @@ def _paste_and_submit(
     _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
     transcript_before_paste = _capture_pane(socket_path, tmux_target)
     draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
-        bridge_dir, socket_path, tmux_target, text=text, needle=needle, tail_needle=tail_needle
+        bridge_dir,
+        socket_path,
+        tmux_target,
+        payload=payload,
+        needle=needle,
+        tail_needle=tail_needle,
     )
     box = _composer_box(pane)
     # A TUI that submits the paste itself leaves an empty box and a new transcript line.
@@ -5108,7 +5127,12 @@ def _paste_and_submit(
         )
         _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
         draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
-            bridge_dir, socket_path, tmux_target, text=text, needle=needle, tail_needle=tail_needle
+            bridge_dir,
+            socket_path,
+            tmux_target,
+            payload=payload,
+            needle=needle,
+            tail_needle=tail_needle,
         )
     delivery_diagnostics.record_draft(
         pane=pane,
@@ -5178,37 +5202,32 @@ def _paste_and_await_draft(
     socket_path: str,
     tmux_target: str,
     *,
-    text: str,
+    payload: bytes,
     needle: str,
     tail_needle: str = "",
 ) -> tuple[bool, str, int, int, float]:
     """
-    Paste *text* into the composer, then poll until its draft shows or the paste budget ends.
+    Paste *payload* into the composer, then poll until its draft shows or the paste budget ends.
 
     :param bridge_dir: Bridge directory whose temp paste file is written here.
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string.
-    :param text: Exact text to paste.
+    :param payload: Encoded paste bytes, including any backslash-protecting CR.
     :param needle: Draft marker from :func:`_submit_needle`.
     :param tail_needle: End-of-draft marker from :func:`_submit_tail_needle`.
     :returns: ``(draft_seen, last_pane, polls, empty_captures, wait_started)``.
     :raises RuntimeError: If a ``tmux`` invocation fails.
     """
-    # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
-    # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
-    # client→server command at ~16KB, so per-byte hex argv blew up with
-    # "command too long" on large payloads (a PR diff in a sub-agent
-    # dispatch). ``load-buffer`` streams the file without that cap, and
-    # ``paste-buffer -p`` wraps it in the same bracketed-paste markers so
-    # interior newlines (mapped to CR below) stay data instead of becoming
-    # per-line submits. See anthropics/claude-code#52126.
+    # Use a tmux buffer, not ``send-keys`` argv: tmux caps a client→server
+    # command at ~16KB. ``load-buffer`` avoids the cap; ``paste-buffer -p``
+    # keeps interior CRs as data, not submits (anthropics/claude-code#52126).
     paste_path: str | None = None
     try:
         with tempfile.NamedTemporaryFile(
             dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
         ) as paste_file:
             paste_path = paste_file.name
-            paste_file.write(_paste_payload_bytes(text + "\n"))
+            paste_file.write(payload)
         _run_tmux(socket_path, "load-buffer", "-b", "omnigent-paste", paste_path)
         _run_tmux(
             socket_path,

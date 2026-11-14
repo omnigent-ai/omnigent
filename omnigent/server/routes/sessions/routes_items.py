@@ -52,10 +52,12 @@ from omnigent.server.routes._sessions.common import (
 )
 from omnigent.server.routes._sessions.helpers import SessionLiveness
 from omnigent.server.routes._sessions.orchestration import (
+    _agent_costs,
     _child_session_summaries_from_conversations,
     _settle_orphaned_running_rows,
 )
 from omnigent.server.schemas import (
+    AgentCostList,
     ChildSessionList,
     PaginatedList,
     SessionItem,
@@ -328,6 +330,72 @@ def register_items_routes(
         if item is None or item.response_id == PENDING_INPUT_RESPONSE_ID:
             raise _item_not_found()
         return item.to_api_dict()
+
+    # ── GET /sessions/{session_id}/agent_costs ───────────────────
+
+    @router.get(
+        "/sessions/{session_id}/agent_costs",
+        response_model=AgentCostList,
+        responses={**STALE_CURSOR_RESPONSE},
+    )
+    async def list_agent_costs(
+        request: Request,
+        session_id: str,
+        limit: int = Query(default=100, ge=1, le=1000),
+        after: str | None = Query(default=None),
+    ) -> AgentCostList:
+        """
+        List display costs for a session and the sub-agents beneath it.
+
+        Subtree totals come from one spawn-tree read (ids, parents and usage
+        only) bounded like ``child_sessions?descendants=true``; a tree past
+        that cap reports no costs. READ on the session covers its
+        descendants, as for ``child_sessions``.
+
+        :param request: Inbound HTTP request carrying the caller identity.
+        :param session_id: Session whose subtree to report, e.g. ``"conv_abc123"``.
+        :param limit: Maximum agents in the page (1-1000, default 100).
+        :param after: Id of the last agent of the previous page, or ``None``.
+        :returns: A page of :class:`AgentCostList` in spawn-tree order.
+        :raises OmnigentError: 403 without READ; 404 when no session exists.
+        :raises StaleCursorError: If *after* is not an agent of the subtree, or
+            the tree outgrew the read cap since the page it came from.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        conv = access.conversation
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        tree = await asyncio.to_thread(
+            conversation_store.list_spawn_tree_usage,
+            conv.root_conversation_id or conv.id,
+            # The tree's root row plus up to the cap of sub-agents.
+            limit=_SPAWN_TREE_READ_CAP + 1,
+        )
+        if tree.has_more:
+            if after is not None:
+                # The tree outgrew one read since the first page: the client restarts.
+                raise StaleCursorError(after)
+            # Subtree totals need the whole tree, so an oversized one reports none.
+            return AgentCostList()
+        costs = _agent_costs(tree.data, conv.id)
+        start = 0
+        if after is not None:
+            position = next((i for i, cost in enumerate(costs) if cost.id == after), None)
+            if position is None:
+                raise StaleCursorError(after)
+            start = position + 1
+        window = costs[start : start + limit]
+        return AgentCostList(
+            data=window,
+            first_id=window[0].id if window else None,
+            last_id=window[-1].id if window else None,
+            has_more=start + limit < len(costs),
+        )
 
     # ── GET /sessions/{session_id}/child_sessions ────────────────
 

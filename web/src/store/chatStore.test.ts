@@ -1083,12 +1083,20 @@ describe("chatStore — lazy subtree usage", () => {
       await useChatStore.getState().switchTo("conv_usage");
       await drainAsync();
       expect(useChatStore.getState().sessionCostUsd).toBe(3.5);
+      await vi.advanceTimersByTimeAsync(2_000);
+      client.setQueryData(["agent_costs", "conv_usage"], new Map());
+      client.setQueryData(["agent_costs", "conv_unsupported"], null);
 
       await advanceReconcileInterval();
+      await vi.advanceTimersByTimeAsync(2_000);
 
       expect(streamOpenCount()).toBe(1);
       expect(readUsage).toHaveBeenCalledTimes(2);
       expect(useChatStore.getState().sessionCostUsd).toBe(8);
+      // A total recovered outside the live stream still refreshes per-agent costs,
+      // except from a server that has no breakdown.
+      expect(client.getQueryState(["agent_costs", "conv_usage"])?.isInvalidated).toBe(true);
+      expect(client.getQueryState(["agent_costs", "conv_unsupported"])?.isInvalidated).toBe(false);
       expect(useChatStore.getState().sessionUsageByModel?.["model-a"]).toMatchObject({
         inputTokens: 500,
         totalCostUsd: 8,
