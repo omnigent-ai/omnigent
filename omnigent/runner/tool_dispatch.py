@@ -2218,6 +2218,54 @@ def _subagent_harness(sub_agent_name: str, agent_spec: AgentSpec | None) -> str 
     return spec_harness(sub_spec) if sub_spec is not None else None
 
 
+async def _check_subagent_usage_limit(
+    *,
+    agent_spec: AgentSpec | None,
+    sub_agent_name: str | None,
+    child_harness: str | None,
+    tool_name: str = "sys_session_send",
+) -> str | None:
+    """Return a policy denial string if the target worker's subscription usage hit threshold."""
+    from omnigent.host.usage_limits import (
+        ACTIVE_MONITOR_MAX_AGE_SECONDS,
+        exceeded_usage_windows,
+        format_usage_limit_denial,
+        read_usage_limits,
+        subscription_provider_for_worker,
+    )
+    from omnigent.policies.builtins.orchestration import (
+        extract_subscription_usage_guard_config,
+    )
+
+    guard_cfg = extract_subscription_usage_guard_config(agent_spec)
+    if guard_cfg is None or tool_name not in guard_cfg.dispatch_tools:
+        return None
+    sub_spec = _find_subagent_spec(sub_agent_name, agent_spec) if sub_agent_name else None
+    provider = subscription_provider_for_worker(
+        sub_spec, child_harness, sub_agent_name=sub_agent_name
+    )
+    if provider is None:
+        return None
+    readings = await read_usage_limits((provider,), max_age_seconds=ACTIVE_MONITOR_MAX_AGE_SECONDS)
+    exceeded = [
+        window
+        for reading in readings
+        for window in exceeded_usage_windows(
+            reading,
+            threshold_percent=guard_cfg.threshold_percent,
+            window_kinds=guard_cfg.window_kinds,
+        )
+    ]
+    if not exceeded:
+        return None
+    reason = format_usage_limit_denial(
+        provider,
+        exceeded,
+        threshold_percent=guard_cfg.threshold_percent,
+    )
+    return f"Denied by policy 'subscription_usage_guard': {reason}"
+
+
 def _subagent_harness_override_from_args(args: _JsonObject) -> str | None:
     """
     Extract a per-dispatch harness override from ``sys_session_send`` args.
@@ -2652,6 +2700,7 @@ async def _execute_subagent_tool(
             conversation_id=conversation_id,
             publish_event=publish_event,
             created_by=dispatch_created_by,
+            agent_spec=agent_spec,
         )
 
     # Named mode: (agent, title) spawn-or-continue.
@@ -2785,6 +2834,14 @@ async def _execute_subagent_tool(
                 wrapper_label=child_wrapper_label,
                 created_by=dispatch_created_by,
             )
+        usage_denial = await _check_subagent_usage_limit(
+            agent_spec=agent_spec,
+            sub_agent_name=str(sub_agent_name),
+            child_harness=_optional_string(existing.get("harness"))
+            or _subagent_harness(str(sub_agent_name), agent_spec),
+        )
+        if usage_denial is not None:
+            return usage_denial
     else:
         _auto_ordinal = False
         if not session_name:
@@ -2879,6 +2936,13 @@ async def _execute_subagent_tool(
                     f"Install/upgrade it with: {install} "
                     f"(or don't dispatch to {sub_agent_name!r} here)."
                 )
+        usage_denial = await _check_subagent_usage_limit(
+            agent_spec=agent_spec,
+            sub_agent_name=str(sub_agent_name),
+            child_harness=child_harness,
+        )
+        if usage_denial is not None:
+            return usage_denial
         # Create child session on the server (no initial items —
         # those go via a separate POST so the server forwards them
         # to the runner and triggers a turn).
@@ -3217,6 +3281,7 @@ async def _send_to_existing_session(
     conversation_id: str,
     publish_event: Callable[[str, _JsonObject], None] | None = None,
     created_by: str | None = None,
+    agent_spec: AgentSpec | None = None,
 ) -> str:
     """
     Post a message to an existing direct-child session, return a handle.
@@ -3318,6 +3383,14 @@ async def _send_to_existing_session(
             wrapper_label=_session_wrapper_label(snap_data),
             created_by=created_by,
         )
+    usage_denial = await _check_subagent_usage_limit(
+        agent_spec=agent_spec,
+        sub_agent_name=agent_label,
+        child_harness=_optional_string(snap_data.get("harness"))
+        or _subagent_harness(agent_label, agent_spec),
+    )
+    if usage_denial is not None:
+        return usage_denial
     work_id = _subagent_work.new_subagent_work_id()
     stamp_error = await _patch_subagent_label(
         server_client, target_session_id, _subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
@@ -3542,6 +3615,7 @@ async def _finalize_created_session(
     message: object,
     server_client: httpx.AsyncClient,
     publish_event: Callable[[str, _JsonObject], None] | None,
+    agent_spec: AgentSpec | None = None,
 ) -> str:
     """
     Register fan-out, emit ``session.created``, send any first message, and build the handle.
@@ -3610,6 +3684,7 @@ async def _finalize_created_session(
                 created_by=await _session_turn_actor(
                     server_client=server_client, conversation_id=conversation_id
                 ),
+                agent_spec=agent_spec,
             )
         except Exception as exc:  # noqa: BLE001
             _subagent_work.unregister_subagent_work(child_id)
@@ -3964,6 +4039,7 @@ async def _execute_session_create(
         message=message,
         server_client=server_client,
         publish_event=publish_event,
+        agent_spec=agent_spec,
     )
 
 
@@ -4228,6 +4304,7 @@ async def _session_create_from_config_path(
         message=args.get("message"),
         server_client=server_client,
         publish_event=publish_event,
+        agent_spec=agent_spec,
     )
 
 

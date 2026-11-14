@@ -12,9 +12,26 @@ from __future__ import annotations
 import posixpath
 import re
 import shlex
-from collections.abc import Callable, Collection
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, TypeAlias
 
+from omnigent.host import usage_limits as _usage_limits
+from omnigent.host.usage_limits import (
+    ACTIVE_MONITOR_MAX_AGE_SECONDS,
+    DEFAULT_MONITORED_WINDOW_KINDS,
+    DEFAULT_USAGE_THRESHOLD_PERCENT,
+    VALID_WINDOW_KINDS,
+    Provider,
+    env_usage_threshold_percent,
+    exceeded_usage_windows,
+    format_usage_limit_denial,
+    provider_for_harness,
+    provider_for_subagent_name,
+    resolve_usage_threshold_percent,
+    usage_limits_disabled,
+    validate_usage_threshold_percent,
+)
 from omnigent.policies.builtins._shell import SHELL_TOOLS
 from omnigent.policies.builtins.safety import NATIVE_WRITE_TOOLS
 
@@ -685,6 +702,191 @@ def read_only_os(
     return _evaluate
 
 
+@dataclass(frozen=True)
+class SubscriptionUsageGuardConfig:
+    """Resolved runtime parameters for subscription usage-limit preemption."""
+
+    threshold_percent: float
+    window_kinds: frozenset[str]
+    dispatch_tools: frozenset[str]
+
+
+def _normalize_window_kinds(window_kinds: Sequence[str]) -> frozenset[str]:
+    if isinstance(window_kinds, (str, bytes)) or not isinstance(window_kinds, Sequence):
+        raise ValueError("subscription_usage_guard: window_kinds must be a non-empty sequence")
+    normalized = frozenset(str(kind).strip() for kind in window_kinds if isinstance(kind, str))
+    if not normalized or len(normalized) != len(window_kinds):
+        raise ValueError("subscription_usage_guard: window_kinds must contain non-empty strings")
+    unknown = sorted(normalized - VALID_WINDOW_KINDS)
+    if unknown:
+        raise ValueError(
+            f"subscription_usage_guard: unknown window_kinds {unknown!r}; "
+            f"must be chosen from {sorted(VALID_WINDOW_KINDS)!r}"
+        )
+    return normalized
+
+
+def _normalize_dispatch_tools(dispatch_tools: Sequence[str]) -> frozenset[str]:
+    if isinstance(dispatch_tools, (str, bytes)) or not isinstance(dispatch_tools, Sequence):
+        raise ValueError("subscription_usage_guard: dispatch_tools must be a non-empty sequence")
+    normalized = frozenset(
+        tool.strip() for tool in dispatch_tools if isinstance(tool, str) and tool.strip()
+    )
+    if not normalized or len(normalized) != len(dispatch_tools):
+        raise ValueError("subscription_usage_guard: dispatch_tools must contain non-empty strings")
+    return normalized
+
+
+def extract_subscription_usage_guard_config(
+    spec: object | None,
+) -> SubscriptionUsageGuardConfig | None:
+    """Resolve active ``subscription_usage_guard`` settings from *spec* or environment."""
+    if usage_limits_disabled():
+        return None
+    guardrails = getattr(spec, "guardrails", None) if spec is not None else None
+    policies = getattr(guardrails, "policies", None) or ()
+    for policy_spec in policies:
+        if getattr(policy_spec, "enabled", True) is False:
+            continue
+        func_ref = getattr(policy_spec, "function", None)
+        path = getattr(func_ref, "path", None)
+        if not isinstance(path, str) or not path.endswith(".subscription_usage_guard"):
+            continue
+        raw_args = getattr(func_ref, "arguments", None)
+        args = raw_args if isinstance(raw_args, Mapping) else {}
+        raw_threshold = args.get("threshold_percent")
+        configured_threshold = (
+            validate_usage_threshold_percent(raw_threshold)
+            if raw_threshold is not None
+            else DEFAULT_USAGE_THRESHOLD_PERCENT
+        )
+        raw_windows = args.get("window_kinds")
+        window_kinds = (
+            _normalize_window_kinds(raw_windows)
+            if isinstance(raw_windows, Sequence) and not isinstance(raw_windows, (str, bytes))
+            else frozenset(DEFAULT_MONITORED_WINDOW_KINDS)
+        )
+        raw_tools = args.get("dispatch_tools")
+        dispatch_tools = (
+            _normalize_dispatch_tools(raw_tools)
+            if isinstance(raw_tools, Sequence) and not isinstance(raw_tools, (str, bytes))
+            else frozenset({"sys_session_send", "sys_session_create"})
+        )
+        return SubscriptionUsageGuardConfig(
+            threshold_percent=resolve_usage_threshold_percent(configured_threshold),
+            window_kinds=window_kinds,
+            dispatch_tools=dispatch_tools,
+        )
+    env_threshold = env_usage_threshold_percent()
+    if env_threshold is not None:
+        return SubscriptionUsageGuardConfig(
+            threshold_percent=env_threshold,
+            window_kinds=frozenset(DEFAULT_MONITORED_WINDOW_KINDS),
+            dispatch_tools=frozenset({"sys_session_send", "sys_session_create"}),
+        )
+    return None
+
+
+def _provider_from_config_path(config_path: object) -> Provider | None:
+    if not isinstance(config_path, str) or not config_path.strip():
+        return None
+    trimmed = config_path.strip().replace("\\", "/").rstrip("/")
+    for suffix in ("/config.yaml", "/config.yml", ".yaml", ".yml"):
+        if trimmed.endswith(suffix):
+            trimmed = trimmed[: -len(suffix)]
+            break
+    slug = posixpath.basename(trimmed)
+    return provider_for_subagent_name(slug)
+
+
+def _target_subscription_provider(event: _Json, args: _Json) -> Provider | None:
+    data = event.get("data")
+    tool_name = data.get("name") if isinstance(data, Mapping) else None
+    nested_args = args.get("args")
+    if isinstance(nested_args, Mapping):
+        raw_harness = nested_args.get("harness")
+        if isinstance(raw_harness, str) and raw_harness.strip():
+            return provider_for_harness(raw_harness)
+    top_harness = args.get("harness")
+    if isinstance(top_harness, str) and top_harness.strip():
+        return provider_for_harness(top_harness)
+
+    if tool_name == "sys_session_create":
+        for key in ("agent_id", "agent"):
+            candidate = args.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                resolved = provider_for_harness(candidate) or provider_for_subagent_name(candidate)
+                if resolved is not None:
+                    return resolved
+        return _provider_from_config_path(args.get("config_path"))
+
+    agent_name = args.get("agent")
+    if not isinstance(agent_name, str) or not agent_name.strip():
+        return None
+    context = event.get("context")
+    sub_agent_providers = (
+        context.get("sub_agent_providers") if isinstance(context, Mapping) else None
+    )
+    if isinstance(sub_agent_providers, Mapping):
+        mapped = sub_agent_providers.get(agent_name)
+        return mapped if mapped in ("claude", "codex") else None
+    return provider_for_subagent_name(agent_name)
+
+
+def subscription_usage_guard(
+    *,
+    threshold_percent: float = DEFAULT_USAGE_THRESHOLD_PERCENT,
+    window_kinds: Sequence[str] = DEFAULT_MONITORED_WINDOW_KINDS,
+    dispatch_tools: Sequence[str] = ("sys_session_send", "sys_session_create"),
+) -> Callable[[_Json], Awaitable[_Json]]:
+    """
+    Factory: hold off sub-agent dispatches once subscription usage reaches *threshold_percent*.
+
+    Probes the local Claude or Codex CLI usage windows for subscription-backed
+    workers and returns ``DENY`` when any monitored window (5-hour ``session`` or
+    ``weekly`` by default) is at or above the threshold. API-key and gateway
+    setups report ``unavailable`` rate limits and pass through unaffected.
+    """
+    configured_threshold = validate_usage_threshold_percent(
+        threshold_percent, source="subscription_usage_guard: threshold_percent"
+    )
+    monitored_windows = _normalize_window_kinds(window_kinds)
+    monitored_tools = _normalize_dispatch_tools(dispatch_tools)
+
+    async def _evaluate(event: _Json) -> _Json:
+        args = _tool_call(event, monitored_tools)
+        if args is None or usage_limits_disabled():
+            return _ALLOW
+        provider = _target_subscription_provider(event, args)
+        if provider is None:
+            return _ALLOW
+        effective_threshold = resolve_usage_threshold_percent(configured_threshold)
+        readings = await _usage_limits.read_usage_limits(
+            (provider,), max_age_seconds=ACTIVE_MONITOR_MAX_AGE_SECONDS
+        )
+        exceeded = [
+            window
+            for reading in readings
+            for window in exceeded_usage_windows(
+                reading,
+                threshold_percent=effective_threshold,
+                window_kinds=monitored_windows,
+            )
+        ]
+        if exceeded:
+            return _decision(
+                "DENY",
+                format_usage_limit_denial(
+                    provider,
+                    exceeded,
+                    threshold_percent=effective_threshold,
+                ),
+            )
+        return _ALLOW
+
+    return _evaluate
+
+
 # ── Registry ─────────────────────────────────────────────────────────────────
 
 POLICY_REGISTRY: list[dict[str, object]] = [
@@ -753,5 +955,43 @@ POLICY_REGISTRY: list[dict[str, object]] = [
         "description": "Denies every file-mutating tool (sys_os_write/edit, Claude/Codex "
         "native Write/Edit/MultiEdit/NotebookEdit, and Pi native write/edit) so a "
         "report-only agent can read and run shell but never change code",
+    },
+    {
+        "handler": "omnigent.policies.builtins.orchestration.subscription_usage_guard",
+        "kind": "factory",
+        "name": "Hold Off Sub-Agents Near Subscription Usage Limit",
+        "description": "Checks local Claude and Codex CLI subscription usage windows "
+        "(5-hour session and weekly) and holds off new dispatches once utilization "
+        "reaches the configured threshold percentage",
+        "params_schema": {
+            "type": "object",
+            "properties": {
+                "threshold_percent": {
+                    "type": "number",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "description": "Utilization percentage at or above which new sub-agent "
+                    "dispatches to that subscription provider are held off (overridable via "
+                    "OMNIGENT_USAGE_LIMIT_THRESHOLD_PERCENT).",
+                    "default": 90,
+                },
+                "window_kinds": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["session", "weekly", "weekly_model", "monthly"],
+                    },
+                    "description": "Usage window kinds that trigger hold-off when any reaches "
+                    "threshold_percent.",
+                    "default": ["session", "weekly"],
+                },
+                "dispatch_tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Orchestration tool names gated against subscription usage.",
+                    "default": ["sys_session_send", "sys_session_create"],
+                },
+            },
+        },
     },
 ]

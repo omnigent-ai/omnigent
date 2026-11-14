@@ -206,6 +206,8 @@ class RunnerToolPolicyGate:
             start_gated = Phase.TOOL_CALL in phases
             try:
                 policy = resolve_function_policy(ps)
+                if isinstance(policy, FunctionPolicy):
+                    policy.bind_agent_spec(spec)
             except Exception as exc:  # noqa: BLE001 - all resolution failures deny
                 diagnostic = _resolve_failure_diagnostic(ps, exc)
                 _logger.error(

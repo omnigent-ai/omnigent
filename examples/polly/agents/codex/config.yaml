@@ -45,6 +45,13 @@ prompt: |
   (file:line) and how you verified it; for REVIEW / EXPLORE, your findings.
   Note anything that did not fit the task.
 
+  If you receive a `[System: Subscription usage limit reached ...]` spin-down
+  notice mid-turn, stop starting new edits or test suites immediately, stage and
+  commit clean WIP on your task branch (with the co-sign trailer; do not open an
+  incomplete PR unless all gates are already green), and finish your turn with a
+  checkpoint summary: branch, worktree path, commit SHA (or PR URL), completed
+  vs remaining work, and the reported window reset time.
+
 os_env:
   type: caller_process
   cwd: .
