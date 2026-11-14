@@ -8,10 +8,12 @@ unchanged, so the ``TEXT`` → ``BLOB`` migration needs no backfill.
 from __future__ import annotations
 
 import json
+import random
+import string
 
 import pytest
 
-from omnigent.db.compression import _MIN_COMPRESS_BYTES, decode, encode
+from omnigent.db.compression import _MIN_COMPRESS_BYTES, CompressedText, decode, encode
 
 
 @pytest.mark.parametrize("write_content_size", [False, True])
@@ -96,3 +98,37 @@ def test_memoryview_is_accepted() -> None:
 def test_empty_bytes_decode_to_empty_string() -> None:
     """A legacy empty ``TEXT`` value (empty bytes) decodes to ``''``."""
     assert decode(b"") == ""
+
+
+def _incompressible_text(length: int) -> str:
+    """Seeded high-entropy text, which zstd cannot shrink much."""
+    rng = random.Random(42)
+    return "".join(rng.choices(string.ascii_letters + string.digits, k=length))
+
+
+def test_compressed_text_without_limits_accepts_any_size() -> None:
+    codec = CompressedText()
+    value = _incompressible_text(100_000)
+    assert codec.process_result_value(codec.process_bind_param(value, None), None) == value
+
+
+def test_compressed_text_max_stored_bytes_bounds_framed_writes() -> None:
+    codec = CompressedText(max_stored_bytes=65_535)
+    # Compressible text far above the stored limit still fits once compressed.
+    value = "x" * (1024 * 1024)
+    assert codec.process_result_value(codec.process_bind_param(value, None), None) == value
+    value = _incompressible_text(100_000)
+    assert len(encode(value)) > 65_535
+    with pytest.raises(ValueError, match="size limit"):
+        codec.process_bind_param(value, None)
+    # Reads are not size-checked: legacy and framed values already stored still decode.
+    assert codec.process_result_value(b"x" * 65_536, None) == "x" * 65_536
+    assert codec.process_result_value(encode(value), None) == value
+
+
+@pytest.mark.parametrize("value", ["x" * 10, _incompressible_text(2048)], ids=["raw", "zstd"])
+def test_compressed_text_max_stored_bytes_is_inclusive(value: str) -> None:
+    stored = len(encode(value))
+    assert CompressedText(max_stored_bytes=stored).process_bind_param(value, None) == encode(value)
+    with pytest.raises(ValueError, match="size limit"):
+        CompressedText(max_stored_bytes=stored - 1).process_bind_param(value, None)

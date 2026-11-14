@@ -36,3 +36,32 @@ def test_native_message_stream_id_survives_snapshot_serialization() -> None:
     assert persisted.to_api_dict()["stream_message_id"] == (
         "codex:thread_1:turn_1:agentMessage:item_1"
     )
+
+
+def test_native_message_phase_survives_snapshot_serialization() -> None:
+    """Codex's commentary/answer label reaches the web UI on reload and live broadcast."""
+    parsed = _parse_external_conversation_item(
+        SessionEventInput(
+            type="external_conversation_item",
+            data={
+                "item_type": "message",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "codex-native-ui",
+                    "content": [{"type": "output_text", "text": "Checking the tests."}],
+                    "phase": "commentary",
+                },
+                "response_id": "turn_1",
+            },
+        )
+    )
+
+    persisted = ConversationItem(
+        id="item_1",
+        type=parsed.type,
+        status="completed",
+        response_id=parsed.response_id,
+        created_at=1,
+        data=parsed.data,
+    )
+    assert persisted.to_api_dict()["phase"] == "commentary"

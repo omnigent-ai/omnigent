@@ -352,6 +352,23 @@ async def test_invalid_default_rejects_multipart_create_before_persistence(
     assert {conv.id for conv in store.list_conversations().data} == before_ids
 
 
+async def test_unlisted_override_rejects_multipart_create_before_persistence(
+    client: httpx.AsyncClient,
+) -> None:
+    """A multipart create checks ``model_override`` against the ACP list, as JSON creates do."""
+    bundle = build_agent_bundle("listed-acp", executor=_executor(), include_llm=False)
+    store = get_conversation_store()
+    before_ids = {conv.id for conv in store.list_conversations().data}
+    response = await client.post(
+        "/v1/sessions",
+        data={"metadata": '{"model_override": "' + _UNLISTED + '"}'},
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    assert response.status_code == 400, response.text
+    assert "configured model list" in response.text
+    assert {conv.id for conv in store.list_conversations().data} == before_ids
+
+
 @pytest.mark.parametrize("model", [_ALTERNATE, "default"])
 async def test_invalid_default_rejects_patch_without_mutating_metadata(
     client: httpx.AsyncClient, tmp_path: Path, model: str

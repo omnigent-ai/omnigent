@@ -14,6 +14,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileViewerContext } from "@/shell/FileViewerContext";
+import { mentionPillMarkdown } from "@/lib/mentionPills";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
@@ -634,6 +635,128 @@ describe("dead file links give feedback instead of a silent no-op", () => {
     const message = String(toastMock.mock.calls[0][0]);
     expect(message).toContain("doesn't resolve");
     expect(message).not.toContain("wasn't found");
+  });
+});
+
+describe("mention pills from tagged files", () => {
+  it("opens the tagged file, without its line span, when the pill is clicked", () => {
+    renderMarkdown(
+      `see ${mentionPillMarkdown({ kind: "file", path: "src/a.ts" })} and ` +
+        mentionPillMarkdown({ kind: "file", path: "src/b.ts:3-9" }),
+      ["src/a.ts", "src/b.ts"],
+    );
+    const [whole, span] = screen.getAllByTestId("mention-pill");
+    expect([whole.textContent, span.textContent]).toEqual(["@src/a.ts", "@src/b.ts:3-9"]);
+    fireEvent.click(whole);
+    expect(openFile).toHaveBeenLastCalledWith("src/a.ts");
+    fireEvent.click(span);
+    expect(openFile).toHaveBeenLastCalledWith("src/b.ts");
+  });
+});
+
+describe("links to folders", () => {
+  const openFolder = vi.fn();
+  const FOLDER_VIEWER = { ...FILE_VIEWER_WITH_SESSION, openFolder };
+  const FOLDER = `${WORKSPACE}/experimental/data/mobile-touch-targets`;
+
+  function folderListing(): Response {
+    return jsonResponse({
+      object: "list",
+      data: [
+        {
+          name: "mobile-touch-targets",
+          path: "experimental/data/mobile-touch-targets",
+          type: "directory",
+          bytes: null,
+        },
+        { name: "summary.md", path: "experimental/data/summary.md", type: "file", bytes: 5 },
+      ],
+      has_more: false,
+    });
+  }
+
+  beforeEach(() => openFolder.mockClear());
+
+  it("opens a linked folder in the Files tree instead of claiming it wasn't found", async () => {
+    fetchMock.mockResolvedValue(folderListing());
+    renderMarkdown(`[mobile-touch-targets](${FOLDER})`, [], FOLDER_VIEWER);
+
+    fireEvent.click(await screen.findByRole("button", { name: "mobile-touch-targets" }));
+    expect(openFolder).toHaveBeenCalledWith(FOLDER);
+    expect(openFile).not.toHaveBeenCalled();
+    expect(toastMock).not.toHaveBeenCalled();
+  });
+
+  it("opens a workspace-relative folder link at its host-absolute location", async () => {
+    fetchMock.mockResolvedValue(folderListing());
+    renderMarkdown("[targets](experimental/data/mobile-touch-targets)", [], FOLDER_VIEWER);
+
+    fireEvent.click(await screen.findByRole("button", { name: "targets" }));
+    expect(openFolder).toHaveBeenCalledWith(FOLDER);
+    expect(toastMock).not.toHaveBeenCalled();
+  });
+
+  it("opens a tagged folder's pill in the Files tree", async () => {
+    fetchMock.mockResolvedValue(folderListing());
+    renderMarkdown(
+      mentionPillMarkdown({ kind: "file", path: "experimental/data/mobile-touch-targets/" }),
+      [],
+      FOLDER_VIEWER,
+    );
+    const pill = screen.getByTestId("mention-pill");
+    expect(pill.textContent).toBe("@experimental/data/mobile-touch-targets/");
+    // The pill is enabled once the existence check confirms it is a folder.
+    await waitFor(() => expect(pill).not.toHaveAttribute("aria-disabled"));
+    fireEvent.click(pill);
+    expect(openFolder).toHaveBeenCalledWith(FOLDER);
+    expect(openFile).not.toHaveBeenCalled();
+  });
+
+  it("leaves a folder as plain text where no Files tree can show it", async () => {
+    fetchMock.mockResolvedValue(folderListing());
+    renderMarkdown(
+      `[summary](experimental/data/summary.md) and [mobile-touch-targets](${FOLDER})`,
+      [],
+      FILE_VIEWER_WITH_SESSION,
+    );
+
+    // The sibling file shares the parent listing, so once it opens the folder has been checked.
+    fireEvent.click(await screen.findByRole("button", { name: "summary" }));
+    expect(openFile).toHaveBeenCalledWith("experimental/data/summary.md");
+    expect(screen.queryByRole("button", { name: "mobile-touch-targets" })).toBeNull();
+    expect(screen.getByText("mobile-touch-targets")).toBeInTheDocument();
+    expect(toastMock).not.toHaveBeenCalled();
+  });
+
+  it("opens a folder named like a video in the Files tree, not a player", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        object: "list",
+        data: [{ name: "run.mp4", path: "recordings/run.mp4", type: "directory", bytes: null }],
+        has_more: false,
+      }),
+    );
+    renderMarkdown("[run](recordings/run.mp4)", [], FOLDER_VIEWER);
+
+    fireEvent.click(await screen.findByRole("button", { name: "run" }));
+    expect(openFolder).toHaveBeenCalledWith(`${WORKSPACE}/recordings/run.mp4`);
+    expect(screen.queryByRole("button", { name: /Play video/ })).toBeNull();
+    expect(document.querySelectorAll("video")).toHaveLength(0);
+  });
+
+  it("keeps an inline-code folder path as plain code", async () => {
+    fetchMock.mockResolvedValue(folderListing());
+    renderMarkdown(
+      "`experimental/data/summary.md` and `experimental/data/mobile-touch-targets`",
+      [],
+      FOLDER_VIEWER,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "experimental/data/summary.md" }));
+    expect(openFile).toHaveBeenCalledWith("experimental/data/summary.md");
+    expect(screen.getByText("experimental/data/mobile-touch-targets").tagName).toBe("CODE");
+    expect(openFolder).not.toHaveBeenCalled();
+    expect(toastMock).not.toHaveBeenCalled();
   });
 });
 

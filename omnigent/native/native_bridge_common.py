@@ -35,10 +35,27 @@ from pathlib import Path
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
+from omnigent.process_logging import data_dir
+
 _logger = logging.getLogger(__name__)
 
 OWNER_PID_FILENAME = "owner.pid"
 _LOCK_DIR_NAME = ".locks"
+
+
+def native_bridge_data_dir() -> Path:
+    """
+    Return the configured data dir as an absolute path for native bridge roots.
+
+    Native harness children run in the session's workspace, not the host's
+    launch directory, so a relative ``OMNIGENT_DATA_DIR`` must be anchored in
+    the originating process before bridge paths or the relay's pinned data dir
+    cross that boundary. Like the relay's bridge-dir validation, this only
+    normalizes syntactically and never follows symlinks.
+
+    :returns: Absolute data dir, e.g. ``Path("/home/me/.omnigent")``.
+    """
+    return Path(os.path.abspath(os.fspath(data_dir())))
 
 
 def _bridge_dir_lock(bridge_dir: Path) -> FileLock:

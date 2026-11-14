@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -15,23 +16,29 @@ from httpx import ASGITransport, AsyncClient
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
+    CAP_HARNESS_ACCOUNTS,
+    CAP_HARNESS_LOGIN,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
+    HostProbeAccountsFrame,
+    decode_host_frame,
     encode_host_frame,
 )
-from omnigent.server.auth import LEVEL_OWNER
+from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._host_launch import HostLaunchTarget, resolve_host_launch
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.hosts import create_hosts_router
 from omnigent.server.routes.skills import create_skills_router
+from omnigent.server.sharing_settings import SiblingSessionDestinations
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.sandbox_profile_store import SandboxProfileStore
 from tests.budgets import budget
 from tests.server.helpers import websocket_scope as _websocket_scope
 
@@ -47,6 +54,8 @@ def _make_hello(
     name: str = "test-laptop",
     configured_harnesses: dict[str, bool | str] | None = None,
     gateway_inference: dict[str, bool] | None = None,
+    harness_accounts: dict[str, dict[str, object]] | None = None,
+    capabilities: list[str] | None = None,
 ) -> str:
     """Encode a HostHelloFrame for tests.
 
@@ -66,6 +75,8 @@ def _make_hello(
             name=name,
             configured_harnesses=configured_harnesses,
             gateway_inference=gateway_inference,
+            harness_accounts=harness_accounts,
+            capabilities=capabilities or [],
         )
     )
 
@@ -84,6 +95,8 @@ def host_api_app(
 
 def _build_host_api_app(
     db_uri: str,
+    *,
+    harness_install: bool | Callable[[], bool] | None = None,
 ) -> tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore]:
     """Build one replica's app over *db_uri*.
 
@@ -92,6 +105,7 @@ def _build_host_api_app(
     an empty registry.
 
     :param db_uri: SQLite URI from the shared fixture.
+    :param harness_install: Optional harness-repair feature override.
     :returns: Tuple of (app, registry, host_store, conv_store).
     """
     registry = HostRegistry()
@@ -100,11 +114,20 @@ def _build_host_api_app(
     conv_store = SqlAlchemyConversationStore(db_uri)
     app = FastAPI()
     app.include_router(
-        create_host_tunnel_router(registry, host_store),
+        create_host_tunnel_router(
+            registry,
+            host_store,
+            harness_install=False if harness_install is None else harness_install,
+        ),
         prefix="/v1",
     )
     app.include_router(
-        create_hosts_router(registry, host_store, conv_store),
+        create_hosts_router(
+            registry,
+            host_store,
+            conv_store,
+            harness_install=harness_install,
+        ),
         prefix="/v1",
     )
 
@@ -129,6 +152,8 @@ async def _connect_host(
     name: str = "test-laptop",
     configured_harnesses: dict[str, bool | str] | None = None,
     gateway_inference: dict[str, bool] | None = None,
+    harness_accounts: dict[str, dict[str, object]] | None = None,
+    capabilities: list[str] | None = None,
 ) -> ApplicationCommunicator:
     """Connect a mock host via WebSocket tunnel.
 
@@ -151,7 +176,13 @@ async def _connect_host(
     await comm.send_input(
         {
             "type": "websocket.receive",
-            "text": _make_hello(name, configured_harnesses, gateway_inference),
+            "text": _make_hello(
+                name,
+                configured_harnesses,
+                gateway_inference,
+                harness_accounts,
+                capabilities,
+            ),
         },
     )
     while registry.get(host_id) is None:
@@ -324,6 +355,80 @@ async def test_hosts_api_configured_harnesses_null_for_older_host(
 
     assert resp.status_code == 200
     assert resp.json()["hosts"][0]["configured_harnesses"] is None
+
+
+async def test_harness_accounts_are_live_only_and_login_support_is_explicit(
+    db_uri: str,
+) -> None:
+    """Account PII follows the local tunnel and is never read from the host row."""
+    app, registry, _hs, _cs = _build_host_api_app(db_uri, harness_install=True)
+    _comm = await _connect_host(
+        app,
+        registry,
+        configured_harnesses={"codex": True},
+        harness_accounts={"codex": {"kind": "chatgpt", "email": "person@example.test"}},
+        capabilities=[CAP_HARNESS_ACCOUNTS, CAP_HARNESS_LOGIN],
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        connected = (await client.get("/v1/hosts")).json()["hosts"][0]
+    assert connected["harness_accounts"] == {
+        "codex": {"kind": "chatgpt", "email": "person@example.test"}
+    }
+    assert connected["harness_accounts_supported"] is True
+    assert connected["harness_login_supported"] is True
+
+    other_app, _other_registry, _other_store, _other_conversations = _build_host_api_app(
+        db_uri, harness_install=True
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=other_app), base_url="http://test"
+    ) as client:
+        disconnected = (await client.get("/v1/hosts")).json()["hosts"][0]
+        detail = (await client.get(f"/v1/hosts/{_HOST_ID}")).json()
+    assert "harness_accounts" not in disconnected
+    assert "harness_accounts" not in detail
+    assert disconnected["harness_accounts_supported"] is False
+    assert detail["harness_accounts_supported"] is False
+    assert disconnected["harness_login_supported"] is False
+    assert detail["harness_login_supported"] is False
+
+
+@pytest.mark.parametrize(
+    ("harness_install", "capabilities", "expects_probe"),
+    [
+        (True, [CAP_HARNESS_ACCOUNTS], True),
+        (lambda: True, [CAP_HARNESS_ACCOUNTS], True),
+        (False, [CAP_HARNESS_ACCOUNTS], False),
+        (lambda: False, [CAP_HARNESS_ACCOUNTS], False),
+        (True, [], False),
+    ],
+    ids=["on", "callable-on", "off", "callable-off", "old-host"],
+)
+async def test_connect_requests_accounts_only_when_enabled_and_supported(
+    db_uri: str,
+    harness_install: bool | Callable[[], bool],
+    capabilities: list[str],
+    expects_probe: bool,
+) -> None:
+    """Registration stays non-blocking and only enabled capable hosts are probed."""
+    app, registry, _host_store, _conversations = _build_host_api_app(
+        db_uri,
+        harness_install=harness_install,
+    )
+    comm = await _connect_host(app, registry, capabilities=capabilities)
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    for _ in range(20):
+        if conn.pending_harness_account_probes:
+            break
+        await asyncio.sleep(0.01)
+
+    assert bool(conn.pending_harness_account_probes) is expects_probe
+    if expects_probe:
+        output = await comm.receive_output(timeout=1)
+        assert output["type"] == "websocket.send"
+        assert isinstance(decode_host_frame(output["text"]), HostProbeAccountsFrame)
 
 
 async def test_hosts_api_surfaces_gateway_inference(
@@ -545,8 +650,26 @@ async def test_list_hosts_reports_offline_after_disconnect(
     assert get_resp.json()["status"] == "offline"
 
 
+@pytest.mark.parametrize(
+    "nested,enabled,policy,previous_host,expected_status",
+    [
+        (False, True, "current_host", None, 200),
+        (False, True, "current_host", "3" * 32, 200),
+        (True, True, "current_host", _HOST_ID, 200),
+        (True, True, "any_host", "3" * 32, 200),
+        (True, True, "current_host", "3" * 32, 403),
+        (True, True, "current_host_or_new_sandbox", "3" * 32, 403),
+        (True, False, "current_host", "3" * 32, 200),
+    ],
+)
 async def test_launch_runner_happy_path(
-    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    nested: bool,
+    enabled: bool,
+    policy: str,
+    previous_host: str | None,
+    expected_status: int,
 ) -> None:
     """
     Verify the full launch flow: host receives launch frame, responds
@@ -555,10 +678,19 @@ async def test_launch_runner_happy_path(
     If the host never receives the frame, the send_text path is broken.
     If the future doesn't resolve, the receive loop routing is broken.
     """
-    app, registry, _hs, conv_store = host_api_app
+    monkeypatch.setenv("OMNIGENT_FEATURES", "sibling_sessions" if enabled else "-sibling_sessions")
+    app, registry, _hs, conv_store = _build_host_api_app(db_uri)
+    app.state.sibling_session_destinations = lambda: SiblingSessionDestinations(policy)
     comm = await _connect_host(app, registry)
 
-    conv = conv_store.create_conversation(agent_id=None)
+    conv = conv_store.create_conversation(
+        agent_id=None, host_id=previous_host, workspace="/tmp/source" if previous_host else None
+    )
+    if nested:
+        source = conv_store.create_conversation(
+            agent_id=None, host_id=previous_host, workspace="/tmp/source"
+        )
+        conv_store.add_new_sibling(source.id, conv.id, user_id=None)
 
     async def _respond_to_launch() -> None:
         """Read the launch frame from the host's outbound queue and respond."""
@@ -587,7 +719,7 @@ async def test_launch_runner_happy_path(
                 return
         raise AssertionError("Host never received launch frame")
 
-    responder = asyncio.create_task(_respond_to_launch())
+    responder = asyncio.create_task(_respond_to_launch()) if expected_status == 200 else None
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
@@ -598,7 +730,18 @@ async def test_launch_runner_happy_path(
             },
         )
 
-    await responder
+    if responder is not None:
+        await responder
+
+    assert resp.status_code == expected_status, resp.text
+    if expected_status == 403:
+        unchanged = conv_store.get_conversation(conv.id)
+        assert unchanged is not None and unchanged.runner_id is None
+        assert unchanged.host_id == previous_host
+        assert unchanged.family_id == source.id
+        assert "server policy" in resp.text
+        assert registry.get(_HOST_ID).outbound_queue.empty()
+        return
 
     assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
     data = resp.json()
@@ -647,8 +790,11 @@ async def test_launch_runner_happy_path(
         ),
     ],
 )
+@pytest.mark.parametrize("nested", [False, True])
 async def test_launch_runner_categorical_failure_returns_specific_status(
-    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    nested: bool,
     wire_error_code: str | None,
     launch_error: str,
     expected_status: int,
@@ -666,7 +812,9 @@ async def test_launch_runner_categorical_failure_returns_specific_status(
     """
     from omnigent.errors import OmnigentError
 
-    app, registry, _hs, conv_store = host_api_app
+    monkeypatch.setenv("OMNIGENT_FEATURES", "sibling_sessions")
+    app, registry, _hs, conv_store = _build_host_api_app(db_uri)
+    app.state.sibling_session_destinations = lambda: SiblingSessionDestinations.CURRENT_HOST
 
     # The bare test app has no exception handlers; register the same
     # OmnigentError → JSON handler create_app installs (app.py), so the
@@ -687,6 +835,21 @@ async def test_launch_runner_categorical_failure_returns_specific_status(
 
     comm = await _connect_host(app, registry)
     conv = conv_store.create_conversation(agent_id=None)
+    if nested:
+        conv_store.set_host_id(conv.id, _HOST_ID, workspace="/tmp/source")
+        source = conv_store.create_conversation(agent_id=None)
+        conv_store.add_new_sibling(source.id, conv.id, user_id=None)
+        profiles = SandboxProfileStore(conv_store)
+        snapshot = {
+            "provider": "test",
+            "id": "build",
+            "revision": "v1",
+            "name": "Build",
+            "description": "",
+            "user_id": RESERVED_USER_LOCAL,
+            "workspace_id": 0,
+        }
+        profiles.bind_session(conv.id, snapshot)
 
     async def _refuse_launch() -> None:
         """Reply ``failed`` with the parameterized structured code."""
@@ -736,12 +899,21 @@ async def test_launch_runner_categorical_failure_returns_specific_status(
         assert "SECRET_TOKEN" not in body["error"]["message"]
         assert "forged workspace failure" not in body["error"]["message"]
 
-    # _rollback_failed_launch ran: the session is fully unbound so a
-    # retry after `omnigent setup` starts clean.
     updated = conv_store.get_conversation(conv.id)
     assert updated is not None
     assert updated.runner_id is None, "failed launch must unbind runner_id"
-    assert updated.host_id is None, "failed launch must unbind host_id"
+    assert updated.host_id == (_HOST_ID if nested else None)
+    if nested:
+        assert updated.workspace == "/tmp/source"
+        assert profiles.get_session_snapshot(conv.id) == snapshot
+        responder = asyncio.create_task(_refuse_launch())
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            retry = await client.post(
+                f"/v1/hosts/{_HOST_ID}/runners",
+                json={"session_id": conv.id, "workspace": "/tmp/test-workspace"},
+            )
+        await responder
+        assert retry.status_code == expected_status, retry.text
 
 
 async def test_launch_runner_409_host_offline(
@@ -879,6 +1051,7 @@ def multi_user_app(
             conv_store,
             auth_provider=auth,
             permission_store=permission_store,
+            harness_install=True,
         ),
         prefix="/v1",
     )
@@ -959,6 +1132,27 @@ async def test_get_host_403_wrong_owner(
         f"Expected 403 for wrong owner, got {resp.status_code}. "
         "Owner check on GET /v1/hosts/{{id}} is missing."
     )
+
+
+async def test_refresh_harness_accounts_requires_owner(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """Account probing cannot be triggered on another user's machine."""
+    app, registry, host_store, _conversations = multi_user_app
+    host_id = "294391bc835cde1130ef2a02dcd2b7b3"
+    host_store.upsert_on_connect(host_id, "alice-laptop", "alice@test.com")
+    _register_fake_host(registry, host_id, "alice@test.com")
+    conn = registry.get(host_id)
+    assert conn is not None
+    conn.hello.capabilities = [CAP_HARNESS_ACCOUNTS]
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"/v1/hosts/{host_id}/harnesses/accounts/refresh",
+            headers={"x-test-user": "bob@test.com"},
+        )
+
+    assert response.status_code == 403
 
 
 @pytest.mark.parametrize("user,status", [(None, 401), ("bob@test.com", 403)])

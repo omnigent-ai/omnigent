@@ -572,6 +572,64 @@ async def test_codex_session_does_not_list_claude_plugin_skills(
 
 
 @pytest.mark.asyncio
+async def test_wrapped_codex_resolves_workspace_and_repo_root_agents_skills(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wrapped Codex runs ``.agents`` skills from the workspace up to the repository root."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+
+    bundled_dir = tmp_path / "bundle" / "skills" / "shared"
+    bundled_dir.mkdir(parents=True)
+    (bundled_dir / "SKILL.md").write_text(_skill_md("shared", "Bundled copy."))
+    bundled = [
+        SkillSpec(
+            name="shared",
+            description="Bundled copy.",
+            content="Bundled body.",
+            skill_dir=bundled_dir,
+        )
+    ]
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    workspace = repo / "app"
+    skill_paths = {}
+    for name, root in (("ws-skill", workspace), ("root-skill", repo), ("shared", workspace)):
+        skill_dir = root / ".agents" / "skills" / name
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(_skill_md(name, f"{name} description."))
+        skill_paths[name] = skill_dir.resolve() / "SKILL.md"
+    app = _make_app(tmp_path / "bundle", bundled, "all", workspace=workspace, harness="codex")
+
+    async for c in _client(app):
+        responses = {
+            name: await c.post(
+                "/v1/sessions/conv_wrapped_codex/skills/resolve",
+                json={"name": name, "arguments": f"run {name}"},
+            )
+            for name in skill_paths
+        }
+
+    # The agent's bundled skill outranks a same-named workspace skill, as in the menu.
+    shared = responses.pop("shared")
+    assert shared.status_code == 200, shared.text
+    shared_meta = shared.json()["meta_text"]
+    assert f"<path>{bundled_dir / 'SKILL.md'}</path>" in shared_meta
+    assert "Bundled body." in shared_meta
+    assert "body for shared" not in shared_meta
+    for name, resp in responses.items():
+        assert resp.status_code == 200, resp.text
+        meta = resp.json()["meta_text"]
+        assert f"<name>{name}</name>" in meta
+        assert f"<path>{skill_paths[name]}</path>" in meta
+        assert f"body for {name}" in meta
+        assert f"<user_request>\nrun {name}\n</user_request>" in meta
+
+
+@pytest.mark.asyncio
 async def test_resolve_finds_a_surfaced_plugin_skill(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -105,6 +105,7 @@ class PolicyStore(ABC):
         name: str | None = None,
         handler: str | None = None,
         enabled: bool | None = None,
+        factory_params: dict[str, Any] | None = None,
     ) -> Policy | None:
         """
         Update mutable fields of a policy. ``type`` is immutable.
@@ -116,6 +117,8 @@ class PolicyStore(ABC):
         :param name: New name.
         :param handler: New handler path or URL.
         :param enabled: New enabled flag.
+        :param factory_params: New kwargs for the handler factory, replacing
+            the stored ones in the same write.
         :returns: The updated :class:`Policy`, or ``None``.
         """
         ...

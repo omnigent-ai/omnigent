@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import sqlite3
 import threading
 from collections.abc import AsyncIterator, Iterator
@@ -24,6 +25,7 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.db.utils import _engine_cache, _engine_lock, get_or_create_engine
+from omnigent.debug_logging import record_to_row
 from omnigent.llms.types import (
     FunctionCallOutput,
     MessageOutput,
@@ -390,6 +392,35 @@ class _MockResponsesNamespace:
 
 
 # ── Fixtures ──────────────────────────────────────────
+
+
+@pytest.fixture()
+def debug_log_rows() -> Iterator[list[dict[str, Any]]]:
+    """
+    Server debug-log rows built the way the sink builds them.
+
+    ``record_to_row`` fills ambient attribution (user, session) from context
+    variables at emit time, so rows are built inside ``emit`` instead of from
+    ``caplog`` records after the fact.
+
+    :yields: Rows appended in emit order for ``omnigent.*`` INFO+ records.
+    """
+    rows: list[dict[str, Any]] = []
+
+    class _RowCapture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            rows.append(record_to_row(record, "server"))
+
+    handler = _RowCapture(level=logging.INFO)
+    omnigent_logger = logging.getLogger("omnigent")
+    previous_level = omnigent_logger.level
+    omnigent_logger.addHandler(handler)
+    omnigent_logger.setLevel(logging.INFO)
+    try:
+        yield rows
+    finally:
+        omnigent_logger.removeHandler(handler)
+        omnigent_logger.setLevel(previous_level)
 
 
 @pytest.fixture()

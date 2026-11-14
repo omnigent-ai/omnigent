@@ -48,10 +48,12 @@ class CodexGoalRunner:
         bridge_state_for_session: BridgeStateForSession,
         client_safe_error_detail: ClientSafeErrorDetail,
         logger: logging.Logger,
+        bridge_is_inactive: Callable[[str, CodexNativeBridgeState], bool] | None = None,
     ) -> None:
         self._bridge_state_for_session = bridge_state_for_session
         self._client_safe_error_detail = client_safe_error_detail
         self._logger = logger
+        self._bridge_is_inactive = bridge_is_inactive
 
     @staticmethod
     def _goal_to_api(goal: dict[str, object]) -> dict[str, object]:
@@ -151,7 +153,18 @@ class CodexGoalRunner:
             client_name="omnigent-codex-native-runner",
         )
         try:
-            await codex_client.connect()
+            try:
+                await codex_client.connect()
+            except (ConnectionRefusedError, FileNotFoundError):
+                if (
+                    method == "thread/goal/get"
+                    and self._bridge_is_inactive is not None
+                    and self._bridge_is_inactive(conv_id, state)
+                ):
+                    # Idle reaping leaves its old bridge file behind. Match the
+                    # disconnected-runner read without waking an autonomous goal.
+                    return {"goal": None}
+                raise
             return self._goal_result(
                 await codex_client.request(method, {"threadId": state.thread_id, **params}),
                 action=action,

@@ -245,7 +245,8 @@ final class DatabricksWorkspaceBootstrapTests: XCTestCase {
   func testConfigurationAndSessionFailuresStillHaveMessages() {
     for error: Error in [
       DatabricksOAuthError.invalidClientID, DatabricksSessionError.missingCookie,
-      DatabricksSessionError.networkUnavailable, DatabricksSessionError.rejected(403),
+      DatabricksSessionError.networkUnavailable(DatabricksTransportFailure(URLError(.timedOut))),
+      DatabricksSessionError.rejected(403),
     ] {
       XCTAssertEqual(
         OmnigentWebView.Coordinator.workspaceErrorMessage(error), error.localizedDescription)
@@ -266,6 +267,32 @@ final class DatabricksWorkspaceBootstrapTests: XCTestCase {
     XCTAssertNil(
       OmnigentWebView.Coordinator.workspaceErrorMessage(
         DatabricksSessionError.cancelled, databricksInternalFeaturesEnabled: true))
+  }
+
+  func testWrappedUnreachableHostKeepsTheSharedPageLoadGuidance() {
+    let unreachable = NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotFindHost)
+    let guidance = OmnigentWebView.connectionErrorMessage(
+      for: unreachable, databricksInternalFeaturesEnabled: true)
+    let failure = DatabricksTransportFailure(unreachable)
+    for error: Error in [
+      DatabricksSessionError.networkUnavailable(failure),
+      DatabricksOAuthError.networkUnavailable(failure),
+    ] {
+      XCTAssertEqual(
+        OmnigentWebView.Coordinator.workspaceErrorMessage(
+          error, databricksInternalFeaturesEnabled: true), guidance)
+      XCTAssertEqual(
+        OmnigentWebView.Coordinator.workspaceErrorMessage(
+          error, databricksInternalFeaturesEnabled: false),
+        "Could not reach Databricks. Please try again. (NSURLErrorDomain -1003)")
+    }
+    // A timeout is not a DNS failure, so it keeps the message that names its code.
+    let timedOut = DatabricksSessionError.networkUnavailable(
+      DatabricksTransportFailure(URLError(.timedOut)))
+    XCTAssertEqual(
+      OmnigentWebView.Coordinator.workspaceErrorMessage(
+        timedOut, databricksInternalFeaturesEnabled: true),
+      "Could not reach Databricks. Please try again. (NSURLErrorDomain -1001)")
   }
 
   func testSilentRecoveryDoesNotPresentBrowserWhenGrantIsMissing() async throws {

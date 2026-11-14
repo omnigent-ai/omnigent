@@ -32,13 +32,6 @@ _KNOWN_GAPS = {
         "given while the host was offline never reaches Claude",
         [("approve", 150)],
     ),
-    **contract.gaps(
-        "R3: a message sent while the host is unreachable is accepted (202), then the "
-        "relaunch fails with runner_failed_to_start; the message is never delivered and "
-        "the failure stays after the host returns",
-        [("send", 20), ("send", 150)],
-        harnesses=("claude", "codex"),
-    ),
 }
 #: A refusal slower than this is not "at once" for a user waiting on a button.
 _PROMPT_REFUSAL_S = 35.0

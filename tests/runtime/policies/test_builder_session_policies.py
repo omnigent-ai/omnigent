@@ -11,6 +11,10 @@ Also covers DB-stored default policies (``session_id IS NULL``) and the
 
 from __future__ import annotations
 
+import logging
+from typing import Any
+
+import cachetools
 import pytest
 
 from omnigent.entities import Policy as StoredPolicy
@@ -18,6 +22,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.policies.function import FunctionPolicy
 from omnigent.runtime.policies.builder import (
     _DEFAULT_POLICY_SPECS_CACHE,
+    _DEFAULT_POLICY_SPECS_KEY,
     _SESSION_POLICY_SPECS_CACHE,
     _load_default_policy_specs,
     _load_session_policy_specs,
@@ -25,6 +30,7 @@ from omnigent.runtime.policies.builder import (
     build_policy_engine,
     invalidate_default_policy_specs_cache,
     invalidate_session_policy_specs_cache,
+    policy_specs_cache_age,
 )
 from omnigent.spec.types import (
     AgentSpec,
@@ -183,6 +189,54 @@ def test_invalidate_session_policy_specs_cache(db_uri: str) -> None:
 
     second = _load_session_policy_specs(conv.id, store)
     assert len(second) == 2
+
+
+class _CorruptedTTLCache(cachetools.TTLCache[Any, Any]):
+    """TTLCache whose expiry links are broken, as after unlocked writes."""
+
+    def __init__(self) -> None:
+        super().__init__(maxsize=64, ttl=30)
+
+    def expire(self, time: Any = None) -> Any:
+        raise KeyError((0, "conv_corrupted"))
+
+
+def test_corrupted_session_cache_falls_back_to_db_and_resets(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A raising session-policy cache never fails the engine build.
+
+    The DB specs are still enforced, a warning is logged, and the
+    corrupted backing is replaced so later builds cache normally again.
+
+    :param db_uri: Per-test SQLite URI from the root conftest.
+    """
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.create_conversation()
+    policy_store = SqlAlchemyPolicyStore(db_uri)
+    policy_store.create(
+        policy_id="3f0c2b8e6a9d4e1f8b7a6c5d4e3f2a1b",
+        session_id=conv.id,
+        name="survives_corruption",
+        type="python",
+        handler="tests.resources.examples._shared.tool_functions.block_long_sleep",
+    )
+    corrupted = _CorruptedTTLCache()
+    monkeypatch.setattr(_SESSION_POLICY_SPECS_CACHE, "_backing", corrupted)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.db.workspace_cache"):
+        engine = build_policy_engine(
+            spec=_make_minimal_spec(),
+            conversation_id=conv.id,
+            conversation_store=conv_store,
+            policy_store=policy_store,
+        )
+
+    assert engine.policies[0].spec.name == "survives_corruption"
+    assert "Resetting workspace-scoped cache" in caplog.text
+    assert _SESSION_POLICY_SPECS_CACHE._backing is not corrupted
+    first = _load_session_policy_specs(conv.id, policy_store)
+    assert _load_session_policy_specs(conv.id, policy_store) is first
 
 
 def test_load_session_policy_specs_filters_disabled(db_uri: str) -> None:
@@ -835,3 +889,30 @@ def test_build_engine_ordering_session_agent_db_default_admin(db_uri: str) -> No
         "__ask_on_add_policy",
         "__ask_on_scheduled_task_change",
     ]
+
+
+def test_policy_specs_cache_age_tracks_the_older_store_read(db_uri: str) -> None:
+    """A no-policy answer is as old as the older of the two lists behind it.
+
+    A list no longer cached counts as a full TTL old, and without a store
+    there is nothing to go stale.
+
+    :param db_uri: Per-test SQLite URI from the root conftest.
+    """
+    store = SqlAlchemyPolicyStore(db_uri)
+    session_id = "0f4a9f8e7d6c5b4a39281706f5e4d3c2"
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+    _SESSION_POLICY_SPECS_CACHE.clear()
+    assert policy_specs_cache_age(session_id, None) == 0.0
+    assert policy_specs_cache_age(session_id, store) == 30.0
+
+    _load_default_policy_specs(store)
+    _load_session_policy_specs(session_id, store)
+    assert policy_specs_cache_age(session_id, store) < 1.0
+
+    specs, loaded_at = _SESSION_POLICY_SPECS_CACHE[session_id]
+    _SESSION_POLICY_SPECS_CACHE[session_id] = (specs, loaded_at - 20.0)
+    assert 20.0 <= policy_specs_cache_age(session_id, store) < 21.0
+    assert _DEFAULT_POLICY_SPECS_KEY in _DEFAULT_POLICY_SPECS_CACHE
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+    _SESSION_POLICY_SPECS_CACHE.clear()

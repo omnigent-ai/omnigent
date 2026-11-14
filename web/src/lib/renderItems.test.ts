@@ -241,9 +241,9 @@ describe("shell command user turns", () => {
 });
 
 describe("sub-agent timeline events", () => {
-  const notice = (): AnyBlock => ({
+  const notice = (itemId = "notice_1"): AnyBlock => ({
     type: "native_tool",
-    ctx: ctx({ itemId: "notice_1", responseId: "subagent_returned" }),
+    ctx: ctx({ itemId, responseId: `subagent_${itemId}` }),
     toolType: "subagent_activity",
     label: "Sub-agent activity",
     data: {},
@@ -254,52 +254,222 @@ describe("sub-agent timeline events", () => {
     executions: [mkExec("Agent", "call_1")],
     iteration: 0,
   };
-  const answer: AnyBlock = {
+  const text = (itemId: string, responseId: string, fullText: string): AnyBlock => ({
     type: "text_done",
-    ctx: ctx({ itemId: "parent_answer", responseId: "parent_turn" }),
-    fullText: "The review is complete.",
+    ctx: ctx({ itemId, responseId }),
+    fullText,
     hasCodeBlocks: false,
+  });
+  const answer = text("parent_answer", "parent_turn", "The review is complete.");
+
+  const prompt: AnyBlock = {
+    type: "user_message",
+    ctx: ctx({ itemId: "prompt", responseId: "prompt_turn" }),
+    content: [{ type: "input_text", text: "Review the change." }],
   };
+  // Streams `blocks` after a prompt (so the reuse cache can engage) and checks
+  // every prefix against a full rebuild. Returns the bubbles after the prompt.
+  function buildStreamed(blocks: AnyBlock[]): Bubble[] {
+    const all = [prompt, ...blocks];
+    const cache = createBubbleCache();
+    for (let length = 1; length < all.length; length++) {
+      const prefix = all.slice(0, length);
+      expect(buildBubbles(prefix, null, cache)).toEqual(buildBubbles(prefix, null));
+    }
+    const bubbles = buildBubbles(all, null, cache);
+    expect(bubbles).toEqual(buildBubbles(all, null));
+    return bubbles.slice(1);
+  }
 
   it.each([true, false])("preserves parent liveness with streaming response = %s", (streaming) => {
     const active: ActiveResponse | null = streaming
       ? { responseId: "parent_turn", state: "streaming", error: null }
       : null;
     const bubbles = buildBubbles([work, notice()], active, undefined, [], true);
-    expect(bubbles[0]).toMatchObject({
-      kind: "assistant",
-      responseId: "parent_turn",
-      lifecycle: streaming ? "streaming" : "completed",
-      items: [{ kind: "tool", state: "input-available" }],
-    });
+    expect(bubbles).toMatchObject([
+      {
+        kind: "assistant",
+        responseId: "parent_turn",
+        lifecycle: streaming ? "streaming" : "completed",
+        items: [
+          { kind: "tool", state: "input-available" },
+          { kind: "subagent_activity", itemId: "notice_1" },
+        ],
+      },
+    ]);
     expect(liveCandidateAssistantIndex(bubbles)).toBe(0);
   });
 
-  it.each([false, true])("preserves timeline and parent identity with steering = %s", (steered) => {
+  it.each([false, true])("keeps a mid-turn notice in its turn with steering = %s", (steered) => {
     const user: AnyBlock = {
       type: "user_message",
       ctx: ctx({ itemId: "steering", responseId: "parent_turn" }),
       content: [{ type: "input_text", text: "Include the API change too." }],
     };
-    const cache = createBubbleCache();
-    const blocks = [work, notice(), ...(steered ? [user] : [])];
-    buildBubbles(blocks, null, cache);
-    const bubbles = buildBubbles([...blocks, answer], null, cache);
-    expect(bubbles.map((bubble) => bubble.kind)).toEqual([
-      "assistant",
-      "subagent_activity",
-      ...(steered ? ["user"] : []),
-      "assistant",
+    const bubbles = buildStreamed([work, notice(), ...(steered ? [user] : []), answer]);
+    const answerItem = { kind: "text", text: "The review is complete." };
+    expect(bubbles).toMatchObject([
+      {
+        kind: "assistant",
+        responseId: "parent_turn",
+        stableId: "parent_tool",
+        items: [{ kind: "tool" }, { kind: "subagent_activity" }, ...(steered ? [] : [answerItem])],
+      },
+      ...(steered
+        ? [
+            { kind: "user" },
+            { responseId: "parent_turn", stableId: "parent_answer", defaultExpanded: true },
+          ]
+        : []),
     ]);
-    if (!steered) expect(bubbles[0]).toMatchObject({ continued: true });
-    expect(bubbles.at(-1)).toMatchObject({
-      responseId: "parent_turn",
-      stableId: "parent_answer",
-      ...(steered ? { defaultExpanded: true } : {}),
-      items: [{ kind: "text", text: "The review is complete." }],
-    });
     expect(lastRenderableAssistantIndex(bubbles)).toBe(bubbles.length - 1);
     expect(liveCandidateAssistantIndex(bubbles)).toBe(bubbles.length - 1);
+  });
+
+  it("opens a woken turn's bubble with the notice that woke it", () => {
+    const bubbles = buildStreamed([
+      work,
+      notice("started"),
+      text("parent_wait", "parent_turn", "Waiting on the reviewer."),
+      notice("returned"),
+      { ...work, ctx: ctx({ itemId: "wake_tool", responseId: "wake_turn" }) },
+      text("wake_answer", "wake_turn", "The reviewer approved it."),
+    ]);
+    expect(bubbles).toMatchObject([
+      {
+        responseId: "parent_turn",
+        continued: true,
+        items: [
+          { kind: "tool" },
+          { kind: "subagent_activity", itemId: "started" },
+          { kind: "text" },
+        ],
+      },
+      {
+        responseId: "wake_turn",
+        stableId: "returned",
+        items: [
+          { kind: "subagent_activity", itemId: "returned" },
+          { kind: "tool" },
+          { kind: "text" },
+        ],
+      },
+    ]);
+  });
+
+  it("holds a woken lead's unnamed output with its notice until committed work names it", () => {
+    // Native reasoning deltas carry no response id, so they inherit the old turn's.
+    const thinking: AnyBlock = {
+      type: "reasoning_chunk",
+      ctx: ctx({ responseId: "parent_turn" }),
+      text: "Reading the result.",
+    };
+    const woken = [work, answer, notice("returned"), thinking];
+    expect(buildStreamed(woken)).toMatchObject([
+      {
+        responseId: "parent_turn",
+        items: [
+          { kind: "tool" },
+          { kind: "text" },
+          { kind: "subagent_activity" },
+          { kind: "reasoning" },
+        ],
+      },
+    ]);
+    expect(buildStreamed([...woken, text("wake_answer", "wake_turn", "Approved.")])).toMatchObject([
+      { responseId: "parent_turn", items: [{ kind: "tool" }, { kind: "text" }] },
+      {
+        responseId: "wake_turn",
+        items: [{ kind: "subagent_activity" }, { kind: "reasoning" }, { kind: "text" }],
+      },
+    ]);
+  });
+
+  it("splits at a notice only where committed work changes response", () => {
+    // A live delta carries the active response's id; server items decide, as on reload.
+    const delta: AnyBlock = {
+      type: "text_chunk",
+      ctx: ctx({ responseId: "codex_step2" }),
+      text: "On ",
+    };
+    expect(buildStreamed([work, notice(), delta, answer])).toHaveLength(1);
+    // A response that starts after the notice gets its own bubble, step ids included.
+    const nextStep = text("step_two", "codex_step2", "Next step.");
+    expect(buildStreamed([work, notice(), nextStep])).toMatchObject([
+      { responseId: "parent_turn" },
+      { responseId: "codex_step2", items: [{ kind: "subagent_activity" }, { kind: "text" }] },
+    ]);
+  });
+
+  it("keeps a late notice out of the turn's timing", () => {
+    const stamped = (block: AnyBlock, createdAtS: number): AnyBlock => ({
+      ...block,
+      ctx: { ...block.ctx, createdAtS },
+    });
+    const [bubble] = buildBubbles(
+      [stamped(work, 100), stamped(answer, 130), stamped(notice(), 900)],
+      null,
+    );
+    expect(bubble).toMatchObject({ workedForS: 30, lastActivityAtS: 130, createdAtS: 130 });
+  });
+
+  it("never looks past an unconfirmed user message for the next turn", () => {
+    const sent: AnyBlock = {
+      type: "user_message",
+      ctx: ctx({ itemId: "sent", responseId: "" }),
+      content: [{ type: "input_text", text: "Any update?" }],
+    };
+    expect(
+      buildStreamed([work, notice(), sent, text("wake_answer", "wake_turn", "Still running.")]),
+    ).toMatchObject([
+      { responseId: "parent_turn", items: [{ kind: "tool" }, { kind: "subagent_activity" }] },
+      { kind: "user", itemId: "sent" },
+      { responseId: "wake_turn" },
+    ]);
+  });
+
+  it("keeps notices standalone until work follows them", () => {
+    const notices = [notice("started"), notice("returned")];
+    expect(buildBubbles([prompt, ...notices], null).map((bubble) => bubble.kind)).toEqual([
+      "user",
+      "subagent_activity",
+      "subagent_activity",
+    ]);
+    expect(buildStreamed([...notices, answer])).toMatchObject([
+      {
+        kind: "assistant",
+        responseId: "parent_turn",
+        items: [{ kind: "subagent_activity" }, { kind: "subagent_activity" }, { kind: "text" }],
+      },
+    ]);
+    // A file block renders nothing, so it doesn't hide the work after it.
+    const file: AnyBlock = {
+      type: "file",
+      ctx: ctx({ itemId: "file" }),
+      fileId: "f",
+      filename: null,
+    };
+    expect(buildStreamed([notices[0]!, file, answer])).toMatchObject([
+      { kind: "assistant", items: [{ kind: "subagent_activity" }, { kind: "text" }] },
+    ]);
+  });
+
+  it("keeps a notice recorded before a wake marker in the turn it ended", () => {
+    const wake: AnyBlock = {
+      type: "user_message",
+      ctx: ctx({ itemId: "wake", responseId: "wake_turn" }),
+      content: [{ type: "input_text", text: "[System: sub-agent reviewer finished (completed)]" }],
+    };
+    const wakeTool = { ...work, ctx: ctx({ itemId: "wake_tool", responseId: "wake_turn" }) };
+    expect(buildStreamed([work, notice("returned"), wake, wakeTool])).toMatchObject([
+      {
+        responseId: "parent_turn",
+        continued: true,
+        items: [{ kind: "tool" }, { kind: "subagent_activity", itemId: "returned" }],
+      },
+      { kind: "user", itemId: "wake" },
+      { responseId: "wake_turn", items: [{ kind: "tool" }] },
+    ]);
   });
 });
 
@@ -2255,6 +2425,28 @@ describe("buildBubbles — lifecycle from activeResponse", () => {
       },
     ]);
   });
+
+  it("carries a TextDone phase onto its text item", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "msg_commentary", responseId: "codex_turn_123" }),
+        fullText: "Checking the tests.",
+        hasCodeBlocks: false,
+        phase: "commentary",
+      },
+    ];
+    const a = buildBubbles(blocks, null)[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(a.items).toEqual([
+      {
+        kind: "text",
+        itemId: "msg_commentary",
+        text: "Checking the tests.",
+        final: true,
+        phase: "commentary",
+      },
+    ]);
+  });
 });
 
 describe("buildBubbles — reasoning", () => {
@@ -4164,6 +4356,69 @@ describe("buildBubbles — anonymous blocks join the surrounding turn", () => {
       null,
     );
     expect(assistants(bubbles)[0]!.stableId).toBe("m2");
+  });
+
+  it("keeps a streaming reply's keys while its turn's items commit", () => {
+    // The relay stamps a streamed text's id after the tool call that closed it has
+    // committed, and a step-wise turn moves to a new response id. Re-keying on any
+    // of these would remount the reply mid-turn.
+    const live = (block: AnyBlock): AnyBlock => ({
+      ...block,
+      ctx: { ...block.ctx, clientCreatedAtS: 1_700_000_000 },
+    });
+    const user: AnyBlock = {
+      type: "user_message",
+      ctx: ctx({ itemId: "u1", responseId: "" }),
+      content: [{ type: "input_text", text: "Read the file." }],
+    };
+    const streamed = live(textDone(null, "resp_1", "Reading it."));
+    const call = live({
+      type: "tool_group",
+      ctx: ctx({ itemId: "fc_1", responseId: "resp_1" }),
+      executions: [mkExec("shell", "c1")],
+      iteration: 0,
+    });
+    const stamped: AnyBlock = { ...streamed, ctx: { ...streamed.ctx, itemId: "msg_1" } };
+    const nextStep = live(textDone(null, "resp_2", "Next step."));
+    const reply = (blocks: AnyBlock[]) => assistants(buildBubbles(blocks, null))[0]!;
+
+    const opened = reply([user, streamed]);
+    for (const blocks of [
+      [user, streamed, call],
+      [user, stamped, call],
+      [user, stamped, call, nextStep],
+    ]) {
+      const bubble = reply(blocks);
+      expect(bubble.stableId).toBe(opened.stableId);
+      expect(bubble.items[0]).toMatchObject({ kind: "text", streamKey: "text#0" });
+    }
+    // History from the server keys by its first item id as before.
+    expect(reply([user, textDone("msg_1", "resp_1", "Reading it."), call]).stableId).toBe("msg_1");
+    // A queued message splits the response; the next streamed bubble gets its own key.
+    const queued: AnyBlock = { ...user, ctx: ctx({ itemId: "u2", responseId: "" }) };
+    const more = live(textDone(null, "resp_1", "Two names."));
+    const [first, second] = assistants(buildBubbles([user, stamped, call, queued, more], null));
+    expect(second!.stableId).not.toBe(first!.stableId);
+    // A cached build reusing that first reply numbers the next one as a fresh build does.
+    const cache = createBubbleCache();
+    const before = buildBubbles([user, stamped, call, queued], null, cache);
+    const after = buildBubbles([user, stamped, call, queued, more], null, cache);
+    expect(after[1]).toBe(before[1]);
+    expect(assistants(after).map((b) => b.stableId)).toEqual([first!.stableId, second!.stableId]);
+    // An empty segment is dropped once a non-empty text lands; the answer keeps its key.
+    const empty = live(textDone(null, "resp_1", ""));
+    const chunk = live({
+      type: "text_chunk",
+      ctx: ctx({ itemId: null, responseId: "resp_1" }),
+      text: "Two names.",
+    });
+    const answer = (blocks: AnyBlock[]) =>
+      reply(blocks).items.find(
+        (item): item is Extract<RenderItem, { kind: "text" }> =>
+          item.kind === "text" && item.text === "Two names.",
+      );
+    expect(answer([user, empty, call, chunk])).toMatchObject({ streamKey: "text#1" });
+    expect(answer([user, empty, call, chunk, more])).toMatchObject({ streamKey: "text#1" });
   });
 });
 

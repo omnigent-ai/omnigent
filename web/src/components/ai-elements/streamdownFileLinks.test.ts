@@ -151,6 +151,7 @@ describe("markWorkspaceFileLinks", () => {
 
   it.each([
     ["https://example.com/docs.md", "external URL"],
+    ["/c/conv_123", "chat route in a clear or rewind notice"],
     ["http://localhost:3000/x.md", "plain http URL"],
     ["//cdn.example.com/x.md", "protocol-relative URL"],
     ["mailto:someone@example.com", "mailto"],

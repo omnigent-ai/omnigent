@@ -6,6 +6,7 @@ import pytest
 
 from omnigent.harness_aliases import (
     canonicalize_harness,
+    harness_account_key,
     is_native_harness,
     native_terminal_name,
 )
@@ -47,6 +48,22 @@ def test_canonicalize_harness(alias: str | None, canonical: str | None) -> None:
     ``_validate_harness``.
     """
     assert canonicalize_harness(alias) == canonical
+
+
+@pytest.mark.parametrize(
+    "harness,expected",
+    [
+        ("claude", "claude"),
+        ("claude-native", "claude"),
+        ("codex-native", "codex"),
+        ("native-pi", "pi"),
+        ("opencode-native", "opencode"),
+        ("qwen", None),
+        (None, None),
+    ],
+)
+def test_harness_account_key(harness: str | None, expected: str | None) -> None:
+    assert harness_account_key(harness) == expected
 
 
 @pytest.mark.parametrize(

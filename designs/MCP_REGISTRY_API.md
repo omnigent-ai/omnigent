@@ -201,6 +201,34 @@ OAuth connection failures return to the UI as sign-in errors, with the storage-l
 diagnosis in the server log. A refresh response that omits a refresh token or returns
 null keeps the existing refresh token.
 
+## Sessions the server creates
+
+Two kinds of session are created for an owner rather than from the composer,
+and both start with a saved selection:
+
+- **Scheduled tasks** accept `mcp_services` on `POST /v1/scheduled-tasks` and
+  `PATCH /v1/scheduled-tasks/{id}` (and the `sys_scheduled_task_*` tools), when
+  `GET /v1/info` reports `scheduled_task_mcp_services`. When it is saved, the
+  owner must be allowed to use each service and have connected any account it
+  needs. It is stored on the task and stamped as `omnigent.mcp_service.<id>`
+  labels on every session the task creates. `[]` clears it. Changing it makes a
+  continue task's next run start a new session, as other session settings do.
+  A task that starts each run from a copy of a session replaces the copy's
+  selection with its own; with no services of its own, the copy keeps the
+  source session's.
+- **Independent workers** a session starts through `sys_session_create`
+  inherit that session's selection when the request selects none of its own.
+  The worker starts without it if a service is no longer usable by the owner,
+  a name collides with a custom server in the worker's agent, the agent cannot
+  be loaded to check, or the worker's host or runner lacks registry support.
+  Child sessions and named sub-agents keep their own configuration.
+
+A deployment that records selections differently passes its own
+[`SessionMcpSelection`](../omnigent/server/session_mcp_selection.py) with
+`create_app(session_mcp_selection=...)`. It validates a list when an owner saves
+it, turns a list into labels, and reads a list back from labels; the default,
+`RegistryMcpSelection`, uses the registry labels above.
+
 ## Gateway requests and policy context
 
 `POST /v1/mcp/{service_id}` is the per-service JSON-RPC endpoint. Use
@@ -329,6 +357,7 @@ does not implement an on-behalf-of exchange.
 | [`McpPolicyAdapter`](../omnigent/server/mcp_policy_adapter.py) | Resolves trusted session context and applies existing policies around either backend. |
 | [`ConnectionHooks`, `create_connection_router`](../omnigent/server/routes/connections_base.py) | Existing provider protocol and shared OAuth route factory. `McpOAuthHooks` implements the MCP flow. |
 | [`AuthProvider`](../omnigent/server/auth.py) | Existing identity abstraction; inject with `create_app(auth_provider=...)`. |
+| [`SessionMcpSelection`, `RegistryMcpSelection`](../omnigent/server/session_mcp_selection.py) | How scheduled-task fires and workers record their MCP services; inject with `create_app(session_mcp_selection=...)`. |
 | [`CredentialStore`](../omnigent/stores/credential_store/sqlalchemy_store.py) | Existing encrypted grant persistence. The resolver owns refresh/exchange, the store owns persistence. |
 
 ### Execution extension point

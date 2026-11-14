@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.entities import ProviderConnection
 from omnigent.server.routes.connections_base import ConnectionError, ConnectStart
-from omnigent.stores.credential_store.secret_cipher import SecretTooLargeError
+from omnigent.stores.credential_store.secret_cipher import SecretTooLargeError, build_secret_cipher
 from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
 
 _logger = logging.getLogger(__name__)
@@ -196,6 +196,17 @@ class McpRegistry:
             raise ConnectionError("MCP service is unavailable for this user")
         return service
 
+    def connected(self, service: McpService, user_id: str, app_state: Any) -> bool:
+        """Whether *user_id* has the account *service* needs; blocking store read."""
+        if service.auth in {"github", "databricks"}:
+            store = getattr(app_state, f"{service.auth}_store", None)
+            return store is not None and store.get(user_id) is not None
+        if service.auth in {"oauth", "bearer"}:
+            return (
+                self.store is not None and self.store.get(user_id, f"mcp:{service.id}") is not None
+            )
+        return service.auth == "none"
+
     async def token(self, service: McpService, user_id: str, app_state: Any) -> str | None:
         if service.auth == "none":
             return None
@@ -357,6 +368,18 @@ class McpRegistry:
                 failure.status_code,
             )
             raise failure from None
+
+
+def build_mcp_registry_from_env(db_uri: str) -> McpRegistry | None:
+    """Build the operator catalog named by ``OMNIGENT_MCP_REGISTRY``, or ``None`` when unset.
+
+    Invalid catalogs and missing ciphers raise so every server entrypoint fails at startup.
+    """
+    config = McpRegistryConfig.from_env()
+    if config is None:
+        return None
+    cipher = build_secret_cipher()
+    return McpRegistry(config, CredentialStore(db_uri, cipher) if cipher else None)
 
 
 class McpOAuthHooks:

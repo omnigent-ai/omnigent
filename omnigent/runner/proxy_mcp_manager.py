@@ -26,10 +26,13 @@ import json
 import logging
 import uuid
 from collections.abc import Callable
+from contextlib import nullcontext, suppress
+from time import monotonic
 from typing import cast
 
 import httpx
 
+from omnigent.debug_logging import debug_event
 from omnigent.runner import pending_approvals
 from omnigent.runner.mcp_execution_registry import (
     MCP_OPERATION_ID_PARAM,
@@ -157,6 +160,7 @@ class ProxyMcpManager:
         ap_client: httpx.AsyncClient,
         publish_event: _EventPublisher | None = None,
         execution_registry: McpExecutionRegistry | None = None,
+        reattach_client_factory: Callable[[], httpx.AsyncClient] | None = None,
     ) -> None:
         """Create a proxy manager bound to one session.
 
@@ -170,11 +174,14 @@ class ProxyMcpManager:
             is irrelevant.
         :param execution_registry: Runner-owned MCP operations that a new
             server generation can reattach to after a tunnel replacement.
+        :param reattach_client_factory: Open an isolated server connection for
+            reattachment without disturbing requests on the shared client.
         """
         self._session_id = session_id
         self._omnigent_client = ap_client
         self._publish_event = publish_event
         self._execution_registry = execution_registry
+        self._reattach_client_factory = reattach_client_factory
         self._registry_services: set[str] = set()
 
     @property
@@ -358,6 +365,49 @@ class ProxyMcpManager:
         wire_name = upstream_name if managed else tool_name
         url = f"/v1/mcp/{service}" if managed else self._mcp_url
 
+        def _record_failure(
+            exc: BaseException | None,
+            *,
+            phase: str,
+            request_generation: int,
+            started: float,
+            response: httpx.Response | None = None,
+            reattach_trigger: str | None = None,
+        ) -> None:
+            # Diagnostics must preserve the original failure and replay policy.
+            with suppress(Exception):
+                upstream_request_id = None
+                if response is not None:
+                    raw_id = response.headers.get("x-request-id", "")
+                    try:
+                        if len(raw_id) in {32, 36}:
+                            upstream_request_id = str(uuid.UUID(raw_id))
+                    except ValueError:
+                        pass
+                registry = self._execution_registry
+                _logger.warning(
+                    "MCP proxy call failed",
+                    extra=debug_event(
+                        "mcp_proxy_call_failed",
+                        session_id=self._session_id,
+                        operation_id=operation_id,
+                        jsonrpc_request_id=request_id,
+                        proxy_route="registry" if managed else "session",
+                        failure_phase=phase,
+                        exception_type=type(exc).__name__[:80] if exc is not None else "none",
+                        http_status=response.status_code if response is not None else None,
+                        upstream_request_id=upstream_request_id,
+                        server_generation=request_generation,
+                        observed_server_generation=pending_approvals.current_server_generation(),
+                        operation_retained=registry is not None
+                        and registry.has_operation(self._session_id, operation_id),
+                        reattach_trigger=reattach_trigger[:80]
+                        if reattach_trigger is not None
+                        else None,
+                        phase_elapsed_ms=round((monotonic() - started) * 1000),
+                    ),
+                )
+
         def _initial_payload() -> _JsonObject:
             return {
                 "jsonrpc": "2.0",
@@ -370,12 +420,27 @@ class ProxyMcpManager:
                 },
             }
 
+        reattaching = False
+
         async def _wait_to_reattach(
             request_generation: int,
             cause: BaseException | None = None,
+            *,
+            response: httpx.Response | None = None,
         ) -> None:
+            nonlocal reattaching
+            started = monotonic()
+            trigger = type(cause).__name__ if cause is not None else "detached_response"
             registry = self._execution_registry
             if registry is None or not registry.has_operation(self._session_id, operation_id):
+                _record_failure(
+                    cause,
+                    phase="server_reattach",
+                    request_generation=request_generation,
+                    started=started,
+                    response=response,
+                    reattach_trigger=trigger,
+                )
                 raise RuntimeError(
                     f"MCP proxy call for tool {tool_name!r} in session "
                     f"{self._session_id!r} lost its server without a reserved "
@@ -387,37 +452,65 @@ class ProxyMcpManager:
                     timeout_seconds=_SERVER_RECONNECT_WAIT_S,
                 )
             except TimeoutError as reconnect_exc:
+                _record_failure(
+                    reconnect_exc,
+                    phase="server_reattach",
+                    request_generation=request_generation,
+                    started=started,
+                    response=response,
+                    reattach_trigger=trigger,
+                )
                 raise RuntimeError(
                     f"MCP proxy call for tool {tool_name!r} in session "
                     f"{self._session_id!r} lost its server and no replacement "
                     f"connected within {_SERVER_RECONNECT_WAIT_S:.0f}s"
                 ) from reconnect_exc
 
+            reattaching = True
+
         payload = _initial_payload()
         approval_retries = 0
 
         while True:
             request_generation = pending_approvals.current_server_generation()
+            started = monotonic()
+            failure_phase = "transport"
+            resp: httpx.Response | None = None
             try:
-                resp = await self._omnigent_client.post(
-                    url,
-                    json=payload,
-                    headers={"X-Omnigent-Session-Id": self._session_id} if managed else {},
-                    # Short connect timeout still fails fast on an unreachable
-                    # server; the read timeout covers ordinary proxy request
-                    # hangs. Sub-agent dispatch returns an async handle
-                    # immediately and no longer holds this call for a child turn.
-                    timeout=httpx.Timeout(
-                        connect=10.0,
-                        read=MCP_PROXY_CALL_TIMEOUT_S,
-                        write=10.0,
-                        pool=10.0,
-                    ),
+                # A pooled HTTP connection can still lead to the previous replica.
+                client_context = (
+                    self._reattach_client_factory()
+                    if reattaching and not managed and self._reattach_client_factory is not None
+                    else nullcontext(self._omnigent_client)
                 )
+                async with client_context as request_client:
+                    resp = await request_client.post(
+                        url,
+                        json=payload,
+                        headers={"X-Omnigent-Session-Id": self._session_id} if managed else {},
+                        # Short connect timeout still fails fast on an unreachable
+                        # server; the read timeout covers ordinary proxy request
+                        # hangs. Sub-agent dispatch returns an async handle
+                        # immediately and no longer holds this call for a child turn.
+                        timeout=httpx.Timeout(
+                            connect=10.0,
+                            read=MCP_PROXY_CALL_TIMEOUT_S,
+                            write=10.0,
+                            pool=10.0,
+                        ),
+                    )
+                failure_phase = "http_status"
                 resp.raise_for_status()
+                failure_phase = "response_decode"
                 data = _response_json_object(resp)
             except httpx.TransportError as exc:
                 if managed:
+                    _record_failure(
+                        exc,
+                        phase=failure_phase,
+                        request_generation=request_generation,
+                        started=started,
+                    )
                     raise RuntimeError(
                         "MCP gateway transport failed; completion is unknown. "
                         "Call was not retried."
@@ -430,6 +523,13 @@ class ProxyMcpManager:
                 payload = cast("_JsonObject", {**payload, "id": request_id})
                 continue
             except Exception as exc:
+                _record_failure(
+                    exc,
+                    phase=failure_phase,
+                    request_generation=request_generation,
+                    started=started,
+                    response=resp,
+                )
                 raise RuntimeError(
                     f"MCP proxy call failed for tool {tool_name!r} in session "
                     f"{self._session_id!r}: {exc}"
@@ -444,7 +544,7 @@ class ProxyMcpManager:
                 code = err.get("code")
                 msg = err.get("message", "")
                 if code == RUNNER_MCP_EXECUTION_DETACHED_CODE:
-                    await _wait_to_reattach(request_generation)
+                    await _wait_to_reattach(request_generation, response=resp)
                     request_id += 1
                     payload = cast("_JsonObject", {**payload, "id": request_id})
                     continue

@@ -16,6 +16,12 @@ _check-uv:
 _ensure-uv:
     uv sync --extra all --group dev
 
+# Installs the pre-commit and pre-push git hooks (see default_install_hook_types
+# in .pre-commit-config.yaml). Worktrees share the main checkout's .git, so one
+# install covers all of them.
+_ensure-hooks: _ensure-uv
+    uv run --no-sync pre-commit install
+
 # --- iOS Ruby dependencies ---
 
 _check-ios:
@@ -41,7 +47,7 @@ _ensure-omnidev:
 check: _check-uv _check-ios _check-omnidev
 
 [group('setup')]
-ensure: _ensure-uv _ensure-ios _ensure-omnidev
+ensure: _ensure-uv _ensure-hooks _ensure-ios _ensure-omnidev
 
 # --- Local dev ---
 
@@ -255,6 +261,10 @@ lint: _ensure-uv
 [group('lint')]
 lint-all: _ensure-uv
     uv run --no-sync pre-commit run --all-files
+
+# Install (or reinstall) the git hooks without the rest of `just ensure`.
+[group('lint')]
+hooks: _ensure-hooks
 
 [group('lint')]
 typecheck-python: _ensure-uv

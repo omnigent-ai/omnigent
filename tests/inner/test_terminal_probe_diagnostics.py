@@ -111,7 +111,10 @@ async def test_unavailable_error_retains_both_probes_before_cleanup(
 
     assert not tmp_path.exists()
     assert not instance.running
-    assert commands == ["capture-pane", "has-session"] * 3
+    # The threaded watcher folds the liveness probe and capture into one
+    # `list-panes ; capture-pane` exec, so its first subcommand is list-panes.
+    capture_subcommand = "list-panes" if threaded else "capture-pane"
+    assert commands == [capture_subcommand, "has-session"] * 3
     records = [
         r
         for r in caplog.records
@@ -176,6 +179,9 @@ async def test_probe_history_resets_on_recovery(
     def run(cmd, **kwargs):
         nonlocal tick
         command = cmd[5]
+        if threaded and command == "list-panes":
+            # Folded `list-panes ; capture-pane` exec stands in for the capture probe.
+            command = "capture-pane"
         if command == "capture-pane":
             tick += 1
         if tick == 3 and (
@@ -253,3 +259,45 @@ def test_socket_stat_failure_does_not_hide_probe_error(
     record = next(r for r in caplog.records if "tmux unavailable after" in r.getMessage())
     assert record.attributes["socket_state"] == "stat_failed"
     assert record.attributes["socket_stat_errno"] == errno.EACCES
+
+
+@pytest.mark.parametrize(
+    ("stderr", "keep_alive_after_exit", "killed_by_tmux"),
+    [
+        ("no current target", True, True),
+        ("can't find session: main", True, True),
+        # The socket outlived its server, e.g. after ``killall tmux``.
+        ("no server running on /tmp/omnigent-terminal-x/tmux.sock", True, True),
+        (
+            "error connecting to /tmp/omnigent-terminal-x/tmux.sock (No such file or directory)",
+            True,
+            False,
+        ),
+        ("no current target", False, False),
+    ],
+)
+async def test_session_killed_by_tmux_reads_the_has_session_answer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stderr: str,
+    keep_alive_after_exit: bool,
+    killed_by_tmux: bool,
+) -> None:
+    """A kept-alive session tmux lost, or whose server died, reads as killed by tmux."""
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+        keep_alive_after_exit=keep_alive_after_exit,
+    )
+
+    def run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, b"", stderr.encode())
+
+    _patch_tmux(monkeypatch, run)
+    await _run_watcher(instance, False, lambda: None)
+
+    assert not instance.running
+    assert instance.session_killed_by_tmux() is killed_by_tmux

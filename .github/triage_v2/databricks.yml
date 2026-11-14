@@ -65,6 +65,15 @@ variables:
   scheduled_adopt_legacy_bot_priorities:
     description: Adopt legacy bot labels during triggered runs while ownership is migrated.
     default: "false"
+  prod_root_folder:
+    description: Shared workspace folder for the prod deployment; the manager group and service principal need CAN_MANAGE on it.
+    default: ""
+  prod_service_principal:
+    description: Application ID of the service principal the prod job runs as.
+    default: ""
+  prod_manager_group:
+    description: Workspace group that gets CAN_MANAGE on the prod job.
+    default: ""
 
 targets:
   dev:
@@ -72,3 +81,20 @@ targets:
     mode: development
   prod:
     mode: production
+    # Workspace identities come from .databricks/bundle/prod/variable-overrides.json
+    # (see README); without them validation fails before anything is deployed.
+    workspace:
+      root_path: ${var.prod_root_folder}/${bundle.name}/${bundle.target}
+    run_as:
+      service_principal_name: ${var.prod_service_principal}
+    permissions:
+      - group_name: ${var.prod_manager_group}
+        level: CAN_MANAGE
+    # The live behavior, so a redeploy cannot reset it to the safe defaults.
+    variables:
+      artifact_volume_name: issue_priority_prod_artifacts
+      github_auth_mode: app
+      allow_github_writes: "true"
+      scheduled_mode: apply
+      scheduled_adopt_legacy_bot_priorities: "true"
+      schedule_pause_status: UNPAUSED

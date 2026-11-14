@@ -12,8 +12,9 @@
 //
 // The pure helpers (matchesServer, parseDaemonRecord, normalizeServerUrl,
 // candidatePaths, resolveCliPath with injected probes) are unit-tested in
-// test/omnigent_cli.test.js; the functions that actually spawn a binary are
-// exercised in the manual verification flow.
+// test/omnigent_cli.test.js, as is runCli's failure classification against real
+// subprocesses; the other spawning functions are exercised in the manual
+// verification flow.
 
 "use strict";
 
@@ -27,6 +28,9 @@ const url = require("./url");
 
 /** Default timeout for the short status commands. */
 const DEFAULT_TIMEOUT_MS = 10000;
+
+/** Ceiling for `login`, just past the CLI's own 300s OIDC ticket deadline. */
+const LOGIN_TIMEOUT_MS = 305000;
 
 /**
  * One-liner shown on the setup page when the CLI is missing. Mirrors the
@@ -66,9 +70,9 @@ function isLoopbackServer(serverUrl) {
 
 /**
  * True when two URLs refer to the same local server — both loopback hosts on
- * the same port (so ``localhost:6767`` and ``127.0.0.1:6767`` match, but
- * ``localhost:8000`` does not). Used to confirm the CLI's local server is the
- * one a window is actually connected to before showing its controls.
+ * the same endpoint with only the loopback hostname substituted. Used to
+ * confirm the CLI's local server is the one a window is actually connected
+ * to before showing its controls.
  *
  * @param {string} a
  * @param {string} b
@@ -79,7 +83,8 @@ function sameLoopbackServer(a, b) {
     const ua = new URL(a);
     const ub = new URL(b);
     if (!url.LOCAL_HOSTS.has(ua.hostname) || !url.LOCAL_HOSTS.has(ub.hostname)) return false;
-    return ua.port === ub.port;
+    ua.hostname = ub.hostname;
+    return normalizeServerUrl(ua.href) === normalizeServerUrl(ub.href);
   } catch {
     return false;
   }
@@ -152,14 +157,20 @@ let cachedHostId = null;
  */
 function localHostId() {
   if (cachedHostId) return cachedHostId;
+  cachedHostId = readLocalHostId();
+  return cachedHostId;
+}
+
+/** Read the current machine identity without retaining a stale config value. */
+function readLocalHostId() {
   try {
     const parsed = yaml.load(fs.readFileSync(path.join(localConfigDir(), "config.yaml"), "utf8"));
     const id = parsed && typeof parsed === "object" ? parsed.host?.host_id : null;
-    if (typeof id === "string" && id) cachedHostId = id.replace(/^host_/, "");
+    if (typeof id === "string" && id) return id.replace(/^host_/, "") || null;
   } catch {
     // No config yet, or unparseable.
   }
-  return cachedHostId;
+  return null;
 }
 
 /**
@@ -376,8 +387,8 @@ function resolveCliPath(configuredPath, deps = {}) {
 }
 
 /**
- * Normalize a CLI invocation. Public paths pass a string (`/path/omnigent`);
- * Databricks-internal host enrollment passes an executable + fixed argv prefix
+ * Normalize a CLI invocation. A plain path passes a string (`/path/omnigent`);
+ * managed host enrollment passes an executable + fixed argv prefix
  * (`/usr/local/bin/isaac`, `["omni"]`). Both stay shell-free.
  *
  * @param {string | {
@@ -414,14 +425,57 @@ function cliCommandParts(command) {
 }
 
 /**
+ * Why a CLI subprocess failed, built only from process-level facts so it is
+ * safe to show or log: CLI output can carry auth material and is never read.
+ *
+ * @typedef {{
+ *   kind: "cli-not-found" | "spawn-failed" | "timed-out" | "signal" | "exited" | "failed",
+ *   exitCode?: number,
+ *   signal?: string,
+ *   errorCode?: string,
+ * }} CliFailure
+ */
+
+/**
+ * Classify an `execFile` error. execFile sets `err.code` to the numeric exit
+ * code on a normal non-zero exit, or a string errno (e.g. "ENOENT") with a
+ * `spawn …` syscall when the spawn itself failed; `killed` marks its own
+ * timeout kill, which a child that handles the signal can still answer with an
+ * exit code instead of dying by the signal.
+ *
+ * @param {Error & { code?: unknown, syscall?: unknown, killed?: boolean, signal?: string | null }} err
+ * @returns {CliFailure}
+ */
+function cliFailureOf(err) {
+  if (err.killed) {
+    return {
+      kind: "timed-out",
+      ...(typeof err.code === "number" ? { exitCode: err.code } : {}),
+      ...(typeof err.signal === "string" ? { signal: err.signal } : {}),
+    };
+  }
+  if (typeof err.code === "number") return { kind: "exited", exitCode: err.code };
+  if (
+    typeof err.code === "string" &&
+    typeof err.syscall === "string" &&
+    err.syscall.startsWith("spawn")
+  ) {
+    return { kind: err.code === "ENOENT" ? "cli-not-found" : "spawn-failed", errorCode: err.code };
+  }
+  if (typeof err.signal === "string") return { kind: "signal", signal: err.signal };
+  return { kind: "failed" };
+}
+
+/**
  * Run an Omnigent CLI subcommand and resolve with its captured output. Never
- * rejects — a failure surfaces as a non-zero `code` plus stderr so callers can
- * decide. `execFile` (no shell) avoids quoting pitfalls.
+ * rejects — a failure surfaces as a non-zero `code` (1 when there's no exit
+ * code) plus stderr and a {@link CliFailure} so callers can decide. `execFile`
+ * (no shell) avoids quoting pitfalls.
  *
  * @param {Parameters<typeof cliCommandParts>[0]} command
  * @param {string[]} args
  * @param {{ timeoutMs?: number }} [opts]
- * @returns {Promise<{ code: number, stdout: string, stderr: string }>}
+ * @returns {Promise<{ code: number, stdout: string, stderr: string, failure?: CliFailure }>}
  */
 function runCli(command, args, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
   const { executable, prefixArgs } = cliCommandParts(command);
@@ -431,10 +485,13 @@ function runCli(command, args, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
       [...prefixArgs, ...args],
       { timeout: timeoutMs, encoding: "utf8" },
       (err, stdout, stderr) => {
-        // execFile sets err.code to the numeric exit code on a normal non-zero
-        // exit, or a string errno (e.g. "ENOENT") when the spawn itself failed.
         const code = err ? (typeof err.code === "number" ? err.code : 1) : 0;
-        resolve({ code, stdout: stdout || "", stderr: stderr || "" });
+        resolve({
+          code,
+          stdout: stdout || "",
+          stderr: stderr || "",
+          ...(err ? { failure: cliFailureOf(err) } : {}),
+        });
       },
     );
   });
@@ -484,11 +541,15 @@ function serverAuthed(serverUrl) {
  * @param {string} cliPath
  * @param {string} serverUrl
  * @param {{ timeoutMs?: number }} [opts]
- * @returns {Promise<{ ok: boolean, output: string }>}
+ * @returns {Promise<{ ok: boolean, output: string, failure?: CliFailure }>}
  */
-async function loginServer(cliPath, serverUrl, { timeoutMs = 305000 } = {}) {
+async function loginServer(cliPath, serverUrl, { timeoutMs = LOGIN_TIMEOUT_MS } = {}) {
   const res = await runCli(cliPath, ["login", serverUrl], { timeoutMs });
-  return { ok: res.code === 0, output: (res.stdout || res.stderr).trim() };
+  return {
+    ok: res.code === 0,
+    output: (res.stdout || res.stderr).trim(),
+    ...(res.failure ? { failure: res.failure } : {}),
+  };
 }
 
 /**
@@ -808,25 +869,14 @@ async function stopHost(cliPath, serverUrl) {
   return { ok: res.code === 0, output: (res.stdout || res.stderr).trim() };
 }
 
-/**
- * True when a daemon record refers to the given server URL. Compares its
- * `server_url`, `target`, AND `resolved_server_url` (after trailing-slash
- * normalization) — the last matters for a local-mode daemon (target `"local"`,
- * server_url null) whose loopback URL only appears as `resolved_server_url`, so
- * connecting by that loopback URL still recognizes it.
- *
- * @param {Record<string, unknown>} daemon One entry from the daemons array.
- * @param {string} serverUrl
- * @returns {boolean}
- */
+/** True when any recorded server URL matches, including loopback aliases.
+ * Local-mode records may carry the URL only in resolved_server_url. */
 function matchesServer(daemon, serverUrl) {
   if (!daemon || typeof daemon !== "object") return false;
   const want = normalizeServerUrl(serverUrl);
   if (want === "") return false;
-  return (
-    normalizeServerUrl(daemon.server_url) === want ||
-    normalizeServerUrl(daemon.target) === want ||
-    normalizeServerUrl(daemon.resolved_server_url) === want
+  return [daemon.server_url, daemon.target, daemon.resolved_server_url].some(
+    (field) => normalizeServerUrl(field) === want || sameLoopbackServer(field, serverUrl),
   );
 }
 
@@ -969,6 +1019,29 @@ function bearerTokenFor(serverUrl) {
   return null;
 }
 
+const OMNIGENT_SLICE_KEY_HEADER = "X-Databricks-Omnigent-Slice-Key";
+const WORKSPACE_API_PATH = "/api/2.0/omnigent";
+
+/**
+ * Whether requests to `serverUrl` should carry a host's routing key, by the same
+ * rule as `databricks_request_headers()` (omnigent/cli_auth.py): on by default
+ * for workspace mounts, opt-in on other servers with
+ * `OMNIGENT_HOST_SLICE_KEY_ENABLED=1`, and off for either when it is "0".
+ *
+ * @param {string} serverUrl
+ * @returns {boolean}
+ */
+function hostRoutingEnabled(serverUrl) {
+  const setting = process.env.OMNIGENT_HOST_SLICE_KEY_ENABLED;
+  if (setting === "0") return false;
+  if (setting === "1") return true;
+  try {
+    return new URL(serverUrl).pathname.replace(/\/+$/, "") === WORKSPACE_API_PATH;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * The "basic request" that detects whether a host's tunnel is up: a single
  * `GET {serverUrl}/v1/hosts/{host_id}`, reading `body.status` — the same probe
@@ -998,6 +1071,8 @@ async function probeHostTunnel(serverUrl, hostId, { timeoutMs = 2000 } = {}) {
   if (token) headers.Authorization = `Bearer ${token}`;
   else if (!isLoopbackServer(serverUrl))
     return { status: null, reachable: false, authMissing: true };
+  // Route to the replica holding this host's tunnel, the one whose status we want.
+  if (hostRoutingEnabled(serverUrl)) headers[OMNIGENT_SLICE_KEY_HEADER] = hostId;
   const base = serverUrl.replace(/\/+$/, "");
   const target = `${base}/v1/hosts/${encodeURIComponent(hostId)}`;
   try {
@@ -1080,23 +1155,13 @@ async function probeServerAuth(serverUrl, { timeoutMs = 10000 } = {}) {
  * }>}
  */
 async function getHostConnectionFast(serverUrl, { probe = true, timeoutMs = 2000 } = {}) {
-  const match = readDaemonRecords().find((r) => matchesServer(r, serverUrl)) || null;
+  const match = liveDaemonRecordFor(serverUrl);
   if (!match) {
     return {
       connected: false,
       process: "offline",
       hostStatus: null,
       pid: null,
-      error: null,
-      verified: true,
-    };
-  }
-  if (!isPidAlive(match.pid)) {
-    return {
-      connected: false,
-      process: "offline",
-      hostStatus: null,
-      pid: match.pid,
       error: null,
       verified: true,
     };
@@ -1156,13 +1221,25 @@ async function getHostConnectionFast(serverUrl, { probe = true, timeoutMs = 2000
   };
 }
 
+/** Find a live daemon enrolled with this server, including loopback URL aliases. */
+function liveDaemonRecordFor(serverUrl) {
+  return (
+    readDaemonRecords().find(
+      (record) => isPidAlive(record.pid) && matchesServer(record, serverUrl),
+    ) ?? null
+  );
+}
+
 module.exports = {
   INSTALL_COMMAND,
   DEFAULT_TIMEOUT_MS,
+  LOGIN_TIMEOUT_MS,
   normalizeServerUrl,
   isLoopbackServer,
   sameLoopbackServer,
   localHostId,
+  readLocalHostId,
+  liveDaemonRecordFor,
   parseLocalServerPidfile,
   isPidAlive,
   readLocalServerPidfile,
@@ -1193,6 +1270,7 @@ module.exports = {
   readDaemonRecords,
   daemonServerUrl,
   bearerTokenFor,
+  hostRoutingEnabled,
   probeHostTunnel,
   getHostConnectionFast,
 };

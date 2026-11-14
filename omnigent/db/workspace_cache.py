@@ -18,6 +18,10 @@ is the one exception — a global reset primitive that wipes every
 workspace, matching its only callers (process-wide store re-wiring and
 "invalidate everything" seams).
 
+Every operation on the backing mapping runs under a per-instance lock:
+``cachetools`` caches are not thread-safe, and these globals are reached
+both from the event loop and from ``asyncio.to_thread`` workers.
+
 The ``dev/lint/lint_workspace_scoped_cache.py`` hook requires every
 module-level cache-like global under ``omnigent/server`` and
 ``omnigent/runtime`` to be one of these types, unless it is allow-listed
@@ -27,7 +31,10 @@ there because its key is already globally unique (``call_id``,
 
 from __future__ import annotations
 
+import logging
+import threading
 from collections.abc import Callable, Iterator, Mapping, MutableMapping
+from contextlib import contextmanager
 from typing import Any, Generic, TypeVar, overload
 
 from omnigent.db.db_models import current_workspace_id
@@ -35,6 +42,8 @@ from omnigent.db.db_models import current_workspace_id
 K = TypeVar("K")
 V = TypeVar("V")
 D = TypeVar("D")
+
+_logger = logging.getLogger(__name__)
 
 # Sentinel distinguishing "no default supplied" from an explicit ``None``
 # default in :meth:`WorkspaceScopedCache.pop`.
@@ -55,23 +64,64 @@ class WorkspaceScopedCache(Generic[K, V]):
     can mutate during a sweep.
     """
 
-    def __init__(self, factory: Callable[[], MutableMapping[tuple[int, K], V]] = dict) -> None:
+    def __init__(
+        self,
+        factory: Callable[[], MutableMapping[tuple[int, K], V]] = dict,
+        *,
+        reset_on_error: bool = False,
+    ) -> None:
+        """
+        :param factory: Produces the backing mapping.
+        :param reset_on_error: For pure caches only. When ``True``, a
+            failure raised by the backing mapping in :meth:`get`, ``in``,
+            ``pop(key, default)``, :meth:`setdefault`, :meth:`update` or
+            assignment is logged, the backing mapping is replaced with a
+            fresh one, and the call degrades to a miss / no-op so callers
+            fall back to their source of truth instead of failing until
+            restart.
+        """
+        self._factory = factory
         self._backing: MutableMapping[tuple[int, K], V] = factory()
+        self._lock = threading.Lock()
+        self._reset_on_error = reset_on_error
 
     def _scoped(self, key: K) -> tuple[int, K]:
         return (current_workspace_id(), key)
 
+    @contextmanager
+    def _reset_on_backing_error(self, operation: str) -> Iterator[None]:
+        """Caller holds the lock so a failed operation and reset stay atomic."""
+        try:
+            yield
+        except Exception as error:
+            if not self._reset_on_error:
+                raise
+            _logger.warning(
+                "Resetting workspace-scoped cache after %s failed on %s",
+                operation,
+                type(self._backing).__name__,
+                exc_info=error,
+            )
+            self._backing = self._factory()
+
     def __getitem__(self, key: K) -> V:
-        return self._backing[self._scoped(key)]
+        with self._lock:
+            return self._backing[self._scoped(key)]
 
     def __setitem__(self, key: K, value: V) -> None:
-        self._backing[self._scoped(key)] = value
+        scoped = self._scoped(key)
+        with self._lock, self._reset_on_backing_error("set"):
+            self._backing[scoped] = value
 
     def __delitem__(self, key: K) -> None:
-        del self._backing[self._scoped(key)]
+        with self._lock:
+            del self._backing[self._scoped(key)]
 
     def __contains__(self, key: object) -> bool:
-        return (current_workspace_id(), key) in self._backing
+        scoped = (current_workspace_id(), key)
+        with self._lock, self._reset_on_backing_error("contains"):
+            return scoped in self._backing
+        return False
 
     @overload
     def get(self, key: K) -> V | None:
@@ -86,16 +136,25 @@ class WorkspaceScopedCache(Generic[K, V]):
         """Return the current workspace's value, or *default* if absent."""
 
     def get(self, key: K, default: Any = None) -> Any:
-        return self._backing.get(self._scoped(key), default)
+        scoped = self._scoped(key)
+        with self._lock, self._reset_on_backing_error("get"):
+            return self._backing.get(scoped, default)
+        return default
 
     def setdefault(self, key: K, default: V) -> V:
-        return self._backing.setdefault(self._scoped(key), default)
+        scoped = self._scoped(key)
+        with self._lock, self._reset_on_backing_error("setdefault"):
+            return self._backing.setdefault(scoped, default)
+        return default
 
     def update(self, other: Mapping[K, V]) -> None:
         """Merge *other*'s entries into the current workspace's slice."""
         ws = current_workspace_id()
-        for key, value in other.items():
-            self._backing[(ws, key)] = value
+        # Source reads may reenter this cache; only backing writes need its lock.
+        entries = list(other.items())
+        with self._lock, self._reset_on_backing_error("update"):
+            for key, value in entries:
+                self._backing[(ws, key)] = value
 
     @overload
     def pop(self, key: K) -> V:
@@ -107,24 +166,30 @@ class WorkspaceScopedCache(Generic[K, V]):
 
     def pop(self, key: K, default: Any = _MISSING) -> Any:
         scoped = self._scoped(key)
-        if default is _MISSING:
-            return self._backing.pop(scoped)
-        return self._backing.pop(scoped, default)
+        with self._lock:
+            if default is _MISSING:
+                return self._backing.pop(scoped)
+            with self._reset_on_backing_error("pop"):
+                return self._backing.pop(scoped, default)
+        return default
 
     def keys(self) -> list[K]:
         """Current workspace's keys, in backing order (a snapshot)."""
         ws = current_workspace_id()
-        return [key for (w, key) in self._backing if w == ws]
+        with self._lock:
+            return [key for (w, key) in self._backing if w == ws]
 
     def values(self) -> list[V]:
         """Current workspace's values (a snapshot)."""
         ws = current_workspace_id()
-        return [value for (w, _key), value in self._backing.items() if w == ws]
+        with self._lock:
+            return [value for (w, _key), value in self._backing.items() if w == ws]
 
     def items(self) -> list[tuple[K, V]]:
         """Current workspace's ``(key, value)`` pairs (a snapshot)."""
         ws = current_workspace_id()
-        return [(key, value) for (w, key), value in self._backing.items() if w == ws]
+        with self._lock:
+            return [(key, value) for (w, key), value in self._backing.items() if w == ws]
 
     def __iter__(self) -> Iterator[K]:
         return iter(self.keys())
@@ -132,11 +197,13 @@ class WorkspaceScopedCache(Generic[K, V]):
     def __len__(self) -> int:
         """Number of entries in the current workspace only."""
         ws = current_workspace_id()
-        return sum(1 for (w, _key) in self._backing if w == ws)
+        with self._lock:
+            return sum(1 for (w, _key) in self._backing if w == ws)
 
     def clear(self) -> None:
         """Drop EVERY workspace's entries (process-wide reset primitive)."""
-        self._backing.clear()
+        with self._lock:
+            self._backing.clear()
 
     def all_values(self) -> list[V]:
         """Every workspace's values — the cross-workspace escape hatch.
@@ -146,7 +213,8 @@ class WorkspaceScopedCache(Generic[K, V]):
         which signals all subscribers regardless of workspace). Ordinary
         callers use :meth:`values`.
         """
-        return list(self._backing.values())
+        with self._lock:
+            return list(self._backing.values())
 
 
 class WorkspaceScopedSet(Generic[K]):

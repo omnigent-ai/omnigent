@@ -91,6 +91,8 @@ describe("peek card entry window", () => {
     renderSidebar({ open: false, peek: true });
 
     expect(card()).toHaveClass("pointer-events-none");
+    expect(card()).toHaveClass("omnigent-sidebar-panel");
+    expect(card()).toHaveAttribute("data-floating", "true");
   });
 
   it("takes the pointer over once its own entry animation completes", () => {
@@ -149,5 +151,23 @@ describe("peek card entry window", () => {
     renderSidebar({ open: true });
 
     expect(card()).not.toHaveClass("pointer-events-none");
+    expect(card()).toHaveAttribute("data-floating", "false");
+  });
+});
+
+describe("peek card dismissal", () => {
+  it("drops back into the collapsed layout without animating its width", () => {
+    vi.useFakeTimers();
+    const view = renderSidebar({ open: false, peek: true });
+    // Collapsed, the aside is aria-hidden, so look it up directly.
+    const aside = () => view.container.querySelector("aside.conversations-sidebar")!;
+    expect(aside()).not.toHaveAttribute("data-sidebar-motion");
+
+    view.rerenderSidebar({ open: false, peek: false });
+    expect(aside()).not.toHaveAttribute("data-sidebar-motion");
+    expect(aside()).not.toHaveClass("md:transition-[width,opacity]");
+
+    act(() => vi.advanceTimersToNextFrame());
+    expect(aside()).toHaveAttribute("data-sidebar-motion");
   });
 });

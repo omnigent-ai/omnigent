@@ -3,6 +3,9 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ExtensionCatalogItem } from "../types";
 import { HOST_METHOD_PERMISSIONS } from "./registry";
 import { resetExtensionStorageForTests } from "./storage";
@@ -322,6 +325,119 @@ describe("useExtensionHostServices", () => {
       "noopener,noreferrer",
     );
     open.mockRestore();
+  });
+
+  it.each([
+    { server: "current", stored: true },
+    { server: "older", stored: false },
+  ])("answers offline from the $server server's stored pull request", async ({ stored }) => {
+    authenticatedFetchMock.mockImplementation((url: string) =>
+      Promise.resolve(
+        url.includes("/resources/github")
+          ? new Response(
+              JSON.stringify({ error: { code: "runner_unavailable", message: "offline" } }),
+              { status: 503 },
+            )
+          : new Response(
+              JSON.stringify({
+                object: "list",
+                data: [
+                  {
+                    url: "https://github.com/acme/repo/pull/42",
+                    host: "github.com",
+                    repository: "acme/repo",
+                    number: 42,
+                    title: "Add canvas",
+                    relationship: "created",
+                    state: "MERGED",
+                  },
+                ],
+                // A linked PR with a fetched state answers even before the server imports
+                // the session; only an empty list then can't mean "no PR".
+                synced: false,
+              }),
+              { status: 200 },
+            ),
+      ),
+    );
+    const { result } = renderHook(() => useExtensionHostServices(extension), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, session_pull_requests: stored }}>
+          {wrapper({ children })}
+        </CapabilitiesProvider>
+      ),
+    });
+
+    const answer = result.current.methods["sessions.pullRequest"]?.(
+      { sessionId: "conv_1" },
+      signal(),
+    );
+    if (stored) {
+      await expect(answer).resolves.toEqual({
+        number: 42,
+        title: "Add canvas",
+        state: "MERGED",
+        url: "https://github.com/acme/repo/pull/42",
+      });
+    } else {
+      // Servers without stored PRs surface the runner's offline error.
+      await expect(answer).rejects.toBeInstanceOf(RunnerOfflineError);
+    }
+    expect(authenticatedFetchMock.mock.calls.map(([url]) => url)).toEqual(
+      stored
+        ? ["/v1/sessions/conv_1/resources/github", "/v1/sessions/conv_1/pull-requests?limit=100"]
+        : ["/v1/sessions/conv_1/resources/github"],
+    );
+  });
+
+  it.each([
+    {
+      case: "a stored PR the host never fetched",
+      status: 200,
+      data: [{ state: null }],
+      synced: true,
+    },
+    { case: "a session the server hasn't imported", status: 200, data: [], synced: false },
+    { case: "a failed stored read", status: 500, data: [], synced: true },
+  ])("keeps the offline error for $case", async ({ status, data, synced }) => {
+    authenticatedFetchMock.mockImplementation((url: string) =>
+      Promise.resolve(
+        url.includes("/resources/github")
+          ? new Response(
+              JSON.stringify({ error: { code: "runner_unavailable", message: "offline" } }),
+              { status: 503 },
+            )
+          : new Response(
+              JSON.stringify({
+                object: "list",
+                data: data.map((pr) => ({
+                  url: "https://github.com/acme/repo/pull/42",
+                  host: "github.com",
+                  repository: "acme/repo",
+                  number: 42,
+                  relationship: "created",
+                  ...pr,
+                })),
+                synced,
+              }),
+              { status },
+            ),
+      ),
+    );
+    const { result } = renderHook(() => useExtensionHostServices(extension), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, session_pull_requests: true }}>
+          {wrapper({ children })}
+        </CapabilitiesProvider>
+      ),
+    });
+
+    const error = await result.current.methods["sessions.pullRequest"]?.(
+      { sessionId: "conv_1" },
+      signal(),
+    ).catch((thrown: unknown) => thrown);
+    expect(error).toBeInstanceOf(RunnerOfflineError);
+    expect((error as Error).cause !== undefined).toBe(status !== 200);
   });
 
   it("does not make session pages wait behind pull-request enrichment", async () => {

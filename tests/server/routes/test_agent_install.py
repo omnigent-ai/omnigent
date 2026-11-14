@@ -26,7 +26,7 @@ from omnigent.db.utils import builtin_agent_id, generate_agent_id, installed_age
 from omnigent.entities import Agent
 from omnigent.errors import OmnigentError
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server.auth import UnifiedAuthProvider
+from omnigent.server.auth import LEVEL_EDIT, UnifiedAuthProvider
 from omnigent.server.routes._session_create_validation import require_user_agent_visible
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -808,7 +808,7 @@ async def multi_user_client(
 async def test_new_session_from_another_users_agent_runs_on_your_copy(
     multi_user_client: httpx.AsyncClient, db_uri: str, tmp_path: Path
 ) -> None:
-    """Bob may start from Alice's agent (he can read a session using it), but on his
+    """Bob may start from Alice's agent (he can edit a session using it), but on his
     own copy, so Alice reinstalling it never changes code in Bob's sessions."""
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
@@ -826,7 +826,7 @@ async def test_new_session_from_another_users_agent_runs_on_your_copy(
     assert alices.json()["agent_id"] == orion["id"], "the owner binds the agent itself"
     perms = SqlAlchemyPermissionStore(db_uri)
     perms.ensure_user("bob@example.com")
-    perms.grant("bob@example.com", alices.json()["id"], 1)
+    perms.grant("bob@example.com", alices.json()["id"], LEVEL_EDIT)
 
     bobs = await c.post("/v1/sessions", json={"agent_id": orion["id"]}, headers=BOB)
     assert bobs.status_code == 201, bobs.text
@@ -977,7 +977,7 @@ async def test_children_and_schedules_run_another_users_agent_on_your_copy(
     alices = (await c.post("/v1/sessions", json={"agent_id": orion["id"]}, headers=ALICE)).json()
     perms = SqlAlchemyPermissionStore(db_uri)
     perms.ensure_user("bob@example.com")
-    perms.grant("bob@example.com", alices["id"], 1)
+    perms.grant("bob@example.com", alices["id"], LEVEL_EDIT)
     vega = (await _install(c, BOB, "vega")).json()
     bobs = (await c.post("/v1/sessions", json={"agent_id": vega["id"]}, headers=BOB)).json()
 
@@ -1019,7 +1019,7 @@ async def test_a_failed_session_create_keeps_a_copy_another_request_bound(
     alices = (await c.post("/v1/sessions", json={"agent_id": orion["id"]}, headers=ALICE)).json()
     perms = SqlAlchemyPermissionStore(db_uri)
     perms.ensure_user("bob@example.com")
-    perms.grant("bob@example.com", alices["id"], 1)
+    perms.grant("bob@example.com", alices["id"], LEVEL_EDIT)
     create = SqlAlchemyConversationStore.create_conversation
     others: list[str] = []
 
@@ -1053,7 +1053,7 @@ async def test_a_failed_schedule_switch_leaves_no_agent_copy(
     alices = (await c.post("/v1/sessions", json={"agent_id": orion["id"]}, headers=ALICE)).json()
     perms = SqlAlchemyPermissionStore(db_uri)
     perms.ensure_user("bob@example.com")
-    perms.grant("bob@example.com", alices["id"], 1)
+    perms.grant("bob@example.com", alices["id"], LEVEL_EDIT)
     vega = (await _install(c, BOB, "vega")).json()
     task = await c.post(
         "/v1/scheduled-tasks",

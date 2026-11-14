@@ -18,8 +18,8 @@ User journeys covered (the reporter's, on iOS web, plus the landing page):
    becomes the destructive Stop (Interrupt) square — the icon-only model
    trigger stays beside it, never beneath it,
 3. widen the window to desktop — the labels reappear,
-4. the new-session (landing) composer does the same with its permission and
-   model text.
+4. the landing composer starts compact, reveals an icon-only permission
+   control on focus, and keeps the model control in the mobile header.
 
 Harness notes:
 
@@ -44,9 +44,12 @@ import os
 import re
 import time
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+import pytest
+from playwright.async_api import Page as AsyncPage
 from playwright.async_api import async_playwright
 from playwright.async_api import expect as async_expect
 from playwright.sync_api import FloatRect, Locator, Page, Route, expect
@@ -235,6 +238,45 @@ def _assert_same_row(a: FloatRect, b: FloatRect) -> None:
     )
 
 
+# For each text leaf in the menu rows: the fraction left visible by clipping
+# ancestors, and whether its own text overflows (an ellipsis).
+_MENU_ROW_TEXT_JS = """(menu) => [...menu.querySelectorAll('[role="menuitem"] span')]
+  .filter((el) => el.childElementCount === 0 && el.textContent.trim())
+  .map((el) => {
+    const box = el.getBoundingClientRect();
+    let [left, top, right, bottom] = [box.left, box.top, box.right, box.bottom];
+    for (let node = el.parentElement; node !== menu.parentElement; node = node.parentElement) {
+      if (getComputedStyle(node).overflow === "visible") continue;
+      const clip = node.getBoundingClientRect();
+      left = Math.max(left, clip.left);
+      top = Math.max(top, clip.top);
+      right = Math.min(right, clip.right);
+      bottom = Math.min(bottom, clip.bottom);
+    }
+    const shown = Math.max(0, right - left) * Math.max(0, bottom - top);
+    return {
+      text: el.textContent,
+      shown: shown / (box.width * box.height),
+      overflow: el.scrollWidth - el.clientWidth,
+    };
+  })"""
+
+
+def _menu_row_texts_shown(texts: list[dict[str, Any]]) -> set[str]:
+    """Fail if any menu row text is cut off; return the texts shown in full.
+
+    :param texts: ``_MENU_ROW_TEXT_JS`` evaluated on the open Add menu.
+    :returns: The row labels and descriptions that are fully visible.
+    """
+    cut = [
+        text
+        for text in texts
+        if text["shown"] > 0 and (text["shown"] < 0.99 or text["overflow"] > 0)
+    ]
+    assert not cut, f"Add menu text is cut off: {cut}"
+    return {text["text"] for text in texts if text["shown"] > 0}
+
+
 def _screenshot(page: Page, name: str) -> None:
     """Save a demo screenshot when E2E_SCREENSHOT_DIR is set (local runs)."""
     shot_dir = os.environ.get("E2E_SCREENSHOT_DIR")
@@ -263,23 +305,7 @@ def test_composer_model_label_stays_clear_of_stop_button_on_mobile(
     seeded_session: tuple[str, str],
     mock_llm_server_url: str,
 ) -> None:
-    """On a phone viewport the model/effort text collapses to the harness icon,
-    which stays beside the Stop (Interrupt) button on a single row.
-
-    Asserts the label is rendered but hidden while the row is collapsed, then
-    sends a message whose turn the mock LLM holds open, waits for the
-    composer's destructive Stop square, and asserts the icon-only model
-    trigger neither intersects the Stop button's bounding box nor pushes it
-    off-screen, and that the leftmost and rightmost controls share one row. A
-    ≤1px touch is tolerated (border rounding / antialiasing); anything more is
-    the reported overlap. Finally widens the window to a laptop viewport and
-    asserts the label text comes back.
-
-    :param page: Playwright page fixture (fresh context per test).
-    :param seeded_session: ``(base_url, session_id)`` of a runner-bound session.
-    :param mock_llm_server_url: Session-scoped mock LLM server URL.
-    :returns: None.
-    """
+    """The mobile header model control stays clear of Stop; desktop keeps it in the row."""
     base_url, session_id = seeded_session
 
     page.set_viewport_size(_IPHONE_VIEWPORT)
@@ -305,16 +331,13 @@ def test_composer_model_label_stays_clear_of_stop_button_on_mobile(
         composer = page.get_by_label("Message the agent")
         expect(composer).to_be_visible(timeout=15_000)
 
-        # The reporter's label is rendered, but a phone-width row cannot fit
-        # it beside the other controls, so the row collapses every label to
-        # its icon: the text is in the DOM yet hidden, never wrapped.
+        # The mobile header keeps the model name accessible in an icon-only trigger.
         trigger = page.get_by_test_id("composer-config-gear")
         label = page.get_by_test_id("composer-agent-config-value")
-        row = page.get_by_test_id("composer-action-row")
         expect(trigger).to_be_visible(timeout=15_000)
         expect(label).to_contain_text(_MODEL_ID)
-        expect(row).to_have_attribute("data-labels", "collapsed")
-        expect(label).to_be_hidden()
+        expect(page.get_by_test_id("mobile-header-controls-slot")).to_contain_text(_MODEL_ID)
+        expect(label).to_have_class(re.compile(r"\bsr-only\b"))
         _screenshot(page, "chat-composer-phone-collapsed")
 
         composer.fill(_SENTINEL)
@@ -330,7 +353,7 @@ def test_composer_model_label_stays_clear_of_stop_button_on_mobile(
         page.wait_for_timeout(1_500)
         _screenshot(page, "chat-composer-phone-collapsed-running")
 
-        expect(label).to_be_hidden()
+        expect(label).to_have_class(re.compile(r"\bsr-only\b"))
         trigger_box = _box(trigger)
         stop_box = _box(stop)
 
@@ -375,12 +398,17 @@ def test_composer_model_label_stays_clear_of_stop_button_on_mobile(
         reset_mock_llm(mock_llm_server_url)
 
 
+@pytest.mark.parametrize("native_kind", [None, "ios", "android"])
 def test_composer_plan_and_goal_actions_fit_mobile_and_desktop(
     page: Page,
     seeded_session: tuple[str, str],
+    native_kind: str | None,
 ) -> None:
-    """Keep Goal and Plan reachable in the shared Add menu at both widths."""
+    """Keep Goal and Plan reachable in the shared Add menu at both widths, with
+    no row text cut off and only the side-chat description hidden on a phone."""
     base_url, session_id = seeded_session
+    if native_kind:
+        page.add_init_script(f"window.omnigentNative = {{kind: {json.dumps(native_kind)}}};")
     page.set_viewport_size(_IPHONE_VIEWPORT)
     _patch_session_as_databricks_codex_native(page, session_id)
     try:
@@ -391,13 +419,38 @@ def test_composer_plan_and_goal_actions_fit_mobile_and_desktop(
             expect(trigger).to_be_visible()
             expect(page.get_by_test_id("composer-config-gear")).to_be_visible()
             trigger.click()
-            for action_id in ["composer-plan-action", "composer-goal-action"]:
+            for action_id in [
+                "composer-side-chat-action",
+                "composer-plan-action",
+                "composer-goal-action",
+            ]:
                 action = page.get_by_test_id(action_id)
                 expect(action).to_be_visible()
                 expect(action).to_be_enabled()
+                action.scroll_into_view_if_needed()
                 bounds = _box(action)
                 assert bounds["x"] >= 0
                 assert bounds["x"] + bounds["width"] <= viewport["width"]
+                if native_kind:
+                    assert bounds["width"] >= 44
+                    assert bounds["height"] >= 44, f"{action_id} is only {bounds['height']}px tall"
+                    assert action.evaluate("""element => {
+                        const box = element.getBoundingClientRect();
+                        return [box.left + 2, box.left + box.width / 2, box.right - 2]
+                          .every(x => element.contains(
+                            document.elementFromPoint(x, box.top + box.height / 2)));
+                    }""")
+            menu = page.get_by_test_id("composer-add-menu")
+            shown = _menu_row_texts_shown(menu.evaluate(_MENU_ROW_TEXT_JS))
+            assert {
+                "Start a new side chat",
+                "Goal",
+                "Set a goal for this session",
+                "Plan",
+                "Turn plan mode on",
+            } <= shown
+            description_shown = "Ask without affecting this conversation" in shown
+            assert description_shown == (viewport["width"] >= 1200)
             page.keyboard.press("Escape")
             expect(trigger).to_be_focused()
     finally:
@@ -407,9 +460,10 @@ def test_composer_plan_and_goal_actions_fit_mobile_and_desktop(
 def test_new_session_composer_collapses_labels_to_icons_on_mobile(
     seeded_session: tuple[str, str],
 ) -> None:
-    """The landing composer hides its permission and model text on a phone
-    viewport, keeps every control on one row, and shows the text again on a
-    laptop-width window.
+    """The compact landing composer hides permissions until focused, then
+    shows an icon-only permission control. The model stays in the mobile
+    header. Both menus remain usable without losing the draft, and the
+    permission button and labels return at desktop width.
 
     :param seeded_session: ``(base_url, session_id)``; the landing page's
         create POST is stubbed to return this real session id.
@@ -417,6 +471,19 @@ def test_new_session_composer_collapses_labels_to_icons_on_mobile(
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_landing_collapse(base_url, session_id))
+
+
+async def _landing_add_menu_texts_shown(page: AsyncPage) -> set[str]:
+    """Open the landing Add menu, check its row text, and close it again."""
+    await page.get_by_test_id("new-chat-landing-attach").click()
+    menu = page.get_by_test_id("new-chat-landing-add-menu")
+    await async_expect(
+        menu.get_by_role("menuitem", name=re.compile("Work in a project"))
+    ).to_be_visible()
+    shown = _menu_row_texts_shown(await menu.evaluate(_MENU_ROW_TEXT_JS))
+    await page.keyboard.press("Escape")
+    await async_expect(menu).to_be_hidden()
+    return shown
 
 
 async def _drive_landing_collapse(base_url: str, session_id: str) -> None:
@@ -430,31 +497,32 @@ async def _drive_landing_collapse(base_url: str, session_id: str) -> None:
                 re.compile(r"/v1/sessions\?"),
                 lambda route: route.fulfill(json={"data": [], "has_more": False}),
             )
-            # A model catalog for the auto-selected Claude Code agent, so the
-            # trigger shows a real ``Opus 4.8 (1M context)`` label to collapse.
+            # Give the header's auto-selected Claude Code control a real model.
             await page.route(
                 f"**/v1/hosts/{_HOST_ID}/harnesses/claude-native/model-options",
                 lambda route: route.fulfill(json={"models": _CLAUDE_HOST_ROWS}),
             )
             await page.goto(f"{base_url}/")
-            await async_expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible(
-                timeout=30_000
-            )
-            row = page.get_by_test_id("new-chat-landing-actions")
-            permission_text = page.get_by_test_id("new-chat-landing-permission-chip").locator(
-                "span"
-            )
+            input_field = page.get_by_test_id("new-chat-landing-input")
+            await async_expect(input_field).to_be_visible(timeout=30_000)
+            composer = page.get_by_test_id("new-chat-landing-composer")
+            permission = page.get_by_test_id("new-chat-landing-permission-chip")
+            permission_text = permission.locator("[data-composer-permission-label]")
+            model = page.get_by_test_id("new-chat-landing-agent-select")
             model_text = page.get_by_test_id("new-chat-landing-agent-config-value")
             await async_expect(
-                page.get_by_test_id("new-chat-landing-agent-select")
+                page.get_by_test_id("mobile-header-controls-slot").get_by_test_id(
+                    "new-chat-landing-agent-select"
+                )
             ).to_be_visible()
             await async_expect(permission_text).not_to_be_empty()
             await async_expect(model_text).not_to_be_empty()
 
-            # Phone width: both labels collapse to icons and the row stays single-line.
-            await async_expect(row).to_have_attribute("data-labels", "collapsed")
+            # The compact composer hides permissions; the model lives in the header.
+            await async_expect(composer).to_have_attribute("data-mobile-composer", "collapsed")
+            await async_expect(permission).to_be_hidden()
             await async_expect(permission_text).to_be_hidden()
-            await async_expect(model_text).to_be_hidden()
+            await async_expect(model_text).to_have_class(re.compile(r"\bsr-only\b"))
             add_box = await page.get_by_test_id("new-chat-landing-attach").bounding_box()
             submit_box = await page.get_by_test_id("new-chat-landing-submit").bounding_box()
             assert add_box is not None and submit_box is not None
@@ -462,15 +530,51 @@ async def _drive_landing_collapse(base_url: str, session_id: str) -> None:
                 submit_box
             )
             _assert_same_row(add_box, submit_box)
+            assert "Work in a project" in await _landing_add_menu_texts_shown(page)
+            await async_expect(composer).to_have_attribute("data-mobile-composer", "collapsed")
             shot_dir = os.environ.get("E2E_SCREENSHOT_DIR")
             if shot_dir:
                 await page.screenshot(path=str(Path(shot_dir) / "landing-composer-phone.png"))
 
-            # Laptop width: the text is back and nothing is collapsed.
+            # Focusing reveals the permission icon, while its label stays hidden.
+            await input_field.fill("Keep this draft")
+            await async_expect(composer).to_have_attribute("data-mobile-composer", "expanded")
+            await async_expect(permission).to_be_visible()
+            await async_expect(permission_text).to_be_hidden()
+            await async_expect(permission).to_have_accessible_name(re.compile(r": Manual$"))
+            await permission.click()
+            permission_menu = page.get_by_test_id("new-chat-landing-permission-menu")
+            await async_expect(permission_menu).to_be_visible()
+            await async_expect(
+                permission_menu.get_by_role("menuitemradio", checked=True)
+            ).to_be_visible()
+            await page.keyboard.press("Escape")
+            await async_expect(permission_menu).to_be_hidden()
+
+            # Model settings remain reachable from the header without losing the draft.
+            await model.click()
+            await async_expect(page.get_by_role("menu")).to_be_visible()
+            await page.keyboard.press("Escape")
+            await async_expect(page.get_by_role("menu")).to_be_hidden()
+            await async_expect(input_field).to_have_value("Keep this draft")
+            await async_expect(permission_text).to_be_hidden()
+
+            # Wider layouts restore the permission and model controls with text.
             await page.set_viewport_size(_DESKTOP_VIEWPORT)
+            await async_expect(composer).not_to_have_attribute(
+                "data-mobile-composer", re.compile(r".+")
+            )
+            await async_expect(permission).to_be_visible()
             await async_expect(permission_text).to_be_visible()
+            await async_expect(
+                composer.get_by_test_id("new-chat-landing-agent-select")
+            ).to_be_visible()
             await async_expect(model_text).to_be_visible()
-            await async_expect(row).not_to_have_attribute("data-labels", "collapsed")
+            await async_expect(input_field).to_have_value("Keep this draft")
+            assert {
+                "Work in a project",
+                "Choose a project for this session",
+            } <= await _landing_add_menu_texts_shown(page)
             if shot_dir:
                 await page.screenshot(path=str(Path(shot_dir) / "landing-composer-desktop.png"))
         finally:

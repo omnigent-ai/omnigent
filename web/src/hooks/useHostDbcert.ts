@@ -10,7 +10,7 @@ import {
 } from "@/lib/hostDbcert";
 import { getDesktopFeatures, hasDbcertRefreshBridge, refreshDbcert } from "@/lib/nativeBridge";
 
-/** How often to re-read a valid cert, since Companion may replace it early. */
+/** How often to re-read a valid cert, since it may be replaced early. */
 const CHECK_INTERVAL_MS = 5 * 60_000;
 /** How often to re-read an expired cert, so a refresh made elsewhere clears the banner. */
 const EXPIRED_CHECK_INTERVAL_MS = 60_000;
@@ -20,23 +20,23 @@ const CAPABILITY_RETRY_MAX_MS = 30 * 60_000;
 const CAPABILITY_ERROR_RETRY_MAX_MS = 5 * 60_000;
 /** How often to re-read the cert while a refresh runs. */
 const REFRESH_POLL_MS = 4_000;
-/** How long Companion may take to copy a laptop refresh to the host. */
+/** How long a laptop refresh may take to reach the host. */
 const LAPTOP_SYNC_WAIT_MS = 2 * 60_000;
 
 export type DbcertRefreshPhase = "idle" | "running" | "failed";
 
 /**
  * Track the dbcert on the session's host, if it has one, and renew it. In the
- * desktop app a refresh renews the laptop's dbcert, which Arca Companion copies
- * to every box; elsewhere it renews the host's own copy.
+ * desktop app a refresh renews the laptop's copy, which hosts pick up;
+ * elsewhere it renews the host's own copy.
  */
 export function useHostDbcert(
   conversationId: string | null | undefined,
   hostId: string | null | undefined,
 ) {
-  // dbcert is Databricks-internal, so only Databricks deployments ask hosts for one.
+  // Only managed servers ask hosts for a dbcert.
   const onDatabricks = isDatabricksWorkspace();
-  // Arclets are server-managed sandbox hosts, which the default host list hides.
+  // Sandbox hosts are hidden from the default host list.
   const { data: hosts } = useHosts({
     includeSandbox: true,
     enabled: onDatabricks && Boolean(conversationId && hostId),
@@ -141,7 +141,7 @@ export function useHostDbcert(
   }, [sessionId, target, refreshMode]);
 
   // Re-read on open, when the tab comes back, and periodically. `expired` is a
-  // dependency so the expiry moment itself triggers a read: Companion may have
+  // dependency so the expiry moment itself triggers a read: a refresh may have
   // already replaced the cert.
   useEffect(() => {
     if (!target || !refreshMode) return;

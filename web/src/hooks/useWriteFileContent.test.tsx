@@ -103,7 +103,8 @@ describe("useWriteFileContent", () => {
     expect(cached.content).toBe("new content");
   });
 
-  it("does not invalidate queries when the PUT fails", async () => {
+  it("re-reads the file, but not the changed-files list, when the PUT fails", async () => {
+    // The write cancelled any read in flight, so the file is read again.
     fetchMock.mockResolvedValue(errorResponse(500));
     const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
     const invalidateSpy = vi.spyOn(qc, "invalidateQueries");
@@ -114,7 +115,9 @@ describe("useWriteFileContent", () => {
     });
 
     await waitFor(() => expect(result.current.isError).toBe(true));
-    expect(invalidateSpy).not.toHaveBeenCalled();
+    expect(invalidateSpy).toHaveBeenCalledExactlyOnceWith({
+      queryKey: ["file-content", "sess_3", "a.md"],
+    });
   });
 
   it("throws on non-ok response", async () => {

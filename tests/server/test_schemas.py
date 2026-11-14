@@ -1035,16 +1035,65 @@ def test_session_metadata_host_type_defaults_external() -> None:
     assert SessionCreateMetadata().host_type == "external"
 
 
-def test_session_metadata_managed_rejects_host_id() -> None:
+_MANAGED_HOST_ID = "0123456789abcdef0123456789abcdef"
+
+
+def test_session_metadata_managed_accepts_requested_host_id() -> None:
     """
-    Multipart ``host_type="managed"`` + a caller-supplied ``host_id`` is
-    a contradiction (the server provisions the host) — mirrors the JSON
-    path's contract.
+    Multipart ``host_type="managed"`` + ``host_id`` names the new sandbox
+    host, the same as the JSON create: it moves to ``requested_host_id``
+    and survives a dump-and-revalidate.
     """
     from omnigent.server.schemas import SessionCreateMetadata
 
-    with pytest.raises(ValidationError, match="host_id must not be set"):
-        SessionCreateMetadata(host_type="managed", host_id="host_abc")
+    meta = SessionCreateMetadata(host_type="managed", host_id=_MANAGED_HOST_ID)
+    assert meta.host_id is None
+    assert meta.requested_host_id == _MANAGED_HOST_ID
+    again = SessionCreateMetadata.model_validate_json(meta.model_dump_json())
+    assert again.requested_host_id == _MANAGED_HOST_ID
+
+
+def test_session_metadata_without_host_id_leaves_requested_host_id_unset() -> None:
+    """The absent-field path is unchanged: no requested host id is set."""
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    meta = SessionCreateMetadata(host_type="managed")
+    assert meta.requested_host_id is None
+    assert meta.host_id is None
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        pytest.param(
+            {"host_type": "managed", "host_id": "host_abc"},
+            "32 lowercase hex characters",
+            id="malformed",
+        ),
+        pytest.param(
+            {"host_type": "managed", "host_id": _MANAGED_HOST_ID.upper()},
+            "32 lowercase hex characters",
+            id="uppercase",
+        ),
+        pytest.param(
+            {"host_type": "managed", "host_id": _MANAGED_HOST_ID, "parent_session_id": "conv_p"},
+            "managed child session",
+            id="parent",
+        ),
+        pytest.param(
+            {"requested_host_id": _MANAGED_HOST_ID},
+            "only applies to host_type 'managed'",
+            id="external",
+        ),
+    ],
+)
+def test_session_metadata_rejects_invalid_requested_host_id(
+    kwargs: dict[str, Any], message: str
+) -> None:
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    with pytest.raises(ValidationError, match=message):
+        SessionCreateMetadata(**kwargs)
 
 
 def test_session_metadata_managed_rejects_path_workspace() -> None:
@@ -1075,6 +1124,32 @@ def test_session_metadata_managed_accepts_repo_url_workspace(workspace: str) -> 
 
     meta = SessionCreateMetadata(host_type="managed", workspace=workspace)
     assert meta.workspace == workspace
+
+
+def test_session_metadata_managed_accepts_multiple_repo_workspaces() -> None:
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    workspaces = ["https://github.com/org/one", "git@github.com:org/two.git#release"]
+    meta = SessionCreateMetadata(host_type="managed", workspaces=workspaces)
+    assert meta.managed_repo_workspaces() == workspaces
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"host_type": "managed", "workspace": "https://github.com/org/one", "workspaces": []},
+        {"host_type": "managed", "workspaces": ["https://github.com/org/one"] * 11},
+        {"host_type": "managed", "workspaces": ["/tmp/local"]},
+        {"host_type": "external", "workspaces": ["https://github.com/org/one"]},
+        {"host_type": "managed", "git": {"branch_name": "new"}},
+        {"git": {"branch_name": "new"}},
+    ],
+)
+def test_bundled_workspace_metadata_rejects_incompatible_options(metadata) -> None:
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    with pytest.raises(ValidationError):
+        SessionCreateMetadata.model_validate(metadata)
 
 
 def test_session_metadata_managed_accepts_sandbox_provider() -> None:
@@ -1139,6 +1214,58 @@ def test_session_fork_managed_accepts_provider_and_repo_workspace() -> None:
     assert req.workspace == "https://github.com/org/repo#release-1.2"
 
 
+def test_session_fork_managed_accepts_multiple_workspaces() -> None:
+    """A fork can replace its source's repositories and their selected refs."""
+    from omnigent.server.schemas import SessionForkRequest
+
+    repos = [
+        "https://github.com/org/api#fix-auth",
+        "git@github.com:org/web.git#release-1.2",
+    ]
+    req = SessionForkRequest(host_type="managed", workspaces=repos)
+    assert req.workspaces == repos
+
+
+@pytest.mark.parametrize("workspace", ["https://github.com/org/api", None])
+@pytest.mark.parametrize("workspaces", [["https://github.com/org/web"], [], None])
+def test_session_fork_rejects_both_workspace_fields(
+    workspace: str | None, workspaces: list[str] | None
+) -> None:
+    """Explicit null clears a fork's repos, so two supplied fields are ambiguous."""
+    from omnigent.server.schemas import SessionForkRequest
+
+    with pytest.raises(ValidationError, match="not both"):
+        SessionForkRequest(host_type="managed", workspace=workspace, workspaces=workspaces)
+
+
+def test_session_fork_managed_rejects_too_many_workspaces() -> None:
+    """Fork requests have the same repository limit as new managed sessions."""
+    from omnigent.server.schemas import _MAX_MANAGED_WORKSPACES, SessionForkRequest
+
+    repos = [f"https://github.com/org/r{i}" for i in range(_MAX_MANAGED_WORKSPACES + 1)]
+    with pytest.raises(ValidationError, match="at most"):
+        SessionForkRequest(host_type="managed", workspaces=repos)
+
+
+def test_session_fork_managed_validates_every_workspace() -> None:
+    """An invalid later repository fails before a sandbox launch is scheduled."""
+    from omnigent.server.schemas import SessionForkRequest
+
+    with pytest.raises(ValidationError, match="not a supported repository URL"):
+        SessionForkRequest(
+            host_type="managed", workspaces=["https://github.com/org/api", "/tmp/web"]
+        )
+
+
+@pytest.mark.parametrize("workspaces", [["https://github.com/org/api"], [], None])
+def test_session_fork_external_rejects_workspaces(workspaces: list[str] | None) -> None:
+    """An external fork chooses its directory when it binds a host."""
+    from omnigent.server.schemas import SessionForkRequest
+
+    with pytest.raises(ValidationError, match="workspaces only applies"):
+        SessionForkRequest(workspaces=workspaces)
+
+
 @pytest.mark.parametrize(
     ("host_type", "host_id", "error"),
     [
@@ -1201,6 +1328,40 @@ def test_session_fork_external_rejects_any_workspace(workspace: str) -> None:
 
     with pytest.raises(ValidationError, match="workspace only applies"):
         SessionForkRequest(workspace=workspace)
+
+
+@pytest.mark.parametrize(
+    ("fields", "error"),
+    [
+        ({}, None),
+        (
+            {
+                "sandbox_provider": "modal",
+                "host_id": "0123456789abcdef0123456789abcdef",
+                "workspace": "https://github.com/org/repo#main",
+            },
+            None,
+        ),
+        ({"host_id": "host_abc"}, "32 lowercase hex characters"),
+        ({"workspace": "/Users/alice/repo"}, "takes a git repository URL"),
+        ({"host_type": "managed"}, "Extra inputs are not permitted"),
+    ],
+)
+def test_session_managed_host_request_takes_a_managed_forks_sandbox_fields(
+    fields: dict[str, str], error: str | None
+) -> None:
+    """
+    Moving a session onto a sandbox names the new sandbox as a managed fork
+    does: a provider, an optional host id of the minted shape, and a repository
+    URL rather than a path, since the sandbox's filesystem doesn't exist yet.
+    """
+    from omnigent.server.schemas import SessionManagedHostRequest
+
+    if error is None:
+        assert SessionManagedHostRequest(**fields).model_dump(exclude_unset=True) == fields
+        return
+    with pytest.raises(ValidationError, match=error):
+        SessionManagedHostRequest(**fields)
 
 
 @pytest.mark.parametrize("status", ["idle", "running", "waiting", "failed"])

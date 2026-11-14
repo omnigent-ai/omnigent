@@ -21,6 +21,9 @@ from omnigent.spec.skill_sources import (
 from omnigent.spec.types import AgentSpec
 
 SKILLS_CACHE_TTL_SECONDS = 60.0
+# Incomplete catalogs stay cached just long enough to absorb bursts of requests
+# while a source keeps failing, and short enough that Retry rescans soon.
+INCOMPLETE_CATALOG_TTL_SECONDS = 5.0
 _MAX_CACHED_CATALOGS = 128
 
 
@@ -40,17 +43,25 @@ def _subagent_bundle(spec: AgentSpec, directory: Path, name: str) -> tuple[Agent
 
 
 class HostSkillDiscovery:
-    """Cache successful catalogs and serialize scans off the host's event loop."""
+    """Cache catalogs and serialize scans off the host's event loop."""
 
     def __init__(self, fetch_bundle: Callable[[HostSkillsFrame], httpx.Response]) -> None:
         self._fetch_bundle = fetch_bundle
         self._lock = threading.Lock()
+        # Each entry: expiry, catalog, and the warnings that make the catalog incomplete.
         self._cache: OrderedDict[
-            tuple[str | tuple[str, ...] | None, ...], tuple[float, list[dict[str, str]]]
+            tuple[str | tuple[str, ...] | None, ...],
+            tuple[float, list[dict[str, str]], list[str]],
         ] = OrderedDict()
 
-    def discover(self, frame: HostSkillsFrame, root: Path) -> list[dict[str, str]]:
-        """Return metadata for the exact launch target or effective session bundle."""
+    def discover(
+        self, frame: HostSkillsFrame, root: Path, *, warnings: list[str] | None = None
+    ) -> list[dict[str, str]]:
+        """Return metadata for the exact launch target or effective session bundle.
+
+        Sources a provider could not read are reported through ``warnings``.
+        Such incomplete catalogs are cached only briefly, so a retry rescans soon.
+        """
         key = (
             str(root),
             frame.harness,
@@ -66,10 +77,16 @@ class HostSkillDiscovery:
             cached = self._cache.get(key)
             if cached is not None and cached[0] > time.monotonic():
                 self._cache.move_to_end(key)
+                if warnings is not None:
+                    warnings.extend(cached[2])
                 return list(cached[1])
+            problems: list[str] = []
             if frame.session_id is None:
                 ctx = skill_source_context_from_env(
-                    roots=(root,), harness=frame.harness, skills_filter=frame.skills_filter
+                    roots=(root,),
+                    harness=frame.harness,
+                    skills_filter=frame.skills_filter,
+                    warnings=problems,
                 )
                 skills = resolve_harness_skills(ctx, frame.harness)
             else:
@@ -91,13 +108,18 @@ class HostSkillDiscovery:
                     )
                     if frame.sub_agent_name:
                         spec, directory = _subagent_bundle(spec, directory, frame.sub_agent_name)
-                    skills = resolve_session_skills(spec, (root, directory), directory)
+                    skills = resolve_session_skills(
+                        spec, (root, directory), directory, warnings=problems
+                    )
             result = [
                 {"name": skill.name, "description": skill.description}
                 | ({"display_name": skill.display_name} if skill.display_name else {})
                 for skill in skills
             ]
-            self._cache[key] = (time.monotonic() + SKILLS_CACHE_TTL_SECONDS, result)
+            if warnings is not None:
+                warnings.extend(problems)
+            ttl = INCOMPLETE_CATALOG_TTL_SECONDS if problems else SKILLS_CACHE_TTL_SECONDS
+            self._cache[key] = (time.monotonic() + ttl, result, problems)
             self._cache.move_to_end(key)
             while len(self._cache) > _MAX_CACHED_CATALOGS:
                 self._cache.popitem(last=False)

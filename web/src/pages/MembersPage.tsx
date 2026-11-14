@@ -48,11 +48,13 @@ import {
 } from "@/lib/accountsApi";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { withBasePath } from "@/lib/basePath";
 import { isSingleUserMode } from "@/lib/capabilities";
 
 export function MembersPage() {
   const info = useServerInfo();
+  const capabilitiesLoading = info === "loading" || isBootFallbackInfo(info);
   // Password-based management (invite / reset / remove) only exists in
   // accounts mode — OIDC identities are owned by the IdP, so under OIDC
   // this page is a read-only user list (no action column, no modals).
@@ -92,7 +94,7 @@ export function MembersPage() {
   // mode since no auth endpoints exist. isSingleUser is a stable boolean
   // so it is safe as a dep without risking infinite re-renders.
   useEffect(() => {
-    if (isSingleUser) return;
+    if (isSingleUser || capabilitiesLoading) return;
     void (async () => {
       const userId = await resolveIdentity();
       if (userId === null) {
@@ -106,12 +108,16 @@ export function MembersPage() {
       setMeIsAdmin(isAdmin);
       if (isAdmin) await refresh();
     })();
-  }, [refresh, isSingleUser]);
+  }, [refresh, isSingleUser, capabilitiesLoading]);
 
   if (isSingleUser) {
     return (
-      <PageScroll contentClassName="px-4 md:px-8" extraBottom="2.5rem">
-        <h1 className="settings-page-title mb-2 text-2xl font-semibold">Members</h1>
+      <PageScroll
+        maxWidthClassName="max-w-4xl"
+        contentClassName="px-4 md:px-8"
+        extraBottom="2.5rem"
+      >
+        <h1 className="settings-page-title mb-2 text-2xl font-medium">Members</h1>
         <p className="text-ui text-muted-foreground">
           Member management is not available in single-user mode.
         </p>
@@ -135,8 +141,12 @@ export function MembersPage() {
   // Non-admin: hard stop. Server would also 403, this is just UX.
   if (meIsAdmin === false) {
     return (
-      <PageScroll contentClassName="px-4 md:px-8" extraBottom="2.5rem">
-        <h1 className="settings-page-title mb-2 text-2xl font-semibold">Members</h1>
+      <PageScroll
+        maxWidthClassName="max-w-4xl"
+        contentClassName="px-4 md:px-8"
+        extraBottom="2.5rem"
+      >
+        <h1 className="settings-page-title mb-2 text-2xl font-medium">Members</h1>
         <p className="text-ui text-muted-foreground">
           You don't have permission to manage members.
         </p>
@@ -187,9 +197,9 @@ export function MembersPage() {
   }
 
   return (
-    <PageScroll contentClassName="px-4 md:px-8" extraBottom="2.5rem">
+    <PageScroll maxWidthClassName="max-w-4xl" contentClassName="px-4 md:px-8" extraBottom="2.5rem">
       <div className="mb-6 flex items-center justify-between">
-        <h1 className="settings-page-title text-2xl font-semibold">Members</h1>
+        <h1 className="settings-page-title text-2xl font-medium">Members</h1>
         {/* Invite mints a password-backed account — accounts mode only.
         Under OIDC, accounts are provisioned by the IdP on first login, so
         there's nothing to invite here. */}
@@ -201,9 +211,8 @@ export function MembersPage() {
       </div>
 
       {!manageable && (
-        <p className="mb-4 text-ui text-muted-foreground">
-          Users are provisioned automatically on first sign-in through your identity provider. This
-          list is read-only.
+        <p className="mb-4 text-sm text-muted-foreground">
+          Users are added on first sign-in through your identity provider. This list is read-only.
         </p>
       )}
 

@@ -249,3 +249,102 @@ export function terminalInfoFromResource(resource: Record<string, unknown>): Ter
     directAttachUrl: parseDirectAttachUrl(metadata.direct_attach_url),
   };
 }
+
+/** Mirror of the server's ``safe_resource_component`` (``entities/session_resources.py``). */
+function safeResourceComponent(value: string): string {
+  const safe = value
+    .trim()
+    .replace(/[^A-Za-z0-9_.-]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return safe || "resource";
+}
+
+/**
+ * The resource id the server assigns a terminal, e.g. ``"terminal_zsh_u-ab12cd"``.
+ *
+ * Mirrors ``terminal_resource_id`` so the web can address a new shell before
+ * its create request returns.
+ */
+export function terminalResourceId(terminalName: string, sessionKey: string): string {
+  return `terminal_${safeResourceComponent(terminalName)}_${safeResourceComponent(sessionKey)}`;
+}
+
+/**
+ * How a terminal whose create request is still in flight attaches: ``"attach"``
+ * dials now with ``await_launch`` (runner online); ``"wait"`` holds the attach
+ * until the create returns (the create may be waking the runner).
+ */
+export type TerminalLaunchMode = "attach" | "wait";
+
+const launchingTerminals = new Map<string, TerminalLaunchMode>();
+/** The conversation each launching terminal belongs to. */
+const launchingConversations = new Map<string, string>();
+const launchListeners = new Set<() => void>();
+
+/** Record *terminalId*'s in-flight create, or clear it with ``null``. */
+export function setTerminalLaunching(
+  terminalId: string,
+  mode: TerminalLaunchMode | null,
+  conversationId = "",
+): void {
+  if (mode === null) {
+    launchingTerminals.delete(terminalId);
+    launchingConversations.delete(terminalId);
+  } else {
+    launchingTerminals.set(terminalId, mode);
+    launchingConversations.set(terminalId, conversationId);
+  }
+  for (const listener of launchListeners) listener();
+}
+
+/** The in-flight create's attach mode for *terminalId*, or ``null`` when none. */
+export function terminalLaunchMode(terminalId: string): TerminalLaunchMode | null {
+  return launchingTerminals.get(terminalId) ?? null;
+}
+
+/**
+ * Whether an attach to *terminalId* should ask the server to wait for the
+ * launch (``?await_launch=true``) rather than close as not found.
+ */
+export function isTerminalLaunching(terminalId: string): boolean {
+  return launchingTerminals.get(terminalId) === "attach";
+}
+
+/** Launching terminals the user closed before their create returned. */
+const closedDuringLaunch = new Set<string>();
+
+/**
+ * Record a close of *terminalId* while its create is still in flight.
+ *
+ * :returns: ``true`` when the terminal is launching, so the caller skips the
+ *     DELETE; the launch deletes the terminal once its create returns.
+ */
+export function requestCloseDuringLaunch(terminalId: string): boolean {
+  if (!launchingTerminals.has(terminalId)) return false;
+  closedDuringLaunch.add(terminalId);
+  return true;
+}
+
+/** Whether the user closed *terminalId* before its create returned. */
+export function isClosedDuringLaunch(terminalId: string): boolean {
+  return closedDuringLaunch.has(terminalId);
+}
+
+/** Forget a close recorded by {@link requestCloseDuringLaunch}. */
+export function clearClosedDuringLaunch(terminalId: string): void {
+  closedDuringLaunch.delete(terminalId);
+}
+
+/** Whether a shell create is in flight in *conversationId*; its launches don't overlap. */
+export function anyTerminalLaunching(conversationId: string): boolean {
+  for (const owner of launchingConversations.values()) {
+    if (owner === conversationId) return true;
+  }
+  return false;
+}
+
+/** Subscribe to launch-state changes (for ``useSyncExternalStore``). */
+export function subscribeTerminalLaunches(listener: () => void): () => void {
+  launchListeners.add(listener);
+  return () => launchListeners.delete(listener);
+}

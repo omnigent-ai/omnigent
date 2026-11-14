@@ -34,6 +34,7 @@ import os
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -49,6 +50,34 @@ RESERVED_USER_LOCAL = "local"
 RESERVED_USER_PUBLIC = "__public__"
 _RESERVED_USERS = frozenset({RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC})
 _TRUTHY_STRINGS = ("1", "true", "yes")
+
+ADMIN_VIEW_COOKIE = "omnigent_admin_view"
+_admin_view_enabled: ContextVar[bool] = ContextVar("admin_view_enabled", default=True)
+
+
+def effective_admin(eligible: bool) -> bool:
+    """Apply the browser view without changing the account's admin role."""
+    return eligible and _admin_view_enabled.get()
+
+
+class AdminViewMiddleware:
+    """Apply the browser preference to HTTP requests and WebSocket connections."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] not in ("http", "websocket"):
+            await self._app(scope, receive, send)
+            return
+        token = _admin_view_enabled.set(
+            HTTPConnection(scope).cookies.get(ADMIN_VIEW_COOKIE) != "off"
+        )
+        try:
+            await self._app(scope, receive, send)
+        finally:
+            _admin_view_enabled.reset(token)
+
 
 # Path prefixes a restricted (device-grant or machine client-credential)
 # access token may reach.

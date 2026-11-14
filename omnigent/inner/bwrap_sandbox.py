@@ -189,7 +189,7 @@ _ALLOWED_SOCKET_FAMILIES = (
 # Vetted outer sandboxes; see _should_bind_host_proc for isolation requirements.
 _PROC_BIND_HOST_BACKENDS: frozenset[str] = frozenset({"lakebox", "phoenix-kubernetes"})
 
-# Marker directory the Databricks Lakebox runtime seeds inside every
+# Marker directory the Lakebox runtime seeds inside every
 # microVM. Used to autodetect lakebox when the launcher hasn't declared the
 # backend via :data:`HOST_SANDBOX_BACKEND_ENV`.
 _LAKEBOX_MARKER = Path("/run/lakebox")
@@ -373,6 +373,7 @@ class BwrapSandboxBackend(SandboxBackend):
             ),
             credential_proxy=sandbox_spec.credential_proxy,
             git_ssh=sandbox_spec.git_ssh,
+            tcp_egress=sandbox_spec.tcp_egress,
         )
 
     def wrap_launcher_argv(
@@ -428,6 +429,8 @@ class BwrapSandboxBackend(SandboxBackend):
         :func:`omnigent.inner.sandbox.run_launcher`.
         """
         policy = self.prepare_launcher_policy(policy)
+        if policy.tcp_egress and policy.tcp_egress_socket_path is None:
+            raise ValueError("tcp_egress requires its parent broker before sandbox launch")
         cwd_resolved = cwd.resolve(strict=False)
         chdir_target = chdir.resolve(strict=False) if chdir is not None else cwd_resolved
         bwrap_args: list[str] = ["bwrap"]
@@ -608,6 +611,7 @@ class BwrapSandboxBackend(SandboxBackend):
             not policy.allow_network
             or policy.egress_relay_port is not None
             or policy.git_ssh_socket_path is not None
+            or policy.tcp_egress_socket_path is not None
         ):
             bwrap_args.append("--unshare-net")
 

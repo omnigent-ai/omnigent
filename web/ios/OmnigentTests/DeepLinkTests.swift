@@ -43,6 +43,29 @@ final class DeepLinkTests: XCTestCase {
     XCTAssertEqual(dl?.path, "/c/\(hex)")
   }
 
+  func testPreservesFullscreenFileLinkParameters() {
+    let query = "file=%2Frepo%2FMy+notes%2Fplot+%231+%26+a%2Bb.html&fullscreen=1"
+    let dl = DeepLink.parse(
+      URL(string: "omnigent://example.com/c/\(hex)?\(query)&view=terminal&reply=1#frag")!)
+
+    XCTAssertEqual(dl?.path, "/c/\(hex)?\(query)")
+    XCTAssertEqual(dl?.origin, "https://example.com")
+  }
+
+  func testPreservesPercentEncodedFilePathWithoutInterpretingURLStructure() {
+    let query = "file=%2Frepo%2Freport%20%23draft%3Fview%3D1%26x%3D2%2B3.html&fullscreen=1"
+    let dl = DeepLink.parse(URL(string: "omnigent://localhost:8000/c/\(hex)/?\(query)#frag")!)
+
+    XCTAssertEqual(dl?.path, "/c/\(hex)?\(query)")
+  }
+
+  func testDropsUnrelatedQueryParametersAndHashes() {
+    let dl = DeepLink.parse(
+      URL(string: "omnigent://localhost:8000/c/\(hex)?reply=1&view=chat#frag")!)
+
+    XCTAssertEqual(dl?.path, "/c/\(hex)")
+  }
+
   func testAcceptsDashedUuidId() {
     // The SPA's `bareConversationId` normalizes a canonical dashed uuid to the
     // bare hex form, so a deep link minted with a dashed id must still parse.
@@ -175,6 +198,23 @@ final class DeepLinkTests: XCTestCase {
     ] {
       XCTAssertEqual(
         AppRootView.conversationURL(for: URL(string: base)!, path: "/c/abc").absoluteString,
+        expected)
+    }
+  }
+
+  @MainActor
+  func testConversationURLPreservesFullscreenFileQueryUnderWorkspaceMount() {
+    let query = "file=docs%2FMy+notes%2Fplot%20%231+%26+a%2Bb.html&fullscreen=1"
+    let deepLink = DeepLink.parse(URL(string: "omnigent://example.com/c/\(hex)?\(query)")!)!
+    for (base, expected) in [
+      ("http://localhost:8000/", "http://localhost:8000/c/\(hex)?\(query)"),
+      (
+        "https://example.com/custom%20mount/?o=123%2B456#view",
+        "https://example.com/custom%20mount/c/\(hex)?o=123%2B456&\(query)#view"
+      ),
+    ] {
+      XCTAssertEqual(
+        AppRootView.conversationURL(for: URL(string: base)!, path: deepLink.path).absoluteString,
         expected)
     }
   }

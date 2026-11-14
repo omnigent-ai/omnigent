@@ -31,6 +31,8 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from omnigent.runtime.tool_call_deadline import pause_tool_call_deadline
+
 # Default wait budget for a UI verdict, in seconds. Held at one day
 # (86400s) — matching the deciding policy's default ``ask_timeout``: an ASK
 # is a human-in-the-loop gate and should outlive a user stepping away rather
@@ -298,7 +300,8 @@ async def wait_for_user_verdict(
     _session_pending[conversation_id] = _session_pending.get(conversation_id, 0) + 1
     answered = False
     try:
-        verdict = await asyncio.wait_for(fut, timeout=effective_timeout)
+        with pause_tool_call_deadline(effective_timeout):
+            verdict = await asyncio.wait_for(fut, timeout=effective_timeout)
         answered = True
     except TimeoutError:
         verdict = Verdict(approved=False)

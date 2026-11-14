@@ -35,6 +35,21 @@ describe("CodeBlock — lazy Shiki highlighting", () => {
   });
 });
 
+describe("CodeBlock — blank lines", () => {
+  it.each(["text", "python"] as const)(
+    "keeps a blank line in %s code once highlighted",
+    async (language) => {
+      const { container } = render(<CodeBlock code={"first\n\nthird"} language={language} />);
+      await waitFor(
+        () => expect(container.querySelector('[data-code-highlighted="true"]')).toBeTruthy(),
+        { timeout: 10000 },
+      );
+      const lines = [...container.querySelectorAll("pre > code > span")];
+      expect(lines.map((line) => line.textContent)).toEqual(["first", "\n", "third"]);
+    },
+  );
+});
+
 describe("CodeBlock — soft wrap", () => {
   it("keeps white-space: pre by default so columns stay aligned", () => {
     const { container } = render(<CodeBlock code={"a  b  c"} language="json" />);

@@ -29,7 +29,7 @@
 The device grant (`designs/DEVICE_AUTH.md`) answers "a browserless client must
 act **as a human**, without ever holding that human's credentials". It does not
 answer the other case: a headless process that acts **as itself** — a scheduled
-job, a webhook receiver, an internal service calling the sessions API. There is
+job, a webhook receiver, a backend service calling the sessions API. There is
 no human to consent, so a flow built around out-of-band browser consent has
 nothing to ask.
 

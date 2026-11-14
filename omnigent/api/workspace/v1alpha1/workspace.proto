@@ -1,0 +1,113 @@
+syntax = "proto3";
+
+// Workspace API: read a session's workspace files.
+//
+// One implementation serves every route: directly from the desktop app over a
+// local socket, and through the server for every other client. Which session
+// and workspace a call reads comes from its credentials, never from a message.
+// Paths in messages are always relative to the workspace root.
+//
+// v1alpha1 may still change incompatibly.
+package omnigent.api.workspace.v1alpha1;
+
+import "google/protobuf/timestamp.proto";
+
+service WorkspaceService {
+  // Lists what this server supports, so clients can skip what it lacks.
+  rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Lists one directory's entries in name order.
+  rpc ListDirectory(ListDirectoryRequest) returns (ListDirectoryResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Streams a file: metadata first, then its bytes in order.
+  rpc ReadFile(ReadFileRequest) returns (stream ReadFileResponse);
+}
+
+message GetCapabilitiesRequest {}
+
+message GetCapabilitiesResponse {
+  // Supported method names, e.g. "ListDirectory". Clients treat a missing
+  // name as unsupported and use another route.
+  repeated string capabilities = 1;
+}
+
+message ListDirectoryRequest {
+  // Directory to list. Empty for the workspace root.
+  string path = 1;
+
+  // Maximum entries to return; 0 means the server's default. Values above
+  // the server's maximum are lowered to it.
+  int32 page_size = 2;
+
+  // `next_page_token` from the previous response, to continue a listing.
+  string page_token = 3;
+}
+
+message ListDirectoryResponse {
+  repeated Entry entries = 1;
+
+  // Pass as `page_token` to get the next page. Empty when there are no more.
+  string next_page_token = 2;
+}
+
+message Entry {
+  // Last path segment, e.g. "main.py".
+  string name = 1;
+
+  // Path from the workspace root, e.g. "src/main.py".
+  string path = 2;
+
+  // A symlink reports the type of its target.
+  EntryType type = 3;
+
+  // File size in bytes. Unset for directories and broken symlinks.
+  optional int64 size = 4;
+
+  google.protobuf.Timestamp modify_time = 5;
+}
+
+enum EntryType {
+  ENTRY_TYPE_UNSPECIFIED = 0;
+  ENTRY_TYPE_FILE = 1;
+  ENTRY_TYPE_DIRECTORY = 2;
+}
+
+message ReadFileRequest {
+  // File to read, e.g. "src/main.py".
+  string path = 1;
+}
+
+message ReadFileResponse {
+  // Set on the first message only.
+  FileMetadata metadata = 1;
+
+  // The next part of the file. Concatenate every message's `data`.
+  bytes data = 2;
+}
+
+message FileMetadata {
+  // Total bytes the stream delivers.
+  int64 size = 1;
+
+  // True when the file exceeds the server's read limit and the stream stops
+  // at that limit.
+  bool truncated = 2;
+
+  // Decided from all delivered bytes.
+  ContentEncoding encoding = 3;
+
+  // Guessed from the file name, e.g. "text/markdown". Empty when unknown.
+  string content_type = 4;
+}
+
+enum ContentEncoding {
+  CONTENT_ENCODING_UNSPECIFIED = 0;
+  // The delivered bytes are valid UTF-8 text.
+  CONTENT_ENCODING_UTF8 = 1;
+  // The delivered bytes are not valid UTF-8.
+  CONTENT_ENCODING_BINARY = 2;
+}

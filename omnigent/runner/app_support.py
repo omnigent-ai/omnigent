@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypeAlias, overload
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias, overload
 
 import httpx
 
 from omnigent.debug_logging import runner_primary_session_id
+from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.inner.native_attachments import (
     framework_notice_block,
     has_unresolved_file_id,
@@ -26,6 +27,29 @@ if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeToolRelay
 
 _logger = logging.getLogger("omnigent.runner.app")
+
+
+class _TurnMessage(dict[str, Any]):
+    """Keep input attribution through buffering/requeueing, outside the wire payload."""
+
+    def __init__(self, body: _JsonObject, scheduled_run: ScheduledRunLogContext | None) -> None:
+        super().__init__(body)
+        self.scheduled_run = scheduled_run
+
+
+def _message_scheduled_run(body: Mapping[str, Any] | None) -> ScheduledRunLogContext | None:
+    """Internal wakes and ordinary dictionaries have no automation attribution."""
+    return body.scheduled_run if isinstance(body, _TurnMessage) else None
+
+
+def _shared_scheduled_run(
+    bodies: Sequence[Mapping[str, Any]],
+) -> ScheduledRunLogContext | None:
+    """Return the shared occurrence, or None when input contexts differ."""
+    if not bodies:
+        return None
+    run = _message_scheduled_run(bodies[0])
+    return run if all(_message_scheduled_run(body) == run for body in bodies) else None
 
 
 def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:

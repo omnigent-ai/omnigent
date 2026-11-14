@@ -38,13 +38,18 @@ def test_mock_session_uses_owned_config(monkeypatch, tmp_path, harness, owned):
     monkeypatch.setattr(fixtures, f"_create_native_{harness}_session", create)
     delete = Mock()
     monkeypatch.setattr(fixtures.httpx, "delete", delete)
+    labels = {"omnigent.codex_native.collaboration_mode": "plan"}
+    fixture_kwargs = {"request": Mock(param=labels)}
+    if harness == "claude":
+        fixture_kwargs = {"claude_managed_settings": None}
     journey = getattr(fixtures, f"native_{harness}_mock_session").__wrapped__(
-        "http://server", "http://model", None,
-        **({"claude_managed_settings": None} if harness == "claude" else {})
+        "http://server", "http://model", None, **fixture_kwargs
     )
     try:
         assert next(journey) == ("http://server", "session")
-        create.assert_called_once_with("http://server", "runner")
+        create.assert_called_once_with(
+            "http://server", "runner", **({} if harness == "claude" else {"labels": labels})
+        )
         if owned:
             assert config.read_text() == "original"
         else:

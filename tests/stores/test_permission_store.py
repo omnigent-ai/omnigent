@@ -10,17 +10,31 @@ SQLite file and tears it down automatically.
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from sqlalchemy import event
 
-from omnigent.entities import SessionPermission
-from omnigent.server.auth import RESERVED_USER_PUBLIC
+from omnigent.db.db_models import workspace_scope
+from omnigent.entities import ScheduledTaskPermission, SessionPermission
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server import session_sharing
+from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_OWNER,
+    LEVEL_READ,
+    RESERVED_USER_LOCAL,
+    RESERVED_USER_PUBLIC,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.permission_store import MAX_GRANTS_PAGE_SIZE, PermissionStore
+from omnigent.stores.permission_store import sqlalchemy_store as permission_module
 from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
 )
+from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
 
 @pytest.fixture()
@@ -57,6 +71,22 @@ def _create_conversation(db_uri: str) -> str:
     conv_store = SqlAlchemyConversationStore(db_uri)
     conv = conv_store.create_conversation()
     return conv.id
+
+
+def _create_scheduled_task(db_uri: str, owner: str = "owner@example.com") -> str:
+    """Create a scheduled task and return its id; grants refuse a missing task."""
+    task = SqlAlchemyScheduledTaskStore(db_uri).create(
+        uuid.uuid4().hex, "job", "hello", "FREQ=DAILY", owner, uuid.uuid4().hex, "UTC"
+    )
+    return task.id
+
+
+@pytest.fixture()
+def wider_scheduled_task_grant_levels(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Allow Edit as well as Read, as a widened allowlist would, to exercise level changes."""
+    monkeypatch.setattr(
+        session_sharing, "SCHEDULED_TASK_GRANT_LEVELS", frozenset({LEVEL_READ, LEVEL_EDIT})
+    )
 
 
 # ── grant ────────────────────────────────────────────────────────────────────
@@ -185,6 +215,32 @@ def test_grant_with_public_sentinel(store: SqlAlchemyPermissionStore, db_uri: st
         "The __public__ sentinel is not persisting as a normal user_id."
     )
     assert fetched.level == 1
+
+
+@pytest.mark.parametrize(
+    ("existing_level", "requested_level", "expected_level"),
+    [(None, 1, 1), (1, 2, 2), (1, 1, 1), (2, 1, 2), (3, 1, 3), (4, 1, 4)],
+)
+def test_grant_ensures_minimum_level(
+    store: SqlAlchemyPermissionStore,
+    db_uri: str,
+    existing_level: int | None,
+    requested_level: int,
+    expected_level: int,
+) -> None:
+    """Invitations create or upgrade access without replacing a stronger grant."""
+    user_id = "recipient@example.com"
+    _ensure_user(store, user_id)
+    conv_id = _create_conversation(db_uri)
+    if existing_level is not None:
+        store.grant(user_id, conv_id, existing_level)
+
+    result = store.grant(user_id, conv_id, requested_level, ensure_minimum=True)
+
+    assert result.level == expected_level
+    fetched = store.get(user_id, conv_id)
+    assert fetched is not None
+    assert fetched.level == expected_level
 
 
 # ── revoke ───────────────────────────────────────────────────────────────────
@@ -1112,6 +1168,12 @@ def test_list_for_sessions_returns_grouped_grants(
     assert len(result[conv_b]) == 1
     assert result[conv_b][0].user_id == "alice"
 
+    for user_id in {grant.user_id for grants in result.values() for grant in grants}:
+        assert store.list_for_sessions([conv_a, conv_b], user_id=user_id) == {
+            conversation_id: [grant for grant in grants if grant.user_id == user_id]
+            for conversation_id, grants in result.items()
+        }
+
 
 def test_list_for_sessions_empty_input(store: SqlAlchemyPermissionStore) -> None:
     """list_for_sessions with empty list returns empty dict."""
@@ -1346,3 +1408,248 @@ def test_resolve_access_cache_evicts_least_recently_used_over_cap(
     finally:
         detach()
     assert count[0] == 1, f"only the LRU-evicted entry should re-read, got {count[0]}"
+
+
+# ── validate_grants (default) ─────────────────────────────────────────────────
+
+
+def test_validate_grants_default_keeps_order_and_creates_no_users(
+    store: SqlAlchemyPermissionStore,
+) -> None:
+    """The base default accepts every grant in input order and writes nothing."""
+    grants = [("bob@example.com", 1), ("alice@example.com", 2), ("__public__", 1)]
+    assert store.validate_grants(grants) == grants
+    assert store.validate_grants([]) == []
+    assert store.user_exists("bob@example.com") is False
+
+
+# ── scheduled task grants ────────────────────────────────────────────────────
+
+
+@pytest.mark.usefixtures("wider_scheduled_task_grant_levels")
+def test_scheduled_task_grant_upserts_and_revoke_removes(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """A grant overwrites its level either way, and revoke reports whether it removed one."""
+    task_id = _create_scheduled_task(db_uri)
+    _ensure_user(store, "alice@example.com")
+
+    assert store.supports_scheduled_task_grants is True
+    granted = store.grant_for_scheduled_task("alice@example.com", task_id, LEVEL_READ)
+    assert granted == ScheduledTaskPermission("alice@example.com", task_id, LEVEL_READ)
+    store.grant_for_scheduled_task("alice@example.com", task_id, LEVEL_EDIT)
+    assert store.list_for_scheduled_task(task_id)[0][0].level == LEVEL_EDIT
+    store.grant_for_scheduled_task("alice@example.com", task_id, LEVEL_READ)
+    assert store.list_for_scheduled_task(task_id) == (
+        [ScheduledTaskPermission("alice@example.com", task_id, LEVEL_READ)],
+        None,
+    )
+
+    assert store.revoke_for_scheduled_task("alice@example.com", task_id) is True
+    assert store.revoke_for_scheduled_task("alice@example.com", task_id) is False
+    assert store.list_for_scheduled_task(task_id) == ([], None)
+
+
+def test_list_for_scheduled_task_pages_by_user_id(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """Pages follow the exclusive user_id cursor and exclude other tasks' grants."""
+    task_id, other_task_id = _create_scheduled_task(db_uri), _create_scheduled_task(db_uri)
+    user_ids = [f"user{i:02d}@example.com" for i in range(5)]
+    for user_id in reversed(user_ids):
+        _ensure_user(store, user_id)
+        store.grant_for_scheduled_task(user_id, task_id, 1)
+    store.grant_for_scheduled_task("user00@example.com", other_task_id, 1)
+
+    pages: list[list[str]] = []
+    cursors: list[str | None] = []
+    cursor = None
+    while True:
+        page, cursor = store.list_for_scheduled_task(task_id, limit=2, after_user_id=cursor)
+        pages.append([grant.user_id for grant in page])
+        cursors.append(cursor)
+        if cursor is None:
+            break
+    assert pages == [user_ids[:2], user_ids[2:4], user_ids[4:]]
+    assert cursors == [user_ids[1], user_ids[3], None]
+    for limit in (0, -1, MAX_GRANTS_PAGE_SIZE + 1):
+        with pytest.raises(OmnigentError) as caught:
+            store.list_for_scheduled_task(task_id, limit=limit)
+        assert caught.value.code == ErrorCode.INVALID_INPUT
+    assert len(store.list_for_scheduled_task(task_id, limit=MAX_GRANTS_PAGE_SIZE)[0]) == 5
+
+
+@pytest.mark.usefixtures("wider_scheduled_task_grant_levels")
+def test_resolve_scheduled_task_access_returns_highest_principal_level(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """The caller's ID and groups resolve to the highest level any of them holds."""
+    task_id, other_task_id = _create_scheduled_task(db_uri), _create_scheduled_task(db_uri)
+    for user_id, level in (("alice@example.com", 1), ("editors", 2)):
+        _ensure_user(store, user_id)
+        store.grant_for_scheduled_task(user_id, task_id, level)
+
+    assert store.resolve_scheduled_task_access(["alice@example.com", "editors"], task_id) == 2
+    assert store.resolve_scheduled_task_access(["alice@example.com", "viewers"], task_id) == 1
+    assert store.resolve_scheduled_task_access(["bob@example.com"], task_id) is None
+    assert store.resolve_scheduled_task_access([], task_id) is None
+    assert store.resolve_scheduled_task_access(["editors"], other_task_id) is None
+
+
+def test_delete_for_scheduled_task_removes_only_that_tasks_grants(
+    store: SqlAlchemyPermissionStore, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Grants go in batches that each commit on their own, until a batch comes back empty."""
+    task_id, other_task_id = _create_scheduled_task(db_uri), _create_scheduled_task(db_uri)
+    user_ids = [f"user{i}@example.com" for i in range(5)]
+    for user_id in user_ids:
+        _ensure_user(store, user_id)
+        store.grant_for_scheduled_task(user_id, task_id, 1)
+    store.grant_for_scheduled_task("user0@example.com", other_task_id, 1)
+    monkeypatch.setattr(store, "_cleanup_batch_size", 2)
+    batch_deletions: list[int] = []
+    run_write_transaction = permission_module.run_write_transaction
+
+    def recording_transaction(session_maker, operation_name, callback, **kwargs):
+        result = run_write_transaction(session_maker, operation_name, callback, **kwargs)
+        batch_deletions.append(result[1])
+        return result
+
+    monkeypatch.setattr(permission_module, "run_write_transaction", recording_transaction)
+
+    assert store.delete_for_scheduled_task(task_id) == 5
+    # Each committed transaction deletes at most one batch.
+    assert max(batch_deletions) <= 2
+    assert len([count for count in batch_deletions if count]) >= 3
+    assert store.delete_for_scheduled_task(task_id) == 0
+    assert store.list_for_scheduled_task(task_id) == ([], None)
+    assert store.list_for_scheduled_task(other_task_id) == (
+        [ScheduledTaskPermission("user0@example.com", other_task_id, 1)],
+        None,
+    )
+
+
+def test_scheduled_task_grant_refuses_a_missing_or_deleted_task(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """A grant on a missing or deleted task would outlive it, since no foreign key cascades."""
+    deleted_task_id = _create_scheduled_task(db_uri)
+    assert SqlAlchemyScheduledTaskStore(db_uri).update(deleted_task_id, state="deleted")
+    _ensure_user(store, "alice@example.com")
+
+    for task_id in (uuid.uuid4().hex, deleted_task_id):
+        with pytest.raises(OmnigentError) as caught:
+            store.grant_for_scheduled_task("alice@example.com", task_id, 1)
+        assert caught.value.code == ErrorCode.NOT_FOUND
+        assert store.list_for_scheduled_task(task_id) == ([], None)
+
+
+@pytest.mark.parametrize(
+    ("user_id", "level", "storable"),
+    [
+        ("x" * 128, LEVEL_READ, True),
+        ("x" * 129, LEVEL_READ, False),
+        ("alice@example.com", LEVEL_EDIT, False),
+        ("alice@example.com", LEVEL_OWNER, False),
+        (RESERVED_USER_PUBLIC, LEVEL_READ, False),
+        ("__PUBLIC__", LEVEL_READ, False),
+        (RESERVED_USER_LOCAL, LEVEL_READ, False),
+    ],
+    ids=["widest-id", "over-wide-id", "edit", "owner-level", "public", "public-variant", "local"],
+)
+def test_scheduled_task_grant_refuses_what_the_store_must_not_hold(
+    store: SqlAlchemyPermissionStore, db_uri: str, user_id: str, level: int, storable: bool
+) -> None:
+    """IDs fit the column on every engine; grants are Read only and never public or local."""
+    task_id = _create_scheduled_task(db_uri)
+    if storable:
+        _ensure_user(store, user_id)
+        store.grant_for_scheduled_task(user_id, task_id, level)
+    else:
+        with pytest.raises(OmnigentError) as caught:
+            store.grant_for_scheduled_task(user_id, task_id, level)
+        assert caught.value.code == ErrorCode.INVALID_INPUT
+    assert store.list_for_scheduled_task(task_id)[0] == (
+        [ScheduledTaskPermission(user_id, task_id, level)] if storable else []
+    )
+
+
+def test_scheduled_task_grants_follow_the_key_collation(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """MySQL's keys fold case and accents: a grantee's variant merges into one grant, and
+    variants of the owner or a reserved ID are refused. An owner variant's run-session
+    grant would overwrite the owner's own session grant."""
+    task_id = _create_scheduled_task(db_uri, owner="alice@example.com")
+    accent_variants = ["__públic__", "lócal"]
+    for user_id in (
+        "bob@example.com",
+        "Bob@example.com",
+        "alice@example.com",
+        "Alice@example.com",
+        *accent_variants,
+    ):
+        _ensure_user(store, user_id)
+        try:
+            store.grant_for_scheduled_task(user_id, task_id, LEVEL_READ)
+        except OmnigentError as error:
+            assert error.code == ErrorCode.INVALID_INPUT, error
+
+    folds_case = store._engine.dialect.name == "mysql"
+    grants, _ = store.list_for_scheduled_task(task_id)
+    assert {grant.user_id for grant in grants} == (
+        {"bob@example.com"}
+        if folds_case
+        else {"bob@example.com", "Bob@example.com", "Alice@example.com", *accent_variants}
+    )
+    assert store.resolve_scheduled_task_access(["BOB@example.com"], task_id) == (
+        LEVEL_READ if folds_case else None
+    )
+
+
+def test_scheduled_task_grants_are_scoped_to_the_workspace(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    with workspace_scope(101):
+        task_id = _create_scheduled_task(db_uri)
+        _ensure_user(store, "alice@example.com")
+        store.grant_for_scheduled_task("alice@example.com", task_id, 1)
+
+    with workspace_scope(102):
+        with pytest.raises(OmnigentError) as caught:
+            store.grant_for_scheduled_task("alice@example.com", task_id, 1)
+        assert caught.value.code == ErrorCode.NOT_FOUND
+        assert store.list_for_scheduled_task(task_id) == ([], None)
+        assert store.resolve_scheduled_task_access(["alice@example.com"], task_id) is None
+        assert store.revoke_for_scheduled_task("alice@example.com", task_id) is False
+        assert store.delete_for_scheduled_task(task_id) == 0
+
+    with workspace_scope(101):
+        assert store.resolve_scheduled_task_access(["alice@example.com"], task_id) == 1
+
+
+def test_store_without_scheduled_task_grants_keeps_safe_defaults() -> None:
+    """A subclass without scheduled task grants still instantiates and holds or grants none."""
+    scheduled_task_methods = {
+        "grant_for_scheduled_task",
+        "revoke_for_scheduled_task",
+        "list_for_scheduled_task",
+        "resolve_scheduled_task_access",
+        "delete_for_scheduled_task",
+    }
+    assert not scheduled_task_methods & PermissionStore.__abstractmethods__
+    minimal_store_class = type(
+        "MinimalPermissionStore",
+        (PermissionStore,),
+        {name: lambda self, *args, **kwargs: None for name in PermissionStore.__abstractmethods__},
+    )
+    minimal = minimal_store_class("unused://")
+
+    assert minimal.supports_scheduled_task_grants is False
+    with pytest.raises(OmnigentError) as caught:
+        minimal.grant_for_scheduled_task("alice@example.com", "task", 1)
+    assert caught.value.code == ErrorCode.FORBIDDEN
+    assert minimal.revoke_for_scheduled_task("alice@example.com", "task") is False
+    assert minimal.list_for_scheduled_task("task") == ([], None)
+    assert minimal.resolve_scheduled_task_access(["alice@example.com"], "task") is None
+    assert minimal.delete_for_scheduled_task("task") == 0

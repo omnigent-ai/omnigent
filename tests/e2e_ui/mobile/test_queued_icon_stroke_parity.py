@@ -79,6 +79,8 @@ def test_queued_row_action_icon_geometry_matches_composer(
         record_video_dir=os.environ.get("OMNIGENT_E2E_RECORD_DIR"),
     )
     page = context.new_page()
+    # Queue busy follow-ups instead of steering them (Always steer defaults on).
+    page.add_init_script("localStorage.setItem('omnigent:always-steer', 'false')")
 
     def ack_event(route: Route) -> None:
         # Ack every send; never emit a session.status event, so the SPA's

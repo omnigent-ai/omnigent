@@ -3,7 +3,7 @@
 // whether the file is read or edited. Streamdown's mermaid plugin sanitises the
 // SVG internally — the same trusted path chat messages use.
 
-import { mermaid } from "@streamdown/mermaid";
+import { mermaid } from "@/components/ai-elements/mermaidPlugin";
 import { Streamdown } from "streamdown";
 import { MERMAID_STREAMDOWN_PROPS } from "@/components/ai-elements/MermaidBlock";
 import { MarkdownErrorBoundary } from "@/components/ai-elements/MarkdownErrorBoundary";

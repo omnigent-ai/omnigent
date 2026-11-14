@@ -113,9 +113,23 @@ describe("useSessionModelLabel", () => {
   });
 
   it.each([
+    ["gpt-6.1-sol", "GPT-6.1-Sol"],
+    ["system.ai.gpt-6-1-sol", "GPT-6.1-Sol"],
+    ["Session's custom name", "Session's custom name"],
+  ])("prefers a host name over the cached ID %s, preserving custom names", (cached, expected) => {
+    const reported = "system.ai.gpt-6-1-sol";
+    writeSessionModelLabelCache(getSessionModelLabelCacheKey(scope, reported), cached);
+    const { result } = renderLabel({
+      model: reported,
+      hostOptions: [{ id: "gpt-6.1-sol", displayName: "GPT-6.1-Sol" }],
+    });
+    expect(result.current.label).toBe(expected);
+  });
+
+  it.each([
     ["codex-native", "system.ai.gpt-5-6-luna"],
     ["codex-native", "system.ai.gpt-5-5-sol"],
-    ["claude-native", "system.ai.gpt-5-6-sol"],
+    ["claude-native", "system.ai.gpt-5-6-sol[1m]"],
   ])("does not borrow a host name for %s reporting %s", (harness, reported) => {
     const { result } = renderLabel({
       scope: { ...scope, harness },
@@ -180,6 +194,29 @@ describe("useSessionModelLabel", () => {
     expect(result.current).toEqual(named);
     expect(readSessionModelLabelCache(cacheKey())).toBe(named.label);
   });
+
+  it.each([
+    ["codex-native", "gpt-6.1-sol", "system.ai.gpt-6-1-sol", "GPT-6.1-Sol"],
+    ["claude-native", "SYSTEM.AI.CLAUDE-SONNET-5", "claude-sonnet-5", "Sonnet 5"],
+    ["pi-native", "provider/GLM-5.3", "provider/glm-5.3", "GLM-5.3"],
+    ["cursor-native", "GEMINI-2.5-PRO", "gemini-2.5-pro", "Gemini 2.5 Pro"],
+  ])(
+    "keeps %s names consistent across host, live and cached catalogs",
+    (harness, reported, id, label) => {
+      const props = { ...defaults, scope: { ...scope, harness }, model: reported };
+      const options = [{ id, model: id, displayName: label }];
+      const expected = { label, loading: false, unavailable: false };
+      const { result, rerender, unmount } = renderLabel({ ...props, hostOptions: options });
+      expect(result.current).toEqual(expected);
+      rerender({ ...props, options });
+      expect(result.current).toEqual(expected);
+      expect(readSessionModelLabelCache(getSessionModelLabelCacheKey(props.scope, reported))).toBe(
+        label,
+      );
+      unmount();
+      expect(renderLabel(props).result.current).toEqual(expected);
+    },
+  );
 
   it("renders synchronously from storage after a remount with no catalog", () => {
     const first = renderLabel({ options: catalog });

@@ -1,7 +1,8 @@
 """Best-effort persistence of per-session live state to the conversations table.
 
-The sidebar's live fields — ``runner_online``, turn ``status``, and the
-pending-approval count — were historically served from in-memory caches
+The sidebar's live fields — ``runner_online``, turn ``status``, the
+pending-approval count, the background-shell flag, and the parked reason —
+were historically served from in-memory caches
 that exist only on the server replica holding a session's runner tunnel
 (the tunnel registry, the SSE-relay status cache, and the
 pending-elicitations index). Under host_id replica sharding a session
@@ -37,9 +38,12 @@ unaffected.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
+import functools
 import logging
 import time
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
@@ -73,6 +77,11 @@ _executor: ThreadPoolExecutor | None = None
 _last_status: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 # Last count persisted per session, for dedupe.
 _last_pending: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+# Last parked reason persisted per session (``""`` = not parked), for dedupe.
+_last_blocked_on: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+# Handoffs to another replica per session. A write queued before a handoff sees
+# the count change and is skipped, so it cannot overwrite the new owner's value.
+_handoffs: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
 # This process's own last touch_runner_liveness() stamp per runner id.
 # Never erased by clear_runner_liveness — only configure() resets it.
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by globally-unique runner_id
@@ -97,6 +106,8 @@ def configure(
     _scheduled_task_store = scheduled_task_store
     _last_status.clear()
     _last_pending.clear()
+    _last_blocked_on.clear()
+    _handoffs.clear()
     _last_liveness_stamp.clear()
 
 
@@ -193,9 +204,49 @@ def persist_live_status(session_id: str, status: str) -> None:
     submit("live_status", _store.set_session_live_status, session_id, status, on_failure=_evict)
 
 
+def handoff_count(session_id: str) -> int:
+    """
+    Return how often this replica has handed *session_id* to another one.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :returns: The count, compared later to tell whether a handoff happened since.
+    """
+    return _handoffs.get(session_id, 0)
+
+
+def _submit_while_owned(
+    session_id: str,
+    description: str,
+    fn: Callable[..., object],
+    *args: object,
+    on_failure: Callable[[], None] | None = None,
+    handoffs: int | None = None,
+) -> Future[Any]:
+    """
+    Queue a write that is skipped if *session_id* is handed off before it runs.
+
+    :param handoffs: :func:`handoff_count` when the write's request began; a
+        handoff since then also skips it. ``None`` uses the count at queue time.
+    :returns: Future of ``True`` once the write ran, or of ``None`` when it was
+        skipped or failed.
+    """
+    if handoffs is None:
+        handoffs = _handoffs.get(session_id, 0)
+
+    def _write() -> bool | None:
+        if _handoffs.get(session_id, 0) != handoffs:
+            return None
+        fn(*args)
+        return True
+
+    return submit(description, _write, on_failure=on_failure)
+
+
 def forget_live_status(session_id: str) -> None:
-    """Drop this process's dedupe state for a session handed to another replica."""
+    """Drop this process's dedupe state and queued writes for a session handed off."""
+    _handoffs[session_id] = _handoffs.get(session_id, 0) + 1
     _last_status.pop(session_id, None)
+    _last_blocked_on.pop(session_id, None)
 
 
 def persist_scheduled_run_completion(
@@ -288,6 +339,102 @@ def persist_pending_count(conversation_id: str, count: int) -> None:
     )
 
 
+def persist_background_work_running(
+    session_id: str,
+    running: bool,
+    *,
+    runner_id: str | None = None,
+    handoffs: int | None = None,
+    reported_at: int | None = None,
+) -> Future[Any] | None:
+    """
+    Persist whether a session's background shells outlive its ended turn.
+
+    The stored row is what every replica's session list reads, so each report
+    is written; the store keeps the newest by *reported_at*.
+
+    :param session_id: Session/conversation identifier.
+    :param running: ``True`` while a background shell outlives the turn.
+    :param runner_id: The reporting runner, when known; the write applies only
+        while the session is still bound to it.
+    :param handoffs: :func:`handoff_count` when the report arrived; the write is
+        skipped if the session was handed to another replica since.
+    :param reported_at: When the runner decided *running*, in its epoch
+        nanoseconds; an older report than the stored one is not written.
+    :returns: Future of ``True`` once the write ran, of ``None`` when it was
+        skipped or failed; ``None`` without a store.
+    """
+    if _store is None:
+        return None
+    return _submit_while_owned(
+        session_id,
+        "background_work_running",
+        functools.partial(
+            _store.set_background_work_running, runner_id=runner_id, reported_at=reported_at
+        ),
+        session_id,
+        running,
+        handoffs=handoffs,
+    )
+
+
+def clear_background_work_running(session_id: str, runner_id: str, *, unseen_since: int) -> None:
+    """
+    Clear a session's background flag while it is still bound to a departed runner.
+
+    The write applies only while the session is bound to *runner_id* and that
+    runner has not been seen since *unseen_since*, so neither a replacement
+    runner's report nor one from the same runner reconnecting is erased.
+
+    :param session_id: Session/conversation identifier.
+    :param runner_id: The departed runner, e.g. ``"runner_abc123"``.
+    :param unseen_since: Epoch seconds the runner must not have been seen since.
+    """
+    if _store is None:
+        return
+    _submit_while_owned(
+        session_id,
+        "background_work_running",
+        functools.partial(
+            _store.set_background_work_running, runner_id=runner_id, unseen_since=unseen_since
+        ),
+        session_id,
+        False,
+    )
+
+
+def persist_blocked_on(session_id: str, blocked_on: str | None) -> None:
+    """
+    Persist why a running session's agent is parked on a terminal prompt.
+
+    Called wherever ``_session_blocked_on_cache`` is written, which is every
+    published status edge. Deduplicated: only a change reaches the database.
+
+    :param session_id: Session/conversation identifier.
+    :param blocked_on: The reason, e.g. ``"permission prompt"``, or ``None``
+        when the session is not parked.
+    """
+    value = blocked_on or ""
+    if _store is None or _last_blocked_on.get(session_id) == value:
+        return
+    _last_blocked_on[session_id] = value
+
+    def _evict() -> None:
+        # See persist_live_status._evict: a dropped write must not leave the
+        # dedupe cache asserting this value reached the database.
+        if _last_blocked_on.get(session_id) == value:
+            _last_blocked_on.pop(session_id, None)
+
+    _submit_while_owned(
+        session_id,
+        "blocked_on",
+        _store.set_blocked_on,
+        session_id,
+        value or None,
+        on_failure=_evict,
+    )
+
+
 def touch_runner_liveness(runner_ids: list[str]) -> None:
     """
     Stamp ``runner_last_seen`` (now) for sessions bound to live runners.
@@ -313,6 +460,27 @@ def touch_runner_liveness(runner_ids: list[str]) -> None:
     for runner_id in runner_ids:
         _last_liveness_stamp[runner_id] = now
     submit("runner_liveness", _store.touch_runner_liveness, list(runner_ids), now)
+
+
+async def stamp_runner_liveness(runner_id: str) -> None:
+    """
+    Stamp ``runner_last_seen`` now and wait for the write to land.
+
+    Called before a reconnecting runner's tunnel is registered. The background
+    stamp can queue behind other writes, and in that gap another replica may
+    settle the runner's running sessions as orphaned. A failed write is logged
+    and the connection proceeds, as with the background stamp.
+
+    :param runner_id: The reconnecting runner's id, e.g. ``"runner_abc123"``.
+    """
+    if _store is None:
+        return
+    now = int(time.time())
+    _last_liveness_stamp[runner_id] = now
+    try:
+        await asyncio.to_thread(_store.touch_runner_liveness, [runner_id], now)
+    except Exception:  # best-effort, like the background stamp
+        _logger.warning("liveness stamp failed for %s", runner_id, exc_info=True)
 
 
 def last_liveness_stamp(runner_id: str) -> int | None:

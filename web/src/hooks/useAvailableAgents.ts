@@ -1,14 +1,14 @@
-import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
-import { useMemo } from "react";
-import { useSidebarData } from "./useSidebarData";
+import { useQueries, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
+import { useCallback, useMemo } from "react";
+import { useOptionalMineSessions, useSidebarData } from "./useSidebarData";
 import { authenticatedFetch } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { agentRootName } from "@/lib/forkHarness";
 import { capitalizeAgentName, useAcpHarnessIds, useHarnessLabels } from "@/lib/agentLabels";
 import {
+  NATIVE_CODING_AGENTS,
   nativeCodingAgentForAvailableAgent,
-  nativeCodingAgentForAgentName,
-  nativeCodingAgentForHarness,
+  type NativeCodingAgentSpec,
 } from "@/lib/nativeCodingAgents";
 import type { SkillSummary } from "@/lib/types";
 
@@ -68,32 +68,58 @@ const DISPLAY_NAMES: Record<string, string> = {
   debby: "Debby",
 };
 
+/**
+ * The vendor whose stock harness row this is: the canonical wrapper name
+ * (`claude-native-ui`) or a clone of it. A custom agent that merely runs on a
+ * native harness is its own picker entry, labelled by its own name.
+ */
+function stockNativeAgent(
+  agent: Pick<AvailableAgent, "name" | "harness">,
+): NativeCodingAgentSpec | undefined {
+  const spec = nativeCodingAgentForAvailableAgent(agent);
+  return spec !== undefined && agentRootName(agent.name) === spec.agentName ? spec : undefined;
+}
+
+/**
+ * The vendor wrapper slot a row folds into for dedup and shadow removal: the
+ * stock wrapper, or a flagless legacy/session row that matches a native vendor
+ * by harness alone. A row the server flags `builtin` keeps its own picker row.
+ */
+function nativeWrapperSlot(
+  agent: Pick<AvailableAgent, "name" | "harness" | "builtin">,
+): NativeCodingAgentSpec | undefined {
+  const stock = stockNativeAgent(agent);
+  if (stock !== undefined) return stock;
+  if (agent.builtin !== undefined) return undefined;
+  return nativeCodingAgentForAvailableAgent(agent);
+}
+
 function displayNameForAgent(name: string, harness?: string | null): string {
   return (
-    nativeCodingAgentForHarness(harness)?.displayName ??
-    nativeCodingAgentForAgentName(name)?.displayName ??
+    stockNativeAgent({ name, harness: harness ?? null })?.displayName ??
     DISPLAY_NAMES[name] ??
     capitalizeAgentName(name)
   );
 }
 
+/** Keep one row per stock native wrapper, preferring the canonically named one. */
 function dedupeNativeAgents(agents: AvailableAgent[]): AvailableAgent[] {
   const result: AvailableAgent[] = [];
-  const nativeIndex = new Map<string, number>();
+  const stockIndex = new Map<string, number>();
   for (const agent of agents) {
-    const nativeAgent = nativeCodingAgentForAvailableAgent(agent);
-    if (nativeAgent === undefined) {
+    const stock = nativeWrapperSlot(agent);
+    if (stock === undefined) {
       result.push(agent);
       continue;
     }
-    const existingIndex = nativeIndex.get(nativeAgent.key);
+    const existingIndex = stockIndex.get(stock.key);
     if (existingIndex === undefined) {
-      nativeIndex.set(nativeAgent.key, result.length);
+      stockIndex.set(stock.key, result.length);
       result.push(agent);
       continue;
     }
     const existing = result[existingIndex];
-    if (agent.name === nativeAgent.agentName && existing.name !== nativeAgent.agentName) {
+    if (agent.name === stock.agentName && existing.name !== stock.agentName) {
       result[existingIndex] = agent;
     }
   }
@@ -118,14 +144,28 @@ interface BuiltinAgentsListWire {
   data: BuiltinAgentWire[];
   has_more?: boolean;
   last_id?: string | null;
+  // Packaged built-ins the deployment trimmed via OMNIGENT_SEEDED_AGENTS.
+  // Absent on older servers.
+  suppressed_agent_names?: string[];
+}
+
+const NO_SUPPRESSED_NAMES: ReadonlySet<string> = new Set();
+
+/** The built-in catalog plus the packaged names the deployment hides. */
+export interface AgentCatalog {
+  agents: AvailableAgent[];
+  // A hidden built-in with prior sessions must not resurface from session
+  // discovery as a "custom" agent, so the merge drops these names.
+  suppressedNames: ReadonlySet<string>;
 }
 
 /**
  * Fetch the built-in agents from the read-only list `GET /v1/agents`
  * (see designs/BUILTIN_AGENTS.md).
  */
-export async function fetchAgentCatalog(): Promise<AvailableAgent[]> {
+export async function fetchAgentCatalog(): Promise<AgentCatalog> {
   const rows: BuiltinAgentWire[] = [];
+  const suppressedNames = new Set<string>();
   let after: string | null = null;
   // Each page provides the cursor for the next request.
   /* oxlint-disable no-await-in-loop */
@@ -137,11 +177,13 @@ export async function fetchAgentCatalog(): Promise<AvailableAgent[]> {
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     const body = (await res.json()) as BuiltinAgentsListWire;
     rows.push(...body.data);
+    for (const name of body.suppressed_agent_names ?? []) suppressedNames.add(name);
     after = body.has_more === true && body.last_id ? body.last_id : null;
   } while (after != null);
   /* oxlint-enable no-await-in-loop */
 
-  return rows.map(agentFromWire);
+  const agents = rows.map(agentFromWire);
+  return { agents, suppressedNames };
 }
 
 function agentFromWire(a: BuiltinAgentWire): AvailableAgent {
@@ -160,41 +202,61 @@ function agentFromWire(a: BuiltinAgentWire): AvailableAgent {
   };
 }
 
+// The caller's own agents are read until this many distinct names, or this many pages.
+const USER_AGENT_NAME_CAP = 50;
+const USER_AGENT_PAGE_CAP = 5;
+
+/** The caller's own agents, and whether the read stopped before the oldest of them. */
+export interface UserAgentList {
+  agents: AvailableAgent[];
+  truncated: boolean;
+}
+
 /**
  * Fetch the caller's own agents, `GET /v1/agents?scope=user` (installed with
  * `omnigent agent add` or uploaded). Follows the cursor until 50 agent names,
  * since a page can come back empty when the server skipped only copies, or
  * repeat one name (servers before shared uploads kept a row per run).
+ * Past 5 pages, or 50 names, older agents go unread and the list says so.
  */
-export async function fetchUserAgents(): Promise<AvailableAgent[]> {
+export async function fetchUserAgents(): Promise<UserAgentList> {
   const rows: BuiltinAgentWire[] = [];
   const names = new Set<string>();
   let after: string | null = null;
-  // ponytail: 5 pages (250 rows); copies or repeats beyond that can still hide an older agent.
+  let truncated = true;
   /* oxlint-disable no-await-in-loop */
-  for (let page = 0; page < 5 && names.size < 50; page++) {
+  for (let page = 0; page < USER_AGENT_PAGE_CAP && names.size < USER_AGENT_NAME_CAP; page++) {
     const params = new URLSearchParams({ scope: "user", limit: "50" });
     if (after !== null) params.set("after", after);
     const res = await authenticatedFetch(`/v1/agents?${params}`);
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     const body = (await res.json()) as BuiltinAgentsListWire;
+    let skipped = false;
     for (const row of body.data) {
       const name = agentRootName(row.name);
-      if (names.size >= 50 && !names.has(name)) continue;
+      if (names.size >= USER_AGENT_NAME_CAP && !names.has(name)) {
+        skipped = true;
+        continue;
+      }
       names.add(name);
       rows.push(row);
     }
-    if (body.has_more !== true || !body.last_id || body.last_id === after) break;
+    if (body.has_more !== true) {
+      truncated = skipped;
+      break;
+    }
+    if (!body.last_id || body.last_id === after) break;
     after = body.last_id;
   }
   /* oxlint-enable no-await-in-loop */
-  return rows.map((a) => ({
-    ...agentFromWire(a),
-    // By its own name: "orion" on claude-native is Orion, not "Claude Code".
-    display_name: displayNameForAgent(a.name),
-    updated_at: a.updated_at ?? null,
-    mine: true as const,
-  }));
+  return {
+    agents: rows.map((a) => ({
+      ...agentFromWire(a),
+      updated_at: a.updated_at ?? null,
+      mine: true as const,
+    })),
+    truncated,
+  };
 }
 
 interface DiscoveredSessionAgent {
@@ -204,28 +266,47 @@ interface DiscoveredSessionAgent {
   agent: AvailableAgent;
 }
 
+type MineSessions = ReturnType<typeof useSidebarData>["mine"];
+
+/** The agents of the first 30 owned sessions the sidebar loaded, name-only. */
+function discoverSessionAgents(mineData: NonNullable<MineSessions["data"]>): AvailableAgent[] {
+  const agents = new Map<string, AvailableAgent>();
+  for (const row of mineData.pages.flatMap((page) => page.data).slice(0, 30)) {
+    if (!row.agent_id || !row.agent_name || agents.has(row.agent_id)) continue;
+    agents.set(row.agent_id, {
+      id: row.agent_id,
+      name: row.agent_name,
+      display_name: displayNameForAgent(row.agent_name),
+      description: null,
+      harness: null,
+      skills: [],
+      sessionId: row.id,
+      created_at: row.created_at,
+    });
+  }
+  return [...agents.values()];
+}
+
 /** Discover agents from the first 30 owned sessions already loaded by the sidebar. */
 export function useSessionAgents(enabled = true) {
   const { mine } = useSidebarData();
-  const data = useMemo(() => {
-    if (!enabled || !mine.data) return undefined;
-    const agents = new Map<string, AvailableAgent>();
-    for (const row of mine.data.pages.flatMap((page) => page.data).slice(0, 30)) {
-      if (!row.agent_id || !row.agent_name || agents.has(row.agent_id)) continue;
-      agents.set(row.agent_id, {
-        id: row.agent_id,
-        name: row.agent_name,
-        display_name: displayNameForAgent(row.agent_name),
-        description: null,
-        harness: null,
-        skills: [],
-        sessionId: row.id,
-        created_at: row.created_at,
-      });
-    }
-    return [...agents.values()];
-  }, [enabled, mine.data]);
+  const data = useMemo(
+    () => (enabled && mine.data ? discoverSessionAgents(mine.data) : undefined),
+    [enabled, mine.data],
+  );
   return { ...mine, data };
+}
+
+/**
+ * The harness of the agent a session runs, from `GET /v1/sessions/{id}/agent`.
+ * Rejects when the server couldn't read it, so the lookup is retried later.
+ */
+async function fetchSessionAgentHarness(sessionId: string): Promise<string> {
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/agent`);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const harness = ((await res.json()) as AgentObjectWire).harness;
+  if (!harness) throw new Error("the session's agent has no readable harness");
+  return harness;
 }
 
 /** Wire shape of `GET /v1/sessions/{id}/agent` (AgentObject). */
@@ -271,17 +352,13 @@ export async function prefetchAvailableAgentDetails(
               skills: json.skills ?? [],
             },
       );
-      // If enrichment reveals this agent is a native coding agent (e.g. a
-      // kiro-native session with a non-canonical name), remove it when a
-      // seeded built-in with the same native key already exists so it doesn't
-      // surface as a duplicate picker row.
+      // If enrichment folds this agent into a stock native wrapper and that
+      // wrapper's seeded row already exists, drop it so it isn't a duplicate row.
       const enrichedAgent = enriched.find((a) => a.id === agent.id);
-      const enrichedKey = enrichedAgent
-        ? nativeCodingAgentForAvailableAgent(enrichedAgent)?.key
-        : undefined;
+      const enrichedKey = enrichedAgent ? nativeWrapperSlot(enrichedAgent)?.key : undefined;
       if (enrichedKey) {
         const builtinExists = enriched.some(
-          (a) => a.id !== agent.id && nativeCodingAgentForAvailableAgent(a)?.key === enrichedKey,
+          (a) => a.id !== agent.id && nativeWrapperSlot(a)?.key === enrichedKey,
         );
         if (builtinExists) return enriched.filter((a) => a.id !== agent.id);
       }
@@ -313,6 +390,7 @@ async function fetchAvailableAgents(
             queryFn: fetchUserAgents,
             staleTime: AVAILABLE_AGENTS_STALE_MS,
           })
+          .then((list) => list.agents)
           .catch(() => [] as AvailableAgent[])
       : ([] as AvailableAgent[]),
   ]);
@@ -322,12 +400,23 @@ async function fetchAvailableAgents(
     createdAt: agent.created_at ?? null,
     agent,
   }));
-  const merged = mergeAvailableAgents(catalog, discovered, userAgents);
+  const merged = mergeAvailableAgents(
+    catalog.agents,
+    discovered,
+    userAgents,
+    catalog.suppressedNames,
+  );
   for (const id of pinnedAgentIds) {
     if (merged.some((agent) => agent.id === id)) continue;
+    // A pin (e.g. a project default) must not resurface a trimmed built-in
+    // from session history; the caller's own same-named agent still resolves
+    // through `userAgents` below.
+    const sessionAgent = sessionAgents.find((a) => a.id === id);
     const agent =
-      sessionAgents.find((a) => a.id === id) ??
-      catalog.find((a) => a.id === id) ??
+      (sessionAgent && !catalog.suppressedNames.has(agentRootName(sessionAgent.name))
+        ? sessionAgent
+        : undefined) ??
+      catalog.agents.find((a) => a.id === id) ??
       userAgents.find((a) => a.id === id);
     if (agent) merged.push(agent);
   }
@@ -338,6 +427,7 @@ function mergeAvailableAgents(
   catalog: AvailableAgent[],
   discovered: DiscoveredSessionAgent[],
   userAgents: AvailableAgent[] = [],
+  suppressedNames: ReadonlySet<string> = new Set(),
 ): AvailableAgent[] {
   // Seeded built-ins are emitted verbatim and protected; user-registered
   // templates seed the newest-wins buckets so an upload can supersede them.
@@ -349,7 +439,7 @@ function mergeAvailableAgents(
   const catalogIds = new Set(catalog.map((a) => a.id));
   const userAgentIds = new Set(userAgents.map((a) => a.id));
   const seededNames = new Set(seeded.map((a) => agentRootName(a.name)));
-  const hasKiroBuiltin = seeded.some((a) => nativeCodingAgentForAvailableAgent(a)?.key === "kiro");
+  const hasKiroBuiltin = seeded.some((a) => nativeWrapperSlot(a)?.key === "kiro");
   const kiroLegacyNames = new Set(["kiro"]);
 
   const recencyOf = (a: AvailableAgent): number => a.created_at ?? 0;
@@ -385,6 +475,8 @@ function mergeAvailableAgents(
     if (userAgentIds.has(agent.agentId)) continue;
     // Seeded built-in name (incl. fork/switch clones): the built-in wins.
     if (seededNames.has(base)) continue;
+    // A packaged built-in the deployment trimmed: hidden, not a custom upload.
+    if (suppressedNames.has(base)) continue;
     if (hasKiroBuiltin && kiroLegacyNames.has(base.toLocaleLowerCase())) continue;
     // Genuine custom upload (or a clone of one). Newest same-named row wins,
     // superseding an older user-registered template seeded above. Strict `>`
@@ -411,10 +503,7 @@ function mergeAvailableAgents(
 
   const resolved = Array.from(byName.values())
     .map((c) => (c.template !== null ? c.template : sessionAgentFromDiscovery(c.discovered!)))
-    .filter((agent) => {
-      const nativeKey = nativeCodingAgentForAvailableAgent(agent)?.key;
-      return nativeKey !== "kiro" || !hasKiroBuiltin;
-    });
+    .filter((agent) => nativeWrapperSlot(agent)?.key !== "kiro" || !hasKiroBuiltin);
   // Seeded built-ins first; user templates / custom uploads follow, newest
   // first. NewChatDialog's display-order sort is stable, so unranked names
   // keep this relative order.
@@ -429,6 +518,130 @@ const AGENT_CATALOG_QUERY_KEY = ["available-agents-catalog"] as const;
 // The caller's own agents (GET /v1/agents?scope=user); refetch after an install.
 export const USER_AGENTS_QUERY_KEY = ["available-agents-user"] as const;
 const AVAILABLE_AGENTS_STALE_MS = 30_000;
+
+/**
+ * The picker's agents without session discovery: the catalog plus the caller's
+ * own agents, flagged and labelled the way the picker shows them.
+ *
+ * Shares the picker's query keys, and works outside a ``SidebarDataProvider``.
+ * Agents known only from a session (a one-off upload) are absent from *data*.
+ *
+ * @param enabled - Whether to fetch; defaults true.
+ * @param options.sessionAgents - Also resolve those session-only agents, with
+ *   their harness, from the sidebar's recent sessions, as New Chat offers them.
+ * @returns The merged agents (``undefined`` until the catalog loads), whether
+ *   the catalog is still loading or failed to load, and a retry.
+ */
+export function useAgentCatalog(
+  enabled = true,
+  { sessionAgents: includeSessionAgents = false }: { sessionAgents?: boolean } = {},
+): {
+  data: AvailableAgent[] | undefined;
+  /** All catalog, own and session candidates a pin can restore, with harnesses resolved. */
+  harnessAgents: AvailableAgent[];
+  /** Built-in names the deployment hides; empty until the catalog loads. */
+  suppressedNames: ReadonlySet<string>;
+  /**
+   * Whether every candidate source loaded without truncation or a failed
+   * latest fetch; with ``sessionAgents``, also every session-only harness.
+   */
+  complete: boolean;
+  isLoading: boolean;
+  isError: boolean;
+  retry: () => void;
+} {
+  const serverInfo = useServerInfo();
+  const includeUserAgents = serverInfo !== "loading" && serverInfo.agent_install === true;
+  const catalogQuery = useQuery({
+    queryKey: AGENT_CATALOG_QUERY_KEY,
+    queryFn: fetchAgentCatalog,
+    enabled,
+    staleTime: AVAILABLE_AGENTS_STALE_MS,
+  });
+  const userAgentsQuery = useQuery({
+    queryKey: USER_AGENTS_QUERY_KEY,
+    queryFn: fetchUserAgents,
+    enabled: enabled && includeUserAgents,
+    staleTime: AVAILABLE_AGENTS_STALE_MS,
+  });
+  const acpHarnessIds = useAcpHarnessIds(enabled);
+  const harnessLabels = useHarnessLabels(enabled);
+  const catalog = catalogQuery.data;
+  const userAgentList = userAgentsQuery.data;
+  const userAgents = userAgentList?.agents;
+  const data = useMemo(
+    () =>
+      catalog === undefined
+        ? undefined
+        : applyAcpHarnessCatalog(
+            mergeAvailableAgents(catalog.agents, [], userAgents ?? [], catalog.suppressedNames),
+            acpHarnessIds,
+            harnessLabels,
+          ),
+    [catalog, userAgents, acpHarnessIds, harnessLabels],
+  );
+  const mine = useOptionalMineSessions();
+  const mineData = includeSessionAgents ? mine?.data : undefined;
+  // New Chat also offers these, found only in a recent session, without a harness.
+  // Only a deployment that hides a built-in needs them: nothing else is curated.
+  const hidesBuiltins = NATIVE_CODING_AGENTS.some((spec) =>
+    catalog?.suppressedNames.has(spec.agentName),
+  );
+  const sessionOnly = useMemo(() => {
+    if (catalog === undefined || mineData === undefined || !hidesBuiltins) return [];
+    const knownIds = new Set([...catalog.agents, ...(userAgents ?? [])].map((agent) => agent.id));
+    // Pins can restore older same-named agents, so keep candidates by id here.
+    return discoverSessionAgents(mineData).filter(
+      (agent) => !knownIds.has(agent.id) && !catalog.suppressedNames.has(agentRootName(agent.name)),
+    );
+  }, [catalog, mineData, userAgents, hidesBuiltins]);
+  const sessionHarnesses = useQueries({
+    queries: sessionOnly.map((agent) => ({
+      // By agent, which keeps its harness whichever recent session represents it.
+      queryKey: ["session-agent-harness", agent.id],
+      queryFn: () => fetchSessionAgentHarness(agent.sessionId!),
+      enabled,
+      staleTime: 0,
+    })),
+    combine: (results) => ({
+      harnesses: results.map((result) => result.data ?? null),
+      resolved: results.every((result) => result.isSuccess),
+    }),
+  });
+  const harnessAgents = useMemo(
+    () => [
+      ...(catalog?.agents ?? []),
+      ...(userAgents ?? []),
+      ...sessionOnly.map((agent, index) => ({
+        ...agent,
+        harness: sessionHarnesses.harnesses[index] ?? null,
+      })),
+    ],
+    [catalog, userAgents, sessionOnly, sessionHarnesses.harnesses],
+  );
+  const sessionAgentsComplete =
+    !includeSessionAgents ||
+    (catalog !== undefined && !hidesBuiltins) ||
+    (mineData !== undefined && mine?.isError !== true && sessionHarnesses.resolved);
+  const { refetch } = catalogQuery;
+  const retry = useCallback(() => void refetch(), [refetch]);
+  // A failed refetch keeps the last data, so the error flags count too.
+  // Past the read cap, an older agent a recent session still offers may be missing.
+  const userAgentsComplete =
+    serverInfo !== "loading" &&
+    (!includeUserAgents ||
+      (userAgentList !== undefined && !userAgentsQuery.isError && !userAgentList.truncated));
+  return {
+    data,
+    harnessAgents,
+    suppressedNames: catalog?.suppressedNames ?? NO_SUPPRESSED_NAMES,
+    complete:
+      data !== undefined && !catalogQuery.isError && userAgentsComplete && sessionAgentsComplete,
+    isLoading: catalogQuery.isLoading,
+    isError: catalogQuery.isError,
+    retry,
+  };
+}
 
 interface UseAvailableAgentsOptions {
   enabled?: boolean;
@@ -515,7 +728,10 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
   // partial list read isPlaceholderData to tell this state apart.
   //
   const placeholderData = useMemo(
-    () => (catalog === undefined ? undefined : mergeAvailableAgents(catalog, [])),
+    () =>
+      catalog === undefined
+        ? undefined
+        : mergeAvailableAgents(catalog.agents, [], [], catalog.suppressedNames),
     [catalog],
   );
   const query = useQuery({

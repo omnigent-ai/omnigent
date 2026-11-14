@@ -6,19 +6,26 @@ import asyncio
 import base64
 import io
 import os
+import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import time
 import tracemalloc
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from pathlib import Path
 from typing import IO
 
 import pytest
 
+from omnigent.inner._proc import process_alive
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import (
     CallerProcessOSEnvironment,
     _child_shell_env,
+    _handle_helper_request,
     _project_root,
     _read_impl,
     _shell_impl,
@@ -168,17 +175,63 @@ def test_shell_impl_timeout_includes_exit_code(tmp_path: Path) -> None:
     assert shell_path is not None
 
     result = _shell_impl(
-        command="sleep 2",
+        command="printf partial-stdout; printf partial-stderr >&2; sleep 2",
         timeout=1,
         shell_path=shell_path,
         cwd=tmp_path,
     )
 
-    assert result["stdout"] == ""
-    assert result["stderr"] == ""
+    assert result["stdout"] == "partial-stdout"
+    assert result["stderr"] == "partial-stderr"
     assert result["exit_code"] is None
     assert result["timed_out"] is True
     assert result["error"] == "Command timed out after 1 seconds"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Requires POSIX shell commands and signals")
+@pytest.mark.parametrize(
+    ("command_kind", "timed_out"),
+    [("foreground", True), ("live-shell", True), ("exited-shell", True), ("redirected", False)],
+    ids=["foreground", "live-shell", "exited-shell", "successful-background"],
+)
+def test_shell_impl_child_lifetime(tmp_path: Path, command_kind: str, timed_out: bool) -> None:
+    shell_path = shutil.which("bash") or shutil.which("sh")
+    assert shell_path is not None
+    pid_file = tmp_path / "child.pid"
+    if command_kind == "foreground":
+        child_command = f"echo $$ > {shlex.quote(str(pid_file))}; exec sleep 30"
+        command = f"sh -c {shlex.quote(child_command)}; echo after"
+    else:
+        redirect = " > /dev/null 2>&1" if command_kind == "redirected" else ""
+        command = f"sleep 30{redirect} & echo $! > {shlex.quote(str(pid_file))}"
+        if command_kind == "live-shell":
+            command += "; wait"
+
+    try:
+        started = time.monotonic()
+        result = _shell_impl(
+            command=command,
+            timeout=1,
+            shell_path=shell_path,
+            cwd=tmp_path,
+        )
+
+        assert result["timed_out"] is timed_out
+        if timed_out:
+            assert time.monotonic() - started < 15
+        assert result["stdout"] == ""
+        assert result["stderr"] == ""
+        pid = int(pid_file.read_text())
+        deadline = time.monotonic() + 2
+        while timed_out and process_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert process_alive(pid) is not timed_out
+    finally:
+        if pid_file.exists():
+            pid = int(pid_file.read_text())
+            if process_alive(pid):
+                with suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +292,33 @@ def test_read_impl_binary_truncated_at_cap(tmp_path: Path) -> None:
     assert result["returned_bytes"] == 4
     assert result["total_bytes"] == len(_BINARY)
     assert result["truncated"] is True
+
+
+@pytest.mark.parametrize("kind", ["text", "binary", "large", "fifo", "outside"])
+def test_regular_original_read_is_bounded(tmp_path: Path, kind: str) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    path = workspace / "file"
+    if kind == "fifo":
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("FIFO requires POSIX")
+        os.mkfifo(path)
+    elif kind == "outside":
+        outside = tmp_path / "outside"
+        outside.write_text("private")
+        path.symlink_to(outside)
+    else:
+        path.write_bytes({"text": b"hello\n", "binary": b"\x00\xff", "large": b"x" * 20}[kind])
+    result = _handle_helper_request(
+        request={"op": "read", "path": "file", "max_bytes": 10, "regular_only": True},
+        cwd=workspace,
+        shell_path="/bin/sh",
+        sandbox=_inactive_policy(),
+    )
+    if kind == "text":
+        assert result["content"] == "hello\n"
+    else:
+        assert "error" in result
 
 
 def _make_large_binary(path: Path, size: int) -> None:
@@ -550,13 +630,144 @@ def _helper_env(workspace: Path, backend: str) -> CallerProcessOSEnvironment:
             cwd=str(workspace),
             sandbox=OSEnvSandboxSpec(
                 type=backend,
-                read_paths=[str(_project_root() / "omnigent")],
+                read_paths=[str(_project_root())],
                 write_paths=["."],
             ),
         )
     )
     assert isinstance(os_env, CallerProcessOSEnvironment)
     return os_env
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        *_HELPER_BACKENDS,
+        pytest.param(
+            "darwin_seatbelt",
+            marks=pytest.mark.skipif(sys.platform != "darwin", reason="macOS only"),
+        ),
+    ],
+)
+def test_git_reads_preserve_filters_inside_the_session_sandbox(
+    tmp_path: Path, backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    repo = workspace / "repo"
+    repo.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.write_text("outside-sentinel")
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+
+    git("init")
+    (repo / "file").write_text("HELLO\n")
+    (repo / "binary").write_bytes(b"\x00\xff")
+    (repo / "large").write_bytes(b"x" * (10 * 1024 * 1024 + 1))
+    git("add", ".")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "base")
+    git("clone", "--bare", str(repo), str(tmp_path / "outside-git"))
+    (workspace / "filter.sh").write_text(
+        f"if cat {shlex.quote(str(outside))} >/dev/null 2>&1; then echo readable; "
+        "else echo blocked; fi >../attempt\ntr '[:lower:]' '[:upper:]'\n"
+    )
+    git("config", "filter.guard.clean", "sh ../filter.sh")
+    git("config", "filter.guard.required", "true")
+    git("config", "core.fsmonitor", "touch ../fsmonitor-ran")
+    (repo / ".git/info/attributes").write_text("file filter=guard\n")
+    (repo / "file").write_text("hello\n")
+    index = (repo / ".git/index").read_bytes()
+    monkeypatch.setenv("HOME", str(workspace))
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "missing-git-dir"))
+    os_env = _helper_env(workspace, backend)
+    try:
+        result = os_env.run_git(["status", "--porcelain", "--", "file"], repo, 5)
+        assert result.returncode == 0 and result.stdout == b"", result.stderr
+        assert (workspace / "attempt").read_text().strip() == (
+            "readable" if backend == "none" else "blocked"
+        )
+        assert not (workspace / "fsmonitor-ran").exists()
+        assert (repo / ".git/index").read_bytes() == index
+        (repo / "file").write_text("different\n")
+        assert (
+            os_env.run_git(["diff", "--numstat", "HEAD", "--", "file"], repo, 5).stdout
+            == b"1\t1\tfile\n"
+        )
+        assert os_env.run_git(["show", "HEAD:binary"], repo, 5).stdout == b"\x00\xff"
+        assert os_env.run_git(["show", "HEAD:missing"], repo, 5).returncode != 0
+        with pytest.raises(OSError, match="10 MiB"):
+            os_env.run_git(["show", "HEAD:large"], repo, 5)
+        with pytest.raises(OSError, match="outside"):
+            os_env.run_git(["status"], tmp_path, 5)
+        if backend != "none":
+            redirect = workspace / "redirect"
+            redirect.mkdir()
+            (redirect / ".git").write_text(f"gitdir: {tmp_path}/outside-git\n")
+            assert os_env.run_git(["show", "HEAD:binary"], redirect, 5).returncode != 0
+    finally:
+        os_env.close()
+
+    if backend == "none":
+        return
+    (repo / ".git/info/attributes").unlink()
+    scratch_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(
+                type=backend,
+                read_paths=[str(_project_root()), str(workspace)],
+            ),
+            start_in_scratch=True,
+        )
+    )
+    assert scratch_env is not None
+    try:
+        assert scratch_env.run_git(["status", "--porcelain"], repo, 5).returncode == 0
+        assert scratch_env.run_git(["show", "HEAD:binary"], repo, 5).stdout == b"\x00\xff"
+        with pytest.raises(OSError, match="outside"):
+            scratch_env.run_git(["status"], tmp_path, 5)
+    finally:
+        scratch_env.close()
+
+
+def test_git_read_timeout_survives_helper_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    os_env = _helper_env(tmp_path, "none")
+
+    def timed_out(*args: object, **kwargs: object) -> None:
+        raise subprocess.TimeoutExpired("git", 0.1)
+
+    monkeypatch.setattr(subprocess, "run", timed_out)
+    monkeypatch.setattr(
+        os_env._helper,
+        "request",
+        lambda request: _handle_helper_request(
+            request=request, cwd=tmp_path, shell_path="/bin/sh", sandbox=_inactive_policy()
+        ),
+    )
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            os_env.run_git(["status", "--porcelain"], tmp_path, 0.1)
+        with pytest.raises(OSError, match="Invalid Git"):
+            os_env.run_git(["config", "core.worktree", "/outside"], tmp_path, 1)
+    finally:
+        os_env.close()
+
+
+def test_git_read_deadline_includes_waiting_for_the_helper(tmp_path: Path) -> None:
+    os_env = _helper_env(tmp_path, "none")
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            with os_env._helper._lock:
+                result = executor.submit(os_env.run_git, ["status"], tmp_path, 0.02)
+                with pytest.raises(subprocess.TimeoutExpired):
+                    result.result(timeout=1)
+            assert os_env._helper._proc is None
+    finally:
+        os_env.close()
 
 
 class _UnsentRequest:
@@ -658,11 +869,38 @@ def test_request_that_never_reached_its_helper_runs_once_on_a_new_one(
 
 
 @pytest.mark.parametrize("backend", _HELPER_BACKENDS)
+@pytest.mark.parametrize("timeout_child", [False, True], ids=["completed", "timed-out-child"])
 def test_close_stops_the_helper_and_releases_its_spawner_thread(
-    tmp_path: Path, backend: str
+    tmp_path: Path, backend: str, timeout_child: bool
 ) -> None:
     """Closing ends the helper and its spawning thread, and can be repeated."""
     os_env = _helper_env(tmp_path.resolve(), backend)
+    if timeout_child:
+        pid_file = tmp_path / "child.pid"
+        try:
+            result = asyncio.run(
+                os_env.shell(f"sleep 30 & echo $! > {shlex.quote(str(pid_file))}", timeout=1)
+            )
+            assert result.get("timed_out") is True
+            child_pid = int(pid_file.read_text())
+            # The sandbox may have a private PID namespace; inspect it there.
+            check = (
+                "import psutil; "
+                f"print({child_pid} in [p.pid for p in psutil.process_iter(['status']) "
+                "if p.info['status'] != psutil.STATUS_ZOMBIE])"
+            )
+            status = asyncio.run(
+                os_env.shell(f"{shlex.quote(sys.executable)} -c {shlex.quote(check)}")
+            )
+            assert status.get("stdout", "").strip() == "False", status
+        except BaseException:
+            try:
+                with suppress(Exception):
+                    if pid_file.exists():
+                        asyncio.run(os_env.shell(f"kill -9 {int(pid_file.read_text())}"))
+            finally:
+                os_env.close()
+            raise
     assert asyncio.run(os_env.shell("true")).get("exit_code") == 0
     helper = os_env._helper._proc
     assert helper is not None

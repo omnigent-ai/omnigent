@@ -1,30 +1,76 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { MemoryRouter } from "react-router-dom";
+import type { ServerInfo } from "@/lib/capabilities";
+import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
 import { SidebarServerPicker } from "./SidebarServerPicker";
 
-// The picker reaches the Electron shell only through nativeBridge, so the
-// bridge is the seam: mocking it covers "inside the shell" (info resolves) and
-// "plain browser" (resolves null) without having to fake a preload object.
+// Native server switching is capability-gated; browsers retain the profile
+// footer with a read-only current-server section.
 const getServerPicker = vi.fn();
 const switchServer = vi.fn();
 const openServerSetup = vi.fn();
 const signOutOfServer = vi.fn();
+const supportsNativeServerPicker = vi.fn();
+const viewer = vi.hoisted(() => ({ id: "alice.smith@example.com" }));
+const signOutOfBrowserSession = vi.hoisted(() => vi.fn());
+
+vi.mock("@/lib/accountsApi", () => ({
+  signOutOfBrowserSession: (accountsEnabled: boolean) => signOutOfBrowserSession(accountsEnabled),
+}));
 
 vi.mock("@/lib/nativeBridge", () => ({
   getServerPicker: () => getServerPicker(),
   switchServer: (url: string) => switchServer(url),
   openServerSetup: () => openServerSetup(),
   signOutOfServer: () => signOutOfServer(),
+  supportsNativeServerPicker: () => supportsNativeServerPicker(),
+  // Shortcut labels: a browser tab, without the desktop menu's Cmd/Ctrl+,.
+  isNativeShell: () => false,
+  supportsDesktopCommands: () => false,
 }));
 
-function renderPicker() {
+vi.mock("@/hooks/useViewerId", () => ({
+  useViewerId: () => viewer.id,
+}));
+
+function renderPicker(initialEntries = ["/"], serverInfo: ServerInfo | "loading" = "loading") {
   return render(
-    <TooltipProvider>
-      <SidebarServerPicker />
-    </TooltipProvider>,
+    <CapabilitiesContext.Provider value={serverInfo}>
+      <MemoryRouter initialEntries={initialEntries}>
+        <TooltipProvider>
+          <SidebarServerPicker />
+        </TooltipProvider>
+      </MemoryRouter>
+    </CapabilitiesContext.Provider>,
   );
+}
+
+/** Browser server info with only the sign-in fields a test cares about. */
+function browserServer(overrides: Partial<ServerInfo>): ServerInfo {
+  return {
+    accounts_enabled: false,
+    single_user: false,
+    login_url: null,
+    needs_setup: false,
+    databricks_features: false,
+    managed_sandboxes_enabled: false,
+    sandbox_provider: null,
+    sandbox_providers: [],
+    enabled_connections: [],
+    sharing_mode: "on",
+    public_sharing_enabled: true,
+    server_version: null,
+    smart_routing_enabled: false,
+    smart_routing_sources: { external: false, oss: false },
+    features: {},
+    harness_install_enabled: false,
+    installable_harnesses: [],
+    dictation_available: false,
+    ...overrides,
+  };
 }
 
 /**
@@ -42,19 +88,85 @@ beforeEach(() => {
   switchServer.mockReset();
   openServerSetup.mockReset();
   signOutOfServer.mockReset();
+  signOutOfBrowserSession.mockReset();
+  supportsNativeServerPicker.mockReset();
+  supportsNativeServerPicker.mockReturnValue(true);
+  viewer.id = "alice.smith@example.com";
 });
 
 afterEach(cleanup);
 
 describe("SidebarServerPicker", () => {
-  it("renders nothing in a plain browser (bridge resolves null)", async () => {
-    getServerPicker.mockResolvedValue(null);
-    const { container } = renderPicker();
+  it("keeps the profile footer in a browser without native server actions", async () => {
+    supportsNativeServerPicker.mockReturnValue(false);
+    renderPicker();
 
-    // Wait out the resolve so this can't pass merely by asserting too early.
-    await waitFor(() => expect(getServerPicker).toHaveBeenCalled());
-    expect(screen.queryByTestId("sidebar-server-picker")).toBeNull();
-    expect(container).toBeEmptyDOMElement();
+    expect(await screen.findByTestId("sidebar-server-picker")).toBeInTheDocument();
+    expect(screen.getByText(window.location.host)).toHaveClass("text-sm");
+    await openMenu();
+    expect(screen.getByTestId("sidebar-profile-menu-settings")).toHaveAttribute(
+      "href",
+      "/settings",
+    );
+    // A browser keeps Cmd/Ctrl+Alt+, because Cmd/Ctrl+, opens its own settings.
+    expect(
+      Array.from(
+        screen.getByTestId("sidebar-profile-menu-settings").querySelectorAll("kbd"),
+        (key) => key.textContent,
+      ),
+    ).toEqual(["Ctrl", "Alt", ","]);
+    expect(screen.getByText("Server")).toBeInTheDocument();
+    expect(screen.queryByText("Connect to new server…")).toBeNull();
+    expect(getServerPicker).not.toHaveBeenCalled();
+  });
+
+  it("keeps the footer and Settings when the native shell returns no picker data", async () => {
+    getServerPicker.mockResolvedValue(null);
+    renderPicker();
+
+    expect(await screen.findByTestId("sidebar-server-picker")).toBeInTheDocument();
+    expect(screen.getByText(window.location.host)).toBeInTheDocument();
+    expect(screen.getByTestId("sidebar-profile-settings")).toHaveAttribute("href", "/settings");
+  });
+
+  it("keeps the last server list when a refresh on open returns nothing", async () => {
+    getServerPicker.mockResolvedValueOnce({
+      currentOrigin: "https://omni.example",
+      recentServers: [],
+    });
+    getServerPicker.mockResolvedValue(null);
+    renderPicker();
+    await openMenu();
+    await waitFor(() => expect(getServerPicker).toHaveBeenCalledTimes(2));
+    expect(screen.getByTestId("sidebar-server-picker")).toHaveAttribute("title", "omni.example");
+  });
+
+  it.each([
+    ["accounts", true],
+    ["OIDC", false],
+  ])("signs a browser out through the %s flow", async (_mode, accountsEnabled) => {
+    supportsNativeServerPicker.mockReturnValue(false);
+    renderPicker(["/"], browserServer({ accounts_enabled: accountsEnabled, login_url: "/login" }));
+    await openMenu();
+    fireEvent.click(await screen.findByTestId("sidebar-server-sign-out"));
+    expect(signOutOfBrowserSession).toHaveBeenCalledWith(accountsEnabled);
+  });
+
+  it("hides Sign out in a browser whose server has no sign-in", async () => {
+    supportsNativeServerPicker.mockReturnValue(false);
+    renderPicker(["/"], browserServer({ login_url: null }));
+    await openMenu();
+    expect(await screen.findByText("Server")).toBeInTheDocument();
+    expect(screen.queryByTestId("sidebar-server-sign-out")).toBeNull();
+  });
+
+  it("turns the footer gear into a Home link without the Settings shortcut on /settings", async () => {
+    supportsNativeServerPicker.mockReturnValue(false);
+    renderPicker(["/settings"]);
+    const home = await screen.findByTestId("sidebar-profile-settings");
+    expect(home).toHaveAttribute("href", "/");
+    const button = screen.getByRole("link", { name: "Home" });
+    expect(button).not.toHaveAttribute("aria-keyshortcuts");
   });
 
   it("shows the current host on the row and lists recents in the menu", async () => {
@@ -69,7 +181,10 @@ describe("SidebarServerPicker", () => {
     renderPicker();
 
     const trigger = await openMenu();
-    expect(trigger).toHaveAttribute("aria-label", "Server: localhost:8000. Switch server");
+    expect(trigger).toHaveAttribute(
+      "aria-label",
+      "alice.smith@example.com. Server: localhost:8000. Open profile menu",
+    );
 
     expect(await screen.findByText("Recents")).toBeInTheDocument();
     // localhost:8000 shows twice by design — once as the row's own label, once
@@ -82,6 +197,76 @@ describe("SidebarServerPicker", () => {
     expect(
       screen.getByText("omnigents-9147263058412098.aws.databricksapps.com"),
     ).toBeInTheDocument();
+  });
+
+  it("shows the viewer and server in the profile control with direct Settings access", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "http://localhost:8000",
+      recentServers: [],
+    });
+    renderPicker();
+
+    const initials = await screen.findByText("AS");
+    expect(initials).toHaveClass("bg-secondary", "text-secondary-foreground");
+    expect(initials).toHaveClass("text-sm");
+    expect(initials.parentElement).toHaveClass("size-7", "after:hidden");
+    expect(screen.getByText("alice.smith@example.com")).toHaveClass(
+      "text-left",
+      "font-medium",
+      "text-ui",
+    );
+    expect(screen.getByText("localhost:8000")).toHaveClass(
+      "text-left",
+      "text-sm",
+      "text-muted-foreground",
+    );
+    expect(screen.getByTestId("sidebar-server-picker")).toHaveClass("h-9");
+    expect(screen.getByTestId("sidebar-profile-settings")).toHaveClass("size-9");
+    expect(screen.getByTestId("sidebar-profile-settings")).toHaveAttribute("href", "/settings");
+  });
+
+  it("uses both initials from the local user label", async () => {
+    viewer.id = "local";
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "http://localhost:8000",
+      recentServers: [],
+    });
+    renderPicker();
+
+    expect(await screen.findByText("LU")).toBeInTheDocument();
+  });
+
+  it("uses the footer Settings control to return home from Settings", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "http://localhost:8000",
+      recentServers: [],
+    });
+    renderPicker(["/settings/general"]);
+
+    const settingsToggle = await screen.findByTestId("sidebar-profile-settings");
+    expect(settingsToggle).toHaveAttribute("href", "/");
+    expect(settingsToggle).toHaveAttribute("aria-label", "Home");
+  });
+
+  it("orders Settings, server actions, and Sign out as three menu sections", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "http://localhost:8000",
+      recentServers: [],
+      canSignOut: true,
+    });
+    renderPicker();
+    await openMenu();
+
+    const menu = screen.getByRole("menu");
+    expect(menu).toHaveClass("min-w-[var(--radix-dropdown-menu-trigger-width)]");
+    const items = within(menu).getAllByRole("menuitem");
+    expect(items[0]).toHaveTextContent("Settings");
+    expect(items.at(-2)).toHaveTextContent("Connect to new server…");
+    expect(items.at(-1)).toHaveTextContent("Sign out of localhost:8000");
+    expect(screen.getByTestId("sidebar-profile-menu-settings")).toHaveAttribute(
+      "href",
+      "/settings",
+    );
   });
 
   it("shows managed servers before recents and switches to one", async () => {
@@ -166,7 +351,10 @@ describe("SidebarServerPicker", () => {
     renderPicker();
 
     const trigger = await openMenu();
-    expect(trigger).toHaveAttribute("aria-label", "Server: not-a-url. Switch server");
+    expect(trigger).toHaveAttribute(
+      "aria-label",
+      "alice.smith@example.com. Server: not-a-url. Open profile menu",
+    );
 
     // Unparseable recents survive as-is rather than being dropped, so a
     // hand-edited settings file stays switchable instead of invisible.
@@ -268,7 +456,7 @@ describe("SidebarServerPicker", () => {
     const trigger = await openMenu();
     expect(trigger).toHaveAttribute(
       "aria-label",
-      "Server: Acme Engineering (omni.example). Switch server",
+      "alice.smith@example.com. Server: Acme Engineering (omni.example). Open profile menu",
     );
     // The current entry and the other named recent both keep their host visible.
     expect(screen.getAllByText("Acme Engineering").length).toBeGreaterThan(1);
@@ -288,7 +476,10 @@ describe("SidebarServerPicker", () => {
     });
     renderPicker();
     const trigger = await openMenu();
-    expect(trigger).toHaveAttribute("aria-label", "Server: omni.example. Switch server");
+    expect(trigger).toHaveAttribute(
+      "aria-label",
+      "alice.smith@example.com. Server: omni.example. Open profile menu",
+    );
   });
 
   it("names an unnamed managed server from its manifest, with its host", async () => {
