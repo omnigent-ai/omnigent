@@ -41,6 +41,25 @@ def is_claude_sdk_harness_name(harness: str | None) -> bool:
     return canonicalize_harness(harness) == "claude-sdk"
 
 
+def resolve_acp_probe_harness(harness: str) -> str:
+    """Preserve ``acp:<slug>`` identifiers while canonicalizing other harnesses."""
+    stripped = harness.strip()
+    if stripped.startswith("acp:"):
+        return stripped
+    return canonicalize_harness(stripped) or stripped
+
+
+def is_acp_harness(harness: str | None) -> bool:
+    """Return ``True`` for generic ACP harnesses (``acp``, ``acp:<slug>``, and ACP CLIs)."""
+    if harness is None:
+        return False
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+
+    stripped = harness.strip()
+    canonical = canonicalize_harness(stripped)
+    return canonical == "acp" or canonical in ACP_CLI_HARNESSES
+
+
 def is_native_harness(harness: str | None) -> bool:
     """Return whether *harness* is a native CLI harness.
 
