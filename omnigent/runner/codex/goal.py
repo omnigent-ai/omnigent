@@ -159,11 +159,12 @@ class CodexGoalRunner:
             except (ConnectionRefusedError, FileNotFoundError):
                 if (
                     method == "thread/goal/get"
+                    and not require_live
                     and self._bridge_is_inactive is not None
                     and self._bridge_is_inactive(conv_id, state)
                 ):
-                    # Strict readers retain cached state without waking an idle goal.
-                    return self._bridge_error(action) if require_live else {"goal": None}
+                    # Legacy reads preserve the empty response for an idle thread.
+                    return {"goal": None}
                 raise
             return self._goal_result(
                 await codex_client.request(method, {"threadId": state.thread_id, **params}),

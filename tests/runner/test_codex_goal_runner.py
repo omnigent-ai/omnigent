@@ -252,8 +252,8 @@ async def test_request_maps_generic_exception_to_safe_detail(
     [
         ("thread/goal/get", "connect", ConnectionRefusedError(), False, 200),
         ("thread/goal/get", "connect", FileNotFoundError(), False, 200),
-        ("thread/goal/get", "connect", ConnectionRefusedError(), True, 502),
-        ("thread/goal/get", "connect", FileNotFoundError(), True, 502),
+        ("thread/goal/get", "connect", ConnectionRefusedError(), True, 503),
+        ("thread/goal/get", "connect", FileNotFoundError(), True, 503),
         ("thread/goal/get", "connect", RuntimeError("handshake failed"), False, 503),
         ("thread/goal/get", "request", ConnectionRefusedError(), False, 503),
         ("thread/goal/set", "connect", ConnectionRefusedError(), False, 503),
