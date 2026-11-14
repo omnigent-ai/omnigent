@@ -4608,6 +4608,35 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(prompt).not.toContain("Omnigent session:");
   });
 
+  it("watches merged pull requests on a base branch, with link-back off by default", async () => {
+    renderTrigger("github");
+    pick("task-trigger-event", "task-trigger-event-merged");
+    expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Pull request merged");
+    expect(screen.queryByTestId("task-trigger-target")).toBeNull();
+    expect(screen.getByTestId("task-trigger-description")).toHaveTextContent(
+      "Runs your automation each time a matching pull request is merged. Pull requests merged before this automation existed are skipped.",
+    );
+    expect(
+      screen.getByRole("checkbox", { name: "Comment the session link on it" }),
+    ).not.toBeChecked();
+    fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
+    fireEvent.keyDown(screen.getByTestId("task-trigger-condition-0-field"), { key: "Enter" });
+    // Merging clears review requests, so only the requested-reviewer filter is gone.
+    expect(screen.queryByTestId("task-trigger-condition-0-field-reviewer")).toBeNull();
+    fireEvent.click(screen.getByTestId("task-trigger-condition-0-field-base"));
+    type("task-trigger-condition-0-value", "main");
+    type("task-trigger-scope", "acme/app");
+    type("task-trigger-instructions", "Restack the pull requests based on this one.");
+
+    const prompt = await submittedPrompt();
+    expect(prompt).toContain(
+      "gh api -X GET search/issues -f q='repo:acme/app is:pr is:merged base:main merged:>=<that time>' -f per_page=100 --paginate",
+    );
+    expect(prompt).toContain('title "GitHub <owner/repo>#<number> merged"');
+    expect(prompt).toContain('"Watching since:"');
+    expect(prompt).not.toContain("Omnigent session:");
+  });
+
   it("explains that a Reviewer filter on opened pull requests misses later requests", () => {
     renderTrigger("github");
     pick("task-trigger-event", "task-trigger-event-pr");

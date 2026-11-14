@@ -32,7 +32,10 @@ to customize.
   since" line, kept in every reply, bounds the search overlap), show their own
   help text, and hide the Assignee condition; review requests start with link-back off.
   Pull request opened gains an optional Reviewer filter with a hint that it only sees
-  reviewers requested before the first check after opening.
+  reviewers requested before the first check after opening. GitHub **Pull request
+  merged** fires once per merged pull request (`GitHub owner/repo#N merged`), with the
+  same "Watching since" bound and link-back off; it hides Reviewer. Pull request events
+  offer a Base branch condition (equals or doesn't equal).
 - `jira-custom-field`: Jira's **Add condition → Custom field** row shows a field-name
   input (a Jira field name or a `cf[10010]` ID) before the operator, which is equals,
   doesn't equal, is empty, or is set. Create stays disabled and the incomplete-condition
