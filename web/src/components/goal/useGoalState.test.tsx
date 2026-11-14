@@ -145,30 +145,42 @@ describe("useGoalState", () => {
     expect(result.current.goal).toEqual(pausedGoal);
   });
 
-  it("propagates current dialog read errors and swallows superseded errors", async () => {
-    const older = deferredGoalRead();
-    const newer = deferredGoalRead();
-    mockGetGoal
-      .mockResolvedValueOnce({ goal: GOAL })
-      .mockReturnValueOnce(older.promise)
-      .mockReturnValueOnce(newer.promise);
-    const { result } = renderHook(() => useGoalState("conv", true));
-    await act(async () => {});
-    const olderRefresh = result.current.refreshGoal();
-    const newerRefresh = result.current.refreshGoal();
+  it.each(["dialog refresh", "poll"])(
+    "propagates an explicit read error after a newer %s fails",
+    async (newest) => {
+      const older = deferredGoalRead();
+      const newer = deferredGoalRead();
+      mockGetGoal
+        .mockResolvedValueOnce({ goal: GOAL })
+        .mockReturnValueOnce(older.promise)
+        .mockReturnValueOnce(newer.promise);
+      const { result } = renderHook(() => useGoalState("conv", true));
+      await act(async () => {});
+      const olderRefresh = result.current.refreshGoal();
+      let newerRefresh: Promise<void> | undefined;
+      if (newest === "poll") {
+        act(() => {
+          window.dispatchEvent(new Event("focus"));
+        });
+      } else {
+        newerRefresh = result.current.refreshGoal();
+      }
+      expect(mockGetGoal).toHaveBeenCalledTimes(3);
 
-    await act(async () => {
-      older.reject(new Error("superseded read failed"));
-      await expect(olderRefresh).resolves.toBeUndefined();
-    });
-    const currentError = new Error("current read failed");
-    await act(async () => {
-      newer.reject(currentError);
-      await expect(newerRefresh).rejects.toBe(currentError);
-    });
+      const currentError = new Error("current read failed");
+      await act(async () => {
+        newer.reject(currentError);
+        if (newerRefresh) await expect(newerRefresh).rejects.toBe(currentError);
+      });
+      const openingError = new Error("opening read failed");
+      await act(async () => {
+        older.reject(openingError);
+        await expect(olderRefresh).rejects.toBe(openingError);
+      });
 
-    expect(result.current.goal).toEqual(GOAL);
-  });
+      expect(result.current.goal).toEqual(GOAL);
+    },
+  );
 
   it("reports an unavailable session when explicitly refreshed while disconnected", async () => {
     const { result } = renderHook(() => useGoalState("conv", false));

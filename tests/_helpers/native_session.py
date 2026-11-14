@@ -22,6 +22,7 @@ from omnigent._wrapper_labels import (
     UI_MODE_TERMINAL_VALUE,
     WRAPPER_LABEL_KEY,
 )
+from omnigent.process_logging import redact_log_text
 from tests._helpers.session import bundle_files, post_session_bundle
 
 NativeHarness = Literal["antigravity", "claude", "codex", "cursor", "goose", "kiro", "hermes"]
@@ -103,5 +104,12 @@ def create_native_session(
         headers=headers,
         timeout=30.0,
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as error:
+        error.add_note(
+            "Native session create response (redacted, up to 2048 characters): "
+            + redact_log_text(response.text, include_whitespace_credentials=True)[:2048]
+        )
+        raise
     return response.json()

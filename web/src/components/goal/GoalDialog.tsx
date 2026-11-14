@@ -394,7 +394,7 @@ function useGoalDialogState({
   const dialogBinding = useRef<object | null>(null);
 
   useLayoutEffect(() => {
-    // Reopening the same session starts a new lifetime for pending operations.
+    // New dialog or goal-owner bindings invalidate pending operations.
     dialogBinding.current = open && conversationId ? {} : null;
     setLoading(false);
     setSaving(false);
@@ -404,7 +404,7 @@ function useGoalDialogState({
     return () => {
       dialogBinding.current = null;
     };
-  }, [conversationId, open]);
+  }, [conversationId, open, refreshGoal]);
 
   useEffect(() => {
     if (!open) {

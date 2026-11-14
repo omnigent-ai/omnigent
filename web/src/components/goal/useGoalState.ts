@@ -53,7 +53,7 @@ export function useGoalState(conversationId: string | null, enabled: boolean): U
         setSnapshot((current) => (isCurrent() ? { binding, goal: response.goal } : current));
       }
     } catch (error) {
-      if (isCurrent()) throw error;
+      if (activeBinding.current === binding) throw error;
     }
   }, [binding]);
 

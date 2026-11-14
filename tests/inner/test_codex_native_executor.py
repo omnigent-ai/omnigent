@@ -1382,9 +1382,14 @@ def test_goal_command_sets_goal_before_submitting_objective(
 
 
 @pytest.mark.parametrize("reply_lost", [False, True], ids=["refused", "reply-lost"])
-@pytest.mark.parametrize("live_injection", [False, True], ids=["run-turn", "live-queue"])
+@pytest.mark.parametrize(
+    ("active_turn_id", "live_injection"),
+    [(None, False), ("turn_existing", False), ("turn_existing", True)],
+    ids=["idle", "active-turn", "live-queue"],
+)
 def test_failed_goal_command_does_not_deliver_input_or_interrupt_native_work(
     reply_lost: bool,
+    active_turn_id: str | None,
     live_injection: bool,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1405,7 +1410,7 @@ def test_failed_goal_command_does_not_deliver_input_or_interrupt_native_work(
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _GoalFailingClient
     )
-    _seed_bridge(tmp_path, active_turn_id="turn_existing")
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
 
     if live_injection:
@@ -1422,7 +1427,7 @@ def test_failed_goal_command_does_not_deliver_input_or_interrupt_native_work(
     ]
     state = read_bridge_state(tmp_path)
     assert state is not None
-    assert state.active_turn_id == "turn_existing"
+    assert state.active_turn_id == active_turn_id
 
 
 @pytest.mark.parametrize(

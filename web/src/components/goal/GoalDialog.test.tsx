@@ -70,8 +70,8 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-function ManagedDialog() {
-  const { goal, setGoal: setGoalState, refreshGoal } = useGoalState("conv_codex", true);
+function ManagedDialog({ enabled = true }: { enabled?: boolean }) {
+  const { goal, setGoal: setGoalState, refreshGoal } = useGoalState("conv_codex", enabled);
   return (
     <GoalDialog
       open
@@ -349,6 +349,89 @@ describe("GoalDialog", () => {
       }
     },
   );
+
+  it("shows the opening-read error when a competing poll also fails", async () => {
+    const openingRead = deferred<{ goal: Goal | null }>();
+    const pollRead = deferred<{ goal: Goal | null }>();
+    mockGetGoal.mockReturnValueOnce(openingRead.promise).mockReturnValueOnce(pollRead.promise);
+    render(<ManagedDialog />);
+    expect(mockGetGoal).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      pollRead.reject(new Error("poll unavailable"));
+      openingRead.reject(new Error("opening read unavailable"));
+    });
+
+    expect(screen.getByText("Could not read goal: opening read unavailable")).toBeInTheDocument();
+    expect(screen.queryByText("Loading goal")).not.toBeInTheDocument();
+    expect(screen.getByTestId("goal-objective")).toHaveValue("");
+  });
+
+  describe.each(["success", "error"] as const)("old %s after runner reconnect", (outcome) => {
+    it.each(mutations)(
+      "preserves the new draft and busy $action operation",
+      async ({ action, button }) => {
+        const oldRequest = deferred<{ goal: Goal | null; cleared: boolean }>();
+        const newRequest = deferred<{ goal: Goal | null; cleared: boolean }>();
+        if (action === "save")
+          mockSetGoal
+            .mockReturnValueOnce(oldRequest.promise)
+            .mockReturnValueOnce(newRequest.promise);
+        else if (action === "clear")
+          mockClearGoal
+            .mockReturnValueOnce(oldRequest.promise)
+            .mockReturnValueOnce(newRequest.promise);
+        else
+          mockUpdateGoalStatus
+            .mockReturnValueOnce(oldRequest.promise)
+            .mockReturnValueOnce(newRequest.promise);
+        const { rerender } = render(<ManagedDialog />);
+        await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
+        fireEvent.click(screen.getByTestId(button));
+
+        rerender(<ManagedDialog enabled={false} />);
+        await screen.findByText("Could not read goal: Goal is unavailable for this session.");
+        rerender(<ManagedDialog />);
+        await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
+        const newGoal = {
+          ...ACTIVE_GOAL,
+          objective: "Draft after reconnect",
+          tokenBudget: 999,
+          status: "paused",
+        };
+        fireEvent.change(screen.getByTestId("goal-objective"), {
+          target: { value: newGoal.objective },
+        });
+        fireEvent.change(screen.getByTestId("goal-token-budget"), { target: { value: "999" } });
+        fireEvent.click(screen.getByTestId("goal-mode-paused"));
+        fireEvent.click(screen.getByTestId(button));
+
+        await act(async () => {
+          if (outcome === "success") oldRequest.resolve({ goal: ACTIVE_GOAL, cleared: true });
+          else oldRequest.reject(new Error("old mutation failed"));
+        });
+        const backgroundGoal = {
+          ...ACTIVE_GOAL,
+          objective: "Current background goal",
+          tokenBudget: 888,
+        };
+        mockGetGoal.mockResolvedValueOnce({ goal: backgroundGoal });
+        await act(async () => window.dispatchEvent(new Event("focus")));
+
+        expect(screen.getByTestId("goal-current")).toHaveTextContent(backgroundGoal.objective);
+        expect(screen.getByTestId("goal-objective")).toHaveValue(newGoal.objective);
+        expect(screen.getByTestId("goal-token-budget")).toHaveValue(999);
+        expect(screen.getByTestId("goal-mode-paused")).toHaveAttribute("aria-checked", "true");
+        expect(screen.getByTestId("goal-save")).toBeDisabled();
+        expect(screen.queryByText(/old mutation failed/)).not.toBeInTheDocument();
+
+        await act(async () => newRequest.resolve({ goal: newGoal, cleared: true }));
+        expect(screen.getByTestId("goal-save")).toBeEnabled();
+        if (action === "clear") expect(screen.getByTestId("goal-empty")).toBeInTheDocument();
+        else expect(screen.getByTestId("goal-current")).toHaveTextContent(newGoal.objective);
+      },
+    );
+  });
 
   describe.each(["session switch", "reopen"] as const)(
     "pending operations across %s",
