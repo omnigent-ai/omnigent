@@ -9,7 +9,7 @@ import {
   ChevronLeftIcon,
   ClockIcon,
   Loader2Icon,
-  MessageSquareIcon,
+  PencilIcon,
   PlayIcon,
   SaveIcon,
   Trash2Icon,
@@ -45,6 +45,7 @@ import {
   WorkflowNotFoundError,
 } from "@/hooks/useWorkflow";
 import { useSessionJournal } from "@/hooks/useSessionJournal";
+import { useSession } from "@/hooks/useSession";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { WorkflowPlanningChat } from "@/components/workflows/WorkflowPlanningChat";
 import { automationPagePath } from "@/lib/automationFromSession";
@@ -81,7 +82,15 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const [plannerOpen, setPlannerOpen] = useState<boolean | null>(null);
   const showPlanner = plannerOpen ?? workflow?.is_draft ?? false;
   const isMobile = useIsMobileViewport();
-  const journal = useSessionJournal(workflow?.planning_session_id ?? undefined, showPlanner);
+  const { session: planningSession, error: planningSessionError } = useSession(
+    showPlanner ? workflow?.planning_session_id : null,
+  );
+  const canReadProposal =
+    showPlanner && !!planningSession && !planningSession.archived && !planningSessionError;
+  const journal = useSessionJournal(
+    canReadProposal ? planningSession.id : undefined,
+    canReadProposal,
+  );
   const savePlan = useSaveWorkflowPlan(workflowId);
 
   if (isLoading) {
@@ -126,7 +135,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
 
   const summary = { id: workflow.id, name: workflow.name, description: workflow.description };
   const runList = runs.data?.pages.flatMap((page) => page.runs) ?? [];
-  const proposal = showPlanner ? currentPlan(journal.entries) : null;
+  const proposal = canReadProposal ? currentPlan(journal.entries) : null;
   const proposedSteps = proposal ? planSteps(proposal) : null;
   const stepSignature = (steps: typeof workflow.steps) =>
     JSON.stringify(
@@ -158,12 +167,13 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <Button
-              variant="outline"
-              onClick={() => setPlannerOpen(!showPlanner)}
-              aria-expanded={showPlanner}
+              variant="ghost"
+              size="icon-sm"
+              aria-label="Edit workflow"
+              data-testid="workflow-detail-edit"
+              onClick={() => setPlannerOpen(true)}
             >
-              <MessageSquareIcon className="size-4" />
-              Plan with agent
+              <PencilIcon className="size-4" />
             </Button>
             <Button
               variant="ghost"
@@ -207,14 +217,12 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
         <section className="mt-6">
           <div className="mb-3 flex items-center justify-between gap-3">
             <div>
-              <h2 className="text-sm font-medium">Plan</h2>
-              <p className="text-xs text-muted-foreground" role="status">
-                {hasChanges
-                  ? "Unsaved proposal · Save to enable Run"
-                  : isDraft
-                    ? "No saved plan yet"
-                    : "Saved plan"}
-              </p>
+              <h2 className="text-sm font-medium text-muted-foreground">Plan</h2>
+              {(hasChanges || !isDraft) && (
+                <p className="text-xs text-muted-foreground" role="status">
+                  {hasChanges ? "Unsaved changes" : "Saved plan"}
+                </p>
+              )}
             </div>
             {hasChanges && (
               <Button
@@ -236,7 +244,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
               Couldn’t save the plan. {savePlan.error.message}
             </p>
           )}
-          {showPlanner && journal.error && (
+          {canReadProposal && journal.error && (
             <p role="alert" className="mb-3 text-sm text-destructive">
               Couldn’t load the latest proposal. Reopen the chat to try again.
             </p>
@@ -244,16 +252,17 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
           {(proposedSteps ?? workflow.steps).length > 0 ? (
             <WorkflowStepsGraph steps={proposedSteps ?? workflow.steps} title={workflow.name} />
           ) : (
-            <div className="flex min-h-64 flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-border px-6 text-center">
+            <div className="flex flex-col items-center gap-2 rounded-xl border border-dashed border-border bg-card px-6 py-16 text-center">
               <WorkflowIcon className="size-8 text-muted-foreground/50" />
-              <h3 className="text-sm font-medium">Let’s shape the plan</h3>
+              <p className="text-ui font-medium">No plan yet</p>
               <p className="max-w-sm text-sm text-muted-foreground">
-                Describe the outcome in chat. Your agent’s proposed steps will appear here as you
-                work together.
+                Describe the workflow to an agent.
+                <br />
+                Your proposed steps will appear here.
               </p>
               {!showPlanner && (
                 <Button variant="outline" size="sm" onClick={() => setPlannerOpen(true)}>
-                  Plan with agent
+                  Create plan
                 </Button>
               )}
             </div>
@@ -332,7 +341,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
               aria-describedby={undefined}
               className="flex h-[90dvh] flex-col gap-0 overflow-hidden p-0"
             >
-              <DialogTitle className="sr-only">Plan with agent</DialogTitle>
+              <DialogTitle className="sr-only">Create plan</DialogTitle>
               <WorkflowPlanningChat workflow={workflow} onClose={() => setPlannerOpen(false)} />
             </DialogContent>
           </Dialog>

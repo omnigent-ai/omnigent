@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
-import { useHostFilesystem } from "@/hooks/useHostFilesystem";
+import { type HostDirectoryListing, useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { type Host, useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { useSandboxModelOptions } from "@/hooks/useSandboxModelOptions";
 import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
@@ -61,6 +61,18 @@ const CODEX = testAgent("ag_codex_native", "codex-native-ui", {
   display_name: "Codex",
   harness: "codex-native",
 });
+const HOME_LISTING: HostDirectoryListing = {
+  entries: [
+    {
+      name: "projects",
+      path: "/home/you/projects",
+      type: "directory",
+      bytes: null,
+      modified_at: 0,
+    },
+  ],
+  truncated: false,
+};
 
 function setHosts(hosts: Partial<Host>[]) {
   vi.mocked(useHosts).mockReturnValue({
@@ -357,7 +369,26 @@ describe("WorkflowSessionDialog", () => {
     expect(submit()).toBeEnabled();
   });
 
-  it("needs an absolute directory before it runs", () => {
+  it("defaults a planning session to the host home when no directory was used", async () => {
+    setHosts([{ host_id: "host_1" }]);
+    vi.mocked(useHostFilesystem).mockReturnValue({
+      data: HOME_LISTING,
+      isLoading: false,
+    } as unknown as ReturnType<typeof useHostFilesystem>);
+    startedSession();
+    const attached = vi.fn().mockResolvedValue(undefined);
+    renderDialog({}, { kind: "plan", workflow: WORKFLOW }, attached);
+
+    expect(screen.getByPlaceholderText("Type a path or browse…")).toHaveValue("/home/you");
+    fireEvent.click(submit());
+    await waitFor(() => expect(attached).toHaveBeenCalled());
+    expect(vi.mocked(createSession).mock.calls[0]![2]).toMatchObject({
+      hostId: "host_1",
+      workspace: "/home/you",
+    });
+  });
+
+  it("preserves typed directories while home loads and requires an absolute path", () => {
     setHosts([{ host_id: "host_1" }]);
     renderDialog();
 
@@ -372,6 +403,19 @@ describe("WorkflowSessionDialog", () => {
     fireEvent.change(directory, { target: { value: "/srv/app" } });
     expect(screen.queryByText(/Enter an absolute path/)).toBeNull();
     expect(submit()).toBeEnabled();
+
+    vi.mocked(useHostFilesystem).mockReturnValue({
+      data: HOME_LISTING,
+      isLoading: false,
+    } as unknown as ReturnType<typeof useHostFilesystem>);
+    fireEvent.change(screen.getByTestId("workflow-session-instructions"), {
+      target: { value: "Only check the current branch." },
+    });
+    expect(directory).toHaveValue("/srv/app");
+
+    fireEvent.change(directory, { target: { value: "" } });
+    expect(directory).toHaveValue("");
+    expect(submit()).toBeDisabled();
   });
 
   it("shows how to connect a host when none is online", () => {

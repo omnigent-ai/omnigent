@@ -101,13 +101,15 @@ function StepNode({ id, data }: NodeProps<Node<StepNodeData>>) {
               "flex items-start gap-2 rounded-lg border bg-card px-3 py-2 shadow-sm transition-colors",
               NODE_TINT[data.state ?? "waiting"],
             )}
-            style={{ width: STEP_NODE_WIDTH }}
+            style={{ width: STEP_NODE_WIDTH, pointerEvents: "auto" }}
             data-testid="workflow-step-node"
             data-state={data.state}
           >
             <StepGlyph state={data.state ?? "waiting"} number={data.number} />
             <div className="min-w-0 flex-1">
-              <p className="truncate text-sm font-medium leading-[18px]">{data.name}</p>
+              <p className="line-clamp-2 break-words text-sm font-medium leading-[18px]">
+                {data.name}
+              </p>
               {/* A step that can't start says why in place of its goal, which its card shows. */}
               {data.failedNames ? (
                 <p className="mt-0.5 line-clamp-2 text-xs leading-snug text-muted-foreground">

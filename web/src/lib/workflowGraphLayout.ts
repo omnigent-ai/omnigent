@@ -27,11 +27,11 @@ export interface StepNodeData extends Record<string, unknown> {
   failedNames?: readonly string[];
 }
 
-export const STEP_NODE_WIDTH = 220;
-// Room for the name and two lines of the goal.
-export const STEP_NODE_HEIGHT = 72;
+export const STEP_NODE_WIDTH = 280;
+// Room for two lines each of the name and goal.
+export const STEP_NODE_HEIGHT = 90;
 // A step with no goal shows its name alone.
-export const STEP_NAME_ONLY_HEIGHT = 36;
+export const STEP_NAME_ONLY_HEIGHT = 54;
 const COLUMN_GAP = 32;
 // Room for a short arrow from one row to the next.
 const ROW_GAP = 28;
@@ -73,7 +73,7 @@ export function stepRows(steps: readonly WorkflowStep[]): Map<string, number> {
  *
  * @param states - Where each step stands in a run, by step ID; the edges into a
  *   running step move.
- * @returns The nodes, an edge from each step to each step that waits for it,
+ * @returns The nodes, the non-redundant dependency edges,
  *   and how tall the steps are at full size, in pixels.
  */
 export function layoutWorkflowSteps(
@@ -123,17 +123,39 @@ export function layoutWorkflowSteps(
     });
   }
   const known = new Set(steps.map((step) => step.id));
+  const dependencies = new Map(
+    steps.map((step) => [step.id, new Set(step.depends_on.filter((id) => known.has(id)))]),
+  );
+  // An edge adds no ordering information if another path already connects its steps.
+  for (const [id, direct] of dependencies) {
+    for (const dependency of direct) {
+      const pending = [...direct].filter((other) => other !== dependency);
+      const visited = new Set([id]);
+      while (pending.length) {
+        const current = pending.pop()!;
+        if (current === dependency) {
+          direct.delete(dependency);
+          break;
+        }
+        if (visited.has(current)) continue;
+        visited.add(current);
+        pending.push(...(dependencies.get(current) ?? []));
+      }
+    }
+  }
   const edges: Edge[] = steps.flatMap((step) =>
-    step.depends_on
-      .filter((dependency) => known.has(dependency))
-      .map((dependency) => ({
-        id: `${dependency}->${step.id}`,
-        source: dependency,
-        target: step.id,
-        style: EDGE_STYLE,
-        animated: states?.get(step.id) === "running",
-        markerEnd: { type: "arrowclosed" as MarkerType, color: "var(--muted-foreground)" },
-      })),
+    [...dependencies.get(step.id)!].map((dependency, index) => ({
+      id: `${dependency}->${step.id}`,
+      source: dependency,
+      target: step.id,
+      style: EDGE_STYLE,
+      animated: states?.get(step.id) === "running",
+      // Incoming paths share a target handle, so draw its arrowhead once.
+      markerEnd:
+        index === 0
+          ? { type: "arrowclosed" as MarkerType, color: "var(--muted-foreground)" }
+          : undefined,
+    })),
   );
   return { nodes, edges, height: Math.max(0, nextTop - ROW_GAP) };
 }

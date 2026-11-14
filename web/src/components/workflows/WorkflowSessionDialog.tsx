@@ -306,6 +306,12 @@ export function WorkflowSessionForm({
     (id: string) => choices.workspaces[id] ?? readRecentWorkspaces(id)[0] ?? "",
     [choices],
   );
+  // Home can resolve after the user has already picked or typed a directory.
+  useEffect(() => {
+    if (hostId === null || home === null) return;
+    setWorkspace((current) => current || home);
+  }, [hostId, home]);
+
   const selectTarget = (value: string) => {
     setTarget(value);
     setBrowsing(false);
