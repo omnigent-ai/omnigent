@@ -7601,27 +7601,45 @@ async def test_first_turn_skips_the_context_window_lookup() -> None:
 
 
 @pytest.mark.asyncio
-async def test_rebuilt_executor_replays_within_the_window_claude_code_reported() -> None:
-    """A declared window larger than the one Claude Code uses does not size the replay."""
+@pytest.mark.parametrize(
+    ("declared_window", "model_usage", "omitted"),
+    [
+        (1_000_000, {"reported-window-model": {"contextWindow": 4_200}}, 2),
+        (1_000_000, {"concrete-model-id": {"contextWindow": 4_200}}, 2),
+        (1_000_000, {"model-a": {"contextWindow": 4_200}, "model-b": {"contextWindow": 4_200}}, 0),
+        (4_200, {"reported-window-model": {"contextWindow": 1_000_000}}, 2),
+    ],
+    ids=["same-model", "single-other-id", "unmatched-models", "larger-than-declared"],
+)
+async def test_rebuilt_executor_replays_within_the_window_claude_code_reported(
+    declared_window, model_usage, omitted
+) -> None:
+    """A rebuilt client's replay fits the smaller of the declared and reported windows."""
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
-    # Reported windows are kept per model for the process, so use a model no other test runs.
     model = "reported-window-model"
-    reported = _sdk_result(model_usage={model: {"contextWindow": 4_200}})
+    reported = _sdk_result(model_usage=model_usage)
     fake_sdk = _make_recovery_fake_sdk([[reported]])
     messages = [*_long_prior_messages(), {"role": "user", "content": "What next?"}]
-    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
-        first = ClaudeSDKExecutor(model=model, context_window=1_000_000)
+    with (
+        patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk),
+        patch.dict("omnigent.inner.claude_sdk_executor._CLI_CONTEXT_WINDOWS", clear=True),
+    ):
+        first = ClaudeSDKExecutor(model=model, context_window=declared_window)
         [event async for event in first.run_turn([{"role": "user", "content": "hi"}], [], "")]
         # A fresh executor simulates a restarted runner launching a new client.
-        rebuilt = ClaudeSDKExecutor(model=model, context_window=1_000_000)
+        rebuilt = ClaudeSDKExecutor(model=model, context_window=declared_window)
         events = [event async for event in rebuilt.run_turn(messages, [], "")]
 
     assert not [event for event in events if isinstance(event, ExecutorError)]
     [prompt] = fake_sdk.created_clients[1].prompts
-    assert "[Earlier messages omitted to fit the model's context window: 2.]" in prompt
-    assert "turn-1" not in prompt
-    assert "turn-2" in prompt
+    assert f"turn-{omitted} " in prompt
+    if omitted:
+        marker = f"[Earlier messages omitted to fit the model's context window: {omitted}.]"
+        assert marker in prompt
+        assert f"turn-{omitted - 1} " not in prompt
+    else:
+        assert "Earlier messages omitted" not in prompt
 
 
 @pytest.mark.asyncio
@@ -7631,6 +7649,7 @@ async def test_rebuilt_executor_replays_within_the_window_claude_code_reported()
         ("Prompt is too long", 2),
         ("Prompt is too long · the request is ~9000 tokens (limit 2400) and ...", 1),
         ("API Error: 400 prompt is too long: 9000 tokens > 2400 maximum", 1),
+        ("Prompt is too long · the request is ~130000 tokens (limit 100000) and ...", 2),
     ],
 )
 @pytest.mark.parametrize("synthetic_error_reply", [False, True])
