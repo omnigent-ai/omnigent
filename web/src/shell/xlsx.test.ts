@@ -1,7 +1,16 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { DATA_TABLE_MAX_CHARS, DATA_TABLE_MAX_COLUMNS } from "./dataTable";
-import { excelSerialToText, isDateFormatCode, readWorkbook, WorkbookError } from "./xlsx";
+import {
+  elapsedFormat,
+  elapsedText,
+  excelSerialToText,
+  isDateFormatCode,
+  isElapsedFormatCode,
+  isTimeFormatCode,
+  readWorkbook,
+  WorkbookError,
+} from "./xlsx";
 
 /** A fixture's bytes, copied into this realm's buffer as the browser's base64 decode makes them. */
 function fixture(name: string): Uint8Array {
@@ -114,6 +123,46 @@ describe("readWorkbook", () => {
   });
 });
 
+describe("readWorkbook time formats and limits", () => {
+  // Hand-built: a built-in time format, a built-in date format and a custom
+  // "hh:mm" format, each holding a serial, and a formula with its saved result.
+  it.each([
+    ["times1900.xlsx", ["00:00:00", "1899-12-31", "12:00:00", "3", "36:00:00", "2160:00"]],
+    ["times1904.xlsx", ["00:00:00", "1904-01-01", "12:00:00", "3", "36:00:00", "2160:00"]],
+  ])("shows %s's times, durations and a saved formula result as Excel does", async (name, row) => {
+    const [sheet] = await readWorkbook(fixture(name));
+    expect(sheet.table?.header).toEqual([
+      "time",
+      "date",
+      "short time",
+      "total",
+      "elapsed",
+      "minutes",
+    ]);
+    expect(sheet.table?.rows).toEqual([row]);
+  });
+
+  it("marks a sheet that inflates past the limit whatever size it declares", async () => {
+    // Two sheets share a part whose headers say 1 KiB; it inflates past 64 MiB.
+    const sheets = await readWorkbook(fixture("understated.xlsx"));
+    expect(sheets.map((sheet) => [sheet.name, sheet.table, sheet.message])).toEqual([
+      ["Times", null, "This sheet is too large to preview. Download the workbook to open it."],
+      ["Again", null, "This sheet is too large to preview. Download the workbook to open it."],
+    ]);
+  });
+
+  // Small and Again point at one part; Big is stored uncompressed, 20 KB.
+  it("reads a shared part once and marks only the sheets past the workbook limit", async () => {
+    const sheets = await readWorkbook(fixture("budget.xlsx"), 10_000);
+    expect(sheets.map((sheet) => [sheet.name, sheet.table?.rows, sheet.message])).toEqual([
+      ["Small", [["pens"]], undefined],
+      ["Big", undefined, "This sheet is too large to preview. Download the workbook to open it."],
+      ["Again", [["pens"]], undefined],
+    ]);
+    expect(sheets[2].table).toBe(sheets[0].table);
+  });
+});
+
 describe("excelSerialToText", () => {
   it.each([
     [45658, false, "2025-01-01"],
@@ -132,11 +181,56 @@ describe("excelSerialToText", () => {
     [2958465, false, "9999-12-31"],
     // The 1904 system reaches 9999 four years of serials sooner.
     [2958465, true, "2958465"],
-    // The last millisecond of 9999 is still a date; rounding past it isn't.
-    [2958465.99999999, false, "9999-12-31 23:59:59"],
-    [2958465.999999999, false, "2958466"],
+    // Times round to the nearest second, as Excel shows them.
+    [0.4166666, false, "10:00:00"],
+    // The day is the rounded time's, on either side of the phantom leap day.
+    [59.999999, false, "1900-02-29 00:00:00"],
+    [60.999999, false, "1900-03-01 00:00:00"],
+    // The last second of 9999 is still a date; a time rounding past it isn't.
+    [2958465.99998, false, "9999-12-31 23:59:58"],
+    [2958465.99999999, false, "2958465.99999999"],
   ])("%d (1904: %s) → %s", (serial, date1904, expected) => {
     expect(excelSerialToText(serial, date1904)).toBe(expected);
+  });
+});
+
+describe("isTimeFormatCode", () => {
+  it.each([
+    ["hh:mm", true],
+    ["h:mm AM/PM", true],
+    ["[h]:mm:ss", false],
+    ["mm:ss", true],
+    ["e h:mm", false],
+    ["yyyy-mm-dd hh:mm", false],
+    ["mmm-yy", false],
+    ["d-mmm", false],
+  ])("%s → %s", (code, expected) => {
+    expect(isTimeFormatCode(code)).toBe(expected);
+  });
+});
+
+describe("elapsed time", () => {
+  it.each([
+    ["[h]:mm:ss", { unit: "h", seconds: true }],
+    ["[h]:mm", { unit: "h", seconds: false }],
+    ["[mm]:ss", { unit: "m", seconds: true }],
+    ["[ss]", { unit: "s", seconds: true }],
+    ["h:mm", null],
+    ['"[h]" mm', null],
+  ])("%s → %j", (code, expected) => {
+    expect(elapsedFormat(code)).toEqual(expected);
+    expect(isElapsedFormatCode(code)).toBe(expected !== null);
+  });
+
+  it.each([
+    [1.5, { unit: "h", seconds: true }, "36:00:00"],
+    [1.5, { unit: "h", seconds: false }, "36:00"],
+    [1.5, { unit: "m", seconds: true }, "2160:00"],
+    [1.5, { unit: "s", seconds: true }, "129600"],
+    [0.0006944444, { unit: "h", seconds: true }, "0:01:00"],
+    [-0.5, { unit: "h", seconds: true }, "-12:00:00"],
+  ] as const)("%d days as %j → %s", (days, format, expected) => {
+    expect(elapsedText(days, format)).toBe(expected);
   });
 });
 

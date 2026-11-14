@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   DATA_TABLE_MAX_CELLS,
   DATA_TABLE_MAX_CHARS,
+  DATA_TABLE_MAX_NAME_CHARS,
   DATA_TABLE_MAX_COLUMNS,
   DATA_TABLE_MAX_ROWS,
   compareCells,
@@ -109,13 +110,47 @@ describe("parseDataTable", () => {
     expect(table?.totalColumns).toBe(3);
   });
 
-  it("keeps an oversized header as the header, its text cut at the budget", () => {
+  it("keeps an oversized header as the header, each name cut to the name limit", () => {
     const wideHeader = "h".repeat(DATA_TABLE_MAX_CHARS + 1);
     const table = parseDataTable(`${wideHeader},b\n1,2\n`, "wide.csv");
-    expect(table?.header.map((name) => name.length)).toEqual([DATA_TABLE_MAX_CHARS, 0]);
-    // The header spent the budget, so no row is kept, though every row is counted.
-    expect(table?.rows).toEqual([]);
+    // Only the kept part of a name counts, so the rest of the file still fits.
+    expect(table?.header).toEqual(["h".repeat(DATA_TABLE_MAX_NAME_CHARS), "b"]);
+    expect(table?.rows).toEqual([["1", "2"]]);
+    expect(table?.textCut).toBe(true);
     expect(table?.totalRows).toBe(1);
+  });
+
+  it("charges a cut header name only what the table keeps of it", () => {
+    const name = "h".repeat(1_500_000);
+    const row = "r".repeat(600_000);
+    const table = parseDataTable(`${name}\n${row}\n`, "x.csv");
+    expect(table?.header[0]).toHaveLength(DATA_TABLE_MAX_NAME_CHARS);
+    expect(table?.rows).toEqual([[row]]);
+  });
+
+  it("doesn't cut a character in half when it cuts a row", () => {
+    const cell = `${"x".repeat(DATA_TABLE_MAX_CHARS - 3)}😀😀`;
+    const table = tableFromRecords([["a"], [cell]], 1, 1, "test");
+    const kept = table?.rows[0]?.[0] ?? "";
+    expect(kept.endsWith("x…")).toBe(true);
+  });
+
+  it("keeps generated column labels within the text budget", () => {
+    const table = parseDataTable(
+      `${"h".repeat(DATA_TABLE_MAX_CHARS)}\n${",".repeat(499)}\n`,
+      "x.csv",
+    );
+    const kept = [table?.header ?? [], ...(table?.rows ?? [])].flat().join("").length;
+    expect(table?.header).toHaveLength(DATA_TABLE_MAX_COLUMNS);
+    expect(kept).toBeLessThanOrEqual(DATA_TABLE_MAX_CHARS);
+  });
+
+  it("keeps a CSV's oversized first row cut, as the other readers do", () => {
+    const table = parseDataTable(`a,b\n${"x".repeat(DATA_TABLE_MAX_CHARS)},1\n2,3\n`, "x.csv");
+    expect(table?.rows).toHaveLength(1);
+    expect(table?.rows[0]?.[0]).toHaveLength(DATA_TABLE_MAX_CHARS - "ab".length);
+    expect(table?.textCut).toBe(true);
+    expect(table?.totalRows).toBe(2);
   });
 
   it("infers each column's type", () => {
@@ -141,10 +176,51 @@ describe("tableFromRecords", () => {
 
     const kept = [table?.header ?? [], ...(table?.rows ?? [])].flat().join("").length;
     expect(kept).toBe(DATA_TABLE_MAX_CHARS);
-    // The header spent the budget, cut short; no row fits, but every row counts.
-    expect(table?.header).toHaveLength(DATA_TABLE_MAX_COLUMNS);
-    expect(table?.rows).toEqual([]);
+    // Each name is cut to the name limit; the first row is cut to the rest.
+    expect(new Set(table?.header.map((name) => name.length))).toEqual(
+      new Set([DATA_TABLE_MAX_NAME_CHARS]),
+    );
+    expect(table?.rows).toHaveLength(1);
+    expect(table?.textCut).toBe(true);
     expect(table?.totalRows).toBe(DATA_TABLE_MAX_ROWS);
+  });
+
+  it("keeps a first row bigger than the budget, cutting only the cell that overflows", () => {
+    const wide = "x".repeat(DATA_TABLE_MAX_CHARS);
+    const table = tableFromRecords(
+      [
+        ["id", "note", "amount"],
+        ["1", wide, "1234"],
+        ["2", "b", "5"],
+      ],
+      2,
+      3,
+      "test",
+    );
+
+    const [id, note, amount] = table?.rows[0] ?? [];
+    expect(table?.rows).toHaveLength(1);
+    expect(id).toBe("1");
+    // The overflowing cell ends in an ellipsis; a cell after it is blank, not shortened.
+    expect(note).toHaveLength(DATA_TABLE_MAX_CHARS - "idnoteamount1".length);
+    expect(note?.endsWith("…")).toBe(true);
+    expect(amount).toBe("");
+    expect(table?.textCut).toBe(true);
+    expect(table?.totalRows).toBe(2);
+  });
+
+  it("labels a blank or whitespace column name and marks no text cut", () => {
+    const table = tableFromRecords(
+      [
+        ["id", "", "  "],
+        ["1", "2", "3"],
+      ],
+      1,
+      3,
+      "test",
+    );
+    expect(table?.header).toEqual(["id", "column 2", "column 3"]);
+    expect(table?.textCut).toBeUndefined();
   });
 });
 

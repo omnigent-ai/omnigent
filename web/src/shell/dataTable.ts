@@ -5,6 +5,8 @@
 export const DATA_TABLE_MAX_ROWS = 1000;
 /** Characters of cell text the preview keeps, so wide rows can't exhaust memory. */
 export const DATA_TABLE_MAX_CHARS = 2_000_000;
+/** Longest a column name is kept; 500 of them stay well within the text budget. */
+export const DATA_TABLE_MAX_NAME_CHARS = 1_000;
 /** Columns the preview keeps; a row of delimiters can't widen every row past this. */
 export const DATA_TABLE_MAX_COLUMNS = 500;
 /** Cells the preview keeps, header and padding included, so a wide table keeps fewer rows. */
@@ -28,6 +30,8 @@ export interface DataTable {
   columnTypes: DataColumnType[];
   /** Format or non-UTF-8 encoding, e.g. "windows-1252" or "Parquet". */
   description: string;
+  /** Whether text past the budget was cut from a column name or the first row. */
+  textCut?: boolean;
 }
 
 function extensionOf(path: string): string | null {
@@ -141,8 +145,9 @@ export function detectDelimiter(text: string, path: string): string {
  *
  * Records are counted up to *scanRecords*. The first *keepRecords* are kept
  * while their field text fits in *keepChars*; the first record that doesn't
- * ends keeping, so the kept records are always a prefix. The first record is
- * kept, its text cut at *keepChars*. Each kept record keeps at most
+ * ends keeping, so the kept records are always a prefix. The first two records
+ * (the header and the first row) are kept even with their text cut at
+ * *keepChars*, which *textCut* reports. Each kept record keeps at most
  * *keepFields* fields; *widest* counts the fields of every record, kept or not,
  * and *fieldCounts* lists each scanned record's.
  */
@@ -155,9 +160,16 @@ function parseRecords(
     scanRecords = Number.POSITIVE_INFINITY,
     keepFields = Number.POSITIVE_INFINITY,
   }: { keepRecords: number; keepChars?: number; scanRecords?: number; keepFields?: number },
-): { records: string[][]; count: number; widest: number; fieldCounts: number[] } {
+): {
+  records: string[][];
+  count: number;
+  widest: number;
+  fieldCounts: number[];
+  textCut: boolean;
+} {
   const records: string[][] = [];
   const fieldCounts: number[] = [];
+  let textCut = false;
   let count = 0;
   let widest = 0;
   let fieldCount = 0;
@@ -177,11 +189,18 @@ function parseRecords(
   // Append to the field being read while the record's text fits what's left of the budget.
   const append = (chars: string) => {
     if (!keepingField()) return;
-    if (recordChars + field.length + chars.length > keepChars - keptChars) {
+    let kept = chars;
+    // A header name is kept only up to the name limit, so its excess costs nothing.
+    if (records.length === 0 && field.length + kept.length > DATA_TABLE_MAX_NAME_CHARS) {
+      kept = kept.slice(0, Math.max(0, DATA_TABLE_MAX_NAME_CHARS - field.length));
+      textCut = true;
+      if (kept === "") return;
+    }
+    if (recordChars + field.length + kept.length > keepChars - keptChars) {
       recordOverflowed = true;
       return;
     }
-    field += chars;
+    field += kept;
   };
 
   const endRecord = () => {
@@ -192,8 +211,11 @@ function parseRecords(
       fieldCounts.push(fieldCount + 1);
       if (keeping) {
         if (fields.length < keepFields) fields.push(field);
-        // The header is kept even cut short; any later record that overflows ends keeping.
-        if (records.length === 0 || !recordOverflowed) {
+        // The header and the first data row are kept even cut short, as the
+        // other readers keep them; a later record that overflows ends keeping.
+        const keptSome = recordChars + field.length > 0;
+        if (records.length === 0 || !recordOverflowed || (records.length === 1 && keptSome)) {
+          textCut ||= recordOverflowed;
           records.push(fields);
           keptChars += recordChars + field.length;
           keeping = records.length < keepRecords;
@@ -250,7 +272,7 @@ function parseRecords(
     }
   }
   if ((fieldHasChars || recordHasContent) && count < scanRecords) endRecord();
-  return { records, count, widest, fieldCounts };
+  return { records, count, widest, fieldCounts, textCut };
 }
 
 const NUMBER_PATTERN = /^([-+]?)(\d{1,3}(?:,\d{3})+|\d+)?(?:\.(\d+))?(?:[eE]([-+]?\d+))?(%?)$/;
@@ -361,6 +383,25 @@ function textLength(cells: string[]): number {
 }
 
 /**
+ * *cells* fitted to *budget* characters: whole until one doesn't fit, which is
+ * cut and ends in ``…``; the cells after it are left blank.
+ */
+function cutToBudget(cells: string[], budget: number): string[] {
+  let left = budget;
+  return cells.map((cell) => {
+    if (cell.length <= left) {
+      left -= cell.length;
+      return cell;
+    }
+    // Cutting between a surrogate pair would leave half a character.
+    const end = /[\uD800-\uDBFF]/.test(cell[left - 2] ?? "") ? left - 2 : left - 1;
+    const cut = left > 0 ? `${cell.slice(0, Math.max(end, 0))}…` : "";
+    left = 0;
+    return cut;
+  });
+}
+
+/**
  * Build the preview table from records whose first is the header.
  *
  * Keeps at most ``DATA_TABLE_MAX_COLUMNS`` columns, and as many rows as fit in
@@ -372,6 +413,7 @@ function textLength(cells: string[]): number {
  * @param totalRows - Data rows in the file, kept or not.
  * @param totalColumns - Fields in the file's widest row, kept or not.
  * @param description - Where the table came from, e.g. ``"Parquet"``.
+ * @param textCutEarlier - Whether the reader already cut text from *records*.
  * @returns The table, or ``null`` when there is no header row.
  */
 export function tableFromRecords(
@@ -379,6 +421,7 @@ export function tableFromRecords(
   totalRows: number,
   totalColumns: number,
   description: string,
+  textCutEarlier = false,
 ): DataTable | null {
   if (records.length === 0) return null;
   const [header, ...parsedRows] = records;
@@ -391,18 +434,28 @@ export function tableFromRecords(
   // many cells can't multiply past it. The header is cut to fit; rows are kept
   // while they fit, so the kept rows stay a prefix of the file.
   let budget = DATA_TABLE_MAX_CHARS;
+  let textCut = textCutEarlier;
   const columns = Array.from({ length: width }, (_, index) => {
-    const name = header[index];
-    if (name === undefined) return `column ${index + 1}`;
-    const kept = name.slice(0, budget);
-    budget -= kept.length;
-    return kept;
+    const name = header[index] ?? "";
+    const cut = name.slice(0, DATA_TABLE_MAX_NAME_CHARS);
+    textCut ||= cut.length < name.length;
+    // A blank name still needs a label, which counts against the budget too.
+    const label = cut.trim() === "" ? `column ${index + 1}` : cut;
+    budget -= label.length;
+    return label;
   });
   const kept: string[][] = [];
   for (const row of rows) {
     const cells = row.length > width ? row.slice(0, width) : row;
     const length = textLength(cells);
-    if (length > budget) break;
+    if (length > budget) {
+      // The first row is kept with its text cut, so an oversized row still shows.
+      if (kept.length === 0 && budget > 0) {
+        kept.push(cutToBudget(cells, budget));
+        textCut = true;
+      }
+      break;
+    }
     budget -= length;
     kept.push(cells);
   }
@@ -416,6 +469,7 @@ export function tableFromRecords(
     totalColumns: Math.max(totalColumns, width),
     columnTypes: columns.map((_, index) => inferColumnType(padded.map((row) => row[index]))),
     description,
+    ...(textCut && { textCut }),
   };
 }
 
@@ -430,11 +484,11 @@ export function tableFromRecords(
  */
 export function parseDataTable(text: string, path: string, encoding = "utf-8"): DataTable | null {
   const delimiter = detectDelimiter(text, path);
-  const { records, count, widest } = parseRecords(text, delimiter, {
+  const { records, count, widest, textCut } = parseRecords(text, delimiter, {
     keepRecords: DATA_TABLE_MAX_ROWS + 1,
     keepChars: DATA_TABLE_MAX_CHARS,
     keepFields: DATA_TABLE_MAX_COLUMNS,
   });
   const description = encoding === "utf-8" ? "" : encoding;
-  return tableFromRecords(records, count - 1, widest, description);
+  return tableFromRecords(records, count - 1, widest, description, textCut);
 }

@@ -11,11 +11,17 @@ import {
 
 /** Most bytes one part may inflate to, so a zip bomb can't exhaust memory. */
 const MAX_PART_BYTES = 64 * 1024 * 1024;
+/** Most bytes all of a workbook's parts may inflate to together, bounding the work. */
+const MAX_WORKBOOK_BYTES = 256 * 1024 * 1024;
 
 const END_OF_CENTRAL_DIRECTORY = 0x06054b50;
 const CENTRAL_DIRECTORY_ENTRY = 0x02014b50;
 const LOCAL_FILE_HEADER = 0x04034b50;
 
+/** Built-in formats that show only a time of day, e.g. 21 is ``h:mm:ss``. */
+const BUILT_IN_TIME_FORMATS = new Set([18, 19, 20, 21, 45, 47]);
+/** The built-in elapsed-time format, ``[h]:mm:ss``. */
+const BUILT_IN_ELAPSED_FORMAT = 46;
 /** Excel's built-in number formats that show a date or time. */
 const BUILT_IN_DATE_FORMATS = new Set([
   14, 15, 16, 17, 18, 19, 20, 21, 22, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 45, 46, 47, 50, 51,
@@ -34,10 +40,15 @@ const LAST_DATE_MS = Date.UTC(10000, 0, 1);
 /** A workbook that can't be read, with a message for the person viewing it. */
 export class WorkbookError extends Error {}
 
+/** A part or workbook past the size limits. */
+class WorkbookTooLargeError extends WorkbookError {}
+
 export interface WorkbookSheet {
   name: string;
-  /** ``null`` for a sheet with no cells. */
+  /** ``null`` for a sheet with no cells, or one that couldn't be read. */
   table: DataTable | null;
+  /** Why the sheet couldn't be read, e.g. it is too large to preview. */
+  message?: string;
 }
 
 interface ZipEntry {
@@ -95,7 +106,16 @@ function rawInflater(): DecompressionStream {
   }
 }
 
-async function inflateRaw(data: Uint8Array): Promise<Uint8Array> {
+const TOO_LARGE = "This workbook is too large to preview. Download it to open it.";
+const TOO_LARGE_SHEET = "This sheet is too large to preview. Download the workbook to open it.";
+const PAST_LIMIT = Symbol("past the size limits");
+
+/** Bytes the workbook's parts may still inflate to. */
+interface InflateBudget {
+  left: number;
+}
+
+async function inflateRaw(data: Uint8Array, limit: number): Promise<Uint8Array> {
   const source = new ReadableStream<BufferSource>({
     start(controller) {
       controller.enqueue(data as Uint8Array<ArrayBuffer>);
@@ -111,9 +131,9 @@ async function inflateRaw(data: Uint8Array): Promise<Uint8Array> {
     const { done, value } = await reader.read();
     if (done) break;
     total += value.length;
-    if (total > MAX_PART_BYTES) {
+    if (total > limit) {
       await reader.cancel();
-      throw new WorkbookError("This workbook is too large to preview. Download it to open it.");
+      throw new WorkbookTooLargeError(TOO_LARGE);
     }
     chunks.push(value);
   }
@@ -131,6 +151,7 @@ async function readPart(
   bytes: Uint8Array,
   entries: Map<string, ZipEntry>,
   name: string,
+  budget: InflateBudget,
 ): Promise<Document | null> {
   const entry = entries.get(name);
   if (!entry) return null;
@@ -138,9 +159,8 @@ async function readPart(
   if (view.getUint32(entry.offset, true) !== LOCAL_FILE_HEADER) {
     throw new WorkbookError("This Excel workbook is damaged.");
   }
-  if (entry.uncompressedSize > MAX_PART_BYTES) {
-    throw new WorkbookError("This workbook is too large to preview. Download it to open it.");
-  }
+  const limit = Math.min(MAX_PART_BYTES, budget.left);
+  if (entry.uncompressedSize > limit) throw new WorkbookTooLargeError(TOO_LARGE);
   const start =
     entry.offset +
     30 +
@@ -149,8 +169,17 @@ async function readPart(
   const data = bytes.subarray(start, start + entry.compressedSize);
   let xml: Uint8Array;
   if (entry.method === 0) xml = data;
-  else if (entry.method === 8) xml = await inflateRaw(data);
-  else throw new WorkbookError("This workbook uses a compression the preview can't read.");
+  else if (entry.method === 8) {
+    try {
+      xml = await inflateRaw(data, limit);
+    } catch (error) {
+      // The work done before the limit counts, so a part can't be retried for free.
+      if (error instanceof WorkbookTooLargeError) budget.left -= limit;
+      throw error;
+    }
+  } else throw new WorkbookError("This workbook uses a compression the preview can't read.");
+  if (xml.length > limit) throw new WorkbookTooLargeError(TOO_LARGE);
+  budget.left -= xml.length;
   const parsed = new DOMParser().parseFromString(new TextDecoder().decode(xml), "application/xml");
   // DOMParser reports malformed XML as a <parsererror> element, not by throwing.
   if (parsed.getElementsByTagName("parsererror").length > 0) {
@@ -175,17 +204,52 @@ function runText(element: Element): string {
     .join("");
 }
 
-/** Whether a custom number format shows a date or time, e.g. ``"yyyy-mm-dd"``. */
-export function isDateFormatCode(code: string): boolean {
-  const bare = code
+/** A format code without its quoted text, escapes and non-time brackets. */
+function bareFormat(code: string): string {
+  return code
     .replace(/"[^"]*"/g, "")
     .replace(/\\./g, "")
     .replace(/\[(?!h+\]|m+\]|s+\])[^\]]*\]/gi, "");
+}
+
+/** Whether a custom number format shows a date or time, e.g. ``"yyyy-mm-dd"``. */
+export function isDateFormatCode(code: string): boolean {
+  const bare = bareFormat(code);
   return /[dmyhs]/i.test(bare) && !/general/i.test(bare);
 }
 
-function dateStyles(styles: Document | null): Set<number> {
-  const dated = new Set<number>();
+/** Whether a date or time format shows only a time of day, e.g. ``"hh:mm"``. */
+export function isTimeFormatCode(code: string): boolean {
+  const bare = bareFormat(code);
+  // ``m`` next to ``h`` or ``s`` is minutes; three or more is a month name;
+  // ``e``, ``g`` and ``b`` are era years.
+  return /[hs]/i.test(bare) && !/[dyegb]|m{3,}/i.test(bare) && !isElapsedFormatCode(code);
+}
+
+/** Whether a format counts elapsed time past a day, e.g. ``"[h]:mm:ss"`` shows 36:00:00. */
+export function isElapsedFormatCode(code: string): boolean {
+  return elapsedFormat(code) !== null;
+}
+
+/** How an elapsed format counts: its largest unit, and whether it shows seconds. */
+export interface ElapsedFormat {
+  unit: "h" | "m" | "s";
+  seconds: boolean;
+}
+
+/** ``"[mm]:ss"`` → minutes with seconds; ``null`` for a format that isn't elapsed. */
+export function elapsedFormat(code: string): ElapsedFormat | null {
+  const bare = bareFormat(code);
+  const unit = /\[(h+|m+|s+)\]/i.exec(bare)?.[1]?.[0]?.toLowerCase();
+  if (unit !== "h" && unit !== "m" && unit !== "s") return null;
+  return { unit, seconds: unit === "s" || /s/i.test(bare.replace(/\[[^\]]*\]/g, "")) };
+}
+
+/** How a cell style shows a date serial: as a date (and time), a time of day, or elapsed time. */
+type DateStyle = "date" | "time" | ElapsedFormat;
+
+function dateStyles(styles: Document | null): Map<number, DateStyle> {
+  const dated = new Map<number, DateStyle>();
   if (!styles) return dated;
   const custom = new Map<number, string>();
   for (const format of descendants(styles, "numFmt")) {
@@ -197,7 +261,14 @@ function dateStyles(styles: Document | null): Set<number> {
     const id = Number(format.getAttribute("numFmtId") ?? 0);
     const code = custom.get(id);
     if (code !== undefined ? isDateFormatCode(code) : BUILT_IN_DATE_FORMATS.has(id)) {
-      dated.add(index);
+      const elapsed =
+        code !== undefined
+          ? elapsedFormat(code)
+          : id === BUILT_IN_ELAPSED_FORMAT
+            ? ({ unit: "h", seconds: true } as const)
+            : null;
+      const timeOnly = code !== undefined ? isTimeFormatCode(code) : BUILT_IN_TIME_FORMATS.has(id);
+      dated.set(index, elapsed ?? (timeOnly ? "time" : "date"));
     }
   });
   return dated;
@@ -208,23 +279,49 @@ function dateStyles(styles: Document | null): Set<number> {
  *
  * @param serial - Days since the workbook's epoch, e.g. ``46082.5``.
  * @param date1904 - Whether the workbook uses the 1904 date system.
+ * @param timeOnly - Whether the cell's format shows only a time of day.
  * @returns E.g. ``"2026-03-01"``, ``"12:00:00"`` or ``"2026-03-01 12:00:00"``.
  */
-export function excelSerialToText(serial: number, date1904: boolean): string {
+export function excelSerialToText(serial: number, date1904: boolean, timeOnly = false): string {
+  // Excel shows times to the nearest second, so the day is the rounded serial's.
+  const seconds = Math.round((serial * DAY_MS) / 1000);
+  const rounded = (seconds * 1000) / DAY_MS;
   const epoch = date1904
     ? EPOCH_1904
-    : serial < PHANTOM_LEAP_DAY
+    : rounded < PHANTOM_LEAP_DAY
       ? EPOCH_1900 + DAY_MS
       : EPOCH_1900;
-  const ms = epoch + Math.round(serial * DAY_MS);
+  const ms = epoch + seconds * 1000;
   // Excel shows no date before its epoch or past 9999; the number stays visible.
   if (!(serial >= 0 && ms < LAST_DATE_MS)) return numberText(String(serial));
   const iso = new Date(ms).toISOString().slice(0, 19).replace("T", " ");
   const [isoDay, time] = iso.split(" ");
   // Excel shows the phantom day as the date it counts.
-  const day = !date1904 && Math.floor(serial) === PHANTOM_LEAP_DAY ? "1900-02-29" : isoDay;
+  const day = !date1904 && Math.floor(rounded) === PHANTOM_LEAP_DAY ? "1900-02-29" : isoDay;
+  if (timeOnly) return time;
   if (Number.isInteger(serial)) return day;
   return serial < 1 ? time : `${day} ${time}`;
+}
+
+/**
+ * Elapsed time counted in *format*'s largest unit, as Excel shows it: 1.5 days
+ * is ``"36:00:00"`` as ``[h]:mm:ss``, ``"36:00"`` as ``[h]:mm`` and
+ * ``"2160:00"`` as ``[mm]:ss``.
+ */
+export function elapsedText(days: number, format: ElapsedFormat): string {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  // Rounded to the smallest unit shown.
+  const step = format.seconds ? 1 : 60;
+  const total = Math.round((Math.abs(days) * 86_400) / step) * step;
+  const minutes = Math.floor(total / 60);
+  const seconds = format.seconds ? `:${pad(total % 60)}` : "";
+  const text =
+    format.unit === "h"
+      ? `${Math.floor(minutes / 60)}:${pad(minutes % 60)}${seconds}`
+      : format.unit === "m"
+        ? `${minutes}${seconds}`
+        : String(total);
+  return days < 0 ? `-${text}` : text;
 }
 
 /** ``"BC"`` → 54: the zero-based column of a cell reference's letters. */
@@ -247,7 +344,7 @@ function numberText(value: string): string {
 function cellText(
   cell: Element,
   sharedStrings: string[],
-  dated: Set<number>,
+  dated: Map<number, DateStyle>,
   date1904: boolean,
 ): string {
   const type = cell.getAttribute("t");
@@ -264,9 +361,11 @@ function cellText(
   if (type === "s") return sharedStrings[Number(value)] ?? "";
   if (type === "b") return value === "1" ? "TRUE" : "FALSE";
   if (type === "str" || type === "e" || type === "d") return value;
-  if (dated.has(Number(cell.getAttribute("s") ?? -1))) {
+  const style = dated.get(Number(cell.getAttribute("s") ?? -1));
+  if (style) {
     const serial = Number(value);
-    if (Number.isFinite(serial)) return excelSerialToText(serial, date1904);
+    if (Number.isFinite(serial) && typeof style === "object") return elapsedText(serial, style);
+    if (Number.isFinite(serial)) return excelSerialToText(serial, date1904, style === "time");
   }
   return numberText(value);
 }
@@ -274,7 +373,7 @@ function cellText(
 function sheetTable(
   sheet: Document,
   sharedStrings: string[],
-  dated: Set<number>,
+  dated: Map<number, DateStyle>,
   date1904: boolean,
 ): DataTable | null {
   const records: string[][] = [];
@@ -320,9 +419,12 @@ function relationshipId(sheet: Element): string | undefined {
  * @returns Each visible sheet in workbook order, with its table.
  * @throws WorkbookError When the file can't be read, with a message to show.
  */
-export async function readWorkbook(bytes: Uint8Array): Promise<WorkbookSheet[]> {
+export async function readWorkbook(
+  bytes: Uint8Array,
+  maxBytes = MAX_WORKBOOK_BYTES,
+): Promise<WorkbookSheet[]> {
   try {
-    return await readSheets(bytes);
+    return await readSheets(bytes, maxBytes);
   } catch (error) {
     if (error instanceof WorkbookError) throw error;
     // Offsets or sizes in a corrupt zip that point outside the file.
@@ -330,11 +432,12 @@ export async function readWorkbook(bytes: Uint8Array): Promise<WorkbookSheet[]> 
   }
 }
 
-async function readSheets(bytes: Uint8Array): Promise<WorkbookSheet[]> {
+async function readSheets(bytes: Uint8Array, maxBytes: number): Promise<WorkbookSheet[]> {
   const entries = zipEntries(bytes);
-  const workbook = await readPart(bytes, entries, "xl/workbook.xml");
+  const budget: InflateBudget = { left: maxBytes };
+  const workbook = await readPart(bytes, entries, "xl/workbook.xml", budget);
   if (!workbook) throw new WorkbookError("This file isn't a readable Excel workbook.");
-  const relationships = await readPart(bytes, entries, "xl/_rels/workbook.xml.rels");
+  const relationships = await readPart(bytes, entries, "xl/_rels/workbook.xml.rels", budget);
   const targets = new Map<string, string>();
   for (const relationship of Array.from(
     relationships ? descendants(relationships, "Relationship") : [],
@@ -345,23 +448,36 @@ async function readSheets(bytes: Uint8Array): Promise<WorkbookSheet[]> {
       target.startsWith("/") ? target.slice(1) : `xl/${target}`,
     );
   }
-  const shared = await readPart(bytes, entries, "xl/sharedStrings.xml");
+  const shared = await readPart(bytes, entries, "xl/sharedStrings.xml", budget);
   const sharedStrings = (shared ? descendants(shared, "si") : []).map(runText);
-  const dated = dateStyles(await readPart(bytes, entries, "xl/styles.xml"));
+  const dated = dateStyles(await readPart(bytes, entries, "xl/styles.xml", budget));
   const properties = descendants(workbook, "workbookPr")[0];
   const date1904 = ["1", "true"].includes(properties?.getAttribute("date1904") ?? "");
 
   const sheets: WorkbookSheet[] = [];
+  // Sheets pointing at the same part share its table instead of reading it again.
+  // A part past the size limits is remembered too, so it is tried only once.
+  const tables = new Map<string, DataTable | null | typeof PAST_LIMIT>();
   // One sheet at a time, so only one inflated part is held at once.
   /* oxlint-disable no-await-in-loop */
   for (const sheet of descendants(workbook, "sheet")) {
     if (["hidden", "veryHidden"].includes(sheet.getAttribute("state") ?? "")) continue;
+    const name = sheet.getAttribute("name") ?? `Sheet ${sheets.length + 1}`;
     const target = targets.get(relationshipId(sheet) ?? "");
-    const part = target ? await readPart(bytes, entries, target) : null;
-    sheets.push({
-      name: sheet.getAttribute("name") ?? `Sheet ${sheets.length + 1}`,
-      table: part ? sheetTable(part, sharedStrings, dated, date1904) : null,
-    });
+    if (target !== undefined && !tables.has(target)) {
+      try {
+        const part = await readPart(bytes, entries, target, budget);
+        tables.set(target, part ? sheetTable(part, sharedStrings, dated, date1904) : null);
+      } catch (error) {
+        // A sheet past the size limits is marked, and the sheets that fit still show.
+        if (!(error instanceof WorkbookTooLargeError)) throw error;
+        tables.set(target, PAST_LIMIT);
+      }
+    }
+    const table = target === undefined ? null : (tables.get(target) ?? null);
+    sheets.push(
+      table === PAST_LIMIT ? { name, table: null, message: TOO_LARGE_SHEET } : { name, table },
+    );
   }
   /* oxlint-enable no-await-in-loop */
   return sheets;

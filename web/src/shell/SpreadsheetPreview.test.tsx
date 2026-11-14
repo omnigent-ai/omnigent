@@ -59,6 +59,20 @@ describe("SpreadsheetPreview", () => {
       false,
       "This file is compressed with ZSTD, which the preview can't read yet.",
     ],
+    [
+      "a damaged workbook",
+      btoa("not a zip"),
+      "x.xlsx",
+      false,
+      "This file isn't a readable Excel workbook.",
+    ],
+    [
+      "a sheet past the size limit",
+      base64Fixture("understated.xlsx"),
+      "x.xlsx",
+      false,
+      "This sheet is too large to preview. Download the workbook to open it.",
+    ],
     // Not even base64: no reader names the failure, so the generic message shows.
     [
       "a file it can't decode",

@@ -42,8 +42,9 @@ export function SpreadsheetPreview({
 }) {
   const [state, setState] = useState<LoadState>({ status: "loading" });
   const [active, setActive] = useState(0);
-  // Switching sheets changes what find searches, even to a sheet with no table.
-  useEffect(() => onRowsChange?.(), [active, onRowsChange]);
+  // Switching sheets, or the file loading, failing or emptying on a refresh,
+  // changes what find searches.
+  useEffect(() => onRowsChange?.(), [active, state, onRowsChange]);
 
   useEffect(() => {
     // Both formats keep their index at the end of the file, which a partial read lacks.
@@ -148,7 +149,12 @@ export function SpreadsheetPreview({
             onRowsChange={onRowsChange}
           />
         ) : (
-          <div className="p-8 text-ui text-muted-foreground">This sheet is empty.</div>
+          <div
+            role={sheet.message ? "alert" : undefined}
+            className="p-8 text-ui text-muted-foreground"
+          >
+            {sheet.message ?? "This sheet is empty."}
+          </div>
         )}
       </div>
     </div>
