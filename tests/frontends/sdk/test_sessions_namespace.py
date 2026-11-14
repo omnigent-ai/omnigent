@@ -51,6 +51,7 @@ from omnigent.server.schemas import (
     SessionInputConsumedEvent,
     SessionStatusEvent,
 )
+from tests.budgets import budget
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -2096,8 +2097,10 @@ async def test_host_launch_waits_past_the_ordinary_http_read_timeout() -> None:
 
     server = await asyncio.start_server(connected, "127.0.0.1", 0)
     base_url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+    # Only reads need a short deadline; TCP setup is a hang guard.
+    timeout = httpx.Timeout(budget(5.0), read=0.05)
     try:
-        async with server, httpx.AsyncClient(timeout=0.05, trust_env=False) as http:
+        async with server, httpx.AsyncClient(timeout=timeout, trust_env=False) as http:
             sessions = SessionsNamespace(http, base_url)
             launched = await sessions.create_from_agent_id("ag_abc", host_id="host_1")
             assert launched.id == "conv_abc"
