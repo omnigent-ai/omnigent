@@ -207,6 +207,9 @@ islo = ["islo>=0.3.5,<0.4"]
 # lazy-import posture as above. Pre-1.0 SDK: pin minor. 0.1 addresses
 # exec by sandbox name within a workspace.
 openshell = ["openshell>=0.1.0,<1"]
+# Workspace API server and client (omnigent/api/workspace/v1alpha1/workspace.proto)
+# for the desktop fast track; optional while it ships off. Pre-1.0: pin minor.
+workspace-api = ["connectrpc>=0.13,<0.14"]
 # On-demand Kubernetes runner Pod launcher (server-managed
 # `sandbox.provider: kubernetes`). The launcher module ships in the base
 # package and imports the official client lazily, so only users of the
@@ -341,15 +344,12 @@ lint = [
     "ruff>=0.6",
     "pyrefly==1.1.1",
     "pre-commit>=3.5",
-    # protoc + the well-known-type protos, for regenerating the routing API
-    # bindings (omnigent/api/routing/v1/routing_pb2.*). Bundles its own compiler so no
-    # system protoc is needed. Capped below 1.83 so the bundled libprotoc emits
-    # protobuf 6.x gencode; routing_pb2 must stay at gencode 6.x because
-    # cwsandbox/modal installs are pinned to a protobuf 6.x runtime and the
-    # protobuf runtime cannot be older than the gencode version. A 7.x runtime
-    # (antigravity) also loads 6.x gencode under the forward-compat guarantee,
-    # so 6.x gencode satisfies all install forks.
+    # Bundled protoc for scripts/gen_protobuf.py. Capped <=1.81.1 so gencode stays
+    # protobuf 6.x: cwsandbox/modal pin a 6.x runtime, and a 7.x runtime still loads it.
     "grpcio-tools>=1.68,<=1.81.1",
+    # protoc plugin for the Connect RPC stubs (omnigent/api/**/*_connect.py).
+    # Keep in step with the connectrpc runtime pin.
+    "protoc-gen-connectrpc>=0.13,<0.14",
 ]
 test = [
     "pytest>=7.0",
@@ -359,6 +359,7 @@ test = [
     # and execute the real packages against mocks.
     "hindsight-client>=0.4.0",
     "nimble-python>=1.2.0,<2",
+    "connectrpc>=0.13,<0.14",
     "pytest-asyncio>=0.21",
     "pytest-xdist>=3.6",
     # Line coverage during the unit-test matrix. Each CI shard writes its
@@ -575,6 +576,7 @@ extend-exclude = [
     # Protobuf-generated code (DO NOT EDIT); not ours to restyle.
     "omnigent/api/**/*_pb2.py",
     "omnigent/api/**/*_pb2.pyi",
+    "omnigent/api/**/*_connect.py",
 ]
 
 [tool.ruff.format]

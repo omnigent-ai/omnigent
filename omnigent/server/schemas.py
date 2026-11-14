@@ -2229,8 +2229,7 @@ class SandboxStatus(BaseModel):
         has none) → ``starting`` (starting the in-sandbox host) →
         ``connecting`` (launching the agent runner) → ``ready`` /
         ``failed``.
-    :param provider: Sandbox provider being launched, e.g. ``"arclet"``,
-        or ``None`` when unknown.
+    :param provider: Sandbox provider being launched, or ``None`` when unknown.
     :param details: What the user needs to do when
         ``stage == "action_required"``, e.g. ``"Sign in on your laptop."``.
         ``None`` otherwise.
@@ -3534,6 +3533,34 @@ class SessionList(BaseModel):
     page_boundary: SessionPageBoundary | None = None
 
 
+class AgentCost(BaseModel):
+    """
+    Display cost of one agent in a session tree.
+
+    :param id: Session id, e.g. ``"conv_child123"``.
+    :param cost_usd: Priced USD cost of this agent including its sub-agents
+        (the same total its own session reports), or ``None`` when nothing
+        in that subtree is priced.
+    :param estimated_cost_usd: When ``cost_usd`` is ``None``, an ancestor
+        harness's transcript estimate for this agent, which that ancestor's
+        total already includes; otherwise ``None``.
+    """
+
+    id: str
+    cost_usd: float | None = None
+    estimated_cost_usd: float | None = None
+
+
+class AgentCostList(BaseModel):
+    """A page of costs for a session and its descendants; ``data`` lists ``AgentCost``."""
+
+    object: Literal["list"] = "list"
+    data: list[AgentCost] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
+
+
 class ChildSessionList(BaseModel):
     """Paginated list of child sessions; ``data`` is a page of ``ChildSessionSummary``."""
 
@@ -4360,8 +4387,7 @@ class SessionSandboxStatusEvent(_SSEEventBase):
     :param stage: The launch stage just entered, e.g.
         ``"provisioning"`` — see :class:`SandboxStatus` for the full
         pipeline order.
-    :param provider: Sandbox provider being launched, e.g. ``"arclet"``,
-        or ``None`` when unknown.
+    :param provider: Sandbox provider being launched, or ``None`` when unknown.
     :param details: What the user needs to do when
         ``stage == "action_required"``, e.g. ``"Sign in on your laptop."``.
         ``None`` otherwise.

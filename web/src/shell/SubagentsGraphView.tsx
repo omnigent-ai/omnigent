@@ -6,6 +6,7 @@ import { RunningDot } from "@/components/RunningDot";
 import { Badge } from "@/components/ui/badge";
 import { ZoomInIcon, ZoomOutIcon, Maximize2Icon } from "lucide-react";
 import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import type { AgentCosts } from "@/hooks/useAgentCosts";
 import { useSession } from "@/hooks/useSession";
 import { cn } from "@/lib/utils";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
@@ -15,6 +16,7 @@ import {
   type AgentActivity,
   type AgentNodeData,
 } from "./subagentGraphLayout";
+import { AgentCostTag } from "./AgentCostTag";
 import { activityDotClassName, sessionStatus } from "./subagentStatus";
 import { useOpenSubagentInPanel } from "./subagentPanelOpener";
 
@@ -51,7 +53,7 @@ function NodeStatusDot({ activity }: { activity: AgentActivity }) {
 }
 
 function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
-  const { label, activity, statusLabel, isActive, preview } = data;
+  const { label, activity, statusLabel, isActive, preview, cost } = data;
   const tint = ACTIVITY_TINT[activity];
 
   return (
@@ -73,6 +75,7 @@ function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
         <div className="flex items-center gap-1.5">
           <span className="truncate text-sm font-medium leading-tight">{label}</span>
           <span className="flex-1" />
+          <AgentCostTag cost={cost} />
           <NodeStatusDot activity={activity} />
         </div>
         {preview && (
@@ -160,9 +163,15 @@ function ChildCollector({
 interface SubagentsGraphViewProps {
   conversationId: string;
   rootSessionId: string;
+  /** Display costs by session id, when loaded. */
+  costs?: AgentCosts;
 }
 
-export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsGraphViewProps) {
+export function SubagentsGraphView({
+  conversationId,
+  rootSessionId,
+  costs,
+}: SubagentsGraphViewProps) {
   const { session } = useSession(rootSessionId);
   const { children: rootChildren } = useChildSessions(rootSessionId);
 
@@ -209,6 +218,16 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
       ),
     [rootSessionId, rootLabel, rootActivity, rootStatusLabel, childrenMap, conversationId],
   );
+  const nodes = useMemo(
+    () =>
+      costs
+        ? layoutNodes.map((node) => ({
+            ...node,
+            data: { ...node.data, cost: costs.get(node.data.sessionId) },
+          }))
+        : layoutNodes,
+    [layoutNodes, costs],
+  );
 
   const navigate = useNavigate();
   const location = useLocation();
@@ -235,7 +254,7 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
     >
       <div className="h-full w-full" style={{ minHeight: 200 }}>
         <ReactFlow
-          nodes={layoutNodes}
+          nodes={nodes}
           edges={layoutEdges}
           nodeTypes={nodeTypes}
           onNodeClick={handleNodeClick}

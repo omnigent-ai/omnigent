@@ -99,6 +99,17 @@ class _StubResourceRegistry:
         """
         self._terminal_activity_publisher = publisher
 
+    def wake_session_terminal_watchers(self, session_id: str) -> None:
+        """
+        Accept the turn-start wake the runner issues for every running status.
+
+        The stub owns no terminals, so there is no idle watcher to wake.
+
+        :param session_id: Session whose terminal watchers would be woken.
+        :returns: None.
+        """
+        del session_id
+
     def set_session_background_publisher(
         self,
         publisher: Callable[[str, bool], None],

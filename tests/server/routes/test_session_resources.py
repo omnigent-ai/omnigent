@@ -9,6 +9,7 @@ import logging
 import ntpath
 import re
 import threading
+import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
@@ -24,6 +25,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
 from omnigent.errors import ErrorCode, OmnigentError, TerminalLaunchError
 from omnigent.host.frames import HOST_CAPABILITIES, HostHelloFrame
+from omnigent.host.workspace_tokens import TOKEN_TTL_S, WorkspaceGrant, verify_token
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runtime import (
     _globals,
@@ -40,6 +42,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     UnifiedAuthProvider,
 )
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
@@ -1293,6 +1296,158 @@ async def test_list_terminals_without_runner_advert_leaves_payload_untouched(
     assert resp.status_code == 200
     (item,) = resp.json()["data"]
     assert "direct_attach_url" not in item["metadata"]
+
+
+_DIRECT_ACCESS_SESSION = "79b22ebd2309e48fdeb450c65611d51b"
+_DIRECT_ACCESS_URL = f"/v1/sessions/{_DIRECT_ACCESS_SESSION}/workspace/direct-access"
+_DIRECT_ACCESS_KEY = "direct-access-test-key-0123456789abcdef"
+
+
+def _offer_direct_access(
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    flag: bool = True,
+    host: bool = True,
+    socket: bool = True,
+    sandbox: str | None = "none",
+) -> None:
+    """Bind the canned session to a host; each keyword can break one precondition."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    if flag:
+        app.state.feature_flags = FeatureFlags(frozenset({Feature.WORKSPACE_DIRECT_ACCESS}))
+    conv = app.state.test_conversation_store._conversations[_DIRECT_ACCESS_SESSION]
+    conv.host_id = "host_direct"
+    conv.workspace = "/workspace"
+    if host:
+        app.state.test_host_registry.register(
+            conv.host_id,
+            object(),  # type: ignore[arg-type]
+            HostHelloFrame(
+                version="0.1.0-test",
+                frame_protocol_version=1,
+                name="direct",
+                workspace_socket="/tmp/omnigent-workspace-t/workspace.sock" if socket else None,
+                workspace_token_key=_DIRECT_ACCESS_KEY if socket else None,
+            ),
+            owner=None,
+        )
+    spec = _direct_access_spec(sandbox)
+    monkeypatch.setattr(sessions_module, "_load_agent_spec_for_session", lambda *_: spec)
+
+
+def _direct_access_spec(sandbox: str | None) -> Any:
+    """An agent spec that is unconfined for ``"none"`` and confined for ``None``."""
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.spec.types import AgentSpec
+
+    os_env = OSEnvSpec(sandbox=OSEnvSandboxSpec(type=sandbox) if sandbox else None)
+    return AgentSpec(spec_version=1, os_env=os_env)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("child_sandbox", "status"), [("none", 200), (None, 404)], ids=["unconfined", "confined"]
+)
+async def test_direct_access_for_a_hostless_child_uses_its_own_workspace_and_sandbox(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    child_sandbox: str | None,
+    status: int,
+) -> None:
+    """A sub-agent runs on its parent's host but keeps its own workspace and spec."""
+    import dataclasses
+
+    from omnigent.server.routes import sessions as sessions_module
+
+    _offer_direct_access(app, monkeypatch)
+    conversations = app.state.test_conversation_store._conversations
+    parent = conversations[_DIRECT_ACCESS_SESSION]
+    child = dataclasses.replace(
+        parent,
+        id="child_session",
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        root_conversation_id=parent.id,
+        host_id=None,
+        workspace="/workspace/child",
+    )
+    conversations[child.id] = child
+    specs = {parent.id: _direct_access_spec("none"), child.id: _direct_access_spec(child_sandbox)}
+    monkeypatch.setattr(
+        sessions_module, "_load_agent_spec_for_session", lambda conv, *_: specs[conv.id]
+    )
+
+    resp = await client.post(f"/v1/sessions/{child.id}/workspace/direct-access")
+
+    assert resp.status_code == status, resp.text
+    if status == 200:
+        grant = verify_token(_DIRECT_ACCESS_KEY, resp.json()["token"], host_id="host_direct")
+        assert grant == WorkspaceGrant(session_id=child.id, workspace="/workspace/child")
+
+
+@pytest.mark.asyncio
+async def test_direct_access_gives_the_owner_a_token_the_host_accepts(
+    app: FastAPI, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Single-user mode is owner mode; the token names this session's workspace."""
+    _offer_direct_access(app, monkeypatch)
+
+    resp = await client.post(_DIRECT_ACCESS_URL)
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["host_id"] == "host_direct"
+    assert body["socket_path"] == "/tmp/omnigent-workspace-t/workspace.sock"
+    assert verify_token(_DIRECT_ACCESS_KEY, body["token"], host_id="host_direct") == (
+        WorkspaceGrant(session_id=_DIRECT_ACCESS_SESSION, workspace="/workspace")
+    )
+    assert 0 < body["expires_at"] - time.time() <= TOKEN_TTL_S
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "broken",
+    [{"flag": False}, {"host": False}, {"socket": False}, {"sandbox": None}],
+    ids=["flag-off", "host-offline", "host-without-socket", "confined-session"],
+)
+async def test_direct_access_refuses_when_a_precondition_fails(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    broken: dict[str, Any],
+) -> None:
+    """Every refusal is a 404, so the client keeps using the server route."""
+    _offer_direct_access(app, monkeypatch, **broken)
+
+    resp = await client.post(_DIRECT_ACCESS_URL)
+
+    assert resp.status_code == 404, resp.text
+    assert "token" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_direct_access_readdresses_a_host_on_another_replica(
+    app: FastAPI, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host live on another replica gets the wrong-replica retry signal, not a 404."""
+    from types import SimpleNamespace
+
+    from omnigent.errors import WrongReplicaError
+
+    _offer_direct_access(app, monkeypatch, host=False)
+    app.state.host_store = SimpleNamespace(get_host=lambda _host_id: object())
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_resources.host_absent_error",
+        lambda _host: WrongReplicaError("host is on another replica", host_id="host_direct"),
+    )
+
+    resp = await client.post(_DIRECT_ACCESS_URL)
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "wrong_replica"
 
 
 @pytest.mark.asyncio

@@ -301,14 +301,16 @@ async def test_session_snapshot_uses_child_spec_metadata(
         ),
     }
     conv_store = _ConversationStore([], conversations=conversations)
+    event_loop_thread = threading.get_ident()
     cache_loads: list[bool] = []
+    cache_loads_on_loop: list[bool] = []
     agent_reads_on_loop: list[bool] = []
 
     class _AgentStore:
         @staticmethod
         def get(agent_id: str) -> Any:
             assert agent_id == "ag_advisor"
-            agent_reads_on_loop.append(threading.current_thread() is threading.main_thread())
+            agent_reads_on_loop.append(threading.get_ident() == event_loop_thread)
             return type(
                 "StoredAgent",
                 (),
@@ -323,9 +325,14 @@ async def test_session_snapshot_uses_child_spec_metadata(
 
     class _AgentCache:
         @staticmethod
+        def load_spec(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
+            return _AgentCache.load(agent_id, bundle_location, expand_env=expand_env).spec
+
+        @staticmethod
         def load(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
             assert (agent_id, bundle_location) == ("ag_advisor", "bundle")
             cache_loads.append(expand_env)
+            cache_loads_on_loop.append(threading.get_ident() == event_loop_thread)
             return type("LoadedAgent", (), {"spec": parent_spec})()
 
     monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
@@ -353,6 +360,7 @@ async def test_session_snapshot_uses_child_spec_metadata(
     assert child.context_window == 100_000
     assert child.harness == "codex"
     assert cache_loads == [True, True, True, True]
+    assert cache_loads_on_loop == [False, False, False, False]
     assert agent_reads_on_loop == [False, False]
 
 
@@ -411,6 +419,10 @@ async def test_session_snapshot_does_not_claim_agent_model_for_own_auth_acp(
             )()
 
     class _AgentCache:
+        @staticmethod
+        def load_spec(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
+            return _AgentCache.load(agent_id, bundle_location, expand_env=expand_env).spec
+
         @staticmethod
         def load(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
             return type("LoadedAgent", (), {"spec": spec})()
@@ -504,6 +516,10 @@ async def test_session_snapshot_unresolvable_sub_agent_warns_and_reports_parent(
 
     class _AgentCache:
         @staticmethod
+        def load_spec(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
+            return _AgentCache.load(agent_id, bundle_location, expand_env=expand_env).spec
+
+        @staticmethod
         def load(agent_id: str, bundle_location: str, *, expand_env: bool = True) -> Any:
             assert (agent_id, bundle_location) == ("ag_advisor", "bundle")
             return type("LoadedAgent", (), {"spec": parent_spec})()
@@ -585,6 +601,10 @@ async def test_session_snapshot_native_sub_agent_reports_parent_without_warning(
             )()
 
     class _AgentCache:
+        @staticmethod
+        def load_spec(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
+            return _AgentCache.load(agent_id, bundle_location, expand_env=expand_env).spec
+
         @staticmethod
         def load(agent_id: str, bundle_location: str, *, expand_env: bool = True) -> Any:
             return type("LoadedAgent", (), {"spec": parent_spec})()
@@ -2539,7 +2559,10 @@ async def test_session_snapshot_fills_cold_claude_catalog_from_host(
 
     host_queries: list[str] = []
 
-    async def _fake_host_options(host_id: str) -> list[dict[str, object]] | None:
+    async def _fake_host_options(
+        host_id: str, harness: str = "claude-native"
+    ) -> list[dict[str, object]] | None:
+        assert harness == "claude-native"
         host_queries.append(host_id)
         return [{"id": "opus", "displayName": "Opus"}]
 
@@ -2574,6 +2597,167 @@ async def test_session_snapshot_fills_cold_claude_catalog_from_host(
     assert host_queries == ["host_abc"]
     assert [m.id for m in snapshot.model_options] == ["opus"]
     assert session_id in _mod._model_options_stale
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inherited_host", [False, True])
+@pytest.mark.parametrize("first_host_failure", [False, True], ids=["success", "retry"])
+async def test_session_snapshot_fills_cold_pi_catalog_from_host(
+    monkeypatch: pytest.MonkeyPatch,
+    inherited_host: bool,
+    first_host_failure: bool,
+) -> None:
+    """Cold Pi snapshots refill from direct or inherited hosts and retry failed lookups."""
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.schemas import SessionEventInput
+
+    session_id = "conv_pi_host_catalog"
+    _mod._session_status_cache.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+    _mod._pushed_model_options_cache.clear()
+
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    host_queries: list[tuple[str, str]] = []
+    release_host = asyncio.Event()
+    published: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._publish_model_options", published.append
+    )
+
+    async def _fake_host_options(
+        host_id: str, harness: str = "claude-native"
+    ) -> list[dict[str, object]] | None:
+        host_queries.append((host_id, harness))
+        await release_host.wait()
+        if first_host_failure and len(host_queries) == 1:
+            return None
+        return [{"id": "provider/test-model", "displayName": "Test Model"}]
+
+    monkeypatch.setattr(_mod, "_host_model_options_via_registry", _fake_host_options)
+
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="parent" if inherited_host else session_id,
+        parent_conversation_id="parent" if inherited_host else None,
+        kind="sub_agent" if inherited_host else "default",
+        agent_id="ag_test",
+        host_id=None if inherited_host else "host_abc",
+        labels={
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._PI_NATIVE_WRAPPER_LABEL_VALUE,
+        },
+    )
+    parent = Conversation(
+        id="parent",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="parent",
+        host_id="host_abc",
+        agent_id="ag_test",
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={session_id: conv, "parent": parent},
+    )
+
+    first = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+    )
+    assert first.model_options == []
+    filling = _mod._model_options_inflight[session_id]
+    second = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert second.model_options == []
+    assert _mod._model_options_inflight[session_id] is filling
+    release_host.set()
+    await asyncio.wait_for(filling, timeout=5)
+    assert session_id not in _mod._model_options_inflight
+    if first_host_failure:
+        assert session_id not in _mod._pushed_model_options_cache
+        assert published == []
+        release_host.clear()
+        retry = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+        assert retry.model_options == []
+        refilling = _mod._model_options_inflight[session_id]
+        assert refilling is not filling
+        release_host.set()
+        await asyncio.wait_for(refilling, timeout=5)
+        assert session_id not in _mod._model_options_inflight
+    assert published == [session_id]
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+    )
+    assert host_queries == [("host_abc", "pi-native")] * (2 if first_host_failure else 1)
+    assert [m.id for m in snapshot.model_options] == ["provider/test-model"]
+    # Not stale-marked: pi's picker reads only the pushed cache.
+    assert session_id not in _mod._model_options_stale
+
+    _mod._persist_external_model_options(
+        session_id,
+        conv,
+        SessionEventInput(type="external_model_options", data={"models": [{"id": "extension"}]}),
+    )
+    replaced = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert [model.id for model in replaced.model_options] == ["extension"]
+    assert session_id not in _mod._model_options_inflight
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("empty_push", [False, True], ids=["catalog", "cleared"])
+async def test_pi_host_fill_does_not_clobber_extension_push(
+    monkeypatch: pytest.MonkeyPatch,
+    empty_push: bool,
+) -> None:
+    """An accepted catalog or clear during host recovery wins, including later snapshots."""
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.schemas import SessionEventInput
+
+    session_id = "conv_pi_push_wins"
+    _mod._session_status_cache.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+    _mod._pushed_model_options_cache.clear()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="ag_test",
+        host_id="host_abc",
+        labels={_mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._PI_NATIVE_WRAPPER_LABEL_VALUE},
+    )
+    conv_store = _ConversationStore([], conversations={session_id: conv})
+    pushed_models = [] if empty_push else [{"id": "pushed"}]
+    host_queries: list[tuple[str, str]] = []
+
+    async def _fake_host_options(
+        host_id: str, harness: str = "claude-native"
+    ) -> list[dict[str, object]] | None:
+        host_queries.append((host_id, harness))
+        _mod._persist_external_model_options(
+            session_id,
+            conv,
+            SessionEventInput(type="external_model_options", data={"models": pushed_models}),
+        )
+        return [{"id": "from-host"}]
+
+    monkeypatch.setattr(_mod, "_host_model_options_via_registry", _fake_host_options)
+
+    await _mod._load_model_options_from_host(session_id, "host_abc", "pi-native")
+
+    expected_ids = [] if empty_push else ["pushed"]
+    assert [model["id"] for model in _mod._pushed_model_options_cache[session_id]] == expected_ids
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert [model.id for model in snapshot.model_options] == expected_ids
+    assert session_id not in _mod._model_options_inflight
+    assert host_queries == [("host_abc", "pi-native")]
 
 
 @pytest.mark.asyncio

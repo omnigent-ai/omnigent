@@ -1504,7 +1504,7 @@ describe("composer /clear and /rewind gating", () => {
 });
 
 describe("buildSlashCommandMap", () => {
-  const gatedOffByDefault = ["/btw", "/side", "/mcp", "/clear", "/permissions", "/rewind"];
+  const gatedOffByDefault = ["/btw", "/side", "/mcp", "/clear", "/permissions", "/rewind", "/goal"];
 
   it("returns the built-ins unchanged when no skills are loaded", () => {
     const map = buildSlashCommandMap([], true, true);

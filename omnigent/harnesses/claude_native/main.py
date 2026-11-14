@@ -1056,8 +1056,12 @@ def _claude_model_probe_launch(
     if not claude_code_managed_mcp_present():
         args.extend(["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'])
     args.extend(["--no-session-persistence", *extra_args])
+    # The user's SessionStart hooks would otherwise run for this headless call
+    # and push it past the probe timeout.
+    probe_settings: dict[str, object] = {"disableAllHooks": True}
     if claude_config is not None and claude_config.api_key_helper:
-        args.extend(("--settings", json.dumps({"apiKeyHelper": claude_config.api_key_helper})))
+        probe_settings["apiKeyHelper"] = claude_config.api_key_helper
+    args.extend(("--settings", json.dumps(probe_settings)))
     cfg = load_effective_config()
     command = resolve_harness_command("claude-native", default="claude", cfg=cfg)
     launch_args = resolve_harness_args("claude-native", tuple(args), cfg=cfg)
@@ -5159,7 +5163,7 @@ def _run_with_remote_server(
     # long-lived transcript-forwarder client survives the ~1h Databricks
     # OAuth token TTL.
     startup_profiler.mark("remote auth resolving")
-    forwarder_auth = _server_auth(server_url=base_url, session_id=None)
+    forwarder_auth = _server_auth(server_url=base_url)
     startup_profiler.mark("remote auth resolved")
     prepared: PreparedClaudeTerminal | None = None
     # Bound before the attach call so the ``finally`` can read it even

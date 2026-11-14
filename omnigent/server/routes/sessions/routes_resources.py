@@ -29,7 +29,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from starlette.types import Receive, Scope, Send
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from omnigent.debug_logging import StageTimings, debug_event
 from omnigent.entities import (
@@ -37,12 +37,13 @@ from omnigent.entities import (
     StoredFile,
 )
 from omnigent.entities.session_resources import session_resource_view_to_dict
-from omnigent.errors import ErrorCode, OmnigentError, TerminalLaunchError
+from omnigent.errors import ErrorCode, OmnigentError, TerminalLaunchError, WrongReplicaError
+from omnigent.host.workspace_tokens import mint_token
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_terminal_name,
 )
-from omnigent.runner.routing import RunnerRouter, routing_host_id
+from omnigent.runner.routing import RunnerRouter, routing_host_id, routing_host_session
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server import session_pull_requests as server_prs
 from omnigent.server._elicitation_registry import (
@@ -60,7 +61,7 @@ from omnigent.server.auth import (
     AuthProvider,
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags
-from omnigent.server.host_registry import HostRegistry
+from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
@@ -73,7 +74,7 @@ from omnigent.server.routes._content_type import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._gzip_route import GZipFileContentRoute, skip_gzip
-from omnigent.server.routes._host_launch import resolve_host_owner
+from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._sessions.common import (
     _logger,
@@ -725,8 +726,34 @@ def register_resources_routes(
             raise runner_offline
         return payload
 
+    async def _session_host(
+        conv: Conversation, request: Request
+    ) -> tuple[str | None, HostConnection | None, str | None]:
+        """Return the host a session runs on, its tunnel here, and the session's workspace.
+
+        Side chats and sub-agents run on the host of the session that owns them,
+        but keep their own workspace; like the runner, fall back to the owner's
+        workspace only when the session has none. The tunnel is ``None`` when the
+        host isn't connected here; a host live on another replica raises
+        :class:`WrongReplicaError`, so the client re-addresses.
+
+        :param conv: The authorized session.
+        :param request: The incoming request, for the app's host store.
+        :returns: ``(host id, local host connection or None, workspace)``.
+        """
+        owner = await asyncio.to_thread(routing_host_session, conv, conversation_store) or conv
+        host_id = owner.host_id
+        host = host_registry.get(host_id) if host_registry is not None and host_id else None
+        host_store = getattr(request.app.state, "host_store", None)
+        if host is None and host_id and host_store is not None:
+            record = await asyncio.to_thread(host_store.get_host, host_id)
+            absent = host_absent_error(record) if record is not None else None
+            if isinstance(absent, WrongReplicaError):
+                raise absent
+        return host_id, host, conv.workspace or owner.workspace
+
     async def _environment_reach_for_session(
-        conversation: Conversation,
+        conversation: Conversation, workspace: str | None = None
     ) -> tuple[list[Any], bool, str] | None:
         """Compute a session's browse reach without consulting the runner.
 
@@ -737,12 +764,15 @@ def register_resources_routes(
         the decision has to be made here.
 
         :param conversation: Conversation loaded during authorization.
+        :param workspace: The workspace to resolve against, when it isn't the
+            conversation's own (a sub-agent inheriting its runner's).
         :returns: ``(roots, unconfined, workspace)``, or ``None`` when the
             session has no workspace or spec to resolve.
         """
         from omnigent.inner.sandbox import declared_filesystem_reach
 
-        if not conversation.workspace:
+        workspace = workspace or conversation.workspace
+        if not workspace:
             return None
         spec = await asyncio.to_thread(
             _load_agent_spec_for_session,
@@ -752,13 +782,8 @@ def register_resources_routes(
         spec_os_env = getattr(spec, "os_env", None) if spec is not None else None
         if spec_os_env is None:
             return None
-        root = Path(conversation.workspace)
-        roots, unconfined = declared_filesystem_reach(root, spec_os_env)
-        return (
-            roots,
-            unconfined,
-            conversation.workspace,
-        )
+        roots, unconfined = declared_filesystem_reach(Path(workspace), spec_os_env)
+        return roots, unconfined, workspace
 
     def _runner_environment_segment(environment_id: str) -> str:
         """Preserve an environment identifier as one runner URL segment."""
@@ -2747,6 +2772,104 @@ def register_resources_routes(
                 "Session runner does not support content search; update the host and restart the session"
             ),
         )
+
+    @router.post(
+        "/sessions/{session_id}/workspace/direct-access",
+        response_model=None,
+        dependencies=[Depends(require_trusted_origin)],
+    )
+    async def create_workspace_direct_access(request: Request, session_id: str) -> dict[str, Any]:
+        """Give the session owner a short-lived token for its host's workspace socket.
+
+        The owner's desktop app, on the same machine as the host, uses it to call
+        the workspace API without a server round trip. Unconfined sessions only:
+        the host reads the workspace itself and applies no sandbox's hidden paths.
+        Any refusal leaves the client on the server route.
+        """
+        flags = getattr(request.app.state, "feature_flags", FeatureFlags())
+        if not flags.enabled(Feature.WORKSPACE_DIRECT_ACCESS):
+            raise HTTPException(status_code=404, detail="Workspace direct access is disabled")
+        conv, is_owner = await _authorize_browse_read_with_owner(session_id, request)
+        if not is_owner:
+            raise HTTPException(
+                status_code=403, detail="Only the session owner can read its workspace directly"
+            )
+        host_id, host, workspace = await _session_host(conv, request)
+        if host_id is None or host is None:
+            raise HTTPException(status_code=404, detail="The session's host is not connected")
+        socket_path = host.hello.workspace_socket
+        key = host.hello.workspace_token_key
+        if not socket_path or not key:
+            raise HTTPException(
+                status_code=404, detail="The session's host offers no direct access"
+            )
+        # The session's own spec decides confinement, even on an inherited host.
+        reach = await _environment_reach_for_session(conv, workspace)
+        if reach is None or not reach[1]:
+            raise HTTPException(
+                status_code=404, detail="Direct access serves unconfined sessions only"
+            )
+        token, expires_at = mint_token(
+            key, host_id=host_id, session_id=session_id, workspace=reach[2]
+        )
+        return {
+            "host_id": host_id,
+            "socket_path": socket_path,
+            "token": token,
+            "expires_at": expires_at,
+        }
+
+    @router.post("/sessions/{session_id}/workspace/{service}/{method}", response_model=None)
+    async def call_workspace_api(
+        request: Request, session_id: str, service: str, method: str
+    ) -> Response:
+        """Serve the workspace API to any client, answered by the session's host.
+
+        Same read gate as the file routes; the API never takes absolute paths.
+        Side chats and sub-agents use the host and workspace of the session that
+        owns them. Unconfined sessions only, because the host applies no sandbox's
+        hidden paths. A host on another replica gets the REST wrong-replica error,
+        so the client's fetch re-addresses it; other refusals are Connect errors.
+        """
+        flags = getattr(request.app.state, "feature_flags", FeatureFlags())
+        if not flags.enabled(Feature.WORKSPACE_API_SERVER_ACCESS):
+            raise HTTPException(status_code=404, detail="The workspace API is disabled")
+        try:
+            from connectrpc.code import Code
+        except ImportError:
+            raise HTTPException(
+                status_code=501, detail="The workspace API needs `omnigent[workspace-api]`"
+            ) from None
+        from connectrpc.errors import ConnectError
+
+        from omnigent.api.workspace.v1alpha1.workspace_connect import (
+            WorkspaceServiceASGIApplication,
+        )
+        from omnigent.host.frames import CAP_WORKSPACE_API
+        from omnigent.server.workspace_api import (
+            ConnectCallResponse,
+            HostTarget,
+            HostWorkspaceService,
+        )
+
+        conv = await _authorize_browse_read(session_id, request)
+        _host_id, host, workspace = await _session_host(conv, request)
+        # The session's own spec decides confinement, even on an inherited host.
+        reach = await _environment_reach_for_session(conv, workspace) if host is not None else None
+        target: HostTarget | ConnectError
+        if host is None or host_registry is None:
+            target = ConnectError(Code.UNAVAILABLE, "The session's host is not connected")
+        elif CAP_WORKSPACE_API not in host.hello.capabilities:
+            target = ConnectError(Code.UNIMPLEMENTED, "The session's host needs an update")
+        elif reach is None or not reach[1]:
+            target = ConnectError(
+                Code.FAILED_PRECONDITION, "The workspace API serves unconfined sessions only"
+            )
+        else:
+            target = HostTarget(host_registry, host, reach[2])
+        app = WorkspaceServiceASGIApplication(HostWorkspaceService(target))
+        # connectrpc types ASGI with asgiref's TypedDicts; Starlette's are plain mappings.
+        return ConnectCallResponse(cast("ASGIApp", app), f"/{service}/{method}")
 
     @router.get(
         "/sessions/{session_id}/resources/environments/{environment_id}/search",

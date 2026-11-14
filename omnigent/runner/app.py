@@ -1337,6 +1337,7 @@ def create_runner_app(
     process_manager: HarnessProcessManager | None = None,
     spec_resolver: SpecResolver | None = None,
     server_client: httpx.AsyncClient,
+    mcp_reattach_client_factory: Callable[[], httpx.AsyncClient] | None = None,
     terminal_registry: TerminalRegistry | None = None,
     resource_registry: SessionResourceRegistry | None = None,
     runner_workspace: Path | None = None,
@@ -1359,6 +1360,8 @@ def create_runner_app(
         elicitation/approval forwarding.
         In-process: pointed at the Omnigent ASGI app.
         Out-of-process: pointed at the server's HTTP URL.
+    :param mcp_reattach_client_factory: Open an independently owned server client
+        after a tunnel reconnect, preserving server authentication and routing.
     :param terminal_registry: TerminalRegistry instance for
         runner-local terminal tool dispatch (Phase 2).
         ``None`` → terminal tools relay upstream.
@@ -4095,6 +4098,7 @@ def create_runner_app(
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
+        await _native_runtime.teardown_codex_native_app_server(session_id)
         await _cancel_auto_forwarder_task(session_id)
         # Close any OpenCode server that no forwarder adopted.
         await _native_runtime.teardown_opencode_native_server(session_id)
@@ -4262,6 +4266,10 @@ def create_runner_app(
         source_error: Mapping[str, object] | None = None,
         response_id: str | None = None,
     ) -> None:
+        if status == "running":
+            # A new turn pulls any backed-off native idle watcher back to the
+            # base cadence so session status tracks the turn, not a slow poll.
+            resource_registry.wake_session_terminal_watchers(conv_id)
         if status == "waiting" and not (
             _server_version is not None and _version_supports_waiting_status(_server_version)
         ):
@@ -5762,6 +5770,7 @@ def create_runner_app(
                 server_client,
                 publish_event=_publish_event,
                 execution_registry=mcp_execution_registry,
+                reattach_client_factory=mcp_reattach_client_factory,
             ).call_tool(relay_spec, name, arguments)
             try:
                 return cast(_JsonObject, _json.loads(result_str))
@@ -6332,6 +6341,7 @@ def create_runner_app(
                     conv,
                     server_client,
                     execution_registry=mcp_execution_registry,
+                    reattach_client_factory=mcp_reattach_client_factory,
                 )
                 try:
                     mcp_result = await _session_mcp_proxy.schemas_for(
@@ -6737,6 +6747,7 @@ def create_runner_app(
                 conv_id,
                 server_client,
                 execution_registry=mcp_execution_registry,
+                reattach_client_factory=mcp_reattach_client_factory,
             )
             if _eager_spec_error is None and _turn_spec is not None:
                 try:
@@ -7336,6 +7347,7 @@ def create_runner_app(
                                             server_client,
                                             publish_event=_publish_event,
                                             execution_registry=mcp_execution_registry,
+                                            reattach_client_factory=mcp_reattach_client_factory,
                                         )
                                         _dispatch_tasks.append(
                                             _asyncio.create_task(
@@ -9392,14 +9404,9 @@ def create_runner_app_from_env() -> FastAPI:
     server_url = os.environ.get("RUNNER_SERVER_URL", "").strip()
     if not server_url:
         raise RuntimeError("RUNNER_SERVER_URL is required for the runner subprocess factory")
-    from omnigent_client._http import is_loopback_url
+    from omnigent.cli_auth import open_server_client
 
-    server_client = httpx.AsyncClient(
-        base_url=server_url,
-        timeout=httpx.Timeout(5.0, read=None),
-        # A proxy cannot reach a loopback server, so local targets bypass it.
-        trust_env=not is_loopback_url(server_url),
-    )
+    server_client = open_server_client(server_url, timeout=httpx.Timeout(5.0, read=None))
     return create_runner_app(server_client=server_client)
 
 

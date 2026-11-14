@@ -1760,6 +1760,8 @@ class _WatcherCapture:
         was wired.
     :param on_tick: The per-tick callback the registry passed (drives the
         claude-native status-file poller), or ``None`` if none was wired.
+    :param idle_poll_backoff_allowed: The native idle-poll backoff gate the
+        registry passed, or ``None`` when no backoff gate was wired.
     :param idle_threshold_s: The per-watcher idle threshold the registry
         passed, or ``None`` for the module default.
     :param poll_interval_s: The per-watcher poll interval the registry
@@ -1771,6 +1773,7 @@ class _WatcherCapture:
     on_idle: Callable[[], None] | None = None
     on_exit: Callable[[], None] | None = None
     on_tick: Callable[[], None] | None = None
+    idle_poll_backoff_allowed: Callable[[], bool] | None = None
     idle_threshold_s: float | None = None
     poll_interval_s: float | None = None
     replace: bool = False
@@ -1806,6 +1809,7 @@ def _make_capturing_instance(
         on_activity: Callable[[], None] | None = None,
         on_exit: Callable[[], None] | None = None,
         on_tick: Callable[[], None] | None = None,
+        idle_poll_backoff_allowed: Callable[[], bool] | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         replace: bool = False,
@@ -1815,6 +1819,7 @@ def _make_capturing_instance(
         capture.on_activity = on_activity
         capture.on_exit = on_exit
         capture.on_tick = on_tick
+        capture.idle_poll_backoff_allowed = idle_poll_backoff_allowed
         capture.idle_threshold_s = idle_threshold_s
         capture.poll_interval_s = poll_interval_s
         capture.replace = replace
