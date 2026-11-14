@@ -130,6 +130,15 @@ def resolve_antigravity_credentials() -> AntigravityCredentials | None:
     key_env = getenv_nonempty_with_omnigent_prefix("GEMINI_API_KEY")
     if key_env is None:
         return None
+    # An ambient ``GEMINI_API_KEY`` exported for other tooling must not preempt
+    # a persisted OAuth login — the key pins the session to that key's project
+    # quota (free-tier 429s) while the subscription sits unused. The
+    # ``OMNIGENT_``-prefixed variant stays honored as an explicit opt-in.
+    if key_env[0] == "GEMINI_API_KEY":
+        from omnigent.onboarding.gemini_auth import gemini_oauth_login_detected
+
+        if gemini_oauth_login_detected():
+            return None
     endpoint = getenv_nonempty_with_omnigent_prefix(GEMINI_BASE_URL_ENV)
     return AntigravityCredentials(
         key_env[1].strip(),

@@ -32,6 +32,9 @@ def isolated_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
     )
     monkeypatch.setattr("omnigent.onboarding.gemini_auth.gemini_login_detected", lambda: False)
     monkeypatch.setattr(
+        "omnigent.onboarding.gemini_auth.gemini_oauth_login_detected", lambda: False
+    )
+    monkeypatch.setattr(
         "omnigent.harnesses.antigravity_native.launch.gemini_auth_has_credential", lambda: False
     )
 
@@ -156,6 +159,29 @@ def test_ambient_gateway(monkeypatch: pytest.MonkeyPatch, prefix: str) -> None:
     monkeypatch.setenv(prefix + "GEMINI_API_KEY", "ambient-fake")
     monkeypatch.setenv(prefix + "GOOGLE_GEMINI_BASE_URL", "https://ambient.example/gemini/")
     assert resolve_antigravity_credentials().base_url == "https://ambient.example/gemini"
+
+
+def test_ambient_key_loses_to_persisted_oauth_login(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stray ambient key must not preempt the subscription login (#13925)."""
+    monkeypatch.setenv("GEMINI_API_KEY", "ambient-fake")
+    monkeypatch.setenv("GOOGLE_GEMINI_BASE_URL", "https://ambient.example/gemini/")
+    monkeypatch.setattr(
+        "omnigent.onboarding.gemini_auth.gemini_oauth_login_detected", lambda: True
+    )
+    assert resolve_antigravity_credentials() is None
+
+
+def test_prefixed_key_stays_an_explicit_opt_in_over_oauth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``OMNIGENT_GEMINI_API_KEY`` is deliberate, so it keeps precedence."""
+    monkeypatch.setenv("OMNIGENT_GEMINI_API_KEY", "explicit-fake")
+    monkeypatch.setattr(
+        "omnigent.onboarding.gemini_auth.gemini_oauth_login_detected", lambda: True
+    )
+    credentials = resolve_antigravity_credentials()
+    assert credentials is not None
+    assert credentials.api_key == "explicit-fake"
 
 
 def test_oauth_fallback_removes_bridge_owned_gemini_provider(
