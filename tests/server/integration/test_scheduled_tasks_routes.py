@@ -94,6 +94,7 @@ def _build_app(
     tmp_path: Path,
     *,
     persistent: bool = False,
+    one_time: bool = False,
     local_single_user: bool = False,
     projects: bool = True,
     automations: bool | Callable[[], bool] | None = None,
@@ -119,7 +120,12 @@ def _build_app(
         automations=automations,
         auth_provider=UnifiedAuthProvider(source="header", local_single_user=local_single_user),
         feature_flags=resolve_feature_flags(
-            {"OMNIGENT_FEATURES": "automations_v2" if persistent else "-automations_v2"}
+            {
+                "OMNIGENT_FEATURES": (
+                    ("automations_v2" if persistent else "-automations_v2")
+                    + (",one_time_automations" if one_time else "")
+                )
+            }
         ),
         server_config={"scheduled_task_scheduler": {"startup_retry_seconds": 0.01}},
         scheduled_task_dispatch=(
@@ -135,7 +141,16 @@ def _build_app(
 def auth_app(
     runtime_init: None, db_uri: str, tmp_path: Path, request: pytest.FixtureRequest
 ) -> FastAPI:
-    app = _build_app(db_uri, tmp_path, persistent=getattr(request, "param", False))
+    # ``True`` turns on the database scheduler; ``"one_time"`` also enables
+    # one-time automations on it; ``"one_time_without_dispatch"`` enables only
+    # the release feature, which needs the database scheduler to take effect.
+    param = getattr(request, "param", False)
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        persistent=param in (True, "one_time"),
+        one_time=param in ("one_time", "one_time_without_dispatch"),
+    )
     _make_user(db_uri)
     _register_host(app, "4b653f6031f35d168cc0b37caa1306d1", "alice@example.com")
     return app
@@ -739,6 +754,214 @@ async def test_create_rejects_invalid_rrule(auth_client: httpx.AsyncClient, db_u
     assert resp.status_code == 400, resp.text
 
     assert not [row for row in rows if row["event_name"] == "scheduled_task_created"]
+
+
+def _one_time_rule_in(hours: int) -> tuple[str, int]:
+    """A reminder's one-time rule for whole-minute UTC time *hours* from now."""
+    from datetime import UTC, datetime, timedelta
+
+    from omnigent.tools.builtins.scheduled_tasks import reminder_rrule
+
+    when = (datetime.now(UTC) + timedelta(hours=hours)).replace(second=0, microsecond=0)
+    return reminder_rrule(when), int(when.timestamp())
+
+
+@pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
+async def test_database_scheduler_accepts_a_one_time_rule(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    # Its single run and completion are covered by the dispatcher's exhaustion test.
+    info = (await auth_client.get("/v1/info", headers=_headers())).json()
+    assert info["scheduled_task_one_time"] is True
+    rule, fire_at = _one_time_rule_in(hours=2)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(rrule=rule, timezone="UTC", first_run_at=fire_at),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    task = SqlAlchemyScheduledTaskStore(db_uri).get(created.json()["id"])
+    assert task is not None
+    assert (task.state, task.next_run_at) == ("active", fire_at)
+
+    # An edit that keeps the rule is revalidated with the same allowance.
+    renamed = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task.id}",
+        json={"name": "renamed", "session_mode": "new"},
+        headers=_headers(),
+    )
+    assert renamed.status_code == 200, renamed.text
+
+
+@pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
+async def test_the_reminder_tools_request_continues_its_session(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    from datetime import UTC, datetime
+
+    from omnigent.tools.builtins.scheduled_tasks import reminder_name, reminder_prompt
+
+    session_id = _owned_session(db_uri)
+    rule, fire_at = _one_time_rule_in(hours=2)
+    when = datetime.fromtimestamp(fire_at, UTC)
+    # The request body sys_reminder_set sends: no host or workspace, the session's own
+    # agent, no permission override, and the first run pinned to the reminder's minute.
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json={
+            "name": reminder_name("Check CI"),
+            "prompt": reminder_prompt("Check CI", when),
+            "rrule": rule,
+            "timezone": "UTC",
+            "agent_id": builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
+            "permission_mode": None,
+            "session_mode": "continue",
+            "session_id": session_id,
+            "kind": "reminder",
+            "first_run_at": fire_at,
+        },
+        headers={**_headers(), "x-omnigent-automation-source": "agent"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["kind"] == "reminder"
+    task = SqlAlchemyScheduledTaskStore(db_uri).get(resp.json()["id"])
+    assert task is not None
+    assert (task.session_mode, task.session_id, task.kind) == ("continue", session_id, "reminder")
+    assert task.agent_id == builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME)
+    assert (task.permission_mode, task.state, task.next_run_at) == (None, "active", fire_at)
+
+
+@pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
+async def test_the_list_leaves_reminders_out_until_an_edit_makes_one_an_automation(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session_id = _owned_session(db_uri)
+    rule, fire_at = _one_time_rule_in(hours=2)
+    reminder = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json={
+            "name": "Reminder: check CI",
+            "prompt": "check CI",
+            "rrule": rule,
+            "timezone": "UTC",
+            "agent_id": builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
+            "session_mode": "continue",
+            "session_id": session_id,
+            "kind": "reminder",
+            "first_run_at": fire_at,
+        },
+        headers=_headers(),
+    )
+    assert reminder.status_code == 200, reminder.text
+    automation = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    )
+    assert automation.status_code == 200, automation.text
+
+    async def listed(params: dict[str, str]) -> list[str]:
+        resp = await auth_client.get("/v1/scheduled-tasks", params=params, headers=_headers())
+        assert resp.status_code == 200, resp.text
+        return sorted(t["id"] for t in resp.json()["scheduled_tasks"])
+
+    reminder_id, automation_id = reminder.json()["id"], automation.json()["id"]
+    assert await listed({}) == [automation_id]
+    assert await listed({"kind": "automation"}) == [automation_id]
+    assert await listed({"kind": "all"}) == sorted([reminder_id, automation_id])
+    # A reminder left off the list still opens by id, for example from the Inbox.
+    opened = await auth_client.get(f"/v1/scheduled-tasks/{reminder_id}", headers=_headers())
+    assert opened.status_code == 200, opened.text
+    # No reminders-only view: the list reads every task, so a selective filter would
+    # need an indexed, paginated query.
+    for kind in ("reminder", "trigger"):
+        bad = await auth_client.get(
+            "/v1/scheduled-tasks", params={"kind": kind}, headers=_headers()
+        )
+        assert bad.status_code == 422, bad.text
+
+    renamed = await auth_client.patch(
+        f"/v1/scheduled-tasks/{reminder_id}", json={"name": "renamed"}, headers=_headers()
+    )
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["kind"] == "reminder"
+    assert await listed({}) == [automation_id]
+
+    # The store tests cover every edit that demotes a reminder; this checks the route.
+    edited = await auth_client.patch(
+        f"/v1/scheduled-tasks/{reminder_id}",
+        json={"rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0"},
+        headers=_headers(),
+    )
+    assert edited.status_code == 200, edited.text
+    # The marker can't keep a recurring automation off the list.
+    assert edited.json()["kind"] == "automation"
+    assert SqlAlchemyScheduledTaskStore(db_uri).get(reminder_id).kind == "automation"
+    assert await listed({}) == sorted([reminder_id, automation_id])
+
+
+@pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
+async def test_late_create_refuses_a_one_time_rule_instead_of_moving_it_a_year(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The store tests cover each schedule outcome; this checks the route's 400.
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    rule, fire_at = _one_time_rule_in(hours=2)
+    # The request reaches the store a second after the requested minute, so the
+    # rule's next match would be the same minute a year later.
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: fire_at + 1)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(rrule=rule, timezone="UTC", first_run_at=fire_at),
+        headers=_headers(),
+    )
+    assert resp.status_code == 400, resp.text
+    assert "The task was not created." in resp.text
+    assert "may have arrived after that time" in resp.text
+    assert SqlAlchemyScheduledTaskStore(db_uri).list() == []
+
+
+# The legacy timer re-anchors COUNT at each re-arm, so it would fire a one-time rule
+# again. The database scheduler accepts one-time rules but doesn't create them
+# without one_time_automations, so a reminder can't reach an older scheduler that
+# would pause it.
+@pytest.mark.parametrize(
+    "auth_app",
+    [False, True, "one_time_without_dispatch"],
+    indirect=True,
+    ids=["legacy_timer", "no_release_feature", "release_feature_without_dispatch"],
+)
+async def test_servers_without_one_time_automations_refuse_them(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    info = (await auth_client.get("/v1/info", headers=_headers())).json()
+    assert info["scheduled_task_one_time"] is False
+    rule, fire_at = _one_time_rule_in(hours=2)
+    one_time = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(rrule=rule, timezone="UTC"), headers=_headers()
+    )
+    assert one_time.status_code == 400, one_time.text
+    assert "fires only once" in one_time.text
+    # A recurring rule passes RRULE validation, so this reaches the first_run_at gate.
+    guarded = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(first_run_at=fire_at), headers=_headers()
+    )
+    assert guarded.status_code == 400, guarded.text
+    assert "first_run_at needs one-time automations" in guarded.text
+    assert SqlAlchemyScheduledTaskStore(db_uri).list() == []
+    # An edit can't turn an existing task into a one-time one either.
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    edited = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created.json()['id']}", json={"rrule": rule}, headers=_headers()
+    )
+    assert edited.status_code == 400, edited.text
+    assert "fires only once" in edited.text
+    assert SqlAlchemyScheduledTaskStore(db_uri).get(created.json()["id"]).rrule == _VALID_RRULE
 
 
 async def test_create_rejects_unknown_agent(auth_client: httpx.AsyncClient, db_uri: str) -> None:
@@ -4085,8 +4308,8 @@ async def test_concurrent_schedule_edits_reject_stale_validation(
     validated = asyncio.Barrier(2)
     first_saved = asyncio.Event()
 
-    async def validate_together(rrule, session_mode, execution_target):
-        await validate(rrule, session_mode, execution_target)
+    async def validate_together(rrule, session_mode, execution_target, *, allow_single_fire):
+        await validate(rrule, session_mode, execution_target, allow_single_fire=allow_single_fire)
         await validated.wait()
         if (rrule == recurrence_patch["rrule"]) != recurrence_first:
             await first_saved.wait()

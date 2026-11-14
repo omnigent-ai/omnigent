@@ -353,8 +353,8 @@ tests/server/integration/test_session_orchestration.py --reruns 0` checks the
   normal destination permissions and policy checks. The check and subsequent
   dispatch/save are not one atomic transaction. Unsharing does not erase history.
 - For peer messages, an explicit wrong-replica refusal permits a bounded re-address.
-  If the subsequent host lookup fails, the task was not delivered. A successful
-  lookup with no host may still attempt legacy keyless delivery; uncertainty on
+  A failed or hostless lookup permits one legacy keyless delivery attempt.
+  Only its final outcome determines delivery; uncertainty on
   that POST remains uncertain. Timeouts,
   other refusals and unparseable delivery acknowledgements are never retried.
 - Scheduled origin is recorded before launch, cannot be edited by clients, and
