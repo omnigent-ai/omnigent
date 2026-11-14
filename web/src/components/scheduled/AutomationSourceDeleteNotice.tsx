@@ -76,6 +76,29 @@ export function AutomationSourceDeleteNotice({
   );
 }
 
+export function WorkflowAutomationDeleteNotice({
+  tasks,
+  onNavigate,
+}: {
+  tasks: ScheduledTask[];
+  onNavigate: () => void;
+}) {
+  return (
+    <AutomationDeleteCallout
+      title={
+        tasks.length === 1
+          ? "This workflow is used by an automation"
+          : `This workflow is used by ${tasks.length} automations`
+      }
+      testId="workflow-automation-delete-notice"
+    >
+      Future runs of <AutomationLinks tasks={tasks} onNavigate={onNavigate} /> won’t be able to load
+      this workflow. Edit or delete {tasks.length === 1 ? "the automation" : "these automations"}{" "}
+      first.
+    </AutomationDeleteCallout>
+  );
+}
+
 /** Bulk-delete warning naming the automations that run from the selected sessions. */
 export function AutomationSourcesDeleteNotice({
   taskIds,

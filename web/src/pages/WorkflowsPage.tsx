@@ -16,16 +16,13 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { showToast } from "@/components/ui/toast";
 import { NewWorkflowDialog } from "@/components/workflows/NewWorkflowDialog";
+import { DeleteWorkflowDialog } from "@/components/workflows/DeleteWorkflowDialog";
 import { WorkflowRow } from "@/components/workflows/WorkflowRow";
 import {
   type WorkflowSessionRequest,
   WorkflowSessionDialog,
 } from "@/components/workflows/WorkflowSessionDialog";
-import {
-  type SavedWorkflow,
-  useDeleteWorkflow,
-  useSavedWorkflows,
-} from "@/hooks/useSavedWorkflows";
+import { type SavedWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import { automationPagePath } from "@/lib/automationFromSession";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useNavigate } from "@/lib/routing";
@@ -34,11 +31,11 @@ import { useCreateWorkflowDraft } from "@/hooks/useWorkflow";
 export function WorkflowsPage() {
   const { workflows, isLoading, isError, refresh } = useSavedWorkflows();
   const createDraft = useCreateWorkflowDraft();
-  const deleteWorkflow = useDeleteWorkflow();
   const navigate = useNavigate();
   const info = useServerInfo();
   const [search, setSearch] = useState("");
   const [creating, setCreating] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<SavedWorkflow | null>(null);
   // The request stays set while its session dialog closes.
   const [sessionRequest, setSessionRequest] = useState<WorkflowSessionRequest | null>(null);
   const [sessionOpen, setSessionOpen] = useState(false);
@@ -125,16 +122,15 @@ export function WorkflowsPage() {
                 setAutomationTarget(workflow);
                 setAutomationOpen(true);
               }}
-              onDelete={() =>
-                deleteWorkflow.mutate(workflow.id, {
-                  onError: () => showToast(`Couldn’t delete “${workflow.name}”.`),
-                })
-              }
+              onDelete={() => setDeleteTarget(workflow)}
             />
           ))}
         </div>
       )}
 
+      {deleteTarget && (
+        <DeleteWorkflowDialog workflow={deleteTarget} onClose={() => setDeleteTarget(null)} />
+      )}
       <NewWorkflowDialog
         open={creating}
         onOpenChange={setCreating}
