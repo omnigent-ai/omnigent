@@ -25,7 +25,7 @@ import builtins
 import json
 import logging
 from collections.abc import AsyncIterator, Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 import httpx
@@ -222,6 +222,21 @@ class Session:
     :param usage_included: ``False`` when the snapshot was fetched with
         ``include_usage=false``, so ``total_cost_usd`` and
         ``usage_by_model`` are unknown rather than zero.
+    :param runner_online: ``True`` iff a runner tunnel is currently
+        registered for this session. ``None`` when liveness was not
+        requested, or the server has no liveness lookup wired; never a
+        stand-in for "offline".
+    :param host_online: Whether the session's host tunnel is live.
+        ``None`` when liveness was not requested, or the session has no
+        host (CLI/local).
+    :param host_resumable: Whether the session is bound to a dormant
+        managed host the server can wake in place. Read from the host
+        store rather than the liveness lookup, so the server sends it
+        either way; ``None`` only when an older server omits it.
+    :param items_included: ``False`` when the snapshot was fetched with
+        ``include_items=false``, or returned by a ``PATCH`` (which never
+        reads items). The server returns ``items=[]`` either way, so an
+        empty ``items`` means "none committed" only when this is ``True``.
     """
 
     id: str
@@ -252,6 +267,10 @@ class Session:
     total_cost_usd: float | None = None
     usage_by_model: dict[str, dict[str, Any]] | None = None
     usage_included: bool = True
+    runner_online: bool | None = None
+    host_online: bool | None = None
+    host_resumable: bool | None = None
+    items_included: bool = True
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Session:
@@ -297,9 +316,26 @@ class Session:
             total_cost_usd=float(raw_cost) if raw_cost is not None else None,
             usage_by_model=usage_raw if isinstance(usage_raw, dict) else None,
             usage_included=bool(raw.get("usage_included", True)),
+            runner_online=raw.get("runner_online"),
+            host_online=raw.get("host_online"),
+            host_resumable=raw.get("host_resumable"),
             host_id=raw.get("host_id"),
             sandbox_status=raw.get("sandbox_status"),
         )
+
+
+def _session_from_patch(resp: httpx.Response) -> Session:
+    """
+    Parse the snapshot a ``PATCH /v1/sessions/{id}`` returns.
+
+    The route always builds its snapshot without the committed-items read,
+    so the empty ``items`` it returns says nothing about the transcript.
+
+    :param resp: The PATCH response, already status-checked.
+    :returns: The snapshot with ``items_included`` marked ``False``.
+    """
+    session = Session.from_dict(require_json_object(resp, "PATCH /v1/sessions/{session_id}"))
+    return replace(session, items_included=False)
 
 
 @dataclass(frozen=True)
@@ -848,9 +884,7 @@ class SessionsNamespace:
             json={"runner_id": runner_id},
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.from_dict(
-            require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
-        )
+        return _session_from_patch(resp)
 
     async def unbind_runner(self, session_id: str) -> Session:
         """
@@ -871,9 +905,7 @@ class SessionsNamespace:
             json={"runner_id": ""},
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.from_dict(
-            require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
-        )
+        return _session_from_patch(resp)
 
     async def set_reasoning_effort(
         self,
@@ -902,9 +934,7 @@ class SessionsNamespace:
             json={"reasoning_effort": wire_effort},
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.from_dict(
-            require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
-        )
+        return _session_from_patch(resp)
 
     async def set_model_override(
         self,
@@ -947,9 +977,7 @@ class SessionsNamespace:
             json=body,
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.from_dict(
-            require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
-        )
+        return _session_from_patch(resp)
 
     async def set_archived(
         self,
@@ -981,9 +1009,7 @@ class SessionsNamespace:
             json={"archived": archived},
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.from_dict(
-            require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
-        )
+        return _session_from_patch(resp)
 
     async def set_external_session_id(
         self,
@@ -1016,9 +1042,7 @@ class SessionsNamespace:
             json={"external_session_id": external_session_id},
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.from_dict(
-            require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
-        )
+        return _session_from_patch(resp)
 
     async def set_labels(
         self,
@@ -1053,9 +1077,7 @@ class SessionsNamespace:
             json={"labels": labels},
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.from_dict(
-            require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
-        )
+        return _session_from_patch(resp)
 
     async def list_items(
         self,
@@ -1256,6 +1278,7 @@ class SessionsNamespace:
         include_liveness: bool = True,
         include_live_status: bool = True,
         include_usage: bool = True,
+        refresh_state: bool = False,
     ) -> Session:
         """
         Fetch the current snapshot of a session.
@@ -1270,6 +1293,17 @@ class SessionsNamespace:
         ``False`` are sent, so the default request is unchanged and older
         servers, which ignore unknown parameters, still answer.
 
+        A skipped flag leaves its fields unknown rather than empty: usage reads
+        ``None`` with ``usage_included=False``, liveness reads ``None``, and
+        ``items_included`` is ``False`` beside the empty ``items``.
+
+        Two things ``status`` does not tell a poller. It is the session's
+        current lifecycle state, not an outcome for one submitted turn, so
+        ``"idle"`` does not prove the turn this caller sent is the one that
+        finished; correlate a specific turn through the stream or its items.
+        And a skipped liveness lookup is not evidence the runner stopped:
+        ``runner_online`` reads ``None`` whether the runner is up or down.
+
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
         :param include_items: ``False`` skips the committed-items read
@@ -1279,6 +1313,11 @@ class SessionsNamespace:
         :param include_live_status: ``False`` reports the cached status
             instead of probing the bound runner.
         :param include_usage: ``False`` skips the subtree usage read.
+        :param refresh_state: ``True`` refreshes runner-derived overlays from
+            the live session instead of serving cached state. It drops the
+            server's cached catalogs for this session, which every client of it
+            shares, so use it to recover from stale state rather than on each
+            poll.
         :returns: The current :class:`Session` snapshot.
         :raises OmnigentError: If the server returns a non-2xx
             status (404 when the session does not exist).
@@ -1290,12 +1329,17 @@ class SessionsNamespace:
             "include_usage": include_usage,
         }
         params = {name: "false" for name, enabled in flags.items() if not enabled}
+        if refresh_state:
+            params["refresh_state"] = "true"
         resp = await self._http.get(
             session_url(self._base, session_id),
             params=params or None,
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.from_dict(require_json_object(resp, "GET /v1/sessions/{session_id}"))
+        session = Session.from_dict(require_json_object(resp, "GET /v1/sessions/{session_id}"))
+        # The server returns items=[] whether they were excluded or the
+        # session has none, so the request is what tells the two apart.
+        return replace(session, items_included=include_items)
 
     async def delete(
         self,
