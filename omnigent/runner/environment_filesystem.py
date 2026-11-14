@@ -230,15 +230,71 @@ def _lstat_beneath(root: Path, rel: str) -> os.stat_result | None:
         except OSError:
             return None
     try:
-        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        fd = _open_directory_beneath(root, parts[:-1])
     except OSError:
         return None
     try:
-        for name in parts[:-1]:
-            nfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=fd)
-            os.close(fd)
-            fd = nfd
         return os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _open_directory_beneath(root: Path, parts: Sequence[str], *, follow_root: bool = True) -> int:
+    """Open *root*/*parts* as a directory, opening each part ``O_NOFOLLOW``.
+
+    :param follow_root: Whether *root* itself may be a symlink.
+    :raises OSError: When a part is missing, a symlink or not a directory.
+    """
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | (0 if follow_root else os.O_NOFOLLOW))
+    try:
+        for name in parts:
+            next_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def read_regular_file_beneath(root: Path, rel: str, max_bytes: int) -> bytes | None:
+    """Read at most ``max_bytes + 1`` bytes of the regular file *root*/*rel*.
+
+    Like :func:`_lstat_beneath`, no component may be a symlink, even if one
+    is swapped in mid-read, and a FIFO cannot block the open. Unlike it,
+    *root* itself may not be a symlink and *rel* may not step outside it.
+
+    :param root: Absolute, resolved directory the path is relative to.
+    :param rel: ``/``-separated path relative to *root*.
+    :param max_bytes: Read cap; one more byte is read so callers see overflow.
+    :returns: The bytes read, or ``None`` when the path is unsafe, not a
+        regular file or unreadable, or the platform lacks ``dir_fd`` support.
+    """
+    parts = rel.split("/")
+    if not _BENEATH_SUPPORTED or any(part in ("", ".", "..") for part in parts):
+        return None
+    try:
+        parent = _open_directory_beneath(root, parts[:-1], follow_root=False)
+    except OSError:
+        return None
+    try:
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+    except OSError:
+        return None
+    finally:
+        os.close(parent)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        # A short read is not EOF; keep reading until EOF or the cap.
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0 and (chunk := os.read(fd, remaining)):
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
     except OSError:
         return None
     finally:

@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import { SessionCostButton, SessionOverview } from "./SessionOverview";
 
+vi.mock("./SessionOverviewSubagents", () => ({ SessionOverviewSubagents: () => null }));
+
 beforeEach(() => {
   useChatStore.setState({
     sessionCostUsd: null,

@@ -3261,6 +3261,29 @@ async def test_continue_starts_a_new_session_when_the_old_one_was_deleted() -> N
 
 
 @pytest.mark.asyncio
+async def test_a_one_time_task_fails_instead_of_replacing_its_deleted_session() -> None:
+    """A reminder belongs to its session: with the session gone, nothing runs elsewhere."""
+    conv_store = _ExistingConversationStore()  # conv_prev is gone
+    reminder = _continuing_task(
+        rrule="FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=12;BYHOUR=23;BYMINUTE=0;BYSECOND=0;COUNT=1"
+    )
+    store = FakeScheduledTaskStore(rows={"task_1": reminder})
+
+    launched = await _fire_once(_deps(store, conversation_store=conv_store))
+
+    assert launched == []
+    assert conv_store.created == []
+    assert store.released == []
+    assert store.adopted == []
+    assert [(run["status"], run.get("error_code")) for run in store.runs] == [
+        ("failed", "continued_session_missing")
+    ]
+    # It has no next run, so the hint for recurring tasks would mislead.
+    assert "next run" not in store.runs[0]["error"]
+    assert "set a new reminder" in store.runs[0]["error"]
+
+
+@pytest.mark.asyncio
 async def test_continue_follows_a_replacement_another_run_recorded_first() -> None:
     """Two runs find the session gone; the loser continues the winner's new session."""
     conv_store = _ExistingConversationStore(_continued_session(id="conv_new"))

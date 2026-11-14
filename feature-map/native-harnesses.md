@@ -223,6 +223,13 @@ interface creating the fork. Gateway requests carry `Databricks-Custom-Coding-Ag
 creating interface use `omnigent` as a fallback.
 Routes configured by ug retain the additional `ug` surface.
 
+**Reminders:** on a server with `automations_v2` and `one_time_automations`,
+ask a native session to remind it later ("remind me in 45 minutes to check CI").
+The agent calls `sys_reminder_set`, an approval card shows the resolved time and
+the full message, and after approval the message arrives in the same session at
+that time. See the reminder recipe under "Driving it with the repro
+environment".
+
 **Agent instructions:** supported native startup paths add Omnigent's guidance
 to embed existing workspace screenshots in replies using their real file paths.
 After upgrading, start a new session or restart/cold-resume an existing one to
@@ -1439,6 +1446,24 @@ app-server's MCP client. This isolates the relay's unchanged 300-second executio
 budget; it does not prove the default client can wait for a full approval day.
 With the default client deadline, cancellation must clear the approval without
 creating the automation. Record the client configuration with the evidence.
+
+Native sessions also get `sys_reminder_set`, which parks on the same approval
+gate with a shorter prompt: the reminder's time, resolved as the tool will
+(`at <UTC minute> UTC`, or `N seconds after approval, rounded up to the next
+minute`), and its full message, which arrives later as a new turn in the same
+session.
+`tests/policies/builtins/test_safety.py::test_ask_on_scheduled_task_change_asks_for_a_reminder`
+covers the prompt, `::test_reminder_approval_shows_the_resolved_time_whatever_the_raw_text`
+covers padded and long-fraction times, and `::test_reminder_approval_denies_a_time_the_tool_would_reject`
+and `::test_ask_on_scheduled_task_change_denies_a_reminder_without_message` cover
+the denies. For a human check in an isolated instance
+started with `OMNIGENT_FEATURES=one_time_automations` (one-time automations are
+off by default; the database scheduler, `automations_v2`, is on by default; without
+either the tool refuses), ask a native session to remind it in 15 minutes. Reject the approval and
+confirm `sys_scheduled_task_list` shows no `Reminder: ...` task. Ask again,
+approve, and confirm the list shows one while the Automations page does not, that
+the message arrives as a new turn about 15 minutes later, and that
+`GET /v1/scheduled-tasks/{id}` then reports it `completed`.
 
 ## Gotchas
 

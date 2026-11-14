@@ -184,6 +184,15 @@ Actual Size, then collapse/reopen the sidebar and open Settings.
    `fixed-<facet>`), then write the journey `caption` for the handoff exactly as
    the other lanes do (see `dev/repro-agent/AGENTS.md`, Step 4).
 
+## Security-key notice
+
+`desktop_browser_webauthn_prompt.e2e.js` opens an Okta-style verify page in a
+session's Browser tab. That page requests a WebAuthn assertion that nothing can
+answer. The test checks that the shell's security-key notice appears for the
+page's origin while the request is still pending. Its **Open in browser** button
+must hand the same URL to `fixtures/fakeSystemBrowser.cjs`. It runs on Linux
+under `xvfb-run` and needs no security key.
+
 ## Navigation policy runtime boundary
 
 `desktop_navigation_policy.e2e.js` uses the production partition hooks in a real

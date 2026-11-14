@@ -655,6 +655,7 @@ class WorkspaceReader:
                 "modified_at": rec.get("modified_at"),
                 "lines_added": rec.get("lines_added"),
                 "lines_removed": rec.get("lines_removed"),
+                "untracked_lines": rec.get("untracked_lines"),
             }
             for rec in raw_changes
         ]
