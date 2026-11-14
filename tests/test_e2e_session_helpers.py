@@ -257,6 +257,36 @@ def test_pending_tool_poll_waits_for_this_turn(monkeypatch, previous_call) -> No
             for label in ("passwd", "credentials", "api.key")
             for location in ("key", "leaf")
         ],
+        *[
+            pytest.param(
+                {
+                    label: "synthetic-direct-tail",
+                    "details": [
+                        {label: {"value": "synthetic-object-tail"}},
+                        {label: ["synthetic-list-tail"]},
+                        {label: 'prefix"synthetic-escaped-tail\\\n\tend'},
+                    ],
+                }
+                if location == "field"
+                else {
+                    "details": [
+                        f"{label}: session=synthetic-direct-tail",
+                        f'{label}: prefix"synthetic-escaped-tail\\\n\tend',
+                    ]
+                },
+                (
+                    "synthetic-direct-tail",
+                    "synthetic-object-tail",
+                    "synthetic-list-tail",
+                    "synthetic-escaped-tail",
+                )
+                if location == "field"
+                else ("synthetic-direct-tail", "synthetic-escaped-tail"),
+                id=f"{label}-direct-{location}",
+            )
+            for label in ("passphrase", "Cookie", "Set-Cookie", "private_key")
+            for location in ("field", "leaf")
+        ],
     ],
 )
 def test_native_create_failure_keeps_bounded_redacted_response(

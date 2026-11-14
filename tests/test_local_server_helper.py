@@ -2,7 +2,9 @@
 
 import os
 import subprocess
+from contextlib import ExitStack
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -48,12 +50,46 @@ def test_startup_exit_reports_log_and_reaps_child(tmp_path: Path, monkeypatch: p
     assert len(children) == 1 and children[0].returncode == 23
 
 
-@pytest.mark.parametrize("inherit_env", [True, False])
-@pytest.mark.parametrize("failing_process", ["server", "runner"])
+@pytest.mark.parametrize(
+    ("failing_process", "inherit_env"),
+    [
+        ("server", True),
+        ("runner", True),
+        ("server", False),
+        ("runner", False),
+        pytest.param("host-identity", False, id="host-identity"),
+    ],
+)
 def test_stack_startup_failure_closes_started_processes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing_process: str, inherit_env: bool
 ):
-    from tests._helpers.server_runner import server_runner
+    from tests._helpers.server_runner import ServerRunner, server_runner
+
+    if failing_process == "host-identity":
+        with ExitStack() as resources:
+            stack = ServerRunner(
+                tmp_path,
+                resources,
+                server_bootstrap=None,
+                server_env={},
+                base_env={},
+                server_cwd=None,
+                workspace=None,
+                database_uri=None,
+                artifact_location=None,
+                binding_token="example-token",
+                health_timeout=1,
+                poll_interval=0,
+            )
+            spawn = Mock(side_effect=AssertionError("Host identity overrides must not spawn"))
+            monkeypatch.setattr(stack, "_spawn", spawn)
+            for key in ("OMNIGENT_HOST_ID", "OMNIGENT_HOST_NAME"):
+                for value in ("invalid", None):
+                    with pytest.raises(ValueError, match="Host identity is owned"):
+                        stack.start_host(env={key: value})
+                    assert stack.host is None
+            spawn.assert_not_called()
+        return
 
     children = []
     real_popen = subprocess.Popen

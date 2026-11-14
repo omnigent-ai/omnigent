@@ -30,7 +30,8 @@ from tests._helpers.session import bundle_files, post_session_bundle
 NativeHarness = Literal["antigravity", "claude", "codex", "cursor", "goose", "kiro", "hermes"]
 
 _SENSITIVE_RESPONSE_KEY_PATTERN = re.compile(
-    r"authorization|token|secret|password|passwd|credential|api[\s_.-]*key",
+    r"authorization|token|secret|password|passwd|passphrase|credential|cookie"
+    r"|(?:api|private)[\s_.-]*key",
     re.IGNORECASE,
 )
 _MAX_DIAGNOSTIC_RESPONSE_BYTES = 16 * 1024
