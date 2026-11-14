@@ -15,7 +15,7 @@ and every index ends with ``position, created_at``. Keeping ``created_at`` in
 the primary key, with no unique key that leaves it out, lets a deployment
 partition the table by time with pure DDL. So the heads lock, not the
 database, keeps positions and idempotency keys unique, as the conversation
-lock does for conversation items. The payload is the entry's compressed
+lock does for conversation items. ``content`` is the entry's compressed
 JSON, which the journal store keeps under 16,384 stored bytes. ``kind`` has
 no CHECK, so adding a kind needs no migration. The tables have no database
 defaults: writes name the workspace. ``workflow_id`` is nullable and
@@ -82,7 +82,7 @@ def upgrade() -> None:
         sa.Column("workflow_id", Uuid16(), nullable=True),
         sa.Column("step", sa.String(64), nullable=True),
         sa.Column("idempotency_key", sa.String(128), nullable=False),
-        sa.Column("payload", sa.LargeBinary(), nullable=False),
+        sa.Column("content", sa.LargeBinary(), nullable=False),
         sa.PrimaryKeyConstraint("workspace_id", "conversation_id", "position", "created_at"),
     )
     for name, columns in _INDEXES.items():

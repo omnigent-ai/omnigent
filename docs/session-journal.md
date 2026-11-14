@@ -413,5 +413,5 @@ Entries live in `session_journal_entries`, beside the session metadata, keyed by
 workspace, session, position and creation time; `session_journal_heads` holds
 each session's next position. An append locks only its session's heads row, so
 one session's appends run in order without slowing other sessions or the
-session's own metadata updates. Payloads are compressed JSON, at most 16,383
-bytes stored.
+session's own metadata updates. An entry's `content` is compressed JSON, at
+most 16,383 bytes stored.

@@ -60,7 +60,7 @@ class InvalidJournalEntryError(ValueError):
 
 
 class JournalEntryTooLargeError(InvalidJournalEntryError):
-    """An entry is over a size limit: a kind's raw limit, or the stored-payload limit.
+    """An entry is over a size limit: a kind's raw limit, or the stored-content limit.
 
     :param what: What is too large, e.g. ``"body"``.
     :param size: Its size, in bytes.
