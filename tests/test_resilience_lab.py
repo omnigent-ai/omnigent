@@ -25,6 +25,7 @@ from tests.e2e.resilience.lab.lab import Lab
         pytest.param("server-runner", "deadline", id="server-runner-deadline"),
         pytest.param("lab", "remaining-budget", id="lab-rpc-remaining-budget"),
         pytest.param("lab", "late-success", id="lab-rpc-late-success"),
+        pytest.param("lab", "final-sleep-budget", id="lab-final-sleep-budget"),
         pytest.param("server-runner", "remaining-budget", id="server-runner-rpc-remaining-budget"),
         pytest.param("server-runner", "late-success", id="server-runner-rpc-late-success"),
         pytest.param("lab", "host-exit", id="lab-host-exit"),
@@ -43,7 +44,7 @@ def test_host_startup_waits_for_rpc_when_online_row_precedes_tunnel(
     rpc_timeouts = []
 
     def advance_clock(seconds: float) -> None:
-        clock.now += max(seconds, 0.1)
+        clock.now += seconds if scenario == "final-sleep-budget" else max(seconds, 0.1)
 
     sleep = Mock(side_effect=advance_clock)
 
@@ -73,6 +74,8 @@ def test_host_startup_waits_for_rpc_when_online_row_precedes_tunnel(
                 raise httpx.ReadTimeout("host tunnel is not ready", request=request)
             if scenario in {"remaining-budget", "late-success"}:
                 clock.now = 0.75
+            if scenario == "final-sleep-budget":
+                clock.now = 0.99
             return httpx.Response(
                 409, json={"error": {"code": "conflict", "message": "host is offline"}}
             )
@@ -103,8 +106,11 @@ def test_host_startup_waits_for_rpc_when_online_row_precedes_tunnel(
                 "tests.e2e.resilience.lab.lab.time",
                 SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep),
             )
-            monkeypatch.setattr("tests.e2e.resilience.lab.lab._POLL_S", 0)
-            if scenario in {"remaining-budget", "late-success"}:
+            monkeypatch.setattr(
+                "tests.e2e.resilience.lab.lab._POLL_S",
+                0.25 if scenario == "final-sleep-budget" else 0,
+            )
+            if scenario in {"remaining-budget", "late-success", "final-sleep-budget"}:
                 monkeypatch.setattr("tests.e2e.resilience.lab.lab._STARTUP_TIMEOUT_S", 1.0)
             start_host = lab._start_host
         else:
@@ -148,13 +154,18 @@ def test_host_startup_waits_for_rpc_when_online_row_precedes_tunnel(
             assert "host-startup-marker" in str(raised.value)
             assert not request_timeouts, "An exited host must fail before any readiness request"
             sleep.assert_not_called()
-        elif scenario in {"deadline", "late-success"}:
+        elif scenario in {"deadline", "late-success", "final-sleep-budget"}:
             error = TimeoutError if helper == "lab" else AssertionError
             with pytest.raises(error, match=r"host daemon|never became ready"):
                 start_host()
             if scenario == "deadline":
                 assert not rpc_ready, "No host RPC may start after the readiness deadline"
                 assert request_timeouts[0]["read"] <= 1.0
+            elif scenario == "final-sleep-budget":
+                assert not rpc_ready
+                assert len(request_timeouts) == len(rpc_timeouts) == 1
+                sleep.assert_called_once_with(pytest.approx(0.01))
+                assert clock.now == pytest.approx(1.0)
             else:
                 assert rpc_ready, "The deadline must reject the late successful RPC"
         else:

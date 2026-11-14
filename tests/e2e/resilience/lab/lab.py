@@ -159,9 +159,10 @@ def wait_for(predicate: Callable[[], T | None], *, timeout: float, what: str) ->
         value = predicate()
         if value is not None:
             return value
-        if time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             raise TimeoutError(f"timed out after {timeout}s waiting for {what}")
-        time.sleep(_POLL_S)
+        time.sleep(min(_POLL_S, remaining))
 
 
 def _write_yaml(path: Path, value: dict[str, Any]) -> None:

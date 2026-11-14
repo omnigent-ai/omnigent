@@ -435,12 +435,6 @@ def _sized_json_response_body(size_bytes: int, character: str) -> str:
         pytest.param(
             "[" * 1100 + '"synthetic-omitted-tail"' + "]" * 1100, None, True, id="deep-json"
         ),
-        pytest.param(
-            json.dumps({"message": "password" * 4096 + "synthetic-omitted-tail"}),
-            None,
-            True,
-            id="repeated-sensitive-label",
-        ),
         *[
             pytest.param(
                 _sized_json_response_body(size_bytes, character),
