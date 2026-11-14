@@ -35,7 +35,8 @@ import {
   writeWorkspacePickerSort,
   type WorkspacePickerSort,
 } from "@/lib/workspacePickerPreferences";
-import { fileManagerName, useDesktopHostId } from "./RevealInFileManager";
+import { useDesktopHostId } from "@/lib/desktopHostId";
+import { fileManagerName } from "./RevealInFileManager";
 import {
   WORKTREE_RADIO_SPACIOUS_INPUT_CLASS,
   WORKTREE_RADIO_SPACIOUS_ROW_CLASS,
