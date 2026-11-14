@@ -53,7 +53,6 @@ from omnigent.harnesses.claude_native.bridge import (
     write_active_session_id,
 )
 from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
-from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import sync_raw_status_context
 from omnigent.inner.hook_scripts.subagent_router import AGENT_TOOL_NAMES
 from omnigent.models.model_metadata import concrete_reported_model
@@ -6044,13 +6043,8 @@ async def _forward_available_deltas(
     :returns: The updated delta cursor state (offset advanced past the
         records just read).
     """
-    # The deltas file only exists once the MessageDisplay hook has fired
-    # for this Claude process. Skip the worker-thread read until then so
-    # idle / non-streaming polls don't churn the thread pool (this loop
-    # polls every ~0.25s). A bare ``exists()`` is a cheap stat consistent
-    # with the other sync reads this loop already does each poll.
-    if not (bridge_dir / MESSAGE_DELTAS_FILE).exists():
-        return state
+    # The reader preserves the cursor when the hook has not created the file.
+    # Keep even the missing-file check off the loop: stat can block on storage.
     result = await asyncio.to_thread(
         read_message_deltas_from_offset, bridge_dir, state.byte_offset
     )
