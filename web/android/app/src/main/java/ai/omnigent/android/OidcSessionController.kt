@@ -37,6 +37,9 @@ internal class OidcSessionController(
         /** Covers the page with [message], **Sign In** and Cancel. */
         fun showSignInRequired(message: String)
 
+        /** A native sign-in request could not reach the server. */
+        fun showServerUnreachable(error: Throwable)
+
         /** The server doesn't offer this app native sign-in: load it as before. */
         fun loadWithoutNativeSignIn(url: String)
 
@@ -601,7 +604,11 @@ internal class OidcSessionController(
             ask(attempt)
         } else {
             stop()
-            host.returnToSetup(if (error is CancellationException) null else error?.message)
+            if (OidcWebSession.isNetworkFailure(error) && error != null) {
+                host.showServerUnreachable(error)
+            } else {
+                host.returnToSetup(if (error is CancellationException) null else error?.message)
+            }
         }
     }
 
