@@ -1,4 +1,4 @@
-"""Real native CLIs must omit disabled servers and retain the Omnigent relay.
+"""Real native CLIs must omit disabled or non-allowlisted servers and retain the Omnigent relay.
 
 CI pins Claude 2.1.295 and Codex 0.142.0 in setup-harness-cli/manifest.json.
 """
@@ -9,6 +9,7 @@ import json
 import shutil
 import sys
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
@@ -32,23 +33,36 @@ from tests.e2e.conftest import configure_mock_llm, get_mock_requests
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-@pytest.fixture(scope="module")
-def mcp_enabled_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
-    """Keep MCP release flags local to this journey, preserving old-server compatibility."""
-    env = {
-        "PYTHONPATH": server_pythonpath(_REPO_ROOT),
-    }
-    if compat_server_python() is None:
+@contextmanager
+def _journey_server(
+    tmp_path_factory: pytest.TempPathFactory, name: str, *, mcp_flags: bool
+) -> Iterator[str]:
+    env = {"PYTHONPATH": server_pythonpath(_REPO_ROOT)}
+    if mcp_flags and compat_server_python() is None:
         env["OMNIGENT_FEATURES"] = (
             "mcp_disabled_servers,mcp_disabled_servers_claude,mcp_disabled_servers_codex"
         )
     with isolated_local_server(
-        tmp_path_factory.mktemp("mcp_enabled_server"),
+        tmp_path_factory.mktemp(name),
         env=env,
         executable=server_executable(),
         cwd=compat_server_cwd(),
         health_timeout=180.0,
     ) as base_url:
+        yield base_url
+
+
+@pytest.fixture(scope="module")
+def mcp_enabled_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
+    """Keep MCP release flags local to this journey, preserving old-server compatibility."""
+    with _journey_server(tmp_path_factory, "mcp_enabled_server", mcp_flags=True) as base_url:
+        yield base_url
+
+
+@pytest.fixture(scope="module")
+def mcp_flagless_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
+    """A server without the MCP release flags, which strict mode does not need."""
+    with _journey_server(tmp_path_factory, "mcp_flagless_server", mcp_flags=False) as base_url:
         yield base_url
 
 
@@ -61,12 +75,20 @@ def server_version(mcp_enabled_server: str) -> str:
 @pytest.mark.min_server_version("0.22.0.dev0")
 @pytest.mark.min_runner_version("0.22.0.dev0")
 @pytest.mark.timeout(300)
+@pytest.mark.parametrize("control", ["switch", "strict"])
 @pytest.mark.parametrize("harness", ["claude", "codex"])
 def test_disabled_server_absent_from_real_native_session(
-    mcp_enabled_server: str, mock_llm_server_url: str, tmp_path: Path, harness: str
+    request: pytest.FixtureRequest,
+    mock_llm_server_url: str,
+    tmp_path: Path,
+    harness: str,
+    control: str,
 ) -> None:
     if shutil.which(harness) is None:
         pytest.skip(f"needs the {harness} CLI")
+    server = request.getfixturevalue(
+        "mcp_enabled_server" if control == "switch" else "mcp_flagless_server"
+    )
     home = tmp_path / "host" / "home"
     home.mkdir(parents=True)
     workspace = tmp_path / "workspace"
@@ -77,6 +99,12 @@ def test_disabled_server_absent_from_real_native_session(
     config = {name: {"command": sys.executable, "args": [str(fixture)]} for name in names}
     if harness == "claude":
         (home / ".claude.json").write_text(json.dumps({"mcpServers": config}))
+        if control == "strict":
+            # Claude unions allowlists across settings sources; strict mode must still win.
+            (home / ".claude").mkdir()
+            (home / ".claude/settings.json").write_text(
+                json.dumps({"allowedMcpServers": [{"serverName": "off_fixture"}]})
+            )
     else:
         codex = home / ".codex"
         codex.mkdir()
@@ -88,7 +116,7 @@ def test_disabled_server_absent_from_real_native_session(
         # Exercise Codex's project layer as well as its private user-home copy.
         (workspace / ".codex").mkdir()
         (workspace / ".codex/config.toml").write_text(text)
-    model = f"mcp-disable-{harness}-{tmp_path.name}"
+    model = f"mcp-{control}-{harness}-{tmp_path.name}"
     family = "anthropic" if harness == "claude" else "openai"
     provider = {
         "base_url": mock_llm_server_url if harness == "claude" else f"{mock_llm_server_url}/v1",
@@ -113,12 +141,19 @@ def test_disabled_server_absent_from_real_native_session(
             },
         )
     configure_mock_llm(mock_llm_server_url, responses, key=model)
+    host_config: dict[str, object] = {
+        "providers": {"test": {"kind": "key", "default": [family], family: provider}}
+    }
+    if control == "strict":
+        # The user-config allowlist needs no host disable state or server feature flag;
+        # this server runs without the flags.
+        host_config["mcp"] = {"inherit": False, "allow": ["on_fixture"]}
     with (
-        httpx.Client(base_url=mcp_enabled_server, timeout=120) as client,
+        httpx.Client(base_url=server, timeout=120) as client,
         isolated_host(
             tmp_path / "host",
-            mcp_enabled_server,
-            config={"providers": {"test": {"kind": "key", "default": [family], family: provider}}},
+            server,
+            config=host_config,
             env={
                 "CLAUDE_CONFIG_DIR": None,
                 "CODEX_HOME": None,
@@ -128,18 +163,19 @@ def test_disabled_server_absent_from_real_native_session(
             ready=lambda host: host.wait_online(client, timeout=90),
         ) as host,
     ):
-        response = client.put(
-            f"/v1/hosts/{host.host_id}/mcp-servers/enabled",
-            json={
-                "harness": harness,
-                "server": "off_fixture",
-                "enabled": False,
-            },
-        )
-        response.raise_for_status()
+        if control == "switch":
+            response = client.put(
+                f"/v1/hosts/{host.host_id}/mcp-servers/enabled",
+                json={
+                    "harness": harness,
+                    "server": "off_fixture",
+                    "enabled": False,
+                },
+            )
+            response.raise_for_status()
         session = create_native_session(
             client,
-            mcp_enabled_server,
+            server,
             harness=harness,
             metadata={
                 "host_id": host.host_id,

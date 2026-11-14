@@ -1,6 +1,7 @@
 """Public contract for host-owned MCP disable state and launch planning."""
 
 import json
+import re
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -9,18 +10,30 @@ from omnigent.config import global_config_path
 from omnigent.mcp_disabled_servers import (
     FILENAME,
     DisabledServerWriteError,
+    McpStrictModeError,
     ServerKey,
     apply_claude_settings,
     claude_loaded_anyway,
     is_disabled,
     set_disabled,
 )
+from tests._helpers.mcp_disabled_servers import isolate_claude_settings, write_mcp_inheritance
 
 
 @pytest.fixture(autouse=True)
 def config_home(tmp_path, monkeypatch):
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     return tmp_path / FILENAME
+
+
+@pytest.fixture(autouse=True)
+def claude_project(tmp_path, monkeypatch):
+    return isolate_claude_settings(monkeypatch, tmp_path / "claude")
+
+
+def _write_json(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(payload if isinstance(payload, str) else json.dumps(payload))
 
 
 def test_round_trip_exact_keys_no_pruning(config_home):
@@ -181,6 +194,288 @@ def test_malformed_sdk_settings_fail_open(settings):
         apply_claude_settings(settings, executor="claude-sdk", active_harnesses=["claude"])
         is settings
     )
+
+
+@pytest.mark.parametrize("executor", ["claude-native", "claude-sdk"])
+@pytest.mark.parametrize("active", [None, ["claude"]])
+def test_claude_strict_allowlist_replaces_caller_allowlist(executor, active):
+    write_mcp_inheritance({"inherit": False, "allow": ["zeta", "alpha", "omnigent"]})
+    set_disabled(ServerKey("claude", "github"), True)
+    original = {"allowedMcpServers": [{"serverName": "caller"}], "other": [1]}
+    settings = original if executor == "claude-native" else json.dumps(original)
+    result = apply_claude_settings(settings, executor=executor, active_harnesses=active)
+    parsed = result if isinstance(result, dict) else json.loads(result)
+    expected = {
+        "other": [1],
+        "allowedMcpServers": [
+            {"serverName": "omnigent"},
+            {"serverName": "alpha"},
+            {"serverName": "zeta"},
+        ],
+    }
+    if active:
+        expected["deniedMcpServers"] = [{"serverName": "github"}]
+    assert parsed == expected
+    assert original["allowedMcpServers"] == [{"serverName": "caller"}]
+    assert apply_claude_settings(result, executor=executor, active_harnesses=active) is result
+
+
+def test_claude_strict_starts_from_empty_sdk_settings():
+    write_mcp_inheritance({"inherit": False})
+    result = apply_claude_settings(None, executor="claude-sdk", active_harnesses=None)
+    assert json.loads(result) == {"allowedMcpServers": [{"serverName": "omnigent"}]}
+
+
+def test_claude_strict_follows_executor_override():
+    write_mcp_inheritance({"inherit": False})
+    path = global_config_path()
+    path.write_text(
+        path.read_text() + "harness:\n  claude-native:\n    mcp:\n      inherit: true\n"
+    )
+    assert apply_claude_settings({}, executor="claude-native", active_harnesses=None) == {}
+    assert "allowedMcpServers" in json.loads(
+        apply_claude_settings("{}", executor="claude-sdk", active_harnesses=None)
+    )
+
+
+def test_claude_loaded_anyway_reports_names_outside_strict_allowlist():
+    write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
+    set_disabled(ServerKey("claude", "kept"), True)
+    assert claude_loaded_anyway(
+        ["omnigent", "kept", "extra", "plugin:tools:notion", "extra"], active_harnesses=["claude"]
+    ) == ("kept", "extra", "plugin:tools:notion")
+
+
+@pytest.mark.parametrize("settings", ["[]", '{"deniedMcpServers": {}}'])
+def test_malformed_sdk_settings_refuse_strict_launch(settings, caplog):
+    write_mcp_inheritance({"inherit": False})
+    with pytest.raises(McpStrictModeError, match="claude-sdk launch"):
+        apply_claude_settings(settings, executor="claude-sdk", active_harnesses=None)
+    assert "mcp_strict_launch_refused executor=claude-sdk path=--settings" in caplog.text
+
+
+@pytest.mark.parametrize("executor", ["claude-native", "claude-sdk"])
+def test_claude_strict_denies_inherited_allow_entries(executor, tmp_path, claude_project):
+    """Claude unions allowlists across sources, so inherited entries must become denies."""
+    from omnigent.onboarding import ambient
+
+    write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
+    url = {"serverUrl": "https://mcp.example.com/*"}
+    _write_json(
+        tmp_path / "claude/claude-config/settings.json",
+        {
+            "allowedMcpServers": [
+                {"serverName": "user_only"},
+                {"serverName": "kept"},
+                {"serverName": "omnigent"},
+                url,
+                "not-an-entry",
+                {"serverName": 3, "serverCommand": "not-a-list"},
+            ]
+        },
+    )
+    _write_json(
+        claude_project / ".claude/settings.json",
+        {"allowedMcpServers": [{"serverName": "user_only"}, {"serverName": "project_only"}]},
+    )
+    _write_json(
+        claude_project / ".claude/settings.local.json",
+        {"allowedMcpServers": [{"serverName": "local_only"}]},
+    )
+    managed = ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS[0]
+    _write_json(managed, {"allowedMcpServers": [{"serverName": "managed_only"}]})
+    # Servers in managed-mcp.json skip the allowlist, so only a deny stops them.
+    _write_json(
+        managed.with_name("managed-mcp.json"),
+        {"mcpServers": {"omnigent": {}, "kept": {}, "pinned": {"command": "pinned"}}},
+    )
+    _write_json(
+        managed.with_name("managed-settings.d") / "10-team.json",
+        {"allowedMcpServers": [{"serverName": "drop_in_only"}]},
+    )
+    # Claude versions read project settings from the launch directory or the Git root.
+    _write_json(
+        claude_project / "sub/.claude/settings.json",
+        {"allowedMcpServers": [{"serverName": "subdirectory_only"}]},
+    )
+    original = {"deniedMcpServers": [{"serverName": "caller"}]}
+    settings = original if executor == "claude-native" else json.dumps(original)
+    result = apply_claude_settings(
+        settings, executor=executor, active_harnesses=None, cwd=claude_project / "sub"
+    )
+    parsed = result if isinstance(result, dict) else json.loads(result)
+    assert parsed == {
+        "deniedMcpServers": [
+            {"serverName": "caller"},
+            {"serverName": "user_only"},
+            url,
+            {"serverName": "subdirectory_only"},
+            {"serverName": "project_only"},
+            {"serverName": "local_only"},
+            {"serverName": "managed_only"},
+            {"serverName": "drop_in_only"},
+            {"serverName": "pinned"},
+        ],
+        "allowedMcpServers": [{"serverName": "omnigent"}, {"serverName": "kept"}],
+    }
+
+
+@pytest.mark.parametrize("main_local", ["readable", "unreadable"])
+def test_claude_strict_reads_linked_worktree_and_main_checkout_settings(
+    claude_project, main_local
+):
+    write_mcp_inheritance({"inherit": False})
+    worktree = claude_project.parent / "worktree"
+    metadata = claude_project / ".git/worktrees/session"
+    _write_json(metadata / "commondir", "../..\n")
+    _write_json(metadata / "gitdir", str(worktree / ".git"))
+    _write_json(worktree / ".git", f"gitdir: {metadata}\n")
+    _write_json(
+        worktree / ".claude/settings.local.json",
+        {"allowedMcpServers": [{"serverName": "worktree_local"}]},
+    )
+    main_settings = claude_project / ".claude/settings.local.json"
+    if main_local == "unreadable":
+        main_settings.mkdir(parents=True)
+        with pytest.raises(McpStrictModeError) as raised:
+            apply_claude_settings(
+                {}, executor="claude-native", active_harnesses=None, cwd=worktree
+            )
+        assert raised.value.path == main_settings
+        return
+    _write_json(main_settings, {"allowedMcpServers": [{"serverName": "main_local"}]})
+    result = apply_claude_settings(
+        {}, executor="claude-native", active_harnesses=None, cwd=worktree
+    )
+    assert result["deniedMcpServers"] == [
+        {"serverName": "worktree_local"},
+        {"serverName": "main_local"},
+    ]
+
+
+@pytest.mark.parametrize("executor", ["claude-native", "claude-sdk"])
+def test_claude_strict_refuses_inherited_command_entries(claude_project, executor):
+    """Claude then admits stdio servers by command alone, ignoring the name allowlist."""
+    write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
+    # Both servers satisfy the command entry, so neither keeping nor denying it works.
+    _write_json(
+        claude_project.parent / "claude-config/.claude.json",
+        {
+            "mcpServers": {
+                "kept": {"command": "npx", "args": ["server"], "env": {"ROLE": "kept"}},
+                "other": {"command": "npx", "args": ["server"], "env": {"ROLE": "other"}},
+            }
+        },
+    )
+    settings = claude_project / ".claude/settings.json"
+    _write_json(settings, {"allowedMcpServers": [{"serverCommand": ["npx", "server"]}]})
+    with pytest.raises(McpStrictModeError, match="including for the omnigent relay") as raised:
+        apply_claude_settings(
+            {} if executor == "claude-native" else None, executor=executor, active_harnesses=None
+        )
+    assert raised.value.path == settings
+
+
+@pytest.mark.parametrize(
+    ("pattern", "source"),
+    [
+        ("https://mcp.example.com/kept", "user"),
+        ("https://mcp.example.com/kept", "project_key"),
+        ("https://mcp.example.com/*", "mcp_json"),
+    ],
+)
+def test_claude_strict_refuses_url_entries_matching_allowlisted_servers(
+    claude_project, pattern, source
+):
+    """Denying such an entry blocks the server; keeping it admits others at that URL."""
+    write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
+    servers = {"mcpServers": {"kept": {"type": "http", "url": "https://mcp.example.com/kept"}}}
+    if source == "mcp_json":
+        _write_json(claude_project / ".mcp.json", servers)
+    else:
+        # Claude keys projects by the physical path of its working directory.
+        user = {"projects": {str(claude_project.resolve()): servers}}
+        _write_json(
+            claude_project.parent / "claude-config/.claude.json",
+            servers if source == "user" else user,
+        )
+    other = {"serverUrl": "https://other.example.com/mcp"}
+    settings = claude_project / ".claude/settings.json"
+    _write_json(settings, {"allowedMcpServers": [other, {"serverUrl": pattern}]})
+    launch = claude_project.parent / "linked-project"
+    launch.symlink_to(claude_project, target_is_directory=True)
+    with pytest.raises(
+        McpStrictModeError,
+        match=re.escape(f"serverUrl {pattern}, which matches allowlisted server kept"),
+    ) as raised:
+        apply_claude_settings({}, executor="claude-native", active_harnesses=None, cwd=launch)
+    assert raised.value.path == launch / ".claude/settings.json"
+    _write_json(settings, {"allowedMcpServers": [other]})
+    result = apply_claude_settings({}, executor="claude-native", active_harnesses=None, cwd=launch)
+    assert result["deniedMcpServers"] == [other]
+
+
+def test_claude_strict_logs_unreadable_server_configs(claude_project, caplog):
+    """An unreadable ``.mcp.json`` hides allowlisted transports, so it is logged."""
+    write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
+    (claude_project / ".mcp.json").write_text("{not json", encoding="utf-8")
+    entry = {"serverUrl": "https://mcp.example.com/kept"}
+    _write_json(claude_project / ".claude/settings.json", {"allowedMcpServers": [entry]})
+    result = apply_claude_settings(
+        {}, executor="claude-native", active_harnesses=None, cwd=claude_project
+    )
+    assert result["deniedMcpServers"] == [entry]
+    assert (
+        f"mcp_strict_claude_config_read_failed path={claude_project / '.mcp.json'} "
+        "reason=JSONDecodeError"
+    ) in caplog.text
+
+
+def test_claude_strict_reads_settings_for_the_launch_environment(tmp_path, claude_project):
+    """A relative config directory resolves against the launch cwd, not this process's."""
+    write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
+    _write_json(
+        tmp_path / "claude/claude-config/settings.json",
+        {"allowedMcpServers": [{"serverName": "process_user"}]},
+    )
+    launch = tmp_path / "launch"
+    launch_settings = launch / "launch-config/settings.json"
+    _write_json(launch_settings, {"allowedMcpServers": [{"serverName": "launch_user"}]})
+    env = {"CLAUDE_CONFIG_DIR": "launch-config"}
+    result = apply_claude_settings(
+        {}, executor="claude-native", active_harnesses=None, cwd=launch, env=env
+    )
+    assert result["deniedMcpServers"] == [{"serverName": "launch_user"}]
+    # The launch's own global config supplies the allowlisted server's transport.
+    url = "https://mcp.example.com/kept"
+    _write_json(
+        launch / "launch-config/.claude.json",
+        {"mcpServers": {"kept": {"type": "http", "url": url}}},
+    )
+    _write_json(launch_settings, {"allowedMcpServers": [{"serverUrl": url}]})
+    with pytest.raises(McpStrictModeError, match="matches allowlisted server kept"):
+        apply_claude_settings(
+            {}, executor="claude-native", active_harnesses=None, cwd=launch, env=env
+        )
+
+
+@pytest.mark.parametrize("content", ["{", "[]", None])
+def test_unreadable_claude_settings_refuse_only_strict_launches(content, claude_project, caplog):
+    path = claude_project / ".claude/settings.local.json"
+    if content is None:
+        path.mkdir(parents=True)  # Read failure, even when tests run as root.
+    else:
+        _write_json(path, content)
+    set_disabled(ServerKey("claude", "github"), True)
+    assert apply_claude_settings({}, executor="claude-native", active_harnesses=["claude"]) == {
+        "deniedMcpServers": [{"serverName": "github"}]
+    }
+    write_mcp_inheritance({"inherit": False})
+    with pytest.raises(McpStrictModeError) as refused:
+        apply_claude_settings({}, executor="claude-native", active_harnesses=None)
+    assert refused.value.path == path
+    assert "harness.claude-native.mcp.inherit: true" in str(refused.value)
+    assert f"mcp_strict_launch_refused executor=claude-native path={path}" in caplog.text
 
 
 def test_thread_writers_do_not_lose_updates():

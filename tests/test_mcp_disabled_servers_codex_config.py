@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -12,12 +13,21 @@ from unittest.mock import patch
 
 import pytest
 
-from omnigent.mcp_disabled_servers import ServerKey, plan_codex_launch, set_disabled
+from omnigent import mcp_disabled_servers
+from omnigent.config import global_config_path
+from omnigent.mcp_disabled_servers import (
+    McpStrictModeError,
+    ServerKey,
+    plan_codex_launch,
+    set_disabled,
+)
+from tests._helpers.mcp_disabled_servers import isolate_codex_system_layers, write_mcp_inheritance
 
 
 @pytest.fixture
 def launch(tmp_path, monkeypatch):
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "omnigent"))
+    isolate_codex_system_layers(monkeypatch, tmp_path / "etc-codex")
     home = tmp_path / "private-home"
     home.mkdir()
     repo = tmp_path / "repo"
@@ -30,6 +40,29 @@ def launch(tmp_path, monkeypatch):
 def _write(path, content):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)
+
+
+# Codex accepts this multiline inline table; tomllib does not.
+_TOML_1_1_CONFIG = (
+    'mcp_servers.user = {\n  command = "true",\n}\n[mcp_servers.kept]\ncommand="true"\n'
+)
+
+
+def _codex_mcp_list(home, repo, overrides):
+    """Return the real Codex CLI's ``mcp list --json`` rows for *overrides*."""
+    argv = ["codex"]
+    for override in overrides:
+        argv.extend(["-c", override])
+    result = subprocess.run(
+        [*argv, "mcp", "list", "--json"],
+        env={**os.environ, "CODEX_HOME": str(home)},
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+    return json.loads(result.stdout)
 
 
 def _plan(home, cwd, overrides=(), *, active=("codex",), executor="codex"):
@@ -339,6 +372,186 @@ def test_plan_is_synchronous_and_never_spawns(launch):
         assert _plan(home, repo).outcome == "applied"
 
 
+@pytest.mark.parametrize("executor", ["codex", "codex-native"])
+def test_strict_disables_every_layer_except_allowlist_without_retry(launch, executor, caplog):
+    caplog.set_level(logging.INFO, logger=mcp_disabled_servers.__name__)
+    home, repo = launch
+    write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
+    _write(mcp_disabled_servers.CODEX_SYSTEM_CONFIG_PATH, '[mcp_servers.system]\ncommand="true"\n')
+    managed = mcp_disabled_servers.CODEX_MANAGED_CONFIG_PATH
+    # The managed layer outranks ``-c``; enabling an allowlisted server there is fine.
+    managed_servers = '[mcp_servers.managed]\ncommand="true"\n[mcp_servers.kept]\nenabled=true\n'
+    _write(managed, managed_servers)
+    _write(
+        home / "config.toml",
+        '[mcp_servers.user]\ncommand="true"\n[mcp_servers.kept]\ncommand="true"\n'
+        '[mcp_servers.omnigent]\ncommand="true"\n'
+        f'[projects.{json.dumps(str(repo))}]\ntrust_level="trusted"\n',
+    )
+    _write(repo / ".codex/config.toml", '[mcp_servers.repo]\ncommand="true"\n')
+    plan = _plan(home, repo, ['mcp_servers.cli.command="true"'], active=None, executor=executor)
+    # Codex reads its /etc layers only on POSIX hosts.
+    names = (
+        ["cli", "managed", "repo", "system", "user"]
+        if os.name == "posix"
+        else ["cli", "repo", "user"]
+    )
+    expected = (
+        'mcp_servers.cli.command="true"',
+        *(f"mcp_servers.{name}.enabled=false" for name in names),
+    )
+    assert plan.config_overrides == plan.fallback_config_overrides == expected
+    assert plan.outcome == "none"
+    assert plan.overrides_after_early_exit() is None
+    assert (
+        f"mcp_strict_mode_applied executor={executor} "
+        f"disabled={tuple(names)} allowed=('omnigent', 'kept')"
+    ) in caplog.text
+    if os.name != "posix":
+        return
+    # Enabling any other server there would defeat its ``enabled=false`` override.
+    _write(managed, f"{managed_servers}[mcp_servers.user]\nenabled=true\n")
+    with pytest.raises(McpStrictModeError, match="enabled = true for MCP server user") as refused:
+        _plan(home, repo, ['mcp_servers.cli.command="true"'], active=None, executor=executor)
+    assert refused.value.path == managed
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Codex reads /etc layers only on POSIX")
+@pytest.mark.parametrize("strict", [False, True])
+def test_strict_refuses_launch_when_a_layer_is_unreadable(launch, caplog, strict):
+    home, repo = launch
+    if strict:
+        write_mcp_inheritance({"inherit": False})
+    else:
+        set_disabled(ServerKey("codex", "user"), True)
+    managed = mcp_disabled_servers.CODEX_MANAGED_CONFIG_PATH
+    _write(managed, "[mcp_servers.managed\n")
+    _write(home / "config.toml", '[mcp_servers.user]\ncommand="true"\n')
+    if not strict:
+        plan = _plan(home, repo, executor="codex-native")
+        assert plan.config_overrides == ("mcp_servers.user.enabled=false",)
+        assert "mcp_strict_launch_refused" not in caplog.text
+        return
+    with pytest.raises(McpStrictModeError, match="codex-native launch") as refused:
+        _plan(home, repo, executor="codex-native")
+    assert refused.value.path == managed
+    assert "harness.codex-native.mcp.inherit: true" in str(refused.value)
+    assert f"mcp_strict_launch_refused executor=codex-native path={managed}" in caplog.text
+
+
+# Codex accepts these multiline inline tables as whole-table and dotted CLI overrides.
+_TOML_1_1_CLI_OVERRIDES = (
+    'mcp_servers={blocked={\ncommand="true",\n}}',
+    'mcp_servers.multiline={\ncommand="true",\n}',
+)
+
+
+def test_toml_1_1_layer_is_read(launch):
+    home, repo = launch
+    write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
+    _write(home / "config.toml", _TOML_1_1_CONFIG)
+    assert _plan(home, repo, active=None).config_overrides == ("mcp_servers.user.enabled=false",)
+
+
+@pytest.mark.parametrize("override", _TOML_1_1_CLI_OVERRIDES)
+def test_toml_1_1_cli_override_is_read(launch, override):
+    home, repo = launch
+    write_mcp_inheritance({"inherit": False})
+    name = "blocked" if override.startswith("mcp_servers={") else "multiline"
+    assert _plan(home, repo, [override], active=None).config_overrides == (
+        override,
+        f"mcp_servers.{name}.enabled=false",
+    )
+
+
+@pytest.mark.parametrize(
+    "override", ["mcp_servers={broken", "mcp_servers.named=[1]", "mcp_servers"]
+)
+@pytest.mark.parametrize("strict", [False, True])
+def test_strict_refuses_uninterpretable_server_override(launch, caplog, override, strict):
+    home, repo = launch
+    write_mcp_inheritance({"inherit": not strict})
+    set_disabled(ServerKey("codex", "user"), True)
+    _write(home / "config.toml", '[mcp_servers.user]\ncommand="true"\n')
+    if not strict:
+        assert _plan(home, repo, [override]).config_overrides[0] == override
+        assert "mcp_strict_launch_refused" not in caplog.text
+        return
+    key = override.partition("=")[0]
+    with pytest.raises(McpStrictModeError, match="codex launch") as refused:
+        _plan(home, repo, [override])
+    assert refused.value.path == Path(f"-c {key}")
+    # Override values may carry credentials, so the refusal names only the key.
+    assert "broken" not in caplog.text
+    assert "[1]" not in caplog.text
+
+
+def test_strict_with_switch_retry_keeps_strict_overrides(launch):
+    home, repo = launch
+    write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
+    set_disabled(ServerKey("codex", "kept"), True)
+    set_disabled(ServerKey("codex", "other"), True)
+    _write(
+        home / "config.toml",
+        '[mcp_servers.kept]\ncommand="true"\n[mcp_servers.other]\ncommand="true"\n',
+    )
+    plan = _plan(home, repo, ["base=true"])
+    assert plan.config_overrides == (
+        "base=true",
+        "mcp_servers.other.enabled=false",
+        "mcp_servers.kept.enabled=false",
+    )
+    assert plan.outcome == "applied"
+    assert plan.overrides_after_early_exit() == ("base=true", "mcp_servers.other.enabled=false")
+
+
+def test_strict_quoted_name_preserves_cli_transport(launch):
+    home, repo = launch
+    write_mcp_inheritance({"inherit": False})
+    overrides = ['mcp_servers={"with.dot"={command="true"}}']
+    plan = _plan(home, repo, overrides, active=None)
+    assert plan.config_overrides[:-1] == tuple(overrides)
+    assert tomllib.loads(plan.config_overrides[-1])["mcp_servers"] == {
+        "with.dot": {"command": "true", "enabled": False}
+    }
+
+
+def test_harness_override_keeps_codex_native_inheriting(launch):
+    home, repo = launch
+    write_mcp_inheritance({"inherit": False})
+    path = global_config_path()
+    path.write_text(
+        path.read_text() + "harness:\n  codex-native:\n    mcp:\n      inherit: true\n"
+    )
+    _write(home / "config.toml", '[mcp_servers.user]\ncommand="true"\n')
+    assert _plan(home, repo, executor="codex-native", active=None).config_overrides == ()
+    assert _plan(home, repo, executor="codex", active=None).config_overrides == (
+        "mcp_servers.user.enabled=false",
+    )
+
+
+@pytest.mark.skipif(shutil.which("codex") is None, reason="Codex CLI not installed")
+def test_real_codex_enables_only_allowlisted_servers_in_strict_mode(launch):
+    home, repo = launch
+    write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
+    _write(
+        home / "config.toml",
+        _TOML_1_1_CONFIG
+        + '[mcp_servers.omnigent]\ncommand="true"\n[mcp_servers."quoted.name"]\ncommand="true"\n',
+    )
+    overrides = [*_TOML_1_1_CLI_OVERRIDES, 'mcp_servers.cli.command="true"']
+    rows = _codex_mcp_list(home, repo, _plan(home, repo, overrides, active=None).config_overrides)
+    assert {row["name"]: row["enabled"] for row in rows} == {
+        "blocked": False,
+        "cli": False,
+        "multiline": False,
+        "kept": True,
+        "omnigent": True,
+        "quoted.name": False,
+        "user": False,
+    }
+
+
 @pytest.mark.skipif(shutil.which("codex") is None, reason="Codex CLI not installed")
 def test_real_codex_config_names_match_in_process_plan(launch):
     home, repo = launch
@@ -362,39 +575,15 @@ def test_real_codex_config_names_match_in_process_plan(launch):
     for name in ["user", "repo", "cli", "cli.dotted", "missing", *quoted_names]:
         set_disabled(ServerKey("codex", name), True)
     plan = _plan(home, repo, overrides)
-    argv = ["codex"]
-    for override in overrides:
-        argv.extend(["-c", override])
-    result = subprocess.run(
-        [*argv, "mcp", "list", "--json"],
-        env={**os.environ, "CODEX_HOME": str(home)},
-        cwd=repo,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=10,
-    )
-    cli_names = {row["name"] for row in json.loads(result.stdout)}
+    baseline = _codex_mcp_list(home, repo, overrides)
     expected_names = {"user", "repo", "cli", "cli.dotted", "keep", *quoted_names}
-    assert cli_names == expected_names
+    assert {row["name"] for row in baseline} == expected_names
     assert plan.dropped == ("missing",)
-    argv = ["codex"]
-    for override in plan.config_overrides:
-        argv.extend(["-c", override])
-    disabled = subprocess.run(
-        [*argv, "mcp", "list", "--json"],
-        env={**os.environ, "CODEX_HOME": str(home)},
-        cwd=repo,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=10,
-    )
-    rows = json.loads(disabled.stdout)
+    rows = _codex_mcp_list(home, repo, plan.config_overrides)
     assert {row["name"] for row in rows} == expected_names
     assert {row["name"]: row["enabled"] for row in rows} == {
         name: name == "keep" for name in expected_names
     }
     assert {row["name"]: row["transport"] for row in rows} == {
-        row["name"]: row["transport"] for row in json.loads(result.stdout)
+        row["name"]: row["transport"] for row in baseline
     }

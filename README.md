@@ -513,6 +513,55 @@ runs the session.
 
 </details>
 
+<details>
+<summary>Limit which MCP servers launched agents load</summary>
+
+By default, Claude Code and Codex sessions that Omnigent launches load the same
+MCP servers as the CLI on its own. To start them with only Omnigent's tools plus
+servers you name (within the limits below), add this to `~/.omnigent/config.yaml`:
+
+```yaml
+mcp:
+  inherit: false
+  allow: [github] # optional; Omnigent's own `omnigent` server is always kept
+harness:
+  codex-native:
+    mcp:
+      inherit: true # optional per-harness override
+```
+
+This applies to `omnigent claude`, `omnigent codex`, and Claude/Codex SDK
+sessions started on this machine, including new sessions and cold resumes.
+Claude receives an `allowedMcpServers` setting, plus a `deniedMcpServers`
+entry for each other entry in the `allowedMcpServers` lists of your user,
+project, local and managed Claude settings (project and local files are read
+from the launch directory, its Git root and, for a linked worktree, the main
+checkout); Claude would otherwise combine those
+lists with Omnigent's. Servers other than allowed ones in `managed-mcp.json` are
+denied by name, since Claude does not apply the allowlist to them. A `serverUrl`
+entry is denied too, but one matching an allowed server's URL (in Claude's
+global config, the project's `.mcp.json` or `managed-mcp.json`) stops the
+launch, as does any `serverCommand` entry: Claude then admits stdio servers by
+command alone, which would bypass the names or reject Omnigent's relay. Codex
+receives `-c mcp_servers.<name>.enabled=false` for every other server it would
+load from the system, user, trusted project, command-line, and managed config
+layers; a managed `enabled = true` for any other server stops the launch, since
+that layer outranks the override. For host-launched native Claude sessions,
+Claude's settings are read for the launched CLI's working directory and
+environment, including a configured `env -C` or `CLAUDE_CONFIG_DIR` wrapper. If one of those Claude settings or
+Codex config files exists but cannot be read or parsed, or a `-c mcp_servers`
+override is not a TOML table, the launch stops with an error naming it. A malformed `inherit` or `allow` value is
+ignored with a warning, so `inherit: false` with an invalid `allow` allows only
+`omnigent`; an unreadable `config.yaml` inherits everything. Your own Claude
+and Codex configuration files are not modified, and project
+`.omnigent/config.yaml` files cannot change this setting. Per-harness keys are
+`claude-native`, `claude-sdk` (or `claude`), `codex-native`, and `codex`.
+Claude plugin MCP servers cannot be allowlisted by name, so strict mode blocks
+them. Codex plugin MCP servers are not discovered, so strict mode does not
+disable them.
+
+</details>
+
 ### 3. Choose & switch models
 
 ```bash
