@@ -1,14 +1,26 @@
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
+import click
+import pytest
 from click.testing import CliRunner
 
 from omnigent import cli as cli_module
 from omnigent.install_ledger import InstallLedger, new_ledger
+
+
+@pytest.fixture(autouse=True)
+def _posix_uninstaller(monkeypatch) -> None:
+    """Exercise the shell-script path regardless of the test host's OS."""
+    monkeypatch.setattr(cli_module, "IS_WINDOWS", False)
 
 
 def test_uninstall_cli_resolves_ledger_and_forwards_flags(monkeypatch, tmp_path: Path) -> None:
@@ -122,3 +134,57 @@ def test_uninstall_cli_uses_exclusive_manifest_and_cleans_temp_script(
     assert result.exit_code == 0, result.output
     assert manifest_paths and not manifest_paths[0].exists()
     assert not temp_script_dir.exists()
+
+
+def test_uninstall_cli_on_windows_explains_manual_steps(monkeypatch, tmp_path: Path) -> None:
+    runner = CliRunner()
+    ledger = new_ledger(source="installer", strategy="install", deep=False)
+    monkeypatch.setattr(cli_module, "IS_WINDOWS", True)
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr("omnigent.install_ledger.resolve_uninstall_ledger", lambda: ledger)
+
+    def _run(*args, **kwargs):
+        raise AssertionError("the POSIX uninstall script must not run on Windows")
+
+    monkeypatch.setattr(cli_module.subprocess, "run", _run)
+
+    result = runner.invoke(cli_module.cli, ["uninstall", "--yes"])
+
+    assert result.exit_code == 3
+    assert "uv tool uninstall omnigent" in result.output
+    assert str(tmp_path) in result.output
+
+
+def test_uninstall_cli_on_windows_json_reports_refusal(monkeypatch, tmp_path: Path) -> None:
+    runner = CliRunner()
+    ledger = new_ledger(source="installer", strategy="install", deep=False)
+    monkeypatch.setattr(cli_module, "IS_WINDOWS", True)
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr("omnigent.install_ledger.resolve_uninstall_ledger", lambda: ledger)
+
+    result = runner.invoke(cli_module.cli, ["uninstall", "--json"])
+
+    assert result.exit_code == 3
+    payload = json.loads(result.stdout)
+    assert payload["exit_code"] == 3
+    assert payload["actions"] == []
+    assert payload["ledger_source"] == "installer"
+    assert "uv tool uninstall omnigent" in payload["error"]
+
+
+def test_main_uninstall_failure_omits_stale_host_hint(monkeypatch) -> None:
+    monkeypatch.setattr("omnigent.cli_diagnostics.setup_cli_logging", lambda argv: None)
+
+    def _fail(*_args: object, **_kwargs: object) -> None:
+        raise click.ClickException("uninstall failed")
+
+    monkeypatch.setattr(cli_module, "cli", _fail)
+    monkeypatch.setattr(sys, "argv", ["omnigent", "uninstall"])
+
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr), pytest.raises(SystemExit) as excinfo:
+        cli_module.main()
+
+    assert excinfo.value.code == 1
+    assert "uninstall failed" in stderr.getvalue()
+    assert "stale host processes" not in stderr.getvalue()
