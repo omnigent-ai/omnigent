@@ -33,16 +33,19 @@ function resolveTarget(raw: string): string {
 
 const OMNIGENT_URL = resolveTarget(process.env.OMNIGENT_URL ?? "http://localhost:6767");
 
-let cachedToken: string | null | undefined;
+// `databricks auth token` refreshes its OAuth token (valid for about an hour)
+// when asked, so ask again every few minutes rather than once per dev server.
+const TOKEN_REFRESH_MS = 5 * 60 * 1000;
+// A failed refresh (while offline, say) keeps the last token, which may have
+// expired by then, so try again soon rather than after the full interval.
+const FAILED_REFRESH_RETRY_MS = 15 * 1000;
+let cachedToken: { value: string | null; refreshAt: number } | undefined;
 
 function resolveToken(host: string): string | null {
-  if (cachedToken !== undefined) return cachedToken;
+  if (process.env.OMNIGENT_AUTH_TOKEN) return process.env.OMNIGENT_AUTH_TOKEN;
+  if (cachedToken && Date.now() < cachedToken.refreshAt) return cachedToken.value;
 
-  if (process.env.OMNIGENT_AUTH_TOKEN) {
-    cachedToken = process.env.OMNIGENT_AUTH_TOKEN;
-    return cachedToken;
-  }
-
+  let value: string | null = null;
   try {
     const output = execFileSync(
       "databricks",
@@ -50,15 +53,20 @@ function resolveToken(host: string): string | null {
       {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
+        // The call blocks the dev server, so a stalled network can't hold it long.
+        timeout: 10_000,
       },
     );
     const tokenResponse = JSON.parse(output) as { access_token?: string };
-    cachedToken = tokenResponse.access_token ?? null;
+    value = tokenResponse.access_token ?? null;
   } catch {
-    cachedToken = null;
+    // Keep the last token through a failed refresh.
   }
-
-  return cachedToken;
+  cachedToken =
+    value === null
+      ? { value: cachedToken?.value ?? null, refreshAt: Date.now() + FAILED_REFRESH_RETRY_MS }
+      : { value, refreshAt: Date.now() + TOKEN_REFRESH_MS };
+  return cachedToken.value;
 }
 
 function configureProxy(target: string, useAuth: boolean): NonNullable<ProxyOptions["configure"]> {
