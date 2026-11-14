@@ -427,6 +427,23 @@ wheels = [
 ]
 
 [[package]]
+name = "boxd"
+version = "0.3.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "grpcio" },
+    { name = "httpx" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra != 'extra-8-omnigent-antigravity' or extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint'" },
+    { name = "protobuf", version = "7.35.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-antigravity'" },
+    { name = "pydantic" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/72/af/6fcf04f13be4a7f22b290cc6c995acb5887b850e027db4feb477230b05e5/boxd-0.3.0.tar.gz", hash = "sha256:2f8fe0aa3c3a67c3f043b699ed4bdfa0d47ee6b4cc54f314743c4c1fe82ccf00", size = 263083, upload-time = "2026-11-03T05:15:11.847Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/92/b1/a648228186567ee1b3ec13b1da57baafbd1ed59031af8a79d3632aa54290/boxd-0.3.0-py3-none-any.whl", hash = "sha256:264e35789ea0d0b10095131340888f8bc43fb6aeeeaf8082b1cf830880c4d307", size = 173193, upload-time = "2026-11-03T05:15:10.704Z" },
+]
+
+[[package]]
 name = "boxlite"
 version = "0.9.5"
 source = { registry = "https://pypi.org/simple" }
@@ -3355,6 +3372,9 @@ bedrock = [
 blaxel = [
     { name = "blaxel" },
 ]
+boxd = [
+    { name = "boxd" },
+]
 boxlite = [
     { name = "boxlite" },
 ]
@@ -3518,6 +3538,7 @@ requires-dist = [
     { name = "botocore", marker = "extra == 'kms'", specifier = ">=1.30,<2" },
     { name = "botocore", marker = "extra == 'lambda-microvm'", specifier = ">=1.43.35,<2" },
     { name = "botocore", marker = "extra == 's3'", specifier = ">=1.30,<2" },
+    { name = "boxd", marker = "extra == 'boxd'", specifier = ">=0.2.20,<0.4" },
     { name = "boxlite", marker = "extra == 'boxlite'", specifier = ">=0.9.5,<1" },
     { name = "cachetools", specifier = ">=5.0,<8" },
     { name = "cel-python", specifier = ">=0.5" },
@@ -3603,7 +3624,7 @@ requires-dist = [
     { name = "websockets", specifier = ">=10.4,<15" },
     { name = "zstandard", specifier = ">=0.22,<1" },
 ]
-provides-extras = ["claude-sdk", "openai-agents", "cockroachdb", "all", "bedrock", "kms", "s3", "vertex", "modal", "daytona", "blaxel", "boxlite", "microsandbox", "cwsandbox", "e2b", "islo", "openshell", "workspace-api", "kubernetes", "lambda-microvm", "vault", "tracing", "agents-sdk", "antigravity", "copilot", "dictation", "cursor", "hindsight", "nimble", "slack", "postgres", "databricks", "loadtest"]
+provides-extras = ["claude-sdk", "openai-agents", "cockroachdb", "all", "bedrock", "kms", "s3", "vertex", "modal", "daytona", "blaxel", "boxlite", "microsandbox", "cwsandbox", "e2b", "islo", "boxd", "openshell", "workspace-api", "kubernetes", "lambda-microvm", "vault", "tracing", "agents-sdk", "antigravity", "copilot", "dictation", "cursor", "hindsight", "nimble", "slack", "postgres", "databricks", "loadtest"]
 
 [package.metadata.requires-dev]
 dev = [
