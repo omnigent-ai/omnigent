@@ -668,7 +668,7 @@ def attachment_delivery(
 # ── Text-attachment extraction for input-phase policy scanning ─────────
 
 
-def _is_text_like_attachment(content_type: str, filename: str | None) -> bool:
+def is_text_like_attachment(content_type: str, filename: str | None) -> bool:
     """Whether an attachment's content is text the policy layer can scan.
 
     :param content_type: Resolved MIME, e.g. ``"text/csv"``.
@@ -746,7 +746,7 @@ def extract_text_attachments(
                 }
             )
             continue
-        if not _is_text_like_attachment(content_type, file_meta.filename):
+        if not is_text_like_attachment(content_type, file_meta.filename):
             continue
         try:
             # Bytes live under blob_key (a fork copy shares the source's blob).

@@ -4532,6 +4532,7 @@ function ComposerImpl(
               <ComposerContextRing
                 contextWindow={composerContextWindow}
                 tokensUsed={composerTokensUsed}
+                sessionId={conversationId}
               />
             </div>
           </ComposerWorkspaceBar>

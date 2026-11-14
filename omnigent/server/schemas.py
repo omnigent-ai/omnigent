@@ -3242,6 +3242,103 @@ class SessionRewindResponse(BaseModel):
     attachments_incomplete: bool = False
 
 
+class ContextBreakdownAttachment(BaseModel):
+    """
+    One attachment still in a session's live conversation history.
+
+    :param file_id: Uploaded file id, e.g. ``"file_abc123"``; ``None`` for
+        bytes sent inline in the message.
+    :param filename: Display name, e.g. ``"report.pdf"``; ``None`` when unknown.
+    :param content_type: Stored MIME type, e.g. ``"image/png"``.
+    :param bytes: Stored size in bytes; ``None`` when the file is gone.
+    :param delivery: ``"inline"`` (sent to the model), ``"workspace"``
+        (saved to the workspace, or any attachment of a native harness; only
+        its path reaches the model) or
+        ``"missing"`` (the file record no longer exists).
+    :param estimated_tokens: Estimated prompt tokens for an inline
+        attachment; ``None`` when its type has no reliable estimate (e.g. a
+        PDF) or it is not inline.
+    """
+
+    file_id: str | None = None
+    filename: str | None = None
+    content_type: str | None = None
+    bytes: int | None = None
+    delivery: Literal["inline", "workspace", "missing"]
+    estimated_tokens: int | None = None
+
+
+class ContextBreakdownTools(BaseModel):
+    """
+    Tool sources declared by a session's agent. Schemas are listed by the
+    runner at turn time, so their size is not estimated here.
+
+    :param mcp_servers: Enabled MCP server names, e.g. ``["github"]``.
+    :param local_tool_count: Agent-bundled tools, e.g. ``2``.
+    :param builtin_tool_count: Configured built-in tools, e.g. ``1``.
+    """
+
+    mcp_servers: list[str] = Field(default_factory=list)
+    local_tool_count: int = 0
+    builtin_tool_count: int = 0
+
+
+class ContextBreakdownHistory(BaseModel):
+    """
+    Estimated size of a session's live conversation history.
+
+    :param estimated_tokens: Estimated tokens of the live history, including
+        the latest compaction summary and excluding attachments.
+    :param item_count: Messages and tool calls/results still sent in full.
+    :param summarized_item_count: Earlier messages and tool calls/results
+        replaced by a compaction summary.
+    :param summary_tokens: Token count recorded for that summary; ``0``
+        when the history was never compacted.
+    :param partial: The scan stopped at its item cap before the summarized
+        range, so the live counts are lower bounds.
+    :param summarized_partial: The scan stopped inside the summarized range,
+        so ``summarized_item_count`` is a lower bound.
+    """
+
+    estimated_tokens: int = 0
+    item_count: int = 0
+    summarized_item_count: int = 0
+    summary_tokens: int = 0
+    partial: bool = False
+    summarized_partial: bool = False
+
+
+class SessionContextBreakdown(BaseModel):
+    """
+    Response for ``GET /v1/sessions/{session_id}/context-breakdown``.
+
+    Every token figure is an estimate from content size; the measured total
+    stays on the session snapshot (``last_total_tokens`` / ``context_window``).
+    Content a harness adds itself (its own system prompt, tool schemas,
+    project instructions) is not visible here.
+
+    :param session_id: The session, e.g. ``"conv_abc123"``.
+    :param system_prompt_tokens: Estimated agent instructions plus
+        Omnigent's own guidance; ``None`` when the agent spec could not load.
+    :param skill_count: Skills the agent bundles, e.g. ``3``.
+    :param skill_listing_tokens: Estimated tokens of their name/description
+        listing.
+    :param tools: Declared tool sources.
+    :param attachments: Attachments in the live history, oldest first.
+    :param history: Live conversation history estimate.
+    :param bytes_per_token: Ratio behind the text estimates, e.g. ``4``.
+    """
+
+    session_id: str
+    system_prompt_tokens: int | None = None
+    skill_count: int = 0
+    skill_listing_tokens: int = 0
+    tools: ContextBreakdownTools = Field(default_factory=ContextBreakdownTools)
+    attachments: list[ContextBreakdownAttachment] = Field(default_factory=list)
+    history: ContextBreakdownHistory = Field(default_factory=ContextBreakdownHistory)
+    bytes_per_token: int
+
+
 class ReadStatePutRequest(BaseModel):
     """
     Request body for ``PUT /v1/sessions/{session_id}/read-state``.

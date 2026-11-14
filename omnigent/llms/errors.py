@@ -72,9 +72,9 @@ REQUEST_SIZE_OVERFLOW_GUIDANCE = (
     "request size limit. Compact the conversation or start a new session to continue."
 )
 
-# Rough bytes-per-token ratio for expressing a byte-cap rejection in the
-# token units the context-overflow plumbing carries.
-_APPROX_BYTES_PER_TOKEN = 4
+# Rough bytes-per-token ratio for expressing byte sizes in token units, e.g.
+# a byte-cap rejection or a context-window estimate.
+APPROX_BYTES_PER_TOKEN = 4
 
 
 @dataclass(frozen=True)
@@ -93,12 +93,12 @@ class RequestSizeOverflow:
     @property
     def approx_request_tokens(self) -> int:
         """The request size expressed as an approximate token count."""
-        return max(self.request_bytes // _APPROX_BYTES_PER_TOKEN, 1)
+        return max(self.request_bytes // APPROX_BYTES_PER_TOKEN, 1)
 
     @property
     def approx_limit_tokens(self) -> int:
         """The byte cap expressed as an approximate token count."""
-        return max(self.limit_bytes // _APPROX_BYTES_PER_TOKEN, 1)
+        return max(self.limit_bytes // APPROX_BYTES_PER_TOKEN, 1)
 
 
 def detect_request_size_overflow(message: str) -> RequestSizeOverflow | None:
