@@ -322,3 +322,14 @@ def test_the_header_link_cannot_break_out_of_its_markdown() -> None:
     notebook = _notebook([], session_url="https://omnigent.example/c/a)[x](<img>")
     [link] = [line for line in notebook["cells"][0]["source"].splitlines() if "Link" in line]
     assert link == "- **Link:** https://omnigent.example/c/a%29%5Bx%5D%28%3Cimg%3E"
+
+
+def test_dollar_signs_in_text_stay_text_but_code_keeps_them() -> None:
+    text = "West made $538.9k (\\$2k fees); see `echo $HOME` and\n```\n$ ls\n```"
+    notebook = _notebook([_message("assistant", text)])
+    [(_, source)] = _cells(notebook)
+    dollar = "<span>&#36;</span>"
+    assert source == (
+        f"**Assistant**\n\nWest made {dollar}538.9k ({dollar}2k fees); "
+        "see `echo $HOME` and\n```\n$ ls\n```"
+    )

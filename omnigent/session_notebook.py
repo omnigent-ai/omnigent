@@ -109,15 +109,32 @@ def _sql_query(name: str, arguments: Mapping[str, Any]) -> str | None:
     return None
 
 
+# Fenced blocks and inline code spans, where ``$`` is literal.
+_MARKDOWN_CODE = re.compile(r"(```.*?```|~~~.*?~~~|`[^`\n]*`)", re.DOTALL)
+_DOLLAR = re.compile(r"\\?\$")
+# JupyterLab typesets ``\$`` and ``&#36;`` as math too; an entity in its own
+# element is the form both it and nbconvert show as a plain dollar sign.
+_LITERAL_DOLLAR = "<span>&#36;</span>"
+
+
+def _markdown_text(text: str) -> str:
+    """*text* for a Markdown cell, ``$`` outside code kept from rendering as LaTeX."""
+    segments = _MARKDOWN_CODE.split(text)
+    return "".join(
+        segment if index % 2 else _DOLLAR.sub(_LITERAL_DOLLAR, segment)
+        for index, segment in enumerate(segments)
+    )
+
+
 def _message_text(content: Iterable[Mapping[str, Any]]) -> str:
     """A message's content parts as Markdown: text as is, images inline or noted."""
     parts: list[str] = []
     for part in content:
         part_type = part.get("type")
         if part_type in {"input_text", "output_text", "text"}:
-            parts.append(str(part.get("text", "")))
+            parts.append(_markdown_text(str(part.get("text", ""))))
         elif part_type == "refusal":
-            parts.append(f"*Refused: {part.get('refusal', '')}*")
+            parts.append(f"*Refused: {_markdown_text(str(part.get('refusal', '')))}*")
         elif part_type in {"input_image", "output_image"}:
             url = part.get("image_url")
             if (
@@ -308,7 +325,7 @@ def session_notebook(
     """
     builder = _NotebookBuilder(include_outputs)
     title = str(session.get("title") or session.get("id") or "Omnigent session")
-    header = [f"# {title}", ""]
+    header = [f"# {_markdown_text(title)}", ""]
     details = [
         ("Session", f"`{session.get('id')}`" if session.get("id") else None),
         ("Agent", session.get("agent_name")),
@@ -344,21 +361,21 @@ def session_notebook(
                 if isinstance(block, Mapping) and str(block.get("text", "")).strip()
             )
             if summary:
-                builder.markdown(f"*Reasoning:*\n\n{summary}")
+                builder.markdown(f"*Reasoning:*\n\n{_markdown_text(summary)}")
             elif item.get("encrypted_content"):
                 builder.markdown("*(The model's encrypted reasoning isn't included.)*")
         elif item_type == "routing_decision":
             verb = "picked" if item.get("applied", True) else "would have picked"
             builder.markdown(f"*The model router {verb} `{item.get('model', '')}`.*")
         elif item_type == "error":
-            builder.markdown(f"*Error: {item.get('message', '')}*")
+            builder.markdown(f"*Error: {_markdown_text(str(item.get('message', '')))}*")
         elif item_type == "slash_command":
             arguments = f" {item['arguments']}" if item.get("arguments") else ""
             builder.markdown(f"*Command: `/{item.get('name', '')}{arguments}`*")
         elif item_type == "compaction":
             summary = str(item.get("summary") or "").strip()
             note = "*(Earlier conversation was compacted here.)*"
-            builder.markdown(f"{note}\n\n{summary}" if summary else note)
+            builder.markdown(f"{note}\n\n{_markdown_text(summary)}" if summary else note)
         elif item_type == "native_tool":
             native_type = (item.get("item") or {}).get("type", "a built-in tool")
             builder.markdown(f"*Built-in tool used: `{native_type}`.*")
