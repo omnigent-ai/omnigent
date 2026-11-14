@@ -11,10 +11,11 @@ conversation rows; the server validates session access and forwards a
 generic goal control event to the bound runner, which calls Codex
 app-server (`thread/goal/get`, `thread/goal/set`, or
 `thread/goal/clear`). Pause/resume use Codex `thread/goal/set` with
-only a `status` field. If no runner is currently registered, the server
-first tries to wake the session's existing host/workspace binding and
-initializes the relaunched runner before retrying the goal control. The
-caller cannot choose a new host or workspace through these routes.
+only a `status` field. Reads never launch a runner or native backend. For
+mutations, if no runner is registered, the server first tries to wake the
+session's existing host/workspace binding and initializes the relaunched
+runner before retrying the goal control. The caller cannot choose a new
+host or workspace through these routes.
 
 All routes are valid only for sessions stamped with
 `omnigent.wrapper=codex-native-ui`.
@@ -23,14 +24,13 @@ All routes are valid only for sessions stamped with
 GET /v1/sessions/{session_id}/codex_goal
 ```
 
-Auth: read access to the session. If the session's runner is offline
-and the server must relaunch the stored host binding, edit access is
-required for that wake-up side effect.
+Auth: read access to the session. Goal reads have no wake-up side effect.
 
 200 OK:
 
 ```
 {
+  "available": true,
   "goal": {
     "thread_id": "thr_123",
     "objective": "Finish the migration and keep tests green",
@@ -44,8 +44,26 @@ required for that wake-up side effect.
 }
 ```
 
-`goal` is `null` when Codex reports no persisted goal. `created_at`
-and `updated_at` may be `null` if the app-server response omits them.
+`available: true` means the native backend confirmed the response. In that
+case, `goal: null` confirms that Codex has no persisted goal. A non-strict
+read that cannot reach a runner, or encounters a verified idle native
+bridge, returns `{"available": false, "goal": null}`. Retain the last
+accepted goal and any draft or read error for this unavailable response.
+It does not confirm deletion.
+
+Send `X-Omnigent-Codex-Goal-Read: strict` for an explicit read that must
+confirm native state. Unavailable strict reads return 503; malformed runner
+responses return 502, and structured runner errors retain their status.
+Strict reads also leave an idle backend stopped.
+
+Older server or runner responses may omit `available`; its absence makes
+no new availability claim. In particular, an unmarked background
+`goal: null` cannot distinguish an unavailable backend from deletion.
+Explicit strict reads keep their existing response/error contract.
+The availability field belongs only to GET; write responses retain their
+existing schemas.
+
+`created_at` and `updated_at` may be `null` if the app-server response omits them.
 `status` is forwarded exactly as Codex reports it; Omnigent does not
 rename or normalize lifecycle states.
 

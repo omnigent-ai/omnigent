@@ -474,7 +474,7 @@ async def test_goal_read_after_idle_reap_does_not_wake_codex(
         assert response.json()["error"] == "codex_native_goal_failed"
     else:
         assert response.status_code == 200, response.text
-        assert response.json() == {"goal": None}
+        assert response.json() == {"goal": None, "available": False}
     assert session.codex.launches == 1
     assert session.codex.requests == []
     assert session.terminals.get(session.session_id, "codex", "main") is None
@@ -488,7 +488,7 @@ async def test_goal_read_forwards_to_a_live_codex_backend(
     response = await client.get(f"/v1/sessions/{session.session_id}/codex_goal")
 
     assert response.status_code == 200, response.text
-    assert response.json() == {"goal": None}
+    assert response.json() == {"goal": None, "available": True}
     assert ("thread/goal/get", {"threadId": session.codex.thread_id}) in session.codex.requests
     assert session.codex.launches == 1
 

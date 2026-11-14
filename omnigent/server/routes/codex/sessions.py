@@ -37,6 +37,7 @@ from omnigent.server.routes.sessions import (
 )
 from omnigent.server.schemas import (
     ClearCodexGoalResponse,
+    CodexGoalReadResponse,
     CodexGoalResponse,
     SetCodexGoalRequest,
     UpdateCodexGoalStatusRequest,
@@ -476,22 +477,22 @@ def register_codex_session_routes(
 
     @router.get(
         "/sessions/{session_id}/codex_goal",
-        response_model=CodexGoalResponse,
+        response_model=CodexGoalReadResponse | CodexGoalResponse,
     )
     async def get_codex_goal(
         request: Request,
         session_id: str,
-    ) -> CodexGoalResponse | Response:
+    ) -> CodexGoalReadResponse | CodexGoalResponse | Response:
         """
         Read the current Codex app-server goal for a Codex-native session.
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session/conversation identifier, e.g.
             ``"conv_abc123"``.
-        :returns: Current Codex goal state, or ``goal=None`` when no goal is
-            set.
+        :returns: Current Codex goal state and availability. Legacy runner
+            replies leave availability unspecified.
         ``X-Omnigent-Codex-Goal-Read: strict`` opts into unavailable-read errors.
-        Legacy callers keep the empty response for absent or idle runners.
+        Background reads report ``available=False`` for absent or idle runners.
         Strict reads return 503 when no live runner is available and 502 for
         malformed runner replies; structured runner errors preserve their status.
 
@@ -519,7 +520,7 @@ def register_codex_session_routes(
             runner_exit_reports=runner_exit_reports,
         )
         if runner_result is None and not require_live:
-            return CodexGoalResponse(goal=None)
+            return CodexGoalReadResponse(goal=None, available=False)
         runner_payload = _require_codex_goal_runner_payload(
             session_id,
             action="read",
@@ -528,12 +529,26 @@ def register_codex_session_routes(
         if isinstance(runner_payload, JSONResponse):
             return runner_payload
         try:
-            goal_response = CodexGoalResponse.model_validate(runner_payload)
+            # A present availability field must validate before legacy parsing.
+            goal_response = (
+                CodexGoalReadResponse.model_validate(runner_payload)
+                if "available" in runner_payload
+                else CodexGoalResponse.model_validate(runner_payload)
+            )
         except ValueError as exc:
             del exc
             return _codex_goal_error(
                 502,
                 detail="Could not read Codex goal: runner returned a malformed response.",
+            )
+        if (
+            require_live
+            and isinstance(goal_response, CodexGoalReadResponse)
+            and not goal_response.available
+        ):
+            return _codex_goal_error(
+                503,
+                detail="Could not read Codex goal: no live native goal response is available.",
             )
         return goal_response
 

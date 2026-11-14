@@ -74,7 +74,7 @@ describe("useGoalState", () => {
               { error: "codex_native_goal_failed", detail: "runner unavailable" },
               { status: 503 },
             )
-          : Response.json({ goal: null }),
+          : Response.json({ goal: null, available: true }),
       );
     const { result, unmount } = renderHook(() => useGoalState("conv", true));
     try {
@@ -102,6 +102,68 @@ describe("useGoalState", () => {
       fetch.mockRestore();
     }
   });
+
+  it("does not publish an unavailable initial background read", async () => {
+    mockGetGoal.mockResolvedValue({ available: false });
+    const { result } = renderHook(() => useGoalState("conv", true));
+
+    await act(async () => {});
+
+    expect(result.current.goal).toBeNull();
+    expect(result.current.goalRevision).toBe(0);
+  });
+
+  it.each([GOAL, null])(
+    "retains the snapshot and revision after unavailable polling (%j)",
+    async (goal) => {
+      vi.useFakeTimers();
+      mockGetGoal.mockResolvedValueOnce({ goal });
+      const { result } = renderHook(() => useGoalState("conv", true));
+      await act(async () => {});
+      const revision = result.current.goalRevision;
+      mockGetGoal.mockRejectedValueOnce(new Error("runner unavailable"));
+      await act(async () => {
+        await expect(result.current.refreshGoal()).rejects.toThrow("runner unavailable");
+      });
+      mockGetGoal.mockResolvedValue({ available: false });
+
+      await act(() => vi.advanceTimersByTimeAsync(5_000));
+      await act(async () => window.dispatchEvent(new Event("focus")));
+
+      expect(result.current.goal).toBe(goal);
+      expect(result.current.goalRevision).toBe(revision);
+      expect(mockGetGoal).toHaveBeenLastCalledWith("conv", { strict: false });
+    },
+  );
+
+  it.each([GOAL, null])(
+    "accepts an older owned read after a newer unavailable poll (%j)",
+    async (goal) => {
+      vi.useFakeTimers();
+      const olderRead = deferredGoalRead();
+      mockGetGoal
+        .mockResolvedValueOnce({ goal: GOAL })
+        .mockReturnValueOnce(olderRead.promise)
+        .mockResolvedValue({ available: false });
+      const { result } = renderHook(() => useGoalState("conv", true));
+      await act(async () => {});
+      const revision = result.current.goalRevision;
+      let refresh: Promise<void> | undefined;
+      act(() => {
+        refresh = result.current.refreshGoal();
+      });
+
+      await act(() => vi.advanceTimersByTimeAsync(5_000));
+      expect(result.current.goalRevision).toBe(revision);
+      await act(async () => {
+        olderRead.resolve({ goal });
+        await refresh;
+      });
+
+      expect(result.current.goal).toBe(goal);
+      expect(result.current.goalRevision).toBeGreaterThan(revision);
+    },
+  );
 
   it("reflects goals created and paused outside the dialog", async () => {
     vi.useFakeTimers();
@@ -389,7 +451,7 @@ describe("useGoalState", () => {
           { status: 503 },
         ),
       )
-      .mockResolvedValueOnce(Response.json({ goal: null }));
+      .mockResolvedValueOnce(Response.json({ available: true, goal: null }));
     const { result, unmount } = renderHook(() => useGoalState("conv", true));
     try {
       await act(async () => {});

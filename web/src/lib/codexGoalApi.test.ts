@@ -102,7 +102,7 @@ describe("codex goal API", () => {
   });
 
   it("allows an idle background read to return no goal without requiring a live runner", async () => {
-    mockAuthenticatedFetch.mockResolvedValueOnce(mockJsonResponse({ goal: null }));
+    mockAuthenticatedFetch.mockResolvedValueOnce(mockJsonResponse({ goal: null, available: true }));
 
     await expect(getCodexGoal("conv", { strict: false })).resolves.toEqual({ goal: null });
 
@@ -110,6 +110,97 @@ describe("codex goal API", () => {
     expect(url).toBe("/v1/sessions/conv/codex_goal");
     expect(new Headers(init?.headers).has("X-Omnigent-Codex-Goal-Read")).toBe(false);
     expect(init?.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it.each([true, false])("accepts a confirmed null with strict=%s", async (strict) => {
+    mockAuthenticatedFetch.mockResolvedValueOnce(mockJsonResponse({ goal: null, available: true }));
+
+    await expect(getCodexGoal("conv", { strict })).resolves.toEqual({ goal: null });
+  });
+
+  it("keeps an unavailable background read distinct from an absent goal", async () => {
+    mockAuthenticatedFetch.mockResolvedValueOnce(
+      mockJsonResponse({ goal: null, available: false }),
+    );
+
+    await expect(getCodexGoal("conv", { strict: false })).resolves.toEqual({
+      available: false,
+    });
+    expect(
+      new Headers(mockAuthenticatedFetch.mock.calls[0][1]?.headers).has(
+        "X-Omnigent-Codex-Goal-Read",
+      ),
+    ).toBe(false);
+  });
+
+  it("keeps an unmarked legacy background null unavailable", async () => {
+    mockAuthenticatedFetch.mockResolvedValueOnce(mockJsonResponse({ goal: null }));
+
+    await expect(getCodexGoal("conv", { strict: false })).resolves.toEqual({
+      available: false,
+    });
+  });
+
+  it("accepts an unmarked populated background goal", async () => {
+    mockAuthenticatedFetch.mockResolvedValueOnce(mockJsonResponse({ goal: WIRE_GOAL }));
+
+    const response = await getCodexGoal("conv", { strict: false });
+
+    expect(response).toMatchObject({
+      goal: { threadId: "thread-1", objective: WIRE_GOAL.objective },
+    });
+    expect(response).not.toHaveProperty("available");
+  });
+
+  it.each([undefined, true])("rejects unavailable strict reads with strict=%s", async (strict) => {
+    mockAuthenticatedFetch.mockResolvedValueOnce(
+      mockJsonResponse({ goal: null, available: false }),
+    );
+
+    await expect(getCodexGoal("conv", { strict })).rejects.toMatchObject({ status: 503 });
+  });
+
+  it.each([null, 0, 1, "true", "false", [], {}])(
+    "rejects malformed read availability %j without falling back to legacy null",
+    async (available) => {
+      mockAuthenticatedFetch.mockResolvedValueOnce(mockJsonResponse({ goal: null, available }));
+
+      await expect(getCodexGoal("conv", { strict: false })).rejects.toMatchObject({ status: 502 });
+    },
+  );
+
+  it("rejects an unavailable read that carries a non-null goal", async () => {
+    mockAuthenticatedFetch.mockResolvedValueOnce(
+      mockJsonResponse({ goal: WIRE_GOAL, available: false }),
+    );
+
+    await expect(getCodexGoal("conv", { strict: false })).rejects.toMatchObject({ status: 502 });
+  });
+
+  it.each([null, true, 1, "bad", [], {}, { available: true }, { available: false }])(
+    "rejects a malformed read envelope %j",
+    async (body) => {
+      mockAuthenticatedFetch.mockResolvedValueOnce(mockJsonResponse(body));
+
+      await expect(getCodexGoal("conv", { strict: false })).rejects.toMatchObject({
+        status: 502,
+        code: "codex_native_goal_failed",
+      });
+    },
+  );
+
+  it("keeps read availability out of mutation conversion", async () => {
+    mockAuthenticatedFetch.mockResolvedValue(
+      mockJsonResponse({ goal: WIRE_GOAL, available: false }),
+    );
+
+    for (const response of [
+      await setCodexGoal("conv", { objective: "Ship goal mode" }),
+      await updateCodexGoalStatus("conv", "paused"),
+    ]) {
+      expect(response.goal?.objective).toBe(WIRE_GOAL.objective);
+      expect(response).not.toHaveProperty("available");
+    }
   });
 
   it("sets, updates, and clears goals with the expected wire payloads", async () => {

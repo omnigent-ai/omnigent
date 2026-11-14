@@ -2908,6 +2908,22 @@ class CodexGoalResponse(BaseModel):
     goal: CodexGoalObject | None
 
 
+class CodexGoalReadResponse(CodexGoalResponse):
+    """Goal read with explicit availability from the native backend.
+
+    :param available: Whether the backend confirmed the goal, including its
+        absence. An unavailable read must not replace the caller's snapshot.
+    """
+
+    available: Annotated[bool, Strict()]
+
+    @model_validator(mode="after")
+    def _validate_unavailable_goal(self) -> Self:
+        if not self.available and self.goal is not None:
+            raise ValueError("An unavailable goal read cannot contain a goal")
+        return self
+
+
 class SetCodexGoalRequest(BaseModel):
     """
     Request body for ``PUT /v1/sessions/{id}/codex_goal``.

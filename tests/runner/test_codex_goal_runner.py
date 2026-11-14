@@ -283,7 +283,7 @@ async def test_inactive_bridge_only_changes_read_connection_refusal(
     )
 
     if status_code == 200:
-        assert result == {"goal": None}
+        assert result == {"goal": None, "available": False}
     else:
         assert isinstance(result, JSONResponse)
         assert result.status_code == status_code
@@ -314,7 +314,80 @@ async def test_get_allows_absent_goal() -> None:
 
     response = await runner.get("conv_1")
 
-    assert _json_response(response) == {"goal": None}
+    assert _json_response(response) == {"goal": None, "available": True}
+
+
+@pytest.mark.parametrize("require_live", [False, True])
+async def test_get_preserves_unavailable_reads(require_live: bool) -> None:
+    runner = _make_runner()
+    runner._request = AsyncMock(  # type: ignore[method-assign]
+        return_value={"goal": None, "available": False}
+    )
+
+    response = await runner.get("conv_1", require_live=require_live)
+
+    if require_live:
+        assert response.status_code == 503
+        assert _json_response(response)["error"] == "codex_native_goal_failed"
+    else:
+        assert response.status_code == 200
+        assert _json_response(response) == {"goal": None, "available": False}
+
+
+async def test_get_marks_a_native_goal_available(upstream_goal: dict[str, object]) -> None:
+    runner = _make_runner()
+    runner._request = AsyncMock(return_value={"goal": upstream_goal})  # type: ignore[method-assign]
+
+    response = await runner.get("conv_1")
+
+    assert _json_response(response) == {
+        "goal": CodexGoalRunner._goal_to_api(upstream_goal),
+        "available": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("payload", "detail"),
+    [
+        ({}, "invalid goal object"),
+        ({"available": True}, "invalid goal object"),
+        ({"available": False}, "invalid goal object"),
+    ]
+    + [
+        ({"goal": None, "available": value}, "invalid availability")
+        for value in (None, 0, 1, "true", "false", [], {})
+    ],
+)
+async def test_get_rejects_malformed_read_envelopes(
+    payload: dict[str, object], detail: str
+) -> None:
+    runner = _make_runner()
+    runner._request = AsyncMock(return_value=payload)  # type: ignore[method-assign]
+
+    response = await runner.get("conv_1")
+
+    assert response.status_code == 503
+    assert _json_response(response) == {
+        "error": "codex_native_goal_failed",
+        "detail": f"Codex-native goal read returned {detail}.",
+    }
+
+
+async def test_get_rejects_an_unavailable_native_goal(
+    upstream_goal: dict[str, object],
+) -> None:
+    runner = _make_runner()
+    runner._request = AsyncMock(  # type: ignore[method-assign]
+        return_value={"goal": upstream_goal, "available": False}
+    )
+
+    response = await runner.get("conv_1")
+
+    assert response.status_code == 503
+    assert _json_response(response) == {
+        "error": "codex_native_goal_failed",
+        "detail": "Codex-native goal read returned invalid availability.",
+    }
 
 
 @pytest.mark.asyncio

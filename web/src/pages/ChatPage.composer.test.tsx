@@ -1175,7 +1175,7 @@ describe("Composer native goal state", () => {
         expect(screen.getByTestId("goal-current")).toHaveTextContent(goal.objective),
       );
       expect(mockGetGoal).toHaveBeenCalledTimes(1);
-      expect(mockGetGoal).toHaveBeenCalledWith("conv_goal");
+      expect(mockGetGoal).toHaveBeenNthCalledWith(1, "conv_goal", { strict: true });
       expect(screen.queryByText(/Could not read goal/)).toBeNull();
 
       rerender(
@@ -1215,6 +1215,12 @@ describe("Composer native goal state", () => {
       );
 
       await waitFor(() => expect(mockGetGoal).toHaveBeenCalledTimes(3));
+      expect(mockGetGoal.mock.calls.slice(1)).toEqual(
+        expect.arrayContaining([
+          ["conv_goal", { strict: true }],
+          ["conv_goal", { strict: false }],
+        ]),
+      );
       expect(screen.getByTestId("goal-current")).toHaveTextContent(updatedGoal.objective);
     },
   );

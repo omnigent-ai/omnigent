@@ -60,4 +60,12 @@ describe("goal API facade", () => {
 
     expect(mockGetCodexGoal).toHaveBeenCalledWith("conv", options);
   });
+
+  it("preserves unavailable background reads without creating an empty goal", async () => {
+    mockGetCodexGoal.mockResolvedValueOnce({ available: false });
+
+    await expect(getGoal("conv", { strict: false })).resolves.toEqual({ available: false });
+
+    expect(mockGetCodexGoal).toHaveBeenCalledWith("conv", { strict: false });
+  });
 });

@@ -38,6 +38,11 @@ interface CodexGoalResponseWire {
   goal: CodexGoalWire | null;
 }
 
+interface CodexGoalReadResponseWire extends CodexGoalResponseWire {
+  /** Omitted by older servers and runners that do not report availability. */
+  available?: boolean;
+}
+
 /**
  * Browser-facing Codex goal shape. This is the camelCase projection of
  * `CodexGoalWire`; callers should not depend on raw app-server field names.
@@ -69,6 +74,10 @@ export interface CodexGoalResponse {
   /** Current goal, or `null` when Codex has no goal for the thread. */
   goal: CodexGoal | null;
 }
+
+/** Unavailable reads carry no snapshot for callers to publish. */
+export type CodexGoalReadResponse =
+  (CodexGoalResponse & { available?: true }) | { available: false };
 
 /** Payload accepted by `PUT /v1/sessions/{id}/codex_goal`. */
 export interface SetCodexGoalInput {
@@ -179,21 +188,48 @@ function codexGoalResponseFromWire(wire: CodexGoalResponseWire): CodexGoalRespon
  * Read the current Codex-native thread goal for a session.
  *
  * @param sessionId - Session identifier, e.g. ``"conv_abc123"``.
- * @param options - Background reads may allow an idle runner to return no goal.
- * @returns The current goal, or ``goal: null`` when Codex has none.
+ * @param options - Background reads may report an unavailable idle runner.
+ * @returns A confirmed snapshot, or ``available: false`` for an unavailable background read.
  * @throws ApiError when the runner is unavailable or the server rejects the request.
  */
 export async function getCodexGoal(
   sessionId: string,
   options: CodexGoalReadOptions = {},
-): Promise<CodexGoalResponse> {
-  const wire = await requestCodexGoal<CodexGoalResponseWire>(
+): Promise<CodexGoalReadResponse> {
+  const strict = options.strict !== false;
+  const wire = await requestCodexGoal<CodexGoalReadResponseWire>(
     `/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`,
     {
-      headers:
-        options.strict === false ? undefined : { [CODEX_GOAL_READ_HEADER]: CODEX_GOAL_READ_STRICT },
+      headers: strict ? { [CODEX_GOAL_READ_HEADER]: CODEX_GOAL_READ_STRICT } : undefined,
     },
   );
+  if (
+    !wire ||
+    typeof wire !== "object" ||
+    !("goal" in wire) ||
+    ("available" in wire && typeof wire.available !== "boolean") ||
+    (wire.available === false && wire.goal !== null)
+  ) {
+    throw new ApiError(
+      "Could not read Codex goal: server returned a malformed response.",
+      502,
+      "codex_native_goal_failed",
+    );
+  }
+  if (wire.available === false) {
+    if (strict) {
+      throw new ApiError(
+        "Could not read Codex goal: no live native goal response is available.",
+        503,
+        "codex_native_goal_failed",
+      );
+    }
+    return { available: false };
+  }
+  // An unmarked legacy background null cannot distinguish idle from deletion.
+  if (!strict && wire.available === undefined && wire.goal === null) {
+    return { available: false };
+  }
   return codexGoalResponseFromWire(wire);
 }
 

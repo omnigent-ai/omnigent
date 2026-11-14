@@ -73,6 +73,7 @@ export function useGoalState(
         activeBinding.current === binding && version > lastSuccessfulVersion.current;
       try {
         const response = await getGoal(binding.conversationId, { strict });
+        if (response.available === false) return;
         if (isCurrent()) {
           lastSuccessfulVersion.current = version;
           setSnapshot((current) =>

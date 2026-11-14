@@ -167,8 +167,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   the current goal fields. Failed background reads keep the last goal and slow
   retries; returning to the tab retries immediately.
   Automatic refresh runs while the runner is online and Chat is visible;
-  polling and focus reads let an idle-reaped thread report no goal without
-  waking it. Explicit dialog and reconciliation reads require a live response
+  polling and focus reads retain the last snapshot, drafts and read error when
+  the native goal is unavailable, without waking an idle-reaped thread. A
+  confirmed native response with no goal still clears the accepted goal. Legacy
+  background replies without availability cannot confirm an absent goal.
+  Explicit dialog and reconciliation reads require a live response
   and surface runner errors. Dialog reads and updates remain available while
   runner status is offline or unknown. A new runner connection invalidates
   earlier callbacks while retaining this session's accepted goal; a failed

@@ -405,6 +405,71 @@ describe("GoalDialog", () => {
     expect(screen.getByTestId("goal-objective")).toHaveValue("");
   });
 
+  it("retains a strict read error and drafts until a confirmed background null arrives", async () => {
+    vi.useFakeTimers();
+    const actualGoalApi = await vi.importActual<typeof GoalApiModule>("@/lib/goalApi");
+    mockGetGoal.mockImplementation(actualGoalApi.getGoal);
+    let strictFailure = false;
+    let background: object = {
+      available: true,
+      goal: {
+        thread_id: "thread-1",
+        objective: ACTIVE_GOAL.objective,
+        status: "paused",
+        token_budget: ACTIVE_GOAL.tokenBudget,
+        tokens_used: ACTIVE_GOAL.tokensUsed,
+        time_used_seconds: ACTIVE_GOAL.timeUsedSeconds,
+      },
+    };
+    const fetch = vi
+      .spyOn(identity, "authenticatedFetch")
+      .mockImplementation(async (_url, init) => {
+        if ((init?.method ?? "GET") !== "GET") throw new Error("Unexpected goal write");
+        return strictFailure &&
+          new Headers(init?.headers).get("X-Omnigent-Codex-Goal-Read") === "strict"
+          ? Response.json(
+              { error: "codex_native_goal_failed", detail: "runner unavailable" },
+              { status: 503 },
+            )
+          : Response.json(background);
+      });
+    const { rerender } = render(<ManagedDialog />);
+    await act(async () => {});
+    fireEvent.change(screen.getByTestId("goal-objective"), {
+      target: { value: "Unsaved objective" },
+    });
+    strictFailure = true;
+    rerender(<ManagedDialog pollingEnabled={false} />);
+    await act(async () => {});
+    expect(screen.getByText("Could not read goal: runner unavailable")).toBeInTheDocument();
+    background = { available: false, goal: null };
+
+    rerender(<ManagedDialog />);
+    await act(async () => {});
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+
+    expect(screen.getByTestId("owner-goal")).toHaveTextContent(ACTIVE_GOAL.objective);
+    expect(screen.getByTestId("goal-current")).toHaveTextContent(ACTIVE_GOAL.objective);
+    expect(screen.getByTestId("goal-objective")).toHaveValue("Unsaved objective");
+    expect(screen.getByTestId("goal-token-budget")).toHaveValue(ACTIVE_GOAL.tokenBudget);
+    expect(screen.getByTestId("goal-mode-paused")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByText("Could not read goal: runner unavailable")).toBeInTheDocument();
+    expect(mockSetGoal).not.toHaveBeenCalled();
+    expect(mockUpdateGoalStatus).not.toHaveBeenCalled();
+    expect(mockClearGoal).not.toHaveBeenCalled();
+
+    background = { available: true, goal: null };
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+
+    expect(screen.getByTestId("owner-goal")).toHaveTextContent("No goal");
+    expect(screen.getByTestId("goal-empty")).toBeInTheDocument();
+    expect(screen.queryByText(/Could not read goal/)).not.toBeInTheDocument();
+    expect(screen.getByTestId("goal-objective")).toHaveValue("Unsaved objective");
+    expect(screen.getByTestId("goal-token-budget")).toHaveValue(null);
+    expect(screen.getByTestId("goal-mode-active")).toHaveAttribute("aria-checked", "true");
+    expect(fetch.mock.calls.every(([, init]) => (init?.method ?? "GET") === "GET")).toBe(true);
+  });
+
   it.each(
     goalReadResults.flatMap((read) =>
       ["same batch", "error first"].map((ordering) => ({ ...read, ordering })),

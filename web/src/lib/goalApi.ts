@@ -15,6 +15,8 @@ export interface GoalResponse {
   goal: Goal | null;
 }
 
+export type GoalReadResponse = (GoalResponse & { available?: true }) | { available: false };
+
 export interface SetGoalInput {
   objective: string;
   tokenBudget?: number | null;
@@ -34,7 +36,10 @@ export interface GoalReadOptions {
  * Codex remains the only supported backend in this refactor. The generic
  * session endpoint can replace this delegation without changing UI callers.
  */
-export async function getGoal(sessionId: string, options?: GoalReadOptions): Promise<GoalResponse> {
+export async function getGoal(
+  sessionId: string,
+  options?: GoalReadOptions,
+): Promise<GoalReadResponse> {
   return getCodexGoal(sessionId, options);
 }
 

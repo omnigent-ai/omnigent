@@ -163,8 +163,8 @@ class CodexGoalRunner:
                     and self._bridge_is_inactive is not None
                     and self._bridge_is_inactive(conv_id, state)
                 ):
-                    # Legacy reads preserve the empty response for an idle thread.
-                    return {"goal": None}
+                    # An idle bridge cannot confirm whether the goal still exists.
+                    return {"goal": None, "available": False}
                 raise
             return self._goal_result(
                 await codex_client.request(method, {"threadId": state.thread_id, **params}),
@@ -205,13 +205,24 @@ class CodexGoalRunner:
         if isinstance(result, JSONResponse):
             return result
         goal = result.get("goal")
-        if goal is not None and not isinstance(goal, dict):
+        available = result.get("available", True)
+        if type(available) is not bool or (not available and goal is not None):
+            return self._malformed_response("read", "invalid availability")
+        if not available and require_live:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_goal_failed",
+                    "detail": "Codex-native goal read requires a live Codex bridge.",
+                },
+            )
+        if "goal" not in result or (goal is not None and not isinstance(goal, dict)):
             return self._malformed_response("read", "invalid goal object")
         try:
             api_goal = None if goal is None else self._goal_to_api(goal)
         except ValueError as exc:
             return self._malformed_response("read", str(exc))
-        return JSONResponse({"goal": api_goal})
+        return JSONResponse({"goal": api_goal, "available": available})
 
     async def set(
         self,
