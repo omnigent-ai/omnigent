@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from pathlib import Path
 from typing import IO
+from unittest.mock import Mock
 
 import pytest
 
@@ -623,7 +624,13 @@ _HELPER_BACKENDS = [
 ]
 
 
-def _helper_env(workspace: Path, backend: str) -> CallerProcessOSEnvironment:
+def _helper_env(
+    workspace: Path,
+    backend: str,
+    *,
+    relaunch_when_stale: bool = False,
+    env_passthrough: list[str] | None = None,
+) -> CallerProcessOSEnvironment:
     os_env = create_os_environment(
         OSEnvSpec(
             type="caller_process",
@@ -632,11 +639,50 @@ def _helper_env(workspace: Path, backend: str) -> CallerProcessOSEnvironment:
                 type=backend,
                 read_paths=[str(_project_root())],
                 write_paths=["."],
+                env_passthrough=env_passthrough,
             ),
-        )
+        ),
+        relaunch_when_stale=relaunch_when_stale,
     )
     assert isinstance(os_env, CallerProcessOSEnvironment)
     return os_env
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize("backend", _HELPER_BACKENDS)
+def test_reused_helper_refreshes_effective_parent_environment(
+    tmp_path: Path, backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Changed or removed inherited values relaunch; filtered-out values do not."""
+    name = "TEST_HARMLESS_PASSTHROUGH"
+    monkeypatch.setenv(name, "first")
+    os_env = _helper_env(tmp_path, backend, relaunch_when_stale=True, env_passthrough=[name])
+    command = 'printf "%s" "${TEST_HARMLESS_PASSTHROUGH-unset}"'
+    try:
+        assert asyncio.run(os_env.shell(command))["stdout"] == "first"
+        first = os_env._helper._proc
+        assert first is not None
+        monkeypatch.setenv("TEST_HARMLESS_FILTERED", "changed")
+        assert asyncio.run(os_env.shell(command))["stdout"] == "first"
+        unchanged = os_env._helper._proc
+        if backend == "none":
+            assert unchanged is not first and first.poll() is not None
+        else:
+            assert unchanged is first
+
+        monkeypatch.setenv(name, "second")
+        assert asyncio.run(os_env.shell(command))["stdout"] == "second"
+        changed = os_env._helper._proc
+        assert changed is not None and changed is not unchanged
+        assert unchanged is not None and unchanged.poll() is not None
+        monkeypatch.delenv(name)
+        assert asyncio.run(os_env.shell(command))["stdout"] == "unset"
+        removed = os_env._helper._proc
+        assert removed is not None and removed is not changed and changed.poll() is not None
+        assert asyncio.run(os_env.shell(command))["stdout"] == "unset"
+        assert os_env._helper._proc is removed
+    finally:
+        os_env.close()
 
 
 @pytest.mark.parametrize(
@@ -833,21 +879,57 @@ def test_shell_command_is_not_rerun_when_its_helper_dies_before_replying(
 
 
 @pytest.mark.parametrize("backend", _HELPER_BACKENDS)
+@pytest.mark.parametrize("config_file_transport", [False, True], ids=["native", "config-file"])
 def test_read_is_answered_by_a_new_helper_when_the_first_dies_before_replying(
-    tmp_path: Path, backend: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    config_file_transport: bool,
 ) -> None:
-    """A read has no side effects, so it is safe to send again."""
+    """Read retries and helper cleanup work with either config transport."""
+    import omnigent.inner.os_env as os_env_module
+
+    created_scratch_dirs: list[Path] = []
+    create_tmpdir = os_env_module.create_private_tmpdir
+
+    def track_tmpdir() -> Path:
+        path = create_tmpdir()
+        created_scratch_dirs.append(path)
+        return path
+
+    monkeypatch.setattr(os_env_module, "create_private_tmpdir", track_tmpdir)
+    if config_file_transport:
+        monkeypatch.setattr(os_env_module, "IS_WINDOWS", True)
     workspace = tmp_path.resolve()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(workspace / "parent-runtime"))
     (workspace / "notes.txt").write_text("kept\n")
     os_env = _helper_env(workspace, backend)
     try:
+        if config_file_transport:
+            spawn = Mock(side_effect=OSError("controlled helper spawn failure"))
+            with monkeypatch.context() as failed_spawn:
+                failed_spawn.setattr(os_env_module.subprocess, "Popen", spawn)
+                with pytest.raises(OSError, match="controlled helper spawn failure"):
+                    asyncio.run(os_env.read("notes.txt"))
+            if backend == "none":
+                assert spawn.call_args.kwargs["env"]["XDG_RUNTIME_DIR"] == str(
+                    workspace / "parent-runtime"
+                )
+            assert created_scratch_dirs and all(not path.exists() for path in created_scratch_dirs)
+            assert os_env._helper._tmpdir is None
         assert asyncio.run(os_env.read("notes.txt")).get("content") == "kept\n"
+        first_scratch_dir = os_env._helper._tmpdir
+        if first_scratch_dir is not None:
+            assert not (first_scratch_dir / "helper-config.json").exists()
         dead_helper = _fail_next_request(os_env, delivered=True)
         result = asyncio.run(os_env.read("notes.txt"))
         assert result.get("content") == "kept\n", result
         assert os_env._helper._proc is not dead_helper
+        if first_scratch_dir is not None:
+            assert not first_scratch_dir.exists()
     finally:
         os_env.close()
+    assert all(not path.exists() for path in created_scratch_dirs)
 
 
 @pytest.mark.parametrize("backend", _HELPER_BACKENDS)
@@ -874,6 +956,7 @@ def test_close_stops_the_helper_and_releases_its_spawner_thread(
     tmp_path: Path, backend: str, timeout_child: bool
 ) -> None:
     """Closing ends the helper and its spawning thread, and can be repeated."""
+    (tmp_path / "notes.txt").write_text("kept\n")
     os_env = _helper_env(tmp_path.resolve(), backend)
     if timeout_child:
         pid_file = tmp_path / "child.pid"
@@ -901,7 +984,7 @@ def test_close_stops_the_helper_and_releases_its_spawner_thread(
             finally:
                 os_env.close()
             raise
-    assert asyncio.run(os_env.shell("true")).get("exit_code") == 0
+    assert asyncio.run(os_env.read("notes.txt")).get("content") == "kept\n"
     helper = os_env._helper._proc
     assert helper is not None
     spawner_threads = list(os_env._helper._spawner._threads)
