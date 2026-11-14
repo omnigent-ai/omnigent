@@ -1044,12 +1044,25 @@ async def test_codex_native_title_prefers_title_model_over_session_sources(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("trigger", ["cancel", "timeout"])
+@pytest.mark.parametrize("cancel_during_cleanup", [None, "kill", "reap"])
 async def test_codex_native_title_kills_process_when_cancelled(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path,
+    tmp_path: Path,
+    trigger: str,
+    cancel_during_cleanup: str | None,
 ) -> None:
     communicate_started = asyncio.Event()
+    communication_failed = asyncio.Event()
+    kill_started = asyncio.Event()
+    kill_release = threading.Event()
+    kill_finished = threading.Event()
+    reap_started = asyncio.Event()
+    reap_release = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    loop_progressed: list[bool] = []
     killed: list[Any] = []
+    title_home: list[Path] = []
 
     class FakeProcess:
         returncode: int | None = None
@@ -1057,15 +1070,27 @@ async def test_codex_native_title_kills_process_when_cancelled(
 
         async def communicate(self) -> tuple[bytes, bytes]:
             communicate_started.set()
-            await asyncio.Event().wait()
-            raise AssertionError("unreachable")
+            await communication_failed.wait()
+            raise TimeoutError("title inference timed out")
 
         async def wait(self) -> int:
+            reap_started.set()
+            await reap_release.wait()
             self.waited = True
             self.returncode = -9
             return self.returncode
 
     process = FakeProcess()
+
+    def kill_tree(candidate: Any) -> None:
+        killed.append(candidate)
+        loop.call_soon_threadsafe(kill_started.set)
+        loop_progressed.append(kill_release.wait(timeout=1.0))
+        kill_finished.set()
+
+    async def create_subprocess_exec(*args: Any, **kwargs: Any) -> FakeProcess:
+        title_home.append(Path(kwargs["env"]["CODEX_HOME"]))
+        return process
 
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.app_server.resolve_native_codex_launch",
@@ -1076,14 +1101,10 @@ async def test_codex_native_title_kills_process_when_cancelled(
         lambda: "codex",
     )
     monkeypatch.setattr(
-        asyncio,
-        "create_subprocess_exec",
-        lambda *args, **kwargs: asyncio.sleep(0, result=process),
+        "omnigent.inner.codex_executor._codex_home_config_source_from_env", lambda: tmp_path
     )
-    monkeypatch.setattr(
-        "omnigent.inner._proc.kill_tree",
-        lambda candidate: killed.append(candidate),
-    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
+    monkeypatch.setattr("omnigent.inner._proc.kill_tree", kill_tree)
 
     task = asyncio.create_task(
         codex_native_titles.generate_background_title(
@@ -1096,13 +1117,44 @@ async def test_codex_native_title_kills_process_when_cancelled(
             )
         )
     )
-    await communicate_started.wait()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    try:
+        await asyncio.wait_for(communicate_started.wait(), timeout=2)
+        if trigger == "cancel":
+            task.cancel()
+        else:
+            communication_failed.set()
+        await asyncio.wait_for(kill_started.wait(), timeout=2)
+        assert not kill_finished.is_set(), "process-tree cleanup blocked the runner loop"
+        assert title_home[0].is_dir()
+        if cancel_during_cleanup == "kill":
+            for _ in range(2):
+                task.cancel()
+                await asyncio.sleep(0)
+                assert not task.done()
+                assert title_home[0].is_dir()
+        kill_release.set()
+        await asyncio.wait_for(reap_started.wait(), timeout=2)
+        assert title_home[0].is_dir()
+        if cancel_during_cleanup == "reap":
+            for _ in range(2):
+                task.cancel()
+                await asyncio.sleep(0)
+                assert not task.done()
+                assert title_home[0].is_dir()
+        reap_release.set()
+        expected_error = asyncio.CancelledError if trigger == "cancel" else TimeoutError
+        with pytest.raises(expected_error):
+            await task
+    finally:
+        kill_release.set()
+        reap_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        assert await asyncio.to_thread(kill_finished.wait, 2)
 
+    assert loop_progressed == [True]
     assert killed == [process]
     assert process.waited is True
+    assert not title_home[0].parent.exists()
 
 
 @pytest.mark.asyncio
