@@ -223,6 +223,8 @@ export interface ElicitationRequest {
    * PermissionRequest for non-AskUserQuestion tools).
    */
   askUserQuestion?: Record<string, unknown> | null;
+  /** Producer-supplied extra (workflow questions only): the ID of the plan step the question is about. */
+  journalStep?: string;
   /**
    * Producer-supplied extra (claude-native only): the FULL
    * ``ExitPlanMode`` tool_input, untruncated — present when the

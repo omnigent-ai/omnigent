@@ -920,6 +920,7 @@ async def test_saving_a_workflow_names_the_sessions_plan_after_it(
 async def test_a_workflows_runs_list_the_sessions_that_ran_it(
     client: httpx.AsyncClient, db_uri: str
 ) -> None:
+    from omnigent.server.routes._sessions.helpers import _publish_status
     from omnigent.stores.session_journal_store import SessionJournalStore
 
     steps = [
@@ -988,6 +989,23 @@ async def test_a_workflows_runs_list_the_sessions_that_ran_it(
     assert [(s["step"], s["payload"]["status"]) for s in by_session[first]["statuses"]] == [
         ("explore", "done")
     ]
+
+    conversations = SqlAlchemyConversationStore(db_uri)
+    child = _session(db_uri, parent_conversation_id=first)
+    # A parent's turn can be idle while its child or background work continues.
+    for child_status in ("running", "waiting", "idle"):
+        _publish_status(child, child_status)
+        page = (await client.get(url, headers=_headers(ALICE))).json()
+        parent_run = next(run for run in page["data"] if run["session_id"] == first)
+        assert parent_run["session_status"] == ("idle" if child_status == "idle" else "running")
+        assert parent_run["background_work_running"] is False
+    for background_running in (True, False):
+        conversations.set_background_work_running(first, background_running)
+        page = (await client.get(url, headers=_headers(ALICE))).json()
+        parent_run = next(run for run in page["data"] if run["session_id"] == first)
+        assert parent_run["session_status"] == "idle"
+        assert parent_run["background_work_running"] is background_running
+
     # One run a page: three pages, one of them empty where bob's run was left out.
     pages, cursor = [], ""
     while cursor is not None:

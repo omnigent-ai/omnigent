@@ -1,6 +1,7 @@
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSavedWorkflowsModule from "@/hooks/useSavedWorkflows";
 import type * as UseSessionJournalModule from "@/hooks/useSessionJournal";
+import type * as SidebarDataModule from "@/hooks/useSidebarData";
 import type * as CapabilitiesModule from "@/lib/CapabilitiesContext";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -10,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import { type SessionJournalView, useSessionJournal } from "@/hooks/useSessionJournal";
+import { useOptionalLoadedConversations } from "@/hooks/useSidebarData";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { formatMessageTimestamp } from "@/lib/relativeTime";
 import type { JournalEntry } from "@/lib/sessionJournal";
@@ -25,6 +27,7 @@ import {
   useSessionTasksActions,
 } from "@/store/sessionTasksActions";
 import { journalEntry, journalPlan } from "@/test/journalFixtures";
+import { conversation, conversationPage } from "@/test/sidebarMockHelpers";
 import { TasksPanel } from "./TasksPanel";
 
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
@@ -38,6 +41,10 @@ vi.mock("@/hooks/useSavedWorkflows", async (importOriginal) => ({
 vi.mock("@/hooks/useSessionJournal", async (importOriginal) => ({
   ...(await importOriginal<typeof UseSessionJournalModule>()),
   useSessionJournal: vi.fn(),
+}));
+vi.mock("@/hooks/useSidebarData", async (importOriginal) => ({
+  ...(await importOriginal<typeof SidebarDataModule>()),
+  useOptionalLoadedConversations: vi.fn(),
 }));
 vi.mock("@/lib/CapabilitiesContext", async (importOriginal) => ({
   ...(await importOriginal<typeof CapabilitiesModule>()),
@@ -76,7 +83,7 @@ function SearchProbe() {
 
 function renderPanel(onStartWorkflow?: () => void, onShowInChat?: () => void) {
   return render(
-    <MemoryRouter initialEntries={["/c/conv"]}>
+    <>
       <TasksPanel
         conversationId="conv"
         active
@@ -84,7 +91,12 @@ function renderPanel(onStartWorkflow?: () => void, onShowInChat?: () => void) {
         onShowInChat={onShowInChat}
       />
       <SearchProbe />
-    </MemoryRouter>,
+    </>,
+    {
+      wrapper: ({ children }) => (
+        <MemoryRouter initialEntries={["/c/conv"]}>{children}</MemoryRouter>
+      ),
+    },
   );
 }
 
@@ -94,6 +106,7 @@ function setSession(state: Partial<ConversationState>) {
 }
 
 beforeEach(() => {
+  vi.mocked(useOptionalLoadedConversations).mockReturnValue(undefined);
   vi.mocked(useChildSessions).mockReturnValue({ children: [] } as never);
   vi.mocked(useServerInfo).mockReturnValue({
     session_journal: true,
@@ -530,6 +543,42 @@ describe("TasksPanel", () => {
     }
   });
 
+  it("takes Continue to the question a waiting task's agent waits on, rather than messaging it", () => {
+    showJournal([
+      journalPlan(0, ["approve"], ["docs"]),
+      status(1, "approve", "needs_input", "Deploy to prod now?"),
+      status(2, "docs", "needs_input", "Paused at your request"),
+    ]);
+    const question = {
+      type: "elicitation",
+      elicitationId: "elicit_approve",
+      status: "pending",
+      phase: "workflow_request_input",
+      journalStep: "approve",
+    };
+    setSession({ blocks: [question] as unknown as ConversationState["blocks"] });
+    const taskAction = vi.fn();
+    const onShowInChat = vi.fn();
+    const withdraw = registerTaskAction("conv", taskAction);
+    try {
+      renderPanel(undefined, onShowInChat);
+      const [approve, docs] = screen.getAllByTestId("tasks-row");
+      fireEvent.pointerDown(within(approve!).getByTestId("tasks-row-menu"), { button: 0 });
+      fireEvent.click(screen.getByTestId("tasks-row-proceed"));
+      expect(taskAction).not.toHaveBeenCalled();
+      expect(onShowInChat).toHaveBeenCalledOnce();
+      const search = new URLSearchParams(screen.getByTestId("search").textContent ?? "");
+      expect(search.get("message")).toBe("elicit_approve");
+
+      // A task with no question waiting still asks the agent to go ahead.
+      fireEvent.pointerDown(within(docs!).getByTestId("tasks-row-menu"), { button: 0 });
+      fireEvent.click(screen.getByTestId("tasks-row-proceed"));
+      expect(taskAction).toHaveBeenCalledWith("proceed", "docs");
+    } finally {
+      act(withdraw);
+    }
+  });
+
   it("offers Stop on a running task while the composer can stop the agent", () => {
     showJournal([journalPlan(0, ["baseline"]), status(1, "baseline", "started")]);
     setSession({ sessionStatus: "running" });
@@ -653,6 +702,38 @@ describe("TasksPanel", () => {
     } finally {
       act(withdraw);
     }
+  });
+
+  it.each([
+    { source: "background work", activity: { background_work_running: true } },
+    { source: "child activity", activity: { status: "running" as const } },
+  ])("keeps tasks running with an idle parent and sidebar $source", ({ activity }) => {
+    showJournal([journalPlan(0, ["deploy"]), status(1, "deploy", "started")]);
+    vi.mocked(useOptionalLoadedConversations).mockReturnValue({
+      ...conversationPage([conversation("conv", activity)]).data!,
+      pageParams: [undefined],
+    });
+    setSession({ sessionStatus: "running" });
+    const { rerender } = renderPanel();
+
+    // An active goal can outlive its turn with no background terminals counted.
+    setSession({ sessionStatus: "idle", backgroundTaskCount: 0 });
+    expect(screen.getByTestId("tasks-row")).toHaveAttribute("data-state", "running");
+    expect(screen.queryByTestId("tasks-paused")).toBeNull();
+
+    // Native task lists use the same activity as journal plans.
+    showJournal([]);
+    setSession({
+      todos: [{ content: "Deploy", status: "in_progress", activeForm: "Deploying" }],
+    });
+    expect(screen.getByTestId("tasks-row")).toHaveAttribute("data-state", "running");
+
+    vi.mocked(useOptionalLoadedConversations).mockReturnValue({
+      ...conversationPage([conversation("conv")]).data!,
+      pageParams: [undefined],
+    });
+    rerender(<TasksPanel conversationId="conv" active />);
+    expect(screen.getByTestId("tasks-row")).toHaveAttribute("data-state", "stopped");
   });
 
   it("shows a task waiting for you in pink, and counts it in the summary", () => {

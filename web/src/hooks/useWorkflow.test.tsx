@@ -16,6 +16,7 @@ const COMPLETED_RUN = {
   title: "Completed run",
   started_at: 1,
   session_status: "idle",
+  background_work_running: false,
   archived: false,
   progress: { total: 2, started: 0, done: 2, needs_input: 0, failed: 0 },
 };
@@ -74,12 +75,23 @@ describe("useWorkflowRuns live refresh", () => {
       expect(result.current.data?.pages[0].runs[0].sessionStatus).toBe("running");
 
       serverRuns = [
+        { ...RUNNING_RUN, session_status: "idle", background_work_running: true },
+        ...history,
+      ];
+      await act(() => vi.advanceTimersByTimeAsync(10_000));
+      expect(result.current.data?.pages[0].runs[0]).toMatchObject({
+        sessionStatus: "idle",
+        backgroundWorkRunning: true,
+      });
+
+      serverRuns = [
         { ...RUNNING_RUN, session_status: "idle", progress: COMPLETED_RUN.progress },
         ...history,
       ];
       await act(() => vi.advanceTimersByTimeAsync(10_000));
       expect(result.current.data?.pages[0].runs[0]).toMatchObject({
         sessionStatus: "idle",
+        backgroundWorkRunning: false,
         progress: { done: 2 },
       });
 

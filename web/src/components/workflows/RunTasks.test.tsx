@@ -8,6 +8,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type * as SessionsApi from "@/lib/sessionsApi";
@@ -105,7 +106,9 @@ describe("RunPlanButton", () => {
     const client = new QueryClient();
     const { result } = renderHook(() => useRunTaskMenus("sess_1", []), {
       wrapper: ({ children }) => (
-        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        <QueryClientProvider client={client}>
+          <MemoryRouter>{children}</MemoryRouter>
+        </QueryClientProvider>
       ),
     });
     const menu = result.current?.({

@@ -15,6 +15,8 @@ export interface WorkflowRun {
   /** Unix epoch seconds when the run's plan was written. */
   startedAt: number;
   sessionStatus: "idle" | "running" | "failed";
+  /** Work that outlives the parent turn, such as background shells or an active goal. */
+  backgroundWorkRunning?: boolean;
   archived: boolean;
   /** The run's starting steps, counted by their current status. */
   progress: {
@@ -30,9 +32,17 @@ export interface WorkflowRun {
   statuses: JournalEntry[];
 }
 
+/** The session's turn, delegated work, or work left running between turns. */
+export function isWorkflowRunWorking(run: WorkflowRun): boolean {
+  return run.sessionStatus === "running" || run.backgroundWorkRunning === true;
+}
+
 /** Where each of the run's steps stands, as the Tasks tab works it out. */
-export function runStepProgress(run: WorkflowRun): StepProgress[] {
-  return stepProgress(run.steps, run.statuses, run.sessionStatus === "running");
+export function runStepProgress(
+  run: WorkflowRun,
+  sessionWorking = isWorkflowRunWorking(run),
+): StepProgress[] {
+  return stepProgress(run.steps, run.statuses, sessionWorking);
 }
 
 /** How a run's row looks: its icon and its one-line state. */
@@ -48,12 +58,15 @@ export type WorkflowRunState =
  * a finished run; a running session shows its progress; otherwise a failed
  * step or session says so, and a run that stopped partway shows its count.
  */
-export function describeWorkflowRun(run: WorkflowRun): WorkflowRunState {
+export function describeWorkflowRun(
+  run: WorkflowRun,
+  sessionWorking = isWorkflowRunWorking(run),
+): WorkflowRunState {
   const { total, done, needsInput, failed } = run.progress;
   const count = `${done} of ${total} done`;
   if (needsInput > 0) return { kind: "waiting", label: "Waiting for you" };
   if (total > 0 && done === total) return { kind: "done", label: "Done" };
-  if (run.sessionStatus === "running") return { kind: "running", label: count };
+  if (sessionWorking) return { kind: "running", label: count };
   if (failed > 0) return { kind: "failed", label: `Failed · ${count}` };
   if (run.sessionStatus === "failed") return { kind: "failed", label: `Session failed · ${count}` };
   return { kind: "stopped", label: count };

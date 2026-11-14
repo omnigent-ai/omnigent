@@ -4,6 +4,7 @@
 import { useChildSessions } from "@/hooks/useChildSessions";
 import { useConversationEntryValue } from "@/hooks/useConversationEntryState";
 import { useSessionJournal, type SessionJournalView } from "@/hooks/useSessionJournal";
+import { useSessionWorking } from "@/hooks/useSessionWorking";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { parentIdFromLabels } from "@/lib/sessionHost";
@@ -54,24 +55,12 @@ export function useSessionTasks(
     serverInfo.session_journal === true;
   const journal = useSessionJournal(conversationId, enabled && journalSupported);
   const nativeTasks = useConversationEntryValue(conversationId ?? null, (state) => state.todos);
-  const sessionStatus = useConversationEntryValue(
-    conversationId ?? null,
-    (state) => state.sessionStatus,
-  );
-  const backgroundTasks = useConversationEntryValue(
-    conversationId ?? null,
-    (state) => state.backgroundTaskCount,
-  );
   // The same list the Agents rail reads. A side chat isn't delegated work.
   const { children } = useChildSessions(conversationId ?? null);
   const workersRunning = children.some(
     (child) => child.busy && parentIdFromLabels(child.labels) === null,
   );
-  const sessionWorking =
-    sessionStatus === "running" ||
-    sessionStatus === "waiting" ||
-    (backgroundTasks ?? 0) > 0 ||
-    workersRunning;
+  const sessionWorking = useSessionWorking(conversationId ?? null, workersRunning);
   // A question or permission prompt in the chat waiting for the user's answer. A
   // workflow question marks only its own task, which the journal already shows.
   const awaitingUser = useConversationEntryValue(conversationId ?? null, (state) =>

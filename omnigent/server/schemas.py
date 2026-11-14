@@ -3482,7 +3482,8 @@ class WorkflowRun(BaseModel):
     :param title: The session's title; empty when it has none yet.
     :param started_at: Unix epoch seconds when the run's plan was written.
     :param session_status: The session's status, ``"idle"``, ``"running"`` or
-        ``"failed"``.
+        ``"failed"``, including active direct sub-agents.
+    :param background_work_running: Whether background work outlives the session's turn.
     :param archived: Whether the session is archived.
     :param progress: Where the run's steps stand.
     :param steps: The steps of the plan that started the run.
@@ -3495,6 +3496,7 @@ class WorkflowRun(BaseModel):
     title: str
     started_at: int
     session_status: Literal["idle", "running", "failed"]
+    background_work_running: bool = False
     archived: bool = False
     progress: WorkflowRunProgress
     steps: list[WorkflowStep] = Field(default_factory=list)
