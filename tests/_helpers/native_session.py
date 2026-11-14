@@ -51,7 +51,8 @@ def _redacted_response_text(response: httpx.Response) -> str:
         if isinstance(value, list):
             return [redact(item) for item in value]
         if isinstance(value, str):
-            if _SENSITIVE_RESPONSE_KEY_PATTERN.search(value):
+            # Validation strings can echo arbitrary metadata, including containers.
+            if "input_value=" in value or _SENSITIVE_RESPONSE_KEY_PATTERN.search(value):
                 return "[REDACTED]"
             redacted = redact_log_text(value, include_whitespace_credentials=True)
             return "[REDACTED]" if redacted != value else value

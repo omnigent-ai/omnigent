@@ -760,14 +760,17 @@ class Lab:
             if remaining <= 0:
                 raise TimeoutError(timeout_detail)
             # The online DB row is committed before the tunnel enters the registry.
-            response = observer.get(
-                f"/v1/hosts/{self.host_id}/filesystem",
-                params={"limit": 1},
-                timeout=min(2.0, remaining),
-            )
+            try:
+                response = observer.get(
+                    f"/v1/hosts/{self.host_id}/filesystem",
+                    params={"limit": 1},
+                    timeout=min(2.0, remaining),
+                )
+            except httpx.HTTPError:
+                response = None
             if time.monotonic() >= deadline:
                 raise TimeoutError(timeout_detail)
-            return True if response.status_code == 200 else None
+            return True if response is not None and response.status_code == 200 else None
 
         wait_for(_ready, timeout=_STARTUP_TIMEOUT_S, what="the host daemon to answer an RPC")
 

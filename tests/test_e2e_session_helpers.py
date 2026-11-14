@@ -216,7 +216,17 @@ def test_pending_tool_poll_waits_for_this_turn(monkeypatch, previous_call) -> No
             ("synthetic-key-tail", "synthetic-key-value-tail"),
             id="non-assignment-password-key",
         ),
-        pytest.param(None, ("synthetic-validation-tail",), id="metadata-validation"),
+        pytest.param(
+            None,
+            (
+                "synthetic-passphrase-tail",
+                "synthetic-cookie-tail",
+                "synthetic-private-key-tail",
+                "synthetic-object-tail",
+                "synthetic-list-tail",
+            ),
+            id="metadata-validation",
+        ),
         pytest.param(
             {
                 'password="\\"synthetic-escaped-key-tail"': {
@@ -258,9 +268,20 @@ def test_native_create_failure_keeps_bounded_redacted_response(
         from omnigent.server.routes._sessions.helpers import _parse_session_create_metadata
 
         with pytest.raises(OmnigentError) as validation:
-            _parse_session_create_metadata(json.dumps({"api_token": credential_tails[0]}))
+            _parse_session_create_metadata(
+                json.dumps(
+                    {
+                        "passphrase": credential_tails[0],
+                        "Cookie": credential_tails[1],
+                        "private_key": credential_tails[2],
+                        "settings": {"value": credential_tails[3]},
+                        "options": [credential_tails[4]],
+                    }
+                )
+            )
         message = validation.value.message
-        assert "input_value" in message and credential_tails[0] in message
+        assert "input_value" in message
+        assert all(tail in message for tail in credential_tails)
     credential = "synthetic-credential-" * 200
     payload = {
         "error": {

@@ -18,6 +18,7 @@ from tests.e2e.resilience.lab.lab import Lab, LabConfig
     "helper,scenario",
     [
         pytest.param("lab", "rpc-delay", id="lab"),
+        pytest.param("lab", "rpc-timeout", id="lab-rpc-timeout-once"),
         pytest.param("server-runner", "rpc-delay", id="server-runner"),
         pytest.param("server-runner", "unrelated-host", id="server-runner-unrelated-host"),
         pytest.param("server-runner", "deadline", id="server-runner-deadline"),
@@ -60,6 +61,8 @@ def test_host_startup_waits_for_rpc_when_online_row_precedes_tunnel(
             return httpx.Response(200, json={"data": []})
         if not rpc_attempted:
             rpc_attempted = True
+            if scenario == "rpc-timeout":
+                raise httpx.ReadTimeout("host tunnel is not ready", request=request)
             if scenario in {"remaining-budget", "late-success"}:
                 clock.now = 0.75
             return httpx.Response(
@@ -129,6 +132,8 @@ def test_host_startup_waits_for_rpc_when_online_row_precedes_tunnel(
         else:
             start_host()
             assert rpc_ready, "Host startup returned before the host could answer an RPC"
+        if scenario == "rpc-timeout":
+            assert len(rpc_timeouts) == 2
         if scenario in {"remaining-budget", "late-success"}:
             assert len(rpc_timeouts) == 2
             assert 0 < rpc_timeouts[0]["read"] <= 1.0
