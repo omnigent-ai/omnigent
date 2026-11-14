@@ -833,6 +833,12 @@ def test_harness_policy_validation_rejects_unenforceable_network_or_backend(feat
         "seatbelt_copy_on_write": "copy_on_write",
         "windows_jobobject": "windows",
     }.get(feature, feature)
+    if feature in ("tcp_egress", "empty_tcp_egress"):
+        assert failure.value.client_message == (
+            "Inner harnesses cannot enforce worker-wide os_env.sandbox.tcp_egress. "
+            "sys_os_shell shares the worker policy. Terminal-local tcp_egress applies only "
+            "to terminal traffic; keep the required worker confinement."
+        )
 
 
 @pytest.mark.parametrize(

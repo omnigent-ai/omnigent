@@ -553,8 +553,9 @@ class HarnessSandboxValidationError(ValueError):
         ),
         "git_ssh": "The selected harness does not support os_env.sandbox.git_ssh.",
         "tcp_egress": (
-            "The selected harness does not support os_env.sandbox.tcp_egress. "
-            "Use sys_os_shell or a sandboxed terminal."
+            "Inner harnesses cannot enforce worker-wide os_env.sandbox.tcp_egress. "
+            "sys_os_shell shares the worker policy. Terminal-local tcp_egress applies only "
+            "to terminal traffic; keep the required worker confinement."
         ),
         "scan_limit": "os_env.sandbox.cwd_hidden_scan_max_entries must be a positive integer.",
         "scan_overflow": (

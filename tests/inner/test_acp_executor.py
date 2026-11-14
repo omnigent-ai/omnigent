@@ -2928,16 +2928,17 @@ def test_resolve_cwd_deleted_process_cwd_readlink_failure_still_raises() -> None
                 _resolve_cwd(None)
 
 
-@pytest.mark.parametrize(
-    ("os_env", "sandbox_requested"),
-    [
-        (None, False),
-        (OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none")), False),
-        (OSEnvSpec(), True),
-        (OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")), True),
-    ],
-    ids=["no-policy", "explicit-none", "default-sandbox", "requested-sandbox"],
-)
+_CWD_POLICY_CASES = [
+    pytest.param(None, False, id="no-policy"),
+    pytest.param(OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none")), False, id="explicit-none"),
+    pytest.param(OSEnvSpec(), True, id="default-sandbox"),
+    pytest.param(
+        OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")), True, id="requested-sandbox"
+    ),
+]
+
+
+@pytest.mark.parametrize(("os_env", "sandbox_requested"), _CWD_POLICY_CASES)
 def test_acp_executor_init_raises_on_deleted_explicit_cwd(
     tmp_path: Path, os_env: OSEnvSpec | None, sandbox_requested: bool
 ) -> None:
@@ -2959,16 +2960,7 @@ def test_acp_executor_init_raises_on_deleted_explicit_cwd(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("os_env", "sandbox_requested"),
-    [
-        (None, False),
-        (OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none")), False),
-        (OSEnvSpec(), True),
-        (OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")), True),
-    ],
-    ids=["no-policy", "explicit-none", "default-sandbox", "requested-sandbox"],
-)
+@pytest.mark.parametrize(("os_env", "sandbox_requested"), _CWD_POLICY_CASES)
 async def test_start_process_guard_raises_clear_error_on_deleted_cwd(
     tmp_path: Path, os_env: OSEnvSpec | None, sandbox_requested: bool
 ) -> None:
@@ -3010,16 +3002,7 @@ async def test_start_process_guard_raises_clear_error_on_deleted_cwd(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("os_env", "sandbox_requested"),
-    [
-        (None, False),
-        (OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none")), False),
-        (OSEnvSpec(), True),
-        (OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")), True),
-    ],
-    ids=["no-policy", "explicit-none", "default-sandbox", "requested-sandbox"],
-)
+@pytest.mark.parametrize(("os_env", "sandbox_requested"), _CWD_POLICY_CASES)
 async def test_start_process_guard_deleted_process_cwd_relative_cwd(
     os_env: OSEnvSpec | None,
     sandbox_requested: bool,
