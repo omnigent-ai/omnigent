@@ -21,6 +21,13 @@ const mocks = vi.hoisted(() => ({
     isError: false,
     error: null,
   },
+  deletePreflight: {
+    mutate: vi.fn(),
+    reset: vi.fn(),
+    isPending: false,
+    isError: false,
+    error: null,
+  },
 }));
 
 vi.mock("@/hooks/useHosts", () => ({
@@ -42,6 +49,7 @@ vi.mock("@/hooks/useConversations", async () => {
       isFetchingNextPage: false,
     }),
     useDeleteProject: () => mocks.deleteProject,
+    useProjectDeletePreflight: () => mocks.deletePreflight,
     useRenameProject: () => mocks.renameProject,
     useProjectConfig: () => ({ data: {}, isLoading: false, isError: false }),
     useUpdateProjectConfig: () => ({
@@ -123,6 +131,14 @@ function expectProjectMenuActions() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.deletePreflight.mutate.mockImplementation(
+    (
+      _name: string,
+      options: {
+        onSuccess: (result: { members: Conversation[]; runningCount: number }) => void;
+      },
+    ) => options.onSuccess({ members: [], runningCount: 0 }),
+  );
   useConversationsMock.mockReset();
   localStorage.clear();
   mockConversations([FILED_CONVERSATION]);
@@ -217,18 +233,23 @@ describe("project folder header context menu", () => {
     fireEvent.click(screen.getByTestId("delete-project"));
     fireEvent.click(screen.getByRole("button", { name: "Delete project" }));
 
-    expect(mocks.deleteProject.mutate).toHaveBeenCalledWith(
-      { id: PROJECT_ID, name: PROJECT_NAME },
-      expect.anything(),
-    );
+    expect(mocks.deleteProject.mutate).toHaveBeenCalledWith({
+      id: PROJECT_ID,
+      name: PROJECT_NAME,
+      members: [],
+    });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
   it("asks again before Delete stops sessions whose agents are working", () => {
-    interface DeleteCallbacks {
-      onSuccess?: (result: unknown) => void;
-    }
-    mocks.deleteProject.mutate.mockImplementationOnce((_vars: unknown, opts: DeleteCallbacks) =>
-      opts.onSuccess?.({ status: "needs_running_confirmation", runningCount: 2 }),
+    const members = [FILED_CONVERSATION];
+    mocks.deletePreflight.mutate.mockImplementation(
+      (
+        _name: string,
+        options: {
+          onSuccess: (result: { members: Conversation[]; runningCount: number }) => void;
+        },
+      ) => options.onSuccess({ members, runningCount: 2 }),
     );
     renderSidebar();
 
@@ -239,20 +260,16 @@ describe("project folder header context menu", () => {
     expect(screen.getByTestId("delete-project-running-warning")).toHaveTextContent(
       `2 sessions in ${PROJECT_NAME} have agents still working.`,
     );
-    expect(mocks.deleteProject.mutate).toHaveBeenLastCalledWith(
-      { id: PROJECT_ID, name: PROJECT_NAME },
-      expect.anything(),
-    );
+    expect(mocks.deleteProject.mutate).not.toHaveBeenCalled();
 
-    mocks.deleteProject.mutate.mockImplementationOnce((_vars: unknown, opts: DeleteCallbacks) =>
-      opts.onSuccess?.({ status: "deleted", succeeded: [], failed: [] }),
-    );
     fireEvent.click(screen.getByRole("button", { name: "Delete anyway" }));
 
-    expect(mocks.deleteProject.mutate).toHaveBeenLastCalledWith(
-      { id: PROJECT_ID, name: PROJECT_NAME, stopRunning: true },
-      expect.anything(),
-    );
+    expect(mocks.deletePreflight.mutate).toHaveBeenCalledTimes(2);
+    expect(mocks.deleteProject.mutate).toHaveBeenCalledWith({
+      id: PROJECT_ID,
+      name: PROJECT_NAME,
+      members,
+    });
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 
     // Reopening starts from the plain confirmation, not the earlier warning.
@@ -263,9 +280,13 @@ describe("project folder header context menu", () => {
   });
 
   it("drops the working-agent warning when Delete is cancelled and reopened", () => {
-    mocks.deleteProject.mutate.mockImplementationOnce(
-      (_vars: unknown, opts: { onSuccess?: (result: unknown) => void }) =>
-        opts.onSuccess?.({ status: "needs_running_confirmation", runningCount: 1 }),
+    mocks.deletePreflight.mutate.mockImplementationOnce(
+      (
+        _name: string,
+        options: {
+          onSuccess: (result: { members: Conversation[]; runningCount: number }) => void;
+        },
+      ) => options.onSuccess({ members: [FILED_CONVERSATION], runningCount: 1 }),
     );
     renderSidebar();
 
@@ -284,11 +305,12 @@ describe("project folder header context menu", () => {
     expect(screen.queryByTestId("delete-project-running-warning")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Delete project" }));
 
-    expect(mocks.deleteProject.mutate).toHaveBeenCalledTimes(2);
-    expect(mocks.deleteProject.mutate).toHaveBeenLastCalledWith(
-      { id: PROJECT_ID, name: PROJECT_NAME },
-      expect.anything(),
-    );
+    expect(mocks.deletePreflight.mutate).toHaveBeenCalledTimes(2);
+    expect(mocks.deleteProject.mutate).toHaveBeenCalledWith({
+      id: PROJECT_ID,
+      name: PROJECT_NAME,
+      members: [],
+    });
   });
 
   it("keeps New session reachable when a touch opens the menu on hover-capable hardware", () => {

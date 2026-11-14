@@ -50,6 +50,17 @@ export function conversationHooksMock() {
     }),
     useMoveToProject: () => ({ mutate: vi.fn() }),
     useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+    useProjectDeletePreflight: () => ({
+      mutate: (
+        _name: string,
+        options: {
+          onSuccess: (result: { members: Conversation[]; runningCount: number }) => void;
+        },
+      ) => options.onSuccess({ members: [], runningCount: 0 }),
+      reset: vi.fn(),
+      isPending: false,
+      isError: false,
+    }),
     useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
     useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
     useProjectConfig: () => ({ data: undefined, isLoading: false }),
