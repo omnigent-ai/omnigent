@@ -141,7 +141,7 @@ function status(step: string, value: string): JournalEntry {
     step,
     author: { type: "agent" },
     kind: "status",
-    payload: { status: value, text: "x" },
+    content: { status: value, text: "x" },
   };
 }
 
@@ -264,7 +264,7 @@ describe("WorkflowDetailPage", () => {
       step: null,
       author: { type: "agent" },
       kind: "plan",
-      payload: { steps: WORKFLOW.steps },
+      content: { steps: WORKFLOW.steps },
     };
     vi.mocked(useSessionJournal).mockReturnValue({
       entries: [proposal],

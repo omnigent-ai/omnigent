@@ -19,7 +19,7 @@ export const WAITING_FOR_YOU = "Waiting for you";
 /** The phase of a workflow question's prompt, which already marks its own task waiting. */
 export const WORKFLOW_QUESTION_PHASE = "workflow_request_input";
 
-/** One plan step, as a plan entry's payload lists it. */
+/** One plan step, as a plan entry's content lists it. */
 export interface JournalPlanStep {
   id: string;
   name: string;
@@ -37,7 +37,7 @@ export interface JournalEntry {
   step: string | null;
   author: { type: "agent" | "omnigent" };
   kind: JournalEntryKind;
-  payload: Record<string, unknown>;
+  content: Record<string, unknown>;
   /** The saved workflow a plan runs or was saved as, and the entries written under it; absent from older servers. */
   workflow_id?: string | null;
 }
@@ -80,24 +80,24 @@ export function mergeJournalEntries(...lists: readonly JournalEntry[][]): Journa
 }
 
 export function statusOf(entry: JournalEntry): StepStatus | null {
-  const status = entry.payload.status;
+  const status = entry.content.status;
   return typeof status === "string" && STEP_STATUSES.includes(status)
     ? (status as StepStatus)
     : null;
 }
 
 export function textOf(entry: JournalEntry): string | null {
-  return typeof entry.payload.text === "string" ? entry.payload.text : null;
+  return typeof entry.content.text === "string" ? entry.content.text : null;
 }
 
 export function planSteps(entry: JournalEntry): JournalPlanStep[] {
-  const steps = entry.payload.steps;
+  const steps = entry.content.steps;
   return Array.isArray(steps) ? (steps as JournalPlanStep[]) : [];
 }
 
 /** A plan's name, its goal in a few words, e.g. "Cut GET /orders p95 by 20%". */
 export function planName(entry: JournalEntry | null): string | null {
-  const name = entry?.payload.name;
+  const name = entry?.content.name;
   return typeof name === "string" && name.trim() ? name : null;
 }
 
@@ -118,7 +118,7 @@ export function stepStatusLabel(
 
 /** Whether *entry* is the session's first plan, which the agent writes when it starts a workflow. */
 export function isFirstPlan(entry: JournalEntry): boolean {
-  return entry.kind === "plan" && entry.payload.version === 1;
+  return entry.kind === "plan" && entry.content.version === 1;
 }
 
 /** The newest plan among the entries, which are in position order. */

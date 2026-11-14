@@ -13,7 +13,7 @@ the work goes. Each entry has a kind:
 * ``dispatch``, ``dispatch_result`` and ``plan_status``: written by Omnigent,
   not by agents.
 
-The normalizers here check an entry's fields and return the payload to store.
+The normalizers here check an entry's fields and return the content to store.
 The journal store runs them on every append, so every write path applies them.
 """
 
@@ -105,7 +105,7 @@ class JournalEntry:
     :param step: The plan step it is about, e.g. ``"propose"``, or ``None``.
     :param scheduled_task_run_id: The automation run the session was serving
         when it was appended, or ``None``.
-    :param payload: The kind's fields, e.g. ``{"status": "done", "text": "PR merged"}``.
+    :param content: The kind's fields, e.g. ``{"status": "done", "text": "PR merged"}``.
     :param workflow_id: The saved workflow the entry was written under: set on
         the plan that starts a run of it, and on the statuses and notes written
         while that plan is current. ``None`` outside saved workflows.
@@ -118,7 +118,7 @@ class JournalEntry:
     kind: str
     step: str | None
     scheduled_task_run_id: str | None
-    payload: dict[str, Any]
+    content: dict[str, Any]
     workflow_id: str | None = None
 
 
@@ -197,7 +197,7 @@ def normalize_step_id(step: object) -> str:
 
 
 def normalize_status(status: object, *, text: object = None) -> dict[str, Any]:
-    """Check a step status and return its payload.
+    """Check a step status and return its content.
 
     :param status: One of :data:`STEP_STATUSES`.
     :param text: Why, in at most :data:`STATUS_TEXT_MAX_CHARS` characters;
@@ -217,7 +217,7 @@ def normalize_status(status: object, *, text: object = None) -> dict[str, Any]:
 
 
 def normalize_note(body: object) -> dict[str, Any]:
-    """Check a note and return its payload.
+    """Check a note and return its content.
 
     :param body: Markdown whose first line is the summary, at most
         :data:`NOTE_BODY_MAX_BYTES` UTF-8 bytes.
@@ -281,7 +281,7 @@ def _check_acyclic(steps: list[dict[str, Any]]) -> None:
 
 
 def normalize_plan(steps: object, *, name: object, source: str = "agent") -> dict[str, Any]:
-    """Check a plan's name and graph and return its payload, without its version.
+    """Check a plan's name and graph and return its content, without its version.
 
     :param steps: The whole graph: a list of ``{"id", "name", "goal",
         "depends_on"}`` objects with unique IDs, dependencies on steps in the
@@ -317,38 +317,38 @@ def normalize_plan(steps: object, *, name: object, source: str = "agent") -> dic
                 f"step {step['id']!r} depends on steps not in the plan: {', '.join(missing)}"
             )
     _check_acyclic(normalized)
-    payload = {"name": plan_name, "source": source, "steps": normalized}
-    size = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    content = {"name": plan_name, "source": source, "steps": normalized}
+    size = len(json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
     if size > PLAN_MAX_RAW_BYTES:
         raise JournalEntryTooLargeError("the plan", size, PLAN_MAX_RAW_BYTES)
-    return payload
+    return content
 
 
-def normalize_payload(kind: str, payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Check an entry's payload for its kind and return the payload to store.
+def normalize_content(kind: str, content: Mapping[str, Any]) -> dict[str, Any]:
+    """Check an entry's content for its kind and return the content to store.
 
     :param kind: One of :data:`JOURNAL_KINDS`.
-    :param payload: The kind's fields; for a plan, without ``version``.
+    :param content: The kind's fields; for a plan, without ``version``.
     :raises InvalidJournalEntryError: If the kind is unknown, has no writer yet,
         or a field is invalid.
     """
     if kind == "status":
-        unknown = set(payload) - {"status", "text"}
+        unknown = set(content) - {"status", "text"}
         if unknown:
             raise InvalidJournalEntryError(f"unknown status fields: {', '.join(sorted(unknown))}")
-        return normalize_status(payload.get("status"), text=payload.get("text"))
+        return normalize_status(content.get("status"), text=content.get("text"))
     if kind == "note":
-        if set(payload) != {"body"}:
+        if set(content) != {"body"}:
             raise InvalidJournalEntryError("a note has exactly one field, body")
-        return normalize_note(payload["body"])
+        return normalize_note(content["body"])
     if kind == "plan":
-        unknown = set(payload) - {"name", "source", "steps"}
+        unknown = set(content) - {"name", "source", "steps"}
         if unknown:
             raise InvalidJournalEntryError(f"unknown plan fields: {', '.join(sorted(unknown))}")
         return normalize_plan(
-            payload.get("steps"),
-            name=payload.get("name"),
-            source=payload.get("source", "agent"),
+            content.get("steps"),
+            name=content.get("name"),
+            source=content.get("source", "agent"),
         )
     if kind in JOURNAL_KINDS:
         raise InvalidJournalEntryError(f"{kind} entries can't be written yet")

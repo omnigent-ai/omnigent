@@ -72,7 +72,7 @@ function status(position: number, step: string, value: string, text?: string, ru
     kind: "status",
     step,
     scheduled_task_run_id: run ?? null,
-    payload: { status: value, text: text ?? null },
+    content: { status: value, text: text ?? null },
   });
 }
 
@@ -441,7 +441,7 @@ describe("TasksPanel", () => {
 
   it("offers Save as workflow in the plan's menu once the composer can save", async () => {
     const named = journalPlan(0, ["baseline"]);
-    named.payload.name = "Cut GET /orders p95 by 20%";
+    named.content.name = "Cut GET /orders p95 by 20%";
     showJournal([named]);
     renderPanel();
     expect(screen.queryByTestId("tasks-plan-menu")).toBeNull();
@@ -600,7 +600,7 @@ describe("TasksPanel", () => {
 
   it("offers play in the header once the agent stopped with tasks left, and stop while it works", () => {
     const named = journalPlan(0, ["baseline"], ["ship", ["baseline"]]);
-    named.payload.name = "Ship the fix";
+    named.content.name = "Ship the fix";
     showJournal([named, status(1, "baseline", "started")]);
     setSession({ sessionStatus: "idle" });
     // Without the composer's action, a viewer gets no play button.
@@ -635,7 +635,7 @@ describe("TasksPanel", () => {
 
   it("heads the list with the plan's name", () => {
     const named = journalPlan(0, ["baseline"]);
-    named.payload.name = "Cut GET /orders p95 by 20%";
+    named.content.name = "Cut GET /orders p95 by 20%";
     showJournal([named]);
     renderPanel();
     expect(screen.getByTestId("tasks-plan-name").textContent).toBe("Cut GET /orders p95 by 20%");
@@ -901,8 +901,8 @@ describe("TasksPanel", () => {
     showJournal([
       journalPlan(0, ["pool"]),
       status(1, "pool", "started"),
-      journalEntry(2, { step: "pool", payload: { body: "Cold connects are the slowest" } }),
-      journalEntry(3, { payload: { body: "Measure first" } }),
+      journalEntry(2, { step: "pool", content: { body: "Cold connects are the slowest" } }),
+      journalEntry(3, { content: { body: "Measure first" } }),
     ]);
     renderPanel();
     fireEvent.click(within(screen.getByTestId("tasks-row")).getByTestId("tasks-row-history"));
@@ -918,8 +918,8 @@ describe("TasksPanel", () => {
 
   it("has no tasks yet when the agent wrote only notes, and no Runs section", () => {
     showJournal([
-      journalEntry(0, { payload: { body: "Measure first" } }),
-      journalEntry(1, { scheduled_task_run_id: RUN, payload: { body: "Stopped at the try cap" } }),
+      journalEntry(0, { content: { body: "Measure first" } }),
+      journalEntry(1, { scheduled_task_run_id: RUN, content: { body: "Stopped at the try cap" } }),
     ]);
     renderPanel();
     expect(screen.getByText("No tasks yet")).toBeTruthy();

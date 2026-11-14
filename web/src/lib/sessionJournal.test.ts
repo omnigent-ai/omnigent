@@ -27,7 +27,7 @@ function status(position: number, step: string, value: string, fields: Partial<J
   return journalEntry(position, {
     kind: "status",
     step,
-    payload: { status: value, text: `${step} ${value}` },
+    content: { status: value, text: `${step} ${value}` },
     ...fields,
   });
 }
@@ -36,10 +36,10 @@ describe("mergeJournalEntries", () => {
   it("orders by position and keeps one copy of each entry", () => {
     const merged = mergeJournalEntries(
       [journalEntry(2), journalEntry(0)],
-      [journalEntry(1), journalEntry(2, { payload: { body: "newer copy" } })],
+      [journalEntry(1), journalEntry(2, { content: { body: "newer copy" } })],
     );
     expect(merged.map((entry) => entry.position)).toEqual([0, 1, 2]);
-    expect(merged[2].payload.body).toBe("newer copy");
+    expect(merged[2].content.body).toBe("newer copy");
   });
 });
 
@@ -89,8 +89,8 @@ describe("stepProgress", () => {
     status(1, "a", "started"),
     status(2, "a", "done"),
     status(3, "b", "started"),
-    journalEntry(4, { step: "b", payload: { body: "first note" } }),
-    journalEntry(5, { step: "b", payload: { body: "second note" } }),
+    journalEntry(4, { step: "b", content: { body: "first note" } }),
+    journalEntry(5, { step: "b", content: { body: "second note" } }),
     status(6, "c", "started"),
     status(7, "c", "failed"),
     status(8, "c", "done"),
@@ -154,7 +154,7 @@ describe("stepProgress", () => {
 
   it("reads a plan's name, and none when the entry has no name", () => {
     expect(planName(plan(0, ["a"]))).toBe("The plan");
-    expect(planName({ ...plan(0, ["a"]), payload: { steps: [] } })).toBeNull();
+    expect(planName({ ...plan(0, ["a"]), content: { steps: [] } })).toBeNull();
     expect(planName(null)).toBeNull();
   });
 

@@ -80,8 +80,8 @@ def _runner(session_id: str, user: str = ALICE) -> dict[str, str]:
     return {**_headers(user), ORCHESTRATION_SOURCE_HEADER: session_id}
 
 
-def _write(kind: str, payload: dict[str, object], key: str, **fields: object) -> dict[str, object]:
-    return {"kind": kind, "payload": payload, "idempotency_key": key, **fields}
+def _write(kind: str, content: dict[str, object], key: str, **fields: object) -> dict[str, object]:
+    return {"kind": kind, "content": content, "idempotency_key": key, **fields}
 
 
 async def test_telemetry_reconstructs_workflow_usage_cohorts_without_retry_or_planning_counts(
@@ -312,10 +312,10 @@ async def test_the_runner_appends_and_people_page_the_journal(
         assert resp.status_code == 200, resp.text
         written.append(resp.json())
     assert [entry["position"] for entry in written] == [0, 1, 2, 3]
-    assert written[0]["payload"]["version"] == 1
-    assert written[0]["payload"]["name"] == "Cut GET /orders p95 by 20%"
+    assert written[0]["content"]["version"] == 1
+    assert written[0]["content"]["name"] == "Cut GET /orders p95 by 20%"
     assert written[0]["author"] == {"type": "agent"} and written[0]["step"] is None
-    assert written[2]["payload"] == {"status": "done", "text": "p95 430 ms"}
+    assert written[2]["content"] == {"status": "done", "text": "p95 430 ms"}
 
     retried = await client.post(
         url, json=_write("note", {"body": "again"}, "tool:4"), headers=_runner(session_id)
@@ -338,11 +338,11 @@ async def test_the_runner_appends_and_people_page_the_journal(
     current = await client.get(
         url, params={"kind": "plan", "order": "desc", "limit": 1}, headers=_headers()
     )
-    assert current.json()["data"][0]["payload"]["steps"][0]["id"] == "baseline"
+    assert current.json()["data"][0]["content"]["steps"][0]["id"] == "baseline"
     statuses = await client.get(
         url, params={"kind": "status", "step": "baseline"}, headers=_headers()
     )
-    assert [entry["payload"]["status"] for entry in statuses.json()["data"]] == ["started", "done"]
+    assert [entry["content"]["status"] for entry in statuses.json()["data"]] == ["started", "done"]
     stale = await client.get(url, params={"after": uuid.uuid4().hex}, headers=_headers())
     assert stale.status_code == 400 and "stale_cursor" in stale.text
 
@@ -456,7 +456,7 @@ async def test_reading_needs_read_access_and_writing_needs_edit(
         ),
         (_write("dispatch", {"dispatch_id": "x"}, "k"), 422, "kind"),
         (
-            {"kind": "note", "payload": {"body": "x"}, "idempotency_key": ""},
+            {"kind": "note", "content": {"body": "x"}, "idempotency_key": ""},
             422,
             "idempotency_key",
         ),
@@ -693,7 +693,7 @@ async def test_a_workflow_question_marks_its_task_and_returns_the_answer(
     # The task waits for the user, its status the question.
     entry = published[-1]["entry"]
     assert entry["step"] == "deploy"
-    assert entry["payload"] == {"status": "needs_input", "text": "Approve the deploy to prod?"}
+    assert entry["content"] == {"status": "needs_input", "text": "Approve the deploy to prod?"}
 
     while not pending_approvals.resolve(
         event["elicitation_id"], True, {"Approve the deploy to prod?": "Approve"}
@@ -773,7 +773,7 @@ async def test_automation_workflows_cannot_wait_for_user_input(
             "sys_journal_write_status", {"step": step, "status": status, "text": text}
         )
     entries = (await client.get(journal, params={"kind": "status"})).json()["data"]
-    assert [(entry["step"], entry["payload"]["status"]) for entry in entries] == [
+    assert [(entry["step"], entry["content"]["status"]) for entry in entries] == [
         ("deploy", "failed"),
         ("report", "done"),
     ]
@@ -906,12 +906,12 @@ async def test_saving_a_workflow_names_the_sessions_plan_after_it(
 
     url = f"/v1/sessions/{session_id}/journal"
     plans = (await client.get(url, params={"kind": "plan"})).json()["data"]
-    assert [(entry["payload"]["version"], entry["workflow_id"]) for entry in plans] == [
+    assert [(entry["content"]["version"], entry["workflow_id"]) for entry in plans] == [
         (1, None),
         (2, saved["id"]),
     ]
-    assert plans[1]["payload"]["name"] == "Fix the upload flakes"
-    assert [step["id"] for step in plans[1]["payload"]["steps"]] == ["explore", "fix"]
+    assert plans[1]["content"]["name"] == "Fix the upload flakes"
+    assert [step["id"] for step in plans[1]["content"]["steps"]] == ["explore", "fix"]
     items = conversations.list_items(session_id, limit=50).data
     markers = [item.data.resource for item in items if item.type == "resource_event"]
     assert [marker.get("change") for marker in markers] == ["made"]
@@ -986,7 +986,7 @@ async def test_a_workflows_runs_list_the_sessions_that_ran_it(
     assert by_session[second]["progress"]["needs_input"] == 1
     # The steps and their newest statuses, for the run's timeline and graph.
     assert [step["id"] for step in by_session[first]["steps"]] == ["explore", "fix"]
-    assert [(s["step"], s["payload"]["status"]) for s in by_session[first]["statuses"]] == [
+    assert [(s["step"], s["content"]["status"]) for s in by_session[first]["statuses"]] == [
         ("explore", "done")
     ]
 
@@ -1071,7 +1071,7 @@ async def test_an_automations_runs_list_the_steps_of_their_first_plans(
     assert [run["run_id"] for run in page["runs"]] == [run_ids[0]]
     (shown,) = page["runs"]
     assert [step["id"] for step in shown["steps"]] == ["explore", "fix"]
-    assert [(s["step"], s["payload"]["status"]) for s in shown["statuses"]] == [
+    assert [(s["step"], s["content"]["status"]) for s in shown["statuses"]] == [
         ("explore", "done")
     ]
     assert page["next_cursor"] is None

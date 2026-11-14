@@ -56,8 +56,8 @@ describe("ChatTasksPreview", () => {
   it("counts a failed task as finished, and says one failed", () => {
     const plan = journalPlan(0, ["measure"], ["pool"]);
     const statuses = [
-      journalEntry(1, { kind: "status", step: "measure", payload: { status: "done", text: "" } }),
-      journalEntry(2, { kind: "status", step: "pool", payload: { status: "failed", text: "" } }),
+      journalEntry(1, { kind: "status", step: "measure", content: { status: "done", text: "" } }),
+      journalEntry(2, { kind: "status", step: "pool", content: { status: "failed", text: "" } }),
     ];
     const progress = stepProgress(planSteps(plan), statuses, false);
     render(
@@ -72,11 +72,11 @@ describe("ChatTasksPreview", () => {
   it("leads with a task waiting for you, in pink", () => {
     const plan = journalPlan(0, ["build"], ["approve", ["build"]]);
     const statuses = [
-      journalEntry(1, { kind: "status", step: "build", payload: { status: "done", text: "ok" } }),
+      journalEntry(1, { kind: "status", step: "build", content: { status: "done", text: "ok" } }),
       journalEntry(2, {
         kind: "status",
         step: "approve",
-        payload: { status: "needs_input", text: "Approve the deploy?" },
+        content: { status: "needs_input", text: "Approve the deploy?" },
       }),
     ];
     const progress = stepProgress(planSteps(plan), statuses, true);
@@ -90,7 +90,7 @@ describe("ChatTasksPreview", () => {
 
   it("names the plan in its label and, on hover or focus, its tooltip", async () => {
     const plan = journalPlan(0, ["measure"]);
-    plan.payload.name = "Cut GET /orders p95 by 20%";
+    plan.content.name = "Cut GET /orders p95 by 20%";
     const progress = stepProgress(planSteps(plan), [], true);
     render(
       <ChatTasksPreview conversationId="c" tasks={view([], { plan, progress, native: false })} />,

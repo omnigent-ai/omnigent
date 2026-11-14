@@ -78,9 +78,9 @@ def test_appends_take_consecutive_positions_and_plans_count_versions(
     )
 
     assert [first.entry.position, status.entry.position, second.entry.position] == [0, 1, 2]
-    assert first.entry.payload["version"] == 1 and second.entry.payload["version"] == 2
-    assert first.entry.step is None and first.entry.payload["source"] == "agent"
-    assert status.entry.payload == {"status": "done", "text": "p95 430 ms"}
+    assert first.entry.content["version"] == 1 and second.entry.content["version"] == 2
+    assert first.entry.step is None and first.entry.content["source"] == "agent"
+    assert status.entry.content == {"status": "done", "text": "p95 430 ms"}
     assert status.entry.scheduled_task_run_id == RUN
     assert all(result.created for result in (first, status, second))
     assert len(status.entry.id) == 32 and status.entry.created_at > 0
@@ -88,7 +88,7 @@ def test_appends_take_consecutive_positions_and_plans_count_versions(
     assert _note(journal, "tool:1", session=OTHER).entry.position == 0
     current = journal.current_plan(SESSION)
     assert current is not None and current.id == second.entry.id
-    assert current.payload["version"] == 2
+    assert current.content["version"] == 2
 
 
 def test_a_retried_append_returns_the_first_attempts_entry(journal: SessionJournalStore) -> None:
@@ -128,8 +128,8 @@ def test_a_step_takes_a_status_only_after_its_dependencies_are_done(
     journal.append(SESSION, "plan", {"name": "Demo", "steps": steps}, idempotency_key="k0")
 
     def status(key: str, step: str, value: str, text: str | None = "x") -> None:
-        payload = {"status": value, **({"text": text} if value != "started" else {})}
-        journal.append(SESSION, "status", payload, idempotency_key=key, step=step)
+        content = {"status": value, **({"text": text} if value != "started" else {})}
+        journal.append(SESSION, "status", content, idempotency_key=key, step=step)
 
     with pytest.raises(StepNotReadyError, match="verify waits on deploy") as raised:
         status("k1", "verify", "started")
@@ -206,7 +206,7 @@ def test_pages_follow_cursors_in_both_directions_and_filter(journal: SessionJour
     notes_a = journal.list_entries(SESSION, kind="note", step="a", order="desc", limit=2)
     assert [entry.position for entry in notes_a.entries] == [5, 3] and notes_a.has_more
     plans = journal.list_entries(SESSION, kind="plan", order="desc", limit=1)
-    assert [entry.payload["version"] for entry in plans.entries] == [1] and not plans.has_more
+    assert [entry.content["version"] for entry in plans.entries] == [1] and not plans.has_more
 
 
 def test_page_arguments_are_checked(journal: SessionJournalStore) -> None:
@@ -282,14 +282,14 @@ def test_a_fork_carries_the_journal_and_continues_it(
 
     fork = conversations.fork_conversation(SESSION)
     copied = journal.list_entries(fork.id).entries
-    assert [(e.position, e.kind, e.step, e.payload) for e in copied] == [
-        (e.position, e.kind, e.step, e.payload) for e in source
+    assert [(e.position, e.kind, e.step, e.content) for e in copied] == [
+        (e.position, e.kind, e.step, e.content) for e in source
     ]
     assert [e.created_at for e in copied] == [e.created_at for e in source]
     assert not {e.id for e in copied} & {e.id for e in source}
     # A run's history lists each entry once, under the session that served it.
     assert [e.scheduled_task_run_id for e in copied] == [None, None, None]
-    assert journal.current_plan(fork.id).payload == journal.current_plan(SESSION).payload
+    assert journal.current_plan(fork.id).content == journal.current_plan(SESSION).content
     # The fork goes on from where its copy ends; the parent is untouched.
     started = journal.append(
         fork.id, "status", {"status": "started"}, idempotency_key="k3", step="video"
@@ -411,7 +411,7 @@ def test_a_workflows_runs_page_newest_first_across_sessions(
         (SESSION, 100),
     ]
     assert rest.next_cursor is None
-    assert [p.payload["steps"][0]["id"] for p in rest.plans] == ["a", "a"]
+    assert [p.content["steps"][0]["id"] for p in rest.plans] == ["a", "a"]
     assert journal.list_workflow_runs(OTHER_WORKFLOW).plans[0].conversation_id == OTHER
     with pytest.raises(ValueError, match="cursor"):
         journal.list_workflow_runs(WORKFLOW, before="100.nope.1")
@@ -428,7 +428,7 @@ def test_plan_step_statuses_reads_each_steps_newest_status(journal: SessionJourn
     other = journal.append(OTHER, "plan", _plan("a"), idempotency_key="k4").entry
 
     statuses = journal.plan_step_statuses([plan, other])
-    assert [{step: e.payload["status"] for step, e in s.items()} for s in statuses] == [
+    assert [{step: e.content["status"] for step, e in s.items()} for s in statuses] == [
         {"a": "done", "b": "failed"},
         {},
     ]

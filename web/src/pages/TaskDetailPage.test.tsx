@@ -1394,7 +1394,7 @@ describe("runs of a saved workflow", () => {
         step: "explore",
         author: { type: "agent" },
         kind: "status",
-        payload: { status: "done", text: "Found it" },
+        content: { status: "done", text: "Found it" },
       },
     ],
   };

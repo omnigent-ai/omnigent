@@ -11,8 +11,8 @@ from omnigent.entities.session_journal import (
     PLAN_NAME_MAX_CHARS,
     InvalidJournalEntryError,
     JournalEntryTooLargeError,
+    normalize_content,
     normalize_note,
-    normalize_payload,
     normalize_plan,
     normalize_status,
     normalize_step_id,
@@ -60,7 +60,7 @@ def test_status_rejects_unknown_values_long_text_and_extra_fields() -> None:
     with pytest.raises(InvalidJournalEntryError, match="at most 80 characters"):
         normalize_status("done", text="x" * 81)
     with pytest.raises(InvalidJournalEntryError, match="unknown status fields: emoji"):
-        normalize_payload("status", {"status": "done", "text": "ok", "emoji": "✅"})
+        normalize_content("status", {"status": "done", "text": "ok", "emoji": "✅"})
 
 
 def test_note_is_trimmed_and_capped_in_bytes() -> None:
@@ -73,11 +73,11 @@ def test_note_is_trimmed_and_capped_in_bytes() -> None:
 
 
 def test_plan_keeps_its_name_and_graph_and_defaults_dependencies() -> None:
-    payload = normalize_plan(
+    content = normalize_plan(
         [_step("baseline"), {"id": "profile", "name": "Profile", "depends_on": ["baseline"]}],
         name="  Cut GET /orders\n p95 by 20%  ",
     )
-    assert payload == {
+    assert content == {
         "name": "Cut GET /orders p95 by 20%",
         "source": "agent",
         "steps": [
@@ -104,7 +104,7 @@ def test_plan_needs_a_one_line_name(name: object, message: str) -> None:
     with pytest.raises(InvalidJournalEntryError, match=message):
         normalize_plan([_step("a")], name=name)
     with pytest.raises(InvalidJournalEntryError, match=message):
-        normalize_payload(
+        normalize_content(
             "plan", {"steps": [_step("a")], **({} if name is None else {"name": name})}
         )
 
@@ -138,10 +138,10 @@ def test_plan_raw_size_is_capped() -> None:
         normalize_plan(steps, name="The plan")
 
 
-def test_payloads_only_for_kinds_with_a_writer() -> None:
+def test_contents_only_for_kinds_with_a_writer() -> None:
     with pytest.raises(InvalidJournalEntryError, match="unknown plan fields: version"):
-        normalize_payload("plan", {"name": "A", "steps": [_step("a")], "version": 7})
+        normalize_content("plan", {"name": "A", "steps": [_step("a")], "version": 7})
     with pytest.raises(InvalidJournalEntryError, match="dispatch entries can't be written yet"):
-        normalize_payload("dispatch", {})
+        normalize_content("dispatch", {})
     with pytest.raises(InvalidJournalEntryError, match="kind must be one of"):
-        normalize_payload("objective", {})
+        normalize_content("objective", {})

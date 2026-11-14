@@ -124,9 +124,9 @@ def _not_found() -> OmnigentError:
 
 def _progress(plan: JournalEntry, statuses: dict[str, JournalEntry]) -> WorkflowRunProgress:
     """Count the run's starting steps by their current status."""
-    steps = plan.payload.get("steps", [])
+    steps = plan.content.get("steps", [])
     counts = Counter(
-        statuses[step["id"]].payload.get("status") if step["id"] in statuses else None
+        statuses[step["id"]].content.get("status") if step["id"] in statuses else None
         for step in steps
     )
     return WorkflowRunProgress(
@@ -367,7 +367,7 @@ def create_workflows_router(
                     background_work_running=session.background_work_running is True,
                     archived=session.archived,
                     progress=_progress(plan, step_statuses),
-                    steps=[WorkflowStep(**step) for step in plan.payload.get("steps", [])],
+                    steps=[WorkflowStep(**step) for step in plan.content.get("steps", [])],
                     statuses=[entry_to_response(entry) for entry in step_statuses.values()],
                 )
             )

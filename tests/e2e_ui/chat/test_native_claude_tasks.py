@@ -133,7 +133,7 @@ def _journal(base_url: str, session_id: str) -> list[dict[str, object]]:
 
 
 def _statuses(entries: list[dict[str, object]]) -> list[tuple[object, object]]:
-    return [(e["step"], e["payload"]["status"]) for e in entries if e["kind"] == "status"]  # type: ignore[index]
+    return [(e["step"], e["content"]["status"]) for e in entries if e["kind"] == "status"]  # type: ignore[index]
 
 
 def _session(base_url: str, session_id: str) -> dict[str, object]:
@@ -378,8 +378,8 @@ def test_a_fork_carries_the_plan_and_its_agent_reads_it(
     try:
         # The fork carries the journal in order, as its own entries.
         copied = _journal(base_url, fork_id)
-        assert [(e["position"], e["kind"], e["step"], e["payload"]) for e in copied] == [
-            (e["position"], e["kind"], e["step"], e["payload"]) for e in source
+        assert [(e["position"], e["kind"], e["step"], e["content"]) for e in copied] == [
+            (e["position"], e["kind"], e["step"], e["content"]) for e in source
         ]
         assert not {e["id"] for e in copied} & {e["id"] for e in source}
 

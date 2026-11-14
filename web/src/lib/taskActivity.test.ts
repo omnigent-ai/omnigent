@@ -102,12 +102,12 @@ describe("taskMarkerTarget", () => {
     const started = journalEntry(1, {
       kind: "status",
       step: "deploy",
-      payload: { status: "started", text: null },
+      content: { status: "started", text: null },
     });
     const done = journalEntry(2, {
       kind: "status",
       step: "deploy",
-      payload: { status: "done", text: "ok" },
+      content: { status: "done", text: "ok" },
     });
     expect(taskMarkerTarget(stepProgress(steps, [started], true)[0])).toBe("journal-e1");
     const progress = stepProgress(steps, [started, done], false);

@@ -3350,8 +3350,8 @@ class SessionJournalEntry(BaseModel):
     :param scheduled_task_run_id: The automation run the session was serving,
         or ``None``.
     :param step: The plan step it is about, e.g. ``"propose"``, or ``None``.
-    :param kind: The entry kind; ``payload`` holds its fields.
-    :param payload: e.g. ``{"status": "done", "text": "PR merged"}`` for a
+    :param kind: The entry kind; ``content`` holds its fields.
+    :param content: e.g. ``{"status": "done", "text": "PR merged"}`` for a
         status, ``{"body": "…"}`` for a note, or ``{"version": 2, "source":
         "agent", "steps": [...]}`` for a plan.
     :param workflow_id: The saved workflow the entry was written under, or
@@ -3366,7 +3366,7 @@ class SessionJournalEntry(BaseModel):
     step: str | None = None
     author: SessionJournalAuthor
     kind: JournalEntryKind
-    payload: dict[str, Any]
+    content: dict[str, Any]
     workflow_id: str | None = None
 
 
@@ -3574,7 +3574,7 @@ class SessionJournalAppendRequest(BaseModel):
     Body of ``POST /v1/sessions/{id}/journal``, sent by the session's runner.
 
     :param kind: The kind the agent writes.
-    :param payload: The kind's fields, e.g. ``{"status": "done", "text": "PR merged"}``.
+    :param content: The kind's fields, e.g. ``{"status": "done", "text": "PR merged"}``.
     :param step: The plan step the entry is about.
     :param idempotency_key: Names the write, e.g. ``"tool:<tool call ID>"``; a
         retry with the same key returns the first attempt's entry.
@@ -3585,7 +3585,7 @@ class SessionJournalAppendRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     kind: Literal["status", "note", "plan"]
-    payload: dict[str, Any]
+    content: dict[str, Any]
     step: str | None = None
     idempotency_key: str = Field(min_length=1, max_length=128)
     workflow_id: str | None = None

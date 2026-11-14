@@ -22,7 +22,7 @@ describe("a live journal entry", () => {
     const tabRequest = () => useSessionTasksActions.getState().tasksTabToOpen;
     appended(
       "conv",
-      journalEntry(0, { kind: "status", step: "a", payload: { status: "started" } }),
+      journalEntry(0, { kind: "status", step: "a", content: { status: "started" } }),
     );
     expect(tabRequest()).toBeNull();
     // Another session's plan, and a later version of this one's, leave the tab alone.

@@ -40,7 +40,7 @@ _ENTRY = {
     "step": None,
     "author": {"type": "agent"},
     "kind": "note",
-    "payload": {"body": "hello"},
+    "content": {"body": "hello"},
 }
 
 
@@ -236,7 +236,7 @@ _QUESTION = {
     "options": [{"label": "Deploy"}, {"label": "Wait"}],
     "recommended": "Wait",
 }
-_STATUS = {**_ENTRY, "kind": "status", "step": "deploy", "payload": {"status": "needs_input"}}
+_STATUS = {**_ENTRY, "kind": "status", "step": "deploy", "content": {"status": "needs_input"}}
 
 
 async def _answer_when_asked(elicitation_id: str, *answers: tuple[bool, dict | None]) -> None:
@@ -356,7 +356,7 @@ _PLAN = {
     "id": "b" * 32,
     "position": 3,
     "kind": "plan",
-    "payload": {
+    "content": {
         "name": "Triage the upload tests",
         "version": 2,
         "source": "agent",
@@ -419,8 +419,8 @@ async def test_a_save_names_the_sessions_plan_after_the_new_workflow() -> None:
     # The same plan, now naming the workflow, so the Tasks tab can show it.
     assert body["kind"] == "plan"
     assert body["workflow_id"] == _WORKFLOW_ID
-    assert body["payload"]["name"] == "Triage the upload tests"
-    assert [step["id"] for step in body["payload"]["steps"]] == ["explore", "fix"]
+    assert body["content"]["name"] == "Triage the upload tests"
+    assert [step["id"] for step in body["content"]["steps"]] == ["explore", "fix"]
     assert body["idempotency_key"] == "tool:call_1:plan"
     assert [event["entry"]["workflow_id"] for event in published] == [_WORKFLOW_ID]
 

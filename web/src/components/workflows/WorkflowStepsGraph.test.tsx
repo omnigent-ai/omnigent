@@ -54,7 +54,7 @@ function statusEntry(step: string, status: string, text: string): JournalEntry {
     step,
     author: { type: "agent" },
     kind: "status",
-    payload: { status, text },
+    content: { status, text },
   };
 }
 

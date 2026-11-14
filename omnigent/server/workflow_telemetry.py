@@ -74,7 +74,7 @@ def log_journal_entry(
     plan = entry if entry.kind == "plan" else previous_plan
     if plan is None or entry.kind not in {"plan", "status"}:
         return
-    steps = plan.payload["steps"]
+    steps = plan.content["steps"]
     step_ids = [step["id"] for step in steps]
     if entry.kind == "status" and entry.step not in step_ids:
         return
@@ -89,7 +89,7 @@ def log_journal_entry(
             "journal_position": entry.position,
             "entry_created_at": entry.created_at,
             "plan_id": plan.id,
-            "plan_version": plan.payload["version"],
+            "plan_version": plan.content["version"],
             "plan_created_at": plan.created_at,
             "workflow_id": plan.workflow_id,
             "workflow_kind": "saved" if plan.workflow_id else "ad_hoc",
@@ -106,7 +106,7 @@ def log_journal_entry(
             "step_count": len(steps),
         }
         if entry.kind == "plan":
-            change = plan_change(previous_plan.payload if previous_plan else None, plan.payload)
+            change = plan_change(previous_plan.content if previous_plan else None, plan.content)
             attributes.update(
                 previous_plan_id=previous_plan.id if previous_plan else None,
                 plan_change=change["change"]
@@ -122,7 +122,7 @@ def log_journal_entry(
             attributes.update(
                 step_key=_step_key(session.id, entry.step),
                 step_index=step_ids.index(entry.step),
-                status=entry.payload["status"],
+                status=entry.content["status"],
                 plan_elapsed_seconds=max(0, entry.created_at - plan.created_at),
             )
             event = "workflow_step_status_written"
