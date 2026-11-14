@@ -43,12 +43,20 @@ function deferred<T>() {
 }
 
 const goalRequests = [
-  { name: "strict read", request: () => getCodexGoal("conv") },
-  { name: "background read", request: () => getCodexGoal("conv", { strict: false }) },
-  { name: "save", request: () => setCodexGoal("conv", { objective: "Do it" }) },
-  { name: "pause", request: () => updateCodexGoalStatus("conv", "paused") },
-  { name: "resume", request: () => updateCodexGoalStatus("conv", "active") },
-  { name: "clear", request: () => clearCodexGoal("conv") },
+  { name: "strict read", timeoutMs: 60_000, request: () => getCodexGoal("conv") },
+  {
+    name: "background read",
+    timeoutMs: 60_000,
+    request: () => getCodexGoal("conv", { strict: false }),
+  },
+  {
+    name: "save",
+    timeoutMs: 190_000,
+    request: () => setCodexGoal("conv", { objective: "Do it" }),
+  },
+  { name: "pause", timeoutMs: 190_000, request: () => updateCodexGoalStatus("conv", "paused") },
+  { name: "resume", timeoutMs: 190_000, request: () => updateCodexGoalStatus("conv", "active") },
+  { name: "clear", timeoutMs: 190_000, request: () => clearCodexGoal("conv") },
 ];
 
 describe("codex goal API", () => {
@@ -81,42 +89,44 @@ describe("codex goal API", () => {
     });
   });
 
-  it("returns goal: null when the server reports no goal", async () => {
-    mockAuthenticatedFetch.mockResolvedValueOnce(mockJsonResponse({ goal: null }));
+  it.each(
+    [
+      {
+        mode: "default strict",
+        options: undefined,
+        header: "strict",
+        legacyResult: { goal: null },
+      },
+      {
+        mode: "explicit strict",
+        options: { strict: true },
+        header: "strict",
+        legacyResult: { goal: null },
+      },
+      {
+        mode: "background",
+        options: { strict: false },
+        header: null,
+        legacyResult: { available: false },
+      },
+    ].flatMap(({ legacyResult, ...mode }) => [
+      { ...mode, envelope: "legacy", body: { goal: null }, expected: legacyResult },
+      {
+        ...mode,
+        envelope: "confirmed",
+        body: { goal: null, available: true },
+        expected: { goal: null },
+      },
+    ]),
+  )("reads $envelope null in $mode mode", async ({ options, body, expected, header }) => {
+    mockAuthenticatedFetch.mockResolvedValueOnce(mockJsonResponse(body));
 
-    await expect(getCodexGoal("conv")).resolves.toEqual({ goal: null });
-    expect(mockAuthenticatedFetch).toHaveBeenCalledWith("/v1/sessions/conv/codex_goal", {
-      headers: { "X-Omnigent-Codex-Goal-Read": "strict" },
-      signal: expect.any(AbortSignal),
-    });
-  });
-
-  it("supports explicitly strict reads", async () => {
-    mockAuthenticatedFetch.mockResolvedValueOnce(mockJsonResponse({ goal: null }));
-
-    await expect(getCodexGoal("conv", { strict: true })).resolves.toEqual({ goal: null });
-
-    expect(mockAuthenticatedFetch).toHaveBeenCalledWith("/v1/sessions/conv/codex_goal", {
-      headers: { "X-Omnigent-Codex-Goal-Read": "strict" },
-      signal: expect.any(AbortSignal),
-    });
-  });
-
-  it("allows an idle background read to return no goal without requiring a live runner", async () => {
-    mockAuthenticatedFetch.mockResolvedValueOnce(mockJsonResponse({ goal: null, available: true }));
-
-    await expect(getCodexGoal("conv", { strict: false })).resolves.toEqual({ goal: null });
+    await expect(getCodexGoal("conv", options)).resolves.toEqual(expected);
 
     const [url, init] = mockAuthenticatedFetch.mock.calls[0];
     expect(url).toBe("/v1/sessions/conv/codex_goal");
-    expect(new Headers(init?.headers).has("X-Omnigent-Codex-Goal-Read")).toBe(false);
+    expect(new Headers(init?.headers).get("X-Omnigent-Codex-Goal-Read")).toBe(header);
     expect(init?.signal).toBeInstanceOf(AbortSignal);
-  });
-
-  it.each([true, false])("accepts a confirmed null with strict=%s", async (strict) => {
-    mockAuthenticatedFetch.mockResolvedValueOnce(mockJsonResponse({ goal: null, available: true }));
-
-    await expect(getCodexGoal("conv", { strict })).resolves.toEqual({ goal: null });
   });
 
   it("keeps an unavailable background read distinct from an absent goal", async () => {
@@ -132,14 +142,6 @@ describe("codex goal API", () => {
         "X-Omnigent-Codex-Goal-Read",
       ),
     ).toBe(false);
-  });
-
-  it("keeps an unmarked legacy background null unavailable", async () => {
-    mockAuthenticatedFetch.mockResolvedValueOnce(mockJsonResponse({ goal: null }));
-
-    await expect(getCodexGoal("conv", { strict: false })).resolves.toEqual({
-      available: false,
-    });
   });
 
   it("accepts an unmarked populated background goal", async () => {
@@ -406,57 +408,93 @@ describe("codex goal API", () => {
       goalRequests.flatMap((request) =>
         ["resolve", "reject"].map((late) => ({ ...request, late })),
       ),
-    )("bounds $name and ignores a late $late after timeout", async ({ request, late }) => {
+    )(
+      "bounds $name and ignores a late $late after timeout",
+      async ({ request, late, timeoutMs }) => {
+        vi.useFakeTimers();
+        const stalled = deferred<unknown>();
+        const payload =
+          stage === "error body"
+            ? { error: { code: "codex_native_goal_failed", message: "late server error" } }
+            : { goal: WIRE_GOAL, cleared: true };
+        const response = mockJsonResponse(payload, {
+          ok: stage !== "error body",
+          status: stage === "error body" ? 503 : 200,
+        });
+        if (stage === "fetch") {
+          mockAuthenticatedFetch.mockReturnValueOnce(stalled.promise as Promise<Response>);
+        } else {
+          response.json = vi.fn(() => stalled.promise);
+          mockAuthenticatedFetch.mockResolvedValueOnce(response);
+        }
+        const fulfilled = vi.fn();
+        const rejected = vi.fn();
+        const outcome = request().then(fulfilled, rejected);
+        const signal = mockAuthenticatedFetch.mock.calls[0][1]?.signal;
+        try {
+          await vi.advanceTimersByTimeAsync(timeoutMs - 1);
+          expect(fulfilled).not.toHaveBeenCalled();
+          expect(rejected).not.toHaveBeenCalled();
+          expect(signal?.aborted ?? false).toBe(false);
+
+          await vi.advanceTimersByTimeAsync(1);
+
+          expect(rejected).toHaveBeenCalledTimes(1);
+          const error = rejected.mock.calls[0][0] as ApiError;
+          expect(error).toBeInstanceOf(ApiError);
+          expect(error.status).toBe(504);
+          expect(error.code).toBe("codex_goal_request_timeout");
+          expect(error.message).toMatch(/timed out/i);
+          if (timeoutMs === 60_000) {
+            expect(error.message).toBe("Goal read timed out. Try again.");
+            expect(error.message).not.toMatch(/uncertain/i);
+          } else {
+            expect(error.message).toMatch(/uncertain/i);
+            expect(error.message).toMatch(/refresh.*before.*retry/i);
+          }
+          expect(signal).toBeInstanceOf(AbortSignal);
+          expect(signal?.aborted).toBe(true);
+          expect(vi.getTimerCount()).toBe(0);
+        } finally {
+          if (late === "reject") stalled.reject(new Error("late transport or body failure"));
+          else stalled.resolve(stage === "fetch" ? response : payload);
+          await vi.advanceTimersByTimeAsync(0);
+          await outcome;
+        }
+
+        expect(fulfilled).not.toHaveBeenCalled();
+        expect(rejected).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(timeoutMs);
+        expect(mockAuthenticatedFetch).toHaveBeenCalledTimes(1);
+        expect(vi.getTimerCount()).toBe(0);
+      },
+    );
+  });
+
+  it.each(goalRequests.filter(({ timeoutMs }) => timeoutMs > 60_000))(
+    "allows a cold-runner $name to finish after the old one-minute deadline",
+    async ({ request }) => {
       vi.useFakeTimers();
-      const stalled = deferred<unknown>();
-      const payload =
-        stage === "error body"
-          ? { error: { code: "codex_native_goal_failed", message: "late server error" } }
-          : { goal: WIRE_GOAL, cleared: true };
-      const response = mockJsonResponse(payload, {
-        ok: stage !== "error body",
-        status: stage === "error body" ? 503 : 200,
-      });
-      if (stage === "fetch") {
-        mockAuthenticatedFetch.mockReturnValueOnce(stalled.promise as Promise<Response>);
-      } else {
-        response.json = vi.fn(() => stalled.promise);
-        mockAuthenticatedFetch.mockResolvedValueOnce(response);
-      }
+      const pending = deferred<Response>();
+      mockAuthenticatedFetch.mockReturnValueOnce(pending.promise);
       const fulfilled = vi.fn();
       const rejected = vi.fn();
       const outcome = request().then(fulfilled, rejected);
       const signal = mockAuthenticatedFetch.mock.calls[0][1]?.signal;
-      try {
-        await vi.advanceTimersByTimeAsync(59_999);
-        expect(fulfilled).not.toHaveBeenCalled();
-        expect(rejected).not.toHaveBeenCalled();
-        expect(signal?.aborted ?? false).toBe(false);
 
-        await vi.advanceTimersByTimeAsync(1);
-
-        expect(rejected).toHaveBeenCalledTimes(1);
-        const error = rejected.mock.calls[0][0] as Error;
-        expect(error.message).toMatch(/timed out/i);
-        expect(error.message).toMatch(/uncertain/i);
-        expect(error.message).toMatch(/refresh.*before.*retry/i);
-        expect(signal).toBeInstanceOf(AbortSignal);
-        expect(signal?.aborted).toBe(true);
-        expect(vi.getTimerCount()).toBe(0);
-      } finally {
-        if (late === "reject") stalled.reject(new Error("late transport or body failure"));
-        else stalled.resolve(stage === "fetch" ? response : payload);
-        await vi.advanceTimersByTimeAsync(0);
-        await outcome;
-      }
+      await vi.advanceTimersByTimeAsync(75_000);
 
       expect(fulfilled).not.toHaveBeenCalled();
-      expect(rejected).toHaveBeenCalledTimes(1);
-      await vi.advanceTimersByTimeAsync(60_000);
+      expect(rejected).not.toHaveBeenCalled();
+      expect(signal?.aborted).toBe(false);
+      pending.resolve(mockJsonResponse({ goal: WIRE_GOAL, cleared: true }));
+      await outcome;
+      expect(fulfilled).toHaveBeenCalledTimes(1);
+      expect(rejected).not.toHaveBeenCalled();
       expect(mockAuthenticatedFetch).toHaveBeenCalledTimes(1);
       expect(vi.getTimerCount()).toBe(0);
-    });
-  });
+    },
+  );
 
   it("keeps the uncertain-outcome message when fetch rejects on abort", async () => {
     vi.useFakeTimers();
@@ -471,10 +509,12 @@ describe("codex goal API", () => {
     const rejected = vi.fn();
     const outcome = setCodexGoal("conv", { objective: "Do it" }).catch(rejected);
 
-    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.advanceTimersByTimeAsync(190_000);
 
     expect(rejected).toHaveBeenCalledWith(
       expect.objectContaining({
+        status: 504,
+        code: "codex_goal_request_timeout",
         message: expect.stringMatching(/uncertain.*refresh.*before.*retry/i),
       }),
     );

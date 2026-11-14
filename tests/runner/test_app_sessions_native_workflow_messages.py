@@ -757,7 +757,24 @@ async def test_refused_steer_is_delivered_as_fresh_continuation_turn() -> None:
 async def test_native_buffered_messages_each_delivered_once_in_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Buffers messages behind an active native turn and delivers each once, in order."""
+    """claude-native: every buffered message is delivered once, in order.
+
+    Repro for the observed ``1 2 4 4 5 6 7 8 9 0`` corruption. claude-native
+    turns are instant and ``run_turn`` types only the *latest* user message,
+    so the runner's LLM-oriented machinery mis-delivers for native sessions:
+    the collapse-batch continuation (``next_body = all_bodies[-1]``) types
+    only the last buffered message (dropping the rest), and the mid-turn
+    forward races the instant turn's teardown (duplicating).
+
+    The native path (RUNNER_MESSAGE_INGEST.md Part C) instead skips the
+    forward and drains the buffer ONE message at a time, so each buffered
+    message gets its own continuation turn — typed exactly once, in order.
+
+    This test buffers 2, 3, 4 behind a blocked first turn and asserts:
+    (a) no mid-turn forward POSTs happen (native skips them), and
+    (b) the continuation starts a turn per buffered message carrying 2, 3,
+    4 as the latest user text, in order — not a single collapsed "4" turn.
+    """
     import asyncio as _aio
 
     def _skip_tools_changed_notification(*args: object, **kwargs: object) -> None:
@@ -778,7 +795,6 @@ async def test_native_buffered_messages_each_delivered_once_in_order(
 
     gate = _aio.Event()
     app, _pm, hc = _build_native_app(gate)
-    buffered_texts = ("2", "3", "4")
 
     async def _post(text: str) -> httpx.Response:
         """POST one user message carrying an agent_id (drives spec resolve)."""
@@ -804,8 +820,8 @@ async def test_native_buffered_messages_each_delivered_once_in_order(
                 break
             await _aio.sleep(0.01)
 
-        # Messages arriving during turn 0 stay buffered without a live forward.
-        for text in buffered_texts:
+        # 2, 3, 4 arrive while turn 0 is active → buffered (native: no forward).
+        for text in ("2", "3", "4"):
             resp = await _post(text)
             assert resp.status_code == 202, f"{text!r}: {resp.status_code} {resp.text}"
             assert resp.json()["status"] == "buffered"
@@ -823,11 +839,15 @@ async def test_native_buffered_messages_each_delivered_once_in_order(
     assert hc.patched_events == [], (
         f"native sessions must not forward mid-turn injections; got {hc.patched_events}"
     )
-    # Each buffered message becomes its own continuation, in order.
+    # (b) One continuation turn per buffered message, each typing 2, 3, 4
+    # as its latest user text, in order (snapshotted at stream time — see
+    # turn_latest_texts). Collapse (the bug) would yield a single
+    # continuation whose latest text is "4", dropping 2 and 3.
     continuation_latest = hc.turn_latest_texts[1:]
-    assert continuation_latest == list(buffered_texts), (
+    assert continuation_latest == ["2", "3", "4"], (
         f"expected one continuation turn per buffered message delivering "
-        f"{buffered_texts!r} in order; got {continuation_latest}.\n"
+        f"2, 3, 4 in order; got {continuation_latest}. A collapsed ['4'] "
+        f"means intermediate messages were dropped from the terminal.\n"
         f"turn_latest_texts={hc.turn_latest_texts}"
     )
 

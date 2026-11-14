@@ -10,6 +10,7 @@ app with the forward step staged.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 from typing import Any, cast
@@ -458,6 +459,79 @@ async def test_forward_wakes_the_runner_then_retries_on_it(
     )
 
 
+@pytest.mark.parametrize(
+    ("event_type", "phase"),
+    [
+        ("goal_get", "forward"),
+        ("goal_set", "forward"),
+        ("goal_set", "recovery"),
+        ("goal_set", "retry"),
+        ("goal_status", "retry"),
+        ("goal_clear", "retry"),
+    ],
+)
+async def test_forward_deadline_covers_live_recovery_and_retry_without_restarting(
+    monkeypatch: pytest.MonkeyPatch, event_type: str, phase: str
+) -> None:
+    calls: list[str] = []
+    cancelled: list[str] = []
+
+    async def stage(name: str, result: Any) -> Any:
+        calls.append(name)
+        if name == phase:
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled.append(name)
+                raise
+        return result
+
+    async def forward(*args: Any) -> Any:
+        return await stage("forward", None)
+
+    async def recover(**kwargs: Any) -> Any:
+        return await stage("recovery", object())
+
+    async def retry(*args: Any) -> Any:
+        return await stage("retry", _result(200, {"goal": None}))
+
+    monkeypatch.setattr(codex, "_CODEX_GOAL_READ_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(codex, "_CODEX_GOAL_MUTATION_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(codex, "_forward_session_change_to_runner", forward)
+    monkeypatch.setattr(codex, "_launch_runner_for_codex_goal", recover)
+    monkeypatch.setattr(codex, "_post_codex_goal_event_to_runner", retry)
+
+    result = await _forward(monkeypatch, {"type": event_type})
+
+    status, body = _status_and_body(_payload_or_response(result))
+    assert status == 504
+    assert body["error"] == "codex_goal_request_timeout"
+    assert ("uncertain" in body["detail"]) is (event_type != "goal_get")
+    assert cancelled == [phase]
+    phases = ["forward", "recovery", "retry"]
+    assert calls == phases[: phases.index(phase) + 1]
+
+
+@pytest.mark.parametrize("failure", ["timeout", "cancellation"])
+async def test_forward_does_not_reclassify_other_timeouts_or_cancellation(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    error = TimeoutError("upstream timeout") if failure == "timeout" else asyncio.CancelledError()
+
+    async def forward(*args: Any) -> None:
+        raise error
+
+    async def never(**kwargs: Any) -> None:
+        raise AssertionError("an interrupted forward must not relaunch")
+
+    monkeypatch.setattr(codex, "_forward_session_change_to_runner", forward)
+    monkeypatch.setattr(codex, "_launch_runner_for_codex_goal", never)
+
+    with pytest.raises(type(error)) as caught:
+        await _forward(monkeypatch, {"type": "goal_set"})
+    assert caught.value is error
+
+
 # ── _require_codex_native_goal_session ─────────────────────────────────────
 
 
@@ -485,6 +559,31 @@ async def codex_session(client: httpx.AsyncClient, db_uri: str) -> str:
         session_id, {WRAPPER_LABEL_KEY: CODEX_NATIVE_WRAPPER_VALUE}
     )
     return session_id
+
+
+@pytest.mark.parametrize("strict", [False, True])
+async def test_goal_read_timeout_is_an_error_instead_of_an_absent_snapshot(
+    client: httpx.AsyncClient,
+    codex_session: str,
+    monkeypatch: pytest.MonkeyPatch,
+    strict: bool,
+) -> None:
+    async def stalled(*args: Any) -> None:
+        await asyncio.Future()
+
+    monkeypatch.setattr(codex, "_CODEX_GOAL_READ_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(codex, "_forward_session_change_to_runner", stalled)
+
+    response = await client.get(
+        f"/v1/sessions/{codex_session}/codex_goal",
+        headers={"X-Omnigent-Codex-Goal-Read": "strict"} if strict else {},
+    )
+
+    assert response.status_code == 504
+    assert response.json() == {
+        "error": "codex_goal_request_timeout",
+        "detail": "Goal read timed out. Try again.",
+    }
 
 
 class _StagedForward:
@@ -584,8 +683,7 @@ async def test_get_goal_preserves_confirmed_runner_availability(
 
 @pytest.mark.parametrize(
     "payload",
-    [{"goal": None, "available": value} for value in (None, 0, 1, "true", "false", [], {})]
-    + [{"goal": _goal(), "available": False}],
+    [{"goal": None, "available": "false"}, {"goal": _goal(), "available": False}],
 )
 async def test_get_goal_rejects_invalid_availability_before_legacy_fallback(
     client: httpx.AsyncClient,

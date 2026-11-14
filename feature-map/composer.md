@@ -179,9 +179,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   preserves edited fields and visible errors in the same open dialog. A pending
   Save, Clear, Pause or Resume stays busy after closing and reopening the same
   session, including when its dialog remounts, until the request and its fresh-read
-  attempt finish. Each browser request has a sixty-second deadline, including
-  response parsing. A timeout leaves the outcome uncertain; refresh the goal
-  before retrying. Other sessions remain independently editable. A fresh accepted
+  attempt finish. Browser reads have a sixty-second deadline and updates have
+  190 seconds, including response parsing. Server forwarding allows fifty
+  seconds for reads and 180 seconds for updates, including runner recovery.
+  A timed-out update leaves the outcome uncertain; refresh the goal before
+  retrying. Other sessions remain independently editable. A fresh accepted
   snapshot releases opening-read loading even if the original read is pending.
 - `slash-rewind`: in claude-sdk and Claude Code native sessions, `/rewind` opens
   a searchable list of the session's prompts, newest first. Choosing one

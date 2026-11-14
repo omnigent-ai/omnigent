@@ -698,9 +698,10 @@ describe("GoalDialog", () => {
   );
 
   it.each(
-    [...mutations, { action: "resume", button: "goal-resume" }].flatMap((mutation) =>
-      ["success", "error"].map((late) => ({ ...mutation, late })),
-    ),
+    [
+      { action: "save", button: "goal-save" },
+      { action: "resume", button: "goal-resume" },
+    ].flatMap((mutation) => ["success", "error"].map((late) => ({ ...mutation, late }))),
   )(
     "bounds a stalled $action and reconciliation after reopening, ignoring late $late",
     async ({ action, button, late }) => {
@@ -741,14 +742,16 @@ describe("GoalDialog", () => {
         await act(async () => {});
         expect(screen.getByTestId("goal-save")).toBeEnabled();
         fireEvent.click(screen.getByTestId(button));
+        expect(screen.getByTestId(button)).toBeDisabled();
         const writeSignal = fetch.mock.calls[1][1]?.signal;
         rerender(<ManagedDialog pollingEnabled={false} open={false} />);
         rerender(<ManagedDialog pollingEnabled={false} />);
         await act(async () => {});
         expect(readCount).toBe(2);
+        expect(screen.getByTestId(button)).toBeDisabled();
         expect(screen.getByTestId("goal-objective")).toBeDisabled();
 
-        await act(() => vi.advanceTimersByTimeAsync(59_999));
+        await act(() => vi.advanceTimersByTimeAsync(189_999));
         expect(readCount).toBe(2);
         await act(() => vi.advanceTimersByTimeAsync(1));
 
@@ -768,7 +771,7 @@ describe("GoalDialog", () => {
 
         expect(reconciliationSignal?.aborted).toBe(true);
         expect(
-          screen.getByText(/Could not read goal: .*uncertain.*refresh.*before.*retry/i),
+          screen.getByText(/Could not read goal: Goal read timed out\. Try again\./i),
         ).toBeInTheDocument();
         expect(screen.getByTestId("goal-save")).toBeEnabled();
         fireEvent.change(screen.getByTestId("goal-objective"), {

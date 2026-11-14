@@ -3,7 +3,9 @@ import { ApiError } from "./sessionsApi";
 
 const CODEX_GOAL_READ_HEADER = "X-Omnigent-Codex-Goal-Read";
 const CODEX_GOAL_READ_STRICT = "strict";
+// Allow delivery time after AP's 50s read / 180s mutation forwarding budgets.
 const CODEX_GOAL_REQUEST_TIMEOUT_MS = 60_000;
+const CODEX_GOAL_MUTATION_TIMEOUT_MS = 190_000;
 
 /**
  * Raw Codex app-server goal object forwarded by the AP route.
@@ -130,17 +132,25 @@ async function readJsonOrThrow<T>(res: Response): Promise<T> {
 }
 
 async function requestCodexGoal<T>(url: string, init: RequestInit = {}): Promise<T> {
+  const isRead = (init.method ?? "GET").toUpperCase() === "GET";
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      reject(
-        new Error(
-          "Goal request timed out. The outcome is uncertain. Refresh the goal before retrying.",
-        ),
-      );
-      controller.abort();
-    }, CODEX_GOAL_REQUEST_TIMEOUT_MS);
+    timer = setTimeout(
+      () => {
+        reject(
+          new ApiError(
+            isRead
+              ? "Goal read timed out. Try again."
+              : "Goal request timed out. The outcome is uncertain. Refresh the goal before retrying.",
+            504,
+            "codex_goal_request_timeout",
+          ),
+        );
+        controller.abort();
+      },
+      isRead ? CODEX_GOAL_REQUEST_TIMEOUT_MS : CODEX_GOAL_MUTATION_TIMEOUT_MS,
+    );
   });
   try {
     const request = authenticatedFetch(url, { ...init, signal: controller.signal }).then(
@@ -209,7 +219,7 @@ function codexGoalResponseFromWire(wire: unknown): CodexGoalResponse {
     );
   }
   return {
-    goal: wire.goal === null || wire.goal === undefined ? null : codexGoalFromWire(wire.goal),
+    goal: wire.goal === null ? null : codexGoalFromWire(wire.goal),
   };
 }
 

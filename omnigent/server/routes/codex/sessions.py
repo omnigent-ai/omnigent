@@ -50,6 +50,9 @@ _logger = logging.getLogger(__name__)
 
 _CODEX_NATIVE_GOAL_ERROR = "codex_native_goal_failed"
 _CODEX_GOAL_READ_HEADER = "X-Omnigent-Codex-Goal-Read"
+# Include runner recovery and RPC time, including transports that ignore HTTPX timeouts.
+_CODEX_GOAL_READ_TIMEOUT_SECONDS = 50.0
+_CODEX_GOAL_MUTATION_TIMEOUT_SECONDS = 180.0
 
 
 def _codex_goal_error(status_code: int, *, detail: str) -> JSONResponse:
@@ -409,28 +412,51 @@ async def _forward_codex_goal_event(
     :returns: Runner forward result, or ``None`` if no runner could be
         reached.
     """
-    runner_result = await _forward_session_change_to_runner(
-        session_id,
-        runner_router,
-        event,
+    is_read = event.get("type") == "goal_get"
+    deadline = asyncio.timeout(
+        _CODEX_GOAL_READ_TIMEOUT_SECONDS if is_read else _CODEX_GOAL_MUTATION_TIMEOUT_SECONDS
     )
-    if runner_result is not None:
-        return runner_result
-    if event.get("type") == "goal_get":
-        return None
-    runner_client = await _launch_runner_for_codex_goal(
-        session_id=session_id,
-        conv=conv,
-        request=request,
-        user_id=user_id,
-        runner_router=runner_router,
-        conversation_store=conversation_store,
-        permission_store=permission_store,
-        runner_exit_reports=runner_exit_reports,
-    )
-    if runner_client is None:
-        return None
-    return await _post_codex_goal_event_to_runner(session_id, runner_client, event)
+    try:
+        async with deadline:
+            runner_result = await _forward_session_change_to_runner(
+                session_id,
+                runner_router,
+                event,
+            )
+            if runner_result is not None:
+                return runner_result
+            if is_read:
+                return None
+            runner_client = await _launch_runner_for_codex_goal(
+                session_id=session_id,
+                conv=conv,
+                request=request,
+                user_id=user_id,
+                runner_router=runner_router,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
+                runner_exit_reports=runner_exit_reports,
+            )
+            if runner_client is None:
+                return None
+            return await _post_codex_goal_event_to_runner(session_id, runner_client, event)
+    except TimeoutError:
+        if not deadline.expired():
+            raise
+        return _RunnerForwardResult(
+            status_code=504,
+            body=json.dumps(
+                {
+                    "error": "codex_goal_request_timeout",
+                    "detail": (
+                        "Goal read timed out. Try again."
+                        if is_read
+                        else "Goal request timed out. The outcome is uncertain. "
+                        "Refresh the goal before retrying."
+                    ),
+                }
+            ),
+        )
 
 
 async def _require_codex_native_goal_session(

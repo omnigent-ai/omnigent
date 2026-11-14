@@ -17,6 +17,13 @@ session's existing host/workspace binding and initializes the relaunched
 runner before retrying the goal control. The caller cannot choose a new
 host or workspace through these routes.
 
+After session access checks, forwarding has a total deadline of 50 seconds
+for reads or 180 seconds for mutations, including runner recovery and
+initialization. An expired deadline returns 504 with error code
+`codex_goal_request_timeout`. A timed-out mutation may have taken effect;
+refresh the goal before retrying. Cancellation does not guarantee that the
+native backend stopped the mutation.
+
 All routes are valid only for sessions stamped with
 `omnigent.wrapper=codex-native-ui`.
 
@@ -147,3 +154,7 @@ Failure modes:
     No live runner can reach the loaded Codex bridge, the session has no
     usable bound host to relaunch, the runner rejects the goal control,
     or the runner returns a malformed goal payload.
+
+  504 Gateway Timeout
+    The total forwarding deadline expired. Mutation outcomes are uncertain;
+    refresh the goal before retrying.
