@@ -20,6 +20,7 @@ Covers the non-trivial logic in the AP-server-side MCP connection pool:
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -148,34 +149,38 @@ def patch_mcp_connection(
     class _FakeMcpServerConnection:
         """Drop-in for McpServerConnection; delegates to the closure dict."""
 
-        def __init__(self, *, config: MCPServerConfig) -> None:
-            """Register a stub for *config.name* if not already present.
-
-            :param config: The server config whose name keys the stub dict.
-            """
-            self._name = config.name
-            if config.name not in conns:
-                conns[config.name] = _FakeConn(tools=[])
+        def __init__(
+            self,
+            *,
+            config: MCPServerConfig,
+            user_id: str | None = None,
+            credential_resolver: Any = None,
+            auth_command_timeout_s: float | None = None,
+        ) -> None:
+            """Register a stub for *config.name* (or ``name:user_id``) if absent."""
+            self.config = config
+            self.user_id = user_id
+            self.credential_resolver = credential_resolver
+            self.auth_command_timeout_s = auth_command_timeout_s
+            user_key = f"{config.name}:{user_id}" if user_id is not None else config.name
+            if user_id is not None and user_key in conns:
+                self._key = user_key
+            else:
+                self._key = config.name
+                if self._key not in conns:
+                    conns[self._key] = _FakeConn(tools=[])
 
         async def connect(self) -> list[McpToolDef]:
-            """Forward to the per-name _FakeConn.
-
-            :returns: Tools from the scripted stub.
-            """
-            return await conns[self._name].connect()
+            """Forward to the per-name _FakeConn."""
+            return await conns[self._key].connect()
 
         async def close(self) -> None:
             """Forward close to the per-name _FakeConn."""
-            await conns[self._name].close()
+            await conns[self._key].close()
 
         async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
-            """Forward call_tool to the per-name _FakeConn.
-
-            :param name: Tool name.
-            :param arguments: Tool arguments.
-            :returns: Stub result.
-            """
-            return await conns[self._name].call_tool(name, arguments)
+            """Forward call_tool to the per-name _FakeConn."""
+            return await conns[self._key].call_tool(name, arguments)
 
     monkeypatch.setattr(
         "omnigent.server.mcp_pool.McpServerConnection",
@@ -406,7 +411,7 @@ async def test_shutdown_for_removes_entry_and_closes(
     await pool.shutdown_for("agent_1")
 
     # 1. Entry must be gone
-    assert "agent_1" not in pool._entries, "Pool entry must be removed after shutdown_for"
+    assert ("agent_1", None) not in pool._entries, "Pool entry must be removed after shutdown_for"
     # 2. Connection must have been closed
     assert patch_mcp_connection["github"].close_calls == 1, (
         "close() must be called exactly once on the live connection; "
@@ -533,14 +538,265 @@ async def test_lru_evicts_least_recently_used_at_capacity(
     # Give background evict tasks a cycle to complete
     await asyncio.sleep(0)
 
-    assert "agent_a" not in pool._entries, (
+    assert ("agent_a", None) not in pool._entries, (
         "agent_a must be evicted (it was the LRU when agent_c was added)"
     )
-    assert "agent_b" in pool._entries, "agent_b must survive (not the LRU)"
-    assert "agent_c" in pool._entries, "agent_c must be present (just added)"
+    assert ("agent_b", None) in pool._entries, "agent_b must survive (not the LRU)"
+    assert ("agent_c", None) in pool._entries, "agent_c must be present (just added)"
     assert len(pool._entries) == 2, "Pool must stay at capacity=2 after eviction"
     assert patch_mcp_connection["a"].close_calls == 1, (
         "agent_a's connection must be closed during LRU eviction; if 0, the connection leaked"
     )
 
     await pool.shutdown_all()
+
+
+# ── user-scoped isolation & credential resolution ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_per_user_pool_isolation(patch_mcp_connection: dict[str, _FakeConn]) -> None:
+    """Two users on the same agent_id must get separate connections and tool scopes."""
+    patch_mcp_connection["github:alice"] = _FakeConn(
+        tools=[_make_tool("alice_tool")],
+        call_tool_results={"who": "alice"},
+    )
+    patch_mcp_connection["github:bob"] = _FakeConn(
+        tools=[_make_tool("bob_tool")],
+        call_tool_results={"who": "bob"},
+    )
+    spec = _make_spec(_make_config("github"))
+    pool = ServerMcpPool()
+
+    try:
+        alice_tools = await pool.list_tools("agent_1", spec, user_id="alice")
+        bob_tools = await pool.list_tools("agent_1", spec, user_id="bob")
+        assert {e.tool.name for e in alice_tools} == {"alice_tool"}
+        assert {e.tool.name for e in bob_tools} == {"bob_tool"}
+
+        alice_res = await pool.call_tool("agent_1", spec, "github", "who", {}, user_id="alice")
+        bob_res = await pool.call_tool("agent_1", spec, "github", "who", {}, user_id="bob")
+        assert alice_res == "alice"
+        assert bob_res == "bob"
+
+        assert ("agent_1", "alice") in pool._entries
+        assert ("agent_1", "bob") in pool._entries
+        assert patch_mcp_connection["github:alice"].connect_calls == 1
+        assert patch_mcp_connection["github:bob"].connect_calls == 1
+    finally:
+        await pool.shutdown_all()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_for_user_scoped_and_whole_agent(
+    patch_mcp_connection: dict[str, _FakeConn],
+) -> None:
+    """``shutdown_for(agent_id, user_id=...)`` closes only that user; ``None`` closes all."""
+    patch_mcp_connection["github:alice"] = _FakeConn(tools=[_make_tool("search")])
+    patch_mcp_connection["github:bob"] = _FakeConn(tools=[_make_tool("search")])
+    spec = _make_spec(_make_config("github"))
+    pool = ServerMcpPool()
+
+    try:
+        await pool.list_tools("agent_1", spec, user_id="alice")
+        await pool.list_tools("agent_1", spec, user_id="bob")
+
+        await pool.shutdown_for("agent_1", user_id="alice")
+        assert ("agent_1", "alice") not in pool._entries
+        assert ("agent_1", "bob") in pool._entries
+        assert patch_mcp_connection["github:alice"].close_calls == 1
+        assert patch_mcp_connection["github:bob"].close_calls == 0
+
+        await pool.shutdown_for("agent_1")
+        assert ("agent_1", "bob") not in pool._entries
+        assert patch_mcp_connection["github:bob"].close_calls == 1
+    finally:
+        await pool.shutdown_all()
+
+
+@pytest.mark.asyncio
+async def test_connection_capacity_lru_eviction_counts_connections(
+    patch_mcp_connection: dict[str, _FakeConn],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Capacity is measured in live connections across ``(agent_id, user_id)`` entries."""
+    monkeypatch.setattr(_mcp_pool_module, "_POOL_CONNECTION_CAPACITY", 3)
+    for key in ["s1:alice", "s2:alice", "s1:bob", "s1:carol"]:
+        patch_mcp_connection[key] = _FakeConn(tools=[_make_tool("ping")])
+
+    spec_two = _make_spec(_make_config("s1"), _make_config("s2"))
+    spec_one = _make_spec(_make_config("s1"))
+    pool = ServerMcpPool()
+
+    try:
+        await pool.list_tools("agent_1", spec_two, user_id="alice")  # 2 connections
+        await pool.list_tools("agent_1", spec_one, user_id="bob")  # +1 = 3 connections
+        # Adding carol's 1 connection exceeds 3 -> must evict alice's 2-connection entry.
+        await pool.list_tools("agent_1", spec_one, user_id="carol")
+        await asyncio.sleep(0)
+
+        assert ("agent_1", "alice") not in pool._entries
+        assert ("agent_1", "bob") in pool._entries
+        assert ("agent_1", "carol") in pool._entries
+        assert pool._live_connection_count() <= 3
+        assert patch_mcp_connection["s1:alice"].close_calls == 1
+        assert patch_mcp_connection["s2:alice"].close_calls == 1
+    finally:
+        await pool.shutdown_all()
+
+
+@pytest.mark.asyncio
+async def test_oversize_spec_rejected_without_evicting_existing_pool(
+    patch_mcp_connection: dict[str, _FakeConn],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An agent requesting more connections than pool capacity fails without evicting others."""
+    monkeypatch.setattr(_mcp_pool_module, "_POOL_CONNECTION_CAPACITY", 2)
+    for key in ["s1:alice", "s1:bob", "s2:bob", "s3:bob"]:
+        patch_mcp_connection[key] = _FakeConn(tools=[_make_tool("ping")])
+
+    pool = ServerMcpPool()
+    spec_ok = _make_spec(_make_config("s1"))
+    spec_oversize = _make_spec(_make_config("s1"), _make_config("s2"), _make_config("s3"))
+
+    try:
+        await pool.list_tools("agent_ok", spec_ok, user_id="alice")
+        with pytest.raises(ValueError, match="exceeding pool connection capacity"):
+            await pool.list_tools("agent_big", spec_oversize, user_id="bob")
+
+        assert ("agent_ok", "alice") in pool._entries
+        assert ("agent_big", "bob") not in pool._entries
+        assert patch_mcp_connection["s1:alice"].close_calls == 0
+    finally:
+        await pool.shutdown_all()
+
+
+@pytest.mark.asyncio
+async def test_single_user_cannot_evict_other_users_entries(
+    patch_mcp_connection: dict[str, _FakeConn],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One user acquiring many entries evicts their own oldest entries before other users'."""
+    monkeypatch.setattr(_mcp_pool_module, "_POOL_CONNECTION_CAPACITY", 4)
+    for agent_name in ["a0", "a1", "a2", "a3", "a4"]:
+        patch_mcp_connection[f"{agent_name}:alice"] = _FakeConn(tools=[_make_tool("t")])
+        patch_mcp_connection[f"{agent_name}:bob"] = _FakeConn(tools=[_make_tool("t")])
+
+    pool = ServerMcpPool()
+    try:
+        await pool.list_tools("a0", _make_spec(_make_config("a0")), user_id="bob")
+        for agent_name in ["a1", "a2", "a3", "a4"]:
+            await pool.list_tools(
+                agent_name, _make_spec(_make_config(agent_name)), user_id="alice"
+            )
+        await asyncio.sleep(0)
+
+        assert ("a0", "bob") in pool._entries
+        assert patch_mcp_connection["a0:bob"].close_calls == 0
+        assert pool._live_connection_count() <= 4
+    finally:
+        await pool.shutdown_all()
+
+
+@pytest.mark.asyncio
+async def test_pool_forwards_user_id_and_credential_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``ServerMcpPool`` passes ``user_id``, resolver, and timeout to connections."""
+    observed: list[tuple[str | None, Any, float | None]] = []
+
+    class _CapturingConn:
+        def __init__(
+            self,
+            *,
+            config: MCPServerConfig,
+            user_id: str | None = None,
+            credential_resolver: Any = None,
+            auth_command_timeout_s: float | None = None,
+        ) -> None:
+            observed.append((user_id, credential_resolver, auth_command_timeout_s))
+
+        async def connect(self) -> list[McpToolDef]:
+            return [_make_tool("ping")]
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("omnigent.server.mcp_pool.McpServerConnection", _CapturingConn)
+
+    def _resolver(cfg: MCPServerConfig, uid: str | None) -> dict[str, str]:
+        return {"Authorization": f"Bearer tok-{uid}"}
+
+    pool = ServerMcpPool(credential_resolver=_resolver, auth_command_timeout_s=7.5)
+    spec = _make_spec(_make_config("github"))
+    try:
+        await pool.list_tools("agent_1", spec, user_id="alice")
+        await pool.list_tools("agent_1", spec, user_id="bob")
+        assert observed == [
+            ("alice", _resolver, 7.5),
+            ("bob", _resolver, 7.5),
+        ]
+    finally:
+        await pool.shutdown_all()
+
+
+@pytest.mark.asyncio
+async def test_require_user_id_rejects_missing_user() -> None:
+    """``require_user_id=True`` must reject missing or whitespace-only ``user_id``."""
+    pool = ServerMcpPool(require_user_id=True)
+    spec = _make_spec(_make_config("github"))
+    with pytest.raises(ValueError, match="user_id is required"):
+        await pool.list_tools("agent_1", spec)
+    with pytest.raises(ValueError, match="user_id is required"):
+        await pool.list_tools("agent_1", spec, user_id="   ")
+    with pytest.raises(ValueError, match="user_id is required"):
+        await pool.call_tool("agent_1", spec, "github", "search", {}, user_id=None)
+    await pool.shutdown_all()
+
+
+@pytest.mark.asyncio
+async def test_shared_static_credentials_warns_and_refuses(
+    patch_mcp_connection: dict[str, _FakeConn],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Multiple users on static-credential HTTP specs warn by default and refuse when strict."""
+    patch_mcp_connection["github"] = _FakeConn(tools=[_make_tool("search")])
+    static_cfg = MCPServerConfig(
+        name="github",
+        transport="http",
+        url="https://mcp.example.com/mcp",
+        headers={"Authorization": "Bearer shared-secret"},
+    )
+    spec_static = _make_spec(static_cfg)
+
+    warn_pool = ServerMcpPool(shared_credential_policy="warn")
+    try:
+        with caplog.at_level(logging.WARNING, logger="omnigent.server.mcp_pool"):
+            await warn_pool.list_tools("agent_1", spec_static, user_id="alice")
+            assert not any("shares static MCP credentials" in r.message for r in caplog.records)
+            await warn_pool.list_tools("agent_1", spec_static, user_id="bob")
+            assert any("shares static MCP credentials" in r.message for r in caplog.records)
+    finally:
+        await warn_pool.shutdown_all()
+
+    refuse_pool = ServerMcpPool(shared_credential_policy="refuse")
+    try:
+        await refuse_pool.list_tools("agent_1", spec_static, user_id="alice")
+        with pytest.raises(RuntimeError, match="Refusing to share static MCP credentials"):
+            await refuse_pool.list_tools("agent_1", spec_static, user_id="bob")
+    finally:
+        await refuse_pool.shutdown_all()
+
+    # With per-user auth_command, strict refuse mode allows distinct users without warning.
+    dynamic_cfg = MCPServerConfig(
+        name="github",
+        transport="http",
+        url="https://mcp.example.com/mcp",
+        auth_command="printf %s tok",
+    )
+    strict_ok_pool = ServerMcpPool(shared_credential_policy="refuse")
+    try:
+        await strict_ok_pool.list_tools("agent_1", _make_spec(dynamic_cfg), user_id="alice")
+        await strict_ok_pool.list_tools("agent_1", _make_spec(dynamic_cfg), user_id="bob")
+    finally:
+        await strict_ok_pool.shutdown_all()

@@ -119,6 +119,8 @@ def register_mcp_routes(
             )
         method: str = body.get("method") or ""
         params: _JsonObject = body.get("params") or {}
+        raw_user_id = body.get("user_id") or params.get("user_id")
+        user_id = raw_user_id.strip() or None if isinstance(raw_user_id, str) else None
 
         raw_operation = body.get("_omnigent_operation")
         if method == "tools/call" and raw_operation is not None:
@@ -198,7 +200,10 @@ def register_mcp_routes(
                     },
                 )
             try:
-                result = await mcp_manager.schemas_for(spec)
+                if user_id is not None:
+                    result = await mcp_manager.schemas_for(spec, user_id=user_id)
+                else:
+                    result = await mcp_manager.schemas_for(spec)
             except Exception as exc:  # noqa: BLE001
                 return JSONResponse(
                     status_code=200,
@@ -268,7 +273,11 @@ def register_mcp_routes(
 
                 try:
                     if input_responses is not None:
-                        route = mcp_manager._resolve_tool_route(spec, tool_name)
+                        route = (
+                            mcp_manager._resolve_tool_route(spec, tool_name, user_id=user_id)
+                            if user_id is not None
+                            else mcp_manager._resolve_tool_route(spec, tool_name)
+                        )
                         if route is None:
                             raise RuntimeError(
                                 f"runner has no live MCP serving tool {tool_name!r}"
@@ -283,6 +292,14 @@ def register_mcp_routes(
                             arguments,
                             input_responses=input_responses,
                             request_state=request_state,
+                        )
+                    elif user_id is not None:
+                        output = await mcp_manager.call_tool(
+                            spec,
+                            tool_name,
+                            arguments,
+                            session_id=session_id,
+                            user_id=user_id,
                         )
                     else:
                         output = await mcp_manager.call_tool(

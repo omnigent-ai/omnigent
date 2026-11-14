@@ -1010,6 +1010,10 @@ class MCPServerConfig:
         initialization and tool calls.
     :param retry: Per-tool retry policy. ``None`` inherits
         ``tools.retry``.
+    :param auth_command: Optional shell command executed at connect
+        and request time via ``/bin/sh -c`` whose trimmed stdout is
+        sent as ``Authorization: Bearer <token>``. Valid only on
+        ``"http"``.
     """
 
     name: str
@@ -1037,23 +1041,27 @@ class MCPServerConfig:
     # tools.timeout / tools.retry.
     timeout: int | None = None
     retry: RetryPolicy | None = None
+    # Dynamic HTTP credential command invoked at connect/request time.
+    auth_command: str | None = field(default=None, repr=False)
 
     def __repr__(self) -> str:
         """
         String representation that redacts secret-bearing fields.
 
-        Header and env values are replaced with ``"[REDACTED]"`` —
-        credentials commonly travel through these fields and we
-        don't want them in exception tracebacks / log scrapes.
-        Keys are preserved so operators can still tell which
+        Header, env, and auth_command values are replaced with
+        ``"[REDACTED]"`` — credentials commonly travel through these
+        fields and we don't want them in exception tracebacks / log
+        scrapes. Keys are preserved so operators can still tell which
         secrets were attached.
         """
         redacted_headers = dict.fromkeys(self.headers, "[REDACTED]") if self.headers else {}
         redacted_env = dict.fromkeys(self.env, "[REDACTED]") if self.env else {}
+        redacted_auth_command = "[REDACTED]" if self.auth_command else None
         return (
             f"MCPServerConfig(name={self.name!r}, transport={self.transport!r}, "
             f"url={self.url!r}, headers={redacted_headers!r}, "
             f"databricks_profile={self.databricks_profile!r}, "
+            f"auth_command={redacted_auth_command!r}, "
             f"command={self.command!r}, args={self.args!r}, "
             f"env={redacted_env!r}, "
             f"timeout={self.timeout!r}, retry={self.retry!r})"

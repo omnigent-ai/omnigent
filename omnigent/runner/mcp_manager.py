@@ -84,12 +84,21 @@ def _build_accept_content(
 _POOL_SPEC_CAPACITY = 8
 
 
+def _normalize_user_id(user_id: str | None) -> str | None:
+    """Normalize empty or whitespace-only user identifiers to ``None``."""
+    if user_id is None:
+        return None
+    stripped = user_id.strip()
+    return stripped or None
+
+
 @dataclass
 class _SharedServerEntry:
     """One live MCP server connection shared by any spec with the same config."""
 
     server_hash: str
     config: MCPServerConfig
+    user_id: str | None = None
     connection: McpServerConnection | None = None
     tools: list[McpToolDef] = field(default_factory=list)
     error: str | None = None
@@ -110,6 +119,7 @@ class _SpecServerRef:
 @dataclass
 class _SpecEntry:
     spec_hash: str
+    user_id: str | None = None
     servers: dict[str, _SpecServerRef] = field(default_factory=dict)
     server_hashes: set[str] = field(default_factory=set)
 
@@ -123,28 +133,38 @@ class McpSchemasResult:
     failures: dict[str, str]  # server_name → error message
 
 
-def compute_spec_hash(configs: list[MCPServerConfig], cwd: Path | None = None) -> str:
-    """Stable content hash over ``spec.mcp_servers`` (+ stdio cwd)."""
+def compute_spec_hash(
+    configs: list[MCPServerConfig],
+    cwd: Path | None = None,
+    *,
+    user_id: str | None = None,
+) -> str:
+    """Stable content hash over ``spec.mcp_servers`` (+ stdio cwd + optional user identity)."""
+    normalized_user = _normalize_user_id(user_id)
+    data: dict[str, object] = {
+        "cwd": str(cwd) if cwd is not None else None,
+        "servers": [
+            {
+                "name": c.name,
+                "transport": c.transport,
+                "url": c.url,
+                "headers": dict(c.headers or {}),
+                "databricks_profile": c.databricks_profile,
+                "auth_command": c.auth_command,
+                "command": c.command,
+                "args": list(c.args or []),
+                "env": dict(c.env or {}),
+                "tools": list(getattr(c, "tools", None) or []),
+                "timeout": c.timeout,
+                "retry": _retry_payload(c.retry),
+            }
+            for c in configs
+        ],
+    }
+    if normalized_user is not None:
+        data["user_id"] = normalized_user
     payload = json.dumps(
-        {
-            "cwd": str(cwd) if cwd is not None else None,
-            "servers": [
-                {
-                    "name": c.name,
-                    "transport": c.transport,
-                    "url": c.url,
-                    "headers": dict(c.headers or {}),
-                    "databricks_profile": c.databricks_profile,
-                    "command": c.command,
-                    "args": list(c.args or []),
-                    "env": dict(c.env or {}),
-                    "tools": list(getattr(c, "tools", None) or []),
-                    "timeout": c.timeout,
-                    "retry": _retry_payload(c.retry),
-                }
-                for c in configs
-            ],
-        },
+        data,
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -159,26 +179,36 @@ def _retry_payload(retry: RetryPolicy | None) -> object:
     return payload
 
 
-def compute_server_hash(config: MCPServerConfig, cwd: Path | None = None) -> str:
+def compute_server_hash(
+    config: MCPServerConfig,
+    cwd: Path | None = None,
+    *,
+    user_id: str | None = None,
+) -> str:
     """Stable content hash over fields that determine one MCP connection.
 
     ``name`` and ``tools`` are intentionally excluded: two specs can expose
     the same underlying server with different namespaces or allow-lists while
-    sharing one transport/subprocess.
+    sharing one transport/subprocess for the same user identity.
     """
+    normalized_user = _normalize_user_id(user_id)
+    data: dict[str, object] = {
+        "cwd": str(cwd) if config.transport == "stdio" and cwd is not None else None,
+        "transport": config.transport,
+        "url": config.url,
+        "headers": dict(config.headers or {}),
+        "databricks_profile": config.databricks_profile,
+        "auth_command": config.auth_command,
+        "command": config.command,
+        "args": list(config.args or []),
+        "env": dict(config.env or {}),
+        "timeout": config.timeout,
+        "retry": _retry_payload(config.retry),
+    }
+    if normalized_user is not None:
+        data["user_id"] = normalized_user
     payload = json.dumps(
-        {
-            "cwd": str(cwd) if config.transport == "stdio" and cwd is not None else None,
-            "transport": config.transport,
-            "url": config.url,
-            "headers": dict(config.headers or {}),
-            "databricks_profile": config.databricks_profile,
-            "command": config.command,
-            "args": list(config.args or []),
-            "env": dict(config.env or {}),
-            "timeout": config.timeout,
-            "retry": _retry_payload(config.retry),
-        },
+        data,
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -400,7 +430,7 @@ class RunnerMcpManager:
 
         return _elicit
 
-    async def prewarm(self, spec: AgentSpec) -> None:
+    async def prewarm(self, spec: AgentSpec, *, user_id: str | None = None) -> None:
         """Register *spec*'s MCPs without spawning transports.
 
         This keeps runner startup cheap when a spec lists many MCPs; the
@@ -409,19 +439,23 @@ class RunnerMcpManager:
         configs = [c for c in (spec.mcp_servers or []) if c.transport != "registry"]
         if not configs:
             return
-        spec_hash = compute_spec_hash(configs, self._stdio_cwd)
+        normalized_user = _normalize_user_id(user_id)
+        spec_hash = compute_spec_hash(configs, self._stdio_cwd, user_id=normalized_user)
         async with self._lock:
-            self._ensure_entry(spec_hash, configs)
+            self._ensure_entry(spec_hash, configs, user_id=normalized_user)
             self._touch(spec_hash)
 
-    async def schemas_for(self, spec: AgentSpec) -> McpSchemasResult:
+    async def schemas_for(
+        self, spec: AgentSpec, *, user_id: str | None = None
+    ) -> McpSchemasResult:
         """Resolve MCP schemas for *spec*; awaits any in-flight connect."""
         configs = [c for c in (spec.mcp_servers or []) if c.transport != "registry"]
         if not configs:
             return McpSchemasResult(schemas=[], tool_names=set(), failures={})
-        spec_hash = compute_spec_hash(configs, self._stdio_cwd)
+        normalized_user = _normalize_user_id(user_id)
+        spec_hash = compute_spec_hash(configs, self._stdio_cwd, user_id=normalized_user)
         async with self._lock:
-            entry = self._ensure_entry(spec_hash, configs)
+            entry = self._ensure_entry(spec_hash, configs, user_id=normalized_user)
             self._touch(spec_hash)
             refs = list(entry.servers.values())
             for ref in refs:
@@ -471,6 +505,8 @@ class RunnerMcpManager:
         tool_name: str,
         arguments: _JsonObject,
         session_id: str | None = None,
+        *,
+        user_id: str | None = None,
     ) -> str:
         """
         Dispatch *tool_name* against the pool's cached MCP session.
@@ -482,6 +518,8 @@ class RunnerMcpManager:
         :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
             Forwarded to the connection for inline elicitation
             context. ``None`` when no session is available.
+        :param user_id: Optional calling user identifier scoping the
+            runner connection and ``auth_command`` environment.
         :returns: Tool result string.
         :raises McpElicitationRequired: When the MCP server returns
             an ``InputRequiredResult`` requiring user input before
@@ -492,12 +530,13 @@ class RunnerMcpManager:
             raise RuntimeError(
                 f"runner has no MCPs registered for this spec; cannot dispatch {tool_name!r}"
             )
-        spec_hash = compute_spec_hash(configs, self._stdio_cwd)
+        normalized_user = _normalize_user_id(user_id)
+        spec_hash = compute_spec_hash(configs, self._stdio_cwd, user_id=normalized_user)
         server_to_release: _SharedServerEntry | None = None
         try:
             if "__" in tool_name:
                 async with self._lock:
-                    entry = self._ensure_entry(spec_hash, configs)
+                    entry = self._ensure_entry(spec_hash, configs, user_id=normalized_user)
                     self._touch(spec_hash)
                     route_ref = self._resolve_tool_ref(entry, tool_name)
                     if route_ref is None:
@@ -518,7 +557,7 @@ class RunnerMcpManager:
                 else:
                     route = None
             else:
-                await self.schemas_for(spec)
+                await self.schemas_for(spec, user_id=normalized_user)
                 async with self._lock:
                     existing_entry = self._specs.get(spec_hash)
                     route = (
@@ -550,6 +589,8 @@ class RunnerMcpManager:
         self,
         spec: AgentSpec,
         tool_name: str,
+        *,
+        user_id: str | None = None,
     ) -> tuple[_SharedServerEntry, str] | None:
         """
         Find the live server and bare MCP tool name for *tool_name*.
@@ -560,7 +601,8 @@ class RunnerMcpManager:
         configs = [c for c in (spec.mcp_servers or []) if c.transport != "registry"]
         if not configs:
             return None
-        spec_hash = compute_spec_hash(configs, self._stdio_cwd)
+        normalized_user = _normalize_user_id(user_id)
+        spec_hash = compute_spec_hash(configs, self._stdio_cwd, user_id=normalized_user)
         entry = self._specs.get(spec_hash)
         if entry is None:
             return None
@@ -634,6 +676,8 @@ class RunnerMcpManager:
         self,
         spec: AgentSpec,
         tool_name: str,
+        *,
+        user_id: str | None = None,
     ) -> _SharedServerEntry | None:
         """
         Find the server entry that owns *tool_name*.
@@ -644,10 +688,11 @@ class RunnerMcpManager:
 
         :param spec: Agent spec whose MCP servers to search.
         :param tool_name: Namespaced or bare MCP tool name.
+        :param user_id: Optional calling user identifier.
         :returns: The owning shared server entry, or ``None`` if the
             tool is not found.
         """
-        route = self._resolve_tool_route(spec, tool_name)
+        route = self._resolve_tool_route(spec, tool_name, user_id=user_id)
         return None if route is None else route[0]
 
     async def shutdown(self) -> None:
@@ -689,17 +734,28 @@ class RunnerMcpManager:
         if self._evict_tasks:
             await asyncio.gather(*list(self._evict_tasks), return_exceptions=True)
 
-    def _ensure_entry(self, spec_hash: str, configs: list[MCPServerConfig]) -> _SpecEntry:
+    def _ensure_entry(
+        self,
+        spec_hash: str,
+        configs: list[MCPServerConfig],
+        *,
+        user_id: str | None = None,
+    ) -> _SpecEntry:
         """Return or create the pool entry for *spec_hash*. Caller holds lock."""
         entry = self._specs.get(spec_hash)
         if entry is not None:
             return entry
-        entry = _SpecEntry(spec_hash=spec_hash)
+        normalized_user = _normalize_user_id(user_id)
+        entry = _SpecEntry(spec_hash=spec_hash, user_id=normalized_user)
         for cfg in configs:
-            server_hash = compute_server_hash(cfg, self._stdio_cwd)
+            server_hash = compute_server_hash(cfg, self._stdio_cwd, user_id=normalized_user)
             server = self._servers.get(server_hash)
             if server is None:
-                server = _SharedServerEntry(server_hash=server_hash, config=cfg)
+                server = _SharedServerEntry(
+                    server_hash=server_hash,
+                    config=cfg,
+                    user_id=normalized_user,
+                )
                 self._servers[server_hash] = server
             if server_hash not in entry.server_hashes:
                 server.ref_count += 1
@@ -807,11 +863,14 @@ class RunnerMcpManager:
                 if server.connection is not None:
                     return
 
-                conn = McpServerConnection(
-                    config=server.config,
-                    cwd=self._stdio_cwd,
-                    elicitation_callback=self._build_elicitation_callback(),
-                )
+                conn_kwargs: dict[str, object] = {
+                    "config": server.config,
+                    "cwd": self._stdio_cwd,
+                    "elicitation_callback": self._build_elicitation_callback(),
+                }
+                if server.user_id is not None:
+                    conn_kwargs["user_id"] = server.user_id
+                conn = McpServerConnection(**conn_kwargs)  # type: ignore[arg-type]
                 try:
                     tools = await conn.connect()
                 except asyncio.CancelledError:

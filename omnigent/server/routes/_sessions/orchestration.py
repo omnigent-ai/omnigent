@@ -13733,6 +13733,9 @@ async def _handle_mcp_tools_call(
         step: str,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"method": "tools/call", "params": execute_params}
+        effective_user = (actor or {}).get("user_id") or credential_user
+        if effective_user:
+            body["user_id"] = effective_user
         if operation_id is not None:
             body["_omnigent_operation"] = {"id": operation_id, "step": step}
         return body
