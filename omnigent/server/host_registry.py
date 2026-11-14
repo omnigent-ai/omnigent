@@ -51,6 +51,7 @@ from omnigent.host.frames import (
     HostSetMcpServerEnabledResultFrame,
     HostSkillContentResultFrame,
     HostSkillsResultFrame,
+    HostWorkspaceReplyFrame,
     encode_host_frame,
 )
 from omnigent.host.harness_startup import HarnessStartup
@@ -124,6 +125,27 @@ def _fail_pending_imports(conn: HostConnection) -> None:
                     "error": f"host '{conn.host_id}' disconnected mid-import",
                 },
             )
+        )
+
+
+def deliver_workspace_reply(conn: HostConnection, frame: HostWorkspaceReplyFrame) -> None:
+    """Hand a workspace call's reply to its waiting caller; a late reply is dropped."""
+    replies = conn.pending_workspace_calls.get(frame.request_id)
+    if replies is not None:
+        replies.put_nowait(frame)
+
+
+def _fail_pending_workspace_calls(conn: HostConnection) -> None:
+    """End every in-flight workspace call when its tunnel disconnects or is replaced."""
+    for request_id in list(conn.pending_workspace_calls):
+        deliver_workspace_reply(
+            conn,
+            HostWorkspaceReplyFrame(
+                request_id=request_id,
+                done=True,
+                error_code="unavailable",
+                error_message=f"host '{conn.host_id}' disconnected",
+            ),
         )
 
 
@@ -486,6 +508,9 @@ class HostConnection:
         Resolved when the host sends ``host.fs_result``. Values
         carry ``status``, ``payload``, ``error_status``,
         ``error_code``, and ``error``.
+    :param pending_workspace_calls: Per-``request_id`` reply queues for
+        in-flight ``host.workspace_call`` workspace API calls. Each queue
+        receives the call's ``host.workspace_reply`` frames in order.
     :param pending_model_options: Per-``request_id`` futures for pre-launch
         model catalogs resolved by the selected host.
     :param pending_skills: Per-``request_id`` futures for sessionless skill discovery.
@@ -577,6 +602,9 @@ class HostConnection:
     )
     credential_write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending_fs_requests: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_workspace_calls: dict[str, asyncio.Queue[HostWorkspaceReplyFrame]] = field(
         default_factory=dict,
     )
     pending_model_options: dict[str, asyncio.Future[dict[str, Any]]] = field(
@@ -725,6 +753,7 @@ class HostRegistry:
                 _fail_pending_imports(old)
                 _fail_pending_harness_startup(old)
                 _fail_pending_plugins(old)
+                _fail_pending_workspace_calls(old)
                 _fail_pending_skill_content(old)
                 _fail_pending_mcp_tools(old)
                 _fail_pending_skills(old)
@@ -777,6 +806,7 @@ class HostRegistry:
         _fail_pending_imports(removed)
         _fail_pending_harness_startup(removed)
         _fail_pending_plugins(removed)
+        _fail_pending_workspace_calls(removed)
         _fail_pending_skill_content(removed)
         _fail_pending_mcp_tools(removed)
         _fail_pending_skills(removed)

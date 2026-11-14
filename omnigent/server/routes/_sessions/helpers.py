@@ -2096,10 +2096,10 @@ def _resolve_harness_impl(
             return None
         if agent_cache is None:
             agent_cache = get_agent_cache()
-        loaded = agent_cache.load(
+        spec = agent_cache.load_spec(
             agent.id, agent.bundle_location, expand_env=agent.operator_authored
         )
-        executor = loaded.spec.executor
+        executor = spec.executor
         # For a bundled-agent head sub-agent, report the HEAD's own harness,
         # not the bundle brain's — `harness` is this session's provider family
         # (a gpt head runs codex, not the claude-sdk brain). Falls back to the
@@ -2107,13 +2107,11 @@ def _resolve_harness_impl(
         if conv.sub_agent_name:
             from omnigent.runtime.workflow import _find_spec_by_name
 
-            sub = _find_spec_by_name(loaded.spec, conv.sub_agent_name)
+            sub = _find_spec_by_name(spec, conv.sub_agent_name)
             if sub is not None:
                 executor = sub.executor
         harness = (
-            executor.config.get("harness")
-            or loaded.spec.executor.config.get("harness")
-            or executor.type
+            executor.config.get("harness") or spec.executor.config.get("harness") or executor.type
         )
         return canonicalize_harness(harness) or harness
     # UUID bind failures are wrapped by SQLAlchemy; do not hide broader DB errors.
@@ -11872,9 +11870,10 @@ def _child_session_summary_from_conversation(
         child-message lookup, or ``None`` when no visible message exists.
     :param cached_status: Session status to derive ``busy`` /
         ``current_task_status`` from, e.g. ``"running"``. ``None`` reads the
-        live ``_session_status_cache``; a status-edge publisher passes the
-        edge's own value so a burst of transitions fans out one summary per
-        edge instead of the latest status repeated.
+        live ``_session_status_cache``, then the row's ``live_status``; a
+        status-edge publisher passes the edge's own value so a burst of
+        transitions fans out one summary per edge instead of the latest status
+        repeated.
     :returns: A populated :class:`ChildSessionSummary`.
     """
     display_title = title_without_closed_marker(conv.title)
@@ -11921,9 +11920,12 @@ def _child_session_summary_from_conversation(
         tool = display_title or None
         session_name = None
 
-    # Derive busy from the relay-fed cache; tasks table is gone.
+    # Derive busy from the relay-fed cache, falling back to the persisted row
+    # status on a replica without the runner's tunnel.
     if cached_status is None:
         cached_status = _session_status_cache.get(conv.id)
+    if cached_status is None:
+        cached_status = conv.live_status
     if cached_status in ("running", "waiting"):
         busy = True
     else:

@@ -116,6 +116,7 @@ from omnigent.server.scheduled.harness_settings import (
     scheduled_agent_harness,
     validate_scheduled_permission_mode,
 )
+from omnigent.server.scheduled.rrule import is_one_time_rule
 from omnigent.server.scheduled.schedule import (
     continued_sandbox_host_id,
     is_trigger_automation,
@@ -728,7 +729,9 @@ async def _run_fire_for_task(
         )
         return
 
-    if task.continues_session:
+    if task.continues_session and not is_one_time_rule(task.rrule):
+        # A one-time task, such as a reminder, belongs to its session: with the
+        # session gone it fails instead of running in a new one without its context.
         task = await _release_replaceable_session(deps, task)
     if task.continues_session:
         await _continue_session(
@@ -963,12 +966,13 @@ async def _source_session_problem(deps: FireDeps, task: ScheduledTask) -> tuple[
 async def _release_replaceable_session(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
     """Drop a continued session that was deleted or never started, so this run starts a new one.
 
-    Only a session that no longer exists, or the task's sandbox session whose
-    first launch failed, is replaced: nothing ever ran in the latter. One the
-    owner archived or that no longer fits the task still fails the run, so a
-    change they made is never undone silently. The new session is recorded like a
-    first run's, and a managed sandbox is provisioned again when the earlier
-    session's workspace is gone (see :func:`_continued_host_binding`).
+    Not called for one-time (``COUNT=1``) tasks, which fail instead. Only a
+    session that no longer exists, or the task's sandbox session whose first
+    launch failed, is replaced: nothing ever ran in the latter. One the owner
+    archived or that no longer fits the task still fails the run, so a change
+    they made is never undone silently. The new session is recorded like a first
+    run's, and a managed sandbox is provisioned again when the earlier session's
+    workspace is gone (see :func:`_continued_host_binding`).
     """
     session_id = task.session_id
     assert session_id is not None  # guarded by the caller
@@ -1037,7 +1041,7 @@ async def _continue_session(
         reason, error_code = problem
         _logger.warning("scheduled fire: task %s cannot continue its session: %s", task.id, reason)
         await recorder.finish(
-            "failed", error=f"{reason}; {_NEW_SESSION_HINT}", error_code=error_code
+            "failed", error=f"{reason}; {_recovery_hint(task)}", error_code=error_code
         )
         return
     assert conv is not None
@@ -1079,7 +1083,7 @@ async def _continue_session(
             "failed",
             conversation_id=session_id,
             error="the session already has a cost cap this automation did not set; remove it "
-            f"from the session's policies, or {_NEW_SESSION_HINT}",
+            f"from the session's policies, or {_recovery_hint(task)}",
             error_code="continued_session_budget_conflict",
         )
         return
@@ -1104,6 +1108,14 @@ async def _continue_session(
 
 
 _NEW_SESSION_HINT = "edit the automation to start a new session on its next run"
+# A one-time task, such as a reminder, has no next run to change.
+_ONE_TIME_HINT = "it has no later run; set a new reminder or create a new automation"
+
+
+def _recovery_hint(task: ScheduledTask) -> str:
+    """What the owner can do about a continued run that failed."""
+    return _ONE_TIME_HINT if is_one_time_rule(task.rrule) else _NEW_SESSION_HINT
+
 
 UNATTENDED_PERMISSION_ERROR_CODE = "permission_mode_not_allowed"
 
@@ -2952,7 +2964,12 @@ class ClaimedRunExecutor:
                 )
                 await recorder.finish(
                     "failed",
-                    error="Could not act as the automation's owner. The next run tries again.",
+                    error="Could not act as the automation's owner. "
+                    + (
+                        "It has no later run, so set it again."
+                        if is_one_time_rule(task.rrule)
+                        else "The next run tries again."
+                    ),
                     error_code="owner_identity_unavailable",
                 )
                 return

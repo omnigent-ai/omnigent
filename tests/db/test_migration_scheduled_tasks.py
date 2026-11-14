@@ -40,6 +40,8 @@ _MCP_SERVICES_PREVIOUS = "1ad1db53f99d"
 _MCP_SERVICES_REVISION = "f2c6a9d1b3e8"
 _COMMENT_ANCHOR_REVISION = "f9b3e6c2a401"
 _MCP_SERVICES_MERGE_REVISION = "a7d4c2e9f610"
+_KIND_PREVIOUS = "b4e2d7a91c35"
+_KIND_REVISION = "27d16059fab9"
 _SHARES_PREVIOUS = "a7d4c2e9f610"
 _SHARES_REVISION = "a8be64286ffc"
 _SCHEMA_PATHS = [
@@ -96,6 +98,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
     assert columns["session_id"]["nullable"] is True
     assert columns["source_session_id"]["nullable"] is True
     assert columns["mcp_services"]["nullable"] is True
+    assert columns["kind"]["nullable"] is False
     cols = set(columns)
     assert cols == {
         "workspace_id",
@@ -127,6 +130,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "session_mode",
         "session_id",
         "source_session_id",
+        "kind",
     }
 
 
@@ -345,10 +349,10 @@ def test_expected_indexes(db_engine: Engine) -> None:
 @pytest.mark.parametrize("db_engine", ["migration", "metadata"], indirect=True)
 def test_state_default_on_omitted_insert(db_engine: Engine) -> None:
     """A raw insert omitting ``state`` / ``workspace_id`` / ``execution_target``
-    / ``session_mode`` picks up their defaults.
+    / ``session_mode`` / ``kind`` picks up their defaults.
 
     Only the integer server_defaults (``state`` / ``workspace_id`` /
-    ``execution_target`` / ``session_mode``) are exercised here — all are
+    ``execution_target`` / ``session_mode`` / ``kind``) are exercised here — all are
     omitted from the insert and must fall back to their defaults, on both the
     migrated and the model-built schema.
     """
@@ -362,9 +366,9 @@ def test_state_default_on_omitted_insert(db_engine: Engine) -> None:
                 "'FREQ=DAILY;BYHOUR=9;BYMINUTE=0', 'u', 'ag_1', 'UTC', 1)"
             )
         )
-        state, workspace_id, execution_target, session_mode, session_id = conn.execute(
+        state, workspace_id, execution_target, session_mode, session_id, kind = conn.execute(
             sa.text(
-                "SELECT state, workspace_id, execution_target, session_mode, session_id "
+                "SELECT state, workspace_id, execution_target, session_mode, session_id, kind "
                 "FROM scheduled_tasks WHERE id = X'00000000000000000000000000000de1'"
             )
         ).one()
@@ -373,6 +377,7 @@ def test_state_default_on_omitted_insert(db_engine: Engine) -> None:
     assert execution_target == 1  # 1 = 'connected_host'
     assert session_mode == 1  # 1 = 'new'
     assert session_id is None
+    assert kind == 1  # 1 = 'automation'
 
 
 def test_execution_target_check_rejects_bad_code(db_engine: Engine) -> None:
@@ -410,6 +415,26 @@ def test_session_mode_check_rejects_bad_code(db_engine: Engine) -> None:
                 agent_id=b"g" * 16,
                 timezone="UTC",
                 session_mode=3,
+                created_at=1,
+            )
+        )
+
+
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_kind_check_rejects_bad_code(db_engine: Engine) -> None:
+    """Migrated and model-built ``kind`` CHECKs both reject codes outside 1-2."""
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=db_engine)
+    # MySQL reports CHECK violations as OperationalError (3819).
+    with pytest.raises((IntegrityError, sa.exc.OperationalError)), db_engine.begin() as conn:
+        conn.execute(
+            tasks.insert().values(
+                id=b"k" * 16,
+                name="bad kind",
+                prompt=b"p",
+                rrule="FREQ=DAILY;BYHOUR=9",
+                agent_id=b"g" * 16,
+                timezone="UTC",
+                kind=3,
                 created_at=1,
             )
         )
@@ -1093,6 +1118,48 @@ def test_mcp_services_migration_keeps_existing_tasks_and_round_trips(
         command.upgrade(config, _MCP_SERVICES_REVISION)
     with engine.begin() as conn:
         assert conn.execute(sa.select(tasks.c.mcp_services)).scalars().all() == [None, None]
+
+
+def test_kind_migration_makes_existing_tasks_automations_and_round_trips(
+    dispatch_migration_engine: Engine,
+) -> None:
+    engine = dispatch_migration_engine
+    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+    # Later migrations open their own autocommit blocks on PostgreSQL, so this
+    # upgrade cannot run inside an outer transaction.
+    command.upgrade(config, _KIND_PREVIOUS)
+    values = {
+        "name": "nightly",
+        "prompt": b"p",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "agent_id": b"g" * 16,
+        "timezone": "UTC",
+        "created_at": 1,
+    }
+    before = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        conn.execute(before.insert().values(id=b"a" * 16, **values))
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, _KIND_REVISION)
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        # A task saved before the migration is an ordinary automation.
+        assert conn.execute(sa.select(tasks.c.kind)).scalar_one() == 1
+        conn.execute(tasks.insert().values(id=b"b" * 16, kind=2, **values))
+        kinds = dict(conn.execute(sa.select(tasks.c.id, tasks.c.kind)).tuples().all())
+    assert kinds == {b"a" * 16: 1, b"b" * 16: 2}
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.downgrade(config, _KIND_PREVIOUS)
+    columns = {c["name"] for c in sa.inspect(engine).get_columns("scheduled_tasks")}
+    assert "kind" not in columns
+    with engine.begin() as conn:
+        assert conn.execute(sa.select(sa.func.count()).select_from(before)).scalar_one() == 2
+        config.attributes["connection"] = conn
+        command.upgrade(config, _KIND_REVISION)
+    with engine.begin() as conn:
+        assert conn.execute(sa.select(tasks.c.kind)).scalars().all() == [1, 1]
 
 
 @pytest.mark.parametrize(

@@ -3101,3 +3101,16 @@ def test_enablement_fields_survive_inventory_allow_list():
     assert decoded.mcp_servers[0]["enabled"] == "false"
     assert decoded.mcp_servers[0]["locked"] == "true"
     assert "command" not in decoded.mcp_servers[0]
+
+
+def test_workspace_call_and_reply_frames_round_trip_bytes() -> None:
+    """Request and response messages are raw protobuf bytes; base64 must carry them intact."""
+    from omnigent.host.frames import HostWorkspaceCallFrame, HostWorkspaceReplyFrame
+
+    call = HostWorkspaceCallFrame("req1", "~/project", "ReadFile", b"\x00\xff\n")
+    reply = HostWorkspaceReplyFrame("req1", message=b"\x00\xff\n")
+    end = HostWorkspaceReplyFrame("req1", done=True, error_code="not_found", error_message="gone")
+
+    assert decode_host_frame(encode_host_frame(call)) == call
+    assert decode_host_frame(encode_host_frame(reply)) == reply
+    assert decode_host_frame(encode_host_frame(end)) == end

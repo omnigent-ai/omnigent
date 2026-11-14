@@ -120,9 +120,16 @@ from omnigent.stores.conversation_store import (
     ProfileHostBinding,
     SessionActivity,
     SessionConnectivity,
+    SpawnTreeUsage,
     family_pinned_label_key,
     pinned_label_key,
     runner_seen_is_fresh,
+)
+from omnigent.stores.conversation_store.activity_error import (
+    LATEST_ACTIVITY_ERROR_LABEL_KEY,
+    LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY,
+    ActivityErrorSummary,
+    fold_activity_error,
 )
 from omnigent.stores.conversation_store.overrides import (
     decode_session_overrides as _decode_session_overrides,
@@ -3268,6 +3275,7 @@ class SqlAlchemyConversationStore(ConversationStore):
 
             fts_rows: list[tuple[str, str, str]] = []
             row_values: list[dict[str, object]] = []
+            fresh_items: list[tuple[int, NewConversationItem]] = []
             batch_stable: dict[str, ConversationItem] = {}
             for item, prepared, search in prepared_rows:
                 if item.stable_id is not None:
@@ -3290,6 +3298,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 else:
                     next_pos += 1
                 values["position"] = position
+                fresh_items.append((position, item))
                 item_id = cast(str, values["id"])
                 if search:
                     fts_rows.append((item_id, conversation_id, search))
@@ -3314,6 +3323,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             if row_values:
                 session.execute(insert(SqlConversationItem), row_values)
             insert_fts_bulk(session, fts_rows)
+            self._fold_latest_activity_error(session, conversation_id, fresh_items, now)
 
             # Persist the advanced counter so the next append reads it instead
             # of scanning; this also lazily backfills a pre-counter conversation.
@@ -3327,6 +3337,54 @@ class SqlAlchemyConversationStore(ConversationStore):
             "append_conversation_items",
             write,
         )
+
+    def _fold_latest_activity_error(
+        self,
+        session: Session,
+        conversation_id: str,
+        fresh_items: list[tuple[int, NewConversationItem]],
+        stamp: int,
+    ) -> None:
+        """
+        Fold newly inserted items into the latest-activity-error label.
+
+        Runs inside the append transaction under the conversation row lock. The
+        stored value is read once and rewritten only when the fold changes it.
+
+        :param session: The append's open write session.
+        :param conversation_id: The conversation being appended to.
+        :param fresh_items: ``(position, item)`` for every inserted item, in order.
+        :param stamp: The append's timestamp, e.g. ``1753900000``.
+        """
+        items = [item for _, item in fresh_items]
+        if fold_activity_error(items) is None:
+            return
+        keys = (LATEST_ACTIVITY_ERROR_LABEL_KEY, LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY)
+        stored = dict(
+            session.execute(
+                select(SqlConversationLabel.key, SqlConversationLabel.value).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id == conversation_id,
+                    SqlConversationLabel.key.in_(keys),
+                )
+            )
+            .tuples()
+            .all()
+        )
+        previous_value = stored.get(LATEST_ACTIVITY_ERROR_LABEL_KEY)
+        previous = ActivityErrorSummary(
+            previous_value if previous_value in ("error", "disconnected") else "",
+            stored.get(LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY, ""),
+        )
+        summary = fold_activity_error(items, previous)
+        assert summary is not None
+        labels = {
+            LATEST_ACTIVITY_ERROR_LABEL_KEY: summary.value,
+            LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY: summary.response_id,
+        }
+        changed = {key: value for key, value in labels.items() if stored.get(key) != value}
+        if changed:
+            _upsert_prepared_labels(session, conversation_id, changed, stamp)
 
     def list_projects(
         self,
@@ -4037,6 +4095,53 @@ class SqlAlchemyConversationStore(ConversationStore):
             first_id=rows[0].id if rows else None,
             last_id=rows[-1].id if rows else None,
             has_more=page.has_more,
+        )
+
+    def list_spawn_tree_usage(
+        self, root_conversation_id: str, *, limit: int
+    ) -> PagedList[SpawnTreeUsage]:
+        """Walk the root index for ids and parents, then read usage by those ids."""
+        with self._conv_session("list_spawn_tree_usage") as session:
+            members = session.execute(
+                select(SqlConversation.id, SqlConversation.parent_conversation_id)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.root_conversation_id == root_conversation_id,
+                )
+                .order_by(SqlConversation.id)
+                .limit(limit + 1)
+            ).all()
+        has_more = len(members) > limit
+        members = members[:limit]
+        usage_by_id: dict[str, str | None] = {}
+        if members:
+            with self._session("list_spawn_tree_usage") as session:
+                usage_by_id = {
+                    str(row.id): row.session_usage
+                    for row in session.execute(
+                        select(
+                            SqlConversationMetadata.id, SqlConversationMetadata.session_usage
+                        ).where(
+                            SqlConversationMetadata.workspace_id == current_workspace_id(),
+                            SqlConversationMetadata.id.in_([row.id for row in members]),
+                        )
+                    ).all()
+                }
+        rows = [
+            SpawnTreeUsage(
+                id=str(row.id),
+                parent_conversation_id=(
+                    str(row.parent_conversation_id) if row.parent_conversation_id else None
+                ),
+                session_usage=json.loads(usage) if (usage := usage_by_id.get(str(row.id))) else {},
+            )
+            for row in members
+        ]
+        return PagedList(
+            data=rows,
+            first_id=rows[0].id if rows else None,
+            last_id=rows[-1].id if rows else None,
+            has_more=has_more,
         )
 
     @staticmethod
