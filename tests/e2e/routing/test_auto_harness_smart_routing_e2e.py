@@ -201,6 +201,6 @@ def test_auto_harness_lands_an_arm_then_redirects_a_cross_family_spawn(
         )
 
     assert claude_settings_apart_from_the_model(settings_path) == settings_before, (
-        "~/.claude/settings.json changed beyond its `model` key — routing must "
+        f"{settings_path} changed beyond its `model` key — routing must "
         "confine its hook wiring to the session's bridge dir"
     )

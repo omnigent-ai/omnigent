@@ -14031,7 +14031,7 @@ def test_a_slash_command_stuck_in_the_composer_fails_loud(
     bridge_dir = _picker_bridge_dir(tmp_path)
     _fake_tmux(monkeypatch, [_composer_pane("/effort high")])
 
-    with pytest.raises(RuntimeError, match="was not delivered"):
+    with pytest.raises(RuntimeError, match="could not confirm submission"):
         claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
 

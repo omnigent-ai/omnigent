@@ -194,6 +194,5 @@ def test_claude_routes_the_first_typed_message_exactly_once(
     )
 
     assert claude_settings_apart_from_the_model(settings_path) == settings_before, (
-        "~/.claude/settings.json changed beyond its `model` key — `/model <id>` "
-        "may move Claude Code's own default, nothing else"
+        f"{settings_path} changed beyond its `model` key"
     )
