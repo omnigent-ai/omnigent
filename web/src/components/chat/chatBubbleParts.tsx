@@ -161,7 +161,7 @@ function SessionMessageOriginLine({
   return (
     <div
       data-testid="message-origin"
-      className={cn("flex shrink-0 items-center gap-1 text-xs text-muted-foreground", className)}
+      className={cn("flex min-w-0 items-center gap-1 text-xs text-muted-foreground", className)}
     >
       <CornerDownRightIcon className="size-3 shrink-0" />
       <span>From</span>
@@ -200,9 +200,10 @@ function CollapsedSessionMessage({
       data-message-id={bubble.itemId}
       className="max-w-[640px]"
     >
+      {/* The sender keeps its width while it fits; the preview gives way first, down to the chevron. */}
       <div
         data-testid="collapsed-session-message"
-        className="ml-auto flex w-fit max-w-full items-center gap-2 rounded-lg bg-muted px-3 py-1.5"
+        className="ml-auto grid w-fit max-w-full grid-cols-[minmax(0,max-content)_minmax(1rem,1fr)] items-center gap-2 rounded-lg bg-muted px-3 py-1.5"
       >
         <SessionMessageOriginLine sourceId={origin.sourceId} currentSessionId={currentSessionId} />
         <button

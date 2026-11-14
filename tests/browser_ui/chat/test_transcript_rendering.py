@@ -102,6 +102,23 @@ _SAMPLE_DIAGRAM_FRAMES = """() => {
     };
     requestAnimationFrame(sample);
 }"""
+# Edges of a session message's sender pill and control, and what truncates or overflows.
+_SESSION_MESSAGE_FIT = """(message, control) => {
+    const scroller = document.querySelector('.transcript-hide-native-scrollbar');
+    const pill = message.querySelector('[data-testid="mention-pill"]');
+    const label = pill.querySelector('.truncate');
+    const preview = message.querySelector('[data-testid="expand-session-message"] .truncate');
+    const controlBox = message.querySelector(control).getBoundingClientRect();
+    return {
+        message_right: message.getBoundingClientRect().right,
+        pill_right: pill.getBoundingClientRect().right,
+        control_left: controlBox.left,
+        control_right: controlBox.right,
+        sender_truncated: label.scrollWidth > label.clientWidth,
+        preview_truncated: !!preview && preview.scrollWidth > preview.clientWidth,
+        transcript_overflow: scroller.scrollWidth - scroller.clientWidth,
+    };
+}"""
 _POINTER_CONTEXTS = [
     pytest.param(
         True,
@@ -1362,6 +1379,66 @@ def test_automation_context_is_hidden_from_transcript(
     expect(user).to_contain_text("Summarize today's changes.")
     expect(user).not_to_contain_text("no one is watching")
     expect(user).not_to_contain_text("omnigent-automation-context")
+
+
+def test_long_session_message_sender_truncates_inside_its_message(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
+    """A long sender label truncates inside its message instead of widening a phone transcript."""
+    chat = chat_session_contract
+    chat.seed_sidebar_sessions(
+        ["W5 audit", "W2 PMBench gold nuggets persisted for KPI pool versioning"]
+    )
+    for row in chat.sidebar_sessions:
+        chat.contract.json(f"/v1/sessions/{row['id']}", row)
+    short_sender, long_sender = (row["id"] for row in chat.sidebar_sessions)
+    chat.set_items(
+        [
+            message_item("fan-out", "user", "Fan out the checks.", response_id="fan-out"),
+            message_item(
+                "short-report",
+                "user",
+                f"[Message from session {short_sender}]\n"
+                "Gold-source index covers 47 of 50 questions so far.",
+                response_id="short-report",
+            ),
+            message_item(
+                "long-report",
+                "user",
+                f"[Message from session {long_sender}]\nPersisted 312 gold nuggets.",
+                response_id="long-report",
+            ),
+        ]
+    )
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.goto(chat.url)
+
+    rows = page.get_by_test_id("collapsed-session-message")
+    short_message = rows.filter(has_text="@W5 audit")
+    long_message = rows.filter(has_text="@W2 PMBench")
+    expect(long_message).to_be_visible()
+    chevron = '[data-testid="expand-session-message"] svg'
+    short_row = short_message.evaluate(_SESSION_MESSAGE_FIT, chevron)
+    long_row = long_message.evaluate(_SESSION_MESSAGE_FIT, chevron)
+    for row in (long_row, short_row):
+        assert row["pill_right"] <= row["control_left"], row
+        assert row["control_right"] <= row["message_right"] + 1, row
+        assert row["transcript_overflow"] <= 1, row
+    assert not short_row["sender_truncated"] and short_row["preview_truncated"], short_row
+    assert long_row["sender_truncated"], long_row
+
+    long_message.get_by_test_id("expand-session-message").click()
+    bubble = page.get_by_test_id("user-message-content").filter(has_text="312 gold nuggets")
+    expect(bubble.get_by_test_id("collapse-session-message")).to_be_visible()
+    expanded = bubble.evaluate(_SESSION_MESSAGE_FIT, '[data-testid="collapse-session-message"]')
+    assert expanded["pill_right"] <= expanded["control_left"], expanded
+    assert expanded["control_right"] <= expanded["message_right"] + 1, expanded
+    assert expanded["sender_truncated"], expanded
+    assert expanded["transcript_overflow"] <= 1, expanded
+
+    page.set_viewport_size({"width": 1280, "height": 844})
+    wide_row = short_message.evaluate(_SESSION_MESSAGE_FIT, chevron)
+    assert not wide_row["sender_truncated"] and not wide_row["preview_truncated"], wide_row
 
 
 @pytest.mark.parametrize("width", [1280, 390], ids=["desktop", "mobile"])
