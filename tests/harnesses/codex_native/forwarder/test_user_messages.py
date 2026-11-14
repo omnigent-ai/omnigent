@@ -64,16 +64,27 @@ async def test_post_user_message_image_only_posts_empty_content() -> None:
 
 
 @pytest.mark.asyncio
-async def test_post_user_message_text_posts_input_text() -> None:
+@pytest.mark.parametrize(
+    "client_id",
+    [None, "omnigent:stable:" + "a" * 32, "terminal-client-id", "omnigent:stable:private"],
+)
+async def test_post_user_message_text_posts_input_text(client_id: str | None) -> None:
     """A text ``userMessage`` posts an ``input_text`` block (unchanged path)."""
     client = _RecordingClient()
-    item = {"type": "userMessage", "content": [{"type": "text", "text": "hello"}]}
+    item = {
+        "type": "userMessage",
+        "content": [{"type": "text", "text": "hello"}],
+        "clientId": client_id,
+    }
 
     await fwd._post_user_message(client, "conv_x", {"turnId": "t1"}, item)
 
     assert len(client.posts) == 1
     _url, body = client.posts[0]
     assert body["data"]["item_data"]["content"] == [{"type": "input_text", "text": "hello"}]
+    assert body["data"].get("native_input_id") == (
+        client_id if client_id == "omnigent:stable:" + "a" * 32 else None
+    )
 
 
 @pytest.mark.asyncio

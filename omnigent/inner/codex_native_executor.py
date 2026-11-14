@@ -93,6 +93,7 @@ from omnigent.inner.native_attachments import (
 from omnigent.native.input_diagnostics import (
     current_input_attributes,
     log_input_event,
+    native_input_client_id,
     with_input_attributes,
 )
 from omnigent.process_logging import log_once
@@ -454,7 +455,7 @@ async def _native_delivery_request_once(
     # Only turn input carries an idempotency key; a shell command's receipt has
     # no userMessage item, so a lost shell ack stays ambiguous without a probe.
     client_message_id = (
-        current_input_attributes().get("delivery_attempt_id")
+        native_input_client_id(current_input_attributes())
         if method in ("turn/start", "turn/steer")
         else None
     )
