@@ -1628,6 +1628,74 @@ def test_launch_host_threads_agent_label_into_the_job(
     assert labels["app.kubernetes.io/managed-by"] == "omnigent"
 
 
+@pytest.mark.parametrize(
+    ("agent_name", "expected_image"),
+    [
+        ("researcher", "registry.example.com/host-research:v1"),
+        ("coder", "registry.example.com/host-base:v1"),
+        (None, "registry.example.com/host-base:v1"),
+    ],
+)
+def test_launch_host_uses_per_agent_image(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+    agent_name: str | None,
+    expected_image: str,
+) -> None:
+    """A mapped agent gets its own image; other and unlabeled runners get the fleet image."""
+    core, batch = fake_clients
+    _setup_pod_discovery(core)
+    launcher = KubernetesSandboxLauncher(
+        in_cluster=True,
+        namespace="omnigent-sandboxes",
+        env=(),
+        image="registry.example.com/host-base:v1",
+        agent_images={"researcher": "registry.example.com/host-research:v1"},
+    )
+    launcher.start_host(
+        "omnigent-job-1",
+        token=_TOKEN,
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+        agent_name=agent_name,
+    )
+    pod_spec = batch.created_jobs[0]["spec"]["template"]["spec"]
+    assert {c["image"] for c in pod_spec["containers"] + pod_spec["initContainers"]} == {
+        expected_image
+    }
+
+
+@pytest.mark.parametrize(
+    ("agent_name", "expected_sa"),
+    [("researcher", "researcher-runner"), ("coder", "omnigent-runner"), (None, "omnigent-runner")],
+)
+def test_launch_host_uses_per_agent_service_account(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+    agent_name: str | None,
+    expected_sa: str,
+) -> None:
+    """A mapped agent runs as its own ServiceAccount; others keep the fleet one."""
+    core, batch = fake_clients
+    _setup_pod_discovery(core)
+    launcher = KubernetesSandboxLauncher(
+        in_cluster=True,
+        namespace="omnigent-sandboxes",
+        env=(),
+        service_account="omnigent-runner",
+        agent_service_accounts={"researcher": "researcher-runner"},
+    )
+    launcher.start_host(
+        "omnigent-job-1",
+        token=_TOKEN,
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+        agent_name=agent_name,
+    )
+    pod_spec = batch.created_jobs[0]["spec"]["template"]["spec"]
+    assert pod_spec["serviceAccountName"] == expected_sa
+
+
 def test_launch_host_without_agent_label_keeps_reserved_labels(
     fake_clients: tuple[_FakeCore, _FakeBatch],
 ) -> None:

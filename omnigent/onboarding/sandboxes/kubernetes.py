@@ -1282,6 +1282,8 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         pod_ready_timeout_s: int | None = None,
         runtime_class: str | None = None,
         home_size_limit: str | None = _HOME_SIZE_LIMIT_DEFAULT,
+        agent_images: Mapping[str, str] | None = None,
+        agent_service_accounts: Mapping[str, str] | None = None,
     ) -> None:
         """
         Store provider config for lazy use by :meth:`start_host` / :meth:`terminate`.
@@ -1295,8 +1297,16 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         :param home_size_limit: ``sizeLimit`` for the writable-HOME emptyDir
             of every Pod, or ``None`` for an unbounded emptyDir (the caller
             decides; ``sandbox.kubernetes.home_size_limit: null`` maps here).
+        :param agent_images: Built-in agent name → image overriding *image*
+            for that agent's runners (``sandbox.kubernetes.agents``), or ``None``.
+        :param agent_service_accounts: Built-in agent name → ServiceAccount
+            overriding *service_account* for that agent's runners, or ``None``.
         """
         self._image_ref = image
+        self._agent_images = dict(agent_images) if agent_images else {}
+        self._agent_service_accounts = (
+            dict(agent_service_accounts) if agent_service_accounts else {}
+        )
         self._namespace = namespace
         self._env_names = tuple(env) if env is not None else None
         self._secret_name = secret_name
@@ -1398,12 +1408,22 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         _validate_k8s_name_env(value, env_var=env_var, kind=kind)
         return value
 
-    def _resolve_image(self) -> str:
-        """
-        Resolve the host image: constructor → env override → default.
+    def _has_agent_override(self, agent_name: str | None) -> bool:
+        """Whether *agent_name* has its own image or ServiceAccount in ``agents``."""
+        return agent_name is not None and (
+            agent_name in self._agent_images or agent_name in self._agent_service_accounts
+        )
 
+    def _resolve_image(self, agent_name: str | None = None) -> str:
+        """
+        Resolve the host image: per-agent → constructor → env override → default.
+
+        :param agent_name: Server-resolved built-in agent name, or ``None`` for
+            an unclassified runner (always the fleet image).
         :returns: The image reference to run.
         """
+        if agent_name is not None and agent_name in self._agent_images:
+            return self._agent_images[agent_name]
         return self._image_ref or os.environ.get(HOST_IMAGE_ENV_VAR) or DEFAULT_HOST_IMAGE
 
     def _resolve_namespace(self) -> str:
@@ -1432,13 +1452,17 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
             or None
         )
 
-    def _resolve_service_account(self) -> str:
+    def _resolve_service_account(self, agent_name: str | None = None) -> str:
         """
-        Resolve the ServiceAccount: constructor → env override → default.
+        Resolve the ServiceAccount: per-agent → constructor → env override → default.
 
+        :param agent_name: Server-resolved built-in agent name, or ``None`` for
+            an unclassified runner (always the fleet ServiceAccount).
         :returns: The ServiceAccount the Pod runs as.
         :raises click.ClickException: When the env-var override is invalid.
         """
+        if agent_name is not None and agent_name in self._agent_service_accounts:
+            return self._agent_service_accounts[agent_name]
         return (
             self._service_account
             or self._name_env_override(SERVICE_ACCOUNT_ENV_VAR, kind="subdomain")
@@ -1566,7 +1590,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         from urllib3.exceptions import HTTPError
 
         namespace = self._resolve_namespace()
-        image = self._resolve_image()
+        image = self._resolve_image(agent_name)
         env_literals = self._resolve_sandbox_env()
         secret_name = _token_secret_name(sandbox_id)
         workspace = f"{_HOME_DIR}/workspace"
@@ -1583,7 +1607,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     job_name=sandbox_id,
                     namespace=namespace,
                     image=image,
-                    service_account=self._resolve_service_account(),
+                    service_account=self._resolve_service_account(agent_name),
                     host_id=host_id,
                     host_name=host_name,
                     server_url=server_url,

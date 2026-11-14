@@ -239,6 +239,8 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.pod_ready_timeout_s: int | None = None
         self.runtime_class: str | None = None
         self.home_size_limit: str | None = None
+        self.agent_images: dict[str, str] | None = None
+        self.agent_service_accounts: dict[str, str] | None = None
         # Lambda MicroVM ctor wiring (captured by
         # install_fake_lambda_microvm_launcher).
         self.region: str | None = None
@@ -669,6 +671,8 @@ def install_fake_kubernetes_launcher(
         pod_ready_timeout_s: int | None = None,
         runtime_class: str | None = None,
         home_size_limit: str | None = None,
+        agent_images: dict[str, str] | None = None,
+        agent_service_accounts: dict[str, str] | None = None,
     ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.image = image
@@ -686,6 +690,8 @@ def install_fake_kubernetes_launcher(
         fake.pod_ready_timeout_s = pod_ready_timeout_s
         fake.runtime_class = runtime_class
         fake.home_size_limit = home_size_limit
+        fake.agent_images = agent_images
+        fake.agent_service_accounts = agent_service_accounts
         return fake
 
     monkeypatch.setattr(kubernetes_mod, "KubernetesSandboxLauncher", _ctor)
