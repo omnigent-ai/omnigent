@@ -20,6 +20,7 @@ from omnigent.inner.native_attachments import (
     resolve_file_id_block,
 )
 from omnigent.inner.sandbox import HarnessSandboxValidationError
+from omnigent.models.model_resolver import ModelResolutionError
 from omnigent.process_logging import process_log_reference
 from omnigent.runner.native import ResolvedSpec
 from omnigent.spec.types import AgentSpec
@@ -89,6 +90,12 @@ def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
     policy_error = exc.__cause__ if isinstance(exc, OmnigentError) else exc
     if isinstance(policy_error, HarnessSandboxValidationError):
         return f"{policy_error.client_message} {detail}"
+    if isinstance(exc, OmnigentError) and isinstance(policy_error, ModelResolutionError):
+        return (
+            "No default model could be resolved. Set 'executor.model' in the agent YAML "
+            "or a provider 'models.default', or retry when model discovery is available. "
+            f"{detail}"
+        )
     return detail
 
 

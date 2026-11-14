@@ -2662,10 +2662,12 @@ async def test_background_setup_failure_preserves_replacement_turn(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ["model-discovery", "other-setup"])
 async def test_runner_failed_status_carries_setup_error_message(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     pinned_runner_log: Path,
+    failure_kind: str,
 ) -> None:
     """A setup failure forwards safe diagnostics and allows a corrected retry.
 
@@ -2681,12 +2683,18 @@ async def test_runner_failed_status_carries_setup_error_message(
     :param monkeypatch: pytest fixture used to force the spawn-env build to
         raise the no-model provider error.
     """
+    from unittest.mock import Mock
+
     from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.models.model_resolver import ModelResolutionError
+    from omnigent.runtime import workflow
 
     conv = "conv_failed_status_carries_error"
     stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
-    raised_message = "No model resolved for the 'claude-sdk' harness on a generic provider."
+    raised_message = "Model setup failed at /private/provider-config on provider.example.test."
     setup_valid = False
+    catalog = Mock(side_effect=ModelResolutionError(raised_message))
+    monkeypatch.setattr(workflow, "resolve_catalog_model", catalog)
 
     async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """
@@ -2716,6 +2724,10 @@ async def test_runner_failed_status_carries_setup_error_message(
         """
         del spec, workdir
         if not setup_valid:
+            if failure_kind == "model-discovery":
+                workflow._resolve_catalog_default_model(
+                    "provider.example.test", "openai", context=raised_message
+                )
             raise OmnigentError(raised_message, code=ErrorCode.INVALID_INPUT)
         return {}
 
@@ -2806,13 +2818,25 @@ async def test_runner_failed_status_carries_setup_error_message(
     assert failed_event is not None
     error = failed_event.get("error")
     assert isinstance(error, dict)
+    model_guidance = (
+        "No default model could be resolved. Set 'executor.model' in the agent YAML "
+        "or a provider 'models.default', or retry when model discovery is available. "
+        if failure_kind == "model-discovery"
+        else ""
+    )
     assert error["message"] == (
-        "turn setup failed: Request failed on the runner; "
+        f"turn setup failed: {model_guidance}Request failed on the runner; "
         f"see the runner log for details: {pinned_runner_log}"
     )
     assert undelivered["response"]["error"]["message"] == error["message"]
     assert raised_message not in error["message"]
+    assert "/private/provider-config" not in json.dumps(events)
+    assert "provider.example.test" not in json.dumps(events)
     assert raised_message in caplog.text
+    if failure_kind == "model-discovery":
+        catalog.assert_called_once_with("provider.example.test", family="openai")
+    else:
+        catalog.assert_not_called()
     # Normalized shape always has a code so the wire ErrorDetail validates.
     assert error["code"]
 
