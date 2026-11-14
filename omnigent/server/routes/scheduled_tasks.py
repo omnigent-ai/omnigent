@@ -1591,6 +1591,16 @@ def create_scheduled_tasks_router(
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         task = _require_owned(scheduled_task_id, owner_id)
+        not_session_reminder = OmnigentError(
+            "The task is not a reminder for that session, so it was not deleted.",
+            code=ErrorCode.CONFLICT,
+        )
+        if reminder_session_id is not None and (
+            task.kind != "reminder" or task.session_id != reminder_session_id
+        ):
+            # Refused before any cleanup, so the request changes nothing; the store
+            # checks again under its lock in case an edit lands in between.
+            raise not_session_reminder
         from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
 
         copy_id = task.source_session_id
@@ -1618,10 +1628,7 @@ def create_scheduled_tasks_router(
                         {SCHEDULED_TASK_SOURCE_LABEL_KEY: task.id},
                     )
             if isinstance(exc, ScheduledTaskNotSessionReminderError):
-                raise OmnigentError(
-                    "The task is not a reminder for that session, so it was not deleted.",
-                    code=ErrorCode.CONFLICT,
-                ) from exc
+                raise not_session_reminder from exc
             raise
         scheduler = _scheduler(request)
         if scheduler is not None and not getattr(

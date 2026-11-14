@@ -959,21 +959,42 @@ async def test_a_reminder_only_delete_keeps_a_reminder_moved_to_another_session(
     assert (kept.state, kept.session_id) == ("active", second)
 
 
+@pytest.mark.parametrize("from_source", [False, True], ids=["plain", "source_copy"])
 async def test_a_reminder_only_delete_keeps_an_automation(
-    auth_client: httpx.AsyncClient, db_uri: str
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    from_source: bool,
 ) -> None:
-    created = await auth_client.post(
-        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
+
+    body = (
+        _create_body(source_session_id=_session_with_history(db_uri))
+        if from_source
+        else _create_body()
     )
+    created = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
     assert created.status_code == 200, created.text
-    task_id = created.json()["id"]
+    task_id, copy_id = created.json()["id"], created.json()["source_session_id"]
+    cleared: list[tuple[str, str]] = []
+
+    def record_delete_label(self: object, conversation_id: str, key: str) -> None:
+        cleared.append((conversation_id, key))
+
+    # A refusal must change nothing, not rely on undoing a change afterwards.
+    monkeypatch.setattr(SqlAlchemyConversationStore, "delete_label", record_delete_label)
     refused = await auth_client.delete(
         f"/v1/scheduled-tasks/{task_id}",
         params={"reminder_session_id": _owned_session(db_uri)},
         headers=_headers(),
     )
     assert refused.status_code == 409, refused.text
-    assert SqlAlchemyScheduledTaskStore(db_uri).get(task_id) is not None
+    assert cleared == []
+    kept = SqlAlchemyScheduledTaskStore(db_uri).get(task_id)
+    assert kept is not None and kept.source_session_id == copy_id
+    if from_source:
+        copy = SqlAlchemyConversationStore(db_uri).get_conversation(copy_id)
+        assert copy is not None and copy.labels[SCHEDULED_TASK_SOURCE_LABEL_KEY] == task_id
 
 
 @pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
