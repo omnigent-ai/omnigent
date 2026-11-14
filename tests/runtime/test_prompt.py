@@ -463,9 +463,25 @@ def test_browser_group_disabled_keeps_wake_notice_for_spawning_agent() -> None:
 
 def test_native_startup_instructions_keep_only_stable_image_guidance() -> None:
     """Native startup preserves author text without unrelated tool/turn guidance."""
-    spec = _spec("  Follow the user's directions.  ", spawn=True)
+    spec = _spec("  Follow the user's directions.  ")
     result = build_native_startup_instructions(spec)
     assert result == f"{spec.instructions}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
     assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION not in result
     assert SUBAGENT_WAKE_NOTICE_INSTRUCTION not in result
     assert build_native_startup_instructions(None) == WORKSPACE_IMAGE_INSTRUCTION
+
+
+def test_native_startup_instructions_add_wake_notice_for_dispatching_agent() -> None:
+    """A spec that can dispatch sub-agents hears about the wake notice at
+    native startup, so it ends its turn instead of sleep-polling children."""
+    result = build_native_startup_instructions(_spec("Be terse.", spawn=True))
+    assert result == (
+        f"Be terse.\n\n{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+    )
+    # The other dispatch gates behave the same way.
+    assert SUBAGENT_WAKE_NOTICE_INSTRUCTION in build_native_startup_instructions(
+        _spec(None, agents=("researcher",))
+    )
+    assert SUBAGENT_WAKE_NOTICE_INSTRUCTION in build_native_startup_instructions(
+        _spec(None, builtins=("web_fetch",))
+    )

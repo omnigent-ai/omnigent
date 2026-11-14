@@ -135,7 +135,10 @@ class SysSessionSendTool(Tool):
             "session you created (e.g. via sys_session_create) — this "
             "is confined to your direct children. Provide exactly one "
             "of (agent + title) or session_id, always with args. "
-            "Returns the child's output when its turn completes. To run "
+            "Returns a launching handle immediately, not the child's "
+            "output — the result arrives later through the wake notice "
+            "described below, so end your turn or keep working rather "
+            "than sleeping and polling sys_session_get_info. To run "
             "multiple sessions in parallel, emit multiple "
             "sys_session_send tool_calls in the same response with a "
             "distinct task-based title for each independent session — "
@@ -268,10 +271,15 @@ def _build_sys_session_send_schema(
             "conversation, visible in the session tree) — not your "
             "harness's built-in subagent/Task tool, which remains the "
             "right choice for quick in-context delegation. "
-            "Confined to your direct children. Returns the child's "
-            "output when its turn completes. To run multiple sessions "
-            "in parallel, emit multiple sys_session_send tool_calls in "
-            "the same response — they dispatch concurrently."
+            "Confined to your direct children. Returns a launching "
+            "handle immediately, not the child's output. To run "
+            "multiple sessions in parallel, emit multiple "
+            "sys_session_send tool_calls in the same response — they "
+            "dispatch concurrently. When a dispatched child finishes, "
+            "the runtime posts "
+            f"`{SUBAGENT_WAKE_NOTICE_SHAPE}` into this session; collect "
+            "the result with sys_read_inbox rather than sleeping and "
+            "polling sys_session_get_info."
         )
     )
     # ``args.harness`` is allowlist-gated (design D.4): advertise it only when
@@ -921,9 +929,11 @@ class SysSessionCreateTool(Tool):
 
     Returns a handle ``{conversation_id, agent_id, title, status}``, plus
     ``project_id`` and ``project_name`` for an independent session. The session runs
-    asynchronously — use ``sys_session_get_history`` /
-    ``sys_session_get_info`` to monitor it. Use ``sys_session_send`` for
-    further child work and ``sys_session_message`` for independent sessions.
+    asynchronously — a child posts a wake notice collected via
+    ``sys_read_inbox``, an independent session is monitored with
+    ``sys_session_get_history`` / ``sys_session_get_info``. Use
+    ``sys_session_send`` for further child work and
+    ``sys_session_message`` for independent sessions.
     """
 
     @classmethod
@@ -974,9 +984,13 @@ class SysSessionCreateTool(Tool):
             "read their status/history, and use sys_session_message for subsequent work. "
             "Returns {conversation_id, agent_id, title, status}, plus project_id "
             "and project_name for an independent session; the "
-            "session runs asynchronously — monitor it with "
-            "sys_session_get_history / sys_session_get_info or drive it "
-            "with sys_session_send for children or sys_session_message for independent sessions."
+            "session runs asynchronously — drive a child with "
+            "sys_session_send, and when it finishes the runtime posts "
+            f"`{SUBAGENT_WAKE_NOTICE_SHAPE}` into this session; collect "
+            "its result with sys_read_inbox rather than sleeping and "
+            "polling. Monitor an independent session with "
+            "sys_session_get_history / sys_session_get_info and drive "
+            "it with sys_session_message."
         )
 
     def get_schema(self) -> dict[str, Any]:

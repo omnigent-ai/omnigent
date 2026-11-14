@@ -66,15 +66,24 @@ WORKSPACE_IMAGE_INSTRUCTION = (
 )
 
 
+def _dispatches_subagents(spec: AgentSpec) -> bool:
+    """True when the agent can dispatch sub-agents and so receives wake notices.
+
+    Mirrors the ``sys_session_send`` registration gate in
+    ``omnigent.tools.manager`` (declared sub-agents or ``spawn: true``) plus
+    the ``web_fetch`` builtin, which dispatches the built-in web researcher
+    through the same path.
+    """
+    dispatches_web_researcher = any(entry.name == "web_fetch" for entry in spec.tools.builtins)
+    return bool(spec.tools.agents or spec.spawn or dispatches_web_researcher)
+
+
 def _framework_instructions_for(spec: AgentSpec) -> list[str]:
     """
     Framework instructions that apply to every turn of ``spec``.
 
     Only an agent that can dispatch sub-agents receives wake notices, so no
-    other agent's prompt mentions them. That is the ``sys_session_send``
-    registration gate in ``omnigent.tools.manager`` (declared sub-agents or
-    ``spawn: true``) plus the ``web_fetch`` builtin, which dispatches the
-    built-in web researcher through the same path.
+    other agent's prompt mentions them (see ``_dispatches_subagents``).
 
     The embedded-browser priority guidance follows the ``browser_*``
     registration gate (``ToolManager._register_browser_tools``): every
@@ -85,8 +94,7 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
     :returns: The applicable spec-level framework instructions.
     """
     instructions: list[str] = []
-    dispatches_web_researcher = any(entry.name == "web_fetch" for entry in spec.tools.builtins)
-    if spec.tools.agents or spec.spawn or dispatches_web_researcher:
+    if _dispatches_subagents(spec):
         instructions.append(SUBAGENT_WAKE_NOTICE_INSTRUCTION)
     if spec.tool_groups.browser:
         instructions.append(EMBEDDED_BROWSER_PRIORITY_INSTRUCTION)
@@ -229,19 +237,24 @@ def raw_author_instructions(spec: AgentSpec) -> str | None:
 
 
 def build_native_startup_instructions(spec: AgentSpec | None) -> str:
-    """Compose author text and stable image guidance for native session startup.
+    """Compose author text and stable guidance for native session startup.
 
-    Startup channels persist across turns, so they must not carry per-turn
-    framework metadata or guidance for tools the native harness does not expose.
+    Startup channels persist across turns, so they carry only stable
+    guidance: the workspace-image instruction, plus the sub-agent wake
+    notice explanation when the spec can dispatch sub-agents — a parent
+    that doesn't know about the notice sleep-polls its children instead of
+    ending its turn and resuming on the wake. A ``None`` spec omits it:
+    dispatch capability is unknown, and the dispatch tool result still
+    pre-announces the notice.
 
     :param spec: Resolved agent spec, or ``None`` when unavailable.
-    :returns: Author instructions followed by workspace-image guidance.
+    :returns: Author instructions followed by stable framework guidance.
     """
     authored = raw_author_instructions(spec) if spec is not None else None
-    return (
-        append_framework_instructions(authored, (WORKSPACE_IMAGE_INSTRUCTION,))
-        or WORKSPACE_IMAGE_INSTRUCTION
-    )
+    framework = [WORKSPACE_IMAGE_INSTRUCTION]
+    if spec is not None and _dispatches_subagents(spec):
+        framework.insert(0, SUBAGENT_WAKE_NOTICE_INSTRUCTION)
+    return append_framework_instructions(authored, framework) or WORKSPACE_IMAGE_INSTRUCTION
 
 
 def _strip_output_annotations(
