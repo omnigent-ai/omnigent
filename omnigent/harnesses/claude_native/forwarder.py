@@ -1331,15 +1331,15 @@ async def forward_claude_transcript_to_session(
         at startup would stop authenticating mid-session.
     :returns: Never normally returns; cancel the task to stop it.
     """
-    state = _read_forward_state(bridge_dir)
+    state = await asyncio.to_thread(_read_forward_state, bridge_dir)
     hook_state: HookForwardState | None = None
-    subagent_state = _read_subagent_forward_state(bridge_dir)
+    subagent_state = await asyncio.to_thread(_read_subagent_forward_state, bridge_dir)
     # Live assistant-text streaming. The delta cursor is independent of
     # the transcript/subagent cursors and survives /clear and /fork
     # (the deltas file belongs to the long-lived Claude process). The
     # dedupe ring is per-process and not persisted: the byte offset
     # prevents re-reads on the normal path.
-    delta_state = _read_delta_forward_state(bridge_dir)
+    delta_state = await asyncio.to_thread(_read_delta_forward_state, bridge_dir)
     seen_delta_keys: dict[tuple[str, int], None] = {}
     item_retries = _PostRetryTracker()
     status_retries = _PostRetryTracker()
@@ -1415,7 +1415,9 @@ async def forward_claude_transcript_to_session(
                         )
                     subagent_task = None
                 async with _forward_progress_timeout(client, _FORWARD_LOOP_STALL_DEADLINE_S):
-                    current_session_id = read_active_session_id(bridge_dir) or session_id
+                    current_session_id = (
+                        await asyncio.to_thread(read_active_session_id, bridge_dir)
+                    ) or session_id
                     observer_stderr_offset = await asyncio.to_thread(
                         _log_new_observer_hook_stderr,
                         bridge_dir=bridge_dir,
@@ -1537,7 +1539,7 @@ async def forward_claude_transcript_to_session(
                     # Normalize the statusLine shim's raw capture into
                     # context.json (one stat when nothing changed).
                     status_raw_sig = sync_raw_status_context(bridge_dir, status_raw_sig)
-                    transcript_path = read_transcript_path(bridge_dir)
+                    transcript_path = await asyncio.to_thread(read_transcript_path, bridge_dir)
                     _observe_transcript_discovery(
                         bridge_dir=bridge_dir,
                         session_id=current_session_id,
@@ -2319,7 +2321,7 @@ async def _forward_one_subagent(
         # large child transcript on every poll while its capped backoff runs.
         return
     jsonl_path = subagents_dir / f"agent-{entry.subagent_id}.jsonl"
-    if not jsonl_path.exists():
+    if not await asyncio.to_thread(jsonl_path.exists):
         return
     result = await asyncio.to_thread(
         read_transcript_items_from_offset,
@@ -2821,7 +2823,7 @@ async def _forward_available_subagents(
         existing sub-agents' cursors advanced.
     """
     subagents_dir = _subagents_dir_for_transcript(transcript_path)
-    if not subagents_dir.is_dir():
+    if not await asyncio.to_thread(subagents_dir.is_dir):
         return state
     if batch_capability is None:
         batch_capability = _SessionEventBatchCapability()
@@ -4119,7 +4121,7 @@ async def _maybe_mirror_external_session_id(
         determined to be unrecoverable); ``False`` to retry next
         poll.
     """
-    claude_sid = read_claude_session_id(bridge_dir)
+    claude_sid = await asyncio.to_thread(read_claude_session_id, bridge_dir)
     if claude_sid is None:
         return False
     try:
@@ -4316,7 +4318,7 @@ async def _forward_available_status_events(
     # Read all session ids ever pinned to this bridge so a rotation race
     # (batch spans the old id's StopFailure and the new SessionStart)
     # does not drop the parent's own failure as a subagent event.
-    parent_claude_session_ids = read_seen_claude_session_ids(bridge_dir)
+    parent_claude_session_ids = await asyncio.to_thread(read_seen_claude_session_ids, bridge_dir)
     # Hold records written after the transcript read for the next poll.
     if hooks_cutoff_byte_offset is not None:
         filtered = [r for r in result.records if (r.byte_offset or 0) <= hooks_cutoff_byte_offset]
