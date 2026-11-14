@@ -361,13 +361,15 @@ Journal events carry these dimensions:
 | `automation_session_id`, `task_id` | The observed automation ancestor and task, when available. |
 | `scheduled_task_run_id` | The occurrence recorded on this journal entry. Join it to automation events' `run_id`. It is deliberately absent when only an ancestor's current occurrence is known. |
 
-Plan events additionally carry `previous_plan_id`, `plan_change` and `step_keys`
-(a JSON array of opaque keys). `plan_change` is `made`, `replaced`, `updated`,
+Plan events additionally carry `previous_plan_id`, `plan_change`, `step_keys`
+and `previous_step_keys` (JSON arrays). `plan_change` is `made`, `replaced`, `updated`,
 `renamed`, `association_changed`, or `unchanged`. Status events carry `step_key`,
 the zero-based `step_index`, `status` (`started`, `done`, `failed`, `needs_input`),
-and `plan_elapsed_seconds`. Step keys are hashes scoped to the session, stable
-across plan revisions. Names, step IDs, goals, descriptions, prompts, notes and
-status text are not included.
+and `plan_elapsed_seconds`. Each step key contains only the persisted plan ID
+and zero-based step index. For each current step, `previous_step_keys` gives its
+key in the preceding plan, or null for a new step; this preserves lineage across
+reordering and replans without encoding authored step IDs. Names, step IDs,
+goals, descriptions, prompts, notes and status text are not included.
 
 ### Dashboard definitions
 
@@ -382,9 +384,9 @@ partial when it is included.
 | Saved workflows / savers | First `workflow_saved` per workflow. Keep the first-save history outside the reporting window so edits do not count as new adoption. |
 | Workflow users / sessions | Distinct users / sessions with step-status events, grouped by `execution_source` and `workflow_kind`. |
 | Plans with execution activity | Distinct `plan_id` values with step-status events. Keep plan publication and plan-only editor proposals separate. |
-| Step outcomes / failures / waiting | Latest status per session and step key at the cutoff, ordered by journal position. `failed` and `needs_input` are distinct outcomes. |
+| Step outcomes / failures / waiting | Latest status per session and step lineage at the cutoff, ordered by journal position. Follow `previous_step_keys` across replans. `failed` and `needs_input` are distinct outcomes. |
 | Time to first step | First `started` event for a plan minus its `plan_created_at`; report sample count with percentiles. |
-| Plan progress | Join a plan's `step_keys` to those steps' latest statuses at the cutoff. As in the Tasks tab, surviving step keys retain progress across replans. All current steps must be `done` to infer completion. Missing statuses are pending/unknown. |
+| Plan progress | Join a plan's `step_keys` to those steps' latest statuses at the cutoff, following `previous_step_keys` for progress retained across replans. All current steps must be `done` to infer completion. Missing statuses are pending/unknown. |
 | Automation delivery, startup errors and latency | Existing `scheduled_run_*` events, joined by occurrence ID. Startup success is prompt delivery, not workflow completion. |
 
 A plan version is not necessarily a new logical invocation: agents can replan,

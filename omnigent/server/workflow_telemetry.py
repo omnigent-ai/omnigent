@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import json
 import logging
 
@@ -53,9 +52,9 @@ def log_workflow_saved(
             )
 
 
-def _step_key(session_id: str, step: str) -> str:
-    # Stable across replans in this session, without logging agent-authored step IDs.
-    return hashlib.sha256(f"{session_id}:{step}".encode()).hexdigest()[:32]
+def _step_key(plan_id: str, step_index: int) -> str:
+    # Persisted metadata identifies the step without encoding agent-authored text.
+    return f"{plan_id}:{step_index}"
 
 
 def log_journal_entry(
@@ -107,6 +106,14 @@ def log_journal_entry(
         }
         if entry.kind == "plan":
             change = plan_change(previous_plan.content if previous_plan else None, plan.content)
+            previous_keys = (
+                {
+                    step["id"]: _step_key(previous_plan.id, index)
+                    for index, step in enumerate(previous_plan.content["steps"])
+                }
+                if previous_plan
+                else {}
+            )
             attributes.update(
                 previous_plan_id=previous_plan.id if previous_plan else None,
                 plan_change=change["change"]
@@ -114,14 +121,16 @@ def log_journal_entry(
                 else "association_changed"
                 if previous_plan and previous_plan.workflow_id != plan.workflow_id
                 else "unchanged",
-                step_keys=json.dumps([_step_key(session.id, step) for step in step_ids]),
+                step_keys=json.dumps([_step_key(plan.id, index) for index in range(len(steps))]),
+                previous_step_keys=json.dumps([previous_keys.get(step) for step in step_ids]),
             )
             event = "workflow_plan_written"
         else:
             assert entry.step is not None
+            step_index = step_ids.index(entry.step)
             attributes.update(
-                step_key=_step_key(session.id, entry.step),
-                step_index=step_ids.index(entry.step),
+                step_key=_step_key(plan.id, step_index),
+                step_index=step_index,
                 status=entry.content["status"],
                 plan_elapsed_seconds=max(0, entry.created_at - plan.created_at),
             )

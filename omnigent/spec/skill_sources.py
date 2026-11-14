@@ -283,13 +283,16 @@ FRAMEWORK_SKILLS_DIR = Path(__file__).resolve().parent.parent / "resources" / "s
 _FRAMEWORK_SKILL_GROUPS = {"workflow": "journal", "save-workflow": "journal"}
 
 
-def framework_skill_names(spec: AgentSpec) -> list[str]:
+def framework_skill_names(spec: AgentSpec | None = None) -> list[str]:
     """Names of the skills Omnigent ships for the agent's tool groups, e.g. ``["workflow"]``.
 
-    Each lives in ``FRAMEWORK_SKILLS_DIR / name``.
+    Each lives in ``FRAMEWORK_SKILLS_DIR / name``. Without a spec, return every
+    framework name so reused bundles can remove disabled framework-owned links.
     """
     return [
-        name for name, group in _FRAMEWORK_SKILL_GROUPS.items() if getattr(spec.tool_groups, group)
+        name
+        for name, group in _FRAMEWORK_SKILL_GROUPS.items()
+        if spec is None or getattr(spec.tool_groups, group)
     ]
 
 

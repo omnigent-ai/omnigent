@@ -65,8 +65,9 @@ def test_codex_resolves_the_injected_skill(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("workflows_enabled", [False, True])
+@pytest.mark.parametrize("disabled_by", ["server", "journal", "missing_spec"])
 def test_native_workflow_skills_require_server_flag_and_journal_tools(
-    tmp_path: Path, workflows_enabled: bool
+    tmp_path: Path, workflows_enabled: bool, disabled_by: str
 ) -> None:
     """Native workflow instructions must agree with the tools advertised by the server."""
     from omnigent.spec.types import AgentSpec, ToolGroupsConfig
@@ -87,10 +88,21 @@ def test_native_workflow_skills_require_server_flag_and_journal_tools(
     )
     assert [p.name for p in (without / "skills").iterdir()] == [SKILL_NAME]
 
-    _ensure_orchestrator_skills_in_bundle(with_journal, spec, workflows_enabled=False)
+    disabled_spec = (
+        None
+        if disabled_by == "missing_spec"
+        else AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(journal=False))
+        if disabled_by == "journal"
+        else spec
+    )
+    _ensure_orchestrator_skills_in_bundle(
+        with_journal, disabled_spec, workflows_enabled=disabled_by != "server"
+    )
     assert [p.name for p in (with_journal / "skills").iterdir()] == [SKILL_NAME]
     user_skill = with_journal / "skills" / "workflow" / "SKILL.md"
     user_skill.parent.mkdir()
     user_skill.write_text("User-authored workflow instructions")
-    _ensure_orchestrator_skills_in_bundle(with_journal, spec, workflows_enabled=False)
+    _ensure_orchestrator_skills_in_bundle(
+        with_journal, disabled_spec, workflows_enabled=disabled_by != "server"
+    )
     assert user_skill.read_text() == "User-authored workflow instructions"

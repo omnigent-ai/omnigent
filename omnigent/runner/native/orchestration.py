@@ -8868,17 +8868,20 @@ def _ensure_orchestrator_skills_in_bundle(
     # moving this module deeper must not silently break the source path.
     onboarding_skills = _OMNIGENT_PACKAGE_DIR / "onboarding" / "agent" / "skills"
     sources = {"build-omnigent": onboarding_skills / "build-omnigent"}
+    from omnigent.spec.skill_sources import FRAMEWORK_SKILLS_DIR, framework_skill_names
+
+    # Include disabled names so a reused bundle loses stale framework links.
+    sources.update({name: FRAMEWORK_SKILLS_DIR / name for name in framework_skill_names()})
+    enabled = {"build-omnigent"}
     spec = _unwrap_resolved_spec(agent_spec)
     if isinstance(spec, AgentSpec):
-        from omnigent.spec.skill_sources import FRAMEWORK_SKILLS_DIR, framework_skill_names
-
-        # Names come from Omnigent's own table, so the logs below name no spec value.
-        for name in framework_skill_names(spec):
-            sources[name] = FRAMEWORK_SKILLS_DIR / name
+        enabled.update(framework_skill_names(spec))
+    if not workflows_enabled:
+        enabled.difference_update({"workflow", "save-workflow"})
     for name, source in sources.items():
         target_dir = bundle_dir / "skills" / name
         try:
-            if name in {"workflow", "save-workflow"} and not workflows_enabled:
+            if name not in enabled:
                 if target_dir.is_symlink() and target_dir.resolve() == source.resolve():
                     target_dir.unlink()
                 continue

@@ -207,6 +207,44 @@ async def test_telemetry_reconstructs_workflow_usage_cohorts_without_retry_or_pl
     association = plan_events[-1]["attributes"]
     assert association["plan_change"] == "association_changed"
     assert association["previous_plan_id"] == plans[adhoc]
+    assert json.loads(association["previous_step_keys"]) == plan_keys[plans[adhoc]]
+    assert json.loads(association["step_keys"]) != plan_keys[plans[adhoc]]
+
+    # Plan-local keys retain their lineage when a step moves after a newly added step.
+    with capture_debug_rows("server") as replanned_rows:
+        replanned = await client.post(
+            f"/v1/sessions/{adhoc}/journal",
+            json=_write(
+                "plan",
+                {
+                    "name": "Private plan",
+                    "steps": [{"id": "new-step", "name": "New task"}, *steps],
+                },
+                "replan",
+            ),
+            headers=_runner(adhoc),
+        )
+        assert replanned.status_code == 200, replanned.text
+        status = await client.post(
+            f"/v1/sessions/{adhoc}/journal",
+            json=_write(
+                "status",
+                {"status": "done", "text": "Private result"},
+                "replanned-status",
+                step="private-step",
+            ),
+            headers=_runner(adhoc),
+        )
+        assert status.status_code == 200, status.text
+    replanned_event, status_event = [
+        row["attributes"] for row in replanned_rows if row["event_name"].startswith("workflow_")
+    ]
+    assert json.loads(replanned_event["previous_step_keys"]) == [
+        None,
+        *json.loads(association["step_keys"]),
+    ]
+    assert status_event["step_key"] == json.loads(replanned_event["step_keys"])[1]
+    assert "Private" not in str(replanned_rows) and "private-step" not in str(replanned_rows)
 
 
 async def test_telemetry_records_failed_and_waiting_steps_but_not_rejected_writes(
