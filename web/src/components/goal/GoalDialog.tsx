@@ -497,11 +497,11 @@ function useGoalDialogState({
   const draftOwner = useRef<{ apiScope: GoalApiScope; mutationKey: string } | undefined>(undefined);
   const dirtyFields = useRef(new Set<"objective" | "tokenBudget" | "mode">());
   const dialogBinding = useRef<object | null>(null);
-  const currentGoalOwner = useRef({ apiScope, mutationKey, refreshGoal });
+  const currentGoalOwner = useRef({ apiScope, mutationKey, refreshGoal, onGoalChange });
 
   useLayoutEffect(() => {
-    currentGoalOwner.current = { apiScope, mutationKey, refreshGoal };
-  }, [apiScope, mutationKey, refreshGoal]);
+    currentGoalOwner.current = { apiScope, mutationKey, refreshGoal, onGoalChange };
+  }, [apiScope, mutationKey, refreshGoal, onGoalChange]);
 
   useLayoutEffect(() => {
     // New dialog or goal-owner bindings invalidate async responses.
@@ -671,9 +671,17 @@ function useGoalDialogState({
     setOperationError(null);
     try {
       await clearGoal(conversationId);
+      const current = currentGoalOwner.current;
+      // Acknowledged deletion belongs to the snapshot even after the dialog closes.
+      if (
+        current.apiScope === apiScope &&
+        current.mutationKey === mutationKey &&
+        current.refreshGoal === refreshGoal
+      ) {
+        current.onGoalChange(null);
+      }
       if (!canApplyMutationResult(binding)) return;
       dirtyFields.current.clear();
-      onGoalChange(null);
       setObjective("");
       setTokenBudget("");
       setModeDraftState("active");

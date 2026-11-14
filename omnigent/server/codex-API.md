@@ -76,7 +76,8 @@ automatic absence detection, update the session's owning runner to report
 availability, reconnect it on the existing host/workspace binding, then
 refresh. Repeating refresh against the same legacy response cannot resolve
 the ambiguity. A successful intentional mutation in the current Chat view
-publishes its result.
+publishes its result. An acknowledged Clear also publishes deletion after the
+dialog closes, provided the session, server and connection still match.
 
 An older server may ignore the strict header. For compatibility, the
 browser still accepts its unmarked strict null; this can clear accepted

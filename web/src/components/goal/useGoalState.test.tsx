@@ -113,6 +113,16 @@ describe("useGoalState", () => {
       await act(() => result.current.refreshGoal());
 
       expect(result.current.goalRevision).toBeGreaterThan(changedRevision);
+      const previousThreadGoal = { ...changedGoal, threadId: "native-thread-1" };
+      act(() => result.current.setGoal(previousThreadGoal));
+      const previousThreadRevision = result.current.goalRevision;
+      const nextThreadGoal = { ...previousThreadGoal, threadId: "native-thread-2" };
+      mockGetGoal.mockResolvedValue({ goal: nextThreadGoal });
+
+      await act(async () => window.dispatchEvent(new Event("focus")));
+
+      expect(result.current.goal).toEqual(nextThreadGoal);
+      expect(result.current.goalRevision).toBeGreaterThan(previousThreadRevision);
     },
   );
 
@@ -568,7 +578,7 @@ describe("useGoalState", () => {
   );
 
   it.each(["error", "unavailable"])(
-    "retries on focus and visibility during backoff without overlapping a pending read (%s)",
+    "retries on focus, visibility and activity during backoff without overlapping a pending read (%s)",
     async (failure) => {
       vi.useFakeTimers();
       const recovery = deferredGoalRead();
@@ -597,6 +607,8 @@ describe("useGoalState", () => {
         visibility.mockReturnValue("visible");
         await act(async () => document.dispatchEvent(new Event("visibilitychange")));
         await act(async () => window.dispatchEvent(new Event("focus")));
+        act(() => result.current.refreshGoalAfterActivity());
+        act(() => result.current.refreshGoalAfterActivity());
         await act(() => vi.advanceTimersByTimeAsync(60_000));
         expect(mockGetGoal).toHaveBeenCalledTimes(3);
 
@@ -609,6 +621,26 @@ describe("useGoalState", () => {
       }
     },
   );
+
+  it("resumes bounded backoff when native setup remains unavailable after activity", async () => {
+    vi.useFakeTimers();
+    mockGetGoal.mockResolvedValue({ available: false });
+    const { result } = renderHook(() => useGoalState("conv", true));
+    await act(async () => {});
+
+    await act(async () => result.current.refreshGoalAfterActivity());
+    expect(mockGetGoal).toHaveBeenCalledTimes(2);
+    await act(() => vi.advanceTimersByTimeAsync(180_000));
+    const readsAfterSetupWindow = mockGetGoal.mock.calls.length;
+    await act(() => vi.advanceTimersByTimeAsync(9_999));
+    expect(mockGetGoal).toHaveBeenCalledTimes(readsAfterSetupWindow);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(mockGetGoal).toHaveBeenCalledTimes(readsAfterSetupWindow + 1);
+    await act(() => vi.advanceTimersByTimeAsync(19_999));
+    expect(mockGetGoal).toHaveBeenCalledTimes(readsAfterSetupWindow + 1);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(mockGetGoal).toHaveBeenCalledTimes(readsAfterSetupWindow + 2);
+  });
 
   it("ignores a previous session's reads and dialog updates", async () => {
     let resolveRead!: (response: { goal: Goal | null }) => void;
@@ -730,6 +762,7 @@ describe("useGoalState", () => {
       );
       await act(async () => {});
       const oldSetter = result.current.setGoal;
+      const oldActivityRefresh = result.current.refreshGoalAfterActivity;
       const oldRefresh = result.current.refreshGoal();
 
       rerender({ connected: false });
@@ -745,6 +778,8 @@ describe("useGoalState", () => {
       expect(result.current.goal).toBeNull();
       act(() => oldSetter(GOAL));
       expect(result.current.goal).toBeNull();
+      act(() => oldActivityRefresh());
+      expect(mockGetGoal).toHaveBeenCalledTimes(3);
     },
   );
 });

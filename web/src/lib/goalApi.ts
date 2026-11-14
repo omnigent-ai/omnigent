@@ -2,6 +2,7 @@ import { clearCodexGoal, getCodexGoal, setCodexGoal, updateCodexGoalStatus } fro
 
 /** Browser-facing goal state shared by goal-capable session backends. */
 export interface Goal {
+  threadId?: string;
   objective: string;
   status: string;
   tokenBudget: number | null;

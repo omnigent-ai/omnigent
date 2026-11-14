@@ -720,6 +720,12 @@ describe("GoalDialog", () => {
         expect(screen.getByTestId("goal-objective")).toHaveValue(ACTIVE_GOAL.objective);
         expect(screen.getByTestId("goal-token-budget")).toHaveValue(ACTIVE_GOAL.tokenBudget);
         expect(screen.getByTestId("goal-mode-active")).toHaveAttribute("aria-checked", "true");
+        const reopenedClear = action === "clear" && boundary === "reopen" && outcome === "success";
+        if (reopenedClear) {
+          fireEvent.change(screen.getByTestId("goal-objective"), {
+            target: { value: "New draft after reopening" },
+          });
+        }
 
         const readCount = mockGetGoal.mock.calls.length;
         mockGetGoal.mockReturnValueOnce(refreshRead.promise);
@@ -735,8 +741,12 @@ describe("GoalDialog", () => {
         fireEvent.click(screen.getByTestId("goal-save"));
         expect(mockSetGoal).toHaveBeenCalledTimes(action === "save" ? 1 : 0);
         expect(screen.getByTestId("goal-save")).toBeDisabled();
-        expect(screen.getByTestId("owner-goal")).toHaveTextContent(ACTIVE_GOAL.objective);
-        expect(screen.getByTestId("goal-objective")).toHaveValue(ACTIVE_GOAL.objective);
+        expect(screen.getByTestId("owner-goal")).toHaveTextContent(
+          reopenedClear ? "No goal" : ACTIVE_GOAL.objective,
+        );
+        expect(screen.getByTestId("goal-objective")).toHaveValue(
+          reopenedClear ? "New draft after reopening" : ACTIVE_GOAL.objective,
+        );
         expect(screen.queryByText(/old operation failed/)).not.toBeInTheDocument();
 
         const serverGoal = { ...ACTIVE_GOAL, objective: "Current server goal" };
@@ -753,7 +763,9 @@ describe("GoalDialog", () => {
           expect(screen.getByTestId("goal-token-budget")).toHaveValue(ACTIVE_GOAL.tokenBudget);
         } else {
           expect(screen.getByTestId("owner-goal")).toHaveTextContent(serverGoal.objective);
-          expect(screen.getByTestId("goal-objective")).toHaveValue(serverGoal.objective);
+          expect(screen.getByTestId("goal-objective")).toHaveValue(
+            reopenedClear ? "New draft after reopening" : serverGoal.objective,
+          );
         }
         fireEvent.change(screen.getByTestId("goal-objective"), {
           target: { value: "Next local draft" },
@@ -998,7 +1010,8 @@ describe("GoalDialog", () => {
         await act(async () => pending.resolve({ goal: ACTIVE_GOAL, cleared: true }));
 
         expect(mockRefreshGoal).toHaveBeenCalledTimes(readsBeforeSettlement + 1);
-        expect(onGoalChange).not.toHaveBeenCalled();
+        if (action === "clear") expect(onGoalChange).toHaveBeenCalledWith(null);
+        else expect(onGoalChange).not.toHaveBeenCalled();
         rerender(<GoalDialog {...props} />);
         await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
       } finally {
@@ -1006,6 +1019,62 @@ describe("GoalDialog", () => {
       }
     },
   );
+
+  it("keeps an acknowledged closed Clear after legacy reconciliation fails", async () => {
+    vi.useFakeTimers();
+    const pending = deferred<{ cleared: boolean }>();
+    mockClearGoal.mockReturnValueOnce(pending.promise);
+    const actualGoalApi = await vi.importActual<typeof GoalApiModule>("@/lib/goalApi");
+    mockGetGoal.mockImplementation(actualGoalApi.getGoal);
+    const fetch = vi.spyOn(identity, "authenticatedFetch").mockImplementation(async () =>
+      Response.json({
+        goal: {
+          thread_id: "thread-1",
+          objective: ACTIVE_GOAL.objective,
+          status: ACTIVE_GOAL.status,
+          token_budget: ACTIVE_GOAL.tokenBudget,
+          tokens_used: ACTIVE_GOAL.tokensUsed,
+          time_used_seconds: ACTIVE_GOAL.timeUsedSeconds,
+        },
+      }),
+    );
+    const { rerender, unmount } = render(<ManagedDialog />);
+    try {
+      await act(async () => {});
+      expect(screen.getByTestId("owner-goal")).toHaveTextContent(ACTIVE_GOAL.objective);
+      fireEvent.click(screen.getByTestId("goal-clear"));
+      rerender(<ManagedDialog open={false} />);
+      fetch.mockImplementation(async (_url, init) =>
+        new Headers(init?.headers).get("X-Omnigent-Codex-Goal-Read") === "strict"
+          ? Response.json(
+              { error: "codex_native_goal_failed", detail: "Legacy goal availability is unknown" },
+              { status: 503 },
+            )
+          : Response.json({ goal: null }),
+      );
+      const readsBeforeSettlement = mockGetGoal.mock.calls.length;
+
+      await act(async () => pending.resolve({ cleared: true }));
+
+      expect(mockGetGoal).toHaveBeenCalledTimes(readsBeforeSettlement + 1);
+      expect(mockGetGoal).toHaveBeenLastCalledWith("conv_codex", { strict: true });
+      expect(screen.getByTestId("owner-goal")).toHaveTextContent("No goal");
+      await act(() => vi.advanceTimersByTimeAsync(5_000));
+      expect(mockGetGoal).toHaveBeenLastCalledWith("conv_codex", { strict: false });
+      expect(screen.getByTestId("owner-goal")).toHaveTextContent("No goal");
+
+      rerender(<ManagedDialog />);
+      await act(async () => {});
+      expect(screen.getByTestId("owner-goal")).toHaveTextContent("No goal");
+      expect(screen.getByText(/Legacy goal availability is unknown/)).toBeInTheDocument();
+      expect(screen.getByTestId("goal-objective")).toHaveValue("");
+      expect(screen.getByTestId("goal-save")).toBeEnabled();
+    } finally {
+      unmount();
+      await act(async () => pending.resolve({ cleared: true }));
+      fetch.mockRestore();
+    }
+  });
 
   describe.each(["session", "server", "base path"] as const)(
     "pending successful operations across a %s switch",

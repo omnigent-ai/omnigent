@@ -3,12 +3,15 @@ import { getGoal, type Goal } from "@/lib/goalApi";
 
 const GOAL_POLL_INTERVAL_MS = 5_000;
 const GOAL_POLL_MAX_DELAY_MS = 60_000;
+// Cover the native update/recovery budget before idle backoff resumes.
+const GOAL_ACTIVITY_RETRY_WINDOW_MS = 180_000;
 
 function goalsEqual(previous: Goal | null, next: Goal | null): boolean {
   return (
     previous === next ||
     (previous !== null &&
       next !== null &&
+      previous.threadId === next.threadId &&
       previous.objective === next.objective &&
       previous.status === next.status &&
       previous.tokenBudget === next.tokenBudget &&
@@ -24,6 +27,7 @@ interface UseGoalStateResult {
   goalRevision: number;
   setGoal: (goal: Goal | null) => void;
   refreshGoal: () => Promise<void>;
+  refreshGoalAfterActivity: () => void;
 }
 
 interface GoalOwner {
@@ -50,6 +54,7 @@ export function useGoalState(
   const lastSuccessfulVersion = useRef(0);
   const lastExplicitReadVersion = useRef(0);
   const activeBinding = useRef<GoalBinding | null>(null);
+  const activityPoller = useRef<{ binding: GoalBinding; refresh: () => void } | null>(null);
   const owner = useMemo(
     () => (enabled && conversationId ? { conversationId } : null),
     [conversationId, enabled],
@@ -118,17 +123,27 @@ export function useGoalState(
   const refreshGoal = useCallback(async () => {
     await readGoal(true);
   }, [readGoal]);
+  const refreshGoalAfterActivity = useCallback(() => {
+    if (
+      binding &&
+      activeBinding.current === binding &&
+      activityPoller.current?.binding === binding
+    ) {
+      activityPoller.current.refresh();
+    }
+  }, [binding]);
 
   useEffect(() => {
     let cancelled = false;
     let inFlight = false;
     let timer: number | undefined;
     let pollDelay = GOAL_POLL_INTERVAL_MS;
-    if (!enabled || !conversationId) {
+    let activityRetryUntil = 0;
+    if (!binding) {
       setSnapshot(null);
       return;
     }
-    if (!pollingEnabled) return;
+    if (!binding.pollingEnabled) return;
     const schedule = () => {
       if (!cancelled) timer = window.setTimeout(() => void refresh(), pollDelay);
     };
@@ -146,24 +161,36 @@ export function useGoalState(
       } catch {
         // Keep the last snapshot; opening the dialog surfaces read failures.
       } finally {
-        pollDelay = available
-          ? GOAL_POLL_INTERVAL_MS
-          : Math.min(pollDelay * 2, GOAL_POLL_MAX_DELAY_MS);
+        pollDelay =
+          available || Date.now() < activityRetryUntil
+            ? GOAL_POLL_INTERVAL_MS
+            : Math.min(pollDelay * 2, GOAL_POLL_MAX_DELAY_MS);
         inFlight = false;
         schedule();
       }
     };
+    const poller = {
+      binding,
+      refresh: () => {
+        // Keep retrying while native setup and command delivery can still be pending.
+        activityRetryUntil = Date.now() + GOAL_ACTIVITY_RETRY_WINDOW_MS;
+        pollDelay = GOAL_POLL_INTERVAL_MS;
+        void refresh();
+      },
+    };
+    activityPoller.current = poller;
     void refresh();
     const onFocus = () => void refresh();
     window.addEventListener("focus", onFocus);
     document.addEventListener("visibilitychange", onFocus);
     return () => {
       cancelled = true;
+      if (activityPoller.current === poller) activityPoller.current = null;
       window.clearTimeout(timer);
       window.removeEventListener("focus", onFocus);
       document.removeEventListener("visibilitychange", onFocus);
     };
-  }, [conversationId, enabled, pollingEnabled, readGoal]);
+  }, [binding, readGoal]);
 
   const currentSnapshot = owner !== null && snapshot?.binding.owner === owner ? snapshot : null;
   return {
@@ -171,5 +198,6 @@ export function useGoalState(
     goalRevision: currentSnapshot?.revision ?? 0,
     setGoal,
     refreshGoal,
+    refreshGoalAfterActivity,
   };
 }

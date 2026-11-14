@@ -2959,7 +2959,11 @@ function ComposerImpl(
     goalRevision,
     setGoal: setGoalState,
     refreshGoal,
+    refreshGoalAfterActivity,
   } = useGoalState(composerSessionId, showGoalControl, runnerOnline === true);
+  useEffect(() => {
+    if (isWorking) refreshGoalAfterActivity();
+  }, [isWorking, refreshGoalAfterActivity]);
   // "@"-file-mention is scoped to harnesses whose agent opens an on-disk file
   // from the attachment marker (``harnessSupportsFileMentions``); others get no
   // menu, so the workspace listing is never fetched for them. Codex's marker
@@ -4275,6 +4279,7 @@ function ComposerImpl(
         ),
         sendFiles,
       );
+      if (goalMessage) refreshGoalAfterActivity();
     }
     dirtyRef.current = true;
     clearComposerAfterSend(resetNativeInputSession);

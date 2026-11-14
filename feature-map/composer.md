@@ -160,39 +160,33 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   goal commands use the same canonical message path. Drafts carrying that
   context retain their existing handling.
   In Codex native Chat, the goal indicator follows commands and native goal
-  changes without reopening the dialog. Refreshes preserve edited dialog fields
-  while untouched fields follow current goal state. Reopening or switching
-  sessions discards old drafts, including when the opening read fails.
-  Pending reads and updates from an earlier dialog or session cannot replace
-  the current goal fields. Failed or unavailable background reads keep the last
-  goal and back off up to sixty seconds; returning to the tab retries immediately.
-  Automatic refresh runs while the runner is online and Chat is visible;
-  polling and focus reads retain the last snapshot, drafts and read error when
-  the native goal is unavailable, without waking an idle-reaped thread. A
-  confirmed native response with no goal still clears the accepted goal. Legacy
-  background replies without availability cannot confirm an absent goal.
-  Explicit dialog and reconciliation reads require a live response with current
-  servers and runners, and surface runner errors. A newer server rejects an
-  older runner's ambiguous null even when the native goal is empty. A native
-  terminal clear can then leave the indicator stale. Inspect the native goal;
-  update and reconnect the session's owning runner on its existing host/workspace
-  binding, then refresh to restore automatic absence detection. Repeating the
-  same legacy response cannot resolve the ambiguity. Goal creation and editing
-  remain available. An older server may ignore the strict header; its unmarked
-  strict null remains accepted for compatibility and can clear the indicator
-  without confirming native availability. Dialog reads and updates remain
-  available while runner status is offline or unknown. A new runner connection invalidates
-  earlier callbacks while retaining this session's accepted goal; a failed
-  reconnect read leaves that goal visible. Reconnect
-  preserves edited fields and visible errors in the same open dialog. A pending
-  Save, Clear, Pause or Resume stays busy after closing and reopening the same
-  session, including when its dialog remounts, until the request and its fresh-read
-  attempt finish. Browser reads have a sixty-second deadline and updates have
-  190 seconds, including response parsing. Server forwarding allows fifty
-  seconds for reads and 180 seconds for updates, including runner recovery.
-  A timed-out update leaves the outcome uncertain; refresh the goal before
-  retrying. Other sessions remain independently editable. A fresh accepted
-  snapshot releases opening-read loading even if the original read is pending.
+  changes without reopening the dialog. Sending an objective or resuming native
+  activity promptly retries the goal while setup finishes. Automatic refresh
+  runs while the runner is online and Chat is visible, without starting an idle
+  native session. Failed or unavailable reads keep the last goal and slow down
+  refreshes; returning to the tab retries immediately. Confirmed deletion clears
+  the indicator. Opening the dialog shows read errors, and goal creation and
+  editing remain available while runner status is offline or unknown.
+  Refreshes preserve edited dialog fields while untouched fields follow current
+  goal state. Reopening or switching sessions discards old drafts, including when
+  the opening read fails. Earlier reads and updates cannot replace another
+  session's goal fields. Reconnecting retains this session's last goal, edited
+  fields and visible errors in the same open dialog. A fresh goal response
+  releases opening-read loading even if an earlier read is still pending.
+  A pending Save, Clear, Pause or Resume stays busy after closing and reopening
+  the same session until the request and its refresh attempt finish. An
+  acknowledged Clear removes the indicator even if the dialog was closed and
+  the next refresh fails. Other sessions remain independently editable.
+  A timed-out update may already have taken effect; refresh the goal before
+  retrying.
+  Older runner versions may leave the indicator stale after clearing a goal
+  in the native terminal, or show a read error when no goal exists. Inspect the
+  native goal, then update and reconnect the session's owning runner on its
+  existing host/workspace binding and refresh. Repeating refresh against the
+  same older runner cannot resolve this ambiguity. With older servers, an
+  unavailable session can also appear to have no goal. See the
+  [Goal API compatibility notes](../omnigent/server/codex-API.md) for version
+  requirements.
 - `slash-rewind`: in claude-sdk and Claude Code native sessions, `/rewind` opens
   a searchable list of the session's prompts, newest first. Choosing one
   continues the conversation in a new session holding only the history before

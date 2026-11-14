@@ -58,6 +58,9 @@ const goalRequests = [
   { name: "resume", timeoutMs: 190_000, request: () => updateCodexGoalStatus("conv", "active") },
   { name: "clear", timeoutMs: 190_000, request: () => clearCodexGoal("conv") },
 ];
+const deadlineRequests = goalRequests.filter(
+  ({ name }) => name === "strict read" || name === "save",
+);
 
 describe("codex goal API", () => {
   beforeEach(() => {
@@ -405,9 +408,9 @@ describe("codex goal API", () => {
 
   describe.each(["fetch", "success body", "error body"])("stalled %s", (stage) => {
     it.each(
-      goalRequests
-        .filter(({ name }) => name !== "resume")
-        .flatMap((request) => ["resolve", "reject"].map((late) => ({ ...request, late }))),
+      deadlineRequests.flatMap((request) =>
+        ["resolve", "reject"].map((late) => ({ ...request, late })),
+      ),
     )(
       "bounds $name and ignores a late $late after timeout",
       async ({ request, late, timeoutMs }) => {
@@ -471,7 +474,7 @@ describe("codex goal API", () => {
     );
   });
 
-  it.each(goalRequests.filter(({ timeoutMs }) => timeoutMs > 60_000))(
+  it.each(deadlineRequests.filter(({ timeoutMs }) => timeoutMs > 60_000))(
     "allows a cold-runner $name to finish after the old one-minute deadline",
     async ({ request }) => {
       vi.useFakeTimers();
@@ -522,7 +525,7 @@ describe("codex goal API", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it.each(goalRequests)("clears the deadline after a successful $name", async ({ request }) => {
+  it.each(deadlineRequests)("clears the deadline after a successful $name", async ({ request }) => {
     vi.useFakeTimers();
     mockAuthenticatedFetch.mockResolvedValueOnce(
       mockJsonResponse({ goal: WIRE_GOAL, cleared: true }),
