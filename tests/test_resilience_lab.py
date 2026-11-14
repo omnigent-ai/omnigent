@@ -40,7 +40,11 @@ def test_host_startup_waits_for_rpc_when_online_row_precedes_tunnel(
     spawned_env = {}
     request_timeouts = []
     rpc_timeouts = []
-    sleep = Mock()
+
+    def advance_clock(seconds: float) -> None:
+        clock.now += max(seconds, 0.1)
+
+    sleep = Mock(side_effect=advance_clock)
 
     def respond(request: httpx.Request) -> httpx.Response:
         nonlocal rpc_attempted, rpc_ready
@@ -98,6 +102,7 @@ def test_host_startup_waits_for_rpc_when_online_row_precedes_tunnel(
                 "tests.e2e.resilience.lab.lab.time",
                 SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep),
             )
+            monkeypatch.setattr("tests.e2e.resilience.lab.lab._POLL_S", 0)
             if scenario in {"remaining-budget", "late-success"}:
                 monkeypatch.setattr("tests.e2e.resilience.lab.lab._STARTUP_TIMEOUT_S", 1.0)
             start_host = lab._start_host
