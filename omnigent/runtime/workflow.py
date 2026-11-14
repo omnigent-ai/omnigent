@@ -2676,6 +2676,9 @@ def _build_copilot_spawn_env(
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_COPILOT_OS_ENV"] = os_env_payload
+    permission_mode = spec.executor.config.get("permission_mode")
+    if permission_mode is not None:
+        env["HARNESS_COPILOT_PERMISSION_MODE"] = str(permission_mode)
     return env
 
 

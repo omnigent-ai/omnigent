@@ -45,11 +45,14 @@ def _make_spec(
     model: str | None = "claude-haiku-4.5",
     name: str = "test-copilot",
     auth: ApiKeyAuth | DatabricksAuth | None = None,
+    permission_mode: str | None = None,
 ) -> AgentSpec:
     """Build a minimal copilot :class:`AgentSpec` for the spawn-env tests."""
     config: dict[str, object] = {"harness": "copilot"}
     if model is not None:
         config["model"] = model
+    if permission_mode is not None:
+        config["permission_mode"] = permission_mode
     return AgentSpec(
         spec_version=1,
         name=name,
@@ -126,3 +129,9 @@ def test_no_token_anywhere_leaves_token_unset() -> None:
 def test_bundle_dir_threaded(tmp_path: Path) -> None:
     env = _build_copilot_spawn_env(_make_spec(), workdir=tmp_path)
     assert env["HARNESS_COPILOT_BUNDLE_DIR"] == str(tmp_path)
+
+
+def test_permission_mode_threaded_when_configured() -> None:
+    assert "HARNESS_COPILOT_PERMISSION_MODE" not in _build_copilot_spawn_env(_make_spec())
+    env = _build_copilot_spawn_env(_make_spec(permission_mode="bypassPermissions"))
+    assert env["HARNESS_COPILOT_PERMISSION_MODE"] == "bypassPermissions"

@@ -128,7 +128,10 @@ class _Unsub:
 
 
 class _PermissionHandler:
-    approve_all = "approve_all"
+    @staticmethod
+    def approve_all(request: Any, invocation: Any) -> Any:
+        del request, invocation
+        return _ApproveOnce()
 
 
 def _install_fake_copilot(
@@ -1149,6 +1152,95 @@ async def test_permission_policy_allow_then_elicitation(monkeypatch: pytest.Monk
     decision = await ex._on_permission_request(_perm_request("write", fileName="a.py"), {})
     assert decision.kind == "approve-once"
     assert elicitation_calls == ["write"]
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_permission_bypass_skips_elicitation_and_delegates_to_approve_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_copilot(monkeypatch)
+    ex = CopilotExecutor(github_token="gho_x", permission_mode="bypassPermissions")
+
+    elicitation_called = False
+    approve_all_calls: list[tuple[Any, Any]] = []
+
+    async def allow_policy(phase: str, ctx: dict[str, Any]) -> Any:
+        return _verdict("POLICY_ACTION_ALLOW")
+
+    async def elicitation(name: str, args: dict[str, Any]) -> bool:
+        nonlocal elicitation_called
+        elicitation_called = True
+        return False
+
+    def spy_approve_all(request: Any, invocation: Any) -> Any:
+        approve_all_calls.append((request, invocation))
+        return _ApproveOnce()
+
+    monkeypatch.setattr(_PermissionHandler, "approve_all", staticmethod(spy_approve_all))
+    ex._policy_evaluator = allow_policy
+    ex._elicitation_handler = elicitation
+    req = _perm_request("shell", fullCommandText="pytest -q")
+    inv = {"session_id": "conv_1"}
+    decision = await ex._on_permission_request(req, inv)
+    assert decision.kind == "approve-once"
+    assert not elicitation_called
+    assert approve_all_calls == [(req, inv)]
+
+    # Managed-settings rejections returned by PermissionHandler.approve_all propagate intact.
+    monkeypatch.setattr(
+        _PermissionHandler,
+        "approve_all",
+        staticmethod(lambda _req, _inv: _Reject("managed settings forbid auto-approve")),
+    )
+    managed_decision = await ex._on_permission_request(req, inv)
+    assert managed_decision.kind == "reject"
+    assert managed_decision.feedback == "managed settings forbid auto-approve"
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_permission_bypass_still_enforces_policy_deny_and_ask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_copilot(monkeypatch)
+    ex = CopilotExecutor(github_token="gho_x", permission_mode="bypassPermissions")
+
+    approve_all_called = False
+    elicitation_calls: list[str] = []
+    next_action = "POLICY_ACTION_DENY"
+
+    def fail_approve_all(request: Any, invocation: Any) -> Any:
+        nonlocal approve_all_called
+        del request, invocation
+        approve_all_called = True
+        return _ApproveOnce()
+
+    async def policy(phase: str, ctx: dict[str, Any]) -> Any:
+        return _verdict(next_action, "restricted command")
+
+    async def elicitation(name: str, args: dict[str, Any]) -> bool:
+        elicitation_calls.append(name)
+        return False
+
+    monkeypatch.setattr(_PermissionHandler, "approve_all", staticmethod(fail_approve_all))
+    ex._policy_evaluator = policy
+    ex._elicitation_handler = elicitation
+
+    denied = await ex._on_permission_request(
+        _perm_request("shell", fullCommandText="rm -rf /"), {}
+    )
+    assert denied.kind == "reject"
+    assert "restricted command" in denied.feedback
+    assert not approve_all_called
+    assert elicitation_calls == []
+
+    # Explicit POLICY_ACTION_ASK still prompts via elicitation even in bypassPermissions mode.
+    next_action = "POLICY_ACTION_ASK"
+    asked = await ex._on_permission_request(_perm_request("shell", fullCommandText="git push"), {})
+    assert asked.kind == "reject"
+    assert elicitation_calls == ["shell"]
+    assert not approve_all_called
     await ex.close()
 
 

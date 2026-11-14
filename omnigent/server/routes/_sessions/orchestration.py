@@ -12961,6 +12961,15 @@ async def _create_session_from_existing_agent(
     automation_permission_labels: dict[str, str] = {}
     if automation_launch_options is not None:
         validated_launch_args, automation_permission_labels = automation_launch_options
+    elif body.permission_mode is not None:
+        from omnigent.harness_aliases import canonicalize_harness
+
+        if canonicalize_harness(selected_harness) == "copilot":
+            from omnigent.stores.conversation_store import COPILOT_PERMISSION_MODE_LABEL_KEY
+
+            automation_permission_labels = {
+                COPILOT_PERMISSION_MODE_LABEL_KEY: body.permission_mode
+            }
 
     # Spec-seeded defaults: a self-resolved agent's stored spec supplies the
     # spec-level reasoning effort and, when the body carried no launch args,

@@ -16,7 +16,10 @@ from omnigent.server.scheduled.harness_settings import (
     validate_scheduled_permission_mode,
     validate_scheduled_permission_support,
 )
-from omnigent.stores.conversation_store import CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+    COPILOT_PERMISSION_MODE_LABEL_KEY,
+)
 
 _NULL_HINT = "JSON null (not the string 'null') for the agent default"
 
@@ -36,7 +39,7 @@ _AGENT = SimpleNamespace(id="ag_1", bundle_location="ag_1/hash")
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("harness", ["claude-sdk", "acp", "cursor"])
+@pytest.mark.parametrize("harness", ["claude-sdk", "acp", "cursor", "copilot"])
 async def test_sdk_agent_without_a_spec_mode_can_be_saved(harness: str) -> None:
     """SDK harnesses run in auto when the spec sets no mode."""
     await validate_scheduled_permission_support(
@@ -45,19 +48,24 @@ async def test_sdk_agent_without_a_spec_mode_can_be_saved(harness: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_sdk_agent_whose_spec_bypasses_approval_cannot_be_saved() -> None:
+@pytest.mark.parametrize("harness", ["claude-sdk", "copilot"])
+async def test_sdk_agent_whose_spec_bypasses_approval_cannot_be_saved(harness: str) -> None:
     with pytest.raises(OmnigentError, match="bypassPermissions"):
         await validate_scheduled_permission_support(
             permission_mode=None,
             agent=_AGENT,
-            agent_cache=_AgentCache("claude-sdk", "bypassPermissions"),
+            agent_cache=_AgentCache(harness, "bypassPermissions"),
         )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("harness", "mode"),
-    [("claude-native", "bypassPermissions"), ("codex-native", "full-access")],
+    [
+        ("claude-native", "bypassPermissions"),
+        ("codex-native", "full-access"),
+        ("copilot", "bypassPermissions"),
+    ],
 )
 async def test_explicit_approval_skipping_mode_can_be_saved(harness: str, mode: str) -> None:
     """A mode the task selects itself is shown in its settings, so it may skip approval."""
@@ -147,6 +155,12 @@ class _TaskStore:
         ("claude-native", "auto", (["--permission-mode", "auto"], {})),
         ("codex-native", "bypass", (None, {CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"})),
         ("codex-native", "default", (None, {})),
+        (
+            "copilot",
+            "bypassPermissions",
+            (None, {COPILOT_PERMISSION_MODE_LABEL_KEY: "bypassPermissions"}),
+        ),
+        ("copilot", "default", (None, {COPILOT_PERMISSION_MODE_LABEL_KEY: "default"})),
     ],
 )
 async def test_session_started_by_an_automation_run_uses_its_mode(
