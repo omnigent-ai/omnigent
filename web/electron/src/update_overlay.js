@@ -18,6 +18,10 @@ const { pathToFileURL } = require("node:url");
 
 const OVERLAY_WIDTH = 344; // 320px card + 12px shadow gutter each side
 const OVERLAY_INSET = 12;
+// On Wayland, Chromium subtracts frame/shadow insets from a child's geometry
+// while the parent maximizes. Give the hidden sliver enough height to stay
+// nonzero after that adjustment.
+const COLLAPSED_OVERLAY_HEIGHT = 64;
 
 /**
  * @param {object} deps
@@ -92,7 +96,7 @@ function createUpdateOverlay({
 
   function collapse(parent, overlay) {
     notifyParentHeight(parent, 0);
-    position(parent, overlay, 1);
+    position(parent, overlay, COLLAPSED_OVERLAY_HEIGHT);
     overlay.setIgnoreMouseEvents(true, { forward: true });
     if (!overlay.isVisible()) overlay.showInactive();
   }
@@ -110,7 +114,7 @@ function createUpdateOverlay({
     if (!overlay || overlay.isDestroyed() || parent.isDestroyed()) return;
     const height = heights.get(overlay) ?? 0;
     notifyParentHeight(parent, height);
-    position(parent, overlay, Math.max(1, height));
+    position(parent, overlay, Math.max(COLLAPSED_OVERLAY_HEIGHT, height));
     overlay.setIgnoreMouseEvents(height === 0, height === 0 ? { forward: true } : undefined);
     if (!overlay.isVisible()) overlay.showInactive();
   }
@@ -159,7 +163,7 @@ function createUpdateOverlay({
       show: false,
       ...macOverlayOptions,
       width: OVERLAY_WIDTH,
-      height: 1,
+      height: COLLAPSED_OVERLAY_HEIGHT,
       webPreferences: {
         preload: preloadPath,
         contextIsolation: true,
@@ -197,7 +201,8 @@ function createUpdateOverlay({
       );
     });
 
-    const reposition = () => position(parent, overlay, heights.get(overlay) ?? 1);
+    const reposition = () =>
+      position(parent, overlay, heights.get(overlay) ?? COLLAPSED_OVERLAY_HEIGHT);
     parent.on("resize", reposition);
     parent.on("move", reposition);
     // Electron does NOT auto-close child windows when their parent closes, so
@@ -227,7 +232,7 @@ function createUpdateOverlay({
     // its renderer, so its ResizeObserver stops firing and the card could never
     // report a height again to re-appear (e.g. after a transient "checking"
     // state collapses it). Instead keep the window shown but collapse it to an
-    // invisible, click-through 1px sliver, which keeps layout — and the
+    // invisible, click-through sliver, which keeps layout — and the
     // ResizeObserver — alive so it expands again the moment there's content.
     ipcMain.on("omnigent:overlay-height", (event, height) => {
       const overlay = overlayForSender(event);
@@ -249,7 +254,7 @@ function createUpdateOverlay({
         position(parent, overlay, h);
         overlay.setIgnoreMouseEvents(false);
       } else {
-        position(parent, overlay, 1);
+        position(parent, overlay, COLLAPSED_OVERLAY_HEIGHT);
         overlay.setIgnoreMouseEvents(true, { forward: true });
       }
       if (!overlay.isVisible()) overlay.showInactive();
@@ -319,4 +324,9 @@ function createUpdateOverlay({
   return { ensureOverlay, suppress, unsuppress, registerIpc };
 }
 
-module.exports = { createUpdateOverlay, OVERLAY_WIDTH, OVERLAY_INSET };
+module.exports = {
+  createUpdateOverlay,
+  OVERLAY_WIDTH,
+  OVERLAY_INSET,
+  COLLAPSED_OVERLAY_HEIGHT,
+};
