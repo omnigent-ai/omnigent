@@ -1463,23 +1463,25 @@ def build_native_controls(
         )
         # Translate through the pane's picker values, aliases, and custom slot.
         # An unknown spelling must fail before any command reaches the terminal.
-        env = read_model_env(bridge_dir) or None
+        env = await asyncio.to_thread(read_model_env, bridge_dir) or None
         cached_options = _claude_model_options_rows.get(conv_id)
         if cached_options is not None:
             picker_values = picker_command_values(cached_options[1])
         else:
-            stored_rows = stored_claude_catalog_rows(claude_config)
+            stored_rows = await asyncio.to_thread(stored_claude_catalog_rows, claude_config)
             if stored_rows is not None and not stored_rows:
                 # Discovery stored an authoritative empty catalog (every
                 # picker entry disabled): launch-recorded bridge values are
                 # stale vocabulary, so nothing is switchable.
                 picker_values: list[str] = []
             else:
-                picker_values = read_model_picker_values(bridge_dir)
+                picker_values = await asyncio.to_thread(read_model_picker_values, bridge_dir)
                 if not picker_values:
-                    picker_values = stored_claude_picker_values(claude_config, stored_rows)
+                    picker_values = await asyncio.to_thread(
+                        stored_claude_picker_values, claude_config, stored_rows
+                    )
         model_arg = claude_model_command_arg(resolved_model, env, picker_values=picker_values)
-        inference_config = load_runtime_inference_config()
+        inference_config = await asyncio.to_thread(load_runtime_inference_config)
         bound_model = binding_for_harness(inference_config, "claude-native") is not None
         if bound_model:
             resolved_model = resolve_bound_model(inference_config, "claude-native", selected_model)
