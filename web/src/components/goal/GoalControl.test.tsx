@@ -49,6 +49,7 @@ function renderControl(conversationId: string | null = "conv") {
         readOnly={false}
         goal={GOAL}
         onGoalChange={vi.fn()}
+        refreshGoal={vi.fn().mockResolvedValue(undefined)}
       />
     </TooltipProvider>,
   );

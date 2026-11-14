@@ -22,6 +22,16 @@ const GOAL: Goal = {
   updatedAt: null,
 };
 
+function deferredGoalRead() {
+  let resolve!: (response: { goal: Goal | null }) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<{ goal: Goal | null }>((resolveRead, rejectRead) => {
+    resolve = resolveRead;
+    reject = rejectRead;
+  });
+  return { promise, resolve, reject };
+}
+
 beforeEach(() => {
   mockGetGoal.mockReset();
 });
@@ -60,6 +70,113 @@ describe("useGoalState", () => {
     await act(async () => resolveRead({ goal: null }));
 
     expect(result.current.goal).toEqual(GOAL);
+  });
+
+  it.each([
+    { newest: "dialog refresh", sameBatch: false },
+    { newest: "dialog refresh", sameBatch: true },
+    { newest: "poll", sameBatch: false },
+    { newest: "poll", sameBatch: true },
+  ])(
+    "keeps the latest-started $newest when sameBatch=$sameBatch",
+    async ({ newest, sameBatch }) => {
+      vi.useFakeTimers();
+      const older = deferredGoalRead();
+      const newer = deferredGoalRead();
+      mockGetGoal
+        .mockResolvedValueOnce({ goal: GOAL })
+        .mockReturnValueOnce(older.promise)
+        .mockReturnValueOnce(newer.promise);
+      const { result } = renderHook(() => useGoalState("conv", true));
+      await act(async () => {});
+
+      let dialogRefresh!: Promise<void>;
+      if (newest === "poll") {
+        act(() => {
+          dialogRefresh = result.current.refreshGoal();
+        });
+      }
+      await act(() => vi.advanceTimersByTimeAsync(5_000));
+      if (newest === "dialog refresh") {
+        act(() => {
+          dialogRefresh = result.current.refreshGoal();
+        });
+      }
+      expect(mockGetGoal).toHaveBeenCalledTimes(3);
+      const latestGoal = newest === "poll" ? null : { ...GOAL, status: "paused" as const };
+      const olderGoal = newest === "poll" ? GOAL : null;
+
+      if (sameBatch) {
+        await act(async () => {
+          newer.resolve({ goal: latestGoal });
+          older.resolve({ goal: olderGoal });
+          await dialogRefresh;
+        });
+      } else {
+        await act(async () => newer.resolve({ goal: latestGoal }));
+        expect(result.current.goal).toEqual(latestGoal);
+        await act(async () => {
+          older.resolve({ goal: olderGoal });
+          await dialogRefresh;
+        });
+      }
+
+      expect(result.current.goal).toEqual(latestGoal);
+    },
+  );
+
+  it("invalidates a pending dialog refresh when a goal is explicitly updated", async () => {
+    const read = deferredGoalRead();
+    mockGetGoal.mockResolvedValueOnce({ goal: GOAL }).mockReturnValueOnce(read.promise);
+    const { result } = renderHook(() => useGoalState("conv", true));
+    await act(async () => {});
+    let refresh!: Promise<void>;
+    act(() => {
+      refresh = result.current.refreshGoal();
+    });
+    const pausedGoal = { ...GOAL, status: "paused" as const };
+    act(() => result.current.setGoal(pausedGoal));
+
+    await act(async () => {
+      read.resolve({ goal: null });
+      await refresh;
+    });
+
+    expect(result.current.goal).toEqual(pausedGoal);
+  });
+
+  it("propagates current dialog read errors and swallows superseded errors", async () => {
+    const older = deferredGoalRead();
+    const newer = deferredGoalRead();
+    mockGetGoal
+      .mockResolvedValueOnce({ goal: GOAL })
+      .mockReturnValueOnce(older.promise)
+      .mockReturnValueOnce(newer.promise);
+    const { result } = renderHook(() => useGoalState("conv", true));
+    await act(async () => {});
+    const olderRefresh = result.current.refreshGoal();
+    const newerRefresh = result.current.refreshGoal();
+
+    await act(async () => {
+      older.reject(new Error("superseded read failed"));
+      await expect(olderRefresh).resolves.toBeUndefined();
+    });
+    const currentError = new Error("current read failed");
+    await act(async () => {
+      newer.reject(currentError);
+      await expect(newerRefresh).rejects.toBe(currentError);
+    });
+
+    expect(result.current.goal).toEqual(GOAL);
+  });
+
+  it("reports an unavailable session when explicitly refreshed while disconnected", async () => {
+    const { result } = renderHook(() => useGoalState("conv", false));
+
+    await expect(result.current.refreshGoal()).rejects.toThrow("Goal is unavailable");
+
+    expect(mockGetGoal).not.toHaveBeenCalled();
+    expect(result.current.goal).toBeNull();
   });
 
   it("does not overlap reads or poll after disabling", async () => {
@@ -102,12 +219,15 @@ describe("useGoalState", () => {
           resolveRead = resolve;
         }),
       )
+      .mockResolvedValueOnce({ goal: null })
       .mockResolvedValueOnce({ goal: null });
     const { result, rerender } = renderHook(({ id }) => useGoalState(id, true), {
       initialProps: { id: "first" },
     });
     const updatePreviousGoal = result.current.setGoal;
     rerender({ id: "second" });
+    await act(async () => {});
+    rerender({ id: "first" });
     await act(async () => {});
     await act(async () => resolveRead({ goal: GOAL }));
     act(() => updatePreviousGoal(GOAL));
@@ -187,4 +307,36 @@ describe("useGoalState", () => {
 
     expect(result.current.goal).toBeNull();
   });
+
+  it.each(["success", "failure"])(
+    "ignores a pending dialog read's %s after the same session reconnects",
+    async (outcome) => {
+      const oldRead = deferredGoalRead();
+      mockGetGoal
+        .mockResolvedValueOnce({ goal: GOAL })
+        .mockReturnValueOnce(oldRead.promise)
+        .mockResolvedValueOnce({ goal: null });
+      const { result, rerender } = renderHook(({ enabled }) => useGoalState("conv", enabled), {
+        initialProps: { enabled: true },
+      });
+      await act(async () => {});
+      const oldSetter = result.current.setGoal;
+      const oldRefresh = result.current.refreshGoal();
+
+      rerender({ enabled: false });
+      expect(result.current.goal).toBeNull();
+      rerender({ enabled: true });
+      await act(async () => {});
+      expect(mockGetGoal).toHaveBeenCalledTimes(3);
+
+      await act(async () => {
+        if (outcome === "success") oldRead.resolve({ goal: GOAL });
+        else oldRead.reject(new Error("disconnected read failed"));
+        await expect(oldRefresh).resolves.toBeUndefined();
+      });
+      expect(result.current.goal).toBeNull();
+      act(() => oldSetter(GOAL));
+      expect(result.current.goal).toBeNull();
+    },
+  );
 });

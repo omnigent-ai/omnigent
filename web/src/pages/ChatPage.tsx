@@ -2954,10 +2954,11 @@ function ComposerImpl(
     return true;
   };
   useEffect(() => setGoalDialogOpen(false), [conversationId]);
-  const { goal, setGoal: setGoalState } = useGoalState(
-    composerSessionId,
-    showGoalControl && runnerOnline === true,
-  );
+  const {
+    goal,
+    setGoal: setGoalState,
+    refreshGoal,
+  } = useGoalState(composerSessionId, showGoalControl && runnerOnline === true);
   // "@"-file-mention is scoped to harnesses whose agent opens an on-disk file
   // from the attachment marker (``harnessSupportsFileMentions``); others get no
   // menu, so the workspace listing is never fetched for them. Codex's marker
@@ -4984,6 +4985,7 @@ function ComposerImpl(
           readOnly={isReadOnly}
           goal={goal}
           onGoalChange={setGoalState}
+          refreshGoal={refreshGoal}
         />
       ) : (
         (showClaudeGoalControl || showPollyCodexGoalControl) && (

@@ -161,6 +161,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   changes without reopening the dialog. Refreshes preserve edited dialog fields
   while untouched fields follow current goal state. Reopening or switching
   sessions discards old drafts, including when the opening read fails.
+  Pending reads and updates from an earlier dialog or session cannot replace
+  the current goal fields.
 - `slash-rewind`: in claude-sdk and Claude Code native sessions, `/rewind` opens
   a searchable list of the session's prompts, newest first. Choosing one
   continues the conversation in a new session holding only the history before

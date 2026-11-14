@@ -19,6 +19,7 @@ interface ManagedGoalControlProps extends GoalControlBaseProps {
   mode?: "managed";
   goal: Goal | null;
   onGoalChange: (goal: Goal | null) => void;
+  refreshGoal: () => Promise<void>;
 }
 
 interface CommandGoalControlProps extends GoalControlBaseProps {
@@ -85,6 +86,7 @@ export function GoalControl(props: GoalControlProps) {
           readOnly={readOnly}
           goal={goal}
           onGoalChange={props.onGoalChange}
+          refreshGoal={props.refreshGoal}
         />
       )}
     </>

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { CheckIcon, Loader2Icon, PauseCircleIcon, PlayCircleIcon, TargetIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -12,7 +12,6 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
   clearGoal,
-  getGoal,
   setGoal,
   updateGoalStatus,
   type Goal,
@@ -36,6 +35,7 @@ export interface GoalDialogProps {
   readOnly: boolean;
   goal: Goal | null;
   onGoalChange: (goal: Goal | null) => void;
+  refreshGoal: () => Promise<void>;
 }
 
 interface GoalSummaryProps {
@@ -376,7 +376,11 @@ function useGoalDialogState({
   conversationId,
   goal,
   onGoalChange,
-}: Pick<GoalDialogProps, "open" | "conversationId" | "goal" | "onGoalChange">): GoalDialogState {
+  refreshGoal,
+}: Pick<
+  GoalDialogProps,
+  "open" | "conversationId" | "goal" | "onGoalChange" | "refreshGoal"
+>): GoalDialogState {
   const [objective, setObjective] = useState(goal?.objective ?? "");
   const [tokenBudget, setTokenBudget] = useState(goal?.tokenBudget?.toString() ?? "");
   const [modeDraft, setModeDraftState] = useState<GoalModeDraft>(goalModeDraftForGoal(goal));
@@ -387,6 +391,20 @@ function useGoalDialogState({
   const [error, setError] = useState<string | null>(null);
   const draftSession = useRef<string | null | undefined>(undefined);
   const dirtyFields = useRef(new Set<"objective" | "tokenBudget" | "mode">());
+  const dialogBinding = useRef<object | null>(null);
+
+  useLayoutEffect(() => {
+    // Reopening the same session starts a new lifetime for pending operations.
+    dialogBinding.current = open && conversationId ? {} : null;
+    setLoading(false);
+    setSaving(false);
+    setClearing(false);
+    setStatusUpdating(null);
+    setError(null);
+    return () => {
+      dialogBinding.current = null;
+    };
+  }, [conversationId, open]);
 
   useEffect(() => {
     if (!open) {
@@ -405,33 +423,27 @@ function useGoalDialogState({
   }, [conversationId, goal, open]);
 
   useEffect(() => {
-    if (!open || !conversationId) return;
+    const binding = dialogBinding.current;
+    if (!binding || !conversationId) return;
     let cancelled = false;
-    const refreshGoal = async () => {
+    const refresh = async () => {
       setLoading(true);
       setError(null);
       try {
-        const response = await getGoal(conversationId);
-        if (cancelled) return;
-        onGoalChange(response.goal);
-        if (!dirtyFields.current.has("objective")) setObjective(response.goal?.objective ?? "");
-        if (!dirtyFields.current.has("tokenBudget")) {
-          setTokenBudget(response.goal?.tokenBudget?.toString() ?? "");
-        }
-        if (!dirtyFields.current.has("mode")) {
-          setModeDraftState(goalModeDraftForGoal(response.goal));
-        }
+        await refreshGoal();
       } catch (err) {
-        if (!cancelled) setError(goalError("Could not read goal", err));
+        if (!cancelled && dialogBinding.current === binding) {
+          setError(goalError("Could not read goal", err));
+        }
       } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled && dialogBinding.current === binding) setLoading(false);
       }
     };
-    void refreshGoal();
+    void refresh();
     return () => {
       cancelled = true;
     };
-  }, [conversationId, onGoalChange, open]);
+  }, [conversationId, refreshGoal, open]);
 
   const setObjectiveDraft = (value: string) => {
     dirtyFields.current.add("objective");
@@ -450,7 +462,8 @@ function useGoalDialogState({
   };
 
   const saveGoal = async () => {
-    if (!conversationId) return;
+    const binding = dialogBinding.current;
+    if (!conversationId || !binding) return;
     const trimmedObjective = objective.trim();
     if (!trimmedObjective) {
       setError("Goal objective cannot be empty.");
@@ -471,42 +484,47 @@ function useGoalDialogState({
         tokenBudget: parsedBudget,
         status: modeDraft === "keep" ? undefined : modeDraft,
       });
+      if (dialogBinding.current !== binding) return;
       dirtyFields.current.clear();
       onGoalChange(response.goal);
       setObjective(response.goal?.objective ?? trimmedObjective);
       setTokenBudget(response.goal?.tokenBudget?.toString() ?? tokenBudget.trim());
       setModeDraftState(goalModeDraftForGoal(response.goal));
     } catch (err) {
-      setError(goalError("Could not set goal", err));
+      if (dialogBinding.current === binding) setError(goalError("Could not set goal", err));
     } finally {
-      setSaving(false);
+      if (dialogBinding.current === binding) setSaving(false);
     }
   };
 
   const clearCurrentGoal = async () => {
-    if (!conversationId) return;
+    const binding = dialogBinding.current;
+    if (!conversationId || !binding) return;
     setClearing(true);
     setError(null);
     try {
       await clearGoal(conversationId);
+      if (dialogBinding.current !== binding) return;
       dirtyFields.current.clear();
       onGoalChange(null);
       setObjective("");
       setTokenBudget("");
       setModeDraftState("active");
     } catch (err) {
-      setError(goalError("Could not clear goal", err));
+      if (dialogBinding.current === binding) setError(goalError("Could not clear goal", err));
     } finally {
-      setClearing(false);
+      if (dialogBinding.current === binding) setClearing(false);
     }
   };
 
   const updateStatus = async (status: GoalStatusUpdate) => {
-    if (!conversationId) return;
+    const binding = dialogBinding.current;
+    if (!conversationId || !binding) return;
     setStatusUpdating(status);
     setError(null);
     try {
       const response = await updateGoalStatus(conversationId, status);
+      if (dialogBinding.current !== binding) return;
       dirtyFields.current.clear();
       onGoalChange(response.goal);
       setObjective(response.goal?.objective ?? "");
@@ -514,9 +532,9 @@ function useGoalDialogState({
       setModeDraftState(goalModeDraftForGoal(response.goal));
     } catch (err) {
       const action = status === "paused" ? "pause" : "resume";
-      setError(goalError(`Could not ${action} goal`, err));
+      if (dialogBinding.current === binding) setError(goalError(`Could not ${action} goal`, err));
     } finally {
-      setStatusUpdating(null);
+      if (dialogBinding.current === binding) setStatusUpdating(null);
     }
   };
 
@@ -548,7 +566,8 @@ function useGoalDialogState({
  * @param props.conversationId - Active session id, e.g. ``"conv_abc123"``.
  * @param props.readOnly - ``true`` when write actions must be disabled.
  * @param props.goal - Current goal state, or ``null`` when none is set.
- * @param props.onGoalChange - Called after successful read, set, or clear.
+ * @param props.onGoalChange - Called after successful set, clear, or status updates.
+ * @param props.refreshGoal - Refresh through the owner of the current goal snapshot.
  * @returns Goal dialog.
  */
 export function GoalDialog({
@@ -558,12 +577,14 @@ export function GoalDialog({
   readOnly,
   goal,
   onGoalChange,
+  refreshGoal,
 }: GoalDialogProps) {
   const state = useGoalDialogState({
     open,
     conversationId,
     goal,
     onGoalChange,
+    refreshGoal,
   });
   const { loading, saving, clearing, statusUpdating } = state;
   const busy = loading || saving || clearing || statusUpdating !== null;
