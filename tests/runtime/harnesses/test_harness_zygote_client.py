@@ -11,9 +11,13 @@ protocol paths are fully testable here.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import os
 import signal
 import socket
+import subprocess
+import sys
 
 import pytest
 
@@ -116,6 +120,93 @@ async def test_fork_harness_nonzero_exit(zygote: ZygoteManager, tmp_path) -> Non
         _harness_env(5, tmp_path / "h.log"),
     )
     assert await asyncio.wait_for(proc.wait(), timeout=10) == 5
+
+
+async def test_cancelled_fork_keeps_the_control_channel_serialized() -> None:
+    """The next caller cannot read a cancelled fork's still-pending reply."""
+    client_sock, peer_sock = socket.socketpair()
+    client = HarnessZygoteClient(client_sock.detach())
+    reader, writer = await asyncio.open_connection(sock=peer_sock)
+    fork = asyncio.create_task(client.fork_harness(["--harness", "x"], {}))
+    poll = None
+    try:
+        request = json.loads(await asyncio.wait_for(reader.readline(), timeout=5))
+        assert request["cmd"] == "fork_harness"
+        fork.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await fork
+        poll = asyncio.create_task(client.poll(12345))
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(reader.readline(), timeout=0.05)
+        writer.write(b'{"error":"fork refused"}\n')
+        await writer.drain()
+        request = json.loads(await asyncio.wait_for(reader.readline(), timeout=5))
+        assert request == {"cmd": "poll", "pid": 12345}
+        writer.write(b'{"returncode":7}\n')
+        await writer.drain()
+        assert await asyncio.wait_for(poll, timeout=5) == 7
+    finally:
+        assert client._sock is not None
+        with contextlib.suppress(OSError):
+            client._sock.shutdown(socket.SHUT_RDWR)
+        client._sock.close()
+        writer.close()
+        await writer.wait_closed()
+        for task in [fork, poll]:
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_cancelled_fork_reaps_a_child_from_a_late_reply() -> None:
+    """A launch cancelled before its reply must not leave an ownerless child."""
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    client_sock, peer_sock = socket.socketpair()
+    client = HarnessZygoteClient(client_sock.detach())
+    reader, writer = await asyncio.open_connection(sock=peer_sock)
+    fork = asyncio.create_task(client.fork_harness(["--harness", "x"], {}))
+    responder = None
+    exit_polled = asyncio.Event()
+
+    async def answer_polls() -> None:
+        while line := await reader.readline():
+            request = json.loads(line)
+            assert request == {"cmd": "poll", "pid": child.pid}
+            code = child.poll()
+            writer.write(json.dumps({"returncode": code}).encode() + b"\n")
+            await writer.drain()
+            if code is not None:
+                exit_polled.set()
+
+    try:
+        request = json.loads(await asyncio.wait_for(reader.readline(), timeout=5))
+        assert request["cmd"] == "fork_harness"
+        fork.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await fork
+        writer.write(json.dumps({"pid": child.pid}).encode() + b"\n")
+        await writer.drain()
+        responder = asyncio.create_task(answer_polls())
+        assert await asyncio.to_thread(child.wait, timeout=5) == -signal.SIGKILL
+        await asyncio.wait_for(exit_polled.wait(), timeout=5)
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+        assert client._sock is not None
+        with contextlib.suppress(OSError):
+            client._sock.shutdown(socket.SHUT_RDWR)
+        client._sock.close()
+        writer.close()
+        await writer.wait_closed()
+        for task in [fork, responder]:
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
 
 async def test_wait_timeout_preserves_exit_polling(zygote: ZygoteManager, tmp_path) -> None:
