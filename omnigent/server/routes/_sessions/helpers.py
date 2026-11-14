@@ -10992,9 +10992,10 @@ def _derive_terminal_launch_args_from_spec(
       to ``auto`` or ``auto-review``, emit ``["--auto-review"]`` instead
       (Smart Auto) so a bundle can choose Claude-style auto without full
       yolo.
-    - kimi-native + ``executor.config.yolo: true`` -> ``["--yolo"]``
-      (kimi's auto-approve-tools flag; ``--auto`` full autonomy is NOT
-      mapped). Opt-IN: absent / false leaves args unset.
+    - kimi-native + ``executor.config.yolo: true`` or
+      ``permission_mode: bypassPermissions`` -> ``["--auto"]`` (Kimi's
+      Never Ask mode). ``permission_mode`` takes precedence over
+      ``yolo: false``. Opt-IN: absent / false leaves args unset.
     - antigravity-native + ``executor.config.permission_mode:
       bypassPermissions`` -> ``["--dangerously-skip-permissions"]``, agy's
       only pre-emptive permission control. Opt-IN like claude-native;
@@ -11088,19 +11089,33 @@ def _derive_terminal_launch_args_from_spec(
             return None
         return _validate_terminal_launch_args(["--yolo"])
     if harness == _KIMI_NATIVE_HARNESS:
-        # Opt-IN (unlike codex/cursor's headless default-bypass). The bool
-        # arm covers programmatically built specs; the string arm covers the
-        # parser's stringified ``"True"`` (see the value-matching policy).
+        permission_mode = spec.executor.config.get("permission_mode")
+        if isinstance(permission_mode, str):
+            if permission_mode == "bypassPermissions":
+                return _validate_terminal_launch_args(["--auto"])
+            if permission_mode:
+                _logger.debug(
+                    "kimi-native sub-spec permission_mode=%r has no kimi analogue; ignoring it.",
+                    permission_mode,
+                )
+        elif permission_mode is not None:
+            _logger.debug(
+                "kimi-native sub-spec has unrecognized permission_mode=%r; ignoring it.",
+                permission_mode,
+            )
+
+        # Kimi's --yolo still asks for approval when needed; --auto is its
+        # Never Ask mode and is enabled only by an explicit spec opt-in.
         yolo = spec.executor.config.get("yolo")
         if yolo is True or (isinstance(yolo, str) and yolo.lower() == "true"):
-            return _validate_terminal_launch_args(["--yolo"])
+            return _validate_terminal_launch_args(["--auto"])
         if (
             yolo is not None
             and yolo is not False
             and not _spec_config_flag_explicitly_disabled(spec, "yolo")
         ):
             _logger.debug(
-                "kimi-native sub-spec has unrecognized yolo=%r; launching without --yolo.",
+                "kimi-native sub-spec has unrecognized yolo=%r; launching without --auto.",
                 yolo,
             )
         return None

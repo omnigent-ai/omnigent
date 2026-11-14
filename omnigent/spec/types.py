@@ -539,8 +539,8 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
         opt-in for kimi) and ``"permission_mode"`` (exact-match string;
         ``bypassPermissions`` maps to the claude-native /
         antigravity-native skip flags; a codex-native mode such as
-        ``approve-for-me`` maps to that mode's launch args) into the
-        session's ``terminal_launch_args``.
+        ``approve-for-me`` maps to that mode's launch args; kimi-native
+        ``--auto``) into the session's ``terminal_launch_args``.
 
         🚨 **TECH DEBT — REMOVE WHEN OMNIGENT COMPAT ENDS.**
         This field exists *solely* to carry harness / profile /
