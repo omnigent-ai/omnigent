@@ -88,10 +88,12 @@ export function AppShellOverlays({
         position="top-center"
         visibleToasts={100}
         offset={{
+          top: "calc(1rem + var(--omnigent-safe-top))",
           right: "1rem",
           bottom: updateOverlayToastOffset(updateOverlayHeight),
         }}
         mobileOffset={{
+          top: "calc(1rem + var(--omnigent-safe-top))",
           right: "1rem",
           bottom: updateOverlayToastOffset(updateOverlayHeight),
         }}

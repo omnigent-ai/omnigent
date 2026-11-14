@@ -1143,6 +1143,8 @@ class ClaudeHookRecord:
         payload's ``error_details`` field, e.g.
         ``"prompt is too long: 120000 tokens (limit 100000)"``. ``None`` when absent.
     :param failure_context: Structured evidence supplied by this hook record.
+    :param completion_output: Authoritative ``Stop`` reply, including an empty
+        reply. ``None`` when absent or malformed; never truncated here.
     """
 
     event_cursor: int
@@ -1167,6 +1169,7 @@ class ClaudeHookRecord:
     failure_category: str | None = None
     failure_message: str | None = None
     failure_context: FailureContext | None = None
+    completion_output: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1776,9 +1779,6 @@ def approval_wait_is_fresh(session_id: str, *, bridge_dir: Path | None = None) -
     """
     Whether a permission hook is parked on this session's verdict right now.
 
-    Scans every hook's marker for the session; a stale one (a hook killed
-    mid-wait) is removed on the way so they never accumulate.
-
     :param session_id: Omnigent session id to check, e.g.
         ``"conv_abc123"``.
     :param bridge_dir: Derive the marker root from this bridge, matching the hook writer.
@@ -1786,20 +1786,38 @@ def approval_wait_is_fresh(session_id: str, *, bridge_dir: Path | None = None) -
         :data:`APPROVAL_WAIT_MARKER_TTL_S`; ``False`` when none exists, all
         are stale, or the root is unreadable.
     """
+    return bool(fresh_approval_wait_markers(session_id, bridge_dir=bridge_dir))
+
+
+def fresh_approval_wait_markers(session_id: str, *, bridge_dir: Path | None = None) -> list[str]:
+    """
+    Name each permission hook parked on this session's verdict right now.
+
+    Scans every hook's marker for the session; a stale one (a hook killed
+    mid-wait) is removed on the way so they never accumulate. Each hook
+    process owns one marker, so a name identifies one wait.
+
+    :param session_id: Omnigent session id to check, e.g.
+        ``"conv_abc123"``.
+    :param bridge_dir: Derive the marker root from this bridge, matching the hook writer.
+    :returns: File names of markers touched within
+        :data:`APPROVAL_WAIT_MARKER_TTL_S`, e.g. ``["<digest>.4242.wait"]``;
+        empty when none exists, all are stale, or the root is unreadable.
+    """
     root = bridge_dir.parent / _APPROVAL_WAIT_DIR_NAME if bridge_dir else _APPROVAL_WAIT_ROOT
     try:
         markers = list(root.glob(f"{_approval_wait_digest(session_id)}.*.wait"))
     except OSError:
-        return False
+        return []
     now = time.time()
-    fresh = False
+    fresh: list[str] = []
     for marker in markers:
         try:
             touched_at = marker.stat().st_mtime
         except OSError:
             continue
         if now - touched_at < APPROVAL_WAIT_MARKER_TTL_S:
-            fresh = True
+            fresh.append(marker.name)
         else:
             clear_approval_wait_marker(marker)
     return fresh
@@ -2920,6 +2938,9 @@ def build_hook_settings(
         # a catch-all policy evaluation entry so TOOL_RESULT policies
         # fire for all tools, not just the forwarder-specific ones.
         hooks["PostToolUse"].append({"hooks": [evaluate_policy_hook]})
+        # A failed tool call (e.g. Bash exiting non-zero) fires
+        # PostToolUseFailure instead of PostToolUse.
+        hooks["PostToolUseFailure"] = [{"hooks": [evaluate_policy_hook]}]
         # UserPromptSubmit already carries the transcript forwarder's
         # status hook (running). Append the policy hook so REQUEST-phase
         # policies gate native prompts — for native sessions this is the
@@ -4669,6 +4690,11 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
     failure_category: str | None = None
     failure_message: str | None = None
     failure_context: FailureContext | None = None
+    completion_output: str | None = None
+    if event_name == "Stop" and isinstance(payload, dict):
+        raw_output = payload.get("last_assistant_message")
+        if isinstance(raw_output, str):
+            completion_output = raw_output
     if event_name == "StopFailure" and isinstance(payload, dict):
         failure_category = _bounded_hook_text(payload.get("error"), _FAILURE_CATEGORY_MAX_CHARS)
         # ``error_details`` is the purpose-built API error field; ``last_assistant_message``
@@ -4729,6 +4755,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         failure_category=failure_category,
         failure_message=failure_message,
         failure_context=failure_context,
+        completion_output=completion_output,
     )
 
 
@@ -4890,10 +4917,12 @@ def inject_user_message(
     temp file) + ``paste-buffer -p`` so interior newlines ride as raw CR
     inside the paste markers and Claude Code's TUI keeps multi-line
     input as data rather than submitting on each newline
-    (anthropics/claude-code#52126). A trailing newline inside the paste
-    absorbs any trailing backslash — otherwise ``\`` + the submit
+    (anthropics/claude-code#52126). A message ending in ``\`` gets a
+    trailing newline inside the paste — otherwise ``\`` + the submit
     ``Enter`` reads as a line-continuation and the message sits unsent.
-    ``Enter`` is a separate tmux call. The file-based buffer
+    No other message gets one: Claude Code collapses a paste holding
+    three or more line breaks into a ``[Pasted text #N +X lines]``
+    placeholder. ``Enter`` is a separate tmux call. The file-based buffer
     path (not ``send-keys`` argv) matters: tmux caps a single
     client→server command at ~16KB, so a large message — e.g. a PR diff
     in a sub-agent dispatch — failed with "command too long".
@@ -5050,6 +5079,18 @@ def _paste_and_submit(
             "Answer the pending Claude question or permission request before sending a message.",
             nothing_typed=True,
         )
+    delivery_diagnostics.set_stage("encoding")
+    # Trailing line breaks add nothing before the submit Enter, and a third CR
+    # collapses the paste into a placeholder.
+    payload = _paste_payload_bytes(text).rstrip(b"\r")
+    if not payload:
+        raise RuntimeError(
+            "The message has no text to paste into Claude Code (only line breaks or "
+            "control characters). The message was not delivered."
+        )
+    if payload.endswith(b"\\"):
+        # Append a CR only when a trailing backslash would consume the submit Enter.
+        payload += b"\r"
     tail_needle = _submit_tail_needle(text) if needle else ""
     delivery_diagnostics.set_stage("pasting")
     # Clear stale text first, or the paste lands inside the person's draft and
@@ -5057,7 +5098,12 @@ def _paste_and_submit(
     _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
     transcript_before_paste = _capture_pane(socket_path, tmux_target)
     draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
-        bridge_dir, socket_path, tmux_target, text=text, needle=needle, tail_needle=tail_needle
+        bridge_dir,
+        socket_path,
+        tmux_target,
+        payload=payload,
+        needle=needle,
+        tail_needle=tail_needle,
     )
     box = _composer_box(pane)
     # A TUI that submits the paste itself leaves an empty box and a new transcript line.
@@ -5081,7 +5127,12 @@ def _paste_and_submit(
         )
         _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
         draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
-            bridge_dir, socket_path, tmux_target, text=text, needle=needle, tail_needle=tail_needle
+            bridge_dir,
+            socket_path,
+            tmux_target,
+            payload=payload,
+            needle=needle,
+            tail_needle=tail_needle,
         )
     delivery_diagnostics.record_draft(
         pane=pane,
@@ -5151,37 +5202,32 @@ def _paste_and_await_draft(
     socket_path: str,
     tmux_target: str,
     *,
-    text: str,
+    payload: bytes,
     needle: str,
     tail_needle: str = "",
 ) -> tuple[bool, str, int, int, float]:
     """
-    Paste *text* into the composer, then poll until its draft shows or the paste budget ends.
+    Paste *payload* into the composer, then poll until its draft shows or the paste budget ends.
 
     :param bridge_dir: Bridge directory whose temp paste file is written here.
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string.
-    :param text: Exact text to paste.
+    :param payload: Encoded paste bytes, including any backslash-protecting CR.
     :param needle: Draft marker from :func:`_submit_needle`.
     :param tail_needle: End-of-draft marker from :func:`_submit_tail_needle`.
     :returns: ``(draft_seen, last_pane, polls, empty_captures, wait_started)``.
     :raises RuntimeError: If a ``tmux`` invocation fails.
     """
-    # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
-    # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
-    # client→server command at ~16KB, so per-byte hex argv blew up with
-    # "command too long" on large payloads (a PR diff in a sub-agent
-    # dispatch). ``load-buffer`` streams the file without that cap, and
-    # ``paste-buffer -p`` wraps it in the same bracketed-paste markers so
-    # interior newlines (mapped to CR below) stay data instead of becoming
-    # per-line submits. See anthropics/claude-code#52126.
+    # Use a tmux buffer, not ``send-keys`` argv: tmux caps a client→server
+    # command at ~16KB. ``load-buffer`` avoids the cap; ``paste-buffer -p``
+    # keeps interior CRs as data, not submits (anthropics/claude-code#52126).
     paste_path: str | None = None
     try:
         with tempfile.NamedTemporaryFile(
             dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
         ) as paste_file:
             paste_path = paste_file.name
-            paste_file.write(_paste_payload_bytes(text + "\n"))
+            paste_file.write(payload)
         _run_tmux(socket_path, "load-buffer", "-b", "omnigent-paste", paste_path)
         _run_tmux(
             socket_path,
@@ -6765,8 +6811,8 @@ def _user_prompt_visible(pane: str) -> bool:
     lines = [line for line in pane.splitlines() if line.strip()]
     rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
     region = "\n".join(lines[rules[-2] + 1 :] if len(rules) >= 2 else lines)
-    # Narrow panes wrap the decision footer across captured lines.
-    footer = " ".join(region.split())
+    # Narrow panes can wrap inside the decision footer's words.
+    footer = "".join(region.split())
     # A short pane can clip the plan decision's footer entirely.
     plan_region = "\n".join(lines[rules[-1] + 1 :]) if rules else ""
     plan_exit = re.search(
@@ -6782,8 +6828,8 @@ def _user_prompt_visible(pane: str) -> bool:
         or "Do you want to " in region
         or "Yes, and don't ask again" in region
         or (
-            any(hint in footer for hint in ("Enter to select", "Enter to submit"))
-            and "Esc to cancel" in footer
+            any(hint in footer for hint in ("Entertoselect", "Entertosubmit"))
+            and "Esctocancel" in footer
         )
     )
 
@@ -8304,6 +8350,22 @@ def _paste_payload_bytes(text: str) -> bytes:
     return bytes(body)
 
 
+def read_tmux_target(bridge_dir: Path) -> dict[str, str] | None:
+    """
+    Read the ``tmux.json`` advertisement once.
+
+    :param bridge_dir: Bridge directory path.
+    :returns: ``{"socket_path": ..., "tmux_target": ...}``, or ``None`` when
+        the file is absent or lacks valid fields.
+    """
+    payload = _read_json_file(bridge_dir / _TMUX_FILE)
+    socket_path = payload.get("socket_path") if isinstance(payload, dict) else None
+    tmux_target = payload.get("tmux_target") if isinstance(payload, dict) else None
+    if isinstance(socket_path, str) and isinstance(tmux_target, str):
+        return {"socket_path": socket_path, "tmux_target": tmux_target}
+    return None
+
+
 def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]:
     """
     Wait for the runner to write ``tmux.json``.
@@ -8315,14 +8377,11 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
         ``socket_path`` and ``tmux_target`` fields.
     """
     deadline = time.monotonic() + timeout_s
-    path = bridge_dir / _TMUX_FILE
     while time.monotonic() < deadline:
         _check_injection_cancelled()
-        payload = _read_json_file(path)
-        socket_path = payload.get("socket_path") if isinstance(payload, dict) else None
-        tmux_target = payload.get("tmux_target") if isinstance(payload, dict) else None
-        if isinstance(socket_path, str) and isinstance(tmux_target, str):
-            return {"socket_path": socket_path, "tmux_target": tmux_target}
+        info = read_tmux_target(bridge_dir)
+        if info is not None:
+            return info
         time.sleep(0.05)
     raise TmuxSessionNotAdvertised(
         "Claude terminal tmux target is not advertised yet. Wait for the "

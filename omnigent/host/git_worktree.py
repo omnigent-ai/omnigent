@@ -625,12 +625,12 @@ def _create_worktree(
         work_deadline -= min(_GIT_TIMEOUT_S, budget_s * _ROLLBACK_RESERVE_FRACTION)
         _CREATE_DEADLINE.set((work_deadline, budget_s))
     if base_branch is not None:
-        _ensure_base_resolvable(repo_root, base_branch, deadline=work_deadline, budget_s=budget_s)
+        _ensure_base_resolvable(repo_path, base_branch, deadline=work_deadline, budget_s=budget_s)
     validated_commit: str | None = None
     if relative_directory:
         revision = f"refs/heads/{branch_name}" if existing_branch else (base_branch or "HEAD")
         resolved = _run_git(
-            ["rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}"], cwd=repo_root
+            ["rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}"], cwd=repo_path
         )
         if resolved.returncode != 0:
             raise _git_error("could not resolve worktree revision", resolved)
@@ -663,8 +663,9 @@ def _create_worktree(
             add_args.insert(2, "--no-checkout")
         if base_branch is not None:
             add_args += ["--end-of-options", base_branch]
+    # Resolve HEAD in the selected checkout; placement still uses the main repository.
     result = _run_git_within_budget(
-        add_args, cwd=repo_root, deadline=work_deadline, budget_s=budget_s
+        add_args, cwd=repo_path, deadline=work_deadline, budget_s=budget_s
     )
     if result.returncode != 0:
         raise _git_error("git worktree add failed", result)

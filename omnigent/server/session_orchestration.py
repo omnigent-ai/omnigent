@@ -64,7 +64,7 @@ def require_owned_session(
             if _shared_with_editors(current.id, user_id, permissions):
                 raise OmnigentError(
                     "Sessions shared with edit access cannot send messages, launch "
-                    "independent sessions or move other sessions",
+                    "independent sessions or organize other sessions and projects",
                     code=ErrorCode.FORBIDDEN,
                 )
             if current.labels.get(SIDE_CHAT_LABEL_KEY) == "1":
@@ -97,6 +97,48 @@ def require_private_bound_source(
             "Session orchestration requires the sender's bound runner", code=ErrorCode.FORBIDDEN
         )
     return source
+
+
+# How many sessions the archive guard walks up from the caller before refusing.
+_MAX_ARCHIVE_LINEAGE_DEPTH = 32
+
+
+def require_archive_outside_source_lineage(
+    request: Request, session_id: str, conversations: ConversationStore
+) -> None:
+    """
+    Refuse an agent-tool archive of any session the calling session runs under.
+
+    Archiving stops the target's running sub-agents, so archiving an ancestor
+    would stop the caller mid-turn. The caller may archive itself: the route
+    defers that teardown until its turn ends. Cyclic or over-depth lineages are
+    refused. Requests without the orchestration-source header bypass this
+    agent-only guard.
+    """
+    raw_source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
+    if not raw_source:
+        return
+    target = normalize_uuid(session_id)
+    source_id = normalize_uuid(raw_source)
+    current = conversations.get_conversation(source_id) if source_id else None
+    seen: set[str] = set()
+    while current is not None:
+        if current.id == target and current.id != source_id:
+            raise OmnigentError(
+                "An agent cannot archive a session it runs under",
+                code=ErrorCode.FORBIDDEN,
+            )
+        if current.id in seen or len(seen) >= _MAX_ARCHIVE_LINEAGE_DEPTH:
+            raise OmnigentError(
+                "An agent cannot archive another session while its own session's "
+                "lineage cannot be checked",
+                code=ErrorCode.FORBIDDEN,
+            )
+        seen.add(current.id)
+        next_id = current.parent_conversation_id
+        if next_id is None and current.labels.get(SIDE_CHAT_LABEL_KEY) == "1":
+            next_id = current.labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)
+        current = conversations.get_conversation(next_id) if next_id else None
 
 
 def require_named_source_private(

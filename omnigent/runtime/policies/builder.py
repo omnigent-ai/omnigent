@@ -30,6 +30,7 @@ from omnigent.entities import Conversation
 from omnigent.entities import Policy as StoredPolicy
 from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
 from omnigent.llms.context_window import fetch_model_pricing_with_provider
+from omnigent.models.model_override import is_databricks_model_id
 from omnigent.policies.base import Policy
 from omnigent.policies.builtins.safety import SCHEDULED_TASK_APPROVAL_TOOLS
 from omnigent.policies.function import resolve_function_policy
@@ -994,10 +995,10 @@ def _build_policy_llm_client(
 
 def _normalize_policy_model(model: str) -> str:
     """
-    Apply the ``databricks-`` → ``databricks/`` provider-prefix fixup.
+    Apply the ``databricks/`` provider-prefix fixup to bare Databricks ids.
 
-    Models prefixed with ``databricks-`` (e.g.
-    ``databricks-claude-sonnet-4-6``) need the ``databricks/``
+    Bare Databricks models (e.g. ``databricks-claude-sonnet-4-6`` or the
+    Unity Catalog ``system.ai.claude-sonnet-4-6``) need the ``databricks/``
     provider prefix so the LLM adapter routes through
     ``DatabricksAdapter`` (Chat Completions) rather than
     ``OpenAIAdapter`` (Responses API). Without this, the request
@@ -1006,11 +1007,11 @@ def _normalize_policy_model(model: str) -> str:
     fallback path routes the same way as the primary.
 
     :param model: A model id from the server ``llm:`` config,
-        possibly a bare ``databricks-`` name.
+        possibly a bare ``databricks-`` or ``system.ai.`` name.
     :returns: The model id with the ``databricks/`` prefix applied
         when needed; otherwise unchanged.
     """
-    if "/" not in model and model.startswith("databricks-"):
+    if "/" not in model and is_databricks_model_id(model):
         return f"databricks/{model}"
     return model
 

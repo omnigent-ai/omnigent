@@ -147,9 +147,16 @@ def git_repo(tmp_path: Path) -> Iterator[Path]:
     yield repo
 
 
-def test_create_worktree_places_sibling_of_repo_root(git_repo: Path) -> None:
+@pytest.mark.parametrize("base_branch", [None, "main", "master"])
+def test_create_worktree_places_sibling_of_repo_root(
+    git_repo: Path, base_branch: str | None
+) -> None:
     """A new worktree lands at ``<repo>-worktrees/<branch>`` with the branch checked out."""
-    created = create_worktree(repo_path=str(git_repo), branch_name="feature/login")
+    if base_branch == "master":
+        _git(git_repo, "branch", "-m", "master")
+    created = create_worktree(
+        repo_path=str(git_repo), branch_name="feature/login", base_branch=base_branch
+    )
     expected = git_repo.parent / "myrepo-worktrees" / "feature-login"
     # Path proves the sibling layout + slash->dash dir sanitization;
     # a regression in _resolve_worktree_path would change this.
@@ -158,6 +165,7 @@ def test_create_worktree_places_sibling_of_repo_root(git_repo: Path) -> None:
     assert Path(created.worktree_path).is_dir()
     # The branch is actually checked out in the worktree (not just the dir made).
     assert _current_branch(Path(created.worktree_path)) == "feature/login"
+    assert _rev_parse(Path(created.worktree_path)) == _rev_parse(git_repo)
     assert isinstance(created, CreatedWorktree)
 
 
@@ -218,7 +226,11 @@ def test_create_worktree_missing_subdir_leaves_no_worktree(
     assert _branch_exists(git_repo, "old-base")
 
 
-def test_create_worktree_from_linked_worktree_anchors_at_main_repo(git_repo: Path) -> None:
+@pytest.mark.parametrize("detached", [False, True])
+@pytest.mark.parametrize("subdirectory", [False, True])
+def test_create_worktree_from_linked_worktree_anchors_at_main_repo(
+    git_repo: Path, detached: bool, subdirectory: bool
+) -> None:
     """Creating a worktree while inside a LINKED worktree anchors at the MAIN repo.
 
     Resolving the repo root naively (``rev-parse --show-toplevel``) from a
@@ -232,9 +244,16 @@ def test_create_worktree_from_linked_worktree_anchors_at_main_repo(git_repo: Pat
     first = create_worktree(repo_path=str(git_repo), branch_name="feature/a")
     first_path = Path(first.worktree_path)
     assert first_path == git_repo.parent / "myrepo-worktrees" / "feature-a"
+    (first_path / "src").mkdir()
+    (first_path / "src" / "source.txt").write_text("Only in the source checkout")
+    _git(first_path, "add", ".")
+    _git(first_path, "commit", "-qm", "advance source checkout")
+    if detached:
+        _git(first_path, "checkout", "--detach", "-q")
 
     # Second worktree, requested from INSIDE the first (linked) worktree.
-    second = create_worktree(repo_path=str(first_path), branch_name="feature/b")
+    source_directory = first_path / "src" if subdirectory else first_path
+    second = create_worktree(repo_path=str(source_directory), branch_name="feature/b")
 
     # Sibling of the MAIN repo, NOT nested under the first worktree. A
     # regression to --show-toplevel would put it under
@@ -243,6 +262,11 @@ def test_create_worktree_from_linked_worktree_anchors_at_main_repo(git_repo: Pat
     assert "feature-a-worktrees" not in second.worktree_path
     assert Path(second.worktree_path).is_dir()
     assert _current_branch(Path(second.worktree_path)) == "feature/b"
+    assert _rev_parse(Path(second.worktree_path)) == _rev_parse(first_path)
+    assert _rev_parse(Path(second.worktree_path)) != _rev_parse(git_repo)
+    assert (
+        Path(second.worktree_path) / "src" / "source.txt"
+    ).read_text() == "Only in the source checkout"
 
 
 def test_create_worktree_from_base_branch(git_repo: Path) -> None:

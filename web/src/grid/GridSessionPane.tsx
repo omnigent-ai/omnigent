@@ -8,6 +8,7 @@ import {
   type ComponentProps,
 } from "react";
 import { createPortal } from "react-dom";
+import { useQueryClient } from "@tanstack/react-query";
 import { useDraggable, useDroppable } from "@dnd-kit/core";
 import { cn } from "@/lib/utils";
 import { Maximize2Icon, XIcon } from "lucide-react";
@@ -59,6 +60,7 @@ import type { RightRailTab } from "@/shell/railTabs";
 import type { ChangedSort } from "@/shell/FlatFileList";
 import { WorkspacePanel } from "@/shell/WorkspacePanel";
 import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
+import { selectPullRequestInPanel } from "@/shell/PullRequestPanel";
 import { citedFilePosition } from "@/shell/filePositionState";
 import { useGridSessions } from "./GridSessionsContext";
 
@@ -87,6 +89,7 @@ export function GridSessionPane({
   workspacePanel: GridWorkspacePanelProps;
   onOpenWorkspace: () => void;
 }) {
+  const queryClient = useQueryClient();
   const { session, isLoading: sessionLoading } = useSession(sessionId);
   const state = useConversationEntryState(sessionId);
   const canEdit = useCanEdit(sessionId);
@@ -320,9 +323,12 @@ export function GridSessionPane({
       openFile,
       registerNavigationGuard,
       guardFileNavigation: navigateWorkspace,
-      openGithubTab: () => {
-        selectTab("github");
-        onOpenWorkspace();
+      openGithubTab: (prUrl?: string) => {
+        navigateWorkspace("", undefined, () => {
+          if (prUrl) selectPullRequestInPanel(queryClient, sessionId, prUrl);
+          showTab("github");
+          onOpenWorkspace();
+        });
       },
       openFolder: showFiles
         ? (absolutePath: string) =>
@@ -341,7 +347,7 @@ export function GridSessionPane({
     [
       openFile,
       registerNavigationGuard,
-      selectTab,
+      queryClient,
       navigateWorkspace,
       showTab,
       onOpenWorkspace,

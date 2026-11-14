@@ -31,7 +31,7 @@ interface FileViewerContextType {
   /** Runs the registered guards, then `commit` once the viewer allows leaving its file. */
   guardFileNavigation?: FileNavigationGuard;
   /** Open Pull Requests in the workspace rail or mobile drawer. */
-  openGithubTab: () => void;
+  openGithubTab: (prUrl?: string) => void;
   /** Show a host-absolute folder in the Files tree; absent where no Files panel exists. */
   openFolder?: (absolutePath: string) => void;
   /**
@@ -81,7 +81,7 @@ export function useFolderOpener(): ((absolutePath: string) => void) | null {
  * Returns a callback that opens the Pull Requests rail tab or mobile drawer, or `null`
  * when used outside AppShell (tests, Storybook).
  */
-export function useOpenGithubTab(): (() => void) | null {
+export function useOpenGithubTab(): ((prUrl?: string) => void) | null {
   return useContext(FileViewerContext)?.openGithubTab ?? null;
 }
 

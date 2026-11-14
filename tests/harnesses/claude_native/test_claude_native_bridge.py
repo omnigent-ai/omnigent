@@ -4389,7 +4389,7 @@ def test_generated_claude_subprocesses_pin_runner_tmpdir(
         for hook in entry["hooks"]
         if "/venv/bin/python" in hook["command"]
     ]
-    assert len(python_commands) == 20
+    assert len(python_commands) == 21
     expected_tmpdir = f"env TMPDIR={shlex.quote(str(runner_tmpdir))}"
     assert all(expected_tmpdir in command for command in python_commands)
 
@@ -5164,6 +5164,27 @@ def test_augment_claude_args_registers_user_prompt_submit_policy_hook(
     )
 
 
+def test_augment_claude_args_registers_policy_hook_for_failed_tool_calls(
+    tmp_path: Path,
+) -> None:
+    """
+    Failed tool calls reach TOOL_RESULT policies through PostToolUseFailure.
+
+    Claude Code fires PostToolUseFailure instead of PostToolUse when a tool
+    fails, so result policies such as ``detect_thrashing`` need a catch-all
+    evaluate-policy hook there too. The hook stays gated on a server URL.
+    """
+    settings = _load_invocation_settings(
+        augment_claude_args((), bridge_dir=tmp_path, ap_server_url="http://127.0.0.1:8787")
+    )
+    entries = settings["hooks"].get("PostToolUseFailure", [])
+    assert ["matcher" in entry for entry in entries] == [False]
+    assert "evaluate-policy" in entries[0]["hooks"][0]["command"]
+
+    ungoverned = _load_invocation_settings(augment_claude_args((), bridge_dir=tmp_path))
+    assert "PostToolUseFailure" not in ungoverned["hooks"]
+
+
 def test_augment_claude_args_omits_user_prompt_submit_policy_hook_without_server(
     tmp_path: Path,
 ) -> None:
@@ -5298,6 +5319,35 @@ def test_write_tmux_target_persists_socket_and_target(tmp_path: Path) -> None:
     assert before <= payload["updated_at"] <= after
 
 
+@pytest.mark.parametrize("content", ["\x07\x1b", "\n\n"], ids=["control-only", "newlines-only"])
+def test_inject_user_message_rejects_a_message_with_nothing_to_paste(
+    content: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Content that encodes to an empty paste is refused before any tmux write."""
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    captured: list[list[str]] = []
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=_composer_pane(), stderr="")
+        captured.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    with pytest.raises(RuntimeError, match="no text to paste"):
+        inject_user_message(bridge_dir, content=content)
+
+    assert captured == [], f"Expected no tmux writes for an unpasteable message, got {captured}"
+
+
 # Each send-keys first leaves copy mode in the same tmux call; without it,
 # a pane the reader scrolled back hands the keys to tmux instead of Claude.
 _LEAVE_COPY_MODE = ["copy-mode", "-q", "-t", "claude:0.0", ";"]
@@ -5306,24 +5356,46 @@ _LEAVE_COPY_MODE = ["copy-mode", "-q", "-t", "claude:0.0", ";"]
 @pytest.mark.parametrize(
     "content,expected_payload",
     [
-        # Plain single line: trailing CR appended (newline -> 0x0d).
-        ("hello world", b"hello world\r"),
+        # Plain single line: content bytes only; the submit Enter is a separate call.
+        ("hello world", b"hello world"),
         # Multi-line: interior newline rides as CR inside the paste so
         # Claude's TUI keeps it as data instead of submitting per line.
-        ("line one\nline two", b"line one\rline two\r"),
-        # Trailing "\" escapes the appended paste CR, not the submit Enter.
+        ("line one\nline two", b"line one\rline two"),
+        # Exactly two line breaks stay two: a third CR tips Claude Code into
+        # collapsing the paste to a "[Pasted text #N +3 lines]" placeholder.
+        ("first line\n\nthird line", b"first line\r\rthird line"),
+        # A trailing newline is dropped: it adds nothing before the submit Enter
+        # and would be the third break that collapses the paste.
+        ("first line\n\nthird line\n", b"first line\r\rthird line"),
+        # Trailing "\" escapes an appended paste CR, not the submit Enter.
         ("deploy to prod\\", b"deploy to prod\\\r"),
+        # A "\" the user already followed with a newline needs no extra CR.
+        ("deploy to prod\\\n", b"deploy to prod\\\r"),
+        # The guard looks at the encoded bytes: a dropped control byte after
+        # the "\" still leaves it trailing.
+        ("deploy to prod\\\x07", b"deploy to prod\\\r"),
         # CRLF line endings coalesce to a single CR (no doubled blank line).
-        ("a\r\nb", b"a\rb\r"),
+        ("a\r\nb", b"a\rb"),
         # A stray ESC in the content is dropped so it can't prematurely
         # close the bracketed-paste sequence on Claude's side.
-        ("a\x1bb", b"ab\r"),
+        ("a\x1bb", b"ab"),
         # Large payload (a PR diff in a sub-agent dispatch). Must ride the
         # load-buffer file — per-byte send-keys argv tripped tmux's ~16KB
         # client→server command cap with "command too long".
-        ("x" * 100_000, b"x" * 100_000 + b"\r"),
+        ("x" * 100_000, b"x" * 100_000),
     ],
-    ids=["plain", "multiline", "trailing-backslash", "crlf", "embedded-esc", "large"],
+    ids=[
+        "plain",
+        "multiline",
+        "two-line-breaks",
+        "trailing-newline",
+        "trailing-backslash",
+        "backslash-then-newline",
+        "backslash-then-dropped-control",
+        "crlf",
+        "embedded-esc",
+        "large",
+    ],
 )
 def test_inject_user_message_pastes_content_then_submits(
     content: str,
@@ -5398,9 +5470,8 @@ def test_inject_user_message_pastes_content_then_submits(
     assert refocus[-4:] == ["send-keys", "-t", "claude:0.0", "Space"]
     assert clear[3:8] == _LEAVE_COPY_MODE
     assert clear[-4:] == ["-l", "-t", "claude:0.0", _CLEAR_ONE_ROW_COMPOSER]
-    # The buffer file carried the normalized content + trailing CR. A
-    # missing trailing CR is the trailing-CR regression; a newline that stayed
-    # \n (not CR) is the anthropics/claude-code#52126 multi-line collapse.
+    # An extra CR collapses a two-break message into a placeholder; a newline
+    # left as \n (not CR) is the anthropics/claude-code#52126 collapse.
     assert loaded_payloads == [expected_payload]
     assert load[:6] == [
         "tmux",
@@ -17968,6 +18039,34 @@ async def test_relay_keeps_high_descriptor_connections_alive(
         release.set()
         await asyncio.wait_for(call, 2)
         relay.close()
+
+
+def test_read_tmux_target_reads_back_a_written_advertisement(tmp_path: Path) -> None:
+    """A written advertisement reads back with both fields; a missing one reads as None."""
+    bridge_dir = tmp_path / "bridge"
+    assert claude_native_bridge.read_tmux_target(bridge_dir) is None
+    write_tmux_target(
+        bridge_dir,
+        socket_path=tmp_path / "tmux.sock",
+        tmux_target="main",
+    )
+    assert claude_native_bridge.read_tmux_target(bridge_dir) == {
+        "socket_path": str(tmp_path / "tmux.sock"),
+        "tmux_target": "main",
+    }
+
+
+def test_read_tmux_target_rejects_invalid_payloads(tmp_path: Path) -> None:
+    """Malformed or field-less tmux.json is not a usable advertisement."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    tmux_file = bridge_dir / "tmux.json"
+    tmux_file.write_text("not json", encoding="utf-8")
+    assert claude_native_bridge.read_tmux_target(bridge_dir) is None
+    tmux_file.write_text(json.dumps({"socket_path": "/tmp/x.sock"}), encoding="utf-8")
+    assert claude_native_bridge.read_tmux_target(bridge_dir) is None
+    tmux_file.write_text(json.dumps({"socket_path": 1, "tmux_target": "main"}), encoding="utf-8")
+    assert claude_native_bridge.read_tmux_target(bridge_dir) is None
 
 
 @pytest.mark.parametrize("saved", [False, True])

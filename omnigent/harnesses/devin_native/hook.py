@@ -38,6 +38,7 @@ import httpx
 
 from omnigent.harnesses.devin_native.questions import answered_question_input, question_payload
 from omnigent.native.native_policy_hook import (
+    TOOL_FAILED_PAYLOAD_KEY,
     _is_login_redirect_or_unauthorized,
     evaluation_response_to_hook_output,
     fail_closed_hook_output,
@@ -97,6 +98,8 @@ def _normalize_tool_result(payload: _JsonObject) -> _JsonObject:
     normalize here rather than teaching the shared seam a third spelling.
     Prefers the human-readable ``output``, falling back to ``error`` and then
     the whole object so a policy that matches on result text still sees it.
+    ``"success": false`` sets :data:`TOOL_FAILED_PAYLOAD_KEY`, because the
+    flattened text alone often doesn't look like an error.
     """
     if "tool_output" in payload:
         return payload
@@ -105,6 +108,8 @@ def _normalize_tool_result(payload: _JsonObject) -> _JsonObject:
         return payload
     normalized = dict(payload)
     if isinstance(response, dict):
+        if response.get("success") is False:
+            normalized[TOOL_FAILED_PAYLOAD_KEY] = True
         output = response.get("output")
         error = response.get("error")
         if isinstance(output, str) and output:

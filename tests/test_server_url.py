@@ -16,11 +16,26 @@ import pytest
 from omnigent.util.server_url import (
     ServerUrl,
     display_server_url,
+    format_host_port,
     is_workspace_hosted_url,
     org_id_from_url,
 )
 
 _WORKSPACE_API = "https://ws.databricks.com/api/2.0/omnigent"
+
+
+@pytest.mark.parametrize(
+    "host, expected",
+    [
+        ("server.example.test", "server.example.test:6767"),
+        ("127.0.0.1", "127.0.0.1:6767"),
+        ("::1", "[::1]:6767"),
+        ("2001:db8::1", "[2001:db8::1]:6767"),
+        ("[::1]", "[::1]:6767"),
+    ],
+)
+def test_format_host_port(host: str, expected: str) -> None:
+    assert format_host_port(host, 6767) == expected
 
 
 @pytest.fixture(autouse=True)

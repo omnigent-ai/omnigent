@@ -785,3 +785,20 @@ def test_checkout_inference_keeps_an_existing_association(
     pr_resource.infer_checkout_pr("session", repo)
     [entry] = SessionPrRegistry("session").list()
     assert entry.relationship == relationship
+
+
+def test_a_provider_with_only_the_commit_methods_keeps_its_commit_history() -> None:
+    """Through head is a separate facet, so a provider without it still lists commits."""
+    from omnigent.runner.git_providers import CommitCompareFacet, CommitsFacet
+
+    class CommitsOnly:
+        def commits(self, root: str, reference: object, *, head_sha: str) -> dict[str, object]:
+            return {"object": "list", "data": [], "has_more": False}
+
+        def commit_diff(
+            self, root: str, reference: object, *, commit_sha: str
+        ) -> dict[str, object]:
+            return {"object": "session.github.pr_diff", "patch": ""}
+
+    assert isinstance(CommitsOnly(), CommitsFacet)
+    assert not isinstance(CommitsOnly(), CommitCompareFacet)

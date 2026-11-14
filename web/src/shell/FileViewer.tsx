@@ -54,6 +54,7 @@ import {
   PencilLineIcon,
   RowsIcon,
   SearchIcon,
+  Share2Icon,
   SquareArrowOutUpRightIcon,
   Trash2Icon,
   WrapTextIcon,
@@ -102,12 +103,15 @@ import {
 import { CommentSenderProvider, useOptionalCommentSender } from "@/hooks/CommentSenderContext";
 import { markCommentsSeen } from "@/hooks/useSeenComments";
 import { useChatStore } from "@/store/chatStore";
+import { useFileMentionHarnesses } from "@/lib/agentLabels";
+import { harnessSupportsFileMentions } from "@/lib/composerMentions";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
 import { copyText } from "@/lib/clipboard";
 import { absoluteWorkspacePath } from "@/lib/composerContext";
+import { isFileComment } from "@/lib/localReviewComments";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { hasCommandModifier } from "@/lib/hotkeys";
@@ -345,6 +349,9 @@ interface FileViewerProps {
 
   /** Called when the user navigates to a different file via the prev/next buttons. */
   onNavigateTo?: (path: string) => void;
+  /** Opens session sharing with a fullscreen link to this file. */
+  onShare?: () => void;
+  shareDisabledReason?: string;
   /**
    * Numeric permission level for the current user on this session
    * (1 = read, 2 = edit, 3 = manage, 4 = owner). ``null`` means
@@ -405,6 +412,8 @@ function FileViewerBody({
   onClose,
   onCloseTab,
   onNavigateTo,
+  onShare,
+  shareDisabledReason,
   permissionLevel,
   frameless,
   mobileOverlay = false,
@@ -415,6 +424,10 @@ function FileViewerBody({
   // null = single-user mode (no enforcement); undefined = prop not provided (treat as unrestricted).
   // LEVEL_EDIT = 2; levels below 2 are read-only.
   const canEdit = permissionLevel == null || permissionLevel >= 2;
+  // Same gate as the composer's "@"-mention menu, so "Attach to agent" only
+  // shows when the session's agent will open the attached path.
+  const sessionHarness = useChatStore((s) => s.sessionHarness);
+  const attachToAgent = harnessSupportsFileMentions(sessionHarness, useFileMentionHarnesses());
   const [searchParams, setSearchParams] = useSearchParams();
   const rebasePath = useRebasePath();
   const isMobile = useIsMobileViewport();
@@ -560,7 +573,7 @@ function FileViewerBody({
   // marked seen too.
   useEffect(() => {
     if (!open || !commentsOpen || commentsQuery.data === undefined) return;
-    markCommentsSeen(commentsQuery.data.map((c) => c.id));
+    markCommentsSeen(commentsQuery.data.filter(isFileComment).map((c) => c.id));
   }, [open, commentsOpen, commentsQuery.data]);
   // Notify parent when comments panel opens or closes (e.g. so the parent
   // can widen the inline panel to fit both the code viewer and comments).
@@ -648,7 +661,10 @@ function FileViewerBody({
 
   const sender = useOptionalCommentSender();
 
-  const allComments = useMemo(() => commentsQuery.data ?? [], [commentsQuery.data]);
+  const allComments = useMemo(
+    () => (commentsQuery.data ?? []).filter(isFileComment),
+    [commentsQuery.data],
+  );
   const fileContent = useMemo(() => fileQuery.data?.content ?? "", [fileQuery.data]);
   const [remapFormatted, setRemapFormatted] = useState<
     ((comment: Comment, content: string) => Comment) | null
@@ -677,14 +693,14 @@ function FileViewerBody({
     () => classifyAndRemapComments(allComments, fileContent, remapFormatted),
     [allComments, fileContent, remapFormatted],
   );
-  // Address All sends drafts from every file; this file's own query supplies its drafts.
+  // Address All sends Files drafts across paths; this file's own query supplies its drafts.
   // Until both lists load, a send would silently skip the unloaded list's drafts.
   const { ids: addressableCommentIds, fileCount: addressableFileCount } = useMemo(() => {
     if (!commentsQuery.data || !sessionCommentsQuery.data) return { ids: [], fileCount: 0 };
     const ids = new Set(openComments.map((c) => c.id));
     const paths = new Set(openComments.length > 0 ? [path] : []);
     for (const c of sessionCommentsQuery.data) {
-      if (c.status === "draft" && c.path !== path) {
+      if (isFileComment(c) && c.status === "draft" && c.path !== path) {
         ids.add(c.id);
         paths.add(c.path);
       }
@@ -1213,6 +1229,8 @@ function FileViewerBody({
     icon: ReactNode;
     onSelect?: () => void;
     active?: boolean;
+    disabled?: boolean;
+    disabledLabel?: string;
     /** When set, render a picker (dropdown/submenu) over these mutually
      * exclusive choices instead of a single button. `onSelect` is ignored. */
     options?: ToolbarOption[];
@@ -1461,6 +1479,19 @@ function FileViewerBody({
     ),
     onSelect: copyFileLink,
   });
+  if (onShare) {
+    toolbarActions.push({
+      key: "share-file",
+      label: "Share file",
+      tooltip: shareDisabledReason ?? "Share file",
+      disabledLabel: shareDisabledReason
+        ? `Share file disabled: ${shareDisabledReason}`
+        : undefined,
+      icon: <Share2Icon className="size-4" />,
+      disabled: !!shareDisabledReason,
+      onSelect: onShare,
+    });
+  }
   if (openInActions.length) {
     toolbarActions.push({
       key: "open-in",
@@ -1493,6 +1524,23 @@ function FileViewerBody({
       `path:${path}`,
     ].join("|"),
   );
+
+  const renderActionButton = (action: ToolbarAction, interactive: boolean) => {
+    const button = (
+      <Button
+        type="button"
+        variant={action.active ? "default" : "ghost"}
+        size="icon-sm"
+        aria-label={action.disabledLabel ?? action.label}
+        disabled={action.disabled}
+        tabIndex={interactive ? undefined : -1}
+        onClick={interactive ? action.onSelect : undefined}
+      >
+        {action.icon}
+      </Button>
+    );
+    return action.disabled ? <span className="inline-flex">{button}</span> : button;
+  };
 
   // The expanded inline row — rendered both offscreen (for measurement) and,
   // when it fits, as the visible toolbar. `interactive` is false for the
@@ -1589,18 +1637,7 @@ function FileViewerBody({
       ) : (
         <TooltipProvider key={action.key}>
           <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                type="button"
-                variant={action.active ? "default" : "ghost"}
-                size="icon-sm"
-                aria-label={action.label}
-                tabIndex={interactive ? undefined : -1}
-                onClick={interactive ? action.onSelect : undefined}
-              >
-                {action.icon}
-              </Button>
-            </TooltipTrigger>
+            <TooltipTrigger asChild>{renderActionButton(action, interactive)}</TooltipTrigger>
             <TooltipContent>{action.tooltip ?? action.label}</TooltipContent>
           </Tooltip>
         </TooltipProvider>
@@ -1817,6 +1854,24 @@ function FileViewerBody({
                               )}
                             </DropdownMenuItem>
                           ))
+                        ) : action.disabled ? (
+                          <TooltipProvider key={action.key}>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <span className="block">
+                                  <DropdownMenuItem
+                                    disabled
+                                    aria-label={action.disabledLabel ?? action.label}
+                                    className="whitespace-nowrap"
+                                  >
+                                    {action.icon}
+                                    {action.label}
+                                  </DropdownMenuItem>
+                                </span>
+                              </TooltipTrigger>
+                              <TooltipContent>{action.tooltip ?? action.label}</TooltipContent>
+                            </Tooltip>
+                          </TooltipProvider>
                         ) : (
                           <DropdownMenuItem
                             key={action.key}
@@ -1943,6 +1998,7 @@ function FileViewerBody({
                     activeSelection={activeSelection}
                     onSetActiveSelection={handleSetActiveSelection}
                     pendingBodyRef={pendingBodyRef}
+                    attachToAgent={attachToAgent}
                     searchOpen={searchOpen}
                     searchFocusNonce={searchFocusNonce}
                     onSearchHandled={handleSearchHandled}
@@ -1975,6 +2031,7 @@ function FileViewerBody({
               tocOpen={tocOpen}
               onTocToggle={() => setTocOpen((prev) => !prev)}
               onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
+              attachToAgent={attachToAgent}
             />
           )}
         </div>

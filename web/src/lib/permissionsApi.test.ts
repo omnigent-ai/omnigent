@@ -117,6 +117,22 @@ describe("listPermissions", () => {
 });
 
 describe("grantPermission", () => {
+  it("requests minimum access and returns the stronger stored grant", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ user_id: "bob", conversation_id: "conv_abc", level: 2 }),
+    );
+
+    const result = await grantPermission("conv_abc", "bob", 1, true);
+
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(JSON.parse(init.body as string)).toEqual({
+      user_id: "bob",
+      level: 1,
+      ensure_minimum: true,
+    });
+    expect(result.level).toBe(2);
+  });
+
   it("PUTs /v1/sessions/{id}/permissions with user_id and level", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({ user_id: "bob", conversation_id: "conv_abc", level: 2 }),

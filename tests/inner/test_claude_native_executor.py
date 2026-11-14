@@ -27,7 +27,13 @@ from omnigent.harnesses.claude_native.bridge import (
 )
 from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
-from omnigent.inner.executor import ExecutorConfig, ExecutorError, TextChunk, TurnComplete
+from omnigent.inner.executor import (
+    ExecutorConfig,
+    ExecutorError,
+    ExecutorWait,
+    TextChunk,
+    TurnComplete,
+)
 from omnigent.inner.native_attachments import attachment_cache_dir
 
 # Minimal valid 1x1 white PNG used for multimodal attachment tests.
@@ -405,6 +411,7 @@ async def test_run_turn_cancels_a_full_disk_hold_without_failing(
     )
 
     assert isinstance(await turn.__anext__(), TextChunk)
+    assert isinstance(await turn.__anext__(), ExecutorWait)
     pending_next = asyncio.create_task(turn.__anext__())
     await asyncio.sleep(0)
     pending_next.cancel()

@@ -112,6 +112,11 @@ export interface ScheduledTaskRun {
   finishedAt: number | null;
   /** Queryable failure classification, e.g. `no_online_host`; `null` on success. */
   errorCode: string | null;
+  /**
+   * The server's description of the failure, e.g. a sandbox provider's recovery
+   * steps, capped server-side; `null` when the run recorded none.
+   */
+  errorDetail: string | null;
   /** Epoch seconds of the conversation's last update; `null` for runs without a conversation. */
   conversationUpdatedAt: number | null;
   /**
@@ -263,6 +268,7 @@ interface ScheduledTaskRunWire {
   fired_at: number | null;
   finished_at: number | null;
   error_code: string | null;
+  error_detail?: string | null;
   conversation_updated_at: number | null;
   conversation_status: string | null;
   viewer_last_seen: number | null;
@@ -351,6 +357,7 @@ function runFromWire(wire: ScheduledTaskRunWire): ScheduledTaskRun {
     firedAt: wire.fired_at,
     finishedAt: wire.finished_at,
     errorCode: wire.error_code,
+    errorDetail: wire.error_detail ?? null,
     conversationUpdatedAt: wire.conversation_updated_at ?? null,
     conversationStatus: wire.conversation_status ?? null,
     viewerLastSeen: wire.viewer_last_seen ?? null,

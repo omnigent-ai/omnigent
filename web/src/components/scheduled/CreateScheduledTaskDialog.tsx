@@ -3,10 +3,19 @@ import { useScheduleEscape } from "./useScheduleEscape";
 // Dialog for creating or editing a scheduled task. Reuses the existing agent,
 // host, and workspace pickers where the backend can persist those fields.
 
-import { cn } from "@/lib/utils";
-import { pickerTriggerClass } from "./pickerStyles";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { ChevronDownIcon, ClockIcon, FolderOpenIcon, TriangleAlertIcon } from "lucide-react";
+import {
+  BoxIcon,
+  CalendarOffIcon,
+  ChevronRightIcon,
+  ClockIcon,
+  FolderIcon,
+  FolderOpenIcon,
+  MonitorIcon,
+  RefreshCwIcon,
+  ShieldCheckIcon,
+  TriangleAlertIcon,
+} from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -18,12 +27,17 @@ import {
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
-import { Switch } from "@/components/ui/switch";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -34,27 +48,37 @@ import {
   acceptsApprovalSkippingModes,
   useScheduledHarnessSettings,
 } from "./useScheduledHarnessSettings";
-import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
+import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
+import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
+import { ComposerHarnessTrigger } from "@/components/composer/ComposerControls";
+import { PickerSectionHeader } from "@/components/composer/HarnessMenuRow";
 import { TriggerTemplateFields } from "@/components/scheduled/TriggerTemplateFields";
+import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
 import {
   TriggerWorkerHarnessField,
   TriggerWorkerSettingsFields,
 } from "./TriggerWorkerSettingsFields";
 import {
   combineTriggerPrompt,
+  decodeTriggerPrompt,
   emptyTriggerFields,
   isTaskSessionTriggerPrompt,
+  encodeTriggerPrompt,
+  hasTriggerHeader,
   isTriggerPrompt,
   readTriggerWorkerPlacement,
   readTriggerWorkerSettings,
-  renderTriggerPrompt,
+  renderTriggerConfigPrompt,
   splitTriggerPrompt,
   TRIGGER_SOURCES,
+  stripTriggerHeader,
   TRIGGER_TEMPLATES,
   triggerFieldsComplete,
   triggerPromptSource,
   triggerServiceName,
+  triggerWorkerSettingsOf,
   updateTriggerWorkerSettings,
+  type TriggerConfig,
   type TriggerFields,
   type TriggerTaskSessionMode,
   type TriggerWorkerSettings,
@@ -73,6 +97,7 @@ import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { isFeatureEnabled, pickerCuration, sandboxOptionLabel } from "@/lib/capabilities";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
 import { partitionPickerEntries, selectableSessionAgents } from "@/lib/agentGrouping";
+import { nativeAgentHasModelSettings } from "@/lib/nativeCodingAgents";
 import {
   APPROVAL_SKIPPING_PERMISSION_MODES,
   NEW_AUTOMATION_PERMISSION_MODES,
@@ -105,6 +130,7 @@ import {
 import { localTimezone } from "@/lib/timezones";
 import { describeSchedule } from "@/lib/scheduleText";
 import { Link } from "@/lib/routing";
+import { inferHostSshTarget } from "@/lib/editorLinks";
 import { useSession } from "@/hooks/useSession";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
@@ -112,7 +138,11 @@ import type { AutomationSourceSession } from "@/lib/automationFromSession";
 import type { Session } from "@/lib/types";
 
 const PROVIDER_DEFAULT = "provider-default";
+const PERMISSION_SELECT_DEFAULT = "__agent_default__";
 const DEFAULT_AUTOMATION_PROJECT = "Omnigent Automation";
+const AUTOMATION_CONTROL_TRIGGER_CLASS_NAME =
+  "h-9! min-h-9! max-w-full justify-start gap-1.5 rounded-lg border border-input bg-transparent py-2 pr-2 pl-2.5 text-ui leading-5 font-normal md:min-h-9! [&_svg]:p-0! [&>svg:last-child]:ml-auto [&>svg:last-child]:text-muted-foreground [&>svg:last-child]:opacity-100 [&_[data-testid$='-agent-model-value']]:font-normal";
+const AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME = `${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} border-transparent`;
 
 type AutomationTriggerType = "schedule" | TriggerSource;
 const AUTOMATION_TRIGGER_TYPES: readonly AutomationTriggerType[] = ["schedule", ...TRIGGER_SOURCES];
@@ -136,61 +166,6 @@ function TriggerTypeOption({ type }: { type: AutomationTriggerType }) {
   );
 }
 
-/** The Trigger type field; create mode offers a schedule, a trigger edit only integrations. */
-function TriggerTypeSelect<Type extends AutomationTriggerType>({
-  value,
-  types,
-  isTypeDisabled,
-  onChange,
-  onOpenChange,
-  disabled,
-  children,
-}: {
-  value: Type;
-  types: readonly Type[];
-  isTypeDisabled?: (type: Type) => boolean;
-  onChange: (type: Type) => void;
-  onOpenChange: (isOpen: boolean) => void;
-  disabled: boolean;
-  children?: ReactNode;
-}) {
-  return (
-    <div className="flex flex-col gap-1.5">
-      <Label htmlFor="task-trigger-type">Trigger type</Label>
-      <Select
-        value={value}
-        onValueChange={(next) => onChange(next as Type)}
-        onOpenChange={onOpenChange}
-        disabled={disabled}
-        componentId="tasks.scheduled.trigger_type"
-      >
-        <SelectTrigger id="task-trigger-type" data-testid="task-trigger-type" className="w-full">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent position="popper" align="start">
-          {types.map((type) => (
-            <SelectItem
-              key={type}
-              value={type}
-              disabled={isTypeDisabled?.(type) ?? false}
-              data-testid={`task-trigger-type-${type}`}
-            >
-              <TriggerTypeOption type={type} />
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
-      {children}
-    </div>
-  );
-}
-
-/** A source's draft while editing a trigger: its fields, and its prompt editor once edited as a prompt. */
-interface EditSourceDraft {
-  fields: TriggerFields;
-  promptEditor: { prompt: string; systemPrompt: string | null } | null;
-}
-
 /** Restore a saved trigger prompt, applying worker settings changed while switched away. */
 function restoreSourcePrompt(
   userPrompt: string,
@@ -205,7 +180,8 @@ function restoreSourcePrompt(
     saved === null ||
     (saved.agentId === workerSettings.agentId &&
       saved.model === workerSettings.model &&
-      saved.effort === workerSettings.effort)
+      saved.effort === workerSettings.effort &&
+      saved.permissionMode === workerSettings.permissionMode)
   ) {
     return restored;
   }
@@ -222,6 +198,10 @@ interface AutomationTypeDraft {
   schedule: ScheduleModel;
   timezone: string;
   sessionMode: ScheduledTaskSessionMode;
+}
+
+function SettingsGroupHeading({ children }: { children: ReactNode }) {
+  return <h3 className="text-sm font-medium text-foreground">{children}</h3>;
 }
 
 export function CreateScheduledTaskDialog({
@@ -258,6 +238,8 @@ export function CreateScheduledTaskDialog({
   const anchoredScheduling = isFeatureEnabled(info, "automations_v2");
   const subhourSupported = info !== "loading" && info.scheduled_task_subhour === true;
   const triggerPollMinutes = info !== "loading" ? (info.automation_trigger_poll_minutes ?? 10) : 10;
+  const triggerHeadersSupported =
+    info !== "loading" && info.scheduled_task_trigger_headers === true;
   // Gates the "new sandbox each run" option: only servers that can actually
   // serve a managed launch advertise it (same flag New Chat's sandbox option
   // gates on). "loading" → treat as disabled until /v1/info resolves.
@@ -268,6 +250,10 @@ export function CreateScheduledTaskDialog({
     info !== "loading" && info.scheduled_task_sandbox_workspaces === true && info.sandbox_provider
       ? (info.sandbox_provider_capabilities?.[info.sandbox_provider]?.repo_catalog ?? [])
       : [];
+  const sandboxAutomationNotice =
+    info !== "loading" && info.sandbox_provider
+      ? (info.sandbox_provider_automation_notices?.[info.sandbox_provider] ?? null)
+      : null;
 
   const {
     data: projects = [],
@@ -298,31 +284,42 @@ export function CreateScheduledTaskDialog({
     editingTask !== null &&
     editingTask.sessionMode === "continue" &&
     isTriggerPrompt(editingTask.prompt);
+  // A trigger with a valid header reopens in its form. One edited outside the form
+  // opens as its full prompt; one saved before headers, as its instructions.
+  const editingTriggerConfig = useMemo(
+    () => (editingTemplateTrigger ? decodeTriggerPrompt(editingTask?.prompt ?? "") : null),
+    [editingTemplateTrigger, editingTask],
+  );
   // Temporary prompt edits must not expose controls that can rebind the poller.
-  const savedWorkerSettings = editingTemplateTrigger
-    ? readTriggerWorkerSettings(editingTask.prompt)
-    : null;
+  // A header's worker settings come from the form; an older trigger's, from its creation call.
+  const savedWorkerSettings: TriggerWorkerSettings | null = editingTriggerConfig
+    ? triggerWorkerSettingsOf(editingTriggerConfig.worker)
+    : editingTemplateTrigger
+      ? readTriggerWorkerSettings(editingTask.prompt)
+      : null;
   const editingWorkerSettings = savedWorkerSettings !== null;
   // A switch re-renders the workers, so it needs the saved worker settings to carry over.
   const editingTriggerSource =
-    editingTask !== null && editingWorkerSettings ? triggerPromptSource(editingTask.prompt) : null;
+    editingTriggerConfig?.source ??
+    (editingTask !== null && editingWorkerSettings
+      ? triggerPromptSource(editingTask.prompt)
+      : null);
   const savedWorkerPlacement =
-    editingTask !== null && editingWorkerSettings
+    editingTriggerConfig?.worker.placement ??
+    (editingTask !== null && editingWorkerSettings
       ? readTriggerWorkerPlacement(editingTask.prompt)
-      : null;
+      : null);
 
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
+  // The rendered template text around the instructions of an older trigger. Never shown.
   const [systemPrompt, setSystemPrompt] = useState<string | null>(null);
-  const [systemPromptOpen, setSystemPromptOpen] = useState(false);
-  const [editingSystemPrompt, setEditingSystemPrompt] = useState(false);
   const promptFieldsRef = useRef<HTMLDivElement>(null);
   const [schedule, setSchedule] = useState<ScheduleModel>(DEFAULT_SCHEDULE_MODEL);
   const [timezone, setTimezone] = useState(localTimezone);
 
   // Empty overrides use the agent's configured defaults when a run starts.
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(null);
-  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [pickedModel, setPickedModel] = useState<string>("");
   const [pickedEffort, setPickedEffort] = useState<string>("");
   const [pickedPermission, setPickedPermission] = useState<string>("");
@@ -366,6 +363,9 @@ export function CreateScheduledTaskDialog({
   const sourcePrefilledRef = useRef(false);
 
   function handleSelectAgent(agent: AvailableAgent) {
+    // Opening the selected row's Edit flyout selects it again; keep its current
+    // model and effort instead of treating that as a harness switch.
+    if (agent.id === effectiveAgentId) return;
     sourcePrefilledRef.current = true;
     setPickedAgentId(agent.id);
     // Settings belong to their harness. Returning to the edited task's agent
@@ -379,6 +379,7 @@ export function CreateScheduledTaskDialog({
     );
     setPickedPermission(backToOriginal ? (editingTask?.permissionMode ?? "") : "");
     setPermissionPicked(false);
+    setNewTriggerWorkerSettings(null);
   }
 
   // ── Nested dropdown dismiss guard ─────────────────────────────────────────
@@ -394,6 +395,8 @@ export function CreateScheduledTaskDialog({
   // Radix reports as "interact outside" is absorbed. See `guardDialogDismiss`.
   const selectOpenCountRef = useRef(0);
   const selectClosedAtRef = useRef(0);
+  const nestedMenuOpenCountRef = useRef(0);
+  const nestedMenuClosedAtRef = useRef(0);
   const [workspaceBrowserOpen, setWorkspaceBrowserOpen] = useState(false);
   function handleSelectOpenChange(isOpen: boolean) {
     if (isOpen) {
@@ -402,6 +405,14 @@ export function CreateScheduledTaskDialog({
       selectOpenCountRef.current = Math.max(0, selectOpenCountRef.current - 1);
       selectClosedAtRef.current = Date.now();
     }
+  }
+  function handleNestedMenuOpenChange(isOpen: boolean) {
+    nestedMenuOpenCountRef.current = Math.max(
+      0,
+      nestedMenuOpenCountRef.current + (isOpen ? 1 : -1),
+    );
+    if (!isOpen) nestedMenuClosedAtRef.current = Date.now();
+    handleSelectOpenChange(isOpen);
   }
   const [agentMenuOpen, setAgentMenuOpen] = useState(false);
   function changeAgentMenuOpen(next: boolean) {
@@ -421,11 +432,27 @@ export function CreateScheduledTaskDialog({
     changeProjectMenuOpen(false);
     return true;
   });
+  const [scheduleMenuOpen, setScheduleMenuOpen] = useState(false);
+  function changeScheduleMenuOpen(next: boolean) {
+    setScheduleMenuOpen(next);
+    handleSelectOpenChange(next);
+  }
+  const [endingMenuOpen, setEndingMenuOpen] = useState(false);
+  function changeEndingMenuOpen(next: boolean) {
+    setEndingMenuOpen(next);
+    handleSelectOpenChange(next);
+  }
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   function resetMenus() {
+    setAdvancedOpen(false);
     setWorkspaceBrowserOpen(false);
     setProjectMenuOpen(false);
     setAgentMenuOpen(false);
+    setScheduleMenuOpen(false);
+    setEndingMenuOpen(false);
     selectOpenCountRef.current = 0;
+    nestedMenuOpenCountRef.current = 0;
+    nestedMenuClosedAtRef.current = 0;
     selectClosedAtRef.current = 0;
   }
   /** preventDefault the Dialog's outside-dismiss ONLY for the narrow nested-Select
@@ -449,6 +476,21 @@ export function CreateScheduledTaskDialog({
     ) {
       event.preventDefault();
     }
+  }
+  function keepParentPopoverOpenForNestedMenu(event: {
+    target: EventTarget | null;
+    preventDefault: () => void;
+  }) {
+    if (
+      nestedMenuOpenCountRef.current > 0 ||
+      Date.now() - nestedMenuClosedAtRef.current < 150 ||
+      isInsidePopper(event.target)
+    ) {
+      event.preventDefault();
+    }
+  }
+  function keepParentPopoverOpenOnFocus(event: { preventDefault: () => void }) {
+    event.preventDefault();
   }
   // Pinned host/workspace. "" = none: a new task waits for a pick (it starts on
   // the first online host), and an older unpinned task keeps resolving its host
@@ -501,22 +543,28 @@ export function CreateScheduledTaskDialog({
   const [triggerFields, setTriggerFields] = useState<TriggerFields>(() =>
     emptyTriggerFields("jira"),
   );
-  // Like the model and effort overrides, this Advanced choice outlives switching trigger types.
+  // Like the model and effort overrides, this choice outlives switching trigger types.
   const [triggerTaskSessionMode, setTriggerTaskSessionMode] =
     useState<TriggerTaskSessionMode>("new");
-  // Kept while a trigger edit watches another source, so switching back restores the saved prompt.
+  // Kept while a trigger edit watches another source, so switching back restores the saved trigger.
   const [sourceSwitch, setSourceSwitch] = useState<{
     source: TriggerSource;
     savedPrompt: string;
     savedSystemPrompt: string | null;
+    /** The saved trigger's form, when it reopened from a header. */
+    savedFields: TriggerFields | null;
     savedStartNewSession: boolean;
   } | null>(null);
-  const editSourceDrafts = useRef<Partial<Record<TriggerSource, EditSourceDraft>>>({});
+  // Each other integration's form, so switching back and forth keeps its edits.
+  const editSourceDrafts = useRef<Partial<Record<TriggerSource, TriggerFields>>>({});
   const [switchedWorkerSettings, setSwitchedWorkerSettings] =
     useState<TriggerWorkerSettings | null>(null);
   const [switchedWorkerPlacement, setSwitchedWorkerPlacement] = useState<WorkerPlacement | null>(
     null,
   );
+  // A new trigger's workers follow the polling session's settings until changed; null = follow.
+  const [newTriggerWorkerSettings, setNewTriggerWorkerSettings] =
+    useState<TriggerWorkerSettings | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [scheduleUnsupported, setScheduleUnsupported] = useState(false);
   const defaultTriggerSchedule = useMemo(
@@ -545,18 +593,26 @@ export function CreateScheduledTaskDialog({
       editSourceDrafts.current = {};
       setSwitchedWorkerSettings(null);
       setSwitchedWorkerPlacement(null);
+      setNewTriggerWorkerSettings(null);
       setTriggerType(sourceSession ? "schedule" : (initialTrigger ?? "schedule"));
       resetMenus();
-      setAdvancedOpen(false);
       // A source switch keeps the saved trigger's task-session choice.
       setTriggerTaskSessionMode(
         editingTask && isTaskSessionTriggerPrompt(editingTask.prompt) ? "continue" : "new",
       );
-      setSystemPromptOpen(false);
-      setEditingSystemPrompt(false);
-      const parts = splitTriggerPrompt(editingTask?.prompt ?? initialPrompt ?? "");
-      setPrompt(parts.userPrompt);
-      setSystemPrompt(parts.systemPrompt);
+      const savedPrompt = editingTask?.prompt ?? initialPrompt ?? "";
+      if (editingTriggerConfig !== null) {
+        setPrompt("");
+        setSystemPrompt(null);
+      } else if (hasTriggerHeader(savedPrompt)) {
+        // The header no longer matches, so trust only the text the model runs.
+        setPrompt(stripTriggerHeader(savedPrompt));
+        setSystemPrompt(null);
+      } else {
+        const parts = splitTriggerPrompt(savedPrompt);
+        setPrompt(parts.userPrompt);
+        setSystemPrompt(parts.systemPrompt);
+      }
       setTimezone(editingTask?.timezone ?? localTimezone());
       if (editingTask) {
         const parsedSchedule = savedSchedule;
@@ -576,7 +632,20 @@ export function CreateScheduledTaskDialog({
         setPickedProjectId(null);
         setSessionMode(editingTask.sessionMode);
         setStartNewSession(false);
-        setTrigger(null);
+        if (editingTriggerConfig !== null) {
+          const {
+            source,
+            worker,
+            taskSessionMode: _taskSessionMode,
+            ...fields
+          } = editingTriggerConfig;
+          setTrigger(source);
+          setTriggerFields(fields);
+          setSwitchedWorkerSettings(triggerWorkerSettingsOf(worker));
+          setSwitchedWorkerPlacement(worker.placement);
+        } else {
+          setTrigger(null);
+        }
       } else {
         setName(
           initialTrigger
@@ -614,6 +683,7 @@ export function CreateScheduledTaskDialog({
     initialTrigger,
     defaultTriggerSchedule,
     editingTask,
+    editingTriggerConfig,
     savedSchedule,
     savedWorkspace,
     sourceSession,
@@ -714,6 +784,10 @@ export function CreateScheduledTaskDialog({
   // The resolved Host for the pinned id, or undefined when none is pinned.
   const selectedHost = hostId === "" ? undefined : hostOptions.find((h) => h.host_id === hostId);
   function handleWorkerSettingsChange(settings: TriggerWorkerSettings) {
+    if (!isEdit) {
+      setNewTriggerWorkerSettings(settings);
+      return;
+    }
     if (trigger !== null) {
       setSwitchedWorkerSettings(settings);
       return;
@@ -725,9 +799,10 @@ export function CreateScheduledTaskDialog({
     setSystemPrompt(parts.systemPrompt);
   }
 
-  let workerSettings: TriggerWorkerSettings | null = null;
+  const creatingTriggerWorkers = !isEdit && trigger !== null;
+  let editedWorkerSettings: TriggerWorkerSettings | null = null;
   if (editingWorkerSettings) {
-    workerSettings =
+    editedWorkerSettings =
       trigger !== null
         ? switchedWorkerSettings
         : readTriggerWorkerSettings(combineTriggerPrompt(prompt, systemPrompt));
@@ -741,14 +816,18 @@ export function CreateScheduledTaskDialog({
   }
   const workerSandboxMode = workerPlacement === "managed" || sandboxMode;
   const workerAgent = agents?.find(
-    (agent) => agent.id === (workerSettings?.agentId ?? editingTask?.agentId),
+    (agent) =>
+      agent.id === (editedWorkerSettings?.agentId ?? editingTask?.agentId ?? effectiveAgentId),
   );
+  const workerModel = creatingTriggerWorkers
+    ? (newTriggerWorkerSettings?.model ?? pickedModel)
+    : (editedWorkerSettings?.model ?? "");
   const workerHarnessSettings = useScheduledHarnessSettings(
     workerAgent,
     workerSandboxMode ? undefined : selectedHost,
     workerSandboxMode,
-    workerSettings?.model ?? "",
-    open && workerSettings !== null,
+    workerModel,
+    open && (editedWorkerSettings !== null || creatingTriggerWorkers),
   );
   const harnessSettings = useScheduledHarnessSettings(
     agents?.find((agent) => agent.id === effectiveAgentId),
@@ -776,11 +855,29 @@ export function CreateScheduledTaskDialog({
     harnessSettings.harness !== "claude-native" && permissionChoice === "default"
       ? ""
       : permissionChoice;
+  const sessionPermissionModesSupported =
+    info !== "loading" && info.session_create_permission_modes === true;
+  // A new template's workers default to the polling session's mode, except one that
+  // skips approval, which the server refuses for a session an agent starts.
+  const workerPermissionMode =
+    sessionPermissionModesSupported &&
+    effectivePermission !== "" &&
+    !APPROVAL_SKIPPING_PERMISSION_MODES.has(effectivePermission)
+      ? effectivePermission
+      : undefined;
+  let workerSettings: TriggerWorkerSettings | null = editedWorkerSettings;
+  if (creatingTriggerWorkers) {
+    workerSettings = newTriggerWorkerSettings ?? {
+      agentId: null,
+      model: supportsModel ? pickedModel : "",
+      effort: supportsModel ? pickedEffort : "",
+      permissionMode: workerPermissionMode ?? "",
+    };
+  }
   const originalTargetSelected =
     editingTask?.executionTarget === "managed_sandbox"
       ? sandboxMode
       : !sandboxMode && hostId === (editingTask?.hostId ?? "");
-  const showAdvanced = supportsModel || supportsPermission;
   // From a session: start from its model, effort and permission mode once its
   // snapshot and the harness options are known; unattended rules still apply.
   useEffect(() => {
@@ -836,6 +933,8 @@ export function CreateScheduledTaskDialog({
     }
     setPickedModel(restore ? (editingTask?.modelOverride ?? "") : "");
     setPickedEffort(restore ? (editingTask?.reasoningEffort ?? "") : "");
+    // Each target supplies its own model catalog.
+    setNewTriggerWorkerSettings(null);
     setBaseBranch(
       restore && !nextSandbox && nextWorkspace === savedWorkspace
         ? (editingTask?.baseBranch ?? null)
@@ -856,6 +955,15 @@ export function CreateScheduledTaskDialog({
     ) {
       setPickedEffort("");
     }
+  }
+  function handleEffortChange(effort: string) {
+    sourcePrefilledRef.current = true;
+    setPickedEffort(effort);
+  }
+  function handlePermissionChange(mode: string) {
+    sourcePrefilledRef.current = true;
+    setPickedPermission(mode === PERMISSION_SELECT_DEFAULT ? "" : mode);
+    setPermissionPicked(true);
   }
 
   const workspaceHostOffline = !sandboxMode && selectedHost?.status === "offline";
@@ -900,42 +1008,71 @@ export function CreateScheduledTaskDialog({
     buildRRule(schedule) === buildRRule(savedSchedule);
   const requiresAnchoredScheduling = schedule.preset === "custom" || schedule.end?.type === "count";
   const unsupportedByScheduler = !anchoredScheduling && requiresAnchoredScheduling;
+  // The source an edited trigger watches now: its open form, or its prompt's opening line.
+  const editedTriggerSource =
+    editingTriggerSource === null
+      ? null
+      : (trigger ?? sourceSwitch?.source ?? editingTriggerSource);
+  // The polling session's state tracks the saved source's items, so a switch always resets it.
+  const triggerSourceSwitched = sourceSwitch !== null;
   const scheduleInvalid =
     scheduleUnsupported ||
     unsupportedByScheduler ||
     validateSchedule(schedule, { allowPastEnd, sessionMode, subhourSupported, executionTarget }) !==
       null;
-  const renderedTemplatePrompt =
+  const triggerPromptContext = {
+    sessionLink,
+    pollingIntervalMinutes:
+      schedule.preset === "custom" && schedule.customFreq === "minutely" ? schedule.interval : 60,
+    taskSessionTitle: name,
+  };
+  // An edit keeps the saved workers; a new trigger's workers run where the manager
+  // runs (beside it on a connected host, or each in its own sandbox).
+  const renderedTriggerConfig: TriggerConfig | null =
     trigger !== null && triggerFieldsComplete(triggerFields, trigger)
-      ? renderTriggerPrompt(trigger, triggerFields, {
-          // Workers run where the manager runs: beside it on a connected host,
-          // or each in its own sandbox. A switched edit keeps the saved placement.
-          placement: workerPlacement ?? (sandboxMode ? "managed" : "same_host"),
-          sessionLink,
-          pollingIntervalMinutes:
-            schedule.preset === "custom" && schedule.customFreq === "minutely"
-              ? schedule.interval
-              : 60,
-          // A switched edit keeps the saved workers' harness, model, and effort.
-          ...(workerSettings !== null
-            ? {
-                agentId: workerSettings.agentId,
-                model: workerSettings.model || undefined,
-                effort: workerSettings.effort || undefined,
-              }
-            : {
-                model: supportsModel && pickedModel !== "" ? pickedModel : undefined,
-                effort: supportsModel && pickedEffort !== "" ? pickedEffort : undefined,
-              }),
-          taskSessionMode: triggerTaskSessionMode,
-          taskSessionTitle: name,
-        })
-      : "";
+      ? {
+          source: trigger,
+          ...triggerFields,
+          ...(triggerTaskSessionMode === "continue" ? { taskSessionMode: "continue" } : {}),
+          worker: {
+            placement: workerPlacement ?? (sandboxMode ? "managed" : "same_host"),
+            ...(workerSettings ?? {
+              agentId: null,
+              model: supportsModel ? pickedModel : "",
+              effort: supportsModel ? pickedEffort : "",
+              permissionMode: workerPermissionMode ?? "",
+            }),
+          },
+        }
+      : null;
+  // Only a server that strips the header before dispatch gets one.
+  let renderedTriggerPrompt = "";
+  if (renderedTriggerConfig !== null && triggerHeadersSupported) {
+    renderedTriggerPrompt = encodeTriggerPrompt(renderedTriggerConfig, triggerPromptContext);
+  } else if (renderedTriggerConfig !== null) {
+    renderedTriggerPrompt = renderTriggerConfigPrompt(renderedTriggerConfig, triggerPromptContext);
+  }
   const effectivePrompt =
-    trigger !== null ? renderedTemplatePrompt : combineTriggerPrompt(prompt, systemPrompt);
+    trigger !== null ? renderedTriggerPrompt : combineTriggerPrompt(prompt, systemPrompt);
   const triggerMode =
     trigger !== null ||
     (sessionMode === "continue" && (editingTemplateTrigger || isTriggerPrompt(effectivePrompt)));
+  const usesTriggerSchedule =
+    triggerMode || triggerType !== "schedule" || editedTriggerSource !== null;
+  const compatibleTriggerSchedule =
+    validateSchedule(defaultTriggerSchedule, {
+      sessionMode,
+      subhourSupported,
+      executionTarget,
+    }) === null
+      ? defaultTriggerSchedule
+      : HOURLY_SCHEDULE_MODEL;
+  const hiddenTriggerScheduleNeedsReplacement =
+    usesTriggerSchedule &&
+    !curationPending &&
+    scheduleInvalid &&
+    editingTask !== null &&
+    !triggerSourceSwitched;
   const sendsToTaskSession =
     trigger !== null
       ? triggerTaskSessionMode === "continue"
@@ -947,18 +1084,38 @@ export function CreateScheduledTaskDialog({
       { ...schedule, end: undefined },
       { sessionMode, subhourSupported, executionTarget },
     ) === null;
-  // Collapsed fields must not hide an error that blocks submit.
   const endingInvalid =
     validateSchedule({ ...DEFAULT_SCHEDULE_MODEL, end: schedule.end }, { allowPastEnd }) !== null ||
     (!anchoredScheduling && schedule.end?.type === "count");
-  const advancedError =
-    workspaceWithoutHost ||
-    Boolean(pollingBlockedReason) ||
-    (workerSettings !== null && Boolean(workerHarnessSettings.blockedReason)) ||
-    (!triggerMode && recurrenceValid && endingInvalid);
   useEffect(() => {
-    if (open && advancedError) setAdvancedOpen(true);
-  }, [open, advancedError]);
+    if (!open) return;
+    if (usesTriggerSchedule) {
+      setScheduleMenuOpen(false);
+      if (!curationPending && scheduleInvalid && !hiddenTriggerScheduleNeedsReplacement) {
+        setSchedule(compatibleTriggerSchedule);
+        setScheduleUnsupported(false);
+      }
+      return;
+    }
+    if (!recurrenceValid || scheduleUnsupported || unsupportedByScheduler) {
+      setEndingMenuOpen(false);
+      setScheduleMenuOpen(true);
+    } else if (endingInvalid) {
+      setScheduleMenuOpen(false);
+      setEndingMenuOpen(true);
+    }
+  }, [
+    open,
+    usesTriggerSchedule,
+    curationPending,
+    scheduleInvalid,
+    hiddenTriggerScheduleNeedsReplacement,
+    compatibleTriggerSchedule,
+    recurrenceValid,
+    scheduleUnsupported,
+    unsupportedByScheduler,
+    endingInvalid,
+  ]);
   const displayedModel = reusesExistingSession ? (editingTask?.modelOverride ?? "") : pickedModel;
   const displayedEffort = reusesExistingSession
     ? (editingTask?.reasoningEffort ?? "")
@@ -966,22 +1123,123 @@ export function CreateScheduledTaskDialog({
   const displayedPermission = reusesExistingSession
     ? editablePermissionMode(editingTask?.permissionMode)
     : effectivePermission;
-  const summarySettings = editingWorkerSettings ? workerHarnessSettings : harnessSettings;
-  const summaryModel = editingWorkerSettings ? (workerSettings?.model ?? "") : displayedModel;
-  const summaryEffort = editingWorkerSettings ? (workerSettings?.effort ?? "") : displayedEffort;
-  const summaryPermission = editingWorkerSettings ? "" : displayedPermission;
-  const overrideSummary = [
-    summarySettings.models.find((option) => option.id === summaryModel)?.displayName ??
-      summaryModel,
-    summarySettings.efforts.find((option) => option.value === summaryEffort)?.label ??
-      summaryEffort,
-    summarySettings.permissions.find((option) => option.value === summaryPermission)?.label ??
-      summaryPermission,
-    !triggerMode && schedule.end ? "End limit" : null,
-    trigger !== null && triggerTaskSessionMode === "continue" ? "One task session" : null,
-  ]
-    .filter(Boolean)
-    .join(" · ");
+  const workerGroupName = sendsToTaskSession ? "Task session" : "Matching sessions";
+  const automationModelOptions = [...harnessSettings.models];
+  if (
+    displayedModel !== "" &&
+    !automationModelOptions.some((option) => option.id === displayedModel)
+  ) {
+    automationModelOptions.push({ id: displayedModel, displayName: displayedModel });
+  }
+  const automationEffortOptions = [...harnessSettings.efforts];
+  if (
+    displayedEffort !== "" &&
+    !automationEffortOptions.some((option) => option.value === displayedEffort)
+  ) {
+    automationEffortOptions.push({ value: displayedEffort, label: displayedEffort });
+  }
+  const displayedModelLabel =
+    displayedModel === ""
+      ? "Default"
+      : (automationModelOptions.find((option) => option.id === displayedModel)?.displayName ??
+        displayedModel);
+  const displayedEffortLabel =
+    displayedEffort === ""
+      ? "Default"
+      : (automationEffortOptions.find((option) => option.value === displayedEffort)?.label ??
+        displayedEffort);
+  const automationPickerDetails = supportsModel
+    ? [
+        { label: "Model", value: displayedModelLabel },
+        ...(automationEffortOptions.length > 0 || displayedEffort !== ""
+          ? [{ label: "Effort", value: displayedEffortLabel }]
+          : []),
+      ]
+    : [];
+  const automationPickerConfig =
+    selectedAgent && supportsModel && !reusesExistingSession ? (
+      <ComposerConfigSections
+        models={{
+          testId: "task-agent-models",
+          header: "Models",
+          leading: harnessSettings.catalogMessage ? (
+            <p className="px-2 py-1 text-xs text-muted-foreground">
+              {harnessSettings.catalogMessage}
+            </p>
+          ) : undefined,
+          choices: [
+            {
+              key: "__default__",
+              label: "Default",
+              checked: displayedModel === "",
+              onSelect: () => handleModelChange(""),
+              testId: "task-agent-model-default",
+            },
+            ...automationModelOptions.map((option) => ({
+              key: option.id,
+              label: option.displayName ?? option.id,
+              checked: displayedModel === option.id,
+              onSelect: () => handleModelChange(option.id),
+              testId: `task-agent-model-${option.id}`,
+              modelOption: option,
+            })),
+          ],
+        }}
+        efforts={
+          automationEffortOptions.length > 0
+            ? {
+                testId: "task-agent-efforts",
+                header: "Effort",
+                choices: [
+                  {
+                    key: "__default__",
+                    label: "Default",
+                    checked: displayedEffort === "",
+                    onSelect: () => handleEffortChange(""),
+                    testId: "task-agent-effort-default",
+                  },
+                  ...automationEffortOptions.map((option) => ({
+                    key: option.value,
+                    label: option.label,
+                    checked: displayedEffort === option.value,
+                    onSelect: () => handleEffortChange(option.value),
+                    testId: `task-agent-effort-${option.value}`,
+                  })),
+                ],
+              }
+            : undefined
+        }
+      />
+    ) : null;
+  const runTargetLabel = sandboxMode
+    ? sandboxLabel
+    : (selectedHost?.name ?? (isEdit ? UNPINNED_HOST_LABEL : "Pick a host"));
+  const scheduleSummary = scheduleInvalid
+    ? "Needs attention"
+    : describeSchedule(buildRRule(schedule));
+  const endingSummary =
+    schedule.end?.type === "count"
+      ? `After ${schedule.end.count} occurrences`
+      : schedule.end?.type === "until"
+        ? "On date"
+        : "Never";
+  const workspaceSummary = sandboxMode
+    ? (sandboxRepoCatalog.find((repo) => repo.url === sandboxWorkspace)?.name ??
+      (sandboxWorkspace || "Provider default"))
+    : workspace || "No workspace";
+  const permissionOptions = harnessSettings.permissions.filter(
+    (option) => harnessSettings.harness === "claude-native" || option.value !== "default",
+  );
+  const permissionSelectValue =
+    displayedPermission === "" ||
+    (harnessSettings.harness !== "claude-native" && displayedPermission === "default")
+      ? PERMISSION_SELECT_DEFAULT
+      : displayedPermission;
+  const permissionLabel =
+    permissionSelectValue === PERMISSION_SELECT_DEFAULT
+      ? "Default permissions"
+      : (permissionOptions.find((option) => option.value === permissionSelectValue)?.label ??
+        permissionSelectValue);
   // Set across the whole submit, which may first find or create a project.
   const [submitting, setSubmitting] = useState(false);
   const mutationPending = submitting || createMutation.isPending || updateMutation.isPending;
@@ -998,6 +1256,20 @@ export function CreateScheduledTaskDialog({
     !pollingBlockedReason &&
     !(workerSettings !== null && workerHarnessSettings.blockedReason) &&
     !mutationPending;
+  // Problems that disable Save but whose explanation or fix lives under Advanced settings.
+  const advancedBlocksSubmit =
+    !curationPending &&
+    ((!usesTriggerSchedule &&
+      (endingInvalid ||
+        ((isEdit || fromSession !== null) &&
+          (!recurrenceValid || scheduleUnsupported || unsupportedByScheduler)))) ||
+      workspaceWithoutHost ||
+      Boolean(pollingBlockedReason) ||
+      (workerSettings !== null && Boolean(workerHarnessSettings.blockedReason)) ||
+      (!isEdit && agents !== undefined && effectiveAgentId === null));
+  useEffect(() => {
+    if (open && advancedBlocksSubmit) setAdvancedOpen(true);
+  }, [open, advancedBlocksSubmit]);
 
   function handleTriggerTypeChange(next: AutomationTriggerType) {
     if (isEdit || next === triggerType || (next !== "schedule" && !triggersSupported)) return;
@@ -1035,20 +1307,10 @@ export function CreateScheduledTaskDialog({
     setTimezone(draft?.timezone ?? timezone);
     setSessionMode(draft?.sessionMode ?? (next === "schedule" ? "new" : "continue"));
     setScheduleUnsupported(false);
-    setSystemPromptOpen(false);
-    setEditingSystemPrompt(false);
     setError(null);
   }
 
-  // The source an edited trigger watches now: its open form, or its prompt's opening line.
-  const editedTriggerSource =
-    editingTriggerSource === null
-      ? null
-      : (trigger ?? sourceSwitch?.source ?? editingTriggerSource);
-  // The polling session's state tracks the saved source's items, so a switch always resets it.
-  const triggerSourceSwitched = sourceSwitch !== null;
-
-  /** Edit only: watch another integration, or restore the saved prompt for the original one. */
+  /** Edit only: watch another integration, or restore the saved trigger for the original one. */
   function handleEditTriggerSourceChange(next: TriggerSource) {
     if (editingTriggerSource === null || editedTriggerSource === null) return;
     if (next === editedTriggerSource) return;
@@ -1056,14 +1318,10 @@ export function CreateScheduledTaskDialog({
       source: editingTriggerSource,
       savedPrompt: prompt,
       savedSystemPrompt: systemPrompt,
+      savedFields: trigger !== null ? triggerFields : null,
       savedStartNewSession: startNewSession,
     };
-    if (sourceSwitch !== null) {
-      editSourceDrafts.current[editedTriggerSource] = {
-        fields: triggerFields,
-        promptEditor: trigger === null ? { prompt, systemPrompt } : null,
-      };
-    }
+    if (sourceSwitch !== null) editSourceDrafts.current[editedTriggerSource] = triggerFields;
     // A split template prompt's user part is the instructions for each session.
     let instructions = "";
     if (trigger !== null) instructions = triggerFields.instructions;
@@ -1071,17 +1329,12 @@ export function CreateScheduledTaskDialog({
     if (name === TRIGGER_TEMPLATES[editedTriggerSource].name) {
       setName(TRIGGER_TEMPLATES[next].name);
     }
-    // Restored prompts and drafts keep their text, with the current worker settings;
-    // only a new draft takes the instructions.
-    const draft = next === editingTriggerSource ? null : editSourceDrafts.current[next];
-    const promptEditor =
-      next === editingTriggerSource
-        ? { prompt: saved.savedPrompt, systemPrompt: saved.savedSystemPrompt }
-        : draft?.promptEditor;
-    if (promptEditor) {
+    // The saved trigger comes back as its form, or as its prompt when it has no header;
+    // other integrations reopen their draft, and only a new draft takes the instructions.
+    if (next === editingTriggerSource && saved.savedFields === null) {
       const restored = restoreSourcePrompt(
-        promptEditor.prompt,
-        promptEditor.systemPrompt,
+        saved.savedPrompt,
+        saved.savedSystemPrompt,
         workerSettings,
       );
       setPrompt(restored.userPrompt);
@@ -1089,6 +1342,11 @@ export function CreateScheduledTaskDialog({
       setTrigger(null);
     } else {
       setTrigger(next);
+      setTriggerFields(
+        next === editingTriggerSource
+          ? saved.savedFields!
+          : (editSourceDrafts.current[next] ?? { ...emptyTriggerFields(next), instructions }),
+      );
     }
     // Fall back to the saved workers if the prompt editor's creation call no longer parses.
     setSwitchedWorkerSettings(workerSettings ?? savedWorkerSettings);
@@ -1097,12 +1355,9 @@ export function CreateScheduledTaskDialog({
       setStartNewSession(saved.savedStartNewSession);
       setSourceSwitch(null);
     } else {
-      setTriggerFields(draft?.fields ?? { ...emptyTriggerFields(next), instructions });
       setStartNewSession(true);
       setSourceSwitch({ ...saved, source: next });
     }
-    setSystemPromptOpen(false);
-    setEditingSystemPrompt(false);
     setError(null);
   }
 
@@ -1245,16 +1500,50 @@ export function CreateScheduledTaskDialog({
     }
   }
 
+  // Editing a trigger hides the top-row agent and permission pickers, so its polling
+  // session's settings get their own fields.
+  const pollingModelFields = (
+    <ModelEffortFields
+      model={displayedModel}
+      effort={displayedEffort}
+      permissionMode={displayedPermission}
+      settings={harnessSettings}
+      disabled={curationPending || reusesExistingSession}
+      idPrefix="task-polling"
+      onModelChange={handleModelChange}
+      onEffortChange={handleEffortChange}
+      onPermissionModeChange={(mode) => {
+        sourcePrefilledRef.current = true;
+        setPickedPermission(mode);
+        setPermissionPicked(true);
+      }}
+      onSelectOpenChange={handleSelectOpenChange}
+    />
+  );
+  const workerFields = workerSettings !== null && (
+    <TriggerWorkerSettingsFields
+      value={workerSettings}
+      settings={workerHarnessSettings}
+      permissionModesSupported={sessionPermissionModesSupported}
+      pollingPermissionMode={displayedPermission}
+      taskSession={sendsToTaskSession}
+      creating={creatingTriggerWorkers}
+      followsPolling={creatingTriggerWorkers && newTriggerWorkerSettings === null}
+      disabled={curationPending}
+      onSelectOpenChange={handleSelectOpenChange}
+      onChange={handleWorkerSettingsChange}
+    />
+  );
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent
-        className="flex max-h-[90vh] flex-col gap-0 overflow-hidden p-0 sm:max-w-[560px]"
+        className="flex max-h-[90vh] flex-col gap-0 overflow-hidden p-0 sm:max-w-[720px]"
         data-testid="create-scheduled-task-dialog"
         onOpenAutoFocus={(event) => {
-          const instructions = document.getElementById("task-prompt");
-          if (instructions) {
+          const title = document.getElementById("task-name");
+          if (title) {
             event.preventDefault();
-            instructions.focus();
+            title.focus();
           }
         }}
         // Keep a nested Select's dismiss (pick an option, OR click empty modal
@@ -1266,13 +1555,22 @@ export function CreateScheduledTaskDialog({
         onInteractOutside={guardDialogDismiss}
       >
         <DialogHeader className="shrink-0 px-6 pt-6 pb-0">
-          <DialogTitle>
+          <DialogTitle className="sr-only">
             {fromSession
               ? `New automation from “${fromSession.title || "this session"}”`
               : isEdit
                 ? "Edit automation"
                 : "New automation"}
           </DialogTitle>
+          <Input
+            id="task-name"
+            value={name}
+            placeholder="Name your automation"
+            aria-label="Automation title"
+            data-testid="task-name-input"
+            className="h-8 border-0 px-0 py-0 pr-10 font-heading text-[1.25em] leading-[32px] font-[600] focus-visible:border-transparent focus-visible:ring-0 md:text-[1.25em]"
+            onChange={(event) => setName(event.target.value)}
+          />
           <DialogDescription className="sr-only">
             {triggerMode
               ? "Starts an agent session for each matching item."
@@ -1286,17 +1584,6 @@ export function CreateScheduledTaskDialog({
           className="flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto px-6 py-5"
           data-testid="scheduled-task-dialog-body"
         >
-          <div className="flex flex-col gap-1.5">
-            <Label htmlFor="task-name">Name</Label>
-            <Input
-              id="task-name"
-              value={name}
-              placeholder="Name this automation"
-              data-testid="task-name-input"
-              className="text-ui focus-visible:ring-0"
-              onChange={(e) => setName(e.target.value)}
-            />
-          </div>
           {startsFromSessionId !== null && (
             <StartsFromField
               sessionId={startsFromSessionId}
@@ -1310,184 +1597,251 @@ export function CreateScheduledTaskDialog({
               onSession={fromSession ? setSourceSnapshot : undefined}
             />
           )}
-          {!isEdit && !fromSession && (
-            <TriggerTypeSelect
-              value={triggerType}
-              types={AUTOMATION_TRIGGER_TYPES}
-              isTypeDisabled={(type) => type !== "schedule" && !triggersSupported}
-              onChange={handleTriggerTypeChange}
-              onOpenChange={handleSelectOpenChange}
-              disabled={curationPending || mutationPending}
+          <TooltipProvider skipDelayDuration={0}>
+            <ScheduleFields
+              timezone={timezone}
+              onTimezoneChange={setTimezone}
+              model={schedule}
+              anchoredScheduling={anchoredScheduling}
+              sessionMode={sessionMode}
+              executionTarget={executionTarget}
+              subhourSupported={subhourSupported}
+              recurrenceUnsupported={scheduleUnsupported}
+              allowPastEnd={allowPastEnd}
+              onChange={setSchedule}
+              onRecurrenceSelect={() => setScheduleUnsupported(false)}
+              onSelectOpenChange={handleNestedMenuOpenChange}
+              embedded
             >
-              {!curationPending && !triggersSupported && (
-                <p className="text-sm text-muted-foreground">
-                  Integration triggers aren't available on this server.
-                </p>
-              )}
-            </TriggerTypeSelect>
-          )}
-          {editingTriggerSource !== null && editedTriggerSource !== null && triggersSupported && (
-            <TriggerTypeSelect
-              value={editedTriggerSource}
-              types={TRIGGER_SOURCES}
-              onChange={handleEditTriggerSourceChange}
-              onOpenChange={handleSelectOpenChange}
-              disabled={curationPending || mutationPending}
-            >
-              {triggerSourceSwitched && (
-                <p className="text-sm text-muted-foreground" data-testid="task-trigger-type-note">
-                  Saving replaces the {triggerServiceName(editingTriggerSource)} trigger. The next
-                  run starts a new polling session that watches{" "}
-                  {triggerServiceName(editedTriggerSource)}.
-                  {sendsToTaskSession && " Its first match starts a new task session."}
-                </p>
-              )}
-            </TriggerTypeSelect>
-          )}
-          <ScheduleFields
-            timezone={timezone}
-            onTimezoneChange={setTimezone}
-            model={schedule}
-            anchoredScheduling={anchoredScheduling}
-            sessionMode={sessionMode}
-            executionTarget={executionTarget}
-            subhourSupported={subhourSupported}
-            recurrenceUnsupported={scheduleUnsupported}
-            allowPastEnd={allowPastEnd}
-            onChange={setSchedule}
-            onRecurrenceSelect={() => setScheduleUnsupported(false)}
-            onSelectOpenChange={handleSelectOpenChange}
-          >
-            {({ recurrenceFields, endingFields }) => (
-              <>
-                {trigger !== null ? (
-                  <TriggerTemplateFields
-                    source={trigger}
-                    fields={triggerFields}
-                    onChange={setTriggerFields}
-                    onSelectOpenChange={handleSelectOpenChange}
-                    // Arclet sandboxes provide their agents' MCP tools, Jira and Slack included.
-                    toolsProvided={
-                      sandboxMode && info !== "loading" && info.sandbox_provider === "arclet"
-                    }
-                    taskSessionMode={triggerTaskSessionMode}
-                    renderedPrompt={renderedTemplatePrompt}
-                    onEditAsPrompt={() => {
-                      const parts = splitTriggerPrompt(renderedTemplatePrompt);
-                      setPrompt(parts.userPrompt);
-                      setSystemPrompt(parts.systemPrompt);
-                      setSystemPromptOpen(false);
-                      setEditingSystemPrompt(false);
-                      setTrigger(null);
-                    }}
-                  />
-                ) : (
-                  <div ref={promptFieldsRef} className="flex flex-col gap-1.5">
-                    <Label htmlFor="task-prompt">
-                      {startsFromSession
-                        ? "Additional instructions"
-                        : systemPrompt === null
-                          ? "Instructions"
-                          : "Your prompt"}
-                    </Label>
-                    <Textarea
-                      id="task-prompt"
-                      value={prompt}
-                      rows={5}
-                      placeholder={
-                        startsFromSession
-                          ? "Optional. For example: Use this week's data."
-                          : "What should the agent do each run?"
-                      }
-                      data-testid="task-prompt-input"
-                      componentId="tasks.scheduled.prompt"
-                      className="min-h-32 resize-y rounded-xl p-4 text-ui focus-visible:ring-0"
-                      onChange={(e) => setPrompt(e.target.value)}
-                    />
-                    {systemPrompt !== null &&
-                      splitTriggerPrompt(effectivePrompt).systemPrompt === null && (
-                        <p role="status" className="text-sm text-warning">
-                          {prompt.trim() === ""
-                            ? "Your prompt can't be empty."
-                            : systemPrompt.trim() === ""
-                              ? "System prompt can't be empty. Expand System prompt and click Edit system prompt to restore it."
-                              : "These edits change the template structure. After saving, the full text will appear as one prompt."}
+              {({ recurrenceFields, endingFields }) => (
+                <div className="grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-6">
+                  {((!isEdit && !fromSession) ||
+                    (editingTriggerSource !== null &&
+                      editedTriggerSource !== null &&
+                      triggersSupported)) && (
+                    <div className="contents">
+                      <div className="contents">
+                        <Select
+                          value={editedTriggerSource ?? triggerType}
+                          onValueChange={(value) => {
+                            if (editedTriggerSource !== null) {
+                              handleEditTriggerSourceChange(value as TriggerSource);
+                            } else {
+                              handleTriggerTypeChange(value as AutomationTriggerType);
+                            }
+                          }}
+                          onOpenChange={handleSelectOpenChange}
+                          disabled={curationPending || mutationPending}
+                          componentId="tasks.scheduled.trigger_type"
+                        >
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span
+                                className={`inline-flex w-full ${
+                                  usesTriggerSchedule ? "sm:col-span-6" : "sm:col-span-3"
+                                }`}
+                              >
+                                <SelectTrigger
+                                  id="task-trigger-type"
+                                  aria-label="Trigger type"
+                                  data-testid="task-trigger-type"
+                                  className="h-9! w-full"
+                                >
+                                  <SelectValue />
+                                </SelectTrigger>
+                              </span>
+                            </TooltipTrigger>
+                            <TooltipContent>Trigger type</TooltipContent>
+                          </Tooltip>
+                          <SelectContent position="popper" align="start">
+                            <PickerSectionHeader>Trigger type</PickerSectionHeader>
+                            {(editedTriggerSource !== null
+                              ? TRIGGER_SOURCES
+                              : AUTOMATION_TRIGGER_TYPES
+                            ).map((type) => (
+                              <SelectItem
+                                key={type}
+                                value={type}
+                                disabled={
+                                  editedTriggerSource === null &&
+                                  type !== "schedule" &&
+                                  !triggersSupported
+                                }
+                                data-testid={`task-trigger-type-${type}`}
+                              >
+                                <TriggerTypeOption type={type} />
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                        {!usesTriggerSchedule && (
+                          <Popover open={scheduleMenuOpen} onOpenChange={changeScheduleMenuOpen}>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <span className="inline-flex w-full sm:col-span-3">
+                                  <PopoverTrigger asChild>
+                                    <ComposerHarnessTrigger
+                                      label="Schedule"
+                                      model={scheduleSummary}
+                                      icon={<ClockIcon className="size-4 shrink-0" />}
+                                      className={`${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} w-full`}
+                                      data-testid="task-schedule-trigger"
+                                    />
+                                  </PopoverTrigger>
+                                </span>
+                              </TooltipTrigger>
+                              <TooltipContent>Schedule</TooltipContent>
+                            </Tooltip>
+                            <PopoverContent
+                              align="end"
+                              className="menu-surface w-[max(var(--radix-popover-trigger-width),20rem)] max-w-[calc(100vw-2rem)] gap-0 p-0 ring-0"
+                              onPointerDownOutside={keepParentPopoverOpenForNestedMenu}
+                              onFocusOutside={keepParentPopoverOpenOnFocus}
+                              onInteractOutside={keepParentPopoverOpenForNestedMenu}
+                            >
+                              <PickerSectionHeader className="px-5 pt-3 pb-2">
+                                Schedule
+                              </PickerSectionHeader>
+                              {recurrenceFields}
+                              {scheduleUnsupported && (
+                                <p className="px-4 pb-3 text-sm text-destructive" role="alert">
+                                  This schedule can&apos;t be edited in this form yet. Choose a
+                                  frequency to replace it.
+                                </p>
+                              )}
+                              {unsupportedByScheduler && (
+                                <p className="px-4 pb-3 text-sm text-destructive" role="alert">
+                                  This server does not support custom schedules or occurrence
+                                  limits. Choose a supported frequency to replace this schedule.
+                                </p>
+                              )}
+                            </PopoverContent>
+                          </Popover>
+                        )}
+                      </div>
+                      {!isEdit && !curationPending && !triggersSupported && (
+                        <p className="text-sm text-muted-foreground sm:col-span-6">
+                          Integration triggers aren't available on this server.
                         </p>
                       )}
-                    {systemPrompt !== null && (
-                      <Collapsible
-                        open={systemPromptOpen}
-                        onOpenChange={(expanded) => {
-                          setSystemPromptOpen(expanded);
-                          setEditingSystemPrompt(false);
-                        }}
-                        className="mt-2 rounded-md border border-border p-3"
-                      >
-                        <CollapsibleTrigger className="group flex w-full cursor-pointer items-center gap-2 rounded-sm text-ui text-muted-foreground outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
-                          <ChevronDownIcon className="size-4 transition-transform group-data-[state=closed]:-rotate-90" />
-                          System prompt
-                        </CollapsibleTrigger>
-                        <CollapsibleContent className="space-y-2 pt-3">
-                          <p className="text-sm text-muted-foreground">
-                            Instructions for how the automation runs. Your prompt is added
-                            separately.
-                          </p>
-                          {editingSystemPrompt ? (
-                            <Textarea
-                              aria-label="System prompt"
-                              autoFocus
-                              value={systemPrompt}
-                              rows={8}
-                              className="max-h-80 resize-y text-ui focus-visible:ring-0"
-                              componentId="tasks.scheduled.system_prompt"
-                              onChange={(event) => setSystemPrompt(event.target.value)}
-                            />
-                          ) : (
-                            <pre className="max-h-56 overflow-y-auto rounded-md bg-muted/40 p-2 font-sans text-sm whitespace-pre-wrap break-words">
-                              {systemPrompt}
-                            </pre>
-                          )}
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            componentId="tasks.scheduled.edit_system_prompt"
-                            onClick={() => setEditingSystemPrompt(!editingSystemPrompt)}
+                      {triggerSourceSwitched &&
+                        editingTriggerSource !== null &&
+                        editedTriggerSource !== null && (
+                          <p
+                            className="text-sm text-muted-foreground sm:col-span-6"
+                            data-testid="task-trigger-type-note"
                           >
-                            {editingSystemPrompt
-                              ? "Done editing system prompt"
-                              : "Edit system prompt"}
-                          </Button>
-                        </CollapsibleContent>
-                      </Collapsible>
+                            Saving replaces the {triggerServiceName(editingTriggerSource)} trigger.
+                            The next run starts a new polling session that watches{" "}
+                            {triggerServiceName(editedTriggerSource)}.
+                            {sendsToTaskSession && " Its first match starts a new task session."}
+                          </p>
+                        )}
+                    </div>
+                  )}
+                  <div className="sm:col-span-6">
+                    {trigger !== null ? (
+                      <TriggerTemplateFields
+                        source={trigger}
+                        fields={triggerFields}
+                        onChange={setTriggerFields}
+                        onSelectOpenChange={handleNestedMenuOpenChange}
+                        // Managed sandboxes provide their agents' integration tools.
+                        toolsProvided={
+                          sandboxMode &&
+                          info !== "loading" &&
+                          inferHostSshTarget({
+                            name: "automation",
+                            sandbox_provider: info.sandbox_provider,
+                          }) !== null
+                        }
+                        taskSessionMode={triggerTaskSessionMode}
+                      />
+                    ) : (
+                      <div ref={promptFieldsRef} className="flex flex-col gap-1.5">
+                        <Textarea
+                          id="task-prompt"
+                          aria-label={
+                            startsFromSession ? "Additional instructions" : "Instructions"
+                          }
+                          value={prompt}
+                          rows={5}
+                          placeholder={
+                            startsFromSession
+                              ? "Optional. For example: Use this week's data."
+                              : "What should the agent do each run?"
+                          }
+                          data-testid="task-prompt-input"
+                          componentId="tasks.scheduled.prompt"
+                          className="min-h-40 resize-y rounded-xl text-ui focus-visible:ring-0"
+                          onChange={(e) => setPrompt(e.target.value)}
+                        />
+                        {systemPrompt !== null &&
+                          splitTriggerPrompt(effectivePrompt).systemPrompt === null && (
+                            <p role="status" className="text-sm text-warning">
+                              {prompt.trim() === ""
+                                ? "Instructions can't be empty."
+                                : "These edits change the template structure. After saving, the full text will appear as one prompt."}
+                            </p>
+                          )}
+                      </div>
                     )}
                   </div>
-                )}
-
-                <div className="space-y-3 rounded-xl border border-border px-4 py-3">
-                  {/* Pin a connected host, or provision a sandbox per run (kept for continuing sessions). */}
-                  <div
-                    className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-4 gap-y-2 [&>p]:col-span-2"
-                    data-testid="task-host-field"
-                  >
-                    <Label htmlFor="task-host">Run on</Label>
+                  {hiddenTriggerScheduleNeedsReplacement && (
+                    <div
+                      className="flex items-center justify-between gap-3 rounded-lg bg-muted/50 px-3 py-2 text-ui"
+                      role="alert"
+                      data-testid="task-trigger-schedule-replacement"
+                    >
+                      <p>
+                        This automation&apos;s saved schedule isn&apos;t supported by the current
+                        run setup.
+                      </p>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="shrink-0"
+                        onClick={() => {
+                          setSchedule(compatibleTriggerSchedule);
+                          setScheduleUnsupported(false);
+                        }}
+                      >
+                        Use supported schedule
+                      </Button>
+                    </div>
+                  )}
+                  <div className="grid min-w-0 grid-cols-1 gap-3 sm:col-span-6 sm:grid-cols-6">
                     <Select
                       value={sandboxMode ? SANDBOX_HOST : hostId}
                       componentId="tasks.scheduled.host"
                       onValueChange={handleTargetChange}
                       onOpenChange={handleSelectOpenChange}
                     >
-                      <SelectTrigger
-                        id="task-host"
-                        data-testid="task-host-trigger"
-                        className={cn(
-                          "w-auto min-w-0 max-w-full justify-self-end justify-end border-0 shadow-none text-muted-foreground",
-                          pickerTriggerClass,
-                        )}
-                      >
-                        <SelectValue placeholder={isEdit ? UNPINNED_HOST_LABEL : "Pick a host"} />
-                      </SelectTrigger>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <span className="inline-flex w-full sm:col-span-2">
+                            <SelectTrigger asChild hideIcon>
+                              <ComposerHarnessTrigger
+                                label="Run on"
+                                model={runTargetLabel}
+                                icon={
+                                  sandboxMode ? (
+                                    <BoxIcon className="size-4 shrink-0" />
+                                  ) : (
+                                    <MonitorIcon className="size-4 shrink-0" />
+                                  )
+                                }
+                                className={`${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} w-full`}
+                                data-testid="task-host-trigger"
+                              />
+                            </SelectTrigger>
+                          </span>
+                        </TooltipTrigger>
+                        <TooltipContent>Run on</TooltipContent>
+                      </Tooltip>
                       <SelectContent position="popper" align="end">
+                        <PickerSectionHeader>Run on</PickerSectionHeader>
                         {(managedSandboxesEnabled || sandboxMode) && (
                           <SelectItem value={SANDBOX_HOST} data-testid="task-host-sandbox-option">
                             {sandboxLabel}
@@ -1500,35 +1854,9 @@ export function CreateScheduledTaskDialog({
                         ))}
                       </SelectContent>
                     </Select>
-                    {!sandboxMode && selectedHost?.status === "offline" && (
-                      <p className="text-sm text-muted-foreground">
-                        This host is offline. Runs fail until it reconnects.
-                      </p>
-                    )}
-                  </div>
 
-                  {editingWorkerSettings ? (
-                    workerSettings !== null &&
-                    editingTask && (
-                      <div className="border-t border-border pt-3">
-                        <TriggerWorkerHarnessField
-                          value={workerSettings}
-                          pollingAgentId={editingTask.agentId}
-                          agents={agentList}
-                          selectedAgent={workerAgent}
-                          disabled={curationPending}
-                          onSelectOpenChange={handleSelectOpenChange}
-                          onChange={handleWorkerSettingsChange}
-                        />
-                      </div>
-                    )
-                  ) : (
-                    <div
-                      className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-4 gap-y-2 border-t border-border pt-3 [&>p]:col-span-2"
-                      data-testid="task-agent-field"
-                    >
-                      <Label>Agent</Label>
-                      <div className="min-w-0 justify-self-end" data-testid="task-agent-picker">
+                    {!editingWorkerSettings && (
+                      <div className="sm:col-span-2" data-testid="task-agent-picker">
                         <AgentHarnessPicker
                           agentEntries={agentEntries}
                           harnessEntries={harnessEntries}
@@ -1539,283 +1867,348 @@ export function CreateScheduledTaskDialog({
                           curatedEntries={
                             curation.restrictToAgentNames.size > 0 ? agentList : undefined
                           }
-                          // Sandboxes provision their own harnesses; host badges only apply to hosts.
                           host={sandboxMode ? undefined : badgeHost}
                           onSelectAgent={handleSelectAgent}
                           pendingAgent={null}
                           pendingAgentId="__unused_pending_agent__"
                           onSelectPending={() => {}}
-                          // Custom-agent creation is inert until there is a way to
-                          // persist a new agent independently of creating a session.
                           onCreateCustomAgent={() => {}}
                           sandboxSelected={sandboxMode}
                           allowCreateCustomAgent={false}
                           open={agentMenuOpen}
                           onOpenChange={changeAgentMenuOpen}
-                          // This picker is nested inside a Dialog. Radix DropdownMenu's
-                          // default modal mode can turn an inside-dialog click into a
-                          // parent Dialog outside interaction while the menu dismisses.
                           dropdownModal={false}
-                          // The shared menu caps against available viewport height, so
-                          // constrained screens scroll without clipping taller screens.
                           contentClassName="w-80"
                           contentAlign="end"
-                          triggerClassName={cn(
-                            "h-8 max-w-full justify-end gap-1.5 rounded-lg border-0 bg-transparent pr-2 pl-2.5 text-muted-foreground shadow-none",
-                            pickerTriggerClass,
-                          )}
-                          triggerLabelClassName="min-w-0 max-w-none text-ui [&>span]:text-ui [&>span]:font-normal [&>span]:text-inherit"
+                          triggerDetails={automationPickerDetails}
+                          triggerIcon={
+                            selectedAgent ? (
+                              <span className="flex size-4 shrink-0 items-center justify-center">
+                                <ComposerAgentIcon agent={selectedAgent} />
+                              </span>
+                            ) : null
+                          }
+                          selectedConfigContent={automationPickerConfig}
+                          isEntryConfigurable={(agent) =>
+                            !reusesExistingSession &&
+                            (nativeAgentHasModelSettings(agent) ||
+                              (agent.id === effectiveAgentId && supportsModel))
+                          }
+                          triggerClassName={`${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} w-full`}
+                          triggerTooltip="Agent, model, and effort"
                         />
                       </div>
-                      {agentChanged && (
-                        <p className="text-sm text-muted-foreground">
-                          Future runs use {agentLabel}; past runs keep the agent they ran with
-                        </p>
-                      )}
-                    </div>
-                  )}
-
-                  {/* A trigger needs its one kept session, so its form leaves the choice out. */}
-                  {sessionModesSupported &&
-                    trigger === null &&
-                    !startsFromSession &&
-                    (!editingTemplateTrigger || editingTask?.sessionId) && (
-                      <div
-                        className="flex flex-col gap-2 border-t border-border pt-3"
-                        data-testid="task-session-mode-field"
-                      >
-                        {!editingTemplateTrigger && (
-                          <>
-                            <div className="flex items-center justify-between gap-4">
-                              <Label htmlFor="task-session-mode">
-                                Start each run in a new session
-                              </Label>
-                              <Switch
-                                id="task-session-mode"
-                                checked={sessionMode === "new"}
-                                onCheckedChange={(checked) =>
-                                  setSessionMode(checked ? "new" : "continue")
-                                }
-                                data-testid="task-session-mode-trigger"
-                                componentId="tasks.scheduled.session_mode"
-                              />
-                            </div>
-                            {sessionMode === "continue" && (
-                              <p className="text-sm text-muted-foreground">
-                                Later runs continue in the same session, keeping its context.
-                              </p>
-                            )}
-                          </>
-                        )}
-                        {isEdit && sessionMode === "continue" && editingTask?.sessionId && (
-                          <div className="flex items-center gap-2">
-                            <Checkbox
-                              id="task-start-new-session"
-                              checked={startNewSession || triggerSourceSwitched}
-                              disabled={triggerSourceSwitched}
-                              onCheckedChange={(checked) => setStartNewSession(checked === true)}
-                              data-testid="task-start-new-session"
-                              componentId="tasks.scheduled.start_new_session"
-                            />
-                            <label
-                              htmlFor="task-start-new-session"
-                              className="cursor-pointer text-sm"
-                            >
-                              Start a new session on the next run
-                            </label>
-                          </div>
-                        )}
-                      </div>
                     )}
-                </div>
-                {!triggerMode && recurrenceFields}
-                {triggerMode && !scheduleInvalid && (
-                  <p className="text-sm text-muted-foreground" data-testid="task-trigger-cadence">
-                    Checks for new matches: {describeSchedule(buildRRule(schedule))}.{" "}
-                    {sendsToTaskSession
-                      ? "Matching items go to the task session automatically."
-                      : "Matching items start sessions automatically."}
-                  </p>
-                )}
-                {triggerMode && scheduleInvalid && (
-                  <div className="space-y-2">
-                    <p className="text-sm text-destructive" role="alert">
-                      This polling configuration is no longer supported. Use the server default to
-                      save your changes.
-                    </p>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      onClick={() => {
-                        setSchedule(defaultTriggerSchedule);
-                        setScheduleUnsupported(false);
-                      }}
+
+                    {!editingWorkerSettings && permissionOptions.length > 0 && (
+                      <Select
+                        disabled={curationPending || reusesExistingSession}
+                        value={permissionSelectValue}
+                        componentId="tasks.scheduled.permission_mode"
+                        valueHasNoPii
+                        onValueChange={handlePermissionChange}
+                        onOpenChange={handleSelectOpenChange}
+                      >
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <span className="inline-flex w-full sm:col-span-2">
+                              <SelectTrigger asChild hideIcon>
+                                <ComposerHarnessTrigger
+                                  label="Permissions"
+                                  model={permissionLabel}
+                                  icon={<ShieldCheckIcon className="size-4 shrink-0" />}
+                                  className={`${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} w-full`}
+                                  data-testid="task-permission-trigger"
+                                />
+                              </SelectTrigger>
+                            </span>
+                          </TooltipTrigger>
+                          <TooltipContent>Permissions</TooltipContent>
+                        </Tooltip>
+                        <SelectContent position="popper" align="end">
+                          <PickerSectionHeader>Permissions</PickerSectionHeader>
+                          <SelectItem value={PERMISSION_SELECT_DEFAULT}>Default</SelectItem>
+                          {permissionOptions.map((option) => (
+                            <SelectItem key={option.value} value={option.value}>
+                              {option.label}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    )}
+                    <Collapsible
+                      open={advancedOpen}
+                      onOpenChange={setAdvancedOpen}
+                      className="sm:col-span-6"
                     >
-                      Use server default ({describeSchedule(buildRRule(defaultTriggerSchedule))})
-                    </Button>
-                  </div>
-                )}
-                {!isEdit &&
-                  !curationPending &&
-                  agents !== undefined &&
-                  effectiveAgentId === null && (
-                    <p role="alert" className="text-sm text-destructive">
-                      No agents are available for this automation.
-                    </p>
-                  )}
-                {!triggerMode && scheduleUnsupported && (
-                  <p className="text-sm text-destructive" role="alert">
-                    This schedule can&apos;t be edited in this form yet. Choose a frequency to
-                    replace it.
-                  </p>
-                )}
-
-                {!triggerMode && unsupportedByScheduler && (
-                  <p className="text-sm text-destructive" role="alert">
-                    This server does not support custom schedules or occurrence limits. Choose a
-                    supported frequency and ending to replace this schedule.
-                  </p>
-                )}
-
-                {!advancedOpen && advancedError && (
-                  <p role="alert" className="text-sm text-destructive">
-                    Expand Advanced to fix settings before saving.
-                  </p>
-                )}
-                <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
-                  <CollapsibleTrigger className="group/advanced flex w-full cursor-pointer items-center gap-2 rounded-sm py-1 text-ui text-muted-foreground outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
-                    <span>Advanced</span>
-                    <ChevronDownIcon className="size-4 shrink-0 transition-transform group-data-[state=open]/advanced:rotate-180" />
-                    <span className="ml-auto truncate text-xs" aria-hidden="true">
-                      {overrideSummary}
-                    </span>
-                  </CollapsibleTrigger>
-                  <CollapsibleContent className="space-y-4 pt-4" data-testid="task-advanced-fields">
-                    {trigger !== null && editingTask === null && (
-                      <div
-                        className="flex flex-col gap-2 rounded-xl border border-border p-4"
-                        data-testid="task-trigger-session-mode-field"
+                      <CollapsibleTrigger
+                        className="group flex w-full cursor-pointer items-center justify-start gap-2 rounded-sm text-left text-ui font-medium outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50"
+                        data-testid="task-advanced-settings-trigger"
                       >
-                        <div className="flex items-center justify-between gap-4">
-                          <Label htmlFor="task-trigger-session-mode">
-                            Start a new session for each match
-                          </Label>
-                          <Switch
-                            id="task-trigger-session-mode"
-                            checked={triggerTaskSessionMode === "new"}
-                            onCheckedChange={(checked) =>
-                              setTriggerTaskSessionMode(checked ? "new" : "continue")
-                            }
-                            data-testid="task-trigger-session-mode"
-                            componentId="tasks.scheduled.trigger_session_mode"
-                          />
-                        </div>
-                        {triggerTaskSessionMode === "continue" && (
-                          <p className="text-sm text-muted-foreground">
-                            Every match goes to one task session, started on the first match, so it
-                            keeps its context across matches. Archiving it starts a new one on the
-                            next match.
-                          </p>
-                        )}
-                      </div>
-                    )}
-                    <div className="space-y-4 rounded-xl border border-border p-4">
-                      {sandboxMode && sandboxRepoCatalog.length > 0 && (
-                        <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-4 gap-y-2 [&>p]:col-span-2">
-                          <Label htmlFor="task-sandbox-repository">Repository</Label>
-                          <Select
-                            value={sandboxWorkspace || PROVIDER_DEFAULT}
-                            onValueChange={(value) =>
-                              setWorkspace(value === PROVIDER_DEFAULT ? "" : value)
-                            }
-                            onOpenChange={handleSelectOpenChange}
-                            componentId="tasks.scheduled.sandbox_repository"
-                          >
-                            <SelectTrigger
-                              id="task-sandbox-repository"
-                              className={cn(
-                                "w-full border-0 shadow-none text-muted-foreground",
-                                pickerTriggerClass,
-                              )}
+                        <span>
+                          Advanced settings{" "}
+                          <span className="font-normal text-muted-foreground">(optional)</span>
+                        </span>
+                        <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground transition-transform duration-200 ease-out group-data-[state=open]:rotate-90" />
+                      </CollapsibleTrigger>
+                      <CollapsibleContent className="pt-3">
+                        <div
+                          className="divide-y divide-border"
+                          data-testid="task-top-level-controls"
+                        >
+                          {trigger !== null && editingTask === null && (
+                            <div
+                              className="flex min-h-9 items-center justify-between gap-4 py-px"
+                              data-testid="task-trigger-session-mode-field"
                             >
-                              <SelectValue placeholder="Provider default" />
-                            </SelectTrigger>
-                            <SelectContent position="popper" align="start">
-                              <SelectItem value={PROVIDER_DEFAULT}>Provider default</SelectItem>
-                              {savedSandboxWorkspace &&
-                                !sandboxRepoCatalog.some(
-                                  (repo) => repo.url === savedSandboxWorkspace,
-                                ) && (
-                                  <SelectItem value={savedSandboxWorkspace}>
-                                    {savedSandboxWorkspace}
-                                  </SelectItem>
-                                )}
-                              {sandboxRepoCatalog.map((repo) => (
-                                <SelectItem key={repo.url} value={repo.url}>
-                                  {repo.name}
-                                </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-                        </div>
-                      )}
-
-                      {!sandboxMode && hostId !== "" && (
-                        <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-4 gap-y-2 [&>p]:col-span-2">
-                          <Label>Workspace (optional)</Label>
-                          <Button
-                            type="button"
-                            variant="outline"
-                            className={cn(
-                              "w-full justify-start gap-2 border-0 shadow-none text-muted-foreground",
-                              pickerTriggerClass,
-                            )}
-                            disabled={workspaceHostOffline}
-                            aria-describedby={
-                              workspaceHostOffline ? "task-workspace-help" : undefined
-                            }
-                            onClick={() => setWorkspaceBrowserOpen(true)}
-                            data-testid="task-workspace-browse"
-                          >
-                            <FolderOpenIcon className="size-4 text-muted-foreground" />
-                            <span className="truncate">{workspace || "Browse folders…"}</span>
-                          </Button>
-                          {workspaceHostOffline && (
-                            <p id="task-workspace-help" className="text-sm text-muted-foreground">
-                              Connect your host to select a workspace.
-                            </p>
-                          )}
-                          <WorkspacePickerDialog
-                            open={workspacePickerVisible}
-                            onOpenChange={setWorkspaceBrowserOpen}
-                            hostId={hostId}
-                            initialPath={workspace}
-                            onConfirm={(path) => {
-                              if (path !== workspace) setBaseBranch(null);
-                              setWorkspace(path);
-                            }}
-                          />
-                          {workspace && (
-                            <>
-                              <p className="truncate font-mono text-sm text-muted-foreground">
-                                {workspace}
-                              </p>
-                              {worktreesSupported && !isGitWorkspace && baseBranch !== null && (
-                                <div className="col-span-2 mt-2 text-sm text-muted-foreground">
-                                  <p>Random worktree is enabled. {worktreeStatus}</p>
-                                  <Button
-                                    type="button"
-                                    variant="link"
-                                    onClick={() => setBaseBranch(null)}
+                              <span className="text-ui text-muted-foreground">
+                                Session continuity
+                              </span>
+                              <DropdownMenu>
+                                <DropdownMenuTrigger asChild>
+                                  <ComposerHarnessTrigger
+                                    label="Session continuity"
+                                    model={
+                                      triggerTaskSessionMode === "new"
+                                        ? "New session for each match"
+                                        : "One task session for all matches"
+                                    }
+                                    icon={<RefreshCwIcon className="size-4 shrink-0" />}
+                                    className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
+                                    data-testid="task-trigger-session-mode"
+                                  />
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent align="end" className="min-w-64">
+                                  <DropdownMenuRadioGroup
+                                    value={triggerTaskSessionMode}
+                                    onValueChange={(value) =>
+                                      setTriggerTaskSessionMode(value as TriggerTaskSessionMode)
+                                    }
                                   >
-                                    Turn off random worktree
-                                  </Button>
-                                </div>
+                                    <DropdownMenuRadioItem value="new">
+                                      New session for each match
+                                    </DropdownMenuRadioItem>
+                                    <DropdownMenuRadioItem value="continue">
+                                      One task session for all matches
+                                    </DropdownMenuRadioItem>
+                                  </DropdownMenuRadioGroup>
+                                </DropdownMenuContent>
+                              </DropdownMenu>
+                            </div>
+                          )}
+                          {/* A trigger keeps one session: the mode switch stays hidden, but an edit can restart it. */}
+                          {sessionModesSupported &&
+                            (trigger === null || isEdit) &&
+                            !startsFromSession &&
+                            (!editingTemplateTrigger || editingTask?.sessionId) && (
+                              <div
+                                className="flex min-h-9 items-center justify-between gap-4 py-px"
+                                data-testid="task-session-mode-field"
+                              >
+                                <span className="text-ui text-muted-foreground">
+                                  Session continuity
+                                </span>
+                                <DropdownMenu>
+                                  <DropdownMenuTrigger asChild>
+                                    <ComposerHarnessTrigger
+                                      label="Session continuity"
+                                      model={
+                                        sessionMode === "new"
+                                          ? "New session each run"
+                                          : "Continue one session"
+                                      }
+                                      icon={<RefreshCwIcon className="size-4 shrink-0" />}
+                                      className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
+                                      data-testid="task-session-mode-trigger"
+                                    />
+                                  </DropdownMenuTrigger>
+                                  <DropdownMenuContent align="end" className="min-w-64">
+                                    {!editingTemplateTrigger && (
+                                      <DropdownMenuRadioGroup
+                                        value={sessionMode}
+                                        onValueChange={(value) =>
+                                          setSessionMode(value as ScheduledTaskSessionMode)
+                                        }
+                                      >
+                                        <DropdownMenuRadioItem value="new">
+                                          New session each run
+                                        </DropdownMenuRadioItem>
+                                        <DropdownMenuRadioItem value="continue">
+                                          Continue one session
+                                        </DropdownMenuRadioItem>
+                                      </DropdownMenuRadioGroup>
+                                    )}
+                                    {isEdit &&
+                                      sessionMode === "continue" &&
+                                      editingTask?.sessionId && (
+                                        <>
+                                          {!editingTemplateTrigger && <DropdownMenuSeparator />}
+                                          <DropdownMenuCheckboxItem
+                                            checked={startNewSession || triggerSourceSwitched}
+                                            disabled={triggerSourceSwitched}
+                                            onCheckedChange={(checked) =>
+                                              setStartNewSession(checked === true)
+                                            }
+                                            onSelect={(event) => event.preventDefault()}
+                                            data-testid="task-start-new-session"
+                                          >
+                                            Start a new session on the next run
+                                          </DropdownMenuCheckboxItem>
+                                        </>
+                                      )}
+                                  </DropdownMenuContent>
+                                </DropdownMenu>
+                              </div>
+                            )}
+
+                          {!usesTriggerSchedule && (isEdit || fromSession !== null) && (
+                            <div className="flex min-h-9 items-center justify-between gap-4 py-px">
+                              <span className="text-ui text-muted-foreground">Schedule</span>
+                              <Popover
+                                open={scheduleMenuOpen}
+                                onOpenChange={changeScheduleMenuOpen}
+                              >
+                                <PopoverTrigger asChild>
+                                  <ComposerHarnessTrigger
+                                    label="Schedule"
+                                    model={scheduleSummary}
+                                    icon={<ClockIcon className="size-4 shrink-0" />}
+                                    className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
+                                    data-testid="task-schedule-trigger"
+                                  />
+                                </PopoverTrigger>
+                                <PopoverContent
+                                  align="end"
+                                  className="menu-surface w-[max(var(--radix-popover-trigger-width),20rem)] max-w-[calc(100vw-2rem)] gap-0 p-0 ring-0"
+                                  onPointerDownOutside={keepParentPopoverOpenForNestedMenu}
+                                  onFocusOutside={keepParentPopoverOpenOnFocus}
+                                  onInteractOutside={keepParentPopoverOpenForNestedMenu}
+                                >
+                                  <PickerSectionHeader className="px-5 pt-3 pb-2">
+                                    Schedule
+                                  </PickerSectionHeader>
+                                  {recurrenceFields}
+                                  {scheduleUnsupported && (
+                                    <p className="px-4 pb-3 text-sm text-destructive" role="alert">
+                                      This schedule can&apos;t be edited in this form yet. Choose a
+                                      frequency to replace it.
+                                    </p>
+                                  )}
+                                  {unsupportedByScheduler && (
+                                    <p className="px-4 pb-3 text-sm text-destructive" role="alert">
+                                      This server does not support custom schedules or occurrence
+                                      limits. Choose a supported frequency to replace this schedule.
+                                    </p>
+                                  )}
+                                </PopoverContent>
+                              </Popover>
+                            </div>
+                          )}
+
+                          {!usesTriggerSchedule && (
+                            <div className="flex min-h-9 items-center justify-between gap-4 py-px">
+                              <span className="text-ui text-muted-foreground">Ends</span>
+                              <DropdownMenu
+                                modal={false}
+                                open={endingMenuOpen}
+                                onOpenChange={changeEndingMenuOpen}
+                              >
+                                <DropdownMenuTrigger asChild>
+                                  <ComposerHarnessTrigger
+                                    label="Ends"
+                                    model={endingSummary}
+                                    icon={<CalendarOffIcon className="size-4 shrink-0" />}
+                                    className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
+                                    data-testid="task-ending-trigger"
+                                  />
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent
+                                  align="end"
+                                  className="w-[max(var(--radix-dropdown-menu-trigger-width),20rem)] max-w-[calc(100vw-2rem)]"
+                                  onPointerDownOutside={keepParentPopoverOpenForNestedMenu}
+                                  onFocusOutside={keepParentPopoverOpenOnFocus}
+                                  onInteractOutside={keepParentPopoverOpenForNestedMenu}
+                                >
+                                  {endingFields}
+                                </DropdownMenuContent>
+                              </DropdownMenu>
+                            </div>
+                          )}
+
+                          {(!sandboxMode || sandboxRepoCatalog.length > 0) && (
+                            <div className="flex min-h-9 items-center justify-between gap-4 py-px">
+                              <span className="text-ui text-muted-foreground">
+                                {sandboxMode ? "Repository" : "Workspace"}
+                              </span>
+                              {sandboxMode ? (
+                                <Select
+                                  value={sandboxWorkspace || PROVIDER_DEFAULT}
+                                  onValueChange={(value) =>
+                                    setWorkspace(value === PROVIDER_DEFAULT ? "" : value)
+                                  }
+                                  onOpenChange={handleSelectOpenChange}
+                                  componentId="tasks.scheduled.sandbox_repository"
+                                >
+                                  <SelectTrigger asChild hideIcon>
+                                    <ComposerHarnessTrigger
+                                      label="Repository"
+                                      model={workspaceSummary}
+                                      icon={<FolderOpenIcon className="size-4 shrink-0" />}
+                                      className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
+                                      data-testid="task-sandbox-repository"
+                                    />
+                                  </SelectTrigger>
+                                  <SelectContent position="popper" align="end">
+                                    <SelectItem value={PROVIDER_DEFAULT}>
+                                      Provider default
+                                    </SelectItem>
+                                    {savedSandboxWorkspace &&
+                                      !sandboxRepoCatalog.some(
+                                        (repo) => repo.url === savedSandboxWorkspace,
+                                      ) && (
+                                        <SelectItem value={savedSandboxWorkspace}>
+                                          {savedSandboxWorkspace}
+                                        </SelectItem>
+                                      )}
+                                    {sandboxRepoCatalog.map((repo) => (
+                                      <SelectItem key={repo.url} value={repo.url}>
+                                        {repo.name}
+                                      </SelectItem>
+                                    ))}
+                                  </SelectContent>
+                                </Select>
+                              ) : (
+                                <ComposerHarnessTrigger
+                                  label="Workspace"
+                                  model={workspaceSummary}
+                                  icon={<FolderOpenIcon className="size-4 shrink-0" />}
+                                  disabled={hostId === "" || workspaceHostOffline}
+                                  className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
+                                  data-testid="task-workspace-trigger"
+                                  onClick={() => setWorkspaceBrowserOpen(true)}
+                                />
                               )}
-                              {worktreesSupported && isGitWorkspace && (
-                                <>
-                                  <div className="col-span-2 mt-2 flex items-center gap-2">
+                            </div>
+                          )}
+
+                          {!sandboxMode &&
+                            workspace &&
+                            worktreesSupported &&
+                            (!isGitWorkspace && baseBranch !== null ? (
+                              <div className="py-2 text-sm text-muted-foreground">
+                                <p>Random worktree is enabled. {worktreeStatus}</p>
+                                <Button
+                                  type="button"
+                                  variant="link"
+                                  onClick={() => setBaseBranch(null)}
+                                >
+                                  Turn off random worktree
+                                </Button>
+                              </div>
+                            ) : (
+                              isGitWorkspace && (
+                                <div className="space-y-2 py-2">
+                                  <div className="flex items-center gap-2">
                                     <Checkbox
                                       id="task-random-worktree"
                                       checked={baseBranch !== null}
@@ -1838,198 +2231,218 @@ export function CreateScheduledTaskDialog({
                                       ? "Creates a randomly named worktree from the repository’s current HEAD when starting a session. Later runs reuse it."
                                       : "Creates a fresh randomly named worktree from the repository’s current HEAD for each run."}
                                   </p>
-                                </>
-                              )}
-                            </>
-                          )}
-                        </div>
-                      )}
-                      {projectsSupported && (
-                        <div
-                          className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-4 gap-y-2 [&>p]:col-span-2"
-                          data-testid="task-project-field"
-                        >
-                          <Label>Project (optional)</Label>
-                          <DropdownMenu open={projectMenuOpen} onOpenChange={changeProjectMenuOpen}>
-                            <DropdownMenuTrigger asChild>
-                              <Button
-                                type="button"
-                                variant="outline"
-                                className={cn(
-                                  "w-full justify-start gap-2 border-0 shadow-none text-muted-foreground",
-                                  pickerTriggerClass,
-                                )}
-                                data-testid="task-project-trigger"
-                              >
-                                {(projectName !== "" || unresolvedProjectLabel !== null) && (
-                                  <ProjectRowIcon icon={projectIcon} />
-                                )}
-                                <span className="flex-1 truncate text-left">
-                                  {unresolvedProjectLabel ?? (projectName || "No project")}
-                                </span>
-                                <ChevronDownIcon className="size-4 text-muted-foreground" />
-                              </Button>
-                            </DropdownMenuTrigger>
-                            <DropdownMenuContent align="start" className="min-w-56">
-                              {/* The picker's "Remove from" row needs the name; this works without it. */}
-                              {savedProjectUnresolved && !savedProjectDeleted && (
-                                <DropdownMenuItem
-                                  className="px-2 py-1"
-                                  onSelect={() => {
-                                    setProjectChoice("");
-                                    setPickedProjectId(null);
-                                  }}
-                                >
-                                  No project
-                                </DropdownMenuItem>
-                              )}
-                              <ProjectPicker
-                                currentProject={projectName || null}
-                                onSelect={(next) => {
-                                  setProjectChoice(next);
-                                  setPickedProjectId(
-                                    projects.find((p) => p.name === next)?.id ?? null,
-                                  );
-                                }}
-                              />
-                            </DropdownMenuContent>
-                          </DropdownMenu>
-                          <p className="text-sm text-muted-foreground">
-                            Type a new name to create a project.
-                          </p>
-                        </div>
-                      )}
-                    </div>
-                    <div className="space-y-4 rounded-xl border border-border p-4">
-                      {workspaceWithoutHost && (
-                        <p
-                          className="flex items-center gap-1.5 text-sm text-destructive"
-                          data-testid="workspace-without-host-error"
-                        >
-                          <TriangleAlertIcon className="size-3.5 shrink-0" />
-                          Pick a host before pinning a workspace.
-                        </p>
-                      )}
-
-                      {editingWorkerSettings && pollingBlockedReason && (
-                        <p role="alert" className="text-sm text-destructive">
-                          Polling session cannot start: {pollingBlockedReason}
-                        </p>
-                      )}
-
-                      {editingWorkerSettings && workerSettings !== null && editingTask ? (
-                        <TriggerWorkerSettingsFields
-                          value={workerSettings}
-                          settings={workerHarnessSettings}
-                          taskSession={sendsToTaskSession}
-                          disabled={curationPending}
-                          onSelectOpenChange={handleSelectOpenChange}
-                          onChange={handleWorkerSettingsChange}
-                        />
-                      ) : editingWorkerSettings ? (
-                        <p className="text-sm text-muted-foreground" role="status">
-                          Worker controls are unavailable for these customized instructions. Edit
-                          the prompt or system prompt above to configure matching sessions.
-                        </p>
-                      ) : (
-                        <>
-                          {!showAdvanced && (
-                            <p className="text-sm text-muted-foreground">
-                              Uses this agent&apos;s default model, effort, and permission settings
-                            </p>
-                          )}
-
-                          {harnessSettings.blockedReason && (
-                            <p
-                              role="alert"
-                              data-testid="task-harness-unsupported"
-                              className="text-sm text-destructive"
-                            >
-                              {harnessSettings.blockedReason}
-                            </p>
-                          )}
-                          {/* Each harness exposes only the launch settings it supports. */}
-                          {showAdvanced && (
-                            <div data-testid="task-model-effort-field">
-                              <ModelEffortFields
-                                model={displayedModel}
-                                effort={displayedEffort}
-                                permissionMode={displayedPermission}
-                                settings={harnessSettings}
-                                disabled={curationPending || reusesExistingSession}
-                                onModelChange={handleModelChange}
-                                onEffortChange={(effort) => {
-                                  sourcePrefilledRef.current = true;
-                                  setPickedEffort(effort);
-                                }}
-                                onPermissionModeChange={(mode) => {
-                                  sourcePrefilledRef.current = true;
-                                  setPickedPermission(mode);
-                                  setPermissionPicked(true);
-                                }}
-                                onSelectOpenChange={handleSelectOpenChange}
-                              />
-                              {reusesExistingSession ? (
-                                <div
-                                  className="mt-3 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-sm text-foreground"
-                                  data-testid="task-session-settings-note"
-                                  role="status"
-                                >
-                                  <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
-                                  <p>
-                                    This automation continues in an existing session, so its model,
-                                    effort, and permission mode are controlled by that session. Edit
-                                    the session directly to change them.
-                                    {editingTemplateTrigger && (
-                                      <>
-                                        {" "}
-                                        {sendsToTaskSession
-                                          ? "Trigger automations reuse a polling session, which sends each match to its task session."
-                                          : "Trigger automations reuse a polling session even though each match starts a new worker."}{" "}
-                                        To change the model or harness for future workers, edit the
-                                        worker creation instructions in the{" "}
-                                        {systemPrompt === null ? "prompt" : "system prompt"}.{" "}
-                                        {sendsToTaskSession &&
-                                          "The current task session keeps its settings; archive it so the next match starts one with the new settings. "}
-                                        <button
-                                          type="button"
-                                          className="underline underline-offset-2"
-                                          onClick={() => {
-                                            if (systemPrompt !== null) {
-                                              setSystemPromptOpen(true);
-                                              setEditingSystemPrompt(true);
-                                            }
-                                            promptFieldsRef.current
-                                              ?.querySelector<HTMLTextAreaElement>(
-                                                systemPrompt === null
-                                                  ? "#task-prompt"
-                                                  : 'textarea[aria-label="System prompt"]',
-                                              )
-                                              ?.focus();
-                                          }}
-                                        >
-                                          Edit worker instructions
-                                        </button>
-                                      </>
-                                    )}
-                                  </p>
                                 </div>
-                              ) : (
-                                <p className="mt-1.5 text-sm text-muted-foreground">
-                                  Modes that require approval may pause a run until you respond.
-                                </p>
-                              )}
+                              )
+                            ))}
+
+                          {projectsSupported && (
+                            <div
+                              className="flex min-h-9 items-center justify-between gap-4 py-px"
+                              data-testid="task-project-field"
+                            >
+                              <span className="text-ui text-muted-foreground">Project</span>
+                              <DropdownMenu
+                                open={projectMenuOpen}
+                                onOpenChange={changeProjectMenuOpen}
+                              >
+                                <DropdownMenuTrigger asChild>
+                                  <ComposerHarnessTrigger
+                                    label="Project"
+                                    model={unresolvedProjectLabel ?? (projectName || "No project")}
+                                    icon={
+                                      projectName !== "" || unresolvedProjectLabel !== null ? (
+                                        <ProjectRowIcon icon={projectIcon} />
+                                      ) : (
+                                        <FolderIcon className="size-4 shrink-0" />
+                                      )
+                                    }
+                                    className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
+                                    data-testid="task-project-trigger"
+                                  />
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent align="end" className="min-w-56">
+                                  {savedProjectUnresolved && !savedProjectDeleted && (
+                                    <DropdownMenuItem
+                                      className="px-2 py-1"
+                                      onSelect={() => {
+                                        setProjectChoice("");
+                                        setPickedProjectId(null);
+                                      }}
+                                    >
+                                      No project
+                                    </DropdownMenuItem>
+                                  )}
+                                  <ProjectPicker
+                                    currentProject={projectName || null}
+                                    onSelect={(next) => {
+                                      setProjectChoice(next);
+                                      setPickedProjectId(
+                                        projects.find((project) => project.name === next)?.id ??
+                                          null,
+                                      );
+                                    }}
+                                  />
+                                </DropdownMenuContent>
+                              </DropdownMenu>
                             </div>
                           )}
-                        </>
-                      )}
-                    </div>
-                    {!triggerMode && endingFields}
-                  </CollapsibleContent>
-                </Collapsible>
-              </>
-            )}
-          </ScheduleFields>
+                        </div>
+
+                        <WorkspacePickerDialog
+                          open={workspacePickerVisible}
+                          onOpenChange={setWorkspaceBrowserOpen}
+                          hostId={hostId}
+                          initialPath={workspace}
+                          onConfirm={(path) => {
+                            if (path !== workspace) setBaseBranch(null);
+                            setWorkspace(path);
+                          }}
+                        />
+
+                        <div className="mt-3 space-y-2">
+                          {!sandboxMode && selectedHost?.status === "offline" && (
+                            <p className="text-sm text-muted-foreground">
+                              This host is offline. Runs fail until it reconnects.
+                            </p>
+                          )}
+                          {sandboxMode && sandboxAutomationNotice && (
+                            <p
+                              className="text-sm text-muted-foreground"
+                              data-testid="task-sandbox-automation-notice"
+                            >
+                              {sandboxAutomationNotice}
+                            </p>
+                          )}
+                          {agentChanged && (
+                            <p className="text-sm text-muted-foreground">
+                              Future runs use {agentLabel}; past runs keep the agent they ran with.
+                            </p>
+                          )}
+                          {workspaceWithoutHost && (
+                            <p
+                              className="flex items-center gap-1.5 text-sm text-destructive"
+                              data-testid="workspace-without-host-error"
+                            >
+                              <TriangleAlertIcon className="size-3.5 shrink-0" />
+                              Pick a host before pinning a workspace.
+                            </p>
+                          )}
+                          {editingWorkerSettings && pollingBlockedReason && (
+                            <p role="alert" className="text-sm text-destructive">
+                              Polling session cannot start: {pollingBlockedReason}
+                            </p>
+                          )}
+                          {editingWorkerSettings && workerSettings !== null && editingTask ? (
+                            <>
+                              {(harnessSettings.supportsModel ||
+                                harnessSettings.permissions.length > 0) && (
+                                <div
+                                  className="space-y-3 rounded-xl border border-border p-3"
+                                  data-testid="task-polling-settings"
+                                >
+                                  <SettingsGroupHeading>Polling session</SettingsGroupHeading>
+                                  {pollingModelFields}
+                                  <p className="text-sm text-muted-foreground">
+                                    {reusesExistingSession
+                                      ? "The current polling session keeps these. Check Start a new session on the next run to change them."
+                                      : "The next run starts a new polling session with these."}
+                                  </p>
+                                </div>
+                              )}
+                              <div
+                                className="space-y-3 rounded-xl border border-border p-3"
+                                data-testid="task-matching-settings"
+                              >
+                                <SettingsGroupHeading>{workerGroupName}</SettingsGroupHeading>
+                                <TriggerWorkerHarnessField
+                                  value={workerSettings}
+                                  pollingAgentId={editingTask.agentId}
+                                  agents={agentList}
+                                  selectedAgent={workerAgent}
+                                  disabled={curationPending}
+                                  onSelectOpenChange={handleSelectOpenChange}
+                                  onChange={handleWorkerSettingsChange}
+                                />
+                                {workerFields}
+                              </div>
+                            </>
+                          ) : editingWorkerSettings ? (
+                            <p className="text-sm text-muted-foreground" role="status">
+                              Worker controls are unavailable for these customized instructions.
+                              Create this automation again from its template to configure matching
+                              sessions.
+                            </p>
+                          ) : (
+                            harnessSettings.blockedReason && (
+                              <p
+                                role="alert"
+                                data-testid="task-harness-unsupported"
+                                className="text-sm text-destructive"
+                              >
+                                {harnessSettings.blockedReason}
+                              </p>
+                            )
+                          )}
+                          {creatingTriggerWorkers &&
+                            workerSettings !== null &&
+                            (harnessSettings.supportsModel ||
+                              harnessSettings.permissions.length > 0) && (
+                              <div
+                                className="space-y-3 rounded-xl border border-border p-3"
+                                data-testid="task-matching-settings"
+                              >
+                                <SettingsGroupHeading>{workerGroupName}</SettingsGroupHeading>
+                                <p className="text-sm text-muted-foreground">
+                                  The agent, model, effort, and permissions above run the polling
+                                  session, which checks for new matches. A lighter model keeps
+                                  frequent checks cheaper.
+                                </p>
+                                {workerFields}
+                              </div>
+                            )}
+                          {reusesExistingSession && (
+                            <div
+                              className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-sm text-foreground"
+                              data-testid="task-session-settings-note"
+                              role="status"
+                            >
+                              <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
+                              <p>
+                                This automation continues in an existing session, so its model,
+                                effort, and permission mode are controlled by that session. Edit the
+                                session directly to change them.
+                                {editingTemplateTrigger && (
+                                  <>
+                                    {" "}
+                                    {sendsToTaskSession
+                                      ? "Trigger automations reuse a polling session, which sends each match to its task session."
+                                      : "Trigger automations reuse a polling session even though each match starts a new worker."}{" "}
+                                    {systemPrompt === null
+                                      ? "To change the model or harness for future workers, edit the worker creation instructions in the prompt."
+                                      : "To change the model or harness for future workers, create this automation again from its template."}{" "}
+                                    {sendsToTaskSession &&
+                                      "The current task session keeps its settings; archive it so the next match starts one with the new settings."}
+                                  </>
+                                )}
+                              </p>
+                            </div>
+                          )}
+                        </div>
+                        {!isEdit &&
+                          !curationPending &&
+                          agents !== undefined &&
+                          effectiveAgentId === null && (
+                            <p role="alert" className="text-sm text-destructive">
+                              No agents are available for this automation.
+                            </p>
+                          )}
+                      </CollapsibleContent>
+                    </Collapsible>
+                  </div>
+                </div>
+              )}
+            </ScheduleFields>
+          </TooltipProvider>
           {error && (
             <div
               role="alert"

@@ -198,6 +198,49 @@ def test_scrolling_back_through_history_never_moves_the_offset(
     assert abs(heights[-1] - expected) <= 2, (heights[-1], expected, reading)
 
 
+def test_thumb_dragged_past_the_end_waits_for_the_pointer_to_return(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Pointer travel past the track's end is owed back before the thumb moves again."""
+    base_url, session_id = seeded_session
+    _seed_turns(session_id)
+    page.set_viewport_size(_VIEWPORT)
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_text(_NEWEST_REPLY).first).to_be_visible(timeout=30_000)
+    assert page.evaluate(_TAG_SCROLLER), "transcript did not overflow; seed more turns"
+    page.wait_for_timeout(500)
+    thumb = page.get_by_test_id("transcript-scrollbar-thumb")
+    scroller = page.locator("[data-pw-scroller]")
+
+    def scroll_top() -> float:
+        return scroller.evaluate("(el) => el.scrollTop")
+
+    def thumb_top() -> float:
+        box = thumb.bounding_box()
+        assert box is not None
+        return box["y"]
+
+    # Grab the thumb at the bottom and pull the pointer 120px below the track.
+    box = thumb.bounding_box()
+    assert box is not None
+    x, grab_y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+    resting_thumb = thumb_top()
+    page.mouse.move(x, grab_y)
+    page.mouse.down()
+    page.mouse.move(x, grab_y + 120, steps=6)
+    bottom = scroll_top()
+    # Most of the way back, the thumb has not left the bottom.
+    page.mouse.move(x, grab_y + 20, steps=5)
+    assert scroll_top() == bottom
+    assert abs(thumb_top() - resting_thumb) <= 1
+    # Past the grab point the thumb follows again.
+    page.mouse.move(x, grab_y - 10, steps=3)
+    assert scroll_top() < bottom
+    assert thumb_top() < resting_thumb
+    page.mouse.up()
+
+
 # --- Tool-heavy transcripts: the view holds while pages land and stops with the reader ---
 
 # Earlier turns: a prompt, a folded tool run, a reply. The newest turn alone

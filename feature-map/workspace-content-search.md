@@ -8,6 +8,10 @@ Filename search remains in Files.
 
 - `search`: submit a literal query with Enter or Search, optionally matching case
   or using a ripgrep regular expression; results show paths, lines and previews.
+- `whole-word`: check **Whole word** to skip matches inside longer words. The
+  panel sends it as a ripgrep regular expression on the same route; a search
+  whose expression would exceed the 4,096-character query limit shows an error
+  and disables Search.
 - `filter`: click **Filter files** (the funnel button between the query and
   Search) to show or hide **Include** and **Exclude** globs. The button is
   highlighted while filters are set, even when the fields are hidden.
@@ -56,6 +60,9 @@ shortcut should be unavailable.
 - Browser navigation through the tab, picker and search shortcut:
   `tests/browser_ui/files/test_file_line_navigation.py::test_content_search_opens_line_and_preserves_results`.
   This uses a mocked API and proves line navigation and preserved search state.
+- Whole word patterns through real ripgrep:
+  `tests/runner/test_environment_filesystem.py::test_content_search_whole_word_patterns`
+  and `web/src/lib/contentSearch.test.ts` share `web/src/lib/__fixtures__/contentSearchWholeWord.json`.
 - Runner search and limits:
   `tests/runner/test_environment_filesystem.py::test_content_search_live_workspace`,
   `tests/runner/test_environment_filesystem.py::test_content_search_limits_errors_and_hidden_files`,
@@ -69,6 +76,11 @@ shortcut should be unavailable.
 ## Gotchas
 
 - **Find files by name** in Files searches paths; **Content search** searches text.
+- Whole word follows ripgrep's Unicode word characters. A literal that starts or
+  ends with punctuation matches as typed on that side (`C++` also finds `C++x`);
+  a regular expression always needs a word boundary at both ends. An expression
+  that closes a group it never opened (`foo)|(bar`) or turns on verbose mode
+  (`(?x)`) is refused with Whole word on.
 - Search state stays in memory per conversation until the page reloads. Returning
   to a conversation restores its last search; submit again to refresh the results.
 - Search covers the session workspace on disk, including hidden and untracked

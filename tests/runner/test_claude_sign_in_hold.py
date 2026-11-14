@@ -621,21 +621,42 @@ async def test_messages_queued_during_a_wait_that_ran_out_fail_with_it(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("take_over_at", [1, 2], ids=["before-refusal", "before-stream-end"])
+@pytest.mark.parametrize(
+    ("take_over_at", "new_epoch"),
+    [
+        pytest.param(0, True, id="turn-replaced-before-creation"),
+        pytest.param(1, False, id="response-replaced-before-refusal"),
+        pytest.param(1, True, id="turn-replaced-before-refusal"),
+        pytest.param(2, False, id="response-replaced-before-stream-end"),
+        pytest.param(2, True, id="turn-replaced-before-stream-end"),
+    ],
+)
+@pytest.mark.parametrize("stream_end", ["eof", "broken", "split"])
 async def test_refusal_on_a_stream_a_newer_turn_took_over_is_reported_not_held(
     take_over_at: int,
+    new_epoch: bool,
+    stream_end: str,
 ) -> None:
     """Only the stream that owns the live turn may hold; an older one reports its failure."""
-    script = _TakeoverScript(take_over_at)
-    app, harness, server = _build_app([script])
+    script = _TakeoverScript(3 if stream_end == "split" and take_over_at == 2 else take_over_at)
+    if stream_end == "split":
+        refusal = script[1]
+        midpoint = len(refusal) // 2
+        script[1:] = [refusal[:midpoint], refusal[midpoint:]]
+    broken = _BrokenStreamHarness([script]) if stream_end == "broken" else None
+    app, harness, server = _build_app([script], harness=broken)
     sid = uuid.uuid4().hex
     newer = asyncio.get_running_loop().create_task(asyncio.Event().wait())
     refused_turns: list[asyncio.Task[None]] = []
+    successor_error = {"code": "required_terminal_exited", "message": "newer terminal exited"}
 
     def take_over() -> None:
         refused_turns.append(app.state.active_turns[sid])
+        if new_epoch:
+            app.state.begin_turn_slot(sid)
         app.state.active_turns[sid] = newer
         app.state.live_response_id[sid] = "resp_newer"
+        app.state.required_terminal_exit_errors[sid] = successor_error
 
     script.take_over = take_over
     try:
@@ -646,7 +667,9 @@ async def test_refusal_on_a_stream_a_newer_turn_took_over_is_reported_not_held(
                 json={**_message("first"), "stable_id": _STABLE_ID},
             )
             await _until(lambda: bool(refused_turns) and refused_turns[0].done())
-            await asyncio.sleep(0.05)
+            assert app.state.active_turns[sid] is newer
+            assert app.state.live_response_id[sid] == "resp_newer"
+            assert app.state.required_terminal_exit_errors[sid] is successor_error
     finally:
         newer.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -750,11 +773,14 @@ async def test_message_resent_when_its_wait_ran_out_gets_no_resend_notice(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A message delivered once the wait ran out isn't followed by "send your message again"."""
-    monkeypatch.setattr(runner_app, "_SIGN_IN_HOLD_MAX_S", 0.05)
-    monkeypatch.setattr(sign_in_watch, "_SIGN_IN_WATCH_INTERVAL_S", 0.3)
+    monkeypatch.setattr(sign_in_watch, "_SIGN_IN_WATCH_INTERVAL_S", 0.01)
     sid = uuid.uuid4().hex
+    pane_reading = asyncio.Event()
+    pane_ready = asyncio.Event()
 
     async def read(scrollback: int = 0, *, join_wrapped: bool = False) -> dict[str, object]:
+        pane_reading.set()
+        await pane_ready.wait()
         return {"screen": _READY_SCREEN}
 
     app, harness, server = _build_app(
@@ -763,9 +789,13 @@ async def test_message_resent_when_its_wait_ran_out_gets_no_resend_notice(
     async with _runner_client(app) as client:
         await _create_session(client, sid)
         await client.post(f"/v1/sessions/{sid}/events", json=_message("first"))
+        await asyncio.wait_for(pane_reading.wait(), timeout=budget(5))
+        (watch,) = [t for t in asyncio.all_tasks() if t.get_name() == f"sign-in-watch-{sid}"]
+        app.state.sign_in_holds[sid].deadline = 0.0
         await _until(lambda: len(harness.posted_bodies) == 2 and sid not in app.state.active_turns)
-        # Past the watcher's next poll of the now-ready pane.
-        await asyncio.sleep(0.5)
+        pane_ready.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(watch, timeout=budget(5))
 
     assert [_sent_text(body) for body in harness.posted_bodies] == ["first", "first"]
     assert not server.notices("databricks_sign_in_completed")

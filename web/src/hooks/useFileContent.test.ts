@@ -21,6 +21,7 @@ const isAndroidShell = vi.fn(() => false);
 vi.mock("@/lib/host", () => ({
   isDatabricksWorkspace: () => isDatabricksWorkspace(),
   resolveMediaUrl: (p: string) => resolveMediaUrl(p),
+  isHostRoutingEnabled: () => true,
 }));
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: (u: string) => authenticatedFetch(u) }));
 vi.mock("@/lib/nativeBridge", () => ({
@@ -96,9 +97,11 @@ describe("workspaceFileMediaUrl", () => {
   });
 
   it("is null when the host has no media resolver, so callers fall back to fetching", () => {
+    setSessionHost("sess_abc", "host_1");
     resolveMediaUrl.mockReturnValue(null);
 
     expect(workspaceFileMediaUrl("sess_abc", "demo.mp4")).toBeNull();
+    expect(resolveMediaUrl).toHaveBeenCalled();
   });
 
   it("routes the headerless media load to the session host's replica", () => {
@@ -109,8 +112,9 @@ describe("workspaceFileMediaUrl", () => {
     );
   });
 
-  it("leaves the load unkeyed when the session host is unknown or proven keyless", () => {
-    expect(workspaceFileMediaUrl("sess_abc", "demo.mp4")).toBe(`https://ws.example${MEDIA_URL}`);
+  it("fetches an unknown host's load and leaves a keyless host's unkeyed", () => {
+    // The authenticated fetch recovers from a wrong-replica miss; a bare <video src> can't.
+    expect(workspaceFileMediaUrl("sess_abc", "demo.mp4")).toBeNull();
 
     setSessionHost("sess_abc", "host_1");
     markHostKeyless("host_1");

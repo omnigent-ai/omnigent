@@ -289,6 +289,18 @@ describe("HeaderConversationMenu", () => {
     expect(screen.getByTestId("location")).toHaveTextContent("/?sibling=conv-1");
   });
 
+  it.each([false, true])("hides pin actions on nested sessions (legacy pin: %s)", (legacyPin) => {
+    renderMenu({
+      conversation: {
+        ...CONVERSATION,
+        labels: legacyPin ? { [PINNED_LABEL_KEY]: "1" } : {},
+        family: { id: "family", representative_id: "parent", pinned: false },
+      },
+    });
+    openMenu();
+    expect(screen.queryByTestId("header-pin-conversation")).toBeNull();
+  });
+
   it("runs pin and mark-unread actions for the active session", () => {
     renderMenu();
 
@@ -853,6 +865,23 @@ describe("HeaderConversationMenu desktop menu commands", () => {
         }),
       ),
     );
+    view.rerender(
+      menuTree({
+        conversation: {
+          ...CONVERSATION,
+          labels: { [PINNED_LABEL_KEY]: "1" },
+          family: { id: "family", representative_id: "parent", pinned: true },
+        },
+      }),
+    );
+    await waitFor(() =>
+      expect(setDesktopCommandState).toHaveBeenLastCalledWith(
+        expect.objectContaining({ commands: ["archive-session", "fork-session"] }),
+      ),
+    );
+    mocks.togglePinned.mockClear();
+    act(() => sendCommand({ command: "toggle-pin-session", browserViewId: null }));
+    expect(mocks.togglePinned).not.toHaveBeenCalled();
   });
 
   it("disables Session → Pin while a pin write is pending", async () => {

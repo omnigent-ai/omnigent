@@ -9,6 +9,8 @@ or GitLab token reads the MR; agent CLI and MCP writes associate it with the ses
 - `summary`: MR identity, nested project, description, and checks.
 - `comments`: MR comments on their own tab, whose label shows the count.
 - `changes`: changed files and diff, with exact-revision expanded context, a path filter, and copy-path and open actions. Find searches the fetched patch from the toolbar search button, or Cmd/Ctrl+F while focus is in the Changes tab.
+- `local-review`: submit session-local Agent comments from Changes and send their
+  context chips together through chat; hover to preview and click to return.
 - `associations`: link, select, and unlink MRs across projects.
 - `partial`: incomplete comments, checks, files, and omitted diff explanations.
 - `auth`: missing CLI or denied access retains checkout context and a useful hint.
@@ -36,6 +38,8 @@ available while the host is offline; checks and merge controls resume after
 reconnection.
 On desktop, mobile and Canvas, **Try again** retries failed panel content;
 switching sessions also clears a failed panel. Healthy chat drafts stay mounted.
+All four panel entry points also offer local Agent review in **Changes**; see
+the [local-review flow](pull-request-conversations.md#driving-it-with-the-repro-environment).
 
 ## Driving it with the repro environment
 
@@ -85,12 +89,18 @@ should also recover. This is separate from provider authentication failures.
   without `gh` or `glab` installed. Open the panel from the rail or composer and
   confirm the MR loads. An invalid token must show an access hint, not a CLI
   install prompt. Client and panel component tests cover this without live credentials.
+- Local review on `desktop-rail`, `desktop-composer`, `mobile-composer`, and
+  `canvas`: follow the linked local-review flow with a readable MR diff. Submit
+  an Agent comment, preview its chip, navigate back, edit or delete it, and send
+  attached comments with the chat draft. Confirm no GitLab comment is published.
 
 ## Gotchas
 
 - The shared panel tab and link actions retain the generic Pull Requests wording.
   The provider heading, MR number prefix, external links, and Canvas label must
   use GitLab metadata.
+- Agent comments belong to the session. Publishing inline reviews to GitLab is
+  unsupported; the GitHub destination is unavailable for an MR.
 - A private instance is discovered from the execution host's `glab auth login`
   config. Nondefault HTTPS ports stay part of that saved host. SSH ports are separate;
   `api_host` routing remains owned by glab.

@@ -31,7 +31,7 @@ from omnigent.db.workspace_cache import WorkspaceScopedCache, WorkspaceScopedSet
 from omnigent.entities.conversation import (
     ITEM_TYPE_TO_DATA_CLS,
 )
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import WrongReplicaError
 from omnigent.harness_capabilities import ForkHistory
 from omnigent.harness_plugins import (
     ANTIGRAVITY_NATIVE_CODING_AGENT,
@@ -1086,10 +1086,7 @@ def host_interactive_shells_for_request(
         and runner_router is not None
         and runner_router.host_is_on_another_replica(host_id)
     ):
-        raise OmnigentError(
-            "host shell inventory is on another replica",
-            code=ErrorCode.WRONG_REPLICA,
-        )
+        raise WrongReplicaError("host shell inventory is on another replica", host_id=host_id)
     return normalize_interactive_shells(host_registry.interactive_shells(host_id))
 
 

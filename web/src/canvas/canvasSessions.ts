@@ -14,6 +14,7 @@ import {
   type Conversation,
   type ConversationsPage,
 } from "@/hooks/useConversations";
+import { isAdminViewEnabled } from "@/lib/adminView";
 import { getOmnigentServerIdentity } from "@/lib/host";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
@@ -74,7 +75,7 @@ function sessionCachePrefix(serverId: string = currentServerId()): string {
 }
 
 function sessionCacheKey(viewerId: string, serverId: string = currentServerId()): string {
-  return `${sessionCachePrefix(serverId)}:${viewerId}`;
+  return `${sessionCachePrefix(serverId)}:${viewerId}:${isAdminViewEnabled()}`;
 }
 
 function hasStoredSessionsForServer(): boolean {
@@ -83,7 +84,7 @@ function hasStoredSessionsForServer(): boolean {
     const prefix = `${sessionCachePrefix()}:`;
     return Array.from({ length: window.sessionStorage.length }, (_, index) =>
       window.sessionStorage.key(index),
-    ).some((key) => key?.startsWith(prefix));
+    ).some((key) => key?.startsWith(prefix) && key.endsWith(`:${isAdminViewEnabled()}`));
   } catch {
     return false;
   }

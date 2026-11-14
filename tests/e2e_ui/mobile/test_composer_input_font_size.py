@@ -114,6 +114,10 @@ def test_composer_input_font_setting_and_alignment(
         expect(landing).to_have_attribute("placeholder", "Describe a task...")
     observed = {"landing-hint": _metrics(hint)}
     skill_metrics = None if mobile else _metrics(page.get_by_test_id("skill-pill-context"))
+    # Visibility checks can finish before Chromium paints its first captureable frame.
+    page.evaluate(
+        "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
+    )
     page.screenshot(path=tmp_path / "landing-placeholder.png", animations="disabled")
     _exercise_input(page, landing, mobile=mobile)
     observed.update(

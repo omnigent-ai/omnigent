@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { Conversation } from "@/hooks/useConversations";
 import type { ComponentProps, ReactNode } from "react";
 
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
@@ -13,6 +14,7 @@ vi.mock("@/lib/routing", () => ({
 
 const useConversations = vi.fn();
 const useSessionSearch = vi.fn();
+const useProjects = vi.fn();
 const serverInfo = vi.fn();
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => serverInfo(),
@@ -20,6 +22,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: (...args: unknown[]) => useConversations(...args),
   useSessionSearch: (...args: unknown[]) => useSessionSearch(...args),
+  useProjects: (...args: unknown[]) => useProjects(...args),
 }));
 
 function conv(
@@ -31,7 +34,10 @@ function conv(
   return { id, title, agent_name, archived: false, search_snippet };
 }
 
-function setSessions(sessions: ReturnType<typeof conv>[], isFetching = false) {
+function setSessions(
+  sessions: (ReturnType<typeof conv> & Partial<Conversation>)[],
+  isFetching = false,
+) {
   useConversations.mockReturnValue({ data: { pages: [{ data: sessions }] }, isFetching });
 }
 
@@ -54,7 +60,7 @@ function setSearchGroups({
   }));
 }
 
-function searchPages(...pages: ReturnType<typeof conv>[][]) {
+function searchPages(...pages: (ReturnType<typeof conv> & Partial<Conversation>)[][]) {
   return { data: { pages: pages.map((data) => ({ data })) } };
 }
 
@@ -91,6 +97,7 @@ beforeEach(() => {
   navigate.mockClear();
   useConversations.mockReset();
   useSessionSearch.mockReset();
+  useProjects.mockReturnValue({ data: [] });
   serverInfo.mockReturnValue({ session_search_scope: true });
   setSessions([]);
   setSearchGroups({});
@@ -115,6 +122,93 @@ describe("CommandPalette — sessions", () => {
       expect(screen.queryByText("Archived session")).toBeNull();
     },
   );
+
+  it.each([false, true])(
+    "shows project and parent context without needing the parent in results (sessionsOnly=%s)",
+    (sessionsOnly) => {
+      useProjects.mockReturnValue({ data: [{ id: "project", name: "App redesign" }] });
+      setSessions([
+        {
+          ...conv("nested", "Implement search"),
+          project_id: "project",
+          labels: {},
+          family: {
+            id: "family",
+            representative_id: "parent",
+            representative_title: "Search experience",
+            pinned: false,
+          },
+        },
+        { ...conv("standalone", "Standalone task"), labels: {} },
+      ]);
+      const { onOpenChange } = renderPalette({ sessionsOnly });
+      expect(
+        screen.getByRole("option", {
+          name: /Implement search.*Project:\s*App redesign.*Nested under:\s*Search experience/,
+        }),
+      ).toBeTruthy();
+      expect(
+        labelRow("Standalone task").closest('[role="option"]')!.querySelector("[title]"),
+      ).toBeNull();
+      fireEvent.click(labelRow("Implement search"));
+      expect(navigate).toHaveBeenCalledWith("/c/nested");
+      expect(onOpenChange).toHaveBeenCalledWith(false);
+    },
+  );
+
+  it.each(["recent", "title", "content"])(
+    "uses a parent loaded in %s against older servers without title metadata",
+    (parentSource) => {
+      const parent = conv("parent", "Planning");
+      const nested = {
+        ...conv("nested", "Follow-up"),
+        family: { id: "family", representative_id: "parent", pinned: false },
+      };
+      if (parentSource === "recent") {
+        setSessions([parent, nested]);
+      } else {
+        setSearchGroups({
+          title: searchPages(parentSource === "title" ? [parent] : [nested]),
+          content: searchPages(parentSource === "content" ? [parent] : [nested]),
+        });
+      }
+      renderPalette();
+      if (parentSource !== "recent") {
+        vi.useFakeTimers();
+        try {
+          fireEvent.change(screen.getByTestId("command-palette-input"), {
+            target: { value: "Follow-up" },
+          });
+          act(() => vi.advanceTimersByTime(300));
+        } finally {
+          vi.useRealTimers();
+        }
+      }
+      expect(
+        screen.getByRole("option", { name: /Follow-up.*Nested under:\s*Planning/ }),
+      ).toBeTruthy();
+    },
+  );
+
+  it("uses legacy project labels and omits the parent breadcrumb on the representative", () => {
+    setSessions([
+      {
+        ...conv("parent", "Planning"),
+        labels: { omni_project: "Legacy project" },
+        family: {
+          id: "family",
+          representative_id: "parent",
+          representative_title: "Planning",
+          pinned: false,
+        },
+      },
+    ]);
+    renderPalette();
+    expect(
+      screen.getByRole("option", { name: /Planning.*Project:\s*Legacy project/ }),
+    ).toBeTruthy();
+    expect(screen.queryByText(/Nested under/)).toBeNull();
+  });
 
   it("fuzzy-matches session names without showing unrelated actions", () => {
     setSessions([
@@ -402,6 +496,34 @@ describe("CommandPalette — match preview", () => {
 
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
+
+  it("keeps parent and project context alongside archived content matches", () => {
+    useProjects.mockReturnValue({ data: [{ id: "project", name: "Search project" }] });
+    setSearchGroups({
+      content: searchPages([
+        {
+          ...conv("content", "Investigation", "codex", "The matcher uses a shared index"),
+          project_id: "project",
+          archived: true,
+          family: {
+            id: "family",
+            representative_id: "parent",
+            representative_title: "Search planning",
+            pinned: false,
+          },
+        },
+      ]),
+    });
+    renderPalette();
+    search("matcher");
+    expect(
+      screen.getByRole("option", {
+        name: /Investigation.*Project:\s*Search project.*Nested under:\s*Search planning/,
+      }),
+    ).toBeTruthy();
+    expect(screen.getByText("Archived")).toBeTruthy();
+    expect(labelRow("The matcher uses a shared index")).toBeTruthy();
+  });
 
   it("shows the content snippet as a second line when the match is in the body", () => {
     setSearchGroups({

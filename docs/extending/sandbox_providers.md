@@ -256,7 +256,12 @@ The server's keepalive calls a provider's `keep_alive` while the sandbox's
 runner reports agent work, and for the runner idle timeout
 (`host_config.runner.idle_timeout_s`, one hour by default) afterwards, so a
 sandbox stays warm about as long as an idle runner stays alive. Viewing a session
-does not count as work. After renewal stops, the provider's own idle or expiry
+does not count as work. Waiting on a human (an unanswered dialog or permission
+request) counts as work for at most `OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S` seconds per
+wait (one day by default; `0` removes the limit), measured from the runner's first
+active-work check that observes the wait. Messages queued behind a wait that runs
+out are reported as not sent; a server too old to record that keeps the wait open
+instead. After renewal stops, the provider's own idle or expiry
 behavior applies. For `agent_sandbox`, `sandbox.keep_warm_s` sets that runner
 idle timeout, and expiry suspends compute while retaining storage. Other
 providers have different lifetime behavior, so enabling managed sandboxes alone
@@ -273,6 +278,18 @@ queries stale managed hosts within each workspace. Before calling the provider,
 it atomically detaches the stale sandbox id from the active host generation.
 Failed terminations stay pending and are retried by later sweeps; providers must
 therefore make `terminate()` succeed when the sandbox is already absent.
+
+When a provider's `stop_on_archive` setting is true, archiving a session calls
+`stop()` on its sandbox when no other session uses it (no other session on the
+host, and no side chat or sub-agent of the session), and the next message after
+an unarchive wakes it through `resume()`. Only providers
+whose capabilities declare `resume_stopped` are stopped. `stop()` must treat an
+already stopped sandbox as success; raising `SandboxCapabilityError` leaves the
+sandbox running. Before stopping, the server calls
+`stop_when_archived(owner=..., configured=...)`, which returns the setting by
+default. Override it to decide per owner when the session is archived, for
+example from a feature flag, so turning the behavior on or off needs no server
+restart.
 
 The reaper reuses one launcher per workspace and provider. Override
 `reaper_identity(workspace_id)` when background termination needs a scoped

@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import pytest
 
+from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.tool_dispatch import execute_tool
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
@@ -17,6 +18,7 @@ from omnigent.server.feature_flags import (
 )
 from omnigent.server.sharing_settings import write_peer_session_messaging_override
 from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     CREATED_BY_SESSION_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
@@ -42,7 +44,7 @@ pytestmark = pytest.mark.asyncio
 def orchestration_environment(monkeypatch, request, tmp_path):
     monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / "admin-credentials"))
     features = getattr(request, "param", None)
-    monkeypatch.setenv("OMNIGENT_FEATURES", f"sibling_sessions,{features or ''}")
+    monkeypatch.setenv("OMNIGENT_FEATURES", features or "")
     return features
 
 
@@ -553,6 +555,275 @@ async def test_scheduled_origin_allows_new_controls_children_and_reads(
     )
 
 
+@pytest.mark.parametrize(
+    (
+        "permission_mode",
+        "scheduled_origin",
+        "run_status",
+        "worker_config",
+        "launch_args",
+        "labels",
+    ),
+    [
+        pytest.param(
+            "approve-for-me",
+            True,
+            "running",
+            None,
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            {},
+            id="running-run",
+        ),
+        # A claimed run records its session while starting, before the prompt is sent.
+        pytest.param(
+            "approve-for-me",
+            True,
+            "starting",
+            None,
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            {},
+            id="starting-run",
+        ),
+        # A fork keeps the origin label but isn't the run.
+        pytest.param("approve-for-me", True, None, None, None, {}, id="fork"),
+        pytest.param("approve-for-me", True, "succeeded", None, None, {}, id="finished-run"),
+        pytest.param("approve-for-me", False, "running", None, None, {}, id="no-origin"),
+        pytest.param(None, True, "running", None, None, {}, id="no-mode"),
+        # The automation's own mode wins over a permissive worker spec...
+        pytest.param("default", True, "running", {"yolo": True}, None, {}, id="default-over-spec"),
+        # ...which still applies when the automation sets no mode.
+        pytest.param(
+            None,
+            True,
+            "running",
+            {"yolo": True},
+            ["--dangerously-bypass-approvals-and-sandbox"],
+            {},
+            id="spec-without-mode",
+        ),
+        pytest.param(
+            "bypass",
+            True,
+            "running",
+            None,
+            None,
+            {CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"},
+            id="bypass-label",
+        ),
+    ],
+)
+async def test_scheduled_origin_workers_use_the_automation_permission_mode(
+    auth_client,
+    auth_app,
+    peers,
+    db_uri,
+    monkeypatch,
+    permission_mode,
+    scheduled_origin,
+    run_status,
+    worker_config,
+    launch_args,
+    labels,
+):
+    from omnigent.server.routes.sessions import routes_core
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+
+    source, _target, _captured = peers
+    worker_agent_id = await _upload_codex_worker(auth_client, **(worker_config or {}))
+    schedules = SqlAlchemyScheduledTaskStore(db_uri)
+    task = schedules.create(
+        scheduled_task_id=uuid4().hex,
+        name="Trigger watcher",
+        prompt="Start a worker for each new item",
+        rrule="FREQ=HOURLY",
+        user_id="alice",
+        agent_id=worker_agent_id,
+        timezone="UTC",
+        execution_target="managed_sandbox",
+        permission_mode=permission_mode,
+    )
+    monkeypatch.setattr(auth_app.state, "scheduled_task_store", schedules)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    if scheduled_origin:
+        conversations.set_labels(source["id"], {SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id})
+    if run_status is not None:
+        schedules.create_run(
+            uuid4().hex,
+            task.id,
+            run_status,
+            scheduled_at=1,
+            conversation_id=source["id"],
+            fired_at=1,
+        )
+
+    async def launch(**kwargs):
+        pass
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    result = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": worker_agent_id, "placement": "managed"}),
+            server_client=auth_client,
+            conversation_id=source["id"],
+        )
+    )
+    assert result.get("conversation_id"), result
+    worker = conversations.get_conversation(result["conversation_id"])
+    assert worker.terminal_launch_args == launch_args
+    for key, value in labels.items():
+        assert worker.labels.get(key) == value
+    assert worker.labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == labels.get(
+        CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
+    )
+
+
+@pytest.mark.parametrize(
+    ("automation_mode", "requested_mode", "launch_args"),
+    [
+        # Even the harness default, when the call names it, wins over the automation's mode.
+        pytest.param("approve-for-me", "default", None, id="requested-default"),
+        # A call can't name a bypass, but its gated mode still replaces the automation's.
+        pytest.param(
+            "bypass",
+            "approve-for-me",
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            id="requested-over-bypass",
+        ),
+    ],
+)
+async def test_requested_permission_mode_wins_over_the_automation_mode(
+    auth_client,
+    auth_app,
+    peers,
+    db_uri,
+    monkeypatch,
+    automation_mode,
+    requested_mode,
+    launch_args,
+):
+    from omnigent.server.routes.sessions import routes_core
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+
+    source, _target, _captured = peers
+    worker_agent_id = await _upload_codex_worker(auth_client)
+    schedules = SqlAlchemyScheduledTaskStore(db_uri)
+    task = schedules.create(
+        scheduled_task_id=uuid4().hex,
+        name="Trigger watcher",
+        prompt="Start a worker for each new item",
+        rrule="FREQ=HOURLY",
+        user_id="alice",
+        agent_id=worker_agent_id,
+        timezone="UTC",
+        execution_target="managed_sandbox",
+        permission_mode=automation_mode,
+    )
+    monkeypatch.setattr(auth_app.state, "scheduled_task_store", schedules)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conversations.set_labels(source["id"], {SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id})
+    schedules.create_run(
+        uuid4().hex, task.id, "running", scheduled_at=1, conversation_id=source["id"], fired_at=1
+    )
+
+    async def launch(**kwargs):
+        pass
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    result = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {
+                    "agent_id": worker_agent_id,
+                    "placement": "managed",
+                    "permission_mode": requested_mode,
+                }
+            ),
+            server_client=auth_client,
+            conversation_id=source["id"],
+        )
+    )
+    assert result.get("conversation_id"), result
+    worker = conversations.get_conversation(result["conversation_id"])
+    assert worker.terminal_launch_args == launch_args
+    assert CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY not in worker.labels
+
+
+async def test_worker_started_before_a_legacy_run_is_recorded_uses_the_automation_mode(
+    auth_client, auth_app, peers, db_uri, monkeypatch, tmp_path
+):
+    """A legacy fire sends the prompt before writing its run row; workers the turn
+    starts first still get the automation's mode."""
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.server.routes.sessions import routes_core
+    from omnigent.server.scheduled.fire import FireDeps, build_on_fire
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+    from tests._helpers.polling import poll_until_async
+
+    worker_agent_id = await _upload_codex_worker(auth_client)
+    schedules = SqlAlchemyScheduledTaskStore(db_uri)
+    task = schedules.create(
+        scheduled_task_id=uuid4().hex,
+        name="Trigger watcher",
+        prompt="Start a worker for each new item",
+        rrule="FREQ=HOURLY",
+        user_id="alice",
+        agent_id=worker_agent_id,
+        timezone="UTC",
+        execution_target="connected_host",
+        host_id=uuid4().hex,
+        workspace="/tmp",
+        permission_mode="approve-for-me",
+    )
+    monkeypatch.setattr(auth_app.state, "scheduled_task_store", schedules)
+    conversations = SqlAlchemyConversationStore(db_uri)
+
+    async def managed_launch(**kwargs):
+        pass
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", managed_launch)
+    workers = []
+
+    async def dispatch(session, task):
+        # The run's turn is already going, and no run row exists yet.
+        assert schedules.list_runs(task.id)[0] == []
+        auth_client.headers.update(_bind_runner(db_uri, session.id))
+        workers.append(
+            json.loads(
+                await execute_tool(
+                    tool_name="sys_session_create",
+                    arguments=json.dumps({"agent_id": worker_agent_id, "placement": "managed"}),
+                    server_client=auth_client,
+                    conversation_id=session.id,
+                )
+            )
+        )
+
+    on_fire = build_on_fire(
+        FireDeps(
+            scheduled_task_store=schedules,
+            agent_store=auth_app.state.agent_store,
+            conversation_store=conversations,
+            permission_store=SqlAlchemyPermissionStore(db_uri),
+            host_store=auth_app.state.host_store,
+            host_registry=auth_app.state.host_registry,
+            sandbox_config=auth_app.state.sandbox_config,
+            agent_cache=AgentCache(
+                artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
+                cache_dir=tmp_path / "fire-cache",
+            ),
+        ),
+        launch_dispatch=dispatch,
+    )
+    assert await on_fire(0, task.id)
+    await poll_until_async(lambda: schedules.list_runs(task.id)[0], timeout_s=5)
+    assert len(workers) == 1 and workers[0].get("conversation_id"), workers
+    worker = conversations.get_conversation(workers[0]["conversation_id"])
+    assert worker.terminal_launch_args == PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"]
+
+
 @pytest.mark.parametrize("placement", ["same_host", "managed"])
 @pytest.mark.parametrize("siblings_enabled", [False, True])
 @pytest.mark.parametrize(
@@ -638,6 +909,51 @@ async def test_same_host_still_requires_host_ownership(auth_client, auth_app, pe
     assert auth_app.state.host_registry.get(host_id).outbound_queue.empty()
     assert {s.id for s in store.list_conversations().data} == before_sessions
     assert permissions.list_for_user("alice") == before_grants
+
+
+async def test_same_host_creation_from_runner_keeps_source_surface(
+    auth_client, auth_app, peers, db_uri, monkeypatch
+) -> None:
+    """A web session's runner creates a same_host session, which is labeled web."""
+    from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
+    from omnigent.telemetry.request_headers import client_user_agent
+    from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    source, _, _ = peers
+    host_id = "b" * 32
+    _register_online_host(auth_app, host_id, "alice")
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(source["id"], host_id, workspace="/tmp")
+    store.set_labels(source["id"], {CLIENT_SURFACE_LABEL_KEY: "web"})
+
+    def answer_host(connection, payload):
+        frame = decode_host_frame(payload)
+        if isinstance(frame, HostStatFrame):
+            connection.pending_stats[frame.request_id].set_result(
+                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+            )
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+        else:
+            pytest.fail(f"Unexpected host frame: {frame}")
+
+    monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
+    # The runner's own tool call carries the component User-Agent.
+    auth_client.headers["User-Agent"] = client_user_agent().replace(
+        "omnigent-cli/", "omnigent-runner/"
+    )
+    result = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": source["agent_id"], "placement": "same_host"}),
+            server_client=auth_client,
+            conversation_id=source["id"],
+        )
+    )
+    created = store.get_conversation(result["conversation_id"])
+    assert created is not None, result
+    assert created.labels[CLIENT_SURFACE_LABEL_KEY] == "web"
 
 
 @pytest.mark.parametrize(
@@ -820,6 +1136,124 @@ async def test_same_host_creation_uses_current_source_and_stays_private(
     )
 
 
+async def _upload_codex_worker(auth_client, sub_agents=None, **config) -> str:
+    from tests._helpers.session import post_session_bundle
+    from tests.server.helpers import build_agent_bundle
+
+    bundle = build_agent_bundle(
+        "codex-worker",
+        executor={"config": {"harness": "codex-native", **config}},
+        sub_agents=sub_agents,
+    )
+    uploaded = await post_session_bundle(auth_client.post, "/v1/sessions", bundle)
+    assert uploaded.status_code == 201, uploaded.text
+    return uploaded.json()["agent_id"]
+
+
+@pytest.mark.parametrize(
+    ("placement", "permission_mode", "spec_config", "expected"),
+    [
+        pytest.param(
+            "managed",
+            "approve-for-me",
+            {},
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            id="worker",
+        ),
+        pytest.param(
+            "child",
+            "approve-for-me",
+            {},
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            id="child",
+        ),
+        # The request replaces the spec's own bypass opt-in, even with the harness default.
+        pytest.param("child", "default", {"yolo": True}, None, id="request-over-spec"),
+        pytest.param(
+            "child",
+            None,
+            {"yolo": True},
+            ["--dangerously-bypass-approvals-and-sandbox"],
+            id="spec-without-request",
+        ),
+        pytest.param(
+            "child",
+            None,
+            {"permission_mode": "approve-for-me"},
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            id="spec-permission-mode",
+        ),
+    ],
+)
+async def test_created_session_launches_in_the_requested_permission_mode(
+    auth_client,
+    auth_app,
+    peers,
+    db_uri,
+    monkeypatch,
+    placement,
+    permission_mode,
+    spec_config,
+    expected,
+):
+    from omnigent.server.routes.sessions import routes_core
+
+    source, _, _ = peers
+    worker_agent_id = await _upload_codex_worker(auth_client, **spec_config)
+
+    async def launch(**kwargs):
+        pass
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    arguments = {"agent_id": worker_agent_id, "placement": placement}
+    if permission_mode is not None:
+        arguments["permission_mode"] = permission_mode
+    result = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(arguments),
+            server_client=auth_client,
+            conversation_id=source["id"],
+        )
+    )
+    assert result.get("conversation_id"), result
+    worker = SqlAlchemyConversationStore(db_uri).get_conversation(result["conversation_id"])
+    assert worker.terminal_launch_args == expected
+
+
+@pytest.mark.parametrize(
+    ("fields", "error"),
+    [
+        # An agent reading a ticket could be steered into asking for one.
+        ({"permission_mode": "full-access"}, "skips approval"),
+        ({"permission_mode": "auto"}, "is not a mode of 'codex-native'"),
+        (
+            {"permission_mode": "approve-for-me", "terminal_launch_args": []},
+            "can't be combined with terminal_launch_args",
+        ),
+        # A named sub-agent takes its launch settings from the trusted sub-spec only.
+        (
+            {"permission_mode": "approve-for-me", "sub_agent_name": "helper"},
+            "can't be combined with terminal_launch_args or sub_agent_name",
+        ),
+    ],
+)
+async def test_created_session_refuses_an_unusable_permission_mode(
+    auth_client, peers, db_uri, fields, error
+):
+    source, _, _ = peers
+    worker_agent_id = await _upload_codex_worker(auth_client, sub_agents=[{"name": "helper"}])
+    store = SqlAlchemyConversationStore(db_uri)
+    before = {conversation.id for conversation in store.list_conversations().data}
+    response = await auth_client.post(
+        "/v1/sessions",
+        json={"agent_id": worker_agent_id, "parent_session_id": source["id"], **fields},
+    )
+    assert response.status_code == 400, response.text
+    assert error in response.text
+    assert {conversation.id for conversation in store.list_conversations().data} == before
+
+
 @pytest.mark.parametrize("shape", ["parent", "multipart", "initial_items", "skill"])
 async def test_independent_creation_rejects_child_or_bundle_shape(auth_client, peers, shape):
     from tests._helpers.session import post_session_bundle
@@ -944,6 +1378,72 @@ async def test_managed_creation_uses_default_provider_and_saves_private_first_ta
         await auth_app.state.startup_inputs.shutdown()
 
 
+class _ListLabelSelection:
+    """A deployment that records the whole selection in one JSON label."""
+
+    def validate(self, request, services, *, spec, user_id):
+        if "revoked" in services:
+            from omnigent.errors import ErrorCode, OmnigentError
+
+            raise OmnigentError("revoked", code=ErrorCode.FORBIDDEN)
+        return tuple(services)
+
+    def session_labels(self, services):
+        return {"deployment.mcp_services": json.dumps(list(services))}
+
+    def selected_services(self, labels):
+        return tuple(json.loads(labels.get("deployment.mcp_services", "[]")))
+
+
+@pytest.mark.parametrize(
+    ("source_services", "inherited"),
+    [(["github", "slack"], '["github", "slack"]'), (["github", "revoked"], None), ([], None)],
+    ids=["inherits", "unusable-service", "no-selection"],
+)
+async def test_managed_worker_starts_with_the_source_mcp_services(
+    auth_client, auth_app, peers, db_uri, monkeypatch, source_services, inherited
+):
+    import asyncio
+
+    from omnigent.server.managed_hosts import parse_sandbox_config
+    from omnigent.server.routes.sessions import routes_core
+
+    source, _, _ = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    if source_services:
+        store.set_labels(source["id"], {"deployment.mcp_services": json.dumps(source_services)})
+    auth_app.state.session_mcp_selection = _ListLabelSelection()
+    auth_app.state.sandbox_config = parse_sandbox_config(
+        {"server_url": "https://managed-test.example.com", "providers": [{"provider": "modal"}]}
+    )
+    launched = asyncio.Event()
+    release = asyncio.Event()
+
+    async def launch(**kwargs):
+        launched.set()
+        await release.wait()
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    try:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {"agent_id": source["agent_id"], "placement": "managed", "message": "Go"}
+                ),
+                server_client=auth_client,
+                conversation_id=source["id"],
+            )
+        )
+        assert "error" not in result, result
+        await asyncio.wait_for(launched.wait(), timeout=2)
+        labels = store.get_conversation(result["conversation_id"]).labels
+        assert labels.get("deployment.mcp_services") == inherited
+    finally:
+        release.set()
+        await auth_app.state.startup_inputs.shutdown()
+
+
 @pytest.mark.parametrize("configured", [False, True])
 async def test_managed_creation_requires_launchable_provider(
     auth_client, auth_app, peers, monkeypatch, configured
@@ -1055,7 +1555,7 @@ async def test_peer_message_readdresses_across_replicas(
 
     from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, open_server_client
     from omnigent.runner._entry import _RunnerDatabricksAuth
-    from omnigent.server.routes import sessions
+    from omnigent.server.routes import _host_launch, sessions
     from omnigent.server.routes._sessions.helpers import _get_runner_client_impl
     from tests.server.integration.test_sessions_permissions import _register_online_host
 
@@ -1067,6 +1567,7 @@ async def test_peer_message_readdresses_across_replicas(
     host_id = uuid4().hex
     _register_online_host(stack.tunnel_replica, host_id, "alice")
     stack.conv_store.set_host_id(target["id"], host_id, workspace="/worker")
+    monkeypatch.setattr(_host_launch, "_host_sharded", True)
     captured = _stub_late_runner_bind(monkeypatch)
     capture_client = sessions._get_runner_client
 
@@ -1117,6 +1618,7 @@ async def test_peer_message_readdresses_across_replicas(
         assert client.headers[OMNIGENT_SLICE_KEY_HEADER] == "sender-host"
     assert result.get("queued") is True, result
     posts = [(key, status) for method, path, key, status in received if method == "POST"]
+    # The first attempt uses the sender's key; a refusal re-resolves the target's host.
     assert posts == (
         [("sender-host", 400), (host_id, 400), (None, 202)]
         if legacy_host
@@ -1125,6 +1627,113 @@ async def test_peer_message_readdresses_across_replicas(
     delivered = [body for path, body in captured.get("posts", []) if path.endswith("/events")]
     assert len(delivered) == 1
     assert f"[Message from session {source['id']}]" in json.dumps(delivered)
+
+
+@pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
+@pytest.mark.parametrize("primed", [True, False], ids=["create_response_cached", "other_host"])
+@pytest.mark.parametrize("keyed", [True, False], ids=["keyed_create", "unkeyed_create"])
+async def test_sub_agent_requests_are_keyed_by_its_host_across_replicas(
+    two_replica_stack, db_uri, monkeypatch, primed, keyed
+):
+    import httpx
+
+    from omnigent import session_host
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, open_server_client
+    from omnigent.runner._entry import _RunnerDatabricksAuth
+    from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
+    from omnigent.server.routes import _host_launch, sessions
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes._sessions.helpers import _get_runner_client_impl
+    from omnigent.stores.host_store import HostStore
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    stack = two_replica_stack
+    parent = await _create_session_as(stack.keyless_client, "", "alice")
+    sub_agent = await _create_session_as(stack.tunnel_client, "", "alice")
+    headers = {"X-Forwarded-Email": "alice", **_bind_runner(db_uri, parent["id"])}
+    _bind_runner(db_uri, sub_agent["id"])
+    host_id = uuid4().hex
+    _register_online_host(stack.tunnel_replica, host_id, "alice")
+    HostStore(db_uri).bind_sandbox(host_id, provider="modal", sandbox_id="sandbox-b")
+    stack.conv_store.set_host_id(sub_agent["id"], host_id, workspace="/worker")
+    if keyed:
+        # A create that requested this host id keys it: the refusal then names the host.
+        stack.conv_store.set_labels(sub_agent["id"], {REQUESTED_HOST_ID_LABEL_KEY: host_id})
+    monkeypatch.setattr(_host_launch, "_host_sharded", True)
+    if primed:
+        # The managed create response names the sub-agent's host; the runner caches it.
+        session_host.set_session_host(sub_agent["id"], host_id)
+    captured = _stub_late_runner_bind(monkeypatch)
+    capture_client = sessions._get_runner_client
+
+    async def resolve_runner(session_id, router, **kwargs):
+        if router is stack.tunnel_replica.state.runner_router:
+            return await capture_client(session_id, router, **kwargs)
+        return await _get_runner_client_impl(session_id, router, **kwargs)
+
+    monkeypatch.setattr(sessions, "_get_runner_client", resolve_runner)
+    # A resumable sandbox provider: a host with no tunnel on the replica is woken, not refused.
+    monkeypatch.setattr(orchestration, "host_resume_supported", lambda host, config: True)
+    forced_wakes: list[str] = []
+
+    async def count_wake(woken_host_id, *args, force=False, **kwargs):
+        if force:
+            forced_wakes.append(woken_host_id)
+
+    monkeypatch.setattr("omnigent.server.managed_hosts.resume_managed_host", count_wake)
+    captured.clear()
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
+    monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", "parent-host")
+    transports = [
+        httpx.ASGITransport(app=app) for app in (stack.keyless_replica, stack.tunnel_replica)
+    ]
+    # Every request about the sub-agent: (round, method, key, status, wrong_replica, is_lookup).
+    seen: list[tuple[int, str, str | None, int, bool, bool]] = []
+    current_round = 0
+
+    async def ingress(request):
+        key = request.headers.get(OMNIGENT_SLICE_KEY_HEADER)
+        on_target = key == host_id
+        response = await transports[int(on_target)].handle_async_request(request)
+        await response.aread()
+        if f"/v1/sessions/{sub_agent['id']}" in request.url.path:
+            wrong = response.status_code == 400 and "wrong_replica" in response.text
+            is_lookup = "include_items" in request.url.params
+            seen.append(
+                (current_round, request.method, key, response.status_code, wrong, is_lookup)
+            )
+        return response
+
+    async with open_server_client(
+        "http://sharded",
+        headers=headers,
+        auth=_RunnerDatabricksAuth(lambda: "test-bearer", "http://sharded"),
+        transport=httpx.MockTransport(ingress),
+    ) as client:
+        for current_round in (1, 2, 3):
+            result = await _send(client, parent, sub_agent, message=f"Round {current_round}")
+            assert result.get("queued") is True, result
+            items = await client.get(f"/v1/sessions/{sub_agent['id']}/items")
+            assert items.status_code == 200, items.text
+            status = await client.get(f"/v1/sessions/{sub_agent['id']}")
+            assert status.status_code == 200, status.text
+
+    wrong = [entry for entry in seen if entry[4]]
+    if primed:
+        # The cached host keys round 1 from its first request: no refusal, no lookup.
+        assert wrong == [] and not any(entry[5] for entry in seen), seen
+    else:
+        # The runner's key is refused first, fast and without a wake, then the host serves.
+        assert len(wrong) == 1 and wrong[0][0] == 1, seen
+        assert seen[0][4] and seen[0][2] == "parent-host", seen
+        # A refusal that names the host is retried on it directly; an unnamed one costs a lookup.
+        assert sum(entry[5] for entry in seen) == (0 if keyed else 1), seen
+    settled = [entry for entry in seen if not entry[4] and not entry[5]]
+    assert settled and all(key == host_id for _, _, key, *_ in settled), seen
+    # The keyless replica refuses the runner's key before any wake is kicked, primed or not.
+    assert forced_wakes == [], forced_wakes
+    delivered = [body for path, body in captured.get("posts", []) if path.endswith("/events")]
+    assert len(delivered) == 3
 
 
 @pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
@@ -1378,7 +1987,7 @@ async def test_nested_agent_gate_tracks_request_context_before_creation(
 
     auth_app.state.feature_flags = resolve_feature_flags({})
     info = (await auth_client.get("/v1/info")).json()
-    assert info["sibling_sessions"] is info["features"]["sibling_sessions"] is False
+    assert info["sibling_sessions"] is info["features"]["sibling_sessions"] is True
     auth_app.state.feature_flags = RequestFeatureFlags(resolve_feature_flags({}).enabled_features)
     sibling_id = None
     for active in (False, True, False):
@@ -1511,12 +2120,18 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
     assert "omnigent.session_family_id" not in sibling.labels
     assert [grant.user_id for grant in permissions.list_for_session(sibling_id)[0]] == ["alice"]
     assert store.list_child_conversation_ids_by_parent([source["id"]])[source["id"]] == []
+    renamed = await auth_client.patch(
+        f"/v1/sessions/{source['id']}", json={"title": "Parent planning"}
+    )
+    assert renamed.status_code == 200, renamed.text
     snapshot = await auth_client.get(f"/v1/sessions/{sibling_id}")
     assert snapshot.json()["family"]["id"] == source["id"]
+    assert snapshot.json()["family"]["representative_title"] == "Parent planning"
     listing = await auth_client.get(
         "/v1/sessions", params={"limit": 1, "search_query": "Private sibling"}
     )
     assert [row["id"] for row in listing.json()["data"]] == [sibling_id]
+    assert listing.json()["data"][0]["family"]["representative_title"] == "Parent planning"
     expanded = await auth_client.get(
         "/v1/sessions",
         params={"limit": 1, "search_query": "Private sibling", "expand_families": True},
@@ -1854,6 +2469,32 @@ async def test_family_project_removal_precedes_archive(auth_client, peers, db_ur
     for session_id in (source["id"], sibling_id):
         snapshot = (await auth_client.get(f"/v1/sessions/{session_id}")).json()
         assert snapshot["family"]["pinned_at"] == "1" * 256
+    # A legacy personal pin must not divert the representative's family action.
+    from omnigent.stores.conversation_store import pinned_label_key
+
+    cleared = await auth_client.patch(
+        f"/v1/sessions/{source['id']}", json={"labels": {"omnigent.pinned": ""}}
+    )
+    assert cleared.status_code == 200, cleared.text
+    store.set_labels(source["id"], {pinned_label_key("alice"): "old-pin"})
+    repinned = await auth_client.patch(
+        f"/v1/sessions/{source['id']}", json={"labels": {"omnigent.pinned": "42"}}
+    )
+    assert repinned.status_code == 200, repinned.text
+    assert repinned.json()["family"]["pinned_at"] == "42"
+    unpinned = await auth_client.patch(
+        f"/v1/sessions/{source['id']}", json={"labels": {"omnigent.pinned": ""}}
+    )
+    assert unpinned.status_code == 200, unpinned.text
+    assert not unpinned.json()["family"]["pinned"]
+    assert "omnigent.pinned" not in unpinned.json()["labels"]
+    assert pinned_label_key("alice") not in store.get_conversation(source["id"]).labels
+    pins = (await auth_client.get("/v1/sessions", params={"pinned": True})).json()["data"]
+    assert source["id"] not in {row["id"] for row in pins}
+    repinned = await auth_client.patch(
+        f"/v1/sessions/{source['id']}", json={"labels": {"omnigent.pinned": "42"}}
+    )
+    assert repinned.status_code == 200, repinned.text
     store.set_conversation_project(source["id"], "a" * 32)
     refused = await auth_client.patch(
         f"/v1/sessions/{source['id']}",
@@ -1892,3 +2533,181 @@ async def test_family_project_removal_precedes_archive(auth_client, peers, db_ur
         store.update_conversation(session_id, archived=False)
     snapshot = (await auth_client.get(f"/v1/sessions/{source['id']}")).json()
     assert not snapshot["family"]["pinned"]
+
+
+@pytest.mark.parametrize("scenario", ["allowed", "foreign_host", "restricted", "shared_source"])
+@pytest.mark.parametrize("nested", [False, True])
+async def test_scripted_host_worktree_respects_ownership_and_policy(
+    auth_client, auth_app, peers, db_uri, monkeypatch, scenario, nested
+):
+    from omnigent.host.frames import (
+        HostCreateWorktreeFrame,
+        HostLaunchRunnerFrame,
+        HostStatFrame,
+        decode_host_frame,
+    )
+    from omnigent.server.sharing_settings import SiblingSessionDestinations
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    source, _, _ = peers
+    auth_app.state.feature_flags = resolve_feature_flags(
+        {
+            FEATURES_ENV_VAR: "scripted_sessions,"
+            + ("sibling_sessions" if nested else "-sibling_sessions")
+        }
+    )
+    host = uuid4().hex
+    owner = "bob" if scenario == "foreign_host" else "alice"
+    _register_online_host(auth_app, host, owner)
+    auth_app.state.host_store.upsert_on_connect(host, "review-host", owner)
+    store = SqlAlchemyConversationStore(db_uri)
+    # A hostless caller can choose an owned host when destination policy allows it.
+    if scenario == "restricted":
+        auth_app.state.sibling_session_destinations = lambda: (
+            SiblingSessionDestinations.CURRENT_HOST
+        )
+    if scenario == "shared_source":
+        permissions = SqlAlchemyPermissionStore(db_uri)
+        permissions.ensure_user("bob")
+        permissions.grant("bob", source["id"], LEVEL_EDIT)
+    frames = []
+
+    def answer_host(connection, payload):
+        frame = decode_host_frame(payload)
+        frames.append(frame)
+        assert connection.host_id == host
+        if isinstance(frame, HostStatFrame):
+            connection.pending_stats[frame.request_id].set_result(
+                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+            )
+        elif isinstance(frame, HostCreateWorktreeFrame):
+            connection.pending_create_worktrees[frame.request_id].set_result(
+                {"status": "ok", "worktree_path": "/repos/review", "branch": frame.branch_name}
+            )
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+        else:
+            pytest.fail(f"Unexpected host frame: {frame}")
+
+    monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
+    before = {s.id for s in store.list_conversations().data}
+    result = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {
+                    "agent_id": source["agent_id"],
+                    "placement": "host",
+                    "host_id": host,
+                    "workspace": "/repos/example",
+                    "git": {"branch_name": "review", "base_branch": "main"},
+                }
+            ),
+            server_client=auth_client,
+            conversation_id=source["id"],
+        )
+    )
+    if scenario != "allowed":
+        assert "error" in result, result
+        assert {s.id for s in store.list_conversations().data} == before
+        assert not frames
+        return
+    assert "error" not in result, result
+    created = store.get_conversation(result["conversation_id"])
+    assert created.host_id == host
+    assert created.workspace == "/repos/review"
+    assert created.parent_conversation_id is None
+    worktree = next(f for f in frames if isinstance(f, HostCreateWorktreeFrame))
+    assert worktree.branch_name == "review" and worktree.base_branch == "main"
+    launch = next(f for f in frames if isinstance(f, HostLaunchRunnerFrame))
+    assert launch.workspace == "/repos/review"
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "allowed",
+        "disabled",
+        "shared_source",
+        "read_only_target",
+        "missing_source",
+        "legacy_disabled",
+    ],
+)
+async def test_scripted_pr_link_checks_source_and_target(
+    auth_client, auth_app, peers, db_uri, monkeypatch, scenario
+):
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.server.routes import _host_filesystem
+    from omnigent.server.routes.sessions import routes_resources
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    source, target, _ = peers
+    auth_app.state.feature_flags = resolve_feature_flags(
+        {
+            FEATURES_ENV_VAR: ""
+            if scenario in ("disabled", "legacy_disabled")
+            else "scripted_sessions"
+        }
+    )
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("bob")
+    if scenario == "shared_source":
+        permissions.grant("bob", source["id"], LEVEL_EDIT)
+    if scenario == "read_only_target":
+        target = await _create_session_as(auth_client, "", "bob")
+        permissions.grant("alice", target["id"], LEVEL_READ)
+    host = uuid4().hex
+    _register_online_host(auth_app, host, "alice")
+    SqlAlchemyConversationStore(db_uri).set_host_id(target["id"], host, workspace="/repo")
+
+    # Exercise the host fallback after the remote runner reports it is offline.
+    async def offline_runner(*args, **kwargs):
+        raise OmnigentError("Runner offline", code=ErrorCode.RUNNER_UNAVAILABLE)
+
+    monkeypatch.setattr(routes_resources, "_get_runner_client_for_resource_access", offline_runner)
+    captured = []
+
+    async def write(**kwargs):
+        captured.append(kwargs)
+        return {"object": "session.github.info", "prs": []}
+
+    monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", write)
+    path = f"/v1/sessions/{target['id']}/resources/github/prs"
+    if scenario != "legacy_disabled":
+        path += "/orchestrated"
+    headers = {"X-Forwarded-Email": "alice"}
+    if scenario != "missing_source":
+        headers[ORCHESTRATION_SOURCE_HEADER] = source["id"]
+    response = await auth_client.post(
+        path,
+        headers=headers,
+        json={"url": "https://github.com/example/repo/pull/1", "action": "attach"},
+    )
+    if scenario != "allowed":
+        assert response.status_code == 403, response.text
+        assert not captured
+        return
+    assert response.status_code == 200, response.text
+    assert len(captured) == 1
+    assert captured[0]["op"] == "github_prs_update"
+    assert captured[0]["params"]["session_id"] == target["id"]
+
+
+@pytest.mark.parametrize("enabled,source_header", [(False, True), (True, False)])
+async def test_explicit_host_endpoint_refuses_without_capability_or_source(
+    auth_client, auth_app, peers, db_uri, enabled, source_header
+):
+    source, _, _ = peers
+    auth_app.state.feature_flags = resolve_feature_flags(
+        {FEATURES_ENV_VAR: "scripted_sessions" if enabled else ""}
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    before = {session.id for session in store.list_conversations().data}
+    response = await auth_client.post(
+        "/v1/sessions/orchestrated/host",
+        headers={ORCHESTRATION_SOURCE_HEADER: source["id"]} if source_header else {},
+        json={"agent_id": source["agent_id"], "host_id": uuid4().hex, "workspace": "/repo"},
+    )
+    assert response.status_code == 403, response.text
+    assert {session.id for session in store.list_conversations().data} == before

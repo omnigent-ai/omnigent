@@ -55,6 +55,7 @@ from omnigent.harnesses.devin_native.main import (
     list_devin_cli_model_options,
     resolve_devin_launch_model,
 )
+from omnigent.native.native_policy_hook import TOOL_FAILED_PAYLOAD_KEY
 
 # A real pane capture from devin 3000.10.21 (200x50), trimmed. The composer sits
 # between two horizontal rules with the model/context status line below.
@@ -769,6 +770,19 @@ class TestNormalizeToolResult:
             {"tool_response": {"success": False, "output": "", "error": "boom"}}
         )
         assert payload["tool_output"] == "boom"
+
+    def test_failure_is_flagged_for_result_policies(self) -> None:
+        payload = _normalize_tool_result(
+            {"tool_response": {"success": False, "output": "cat: x: No such file", "error": None}}
+        )
+        assert payload["tool_output"] == "cat: x: No such file"
+        assert payload[TOOL_FAILED_PAYLOAD_KEY] is True
+
+    def test_success_is_not_flagged(self) -> None:
+        payload = _normalize_tool_result(
+            {"tool_response": {"success": True, "output": "hi", "error": None}}
+        )
+        assert TOOL_FAILED_PAYLOAD_KEY not in payload
 
     def test_existing_tool_output_wins(self) -> None:
         payload = _normalize_tool_result({"tool_output": "kept", "tool_response": {"output": "x"}})

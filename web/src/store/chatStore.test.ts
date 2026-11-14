@@ -794,10 +794,13 @@ describe("chatStore — lazy subtree usage", () => {
     expect(useChatStore.getState().blocks).toHaveLength(1);
     expect(useChatStore.getState().sessionCostUsd).toBeNull();
     expect(useChatStore.getState().sessionUsageByModel).toBeNull();
+    // Unknown while the read runs is loading, not unavailable.
+    expect(useChatStore.getState().sessionUsageLoading).toBe(true);
 
     finishUsage(usage("conv_usage", 3.5));
     await tick();
 
+    expect(useChatStore.getState().sessionUsageLoading).toBe(false);
     expect(useChatStore.getState().sessionCostUsd).toBe(3.5);
     expect(useChatStore.getState().sessionUsageByModel).toEqual({
       "model-a": {
@@ -866,6 +869,7 @@ describe("chatStore — lazy subtree usage", () => {
     expect(useChatStore.getState().conversationLoadError).toBeNull();
     expect(useChatStore.getState().sessionCostUsd).toBeNull();
     expect(useChatStore.getState().sessionUsageByModel).toBeNull();
+    expect(useChatStore.getState().sessionUsageLoading).toBe(false);
     expect(readUsage).toHaveBeenCalledOnce();
   });
 
@@ -1068,12 +1072,20 @@ describe("chatStore — lazy subtree usage", () => {
       await useChatStore.getState().switchTo("conv_usage");
       await drainAsync();
       expect(useChatStore.getState().sessionCostUsd).toBe(3.5);
+      await vi.advanceTimersByTimeAsync(2_000);
+      client.setQueryData(["agent_costs", "conv_usage"], new Map());
+      client.setQueryData(["agent_costs", "conv_unsupported"], null);
 
       await advanceReconcileInterval();
+      await vi.advanceTimersByTimeAsync(2_000);
 
       expect(streamOpenCount()).toBe(1);
       expect(readUsage).toHaveBeenCalledTimes(2);
       expect(useChatStore.getState().sessionCostUsd).toBe(8);
+      // A total recovered outside the live stream still refreshes per-agent costs,
+      // except from a server that has no breakdown.
+      expect(client.getQueryState(["agent_costs", "conv_usage"])?.isInvalidated).toBe(true);
+      expect(client.getQueryState(["agent_costs", "conv_unsupported"])?.isInvalidated).toBe(false);
       expect(useChatStore.getState().sessionUsageByModel?.["model-a"]).toMatchObject({
         inputTokens: 500,
         totalCostUsd: 8,
@@ -1096,6 +1108,8 @@ describe("chatStore — lazy subtree usage", () => {
 
       await advanceReconcileInterval();
       expect(readUsage).toHaveBeenCalledTimes(2);
+      // A background re-read keeps the settled answer instead of loading again.
+      expect(useChatStore.getState().sessionUsageLoading).toBe(false);
       handleSessionEvent({
         type: "session_status",
         conversationId: "conv_usage",
@@ -7750,6 +7764,194 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
 
       await useChatStore.getState().clearContext();
 
+      expect(useChatStore.getState().redirectToConversationId).toBeNull();
+    });
+  });
+
+  describe("rewindToPrompt", () => {
+    function answerRewind(response: Response): () => RequestInit | undefined {
+      let sent: RequestInit | undefined;
+      const base = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).endsWith("/v1/sessions/conv_old/rewind")) {
+          sent = init;
+          return Promise.resolve(response.clone());
+        }
+        return base(input, init);
+      });
+      return () => sent;
+    }
+
+    it.each([false, true])(
+      "restores the rewound prompt and warns if incomplete: %s",
+      async (incomplete) => {
+        onTestFinished(() => clearSessionDrafts());
+        useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+        const sent = answerRewind(
+          Response.json({
+            session_id: "conv_new",
+            prompt: "Add parser tests",
+            attachments_incomplete: incomplete,
+          }),
+        );
+        const warning = vi.spyOn(toast, "warning");
+        onTestFinished(() => warning.mockRestore());
+
+        await useChatStore.getState().rewindToPrompt("msg_second");
+
+        if (incomplete) {
+          expect(warning).toHaveBeenCalledExactlyOnceWith(
+            "Some attachments couldn't be restored. Attach them again before sending.",
+          );
+        } else {
+          expect(warning).not.toHaveBeenCalled();
+        }
+        expect(JSON.parse(String(sent()?.body))).toEqual({ item_id: "msg_second" });
+        expect(getSessionDraft("conv_new")?.text).toBe("Add parser tests");
+        expect(useChatStore.getState().redirectToConversationId).toBe("conv_new");
+        expect(useChatStore.getState().rewindPrefill).toEqual({
+          conversationId: "conv_new",
+          text: "Add parser tests",
+          files: [],
+        });
+      },
+    );
+
+    it("stays put when the user switched away before the rewind was acknowledged", async () => {
+      onTestFinished(() => {
+        clearSessionDrafts();
+        useChatStore.setState({ rewindPrefill: null });
+      });
+      useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+      let acknowledge = () => {};
+      const answered = new Promise<void>((resolve) => {
+        acknowledge = resolve;
+      });
+      const base = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).endsWith("/v1/sessions/conv_old/rewind")) {
+          await answered;
+          return Response.json({ session_id: "conv_new", prompt: "Add parser tests" });
+        }
+        return base(input, init);
+      });
+
+      const rewinding = useChatStore.getState().rewindToPrompt("msg_second");
+      useChatStore.setState({ conversationId: "conv_other" });
+      acknowledge();
+      await rewinding;
+
+      expect(useChatStore.getState().redirectToConversationId).toBeNull();
+      // The new session still opens with the prompt when the user goes there.
+      expect(getSessionDraft("conv_new")?.text).toBe("Add parser tests");
+    });
+
+    it("restores the prompt's attachments as the new session's own files", async () => {
+      onTestFinished(() => {
+        clearSessionDrafts();
+        useChatStore.setState({ rewindPrefill: null });
+      });
+      useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+      answerRewind(
+        Response.json({
+          session_id: "conv_new",
+          prompt: "",
+          attachments: [
+            { type: "input_image", file_id: "file_fork_png", filename: "diagram.png" },
+            // Carried inline (e.g. imported), with no stored file to copy.
+            {
+              type: "input_image",
+              file_id: null,
+              image_url: "data:image/png;base64,cGFzdGVk",
+              filename: "pasted.png",
+            },
+            {
+              type: "input_file",
+              file_id: null,
+              file_data: "data:application/pdf;base64,JVBERi0=",
+              filename: "spec.pdf",
+            },
+            {
+              type: "input_file",
+              file_id: null,
+              file_data: "data:text/plain;charset=utf-8;base64,aW5saW5l",
+              filename: "inline.txt",
+            },
+            { type: "input_file", file_id: "file_fork_gone", filename: "gone.txt" },
+            { type: "input_file", file_id: "file_fork_txt", filename: "notes.txt" },
+          ],
+        }),
+      );
+      const contents: Record<string, Response> = {
+        file_fork_png: new Response("png", { headers: { "Content-Type": "image/png" } }),
+        file_fork_gone: Response.json({ error: { code: "not_found" } }, { status: 404 }),
+        file_fork_txt: new Response("notes", { headers: { "Content-Type": "text/plain" } }),
+      };
+      const uploads: string[] = [];
+      const posted: unknown[] = [];
+      const rewindFetch = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const fileId = url.match(
+          /\/v1\/sessions\/conv_new\/resources\/files\/(\w+)\/content$/,
+        )?.[1];
+        if (fileId) return Promise.resolve(contents[fileId]!);
+        if (url.endsWith("/resources/files")) {
+          uploads.push(url);
+          return mockResponse({
+            id: `file_uploaded_${uploads.length}`,
+            name: "inline",
+            metadata: { filename: "inline", bytes: 6, created_at: 0 },
+          });
+        }
+        if (url.endsWith("/v1/sessions/conv_new/events") && init?.method === "POST")
+          posted.push(JSON.parse(String(init.body)));
+        return rewindFetch(input, init);
+      });
+
+      const warning = vi.spyOn(toast, "warning");
+      onTestFinished(() => warning.mockRestore());
+
+      await useChatStore.getState().rewindToPrompt("msg_second");
+
+      expect(warning).toHaveBeenCalledExactlyOnceWith(
+        "Couldn't restore gone.txt to the composer. Attach again to send.",
+      );
+      const files = getSessionDraft("conv_new")?.files ?? [];
+      expect(files.map((file) => [file.name, file.type])).toEqual([
+        ["diagram.png", "image/png"],
+        ["pasted.png", "image/png"],
+        ["spec.pdf", "application/pdf"],
+        ["inline.txt", "text/plain"],
+        ["notes.txt", "text/plain"],
+      ]);
+      expect(await files[1]!.text()).toBe("pasted");
+      expect(await files[2]!.text()).toBe("%PDF-");
+      expect(await files[3]!.text()).toBe("inline");
+      expect(await files[4]!.text()).toBe("notes");
+      expect(useChatStore.getState().rewindPrefill?.files).toEqual(files);
+
+      // Sending them reuses the new session's copies instead of uploading
+      // again; only the inline image and documents, which had no copy, are uploaded.
+      useChatStore.setState({ conversationId: "conv_new", abortController: new AbortController() });
+      await useChatStore.getState().send("", "agent_xyz", files);
+      expect(uploads).toEqual(Array(3).fill("/v1/sessions/conv_new/resources/files"));
+      expect(JSON.stringify(posted)).toContain('"file_id":"file_fork_png"');
+      for (const uploaded of ["file_uploaded_1", "file_uploaded_2", "file_uploaded_3"])
+        expect(JSON.stringify(posted)).toContain(`"file_id":"${uploaded}"`);
+      expect(JSON.stringify(posted)).toContain('"file_id":"file_fork_txt"');
+    });
+
+    it("leaves the view in place when the server refuses", async () => {
+      useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+      answerRewind(
+        Response.json(
+          { error: { code: "invalid_input", message: "Stop the current turn first." } },
+          { status: 400 },
+        ),
+      );
+
+      await expect(useChatStore.getState().rewindToPrompt("msg_second")).rejects.toThrow();
       expect(useChatStore.getState().redirectToConversationId).toBeNull();
     });
   });
@@ -17855,6 +18057,13 @@ describe("chatStore — startStreamPump reconnect loop", () => {
      * snapshot; `pendingFirstOpenFor` parks that session's first open pre-headers,
      * and `failFirstOpenFor` answers it with a 503.
      */
+    // A hostless open carries the client's own random key.
+    const CLIENT_KEY_RE = /^[0-9a-f]{32}$/;
+    function routeLabel(key: string | null): string {
+      if (key === null) return "none";
+      return CLIENT_KEY_RE.test(key) ? "client" : key;
+    }
+
     function routeKeyedStreamOpens(
       opts: {
         snapshotExtras?: Map<string, Record<string, unknown>>;
@@ -17874,7 +18083,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
         if (streamMatch) {
           const open: StreamOpen = { headers: new Headers(init?.headers), aborted: false };
           opens.push(open);
-          log.push(`open:${open.headers.get(SLICE_KEY) ?? "none"}`);
+          log.push(`open:${routeLabel(open.headers.get(SLICE_KEY))}`);
           if (opts.failFirstOpenFor === streamMatch[1] && !firstOpenFailed) {
             firstOpenFailed = true;
             return mockResponse({}, { ok: false, status: 503 });
@@ -17964,8 +18173,8 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       const loop = startStreamPump(id, controller, setState, getState);
       await drainAsync();
       expect(route.opens).toHaveLength(1);
-      // Opened before the host was known: keyless, to the default replica.
-      expect(route.opens[0]!.headers.has(SLICE_KEY)).toBe(false);
+      // Opened before the host was known: on the client key.
+      expect(route.opens[0]!.headers.get(SLICE_KEY)).toMatch(CLIENT_KEY_RE);
 
       // Bytes are flowing, so no stale or stall path could explain a recycle.
       route.sinks[0]!.push(sse("session.heartbeat", {}));
@@ -18012,7 +18221,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
       const loop = startStreamPump(id, controller, setState, getState);
       await drainAsync();
-      expect(route.log).toEqual(["open:none"]);
+      expect(route.log).toEqual(["open:client"]);
 
       // The message was dispatched on the owning replica while this stream sat
       // on the wrong one: its commit and the reply never arrived here.
@@ -18024,7 +18233,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await drainAsync(50);
 
       expect(route.log.filter((entry) => entry.startsWith("open:"))).toEqual([
-        "open:none",
+        "open:client",
         "open:host_b",
       ]);
       const reopenedAt = route.log.indexOf("open:host_b");
@@ -18056,7 +18265,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       const loop = startStreamPump(id, controller, setState, getState);
       await drainAsync();
       // The keyless open's headers never arrive: nothing has connected yet.
-      expect(route.log).toEqual(["open:none"]);
+      expect(route.log).toEqual(["open:client"]);
       expect(route.sinks).toHaveLength(0);
 
       const committed = userMessage("pend_gap", "only once");
@@ -18101,7 +18310,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       const loop = startStreamPump(id, controller, setState, getState);
       await drainAsync();
       // The keyless open failed; the first backoff (125-250 ms) is pending.
-      expect(route.log).toEqual(["open:none"]);
+      expect(route.log).toEqual(["open:client"]);
 
       const committed = userMessage("backoff_gap", "only once");
       const reply = assistantMessage("backoff_gap", "the reply");
@@ -18112,7 +18321,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await drainAsync(50);
 
       expect(route.log.filter((entry) => entry.startsWith("open:"))).toEqual([
-        "open:none",
+        "open:client",
         "open:host_b",
       ]);
       // No attempt was live to recycle, but the host still changed after the
@@ -18144,7 +18353,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       const loop = startStreamPump(child, controller, setState, getState);
       await drainAsync();
       expect(route.opens).toHaveLength(1);
-      expect(route.opens[0]!.headers.has(SLICE_KEY)).toBe(false);
+      expect(route.opens[0]!.headers.get(SLICE_KEY)).toMatch(CLIENT_KEY_RE);
 
       // The child keys by its nearest host-bound ancestor.
       setSessionHost(parent, "host_p");
@@ -18177,7 +18386,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await drainAsync();
       expect(route.opens).toHaveLength(1);
       // No parent link yet, so the child resolves no host of its own.
-      expect(route.opens[0]!.headers.has(SLICE_KEY)).toBe(false);
+      expect(route.opens[0]!.headers.get(SLICE_KEY)).toMatch(CLIENT_KEY_RE);
 
       // A cold /c/<child> open learns the parent from the child's own snapshot
       // after the parent's host is already on the map.

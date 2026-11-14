@@ -57,6 +57,45 @@ export function isValidSandboxBranch(branch: string): boolean {
   );
 }
 
+/** A problem with the sandbox repository inputs and the input it belongs under. */
+export interface SandboxRepoProblem {
+  field: "repository" | "branch";
+  message: string;
+}
+
+/**
+ * Why a single sandbox repository input can't be submitted, or `null` when it
+ * can. A blank repository is legal (an empty sandbox), but a branch without
+ * one, a malformed URL or branch, or an over-long pair is not.
+ *
+ * @param url Repository URL input, e.g. ``"https://github.com/org/repo"``.
+ * @param branch Branch input, e.g. ``"main"``.
+ * @returns The problem and the input to show it under, or `null`.
+ */
+export function sandboxRepoProblem(url: string, branch: string): SandboxRepoProblem | null {
+  if (url.trim() === "") {
+    return branch.trim() === ""
+      ? null
+      : { field: "repository", message: "Add the repository this branch belongs to." };
+  }
+  if (!isValidSandboxRepoUrl(url)) {
+    return {
+      field: "repository",
+      message: "Enter a repository URL like https://github.com/org/repo.",
+    };
+  }
+  if (!isValidSandboxWorkspaceLength(url, branch)) {
+    return { field: "repository", message: SANDBOX_WORKSPACE_LENGTH_MESSAGE };
+  }
+  if (!isValidSandboxBranch(branch)) {
+    return {
+      field: "branch",
+      message: "Enter a valid branch name or leave it blank for the default branch.",
+    };
+  }
+  return null;
+}
+
 /**
  * Compose the managed session's ``workspace`` string from the split
  * repository inputs.

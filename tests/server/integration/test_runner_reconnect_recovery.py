@@ -18,6 +18,8 @@ from fastapi import FastAPI
 
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import Agent, Conversation
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.host.frames import CAP_MCP_REGISTRY, CAP_TCP_EGRESS
 from omnigent.runtime import get_artifact_store
 from omnigent.server.bundles import bundle_location
 from omnigent.server.child_session_recovery import RECOVERY_STORE_CONCURRENCY
@@ -30,6 +32,7 @@ from tests.server.integration.test_runner_tunnel_route import (
     _connect_route,
     _send_hello,
 )
+from tests.server.integration.test_sessions_permissions import _end_stream_via_close
 
 pytestmark = pytest.mark.asyncio
 
@@ -80,6 +83,8 @@ async def _recover(
     app: FastAPI,
     monkeypatch: pytest.MonkeyPatch,
     respond: Callable[[httpx.Request], Awaitable[httpx.Response]],
+    *,
+    capabilities: list[str] | None = None,
 ) -> AsyncIterator[tuple[list[str], asyncio.Event]]:
     relays: list[str] = []
     finished = asyncio.Event()
@@ -101,6 +106,10 @@ async def _recover(
         communicator = await _connect_route(app, _TUNNEL_PATH)
         try:
             await _send_hello(communicator, app.state.tunnel_registry)
+            if capabilities is not None:
+                connection = app.state.tunnel_registry.get(_RUNNER_ID)
+                assert connection is not None
+                connection.hello.capabilities[:] = capabilities
             asyncio.get_running_loop().call_soon(start.set)
             yield relays, finished
         finally:
@@ -325,6 +334,20 @@ async def test_large_mirror_tree_attaches_without_blocking_or_per_child_reads(
         store.set_labels(child.id, {"omnigent.wrapper": "claude-code-native-ui-subagent"})
         mirrors.append(child.id)
     loop_thread = threading.get_ident()
+    requirement_reads: list[int] = []
+
+    def track_requirements(call: Any) -> Any:
+        def tracked(*args: Any, **kwargs: Any) -> Any:
+            requirement_reads.append(threading.get_ident())
+            return call(*args, **kwargs)
+
+        return tracked
+
+    for owner, method in (
+        (app.state.agent_store, "get"),
+        (app.state.runner_router._agent_cache, "load"),
+    ):
+        monkeypatch.setattr(owner, method, track_requirements(getattr(owner, method)))
     real_get = store.get_conversation
     real_get_many = store.get_conversations
     reads: list[tuple[str, int]] = []
@@ -370,7 +393,10 @@ async def test_large_mirror_tree_attaches_without_blocking_or_per_child_reads(
         requests.append(json.loads(request.content)["session_id"])
         return httpx.Response(201, json={})
 
-    async with _recover(app, monkeypatch, respond) as (relays, finished):
+    async with _recover(app, monkeypatch, respond, capabilities=[CAP_MCP_REGISTRY]) as (
+        relays,
+        finished,
+    ):
         ticker = asyncio.create_task(heartbeat())
         try:
             await asyncio.wait_for(finished.wait(), budget(5))
@@ -381,6 +407,7 @@ async def test_large_mirror_tree_attaches_without_blocking_or_per_child_reads(
         assert relays[0] == parent.id
         assert not set(mirrors).intersection(sid for sid, _ in reads)
         assert all(thread != loop_thread for _, thread in reads)
+        assert requirement_reads and all(thread != loop_thread for thread in requirement_reads)
         assert all(0 < len(ids) <= batch_size for ids in attachment_batches)
         assert any(1 < count <= batch_size + 1 for count in heartbeats)
         if superseded:
@@ -418,6 +445,165 @@ async def test_failed_root_init_keeps_failure_but_does_not_block_other_tree(
         assert sessions._session_status_cache[failed.id] == "failed"
         assert sessions._session_status_cache[healthy.id] == "idle"
         assert set(requested) == {failed.id, healthy.id}
+
+
+@pytest.mark.parametrize("bundle_state", ["missing", "invalid", "downgraded"])
+async def test_unreadable_bundle_does_not_block_other_sessions_on_old_runner(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    agent: Agent,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    bundle_state: str,
+) -> None:
+    broken_id = generate_agent_id()
+    bundle = (
+        build_agent_bundle(
+            "restricted",
+            os_env={
+                "type": "caller_process",
+                "sandbox": {
+                    "type": "linux_bwrap",
+                    "tcp_egress": [{"name": "db", "host": "db.example.test", "port": 5432}],
+                },
+            },
+        )
+        if bundle_state == "downgraded"
+        else b"invalid bundle"
+    )
+    location = bundle_location(broken_id, bundle)
+    if bundle_state != "missing":
+        get_artifact_store().put(location, bundle)
+    app.state.agent_store.create(broken_id, "broken", location)
+    failed = _create_session(app, broken_id)
+    healthy = _create_session(app, agent.id)
+    router = app.state.runner_router
+    from omnigent.runtime import _globals
+
+    monkeypatch.setattr(_globals, "_runner_router", router)
+    store = router._conversation_store
+    list_bound = store.list_conversations_by_runner_id
+    monkeypatch.setattr(
+        store,
+        "list_conversations_by_runner_id",
+        lambda rid: sorted(list_bound(rid), key=lambda row: row.id != failed.id),
+    )
+    requested: list[str] = []
+    controls: list[str] = []
+    deletions: list[str] = []
+    reads: list[str] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            reads.append(request.url.path)
+            terminal = {"id": "shell", "type": "terminal"}
+            return httpx.Response(
+                200,
+                json={"data": [terminal]} if request.url.path.endswith("/terminals") else terminal,
+            )
+        if request.method == "DELETE":
+            deletions.append(request.url.path)
+            return httpx.Response(200, json={"deleted": True})
+        if request.url.path.endswith("/events"):
+            controls.append(json.loads(request.content)["type"])
+            return httpx.Response(200, json={"queued": True})
+        requested.append(json.loads(request.content)["session_id"])
+        return httpx.Response(201)
+
+    async with _recover(app, monkeypatch, respond, capabilities=[CAP_MCP_REGISTRY]) as (
+        relays,
+        finished,
+    ):
+        connection = app.state.tunnel_registry.get(_RUNNER_ID)
+        assert connection is not None and CAP_TCP_EGRESS not in connection.hello.capabilities
+        for lookup in (
+            lambda: router.client_for_conversation(
+                conversation_id=failed.id, harness="claude-sdk"
+            ),
+            lambda: router.client_for_session_resources(failed.id),
+            lambda: router.client_for_existing_conversation(failed.id),
+        ):
+            with pytest.raises(OmnigentError) as error:
+                await asyncio.to_thread(lookup)
+            assert error.value.code == (
+                ErrorCode.RUNNER_CAPABILITY_MISMATCH
+                if bundle_state == "downgraded"
+                else ErrorCode.CONFLICT
+            )
+        await asyncio.wait_for(finished.wait(), budget(5))
+        assert relays == requested == [healthy.id]
+        assert sessions._session_status_cache[healthy.id] == "idle"
+        assert sessions._session_status_cache[failed.id] == "failed"
+        assert any(
+            "Failed to resolve runner client" in record.getMessage()
+            and record.exc_info is not None
+            and isinstance(record.exc_info[1], OmnigentError)
+            for record in caplog.records
+        )
+        for event_type in ("interrupt", "stop_session"):
+            response = await client.post(
+                f"/v1/sessions/{failed.id}/events", json={"type": event_type}
+            )
+            assert response.status_code == 202, response.text
+        assert controls == ["interrupt", "stop_session"]
+        assert requested == [healthy.id]
+        assert store.get_conversation(failed.id).host_id is None
+        from omnigent.server.routes._sessions.helpers import (
+            _forward_approval_to_runner,
+            _forward_session_change_to_runner_impl,
+        )
+
+        await _forward_session_change_to_runner_impl(failed.id, router, {"type": "interrupt"})
+        assert controls == ["interrupt", "stop_session", "interrupt"]
+        for action in ("decline", "cancel"):
+            await _forward_approval_to_runner(failed.id, {"action": action}, router)
+        assert controls[-2:] == ["approval", "approval"]
+        for action in ("accept", [], {}):
+            with pytest.raises(OmnigentError):
+                await _forward_approval_to_runner(failed.id, {"action": action}, router)
+        for event in (
+            {"type": "effort_change", "effort": "high"},
+            {"type": "model_change", "model": "example-model"},
+        ):
+            assert await _forward_session_change_to_runner_impl(failed.id, router, event) is None
+        for event_type in ("cost_approval_popup", "policy_blocked_notice"):
+            await _forward_session_change_to_runner_impl(failed.id, router, {"type": event_type})
+        assert controls[-2:] == ["cost_approval_popup", "policy_blocked_notice"]
+        with pytest.raises(OmnigentError):
+            await _forward_session_change_to_runner_impl(failed.id, router, {"type": "compact"})
+
+        async def relay_ready(_session_id, _runner_id, runner_client, *_args, **_kwargs):
+            assert runner_client is not None
+
+        monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", relay_ready)
+        stream_task = asyncio.create_task(client.get(f"/v1/sessions/{failed.id}/stream"))
+        try:
+            response = await _end_stream_via_close(failed.id, stream_task)
+            assert response.status_code == 200, response.text
+            assert response.headers["content-type"].startswith("text/event-stream")
+            first_data = next(
+                line[6:] for line in response.text.splitlines() if line.startswith("data: ")
+            )
+            assert json.loads(first_data)["type"] == "session.heartbeat"
+        finally:
+            stream_task.cancel()
+            await asyncio.gather(stream_task, return_exceptions=True)
+        terminal_path = f"/v1/sessions/{failed.id}/resources/terminals/shell"
+        for path in (terminal_path.rsplit("/", 1)[0], terminal_path):
+            response = await client.get(path)
+            assert response.status_code == 200, response.text
+            assert path in reads
+            payload = response.json()
+            terminal = payload["data"][0] if "data" in payload else payload
+            assert terminal["id"] == "shell"
+            assert "direct_attach_url" not in terminal.get("metadata", {})
+        response = await client.delete(terminal_path)
+        assert response.status_code == 200, response.text
+        response = await client.delete(f"/v1/sessions/{failed.id}")
+        assert response.status_code == 200, response.text
+        assert terminal_path in deletions and f"/v1/sessions/{failed.id}" in deletions
+        assert store.get_conversation(failed.id) is None
+        assert requested == [healthy.id]
 
 
 async def test_failed_binding_batch_does_not_strand_later_roots(

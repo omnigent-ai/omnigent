@@ -537,6 +537,18 @@ def test_content_search_opens_line_and_preserves_results(
     params = parse_qs(urlparse(submitted.value.url).query)
     assert params["include"] == ["src/**, *.{py,txt}"]
     assert params["exclude"] == ["**/tests/**, *.min.js"]
+    assert params["q"] == ["changed"]
+    assert params["regex"] == ["false"]
+    # Whole word is a keyboard-operable checkbox that sends a bounded regex on the same route.
+    whole_word = rail.get_by_role("checkbox", name="Whole word", exact=True)
+    expect(whole_word).not_to_be_checked()
+    whole_word.press("Space")
+    expect(whole_word).to_be_checked()
+    with page.expect_request(lambda request: "/content-search?" in request.url) as submitted:
+        search.press("Enter")
+    params = parse_qs(urlparse(submitted.value.url).query)
+    assert params["q"] == [r"\bchanged\b"]
+    assert params["regex"] == ["true"]
     result = rail.get_by_role("button", name=f"Open {_FILE_PATH} at line 351")
     result.click()
     page.wait_for_function(_CENTERED_LINE, arg={"text": _AFTER_LINES[350], "diff": False})

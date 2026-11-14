@@ -30,6 +30,8 @@ from omnigent.onboarding.sandboxes.base import SandboxHostLauncher
 from omnigent.onboarding.sandboxes.types import RepoWorkspace
 
 SLICE_KEY = "x-databricks-omnigent-slice-key"
+# Startup probes that always carry the browser's own key, never a host's.
+_CLIENT_KEY_PATHS = frozenset({"/v1/info", "/v1/me"})
 _HOP_HEADERS = {"host", "connection", "keep-alive", "transfer-encoding"}
 
 
@@ -214,12 +216,16 @@ def replica_app(
 
 def ingress_app(replica_a: str, replica_b: str, *, strip_host_id: bool = False) -> FastAPI:
     """
-    Forward keyless traffic to A and host-keyed traffic to B, including SSE.
+    Forward host-keyed traffic to B and everything else to A, including SSE.
+
+    The browser keys every request; its own random key, learned from its startup
+    probes, stands for the client's replica, which here is A.
 
     With *strip_host_id*, a managed create loses its ``host_id`` and key, as
     one from a client that doesn't choose the id (the SDK, Slack).
     """
     exchanges: list[dict[str, Any]] = []
+    client_keys: set[str] = set()
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -238,6 +244,8 @@ def ingress_app(replica_a: str, replica_b: str, *, strip_host_id: bool = False) 
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
     async def forward(request: Request, path: str) -> StreamingResponse:
         key = request.headers.get(SLICE_KEY)
+        if key and request.url.path in _CLIENT_KEY_PATHS:
+            client_keys.add(key)
         body = await request.body()
         headers = {k: v for k, v in request.headers.items() if k not in _HOP_HEADERS}
         if strip_host_id and request.method == "POST" and request.url.path == "/v1/sessions":
@@ -269,12 +277,13 @@ def ingress_app(replica_a: str, replica_b: str, *, strip_host_id: bool = False) 
                 if k.lower() not in {SLICE_KEY, "content-length", "content-type"}
             }
             headers["content-type"] = content_type
-        target = replica_b if key else replica_a
+        host_keyed = bool(key) and key not in client_keys
+        target = replica_b if host_keyed else replica_a
         record: dict[str, Any] = {
             "path": request.url.path,
             "method": request.method,
             "key": key,
-            "replica": "b" if key else "a",
+            "replica": "b" if host_keyed else "a",
             "request": body.decode(errors="replace"),
             "status": None,
             "body": "",

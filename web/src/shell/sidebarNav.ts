@@ -4,7 +4,7 @@ import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodi
 import { getOptimisticTitle } from "@/lib/optimisticTitles";
 import { PROJECT_LABEL_KEY, PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import type { SidebarCustomOrder } from "@/lib/sidebarViewPreferences";
-import { orderSessionFamilies, isIndividuallyPinnedSibling } from "@/lib/sessionFamilies";
+import { isIndentedSibling, isSessionPinned, orderSessionFamilies } from "@/lib/sessionFamilies";
 
 export const PINNED_CONVERSATION_IDS_STORAGE_KEY = "omnigent:pinned-conversation-ids";
 
@@ -238,14 +238,17 @@ export function sortConversations(
   sortBy: SessionSortBy = "updated_at",
   custom?: CustomSortOrder | null,
 ): Conversation[] {
-  const effective = (c: Conversation): number => {
+  const byId = new Map(conversations.map((row) => [row.id, row]));
+  const sortRow = (row: Conversation) =>
+    (row.provisional && byId.get(row.family?.representative_id ?? row.id)) || row;
+  const effective = (row: Conversation): number => {
+    const c = sortRow(row);
     const live = activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
     const updatedAt = frozenKeys?.get(c.id) ?? live;
     frozenKeys?.set(c.id, updatedAt);
     return sortBy === "created_at" ? c.created_at : updatedAt;
   };
   // Custom: saved rows by position, later-created sessions above, history (ties too) below.
-  const byId = custom ? new Map(conversations.map((row) => [row.id, row])) : null;
   const rank = (c: Conversation): number => {
     if (!custom) return 0;
     const representative = byId?.get(c.family?.representative_id ?? c.id) ?? c;
@@ -255,11 +258,14 @@ export function sortConversations(
     );
   };
   return [...conversations].sort((a, b) => {
-    const aRank = rank(a);
-    const bRank = rank(b);
+    const aSort = sortRow(a);
+    const bSort = sortRow(b);
+    const aRank = rank(aSort);
+    const bRank = rank(bSort);
     if (aRank !== bRank) return aRank - bRank;
-    const byTime = aRank === -1 ? b.created_at - a.created_at : effective(b) - effective(a);
-    return byTime || b.id.localeCompare(a.id);
+    const byTime =
+      aRank === -1 ? bSort.created_at - aSort.created_at : effective(bSort) - effective(aSort);
+    return byTime || bSort.id.localeCompare(aSort.id);
   });
 }
 
@@ -473,9 +479,8 @@ export function orderByPinnedTimestamp(conversations: readonly Conversation[]): 
 
 // A pinned family member sorts by the family's pin time; NaN when there's no value.
 function pinnedSortValue(c: Conversation): number {
-  const raw = isIndividuallyPinnedSibling(c)
-    ? c.labels[PINNED_LABEL_KEY]
-    : (c.family?.pinned_at ?? c.labels?.[PINNED_LABEL_KEY]);
+  const raw =
+    c.family?.pinned_at ?? (!isIndentedSibling(c) ? c.labels?.[PINNED_LABEL_KEY] : undefined);
   return raw ? Number(raw) : NaN;
 }
 
@@ -488,9 +493,8 @@ export interface PinOrderWrite {
 /** A pinned family moves as one unit; nested rows only provide context. */
 export function isPinOrderUnit(conversation: Conversation): boolean {
   return (
-    isIndividuallyPinnedSibling(conversation) ||
-    !conversation.family?.pinned ||
-    conversation.family.representative_id === conversation.id
+    !conversation.family ||
+    (conversation.family.representative_id === conversation.id && isSessionPinned(conversation))
   );
 }
 
@@ -517,12 +521,7 @@ export function pinOrderWrites(
   const moved = [...pinned];
   const [row] = from < 0 ? [{ id: fromId } as Conversation] : moved.splice(from, 1);
   moved.splice(to, 0, row);
-  const value = (c: Conversation | undefined): number =>
-    Number(
-      c && isIndividuallyPinnedSibling(c)
-        ? c.labels[PINNED_LABEL_KEY]
-        : (c?.family?.pinned_at ?? c?.labels?.[PINNED_LABEL_KEY]),
-    );
+  const value = (c: Conversation | undefined): number => (c ? pinnedSortValue(c) : NaN);
   const prev = value(moved[to - 1]);
   const next = value(moved[to + 1]);
   let pinnedAt = prev + (next - prev) / 2;

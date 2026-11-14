@@ -15,7 +15,7 @@ This module owns:
   ``_RunnerHandle`` and the daemon's watch/stop/cleanup paths use unchanged. The
   daemon is NOT the forked runner's OS parent, so ``poll``/``returncode``/
   ``wait`` round-trip to the zygote (the real parent) for exit status, while
-  ``terminate``/``kill`` signal the pid directly.
+  ``terminate``/``kill`` signal the captured process identity directly.
 
 This code runs on any POSIX host (the gate is ``IS_POSIX``); the copy-on-write
 *savings* are Linux-specific, but the fork/protocol path executes on macOS too.
@@ -68,7 +68,8 @@ class ZygoteRunnerProc:
 
     Implements only the surface the daemon uses on a runner handle: ``pid``,
     ``poll()``, ``returncode``, ``wait()``, ``terminate()``, ``kill()``, ``stop()``. Exit
-    status comes from the zygote (the real parent); signals go to the pid.
+    status comes from the zygote (the real parent); signals use the captured
+    process identity.
 
     :param pid: The forked runner's process id.
     :param manager: The owning :class:`ZygoteManager`, used to poll exit status.
@@ -153,12 +154,15 @@ class ZygoteRunnerProc:
                     return
 
     def _signal(self, sig: int) -> None:
-        """Signal the runner pid, ignoring an already-exited process.
+        """Signal the captured runner, ignoring an exited or inaccessible process.
 
         :param sig: POSIX signal number.
         """
-        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-            os.kill(self.pid, sig)
+        process = self._process
+        if self.returncode is not None or process is None:
+            return
+        with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            process.send_signal(sig)
 
 
 class ZygoteManager:

@@ -158,7 +158,9 @@ class RunnerBackgroundTitleGenerator:
         self._timeout_seconds = timeout_seconds
 
     async def __call__(self, request: BackgroundTitleRequest) -> str | None:
-        routed = self._runner_router.client_for_existing_conversation(request.session_id)
+        routed = await asyncio.to_thread(
+            self._runner_router.client_for_existing_conversation, request.session_id
+        )
         if routed is None:
             return None
         body = {

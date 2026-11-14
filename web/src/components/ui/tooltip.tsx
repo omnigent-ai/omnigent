@@ -37,7 +37,7 @@ function TooltipShortcutKeys({ shortcut }: { shortcut: TooltipShortcut }) {
 function TooltipProvider({
   // Keep incidental pointer movement from flashing tooltips. Callers can still
   // override the delay per provider.
-  delayDuration = 600,
+  delayDuration = 1000,
   ...props
 }: React.ComponentProps<typeof TooltipPrimitive.Provider>) {
   return (

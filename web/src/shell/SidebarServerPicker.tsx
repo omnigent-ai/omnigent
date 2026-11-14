@@ -222,7 +222,7 @@ export function SidebarServerPicker() {
             title={currentDescription}
             data-testid="sidebar-server-picker"
           >
-            <Avatar className="size-7 after:border-0">
+            <Avatar className="size-7 after:hidden">
               <AvatarFallback className="bg-secondary font-medium text-sm text-secondary-foreground">
                 {userInitials(userName.replace(/\s+/g, "."))}
               </AvatarFallback>

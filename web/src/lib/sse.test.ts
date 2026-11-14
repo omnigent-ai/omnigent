@@ -256,6 +256,15 @@ describe("parseEvent — session.superseded", () => {
     } satisfies SessionSupersededEvent);
   });
 
+  it("keeps a rewind reason", () => {
+    const ev = parseEvent("session.superseded", {
+      conversation_id: "conv_old",
+      target_conversation_id: "conv_new",
+      reason: "rewind",
+    });
+    expect(ev).toMatchObject({ type: "session_superseded", reason: "rewind" });
+  });
+
   it("returns null when the target conversation id is missing", () => {
     expect(parseEvent("session.superseded", { conversation_id: "conv_old" })).toBeNull();
   });

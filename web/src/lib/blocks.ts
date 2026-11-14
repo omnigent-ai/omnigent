@@ -635,6 +635,8 @@ export interface ElicitationBlock {
   type: "elicitation";
   ctx: BlockContext;
   elicitationId: string;
+  /** False when the agent keeps working while the card waits, e.g. a Codex async question. */
+  isBlocking?: false;
   /**
    * Session whose resolve endpoint should receive the verdict.
    * Present when a child/sub-agent prompt is mirrored into an
@@ -772,7 +774,12 @@ export type AnyBlock =
   | PolicyDeniedBlock
   | ResponseEndBlock;
 
-/** Whether a pending card answers `sessionId`'s own prompt, not a mirrored sub-agent's. */
+/** Whether a block is a pending card that parks the agent's turn until it is answered. */
+export function isPendingBlockingElicitation(block: AnyBlock): boolean {
+  return block.type === "elicitation" && block.status === "pending" && block.isBlocking !== false;
+}
+
+/** Whether a pending blocking card answers `sessionId`'s own prompt, not a mirrored sub-agent's. */
 export function hasPendingOwnElicitation(
   blocks: readonly AnyBlock[],
   sessionId: string | null,
@@ -780,7 +787,7 @@ export function hasPendingOwnElicitation(
   return blocks.some(
     (b) =>
       b.type === "elicitation" &&
-      b.status === "pending" &&
+      isPendingBlockingElicitation(b) &&
       (b.targetSessionId == null || b.targetSessionId === sessionId),
   );
 }

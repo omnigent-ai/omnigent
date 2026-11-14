@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { isIndentedSibling } from "@/lib/sessionFamilies";
 import {
   ArrowLeftIcon,
@@ -131,6 +132,8 @@ interface MobileSessionMenuProps {
  * stays in one place.
  */
 interface ChatHeaderProps {
+  /** Session cost control from the shell, or nothing when the overview is off. */
+  sessionOverviewControl?: ReactNode;
   /** Whether the left sidebar is open (hides the open-sidebar button). */
   sidebarOpen: boolean;
   /** Open the left sidebar. */
@@ -335,6 +338,7 @@ function PendingHeaderActions({ isMobile }: { isMobile: boolean }) {
  * All state lives in AppShell — this is a pure presentational component.
  */
 export function ChatHeader({
+  sessionOverviewControl,
   sidebarOpen,
   onOpenSidebar,
   settingsMode = false,
@@ -648,6 +652,7 @@ export function ChatHeader({
         {/* Desktop (md+) action buttons. On mobile these collapse into
             the three-dot "Session actions" menu below. Fork is also
             available from the session menus and assistant messages. */}
+        {!pending && conversationId && sessionOverviewControl}
         {pending && <PendingHeaderActions isMobile={isMobile} />}
         {/* Agent info: tools & policies for the bound agent. Desktop-only
             popover; self-hides when the agent has neither configured. */}
