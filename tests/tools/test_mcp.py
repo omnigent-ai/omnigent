@@ -3230,3 +3230,14 @@ async def test_http_credential_resolver_sync_and_async() -> None:
     req = httpx.Request("POST", "https://mcp.example.com/mcp")
     await conn._apply_per_request_auth(req)
     assert req.headers["Authorization"] == "Bearer bob-2"
+
+    # Cross-origin redirect hops must strip dynamic auth headers and not re-invoke resolver.
+    redirected = httpx.Request(
+        "POST",
+        "https://other.example.net/mcp",
+        headers={"Authorization": "Bearer bob-2", "X-Static": "keep"},
+    )
+    await conn._apply_per_request_auth(redirected)
+    assert "Authorization" not in redirected.headers
+    assert redirected.headers["X-Static"] == "keep"
+    assert calls == 2

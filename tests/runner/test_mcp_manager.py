@@ -288,7 +288,7 @@ async def test_shared_server_reused_across_different_specs(
 
 
 def test_compute_hashes_include_auth_command() -> None:
-    """Changing ``auth_command`` changes both spec and server hashes."""
+    """Changing ``auth_command`` or ``user_id`` changes both spec and server hashes."""
     cfg_a = MCPServerConfig(
         name="jira",
         transport="http",
@@ -303,6 +303,54 @@ def test_compute_hashes_include_auth_command() -> None:
     )
     assert compute_server_hash(cfg_a) != compute_server_hash(cfg_b)
     assert compute_spec_hash([cfg_a]) != compute_spec_hash([cfg_b])
+    assert compute_server_hash(cfg_a, user_id="alice") != compute_server_hash(cfg_a, user_id="bob")
+    assert compute_spec_hash([cfg_a], user_id="alice") != compute_spec_hash([cfg_a], user_id="bob")
+    assert compute_server_hash(cfg_a, user_id=None) == compute_server_hash(cfg_a)
+
+
+@pytest.mark.asyncio
+async def test_runner_mcp_manager_isolates_users_and_forwards_user_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two users on the same runner spec get isolated connections with ``user_id`` forwarded."""
+    spawned_users: list[str | None] = []
+
+    class _UserRecorder:
+        def __init__(
+            self,
+            *,
+            config: MCPServerConfig,
+            user_id: str | None = None,
+            **_kw: Any,
+        ) -> None:
+            self._config = config
+            self._user_id = user_id
+            spawned_users.append(user_id)
+
+        async def connect(self) -> list[McpToolDef]:
+            return [_make_tool_def("whoami")]
+
+        async def close(self) -> None:
+            return None
+
+        async def call_tool(self, name: str, arguments: dict[str, Any], **_kw: Any) -> str:
+            return f"{name}:{self._user_id}:{arguments.get('q', '')}"
+
+    monkeypatch.setattr(_mcp_manager_module, "McpServerConnection", _UserRecorder)
+    spec = _make_spec(_make_config("jira"))
+    manager = RunnerMcpManager()
+    try:
+        await manager.schemas_for(spec, user_id="alice")
+        await manager.schemas_for(spec, user_id="bob")
+        await manager.schemas_for(spec, user_id="alice")  # reuses alice's connection
+
+        out_alice = await manager.call_tool(spec, "jira__whoami", {"q": "1"}, user_id="alice")
+        out_bob = await manager.call_tool(spec, "jira__whoami", {"q": "2"}, user_id="bob")
+        assert out_alice == "whoami:alice:1"
+        assert out_bob == "whoami:bob:2"
+        assert spawned_users == ["alice", "bob"]
+    finally:
+        await manager.shutdown()
 
 
 @pytest.mark.asyncio

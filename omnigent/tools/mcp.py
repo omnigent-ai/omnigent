@@ -665,6 +665,7 @@ class McpServerConnection:
         default=None, init=False, repr=False
     )
     _discovered_tools: list[McpToolDef] = field(default_factory=list, init=False, repr=False)
+    _dynamic_auth_header_names: set[str] = field(default_factory=set, init=False, repr=False)
     _breaker: _CircuitBreaker = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -1325,11 +1326,29 @@ class McpServerConnection:
             if resolved is not None:
                 for key, value in resolved.items():
                     dynamic[str(key)] = str(value)
+        self._dynamic_auth_header_names.update(dynamic.keys())
         return dynamic
 
+    def _is_same_origin(self, request_url: httpx.URL) -> bool:
+        """Return whether *request_url* shares ``(scheme, host, port)`` with ``config.url``."""
+        if not self.config.url:
+            return False
+        configured = httpx.URL(self.config.url)
+        return (request_url.scheme, request_url.host, request_url.port) == (
+            configured.scheme,
+            configured.host,
+            configured.port,
+        )
+
     async def _apply_per_request_auth(self, request: httpx.Request) -> None:
-        """Refresh dynamic auth headers before each outbound HTTP request."""
+        """Refresh dynamic auth headers before each same-origin outbound HTTP request."""
         if self.config.auth_command is None and self.credential_resolver is None:
+            return
+        # Never attach or retain dynamic credentials on cross-origin redirect hops.
+        if not self._is_same_origin(request.url):
+            request.headers.pop("Authorization", None)
+            for key in self._dynamic_auth_header_names:
+                request.headers.pop(key, None)
             return
         # Initial connect() resolves headers immediately beforehand; skip
         # re-invoking during the initial handshake until ready.

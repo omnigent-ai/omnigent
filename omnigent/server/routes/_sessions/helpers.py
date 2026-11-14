@@ -12248,6 +12248,8 @@ async def _handle_mcp_tools_list(
     rpc_id: int | str | None,
     session_id: str,
     runner_router: RunnerRouter | None,
+    *,
+    user_id: str | None = None,
 ) -> Response:
     """
     Handle a ``tools/list`` JSON-RPC request for the MCP proxy endpoint.
@@ -12280,9 +12282,12 @@ async def _handle_mcp_tools_list(
         extra={"session_id": session_id},
     )
     try:
+        execute_body: dict[str, Any] = {"method": "tools/list", "params": {}}
+        if user_id:
+            execute_body["user_id"] = user_id
         resp = await runner_client.post(
             f"/v1/sessions/{session_id}/mcp/execute",
-            json={"method": "tools/list", "params": {}},
+            json=execute_body,
             timeout=30.0,
         )
         resp.raise_for_status()

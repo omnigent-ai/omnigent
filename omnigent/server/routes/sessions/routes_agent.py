@@ -556,10 +556,16 @@ def register_agent_routes(
             )
 
         if method == "tools/list":
+            from omnigent.server.mcp_identity import mcp_policy_actor
+
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            actor = mcp_policy_actor(request, conv, user_id) if conv else _build_actor(user_id)
+            effective_user = (actor or {}).get("user_id") or user_id
             response = await _handle_mcp_tools_list(
                 rpc_id,
                 session_id,
                 runner_router,
+                user_id=effective_user,
             )
             registry = getattr(request.app.state, "mcp_registry", None)
             if registry is not None and not params.get("_omnigent_skip_registry"):
@@ -571,7 +577,6 @@ def register_agent_routes(
                 data = json.loads(bytes(response.body))
                 if "error" in data:
                     return response
-                conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
                 if conv is not None and not conv.archived:
                     spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
                     if spec is not None and any(

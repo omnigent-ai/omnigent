@@ -433,7 +433,14 @@ class ServerMcpPool:
             from ``spec.mcp_servers``).
         """
         agent_id, user_id = pool_key
-        spec_hash = compute_spec_hash(configs)
+        needed_connections = len(configs)
+        capacity = _pool_capacity()
+        if needed_connections > capacity:
+            raise ValueError(
+                f"agent {agent_id!r} configures {needed_connections} MCP servers, "
+                f"exceeding pool connection capacity ({capacity})"
+            )
+        spec_hash = compute_spec_hash(configs, user_id=user_id)
         prewarm: asyncio.Task[None] | None = None
 
         async with self._lock:
@@ -455,7 +462,7 @@ class ServerMcpPool:
                 entry = None
 
             if entry is None:
-                self._enforce_capacity(len(configs))
+                self._enforce_capacity(needed_connections, user_id=user_id)
                 entry = _PoolEntry(
                     agent_id=agent_id,
                     user_id=user_id,
@@ -565,15 +572,36 @@ class ServerMcpPool:
         """Return the total number of server slots held across active pool entries."""
         return sum(len(entry.servers) for entry in self._entries.values())
 
-    def _enforce_capacity(self, needed_connections: int = 1) -> None:
+    def _user_connection_count(self, user_id: str | None) -> int:
+        """Return the number of server slots held by *user_id* across active entries."""
+        return sum(len(entry.servers) for key, entry in self._entries.items() if key[1] == user_id)
+
+    def _enforce_capacity(
+        self,
+        needed_connections: int = 1,
+        *,
+        user_id: str | None = None,
+    ) -> None:
         """Evict least-recently-used entries until *needed_connections* fit in capacity.
 
+        When a single *user_id* already holds entries and would exceed half the
+        pool while other users also hold entries, evicts *user_id*'s oldest
+        entry first so one user cannot evict everyone else's connections.
         Called while holding ``_lock``. Fires close tasks in the
         background so the caller is never blocked by connection teardown.
         """
         capacity = _pool_capacity()
+        per_user_cap = max(1, capacity // 2)
         while self._lru and self._live_connection_count() + needed_connections > capacity:
-            oldest = self._lru.pop(0)
+            victim_index = 0
+            if (
+                user_id is not None
+                and self._user_connection_count(user_id) + needed_connections > per_user_cap
+                and any(k[1] == user_id for k in self._lru)
+                and any(k[1] != user_id for k in self._lru)
+            ):
+                victim_index = next(i for i, k in enumerate(self._lru) if k[1] == user_id)
+            oldest = self._lru.pop(victim_index)
             old_entry = self._entries.pop(oldest, None)
             if old_entry is not None:
                 t = asyncio.create_task(

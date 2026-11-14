@@ -646,6 +646,59 @@ async def test_connection_capacity_lru_eviction_counts_connections(
 
 
 @pytest.mark.asyncio
+async def test_oversize_spec_rejected_without_evicting_existing_pool(
+    patch_mcp_connection: dict[str, _FakeConn],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An agent requesting more connections than pool capacity fails without evicting others."""
+    monkeypatch.setattr(_mcp_pool_module, "_POOL_CONNECTION_CAPACITY", 2)
+    for key in ["s1:alice", "s1:bob", "s2:bob", "s3:bob"]:
+        patch_mcp_connection[key] = _FakeConn(tools=[_make_tool("ping")])
+
+    pool = ServerMcpPool()
+    spec_ok = _make_spec(_make_config("s1"))
+    spec_oversize = _make_spec(_make_config("s1"), _make_config("s2"), _make_config("s3"))
+
+    try:
+        await pool.list_tools("agent_ok", spec_ok, user_id="alice")
+        with pytest.raises(ValueError, match="exceeding pool connection capacity"):
+            await pool.list_tools("agent_big", spec_oversize, user_id="bob")
+
+        assert ("agent_ok", "alice") in pool._entries
+        assert ("agent_big", "bob") not in pool._entries
+        assert patch_mcp_connection["s1:alice"].close_calls == 0
+    finally:
+        await pool.shutdown_all()
+
+
+@pytest.mark.asyncio
+async def test_single_user_cannot_evict_other_users_entries(
+    patch_mcp_connection: dict[str, _FakeConn],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One user acquiring many entries evicts their own oldest entries before other users'."""
+    monkeypatch.setattr(_mcp_pool_module, "_POOL_CONNECTION_CAPACITY", 4)
+    for agent_name in ["a0", "a1", "a2", "a3", "a4"]:
+        patch_mcp_connection[f"{agent_name}:alice"] = _FakeConn(tools=[_make_tool("t")])
+        patch_mcp_connection[f"{agent_name}:bob"] = _FakeConn(tools=[_make_tool("t")])
+
+    pool = ServerMcpPool()
+    try:
+        await pool.list_tools("a0", _make_spec(_make_config("a0")), user_id="bob")
+        for agent_name in ["a1", "a2", "a3", "a4"]:
+            await pool.list_tools(
+                agent_name, _make_spec(_make_config(agent_name)), user_id="alice"
+            )
+        await asyncio.sleep(0)
+
+        assert ("a0", "bob") in pool._entries
+        assert patch_mcp_connection["a0:bob"].close_calls == 0
+        assert pool._live_connection_count() <= 4
+    finally:
+        await pool.shutdown_all()
+
+
+@pytest.mark.asyncio
 async def test_pool_forwards_user_id_and_credential_resolver(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
