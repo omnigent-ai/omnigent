@@ -11,6 +11,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -378,6 +379,114 @@ def test_compact_steer_timeout_keeps_input_undelivered_and_bridge_turn(
     assert draining_client.accepted_inputs == []
     state = read_bridge_state(tmp_path)
     assert state is not None and state.active_turn_id == "turn_compact"
+
+
+@pytest.mark.parametrize("live_injection", [False, True], ids=["run-turn", "live-steer"])
+@pytest.mark.parametrize(
+    ("settlement", "after_seconds"),
+    [
+        ("completed", 70.0),
+        ("superseded", 150.0),
+        ("session_id", 75.0),
+        ("thread_id", 75.0),
+        ("socket_path", 75.0),
+        ("codex_home", 75.0),
+        ("missing", 75.0),
+        ("cancelled", 75.0),
+        ("never", 240.0),
+    ],
+)
+async def test_compact_steer_retains_input_past_one_minute(
+    draining_client,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    live_injection: bool,
+    settlement: str,
+    after_seconds: float,
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id="turn_compact")
+    original = read_bridge_state(tmp_path)
+    assert original is not None
+    draining_client.delivery_errors = [_compact_steer_refusal()]
+    elapsed_seconds = 0.0
+
+    async def advance_compaction(seconds: float) -> None:
+        nonlocal elapsed_seconds
+        elapsed_seconds += seconds
+        if elapsed_seconds >= after_seconds:
+            if settlement == "cancelled":
+                raise asyncio.CancelledError
+            if settlement == "missing":
+                (tmp_path / "state.json").unlink()
+            elif settlement in {"completed", "superseded"}:
+                write_bridge_state(
+                    tmp_path,
+                    replace(
+                        original,
+                        active_turn_id=None if settlement == "completed" else "turn_new",
+                    ),
+                )
+            elif settlement != "never":
+                write_bridge_state(
+                    tmp_path, replace(original, **{settlement: "replacement"}, active_turn_id=None)
+                )
+        await asyncio.sleep(0)
+
+    # Advance only the executor's clock; the real test loop and RPC peer remain intact.
+    executor_asyncio = SimpleNamespace(**vars(asyncio))
+    executor_asyncio.sleep = advance_compaction
+    executor_asyncio.get_running_loop = lambda: SimpleNamespace(time=lambda: elapsed_seconds)
+    monkeypatch.setattr(codex_native_executor, "asyncio", executor_asyncio)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def send():
+        if live_injection:
+            return await executor.enqueue_session_message("main", "queued input")
+        return [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "queued input"}], [], ""
+            )
+        ]
+
+    if settlement == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await send()
+    else:
+        result = await send()
+        delivered = settlement in {"completed", "superseded"}
+        if live_injection:
+            assert result is delivered
+        elif delivered:
+            assert [type(event) for event in result] == [TurnComplete]
+        else:
+            [failure] = result
+            assert isinstance(failure, ExecutorError)
+            assert failure.undelivered is True
+            assert failure.preserve_session is True
+            if settlement == "never":
+                assert failure.code == "codex_compacting"
+            else:
+                assert "changed" in failure.message
+
+    assert elapsed_seconds == after_seconds
+    assert draining_client.closes == 1
+    delivered = settlement in {"completed", "superseded"}
+    assert draining_client.accepted_inputs == (
+        [[{"type": "text", "text": "queued input"}]] if delivered else []
+    )
+    assert len(draining_client.requests) == (2 if delivered else 1)
+    if settlement == "completed":
+        assert draining_client.requests[-1][0] == "turn/start"
+    elif settlement == "superseded":
+        assert draining_client.requests[-1][1]["expectedTurnId"] == "turn_new"
+    elif settlement in {"never", "cancelled"}:
+        assert read_bridge_state(tmp_path) == original
+    elif settlement == "missing":
+        assert read_bridge_state(tmp_path) is None
+    else:
+        current = read_bridge_state(tmp_path)
+        assert current is not None and getattr(current, settlement) == "replacement"
 
 
 @pytest.mark.parametrize(
