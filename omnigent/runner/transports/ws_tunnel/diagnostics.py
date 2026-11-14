@@ -83,9 +83,10 @@ class TunnelDiagnosticAttrs(TunnelKeepaliveSettings, total=False):
 class OutboundFrame:
     """An unchanged wire payload timestamped with its diagnostics' monotonic clock."""
 
-    data: str
+    data: str | bytes
     queued_at: float
     app_ping_ts: int | None = None
+    on_sent: Callable[[], None] | None = None
 
 
 @dataclass
@@ -266,8 +267,8 @@ class TunnelDiagnostics:
 
     async def send(
         self,
-        send_text: Callable[[str], Awaitable[None]],
-        data: str,
+        send_text: Callable[..., Awaitable[None]],
+        data: str | bytes,
         *,
         app_ping_ts: int | None = None,
     ) -> None:
