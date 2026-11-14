@@ -11295,6 +11295,99 @@ async def test_handle_import_local_legacy_server_skips_only_unsafe_session(
     ]
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="observes an unreaped Linux child")
+@pytest.mark.parametrize("operation", ["read", "write", "skills", "skill_content"])
+@pytest.mark.parametrize("cancel_request", [False, True])
+async def test_host_command_workers_retain_child_exit_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    cancel_request: bool,
+) -> None:
+    """Command-owning workers retain failures even if the request is cancelled."""
+    import psutil
+
+    from omnigent.host.frames import (
+        HostFsResultFrame,
+        HostFsWriteFrame,
+        HostSkillContentFrame,
+        HostSkillContentResultFrame,
+    )
+    from tests._helpers.polling import poll_until_async
+
+    host = _make_host_process()
+    tunnel = _CollectingWs()
+    started = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    loop = asyncio.get_running_loop()
+    children: list[subprocess.Popen[bytes]] = []
+    exit_codes: list[int] = []
+
+    def command(*_args: object, **_kwargs: object) -> object:
+        try:
+            with subprocess.Popen([sys.executable, "-c", "raise SystemExit(42)"]) as child:
+                children.append(child)
+                loop.call_soon_threadsafe(started.set)
+                assert release.wait(10), "test did not release workspace command"
+                code = child.wait()
+                exit_codes.append(code)
+                if code:
+                    raise subprocess.CalledProcessError(code, "workspace-command")
+                return [] if operation == "skills" else {"unexpected_success": True}
+        finally:
+            finished.set()
+
+    frame: HostFsRequestFrame | HostFsWriteFrame | HostSkillsFrame | HostSkillContentFrame
+    if operation == "read":
+        monkeypatch.setattr(host, "_dispatch_fs_op", command)
+        frame = HostFsRequestFrame("workspace-command", "changes", str(tmp_path), "session")
+    elif operation == "write":
+        monkeypatch.setattr(host, "_dispatch_fs_write_op", command)
+        frame = HostFsWriteFrame(
+            "workspace-command", "github_details_update", str(tmp_path), "session"
+        )
+    elif operation == "skills":
+        monkeypatch.setattr(host._skill_discovery, "discover", command)
+        frame = HostSkillsFrame("workspace-command", "codex-native", str(tmp_path))
+    else:
+        monkeypatch.setattr("omnigent.host.skill_content.read_skill_content", command)
+        frame = HostSkillContentFrame("workspace-command", "codex-native", "fixture")
+    request = asyncio.create_task(host._dispatch_host_frame(tunnel, frame))  # type: ignore[arg-type]
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        child = children[0]
+        await poll_until_async(lambda: psutil.Process(child.pid).status() == psutil.STATUS_ZOMBIE)
+        if cancel_request:
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+        reaped = host._reap_orphans_once([child.pid])
+    finally:
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 5)
+        await asyncio.gather(request, return_exceptions=True)
+        await poll_until_async(lambda: not host._host_subprocess_tasks)
+
+    assert exit_codes == [42], f"orphan reaper collected {reaped} owned children"
+    assert reaped == 0, "the orphan reaper consumed a workspace command's exit status"
+    assert host._owned_subprocess_ops == 0
+    if cancel_request:
+        assert tunnel.sent == []
+    else:
+        request.result()
+        [result] = [decode_host_frame(raw) for raw in tunnel.sent]
+        assert result.request_id == "workspace-command"
+        if operation in {"read", "write"}:
+            assert isinstance(result, HostFsResultFrame)
+            assert result.status == "error"
+            assert result.error_code == f"fs_{operation}_failed"
+            assert "exit status 42" in (result.error or "")
+        else:
+            assert isinstance(result, (HostSkillsResultFrame, HostSkillContentResultFrame))
+            assert result.status == "failed"
+
+
 async def test_dispatch_fs_write_op_routes_github_set_preference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
