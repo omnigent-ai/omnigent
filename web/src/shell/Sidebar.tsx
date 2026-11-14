@@ -222,9 +222,8 @@ import { isInClosedSidebar, registerSidebarRename } from "./sidebarRename";
 import { hasSessionDraft, useHasSessionDraft, useSessionDraftIds } from "@/lib/sessionDrafts";
 import { useNow } from "@/hooks/useNow";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
-import { getSessionState, type SessionState } from "@/hooks/useSessionState";
-import { useSessionErrorStates } from "@/hooks/useSessionErrors";
-import type { LatestSessionError } from "@/lib/sessionError";
+import type { SessionState } from "@/hooks/useSessionState";
+import { useSessionBadgeStates } from "@/hooks/useSessionBadgeStates";
 import { useChatStore } from "@/store/chatStore";
 import {
   isConversationUnseen,
@@ -232,8 +231,10 @@ import {
   markConversationRead,
   markConversationUnread,
   useConversationReadState,
+  useReadStateSnapshot,
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
+import { collectUnreadInboxItems } from "@/lib/inbox";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -896,7 +897,19 @@ function SidebarImpl({
         : availableTab === "shared"
           ? sidebarData.shared
           : sidebarData.all;
-  const inboxCount = sidebarData.inboxCount;
+  const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
+  // Unread sessions as the Inbox lists them; like its row dot, the open session
+  // counts only when marked unread.
+  const unreadInboxCount = useReadStateSnapshot(
+    () =>
+      collectUnreadInboxItems(
+        sidebarData.inboxRows,
+        (id, updatedAt, status) =>
+          isConversationUnseen(id, updatedAt, status) &&
+          (id !== activeConversationId || isExplicitlyUnread(id)),
+      ).length,
+  );
+  const inboxCount = sidebarData.inboxCount + unreadInboxCount;
   const inboxCountIncomplete = sidebarData.inboxCountIncomplete;
 
   // The scrollable list container — used as the IntersectionObserver root for
@@ -1798,8 +1811,7 @@ function ProjectFolder({
     growFrom.current = { height: listRef.current?.offsetHeight ?? 0, count: visibleCount };
     return display.loadMore();
   };
-  // Rendered rows read their own badges; the folder only reuses those results.
-  const errors = useSessionErrorStates(conversations, { startReads: false });
+  const states = useSessionBadgeStates(conversations);
   const startingConversationId = useChatStore((s) =>
     s.status === "streaming" || s.terminalPending ? s.conversationId : null,
   );
@@ -1809,16 +1821,15 @@ function ProjectFolder({
   const isHidden = (_row: unknown, index: number) => index !== heldIndex;
   const marker = projectMarkerState(
     conversations.filter(isHidden),
-    errors.filter(isHidden),
+    states.filter(isHidden),
     startingConversationId,
   );
-  // "Show more" carries the badge of the rows it hides, as a collapsed header does,
-  // from cached reads only: hidden rows show an idle error once they have rendered.
+  // "Show more" carries the badge of the rows it hides, as a collapsed header does.
   const hiddenMarker =
     expanded && visibleCount < conversations.length
       ? projectMarkerState(
           conversations.slice(visibleCount),
-          errors.slice(visibleCount),
+          states.slice(visibleCount),
           startingConversationId,
         )
       : null;
@@ -3775,7 +3786,7 @@ function UngroupDropZone() {
 /** Surface the most actionable state across a collapsed project's loaded rows. */
 function projectMarkerState(
   conversations: Conversation[],
-  errors: readonly (LatestSessionError | null)[],
+  states: readonly (SessionState | null)[],
   startingConversationId: string | null,
 ): SessionState | null {
   let awaiting = 0;
@@ -3786,7 +3797,7 @@ function projectMarkerState(
   let disconnected = false;
   let unseen = false;
   for (const [i, c] of conversations.entries()) {
-    const state = getSessionState(c, errors[i]);
+    const state = states[i];
     if (state?.kind === "awaiting") {
       awaiting += state.count;
       terminalReason ??= state.terminalReason;
@@ -5790,9 +5801,8 @@ function ConversationRowImpl({
   // "Mark as unread" is offered on any row not already showing the dot.
   const canMarkUnread = !hasUnseenMessages;
   // Approvals and failures outrank the unread dot without clearing read state.
-  const errorConversations = useMemo(() => [conversation], [conversation]);
-  const [latestError] = useSessionErrorStates(errorConversations);
-  const derivedState = getSessionState(conversation, latestError);
+  const badgeConversations = useMemo(() => [conversation], [conversation]);
+  const [derivedState] = useSessionBadgeStates(badgeConversations);
   // The bound session's launch/relaunch window: a send is in flight (local
   // status "streaming") or the runner is auto-creating the PTY
   // (`terminalPending`), but the server hasn't confirmed `running` yet — a

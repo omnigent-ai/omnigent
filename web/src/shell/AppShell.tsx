@@ -3199,7 +3199,10 @@ function AppShellImpl() {
                       aria-label="Session overview"
                       className="absolute right-2 top-12 z-20 w-64 max-md:hidden"
                     >
-                      <SessionOverview onClose={toggleSessionOverview} />
+                      <SessionOverview
+                        onClose={toggleSessionOverview}
+                        changesSessionId={showFilesPanel ? serverConversationId : undefined}
+                      />
                     </aside>
                   )}
                 </GridSessionMain>
@@ -3209,7 +3212,10 @@ function AppShellImpl() {
                     aria-label="Session overview"
                     className="flex w-64 shrink-0 flex-col overflow-y-auto px-2 pb-3 pt-12"
                   >
-                    <SessionOverview onClose={toggleSessionOverview} />
+                    <SessionOverview
+                      onClose={toggleSessionOverview}
+                      changesSessionId={showFilesPanel ? serverConversationId : undefined}
+                    />
                   </aside>
                 )}
 
