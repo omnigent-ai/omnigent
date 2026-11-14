@@ -41,8 +41,8 @@ function makeHarness({ captureEvents = false, existingTools = [] } = {}) {
   // global fetch that lets a test capture the posted event bodies. Without
   // them postEvent fails closed (the interrupt tests rely on that).
   const config = captureEvents
-    ? { inboxDir, bridgeDir: inboxDir, serverUrl: "http://mock", sessionId: "conv_test" }
-    : { inboxDir, bridgeDir: inboxDir };
+    ? { inboxDir, bridgeDir: fixtureRoot, serverUrl: "http://mock", sessionId: "conv_test" }
+    : { inboxDir, bridgeDir: fixtureRoot };
   fs.writeFileSync(configPath, JSON.stringify(config));
   process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
 
@@ -108,16 +108,20 @@ function sleep(ms) {
 
 // Drop an interrupt into the inbox and wait until the poller has consumed it
 // (the poller unlinks the file after invoking handleInterrupt -> requestInterrupt).
-async function deliverInterrupt(h) {
-  const file = path.join(h.inboxDir, `int-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
-  fs.writeFileSync(file, JSON.stringify({ type: "interrupt" }));
+async function deliverInboxPayload(h, payload) {
+  const file = path.join(h.inboxDir, `input-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+  fs.writeFileSync(file, JSON.stringify(payload));
   const deadline = Date.now() + 3000;
   while (fs.existsSync(file)) {
-    if (Date.now() > deadline) throw new Error("interrupt file was not consumed by poller");
+    if (Date.now() > deadline) throw new Error("input file was not consumed by poller");
     await sleep(20);
   }
   // The poller runs requestInterrupt synchronously before unlinking, so by the
   // time the file is gone the interrupt has been processed.
+}
+
+async function deliverInterrupt(h) {
+  await deliverInboxPayload(h, { type: "interrupt" });
 }
 
 function assert(name, cond, detail) {
@@ -652,9 +656,46 @@ async function testSessionStartupDoesNotCompleteATurn() {
   );
 }
 
+async function testCommandCatalogMatchesPiAndRefreshesOnReload() {
+  const h = makeHarness();
+  let commands = [
+    { name: "review", description: "Review changes", source: "prompt", sourceInfo: { path: "/private/review.md" } },
+    { name: "commands", source: "extension" },
+    { name: "skill:pdf", description: "Read PDFs", source: "skill" },
+  ];
+  h.pi.getCommands = () => commands;
+  const catalogPath = path.join(h.fixtureRoot, "commands.json");
+  await h.handlers.session_start({}, makeCtx({ idle: true }));
+  assert("catalog contains only runtime command metadata", JSON.stringify(JSON.parse(fs.readFileSync(catalogPath, "utf8"))) === JSON.stringify({ commands: [
+    { name: "review", description: "Review changes" },
+    { name: "commands", description: "" },
+    { name: "skill:pdf", description: "Read PDFs" },
+  ] }));
+  assert("catalog is owner-readable only", (fs.statSync(catalogPath).mode & 0o777) === 0o600);
+  assert("catalog publishes atomically without temp residue", !fs.readdirSync(h.fixtureRoot).some((file) => file.endsWith(".tmp")));
+  commands = [];
+  await h.handlers.session_start({}, makeCtx({ idle: true }));
+  assert("reload replaces removed commands", JSON.parse(fs.readFileSync(catalogPath, "utf8")).commands.length === 0);
+}
+
+async function testInboxExpandsCommandsAndPreservesDeliveryMode() {
+  for (const idle of [true, false]) {
+    const h = makeHarness();
+    const received = [];
+    h.pi.sendUserMessage = (content, options) => received.push({ content, options });
+    await h.handlers.session_start({}, makeCtx({ idle }));
+    for (const content of ["/commands", "/review src/index.ts", "/skill:pdf report.pdf", "ordinary text"]) {
+      await deliverInboxPayload(h, { type: "user_message", content });
+      const delivery = received.at(-1);
+      assert(`command expansion is enabled for ${content}`, delivery.content === content && delivery.options.expandPromptTemplates === true);
+      assert(`delivery mode is preserved while ${idle ? "idle" : "busy"}`, delivery.options.deliverAs === (idle ? "followUp" : "steer"));
+    }
+  }
+}
+
 async function testSessionStartMarksInputReady() {
   const h = makeHarness();
-  const marker = path.join(h.inboxDir, "input_ready");
+  const marker = path.join(h.fixtureRoot, "input_ready");
   assert("input-ready marker is absent before session_start", !fs.existsSync(marker));
 
   await h.handlers.session_start({}, makeCtx({ idle: true }));
@@ -731,6 +772,8 @@ async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
   try {
     await testSessionStartupDoesNotCompleteATurn();
     await testSessionStartMarksInputReady();
+    await testCommandCatalogMatchesPiAndRefreshesOnReload();
+    await testInboxExpandsCommandsAndPreservesDeliveryMode();
     await testQueuedPromptDuringStartupStaysRunningUntilAgentEnd();
     await testRunningIdleShareResponseId();
     await testTaskPlanPublishesTodos();

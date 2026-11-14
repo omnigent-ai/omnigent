@@ -66,13 +66,16 @@ Usage::
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from omnigent.harnesses.pi_native import bridge
 from omnigent.harnesses.pi_native.bridge import enqueue_user_message
+from tests._helpers.terminal_screen import TerminalScreen
 from tests.e2e._harness_probes import cli_unavailable_reason
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -296,3 +299,89 @@ def test_pi_native_send_now_steers_into_active_turn(tmp_path: Path) -> None:
         "The 'Send now' message must be delivered to Pi with deliverAs 'steer' "
         f"to reach the active turn, but the extension used {deliver_as!r}."
     )
+
+
+@pytest.mark.timeout(90)
+def test_native_pi_discovers_and_dispatches_chat_commands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real native Pi loads the catalog and dispatches a bridged command without inference."""
+    pexpect = pytest.importorskip("pexpect")
+    node = shutil.which("node")
+    pi_index = _resolve_pi_index()
+    if node is None or pi_index is None:
+        pytest.skip("node and an installed Pi package are required")
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "pi-native")
+    directory = bridge.prepare_bridge_dir("command-session")
+    config_path = directory / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "bridgeDir": str(directory),
+                "inboxDir": str(directory / "inbox"),
+            }
+        )
+    )
+    marker = tmp_path / "command-result.txt"
+    extension = tmp_path / "check-command.js"
+    extension.write_text(
+        'const fs = require("fs");\n'
+        'module.exports = (pi) => pi.registerCommand("bridge-check", {\n'
+        '  description: "Check bridged command dispatch",\n'
+        f"  handler: async (args) => fs.writeFileSync({json.dumps(str(marker))}, args),\n"
+        "});\n"
+    )
+    template = tmp_path / "review.md"
+    template.write_text("---\ndescription: Review fixture\n---\nReview $ARGUMENTS\n")
+    skill = tmp_path / "pdf"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text(
+        "---\nname: pdf\ndescription: Read fixture PDFs\n---\nRead PDFs\n"
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(home),
+        "TERM": "xterm-256color",
+        "PI_CODING_AGENT_DIR": str(home / ".pi" / "agent"),
+        "OMNIGENT_PI_NATIVE_CONFIG": str(config_path),
+        "PI_OFFLINE": "1",
+    }
+    args = [
+        str(pi_index.parent / "cli.js"),
+        "--offline",
+        "--no-session",
+        "--no-context-files",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-tools",
+        "--extension",
+        str(_EXTENSION_PATH),
+        "--extension",
+        str(extension),
+        "--prompt-template",
+        str(template),
+        "--skill",
+        str(skill),
+    ]
+    with pexpect.spawn(
+        node, args, cwd=str(tmp_path), env=env, encoding="utf-8", dimensions=(30, 120)
+    ) as child:
+        screen = TerminalScreen(child)
+        screen.wait_for(
+            lambda _: (directory / "commands.json").exists(),
+            timeout=45,
+            what="the live Pi command catalog",
+        )
+        catalog = bridge.read_command_catalog("command-session")
+        assert catalog is not None
+        assert {"bridge-check", "review", "skill:pdf"} <= {item["name"] for item in catalog}
+        assert not {"settings", "tree"} & {item["name"] for item in catalog}
+        enqueue_user_message(directory, "/bridge-check exact arguments")
+        screen.wait_for(
+            lambda _: marker.exists(), timeout=15, what="the bridged extension command result"
+        )
+        assert marker.read_text() == "exact arguments"

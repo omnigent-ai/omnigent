@@ -198,6 +198,26 @@ Under an `os_env` sandbox, Pi is granted read-only access to the `skills/`,
 resources load from inside the sandbox too; the bundle root itself is not
 exposed.
 
+### Native Pi slash commands
+
+Once a `pi-native` session's terminal starts, the Chat command menu uses the
+resident Pi process's extension commands, prompt templates, and skills.
+Skill names retain Pi's `/skill:name` prefix. Pi decides which resources are
+loaded, including project trust and resource filters; Omnigent does not scan
+host directories to guess this catalog. `/reload` in the Pi terminal republishes
+the catalog, visible when Chat next refreshes its command menu.
+
+Chat forwards command text with Pi's command expansion enabled. Extension
+handlers run and skill/template instructions expand just as they do for typed
+Pi input, preserving active-turn steering and idle follow-up delivery.
+Interactive-only built-ins such as `/settings`, `/tree`, and `/reload` still
+belong in Pi's terminal; use Omnigent's dedicated controls where available.
+
+The runtime catalog is unavailable before the native terminal starts, and on
+Pi versions without `getCommands()`. An existing session reports that limitation
+instead of claiming its catalog is empty. New-session previews and the separate
+RPC-backed `harness: pi` are not changed by native runtime discovery.
+
 ### Pi system prompt
 
 With `harness: pi` or `pi-native`, `system_prompt_mode` controls how Omnigent

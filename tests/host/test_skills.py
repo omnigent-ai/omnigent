@@ -279,6 +279,56 @@ def test_failed_or_changed_bundle_is_not_cached(tmp_path: Path) -> None:
     assert fetch.call_count == 3
 
 
+@pytest.mark.parametrize("harness", ["pi-native", "native-pi"])
+def test_native_pi_catalog_tracks_the_resident_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str
+) -> None:
+    from omnigent.harnesses.pi_native import bridge
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "pi-native")
+    bundle = _bundle(
+        {"skills/not-loaded/SKILL.md": _skill("not-loaded")},
+        executor={"config": {"harness": harness}},
+    )
+    discovery = HostSkillDiscovery(lambda _: _response(bundle))
+    frame = HostSkillsFrame("request", "session", str(tmp_path), "session", "agent", "1")
+    warnings: list[str] = []
+    assert discovery.discover(frame, tmp_path, warnings=warnings) == []
+    assert len(warnings) == 1 and "Pi command catalog unavailable" in warnings[0]
+
+    catalog = bridge.prepare_bridge_dir("session") / "commands.json"
+    commands = [
+        {"name": "review", "description": "A prompt template"},
+        {"name": "commands", "description": "An extension command"},
+        {"name": "skill:pdf", "description": "A loaded skill"},
+    ]
+    catalog.write_text(json.dumps({"commands": commands}))
+    warnings = []
+    assert discovery.discover(frame, tmp_path, warnings=warnings) == commands
+    assert warnings == []
+
+    # A reload replaces the catalog immediately, without waiting for the cache TTL.
+    catalog.write_text('{"commands": []}')
+    assert discovery.discover(frame, tmp_path, warnings=warnings) == []
+    assert warnings == []
+    catalog.unlink()
+    assert discovery.discover(frame, tmp_path, warnings=warnings) == []
+    assert len(warnings) == 1
+
+
+def test_pi_command_catalog_does_not_leak_into_other_harnesses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.pi_native import bridge
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "pi-native")
+    catalog = bridge.prepare_bridge_dir("session") / "commands.json"
+    catalog.write_text('{"commands": [{"name": "pi-only"}]}')
+    discovery = HostSkillDiscovery(lambda _: _response(_bundle({})))
+    frame = HostSkillsFrame("request", "session", str(tmp_path), "session", "agent", "1")
+    assert discovery.discover(frame, tmp_path) == []
+
+
 def test_directory_catalog_never_downloads_a_session_bundle(tmp_path: Path) -> None:
     directory = tmp_path / ".claude/skills/local"
     directory.mkdir(parents=True)
