@@ -1526,12 +1526,17 @@ def test_tcp_terminal_cleanup_does_not_block_event_loop(
 async def test_tcp_terminal_cancelled_cleanup_still_revokes_broker(
     static_tcp_route: TcpEgressRoute,
     broker_dir: Path,
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     blocked_owner: str,
 ) -> None:
     instance = TerminalInstance(
         name="tcp", session_key="test", private_dir=broker_dir, socket_path=broker_dir / "tmux"
     )
+    launch_directory = tmp_path / "launch-command"
+    launch_directory.mkdir(mode=0o700)
+    (launch_directory / "launch.sh").write_text("exec synthetic-command\n")
+    instance._launch_command_tmpdir = launch_directory
     broker = start_tcp_egress_broker([static_tcp_route], broker_dir)
     instance._tcp_egress_broker = broker
     entered = threading.Event()
@@ -1574,6 +1579,7 @@ async def test_tcp_terminal_cancelled_cleanup_still_revokes_broker(
         await asyncio.wait_for(instance._resource_cleanup_task, timeout=3)
     assert broker._closed and not broker.socket_path.exists()
     assert not broker_dir.exists()
+    assert not launch_directory.exists()
 
 
 @pytest.mark.parametrize("inherited", [False, True])
