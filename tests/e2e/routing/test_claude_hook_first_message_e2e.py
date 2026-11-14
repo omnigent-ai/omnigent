@@ -41,7 +41,7 @@ from omnigent.runner.turn_routing import MARKER_FILE
 from tests.e2e.routing._helpers import (
     capture_pane,
     claude_bridge_dir,
-    claude_settings_apart_from_the_model,
+    claude_settings_snapshot,
     decisions,
     same_arm,
     settle,
@@ -115,7 +115,7 @@ def test_claude_routes_the_first_typed_message_exactly_once(
     routing_arms("claude-native")  # type: ignore[operator]
     workspace = trusted_workspace(tmp_path, "claude_hook_ws")
     settings_path = claude_user_settings_path(workspace, routing_claude_settings_env)
-    settings_before = claude_settings_apart_from_the_model(settings_path, include_model=True)
+    settings_before = claude_settings_snapshot(settings_path, include_model=True)
 
     # A BARE routed create: Smart Routing on, no prompt, so nothing is routed
     # yet and the pick is left to the in-harness hook.
@@ -196,8 +196,7 @@ def test_claude_routes_the_first_typed_message_exactly_once(
     wait_for(
         lambda: (
             True
-            if claude_settings_apart_from_the_model(settings_path, include_model=True)
-            == settings_before
+            if claude_settings_snapshot(settings_path, include_model=True) == settings_before
             else None
         ),
         timeout=10,

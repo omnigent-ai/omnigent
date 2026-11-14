@@ -32,7 +32,7 @@ from omnigent.harnesses.claude_native.bridge import claude_user_settings_path
 from omnigent.server.smart_routing import models_in_family
 from tests.e2e.routing._helpers import (
     arm_in,
-    claude_settings_apart_from_the_model,
+    claude_settings_snapshot,
     decisions,
     same_arm,
     session_snapshot,
@@ -77,7 +77,7 @@ def test_claude_session_create_routes_the_model_and_then_the_spawn(
     routing_arms("claude-native")  # type: ignore[operator]
     workspace = trusted_workspace(tmp_path, "claude_ui_ws")
     settings_path = claude_user_settings_path(workspace, routing_claude_settings_env)
-    settings_before = claude_settings_apart_from_the_model(settings_path, include_model=True)
+    settings_before = claude_settings_snapshot(settings_path, include_model=True)
 
     # ── 1. The routed create ────────────────────────────────────────────────
     # Unique but still rule-0 (short, no error/code markers), so the mock's
@@ -174,8 +174,7 @@ def test_claude_session_create_routes_the_model_and_then_the_spawn(
     wait_for(
         lambda: (
             True
-            if claude_settings_apart_from_the_model(settings_path, include_model=True)
-            == settings_before
+            if claude_settings_snapshot(settings_path, include_model=True) == settings_before
             else None
         ),
         timeout=10,
