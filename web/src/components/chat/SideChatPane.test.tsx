@@ -2086,50 +2086,55 @@ it.each([false, true])(
   },
 );
 
-it.each(["none", "text", "files", "quote", "rejected-file"] as const)(
-  "retracts a delivered grid draft only while unchanged: %s",
-  (edit) => {
-    const entry = conversationRegistry.acquire(childId);
-    const file = new File(["notes"], "notes.txt", { type: "text/plain" });
-    entry.setState({
-      failedSendDraft: {
-        conversationId: childId,
-        text: "> Quote\n\nRetry",
-        files: edit === "rejected-file" ? [new File(["bad"], "bad.exe")] : [file],
-        stableId: "stable",
-      },
-    });
-    renderPane(<SideChatPane childId={childId} fullSession />);
-    expect(screen.getByTestId("side-chat-input")).toHaveValue("> Quote\n\nRetry");
-    act(() =>
-      useChatStore.getState().updateSideChatComposer(childId, (current) => ({
-        ...current,
-        ...{
-          none: {},
-          text: { text: "Edited" },
-          files: { files: [] },
-          quote: { quotes: [{ id: "new", before: "", text: "New quote" }] },
-          "rejected-file": {},
-        }[edit],
-      })),
-    );
-    act(() =>
-      entry.setState({
-        restoredSendDraft: { ...entry.getState().restoredSendDraft!, delivered: true },
-      }),
-    );
-    expect(screen.getByTestId("side-chat-input")).toHaveValue(
-      {
-        none: "",
-        text: "Edited",
-        files: "> Quote\n\nRetry",
-        quote: "> Quote\n\nRetry",
-        "rejected-file": "",
+it.each(
+  (["none", "text", "files", "quote", "rejected-file"] as const).flatMap((edit) =>
+    (["delivered", "cancelled"] as const).map((outcome) => ({ edit, outcome })),
+  ),
+)("retracts a $outcome grid draft only while unchanged: $edit", ({ edit, outcome }) => {
+  const entry = conversationRegistry.acquire(childId);
+  const file = new File(["notes"], "notes.txt", { type: "text/plain" });
+  entry.setState({
+    failedSendDraft: {
+      conversationId: childId,
+      text: "> Quote\n\nRetry",
+      files: edit === "rejected-file" ? [new File(["bad"], "bad.exe")] : [file],
+      stableId: "stable",
+    },
+  });
+  renderPane(<SideChatPane childId={childId} fullSession />);
+  expect(screen.getByTestId("side-chat-input")).toHaveValue("> Quote\n\nRetry");
+  act(() =>
+    useChatStore.getState().updateSideChatComposer(childId, (current) => ({
+      ...current,
+      ...{
+        none: {},
+        text: { text: "Edited" },
+        files: { files: [] },
+        quote: { quotes: [{ id: "new", before: "", text: "New quote" }] },
+        "rejected-file": {},
       }[edit],
-    );
-    expect(entry.getState().restoredSendDraft).toBeNull();
-  },
-);
+    })),
+  );
+  act(() =>
+    entry.setState({
+      restoredSendDraft: {
+        ...entry.getState().restoredSendDraft!,
+        delivered: outcome === "delivered",
+        cancelled: outcome === "cancelled",
+      },
+    }),
+  );
+  expect(screen.getByTestId("side-chat-input")).toHaveValue(
+    {
+      none: "",
+      text: "Edited",
+      files: "> Quote\n\nRetry",
+      quote: "> Quote\n\nRetry",
+      "rejected-file": "",
+    }[edit],
+  );
+  expect(entry.getState().restoredSendDraft).toBeNull();
+});
 
 it.each([false, true])(
   "revalidates recovered files and preserves newer quoted drafts: %s",

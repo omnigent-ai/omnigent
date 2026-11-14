@@ -3460,11 +3460,14 @@ function ComposerImpl(
     if (!isMobileRef.current) textareaRef.current?.focus();
   }, [failedSendDraft, conversationId, settledConversationId, replaceText, draft]);
 
-  // Retract a restored failed-send draft once its send proves delivered (its
-  // committed item arrived over the stream or a reconnect snapshot). Edits win:
-  // the text is cleared only while it is exactly what the restore put there.
+  // Delivery or confirmed cancellation retires the restored draft. Clear only
+  // the text and files the restore put there; newer edits always win.
   useEffect(() => {
-    if (restoredSendDraft === null || !restoredSendDraft.delivered) return;
+    if (
+      restoredSendDraft === null ||
+      (!restoredSendDraft.delivered && !restoredSendDraft.cancelled)
+    )
+      return;
     if (restoredSendDraft.conversationId !== conversationId) return;
     if (settledConversationId !== conversationId) return;
     // Delivery can interrupt the queued text restore with a store render.

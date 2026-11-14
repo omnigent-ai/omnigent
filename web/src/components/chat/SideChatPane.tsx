@@ -637,10 +637,15 @@ function SideChatComposer({
       });
   }, [fullSession, childId, failedSendDraft, updateComposer, attachmentPolicy]);
   useEffect(() => {
-    if (!fullSession || !restoredSendDraft?.delivered) return;
+    if (!fullSession || (!restoredSendDraft?.delivered && !restoredSendDraft?.cancelled)) return;
     const entry = conversationRegistry.peek(childId);
     const restored = entry?.getState().restoredSendDraft;
-    if (!restored?.delivered || restored.conversationId !== childId) return;
+    if (
+      !restored ||
+      (!restored.delivered && !restored.cancelled) ||
+      restored.conversationId !== childId
+    )
+      return;
     const current = useChatStore.getState().sideChatComposers[childId] ?? EMPTY_SIDE_CHAT_COMPOSER;
     entry!.setState({ restoredSendDraft: null });
     if (current.quotes?.length) return;
