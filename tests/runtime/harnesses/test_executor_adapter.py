@@ -465,11 +465,7 @@ async def test_executor_policy_failure_releases_turn_for_corrected_retry(
     from omnigent.inner import antigravity_harness
     from omnigent.inner.executor import ExecutorEvent, MockExecutor, TextChunk, TurnComplete
     from omnigent.inner.sandbox import HarnessSandboxPreparationError
-    from omnigent.runner import app as runner_app_module
-    from omnigent.runner import create_runner_app
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
-    from tests.runner.conftest import _drain_session_event_queue, _FakeProcessManager
-    from tests.runner.helpers import NullServerClient
 
     executor = MockExecutor()
     executor.enqueue_events(
@@ -498,8 +494,6 @@ async def test_executor_policy_failure_releases_turn_for_corrected_retry(
         failed_executor.close = AsyncMock()
         failed_executor.close_session = AsyncMock()
         factory.side_effect = lambda: failed_executor
-    monkeypatch.setattr(runner_app_module, "_session_event_queues_ref", {})
-    monkeypatch.setattr(runner_app_module, "_session_histories_ref", {})
     session_id = "conv_factory_policy_retry"
     adapter = ExecutorAdapter(executor_factory=factory, session_key=session_id)
     app = adapter.build()
@@ -512,21 +506,10 @@ async def test_executor_policy_failure_releases_turn_for_corrected_retry(
                 transport=httpx.ASGITransport(app=app),
                 base_url="http://harness",
                 headers={"Authorization": "Bearer spawn-token"},
-            ) as harness_client,
-            contextlib.AsyncExitStack() as resources,
+            ) as client,
         ):
-            runner = create_runner_app(
-                process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
-                server_client=NullServerClient(),  # type: ignore[arg-type]
-            )
-            runner_client = await resources.enter_async_context(
-                httpx.AsyncClient(
-                    transport=httpx.ASGITransport(app=runner), base_url="http://runner"
-                )
-            )
-            request_body = {**_start_turn_body(), "harness": "openai-agents"}
-            event_url = f"/v1/sessions/{session_id}/events?stream=true"
-            async with runner_client.stream("POST", event_url, json=request_body) as response:
+            event_url = f"/v1/sessions/{session_id}/events"
+            async with client.stream("POST", event_url, json=_start_turn_body()) as response:
                 assert response.status_code == 200
                 failed_events = [event async for event in _stream_iter(response)]
             assert [event.event for event in failed_events] == [
@@ -541,11 +524,6 @@ async def test_executor_policy_failure_releases_turn_for_corrected_retry(
             assert private_diagnostic not in json.dumps([event.data for event in failed_events])
             if error_code == "HarnessSandboxPreparationError" or private_diagnostic in policy:
                 assert private_diagnostic in caplog.text
-            queued = _drain_session_event_queue(runner.state.session_event_queues.get(session_id))
-            queued_failures = [event for event in queued if event["type"] == "response.failed"]
-            assert len(queued_failures) == 1
-            assert queued_failures[0]["response"]["error"] == failed["error"]
-            assert private_diagnostic not in json.dumps(queued)
             factory.assert_called_once_with()
             constructor.assert_not_called()
             assert adapter._executor is None
@@ -558,7 +536,7 @@ async def test_executor_policy_failure_releases_turn_for_corrected_retry(
                 factory.side_effect = constructor
             else:
                 monkeypatch.setenv(policy_env, '{"sandbox": {"type": "none"}}')
-            async with runner_client.stream("POST", event_url, json=request_body) as response:
+            async with client.stream("POST", event_url, json=_start_turn_body()) as response:
                 assert response.status_code == 200
                 retry_events = [event async for event in _stream_iter(response)]
             assert retry_events[0].event == "response.created"

@@ -531,17 +531,20 @@ async def test_enforce_sandbox_no_policy_leaves_spec_unchanged() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("harness", ["codex", "antigravity"])
 @pytest.mark.parametrize(
-    ("sandbox_type", "guidance"),
+    ("harness", "sandbox_type", "guidance"),
     [
-        ("windows_jobobject", "windows"),
-        ("default", "windows"),
-        ("unsupported-type", "type"),
-        ("none", None),
-        ("absent", None),
-        ("linux_bwrap", None),
-        ("provider-error", "provider"),
+        # Codex wraps validation errors; Antigravity raises them directly.
+        ("codex", "default", "windows"),
+        ("codex", "unsupported-type", "type"),
+        ("antigravity", "unsupported-type", "type"),
+        ("antigravity", "linux_bwrap", "sandbox"),
+        ("codex", "provider-error", "provider"),
+        ("codex", "none", None),
+        ("antigravity", "none", None),
+        ("codex", "absent", None),
+        ("antigravity", "absent", None),
+        ("codex", "linux_bwrap", None),
     ],
 )
 async def test_session_init_checks_sandbox_before_spawn(
@@ -603,8 +606,6 @@ async def test_session_init_checks_sandbox_before_spawn(
             "/v1/sessions", json={"session_id": session_id, "agent_id": "ag_test"}
         )
 
-    if harness == "antigravity" and sandbox_type == "linux_bwrap":
-        guidance = "sandbox"
     expected_status = 401 if guidance == "provider" else 400 if guidance is not None else 201
     assert response.status_code == expected_status, response.text
     events = _drain_session_event_queue(app.state.session_event_queues.get(session_id))

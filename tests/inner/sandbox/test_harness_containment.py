@@ -20,12 +20,7 @@ from omnigent.inner import claude_sdk_executor, codex_worker, sandbox
 from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
 from omnigent.inner.codex_executor import CodexExecutor
 from omnigent.inner.codex_worker import prepare_codex_worker
-from omnigent.inner.datamodel import (
-    CredentialProxySpec,
-    OSEnvSandboxSpec,
-    OSEnvSpec,
-    TcpEgressRoute,
-)
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TcpEgressRoute
 from omnigent.inner.executor import Executor
 from omnigent.inner.goose_executor import GooseExecutor
 from omnigent.inner.kimi_executor import KimiExecutor
@@ -323,12 +318,15 @@ def test_relative_policy_cwd_preserves_non_claude_workspace(
     [
         (harness, feature)
         for harness in _HARNESSES
-        for feature in ("cwd_conflict", "egress_rules", "credential_proxy", "tcp_egress")
-        if feature in {"cwd_conflict", "tcp_egress"} or harness != "codex"
+        for feature in ("cwd_conflict", "egress_rules")
+        if feature == "cwd_conflict" or harness != "codex"
         # Claude's successful-wrap scenario also exercises cwd conflicts.
         if (harness, feature) != ("claude-sdk", "cwd_conflict")
     ]
-    + [pytest.param("codex", "empty_tcp_egress", id="codex-empty-tcp-egress")],
+    + [
+        pytest.param("codex", "tcp_egress", id="codex-tcp_egress"),
+        pytest.param("codex", "empty_tcp_egress", id="codex-empty-tcp-egress"),
+    ],
 )
 def test_harness_rejects_policy_features_it_cannot_honor(
     harness: str, feature: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -349,10 +347,7 @@ def test_harness_rejects_policy_features_it_cannot_honor(
             type="darwin_seatbelt"
             if harness == "codex" and feature == "tcp_egress"
             else "linux_bwrap",
-            egress_rules=["GET api.example.com/**"] if feature == "egress_rules" else None,
-            credential_proxy=(
-                CredentialProxySpec(entries=[]) if feature == "credential_proxy" else None
-            ),
+            egress_rules=["GET api.example.test/**"] if feature == "egress_rules" else None,
             tcp_egress=routes,
         ),
     )

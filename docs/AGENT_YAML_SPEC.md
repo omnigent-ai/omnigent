@@ -664,6 +664,17 @@ the spawn environment, including after an agent revision changes.
 Whole-process `allow_network: false` also blocks network-based model-provider
 access, so those providers cannot run under that policy.
 
+**Migration:** Claude SDK agents that declare worker `egress_rules`,
+`credential_proxy`, or `tcp_egress` now fail startup. Those configurations did
+not confine the Claude process. Use `sys_os_shell` or sandboxed terminals for
+brokered tool operations, and choose a supported worker policy that meets the
+agent's isolation and model-connectivity requirements. Worker `tcp_egress` is
+unsupported across harnesses.
+
+Check inherited `web_fetch` policies during migration too: its researcher can
+now refuse to start when the inherited harness cannot enforce confinement.
+Choose a sandbox-capable harness for that research path.
+
 Relative `os_env.cwd` does not override a workspace selected by the runner.
 Claude SDK additionally resolves a named relative directory such as `./project`
 against the runner base when that base is still the selected workspace; `.`

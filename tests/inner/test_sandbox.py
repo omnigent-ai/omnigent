@@ -781,7 +781,10 @@ def test_harness_policy_validation_resolves_relative_cwd(
 @pytest.mark.parametrize(
     "feature",
     [
+        "egress_rules",
         "credential_proxy",
+        "tcp_egress",
+        "empty_tcp_egress",
         "none_network",
         "none_egress",
         "none_copy_on_write",
@@ -794,13 +797,20 @@ def test_harness_policy_validation_rejects_unenforceable_network_or_backend(feat
         CredentialProxySpec,
         OSEnvSandboxSpec,
         OSEnvSpec,
+        TcpEgressRoute,
         WritePathSpec,
     )
     from omnigent.inner.sandbox import validate_harness_sandbox
 
     policy = OSEnvSandboxSpec(type="linux_bwrap")
-    if feature == "credential_proxy":
+    if feature == "egress_rules":
+        policy.egress_rules = ["GET api.example.test/**"]
+    elif feature == "credential_proxy":
         policy.credential_proxy = CredentialProxySpec(entries=[])
+    elif feature in ("tcp_egress", "empty_tcp_egress"):
+        policy.tcp_egress = (
+            [TcpEgressRoute("db", "db.example.test", 5432)] if feature == "tcp_egress" else []
+        )
     elif feature == "none_network":
         policy.type = "none"
         policy.allow_network = False
@@ -812,8 +822,17 @@ def test_harness_policy_validation_rejects_unenforceable_network_or_backend(feat
         policy.write_paths = [WritePathSpec(path="/workspace", copy_on_write=True)]
     else:
         policy.type = feature
-    with pytest.raises(ValueError, match=r"does not support|cannot enforce"):
+    with pytest.raises(
+        HarnessSandboxValidationError, match=r"does not support|cannot enforce"
+    ) as failure:
         validate_harness_sandbox(OSEnvSpec(sandbox=policy), "Example")
+    assert failure.value.reason == {
+        "empty_tcp_egress": "tcp_egress",
+        "none_egress": "none_network",
+        "none_copy_on_write": "copy_on_write",
+        "seatbelt_copy_on_write": "copy_on_write",
+        "windows_jobobject": "windows",
+    }.get(feature, feature)
 
 
 @pytest.mark.parametrize(
