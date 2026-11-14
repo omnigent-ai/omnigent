@@ -236,6 +236,32 @@ def test_first_run_at_is_checked_against_the_saved_schedule(
     assert store.list() == []
 
 
+def test_a_reminder_only_delete_removes_that_sessions_reminder(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task_id = store.create(scheduled_task_id=_uid("st_cancel"), **_reminder_fields()).id
+    assert store.delete(task_id, reminder_session_id=_uid("conv")) is True
+    assert store.get(task_id) is None
+
+
+@pytest.mark.parametrize("case", ["another_session", "automation"])
+def test_a_reminder_only_delete_changes_nothing_for_another_task(
+    store: SqlAlchemyScheduledTaskStore, case: str
+) -> None:
+    from omnigent.stores.scheduled_task_store import ScheduledTaskNotSessionReminderError
+
+    fields = (
+        _reminder_fields()
+        if case == "another_session"
+        else _reminder_fields(rrule="FREQ=MINUTELY", kind="automation")
+    )
+    task_id = store.create(scheduled_task_id=_uid("st_keep"), **fields).id
+    with pytest.raises(ScheduledTaskNotSessionReminderError):
+        store.delete(task_id, reminder_session_id=_uid("conv_other"))
+    kept = store.get(task_id)
+    assert kept is not None and kept.state == "active"
+
+
 # ── state enum ────────────────────────────────────────────────────────────────
 
 

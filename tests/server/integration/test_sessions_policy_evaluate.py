@@ -801,7 +801,10 @@ def _patch_default_policies(monkeypatch: pytest.MonkeyPatch, fn_path: str) -> No
     )
 
 
-@pytest.mark.parametrize("tool_name", ["sys_scheduled_task_create", "sys_scheduled_task_update"])
+@pytest.mark.parametrize(
+    "tool_name",
+    ["sys_scheduled_task_create", "sys_scheduled_task_update", "sys_scheduled_task_delete"],
+)
 @pytest.mark.parametrize("legacy", [False, True], ids=["complete-review", "legacy"])
 async def test_scheduled_changes_require_explicit_approval_without_custom_policies(
     client: httpx.AsyncClient,
@@ -819,6 +822,8 @@ async def test_scheduled_changes_require_explicit_approval_without_custom_polici
             arguments.pop("prompt")
     if legacy:
         arguments.pop("permission_mode")
+    if tool_name == "sys_scheduled_task_delete":
+        arguments = {"scheduled_task_id": "0123456789abcdef0123456789abcdef"}
     drain = asyncio.create_task(_drain_elicitation_id(session_id))
     await asyncio.sleep(0.05)
     evaluate = asyncio.create_task(

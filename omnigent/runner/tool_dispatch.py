@@ -5383,10 +5383,11 @@ async def _execute_reminder_cancel(
     """
     Delete a reminder the calling session set, without the approval other deletes need.
 
-    The task is read first and deleted only when it is a reminder (``kind`` is
-    ``"reminder"``) that continues the calling session, so this path can't remove
-    any other automation. A server that omits ``kind`` predates reminders, so its
-    tasks are refused too.
+    The server checks, in the same write as the delete, that the task is a
+    reminder continuing this session (``reminder_session_id``), so a concurrent
+    edit can't turn this into deleting another task. Older servers ignore that
+    parameter and would delete any task, so the call is refused unless the
+    server advertises ``scheduled_task_reminder_cancel``.
 
     :param args: Parsed arguments with ``scheduled_task_id``.
     :param server_client: HTTP client pointed at the Omnigent server.
@@ -5403,23 +5404,31 @@ async def _execute_reminder_cancel(
             {"error": f"{tool_name} requires canonical 32-character hex scheduled_task_id"}
         )
     try:
-        found = await server_client.get(task_url, timeout=30.0)
-        if found.status_code >= 400:
-            return json.dumps(
-                {"error": f"server returned {found.status_code}", "details": found.text[:1000]}
-            )
-        task = _string_object_dict(found.json()) or {}
-        if task.get("kind") != "reminder" or task.get("session_id") != conversation_id:
+        info = await server_client.get("/v1/info", timeout=30.0)
+        if (
+            info.status_code >= 400
+            or info.json().get("scheduled_task_reminder_cancel") is not True
+        ):
             return json.dumps(
                 {
-                    "error": f"{tool_name} only cancels reminders this session set; "
-                    "delete other tasks with sys_scheduled_task_delete, which asks the "
-                    "user first"
+                    "error": f"{tool_name}: this Omnigent server can't limit a delete to this "
+                    "session's reminders; delete it with sys_scheduled_task_delete, which "
+                    "asks the user first"
                 }
             )
-        resp = await server_client.delete(task_url, timeout=30.0)
+        resp = await server_client.delete(
+            task_url, params={"reminder_session_id": conversation_id}, timeout=30.0
+        )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"{tool_name} failed: {exc}"})
+    if resp.status_code == 409:
+        return json.dumps(
+            {
+                "error": f"{tool_name} only cancels reminders this session set; "
+                "delete other tasks with sys_scheduled_task_delete, which asks the "
+                "user first"
+            }
+        )
     if resp.status_code >= 400:
         return json.dumps(
             {"error": f"server returned {resp.status_code}", "details": resp.text[:1000]}

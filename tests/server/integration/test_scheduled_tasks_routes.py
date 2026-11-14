@@ -898,6 +898,84 @@ async def test_the_list_leaves_reminders_out_until_an_edit_makes_one_an_automati
     assert await listed({}) == sorted([reminder_id, automation_id])
 
 
+async def _create_reminder(client: httpx.AsyncClient, session_id: str) -> str:
+    rule, fire_at = _one_time_rule_in(hours=2)
+    created = await client.post(
+        "/v1/scheduled-tasks",
+        json={
+            "name": "Reminder: check CI",
+            "prompt": "check CI",
+            "rrule": rule,
+            "timezone": "UTC",
+            "agent_id": builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
+            "session_mode": "continue",
+            "session_id": session_id,
+            "kind": "reminder",
+            "first_run_at": fire_at,
+        },
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    return created.json()["id"]
+
+
+@pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
+async def test_a_reminder_only_delete_removes_that_sessions_reminder(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    info = (await auth_client.get("/v1/info", headers=_headers())).json()
+    assert info["scheduled_task_reminder_cancel"] is True
+    session_id = _owned_session(db_uri)
+    task_id = await _create_reminder(auth_client, session_id)
+    deleted = await auth_client.delete(
+        f"/v1/scheduled-tasks/{task_id}",
+        params={"reminder_session_id": session_id},
+        headers=_headers(),
+    )
+    assert deleted.status_code == 200, deleted.text
+    assert SqlAlchemyScheduledTaskStore(db_uri).get(task_id) is None
+
+
+@pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
+async def test_a_reminder_only_delete_keeps_a_reminder_moved_to_another_session(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """An edit between the agent's decision and its delete can't redirect the delete."""
+    first, second = _owned_session(db_uri), _owned_session(db_uri)
+    task_id = await _create_reminder(auth_client, first)
+    moved = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}", json={"session_id": second}, headers=_headers()
+    )
+    assert moved.status_code == 200, moved.text
+    assert moved.json()["kind"] == "reminder"
+    refused = await auth_client.delete(
+        f"/v1/scheduled-tasks/{task_id}",
+        params={"reminder_session_id": first},
+        headers=_headers(),
+    )
+    assert refused.status_code == 409, refused.text
+    kept = SqlAlchemyScheduledTaskStore(db_uri).get(task_id)
+    assert kept is not None
+    assert (kept.state, kept.session_id) == ("active", second)
+
+
+async def test_a_reminder_only_delete_keeps_an_automation(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    task_id = created.json()["id"]
+    refused = await auth_client.delete(
+        f"/v1/scheduled-tasks/{task_id}",
+        params={"reminder_session_id": _owned_session(db_uri)},
+        headers=_headers(),
+    )
+    assert refused.status_code == 409, refused.text
+    assert SqlAlchemyScheduledTaskStore(db_uri).get(task_id) is not None
+
+
 @pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
 async def test_late_create_refuses_a_one_time_rule_instead_of_moving_it_a_year(
     auth_app: FastAPI,

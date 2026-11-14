@@ -7028,6 +7028,11 @@
             "title": "Scheduled Task Projects",
             "type": "boolean"
           },
+          "scheduled_task_reminder_cancel": {
+            "default": true,
+            "title": "Scheduled Task Reminder Cancel",
+            "type": "boolean"
+          },
           "scheduled_task_sandbox_workspaces": {
             "default": true,
             "title": "Scheduled Task Sandbox Workspaces",
@@ -17512,7 +17517,7 @@
     },
     "/v1/scheduled-tasks/{scheduled_task_id}": {
       "delete": {
-        "description": "Check ownership, then delete the task and history in a worker thread.\n\nThe ownership lookup remains synchronous; remove the timer after deletion.",
+        "description": "Check ownership, then delete the task and history in a worker thread.\n\nThe ownership lookup remains synchronous; remove the timer after deletion.\nWith *reminder_session_id*, only that session's reminder is deleted, checked\nin the same write as the delete; any other task is a 409 and stays.",
         "operationId": "delete_scheduled_task_v1_scheduled_tasks__scheduled_task_id__delete",
         "parameters": [
           {
@@ -17522,6 +17527,23 @@
             "schema": {
               "title": "Scheduled Task Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "reminder_session_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Reminder Session Id"
             }
           }
         ],

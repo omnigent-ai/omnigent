@@ -80,6 +80,7 @@ from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import (
     AutomationFailure,
     ScheduledTaskFirstRunMismatchError,
+    ScheduledTaskNotSessionReminderError,
     ScheduledTaskStore,
     encode_mcp_services,
 )
@@ -1579,10 +1580,13 @@ def create_scheduled_tasks_router(
     async def delete_scheduled_task(
         request: Request,
         scheduled_task_id: str,
+        reminder_session_id: str | None = Query(default=None, min_length=1),
     ) -> dict[str, Any]:
         """Check ownership, then delete the task and history in a worker thread.
 
         The ownership lookup remains synchronous; remove the timer after deletion.
+        With *reminder_session_id*, only that session's reminder is deleted, checked
+        in the same write as the delete; any other task is a 409 and stays.
         """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
@@ -1601,8 +1605,10 @@ def create_scheduled_tasks_router(
                 conversation_store.delete_label, copy_id, SCHEDULED_TASK_SOURCE_LABEL_KEY
             )
         try:
-            await asyncio.to_thread(store.delete, scheduled_task_id)
-        except Exception:
+            await asyncio.to_thread(
+                store.delete, scheduled_task_id, reminder_session_id=reminder_session_id
+            )
+        except Exception as exc:
             if copy_id is not None:
                 # The automation stays, so its copy goes on naming it.
                 with contextlib.suppress(Exception):
@@ -1611,6 +1617,11 @@ def create_scheduled_tasks_router(
                         copy_id,
                         {SCHEDULED_TASK_SOURCE_LABEL_KEY: task.id},
                     )
+            if isinstance(exc, ScheduledTaskNotSessionReminderError):
+                raise OmnigentError(
+                    "The task is not a reminder for that session, so it was not deleted.",
+                    code=ErrorCode.CONFLICT,
+                ) from exc
             raise
         scheduler = _scheduler(request)
         if scheduler is not None and not getattr(

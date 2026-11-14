@@ -63,6 +63,7 @@ from omnigent.stores.scheduled_task_store import (
     AdoptOutcome,
     AutomationFailure,
     ScheduledTaskFirstRunMismatchError,
+    ScheduledTaskNotSessionReminderError,
     ScheduledTaskStore,
     decode_mcp_services,
     encode_mcp_services,
@@ -667,7 +668,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
         return run_write_transaction(self._session_immediate, "release_task_session", write)
 
-    def delete(self, scheduled_task_id: str) -> bool:
+    def delete(self, scheduled_task_id: str, *, reminder_session_id: str | None = None) -> bool:
         """Hide the task, then remove history in bounded transactions, preserving live claims."""
 
         def write(session: Session) -> bool:
@@ -687,6 +688,13 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 SqlScheduledTask, (current_workspace_id(), scheduled_task_id), with_for_update=True
             )
             removed = row is not None and row.state != encode_scheduled_task_state("deleted")
+            if removed and reminder_session_id is not None:
+                assert row is not None
+                if (
+                    row.kind != encode_scheduled_task_kind("reminder")
+                    or row.session_id != reminder_session_id
+                ):
+                    raise ScheduledTaskNotSessionReminderError(scheduled_task_id)
             if removed:
                 assert row is not None
                 row.state = encode_scheduled_task_state("deleted")

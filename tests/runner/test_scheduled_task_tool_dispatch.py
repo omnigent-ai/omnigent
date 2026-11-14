@@ -1044,8 +1044,21 @@ async def test_a_failed_lookup_before_creating_makes_no_such_warning() -> None:
 # ── sys_reminder_cancel ──────────────────────────────────────────────────────
 
 
-def _task(**fields: object) -> _Resp:
-    return _Resp(body={"id": _TASK_ID, "kind": "reminder", "session_id": "conv_1", **fields})
+class _CancelClient(_RecordingClient):
+    """Answers ``/v1/info`` and the conditional DELETE, recording its parameters."""
+
+    def __init__(self, delete_response: _Resp | None = None, *, capable: bool = True) -> None:
+        info = {"scheduled_task_reminder_cancel": True} if capable else {}
+        super().__init__(_Resp(body={}), info=_Resp(body=info))
+        self.delete_response = delete_response or _Resp(body={"deleted": True, "id": _TASK_ID})
+        self.delete_params: list[dict[str, str] | None] = []
+
+    async def delete(
+        self, url: str, *, params: dict[str, str] | None = None, timeout: object = None
+    ) -> _Resp:
+        self.calls.append(("DELETE", url, None))
+        self.delete_params.append(params)
+        return self.delete_response
 
 
 async def _cancel(client: _RecordingClient, *, conversation_id: str | None = "conv_1") -> dict:
@@ -1060,41 +1073,61 @@ async def _cancel(client: _RecordingClient, *, conversation_id: str | None = "co
 
 
 @pytest.mark.asyncio
-async def test_reminder_cancel_deletes_a_reminder_this_session_set() -> None:
-    client = _RecordingClient(_task())
+async def test_reminder_cancel_deletes_only_with_the_servers_session_check() -> None:
+    client = _CancelClient()
     out = await _cancel(client)
     assert out == {"status": "cancelled", "scheduled_task_id": _TASK_ID}
     assert client.calls == [
-        ("GET", f"/v1/scheduled-tasks/{_TASK_ID}", None),
+        ("GET", "/v1/info", None),
         ("DELETE", f"/v1/scheduled-tasks/{_TASK_ID}", None),
     ]
+    # The server checks the session in the same write as the delete.
+    assert client.delete_params == [{"reminder_session_id": "conv_1"}]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "task",
-    [
-        _task(session_id="conv_other"),
-        _task(kind="automation"),
-        # A server from before reminders omits kind.
-        _Resp(body={"id": _TASK_ID, "session_id": "conv_1"}),
-    ],
-    ids=["another_sessions_reminder", "automation", "no_kind"],
-)
-async def test_reminder_cancel_refuses_anything_but_this_sessions_reminder(task: _Resp) -> None:
-    client = _RecordingClient(task)
+async def test_reminder_cancel_reports_the_servers_refusal_of_another_task() -> None:
+    # 409: not a reminder, or another session's (including one retargeted meanwhile).
+    client = _CancelClient(_Resp(status_code=409, body={"error": "not a reminder"}))
     out = await _cancel(client)
     assert "only cancels reminders this session set" in out["error"]
+    assert "sys_scheduled_task_delete" in out["error"]
+    assert "status" not in out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("info", [_Resp(body={}), _Resp(status_code=404, body={})])
+async def test_reminder_cancel_refuses_servers_that_cannot_limit_the_delete(info: _Resp) -> None:
+    # An older server ignores reminder_session_id and would delete any task.
+    client = _CancelClient()
+    client._info = info
+    out = await _cancel(client)
+    assert "can't limit a delete" in out["error"]
     assert "sys_scheduled_task_delete" in out["error"]
     assert not [call for call in client.calls if call[0] == "DELETE"]
 
 
 @pytest.mark.asyncio
-async def test_reminder_cancel_passes_a_missing_task_through() -> None:
-    client = _RecordingClient(_Resp(status_code=404, body={"error": "not found"}))
+@pytest.mark.parametrize("status", [404, 500])
+async def test_reminder_cancel_reports_a_failed_delete(status: int) -> None:
+    client = _CancelClient(_Resp(status_code=status, body={"error": "nope"}))
     out = await _cancel(client)
-    assert out["error"] == "server returned 404"
-    assert not [call for call in client.calls if call[0] == "DELETE"]
+    assert out["error"] == f"server returned {status}"
+    assert "status" not in out
+
+
+@pytest.mark.asyncio
+async def test_reminder_cancel_reports_a_transport_failure() -> None:
+    client = _CancelClient()
+
+    async def lost(url: str, **kwargs: object) -> _Resp:
+        client.calls.append(("DELETE", url, None))
+        raise httpx.ReadTimeout("response lost")
+
+    client.delete = lost  # type: ignore[method-assign]
+    out = await _cancel(client)
+    assert "sys_reminder_cancel failed" in out["error"]
+    assert "status" not in out
 
 
 @pytest.mark.asyncio
@@ -1110,7 +1143,7 @@ async def test_reminder_cancel_passes_a_missing_task_through() -> None:
 async def test_reminder_cancel_argument_errors_make_no_server_calls(
     arguments: dict[str, str], conversation_id: str | None, error: str
 ) -> None:
-    client = _RecordingClient(_task())
+    client = _CancelClient()
     out = json.loads(
         await _execute_scheduled_task_tool(
             "sys_reminder_cancel",

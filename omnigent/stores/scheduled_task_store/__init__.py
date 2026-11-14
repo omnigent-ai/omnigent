@@ -77,6 +77,14 @@ class ScheduledTaskFirstRunMismatchError(ValueError):
         super().__init__(f"first run would be at {actual}, not {expected}")
 
 
+class ScheduledTaskNotSessionReminderError(ValueError):
+    """A delete limited to one session's reminder found some other task.
+
+    Raised by :meth:`ScheduledTaskStore.delete` with ``reminder_session_id``
+    before anything is changed.
+    """
+
+
 class ScheduledTaskStore(ABC):
     """
     Abstract base for scheduled-task persistence.
@@ -338,7 +346,7 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
-    def delete(self, scheduled_task_id: str) -> bool:
+    def delete(self, scheduled_task_id: str, *, reminder_session_id: str | None = None) -> bool:
         """
         Delete a scheduled task. Idempotent.
 
@@ -346,7 +354,12 @@ class ScheduledTaskStore(ABC):
         cleanup or completion finishes. Such tasks cannot be edited or fired.
 
         :param scheduled_task_id: Opaque task identifier.
+        :param reminder_session_id: When set, delete only a reminder (``kind``
+            ``"reminder"``) that continues this session, checked under the same
+            lock as the delete so a concurrent edit can't change the answer.
         :returns: ``True`` if newly deleted; ``False`` if missing or already deleted.
+        :raises ScheduledTaskNotSessionReminderError: If ``reminder_session_id``
+            is set and the task is not that session's reminder; nothing changes.
         """
         ...
 

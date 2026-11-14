@@ -127,6 +127,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["scheduled_task_one_time"] is False
     # Lets the trigger form save its header; older servers would send it to the model.
     assert data["scheduled_task_trigger_headers"] is True
+    # Lets sys_reminder_cancel limit a delete to its session's reminder.
+    assert data["scheduled_task_reminder_cancel"] is True
     assert data["automation_trigger_poll_minutes"] == 10
     assert data["scheduled_task_harness_settings"] is True
     # Lets sys_session_create refuse permission_mode on servers that would ignore it.
