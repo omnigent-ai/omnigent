@@ -550,7 +550,7 @@ async def _save_workflow(
 ) -> str:
     """Save a workflow for the session's owner with ``POST /v1/workflows``.
 
-    The session's plan is then the workflow, so it's written again naming it.
+    A matching agent plan is written again naming the saved workflow.
     """
     try:
         name, description, steps = normalize_workflow(
@@ -579,6 +579,7 @@ async def _save_workflow(
     workflow = response.json()
     await _name_plan_workflow(
         workflow["id"],
+        steps=steps,
         server_client=server_client,
         conversation_id=conversation_id,
         call_id=call_id,
@@ -590,16 +591,17 @@ async def _save_workflow(
 async def _name_plan_workflow(
     workflow_id: str,
     *,
+    steps: list[dict[str, Any]],
     server_client: httpx.AsyncClient,
     conversation_id: str,
     call_id: str | None,
     publish_event: _Publisher | None,
 ) -> None:
-    """Write the session's current plan again, unchanged but for *workflow_id*.
+    """Name the saved workflow on a matching agent plan.
 
     The journal adds no chat line for a plan whose steps don't change, and the
-    Tasks tab keeps each step's progress. Skipped when the session has no plan;
-    a failure leaves the saved workflow as it is.
+    Tasks tab keeps each step's progress. An unrelated or drawn plan stays as
+    it is; a failure leaves the saved workflow as it is.
     """
     page = await _get(
         server_client, conversation_id, {"order": "desc", "limit": 1, "kind": "plan"}
@@ -607,7 +609,13 @@ async def _name_plan_workflow(
     if isinstance(page, str) or not page.get("data"):
         return
     plan = page["data"][0]
-    if plan.get("workflow_id") == workflow_id:
+    if plan.get("workflow_id") == workflow_id or plan["content"].get("source") != "agent":
+        return
+    plan_dependencies = {
+        step["id"]: set(step.get("depends_on") or []) for step in plan["content"]["steps"]
+    }
+    saved_dependencies = {step["id"]: set(step.get("depends_on") or []) for step in steps}
+    if plan_dependencies != saved_dependencies:
         return
     await _write(
         "sys_journal_write_plan",

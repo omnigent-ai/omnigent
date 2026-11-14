@@ -468,14 +468,17 @@ async def test_a_save_posts_the_workflow_as_the_session_and_returns_its_id() -> 
     assert [step["id"] for step in body["steps"]] == ["explore", "fix"]
 
 
-async def test_a_save_names_the_sessions_plan_after_the_new_workflow() -> None:
+@pytest.mark.parametrize("saved_steps", [_STEPS, list(reversed(_STEPS))])
+async def test_a_save_names_the_sessions_plan_after_the_new_workflow(
+    saved_steps: list[dict[str, object]],
+) -> None:
     seen: list[httpx.Request] = []
     published: list[dict[str, object]] = []
     async with _client(_save_handler(seen, [_PLAN])) as client:
         result = await _run(
             client,
             "sys_workflow_save",
-            _SAVE_ARGS,
+            {**_SAVE_ARGS, "steps": saved_steps},
             call_id="call_1",
             publish_event=lambda session, event: published.append(event),
         )
@@ -497,8 +500,30 @@ async def test_a_save_names_the_sessions_plan_after_the_new_workflow() -> None:
 
 @pytest.mark.parametrize(
     "plans",
-    [[], [{**_PLAN, "workflow_id": _WORKFLOW_ID}]],
-    ids=["no-plan", "already-named"],
+    [
+        [],
+        [{**_PLAN, "workflow_id": _WORKFLOW_ID}],
+        [
+            {
+                **_PLAN,
+                "content": {
+                    **_PLAN["content"],
+                    "steps": [{"id": "document", "name": "Write the guide", "depends_on": []}],
+                },
+            }
+        ],
+        [
+            {
+                **_PLAN,
+                "content": {
+                    **_PLAN["content"],
+                    "steps": [{**step, "depends_on": []} for step in _STEPS],
+                },
+            }
+        ],
+        [{**_PLAN, "content": {**_PLAN["content"], "source": "workflow"}}],
+    ],
+    ids=["no-plan", "already-named", "different-steps", "different-dependencies", "drawn-plan"],
 )
 async def test_a_save_writes_no_plan_when_there_is_none_to_name(
     plans: list[dict[str, object]],
