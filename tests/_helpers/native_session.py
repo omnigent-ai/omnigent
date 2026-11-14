@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
@@ -26,6 +27,32 @@ from omnigent.process_logging import redact_log_text
 from tests._helpers.session import bundle_files, post_session_bundle
 
 NativeHarness = Literal["antigravity", "claude", "codex", "cursor", "goose", "kiro", "hermes"]
+
+
+def _redacted_response_text(response: httpx.Response) -> str:
+    def redact(value: Any) -> Any:
+        if isinstance(value, dict):
+            result = {}
+            for key, item in value.items():
+                # Reuse the label policy without parsing a credential's escaped quotes.
+                probe = f"{key}=redaction-probe"
+                result[key] = (
+                    "[REDACTED]"
+                    if redact_log_text(probe, include_whitespace_credentials=True) != probe
+                    else redact(item)
+                )
+            return result
+        if isinstance(value, list):
+            return [redact(item) for item in value]
+        if isinstance(value, str):
+            redacted = redact_log_text(value, include_whitespace_credentials=True)
+            return "[REDACTED]" if redacted != value else value
+        return value
+
+    try:
+        return json.dumps(redact(response.json()))
+    except (ValueError, RecursionError):
+        return "[Response body omitted: invalid or excessively nested JSON]"
 
 
 def create_native_session(
@@ -109,7 +136,7 @@ def create_native_session(
     except httpx.HTTPStatusError as error:
         error.add_note(
             "Native session create response (redacted, up to 2048 characters): "
-            + redact_log_text(response.text, include_whitespace_credentials=True)[:2048]
+            + _redacted_response_text(response)[:2048]
         )
         raise
     return response.json()

@@ -113,12 +113,13 @@ class ServerRunner:
                 continue
         return "\n".join(tails)
 
-    def _wait_ready(self, *, runner: bool = False) -> None:
-        url = (
-            f"{self.base_url}/v1/runners/{self.runner_id}/status"
-            if runner
-            else f"{self.base_url}/health"
-        )
+    def _wait_ready(self, *, runner: bool = False, host: bool = False) -> None:
+        if host:
+            url = f"{self.base_url}/v1/hosts"
+        elif runner:
+            url = f"{self.base_url}/v1/runners/{self.runner_id}/status"
+        else:
+            url = f"{self.base_url}/health"
         deadline = time.monotonic() + self._health_timeout
         last = "not polled"
         while time.monotonic() < deadline:
@@ -131,11 +132,23 @@ class ServerRunner:
                 if runner:
                     self._client.get(f"{self.base_url}/health", timeout=2.0).raise_for_status()
                 response = self._client.get(url, timeout=2.0)
-                if response.status_code == 200 and (
-                    not runner or response.json().get("online") is True
-                ):
-                    return
                 last = f"HTTP {response.status_code}: {response.text[:300]}"
+                if response.status_code == 200:
+                    if host:
+                        # A persisted online row can precede tunnel registration.
+                        for row in response.json().get("hosts", []):
+                            if row.get("status") != "online":
+                                continue
+                            rpc = self._client.get(
+                                f"{self.base_url}/v1/hosts/{row['host_id']}/filesystem",
+                                params={"limit": 1},
+                                timeout=2.0,
+                            )
+                            if rpc.status_code == 200:
+                                return
+                            last = f"Host RPC HTTP {rpc.status_code}: {rpc.text[:300]}"
+                    elif not runner or response.json().get("online") is True:
+                        return
             except (httpx.HTTPError, ValueError) as exc:
                 last = f"{type(exc).__name__}: {exc}"
             time.sleep(self._poll_interval)
@@ -181,7 +194,7 @@ class ServerRunner:
         env: Mapping[str, str | None] | None = None,
         cwd: Path | None = None,
     ) -> None:
-        """Start a host daemon that launches runners through the server's host API."""
+        """Start a host daemon and wait until its tunnel answers an RPC."""
         assert self.host is None, "host already started"
         self.host = self._spawn(
             "host",
@@ -190,6 +203,7 @@ class ServerRunner:
             env or {},
             cwd=cwd,
         )
+        self._wait_ready(host=True)
 
     def start_runner(
         self,

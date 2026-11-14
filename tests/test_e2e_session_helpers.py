@@ -154,17 +154,58 @@ def test_pending_tool_poll_waits_for_this_turn(monkeypatch, previous_call) -> No
     assert [item["call_id"] for item in output] == ["new"]
 
 
-def test_native_create_failure_keeps_bounded_redacted_response() -> None:
+@pytest.mark.parametrize(
+    ("sensitive_fields", "credential_tails"),
+    [
+        pytest.param({}, (), id="long-api-key"),
+        pytest.param(
+            {"password": '"synthetic-password-tail'},
+            ("synthetic-password-tail",),
+            id="leading-quote",
+        ),
+        pytest.param(
+            {"password": 'prefix"synthetic-quote-tail\\\n\tend'},
+            ("synthetic-quote-tail",),
+            id="escaped-characters",
+        ),
+        pytest.param(
+            {
+                "details": [
+                    {"access_token": 'prefix"synthetic-nested-token-tail'},
+                    {"Authorization": 'Bearer "synthetic-authorization-tail'},
+                ]
+            },
+            ("synthetic-nested-token-tail", "synthetic-authorization-tail"),
+            id="nested-list",
+        ),
+        pytest.param(
+            {"password": {"value": '"synthetic-container-tail'}},
+            ("synthetic-container-tail",),
+            id="sensitive-object",
+        ),
+        pytest.param(
+            {"details": ['password="\\"synthetic-inline-escaped-tail"']},
+            ("synthetic-inline-escaped-tail",),
+            id="decoded-string",
+        ),
+    ],
+)
+def test_native_create_failure_keeps_bounded_redacted_response(
+    sensitive_fields: dict, credential_tails: tuple[str, ...]
+) -> None:
     credential = "synthetic-credential-" * 200
     payload = {
         "error": {
             "code": "invalid_input",
             "message": "host did not respond to workspace stat",
             "api_key": credential,
+            **sensitive_fields,
+            "detail": "diagnostic-after-credential",
             "context": "x" * 3000 + "outside-diagnostic-limit",
         }
     }
     response = httpx.Response(400, json=payload)
+    original_content = response.content
     with httpx.Client(transport=httpx.MockTransport(lambda _: response)) as client:
         with pytest.raises(httpx.HTTPStatusError) as raised:
             create_native_session(client, "http://server.example.test", harness="codex")
@@ -173,11 +214,38 @@ def test_native_create_failure_keeps_bounded_redacted_response() -> None:
     assert error.response is response
     assert error.request is response.request
     assert error.response.status_code == 400
+    assert error.response.content == original_content
     assert error.response.json() == payload
     note = "\n".join(error.__notes__)
     assert "invalid_input" in note
     assert "host did not respond to workspace stat" in note
+    assert "diagnostic-after-credential" in note
     assert "[REDACTED]" in note
     assert "synthetic-credential-" not in note
+    assert all(tail not in note for tail in credential_tails)
     assert "outside-diagnostic-limit" not in note
     assert len(note) < 2200
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param('upstream password="synthetic-omitted-tail', id="plain-text"),
+        pytest.param('{"password":"\\"synthetic-omitted-tail"} trailing', id="invalid-json"),
+        pytest.param("[" * 1100 + '"synthetic-omitted-tail"' + "]" * 1100, id="deep-json"),
+    ],
+)
+def test_native_create_failure_keeps_http_error_when_diagnostic_body_is_omitted(body: str) -> None:
+    response = httpx.Response(502, content=body)
+    with httpx.Client(transport=httpx.MockTransport(lambda _: response)) as client:
+        with pytest.raises(httpx.HTTPStatusError) as raised:
+            create_native_session(client, "http://server.example.test", harness="codex")
+
+    error = raised.value
+    assert error.response is response
+    assert error.request is response.request
+    assert error.response.status_code == 502
+    assert error.response.text == body
+    note = "\n".join(error.__notes__)
+    assert "Response body omitted" in note
+    assert "synthetic-omitted-tail" not in note
