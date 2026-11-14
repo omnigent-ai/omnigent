@@ -173,7 +173,7 @@ def test_fork_of_a_closed_child_is_open(
     assert not is_session_closed(fork.labels, fork.title)
     assert fork.title == "Fork of researcher:auth"
     saved = conversation_store.get_conversation(child.id)
-    assert saved is not None and is_session_closed(saved.labels, saved.title)
+    assert saved is not None and is_session_closed(saved.labels, saved.title, saved.id)
 
 
 def test_fork_drops_per_repo_sandbox_labels(
