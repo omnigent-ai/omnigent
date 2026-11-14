@@ -11,8 +11,11 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.server.feature_flags import resolve_feature_flags
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.tools.builtins.journal import JOURNAL_TOOLS
+from tests.debug_log_helpers import capture_debug_rows
 from tests.server.conftest import ControllableMockClient
 from tests.server.integration.test_scheduled_tasks_routes import (
     _build_app,
@@ -133,6 +136,66 @@ async def test_a_workflow_round_trips_and_stays_private(client: httpx.AsyncClien
     found = await client.get("/v1/workflows?name=nightly-build", headers=_headers(ALICE))
     assert [item["id"] for item in found.json()["data"]] == [workflow["id"]]
     assert (await client.get("/v1/workflows", headers=_headers(BOB))).json()["data"] == []
+
+
+async def test_telemetry_separates_drafts_saves_and_rejected_writes(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    source = _session(db_uri)
+    token = "workflow-test-runner-token"
+    assert SqlAlchemyConversationStore(db_uri).set_runner_id(source, token_bound_runner_id(token))
+    with capture_debug_rows("server") as rows:
+        draft = await client.post(
+            "/v1/workflows",
+            json={"name": "private-draft", "description": "Private description"},
+            headers=_headers(ALICE),
+        )
+        assert draft.status_code == 200, draft.text
+        workflow_id = draft.json()["id"]
+        path = f"/v1/workflows/{workflow_id}"
+        metadata = await client.patch(
+            path, json={"description": "private-description"}, headers=_headers(ALICE)
+        )
+        assert metadata.status_code == 200, metadata.text
+        assert [
+            row["event_name"] for row in rows if row["event_name"].startswith("workflow_")
+        ] == ["workflow_created"]
+        for _ in range(2):
+            saved = await client.patch(path, json={"steps": STEPS}, headers=_headers(ALICE))
+            assert saved.status_code == 200, saved.text
+        refused = await client.patch(path, json={"steps": STEPS}, headers=_headers(BOB))
+        assert refused.status_code == 404
+        duplicate = await client.post(
+            "/v1/workflows",
+            json={"name": "private-draft", "description": "Private description"},
+            headers=_headers(ALICE),
+        )
+        assert duplicate.status_code == 409
+        invalid = await client.patch(
+            path, json={"steps": [{"id": "INVALID"}]}, headers=_headers(ALICE)
+        )
+        assert invalid.status_code in (400, 422)
+        ready = await client.post(
+            "/v1/workflows",
+            json={"name": "private-ready", "description": "Private description", "steps": STEPS},
+            headers={**_runner(source), RUNNER_TUNNEL_TOKEN_HEADER: token},
+        )
+        assert ready.status_code == 200, ready.text
+
+    events = [row for row in rows if row["event_name"].startswith("workflow_")]
+    created = [row for row in events if row["event_name"] == "workflow_created"]
+    saves = [row for row in events if row["event_name"] == "workflow_saved"]
+    assert len(created) == 2 and len(saves) == 3
+    assert [row["attributes"]["has_plan"] for row in created] == ["False", "True"]
+    assert [row["attributes"]["creation_source"] for row in created] == ["api", "agent"]
+    assert created[1]["session_id"] == source
+    # Repeated saves/edits of the same workflow do not inflate the adoption count.
+    assert {row["attributes"]["workflow_id"] for row in saves} == {
+        workflow_id,
+        ready.json()["id"],
+    }
+    assert {row["user_id"] for row in events} == {ALICE}
+    assert "private-" not in str(events)
 
 
 async def test_writes_report_conflicts_bad_input_and_missing_workflows(

@@ -29,6 +29,7 @@ from omnigent.entities import Conversation
 from omnigent.entities.session_journal import JournalEntry
 from omnigent.entities.workflow import InvalidWorkflowError, Workflow
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.permissions import check_session_access
@@ -50,6 +51,7 @@ from omnigent.server.session_orchestration import (
     require_named_source_private,
     require_owned_session,
 )
+from omnigent.server.workflow_telemetry import log_workflow_saved
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.session_journal_store import SessionJournalStore
@@ -232,6 +234,12 @@ def create_workflows_router(
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
         except WorkflowNameTakenError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.ALREADY_EXISTS) from exc
+        log_workflow_saved(
+            workflow,
+            created=True,
+            plan_saved=True,
+            source_session_id=request.headers.get(ORCHESTRATION_SOURCE_HEADER),
+        )
         return _object(workflow)
 
     @router.get("/workflows/{workflow_id}", response_model=WorkflowObject)
@@ -298,6 +306,12 @@ def create_workflows_router(
             raise OmnigentError(str(exc), code=ErrorCode.ALREADY_EXISTS) from exc
         if workflow is None:
             raise _not_found()
+        log_workflow_saved(
+            workflow,
+            created=False,
+            plan_saved=body.steps is not None,
+            source_session_id=request.headers.get(ORCHESTRATION_SOURCE_HEADER),
+        )
         return _object(workflow)
 
     @router.delete("/workflows/{workflow_id}", response_model=WorkflowDeleted)

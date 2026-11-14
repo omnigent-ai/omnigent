@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import uuid
+from collections import Counter
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -22,6 +24,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+from tests.debug_log_helpers import capture_debug_rows
 from tests.server.conftest import ControllableMockClient
 from tests.server.integration.test_scheduled_tasks_routes import (
     _build_app,
@@ -79,6 +82,178 @@ def _runner(session_id: str, user: str = ALICE) -> dict[str, str]:
 
 def _write(kind: str, payload: dict[str, object], key: str, **fields: object) -> dict[str, object]:
     return {"kind": kind, "payload": payload, "idempotency_key": key, **fields}
+
+
+async def test_telemetry_reconstructs_workflow_usage_cohorts_without_retry_or_planning_counts(
+    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [100]
+    monkeypatch.setattr("omnigent.stores.session_journal_store.now_epoch", lambda: clock[0])
+    steps = [{"id": "private-step", "name": "Private task", "goal": "Private instructions"}]
+    saved = await client.post(
+        "/v1/workflows",
+        json={"name": "Private workflow", "description": "Private description", "steps": steps},
+        headers=_headers(),
+    )
+    assert saved.status_code == 200, saved.text
+    workflow_id = saved.json()["id"]
+    task_id, run_id = uuid.uuid4().hex, uuid.uuid4().hex
+    automation = _session(
+        db_uri,
+        labels={SCHEDULED_TASK_ORIGIN_LABEL_KEY: task_id, SCHEDULED_TASK_RUN_LABEL_KEY: run_id},
+    )
+    worker = _session(db_uri, labels={CREATED_BY_SESSION_LABEL_KEY: automation})
+    child = _session(db_uri, parent_conversation_id=worker)
+    sessions = [
+        (_session(db_uri), "interactive", "saved"),
+        (_session(db_uri), "interactive", "ad_hoc"),
+        (automation, "automation", "saved"),
+        (worker, "automation", "ad_hoc"),
+        (child, "automation", "saved"),
+    ]
+    proposal = _session(db_uri)
+    plans = {}
+    with capture_debug_rows("server") as rows:
+        for session_id, _, kind in sessions:
+            url = f"/v1/sessions/{session_id}/journal"
+            body = _write("plan", {"name": "Private plan", "steps": steps}, "plan")
+            if kind == "saved":
+                body["workflow_id"] = workflow_id
+            clock[0] = 100
+            for _ in range(2):
+                response = await client.post(url, json=body, headers=_runner(session_id))
+                assert response.status_code == 200, response.text
+            plans[session_id] = response.json()["id"]
+            for status, elapsed in (("started", 5), ("done", 11)):
+                clock[0] = 100 + elapsed
+                body = _write("status", {"status": status, "text": "Private result"}, status)
+                for _ in range(2):
+                    response = await client.post(url, json=body, headers=_runner(session_id))
+                    assert response.status_code == 200, response.text
+
+        proposed = await client.post(
+            f"/v1/sessions/{proposal}/journal",
+            json=_write("plan", {"name": "Private proposal", "steps": steps}, "proposal"),
+            headers=_runner(proposal),
+        )
+        assert proposed.status_code == 200, proposed.text
+        # Saving an already-executed ad hoc plan only associates a new plan version.
+        adhoc = sessions[1][0]
+        associated = await client.post(
+            f"/v1/sessions/{adhoc}/journal",
+            json=_write(
+                "plan", {"name": "Private plan", "steps": steps}, "save", workflow_id=workflow_id
+            ),
+            headers=_runner(adhoc),
+        )
+        assert associated.status_code == 200, associated.text
+
+    events = [row for row in rows if row["event_name"].startswith("workflow_")]
+    plan_events = [row for row in events if row["event_name"] == "workflow_plan_written"]
+    status_events = [row for row in events if row["event_name"] == "workflow_step_status_written"]
+    assert len(plan_events) == 7 and len(status_events) == 10
+    assert len({row["attributes"]["journal_entry_id"] for row in events}) == len(events)
+    assert "Private" not in str(events) and "private-step" not in str(events)
+
+    # A dashboard gets only serialized rows, not access to the live stores.
+    observed = {
+        (
+            row["session_id"],
+            row["attributes"]["execution_source"],
+            row["attributes"]["workflow_kind"],
+        )
+        for row in status_events
+    }
+    assert observed == set(sessions)
+    assert Counter((source, kind) for _, source, kind in observed) == {
+        ("interactive", "saved"): 1,
+        ("interactive", "ad_hoc"): 1,
+        ("automation", "saved"): 2,
+        ("automation", "ad_hoc"): 1,
+    }
+    assert {row["user_id"] for row in status_events} == {ALICE}
+    plan_keys = {
+        row["attributes"]["plan_id"]: json.loads(row["attributes"]["step_keys"])
+        for row in plan_events
+    }
+    for row in status_events:
+        attrs = row["attributes"]
+        assert attrs["plan_id"] == plans[row["session_id"]]
+        assert attrs["step_key"] in plan_keys[attrs["plan_id"]]
+        assert attrs["plan_elapsed_seconds"] == ("5" if attrs["status"] == "started" else "11")
+        if attrs["execution_source"] == "automation":
+            assert attrs["automation_session_id"] == automation and attrs["task_id"] == task_id
+        if row["session_id"] == automation:
+            assert attrs["scheduled_task_run_id"] == run_id
+        else:
+            # A worker must not be attributed to an ancestor's newer continued run.
+            assert "scheduled_task_run_id" not in attrs
+    association = plan_events[-1]["attributes"]
+    assert association["plan_change"] == "association_changed"
+    assert association["previous_plan_id"] == plans[adhoc]
+
+
+async def test_telemetry_records_failed_and_waiting_steps_but_not_rejected_writes(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session_id = _session(db_uri)
+    url = f"/v1/sessions/{session_id}/journal"
+    with capture_debug_rows("server") as rows:
+        response = await client.post(
+            url,
+            json=_write(
+                "plan", {"name": "Plan", "steps": [{"id": "check", "name": "Check"}]}, "p"
+            ),
+            headers=_runner(session_id),
+        )
+        assert response.status_code == 200, response.text
+        for status in ("failed", "needs_input"):
+            response = await client.post(
+                url,
+                json=_write("status", {"status": status, "text": "Private blocker"}, status),
+                headers=_runner(session_id),
+            )
+            assert response.status_code == 200, response.text
+        refused = await client.post(
+            url,
+            json=_write("status", {"status": "done", "text": "Finished"}, "foreign"),
+            headers=_runner(session_id, BOB),
+        )
+        assert refused.status_code == 404
+        invalid = await client.post(
+            url, json=_write("status", {"status": "nope"}, "invalid"), headers=_runner(session_id)
+        )
+        assert invalid.status_code == 400
+    statuses = [row for row in rows if row["event_name"] == "workflow_step_status_written"]
+    assert [row["attributes"]["status"] for row in statuses] == ["failed", "needs_input"]
+
+
+async def test_a_logging_failure_does_not_fail_a_committed_workflow_write(
+    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server import workflow_telemetry
+
+    def unavailable(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("Logging sink unavailable")
+
+    # Exercise a failed logging dependency while keeping the route and persistence real.
+    monkeypatch.setattr(workflow_telemetry._logger, "info", unavailable)
+    created = await client.post(
+        "/v1/workflows",
+        json={"name": "Workflow", "description": "Check the result"},
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    session_id = _session(db_uri)
+    url = f"/v1/sessions/{session_id}/journal"
+    response = await client.post(
+        url,
+        json=_write("plan", {"name": "Plan", "steps": [{"id": "check", "name": "Check"}]}, "p"),
+        headers=_runner(session_id),
+    )
+    assert response.status_code == 200, response.text
+    page = await client.get(url, headers=_headers())
+    assert [entry["id"] for entry in page.json()["data"]] == [response.json()["id"]]
 
 
 async def test_plans_and_statuses_mark_the_chat_once_each(

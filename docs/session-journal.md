@@ -307,6 +307,101 @@ Workflows live in `workflows`, keyed by workspace and ID, with the steps as
 compressed JSON of at most 16,383 bytes stored. `GET /v1/info` reports
 `workflows: true` on servers that store them.
 
+## Usage telemetry
+
+Workflow events use the same server-side structured debug-log sink as automation
+events (`omnigent.server.scheduled.telemetry`). Configure that sink as for the
+rest of the server; there is no separate analytics client or database migration.
+UI, API and agent tools all reach these server write boundaries. Delivery is
+best effort and logging failures never fail an accepted write.
+
+| Event | Emitted after | Counting key |
+| --- | --- | --- |
+| `workflow_created` | A workflow is persisted, including an empty draft. | Workspace + `workflow_id` |
+| `workflow_saved` | A nonempty plan is saved by POST or PATCH. Edits and retries can emit another save. | Workspace + `workflow_id`; use the first observed save for adoption. |
+| `workflow_plan_written` | A new plan version is appended to a session journal. | Workspace + `session_id` + `journal_entry_id` |
+| `workflow_step_status_written` | A status for a step in the current plan is appended. | Workspace + `session_id` + `journal_entry_id` |
+
+The log envelope carries `user_id`, `session_id`, `workspace_id`, `client_time`
+and the request ID. Creation and save events carry `step_count`, `has_plan`,
+`workflow_created_at` and `creation_source` (`agent` for an agent's write,
+otherwise `api`, including the web UI). Metadata edits and planning-session
+attachments do not emit saves. Rejected writes emit no successful-write event;
+their HTTP audit events retain the failure status and error classification.
+
+Journal events carry these dimensions:
+
+| Attribute | Meaning |
+| --- | --- |
+| `execution_source` | `automation`, `interactive`, or `unknown`. Both spawning parents and independent workers' creators are followed. Missing ancestry, cycles or failed metadata reads are unknown unless an automation ancestor was found. |
+| `workflow_kind` | `saved` when the plan names a workflow; otherwise `ad_hoc`. This is the association at the time of the event. |
+| `workflow_id` | The saved workflow ID, absent for ad hoc plans. |
+| `plan_id`, `plan_version`, `plan_created_at` | The persisted plan version the entry belongs to. A plan ID is the same ID returned on the saved workflow's runs page. |
+| `journal_entry_id`, `journal_position`, `entry_created_at` | Persisted identity and order; timestamps are epoch seconds. Retried appends emit no second event. |
+| `step_count` | Number of steps in that plan version. |
+| `root_session_id`, `parent_session_id`, `created_by_session_id` | Links to session metadata and usage events, including subagents and independent workers. |
+| `automation_session_id`, `task_id` | The observed automation ancestor and task, when available. |
+| `scheduled_task_run_id` | The occurrence recorded on this journal entry. Join it to automation events' `run_id`. It is deliberately absent when only an ancestor's current occurrence is known. |
+
+Plan events additionally carry `previous_plan_id`, `plan_change` and `step_keys`
+(a JSON array of opaque keys). `plan_change` is `made`, `replaced`, `updated`,
+`renamed`, `association_changed`, or `unchanged`. Status events carry `step_key`,
+the zero-based `step_index`, `status` (`started`, `done`, `failed`, `needs_input`),
+and `plan_elapsed_seconds`. Step keys are hashes scoped to the session, stable
+across plan revisions. Names, step IDs, goals, descriptions, prompts, notes and
+status text are not included.
+
+### Dashboard definitions
+
+Build daily, rolling-seven-day and whole-window results from deduplicated
+events. Recompute distinct users and sessions over the entire period, rather
+than adding daily distinct counts. Use UTC windows and mark the current day
+partial when it is included.
+
+| Metric | Evidence |
+| --- | --- |
+| Workflows created / creators | Distinct workflow IDs / users from `workflow_created`; split drafts with `has_plan`. |
+| Saved workflows / savers | First `workflow_saved` per workflow. Keep the first-save history outside the reporting window so edits do not count as new adoption. |
+| Workflow users / sessions | Distinct users / sessions with step-status events, grouped by `execution_source` and `workflow_kind`. |
+| Plans with execution activity | Distinct `plan_id` values with step-status events. Keep plan publication and plan-only editor proposals separate. |
+| Step outcomes / failures / waiting | Latest status per session and step key at the cutoff, ordered by journal position. `failed` and `needs_input` are distinct outcomes. |
+| Time to first step | First `started` event for a plan minus its `plan_created_at`; report sample count with percentiles. |
+| Plan progress | Join a plan's `step_keys` to those steps' latest statuses at the cutoff. As in the Tasks tab, surviving step keys retain progress across replans. All current steps must be `done` to infer completion. Missing statuses are pending/unknown. |
+| Automation delivery, startup errors and latency | Existing `scheduled_run_*` events, joined by occurrence ID. Startup success is prompt delivery, not workflow completion. |
+
+A plan version is not necessarily a new logical invocation: agents can replan,
+and saving an ad hoc plan writes another version with the saved workflow's ID.
+Use `previous_plan_id` and `plan_change` to inspect those revisions; do not call
+every plan write a new execution. Session adoption counts avoid that ambiguity.
+Saving afterward does not reclassify earlier ad hoc status events. A session can
+participate in multiple cohorts, so their distinct-session totals are not additive.
+
+Automation provenance describes the session's origin, including later human
+follow-ups to an automated session. Workflow classification starts with journal
+evidence: a trigger that fails before a plan is written has unknown workflow
+kind. Retain those failures and an attribution-coverage count in scheduler
+reports; dropping them would bias the success rate. Deleted ancestors and events
+outside log retention also remain unknown. There is no historical backfill.
+
+### Tokens and cost
+
+Join workflow session IDs to existing `session_created` / `session_metadata`
+lineage and usage events. Follow both parent and creator links to include work
+delegated by the workflow. Preserve unknown ancestry and missing usage as
+coverage gaps.
+
+- `response.completed` usage has `usage_kind=delta`, `usage_scope=response`;
+  deduplicate by response identity before summing within a time window.
+- `session.usage` has `usage_kind=cumulative`, `usage_scope=session_subtree`.
+  Use the latest snapshot at the cutoff, and only one root per spawn tree.
+  Do not add repeated snapshots or both a parent and its children's totals.
+  Independent workers have separate spawn trees and must be included separately.
+- A session can do work before, between and after workflows. Whole-session
+  totals measure workflow-associated session spend, not exact per-workflow
+  spend. For a bounded interval, use response deltas or complete before/after
+  snapshots and report missing baselines. Never substitute zero for missing
+  token or cost evidence, or sum overlapping cohorts as though disjoint.
+
 ## Storage
 
 Entries live in `session_journal_entries`, beside the session metadata, keyed by
