@@ -2240,6 +2240,20 @@
             "title": "Execution Target",
             "type": "string"
           },
+          "first_run_at": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "format": "int64",
+                "maximum": 253402300799.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Run At"
+          },
           "host_id": {
             "anyOf": [
               {
@@ -2251,6 +2265,15 @@
               }
             ],
             "title": "Host Id"
+          },
+          "kind": {
+            "default": "automation",
+            "enum": [
+              "automation",
+              "reminder"
+            ],
+            "title": "Kind",
+            "type": "string"
           },
           "max_cost_usd": {
             "anyOf": [
@@ -6993,6 +7016,11 @@
           "scheduled_task_mcp_services": {
             "default": true,
             "title": "Scheduled Task Mcp Services",
+            "type": "boolean"
+          },
+          "scheduled_task_one_time": {
+            "default": false,
+            "title": "Scheduled Task One Time",
             "type": "boolean"
           },
           "scheduled_task_projects": {
@@ -17323,8 +17351,24 @@
     },
     "/v1/scheduled-tasks": {
       "get": {
-        "description": "List the caller's scheduled tasks.\n\nLazy-on-read stale backstop: before returning, force-fail any of this\nowner's runs still `running` past the 6h max age (`incomplete`), so\na future Tasks-list \"last-run status\" badge never shows a stale orphan\nas `running`. Pure age check \u2014 one indexed, owner-scoped query for the\nowner's running runs, then a conditional `update_run`; NO per-run\nconversation I/O. Young in-flight runs are untouched, and completion of\na normal run is handled event-driven (the `_publish_status` hook), not\nhere.",
+        "description": "List the caller's scheduled tasks.\n\nLists automations unless *kind* is `all`, so the reminders agents set for\ntheir own sessions stay off the Automations page. There is no reminders-only\nview: this list reads every task the owner has, and a selective filter needs\nan indexed, paginated query first.\n\nLazy-on-read stale backstop: before returning, force-fail any of this\nowner's runs still `running` past the 6h max age (`incomplete`), so\na future Tasks-list \"last-run status\" badge never shows a stale orphan\nas `running`. Pure age check \u2014 one indexed, owner-scoped query for the\nowner's running runs, then a conditional `update_run`; NO per-run\nconversation I/O. Young in-flight runs are untouched, and completion of\na normal run is handled event-driven (the `_publish_status` hook), not\nhere.",
         "operationId": "list_scheduled_tasks_v1_scheduled_tasks_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "default": "automation",
+              "enum": [
+                "automation",
+                "all"
+              ],
+              "title": "Kind",
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -17343,6 +17387,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "List Scheduled Tasks",
