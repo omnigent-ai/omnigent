@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+import { useProjects, useResolveOrCreateProjectId } from "@/hooks/useConversations";
+import type * as ConversationsModule from "@/hooks/useConversations";
 import { type HostDirectoryListing, useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { type Host, useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { useSandboxModelOptions } from "@/hooks/useSandboxModelOptions";
@@ -33,6 +35,11 @@ import {
 
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn(), useHostModelOptions: vi.fn() }));
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
+vi.mock("@/hooks/useConversations", async (importOriginal) => ({
+  ...(await importOriginal<typeof ConversationsModule>()),
+  useProjects: vi.fn(),
+  useResolveOrCreateProjectId: vi.fn(),
+}));
 vi.mock("@/hooks/useHostFilesystem", () => ({ useHostFilesystem: vi.fn() }));
 vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
   ...(await importOriginal<typeof SandboxModelOptionsModule>()),
@@ -138,6 +145,11 @@ function setSandboxModels(data: Partial<SandboxModelOptionsModule.SandboxModelOp
 const submit = () => screen.getByTestId("workflow-session-submit");
 // Where the dialog keeps each workflow's, and New workflow's, last choices.
 const CHOICES = "omnigent:workflow-session-choices";
+const PROJECTS = [
+  { id: "proj_tests", name: "Tests", icon: "🧪" },
+  { id: "proj_reports", name: "Reports" },
+];
+const resolveProjectId = vi.fn();
 const startedSession = () =>
   vi
     .mocked(createSession)
@@ -150,6 +162,13 @@ describe("WorkflowSessionDialog", () => {
     consumePendingInitialPrompt("conv_run");
     navigate.mockClear();
     vi.mocked(createSession).mockReset();
+    resolveProjectId.mockReset();
+    vi.mocked(useResolveOrCreateProjectId).mockReturnValue(resolveProjectId);
+    vi.mocked(useProjects).mockReturnValue({
+      data: PROJECTS,
+      isSuccess: true,
+      isError: false,
+    } as ReturnType<typeof useProjects>);
     vi.mocked(useAvailableAgents).mockReturnValue({
       data: [CLAUDE_CODE, CODEX],
     } as unknown as ReturnType<typeof useAvailableAgents>);
@@ -178,6 +197,7 @@ describe("WorkflowSessionDialog", () => {
       .mockRejectedValueOnce(new Error("Couldn’t attach chat"))
       .mockResolvedValueOnce(undefined);
     renderDialog({}, { kind: "plan", workflow: WORKFLOW }, attached);
+    expect(screen.queryByTestId("workflow-session-project")).toBeNull();
     expect(screen.queryByTestId("workflow-session-instructions")).toBeNull();
     expect(submit()).toHaveTextContent("Start planning");
     fireEvent.click(submit());
@@ -286,7 +306,7 @@ describe("WorkflowSessionDialog", () => {
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
-  it("starts on the host, directory, agent and settings it last ran a session with", async () => {
+  it("starts with the project, host, directory, agent and settings it last used", async () => {
     setHosts([
       { host_id: "host_1", name: "desk" },
       { host_id: "host_2", name: "laptop" },
@@ -304,6 +324,7 @@ describe("WorkflowSessionDialog", () => {
       terminalLaunchArgs: ["--permission-mode", "acceptEdits"],
     };
     const choices = {
+      projectId: "proj_tests",
       target: "host_2",
       workspaces: { host_2: "/home/you/other" },
       repos: null,
@@ -321,6 +342,7 @@ describe("WorkflowSessionDialog", () => {
     startedSession();
     renderDialog();
 
+    expect(screen.getByTestId("workflow-session-project")).toHaveTextContent("Tests");
     expect(screen.getByTestId("workflow-session-host")).toHaveTextContent("laptop");
     expect(screen.getByPlaceholderText("Type a path or browse…")).toHaveValue("/home/you/other");
     expect(screen.getByTestId("workflow-session-agent")).toHaveTextContent("Claude Code");
@@ -329,6 +351,7 @@ describe("WorkflowSessionDialog", () => {
 
     await waitFor(() => expect(navigate).toHaveBeenCalledWith("/c/conv_run"));
     expect(vi.mocked(createSession).mock.calls[0]![2]).toMatchObject({
+      projectId: "proj_tests",
       hostId: "host_2",
       workspace: "/home/you/other",
       ...settings,
@@ -338,6 +361,98 @@ describe("WorkflowSessionDialog", () => {
     expect(JSON.parse(localStorage.getItem(CHOICES)!)).toEqual({
       [`run:${WORKFLOW.id}`]: choices,
     });
+  });
+
+  it("remembers a picked project per workflow, including clearing it", async () => {
+    setHosts([{ host_id: "host_1" }]);
+    localStorage.setItem("omnigent:recent-workspaces", JSON.stringify({ host_1: ["/srv/app"] }));
+    startedSession();
+    renderDialog();
+    expect(screen.getByTestId("workflow-session-project")).toHaveTextContent("No project");
+    fireEvent.keyDown(screen.getByTestId("workflow-session-project"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Tests" }));
+    fireEvent.click(submit());
+    await waitFor(() => expect(navigate).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(createSession).mock.calls[0]![2]).toMatchObject({ projectId: "proj_tests" });
+    expect(resolveProjectId).not.toHaveBeenCalled();
+    expect(JSON.parse(localStorage.getItem(CHOICES)!)[`run:${WORKFLOW.id}`].projectId).toBe(
+      "proj_tests",
+    );
+
+    cleanup();
+    renderDialog({}, { kind: "run", workflow: { ...WORKFLOW, id: "another-workflow" } });
+    expect(screen.getByTestId("workflow-session-project")).toHaveTextContent("No project");
+
+    cleanup();
+    vi.mocked(useProjects).mockReturnValue({
+      data: [{ ...PROJECTS[0], name: "QA" }],
+      isSuccess: true,
+      isError: false,
+    } as ReturnType<typeof useProjects>);
+    renderDialog();
+    expect(screen.getByTestId("workflow-session-project")).toHaveTextContent("QA");
+    fireEvent.keyDown(screen.getByTestId("workflow-session-project"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Remove from QA/ }));
+    fireEvent.click(submit());
+    await waitFor(() => expect(navigate).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(createSession).mock.calls[1]![2]?.projectId).toBeUndefined();
+
+    cleanup();
+    renderDialog();
+    expect(screen.getByTestId("workflow-session-project")).toHaveTextContent("No project");
+  });
+
+  it("creates a typed project before launching a sandbox and remembers its id", async () => {
+    setHosts([]);
+    resolveProjectId.mockResolvedValue("proj_new");
+    startedSession();
+    renderDialog(SANDBOXES);
+    fireEvent.keyDown(screen.getByTestId("workflow-session-project"), { key: "Enter" });
+    fireEvent.change(await screen.findByLabelText("Search or create project"), {
+      target: { value: "Release checks" },
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Create Release checks/ }));
+    fireEvent.click(submit());
+    await waitFor(() => expect(navigate).toHaveBeenCalled());
+    expect(resolveProjectId).toHaveBeenCalledWith("Release checks");
+    expect(vi.mocked(createSession).mock.calls[0]![2]).toMatchObject({
+      projectId: "proj_new",
+      sandbox: { provider: "modal" },
+    });
+    expect(JSON.parse(localStorage.getItem(CHOICES)!)[`run:${WORKFLOW.id}`].projectId).toBe(
+      "proj_new",
+    );
+  });
+
+  it.each([
+    { state: "loading", isSuccess: false, isError: false, label: "Loading…" },
+    { state: "unavailable", isSuccess: false, isError: true, label: "Project unavailable" },
+    { state: "deleted", isSuccess: true, isError: false, label: "No project" },
+  ])("handles a remembered project that is $state", async ({ isSuccess, isError, label }) => {
+    setHosts([{ host_id: "host_1" }]);
+    localStorage.setItem("omnigent:recent-workspaces", JSON.stringify({ host_1: ["/srv/app"] }));
+    localStorage.setItem(
+      CHOICES,
+      JSON.stringify({ [`run:${WORKFLOW.id}`]: { projectId: "proj_missing" } }),
+    );
+    vi.mocked(useProjects).mockReturnValue({
+      data: [],
+      isSuccess,
+      isError,
+    } as unknown as ReturnType<typeof useProjects>);
+    startedSession();
+    renderDialog();
+    expect(screen.getByTestId("workflow-session-project")).toHaveTextContent(label);
+    if (!isSuccess) {
+      expect(submit()).toBeDisabled();
+      fireEvent.keyDown(screen.getByTestId("workflow-session-project"), { key: "Enter" });
+      fireEvent.click(await screen.findByRole("menuitem", { name: "No project" }));
+    }
+    expect(submit()).toBeEnabled();
+    fireEvent.click(submit());
+    await waitFor(() => expect(navigate).toHaveBeenCalled());
+    expect(vi.mocked(createSession).mock.calls[0]![2]?.projectId).toBeUndefined();
+    expect(resolveProjectId).not.toHaveBeenCalled();
   });
 
   it("keeps each workflow's choices, and New workflow's, to themselves", async () => {
@@ -384,15 +499,20 @@ describe("WorkflowSessionDialog", () => {
   it("keeps the dialog open with the server's reason when the session can't start", async () => {
     setHosts([{ host_id: "host_1" }]);
     localStorage.setItem("omnigent:recent-workspaces", JSON.stringify({ host_1: ["/srv/app"] }));
+    const previous = JSON.stringify({ [`run:${WORKFLOW.id}`]: { projectId: "proj_tests" } });
+    localStorage.setItem(CHOICES, previous);
     vi.mocked(createSession).mockRejectedValue(new Error("Host is busy"));
     const { onOpenChange } = renderDialog();
 
+    fireEvent.keyDown(screen.getByTestId("workflow-session-project"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Reports" }));
     fireEvent.click(submit());
 
     expect(await screen.findByTestId("workflow-session-error")).toHaveTextContent("Host is busy");
     expect(navigate).not.toHaveBeenCalled();
     expect(onOpenChange).not.toHaveBeenCalled();
     expect(submit()).toBeEnabled();
+    expect(localStorage.getItem(CHOICES)).toBe(previous);
   });
 
   it("defaults a planning session to the host home when no directory was used", async () => {

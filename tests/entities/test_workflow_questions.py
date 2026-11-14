@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.entities.session_journal import STATUS_TEXT_MAX_CHARS, InvalidJournalEntryError
+from omnigent.entities.session_journal import InvalidJournalEntryError
 from omnigent.entities.workflow_questions import (
     answers_from_content,
     normalize_questions,
@@ -88,9 +88,29 @@ def test_the_form_lists_the_recommendation_first_and_answers_map_back() -> None:
     assert answers_from_content(questions, None)[0]["answer"] == ""
 
 
-def test_the_status_text_is_the_first_question_cut_to_fit() -> None:
+def test_the_status_text_is_the_whole_first_question() -> None:
     short = normalize_questions([_question()])
     assert status_text(short) == "Which profiles should the release use?"
-    long = normalize_questions([_question(question="Why " * 40)])
-    text = status_text(long)
-    assert len(text) == STATUS_TEXT_MAX_CHARS and text.endswith("…")
+    long = normalize_questions([_question(question="Why " * 200)])
+    assert status_text(long) == ("Why " * 200).strip()
+
+
+def test_questions_have_no_length_limit_on_their_text() -> None:
+    [question] = normalize_questions(
+        [
+            _question(
+                question="Should the release use the staging profiles? " * 20,
+                header="Release profiles " * 5,
+                options=[
+                    {"label": "Use staging " * 10, "description": "Probe it first. " * 30},
+                    {"label": "Use prod"},
+                ],
+            )
+        ]
+    )
+    assert question["question"] == ("Should the release use the staging profiles? " * 20).strip()
+    assert question["header"] == ("Release profiles " * 5).strip()
+    assert question["options"][0] == {
+        "label": ("Use staging " * 10).strip(),
+        "description": ("Probe it first. " * 30).strip(),
+    }

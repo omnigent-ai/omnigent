@@ -25,22 +25,11 @@ from omnigent.entities.session_journal import (
     NOTE_BODY_MAX_BYTES,
     PLAN_MAX_STEPS,
     PLAN_NAME_MAX_CHARS,
-    STATUS_TEXT_MAX_CHARS,
-    STEP_GOAL_MAX_CHARS,
     STEP_ID_MAX_CHARS,
-    STEP_NAME_MAX_CHARS,
     STEP_STATUSES,
 )
 from omnigent.entities.workflow import WORKFLOW_DESCRIPTION_MAX_CHARS, WORKFLOW_NAME_MAX_CHARS
-from omnigent.entities.workflow_questions import (
-    HEADER_MAX_CHARS,
-    OPTION_DESCRIPTION_MAX_CHARS,
-    OPTION_LABEL_MAX_CHARS,
-    OPTIONS_MAX,
-    OPTIONS_MIN,
-    QUESTION_MAX_CHARS,
-    QUESTIONS_MAX,
-)
+from omnigent.entities.workflow_questions import OPTIONS_MAX, OPTIONS_MIN, QUESTIONS_MAX
 from omnigent.tools.base import Tool
 
 # The most entries one sys_journal_read returns.
@@ -197,14 +186,9 @@ def _steps_schema(description: str) -> dict[str, Any]:
                 "id": {"type": "string", "pattern": _STEP_ID_PATTERN, "description": _STEP_DESC},
                 "name": {
                     "type": "string",
-                    "maxLength": STEP_NAME_MAX_CHARS,
                     "description": "A short name, e.g. 'Profile the endpoint'.",
                 },
-                "goal": {
-                    "type": "string",
-                    "maxLength": STEP_GOAL_MAX_CHARS,
-                    "description": "What done means for this step.",
-                },
+                "goal": {"type": "string", "description": "What done means for this step."},
                 "depends_on": {
                     "type": "array",
                     "items": {"type": "string", "pattern": _STEP_ID_PATTERN},
@@ -258,7 +242,6 @@ class SysJournalWriteStatusTool(Tool):
                 },
                 "text": {
                     "type": "string",
-                    "maxLength": STATUS_TEXT_MAX_CHARS,
                     "description": (
                         "Why, e.g. 'p95 430 ms', 'Approve the deploy to prod?' or "
                         "'CI is down: retry later, or skip the check?'."
@@ -337,10 +320,9 @@ class SysWorkflowRequestInputTool(Tool):
         option = {
             "type": "object",
             "properties": {
-                "label": {"type": "string", "maxLength": OPTION_LABEL_MAX_CHARS},
+                "label": {"type": "string"},
                 "description": {
                     "type": "string",
-                    "maxLength": OPTION_DESCRIPTION_MAX_CHARS,
                     "description": "What choosing it means, in a sentence.",
                 },
             },
@@ -350,10 +332,9 @@ class SysWorkflowRequestInputTool(Tool):
         question = {
             "type": "object",
             "properties": {
-                "question": {"type": "string", "maxLength": QUESTION_MAX_CHARS},
+                "question": {"type": "string"},
                 "header": {
                     "type": "string",
-                    "maxLength": HEADER_MAX_CHARS,
                     "description": "A short label for the question, e.g. 'Profiles'.",
                 },
                 "options": {

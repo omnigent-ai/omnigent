@@ -49,10 +49,9 @@ export function useSessionTasks(
   enabled: boolean,
 ): SessionTasksView {
   const serverInfo = useServerInfo();
+  const workflowsEnabled = isFeatureEnabled(serverInfo, "workflows");
   const journalSupported =
-    isFeatureEnabled(serverInfo, "workflows") &&
-    serverInfo !== "loading" &&
-    serverInfo.session_journal === true;
+    workflowsEnabled && serverInfo !== "loading" && serverInfo.session_journal === true;
   const journal = useSessionJournal(conversationId, enabled && journalSupported);
   const nativeTasks = useConversationEntryValue(conversationId ?? null, (state) => state.todos);
   // The same list the Agents rail reads. A side chat isn't delegated work.
@@ -72,7 +71,12 @@ export function useSessionTasks(
     ),
   );
   const entries = journalSupported ? journal.entries : NO_ENTRIES;
-  const tasks = sessionTaskList(entries, nativeTasks, sessionWorking, awaitingUser);
+  const tasks = sessionTaskList(
+    entries,
+    workflowsEnabled ? nativeTasks : [],
+    sessionWorking,
+    awaitingUser,
+  );
   return {
     ...tasks,
     journal,

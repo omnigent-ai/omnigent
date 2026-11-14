@@ -53,9 +53,11 @@ user, unless told to stop sooner.
 A status belongs to a step ID, not to a plan version. When the agent replans, a
 step that keeps its ID keeps its status, so finished work stays finished.
 
-Limits: a plan has at most 100 steps and 32 KiB of JSON; status text is at most
-80 characters (required except for `started`); a note is at most 4 KiB. Every
-stored entry is at most 16,383 bytes after compression.
+Limits: a plan has at most 100 steps and 32 KiB of JSON, and its name at most 80
+characters; status text is required except for `started`; a note is at most 4
+KiB. Every stored entry is at most 16,383 bytes after compression. Step names,
+goals, status text and the agent's questions have no length limit of their own;
+a goal keeps its line breaks.
 
 ## Agent tools
 

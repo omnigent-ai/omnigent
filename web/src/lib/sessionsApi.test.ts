@@ -335,7 +335,7 @@ describe("createSession", () => {
     });
   });
 
-  it("forwards the host, directory, labels and launch settings for a host start", async () => {
+  it("files a host start in its project with the chosen directory and launch settings", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
         id: "conv_run",
@@ -346,6 +346,7 @@ describe("createSession", () => {
     );
 
     await createSession("agent_xyz", [], {
+      projectId: "proj_tests",
       hostId: "host_1",
       workspace: "/home/you/project",
       labels: { "omnigent.ui": "terminal" },
@@ -358,6 +359,8 @@ describe("createSession", () => {
     expect(JSON.parse(init.body as string)).toEqual({
       agent_id: "agent_xyz",
       initial_items: [],
+      project_id: "proj_tests",
+      git: null,
       host_id: "host_1",
       workspace: "/home/you/project",
       labels: { "omnigent.ui": "terminal" },
@@ -382,6 +385,7 @@ describe("createSession", () => {
     };
 
     await createSession("agent_xyz", [], {
+      projectId: "proj_tests",
       sandbox: {
         provider: "modal",
         profileId: "profile_1",
@@ -399,6 +403,9 @@ describe("createSession", () => {
     expect(bodies[0]).toEqual({
       agent_id: "agent_xyz",
       initial_items: [],
+      project_id: "proj_tests",
+      workspace: null,
+      git: null,
       host_type: "managed",
       sandbox_provider: "modal",
       sandbox_profile_id: "profile_1",

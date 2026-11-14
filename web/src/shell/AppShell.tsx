@@ -1129,13 +1129,10 @@ function AppShellImpl() {
         // Pull Requests tab: shares the Files/workspace gate. Non-git workspaces and
         // other unavailable reasons are shown as empty states in the panel.
         github: showFilesPanel,
-        // Tasks tab: on servers that keep journals; elsewhere once the agent
-        // makes a to-do list, so the chat's task preview can always open it.
+        // Tasks need workflows enabled, with a journal or a native to-do list.
         tasks:
-          (isFeatureEnabled(serverInfo, "workflows") &&
-            serverInfo !== "loading" &&
-            serverInfo.session_journal === true) ||
-          hasNativeTasks,
+          isFeatureEnabled(serverInfo, "workflows") &&
+          ((serverInfo !== "loading" && serverInfo.session_journal === true) || hasNativeTasks),
         // Browser soft tabs: available only when the shell hosts the embedded
         // WebContentsView. Plain web and older desktop builds hide the "+"
         // option entirely so they never surface a dead tab whose calls no-op.
@@ -2138,6 +2135,7 @@ function AppShellImpl() {
     if (tasksTabToOpen === null || tasksTabToOpen !== conversationId) return;
     const automatic = useSessionTasksActions.getState().tasksTabAutoOpen;
     useSessionTasksActions.setState({ tasksTabToOpen: null, tasksTabAutoOpen: false });
+    if (!railTabsAvailable.tasks) return;
     if (isMobileViewport()) {
       // A drawer the agent opened would cover the chat it's working in.
       if (!automatic) openTasksPanel();
