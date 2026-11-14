@@ -432,6 +432,24 @@ describe("useSlashCompletion key fallthrough", () => {
 });
 
 describe("inline skill completion", () => {
+  it("uses explicit built-in names only for leading commands", () => {
+    const { view, props } = setup({
+      text: "/go",
+      commands: { "/goal": "View or set the goal" },
+      skills: { "/goal": "Project goal skill" },
+      builtinNames: new Set(["/goal"]),
+    });
+    expect(view.result.current.matches).toEqual(["/goal"]);
+    expect(view.result.current.builtinNames.has("/goal")).toBe(true);
+    expect(view.result.current.commands["/goal"]).toBe("View or set the goal");
+
+    view.rerender({ ...props, text: "please /go" });
+
+    expect(view.result.current.matches).toEqual(["/goal"]);
+    expect(view.result.current.builtinNames.has("/goal")).toBe(false);
+    expect(view.result.current.commands["/goal"]).toBe("Project goal skill");
+  });
+
   it.each(["please /rev", "please\n/rev", "please\t/rev"])("finds skills in %j", (text) => {
     const { view } = setup({ text });
     expect(view.result.current.open).toBe(true);

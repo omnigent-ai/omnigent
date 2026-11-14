@@ -408,13 +408,6 @@ function useGoalDialogState({
     void refreshGoal();
   }, [open, refreshGoal]);
 
-  useEffect(() => {
-    if (!open) return;
-    setObjective(goal?.objective ?? "");
-    setTokenBudget(goal?.tokenBudget?.toString() ?? "");
-    setModeDraftState(goalModeDraftForGoal(goal));
-  }, [goal, open]);
-
   const setObjectiveDraft = (value: string) => {
     setObjective(value);
     if (error !== null) setError(null);
@@ -557,7 +550,9 @@ export function GoalDialog({
           </DialogTitle>
         </DialogHeader>
 
-        <div className="min-h-0 space-y-3 overflow-y-auto">
+        {/* p-1/-m-1 give the fields' 3px focus ring room to paint:
+            overflow-y-auto clips on every side at the padding box. */}
+        <div className="-m-1 min-h-0 space-y-3 overflow-y-auto p-1">
           <GoalSummary loading={loading} goal={goal} />
           <GoalEditor
             objective={state.objective}

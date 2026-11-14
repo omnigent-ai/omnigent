@@ -96,6 +96,15 @@ describe("GoalDialog", () => {
     expect(objective).toHaveClass("wrap-anywhere");
   });
 
+  it("gives the scroll region room for the fields' focus ring", async () => {
+    renderDialog();
+
+    await waitFor(() => expect(mockGetGoal).toHaveBeenCalledWith("conv_codex"));
+    const scrollRegion = screen.getByTestId("goal-objective").closest(".overflow-y-auto");
+    if (!scrollRegion) throw new Error("goal scroll region not found");
+    expect(scrollRegion).toHaveClass("p-1", "-m-1");
+  });
+
   it("saves a trimmed objective, token budget, and selected status", async () => {
     const updatedGoal = { ...ACTIVE_GOAL, objective: "Finish tests", status: "paused" };
     mockSetGoal.mockResolvedValueOnce({ goal: updatedGoal });
@@ -119,6 +128,40 @@ describe("GoalDialog", () => {
       }),
     );
     expect(onGoalChange).toHaveBeenLastCalledWith(updatedGoal);
+  });
+
+  it("keeps unsaved edits when background goal snapshots change", async () => {
+    const onGoalChange = vi.fn();
+    const onOpenChange = vi.fn();
+    const props = {
+      open: true,
+      conversationId: "conv_codex",
+      readOnly: false,
+      goal: ACTIVE_GOAL,
+      onGoalChange,
+      onOpenChange,
+    };
+    const { rerender } = render(<GoalDialog {...props} />);
+    await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
+    fireEvent.change(screen.getByTestId("goal-objective"), {
+      target: { value: "My unsaved objective" },
+    });
+    fireEvent.change(screen.getByTestId("goal-token-budget"), {
+      target: { value: "12345" },
+    });
+    fireEvent.click(screen.getByTestId("goal-mode-paused"));
+
+    for (const goal of [
+      { ...ACTIVE_GOAL },
+      { ...ACTIVE_GOAL, status: "complete", tokensUsed: 2000 },
+    ]) {
+      rerender(<GoalDialog {...props} goal={goal} />);
+      expect(screen.getByTestId("goal-objective")).toHaveValue("My unsaved objective");
+      expect(screen.getByTestId("goal-token-budget")).toHaveValue(12345);
+      expect(screen.getByTestId("goal-mode-paused")).toHaveAttribute("aria-checked", "true");
+    }
+    expect(screen.getByTestId("goal-current")).toHaveTextContent("complete");
+    expect(screen.getByTestId("goal-current")).toHaveTextContent("2,000");
   });
 
   it("preserves Codex-owned statuses when keep-current mode is selected", async () => {

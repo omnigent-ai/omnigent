@@ -2765,8 +2765,9 @@ async def test_watch_injections_skips_conversation_input_without_newest_user_tex
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("delivery", ["fresh-blocks", "fresh-history", "live"])
-async def test_codex_adapter_keeps_multiple_text_blocks_out_of_shell_mode(
-    delivery: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("goal_command", [False, True], ids=["shell-like-text", "goal-command"])
+async def test_codex_adapter_routes_multiple_text_blocks(
+    delivery: str, goal_command: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Real adapter/executor routing must classify the original content block list."""
     import asyncio
@@ -2797,13 +2798,18 @@ async def test_codex_adapter_keeps_multiple_text_blocks_out_of_shell_mode(
     )
     expected_method = "turn/steer" if live else "turn/start"
     client = AsyncMock()
+    text_parts = ["/goal Finish ", "the tests"] if goal_command else ["!printf FIRST", "more"]
 
     async def request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if goal_command and method == "thread/goal/set":
+            assert params == {"threadId": "thread_blocks", "objective": "Finish the tests"}
+            return {"result": {}}
         assert method == expected_method, f"unexpected Codex request: {method}"
-        assert params["input"] == [
-            {"type": "text", "text": "!printf FIRST"},
-            {"type": "text", "text": "more"},
-        ]
+        assert params["input"] == (
+            [{"type": "text", "text": "Finish the tests"}]
+            if goal_command
+            else [{"type": "text", "text": part} for part in text_parts]
+        )
         return {"result": {"turnId": "turn_active", "turn": {"id": "turn_active"}}}
 
     client.request.side_effect = request
@@ -2812,10 +2818,7 @@ async def test_codex_adapter_keeps_multiple_text_blocks_out_of_shell_mode(
     )
     executor = codex_native_executor.CodexNativeExecutor(bridge_dir=tmp_path)
     adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="session_blocks")
-    blocks = [
-        {"type": "input_text", "text": "!printf FIRST"},
-        {"type": "input_text", "text": "more"},
-    ]
+    blocks = [{"type": "input_text", "text": part} for part in text_parts]
     input_value = (
         [{"type": "message", "role": "user", "content": blocks}]
         if delivery == "fresh-history"
@@ -2845,8 +2848,9 @@ async def test_codex_adapter_keeps_multiple_text_blocks_out_of_shell_mode(
         )
         await asyncio.wait_for(adapter.run_turn(native_request, turn_ctx), timeout=5)
 
-    assert client.request.await_count == 1
-    assert client.request.await_args.args[0] == expected_method
+    assert [call.args[0] for call in client.request.await_args_list] == (
+        ["thread/goal/set", expected_method] if goal_command else [expected_method]
+    )
 
 
 @pytest.mark.asyncio

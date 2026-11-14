@@ -389,6 +389,7 @@ def test_compact_steer_timeout_keeps_input_undelivered_and_bridge_turn(
         ("start", "connect"),
         ("steer", "connect"),
         ("live-steer", "connect"),
+        ("live-goal", "connect"),
         ("start", "thread/settings/update"),
         ("start", "model/list"),
     ],
@@ -435,8 +436,9 @@ async def test_delivery_does_not_submit_after_bridge_binding_changes(
         "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", RotatingClient
     )
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
-    if delivery == "live-steer":
-        assert await executor.enqueue_session_message("main", "keep this input") is False
+    if delivery in {"live-steer", "live-goal"}:
+        content = "/goal keep this input" if delivery == "live-goal" else "keep this input"
+        assert await executor.enqueue_session_message("main", content) is False
     else:
         config = (
             ExecutorConfig(
@@ -456,7 +458,10 @@ async def test_delivery_does_not_submit_after_bridge_binding_changes(
         assert failure.undelivered is True
         assert failure.preserve_session is True
         assert "changed" in failure.message
-    assert all(method not in {"turn/start", "turn/steer"} for method, _ in RotatingClient.requests)
+    assert all(
+        method not in {"turn/start", "turn/steer", "thread/goal/set"}
+        for method, _ in RotatingClient.requests
+    )
     assert read_bridge_state(tmp_path) == replacement
 
 
@@ -1300,7 +1305,20 @@ def test_web_started_codex_turn_returns_without_waiting_for_terminal_event(
     ]
 
 
-def test_goal_command_sets_goal_before_starting_objective_turn(
+@pytest.mark.parametrize(
+    ("active_turn_id", "live_injection", "content_blocks"),
+    [
+        (None, False, False),
+        ("turn_existing", False, False),
+        ("turn_existing", True, False),
+        ("turn_existing", True, True),
+    ],
+    ids=["idle", "active-turn", "live-queue", "live-text-blocks"],
+)
+def test_goal_command_sets_goal_before_submitting_objective(
+    active_turn_id: str | None,
+    live_injection: bool,
+    content_blocks: bool,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1319,15 +1337,35 @@ def test_goal_command_sets_goal_before_starting_objective_turn(
             socket_path=str(tmp_path / "app-server.sock"),
             thread_id="thread_123",
             codex_home=str(tmp_path / "codex-home"),
-            active_turn_id=None,
+            active_turn_id=active_turn_id,
             cwd=str(tmp_path),
         ),
     )
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
 
-    events = _collect_turn_events(executor, "  /goal Finish the implementation and tests  ")
-
-    assert [type(event) for event in events] == [TurnComplete]
+    command = "  /goal Finish the implementation and tests  "
+    if live_injection:
+        content = (
+            [
+                {"type": "input_text", "text": "  /goal Finish "},
+                {"type": "input_text", "text": "the implementation and tests  "},
+            ]
+            if content_blocks
+            else command
+        )
+        assert asyncio.run(executor.enqueue_session_message("main", content))
+    else:
+        events = _collect_turn_events(executor, command)
+        assert [type(event) for event in events] == [TurnComplete]
+    turn_params = {
+        "threadId": "thread_123",
+        "input": [{"type": "text", "text": "Finish the implementation and tests"}],
+        **(
+            {"expectedTurnId": active_turn_id}
+            if active_turn_id
+            else {"environments": [{"environmentId": "local", "cwd": str(tmp_path)}]}
+        ),
+    }
     assert _FakeCodexNativeClient.requests == [
         (
             "thread/goal/set",
@@ -1337,14 +1375,54 @@ def test_goal_command_sets_goal_before_starting_objective_turn(
             },
         ),
         (
-            "turn/start",
-            {
-                "threadId": "thread_123",
-                "input": [{"type": "text", "text": "Finish the implementation and tests"}],
-                "environments": [{"environmentId": "local", "cwd": str(tmp_path)}],
-            },
+            "turn/steer" if active_turn_id else "turn/start",
+            turn_params,
         ),
     ]
+
+
+@pytest.mark.parametrize("reply_lost", [False, True], ids=["refused", "reply-lost"])
+@pytest.mark.parametrize("live_injection", [False, True], ids=["run-turn", "live-queue"])
+def test_failed_goal_command_does_not_deliver_input_or_interrupt_native_work(
+    reply_lost: bool,
+    live_injection: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A failed goal request leaves its objective unsent and native work intact."""
+
+    class _GoalFailingClient(_FakeCodexNativeClient):
+        requests = []
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            response = await super().request(method, params)
+            if method == "thread/goal/set":
+                if reply_lost:
+                    raise ConnectionResetError("goal response lost")
+                raise CodexAppServerResponseError({"code": -32600, "message": "goal rejected"})
+            return response
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _GoalFailingClient
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_existing")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    if live_injection:
+        assert not asyncio.run(executor.enqueue_session_message("main", "/goal Finish the tests"))
+    else:
+        events = _collect_turn_events(executor, "/goal Finish the tests")
+        assert [type(event) for event in events] == [ExecutorError]
+        assert events[0].undelivered is True
+        assert events[0].preserve_session is True
+        assert ("goal response lost" if reply_lost else "goal rejected") in events[0].message
+
+    assert _GoalFailingClient.requests == [
+        ("thread/goal/set", {"threadId": "thread_123", "objective": "Finish the tests"})
+    ]
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == "turn_existing"
 
 
 @pytest.mark.parametrize(
@@ -1847,23 +1925,26 @@ def test_non_shell_bang_text_is_sent_as_a_prompt(
 
 
 @pytest.mark.parametrize("delivery", ["idle", "active-turn", "live-queue"])
-@pytest.mark.parametrize("attachment", ["shell-text-file", "text-file", "image"])
-def test_attachment_bang_content_is_never_a_shell_command(
+@pytest.mark.parametrize("attachment", ["command-text-file", "text-file", "image"])
+@pytest.mark.parametrize(
+    "text", ["!echo attachment-test", "/goal Finish the attachment test"], ids=["shell", "goal"]
+)
+def test_attachment_commands_remain_model_input(
     delivery: str,
     attachment: str,
+    text: str,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Attachment bytes and attachment-bearing prompts must go to the model."""
+    """Attachment-bearing prompts keep their text instead of running commands."""
     _FakeCodexNativeClient.requests = []
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
         _FakeCodexNativeClient,
     )
     _seed_bridge(tmp_path, active_turn_id=None if delivery == "idle" else "turn_existing")
-    text = "!echo attachment-test"
     content: list[dict[str, Any]]
-    if attachment == "shell-text-file":
+    if attachment == "command-text-file":
         content = [
             {
                 "type": "input_file",
@@ -1906,10 +1987,17 @@ def test_attachment_bang_content_is_never_a_shell_command(
     ]
     items = _FakeCodexNativeClient.requests[-1][1]["input"]
     assert items[0] == {"type": "text", "text": text}
-    assert len(items) == (1 if attachment == "shell-text-file" else 2)
+    assert len(items) == (1 if attachment == "command-text-file" else 2)
 
 
+@pytest.mark.parametrize(
+    ("active_turn_id", "live_injection"),
+    [(None, False), ("turn_existing", False), ("turn_existing", True)],
+    ids=["idle", "active-turn", "live-queue"],
+)
 def test_overlong_goal_command_fails_clearly_without_reaching_app_server(
+    active_turn_id: str | None,
+    live_injection: bool,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1928,15 +2016,20 @@ def test_overlong_goal_command_fails_clearly_without_reaching_app_server(
             socket_path=str(tmp_path / "app-server.sock"),
             thread_id="thread_123",
             codex_home=str(tmp_path / "codex-home"),
-            active_turn_id=None,
+            active_turn_id=active_turn_id,
             cwd=str(tmp_path),
         ),
     )
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
 
-    events = _collect_turn_events(executor, "/goal " + "x" * 4001)
+    command = "/goal " + "x" * 4001
+    if live_injection:
+        assert not asyncio.run(executor.enqueue_session_message("main", command))
+    events = _collect_turn_events(executor, command)
 
     assert [type(event) for event in events] == [ExecutorError]
+    assert events[0].undelivered is True
+    assert events[0].preserve_session is True
     message = events[0].message
     # The user sees the limit, not the raw JSON-RPC rejection the
     # app-server would have produced.

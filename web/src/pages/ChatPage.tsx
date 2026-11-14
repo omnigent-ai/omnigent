@@ -3155,11 +3155,6 @@ function ComposerImpl(
   const showGoal =
     composerSessionId !== null &&
     (showGoalControl || showClaudeGoalControl || showPollyCodexGoalControl);
-  const menuSkills = useMemo(
-    () =>
-      showGoal && skillPrefix === "/" ? skills.filter((skill) => skill.name !== "goal") : skills,
-    [skills, showGoal, skillPrefix],
-  );
   // The built-ins this session offers; a gated-off one leaves a same-named
   // custom command to run as a skill.
   const offeredBuiltinCommands = useMemo(
@@ -3194,16 +3189,32 @@ function ComposerImpl(
       showGoal,
     ],
   );
+  const builtinCommandNames = useMemo(
+    () => new Set(Object.keys(offeredBuiltinCommands)),
+    [offeredBuiltinCommands],
+  );
+  const commandSkills = useMemo(
+    () =>
+      skills.filter(
+        (skill) => !builtinCommandNames.has(`${skillPrefix}${skill.name}`.toLowerCase()),
+      ),
+    [skills, builtinCommandNames, skillPrefix],
+  );
   const skillCommands = useMemo(
     () =>
       Object.fromEntries(
-        menuSkills.map((skill) => [`${skillPrefix}${skill.name}`, skillMenuDescription(skill)]),
+        skills.map((skill) => [`${skillPrefix}${skill.name}`, skillMenuDescription(skill)]),
       ),
-    [menuSkills, skillPrefix],
+    [skills, skillPrefix],
   );
   const slashCommands = useMemo(
-    () => ({ ...offeredBuiltinCommands, ...skillCommands }),
-    [offeredBuiltinCommands, skillCommands],
+    () => ({
+      ...offeredBuiltinCommands,
+      ...Object.fromEntries(
+        commandSkills.map((skill) => [`${skillPrefix}${skill.name}`, skillMenuDescription(skill)]),
+      ),
+    }),
+    [offeredBuiltinCommands, commandSkills, skillPrefix],
   );
   const slashCommandNames = useMemo(() => Object.keys(slashCommands), [slashCommands]);
   // Skills always need an optional argument fill-in so the user can
@@ -3212,14 +3223,14 @@ function ComposerImpl(
   const slashCommandsWithArgs = useMemo(
     () =>
       buildSlashCommandWithArgsSet(
-        menuSkills,
+        commandSkills,
         showEffort,
         showModel,
         showBtw,
         showSide,
         skillPrefix,
       ),
-    [menuSkills, showEffort, showModel, showBtw, showSide, skillPrefix],
+    [commandSkills, showEffort, showModel, showBtw, showSide, skillPrefix],
   );
 
   // Suggest names until a space starts the arguments; exclude file paths.
@@ -3762,10 +3773,7 @@ function ComposerImpl(
     }
   };
 
-  const skillLabels = useMemo(
-    () => skillDisplayNames(menuSkills, skillPrefix),
-    [menuSkills, skillPrefix],
-  );
+  const skillLabels = useMemo(() => skillDisplayNames(skills, skillPrefix), [skills, skillPrefix]);
   const selectedAgent = agents?.find((agent) => agent.id === boundAgentId);
   const registryEnabled =
     composerServerInfo !== "loading" && !!composerServerInfo.enabled_connections?.includes("mcp");
@@ -3896,6 +3904,7 @@ function ComposerImpl(
     text: value,
     commands: slashCompletionCommands,
     skills: skillCommands,
+    builtinNames: builtinCommandNames,
     labels: skillLabels,
     textareaRef,
     prefix: skillPrefix,
@@ -4134,6 +4143,7 @@ function ComposerImpl(
     const skill = onSendSlashCommand
       ? matchSlashCommandInvocation(trimmed, slashCommandNames)
       : null;
+    let goalMessage: string | null = null;
     if (
       draft.quotes.length === 0 &&
       (skill !== null || isSlashCommandText(trimmed)) &&
@@ -4162,6 +4172,9 @@ function ComposerImpl(
       if (skill !== null && skill.command !== parts[0]) {
         runCommand(() => sendSkill(skill));
         return;
+      }
+      if (cmd === "/goal" && showGoal && arg) {
+        goalMessage = `/goal ${trimmed.slice(parts[0].length).trim()}`;
       }
       // Bare "/model" when the session has a switchable model (claude-native):
       // sent as plaintext it would open Claude's interactive selector inside the
@@ -4250,7 +4263,7 @@ function ComposerImpl(
       outgoing.text = withSessionMentionHint(outgoing.text, tagsSessions);
       onSend(serializeReplyDraft(outgoing), sendFiles, snapshotReplyDraft(outgoing));
     } else {
-      const message = isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd();
+      const message = goalMessage ?? (isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd());
       onSend(
         withSessionMentionHint(
           [expand(message), reviewContext].filter(Boolean).join("\n\n"),
