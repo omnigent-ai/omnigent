@@ -283,7 +283,7 @@ async def test_draft_planning_is_persistent_private_and_separate_from_runs(
     )
     assert proposal.status_code == 200, proposal.text
     saved = await client.patch(
-        path, json={"steps": proposal.json()["payload"]["steps"]}, headers=_headers(ALICE)
+        path, json={"steps": proposal.json()["content"]["steps"]}, headers=_headers(ALICE)
     )
     assert saved.status_code == 200 and saved.json()["is_draft"] is False
     assert saved.json()["planning_session_id"] == planner

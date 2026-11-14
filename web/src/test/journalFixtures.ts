@@ -10,7 +10,7 @@ export function journalEntry(position: number, fields: Partial<JournalEntry> = {
     step: null,
     author: { type: "agent" },
     kind: "note",
-    payload: { body: `note ${position}` },
+    content: { body: `note ${position}` },
     ...fields,
   };
 }
@@ -19,7 +19,7 @@ export function journalEntry(position: number, fields: Partial<JournalEntry> = {
 export function journalPlan(position: number, ...steps: [string, string[]?][]): JournalEntry {
   return journalEntry(position, {
     kind: "plan",
-    payload: {
+    content: {
       name: "The plan",
       version: position + 1,
       source: "agent",

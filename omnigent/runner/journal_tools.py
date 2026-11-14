@@ -145,14 +145,14 @@ def _write_request(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     if step is not None:
         step = normalize_step_id(step)
     if tool_name == "sys_journal_write_note":
-        return {"kind": "note", "payload": normalize_note(args.get("body")), "step": step}
+        return {"kind": "note", "content": normalize_note(args.get("body")), "step": step}
     if tool_name == "sys_journal_write_status":
-        payload = normalize_status(args.get("status"), text=args.get("text"))
-        return {"kind": "status", "payload": payload, "step": step}
+        content = normalize_status(args.get("status"), text=args.get("text"))
+        return {"kind": "status", "content": content, "step": step}
     plan = normalize_plan(args.get("steps"), name=args.get("name"))
     body: dict[str, Any] = {
         "kind": "plan",
-        "payload": {"name": plan["name"], "steps": plan["steps"]},
+        "content": {"name": plan["name"], "steps": plan["steps"]},
         "step": None,
     }
     workflow_id = args.get("workflow_id")
@@ -237,7 +237,7 @@ async def _write(
     _publish(publish_event, conversation_id, entry)
     result: dict[str, Any] = {"id": entry["id"], "position": entry["position"]}
     if entry.get("kind") == "plan":
-        result["version"] = entry["payload"]["version"]
+        result["version"] = entry["content"]["version"]
     return json.dumps(result)
 
 
@@ -338,12 +338,12 @@ def _when(created_at: object) -> str:
 
 def _plan_change(plan: dict[str, Any], previous: dict[str, Any] | None) -> str:
     """One line on what a plan changed, e.g. ``"added opt-n1, opt-pool"``."""
-    steps = plan.get("payload", {}).get("steps", [])
+    steps = plan.get("content", {}).get("steps", [])
     if previous is None:
         return f"{len(steps)} step{'' if len(steps) == 1 else 's'}: " + ", ".join(
             step["id"] for step in steps
         )
-    before = {step["id"]: step for step in previous.get("payload", {}).get("steps", [])}
+    before = {step["id"]: step for step in previous.get("content", {}).get("steps", [])}
     after = {step["id"]: step for step in steps}
     added = [step_id for step_id in after if step_id not in before]
     removed = [step_id for step_id in before if step_id not in after]
@@ -364,22 +364,22 @@ def _line(entry: dict[str, Any], previous_plans: dict[str, dict[str, Any] | None
     run_id = entry.get("scheduled_task_run_id")
     if run_id:
         head += f" run {run_id[:8]}"
-    kind, payload = entry.get("kind"), entry.get("payload") or {}
+    kind, content = entry.get("kind"), entry.get("content") or {}
     step = f" [{entry['step']}]" if entry.get("step") else ""
     if kind == "status":
-        status = str(payload.get("status"))
-        text = f": {payload['text']}" if payload.get("text") else ""
+        status = str(content.get("status"))
+        text = f": {content['text']}" if content.get("text") else ""
         return f"{head} · status{step} {_STATUS_GLYPHS.get(status, '')} {status}{text}"
     if kind == "note":
-        first, _, rest = str(payload.get("body", "")).partition("\n")
+        first, _, rest = str(content.get("body", "")).partition("\n")
         line = f"{head} · note{step}: {first}"
         return line + "".join(f"\n    {more}" for more in rest.splitlines())
     if kind == "plan":
         author = (entry.get("author") or {}).get("type", "agent")
         change = _plan_change(entry, previous_plans.get(entry["id"]))
-        name = f" {json.dumps(payload['name'], ensure_ascii=False)}" if payload.get("name") else ""
-        return f"{head} · plan v{payload.get('version')}{name} ({author}): {change}"
-    return f"{head} · {kind}{step}: {json.dumps(payload, ensure_ascii=False)}"
+        name = f" {json.dumps(content['name'], ensure_ascii=False)}" if content.get("name") else ""
+        return f"{head} · plan v{content.get('version')}{name} ({author}): {change}"
+    return f"{head} · {kind}{step}: {json.dumps(content, ensure_ascii=False)}"
 
 
 async def _get(
@@ -464,11 +464,11 @@ async def _read(
         rendered: list[Any] = [
             {
                 "position": entry["position"],
-                "version": entry["payload"].get("version"),
-                "name": entry["payload"].get("name"),
+                "version": entry["content"].get("version"),
+                "name": entry["content"].get("name"),
                 "created_at": entry["created_at"],
                 "author": (entry.get("author") or {}).get("type"),
-                "steps": entry["payload"].get("steps", []),
+                "steps": entry["content"].get("steps", []),
             }
             for entry in entries
         ]
@@ -586,8 +586,8 @@ async def _name_plan_workflow(
     await _write(
         "sys_journal_write_plan",
         {
-            "name": plan["payload"]["name"],
-            "steps": plan["payload"]["steps"],
+            "name": plan["content"]["name"],
+            "steps": plan["content"]["steps"],
             "workflow_id": workflow_id,
         },
         server_client=server_client,

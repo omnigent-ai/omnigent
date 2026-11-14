@@ -129,7 +129,7 @@ def _require_attended_session(conversations: ConversationStore, session: Convers
 def entry_to_response(entry: JournalEntry) -> SessionJournalEntry:
     """Serialize an entry; its author is derived from its kind and a plan's source."""
     omnigent = entry.kind in _OMNIGENT_KINDS or (
-        entry.kind == "plan" and entry.payload.get("source") == "workflow"
+        entry.kind == "plan" and entry.content.get("source") == "workflow"
     )
     return SessionJournalEntry(
         id=entry.id,
@@ -139,7 +139,7 @@ def entry_to_response(entry: JournalEntry) -> SessionJournalEntry:
         step=entry.step,
         author=SessionJournalAuthor(type="omnigent" if omnigent else "agent"),
         kind=entry.kind,  # type: ignore[arg-type]
-        payload=entry.payload,
+        content=entry.content,
         workflow_id=entry.workflow_id,
     )
 
@@ -241,7 +241,7 @@ def create_session_journal_router(
     async def _append(
         session: Conversation,
         kind: str,
-        payload: dict[str, Any],
+        content: dict[str, Any],
         *,
         idempotency_key: str,
         step: str | None,
@@ -249,14 +249,14 @@ def create_session_journal_router(
         workflow_id: str | None = None,
     ) -> JournalEntry:
         store = _store()
-        if kind == "status" and payload.get("status") == "needs_input":
+        if kind == "status" and content.get("status") == "needs_input":
             await asyncio.to_thread(_require_attended_session, conversation_store, session)
         try:
             appended = await asyncio.to_thread(
                 lambda: store.append(
                     session.id,
                     kind,
-                    payload,
+                    content,
                     idempotency_key=idempotency_key,
                     step=step,
                     scheduled_task_run_id=_run_id(session),
@@ -280,10 +280,10 @@ def create_session_journal_router(
     ) -> SessionJournalEntry:
         """Append an entry written by the session's agent; only its runner calls this."""
         session = await _agent_session(request, session_id)
-        if body.kind == "plan" and set(body.payload) != {"name", "steps"}:
+        if body.kind == "plan" and set(body.content) != {"name", "steps"}:
             # The agent's plans are its own; copies of drawn workflows come later.
             raise OmnigentError(
-                "invalid_entry: a plan payload has exactly two fields, name and steps",
+                "invalid_entry: a plan's content has exactly two fields, name and steps",
                 code=ErrorCode.INVALID_INPUT,
             )
         if body.workflow_id is not None:
@@ -291,7 +291,7 @@ def create_session_journal_router(
         entry = await _append(
             session,
             body.kind,
-            body.payload,
+            body.content,
             idempotency_key=body.idempotency_key,
             step=body.step,
             user_id=get_user_id(request, auth_provider),
@@ -349,7 +349,7 @@ def create_session_journal_router(
             raise OmnigentError(f"invalid_input: {exc}", code=ErrorCode.INVALID_INPUT) from exc
         plan = await asyncio.to_thread(_store().current_plan, session.id)
         task = next(
-            (item for item in (plan.payload["steps"] if plan else []) if item["id"] == step),
+            (item for item in (plan.content["steps"] if plan else []) if item["id"] == step),
             None,
         )
         if task is None:

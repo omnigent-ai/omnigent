@@ -39,8 +39,8 @@ def plan_change(
 ) -> dict[str, Any] | None:
     """How *plan* changed *previous*, compared by step ID; ``None`` when nothing changed.
 
-    :param previous: The previous plan's payload, or ``None`` for the first plan.
-    :param plan: The new plan's payload, e.g. ``{"name": "Ship it", "steps": [...]}``.
+    :param previous: The previous plan's content, or ``None`` for the first plan.
+    :param plan: The new plan's content, e.g. ``{"name": "Ship it", "steps": [...]}``.
     :returns: ``{"change", "name", "tasks", "added", "removed"}``, where change is
         ``made`` (the first plan), ``replaced`` (no task carries over), ``renamed``
         (only the name changed) or ``updated``; added and removed list task names.
@@ -103,7 +103,7 @@ async def record_status_marker(
     :param entry: The status entry the journal accepted.
     :param plan: The plan it was written against, which names the task.
     """
-    names = {step["id"]: step["name"] for step in (plan.payload["steps"] if plan else [])}
+    names = {step["id"]: step["name"] for step in (plan.content["steps"] if plan else [])}
     step = entry.step or ""
     await _append(
         store,
@@ -115,8 +115,8 @@ async def record_status_marker(
             resource_type=RESOURCE_TYPE,
             resource={
                 "name": names.get(step, step),
-                "status": entry.payload["status"],
-                "text": entry.payload.get("text"),
+                "status": entry.content["status"],
+                "text": entry.content.get("text"),
                 "entry_id": entry.id,
                 "native": False,
             },
@@ -131,7 +131,7 @@ async def record_plan_marker(
 
     :param previous: The plan before it, or ``None`` for the session's first.
     """
-    change = plan_change(previous.payload if previous else None, entry.payload)
+    change = plan_change(previous.content if previous else None, entry.content)
     if change is None:
         return
     await _append(

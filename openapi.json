@@ -8696,6 +8696,12 @@
         "additionalProperties": false,
         "description": "Body of `POST /v1/sessions/{id}/journal`, sent by the session's runner.",
         "properties": {
+          "content": {
+            "additionalProperties": true,
+            "description": "The kind's fields, e.g. `{\"status\": \"done\", \"text\": \"PR merged\"}`.",
+            "title": "Content",
+            "type": "object"
+          },
           "idempotency_key": {
             "description": "Names the write, e.g. `\"tool:<tool call ID>\"`; a retry with the same key returns the first attempt's entry.",
             "maxLength": 128,
@@ -8712,12 +8718,6 @@
             ],
             "title": "Kind",
             "type": "string"
-          },
-          "payload": {
-            "additionalProperties": true,
-            "description": "The kind's fields, e.g. `{\"status\": \"done\", \"text\": \"PR merged\"}`.",
-            "title": "Payload",
-            "type": "object"
           },
           "step": {
             "anyOf": [
@@ -8746,7 +8746,7 @@
         },
         "required": [
           "kind",
-          "payload",
+          "content",
           "idempotency_key"
         ],
         "title": "SessionJournalAppendRequest",
@@ -8817,6 +8817,12 @@
           "author": {
             "$ref": "#/components/schemas/SessionJournalAuthor"
           },
+          "content": {
+            "additionalProperties": true,
+            "description": "e.g. `{\"status\": \"done\", \"text\": \"PR merged\"}` for a status, `{\"body\": \"\u2026\"}` for a note, or `{\"version\": 2, \"source\": \"agent\", \"steps\": [...]}` for a plan.",
+            "title": "Content",
+            "type": "object"
+          },
           "created_at": {
             "description": "Unix epoch seconds when it was appended.",
             "format": "int64",
@@ -8829,7 +8835,7 @@
             "type": "string"
           },
           "kind": {
-            "description": "The entry kind; `payload` holds its fields.",
+            "description": "The entry kind; `content` holds its fields.",
             "enum": [
               "status",
               "note",
@@ -8840,12 +8846,6 @@
             ],
             "title": "Kind",
             "type": "string"
-          },
-          "payload": {
-            "additionalProperties": true,
-            "description": "e.g. `{\"status\": \"done\", \"text\": \"PR merged\"}` for a status, `{\"body\": \"\u2026\"}` for a note, or `{\"version\": 2, \"source\": \"agent\", \"steps\": [...]}` for a plan.",
-            "title": "Payload",
-            "type": "object"
           },
           "position": {
             "description": "The entry's place in the journal: 0, 1, 2, \u2026",
@@ -8896,7 +8896,7 @@
           "created_at",
           "author",
           "kind",
-          "payload"
+          "content"
         ],
         "title": "SessionJournalEntry",
         "type": "object"

@@ -51,7 +51,7 @@ from omnigent.entities.session_journal import (
     JournalPage,
     StepNotReadyError,
     WorkflowRunPage,
-    normalize_payload,
+    normalize_content,
     normalize_step_id,
 )
 from omnigent.errors import StaleCursorError
@@ -96,9 +96,9 @@ class JournalSessionNotFoundError(Exception):
     """The session doesn't exist, or was deleted while the append ran."""
 
 
-def _stored_content(payload: Mapping[str, Any]) -> str:
-    """The payload's JSON for the ``content`` column, refused when it doesn't fit compressed."""
-    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+def _stored_content(content: Mapping[str, Any]) -> str:
+    """The entry's JSON for the ``content`` column, refused when it doesn't fit compressed."""
+    text = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
     if len(text.encode()) + _FRAMING_BYTES <= MAX_STORED_VALUE_BYTES:
         return text
     size = len(compression.encode(text) or b"")
@@ -167,7 +167,7 @@ class SessionJournalStore:
                 kind=decode_journal_entry_kind(row.kind),
                 step=row.step,
                 scheduled_task_run_id=row.scheduled_task_run_id,
-                payload=json.loads(row.content),
+                content=json.loads(row.content),
                 workflow_id=row.workflow_id,
             )
             for row in rows
@@ -267,7 +267,7 @@ class SessionJournalStore:
         waiting = []
         for dependency in current["depends_on"] if current else []:
             newest = self._newest_status_row(session, conversation_id, dependency)
-            if newest is None or self._entries([newest])[0].payload.get("status") != "done":
+            if newest is None or self._entries([newest])[0].content.get("status") != "done":
                 waiting.append(dependency)
         return waiting
 
@@ -295,7 +295,7 @@ class SessionJournalStore:
         self,
         conversation_id: str,
         kind: str,
-        payload: Mapping[str, Any],
+        content: Mapping[str, Any],
         *,
         idempotency_key: str,
         step: str | None = None,
@@ -306,8 +306,8 @@ class SessionJournalStore:
 
         :param conversation_id: The session, e.g. ``"0123…cdef"``.
         :param kind: One of :data:`~omnigent.entities.session_journal.JOURNAL_KINDS`.
-        :param payload: The kind's fields, checked with
-            :func:`~omnigent.entities.session_journal.normalize_payload`. A plan's
+        :param content: The kind's fields, checked with
+            :func:`~omnigent.entities.session_journal.normalize_content`. A plan's
             version is set here: the previous plan's version plus one.
         :param idempotency_key: Names the write, e.g. ``"tool:toolu_01…"``. A
             retry with the same key returns the entry the first attempt wrote.
@@ -324,7 +324,7 @@ class SessionJournalStore:
             the current plan aren't all done.
         :raises JournalSessionNotFoundError: If the session doesn't exist.
         """
-        fields = normalize_payload(kind, payload)
+        fields = normalize_content(kind, content)
         if not isinstance(idempotency_key, str) or not idempotency_key.strip():
             raise InvalidJournalEntryError("idempotency_key must not be empty")
         if len(idempotency_key) > IDEMPOTENCY_KEY_MAX_CHARS:
@@ -366,14 +366,14 @@ class SessionJournalStore:
                         "idempotency_key was already used for a different kind of entry"
                     )
                 return earlier, False, None
-            entry_text, entry_payload = stored, fields
+            entry_text, entry_content = stored, fields
             if kind == "plan":
                 previous = self._newest_plan_row(session, conversation_id)
                 version = (
-                    1 if previous is None else self._entries([previous])[0].payload["version"] + 1
+                    1 if previous is None else self._entries([previous])[0].content["version"] + 1
                 )
-                entry_payload = {"version": version, **fields}
-                entry_text = _stored_content(entry_payload)
+                entry_content = {"version": version, **fields}
+                entry_text = _stored_content(entry_content)
             entry_step = step
             entry_workflow_id = workflow_id
             if kind == "note":
@@ -382,7 +382,7 @@ class SessionJournalStore:
             if kind == "status":
                 plan = self._newest_plan_row(session, conversation_id)
                 entry_workflow_id = plan.workflow_id if plan is not None else None
-                steps = self._entries([plan])[0].payload["steps"] if plan is not None else None
+                steps = self._entries([plan])[0].content["steps"] if plan is not None else None
                 if entry_step is None:
                     entry_step = self._default_step(steps)
                 waiting = self._unfinished_dependencies(
@@ -412,12 +412,12 @@ class SessionJournalStore:
                 )
                 .values(next_position=position + 1)
             )
-            return row, True, entry_payload
+            return row, True, entry_content
 
-        row, created, entry_payload = run_write_transaction(
+        row, created, entry_content = run_write_transaction(
             self._session_immediate, "append", write
         )
-        if entry_payload is None:
+        if entry_content is None:
             return JournalAppend(entry=self._entries([row])[0], created=created)
         entry = JournalEntry(
             id=row.id,
@@ -427,7 +427,7 @@ class SessionJournalStore:
             kind=kind,
             step=row.step,
             scheduled_task_run_id=row.scheduled_task_run_id,
-            payload=entry_payload,
+            content=entry_content,
             workflow_id=row.workflow_id,
         )
         return JournalAppend(entry=entry, created=created)
@@ -615,7 +615,7 @@ class SessionJournalStore:
         with self._session("read_plan_step_statuses") as session:
             for plan in plans:
                 current: dict[str, JournalEntry] = {}
-                for step in plan.payload.get("steps", []):
+                for step in plan.content.get("steps", []):
                     row = self._newest_status_row(session, plan.conversation_id, step["id"])
                     if row is not None:
                         current[step["id"]] = self._entries([row])[0]

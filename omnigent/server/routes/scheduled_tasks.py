@@ -1251,7 +1251,7 @@ def create_scheduled_tasks_router(
                 {
                     "run_id": run.id,
                     "workflow_id": plan.workflow_id,
-                    "steps": plan.payload.get("steps", []),
+                    "steps": plan.content.get("steps", []),
                     "statuses": [
                         entry_to_response(entry).model_dump(mode="json")
                         for entry in step_statuses.values()

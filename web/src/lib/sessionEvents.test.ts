@@ -1830,7 +1830,7 @@ describe("session.presence (FLAT envelope)", () => {
 
 describe("session.journal.appended (FLAT envelope)", () => {
   it("carries the session and the new entry", () => {
-    const entry = { id: "e1", position: 1, kind: "note", payload: { body: "hi" } };
+    const entry = { id: "e1", position: 1, kind: "note", content: { body: "hi" } };
     const out = parse("session.journal.appended", {
       type: "session.journal.appended",
       conversation_id: "conv_abc",

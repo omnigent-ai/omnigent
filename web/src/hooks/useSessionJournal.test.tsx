@@ -68,7 +68,7 @@ describe("useSessionJournal", () => {
 
   it("reads the newest plan and statuses when older pages exist", async () => {
     const plan = journalPlan(0, ["a"]);
-    const started = journalEntry(1, { kind: "status", step: "a", payload: { status: "started" } });
+    const started = journalEntry(1, { kind: "status", step: "a", content: { status: "started" } });
     byKind = { plan: journalPage([plan]), status: journalPage([started]) };
     respond(journalPage([journalEntry(3), journalEntry(2)], { has_more: true }));
     const { result } = renderHook(() => useSessionJournal(SESSION, true), { wrapper });
