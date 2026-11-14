@@ -123,6 +123,7 @@ class _RecordingClaudeRegistry(SessionResourceRegistry):
         """Record the spec and return a terminal resource view."""
         del terminal_name, session_key
         self.captured["spec"] = spec
+        self.captured["settings"] = _load_claude_invocation_settings(spec.args)
         return SessionResourceView(
             id="terminal_claude_main",
             type="terminal",
@@ -2638,7 +2639,7 @@ async def test_auto_create_claude_terminal_subscription_ignores_inherited_api_cr
     assert {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"} <= set(spec.env_unset)
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in spec.env_unset
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in spec.env
-    assert "apiKeyHelper" not in _load_claude_invocation_settings(spec.args)
+    assert "apiKeyHelper" not in captured["settings"]
     assert "ANTHROPIC_CUSTOM_MODEL_OPTION" not in spec.env
     assert spec.args[spec.args.index("--model") + 1] == model
 
@@ -2802,7 +2803,7 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     assert spec.args[spec.args.index("--model") + 1] == "databricks-claude-opus-4-7"
     # The apiKeyHelper is registered in private settings, not subprocess argv.
     assert all("sk-sentinel-do-not-use" not in arg for arg in spec.args)
-    settings = _load_claude_invocation_settings(spec.args)
+    settings = captured["settings"]
     assert settings["apiKeyHelper"] == "printf %s sk-sentinel-do-not-use"
     assert settings["modelOverrides"] == {
         "claude-opus-4-7": "databricks-claude-opus-4-7",
@@ -6026,6 +6027,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
             """Record the spec and return a terminal resource view."""
             del terminal_name, session_key
             captured["spec"] = spec
+            captured["settings"] = _load_claude_invocation_settings(spec.args)
             return SessionResourceView(
                 id="terminal_claude_main",
                 type="terminal",
@@ -6051,7 +6053,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
     assert spec.keep_alive_after_exit is True
     args = spec.args
     assert args[args.index("--append-system-prompt") + 1] == WORKSPACE_IMAGE_INSTRUCTION
-    settings = _load_claude_invocation_settings(args)
+    settings = captured["settings"]
     assert "PermissionRequest" in settings["hooks"]
     permission_hook = settings["hooks"]["PermissionRequest"][0]["hooks"][0]
     assert permission_hook["type"] == "command"
@@ -6097,8 +6099,8 @@ async def _run_auto_create_claude_terminal_for_routing_class(
     session_id: str,
     routed: bool,
     auto_harness: bool = False,
-) -> Any:
-    """Drive the claude-native launch and return the captured terminal spec.
+) -> tuple[Any, dict[str, Any]]:
+    """Drive the claude-native launch and capture its spec and owned settings.
 
     :param routed: Stamp ``cost_control_mode_override="on"``, as the create
         path does for a session launched on Smart Routing.
@@ -6159,6 +6161,7 @@ async def _run_auto_create_claude_terminal_for_routing_class(
         ) -> SessionResourceView:
             del terminal_name, session_key
             captured["spec"] = spec
+            captured["settings"] = _load_claude_invocation_settings(spec.args)
             return SessionResourceView(
                 id="terminal_claude_main",
                 type="terminal",
@@ -6192,16 +6195,14 @@ async def _run_auto_create_claude_terminal_for_routing_class(
         subagent_routing.shutdown_session_router(session_id)
         turn_routing.shutdown_session_turn_router(session_id)
         await fake_client.aclose()
-    return captured["spec"]
+    return captured["spec"], captured["settings"]
 
 
-def _claude_pretooluse_matchers(spec: Any) -> list[str | None]:
-    settings = _load_claude_invocation_settings(spec.args)
+def _claude_pretooluse_matchers(settings: dict[str, Any]) -> list[str | None]:
     return [entry.get("matcher") for entry in settings["hooks"].get("PreToolUse", [])]
 
 
-def _claude_hook_commands(spec: Any) -> list[str]:
-    settings = _load_claude_invocation_settings(spec.args)
+def _claude_hook_commands(settings: dict[str, Any]) -> list[str]:
     return [
         hook.get("command", "")
         for entries in settings["hooks"].values()
@@ -6220,7 +6221,7 @@ async def test_auto_create_claude_terminal_loads_workspace_agents_skills(
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
 
-    spec = await _run_auto_create_claude_terminal_for_routing_class(
+    spec, _settings = await _run_auto_create_claude_terminal_for_routing_class(
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
         session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f604",
@@ -6236,7 +6237,7 @@ async def test_auto_create_claude_terminal_loads_workspace_agents_skills(
 async def test_a_plain_claude_native_launch_carries_no_spawn_routing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    spec = await _run_auto_create_claude_terminal_for_routing_class(
+    spec, settings = await _run_auto_create_claude_terminal_for_routing_class(
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
         session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f601",
@@ -6244,9 +6245,9 @@ async def test_a_plain_claude_native_launch_carries_no_spawn_routing(
     )
 
     assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER not in _claude_pretooluse_matchers(
-        spec
+        settings
     )
-    assert all("claude_router_hook" not in command for command in _claude_hook_commands(spec))
+    assert all("claude_router_hook" not in command for command in _claude_hook_commands(settings))
     # The workspace's own picker row survives untouched.
     assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "workspace-picker-row"
 
@@ -6254,15 +6255,17 @@ async def test_a_plain_claude_native_launch_carries_no_spawn_routing(
 async def test_a_routed_claude_native_launch_keeps_the_spawn_gate_and_the_pin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    spec = await _run_auto_create_claude_terminal_for_routing_class(
+    spec, settings = await _run_auto_create_claude_terminal_for_routing_class(
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
         session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f602",
         routed=True,
     )
 
-    assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER in _claude_pretooluse_matchers(spec)
-    assert any("claude_router_hook" in command for command in _claude_hook_commands(spec))
+    assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER in _claude_pretooluse_matchers(
+        settings
+    )
+    assert any("claude_router_hook" in command for command in _claude_hook_commands(settings))
     assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7"
     # A pinned session's spawns stay on the claude family, so it gets neither
     # the routed-spawn note nor the pre-approvals the cross-family hop needs.
@@ -6281,7 +6284,7 @@ async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_rout
     and pinning no arms — an argv that tells Claude to route spawns through a
     hook nothing answers.
     """
-    spec = await _run_auto_create_claude_terminal_for_routing_class(
+    spec, settings = await _run_auto_create_claude_terminal_for_routing_class(
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
         session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f603",
@@ -6290,8 +6293,10 @@ async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_rout
     )
 
     # The whole routed apparatus, not just the spawn note.
-    assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER in _claude_pretooluse_matchers(spec)
-    assert any("claude_router_hook" in command for command in _claude_hook_commands(spec))
+    assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER in _claude_pretooluse_matchers(
+        settings
+    )
+    assert any("claude_router_hook" in command for command in _claude_hook_commands(settings))
     assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7"
     # And the auto-harness extras, which only make sense alongside the router.
     assert "--append-system-prompt" in spec.args
