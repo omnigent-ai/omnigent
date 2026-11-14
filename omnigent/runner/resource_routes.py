@@ -652,15 +652,20 @@ def register_resource_routes(
                     replaced_invocation = True
 
                 async def prepare_claude(instance: TerminalInstance) -> None:
-                    if settings_lease is not None and not replaced_invocation:
-                        settings_lease.attach(instance)
-                    await finalize_claude_caller_settings(
-                        instance,
-                        bridge_dir=bridge_dir_for_bridge_id(bridge_id),
-                        generation=generation,
-                        active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
-                        private_output=settings_lease is not None,
-                    )
+                    try:
+                        if settings_lease is not None and not replaced_invocation:
+                            settings_lease.attach(instance)
+                        await finalize_claude_caller_settings(
+                            instance,
+                            bridge_dir=bridge_dir_for_bridge_id(bridge_id),
+                            generation=generation,
+                            active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
+                            private_output=settings_lease is not None,
+                        )
+                    except CallerSettingsError:
+                        raise
+                    except ValueError as exc:
+                        raise RuntimeError("Claude caller settings preparation failed") from exc
 
             launch_method = (
                 resource_registry.launch_required_terminal
@@ -688,7 +693,7 @@ def register_resource_routes(
                     **settings_request_ack,
                 },
             )
-        except (OSError, RuntimeError, ValueError) as exc:
+        except (CallerSettingsError, OSError, RuntimeError) as exc:
             if launched_relay is not None:
                 _discard_comment_relay(session_id, launched_relay)
             return JSONResponse(
@@ -705,7 +710,16 @@ def register_resource_routes(
                     **settings_request_ack,
                 },
             )
-
+        except ValueError as exc:
+            if launched_relay is not None:
+                _discard_comment_relay(session_id, launched_relay)
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {"code": ErrorCode.INVALID_INPUT, "message": str(exc)},
+                    **settings_request_ack,
+                },
+            )
         except BaseException:
             if launched_relay is not None:
                 _discard_comment_relay(session_id, launched_relay)

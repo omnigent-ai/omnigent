@@ -1984,6 +1984,7 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
             str(legacy_path) if arg == str(baseline_path) else arg for arg in body["spec"]["args"]
         ] + ["--resume", "older-client-session"]
     finalized = []
+    terminal_owners = contextlib.AsyncExitStack()
     original = bridge.finalize_claude_caller_settings
 
     async def record(instance, **kwargs):
@@ -2006,9 +2007,12 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
         try:
             await kwargs["prepare_terminal"](created.instance)
             kwargs["spec"].args = created.instance.args
-            return await original_launch(self, **kwargs)
-        finally:
+            resource = await original_launch(self, **kwargs)
+        except BaseException:
             await created.instance.close()
+            raise
+        terminal_owners.push_async_callback(created.instance.close)
+        return resource
 
     monkeypatch.setattr(_StubResourceRegistry, "launch_required_terminal", launch)
 
@@ -2052,7 +2056,10 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
                     assert finalized[0][:2] == ["claude", "--"]
             await client.delete(f"/v1/sessions/{session_id}")
     finally:
-        shutil.rmtree(bridge_dir, ignore_errors=True)
+        try:
+            await terminal_owners.aclose()
+        finally:
+            shutil.rmtree(bridge_dir, ignore_errors=True)
 
 
 @pytest.mark.asyncio
