@@ -147,7 +147,6 @@ from omnigent.server.schemas import SessionEventInput
 from omnigent.server.session_mcp_selection import SessionMcpSelection, session_mcp_selection
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
-    SCHEDULED_TASK_HISTORY_BOUNDARY_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SCHEDULED_TASK_RUN_LABEL_KEY,
     SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
@@ -2101,19 +2100,6 @@ async def _copy_source_session_for_run(
     except SourceCopyIncompleteError as exc:
         # The run never receives this copy, so its cleanup can't delete it.
         await _discard_session(deps, exc.copy)
-        raise
-    try:
-        history = await asyncio.to_thread(
-            deps.conversation_store.list_items, conv.id, limit=1, order="desc"
-        )
-        if history.data:
-            await asyncio.to_thread(
-                deps.conversation_store.set_labels,
-                conv.id,
-                {SCHEDULED_TASK_HISTORY_BOUNDARY_LABEL_KEY: history.data[0].id},
-            )
-    except Exception:
-        await _discard_session(deps, conv)
         raise
     if task.host_id is not None:
         try:

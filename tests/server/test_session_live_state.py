@@ -17,14 +17,20 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 
+from omnigent.entities import FunctionCallData, MessageData, NewConversationItem, ResourceEventData
 from omnigent.runtime import pending_elicitations
 from omnigent.server import session_live_state
-from omnigent.stores.conversation_store import SCHEDULED_TASK_HISTORY_BOUNDARY_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
+    SCHEDULED_TASK_RUN_LABEL_KEY,
+)
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
 
 def _wait_until(predicate, *, timeout_s: float = 10.0) -> None:
@@ -61,28 +67,10 @@ class _RecordingStore:
         self.blocked_writes: list[tuple[str, str | None]] = []
         self.touches: list[list[str]] = []
         self.clears: list[tuple[str, int | None]] = []
-        # conversation_id -> transcript items, oldest first.
-        self.transcripts: dict[str, list[SimpleNamespace]] = {}
-        self.history_boundaries: dict[str, str] = {}
+        self.labels: dict[str, dict[str, str]] = {}
 
     def get_conversation(self, conversation_id: str) -> SimpleNamespace:
-        boundary = self.history_boundaries.get(conversation_id)
-        return SimpleNamespace(labels={SCHEDULED_TASK_HISTORY_BOUNDARY_LABEL_KEY: boundary})
-
-    def list_items(
-        self,
-        conversation_id: str,
-        limit: int = 100,
-        order: str = "asc",
-        before: str | None = None,
-        **_: object,
-    ) -> SimpleNamespace:
-        items = self.transcripts.get(conversation_id, [])
-        if before is not None:
-            assert order == "desc"
-            boundary = next(index for index, item in enumerate(items) if item.id == before)
-            items = items[boundary + 1 :]
-        return SimpleNamespace(data=(items[::-1] if order == "desc" else items)[:limit])
+        return SimpleNamespace(labels=self.labels.get(conversation_id, {}))
 
     def set_session_live_status(self, conversation_id: str, status: str) -> None:
         self.status_writes.append((conversation_id, status))
@@ -491,7 +479,7 @@ def test_scheduled_run_completion_idle_transitions_to_succeeded() -> None:
     """A terminal ``idle`` edge flips the conversation's running run to succeeded."""
     sched = _FakeScheduledTaskStore({"conv_1": "run_1"})
     conversations = _RecordingStore()
-    conversations.transcripts["conv_1"] = _RUN_ANSWERED
+    conversations.labels["conv_1"] = {SCHEDULED_TASK_ACTIVITY_LABEL_KEY: "run_1"}
     session_live_state.configure(conversations, sched)  # type: ignore[arg-type]
     try:
         session_live_state.persist_scheduled_run_completion("conv_1", "succeeded")
@@ -545,19 +533,64 @@ def test_scheduled_run_completion_idle_transitions_to_succeeded() -> None:
         ),
     ],
 )
+@pytest.mark.parametrize("bookkeeping_tail", [0, 50, 51])
 def test_an_idle_edge_ends_a_scheduled_run_only_after_its_agent_worked(
-    transcript: list[SimpleNamespace], ends_the_run: bool, copied_items: int
+    transcript: list[SimpleNamespace],
+    ends_the_run: bool,
+    copied_items: int,
+    bookkeeping_tail: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An idle edge ends the run only once its agent has written to the session."""
-    sched = _FakeScheduledTaskStore({"conv_1": "run_1"})
-    conversations = _RecordingStore()
-    conversations.transcripts["conv_1"] = transcript
+    conversations = SqlAlchemyConversationStore(f"sqlite:///{tmp_path / 'completion.db'}")
+    conversation = conversations.create_conversation(
+        labels={SCHEDULED_TASK_RUN_LABEL_KEY: "older-run"}
+    )
+
+    def append_items(session_id: str, items: list[SimpleNamespace]) -> None:
+        for item in items:
+            monkeypatch.setattr(
+                "omnigent.stores.conversation_store.sqlalchemy_store.now_epoch",
+                lambda stamp=item.created_at: stamp,
+            )
+            if item.type == "message":
+                data = MessageData(
+                    role=item.data.role,
+                    agent="agent" if item.data.role == "assistant" else None,
+                    content=[{"type": "text", "text": "Run work"}],
+                )
+            elif item.type == "function_call":
+                data = FunctionCallData(
+                    agent="agent", call_id=item.id, name="check", arguments="{}"
+                )
+            else:
+                data = ResourceEventData(
+                    event_type="session.task.updated", resource_type="task", resource_id=item.id
+                )
+            conversations.append(
+                session_id, [NewConversationItem(type=item.type, response_id="turn", data=data)]
+            )
+
     if copied_items:
-        conversations.history_boundaries["conv_1"] = transcript[copied_items - 1].id
+        append_items(conversation.id, transcript[:copied_items])
+        conversation = conversations.fork_conversation(conversation.id, copy_journal=False)
+    conversations.set_labels(conversation.id, {SCHEDULED_TASK_RUN_LABEL_KEY: "run_1"})
+    append_items(conversation.id, transcript[copied_items:])
+    append_items(
+        conversation.id,
+        [_transcript_item("resource_event", _FIRED_AT + 100) for _ in range(bookkeeping_tail)],
+    )
+    sched = _FakeScheduledTaskStore({conversation.id: "run_1"})
     session_live_state.configure(conversations, sched)  # type: ignore[arg-type]
     try:
-        session_live_state.persist_scheduled_run_completion("conv_1", "succeeded")
+        session_live_state.persist_scheduled_run_completion(conversation.id, "succeeded")
         # One ordered worker: once this no-op has run, so has the hook.
+        session_live_state.submit("test_barrier", lambda: None).result(timeout=10)
+        # Evidence from this run must not complete a later invocation.
+        sched._running_by_conv[conversation.id] = "run_2"
+        conversations.set_labels(conversation.id, {SCHEDULED_TASK_RUN_LABEL_KEY: "run_2"})
+        session_live_state.persist_scheduled_run_completion(conversation.id, "succeeded")
         session_live_state.submit("test_barrier", lambda: None).result(timeout=10)
     finally:
         session_live_state.configure(None)

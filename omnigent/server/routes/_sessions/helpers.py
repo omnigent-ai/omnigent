@@ -11253,7 +11253,7 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     from omnigent.stores.conversation_store import (
         CREATED_BY_SESSION_LABEL_KEY,
         FAMILY_PIN_LABEL_PREFIX,
-        SCHEDULED_TASK_HISTORY_BOUNDARY_LABEL_KEY,
+        SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
         SCHEDULED_TASK_RUN_LABEL_KEY,
         SCHEDULED_TASK_SOURCE_LABEL_KEY,
@@ -11266,7 +11266,7 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     for key in (
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
         SCHEDULED_TASK_RUN_LABEL_KEY,
-        SCHEDULED_TASK_HISTORY_BOUNDARY_LABEL_KEY,
+        SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
         # Deleting a session also deletes the automation this label names.
         SCHEDULED_TASK_SOURCE_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,

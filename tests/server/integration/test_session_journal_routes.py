@@ -586,7 +586,7 @@ async def test_a_missing_session_is_not_found(client: httpx.AsyncClient) -> None
 
 
 @pytest.mark.parametrize(
-    "label", [SCHEDULED_TASK_RUN_LABEL_KEY, "omnigent.scheduled_task_history_boundary"]
+    "label", [SCHEDULED_TASK_RUN_LABEL_KEY, "omnigent.scheduled_task_activity"]
 )
 async def test_clients_cannot_set_the_run_label(
     client: httpx.AsyncClient, db_uri: str, label: str

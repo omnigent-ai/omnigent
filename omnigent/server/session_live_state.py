@@ -49,7 +49,7 @@ from typing import TYPE_CHECKING, Any
 
 from omnigent.db.enum_codecs import SESSION_LIVE_STATUS
 from omnigent.db.workspace_cache import WorkspaceScopedCache
-from omnigent.stores.conversation_store import SCHEDULED_TASK_HISTORY_BOUNDARY_LABEL_KEY
+from omnigent.stores.conversation_store import SCHEDULED_TASK_ACTIVITY_LABEL_KEY
 
 if TYPE_CHECKING:
     from omnigent.stores import ConversationStore
@@ -276,7 +276,7 @@ def persist_scheduled_run_completion(
     no rows on a multi-tenant replica.
 
     An ``idle`` edge succeeds the run only once its agent has written to the
-    session (see :func:`_agent_worked_since`): Claude Code reports idle while
+    session (see :func:`_agent_worked_on_run`): Claude Code reports idle while
     it starts, before it has read the run's prompt.
 
     Idempotent by construction: ``update_run`` is conditional on
@@ -304,8 +304,7 @@ def persist_scheduled_run_completion(
             # Not a scheduled fire, or its run is already terminal — nothing to
             # do. This is the common case (interactive sessions).
             return
-        started_at = run.fired_at if run.fired_at is not None else run.scheduled_at
-        if run_status == "succeeded" and not _agent_worked_since(conversation_id, started_at):
+        if run_status == "succeeded" and not _agent_worked_on_run(conversation_id, run.id):
             # The agent hasn't started on the run's prompt, so this idle isn't its end.
             return
         store.update_run(
@@ -319,45 +318,16 @@ def persist_scheduled_run_completion(
     submit("scheduled_run_completion", _transition)
 
 
-# How far back the run-completion hook reads a fired session's transcript.
-_RUN_TRANSCRIPT_ITEMS = 50
-
-# Item types only an agent writes while it works on a turn.
-_AGENT_WORK_ITEM_TYPES = frozenset(
-    {"function_call", "function_call_output", "reasoning", "native_tool"}
-)
-
-
-def _agent_worked_since(conversation_id: str, since: int) -> bool:
-    """Whether the agent has written to the session since *since*.
-
-    Runner bookkeeping and the prompt itself don't count, and neither does a
-    copied session's history, even when it was written in the same second.
-
-    :param conversation_id: The fired session.
-    :param since: Unix epoch seconds the run fired.
-    :returns: ``True`` once the agent has replied, reasoned or called a tool.
-    """
+def _agent_worked_on_run(conversation_id: str, run_id: str) -> bool:
+    """Read durable activity evidence that bookkeeping cannot push out of a page."""
     conversations = _store
     if conversations is None:
         return True
     conversation = conversations.get_conversation(conversation_id)
-    boundary = (
-        conversation.labels.get(SCHEDULED_TASK_HISTORY_BOUNDARY_LABEL_KEY)
-        if conversation is not None
-        else None
+    return (
+        conversation is not None
+        and conversation.labels.get(SCHEDULED_TASK_ACTIVITY_LABEL_KEY) == run_id
     )
-    page = conversations.list_items(
-        conversation_id, limit=_RUN_TRANSCRIPT_ITEMS, order="desc", before=boundary
-    )
-    for item in page.data:
-        if boundary is None and item.created_at < since:
-            return False
-        if item.type in _AGENT_WORK_ITEM_TYPES or (
-            item.type == "message" and getattr(item.data, "role", None) == "assistant"
-        ):
-            return True
-    return False
 
 
 def persist_pending_count(conversation_id: str, count: int) -> None:

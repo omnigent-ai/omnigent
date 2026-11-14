@@ -69,7 +69,7 @@ _KINDS_A_FORK_LEAVES = frozenset(
 )
 # Session deletion removes at most this many entries per transaction.
 JOURNAL_DELETE_BATCH = 500
-# A saved plan can add one boundary marker, so a copy inserts at most 500 rows.
+# Journal copies read and write at most this many entries per transaction.
 JOURNAL_COPY_BATCH = 250
 
 _Statement = TypeVar("_Statement", bound=Select[Any])
@@ -226,21 +226,19 @@ class SessionJournalStore:
         )
 
     @staticmethod
-    def _newest_plan_row(
-        session: Session, conversation_id: str, *, workflow_only: bool = False
+    def _newest_kind_row(
+        session: Session, conversation_id: str, kind: int
     ) -> SqlSessionJournalEntry | None:
         statement = (
             select(SqlSessionJournalEntry)
             .where(
                 SqlSessionJournalEntry.workspace_id == current_workspace_id(),
                 SqlSessionJournalEntry.conversation_id == conversation_id,
-                SqlSessionJournalEntry.kind == _PLAN_KIND,
+                SqlSessionJournalEntry.kind == kind,
             )
             .order_by(SqlSessionJournalEntry.position.desc())
             .limit(1)
         )
-        if workflow_only:
-            statement = statement.where(SqlSessionJournalEntry.workflow_id.is_not(None))
         return session.execute(
             _using(statement, "ix_session_journal_entries_kind")
         ).scalar_one_or_none()
@@ -275,37 +273,14 @@ class SessionJournalStore:
         if current is None or not current["depends_on"]:
             return []
         # A saved workflow starts fresh; replans retain progress within that run.
-        run = self._newest_plan_row(session, conversation_id, workflow_only=True)
-        # Forks retain run boundaries without attributing copied plans to a workflow.
-        entries = SqlSessionJournalEntry
-        copied_run_position = session.execute(
-            _using(
-                select(entries.position)
-                .where(
-                    entries.workspace_id == current_workspace_id(),
-                    entries.conversation_id == conversation_id,
-                    entries.kind == _PLAN_STATUS_KIND,
-                )
-                .order_by(entries.position.desc())
-                .limit(1),
-                "ix_session_journal_entries_kind",
-            )
-        ).scalar_one_or_none()
-        start_position = max(
-            (
-                position
-                for position in (run.position if run else None, copied_run_position)
-                if position is not None
-            ),
-            default=None,
-        )
+        run = self._newest_kind_row(session, conversation_id, _PLAN_STATUS_KIND)
         waiting = []
         for dependency in current["depends_on"]:
             newest = self._newest_status_row(
                 session,
                 conversation_id,
                 dependency,
-                start_position=start_position,
+                start_position=run.position if run is not None else None,
             )
             if newest is None or self._entries([newest])[0].content.get("status") != "done":
                 waiting.append(dependency)
@@ -415,20 +390,27 @@ class SessionJournalStore:
                     )
                 return earlier, False, None
             entry_text, entry_content = stored, fields
+            starts_run = False
             if kind == "plan":
-                previous = self._newest_plan_row(session, conversation_id)
+                previous = self._newest_kind_row(session, conversation_id, _PLAN_KIND)
                 version = (
                     1 if previous is None else self._entries([previous])[0].content["version"] + 1
                 )
                 entry_content = {"version": version, **fields}
                 entry_text = _stored_content(entry_content)
+                starts_run = workflow_id is not None
+                if scheduled_task_run_id is not None and not starts_run:
+                    boundary = self._newest_kind_row(session, conversation_id, _PLAN_STATUS_KIND)
+                    starts_run = (
+                        boundary is None or boundary.scheduled_task_run_id != scheduled_task_run_id
+                    )
             entry_step = step
             entry_workflow_id = workflow_id
             if kind == "note":
-                plan = self._newest_plan_row(session, conversation_id)
+                plan = self._newest_kind_row(session, conversation_id, _PLAN_KIND)
                 entry_workflow_id = plan.workflow_id if plan is not None else None
             if kind == "status":
-                plan = self._newest_plan_row(session, conversation_id)
+                plan = self._newest_kind_row(session, conversation_id, _PLAN_KIND)
                 entry_workflow_id = plan.workflow_id if plan is not None else None
                 steps = self._entries([plan])[0].content["steps"] if plan is not None else None
                 if entry_step is None:
@@ -438,12 +420,31 @@ class SessionJournalStore:
                 )
                 if waiting:
                     raise StepNotReadyError(entry_step, waiting)
+            stamp = now_epoch()
+            entry_id = uuid.uuid4().hex
+            if starts_run:
+                session.add(
+                    SqlSessionJournalEntry(
+                        workspace_id=current_workspace_id(),
+                        conversation_id=conversation_id,
+                        position=position,
+                        created_at=stamp,
+                        id=uuid.uuid4().hex,
+                        kind=_PLAN_STATUS_KIND,
+                        scheduled_task_run_id=scheduled_task_run_id,
+                        workflow_id=workflow_id,
+                        step=None,
+                        idempotency_key=f"run:{entry_id}",
+                        content=_stored_content({"status": "started"}),
+                    )
+                )
+                position += 1
             row = SqlSessionJournalEntry(
                 workspace_id=current_workspace_id(),
                 conversation_id=conversation_id,
                 position=position,
-                created_at=now_epoch(),
-                id=uuid.uuid4().hex,
+                created_at=stamp,
+                id=entry_id,
                 kind=code,
                 scheduled_task_run_id=scheduled_task_run_id,
                 workflow_id=entry_workflow_id,
@@ -560,7 +561,7 @@ class SessionJournalStore:
     def current_plan(self, conversation_id: str) -> JournalEntry | None:
         """The session's newest plan entry, or ``None`` when it has no plan."""
         with self._session("read_current_plan") as session:
-            row = self._newest_plan_row(session, conversation_id)
+            row = self._newest_kind_row(session, conversation_id, _PLAN_KIND)
         return None if row is None else self._entries([row])[0]
 
     def list_workflow_runs(
@@ -650,10 +651,10 @@ class SessionJournalStore:
         return plans
 
     def plan_step_statuses(self, plans: Sequence[JournalEntry]) -> list[dict[str, JournalEntry]]:
-        """For each plan, its steps' newest status entries before the next plan.
+        """For each plan, its steps' newest statuses before the next run starts.
 
         One kind lookup per plan and one kind-and-step lookup per step keep
-        runs with reused step IDs separate, including replans outside this page.
+        runs with reused step IDs separate while retaining progress through replans.
 
         :param plans: Plan entries, e.g. a page of a workflow's runs.
         :returns: One ``{step: entry}`` per plan, in order, e.g. the ``done``
@@ -669,7 +670,7 @@ class SessionJournalStore:
                         .where(
                             entries.workspace_id == current_workspace_id(),
                             entries.conversation_id == plan.conversation_id,
-                            entries.kind == _PLAN_KIND,
+                            entries.kind == _PLAN_STATUS_KIND,
                             entries.position > plan.position,
                         )
                         .order_by(entries.position)
@@ -764,33 +765,22 @@ def copy_journal_for_fork(
             cursor = row.position
             if row.kind in _KINDS_A_FORK_LEAVES:
                 continue
-            records = [(row.kind, row.idempotency_key, row.content)]
-            if row.kind == _PLAN_KIND and row.workflow_id is not None:
-                records.insert(
-                    0,
-                    (
-                        _PLAN_STATUS_KIND,
-                        f"fork-run:{row.id}",
-                        _stored_content({"status": "started"}),
-                    ),
+            session.add(
+                SqlSessionJournalEntry(
+                    workspace_id=row.workspace_id,
+                    conversation_id=fork_id,
+                    position=position,
+                    created_at=row.created_at,
+                    id=uuid.uuid4().hex,
+                    kind=row.kind,
+                    scheduled_task_run_id=None,
+                    workflow_id=None,
+                    step=row.step,
+                    idempotency_key=row.idempotency_key,
+                    content=row.content,
                 )
-            for kind, key, content in records:
-                session.add(
-                    SqlSessionJournalEntry(
-                        workspace_id=row.workspace_id,
-                        conversation_id=fork_id,
-                        position=position,
-                        created_at=row.created_at,
-                        id=uuid.uuid4().hex,
-                        kind=kind,
-                        scheduled_task_run_id=None,
-                        workflow_id=None,
-                        step=row.step,
-                        idempotency_key=key,
-                        content=content,
-                    )
-                )
-                position += 1
+            )
+            position += 1
         if cursor == after:
             raise JournalSessionNotFoundError(source_id)
         return cursor, position, cursor == last_position

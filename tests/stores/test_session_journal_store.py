@@ -449,6 +449,7 @@ def test_a_plan_names_its_workflow_and_the_entries_under_it_carry_it(
         WORKFLOW,
         WORKFLOW,
         WORKFLOW,
+        WORKFLOW,
         None,
         None,
     ]
@@ -536,24 +537,82 @@ def test_plan_step_statuses_reads_each_steps_newest_status(
         SESSION, "status", {"status": "done", "text": "Finished c"}, idempotency_key="k7", step="c"
     )
 
-    # A run page may omit the following plan, especially when it is a replan.
-    assert journal.plan_step_statuses([plan, other]) == statuses
+    # Replans keep updating a run; a new invocation isolates reused step IDs.
+    original_statuses = (
+        {"a": "started", "b": "failed", "c": "done"}
+        if next_workflow is None
+        else {"a": "done", "b": "failed"}
+    )
     assert [
         {step: entry.content["status"] for step, entry in current.items()}
         for current in journal.plan_step_statuses([later, other, plan])
-    ] == [{"a": "started", "c": "done"}, {}, {"a": "done", "b": "failed"}]
+    ] == [{"a": "started", "c": "done"}, {}, original_statuses]
 
 
 def test_an_automation_runs_start_plan_is_its_first(journal: SessionJournalStore) -> None:
     other_run = "1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f"
     journal.append(SESSION, "plan", _plan("old"), idempotency_key="k0")
+    content = {
+        "name": "The plan",
+        "steps": [
+            {"id": "a", "name": "First"},
+            {"id": "b", "name": "Second", "depends_on": ["a"]},
+        ],
+    }
     first = journal.append(
-        SESSION, "plan", _plan("a"), idempotency_key="k1", scheduled_task_run_id=RUN
+        SESSION, "plan", content, idempotency_key="k1", scheduled_task_run_id=RUN
     ).entry
     journal.append(
-        SESSION, "plan", _plan("a", "b"), idempotency_key="k2", scheduled_task_run_id=RUN
+        SESSION,
+        "status",
+        {"status": "done", "text": "Finished a"},
+        idempotency_key="a-done",
+        step="a",
+        scheduled_task_run_id=RUN,
+    )
+    journal.append(SESSION, "plan", content, idempotency_key="k2", scheduled_task_run_id=RUN)
+    journal.append(
+        SESSION,
+        "status",
+        {"status": "done", "text": "Finished b"},
+        idempotency_key="b-done",
+        step="b",
+        scheduled_task_run_id=RUN,
     )
     journal.append(OTHER, "note", {"body": "x"}, idempotency_key="k3", scheduled_task_run_id=RUN)
 
     plans = journal.run_start_plans([(RUN, SESSION), (other_run, SESSION), (RUN, OTHER)])
     assert [plan.id if plan else None for plan in plans] == [first.id, None, None]
+    completed = journal.plan_step_statuses([first])
+    assert {step: entry.content["status"] for step, entry in completed[0].items()} == {
+        "a": "done",
+        "b": "done",
+    }
+    second = journal.append(
+        SESSION, "plan", content, idempotency_key="k4", scheduled_task_run_id=other_run
+    ).entry
+    with pytest.raises(StepNotReadyError, match="b waits on a"):
+        journal.append(
+            SESSION,
+            "status",
+            {"status": "started"},
+            idempotency_key="next-b",
+            step="b",
+            scheduled_task_run_id=other_run,
+        )
+    journal.append(
+        SESSION,
+        "status",
+        {"status": "started"},
+        idempotency_key="next-a",
+        step="a",
+        scheduled_task_run_id=other_run,
+    )
+    assert journal.plan_step_statuses([first]) == completed
+    assert journal.plan_step_statuses([second])[0]["a"].content["status"] == "started"
+    # Retrying the start must not insert another boundary or reset dependencies.
+    retry = journal.append(
+        SESSION, "plan", content, idempotency_key="k4", scheduled_task_run_id=other_run
+    )
+    assert not retry.created and retry.entry == second
+    assert len(journal.list_entries(SESSION, kind="plan_status").entries) == 2

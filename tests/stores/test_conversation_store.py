@@ -178,7 +178,7 @@ def test_fork_drops_the_automation_run_label(
 ) -> None:
     """A fork serves no automation run, so its journal entries are not the run's."""
     from omnigent.stores.conversation_store import (
-        SCHEDULED_TASK_HISTORY_BOUNDARY_LABEL_KEY,
+        SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
         SCHEDULED_TASK_RUN_LABEL_KEY,
     )
 
@@ -187,14 +187,14 @@ def test_fork_drops_the_automation_run_label(
         source.id,
         {
             SCHEDULED_TASK_RUN_LABEL_KEY: "0123456789abcdef0123456789abcdef",
-            SCHEDULED_TASK_HISTORY_BOUNDARY_LABEL_KEY: "copied-reply",
+            SCHEDULED_TASK_ACTIVITY_LABEL_KEY: "older-run",
         },
     )
 
     fork = conversation_store.fork_conversation(source.id)
 
     assert SCHEDULED_TASK_RUN_LABEL_KEY not in fork.labels
-    assert SCHEDULED_TASK_HISTORY_BOUNDARY_LABEL_KEY not in fork.labels
+    assert SCHEDULED_TASK_ACTIVITY_LABEL_KEY not in fork.labels
 
 
 def test_fork_drops_sandbox_repo_label(

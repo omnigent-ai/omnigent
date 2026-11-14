@@ -110,7 +110,9 @@ from omnigent.stores.conversation_store import (
     PENDING_INPUT_RESPONSE_ID,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
+    SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    SCHEDULED_TASK_RUN_LABEL_KEY,
     SIDE_CHAT_COPY_ID_PREFIX_LEN,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
@@ -3315,6 +3317,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 session.execute(insert(SqlConversationItem), row_values)
             insert_fts_bulk(session, fts_rows)
             self._fold_latest_activity_error(session, conversation_id, fresh_items, now)
+            self._record_scheduled_run_activity(session, conversation_id, fresh_items, now)
 
             # Persist the advanced counter so the next append reads it instead
             # of scanning; this also lazily backfills a pre-counter conversation.
@@ -3328,6 +3331,39 @@ class SqlAlchemyConversationStore(ConversationStore):
             "append_conversation_items",
             write,
         )
+
+    @staticmethod
+    def _record_scheduled_run_activity(
+        session: Session,
+        conversation_id: str,
+        fresh_items: list[tuple[int, NewConversationItem]],
+        stamp: int,
+    ) -> None:
+        """Latch activity for the current run in the same transaction as its items."""
+        if not any(
+            item.type in {"function_call", "function_call_output", "reasoning", "native_tool"}
+            or (item.type == "message" and getattr(item.data, "role", None) == "assistant")
+            for _, item in fresh_items
+        ):
+            return
+        labels = dict(
+            session.execute(
+                select(SqlConversationLabel.key, SqlConversationLabel.value).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id == conversation_id,
+                    SqlConversationLabel.key.in_(
+                        (SCHEDULED_TASK_RUN_LABEL_KEY, SCHEDULED_TASK_ACTIVITY_LABEL_KEY)
+                    ),
+                )
+            )
+            .tuples()
+            .all()
+        )
+        run_id = labels.get(SCHEDULED_TASK_RUN_LABEL_KEY)
+        if run_id and labels.get(SCHEDULED_TASK_ACTIVITY_LABEL_KEY) != run_id:
+            _upsert_prepared_labels(
+                session, conversation_id, {SCHEDULED_TASK_ACTIVITY_LABEL_KEY: run_id}, stamp
+            )
 
     def _fold_latest_activity_error(
         self,

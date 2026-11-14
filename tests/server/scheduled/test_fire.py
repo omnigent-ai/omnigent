@@ -4423,25 +4423,11 @@ def test_a_run_from_a_session_sends_its_instructions_or_the_opener_when_empty() 
 
 @pytest.mark.asyncio
 async def test_a_run_starts_from_a_copy_of_the_source_session() -> None:
-    from omnigent.stores.conversation_store import SCHEDULED_TASK_HISTORY_BOUNDARY_LABEL_KEY
-
     conv_store = FakeConversationStore()
-    list_items = conv_store.list_items
-
-    def with_copied_history(conversation_id: str, **kwargs: Any) -> SimpleNamespace:
-        if conversation_id == "conv_1":
-            return SimpleNamespace(data=[SimpleNamespace(id="copied-reply")])
-        return list_items(conversation_id, **kwargs)
-
-    conv_store.list_items = with_copied_history  # type: ignore[method-assign]
     store = FakeScheduledTaskStore(rows={"task_1": _task(source_session_id="conv_source")})
     launched: list[Any] = []
 
     async def _launch(conv: Any, task: Any) -> None:
-        assert (
-            conv_store.label_writes[conv.id][SCHEDULED_TASK_HISTORY_BOUNDARY_LABEL_KEY]
-            == "copied-reply"
-        )
         launched.append(conv)
 
     on_fire = build_on_fire(_deps(store, conversation_store=conv_store), launch_dispatch=_launch)
