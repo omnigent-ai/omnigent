@@ -70,6 +70,7 @@ const HARNESS_DESCRIPTIONS: Record<string, string> = {
   "opencode-native": "An open-source coding agent for terminal, IDE, and desktop.",
   "cursor-native": "An AI editor with agents for navigating and editing code.",
   "pi-native": "A minimal, extensible terminal coding agent.",
+  "omp-native": "An extensible terminal coding agent powered by Oh My Pi.",
   "devin-native": "Cognition’s autonomous coding agent.",
   "antigravity-native": "Google’s agent platform for software development.",
   "kiro-native": "An agentic IDE for spec-driven development.",
@@ -395,7 +396,9 @@ function credentialPresentation(
   override?: HarnessCredentialKind,
 ) {
   if (override === "personal") {
-    return HARNESS_CREDENTIAL_COPY.personal;
+    return harnessAccountKey(harness) === "omp"
+      ? { label: "OMP login", description: "Uses OMP’s own provider accounts on this host" }
+      : HARNESS_CREDENTIAL_COPY.personal;
   }
   if (override === "isaac" || host?.gateway_inference?.[harness] === true) {
     return HARNESS_CREDENTIAL_COPY.isaac;
@@ -413,7 +416,7 @@ function credentialPresentation(
     }
     if (account.kind === "chatgpt" || account.kind === "subscription") {
       return {
-        label: "Personal subscription",
+        label: harnessAccountKey(harness) === "omp" ? "OMP login" : "Personal subscription",
         description: accountDetails(account),
       };
     }

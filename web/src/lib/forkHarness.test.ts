@@ -46,6 +46,9 @@ describe("isNativeHarness", () => {
     ["native-cursor", true],
     ["pi-native", true],
     ["native-pi", true],
+    ["omp-native", true],
+    ["omp", true],
+    ["native-omp", true],
     // Antigravity-native spellings are native too — aligned with Python
     // NATIVE_HARNESSES (the in-process `antigravity` SDK harness is NOT).
     ["antigravity-native", true],
@@ -114,6 +117,9 @@ describe("forkTargetCarriesHistory", () => {
     // still be offered, or the fork picker silently drops it.
     ["pi-native"],
     ["native-pi"],
+    ["omp-native"],
+    ["omp"],
+    ["native-omp"],
     ["antigravity-native"],
     ["native-antigravity"],
     ["agy-native"],

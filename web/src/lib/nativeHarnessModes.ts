@@ -56,6 +56,8 @@ const NATIVE_HARNESS_ALIASES: Record<string, string> = {
   "native-claude": "claude-native",
   "native-codex": "codex-native",
   "native-pi": "pi-native",
+  omp: "omp-native",
+  "native-omp": "omp-native",
   "native-cursor": "cursor-native",
   "native-antigravity": "antigravity-native",
   "agy-native": "antigravity-native",

@@ -5,6 +5,10 @@ This file is generated at release time from each PR's `## Changelog` section
 PRs and author credits. The concise, curated highlights live on the website
 under `/releases`.
 
+## Unreleased
+
+- [Feature] Add the native OMP (Oh My Pi) TUI harness, `omnigent omp`, official OMP branding, independent provider setup, centralized tool approvals, session controls, and native child-session isolation.
+
 ## [v0.22.0] — 2026-11-12
 
 - [Bug fix / Feature / Docs / Test/CI] feat(sandbox): add AWS Lambda MicroVMs sandbox provider ([#2217](https://github.com/omnigent-ai/omnigent/pull/2217), [@laithalsaadoon](https://github.com/laithalsaadoon))

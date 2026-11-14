@@ -1104,6 +1104,13 @@ describe("inventoryTerminals", () => {
     expect(inventoryTerminals([cursorPane, bash], true)).toEqual([bash]);
   });
 
+  it("keeps the OMP pane out of shells while preserving the Chat/Terminal toggle", () => {
+    const ompPane = { id: "terminal_omp_main", name: "omp", session: "main", running: true };
+    expect(inventoryTerminals([ompPane, bash], true)).toEqual([bash]);
+    expect(isAgentTerminalKey("terminal:terminal_omp_main")).toBe(true);
+    expect(findAgentTerminal([bash, ompPane])).toBe(ompPane);
+  });
+
   it("drops the kiro vendor pane for native Kiro sessions", () => {
     // Regression: terminal_kiro_main was missing from AGENT_TERMINAL_IDS,
     // so Kiro's Terminal pill opened a shell view with an X close button

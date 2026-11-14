@@ -21,7 +21,16 @@ const PI_NATIVE_EFFORT_LEVELS = [
 ] as const;
 
 export type NativeModelPickerKind =
-  "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "devin" | "acp" | "configured";
+  | "claude"
+  | "codex"
+  | "cursor"
+  | "kiro"
+  | "opencode"
+  | "pi"
+  | "omp"
+  | "devin"
+  | "acp"
+  | "configured";
 
 /** Preserve inherited effort; clear an explicit choice that the new model cannot use. */
 export function effortAfterModelChange(
@@ -91,6 +100,7 @@ export function effortLevelsForConv(
       // Both catalogs declare effort per model; Devin encodes it as a model variant.
       return codexEffortLevelsForModel(codexModelOptions, currentModel);
     case "pi-native-ui":
+    case "omp-native-ui":
       return PI_NATIVE_EFFORT_LEVELS;
     default:
       // A non-native harness offers its declared family's ladder (claude-sdk →
@@ -142,6 +152,8 @@ export function modelPickerKindForConv(
     case "pi-native-ui":
       // Pi applies switches through setModel and mirrors /model picks to model_override.
       return "pi";
+    case "omp-native-ui":
+      return "omp";
     default:
       if (conv?.inferenceConfigured) return "configured";
       // Generic ACP sessions carry no wrapper label; the server canonicalizes

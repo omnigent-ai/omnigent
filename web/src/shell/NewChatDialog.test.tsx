@@ -5079,7 +5079,7 @@ describe("NewChatLandingScreen", () => {
         fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
       }
 
-      if (["claude", "codex", "pi", "devin"].includes(native.key)) {
+      if (["claude", "codex", "pi", "omp", "devin"].includes(native.key)) {
         fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${agentId}`));
         expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
         expect(screen.getByTestId("new-chat-landing-agent-efforts")).toBeVisible();
@@ -6139,12 +6139,15 @@ describe("NewChatLandingScreen", () => {
     expect(body.model_override).toBeUndefined();
   });
 
-  it("names Pi model and thinking-level details in the harness trigger", () => {
-    mockAgents([testAgent("a_pi", "pi-native-ui", { display_name: "Pi", harness: "pi-native" })]);
+  it.each([
+    ["pi-native", "Pi"],
+    ["omp-native", "OMP"],
+  ])("names %s model and thinking-level details in the harness trigger", (harness, displayName) => {
+    mockAgents([testAgent("a_pi", `${harness}-ui`, { display_name: displayName, harness })]);
     renderLanding();
 
     expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
-      "Pi, Model Default",
+      `${displayName}, Model Default`,
     );
   });
 

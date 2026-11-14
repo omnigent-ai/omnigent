@@ -69,6 +69,8 @@ def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("CODEX_HOME", raising=False)
+    for variable in ("PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE", "PI_CONFIG_DIR"):
+        monkeypatch.delenv(variable, raising=False)
 
 
 @pytest.mark.parametrize(
@@ -288,6 +290,39 @@ def test_directory_catalog_never_downloads_a_session_bundle(tmp_path: Path) -> N
     assert discovery.discover(
         HostSkillsFrame("request", "claude-native", str(tmp_path)), tmp_path
     ) == [{"name": "local", "description": "local description"}]
+    fetch.assert_not_called()
+
+
+@pytest.mark.parametrize("harness", ["omp-native", "omp", "native-omp"])
+def test_omp_host_catalog_uses_project_and_active_profile_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str
+) -> None:
+    home = Path.home()
+    workspace = tmp_path / "repo" / "app"
+    workspace.mkdir(parents=True)
+    (workspace.parent / ".git").mkdir()
+    monkeypatch.setenv("OMP_PROFILE", "work")
+    profile = home / ".omp" / "profiles" / "work" / "agent"
+    for directory, name in (
+        (workspace / ".omp" / "skills", "project"),
+        (workspace.parent / ".omp" / "skills", "ancestor"),
+        (profile / "skills", "profile"),
+        (profile / "managed-skills", "learned"),
+        (home / ".omp" / "agent" / "skills", "inactive"),
+        (home / ".pi" / "agent" / "skills", "pi-only"),
+        (home / ".claude" / "skills", "claude-only"),
+    ):
+        skill_dir = directory / name
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(_skill(name))
+    fetch = Mock()
+    discovery = HostSkillDiscovery(fetch)
+    assert discovery.discover(
+        HostSkillsFrame("request", harness, str(workspace)), workspace
+    ) == [
+        {"name": name, "description": f"{name} description"}
+        for name in ("project", "ancestor", "profile", "learned")
+    ]
     fetch.assert_not_called()
 
 

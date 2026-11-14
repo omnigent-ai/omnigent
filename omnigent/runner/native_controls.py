@@ -335,6 +335,7 @@ class NativeControls:
     handle_opencode_native_compact: Callable[[str], Coroutine[Any, Any, Response]]
     handle_opencode_native_cost_popup: _HandleOpencodeNativeCostPopupFn
     handle_opencode_native_model_change: Callable[[str, str | None], Coroutine[Any, Any, Response]]
+    handle_omp_native_clear: Callable[[str], Coroutine[Any, Any, Response]]
     handle_pi_native_compact: Callable[[str], Coroutine[Any, Any, Response]]
     handle_pi_native_effort_change: Callable[[str, str | None], Coroutine[Any, Any, Response]]
     handle_pi_native_model_change: Callable[[str, str | None], Coroutine[Any, Any, Response]]
@@ -364,6 +365,7 @@ def build_native_controls(
     _native_cost_popup_config_file: Callable[[str, str], Coroutine[Any, Any, Path]],
     _native_pane_status: dict[str, str],
     _opencode_terminal_ensure_locks: dict[str, asyncio.Lock],
+    _omp_terminal_ensure_locks: dict[str, asyncio.Lock],
     _publish_event: Callable[[str, Mapping[str, object]], None],
     _publish_turn_status: _PublishTurnStatusFn,
     _release_session_harness: Callable[[str], Coroutine[Any, Any, None]],
@@ -1074,10 +1076,17 @@ def build_native_controls(
         conv_id: str,
         effort: str | None,
     ) -> Response:
-        from omnigent.harnesses.pi_native.bridge import (
-            bridge_dir_for_session_id,
-            enqueue_thinking_level_change,
-        )
+        is_omp = _session_harness_name(conv_id) == "omp-native"
+        if is_omp:
+            from omnigent.harnesses.omp_native.bridge import (
+                bridge_dir_for_session_id,
+                enqueue_thinking_level_change,
+            )
+        else:
+            from omnigent.harnesses.pi_native.bridge import (
+                bridge_dir_for_session_id,
+                enqueue_thinking_level_change,
+            )
         from omnigent.util.reasoning_effort import to_pi_thinking_level
 
         if effort is None or not effort.strip():
@@ -1099,8 +1108,10 @@ def build_native_controls(
             return JSONResponse(
                 status_code=503,
                 content={
-                    "error": "pi_native_effort_failed",
-                    "detail": _client_safe_error_detail(exc, context="pi-native effort change"),
+                    "error": "omp_native_effort_failed" if is_omp else "pi_native_effort_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context=f"{'omp' if is_omp else 'pi'}-native effort change"
+                    ),
                 },
             )
         return Response(status_code=204)
@@ -1109,10 +1120,17 @@ def build_native_controls(
         conv_id: str,
         model: str | None,
     ) -> Response:
-        from omnigent.harnesses.pi_native.bridge import (
-            bridge_dir_for_session_id,
-            enqueue_model_change,
-        )
+        is_omp = _session_harness_name(conv_id) == "omp-native"
+        if is_omp:
+            from omnigent.harnesses.omp_native.bridge import (
+                bridge_dir_for_session_id,
+                enqueue_model_change,
+            )
+        else:
+            from omnigent.harnesses.pi_native.bridge import (
+                bridge_dir_for_session_id,
+                enqueue_model_change,
+            )
         from omnigent.util.reasoning_effort import to_pi_thinking_level
 
         if model is None or not model.strip():
@@ -1135,8 +1153,10 @@ def build_native_controls(
             return JSONResponse(
                 status_code=503,
                 content={
-                    "error": "pi_native_model_failed",
-                    "detail": _client_safe_error_detail(exc, context="pi-native model change"),
+                    "error": "omp_native_model_failed" if is_omp else "pi_native_model_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context=f"{'omp' if is_omp else 'pi'}-native model change"
+                    ),
                 },
             )
         return Response(status_code=204)
@@ -2088,6 +2108,49 @@ def build_native_controls(
                 await client.aclose()
         return Response(status_code=200 if updated else 204)
 
+    async def _handle_omp_native_clear(conv_id: str) -> Response:
+        from omnigent.entities.session_resources import terminal_resource_id
+        from omnigent.runner.native.orchestration import _auto_create_omp_terminal
+        from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
+
+        try:
+            # Serialize with launches and the pane reaper. Keep the captured UUID
+            # on the server: the replacement's first session_start CASes it and
+            # writes an empty context checkpoint before accepting another turn.
+            async with _omp_terminal_ensure_locks.setdefault(conv_id, asyncio.Lock()):
+                spec = await _resolve_session_agent_spec(conv_id)
+                await resource_registry.close_terminal(
+                    conv_id, terminal_resource_id("omp", "main")
+                )
+                _publish_terminal_deleted_event(
+                    conversation_id=conv_id,
+                    terminal_name="omp",
+                    session_key="main",
+                    publish_event=_publish_event,
+                )
+                await _release_session_harness(conv_id)
+                _session_histories.pop(conv_id, None)
+                _session_message_buffers.pop(conv_id, None)
+                await _auto_create_omp_terminal(
+                    conv_id,
+                    resource_registry,
+                    _publish_event,
+                    agent_spec=spec,
+                    server_client=server_client,
+                    ensure_comment_relay=_ensure_comment_relay_started,
+                    fresh=True,
+                )
+        except Exception as exc:  # Report a failed rotation instead of claiming a clear.
+            _logger.exception("OMP native clear failed for session %s", conv_id)
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "omp_native_clear_failed",
+                    "detail": _client_safe_error_detail(exc, context="omp-native clear"),
+                },
+            )
+        return Response(status_code=200)
+
     async def _handle_opencode_native_clear(conv_id: str) -> Response:
         if _session_harness_name(conv_id) != "opencode-native":
             return Response(status_code=204)
@@ -2152,7 +2215,17 @@ def build_native_controls(
         return Response(status_code=200)
 
     async def _handle_pi_native_compact(conv_id: str) -> Response:
-        from omnigent.harnesses.pi_native.bridge import bridge_dir_for_session_id, enqueue_compact
+        is_omp = _session_harness_name(conv_id) == "omp-native"
+        if is_omp:
+            from omnigent.harnesses.omp_native.bridge import (
+                bridge_dir_for_session_id,
+                enqueue_compact,
+            )
+        else:
+            from omnigent.harnesses.pi_native.bridge import (
+                bridge_dir_for_session_id,
+                enqueue_compact,
+            )
 
         try:
             await asyncio.to_thread(
@@ -2169,8 +2242,10 @@ def build_native_controls(
             return JSONResponse(
                 status_code=503,
                 content={
-                    "error": "pi_native_compact_failed",
-                    "detail": _client_safe_error_detail(exc, context="pi-native compact"),
+                    "error": "omp_native_compact_failed" if is_omp else "pi_native_compact_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context=f"{'omp' if is_omp else 'pi'}-native compact"
+                    ),
                 },
             )
         return Response(status_code=200)
@@ -2669,6 +2744,7 @@ def build_native_controls(
         handle_opencode_native_compact=_handle_opencode_native_compact,
         handle_opencode_native_cost_popup=_handle_opencode_native_cost_popup,
         handle_opencode_native_model_change=_handle_opencode_native_model_change,
+        handle_omp_native_clear=_handle_omp_native_clear,
         handle_pi_native_compact=_handle_pi_native_compact,
         handle_pi_native_effort_change=_handle_pi_native_effort_change,
         handle_pi_native_model_change=_handle_pi_native_model_change,

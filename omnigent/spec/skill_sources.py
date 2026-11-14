@@ -19,6 +19,7 @@ import os
 import re
 import stat
 import subprocess
+import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -41,7 +42,7 @@ from omnigent.spec.types import AgentSpec, SkillSpec
 
 _log = logging.getLogger(__name__)
 
-_SKILL_FAMILIES = frozenset({"claude", "codex", "cursor", "pi", "antigravity", "devin"})
+_SKILL_FAMILIES = frozenset({"claude", "codex", "cursor", "pi", "omp", "antigravity", "devin"})
 
 # The bare ``antigravity`` harness is the in-process Gemini SDK executor, NOT the
 # agy CLI. It never launches agy, so ~/.gemini plugin/builtin skills are not its
@@ -101,6 +102,8 @@ class SkillSourceContext:
         (``$CODEX_HOME``), else ``None`` for the ``home/.codex`` default;
         injected so tests can pin it. Used only for native codex, mirroring
         the terminal, which honors ``$CODEX_HOME`` for its skills.
+    :param omp_agent_dir: OMP's active profile/config root, resolved independently
+        from Pi. Defaults to ``home/.omp/agent`` for explicit contexts.
     :param is_native: Whether the session's harness is a native CLI harness.
         Set by :func:`resolve_harness_skills` from the harness id. Gates the
         terminal-matching resolution (including config-home tiers)
@@ -117,6 +120,7 @@ class SkillSourceContext:
     bundle_dir: Path | None
     claude_config_dir: Path | None = None
     codex_home: Path | None = None
+    omp_agent_dir: Path | None = None
     is_native: bool = False
     warnings: list[str] | None = None
 
@@ -140,6 +144,11 @@ def skill_source_context_from_env(
 
         # Nested runners can inherit a private Codex home; use its original source.
         codex_home = _codex_home_config_source_from_env()
+    omp_agent_dir: Path | None = None
+    if _harness_family(harness) == "omp":
+        from omnigent.harnesses.omp_native.credentials import global_omp_agent_dir
+
+        omp_agent_dir = global_omp_agent_dir(workspace=roots[0] if roots else None)
     return SkillSourceContext(
         roots=roots,
         home=Path.home(),
@@ -149,6 +158,7 @@ def skill_source_context_from_env(
             Path(configured_claude_dir).expanduser() if configured_claude_dir else None
         ),
         codex_home=codex_home,
+        omp_agent_dir=omp_agent_dir,
         warnings=warnings,
     )
 
@@ -1148,6 +1158,83 @@ def pi_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     return []
 
 
+def omp_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
+    """List native OMP authored and managed skills, with project-first precedence.
+
+    OMP scans only direct ``skills/<directory>/SKILL.md`` children, uses the
+    frontmatter name (falling back to the directory), and ignores disabled or
+    description-less entries. Its roots are not Pi's or Claude's skill trees.
+    """
+    if ctx.skills_filter == "none":
+        return []
+    agent_dir = ctx.omp_agent_dir or ctx.home / ".omp" / "agent"
+    ceilings = {
+        ctx.home.resolve(),
+        Path(tempfile.gettempdir()).resolve(),
+        Path("/tmp").resolve(),
+        Path("/var/tmp").resolve(),
+    }
+    directories: list[Path] = []
+    for root in ctx.roots:
+        for directory in repo_scope_dirs(root, home=ctx.home, outside_repo="ancestors"):
+            if directory in ceilings:
+                break
+            if directory != agent_dir.parent and not (directory / ".omp" / "agent").is_dir():
+                directories.append(directory / ".omp" / "skills")
+    directories.extend((agent_dir / "skills", agent_dir / "managed-skills"))
+    out: list[SkillSpec] = []
+    for directory in dict.fromkeys(directories):
+        try:
+            children = sorted(directory.iterdir())
+        except FileNotFoundError:
+            continue
+        except OSError:
+            if ctx.warnings is not None:
+                ctx.warnings.append(f"OMP skills could not be read: {directory}")
+            continue
+        tier: list[SkillSpec] = []
+        for child in children:
+            if child.name.startswith(".") or not child.is_dir():
+                continue
+            path = child / "SKILL.md"
+            try:
+                text = path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                continue
+            except (OSError, UnicodeError):
+                if ctx.warnings is not None:
+                    ctx.warnings.append(f"OMP skill could not be read: {path}")
+                continue
+            match = _FRONTMATTER_RE.match(text)
+            if match is None:
+                continue
+            try:
+                metadata = yaml.safe_load(match[1])
+            except yaml.YAMLError:
+                continue
+            if not isinstance(metadata, dict) or metadata.get("enabled") is False:
+                continue
+            description = metadata.get("description")
+            if not isinstance(description, str) or not description.strip():
+                continue
+            raw_name = metadata.get("name")
+            name = (raw_name.strip() or child.name) if isinstance(raw_name, str) else child.name
+            if "/" in name or "\\" in name:
+                continue
+            if isinstance(ctx.skills_filter, list) and name not in ctx.skills_filter:
+                continue
+            tier.append(
+                SkillSpec(
+                    name=name,
+                    description=description,
+                    content=match[2].strip(),
+                    skill_dir=child,
+                )
+            )
+        out.extend(sorted(tier, key=lambda skill: skill.name))
+    return _dedup(out)
+
+
 def devin_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     """Devin skills: whatever ``devin skills list`` reports as user-invocable.
 
@@ -1232,5 +1319,6 @@ _SKILL_SOURCES: dict[str | None, SkillSource] = {
     "cursor": cursor_host_skills,
     "devin": devin_host_skills,
     "pi": pi_host_skills,
+    "omp": omp_host_skills,
     "antigravity": antigravity_host_skills,
 }

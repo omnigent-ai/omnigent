@@ -17,6 +17,7 @@ import secrets
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from dataclasses import replace
 from typing import Any, Literal, cast
 
 import httpx
@@ -27,6 +28,7 @@ from fastapi import (
 from fastapi.responses import Response
 from pydantic import ValidationError
 
+from omnigent._wrapper_labels import OMP_NATIVE_WRAPPER_VALUE
 from omnigent.cli_invocation import cli_invocation
 from omnigent.db.utils import (
     generate_agent_id,
@@ -1712,7 +1714,7 @@ def _build_session_response(
             conv, agent_store=agent_store, agent_cache=agent_cache, agent=agent
         )
     native_usage_baseline = None
-    if harness == "pi-native":
+    if harness in {"pi-native", "omp-native"}:
         own_usage = conv.session_usage or {}
         cached = int(own_usage.get("cache_read_input_tokens", 0) or 0)
         native_usage_baseline = NativeUsageBaseline(
@@ -3260,6 +3262,19 @@ def _drains_pending_inputs(item: NewConversationItem) -> bool:
     )
 
 
+def _require_current_native_generation(conv: Conversation, body: SessionEventInput) -> None:
+    """Reject delayed telemetry from an OMP context superseded by a native switch."""
+    generation = body.data.get("_omnigent_native_session_id")
+    if (
+        body.type.startswith("external_")
+        and generation is not None
+        and conv.labels.get("omnigent.wrapper")
+        in {OMP_NATIVE_WRAPPER_VALUE, "omp-native-ui-subagent"}
+        and generation != conv.external_session_id
+    ):
+        raise HTTPException(status_code=409, detail="Native session context has changed")
+
+
 async def _persist_external_conversation_item(
     session_id: str,
     conv: Conversation,
@@ -3376,6 +3391,13 @@ async def _persist_external_conversation_item_unlocked(
         no label is stamped in that case.
     :returns: Store-assigned conversation item id.
     """
+    if body.data.get("_omnigent_native_session_id") is not None:
+        # Re-read under the mirror lock: authorization may precede a local switch.
+        fresh = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if fresh is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        _require_current_native_generation(fresh, body)
+        conv = fresh
     item = _new_external_conversation_item(session_id, body)
     source_id = body.data.get("source_id")
     is_peer_wake_marker = (
@@ -7567,7 +7589,11 @@ async def _native_turn_catalog(
         candidate resolution).
     """
     wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-    if wrapper == _PI_NATIVE_WRAPPER_LABEL_VALUE:
+    if wrapper in {
+        _PI_NATIVE_WRAPPER_LABEL_VALUE,
+        OMP_NATIVE_WRAPPER_VALUE,
+        "omp-native-ui-subagent",
+    }:
         options = _pushed_model_options_cache.get(session_id)
     elif wrapper == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
         await _refresh_stale_native_model_options(session_id, runner_client)
@@ -13758,6 +13784,10 @@ async def _handle_mcp_tools_call(
         return _mcp_error_response(
             rpc_id, -32000, f"Session not found or has no agent: {session_id!r}"
         )
+    omp_native = conv.labels.get("omnigent.wrapper") in {
+        OMP_NATIVE_WRAPPER_VALUE,
+        "omp-native-ui-subagent",
+    }
 
     spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
     if spec is None:
@@ -13881,6 +13911,28 @@ async def _handle_mcp_tools_call(
                 f"Denied by policy: {call_result.reason or 'no reason given'}",
             )
 
+        if call_result.action == PolicyAction.ASK and omp_native:
+            if request is None:
+                return _mcp_error_response(
+                    rpc_id, -32000, "Native tool approval requires a request"
+                )
+            approved = await _hold_native_ask_gate(
+                request,
+                session_id=session_id,
+                phase=Phase.TOOL_CALL,
+                data={"name": namespaced_name, "arguments": arguments},
+                engine=engine,
+                result=call_result,
+                conversation_store=conversation_store,
+            )
+            if not approved:
+                return _mcp_error_response(
+                    rpc_id, -32000, "Native tool approval declined or expired"
+                )
+            # The gate applied the reviewed writes; retain only its argument transform.
+            call_result = replace(
+                call_result, action=PolicyAction.ALLOW, set_labels=None, state_updates=None
+            )
         if call_result.action == PolicyAction.ASK:
             # Emit elicitation SSE event (for REPL approval UI) and return
             # InputRequiredResult per the MCP MRTR spec so the runner can
@@ -14131,6 +14183,31 @@ async def _handle_mcp_tools_call(
         extra={"session_id": session_id},
     )
 
+    if result_policy.action == PolicyAction.ASK and omp_native:
+        approved = False
+        if request is not None:
+            try:
+                async with asyncio.timeout(25):
+                    approved = await _hold_native_ask_gate(
+                        request,
+                        session_id=session_id,
+                        phase=Phase.TOOL_RESULT,
+                        data={"name": namespaced_name, "arguments": arguments, "result": output},
+                        engine=engine,
+                        result=result_policy,
+                        conversation_store=conversation_store,
+                    )
+            except TimeoutError:
+                pass
+        result_policy = replace(
+            result_policy,
+            action=PolicyAction.ALLOW if approved else PolicyAction.DENY,
+            reason=result_policy.reason
+            if approved
+            else "Native result approval declined or expired",
+            set_labels=None,
+            state_updates=None,
+        )
     if result_policy.action == PolicyAction.ASK and (
         execute_tool is not None or registry_config is not None
     ):
@@ -14154,6 +14231,8 @@ async def _handle_mcp_tools_call(
     result: dict[str, Any] = {"content": [{"type": "text", "text": output}]}
     if "isError" in exec_data:
         result["isError"] = exec_data["isError"]
+    if omp_native and result_policy.action == PolicyAction.DENY:
+        result["isError"] = True
     return _mcp_ok_response(rpc_id, result)
 
 
@@ -14211,6 +14290,9 @@ async def _fetch_model_options(
         the runner-owned options are not yet available.
     """
     wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+    if wrapper in {OMP_NATIVE_WRAPPER_VALUE, "omp-native-ui-subagent"}:
+        # OMP's extension pushes its live model registry on session start.
+        return _pushed_model_options_cache.get(session_id, [])
     if wrapper == _PI_NATIVE_WRAPPER_LABEL_VALUE:
         # The extension's live registry is authoritative, including models
         # authenticated through Pi's own login rather than Omnigent.

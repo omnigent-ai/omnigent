@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { streamSimpleOpenAICompletions } from "@earendil-works/pi-ai";
+import * as piAi from "@earendil-works/pi-ai";
 
 function signaturesFor(model, context) {
   const calls = new Map();
@@ -159,14 +159,14 @@ export function createStream(streamSimple) {
   };
 }
 
-export default function installGatewayCompatibility(pi) {
+export default function installGatewayCompatibility(pi, streamImplementation = piAi.streamSimpleOpenAICompletions) {
   const providers = JSON.parse(
     readFileSync(
       join(dirname(fileURLToPath(import.meta.url)), "omnigent_gateway_providers.json"),
       "utf8",
     ),
   );
-  const streamSimple = createStream(streamSimpleOpenAICompletions);
+  const streamSimple = createStream(streamImplementation);
   for (const provider of providers) {
     pi.registerProvider(provider, { api: "openai-completions", streamSimple });
   }

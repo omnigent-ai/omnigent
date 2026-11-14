@@ -5725,6 +5725,35 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
         return _to_conversation(ap_row, meta, labels)
 
+    def transition_external_session_id(
+        self, conversation_id: str, previous: str | None, value: str
+    ) -> Conversation:
+        """Compare-and-swap an explicitly transitioned native session identity."""
+
+        def transition(session: Session) -> None:
+            query = select(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == conversation_id,
+            )
+            if self._meta_supports_for_update:
+                query = query.with_for_update()
+            meta = session.scalar(query)
+            if meta is None:
+                raise ConversationNotFoundError(f"conversation {conversation_id!r} does not exist")
+            if meta.external_session_id == value:
+                return
+            if meta.external_session_id != previous:
+                raise ValueError("Native session changed before this transition")
+            meta.external_session_id = value
+
+        run_write_transaction(
+            self._session_immediate, "transition_external_session_id", transition
+        )
+        conversation = self.get_conversation(conversation_id)
+        if conversation is None:
+            raise ConversationNotFoundError(f"conversation {conversation_id!r} does not exist")
+        return conversation
+
     def create_session_with_agent(
         self,
         *,

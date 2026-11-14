@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
+import time
 import weakref
 from collections.abc import Callable
 from typing import Any, NamedTuple
@@ -111,6 +113,7 @@ from omnigent.spec.types import (
     PolicyAction,
 )
 from omnigent.stores import AgentStore, ConversationStore
+from omnigent.stores.conversation_store import NameAlreadyExistsError
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 
@@ -258,6 +261,169 @@ def register_hooks_routes(
     agent_cache: AgentCache | None = None,
 ) -> None:
     """Register the hooks routes on router."""
+
+    @router.post(
+        "/sessions/{session_id}/hooks/omp-child",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def register_omp_child(request: Request, session_id: str) -> dict[str, str]:
+        """Register an in-process OMP child without launching another runner."""
+        from omnigent.server.routes._sessions.helpers import (
+            _find_subagent_child_by_title,
+            _publish_session_created,
+        )
+
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        parent = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if parent is None:
+            raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+        if parent.agent_id is None:
+            raise OmnigentError("OMP parent has no bound agent", code=ErrorCode.INVALID_INPUT)
+        harness = await asyncio.to_thread(
+            _resolve_harness, parent, agent_store=agent_store, agent_cache=agent_cache
+        )
+        if harness != "omp-native":
+            raise OmnigentError("OMP child requires an OMP session", code=ErrorCode.INVALID_INPUT)
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as exc:
+            raise OmnigentError("Invalid OMP child JSON", code=ErrorCode.INVALID_INPUT) from exc
+        native_id = body.get("native_session_id") if isinstance(body, dict) else None
+        agent_id = body.get("agent_id") if isinstance(body, dict) else None
+        if not all(
+            isinstance(value, str) and 0 < len(value) <= 512 for value in (native_id, agent_id)
+        ):
+            raise OmnigentError(
+                "OMP child requires native_session_id and agent_id", code=ErrorCode.INVALID_INPUT
+            )
+        identity = hashlib.sha256(f"{native_id}:{agent_id}".encode()).hexdigest()[:24]
+        title = f"OMP child {identity}"
+        child = await asyncio.to_thread(
+            _find_subagent_child_by_title, conversation_store, session_id, title
+        )
+        if child is None:
+            try:
+                child = await asyncio.to_thread(
+                    conversation_store.create_conversation,
+                    kind="sub_agent",
+                    title=title,
+                    parent_conversation_id=session_id,
+                    agent_id=parent.agent_id,
+                    runner_id=parent.runner_id,
+                    harness_override="omp-native",
+                    labels={
+                        "omnigent.wrapper": "omp-native-ui-subagent",
+                        "omnigent.omp_native.session_id": native_id,
+                        "omnigent.omp_native.agent_id": agent_id,
+                    },
+                )
+            except NameAlreadyExistsError:
+                child = await asyncio.to_thread(
+                    _find_subagent_child_by_title, conversation_store, session_id, title
+                )
+                if child is None:
+                    raise
+            await _publish_session_created(
+                session_id, child.id, parent.agent_id, conversation_store, harness="omp-native"
+            )
+        await asyncio.to_thread(conversation_store.set_external_session_id, child.id, native_id)
+        return {"session_id": child.id}
+
+    @router.post(
+        "/sessions/{session_id}/hooks/omp-session",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def transition_omp_session(request: Request, session_id: str) -> dict[str, str]:
+        """CAS the active OMP identity and save its replacement context checkpoint."""
+        from omnigent.server.routes._sessions.orchestration import (
+            _native_mirror_lock,
+            _new_external_conversation_item,
+            _persist_external_conversation_item_unlocked,
+        )
+        from omnigent.server.schemas import SessionEventInput
+
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+        harness = await asyncio.to_thread(
+            _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+        )
+        if harness != "omp-native":
+            raise OmnigentError(
+                "OMP transition requires an OMP session", code=ErrorCode.INVALID_INPUT
+            )
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as exc:
+            raise OmnigentError(
+                "Invalid OMP transition JSON", code=ErrorCode.INVALID_INPUT
+            ) from exc
+        if not isinstance(body, dict):
+            raise OmnigentError("OMP transition must be an object", code=ErrorCode.INVALID_INPUT)
+        previous, current, transition_id = (
+            body.get("previous_session_id"),
+            body.get("native_session_id"),
+            body.get("transition_id"),
+        )
+        if not all(
+            isinstance(value, str) and 0 < len(value) <= 128 for value in (current, transition_id)
+        ):
+            raise OmnigentError(
+                "OMP transition requires bounded session and transition ids",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if "previous_session_id" not in body or (
+            previous is not None and not (isinstance(previous, str) and 0 < len(previous) <= 128)
+        ):
+            raise OmnigentError(
+                "OMP transition requires the prior session id or null",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        snapshot = body.get("compacted_messages")
+        if not isinstance(snapshot, list):
+            raise OmnigentError(
+                "OMP transition requires a context snapshot", code=ErrorCode.INVALID_INPUT
+            )
+        checkpoint = SessionEventInput(
+            type="external_conversation_item",
+            data={
+                "source_id": f"omp:transition:{transition_id}",
+                "_omnigent_native_session_id": current,
+                "item_type": "compaction",
+                "item_data": {
+                    "summary": "OMP active session context",
+                    "last_item_id": f"omp_transition_{transition_id}",
+                    "model": body.get("model"),
+                    "token_count": 0,
+                    "window_id": transition_id,
+                    "compacted_messages": snapshot,
+                },
+            },
+        )
+        _new_external_conversation_item(session_id, checkpoint)
+        async with _native_mirror_lock(session_id):
+            try:
+                conv = await asyncio.to_thread(
+                    conversation_store.transition_external_session_id,
+                    session_id,
+                    previous,
+                    current,
+                )
+            except ValueError as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+            await _persist_external_conversation_item_unlocked(
+                session_id, conv, checkpoint, conversation_store, created_by=user_id
+            )
+        return {"session_id": session_id, "native_session_id": current}
 
     @router.post(
         "/sessions/{session_id}/hooks/permission-request",
@@ -1012,7 +1178,13 @@ def register_hooks_routes(
             default_policies=_caps.default_policies,
             policy_store=policy_store,
             phase=phase,
-            tool_name=data.get("name") if isinstance(data, dict) else None,
+            tool_name=(
+                event.get("request_data", {}).get("name")
+                if phase == Phase.TOOL_RESULT
+                else data.get("name")
+                if isinstance(data, dict)
+                else None
+            ),
             # A sub-agent conversation's own guardrails live on the CHILD
             # spec inside this bundle; without the row the check would
             # fast-path skip a bundle whose only policies are child-declared.
@@ -1081,20 +1253,11 @@ def register_hooks_routes(
         )
         result = await engine.evaluate(ctx, read_only=is_read_only)
 
-        # URL-based elicitation for blocking phases: on a TOOL_CALL or
-        # LLM_REQUEST ASK, hold the gate server-side rather than
-        # returning ASK. Returning ASK makes the native hook emit
-        # ``defer``, which a permissive ``permission_mode``
-        # (acceptEdits / bypassPermissions) auto-approves — bypassing
-        # the human. Instead we publish the approval elicitation, park
-        # until the human resolves it via the resolve URL, and collapse
-        # to a hard ALLOW / DENY so the caller never sees ASK.
-        # TOOL_CALL, LLM_REQUEST, and REQUEST are the phases that can block
-        # before the action proceeds (tool dispatch / LLM call / a native
-        # session's user prompt via the UserPromptSubmit hook — which has no
-        # ASK primitive of its own, so the server resolves ASK here).
+        # Native result hooks can withhold output, so their ASK must park just
+        # like pre-execution gates. Never return a raw ASK as implicit consent.
         if result.action == PolicyAction.ASK and phase in (
             Phase.TOOL_CALL,
+            Phase.TOOL_RESULT,
             Phase.LLM_REQUEST,
             Phase.REQUEST,
         ):
@@ -1122,6 +1285,7 @@ def register_hooks_routes(
                     result = await engine.evaluate(ctx, read_only=is_read_only)
                     if result.action == PolicyAction.ASK and phase in (
                         Phase.TOOL_CALL,
+                        Phase.TOOL_RESULT,
                         Phase.LLM_REQUEST,
                         Phase.REQUEST,
                     ):
@@ -1738,9 +1902,12 @@ def register_hooks_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
         elicitation_id = payload.get("elicitation_id")
-        if not isinstance(elicitation_id, str) or not elicitation_id.startswith("elicit_pi_"):
+        omp_ui = isinstance(elicitation_id, str) and elicitation_id.startswith("elicit_omp_")
+        if not isinstance(elicitation_id, str) or not (
+            elicitation_id.startswith("elicit_pi_") or omp_ui
+        ):
             raise OmnigentError(
-                "Pi extension UI hook 'elicitation_id' must start with 'elicit_pi_'.",
+                "Native extension UI elicitation id must have a Pi or OMP UI namespace.",
                 code=ErrorCode.INVALID_INPUT,
             )
         elicitation_id = _client_supplied_hook_elicitation_id(
@@ -1752,8 +1919,20 @@ def register_hooks_routes(
                 "Pi extension UI hook body must include a 'request' object.",
                 code=ErrorCode.INVALID_INPUT,
             )
+        harness = "pi-native"
+        if omp_ui or raw_request.get("method") == "formDialog":
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+            harness = await asyncio.to_thread(
+                _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+            )
+            if harness != "omp-native":
+                raise OmnigentError(
+                    "OMP extension UI requires an OMP session", code=ErrorCode.INVALID_INPUT
+                )
         try:
-            params = to_elicitation_params(raw_request)
+            params = to_elicitation_params(raw_request, harness=harness)
         except ValueError as exc:
             raise OmnigentError(
                 str(exc),
@@ -1761,20 +1940,28 @@ def register_hooks_routes(
             ) from exc
         from omnigent.server.routes import sessions as _sf
 
+        wait_timeout = min(
+            timeout_seconds(raw_request) or _sf._PI_EXTENSION_UI_HOOK_TIMEOUT_S,
+            _sf._PI_EXTENSION_UI_HOOK_TIMEOUT_S,
+        )
+        started = time.monotonic()
         result = await _publish_and_wait_for_harness_elicitation(
             request,
             session_id=session_id,
             params=params,
-            timeout_s=min(
-                timeout_seconds(raw_request) or _sf._PI_EXTENSION_UI_HOOK_TIMEOUT_S,
-                _sf._PI_EXTENSION_UI_HOOK_TIMEOUT_S,
-            ),
+            timeout_s=wait_timeout,
             conversation_store=conversation_store,
             elicitation_id=elicitation_id,
-            tool_name="Pi(extension_ui)",
+            tool_name="OMP(extension_ui)" if harness == "omp-native" else "Pi(extension_ui)",
         )
         return Response(
-            content=json.dumps(to_ui_response(raw_request, result)),
+            content=json.dumps(
+                to_ui_response(
+                    raw_request,
+                    result,
+                    timed_out=result is None and time.monotonic() - started >= wait_timeout,
+                )
+            ),
             media_type="application/json",
         )
 

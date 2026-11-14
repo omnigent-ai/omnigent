@@ -135,3 +135,88 @@ def test_text_answer(method: str, action: str, content: dict | None, expected: d
         "id": "dialog",
         **expected,
     }
+
+
+def _omp_form_request() -> dict:
+    return {
+        "id": "native-form",
+        "method": "formDialog",
+        "title": "Configure deployment",
+        "requestedSchema": {
+            "type": "object",
+            "properties": {
+                "f0": {"type": "string", "x-multiline": True, "x-preserve-empty": True},
+                "f1": {"type": "number", "minimum": 1, "maximum": 8},
+                "f2_0": {"type": "boolean", "default": True},
+                "f2_1": {"type": "boolean", "default": False},
+                "f3": {"type": "number", "x-preserve-empty": True},
+            },
+            "required": ["f1"],
+        },
+    }
+
+
+def test_omp_form_schema_uses_safe_controls_without_changing_pi_methods() -> None:
+    request = _omp_form_request()
+    params = to_elicitation_params(request, harness="omp-native")
+    assert params.requestedSchema == request["requestedSchema"]
+    assert params.phase == "omp_extension_ui"
+    assert params.policy_name == "omp_native_extension_ui"
+    assert params.model_extra["omp_extension_ui"] == request
+    assert "ask_user_question" not in params.model_extra
+    assert not is_dialog_method("formDialog")
+    with pytest.raises(ValueError, match="formDialog"):
+        to_elicitation_params(request)
+
+
+def test_omp_form_response_preserves_native_typed_and_exact_text_answers() -> None:
+    content = {
+        "f0": "line one\n\n",
+        "f1": 3.5,
+        "f2_0": False,
+        "f2_1": True,
+        "f3": "",
+        "unrequested": "ignored",
+    }
+    result = to_ui_response(
+        _omp_form_request(), ElicitationResult(action="accept", content=content)
+    )
+    assert result == {
+        "type": "extension_ui_response",
+        "id": "native-form",
+        "value": {key: value for key, value in content.items() if key != "unrequested"},
+    }
+
+
+@pytest.mark.parametrize("action", ["cancel", "decline"])
+def test_omp_form_cancel_never_becomes_timeout_or_default_submission(action: str) -> None:
+    response = to_ui_response(
+        _omp_form_request(), ElicitationResult(action=action), timed_out=True
+    )
+    assert response["cancelled"] is True
+    assert response["timedOut"] is False
+    assert "value" not in response
+    expired = to_ui_response(_omp_form_request(), None, timed_out=True)
+    assert expired["cancelled"] is True and expired["timedOut"] is True
+
+
+@pytest.mark.parametrize("content", [{"f1": True}, {"f2_0": "true"}, {"f0": 3}])
+def test_omp_form_rejects_wrong_primitive_answer_shapes(content: dict) -> None:
+    assert to_ui_response(
+        _omp_form_request(), ElicitationResult(action="accept", content=content)
+    )["cancelled"]
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "object", "properties": []},
+        {"type": "object", "properties": {"x": {"type": "object"}}},
+        {"type": "object", "properties": {}, "required": ["missing"]},
+    ],
+)
+def test_omp_form_rejects_nonprimitive_or_malformed_schema(schema: dict) -> None:
+    with pytest.raises(ValueError, match="OMP formDialog"):
+        to_elicitation_params(
+            {**_omp_form_request(), "requestedSchema": schema}, harness="omp-native"
+        )

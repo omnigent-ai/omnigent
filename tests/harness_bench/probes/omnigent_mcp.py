@@ -3,7 +3,7 @@
 This is intentionally separate from ``ToolCallingProbe``: that probe exercises
 whatever tool mechanism is native to the transport (for example Bash in Claude
 Code), while this probe targets the read-only ``sys_session_list`` tool exposed
-through the generated ``omnigent`` MCP server.
+through the generated ``omnigent`` MCP server or inline native relay tools.
 """
 
 from __future__ import annotations
