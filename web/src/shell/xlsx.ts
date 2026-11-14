@@ -432,25 +432,100 @@ export async function readWorkbook(
   }
 }
 
+/** A package relationship, its target resolved to an archive path. */
+interface Relationship {
+  id: string;
+  type: string;
+  path: string;
+}
+
+/**
+ * *target* resolved against the part *source* that names it, e.g.
+ * ``("xl/workbook.xml", "../xl/worksheets/sheet1.xml")`` → ``"xl/worksheets/sheet1.xml"``;
+ * ``null`` for a target that climbs out of the package.
+ */
+export function resolvePartPath(source: string, target: string): string | null {
+  const segments = target.startsWith("/") ? [] : source.split("/").slice(0, -1);
+  for (const segment of target.split("/")) {
+    if (segment === "..") {
+      if (segments.length === 0) return null;
+      segments.pop();
+    } else if (segment !== "." && segment !== "") {
+      segments.push(segment);
+    }
+  }
+  return segments.join("/");
+}
+
+function decodedTarget(target: string): string {
+  try {
+    return decodeURIComponent(target);
+  } catch {
+    // A stray "%" isn't an escape.
+    return target;
+  }
+}
+
+/** ``"xl/workbook.xml"`` → ``"xl/_rels/workbook.xml.rels"``; ``""`` (the package) → ``"_rels/.rels"``. */
+function relationshipsPath(part: string): string {
+  const slash = part.lastIndexOf("/");
+  return `${part.slice(0, slash + 1)}_rels/${part.slice(slash + 1)}.rels`;
+}
+
+/** *part*'s relationships inside the archive; external targets are left out. */
+async function readRelationships(
+  bytes: Uint8Array,
+  entries: Map<string, ZipEntry>,
+  part: string,
+  budget: InflateBudget,
+): Promise<Relationship[]> {
+  const document = await readPart(bytes, entries, relationshipsPath(part), budget);
+  return (document ? descendants(document, "Relationship") : []).flatMap((relationship) => {
+    if (relationship.getAttribute("TargetMode") === "External") return [];
+    const target = relationship.getAttribute("Target") ?? "";
+    // A target may percent-encode its name; the archive entry is tried as written first.
+    const path = resolvePartPath(part, target);
+    const decoded = resolvePartPath(part, decodedTarget(target));
+    if (path === null) return [];
+    const found = entries.has(path) || decoded === null ? path : decoded;
+    return [
+      {
+        id: relationship.getAttribute("Id") ?? "",
+        type: relationship.getAttribute("Type") ?? "",
+        path: found,
+      },
+    ];
+  });
+}
+
+/** The first relationship of *type*, e.g. ``"styles"``, in either Open XML namespace. */
+function partOfType(relationships: Relationship[], type: string): string | undefined {
+  return relationships.find((relationship) => relationship.type.endsWith(`/${type}`))?.path;
+}
+
 async function readSheets(bytes: Uint8Array, maxBytes: number): Promise<WorkbookSheet[]> {
   const entries = zipEntries(bytes);
   const budget: InflateBudget = { left: maxBytes };
-  const workbook = await readPart(bytes, entries, "xl/workbook.xml", budget);
+  // Parts are found through the package's relationships, wherever the writer put them.
+  // The package's own relationships are optional: Excel's default place is the fallback.
+  const root = await readRelationships(bytes, entries, "", budget).catch((error: unknown) => {
+    if (error instanceof WorkbookTooLargeError) throw error;
+    return [];
+  });
+  const declared = partOfType(root, "officeDocument");
+  const workbookPath = declared && entries.has(declared) ? declared : "xl/workbook.xml";
+  const workbook = await readPart(bytes, entries, workbookPath, budget);
   if (!workbook) throw new WorkbookError("This file isn't a readable Excel workbook.");
-  const relationships = await readPart(bytes, entries, "xl/_rels/workbook.xml.rels", budget);
-  const targets = new Map<string, string>();
-  for (const relationship of Array.from(
-    relationships ? descendants(relationships, "Relationship") : [],
-  )) {
-    const target = relationship.getAttribute("Target") ?? "";
-    targets.set(
-      relationship.getAttribute("Id") ?? "",
-      target.startsWith("/") ? target.slice(1) : `xl/${target}`,
-    );
-  }
-  const shared = await readPart(bytes, entries, "xl/sharedStrings.xml", budget);
+  const relationships = await readRelationships(bytes, entries, workbookPath, budget);
+  const targets = new Map(
+    relationships.map((relationship) => [relationship.id, relationship.path]),
+  );
+  // A workbook that declares no such part may still keep it where Excel does.
+  const sharedPath = partOfType(relationships, "sharedStrings") ?? "xl/sharedStrings.xml";
+  const shared = await readPart(bytes, entries, sharedPath, budget);
   const sharedStrings = (shared ? descendants(shared, "si") : []).map(runText);
-  const dated = dateStyles(await readPart(bytes, entries, "xl/styles.xml", budget));
+  const stylesPath = partOfType(relationships, "styles") ?? "xl/styles.xml";
+  const dated = dateStyles(await readPart(bytes, entries, stylesPath, budget));
   const properties = descendants(workbook, "workbookPr")[0];
   const date1904 = ["1", "true"].includes(properties?.getAttribute("date1904") ?? "");
 
