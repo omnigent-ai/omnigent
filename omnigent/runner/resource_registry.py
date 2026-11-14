@@ -629,6 +629,7 @@ class SessionResourceRegistry:
         # under ``self._lock``.
         self._last_session_status: dict[str, str] = {}
         self._session_activity_epoch: dict[str, int] = {}
+        self._session_activity_recorded_at: dict[str, float] = {}
         self._active_session_turns: set[str] = set()
         # Bumped each time a session's turn becomes active, so a watcher can
         # tell a new turn from the one it was timing.
@@ -785,6 +786,7 @@ class SessionResourceRegistry:
             self._session_activity_epoch[session_id] = (
                 self._session_activity_epoch.get(session_id, 0) + 1
             )
+            self._session_activity_recorded_at[session_id] = time.time()
         if status in {"idle", "failed"}:
             self._active_session_turns.discard(session_id)
         self._last_session_status[session_id] = status
@@ -947,6 +949,11 @@ class SessionResourceRegistry:
         """Whether an explicitly observed turn is unfinished, excluding pane repaints."""
         with self._lock:
             return session_id in self._active_session_turns
+
+    def session_activity_recorded_at(self, session_id: str) -> float | None:
+        """When this runner last observed the explicit activity that advanced its epoch."""
+        with self._lock:
+            return self._session_activity_recorded_at.get(session_id)
 
     def session_has_background_agents(self, session_id: str) -> bool:
         """Whether a settled Claude turn still has a background agent working.
@@ -1899,6 +1906,16 @@ class SessionResourceRegistry:
             with contextlib.suppress(RuntimeError):
                 loop.call_soon_threadsafe(_publish_background_if_current, running)
 
+        def _publish_failure(detail: str | None, epoch: int | None) -> None:
+            loop.call_soon_threadsafe(
+                lambda: _publish_status(
+                    "failed",
+                    record_activity=True,
+                    failure_detail=detail,
+                    failure_activity_epoch=epoch,
+                )
+            )
+
         # Claude reports explicit state through OSC when opted in, with its
         # sessions/<pid>.json file as fallback. Other roles retain pane inference.
         status_poller = (
@@ -1909,9 +1926,7 @@ class SessionResourceRegistry:
                     status, blocked_on, record_activity=True
                 ),
                 on_replay=_publish_replayed_status,
-                on_failure=lambda detail: _publish_status(
-                    "failed", record_activity=True, failure_detail=detail
-                ),
+                on_failure=_publish_failure,
                 on_background=_publish_background,
             )
             if emit_status and resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
@@ -2199,7 +2214,7 @@ class SessionResourceRegistry:
         session_id: str,
         instance: TerminalInstance,
         on_status: Callable[[str, str | None], None],
-        on_failure: Callable[[str], None],
+        on_failure: Callable[[str | None, int | None], None],
         on_replay: Callable[[str, str | None], None],
         on_background: Callable[[bool], None] | None = None,
     ) -> SessionStatusPoller | ClaudeProgramStatusPoller:
@@ -2210,11 +2225,14 @@ class SessionResourceRegistry:
         from omnigent.harnesses.claude_native.bridge import (
             BackgroundAgentsAfterTurnReader,
             bridge_dir_for_conversation_id,
+            bridge_dir_from_launch_args,
             read_claude_session_id,
         )
         from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
 
-        bridge_dir = bridge_dir_for_conversation_id(session_id)
+        bridge_dir = bridge_dir_from_launch_args(instance.args) or bridge_dir_for_conversation_id(
+            session_id
+        )
         background_agents = BackgroundAgentsAfterTurnReader(bridge_dir)
         with self._lock:
             self._background_agent_readers[session_id] = background_agents
@@ -2248,6 +2266,7 @@ class SessionResourceRegistry:
             background_agents_after_turn=_background_agents_after_turn,
         )
         if reader is not None:
+            from omnigent.harnesses.claude_native.forwarder import program_status_failure_detail
             from omnigent.harnesses.claude_native.program_status import ClaudeProgramStatusPoller
 
             return ClaudeProgramStatusPoller(
@@ -2261,6 +2280,13 @@ class SessionResourceRegistry:
                 turn_is_active=lambda: self.session_turn_is_active(session_id),
                 turn_activity_epoch=lambda: self.session_activity_epoch(session_id),
                 on_failure=on_failure,
+                failure_detail=lambda: program_status_failure_detail(
+                    bridge_dir,
+                    session_id,
+                    instance.diagnostic_id,
+                    instance.lifecycle_trace.launch_id,
+                    activity_recorded_at=self.session_activity_recorded_at(session_id),
+                ),
                 background_agents_after_turn=_background_agents_after_turn,
             )
         return fallback
@@ -2601,6 +2627,7 @@ class SessionResourceRegistry:
                         self._session_activity_epoch[target_session_id] = (
                             self._session_activity_epoch.get(target_session_id, 0) + 1
                         )
+                        self._session_activity_recorded_at[target_session_id] = time.time()
                 self._active_session_turns.discard(source_session_id)
                 self._session_turn_generation.pop(source_session_id, None)
                 if role == CLAUDE_NATIVE_TERMINAL_ROLE:
@@ -2659,6 +2686,7 @@ class SessionResourceRegistry:
         self._take_session_status_memo(session_id)
         with self._lock:
             self._session_activity_epoch.pop(session_id, None)
+            self._session_activity_recorded_at.pop(session_id, None)
             self._session_turn_generation.pop(session_id, None)
             self._client_surfaces.pop(session_id, None)
             primary = self._primary_envs.pop(session_id, None)

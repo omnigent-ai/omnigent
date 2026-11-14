@@ -51,7 +51,8 @@ class ClaudeProgramStatusPoller:
         terminal_launch_id: str | None = None,
         turn_is_active: Callable[[], bool] | None = None,
         turn_activity_epoch: Callable[[], int] | None = None,
-        on_failure: Callable[[str], None] | None = None,
+        on_failure: Callable[[str | None, int | None], None] | None = None,
+        failure_detail: Callable[[], str | None] | None = None,
         clock: Callable[[], float] = time.monotonic,
         background_agents_after_turn: Callable[[], bool] | None = None,
     ) -> None:
@@ -69,6 +70,7 @@ class ClaudeProgramStatusPoller:
         self._turn_is_active = turn_is_active
         self._turn_activity_epoch = turn_activity_epoch
         self._on_failure = on_failure
+        self._failure_detail = failure_detail
         self._error_activity_epoch: int | None = None
         self._clock = clock
         self._last: ProgramStatus | None = None
@@ -213,8 +215,21 @@ class ClaudeProgramStatusPoller:
             self._error_failed = False
         elif not self._error_failed and now - self._error_since >= ERROR_HOOK_GRACE_S:
             self._error_failed = True
-            if self._on_failure is not None and report.message and report.message.strip():
-                self._on_failure(report.message)
+            detail = report.message
+            if (not detail or not detail.strip()) and self._failure_detail is not None:
+                try:
+                    detail = self._failure_detail()
+                except Exception:  # noqa: BLE001 - missing diagnostics cannot prevent settlement.
+                    detail = None
+            if not self._turn_is_active() or (
+                self._turn_activity_epoch is not None
+                and self._turn_activity_epoch() != self._error_activity_epoch
+            ):
+                return
+            if self._on_failure is not None:
+                self._on_failure(
+                    detail if detail and detail.strip() else None, self._error_activity_epoch
+                )
             else:
                 self._on_status("failed", None)
 

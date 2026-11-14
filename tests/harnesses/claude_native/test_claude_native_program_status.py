@@ -53,11 +53,18 @@ def _poller(
     turn_is_active: Callable[[], bool] | None = None,
     turn_activity_epoch: Callable[[], int] | None = None,
     failures: list[str] | None = None,
+    failure_detail: Callable[[], str | None] | None = None,
     clock: Callable[[], float] = time.monotonic,
     background_agents_after_turn: Callable[[], bool] | None = None,
 ) -> ClaudeProgramStatusPoller:
     def on_status(status: str, _reason: str | None) -> None:
         published.append(status)
+
+    def on_failure(detail: str | None, _epoch: int | None) -> None:
+        if detail is not None and failures is not None:
+            failures.append(detail)
+        else:
+            on_status("failed", None)
 
     return ClaudeProgramStatusPoller(
         ProgramStatusReader(path),
@@ -70,7 +77,8 @@ def _poller(
         on_status,
         turn_is_active=turn_is_active,
         turn_activity_epoch=turn_activity_epoch,
-        on_failure=failures.append if failures is not None else None,
+        on_failure=on_failure if failures is not None else None,
+        failure_detail=failure_detail,
         clock=clock,
         background_agents_after_turn=background_agents_after_turn,
     )
@@ -189,15 +197,32 @@ def test_error_report_without_a_hook_edge_fails_the_turn_once(
 
 
 @pytest.mark.parametrize("message", [None, "", "  ", "API Error: 499"])
-def test_error_fallback_preserves_available_detail(tmp_path: Path, message: str | None) -> None:
+@pytest.mark.parametrize("transcript_detail", [None, "Prompt is too long", "unreadable"])
+def test_error_fallback_preserves_available_detail(
+    tmp_path: Path, message: str | None, transcript_detail: str | None
+) -> None:
     """A missing hook does not discard the reason already in the OSC report."""
     path = tmp_path / "program-status.json"
     _write_report(path, {**_ERROR_REPORT, "message": message})
     clock = _FakeClock()
     published: list[str] = []
     failures: list[str] = []
+    lookups = []
+
+    def failure_detail() -> str | None:
+        lookups.append(True)
+        if transcript_detail == "unreadable":
+            raise OSError("synthetic unreadable evidence")
+        return transcript_detail
+
     poller = _poller(
-        tmp_path, path, published, turn_is_active=lambda: True, failures=failures, clock=clock
+        tmp_path,
+        path,
+        published,
+        turn_is_active=lambda: True,
+        failures=failures,
+        failure_detail=failure_detail,
+        clock=clock,
     )
     poller.tick()
     assert published == failures == []
@@ -205,7 +230,13 @@ def test_error_fallback_preserves_available_detail(tmp_path: Path, message: str 
     poller.tick()
     poller.resync()
     poller.tick()
-    assert failures == ([message] if message and message.strip() else [])
+    expected = (
+        message
+        if message and message.strip()
+        else (transcript_detail if transcript_detail != "unreadable" else None)
+    )
+    assert failures == ([expected] if expected else [])
+    assert lookups == ([] if message and message.strip() else [True])
     assert published == ([] if failures else ["failed"])
 
 

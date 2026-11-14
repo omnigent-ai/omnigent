@@ -17,7 +17,10 @@ _API_ERROR_BODY_MAX_CHARS = 16384
 
 
 def claude_failure_context(
-    entry: dict[str, object], *, error_text: str | None = None
+    entry: dict[str, object],
+    *,
+    error_text: str | None = None,
+    recorded_at: float | None = None,
 ) -> FailureContext:
     """Keep native IDs distinct from request IDs belonging to the event transport."""
     message = entry.get("message")
@@ -27,6 +30,7 @@ def claude_failure_context(
         "native_session_id": entry.get("sessionId", entry.get("session_id")),
         "native_agent_id": entry.get("agentId", entry.get("agent_id")),
         "native_record_id": entry.get("uuid"),
+        "native_recorded_at": recorded_at,
         "native_request_id": entry.get("requestId"),
         "native_cli_version": entry.get("version"),
         "native_model": concrete_reported_model(message.get("model")),
