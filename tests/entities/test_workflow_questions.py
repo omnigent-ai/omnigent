@@ -46,6 +46,15 @@ def test_questions_are_collapsed_and_keep_an_optional_recommendation() -> None:
         ([_question()] * 4, "questions must list 1 to 3"),
         ([_question(options=[{"label": "Only one"}])], "options must list 2 to 4"),
         ([_question(options=[{"label": "Same"}, {"label": "Same"}])], "different labels"),
+        (
+            [
+                _question(
+                    options=[{"label": "Use prod"}, {"label": "Use prod (recommended)"}],
+                    recommended="Use prod",
+                )
+            ],
+            "different labels",
+        ),
         ([_question(recommended="Use dev")], "recommended must be one of its option labels"),
         ([_question(header="")], "header must not be empty"),
         ([_question(), _question()], "questions must differ"),
@@ -86,6 +95,24 @@ def test_the_form_lists_the_recommendation_first_and_answers_map_back() -> None:
         {"question": "Deploy now?", "answer": "Wait for the freeze"},
     ]
     assert answers_from_content(questions, None)[0]["answer"] == ""
+
+    literal_label = "Use prod (recommended)"
+    for recommended in (None, "Use staging"):
+        literal = normalize_questions(
+            [
+                _question(
+                    options=[
+                        {"label": "Use prod"},
+                        {"label": literal_label},
+                        {"label": "Use staging"},
+                    ],
+                    recommended=recommended,
+                )
+            ]
+        )
+        assert answers_from_content(literal, {literal[0]["question"]: literal_label}) == [
+            {"question": literal[0]["question"], "answer": literal_label}
+        ]
 
 
 def test_the_status_text_is_the_whole_first_question() -> None:

@@ -55,6 +55,10 @@ def _question(raw: object, index: int) -> dict[str, Any]:
         recommended = _line(f"{where}.recommended", recommended)
         if recommended not in labels:
             raise InvalidJournalEntryError(f"{where}.recommended must be one of its option labels")
+        if recommended + _RECOMMENDED_SUFFIX in labels:
+            raise InvalidJournalEntryError(
+                f"{where}.options must have different labels after marking the recommendation"
+            )
     return {
         "question": _line(f"{where}.question", raw.get("question")),
         "header": _line(f"{where}.header", raw.get("header")),
@@ -138,9 +142,8 @@ def answers_from_content(
         if isinstance(raw, list):
             raw = ", ".join(str(item) for item in raw if isinstance(item, str) and item)
         answer = raw if isinstance(raw, str) else ""
-        if answer.endswith(_RECOMMENDED_SUFFIX) and answer[: -len(_RECOMMENDED_SUFFIX)] in {
-            option["label"] for option in question["options"]
-        }:
-            answer = answer[: -len(_RECOMMENDED_SUFFIX)]
+        recommended = question["recommended"]
+        if recommended is not None and answer == recommended + _RECOMMENDED_SUFFIX:
+            answer = recommended
         answers.append({"question": question["question"], "answer": answer.strip()})
     return answers

@@ -13,8 +13,8 @@ Routes, under ``/v1``:
 * ``GET /sessions/{session_id}/journal`` returns one page, with the automation
   runs its entries name (read access).
 * ``POST /sessions/{session_id}/journal`` appends an entry. Only the session's
-  runner writes, so the call must carry the orchestration source header naming
-  the session (edit access).
+  runner writes: the source header names the session, and a shared server
+  verifies its bound runner's tunnel token (edit access).
 * ``POST /sessions/{session_id}/journal/input-requests`` asks the user about a
   task for ``sys_workflow_request_input``: it marks the task ``needs_input`` and
   raises an elicitation whose answer the runner waits for. Runner-only, like
@@ -48,9 +48,13 @@ from omnigent.entities.workflow_questions import (
     status_text,
 )
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+from omnigent.runner.identity import (
+    ORCHESTRATION_SOURCE_HEADER,
+    RUNNER_TUNNEL_TOKEN_HEADER,
+    token_bound_runner_id,
+)
 from omnigent.runtime import session_stream
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.journal_markers import record_plan_marker, record_status_marker
 from omnigent.server.routes._auth_helpers import get_user_id, require_access_and_level
 from omnigent.server.routes._errors import session_not_found
@@ -236,6 +240,18 @@ def create_session_journal_router(
             raise OmnigentError(
                 "Only the session's own agent writes its journal", code=ErrorCode.FORBIDDEN
             )
+        user_id = get_user_id(request, auth_provider)
+        if permission_store is not None and user_id not in (None, RESERVED_USER_LOCAL):
+            # Local single-user runners may use stable IDs unrelated to tunnel tokens.
+            token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+            if (
+                not token
+                or not session.runner_id
+                or token_bound_runner_id(token) != session.runner_id
+            ):
+                raise OmnigentError(
+                    "Only the session's bound runner writes its journal", code=ErrorCode.FORBIDDEN
+                )
         return session
 
     async def _append(

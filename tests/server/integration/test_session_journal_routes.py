@@ -13,8 +13,12 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
-from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
+from omnigent.runner.identity import (
+    ORCHESTRATION_SOURCE_HEADER,
+    RUNNER_TUNNEL_TOKEN_HEADER,
+    token_bound_runner_id,
+)
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, RESERVED_USER_LOCAL
 from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
@@ -38,11 +42,16 @@ pytestmark = pytest.mark.asyncio
 ALICE = "alice@example.com"
 BOB = "bob@example.com"
 CAROL = "carol@example.com"
+_RUNNER_TOKEN = "journal-test-runner"
 
 
 @pytest.fixture()
-def app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
-    app = _build_app(db_uri, tmp_path, workflows=True)
+def app(
+    runtime_init: None, db_uri: str, tmp_path: Path, request: pytest.FixtureRequest
+) -> FastAPI:
+    app = _build_app(
+        db_uri, tmp_path, workflows=True, local_single_user=getattr(request, "param", False)
+    )
     for user in (ALICE, BOB, CAROL):
         _make_user(db_uri, user)
     return app
@@ -63,6 +72,7 @@ def _session(
     title: str | None = None,
     owner: str = ALICE,
     parent_conversation_id: str | None = None,
+    runner_token: str | None = _RUNNER_TOKEN,
 ) -> str:
     """A session *owner* owns, alice by default."""
     conversations = SqlAlchemyConversationStore(db_uri)
@@ -72,12 +82,18 @@ def _session(
     SqlAlchemyPermissionStore(db_uri).grant(owner, session.id, 4)
     if labels:
         conversations.set_labels(session.id, labels)
+    if runner_token is not None:
+        conversations.set_runner_id(session.id, token_bound_runner_id(runner_token))
     return session.id
 
 
 def _runner(session_id: str, user: str = ALICE) -> dict[str, str]:
     """Headers of a call the session's runner relays for its agent."""
-    return {**_headers(user), ORCHESTRATION_SOURCE_HEADER: session_id}
+    return {
+        **_headers(user),
+        ORCHESTRATION_SOURCE_HEADER: session_id,
+        RUNNER_TUNNEL_TOKEN_HEADER: _RUNNER_TOKEN,
+    }
 
 
 def _write(kind: str, content: dict[str, object], key: str, **fields: object) -> dict[str, object]:
@@ -381,13 +397,56 @@ async def test_entries_are_attributed_to_the_run_the_session_serves(
 
 
 async def test_only_the_sessions_own_runner_writes(client: httpx.AsyncClient, db_uri: str) -> None:
+    from omnigent.runtime import pending_elicitations
+
     session_id, other = _session(db_uri), _session(db_uri)
     url = f"/v1/sessions/{session_id}/journal"
     body = _write("note", {"body": "x"}, "tool:1")
-    for headers in (_headers(), {**_headers(), ORCHESTRATION_SOURCE_HEADER: other}):
-        refused = await client.post(url, json=body, headers=headers)
+    assert (
+        await client.post(
+            url, json=_write("plan", _ONE_TASK_PLAN, "plan"), headers=_runner(session_id)
+        )
+    ).status_code == 200
+    requests = (
+        (url, body),
+        (
+            url + "/input-requests",
+            {"step": "deploy", "questions": [_DEPLOY_QUESTION], "idempotency_key": "ask"},
+        ),
+    )
+    for headers in (
+        _headers(),
+        _runner(other),
+        {**_headers(), ORCHESTRATION_SOURCE_HEADER: session_id},
+        {**_runner(session_id), RUNNER_TUNNEL_TOKEN_HEADER: "another-runner"},
+        {**_runner(session_id), RUNNER_TUNNEL_TOKEN_HEADER: " "},
+    ):
+        for path, request_body in requests:
+            refused = await client.post(path, json=request_body, headers=headers)
+            assert refused.status_code == 403, refused.text
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conversations.clear_runner_id(session_id)
+    for path, request_body in requests:
+        refused = await client.post(path, json=request_body, headers=_runner(session_id))
         assert refused.status_code == 403, refused.text
+    assert not pending_elicitations.snapshot_for(session_id)
+    entries = (await client.get(url, headers=_headers())).json()["data"]
+    assert [entry["kind"] for entry in entries] == ["plan"]
+    conversations.set_runner_id(session_id, token_bound_runner_id(_RUNNER_TOKEN))
     assert (await client.post(url, json=body, headers=_runner(session_id))).status_code == 200
+
+
+@pytest.mark.parametrize("app", [True], indirect=True)
+async def test_single_user_journals_accept_local_runner_identity(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session_id = _session(db_uri, owner=RESERVED_USER_LOCAL, runner_token=None)
+    response = await client.post(
+        f"/v1/sessions/{session_id}/journal",
+        json=_write("note", {"body": "Local progress"}, "local"),
+        headers={ORCHESTRATION_SOURCE_HEADER: session_id},
+    )
+    assert response.status_code == 200, response.text
 
 
 async def test_reading_needs_read_access_and_writing_needs_edit(
@@ -409,6 +468,13 @@ async def test_reading_needs_read_access_and_writing_needs_edit(
     body = _write("note", {"body": "x"}, "tool:1")
     assert (await client.get(url, headers=_headers(BOB))).status_code == 200
     assert (await client.post(url, json=body, headers=_runner(readable, BOB))).status_code == 403
+    assert (
+        await client.post(
+            url,
+            json=body,
+            headers={**_headers(CAROL), ORCHESTRATION_SOURCE_HEADER: readable},
+        )
+    ).status_code == 403
     assert (await client.post(url, json=body, headers=_runner(readable, CAROL))).status_code == 200
 
 
@@ -506,7 +572,7 @@ async def test_the_agents_tools_write_and_read_through_the_runner(
     from omnigent.runner.journal_tools import execute_journal_tool
 
     session_id, worker = _session(db_uri), _session(db_uri)
-    client.headers.update(_headers())
+    client.headers.update(_runner(session_id))
     published: list[tuple[str, dict[str, object]]] = []
 
     async def run(
@@ -643,7 +709,7 @@ async def test_a_workflow_question_marks_its_task_and_returns_the_answer(
     elif origin == "interactive_worker":
         labels[CREATED_BY_SESSION_LABEL_KEY] = _session(db_uri)
     session_id = _session(db_uri, labels=labels)
-    client.headers.update(_headers())
+    client.headers.update(_runner(session_id))
     published: list[dict[str, object]] = []
 
     async def run(tool: str, args: dict[str, object], call_id: str | None = None) -> dict:
@@ -730,7 +796,7 @@ async def test_automation_workflows_cannot_wait_for_user_input(
             parent_conversation_id=session_id if edge == "parent" else None,
             labels={CREATED_BY_SESSION_LABEL_KEY: session_id} if edge == "creator" else None,
         )
-    client.headers.update(_headers())
+    client.headers.update(_runner(session_id))
 
     async def run(tool: str, args: dict[str, object]) -> dict:
         output = await asyncio.wait_for(
@@ -809,7 +875,7 @@ async def test_the_workflow_tools_save_and_load_through_the_real_routes(
     from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
     from omnigent.runner.journal_tools import execute_journal_tool
 
-    session_id = _session(db_uri)
+    session_id = _session(db_uri, runner_token=None)
     # The runner's own credentials: its tunnel token, bound to the calling session.
     token = "workflow-tools-runner"
     conversations = SqlAlchemyConversationStore(db_uri)
@@ -879,7 +945,7 @@ async def test_saving_a_workflow_names_the_sessions_plan_after_it(
     from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
     from omnigent.runner.journal_tools import execute_journal_tool
 
-    session_id = _session(db_uri)
+    session_id = _session(db_uri, runner_token=None)
     token = "save-names-plan-runner"
     conversations = SqlAlchemyConversationStore(db_uri)
     assert conversations.set_runner_id(session_id, token_bound_runner_id(token)) is True

@@ -117,15 +117,24 @@ def test_a_status_without_a_step_names_the_only_step_of_the_plan(
         journal.append(SESSION, "plan", _plan("a"), idempotency_key="tool:6", step="a")
 
 
+@pytest.mark.parametrize("saved_workflow", [False, True])
 def test_a_step_takes_a_status_only_after_its_dependencies_are_done(
     journal: SessionJournalStore,
+    saved_workflow: bool,
 ) -> None:
     steps = [
         {"id": "deploy", "name": "Deploy"},
         {"id": "verify", "name": "Verify routing", "depends_on": ["deploy"]},
         {"id": "video", "name": "Record the video", "depends_on": ["verify"]},
     ]
-    journal.append(SESSION, "plan", {"name": "Demo", "steps": steps}, idempotency_key="k0")
+    plan = {"name": "Demo", "steps": steps}
+    journal.append(
+        SESSION,
+        "plan",
+        plan,
+        idempotency_key="k0",
+        workflow_id=WORKFLOW if saved_workflow else None,
+    )
 
     def status(key: str, step: str, value: str, text: str | None = "x") -> None:
         content = {"status": value, **({"text": text} if value != "started" else {})}
@@ -152,6 +161,19 @@ def test_a_step_takes_a_status_only_after_its_dependencies_are_done(
     # A retry of a write that went through returns it, whatever changed since.
     status("k8", "video", "started")
     assert [entry.step for entry in journal.list_entries(SESSION).entries][-1] == "extra"
+
+    # Replanning keeps completed dependencies from this run.
+    journal.append(SESSION, "plan", plan, idempotency_key="replan")
+    status("after-replan", "video", "started")
+    journal.append(SESSION, "plan", plan, idempotency_key="next-run", workflow_id=WORKFLOW)
+    for replanned in (False, True):
+        if replanned:
+            journal.append(SESSION, "plan", plan, idempotency_key="next-run-replan")
+        for value in ("started", "done", "needs_input", "failed"):
+            with pytest.raises(StepNotReadyError, match="verify waits on deploy"):
+                status(f"next-run-{replanned}-{value}", "verify", value)
+    status("next-run-deployed", "deploy", "done")
+    status("next-run-verify", "verify", "started")
 
 
 def test_an_append_to_a_missing_session_writes_nothing(

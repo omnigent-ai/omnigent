@@ -222,7 +222,9 @@ class SessionJournalStore:
         )
 
     @staticmethod
-    def _newest_plan_row(session: Session, conversation_id: str) -> SqlSessionJournalEntry | None:
+    def _newest_plan_row(
+        session: Session, conversation_id: str, *, workflow_only: bool = False
+    ) -> SqlSessionJournalEntry | None:
         statement = (
             select(SqlSessionJournalEntry)
             .where(
@@ -233,6 +235,8 @@ class SessionJournalStore:
             .order_by(SqlSessionJournalEntry.position.desc())
             .limit(1)
         )
+        if workflow_only:
+            statement = statement.where(SqlSessionJournalEntry.workflow_id.is_not(None))
         return session.execute(
             _using(statement, "ix_session_journal_entries_kind")
         ).scalar_one_or_none()
@@ -264,9 +268,18 @@ class SessionJournalStore:
         nothing here.
         """
         current = next((item for item in steps or [] if item["id"] == step), None)
+        if current is None or not current["depends_on"]:
+            return []
+        # A saved workflow starts fresh; replans retain progress within that run.
+        run = self._newest_plan_row(session, conversation_id, workflow_only=True)
         waiting = []
-        for dependency in current["depends_on"] if current else []:
-            newest = self._newest_status_row(session, conversation_id, dependency)
+        for dependency in current["depends_on"]:
+            newest = self._newest_status_row(
+                session,
+                conversation_id,
+                dependency,
+                start_position=run.position if run is not None else None,
+            )
             if newest is None or self._entries([newest])[0].content.get("status") != "done":
                 waiting.append(dependency)
         return waiting

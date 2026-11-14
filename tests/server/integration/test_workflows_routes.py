@@ -141,7 +141,7 @@ async def test_a_workflow_round_trips_and_stays_private(client: httpx.AsyncClien
 async def test_telemetry_separates_drafts_saves_and_rejected_writes(
     client: httpx.AsyncClient, db_uri: str
 ) -> None:
-    source = _session(db_uri)
+    source = _session(db_uri, runner_token=None)
     token = "workflow-test-runner-token"
     assert SqlAlchemyConversationStore(db_uri).set_runner_id(source, token_bound_runner_id(token))
     with capture_debug_rows("server") as rows:

@@ -14,7 +14,7 @@ import jsonschema
 import pytest
 
 from omnigent.runner import pending_approvals
-from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.journal_tools import (
     JOURNAL_TOOL_NAMES,
     execute_journal_tool,
@@ -178,6 +178,7 @@ async def test_a_write_retries_a_dropped_tunnel_with_the_same_key(monkeypatch) -
 
     published: list[dict[str, object]] = []
     async with _client(handler) as client:
+        client.headers[RUNNER_TUNNEL_TOKEN_HEADER] = "journal-test-runner"
         result = await _run(
             client,
             "sys_journal_write_note",
@@ -189,6 +190,10 @@ async def test_a_write_retries_a_dropped_tunnel_with_the_same_key(monkeypatch) -
     bodies = [json.loads(request.content) for request in requests[1:]]
     assert [body["idempotency_key"] for body in bodies] == ["tool:toolu_01", "tool:toolu_01"]
     assert all(request.headers[ORCHESTRATION_SOURCE_HEADER] == SESSION for request in requests)
+    assert all(
+        request.headers[RUNNER_TUNNEL_TOKEN_HEADER] == "journal-test-runner"
+        for request in requests
+    )
     assert published == [
         {"type": "session.journal.appended", "conversation_id": SESSION, "entry": _ENTRY}
     ]
