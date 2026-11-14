@@ -1114,11 +1114,13 @@ def live_server(
     # The shared server keeps per-task timers; dedicated v2 suites start their own.
     # Pre-0.22 compatibility servers already default to the timers.
     features = env.get("OMNIGENT_FEATURES", "")
-    # Workflow scenarios opt in; the server's production default is off.
-    if "workflows" not in features:
+    compat_version = env.get(COMPAT_SERVER_VERSION_ENV) or "0"
+    # Workflow scenarios opt in only on servers that recognize the flag.
+    if "workflows" not in features and (
+        compat_server_python() is None or meets_min_server_version(compat_version, "0.23.0")
+    ):
         features = ",".join(filter(None, (features, "workflows")))
     env["OMNIGENT_FEATURES"] = features
-    compat_version = env.get(COMPAT_SERVER_VERSION_ENV) or "0"
     if "automations_v2" not in features and (
         compat_server_python() is None or meets_min_server_version(compat_version, "0.22.0")
     ):
