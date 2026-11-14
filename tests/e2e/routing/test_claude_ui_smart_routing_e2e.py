@@ -68,7 +68,7 @@ _SPAWN_TIMEOUT_S = 300.0
 def test_claude_session_create_routes_the_model_and_then_the_spawn(
     routing_client: httpx.Client,
     routing_host: str,
-    routing_host_env: dict[str, str],
+    routing_claude_settings_env: dict[str, str],
     routing_arms: object,
     mock_router: MockRouter,
     tmp_path: Path,
@@ -76,7 +76,7 @@ def test_claude_session_create_routes_the_model_and_then_the_spawn(
     require_tmux()
     routing_arms("claude-native")  # type: ignore[operator]
     workspace = trusted_workspace(tmp_path, "claude_ui_ws")
-    settings_path = claude_user_settings_path(workspace, routing_host_env)
+    settings_path = claude_user_settings_path(workspace, routing_claude_settings_env)
     settings_before = claude_settings_apart_from_the_model(settings_path, include_model=True)
 
     # ── 1. The routed create ────────────────────────────────────────────────

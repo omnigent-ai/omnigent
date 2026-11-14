@@ -29,6 +29,7 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -259,20 +260,35 @@ def routing_client(routing_server: str) -> Iterator[httpx.Client]:
         yield client
 
 
-@pytest.fixture(scope="session")
-def routing_host_env() -> dict[str, str]:
-    """The environment passed to the host and inherited by its native launches."""
-    return dict(os.environ)
+@dataclass(frozen=True)
+class _RoutingHostContext:
+    host_id: str
+    claude_settings_env: dict[str, str]
 
 
 @pytest.fixture(scope="session")
 def routing_host(
+    _routing_host_context: _RoutingHostContext,
+) -> str:
+    """The registered routing host's id."""
+    return _routing_host_context.host_id
+
+
+@pytest.fixture(scope="session")
+def routing_claude_settings_env(
+    _routing_host_context: _RoutingHostContext,
+) -> dict[str, str]:
+    """Only the launched host's HOME and CLAUDE_CONFIG_DIR, when present."""
+    return _routing_host_context.claude_settings_env
+
+
+@pytest.fixture(scope="session")
+def _routing_host_context(
     routing_server: str,
-    routing_host_env: dict[str, str],
     routing_client: httpx.Client,
     tmp_path_factory: pytest.TempPathFactory,
-) -> Iterator[str]:
-    """Spawn an ``omnigent host`` against the routing server; yield its host id.
+) -> Iterator[_RoutingHostContext]:
+    """Spawn a routing host and expose its id and Claude settings-path inputs.
 
     The daemon inherits the real ``$HOME`` — the ``claude`` and ``codex``
     logins live there and cannot be relocated — but its omnigent config home
@@ -280,10 +296,9 @@ def routing_host(
     block. ``~/.omnigent/config.yaml`` is never read or written.
 
     :param routing_server: Server URL the daemon registers with.
-    :param routing_host_env: Shared launch environment for settings-path assertions.
     :param routing_client: Used to poll ``GET /v1/hosts``.
     :param tmp_path_factory: Pytest temp path factory.
-    :yields: The registered host's ``host_id``.
+    :yields: The registered host id and scoped settings-path environment.
     """
     providers = _provider_block()
     root = tmp_path_factory.mktemp("routing_e2e_host")
@@ -294,15 +309,13 @@ def routing_host(
     )
     log_path = root / "host.log"
 
-    env = routing_host_env
-    env.update(
-        {
-            "OMNIGENT_CONFIG_HOME": str(config_home),
-            "OMNIGENT_DATA_DIR": str(root / "data"),
-            "PYTHONPATH": str(_REPO_ROOT),
-            "OMNIGENT_LOG_TO_STDERR": "1",
-        }
-    )
+    env = {
+        **os.environ,
+        "OMNIGENT_CONFIG_HOME": str(config_home),
+        "OMNIGENT_DATA_DIR": str(root / "data"),
+        "PYTHONPATH": str(_REPO_ROOT),
+        "OMNIGENT_LOG_TO_STDERR": "1",
+    }
     # Claude Code refuses to start a nested session; the agent process running
     # this suite may export the marker.
     env.pop("CLAUDECODE", None)
@@ -342,7 +355,12 @@ def routing_host(
                 "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT",
                 root / "data" / "codex-native",
             )
-            yield host_id
+            yield _RoutingHostContext(
+                host_id=host_id,
+                claude_settings_env={
+                    key: env[key] for key in ("HOME", "CLAUDE_CONFIG_DIR") if key in env
+                },
+            )
     finally:
         proc.send_signal(signal.SIGTERM)
         try:

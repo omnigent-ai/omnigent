@@ -105,7 +105,7 @@ def _wait_for_pane_ready(socket_path: str, target: str) -> None:
 def test_claude_routes_the_first_typed_message_exactly_once(
     routing_client: httpx.Client,
     routing_host: str,
-    routing_host_env: dict[str, str],
+    routing_claude_settings_env: dict[str, str],
     routing_arms: object,
     mock_router: MockRouter,
     type_into_tui: Callable[[str, str, str], None],
@@ -114,7 +114,7 @@ def test_claude_routes_the_first_typed_message_exactly_once(
     require_tmux()
     routing_arms("claude-native")  # type: ignore[operator]
     workspace = trusted_workspace(tmp_path, "claude_hook_ws")
-    settings_path = claude_user_settings_path(workspace, routing_host_env)
+    settings_path = claude_user_settings_path(workspace, routing_claude_settings_env)
     settings_before = claude_settings_apart_from_the_model(settings_path)
 
     # A BARE routed create: Smart Routing on, no prompt, so nothing is routed

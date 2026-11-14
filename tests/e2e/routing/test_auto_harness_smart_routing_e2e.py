@@ -90,7 +90,7 @@ def _cross_family_subtask() -> str:
 def test_auto_harness_lands_an_arm_then_redirects_a_cross_family_spawn(
     routing_client: httpx.Client,
     routing_host: str,
-    routing_host_env: dict[str, str],
+    routing_claude_settings_env: dict[str, str],
     routing_arms: object,
     mock_router: MockRouter,
     tmp_path: Path,
@@ -99,7 +99,7 @@ def test_auto_harness_lands_an_arm_then_redirects_a_cross_family_spawn(
     # The auto route chooses between both families, so both must be backed.
     routing_arms("claude-native", "codex-native")  # type: ignore[operator]
     workspace = trusted_workspace(tmp_path, "auto_ws")
-    settings_path = claude_user_settings_path(workspace, routing_host_env)
+    settings_path = claude_user_settings_path(workspace, routing_claude_settings_env)
     settings_before = claude_settings_apart_from_the_model(settings_path)
 
     # A contained, code-referencing task: on the ``both`` menu the recipe
