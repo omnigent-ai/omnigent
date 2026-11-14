@@ -10,7 +10,7 @@ import os
 import shlex
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -159,12 +159,17 @@ def _install_doubles(context, monkeypatch: pytest.MonkeyPatch, *, handoff=False,
             scratch = context.payload_paths[-1].parent / "launcher-scratch"
             scratch.mkdir(mode=0o700)
             final = Mock(return_value=SimpleNamespace(returncode=0))
+            bootstrap = dict(env)
+            if policy.active:
+                bootstrap[sb._LAUNCHER_WRAPPED_ENV] = "1"
+            launcher_os = SimpleNamespace(**{**vars(os), "environ": bootstrap})
 
             def activate_without_target_environment(_policy):
-                assert "EXAMPLE_TARGET_ONLY" not in os.environ
+                assert "EXAMPLE_TARGET_ONLY" not in bootstrap
 
             activate = Mock(side_effect=activate_without_target_environment)
             with monkeypatch.context() as inner:
+                inner.setattr(sb, "os", launcher_os)
                 inner.setattr(sb, "activate_sandbox", activate)
                 inner.setattr(
                     sb, "get_backend", Mock(side_effect=AssertionError("unexpected backend"))
@@ -172,25 +177,23 @@ def _install_doubles(context, monkeypatch: pytest.MonkeyPatch, *, handoff=False,
                 inner.setattr(sb, "create_private_tmpdir", Mock(return_value=scratch))
                 inner.setattr(sb, "cleanup_private_tmpdir", Mock())
                 inner.setattr(sb.subprocess, "run", final)
-                inner.setattr(sb.os, "execvp", Mock(side_effect=AssertionError("unexpected exec")))
-                bootstrap = dict(env)
-                if policy.active:
-                    bootstrap[sb._LAUNCHER_WRAPPED_ENV] = "1"
-                with patch.dict(os.environ, bootstrap, clear=True):
-                    encoded = base64.urlsafe_b64encode(
-                        json.dumps(policy.to_jsonable()).encode()
-                    ).decode()
-                    assert (
-                        sb.run_launcher(
-                            encoded,
-                            str(context.executable),
-                            list(args),
-                            cwd=str(context.cwd),
-                            target_environment_path=str(context.payload_paths[-1]),
-                        )
-                        == 0
+                inner.setattr(
+                    launcher_os, "execvp", Mock(side_effect=AssertionError("unexpected exec"))
+                )
+                encoded = base64.urlsafe_b64encode(
+                    json.dumps(policy.to_jsonable()).encode()
+                ).decode()
+                assert (
+                    sb.run_launcher(
+                        encoded,
+                        str(context.executable),
+                        list(args),
+                        cwd=str(context.cwd),
+                        target_environment_path=str(context.payload_paths[-1]),
                     )
-                    assert "EXAMPLE_TARGET_ONLY" not in os.environ
+                    == 0
+                )
+                assert "EXAMPLE_TARGET_ONLY" not in bootstrap
             activate.assert_called_once()
             context.finals.append(final.call_args.kwargs["env"])
         if "--help" in args:

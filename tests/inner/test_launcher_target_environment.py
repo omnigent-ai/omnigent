@@ -56,6 +56,8 @@ def _payload(tmp_path: Path, *, inherit: bool = True) -> Path:
 @pytest.fixture
 def inert_launcher(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     events = []
+    environment: dict[str, str] = {}
+    launcher_os = SimpleNamespace(**{**vars(os), "environ": environment})
     scratch = tmp_path / "launcher-scratch"
     scratch.mkdir(mode=0o700)
     backend = SimpleNamespace(
@@ -65,7 +67,7 @@ def inert_launcher(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     def activate(_policy):
         events.append("activate")
-        assert _SENTINEL not in os.environ.values()
+        assert _SENTINEL not in environment.values()
 
     def read(path, *args, **kwargs):
         events.append("payload-read")
@@ -82,15 +84,22 @@ def inert_launcher(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     run = Mock(side_effect=spawn)
     cleanup = Mock(side_effect=lambda _path: events.append("cleanup"))
     execute = Mock(side_effect=stop_exec)
+    monkeypatch.setattr(sb, "os", launcher_os)
     monkeypatch.setattr(sb, "get_backend", Mock(return_value=backend))
     monkeypatch.setattr(sb, "activate_sandbox", Mock(side_effect=activate))
     monkeypatch.setattr(sb, "create_private_tmpdir", Mock(return_value=scratch))
     monkeypatch.setattr(sb, "cleanup_private_tmpdir", cleanup)
     monkeypatch.setattr(sb, "open", read, raising=False)
     monkeypatch.setattr(sb.subprocess, "run", run)
-    monkeypatch.setattr(sb.os, "execvp", execute)
+    monkeypatch.setattr(launcher_os, "execvp", execute)
     return SimpleNamespace(
-        events=events, scratch=scratch, backend=backend, run=run, cleanup=cleanup, execute=execute
+        environment=environment,
+        events=events,
+        scratch=scratch,
+        backend=backend,
+        run=run,
+        cleanup=cleanup,
+        execute=execute,
     )
 
 
@@ -113,7 +122,7 @@ def test_target_environment_is_read_after_activation_for_final_spawn(
 ) -> None:
     payload = _payload(tmp_path, inherit=inherit)
     bootstrap = _bootstrap(wrapped=active)
-    with patch.dict(os.environ, bootstrap, clear=True):
+    with patch.dict(inert_launcher.environment, bootstrap, clear=True):
         assert (
             sb.run_launcher(
                 _encoded(_policy(active)),
@@ -123,7 +132,7 @@ def test_target_environment_is_read_after_activation_for_final_spawn(
             )
             == 0
         )
-        assert "EXAMPLE_TARGET_ONLY" not in os.environ
+        assert "EXAMPLE_TARGET_ONLY" not in inert_launcher.environment
     assert inert_launcher.events == ["activate", "payload-read", "target-spawn", "cleanup"]
     call = inert_launcher.run.call_args
     assert call.args == ([_TARGET, "doctor"],)
@@ -142,7 +151,7 @@ def test_reexec_transports_payload_path_without_reading_values(
     policy = _policy(True)
     policy.backend_type = backend_name
     payload = _payload(tmp_path)
-    with patch.dict(os.environ, _bootstrap(), clear=True):
+    with patch.dict(inert_launcher.environment, _bootstrap(), clear=True):
         with pytest.raises(SystemExit, match="inert re-exec boundary"):
             sb.run_launcher(
                 _encoded(policy), _TARGET, ["doctor"], target_environment_path=str(payload)
@@ -169,7 +178,7 @@ def test_reexec_transports_payload_path_without_reading_values(
 
 @pytest.mark.parametrize("active", [False, True])
 def test_default_launcher_keeps_inherited_environment_call(inert_launcher, active: bool) -> None:
-    with patch.dict(os.environ, _bootstrap(wrapped=active), clear=True):
+    with patch.dict(inert_launcher.environment, _bootstrap(wrapped=active), clear=True):
         assert sb.run_launcher(_encoded(_policy(active)), _TARGET, ["doctor"]) == 0
     assert inert_launcher.run.call_args.args == ([_TARGET, "doctor"],)
     assert inert_launcher.run.call_args.kwargs == {}
@@ -220,7 +229,7 @@ def test_invalid_target_payload_never_starts_target(
         data = json.loads(path.read_text())
         data[fault] = "wrong-type-" + _SENTINEL
         path.write_text(json.dumps(data))
-    with patch.dict(os.environ, _bootstrap(), clear=True):
+    with patch.dict(inert_launcher.environment, _bootstrap(), clear=True):
         with pytest.raises((ValueError, FileNotFoundError)) as error:
             sb.run_launcher(
                 _encoded(_policy(False)), _TARGET, ["doctor"], target_environment_path=str(path)
@@ -250,7 +259,7 @@ def test_target_failure_cleans_owned_launcher_scratch(
         path.unlink()
     else:
         inert_launcher.run.side_effect = OSError("inert target failure")
-    with patch.dict(os.environ, _bootstrap(wrapped=True), clear=True):
+    with patch.dict(inert_launcher.environment, _bootstrap(wrapped=True), clear=True):
         with pytest.raises(OSError):
             sb.run_launcher(
                 _encoded(_policy(True)), _TARGET, ["doctor"], target_environment_path=str(path)
@@ -268,7 +277,7 @@ def test_target_payload_cannot_restore_runner_secrets(
     data["variables"][SHARED_ENVIRONMENT_VAR] = _SENTINEL
     data["variables"][sb.HOST_SANDBOX_BACKEND_ENV] = "inert-backend-hint"
     path.write_text(json.dumps(data))
-    with patch.dict(os.environ, _bootstrap(wrapped=active), clear=True):
+    with patch.dict(inert_launcher.environment, _bootstrap(wrapped=active), clear=True):
         sb.run_launcher(
             _encoded(_policy(active)), _TARGET, ["doctor"], target_environment_path=str(path)
         )

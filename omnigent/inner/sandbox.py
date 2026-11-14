@@ -17,7 +17,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol, cast
 
-from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
+from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS, strip_runner_auth_secrets
 from omnigent.util.json_types import JsonValue
 
 from .agent_env import DESKTOP_SESSION_ENV_VARS
@@ -1167,7 +1167,7 @@ def _launcher_target_environment(path: str) -> dict[str, str]:
         for values in (variables, overrides)
     ):
         raise ValueError("Invalid target environment values")
-    environment: dict[str, str] = dict(os.environ) if inherit else {}
+    environment: dict[str, str] = strip_runner_auth_secrets(os.environ) if inherit else {}
     for name in unset:
         environment.pop(name, None)
     environment.update(variables)
