@@ -427,6 +427,7 @@ beforeEach(() => {
   clearOptimisticTitles();
   clearSessionDrafts();
   localStorage.clear();
+  sessionStorage.clear();
   searchParams = new URLSearchParams();
   projects = [];
   vi.mocked(useHostModelOptions).mockReturnValue({
@@ -1248,12 +1249,15 @@ describe("NewChatLandingScreen create flow", () => {
         pendingMsgTempId: "pend_cancel",
         createToken: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       });
+      // The original task arrives through a prompt link, so a reload-recovery copy is kept.
+      searchParams = new URLSearchParams("prompt=original+task");
       renderLanding();
       await waitForWorkspaceSeed();
-      typeMessage("original task");
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("original task");
       fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
       await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
       cleanup();
+      searchParams = new URLSearchParams();
 
       hasPendingLocalMessageMock.mockReturnValue(false);
       setSessionDraft(tempConvId, { text: corrected, files: [] });
@@ -1269,8 +1273,47 @@ describe("NewChatLandingScreen create flow", () => {
       renderLanding();
       expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(corrected);
       expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
+
+      // Editing the recovered draft and reloading never brings the link's text back.
+      typeMessage(`${corrected} edited`);
+      cleanup();
+      resetLandingDraft();
+      renderLanding();
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("");
     },
   );
+
+  it("does not restore a submitted prompt while creation is pending", async () => {
+    const tempConvId = "temp:dddddddddddddddddddddddddddddddd";
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }) as ReturnType<typeof authenticatedFetch>,
+    );
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId,
+      pendingMsgTempId: "pend_inflight",
+      createToken: "dddddddddddddddddddddddddddddddd",
+    });
+    searchParams = new URLSearchParams("prompt=First+request");
+    renderLanding();
+    await waitForWorkspaceSeed();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("First request");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    cleanup();
+
+    // "New session" while the first create is still pending: nothing to restore.
+    searchParams = new URLSearchParams();
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("");
+    await act(async () => {
+      resolveCreate({ ok: true, json: async () => ({ id: "conv_first" }) } as unknown as Response);
+    });
+    await waitFor(() => expect(hydrateLocalConversationMock).toHaveBeenCalled());
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("");
+  });
 
   it("restores the recovered temp-draft files onto the still-mounted landing after a failed create", async () => {
     // The create is rejected while the landing is still on screen, and the

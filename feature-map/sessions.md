@@ -277,6 +277,10 @@ the header menu), and each place is a separate entry point.
   Windows at least 1280px wide with the workspace collapsed and chat in view
   dock the card open beside chat; other layouts open it over chat. Mobile keeps
   cost in Agent info.
+  When the session has sub-agents, a **Sub-agents** list names each direct one
+  with its cost, including its own sub-agents; an unpriced one shows no cost.
+  A Claude sub-agent shows its Claude session's transcript estimate as `~$x.xx`. The
+  Agents list and graph show the same costs beside each agent.
 
 ## How to get to it (user POV)
 

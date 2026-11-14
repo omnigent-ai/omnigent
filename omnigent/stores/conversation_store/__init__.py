@@ -16,6 +16,10 @@ from omnigent.entities import (
     PagedList,
 )
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
+from omnigent.stores.conversation_store.activity_error import (
+    LATEST_ACTIVITY_ERROR_LABEL_KEY,
+    LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY,
+)
 from omnigent.util.cost_plan import COST_CONTROL_LABEL_NAMESPACE
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY
 
@@ -273,6 +277,9 @@ _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     SIDE_CHAT_SOURCE_LABEL_KEY,
     _SANDBOX_REPO_LABEL_KEY,
     _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY,
+    # A truncated fork's newest item differs; its next append recomputes it.
+    LATEST_ACTIVITY_ERROR_LABEL_KEY,
+    LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY,
 }
 
 
@@ -346,6 +353,24 @@ class SessionConnectivity:
     needs_workspace: bool
     imported: bool = False
     runner_last_seen: int | None = None
+
+
+@dataclass(frozen=True)
+class SpawnTreeUsage:
+    """
+    One spawn-tree member's place in the tree and its own recorded usage.
+
+    Returned by :meth:`ConversationStore.list_spawn_tree_usage` for cost
+    roll-ups that need neither labels nor content.
+
+    :param id: Conversation id.
+    :param parent_conversation_id: Parent id, or ``None`` for the root.
+    :param session_usage: This conversation's own ``session_usage`` document.
+    """
+
+    id: str
+    parent_conversation_id: str | None
+    session_usage: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -931,6 +956,11 @@ class ConversationStore(ABC):
         item is returned in its place — flagged ``deduplicated`` — instead
         of inserting a duplicate. The existence check rides the append's
         own transaction, so idempotency costs no extra query.
+
+        Implementations should fold the inserted items into the
+        ``LATEST_ACTIVITY_ERROR_LABEL_KEY`` label with
+        :func:`~omnigent.stores.conversation_store.activity_error.fold_activity_error`
+        in the same write. The label is maintained on append only.
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -2075,6 +2105,36 @@ class ConversationStore(ABC):
             data=rows,
             first_id=rows[0].id if rows else None,
             last_id=rows[-1].id if rows else None,
+            has_more=page.has_more,
+        )
+
+    def list_spawn_tree_usage(
+        self, root_conversation_id: str, *, limit: int
+    ) -> PagedList[SpawnTreeUsage]:
+        """Read one spawn tree's hierarchy and usage in a single bounded read.
+
+        Like :meth:`list_spawn_tree` but without labels or other row data, so
+        *limit* bounds all the work. ``has_more`` means the tree holds more
+        than *limit* rows; rows come in id order.
+
+        :param root_conversation_id: Root of the spawn tree.
+        :param limit: Maximum conversations to return.
+        :returns: The tree's members with their parent and own usage.
+        """
+        page = self.list_conversations(
+            limit=limit,
+            kind=None,
+            include_archived=True,
+            root_conversation_id=root_conversation_id,
+            order="asc",
+            sort_by="id",
+        )
+        return PagedList(
+            data=[
+                SpawnTreeUsage(c.id, c.parent_conversation_id, c.session_usage) for c in page.data
+            ],
+            first_id=page.first_id,
+            last_id=page.last_id,
             has_more=page.has_more,
         )
 
