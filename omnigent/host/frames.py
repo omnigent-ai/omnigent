@@ -72,6 +72,11 @@ LAUNCH_HANDLER_FAILED_ERROR_CODE = "launch_handler_failed"
 # tail, whose last line the server keeps when it shortens the report for storage.
 RUNNER_LOG_TAIL_HEADING = "--- runner log tail ---"
 
+# WebSocket close code the server sends when another connection owns this host
+# id: the tunnel was replaced by a newer connection, or a newer host build is
+# already connected with the same id.
+HOST_ID_CONFLICT_CLOSE_CODE = 4010
+
 # Capability tokens a host advertises in ``HostHelloFrame.capabilities``. A token
 # is present only in builds that have the feature, so the server gates on
 # presence — no host-version table to maintain, and a build that lacks the

@@ -45,6 +45,7 @@ from omnigent.host.frames import (
     CAP_WORKTREE_CREATE_BUDGET,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HOST_CAPABILITIES,
+    HOST_ID_CONFLICT_CLOSE_CODE,
     LAUNCH_HANDLER_FAILED_ERROR_CODE,
     SERVER_CAP_TMUX_READINESS,
     SERVER_CAPABILITIES_HEADER,
@@ -8982,6 +8983,40 @@ async def test_sustained_recycle_failures_fall_back_to_backoff(
     # The first _RECYCLE_PROMPT_MAX_STREAK attempts are prompt; every attempt
     # after that takes the backoff ladder.
     assert prompt == [0, 1, 2], f"prompt cadence must stop after the streak cap: {prompt}"
+
+
+async def test_host_id_conflict_close_backs_off_instead_of_recycling(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A tunnel closed because another process owns the host id must not flap.
+
+    Without the conflict code the drop looks like an ingress recycle and the two
+    processes evict each other twice a second; with it the host backs off with a
+    doubling delay, reports the conflict, and recovers on the next ordinary drop.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._HOST_ID_CONFLICT_BACKOFF_S", 0.001)
+    monkeypatch.setattr("omnigent.host.connect._HOST_ID_CONFLICT_BACKOFF_CAP_S", 0.004)
+    conflict = ConnectionClosedError(
+        Close(HOST_ID_CONFLICT_CLOSE_CODE, "replaced by another connection for this host id"),
+        None,
+    )
+    ingress_drop = ConnectionClosedError(None, None)
+    spy = _ConnectSpy([conflict] * 4 + [ingress_drop, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        await _host().run()
+
+    reconnects = [r for r in caplog.records if "Reconnecting in" in r.getMessage()]
+    assert [r.args[1] for r in reconnects] == [0.001, 0.002, 0.004, 0.004, 0.0]
+    assert ["(recycle" in r.getMessage() for r in reconnects] == [False] * 4 + [True]
+    conflicts = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(conflicts) == 4
+    assert all("host_test_connect" in r.getMessage() for r in conflicts)
+    assert capsys.readouterr().err.count("Another omnigent host process") == 1
 
 
 @pytest.mark.parametrize("console_error", [None, BrokenPipeError, ValueError, OSError])

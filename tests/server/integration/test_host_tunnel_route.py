@@ -14,6 +14,7 @@ import anyio
 import pytest
 from asgiref.testing import ApplicationCommunicator
 from fastapi import FastAPI, HTTPException
+from packaging.version import Version
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
@@ -22,6 +23,7 @@ from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.host.frames import (
     CAP_MCP_TOOLS,
     CAP_SKILL_CONTENT,
+    HOST_ID_CONFLICT_CLOSE_CODE,
     SERVER_CAP_TMUX_READINESS,
     SERVER_CAPABILITIES_HEADER,
     HostConnectionErrorFrame,
@@ -117,16 +119,18 @@ def _make_hello(
     name: str = "test-laptop",
     runners: list[str] | None = None,
     connection_id: str | None = None,
+    version: str = "0.1.0-test",
 ) -> str:
     """Encode a HostHelloFrame for tests.
 
     :param name: Human-readable host name.
     :param runners: Live runner IDs, defaults to empty.
+    :param version: Hello-reported host version, e.g. ``"0.22.0"``.
     :returns: JSON-encoded hello frame string.
     """
     return encode_host_frame(
         HostHelloFrame(
-            version="0.1.0-test",
+            version=version,
             frame_protocol_version=1,
             name=name,
             runners=runners or [],
@@ -617,7 +621,15 @@ async def test_host_close_retains_blocked_send_before_cleanup(
         await asyncio.gather(comm.future, return_exceptions=True)
 
 
-async def test_host_replacement_names_retirement_without_inventing_close_code(
+async def _receive_close(communicator: ApplicationCommunicator) -> dict[str, object]:
+    """Return the next ``websocket.close`` the route sent, skipping data frames."""
+    while True:
+        message = await communicator.receive_output(timeout=budget(2.0))
+        if message["type"] == "websocket.close":
+            return message
+
+
+async def test_host_replacement_closes_old_tunnel_with_conflict_code(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -633,6 +645,8 @@ async def test_host_replacement_names_retirement_without_inventing_close_code(
                 "text": _make_hello(connection_id="new-host-socket"),
             }
         )
+        close = await _receive_close(old)
+        assert close["code"] == HOST_ID_CONFLICT_CLOSE_CODE
         await old.wait(timeout=budget(2.0))
         conn = registry.get(_HOST_ID)
         assert conn is not None
@@ -648,14 +662,61 @@ async def test_host_replacement_names_retirement_without_inventing_close_code(
         assert end["ended_by"] == "host-sender"
         assert end["sender_end_reason"] == "queue_retired"
         assert end["retirement_reason"] == "replaced"
-        assert end["close_code"] is None
-        assert end["close_requested_code"] is None
+        assert end["close_requested_code"] == HOST_ID_CONFLICT_CLOSE_CODE
         assert conn.diagnostics.snapshot()["outbound_queue_high_water"] is None
     finally:
         await new.send_input({"type": "websocket.disconnect", "code": 1000})
         await new.wait(timeout=budget(2.0))
         old.stop(exceptions=False)
         await asyncio.gather(old.future, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    ("connected_version", "incoming_version", "incoming_wins"),
+    [
+        ("0.22.0.dev0+build.20261110", "0.17.0", False),
+        ("0.17.0", "0.22.0.dev0+build.20261110", True),
+    ],
+)
+async def test_host_id_conflict_keeps_the_newer_build_connected(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    connected_version: str,
+    incoming_version: str,
+    incoming_wins: bool,
+) -> None:
+    """Two processes sharing a host id: an older build never displaces a newer one."""
+    app, registry, _store = host_app
+    connected = await _connect_route(app, _TUNNEL_PATH)
+    incoming = await _connect_route(app, _TUNNEL_PATH)
+    try:
+        await connected.send_input(
+            {
+                "type": "websocket.receive",
+                "text": _make_hello(connection_id="connected", version=connected_version),
+            }
+        )
+        await asyncio.wait_for(_wait_registered(registry, _HOST_ID), timeout=budget(2.0))
+        await incoming.send_input(
+            {
+                "type": "websocket.receive",
+                "text": _make_hello(connection_id="incoming", version=incoming_version),
+            }
+        )
+        loser = connected if incoming_wins else incoming
+        close = await _receive_close(loser)
+        assert close["code"] == HOST_ID_CONFLICT_CLOSE_CODE
+        await loser.wait(timeout=budget(2.0))
+        conn = registry.get(_HOST_ID)
+        assert conn is not None
+        assert conn.hello.connection_id == ("incoming" if incoming_wins else "connected")
+        assert conn.hello.version == max(connected_version, incoming_version, key=Version)
+    finally:
+        winner = incoming if incoming_wins else connected
+        await winner.send_input({"type": "websocket.disconnect", "code": 1000})
+        await winner.wait(timeout=budget(2.0))
+        for communicator in (connected, incoming):
+            communicator.stop(exceptions=False)
+            await asyncio.gather(communicator.future, return_exceptions=True)
 
 
 @pytest.mark.parametrize(
