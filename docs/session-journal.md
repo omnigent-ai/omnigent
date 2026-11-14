@@ -126,9 +126,10 @@ To keep a workflow that worked, open the **⋯** menu at the right of the plan's
 name in the Tasks tab and choose **Save as workflow…**. Pick a name, which
 starts as the plan's, and choose **Save workflow**. The request goes to the
 agent through the `/save-workflow` skill. The agent keeps the steps worth
-repeating, writes them generically, leaving out the details that change from
-run to run, and saves the workflow with a description that says what a run
-needs ("Give it: the test suite"). You can also ask in chat, "save this as a
+repeating and ends them in a single final step, such as a report. It writes
+them generically, leaving out the details that change from run to run, and
+saves the workflow with a description that says what a run needs ("Give it:
+the test suite"). You can also ask in chat, "save this as a
 workflow"; with no name given, the agent suggests one first. Describe a new
 workflow in chat ("make a workflow that triages flaky tests") and the agent
 writes the draft as the session's plan, so its steps show in the Tasks tab,

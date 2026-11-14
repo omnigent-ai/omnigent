@@ -31,6 +31,10 @@ does ("Triage flaky tests") in your reply, and save once they agree.
 - List the steps in the order a run works on them: each right after the steps
   it depends on, so a step that needs only the exploration comes right after
   the exploration.
+- End with a single final step, such as "Report the results", that depends on
+  every step that would otherwise be last, so a run ends in one place instead
+  of in several steps side by side. If the plan you're saving ends in several
+  steps, add one.
 
 ## Make it generic
 
