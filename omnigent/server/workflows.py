@@ -34,7 +34,7 @@ from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.server.routes._sessions.helpers import _session_status_from_cache
+from omnigent.server.routes._sessions.helpers import _session_status_with_child_rollup
 from omnigent.server.schemas import (
     CreateWorkflowRequest,
     UpdateWorkflowRequest,
@@ -348,23 +348,23 @@ def create_workflows_router(
             if plan.conversation_id in sessions
             and _readable(user_id, sessions[plan.conversation_id])
         ]
-        activity = conversation_store.get_session_activity(
+        children = conversation_store.list_child_conversation_ids_by_parent(
             [plan.conversation_id for plan in readable]
         )
         statuses = journal.plan_step_statuses(readable)
         runs = []
         for plan, step_statuses in zip(readable, statuses, strict=True):
             session = sessions[plan.conversation_id]
-            live = activity.get(plan.conversation_id)
             runs.append(
                 WorkflowRun(
                     id=plan.id,
                     session_id=plan.conversation_id,
                     title=session.title or "",
                     started_at=plan.created_at,
-                    session_status=_session_status_from_cache(
-                        plan.conversation_id, live.live_status if live is not None else None
+                    session_status=_session_status_with_child_rollup(
+                        session.id, children.get(session.id, []), session.live_status
                     ),
+                    background_work_running=session.background_work_running is True,
                     archived=session.archived,
                     progress=_progress(plan, step_statuses),
                     steps=[WorkflowStep(**step) for step in plan.payload.get("steps", [])],
