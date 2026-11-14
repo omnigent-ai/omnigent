@@ -6,7 +6,7 @@ import { Toaster } from "@/components/ui/sonner";
 import type { Conversation } from "@/hooks/useConversations";
 import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
 import { isElectronShell } from "@/lib/nativeBridge";
-import { updateOverlayToastOffset } from "@/lib/updateOverlayInset";
+import { toasterOffsets } from "@/lib/updateOverlayInset";
 import { CommandPalette } from "./CommandPalette";
 import { RecentSessionsSwitcher } from "./RecentSessionsSwitcher";
 
@@ -87,16 +87,8 @@ export function AppShellOverlays({
       <Toaster
         position="top-center"
         visibleToasts={100}
-        offset={{
-          top: "calc(1rem + var(--omnigent-safe-top))",
-          right: "1rem",
-          bottom: updateOverlayToastOffset(updateOverlayHeight),
-        }}
-        mobileOffset={{
-          top: "calc(1rem + var(--omnigent-safe-top))",
-          right: "1rem",
-          bottom: updateOverlayToastOffset(updateOverlayHeight),
-        }}
+        // Keep top toasts below the native status bar / Dynamic Island.
+        {...toasterOffsets(updateOverlayHeight)}
       />
     </>
   );

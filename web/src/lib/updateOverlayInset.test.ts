@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { updateOverlayToastOffset } from "./updateOverlayInset";
+import { toasterOffsets, updateOverlayToastOffset } from "./updateOverlayInset";
 
 describe("updateOverlayToastOffset", () => {
   it("uses only the normal safe-area offset while the overlay is hidden", () => {
@@ -15,5 +15,15 @@ describe("updateOverlayToastOffset", () => {
   it("clamps invalid and negative heights", () => {
     expect(updateOverlayToastOffset(Number.NaN)).toContain("+ 0px");
     expect(updateOverlayToastOffset(-20)).toContain("+ 0px");
+  });
+});
+
+describe("toasterOffsets", () => {
+  it("keeps top toasts below the native status bar safe area", () => {
+    const { offset, mobileOffset } = toasterOffsets(180.4);
+    expect(offset.top).toBe("calc(1rem + var(--omnigent-safe-top))");
+    expect(mobileOffset.top).toBe("calc(1rem + var(--omnigent-safe-top))");
+    expect(offset.bottom).toBe(updateOverlayToastOffset(180.4));
+    expect(mobileOffset.bottom).toBe(updateOverlayToastOffset(180.4));
   });
 });
