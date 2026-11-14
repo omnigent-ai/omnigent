@@ -389,7 +389,6 @@ def test_compact_steer_timeout_keeps_input_undelivered_and_bridge_turn(
         ("start", "connect"),
         ("steer", "connect"),
         ("live-steer", "connect"),
-        ("live-goal", "connect"),
         ("start", "thread/settings/update"),
         ("start", "model/list"),
     ],
@@ -436,9 +435,8 @@ async def test_delivery_does_not_submit_after_bridge_binding_changes(
         "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", RotatingClient
     )
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
-    if delivery in {"live-steer", "live-goal"}:
-        content = "/goal keep this input" if delivery == "live-goal" else "keep this input"
-        assert await executor.enqueue_session_message("main", content) is False
+    if delivery == "live-steer":
+        assert await executor.enqueue_session_message("main", "keep this input") is False
     else:
         config = (
             ExecutorConfig(
@@ -1339,10 +1337,11 @@ def test_goal_command_sets_goal_before_submitting_objective(
 
     command = "  /goal Finish the implementation and tests  "
     if live_injection:
-        assert asyncio.run(executor.enqueue_session_message("main", command))
-    else:
-        events = _collect_turn_events(executor, command)
-        assert [type(event) for event in events] == [TurnComplete]
+        assert not asyncio.run(executor.enqueue_session_message("main", command))
+        assert _FakeCodexNativeClient.requests == []
+        assert _FakeCodexNativeClient.created == []
+    events = _collect_turn_events(executor, command)
+    assert [type(event) for event in events] == [TurnComplete]
     turn_params = {
         "threadId": "thread_123",
         "input": [{"type": "text", "text": "Finish the implementation and tests"}],
@@ -1385,6 +1384,7 @@ async def test_failed_goal_command_does_not_deliver_input_or_interrupt_native_wo
 
     class _GoalFailingClient(_FakeCodexNativeClient):
         requests = []
+        created = []
 
         async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
             nonlocal request_cancelled
@@ -1410,31 +1410,32 @@ async def test_failed_goal_command_does_not_deliver_input_or_interrupt_native_wo
     async with asyncio.timeout(1):
         if live_injection:
             assert not await executor.enqueue_session_message("main", "/goal Finish the tests")
+            assert _GoalFailingClient.requests == []
+            assert _GoalFailingClient.created == []
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "/goal Finish the tests"}], [], ""
+            )
+        ]
+        assert [type(event) for event in events] == [ExecutorError]
+        assert events[0].undelivered is True
+        assert events[0].preserve_session is True
+        expected_error = {
+            "refused": "goal rejected",
+            "reply-lost": "goal response lost",
+            "unanswered": "timed out",
+        }[goal_failure]
+        assert expected_error in events[0].message
+        if goal_failure == "refused":
+            assert "may have succeeded" not in events[0].message
+            assert events[0].remediation is None
         else:
-            events = [
-                event
-                async for event in executor.run_turn(
-                    [{"role": "user", "content": "/goal Finish the tests"}], [], ""
-                )
-            ]
-            assert [type(event) for event in events] == [ExecutorError]
-            assert events[0].undelivered is True
-            assert events[0].preserve_session is True
-            expected_error = {
-                "refused": "goal rejected",
-                "reply-lost": "goal response lost",
-                "unanswered": "timed out",
-            }[goal_failure]
-            assert expected_error in events[0].message
-            if goal_failure == "refused":
-                assert "may have succeeded" not in events[0].message
-                assert events[0].remediation is None
-            else:
-                assert "goal setup may have succeeded" in events[0].message
-                assert "objective input was not delivered" in events[0].message
-                assert events[0].remediation == (
-                    "Open Goal to inspect the current goal before resending this message."
-                )
+            assert "goal setup may have succeeded" in events[0].message
+            assert "objective input was not delivered" in events[0].message
+            assert events[0].remediation == (
+                "Open Goal to inspect the current goal before resending this message."
+            )
 
     assert _GoalFailingClient.requests == [
         ("thread/goal/set", {"threadId": "thread_123", "objective": "Finish the tests"})
@@ -1488,6 +1489,7 @@ def test_goal_draining_refusal_retains_restart_remediation(
 
     if live_injection:
         assert not asyncio.run(executor.enqueue_session_message("main", "/goal Finish tests"))
+        assert _GoalDrainingClient.requests == []
     [failure] = _collect_turn_events(executor, "/goal Finish tests")
 
     assert isinstance(failure, ExecutorError)
@@ -1497,7 +1499,7 @@ def test_goal_draining_refusal_retains_restart_remediation(
     assert failure.preserve_session is (active_turn_id is not None)
     assert _GoalDrainingClient.requests == [
         ("thread/goal/set", {"threadId": "thread_123", "objective": "Finish tests"})
-    ] * (2 if live_injection else 1)
+    ]
 
 
 @pytest.mark.parametrize(

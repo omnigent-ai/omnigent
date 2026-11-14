@@ -2833,14 +2833,18 @@ async def test_codex_adapter_routes_multiple_text_blocks(
             adapter._watch_injections(injection_ctx, executor)  # type: ignore[arg-type]
         )
         try:
-            await poll_until_async(lambda: injection_ctx.emitted, timeout_s=5)
+            await poll_until_async(lambda: injection_ctx.pulls >= 2, timeout_s=5)
         finally:
             watcher.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await watcher
-        assert len(injection_ctx.emitted) == 1
-        assert isinstance(injection_ctx.emitted[0], InjectionConsumedEvent)
-    else:
+        if goal_command:
+            assert injection_ctx.emitted == []
+            client.request.assert_not_awaited()
+        else:
+            assert len(injection_ctx.emitted) == 1
+            assert isinstance(injection_ctx.emitted[0], InjectionConsumedEvent)
+    if not live or goal_command:
         turn_ctx = TurnContext(
             response_id="response_blocks",
             event_queue=asyncio.Queue(),

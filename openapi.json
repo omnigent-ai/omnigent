@@ -19035,7 +19035,7 @@
         ]
       },
       "get": {
-        "description": "Read the current Codex app-server goal for a Codex-native session.\n\n**Returns:** Current Codex goal state, or `goal=None` when no goal is set.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 for non-Codex sessions, 404 for missing sessions, or 503 when no live Codex runner can read the goal.",
+        "description": "Read the current Codex app-server goal for a Codex-native session.\n\n**Returns:** Current Codex goal state, or `goal=None` when no goal is set. `X-Omnigent-Codex-Goal-Read: strict` opts into unavailable-read errors. Legacy callers keep the empty response for absent or idle runners. Strict reads return 503 when no live runner is available and 502 for malformed runner replies; structured runner errors preserve their status.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 for non-Codex sessions or 404 for missing sessions.",
         "operationId": "get_codex_goal_v1_sessions__session_id__codex_goal_get",
         "parameters": [
           {

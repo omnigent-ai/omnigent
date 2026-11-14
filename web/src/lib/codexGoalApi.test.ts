@@ -1,11 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  clearCodexGoal,
-  codexGoalApiErrorFromResponse,
-  getCodexGoal,
-  setCodexGoal,
-  updateCodexGoalStatus,
-} from "./codexGoalApi";
+import { clearCodexGoal, getCodexGoal, setCodexGoal, updateCodexGoalStatus } from "./codexGoalApi";
 import { authenticatedFetch } from "./identity";
 
 vi.mock("./identity", () => ({
@@ -62,10 +56,13 @@ describe("codex goal API", () => {
     });
   });
 
-  it("accepts an empty goal from an older server without a confirmation header", async () => {
+  it("returns goal: null when the server reports no goal", async () => {
     mockAuthenticatedFetch.mockResolvedValueOnce(mockJsonResponse({ goal: null }));
 
     await expect(getCodexGoal("conv")).resolves.toEqual({ goal: null });
+    expect(mockAuthenticatedFetch).toHaveBeenCalledWith("/v1/sessions/conv/codex_goal", {
+      headers: { "X-Omnigent-Codex-Goal-Read": "strict" },
+    });
   });
 
   it("sets, updates, and clears goals with the expected wire payloads", async () => {
@@ -98,29 +95,39 @@ describe("codex goal API", () => {
     );
   });
 
-  it("reads standard nested Omnigent error envelopes", async () => {
-    const err = await codexGoalApiErrorFromResponse(
+  it.each([502, 503])("rejects a strict goal read with nested status %s", async (status) => {
+    mockAuthenticatedFetch.mockResolvedValueOnce(
       mockJsonResponse(
         { error: { code: "codex_native_goal_failed", message: "runner is asleep" } },
-        { ok: false, status: 503, statusText: "Service Unavailable" },
+        { ok: false, status, statusText: "Runner Unavailable" },
       ),
     );
 
-    expect(err.status).toBe(503);
-    expect(err.code).toBe("codex_native_goal_failed");
-    expect(err.message).toBe("runner is asleep");
+    await expect(getCodexGoal("conv")).rejects.toMatchObject({
+      status,
+      code: "codex_native_goal_failed",
+      message: "runner is asleep",
+    });
+    expect(mockAuthenticatedFetch).toHaveBeenCalledWith("/v1/sessions/conv/codex_goal", {
+      headers: { "X-Omnigent-Codex-Goal-Read": "strict" },
+    });
   });
 
-  it("reads flat runner error envelopes preserved by the AP route", async () => {
-    const err = await codexGoalApiErrorFromResponse(
+  it.each([400, 409])("rejects a strict goal read with flat runner status %s", async (status) => {
+    mockAuthenticatedFetch.mockResolvedValueOnce(
       mockJsonResponse(
         { error: "invalid_input", detail: "harness mismatch" },
-        { ok: false, status: 400, statusText: "Bad Request" },
+        { ok: false, status, statusText: "Request Rejected" },
       ),
     );
 
-    expect(err.status).toBe(400);
-    expect(err.code).toBe("invalid_input");
-    expect(err.message).toBe("harness mismatch");
+    await expect(getCodexGoal("conv")).rejects.toMatchObject({
+      status,
+      code: "invalid_input",
+      message: "harness mismatch",
+    });
+    expect(mockAuthenticatedFetch).toHaveBeenCalledWith("/v1/sessions/conv/codex_goal", {
+      headers: { "X-Omnigent-Codex-Goal-Read": "strict" },
+    });
   });
 });

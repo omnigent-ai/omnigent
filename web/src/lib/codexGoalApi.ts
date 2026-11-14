@@ -1,6 +1,9 @@
 import { authenticatedFetch } from "./identity";
 import { ApiError } from "./sessionsApi";
 
+const CODEX_GOAL_READ_HEADER = "X-Omnigent-Codex-Goal-Read";
+const CODEX_GOAL_READ_STRICT = "strict";
+
 /**
  * Raw Codex app-server goal object forwarded by the AP route.
  * The route preserves Codex's snake_case field names and open-ended
@@ -147,10 +150,11 @@ function codexGoalResponseFromWire(wire: CodexGoalResponseWire): CodexGoalRespon
  *
  * @param sessionId - Session identifier, e.g. ``"conv_abc123"``.
  * @returns The current goal, or ``goal: null`` when Codex has none.
+ * @throws ApiError when the runner is unavailable or the server rejects the request.
  */
 export async function getCodexGoal(sessionId: string): Promise<CodexGoalResponse> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`, {
-    headers: { "X-Omnigent-Codex-Goal-Read": "strict" },
+    headers: { [CODEX_GOAL_READ_HEADER]: CODEX_GOAL_READ_STRICT },
   });
   return codexGoalResponseFromWire(await readJsonOrThrow<CodexGoalResponseWire>(res));
 }

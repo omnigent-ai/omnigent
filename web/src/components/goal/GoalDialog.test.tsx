@@ -418,7 +418,7 @@ describe("GoalDialog", () => {
     },
   );
 
-  it("keeps a displayed opening-read error when an older poll succeeds", async () => {
+  it("recovers an opening-read failure when an older pending poll succeeds", async () => {
     const oldPoll = deferred<{ goal: Goal | null }>();
     const openingRead = deferred<{ goal: Goal | null }>();
     mockGetGoal.mockReturnValueOnce(oldPoll.promise).mockReturnValueOnce(openingRead.promise);
@@ -431,9 +431,11 @@ describe("GoalDialog", () => {
     expect(screen.getByText("Could not read goal: current read unavailable")).toBeInTheDocument();
     await act(async () => oldPoll.resolve({ goal: ACTIVE_GOAL }));
 
-    expect(screen.getByText("Could not read goal: current read unavailable")).toBeInTheDocument();
-    expect(screen.getByTestId("goal-empty")).toBeInTheDocument();
-    expect(screen.getByTestId("goal-objective")).toHaveValue("");
+    expect(screen.queryByText(/Could not read goal/)).not.toBeInTheDocument();
+    expect(screen.getByTestId("goal-current")).toHaveTextContent(ACTIVE_GOAL.objective);
+    expect(screen.getByTestId("goal-objective")).toHaveValue(ACTIVE_GOAL.objective);
+    expect(screen.getByTestId("goal-token-budget")).toHaveValue(ACTIVE_GOAL.tokenBudget);
+    expect(screen.getByTestId("goal-save")).toBeEnabled();
   });
 
   it.each(goalReadResults)(
@@ -507,10 +509,17 @@ describe("GoalDialog", () => {
       await act(async () => newerRequest.resolve({ goal: newerGoal, cleared: true }));
       expect(screen.getByTestId("owner-goal")).toHaveTextContent(newerGoal.objective);
 
-      const newestGoal = { ...ACTIVE_GOAL, objective: "Newest accepted goal" };
+      const newestGoal = {
+        ...ACTIVE_GOAL,
+        objective: "Newest accepted goal",
+        tokenBudget: 999,
+        status: "paused",
+      };
       fireEvent.change(screen.getByTestId("goal-objective"), {
         target: { value: newestGoal.objective },
       });
+      fireEvent.change(screen.getByTestId("goal-token-budget"), { target: { value: "999" } });
+      fireEvent.click(screen.getByTestId("goal-mode-paused"));
       fireEvent.click(screen.getByTestId("goal-save"));
       const readCount = mockGetGoal.mock.calls.length;
       mockGetGoal.mockReturnValueOnce(refreshRead.promise);
@@ -519,6 +528,8 @@ describe("GoalDialog", () => {
       expect(mockGetGoal).toHaveBeenCalledTimes(readCount + 1);
       expect(screen.getByTestId("owner-goal")).toHaveTextContent(newerGoal.objective);
       expect(screen.getByTestId("goal-objective")).toHaveValue(newestGoal.objective);
+      expect(screen.getByTestId("goal-token-budget")).toHaveValue(999);
+      expect(screen.getByTestId("goal-mode-paused")).toHaveAttribute("aria-checked", "true");
       expect(screen.getByTestId("goal-save")).toBeDisabled();
 
       const serverGoal = { ...ACTIVE_GOAL, objective: "Current server goal" };
@@ -526,6 +537,8 @@ describe("GoalDialog", () => {
         await act(async () => refreshRead.resolve({ goal: serverGoal }));
         expect(screen.getByTestId("owner-goal")).toHaveTextContent(serverGoal.objective);
         expect(screen.getByTestId("goal-objective")).toHaveValue(newestGoal.objective);
+        expect(screen.getByTestId("goal-token-budget")).toHaveValue(999);
+        expect(screen.getByTestId("goal-mode-paused")).toHaveAttribute("aria-checked", "true");
         expect(screen.getByTestId("goal-save")).toBeDisabled();
         await act(async () => newestRequest.resolve({ goal: newestGoal, cleared: true }));
       } else {
@@ -535,6 +548,8 @@ describe("GoalDialog", () => {
 
       expect(screen.getByTestId("owner-goal")).toHaveTextContent(newestGoal.objective);
       expect(screen.getByTestId("goal-objective")).toHaveValue(newestGoal.objective);
+      expect(screen.getByTestId("goal-token-budget")).toHaveValue(999);
+      expect(screen.getByTestId("goal-mode-paused")).toHaveAttribute("aria-checked", "true");
       expect(screen.getByTestId("goal-save")).toBeEnabled();
     },
   );
@@ -598,53 +613,54 @@ describe("GoalDialog", () => {
     );
   });
 
+  describe("pending successful operations across a session switch", () => {
+    it.each(mutations)(
+      "ignores an old $action response without erasing current drafts",
+      async ({ action, button }) => {
+        const pending = deferred<{ goal: Goal | null; cleared: boolean }>();
+        queueGoalMutations(action, pending.promise);
+        const { props, rerender } = renderDialog();
+        await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
+        fireEvent.click(screen.getByTestId(button));
+        expect(screen.getByTestId("goal-save")).toBeDisabled();
+
+        const nextGoal = { ...ACTIVE_GOAL, objective: "Current goal", tokenBudget: 777 };
+        const nextProps = {
+          ...props,
+          conversationId: "conv_other",
+          goal: nextGoal,
+        };
+        mockRefreshGoal.mockResolvedValueOnce(undefined);
+        rerender(<GoalDialog {...nextProps} />);
+        await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
+        fireEvent.change(screen.getByTestId("goal-objective"), {
+          target: { value: "Current unsaved objective" },
+        });
+        fireEvent.change(screen.getByTestId("goal-token-budget"), { target: { value: "999" } });
+        fireEvent.click(screen.getByTestId("goal-mode-paused"));
+        await act(async () =>
+          pending.resolve({ goal: { ...ACTIVE_GOAL, status: "paused" }, cleared: true }),
+        );
+
+        rerender(
+          <GoalDialog
+            {...nextProps}
+            goal={{ ...nextGoal, objective: "Background update", tokenBudget: 888 }}
+          />,
+        );
+
+        expect(screen.getByTestId("goal-save")).toBeEnabled();
+        expect(screen.getByTestId("goal-objective")).toHaveValue("Current unsaved objective");
+        expect(screen.getByTestId("goal-token-budget")).toHaveValue(999);
+        expect(screen.getByTestId("goal-mode-paused")).toHaveAttribute("aria-checked", "true");
+        expect(props.onGoalChange).not.toHaveBeenCalled();
+      },
+    );
+  });
+
   describe.each(["session switch", "reopen"] as const)(
     "pending operations across %s",
     (boundary) => {
-      it.each(mutations)(
-        "ignores an old $action response without erasing current drafts",
-        async ({ action, button }) => {
-          const pending = deferred<{ goal: Goal | null; cleared: boolean }>();
-          queueGoalMutations(action, pending.promise);
-          const { props, rerender } = renderDialog();
-          await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
-          fireEvent.click(screen.getByTestId(button));
-          expect(screen.getByTestId("goal-save")).toBeDisabled();
-
-          const nextGoal = { ...ACTIVE_GOAL, objective: "Current goal", tokenBudget: 777 };
-          const nextProps = {
-            ...props,
-            conversationId: boundary === "reopen" ? props.conversationId : "conv_other",
-            goal: nextGoal,
-          };
-          mockRefreshGoal.mockResolvedValueOnce(undefined);
-          if (boundary === "reopen") rerender(<GoalDialog {...props} open={false} />);
-          rerender(<GoalDialog {...nextProps} />);
-          await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
-          fireEvent.change(screen.getByTestId("goal-objective"), {
-            target: { value: "Current unsaved objective" },
-          });
-          fireEvent.change(screen.getByTestId("goal-token-budget"), { target: { value: "999" } });
-          fireEvent.click(screen.getByTestId("goal-mode-paused"));
-          await act(async () =>
-            pending.resolve({ goal: { ...ACTIVE_GOAL, status: "paused" }, cleared: true }),
-          );
-
-          rerender(
-            <GoalDialog
-              {...nextProps}
-              goal={{ ...nextGoal, objective: "Background update", tokenBudget: 888 }}
-            />,
-          );
-
-          expect(screen.getByTestId("goal-save")).toBeEnabled();
-          expect(screen.getByTestId("goal-objective")).toHaveValue("Current unsaved objective");
-          expect(screen.getByTestId("goal-token-budget")).toHaveValue(999);
-          expect(screen.getByTestId("goal-mode-paused")).toHaveAttribute("aria-checked", "true");
-          expect(props.onGoalChange).not.toHaveBeenCalled();
-        },
-      );
-
       it.each(mutations)(
         "ignores an old $action error and leaves a newer operation busy",
         async ({ action, button }) => {

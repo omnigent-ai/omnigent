@@ -174,34 +174,49 @@ describe("useGoalState", () => {
     },
   );
 
-  it("publishes an accepted read even when another refresh starts before React commits", async () => {
-    const accepted = deferredGoalRead();
-    const pending = deferredGoalRead();
-    mockGetGoal
-      .mockResolvedValueOnce({ goal: GOAL })
-      .mockReturnValueOnce(accepted.promise)
-      .mockReturnValueOnce(pending.promise);
-    const { result, unmount } = renderHook(() => useGoalState("conv", true));
-    await act(async () => {});
-    const paused = { ...GOAL, status: "paused" as const };
-    let pendingRefresh!: Promise<void>;
+  it.each([
+    { newest: "dialog refresh", ordering: "before the response" },
+    { newest: "dialog refresh", ordering: "after the response" },
+    { newest: "poll", ordering: "before the response" },
+    { newest: "poll", ordering: "after the response" },
+  ])(
+    "publishes a successful read when a newer $newest starts $ordering",
+    async ({ newest, ordering }) => {
+      vi.useFakeTimers();
+      const accepted = deferredGoalRead();
+      const pending = deferredGoalRead();
+      mockGetGoal
+        .mockResolvedValueOnce({ goal: null })
+        .mockReturnValueOnce(accepted.promise)
+        .mockReturnValueOnce(pending.promise);
+      const { result, unmount } = renderHook(() => useGoalState("conv", true));
+      await act(async () => {});
+      const paused = { ...GOAL, status: "paused" as const };
+      let pendingRefresh: Promise<void> | undefined;
+      const startNewer = () => {
+        if (newest === "poll") window.dispatchEvent(new Event("focus"));
+        else pendingRefresh = result.current.refreshGoal();
+      };
 
-    await act(async () => {
-      result.current.setGoal(GOAL);
-      const acceptedRefresh = result.current.refreshGoal();
-      accepted.resolve({ goal: paused });
-      await acceptedRefresh;
-      pendingRefresh = result.current.refreshGoal();
-    });
+      await act(async () => {
+        result.current.setGoal(null);
+        const acceptedRefresh = result.current.refreshGoal();
+        if (ordering === "before the response") startNewer();
+        accepted.resolve({ goal: paused });
+        await acceptedRefresh;
+        if (ordering === "after the response") startNewer();
+      });
 
-    expect(result.current.goal).toEqual(paused);
-    await act(async () => {
-      pending.reject(new Error("newer read failed"));
-      await expect(pendingRefresh).rejects.toThrow("newer read failed");
-    });
-    expect(result.current.goal).toEqual(paused);
-    unmount();
-  });
+      expect(mockGetGoal).toHaveBeenCalledTimes(3);
+      expect(result.current.goal).toEqual(paused);
+      await act(async () => {
+        pending.reject(new Error("newer read failed"));
+        if (pendingRefresh) await expect(pendingRefresh).rejects.toThrow("newer read failed");
+      });
+      expect(result.current.goal).toEqual(paused);
+      unmount();
+    },
+  );
 
   it.each(["dialog refresh", "poll", "dialog update"])(
     "ignores an old explicit read error after a newer %s succeeds",

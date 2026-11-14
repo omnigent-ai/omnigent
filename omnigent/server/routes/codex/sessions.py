@@ -492,6 +492,8 @@ def register_codex_session_routes(
             set.
         ``X-Omnigent-Codex-Goal-Read: strict`` opts into unavailable-read errors.
         Legacy callers keep the empty response for absent or idle runners.
+        Strict reads return 503 when no live runner is available and 502 for
+        malformed runner replies; structured runner errors preserve their status.
 
         :raises OmnigentError: 400 for non-Codex sessions or 404 for missing sessions.
         """

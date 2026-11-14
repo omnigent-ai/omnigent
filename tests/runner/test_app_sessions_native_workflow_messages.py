@@ -754,34 +754,10 @@ async def test_refused_steer_is_delivered_as_fresh_continuation_turn() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "buffered_texts",
-    [
-        pytest.param(("2", "3", "4"), id="plain-text"),
-        pytest.param(("/goal Finish the tests", "3", "4"), id="goal-command"),
-    ],
-)
 async def test_native_buffered_messages_each_delivered_once_in_order(
-    monkeypatch: pytest.MonkeyPatch, buffered_texts: tuple[str, ...]
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Native sessions deliver every buffered message once, in order.
-
-    Repro for the observed ``1 2 4 4 5 6 7 8 9 0`` corruption. claude-native
-    turns are instant and ``run_turn`` types only the *latest* user message,
-    so the runner's LLM-oriented machinery mis-delivers for native sessions:
-    the collapse-batch continuation (``next_body = all_bodies[-1]``) types
-    only the last buffered message (dropping the rest), and the mid-turn
-    forward races the instant turn's teardown (duplicating).
-
-    The native path (RUNNER_MESSAGE_INGEST.md Part C) instead skips the
-    forward and drains the buffer ONE message at a time, so each buffered
-    message gets its own continuation turn — typed exactly once, in order.
-
-    This test buffers three messages behind a blocked first turn and asserts:
-    (a) no mid-turn forward POSTs happen (native skips them), and
-    (b) the continuation starts a turn per buffered message carrying its latest
-    user text, in order, including a queued goal command.
-    """
+    """Buffers messages behind an active native turn and delivers each once, in order."""
     import asyncio as _aio
 
     def _skip_tools_changed_notification(*args: object, **kwargs: object) -> None:
@@ -802,6 +778,7 @@ async def test_native_buffered_messages_each_delivered_once_in_order(
 
     gate = _aio.Event()
     app, _pm, hc = _build_native_app(gate)
+    buffered_texts = ("2", "3", "4")
 
     async def _post(text: str) -> httpx.Response:
         """POST one user message carrying an agent_id (drives spec resolve)."""

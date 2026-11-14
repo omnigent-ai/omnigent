@@ -1010,15 +1010,10 @@ class CodexNativeExecutor(Executor):
         :returns: ``True`` when Codex accepted the steering message.
         """
         del session_key
-        goal_objective = goal_objective_from_content(content)
-        if goal_objective is not None and goal_objective_length_error(goal_objective) is not None:
-            # Keep the input buffered so run_turn can return the validation error.
+        if goal_objective_from_content(content) is not None:
+            # Keep goal setup in run_turn so a refused live message cannot replay it.
             return False
-        input_items: list[dict[str, object]] = (
-            [{"type": "text", "text": goal_objective}]
-            if goal_objective is not None
-            else _content_to_input_items(content, self._bridge_dir)
-        )
+        input_items = _content_to_input_items(content, self._bridge_dir)
         if not input_items:
             return False
         # Serialized against run_turn so the read-decide-RPC-write below
@@ -1042,10 +1037,6 @@ class CodexNativeExecutor(Executor):
                         client, bridge_dir=self._bridge_dir, state=state, command=shell_command
                     )
                 else:
-                    if goal_objective is not None:
-                        await _set_codex_goal(
-                            client, thread_id=state.thread_id, objective=goal_objective
-                        )
                     await _inject_codex_turn(
                         client,
                         bridge_dir=self._bridge_dir,

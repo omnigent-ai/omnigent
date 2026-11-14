@@ -54,7 +54,8 @@ export function useGoalState(conversationId: string | null, enabled: boolean): U
       throw new Error("Goal is unavailable for this session.");
     }
     const version = ++updateVersion.current;
-    const isCurrent = () => activeBinding.current === binding && version === updateVersion.current;
+    const isCurrent = () =>
+      activeBinding.current === binding && version > lastSuccessfulVersion.current;
     try {
       const response = await getGoal(binding.conversationId);
       if (isCurrent()) {
