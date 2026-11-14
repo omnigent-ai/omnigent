@@ -232,6 +232,8 @@ describe("excelSerialToText", () => {
     [2958465, true, "2958465"],
     // Times round to the nearest second, as Excel shows them.
     [0.4166666, false, "10:00:00"],
+    // The 1904 system's day zero is a real date, so a time on it keeps the date.
+    [0.5, true, "1904-01-01 12:00:00"],
     // The day is the rounded time's, on either side of the phantom leap day.
     [59.999999, false, "1900-02-29 00:00:00"],
     [60.999999, false, "1900-03-01 00:00:00"],

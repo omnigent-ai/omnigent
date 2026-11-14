@@ -17,14 +17,20 @@ type LoadState =
 
 const isParquet = (path: string) => path.toLowerCase().endsWith(".parquet");
 
-async function readSpreadsheet(content: string, path: string): Promise<WorkbookSheet[]> {
-  const bytes = decodeBase64(content);
+async function readSpreadsheet(
+  content: string,
+  encoding: "utf-8" | "base64",
+  path: string,
+): Promise<WorkbookSheet[]> {
+  // A file whose bytes happen to be valid UTF-8 can arrive as text, not base64.
+  const bytes = encoding === "base64" ? decodeBase64(content) : new TextEncoder().encode(content);
   if (isParquet(path)) return [{ name: "Parquet", table: await readParquet(bytes) }];
   return readWorkbook(bytes);
 }
 
 export function SpreadsheetPreview({
   content,
+  encoding,
   path,
   truncated,
   rootRef,
@@ -33,6 +39,8 @@ export function SpreadsheetPreview({
 }: {
   /** The file's bytes, base64-encoded as the server sends a binary file. */
   content: string;
+  /** How the server sent *content*: base64, or UTF-8 text when the bytes allowed it. */
+  encoding: "utf-8" | "base64";
   path: string;
   /** The server sent only the start of the file. */
   truncated: boolean;
@@ -58,7 +66,7 @@ export function SpreadsheetPreview({
     }
     let current = true;
     setState({ status: "loading" });
-    readSpreadsheet(content, path).then(
+    readSpreadsheet(content, encoding, path).then(
       (sheets) => {
         if (!current) return;
         setActive(0);
@@ -78,7 +86,7 @@ export function SpreadsheetPreview({
     return () => {
       current = false;
     };
-  }, [content, path, truncated]);
+  }, [content, encoding, path, truncated]);
 
   if (state.status === "loading") {
     return <div className="p-8 text-ui text-muted-foreground">Reading the file…</div>;
