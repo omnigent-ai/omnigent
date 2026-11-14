@@ -25,6 +25,7 @@ from omnigent.server.routes._sessions import common
 from omnigent.server.routes.sessions import routes_events
 from omnigent.server.schemas import BackgroundTaskInfo, ErrorDetail
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests.debug_log_helpers import capture_debug_rows
@@ -77,8 +78,10 @@ async def status_route(
         common._session_active_response_cache[conv.id] = "resp_active"
         common._session_background_task_count_cache[conv.id] = 2
         common._session_background_tasks_cache[conv.id] = [_BACKGROUND_TASK]
+        run_id = uuid4().hex
+        store.set_labels(conv.id, {SCHEDULED_TASK_RUN_LABEL_KEY: run_id})
         scheduled.create_run(
-            run_id=uuid4().hex,
+            run_id=run_id,
             scheduled_task_id=task_id,
             status="running",
             scheduled_at=1000,
