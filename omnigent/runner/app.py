@@ -9200,6 +9200,7 @@ def create_runner_app(
             _tmux_last_client_input_at,
             _tmux_window_activity_at,
         )
+        from omnigent.runner.slow_io import run_slow_io
         from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
         from omnigent.terminals.pane_reaper import (
             PANE_OUTPUT_BUSY_WINDOW_S,
@@ -9270,14 +9271,28 @@ def create_runner_app(
 
         async def _native_pane_is_busy(pane: PaneRef) -> bool:
             conv_id = pane.conversation_id
-            if conv_id in _active_turns or (
-                process_manager is not None and process_manager.has_active_turn(conv_id)
-            ):
+            epoch = _turn_bind_epoch.get(conv_id)
+
+            def work_or_owner_changed() -> bool:
+                return (
+                    conv_id in _active_turns
+                    or (process_manager is not None and process_manager.has_active_turn(conv_id))
+                    or _turn_bind_epoch.get(conv_id) != epoch
+                    or (
+                        pane.instance is not None
+                        and _pane_reaper_registry.get(conv_id, pane.terminal_name, "main")
+                        is not pane.instance
+                    )
+                )
+
+            if work_or_owner_changed():
                 return True
             # A pane parked on a permission prompt emits nothing and reports no
             # active turn, so every signal above reads idle. Reaping it kills the
             # prompt and strands its approval card unanswerable.
-            if approval_wait_is_fresh(conv_id):
+            if await run_slow_io(approval_wait_is_fresh, conv_id):
+                return True
+            if work_or_owner_changed():
                 return True
             # A settled turn's background agent still works in this pane.
             if resource_registry.session_has_background_agents(conv_id):
@@ -9314,9 +9329,11 @@ def create_runner_app(
                 )
             if screen_changed:
                 return True
-            if _native_pane_status.get(conv_id) == "running":
-                return await _server_confirms_turn_in_flight(conv_id)
-            return False
+            if _native_pane_status.get(
+                conv_id
+            ) == "running" and await _server_confirms_turn_in_flight(conv_id):
+                return True
+            return work_or_owner_changed()
 
         async def _reap_native_pane(pane: PaneRef) -> None:
             conv_id = pane.conversation_id
