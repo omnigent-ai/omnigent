@@ -34,6 +34,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.host_store import HostStore
+from tests.budgets import budget
 from tests.server.helpers import create_test_session
 
 pytestmark = pytest.mark.asyncio
@@ -181,33 +182,32 @@ async def test_archive_does_not_block_on_slow_stop(
     session = await create_test_session(client, name="archive-slow-stop")
     session_id = session["id"]
 
+    started = asyncio.Event()
     release = asyncio.Event()
     stopped: list[str] = []
 
     async def _parked_stop(sid: str, *_args: object) -> None:
         stopped.append(sid)
+        started.set()
         await release.wait()
 
     _sessions_common._session_status_cache[session_id] = "running"
     try:
         with patch.object(_sessions_facade, "_best_effort_stop", _parked_stop):
-            # Would exhaust the timeout here if the handler awaited the
-            # stop inline (the fake stop parks until released below).
-            resp = await asyncio.wait_for(
-                client.patch(f"/v1/sessions/{session_id}", json={"archived": True}),
-                timeout=5.0,
-            )
-            assert resp.status_code == 200
-            assert resp.json()["archived"] is True
-            # The detached task starts on a subsequent loop pass and parks
-            # on the release gate — the stop still runs.
-            for _ in range(100):
-                if stopped:
-                    break
-                await asyncio.sleep(0)
-            assert stopped == [session_id]
-            release.set()
-            await _drain_detached_stops()
+            try:
+                # An inline stop would park until the request times out.
+                resp = await asyncio.wait_for(
+                    client.patch(f"/v1/sessions/{session_id}", json={"archived": True}),
+                    timeout=budget(5.0),
+                )
+                assert resp.status_code == 200
+                assert resp.json()["archived"] is True
+                # The stop first waits on a persisted-row lookup in a worker thread.
+                await asyncio.wait_for(started.wait(), timeout=budget(5.0))
+                assert stopped == [session_id]
+            finally:
+                release.set()
+                await _drain_detached_stops()
     finally:
         _sessions_common._session_status_cache.pop(session_id, None)
 
