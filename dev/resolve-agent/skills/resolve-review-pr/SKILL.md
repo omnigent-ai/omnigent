@@ -43,8 +43,10 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
    The test result determines the verdict separately; the footage must
    show the product journey and its visible outcome, never the test runner. When
    the handoff *does* carry a before clip, carry it
-   through **and** produce the after; when it carries none, still produce the
-   after and note the missing before. Only omit the after clip when it is
+   through **and** produce the after. Restate its caption as the observed
+   symptom only after inspecting the frames that show it; otherwise attribute it
+   to Repro and say you did not check them. When it carries none, still produce
+   the after and note the missing before. Only omit the after clip when it is
    genuinely unobtainable (recorder tooling missing, or the fixture can't come
    online after the SPA build **and** the leaked runner env is stripped) — say so
    explicitly in your review comment and in `evidence`, naming the blocker. An
