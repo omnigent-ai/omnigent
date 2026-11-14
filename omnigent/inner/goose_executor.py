@@ -62,6 +62,13 @@ from omnigent.inner.executor import (
 )
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
 
+from .sandbox import (
+    HarnessSandboxPreparationError,
+    HarnessSandboxValidationError,
+    harness_sandbox_preparation,
+    validate_harness_sandbox,
+)
+
 logger = logging.getLogger(__name__)
 
 # Goose speaks the extensible ACP JSON-RPC schema; consumers narrow fields
@@ -354,17 +361,18 @@ class GooseExecutor(Executor):
         Mirrors :meth:`QwenExecutor._sandbox_launch_path`. When
         ``os_env.sandbox`` requests confinement, wraps the goose binary in the
         platform sandbox so the *entire* goose process tree (its builtin shell /
-        editor tools) runs confined to the spec's read/write roots. Falls back to
-        the bare binary (never blocks startup) when no sandbox is requested or the
-        backend is unavailable.
+        editor tools) runs confined to the spec's read/write roots. Requested
+        sandbox failures prevent startup.
         """
         os_env = self._os_env
         if os_env is None:
             return self._goose_path
-        sandbox_spec = os_env.sandbox or OSEnvSandboxSpec()
-        if sandbox_spec.type == "none":
-            return self._goose_path
-        try:
+        with harness_sandbox_preparation():
+            cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
+            validate_harness_sandbox(os_env, "Goose", cwd=cwd)
+            sandbox_spec = os_env.sandbox or OSEnvSandboxSpec()
+            if sandbox_spec.type == "none":
+                return self._goose_path
             from .sandbox import (
                 create_exec_launcher,
                 resolve_sandbox,
@@ -373,10 +381,9 @@ class GooseExecutor(Executor):
                 with_spawn_env_allowlist,
             )
 
-            cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
             sandbox = resolve_sandbox(os_env, cwd)
             if not sandbox.active:
-                return self._goose_path
+                raise OSError("Goose requires an active sandbox for the requested policy")
             # goose must read its own install tree and write its config/state
             # dirs (~/.config/goose, ~/.local/share/goose), or it can't
             # start inside the jail.
@@ -392,10 +399,7 @@ class GooseExecutor(Executor):
             )
             sandbox = with_additional_read_roots(sandbox, [Path.home() / ".config" / "goose"])
             sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
-            return create_exec_launcher(self._goose_path, sandbox)
-        except (OSError, ImportError, NotImplementedError) as exc:
-            logger.warning("Could not apply sandbox for goose; running unsandboxed: %s", exc)
-            return self._goose_path
+            return create_exec_launcher(self._goose_path, sandbox, cwd=str(cwd))
 
     async def _read_stderr(self) -> None:
         """Continuously drain goose stderr, logging each line at debug.
@@ -1110,6 +1114,8 @@ class GooseExecutor(Executor):
                 await self._start_process()
             await self._ensure_initialized()
             session_id = await self._ensure_session()
+        except (HarnessSandboxPreparationError, HarnessSandboxValidationError):
+            raise
         except Exception as exc:  # noqa: BLE001
             yield ExecutorError(message=describe_exception(exc), retryable=False)
             return

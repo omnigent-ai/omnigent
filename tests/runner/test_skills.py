@@ -12,7 +12,7 @@ import pytest
 
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import ResolvedSpec
-from omnigent.spec.types import SkillSpec
+from omnigent.spec.types import AgentSpec, ExecutorSpec, SkillSpec
 
 
 @pytest.fixture(autouse=True)
@@ -35,43 +35,6 @@ def _skill_md(name: str, description: str) -> str:
     :returns: SKILL.md file contents.
     """
     return f"---\nname: {name}\ndescription: {description}\n---\n\nbody for {name}\n"
-
-
-class _ExecutorStub:
-    """Minimal ``ExecutorSpec`` stand-in exposing ``harness_kind``."""
-
-    def __init__(self, harness: str) -> None:
-        """:param harness: The session's harness, e.g. ``"claude-sdk"``."""
-        self.harness_kind = harness
-
-
-class _SpecStub:
-    """
-    Minimal stand-in for an ``AgentSpec`` exposing only what skill
-    discovery reads: the bundled ``skills`` list, ``skills_filter``, and
-    ``executor.harness_kind`` (so the runner can dispatch to the right
-    per-harness skill source).
-
-    :param skills: Bundled skills the agent ships.
-    :param skills_filter: Host-skill filter (``"all"`` / ``"none"`` /
-        list of names).
-    :param harness: The session's harness; defaults to ``"claude-sdk"``.
-    """
-
-    def __init__(
-        self,
-        skills: list[SkillSpec],
-        skills_filter: str | list[str],
-        harness: str = "claude-sdk",
-    ) -> None:
-        """
-        :param skills: Bundled skills the agent ships.
-        :param skills_filter: Host-skill filter from the agent spec.
-        :param harness: Harness id driving per-harness skill discovery.
-        """
-        self.skills = skills
-        self.skills_filter = skills_filter
-        self.executor = _ExecutorStub(harness)
 
 
 class _ServerClient:
@@ -129,21 +92,27 @@ def _make_app(
     harness: str = "claude-sdk",
 ):  # type: ignore[no-untyped-def]
     """
-    Build a runner app whose spec resolver returns a stub spec.
+    Build a runner app whose spec resolver returns a bundled spec.
 
     :param bundle_dir: Materialized bundle workdir (carried on the
         resolved spec entry; no longer the host-skill discovery root).
-    :param bundled: Bundled skills the stub spec exposes.
-    :param skills_filter: Host-skill filter for the stub spec.
+    :param bundled: Bundled skills the spec exposes.
+    :param skills_filter: Host-skill filter for the spec.
     :param workspace: Session workspace the fake server reports — the
         host-skill discovery root. ``None`` omits it.
     :param resolver_calls: Optional list appended to on each
         ``spec_resolver`` invocation, for asserting cache behavior.
-    :param harness: The stub spec's harness, driving per-harness skill
+    :param harness: The spec's harness, driving per-harness skill
         discovery. Defaults to ``"claude-sdk"`` (today's behavior).
     :returns: The configured FastAPI app.
     """
-    spec = _SpecStub(bundled, skills_filter, harness=harness)
+    spec = AgentSpec(
+        spec_version=1,
+        name="skills-test",
+        skills=bundled,
+        skills_filter=skills_filter,
+        executor=ExecutorSpec(config={"harness": harness}),
+    )
     entry = ResolvedSpec(spec=spec, workdir=bundle_dir)
 
     async def _spec_resolver(agent_id: str, session_id: str | None) -> Any:

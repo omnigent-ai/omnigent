@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import NoReturn
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -3396,7 +3396,8 @@ async def test_terminal_desktop_session_follows_sandbox_policy(
         "asyncio",
         SimpleNamespace(create_subprocess_exec=spawn, subprocess=terminal_mod.asyncio.subprocess),
     )
-    monkeypatch.setattr(terminal_mod, "create_exec_launcher", lambda *_: "/test/launcher")
+    launcher = Mock(return_value="/test/launcher")
+    monkeypatch.setattr(terminal_mod, "create_exec_launcher", launcher)
     instance = TerminalInstance(
         name="bash",
         session_key="test-keyring",
@@ -3419,6 +3420,7 @@ async def test_terminal_desktop_session_follows_sandbox_policy(
     spawn.assert_awaited_once()
     env = spawn.call_args.kwargs["env"]
     if sandbox_active:
+        assert launcher.call_args.kwargs["cwd"] == str(tmp_path)
         assert session_env.keys().isdisjoint(env)
     else:
         assert {name: env[name] for name in session_env} == session_env

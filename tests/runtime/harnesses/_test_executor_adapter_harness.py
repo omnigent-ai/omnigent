@@ -12,6 +12,7 @@ Four scripts:
   with a result, then a TurnComplete (no further text).
 - ``"error"``: an ExecutorError event.
 - ``"cancelled"``: a TurnCancelled event.
+- ``"sandbox_policy"``: validate the transported policy before a scripted text turn.
 - ``"capture_messages"``: writes the received messages list as
   JSON to the path in ``MOCK_EXECUTOR_CAPTURE_PATH``, then
   emits a TurnComplete. Used to verify the full AP→harness→
@@ -36,6 +37,7 @@ from omnigent.inner.executor import (
     ExecutorEvent,
     Message,
     MockExecutor,
+    TextChunk,
     ToolCallComplete,
     ToolCallRequest,
     ToolCallStatus,
@@ -44,6 +46,8 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.model_auth import ProviderAuthRequired
+from omnigent.inner.os_env_serialization import resolve_harness_os_env
+from omnigent.inner.sandbox import validate_harness_sandbox
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
 _SCRIPT_ENV_VAR = "MOCK_EXECUTOR_SCRIPT"
@@ -253,7 +257,18 @@ def _build_provider_auth_failure() -> Executor:
     return _ProviderAuthFailureExecutor()
 
 
+def _build_sandbox_policy() -> Executor:
+    """Validate the transported worker policy before allocating a mock executor."""
+    validate_harness_sandbox(resolve_harness_os_env("HARNESS_CLAUDE_SDK_OS_ENV"), "Test")
+    executor = MockExecutor()
+    executor.enqueue_events(
+        [TextChunk(text="policy retry completed"), TurnComplete(response=None)]
+    )
+    return executor
+
+
 _SCRIPTS: dict[str, Callable[[], Executor]] = {
+    "sandbox_policy": _build_sandbox_policy,
     "pr_tracking": _build_pr_tracking,
     "text_only": _build_text_only,
     "tool_call": _build_tool_call,

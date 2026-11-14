@@ -13,11 +13,14 @@ import httpx
 
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.entities.scheduled_task import ScheduledRunLogContext
+from omnigent.errors import OmnigentError
 from omnigent.inner.native_attachments import (
     framework_notice_block,
     has_unresolved_file_id,
     resolve_file_id_block,
 )
+from omnigent.inner.sandbox import HarnessSandboxValidationError
+from omnigent.models.model_resolver import ModelResolutionError
 from omnigent.process_logging import process_log_reference
 from omnigent.runner.native import ResolvedSpec
 from omnigent.spec.types import AgentSpec
@@ -54,14 +57,14 @@ def _shared_scheduled_run(
 
 def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
     """
-    Log *exc* in full and return a generic detail string safe for clients.
+    Log *exc* in full and return a detail string safe for clients.
 
     Raw exception text (``str(exc)``) can embed absolute paths, internal
     hostnames, PIDs, and other server-side state. The runner is reached via
     the AP server proxy and its error bodies are relayed to the caller, so
     the cause is logged here for operators while the HTTP response carries
-    only this fixed string. The structured ``error`` code that accompanies
-    the detail already names the failure category for the caller.
+    only fixed guidance for recognized errors. The structured ``error`` code
+    that accompanies the detail already names the failure category for the caller.
 
     The runner's own log path is named so the reader can go read the cause
     instead of hunting for it; it is home-relative (``~/…``) so it points
@@ -83,7 +86,17 @@ def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
         extra={"session_id": runner_primary_session_id()},
     )
     log_reference = process_log_reference("runner")
-    return f"Request failed on the runner; see the runner log for details: {log_reference}"
+    detail = f"Request failed on the runner; see the runner log for details: {log_reference}"
+    policy_error = exc.__cause__ if isinstance(exc, OmnigentError) else exc
+    if isinstance(policy_error, HarnessSandboxValidationError):
+        return f"{policy_error.client_message} {detail}"
+    if isinstance(exc, OmnigentError) and isinstance(policy_error, ModelResolutionError):
+        return (
+            "No default model could be resolved. Set 'executor.model' in the agent YAML "
+            "or a provider 'models.default', or retry when model discovery is available. "
+            f"{detail}"
+        )
+    return detail
 
 
 _SpecEntry: TypeAlias = AgentSpec | ResolvedSpec

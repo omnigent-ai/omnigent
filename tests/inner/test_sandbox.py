@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import dataclasses
@@ -19,9 +20,12 @@ import pytest
 
 from omnigent.inner.sandbox import (
     HOST_SANDBOX_BACKEND_ENV,
+    HarnessSandboxPreparationError,
+    HarnessSandboxValidationError,
     SandboxPolicy,
     _launcher_inline_source,
     create_exec_launcher,
+    harness_sandbox_preparation,
     run_launcher,
 )
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
@@ -686,3 +690,177 @@ def test_exec_launcher_rejects_an_unnameable_interpreter(monkeypatch) -> None:
     monkeypatch.setattr(sys, "executable", "")
     with pytest.raises(OSError, match=re.escape("sys.executable is empty")):
         create_exec_launcher("/bin/true", _noop_policy())
+
+
+@pytest.mark.parametrize("backend_type", ["linux_bwrap", "darwin_seatbelt"])
+def test_run_launcher_rejects_noop_spawn_wrap(
+    backend_type: str, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    from omnigent.inner import sandbox
+
+    policy = dataclasses.replace(_noop_policy(), active=True, backend_type=backend_type)
+    backend = mock.Mock()
+    backend.prepare_launcher_policy.side_effect = lambda policy: policy
+    backend.wrap_launcher_argv.side_effect = lambda argv, *args, **kwargs: argv
+    monkeypatch.setattr(sandbox, "get_backend", lambda name: backend)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(sandbox, "create_private_tmpdir", lambda: scratch)
+    monkeypatch.setattr(os, "environ", {"PATH": os.defpath})
+    with (
+        mock.patch.object(os, "execvp") as execute,
+        mock.patch.object(sandbox, "activate_sandbox") as activate,
+        pytest.raises(OSError, match="did not wrap"),
+    ):
+        sandbox.run_launcher(
+            sandbox._encode_json_arg(policy.to_jsonable()), sys.executable, ["-c", "pass"]
+        )
+    execute.assert_not_called()
+    activate.assert_not_called()
+    assert not scratch.exists()
+
+
+@pytest.mark.parametrize("feature", ["type", "fork", "start_in_scratch", "git_ssh"])
+def test_harness_policy_validation_rejects_unsupported_features(feature: str) -> None:
+    from omnigent.inner.datamodel import GitSshBinding, OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.sandbox import validate_harness_sandbox
+
+    policy = OSEnvSandboxSpec(type="linux_bwrap")
+    spec = OSEnvSpec(sandbox=policy)
+    if feature == "type":
+        spec.type = "container"
+    elif feature == "git_ssh":
+        policy.git_ssh = [
+            GitSshBinding(
+                host="git.example.test",
+                port=22,
+                username="git",
+                repository="org/repo.git",
+                operations=frozenset({"fetch"}),
+                identity_file="/keys/id",
+                known_hosts_file="/keys/known_hosts",
+            )
+        ]
+    else:
+        setattr(spec, feature, True)
+    with pytest.raises(ValueError, match=feature):
+        validate_harness_sandbox(spec, "Example")
+
+
+@pytest.mark.parametrize(
+    "declaration,conflicts",
+    [
+        (".", False),
+        ("./sub", False),
+        ("sub", False),
+        ("parent", False),
+        ("outside", True),
+        ("prefix", True),
+    ],
+)
+def test_harness_policy_validation_resolves_relative_cwd(
+    declaration: str, conflicts: bool, tmp_path: pathlib.Path
+) -> None:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.sandbox import validate_harness_sandbox
+
+    workspace = tmp_path / "workspace" / "project"
+    declared_cwd = {
+        "parent": str(workspace.parent),
+        "outside": str(tmp_path / "other"),
+        "prefix": str(workspace.parent / "pro"),
+    }.get(declaration, declaration)
+    spec = OSEnvSpec(cwd=declared_cwd, sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
+    if conflicts:
+        with pytest.raises(ValueError, match=r"working directory conflicts with os_env\.cwd"):
+            validate_harness_sandbox(spec, "Example", cwd=workspace)
+    else:
+        validate_harness_sandbox(spec, "Example", cwd=workspace)
+
+
+@pytest.mark.parametrize(
+    "feature",
+    [
+        "egress_rules",
+        "credential_proxy",
+        "tcp_egress",
+        "empty_tcp_egress",
+        "none_network",
+        "none_egress",
+        "none_copy_on_write",
+        "seatbelt_copy_on_write",
+        "windows_jobobject",
+    ],
+)
+def test_harness_policy_validation_rejects_unenforceable_network_or_backend(feature: str) -> None:
+    from omnigent.inner.datamodel import (
+        CredentialProxySpec,
+        OSEnvSandboxSpec,
+        OSEnvSpec,
+        TcpEgressRoute,
+        WritePathSpec,
+    )
+    from omnigent.inner.sandbox import validate_harness_sandbox
+
+    policy = OSEnvSandboxSpec(type="linux_bwrap")
+    if feature == "egress_rules":
+        policy.egress_rules = ["GET api.example.test/**"]
+    elif feature == "credential_proxy":
+        policy.credential_proxy = CredentialProxySpec(entries=[])
+    elif feature in ("tcp_egress", "empty_tcp_egress"):
+        policy.tcp_egress = (
+            [TcpEgressRoute("db", "db.example.test", 5432)] if feature == "tcp_egress" else []
+        )
+    elif feature == "none_network":
+        policy.type = "none"
+        policy.allow_network = False
+    elif feature == "none_egress":
+        policy.type = "none"
+        policy.egress_rules = ["GET api.example.com/**"]
+    elif feature in ("none_copy_on_write", "seatbelt_copy_on_write"):
+        policy.type = "none" if feature == "none_copy_on_write" else "darwin_seatbelt"
+        policy.write_paths = [WritePathSpec(path="/workspace", copy_on_write=True)]
+    else:
+        policy.type = feature
+    with pytest.raises(
+        HarnessSandboxValidationError, match=r"does not support|cannot enforce"
+    ) as failure:
+        validate_harness_sandbox(OSEnvSpec(sandbox=policy), "Example")
+    assert failure.value.reason == {
+        "empty_tcp_egress": "tcp_egress",
+        "none_egress": "none_network",
+        "none_copy_on_write": "copy_on_write",
+        "seatbelt_copy_on_write": "copy_on_write",
+        "windows_jobobject": "windows",
+    }.get(feature, feature)
+    if feature in ("tcp_egress", "empty_tcp_egress"):
+        assert failure.value.client_message == (
+            "Inner harnesses cannot enforce worker-wide os_env.sandbox.tcp_egress. "
+            "sys_os_shell shares the worker policy. Terminal-local tcp_egress applies only "
+            "to terminal traffic; keep the required worker confinement."
+        )
+
+
+@pytest.mark.parametrize(
+    "failure,preserved",
+    [
+        (OSError("private sandbox diagnostic"), False),
+        (NotImplementedError("backend unavailable"), False),
+        (RuntimeError("launcher unavailable"), False),
+        (HarnessSandboxValidationError("unsupported policy", reason="fork"), True),
+        (HarnessSandboxPreparationError("already classified"), True),
+        (asyncio.CancelledError(), True),
+    ],
+)
+def test_harness_sandbox_preparation_preserves_error_boundaries(
+    failure: BaseException, preserved: bool
+) -> None:
+    with pytest.raises(type(failure) if preserved else HarnessSandboxPreparationError) as raised:
+        with harness_sandbox_preparation():
+            raise failure
+    if preserved:
+        assert raised.value is failure
+    else:
+        assert raised.value.__cause__ is failure
+        assert str(raised.value) == str(failure)
+        assert str(failure) not in raised.value.client_message

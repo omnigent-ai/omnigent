@@ -414,6 +414,156 @@ async def test_executor_error_terminates_with_response_failed(
     assert "mock error" in error_detail["message"]
 
 
+@pytest.mark.parametrize(
+    ("policy", "message", "error_code", "failure_stage"),
+    [
+        (
+            '{"fork": "/private/host/scan"}',
+            "The requested sandbox policy is invalid.",
+            "HarnessSandboxValidationError",
+            None,
+        ),
+        (
+            '{"sandbox": {"type": "linux_bwrap"}}',
+            "The selected harness cannot enforce os_env.sandbox",
+            "UnsupportedHarnessSandboxError",
+            None,
+        ),
+        (
+            '{"sandbox": {"type": "linux_bwrap"}}',
+            "The requested sandbox could not be prepared.",
+            "HarnessSandboxPreparationError",
+            "factory",
+        ),
+        (
+            '{"sandbox": {"type": "linux_bwrap"}}',
+            "The requested sandbox could not be prepared.",
+            "HarnessSandboxPreparationError",
+            "turn",
+        ),
+    ],
+    ids=[
+        "invalid-schema",
+        "unsupported-policy",
+        "factory-preparation-error",
+        "turn-preparation-error",
+    ],
+)
+async def test_executor_policy_failure_releases_turn_for_corrected_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    policy: str,
+    message: str,
+    error_code: str,
+    failure_stage: str | None,
+) -> None:
+    """Policy failures settle the turn and permit a same-session corrected retry."""
+    import asyncio
+    import os
+    from unittest.mock import AsyncMock, Mock
+
+    from omnigent.inner import antigravity_harness
+    from omnigent.inner.executor import ExecutorEvent, MockExecutor, TextChunk, TurnComplete
+    from omnigent.inner.sandbox import HarnessSandboxPreparationError
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    executor = MockExecutor()
+    executor.enqueue_events(
+        [TextChunk(text="fake retry response"), TurnComplete(response="fake retry response")]
+    )
+    constructor = Mock(return_value=executor)
+    monkeypatch.setattr(antigravity_harness, "AntigravityExecutor", constructor)
+    policy_env = "HARNESS_ANTIGRAVITY_OS_ENV"
+    builder = antigravity_harness._build_antigravity_executor
+    private_diagnostic = "/private/host/scan"
+    monkeypatch.setenv(policy_env, policy)
+    factory = Mock(wraps=builder)
+    preparation_failure = HarnessSandboxPreparationError(
+        f"Containment setup failed: {private_diagnostic}"
+    )
+    if failure_stage == "factory":
+        factory.side_effect = preparation_failure
+    elif failure_stage == "turn":
+        failed_executor = MockExecutor()
+
+        async def fail_turn(**_kwargs: object) -> AsyncIterator[ExecutorEvent]:
+            raise preparation_failure
+            yield  # pragma: no cover
+
+        monkeypatch.setattr(failed_executor, "run_turn", fail_turn)
+        failed_executor.close = AsyncMock()
+        failed_executor.close_session = AsyncMock()
+        factory.side_effect = lambda: failed_executor
+    session_id = "conv_factory_policy_retry"
+    adapter = ExecutorAdapter(executor_factory=factory, session_key=session_id)
+    app = adapter.build()
+    app.state.conversation_id = session_id
+    app.state.harness_auth_token = "spawn-token"
+    try:
+        async with (
+            asyncio.timeout(5),
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://harness",
+                headers={"Authorization": "Bearer spawn-token"},
+            ) as client,
+        ):
+            event_url = f"/v1/sessions/{session_id}/events"
+            async with client.stream("POST", event_url, json=_start_turn_body()) as response:
+                assert response.status_code == 200
+                failed_events = [event async for event in _stream_iter(response)]
+            assert [event.event for event in failed_events] == [
+                "response.created",
+                "response.in_progress",
+                "response.failed",
+            ]
+            failed = failed_events[-1].data["response"]
+            assert failed["status"] == "failed"
+            assert failed["error"]["code"] == error_code
+            assert message in failed["error"]["message"]
+            assert private_diagnostic not in json.dumps([event.data for event in failed_events])
+            if error_code == "HarnessSandboxPreparationError" or private_diagnostic in policy:
+                assert private_diagnostic in caplog.text
+            factory.assert_called_once_with()
+            constructor.assert_not_called()
+            assert adapter._executor is None
+            assert adapter._current_ctx is None
+            assert adapter._current_agent is None
+            assert adapter._active_turn_ctx is None
+            assert adapter._in_flight == {}
+
+            if failure_stage is not None:
+                factory.side_effect = constructor
+            else:
+                monkeypatch.setenv(policy_env, '{"sandbox": {"type": "none"}}')
+            async with client.stream("POST", event_url, json=_start_turn_body()) as response:
+                assert response.status_code == 200
+                retry_events = [event async for event in _stream_iter(response)]
+            assert retry_events[0].event == "response.created"
+            assert retry_events[0].data["response"]["id"] != failed["id"]
+            assert retry_events[-1].event == "response.completed"
+            assert retry_events[-1].data["response"]["status"] == "completed"
+            assert any(
+                event.event == "response.output_text.delta"
+                and event.data["delta"] == "fake retry response"
+                for event in retry_events
+            )
+            if failure_stage is not None:
+                assert json.loads(policy) == json.loads(os.environ[policy_env])
+            if failure_stage == "turn":
+                failed_executor.close_session.assert_awaited_once_with(session_id)
+                failed_executor.close.assert_awaited_once_with()
+            assert factory.call_count == 2
+            constructor.assert_called_once()
+            assert adapter._executor is executor
+            assert adapter._current_ctx is None
+            assert adapter._current_agent is None
+            assert adapter._active_turn_ctx is None
+            assert adapter._in_flight == {}
+    finally:
+        await adapter.on_shutdown()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("preserve_session", [False, True])
 @pytest.mark.parametrize("retryable", [False, True])

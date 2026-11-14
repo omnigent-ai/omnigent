@@ -3600,18 +3600,41 @@ async def test_persist_error_labels_short_message_stored_verbatim() -> None:
 # ── _runner_reject_detail ────────────────────────────────────────────────────
 
 
-def test_runner_reject_detail_combines_error_code_and_detail() -> None:
-    """The runner's own ``{error, detail}`` shape reads as ``code: detail``."""
+@pytest.mark.parametrize(
+    "status,payload,expected",
+    [
+        (
+            503,
+            {"error": "harness_spawn_failed", "detail": "harness spawn failed (see log)"},
+            "harness_spawn_failed: harness spawn failed (see log)",
+        ),
+        (
+            400,
+            {"error": {"code": "invalid_input", "message": "unsupported harness configuration"}},
+            "invalid_input: unsupported harness configuration",
+        ),
+        (
+            400,
+            {"error": {"code": "invalid_input", "message": "  "}, "detail": "policy rejected"},
+            "invalid_input: policy rejected",
+        ),
+    ],
+    ids=["flat-spawn-failure", "nested-policy-failure", "blank-nested-message-keeps-detail"],
+)
+def test_runner_reject_detail_combines_error_code_and_detail(
+    status: int, payload: dict[str, object], expected: str
+) -> None:
+    """Flat and nested runner rejections retain a readable code and detail."""
     import httpx
 
     from omnigent.server.routes.sessions import _runner_reject_detail
 
     resp = httpx.Response(
-        503,
+        status,
         request=httpx.Request("POST", "http://runner/v1/sessions/conv_x/events"),
-        json={"error": "harness_spawn_failed", "detail": "harness spawn failed (see log)"},
+        json=payload,
     )
-    assert _runner_reject_detail(resp) == "harness_spawn_failed: harness spawn failed (see log)"
+    assert _runner_reject_detail(resp) == expected
 
 
 def test_runner_reject_detail_falls_back_through_code_body_and_status() -> None:

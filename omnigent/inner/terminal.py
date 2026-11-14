@@ -1822,11 +1822,7 @@ class TerminalInstance:
             cli_path = shutil.which(self.command) or self.command
             if sandbox_for_launcher.copy_on_write_namespace:
                 host_cwd = "/"
-                launcher_path = create_exec_launcher(
-                    cli_path, sandbox_for_launcher, cwd=effective_cwd
-                )
-            else:
-                launcher_path = create_exec_launcher(cli_path, sandbox_for_launcher)
+            launcher_path = create_exec_launcher(cli_path, sandbox_for_launcher, cwd=effective_cwd)
             inner_cmd = [launcher_path, *self.args]
         else:
             inner_cmd = [self.command, *self.args]

@@ -1416,12 +1416,19 @@ class ExecutorAdapter(HarnessApp):
         """
         from omnigent.errors import OmnigentError
         from omnigent.inner.model_auth import ProviderAuthRequired
+        from omnigent.inner.sandbox import (
+            HarnessSandboxPreparationError,
+            HarnessSandboxValidationError,
+        )
         from omnigent.runner.launch_failure import (
             diagnose_client_update_required,
             diagnose_model_unavailable,
         )
         from omnigent.server.schemas import ErrorDetail
 
+        if isinstance(exception, (HarnessSandboxPreparationError, HarnessSandboxValidationError)):
+            _logger.warning("Harness sandbox setup failed", exc_info=exception)
+            return ErrorDetail(code=type(exception).__name__, message=exception.client_message)
         if isinstance(exception, ProviderAuthRequired):
             return ErrorDetail(
                 code=exception.code,

@@ -38,17 +38,16 @@ Omnigent-side provider injection remains a deferred follow-up.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 
 from fastapi import FastAPI
 
 from omnigent.harness_startup_config import resolve_harness_path
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.datamodel import OSEnvSpec
 from omnigent.inner.executor import Executor
 from omnigent.inner.kimi_executor import KimiExecutor, _resolve_skills_dirs
-from omnigent.inner.os_env_serialization import decode_sandbox_spec
+from omnigent.inner.os_env_serialization import resolve_harness_os_env
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
 _logger = logging.getLogger(__name__)
@@ -73,42 +72,8 @@ def _parse_truthy_with_default(value: str | None, *, default: bool) -> bool:
 
 
 def _resolve_os_env() -> OSEnvSpec:
-    """Resolve the inner :class:`OSEnvSpec` from :data:`_ENV_OS_ENV`.
-
-    Mirrors the cursor / antigravity wraps' default: when no spec was
-    serialised, fall back to ``caller_process + sandbox=none``. Kimi
-    has its own internal sandbox / approval flow, so Omnigent does not
-    wrap the subprocess in bwrap / seatbelt by default — the user can
-    still set a sandbox via the spec's ``os_env`` block.
-    """
-    raw = os.environ.get(_ENV_OS_ENV, "").strip()
-    if raw:
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            _logger.warning(
-                "%s is not valid JSON (%s); falling back to default os_env",
-                _ENV_OS_ENV,
-                exc,
-            )
-            payload = None
-        if isinstance(payload, dict):
-            sandbox_payload = payload.get("sandbox")
-            sandbox = (
-                decode_sandbox_spec(sandbox_payload) if isinstance(sandbox_payload, dict) else None
-            )
-            return OSEnvSpec(
-                type=str(payload.get("type", "caller_process")),
-                cwd=payload.get("cwd"),
-                sandbox=sandbox,
-                fork=bool(payload.get("fork", False)),
-            )
-    return OSEnvSpec(
-        type="caller_process",
-        cwd=None,
-        sandbox=OSEnvSandboxSpec(type="none"),
-        fork=False,
-    )
+    """Decode the supplied policy without downgrading malformed configuration."""
+    return resolve_harness_os_env(_ENV_OS_ENV)
 
 
 def _build_kimi_executor() -> Executor:

@@ -1849,18 +1849,30 @@ class TestPiExecutorConstructor(unittest.TestCase):
         self.assertEqual(executor._databricks_token, "tok")
 
     def test_constructor_databricks_with_host_override_requires_auth_command(self):
-        with (
-            patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
-            patch("omnigent.inner.pi_executor._read_databrickscfg") as read_cfg,
-        ):
-            with self.assertRaisesRegex(OSError, "requires a gateway auth command"):
-                PiExecutor(
-                    gateway=True,
-                    databricks_profile="missing-profile",
-                    gateway_host="https://example.databricks.com/",
-                )
+        from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
-        read_cfg.assert_not_called()
+        for requested in (False, True):
+            with self.subTest(sandbox=requested):
+                with (
+                    patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+                    patch("omnigent.inner.pi_executor._read_databrickscfg") as read_cfg,
+                    patch("omnigent.inner.pi_executor._try_sandbox_pi") as prepare,
+                    patch(
+                        "omnigent.harnesses.pi_native.main.pi_version", return_value=(0, 80, 4)
+                    ) as probe,
+                ):
+                    with self.assertRaisesRegex(OSError, "requires a gateway auth command"):
+                        PiExecutor(
+                            gateway=True,
+                            databricks_profile="missing-profile",
+                            gateway_host="https://gateway.example.test/",
+                            os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
+                            if requested
+                            else None,
+                        )
+                read_cfg.assert_not_called()
+                prepare.assert_not_called()
+                probe.assert_not_called()
 
     def test_constructor_databricks_with_auth_command(self):
         with (
@@ -5485,6 +5497,7 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
     from omnigent.inner.sandbox import SandboxPolicy
 
     monkeypatch.setenv("FAKE_HOST_SECRET", "PWNED")
+    monkeypatch.delenv("TMPDIR", raising=False)
     captured: dict[str, SandboxPolicy] = {}
     if layout == "standalone":
         executable = tmp_path / "install/bin/pi"
@@ -5499,7 +5512,9 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
     executable.parent.mkdir(parents=True, exist_ok=True)
     executable.touch()
 
-    def _fake_create_exec_launcher(target_path: str, sandbox: SandboxPolicy) -> str:
+    def _fake_create_exec_launcher(
+        target_path: str, sandbox: SandboxPolicy, **_kwargs: object
+    ) -> str:
         assert target_path == str(executable.resolve())
         captured["policy"] = sandbox
         return "/fake/launcher"
@@ -5520,12 +5535,31 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
     monkeypatch.setattr(sandbox_mod, "resolve_sandbox", _fake_resolve_sandbox)
     monkeypatch.setattr(sandbox_mod, "create_exec_launcher", _fake_create_exec_launcher)
 
-    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value=str(pi_binary)):
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value=str(pi_binary)),
+        patch(
+            "omnigent.inner._proc.run_isolated",
+            return_value=SimpleNamespace(stdout="0.80.4\n", stderr=""),
+        ) as probe,
+    ):
         executor = PiExecutor(
             cwd=str(tmp_path),
             os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
         )
 
+    probe_env = probe.call_args.kwargs["env"]
+    probe.assert_called_once_with(
+        ["/fake/launcher", "--version"],
+        capture_output=True,
+        text=True,
+        timeout=5.0,
+        env=probe_env,
+        cwd=str(tmp_path),
+    )
+    assert {key: value for key, value in probe_env.items() if key != "TMPDIR"} == executor._env
+    assert not Path(probe_env["TMPDIR"]).exists()
+    assert "FAKE_HOST_SECRET" not in probe.call_args.kwargs["env"]
+    assert executor._settled_turn_boundary is True
     # The launcher wrap actually engaged (not the silent no-sandbox
     # fallback in ``_try_sandbox_pi``'s except clause).
     assert executor._sandboxed is True
@@ -5536,12 +5570,40 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
     # Per-spawn gateway var must be pruneproof even though it is not in
     # the clean base env yet at construction time.
     assert "PI_CODING_AGENT_DIR" in allowlist
+    assert "TMPDIR" in allowlist
     # A clean-env staple proves the executor's deliberate env names got
     # baked in (an empty allowlist would prune PATH and break node).
     assert "PATH" in allowlist
     # The host secret is not in the clean env, so it must not be in the
     # launcher's keep-set either.
     assert "FAKE_HOST_SECRET" not in allowlist
+
+
+@pytest.mark.parametrize(
+    "failure,error_type,message",
+    [
+        ("policy", ValueError, "Pi does not support os_env.start_in_scratch"),
+        ("setup", OSError, "sandbox unavailable"),
+    ],
+)
+def test_pi_rejects_sandbox_before_version_probe(
+    failure: str, error_type: type[Exception], message: str, tmp_path: Path
+) -> None:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    spec = OSEnvSpec(
+        start_in_scratch=failure == "policy",
+        sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
+    )
+    with (
+        patch("omnigent.inner._proc.run_isolated") as probe,
+        patch(
+            "omnigent.inner.sandbox.resolve_sandbox", side_effect=OSError("sandbox unavailable")
+        ),
+        pytest.raises(error_type, match=message),
+    ):
+        PiExecutor(pi_path="/usr/bin/pi", cwd=str(tmp_path), os_env=spec)
+    probe.assert_not_called()
 
 
 def test_pi_bundle_resource_roots_follow_passed_args(tmp_path: Path) -> None:
@@ -5575,7 +5637,9 @@ def test_pi_sandbox_grants_bundle_resource_dirs_as_read_roots(monkeypatch, tmp_p
 
     captured: dict[str, SandboxPolicy] = {}
 
-    def _fake_create_exec_launcher(target_path: str, sandbox: SandboxPolicy) -> str:
+    def _fake_create_exec_launcher(
+        target_path: str, sandbox: SandboxPolicy, **_kwargs: object
+    ) -> str:
         captured["policy"] = sandbox
         return "/fake/launcher"
 
@@ -6493,7 +6557,7 @@ def test_constructor_probes_pi_version_once() -> None:
         ) as probe,
     ):
         executor = PiExecutor()
-    assert probe.call_count == 1
+    probe.assert_called_once_with(executor._pi_launch_path, env=executor._env, cwd=executor._cwd)
     assert "--approve" in executor._extra_args
 
 

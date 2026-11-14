@@ -481,35 +481,6 @@ def test_executor_factory_decodes_os_env_json(
     assert binding.inject_env == ["OMNIGENT_CODEX_GATEWAY_TOKEN"]
 
 
-def test_executor_factory_falls_back_on_malformed_os_env_json(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Malformed ``HARNESS_CODEX_OS_ENV`` falls back to default.
-
-    A malformed payload should NOT crash the wrap — that would
-    bring the whole subprocess down on first turn. The wrap
-    instead logs a warning and defaults to the parity-preserving
-    ``caller_process + sandbox=none`` so the agent still starts.
-    """
-    monkeypatch.setenv("HARNESS_CODEX_OS_ENV", "{this-is-not-json")
-    captured: dict[str, Any] = {}
-
-    def _fake_init(self: Any, **kwargs: Any) -> None:
-        captured["os_env"] = kwargs["os_env"]
-
-    with patch(
-        "omnigent.inner.codex_harness.CodexExecutor.__init__",
-        _fake_init,
-    ):
-        codex_harness._build_codex_executor()
-
-    os_env_value = captured["os_env"]
-    assert os_env_value is not None
-    assert os_env_value.type == "caller_process"
-    assert os_env_value.sandbox is not None
-    assert os_env_value.sandbox.type == "none"
-
-
 @pytest.mark.parametrize(
     "raw_value,expected",
     [

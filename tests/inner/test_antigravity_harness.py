@@ -49,6 +49,7 @@ _ALL_ANTIGRAVITY_ENV = (
     "HARNESS_ANTIGRAVITY_VERTEX",
     "HARNESS_ANTIGRAVITY_PROJECT",
     "HARNESS_ANTIGRAVITY_LOCATION",
+    "HARNESS_ANTIGRAVITY_OS_ENV",
 )
 
 
@@ -92,10 +93,15 @@ def test_executor_factory_threads_env_vars(monkeypatch: pytest.MonkeyPatch) -> N
     assert captured["location"] == "us-central1"
 
 
-def test_executor_factory_defaults_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("os_env_payload", [None, '{"sandbox": {"type": "none"}}'])
+def test_executor_factory_defaults_when_unset(
+    monkeypatch: pytest.MonkeyPatch, os_env_payload: str | None
+) -> None:
     """Unset env vars resolve to ``None`` / ``False`` (SDK uses ambient creds)."""
     for var in _ALL_ANTIGRAVITY_ENV:
         monkeypatch.delenv(var, raising=False)
+    if os_env_payload is not None:
+        monkeypatch.setenv("HARNESS_ANTIGRAVITY_OS_ENV", os_env_payload)
 
     captured = _capture_factory_kwargs(monkeypatch)
 
@@ -105,6 +111,26 @@ def test_executor_factory_defaults_when_unset(monkeypatch: pytest.MonkeyPatch) -
     assert captured["vertex"] is False
     assert captured["project"] is None
     assert captured["location"] is None
+
+
+@pytest.mark.parametrize(
+    "os_env_payload,message",
+    [
+        ('{"sandbox": {"type": "linux_bwrap"}}', "Antigravity cannot enforce"),
+        ('{"sandbox":', "HARNESS_ANTIGRAVITY_OS_ENV must contain a valid OS environment policy"),
+    ],
+)
+def test_executor_factory_rejects_requested_sandbox(
+    monkeypatch: pytest.MonkeyPatch, os_env_payload: str, message: str
+) -> None:
+    from unittest.mock import Mock
+
+    constructor = Mock()
+    monkeypatch.setattr(antigravity_harness, "AntigravityExecutor", constructor)
+    monkeypatch.setenv("HARNESS_ANTIGRAVITY_OS_ENV", os_env_payload)
+    with pytest.raises(ValueError, match=message):
+        antigravity_harness._build_antigravity_executor()
+    constructor.assert_not_called()
 
 
 @pytest.mark.parametrize(

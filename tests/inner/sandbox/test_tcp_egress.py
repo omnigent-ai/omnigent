@@ -1478,7 +1478,9 @@ def test_tcp_terminal_cleanup_does_not_block_event_loop(
     elif stage == "launcher":
         monkeypatch.setattr(terminal_module, "create_exec_launcher", fail)
     elif stage == "tmux":
-        monkeypatch.setattr(terminal_module, "create_exec_launcher", lambda *_args: "/bin/true")
+        monkeypatch.setattr(
+            terminal_module, "create_exec_launcher", lambda *_args, **_kwargs: "/bin/true"
+        )
 
         async def fail_spawn(*_args: object, **_kwargs: object) -> None:
             fail()

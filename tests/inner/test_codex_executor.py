@@ -1015,7 +1015,7 @@ class TestCodexExecutor(unittest.TestCase):
         _run(_t())
 
     def test_app_server_run_turn_keeps_native_shell_by_default(self):
-        async def _t(supports_direct_tools: bool):
+        async def _t(supports_direct_tools: bool, sandbox_mode: str):
             session = _CodexAppServerSession(
                 codex_path="/bin/echo",
                 cwd="/tmp/workspace",
@@ -1069,13 +1069,14 @@ class TestCodexExecutor(unittest.TestCase):
                     system_prompt="Be helpful.",
                     model="gpt-5.4-mini",
                     cwd=".",
-                    sandbox="workspace-write",
+                    sandbox=sandbox_mode,
                 )
             ]
             await inject_task
 
             thread_start_call = session._request.await_args_list[0]
             params = thread_start_call.args[1]
+            self.assertEqual(params["sandbox"], sandbox_mode)
             self.assertNotIn("features.shell_tool", params["config"])
             if supports_direct_tools:
                 self.assertEqual(
@@ -1089,8 +1090,11 @@ class TestCodexExecutor(unittest.TestCase):
             self.assertEqual(params["dynamicTools"][0]["name"], "sys_os_shell")
 
         for supports_direct_tools in (False, True):
-            with self.subTest(supports_direct_tools=supports_direct_tools):
-                _run(_t(supports_direct_tools))
+            for sandbox_mode in ("read-only", "workspace-write"):
+                with self.subTest(
+                    supports_direct_tools=supports_direct_tools, sandbox_mode=sandbox_mode
+                ):
+                    _run(_t(supports_direct_tools, sandbox_mode))
 
     def test_app_server_run_turn_starts_goal_before_objective_turn(self):
         async def _t():
@@ -6571,6 +6575,57 @@ class TestCodexAppServerSessionHomeStaging(unittest.TestCase):
         self.assertTrue(any("restricted reads" in line for line in logs.output), logs.output)
 
 
+@pytest.mark.parametrize("with_tools", [False, True])
+@pytest.mark.parametrize(
+    "os_env,expected_sandbox",
+    [
+        pytest.param(None, "read-only", id="default"),
+        pytest.param(
+            OSEnvSpec(sandbox=OSEnvSandboxSpec(write_paths=[])), "read-only", id="read-only"
+        ),
+        pytest.param(
+            OSEnvSpec(sandbox=OSEnvSandboxSpec(write_paths=["."])),
+            "workspace-write",
+            id="workspace-write",
+        ),
+        pytest.param(
+            OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none")),
+            "danger-full-access",
+            id="disabled",
+        ),
+    ],
+)
+def test_run_turn_tools_do_not_widen_filesystem_permissions(
+    os_env: OSEnvSpec | None, expected_sandbox: str, with_tools: bool
+) -> None:
+    async def run() -> None:
+        session = _FakeAppSession([[TurnComplete(response="done")]])
+        executor = CodexExecutor(
+            codex_path="/bin/echo",
+            os_env=os_env,
+            app_session_factory=lambda **kwargs: session,
+        )
+        tools = (
+            [{"name": "lookup", "parameters": {"type": "object", "properties": {}}}]
+            if with_tools
+            else []
+        )
+        try:
+            events = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}], tools, ""
+                )
+            ]
+            assert events == [TurnComplete(response="done")]
+            assert session.calls[0]["sandbox"] == expected_sandbox
+            assert session.calls[0]["tools"] == tools
+        finally:
+            await executor.close_session("s1")
+
+    _run(run())
+
+
 def test_run_turn_cli_config_passes_no_model_to_thread_create():
     """On the cli-config path (model_provider_override set), model=None is passed
     to thread/create so the codex binary uses its own configured model rather than
@@ -7260,6 +7315,96 @@ def signed_disabled_mcp_session(disabled_mcp_session, monkeypatch):
         lambda **kwargs: CodexWorkerLaunch("/bin/echo", sandboxed=True),
     )
     return harness
+
+
+@pytest.mark.parametrize("discovery_outcome", ["success", "failure", "cancelled"])
+async def test_provider_discovery_uses_prepared_worker_and_staged_environment(
+    disabled_mcp_session, tmp_path, monkeypatch, discovery_outcome
+):
+    from omnigent.inner.codex_worker import CodexWorkerLaunch
+
+    harness = disabled_mcp_session
+    session = harness.session
+    session._os_env_spec = OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt"))
+    session._env = {"HOST_ONLY": "parent-value"}
+    launcher = tmp_path / "sandbox-launcher"
+    launch = CodexWorkerLaunch(str(launcher), sandboxed=True, _owned_launcher=launcher)
+    discovery_started = asyncio.Event()
+    discovery_pending = asyncio.Event()
+    private_homes = []
+
+    def prepare_worker(**kwargs):
+        assert kwargs["os_env"] is session._os_env_spec
+        assert kwargs["codex_path"] == "/bin/echo"
+        kwargs["worker_env"].pop("HOST_ONLY")
+        kwargs["worker_env"]["HTTPS_PROXY"] = "http://127.0.0.1:12345"
+        launcher.touch()
+        return launch
+
+    worker_prepare = Mock(side_effect=prepare_worker)
+    monkeypatch.setattr("omnigent.inner.codex_executor.prepare_codex_worker", worker_prepare)
+
+    async def prepare_provider(codex_home, overrides, **kwargs):
+        private_homes.append(codex_home)
+        assert session._worker_launch is launch
+        assert launcher.exists()
+        assert (codex_home / "config.toml").is_file()
+        assert kwargs["codex_path"] == str(launcher)
+        assert kwargs["cwd"] == tmp_path.resolve()
+        assert kwargs["env"] is worker_prepare.call_args.kwargs["worker_env"]
+        assert kwargs["env"] == {
+            "CODEX_HOME": str(codex_home),
+            "HTTPS_PROXY": "http://127.0.0.1:12345",
+        }
+        if discovery_outcome == "cancelled":
+            discovery_started.set()
+            await discovery_pending.wait()
+        if discovery_outcome == "failure":
+            raise RuntimeError("provider setup failed")
+        return [*overrides, 'model_provider="configured"']
+
+    provider_prepare = AsyncMock(side_effect=prepare_provider)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.prepare_codex_provider_config",
+        provider_prepare,
+    )
+    try:
+        if discovery_outcome == "cancelled":
+            start_task = asyncio.create_task(session.start())
+            try:
+                await asyncio.wait_for(discovery_started.wait(), timeout=5)
+                start_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(start_task, timeout=5)
+            finally:
+                if not start_task.done():
+                    start_task.cancel()
+                await asyncio.gather(start_task, return_exceptions=True)
+            assert harness.spawns == []
+            harness.initialize.assert_not_awaited()
+            assert session.cleaned
+            assert not launcher.exists()
+            assert not private_homes[0].exists()
+        elif discovery_outcome == "failure":
+            with pytest.raises(RuntimeError, match="provider setup failed"):
+                await session.start()
+            assert harness.spawns == []
+            assert session.cleaned
+            assert not launcher.exists()
+        else:
+            await session.start()
+            assert str(launcher) in harness.spawns[0]
+            assert 'model_provider="configured"' in harness.spawns[0]
+            assert launcher.exists()
+        worker_prepare.assert_called_once()
+        provider_prepare.assert_awaited_once()
+        assert session._env == {"HOST_ONLY": "parent-value"}
+    finally:
+        await session.close()
+    assert not launcher.exists()
+    assert session._codex_home_dir is None
+    assert len(private_homes) == 1
+    assert not private_homes[0].exists()
 
 
 @pytest.mark.parametrize(

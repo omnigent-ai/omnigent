@@ -62,6 +62,8 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 
+from .sandbox import reject_unsupported_harness_sandbox
+
 _logger = logging.getLogger(__name__)
 
 # Maximum seconds to wait for a Hermes subprocess to complete a single turn.
@@ -255,6 +257,7 @@ class HermesExecutor(Executor):
         :param bundle_dir: Agent bundle directory (reserved).
         :param agent_name: Agent display name (reserved).
         """
+        reject_unsupported_harness_sandbox(os_env, "Hermes")
         self._hermes_path = hermes_path or shutil.which("hermes") or "hermes"
         self._cwd = cwd or os.getcwd()
         self._model = model
