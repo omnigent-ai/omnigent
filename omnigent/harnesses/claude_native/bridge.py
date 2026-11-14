@@ -505,6 +505,9 @@ _SHELL_MODE_SURFACE = "shell mode"
 # What :func:`_occupying_surface` reports when a draft taller than the pane
 # has scrolled the box's glyph row out of view.
 _SCROLLED_DRAFT_SURFACE = "a draft taller than the terminal"
+_CLIPPED_TRANSCRIPT_SURFACE = "the detailed transcript"
+_SIDE_CHAT_HISTORY_SURFACE = "the side-chat history"
+_READ_ONLY_VIEWER_SURFACES = (_CLIPPED_TRANSCRIPT_SURFACE, _SIDE_CHAT_HISTORY_SURFACE)
 # Surfaces drawn over the input box advertise their dismissal in the footer
 # ("Esc to cancel", "Esc/Enter/Space to close"), possibly wrapped between words.
 # Escape cannot clear a screen with neither this nor a composer, e.g. a launch wrapper's output.
@@ -7101,6 +7104,8 @@ def _restore_occupied_input(
     and visible decision controls; they require an explicit answer. So are the
     startup dialogs whose Escape quits Claude Code instead of closing them
     (:func:`_escape_quits_claude`): they are left for the person to answer.
+    Clipped transcript and side-chat history viewers stay open until
+    the person closes them, then their held web message can be delivered.
 
     A launcher's idle-compaction log can overwrite the rendered input box. Redraw
     it once with Ctrl+L before any edit keys can erase its identifying prefix,
@@ -7182,11 +7187,11 @@ def _restore_occupied_input(
                 dismiss_timeout_s,
             )
             return surface
-        # Nothing an Escape can clear: launcher output before the input box
-        # mounts, a dialog that offers no dismissal, or one Escape would quit.
-        unclearable = surface == _OVERLAY_SURFACE and (
-            not (_ESCAPE_DISMISS_HINT.search(pane) or _btw_overlay_present(pane))
-            or _escape_quits_claude(pane)
+        # Leave viewers for the person, and avoid Escape on launcher output,
+        # dialogs without a dismissal, or dialogs whose Escape quits Claude.
+        unclearable = surface in _READ_ONLY_VIEWER_SURFACES or (
+            surface == _OVERLAY_SURFACE
+            and (not _overlay_escape_hint(pane) or _escape_quits_claude(pane))
         )
         if not confirmed:
             # One sighting is not enough to spend an Escape on: on a bare
@@ -7228,6 +7233,21 @@ def _restore_occupied_input(
         unclearable_seen = unclearable
         transcript_view_seen = surface == _DETAILED_TRANSCRIPT_SURFACE
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+
+
+def _overlay_escape_hint(pane: str) -> bool:
+    """Read dismissal hints from the current footer, beyond any scrollback rule."""
+    lines = [line for line in pane.splitlines() if line.strip()]
+    last_rule = max((index for index, line in enumerate(lines) if _is_box_rule(line)), default=-1)
+    region = lines[last_rule + 1 :]
+    if not region and last_rule >= 0 and lines[last_rule].lstrip().startswith("╰"):
+        # A bordered panel can put its footer just inside its closing rule.
+        previous_rule = max(
+            (index for index in range(last_rule) if _is_box_rule(lines[index])), default=-1
+        )
+        region = lines[previous_rule + 1 : last_rule]
+    footer = "\n".join(region[-_PROMPT_SCAN_TAIL_LINES:])
+    return bool(_ESCAPE_DISMISS_HINT.search(footer)) or _btw_overlay_present(pane)
 
 
 def _escape_quits_claude(pane: str) -> bool:
@@ -7276,11 +7296,33 @@ def _occupying_surface(pane: str) -> str | None:
         return "the prompt-history search"
     row = _composer_row(pane)
     if row is None:
+        viewer_surface = _read_only_viewer_surface(pane)
+        if viewer_surface is not None:
+            return viewer_surface
         box = _composer_box(pane)
         return _SCROLLED_DRAFT_SURFACE if box is not None else _OVERLAY_SURFACE
     if row.strip().startswith(_CLAUDE_PROMPT_GLYPH):
         return None
     return _SHELL_MODE_SURFACE
+
+
+def _read_only_viewer_surface(pane: str) -> str | None:
+    """Name a viewer's bottom footer when the composer is absent."""
+    lines = [line for line in pane.splitlines() if line.strip()]
+    for footer_rows in range(1, min(len(lines), _PROMPT_SCAN_TAIL_LINES) + 1):
+        footer = "".join("".join(lines[-footer_rows:]).split())
+        if footer.lower().removesuffix("verbose") == (
+            "showingdetailedtranscript·ctrl+ototoggle·?forshortcuts"
+        ):
+            return _CLIPPED_TRANSCRIPT_SURFACE
+        if (
+            footer.lstrip(_BTW_FOOTER_SHIFT_GLYPH).startswith(_BTW_FOOTER_HISTORY_HINTS)
+            and footer.endswith(_BTW_FOOTER_CLOSE_HINT)
+            and all(hint in footer for hint in (*_BTW_FOOTER_COMPLETE_HINTS, "xtoclearhistory"))
+            and _btw_overlay_parts(pane) is None
+        ):
+            return _SIDE_CHAT_HISTORY_SURFACE
+    return None
 
 
 def _shell_mode_draft(pane: str) -> bool:
@@ -8041,6 +8083,13 @@ def _wait_for_claude_prompt_ready(
             empty_polls += 1
         if _claude_prompt_rendered(pane):
             return
+        surface = _occupying_surface(pane)
+        if surface in _READ_ONLY_VIEWER_SURFACES:
+            raise ClaudeInputBoxOccupied(
+                f"Claude Code's input box is occupied by {surface}, so the message was "
+                "not delivered. Open the terminal and close the viewer to continue.",
+                surface=surface,
+            )
         remaining = hard_deadline - time.monotonic()
         occupying_surface = _occupying_surface(pane)
         if (
@@ -8048,10 +8097,7 @@ def _wait_for_claude_prompt_ready(
             and remaining > 0
             and (
                 occupying_surface == _DETAILED_TRANSCRIPT_SURFACE
-                or (
-                    occupying_surface == _OVERLAY_SURFACE
-                    and (_ESCAPE_DISMISS_HINT.search(pane) or _btw_overlay_present(pane))
-                )
+                or (occupying_surface == _OVERLAY_SURFACE and _overlay_escape_hint(pane))
             )
             and _terminal_dialog_headline(pane) is None
             and not _escape_quits_claude(pane)

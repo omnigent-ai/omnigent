@@ -637,6 +637,12 @@ Cross-harness journeys:
   terminal while a question is pending, send an unrelated Chat message, then
   answer the question and verify that the held message arrives once.
 
+- **`steer`, Claude viewers with their top border off screen:**
+  `tests/harnesses/claude_native/test_claude_native_copy_mode.py::test_clipped_viewer_waits_for_close_before_delivering_once`
+  uses real tmux and stand-in transcript/history viewers. Chat input waits for
+  closure; settings report occupied input without changing the viewer. Complete
+  overlays retain normal dismissal, and full transcripts close with one Ctrl+O.
+
 - **Antigravity permission choices (Chat and Inbox):**
   `tests/e2e_ui/approvals/test_agy_permission_full_prompt.py::test_agy_permission_persist_request_round_trip`
   uses a recorded permission prompt and the real server to check both choices
@@ -1121,6 +1127,10 @@ Cross-harness journeys:
   occupies Claude Code's input box afterwards, the web message is refused with a
   notice to open the terminal, dismiss it, and resend. No message text is typed
   into the pane.
+  Dismissal hints above the current pane rule do not send Escape into a starting
+  terminal; `tests/harnesses/claude_native/test_claude_native_bridge.py::test_inject_user_message_sends_no_escape_into_launcher_output`
+  covers initial and late startup frames, with wrapped panels checked through
+  real tmux in `tests/harnesses/claude_native/test_claude_native_copy_mode.py`.
   `tests/harnesses/claude_native/test_claude_native_bridge.py::test_inject_user_message_refuses_a_shell_mode_draft_it_cannot_clear`
   covers the refusal with a fake tmux (plain `uv run pytest`);
   `tests/e2e_ui/messages/test_claude_native_refused_delivery_persistence.py::test_claude_refused_message_survives_reload`
