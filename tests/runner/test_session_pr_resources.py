@@ -973,6 +973,8 @@ def test_enterprise_without_auth_retains_selection(
     monkeypatch.setattr(github, "_list_accounts", lambda _: (True, []))
 
     def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if args == ["auth", "status", "-h", "github.example.org"]:
+            return 1, "", "You are not logged into any accounts on github.example.org"
         assert args[args.index("-R") + 1] in {
             "github.com/example/one",
             "github.com/example/two",
@@ -987,3 +989,41 @@ def test_enterprise_without_auth_retains_selection(
     assert info["selected_account"] is None
     assert info["pr"] is None
     assert len(info["prs"]) == 3
+
+
+@pytest.mark.parametrize(
+    "json_supported", [True, False], ids=["listing_omits_host", "gh_without_json"]
+)
+def test_enterprise_host_signed_in_only_when_named_can_attach_and_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, json_supported: bool
+) -> None:
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(github.shutil, "which", lambda _: "/bin/gh")
+    monkeypatch.setattr(github._config, "github_account_preference", lambda _: None)
+    url = A.replace("github.com", "github.example.org")
+    listed = {"hosts": {"github.com": [{"login": "octocat", "active": True, "state": "success"}]}}
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if args[:4] == ["auth", "status", "--json", "hosts"]:
+            if json_supported:
+                return 0, json.dumps(listed), ""
+            return 1, "", "unknown flag: --json"
+        if args == ["auth", "status"]:
+            return 0, "Logged in to github.com account octocat", ""
+        if args == ["auth", "status", "-h", "github.example.org"]:
+            return 0, "Logged in to github.example.org account octocat", ""
+        if args[:2] == ["pr", "view"]:
+            assert args[args.index("-R") + 1] == "github.example.org/example/one"
+            return 0, json.dumps({"number": 42, "url": url, "title": "Enterprise PR"}), ""
+        assert args[:3] == ["api", "--hostname", "github.example.org"], args
+        if "graphql" in args:
+            return 1, "", "not needed"
+        return 0, json.dumps([[{"filename": "enterprise.py", "status": "added"}]]), ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    info = github.update_session_pr(str(tmp_path), "session", url, "attach")
+    assert info["selected_pr_url"] == url
+    assert info["authenticated"] is True
+    assert info["pr"]["title"] == "Enterprise PR"
+    files = github.github_changed_files(str(tmp_path), session_id="session", pr_url=url)
+    assert [entry["path"] for entry in files["data"]] == ["enterprise.py"]

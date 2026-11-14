@@ -142,7 +142,9 @@ def test_review_candidate_failures_are_user_facing(
 
 def test_enterprise_reviewers_require_a_signed_in_host(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(github, "_list_accounts", lambda _root: (True, [{"host": "github.com"}]))
-    monkeypatch.setattr(github, "_gh", _fake_gh([], []))
+    calls: list[GhCall] = []
+    signed_out = (1, "", "You are not logged into any accounts on ghe.example.com")
+    monkeypatch.setattr(github, "_gh", _fake_gh(calls, [signed_out, signed_out]))
     reference = PullRequestRef.from_url(ENTERPRISE_PR_URL)
     octocat = ReviewerRef(login="octocat", kind="user")
 
@@ -150,6 +152,7 @@ def test_enterprise_reviewers_require_a_signed_in_host(monkeypatch: pytest.Monke
         github._review_candidates("/workspace", reference)
     with pytest.raises(ValueError, match="Sign in to this GitHub host"):
         github._edit_reviewers("/workspace", reference, add=[octocat], remove=[])
+    assert [argv for argv, _token in calls] == [["auth", "status", "-h", "ghe.example.com"]] * 2
 
 
 def test_edit_reviewers_withdraws_then_requests_and_returns_review_states(
