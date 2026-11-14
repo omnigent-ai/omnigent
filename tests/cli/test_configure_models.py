@@ -1512,15 +1512,17 @@ def test_configure_harnesses_add_databricks_normalizes_url_and_persists(
     handling, the per-harness scoping, or persistence surfaces here.
     """
     login_calls: list[str] = []
-    ucode_calls: list[tuple[str, list[str] | None]] = []
+    ucode_calls: list[tuple[str, list[str] | None, str | None]] = []
     exists_calls: list[str] = []
 
     def _fake_login(url: str, *, console: object | None = None) -> str:
         login_calls.append(url)
         return "my-ws"
 
-    def _fake_configure_ucode(url: str, *, agents: list[str] | None = None) -> None:
-        ucode_calls.append((url, agents))
+    def _fake_configure_ucode(
+        url: str, *, agents: list[str] | None = None, profile: str | None = None
+    ) -> None:
+        ucode_calls.append((url, agents, profile))
 
     def _fake_exists(url: str) -> bool:
         exists_calls.append(url)
@@ -1550,7 +1552,7 @@ def test_configure_harnesses_add_databricks_normalizes_url_and_persists(
     # `--agents claude`, NOT the legacy claude,codex,pi. A regression to the
     # hardcoded agent set (configuring/installing harnesses the user didn't
     # pick) changes this and fails here.
-    assert ucode_calls == [(normalized, ["claude"])]
+    assert ucode_calls == [(normalized, ["claude"], "my-ws")]
 
     cfg = _config_yaml(isolated_config)
     # Persisted as a kind=databricks provider keyed on the returned profile, and
@@ -1584,7 +1586,7 @@ def test_configure_harnesses_add_databricks_fails_loud_when_ucode_records_no_sta
     )
     monkeypatch.setattr(
         "omnigent.onboarding.ucode_setup.configure_ucode_for_workspace",
-        lambda url, *, agents=None: None,
+        lambda url, *, agents=None, profile=None: None,
     )
     # ucode "succeeded" but left no state for this workspace.
     monkeypatch.setattr(
@@ -1623,7 +1625,7 @@ def test_configure_harnesses_add_databricks_under_codex_scopes_to_codex(
     )
     monkeypatch.setattr(
         "omnigent.onboarding.ucode_setup.configure_ucode_for_workspace",
-        lambda url, *, agents=None: ucode_calls.append((url, agents)),
+        lambda url, *, agents=None, profile=None: ucode_calls.append((url, agents)),
     )
     monkeypatch.setattr("omnigent.onboarding.ucode_setup.ucode_workspace_exists", lambda url: True)
 
@@ -2597,7 +2599,7 @@ def test_configure_harnesses_add_databricks_under_pi_scopes_to_pi(
     )
     monkeypatch.setattr(
         "omnigent.onboarding.ucode_setup.configure_ucode_for_workspace",
-        lambda url, *, agents=None: ucode_calls.append((url, agents)),
+        lambda url, *, agents=None, profile=None: ucode_calls.append((url, agents)),
     )
     monkeypatch.setattr("omnigent.onboarding.ucode_setup.ucode_workspace_exists", lambda url: True)
 
