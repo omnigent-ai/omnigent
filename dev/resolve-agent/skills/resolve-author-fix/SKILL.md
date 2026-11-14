@@ -211,11 +211,20 @@ fallback if rendering is blocked; keep any usable footage.
 - For internal/API-only results with no visible user interaction, written
   evidence is enough. Set `recordings: []` and describe the before/after result
   in your evidence and the PR Demo section.
+- Before using that carve-out, search for UI and CLI callers (including SDK
+  wrappers) that submit the same request and display its outcome, and retain
+  the search. A caller that exposes the failure — a web dialog that uploads the
+  affected bundle and shows the server error, say — makes the facet that
+  caller's surface: film it on that lane against your fix. Naming the caller
+  without running the recorder is not footage and not a blocker.
 - If recording is blocked by missing tools or an environment that cannot run
   the journey, set `recordings: []` and name the specific blocker in
   `recording_unavailable_reason`. Do not block the fix or PR because footage is
   missing or rejected; explain the gap and continue. Only report clips you
-  actually produced.
+  actually produced. The reason describes a finished attempt — the recorder
+  command and its observed result — never a plan. If you postpone the clip to
+  the Step 4 review wait, record it there before the final handoff; a reason
+  that still says the clip "is being attempted" means the attempt is not done.
 
 Build the SPA before starting the recorder. If you are inside a server-spawned
 runner (`OMNIGENT_RUNNER_ID` is set), strip the inherited runner/host variables
