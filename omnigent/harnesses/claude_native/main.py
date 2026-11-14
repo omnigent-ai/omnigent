@@ -138,6 +138,7 @@ from omnigent.models.claude_model_vocabulary import (
     CUSTOM_MODEL_OPTION_NAME_ENV_VAR,
     LEGACY_CUSTOM_SLOT_ROW_ID,
     claude_model_alias,
+    model_vocabulary_env,
     served_canonical_overrides,
 )
 from omnigent.native._native_resume_hint import echo_native_resume_hint
@@ -3655,7 +3656,7 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
 
     workspace_state = read_ucode_state(workspace_host)
     agent_state = workspace_state.agent(_UCODE_CLAUDE_AGENT_NAME) if workspace_state else None
-    if agent_state is not None:
+    if workspace_state is not None and agent_state is not None:
         ucode_base_url = agent_state.env.get(_UCODE_CLAUDE_BASE_URL_ENV) or agent_state.base_url
         # Security: state.json is writable, and the broker bearer (apiKeyHelper)
         # is presented to whatever ANTHROPIC_BASE_URL resolves to. Only adopt
@@ -3672,6 +3673,13 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
                 if k in _CONNECT_BROKER_UCODE_ENV_ALLOWLIST
             }
             env = {**env, **allowed, _UCODE_CLAUDE_BASE_URL_ENV: ucode_base_url}
+            cached_aliases = model_vocabulary_env(
+                {"id": alias, "model": workspace_state.claude_models.get(alias)}
+                for alias in ALIAS_MODEL_ENV_VARS
+                if alias != "fable" or workspace_state.fable_enabled
+            )
+            for key, value in cached_aliases.items():
+                env.setdefault(key, value)
             adopted_ug_route = True
             # The served model is adopted only alongside a trusted (guarded) base
             # URL; a model with no/off-host URL falls back to the catalog default
