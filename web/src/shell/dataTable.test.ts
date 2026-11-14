@@ -74,21 +74,27 @@ describe("parseDataTable", () => {
     expect(parseDataTable("\n\n", "empty.csv")).toBeNull();
   });
 
-  it("keeps the first rows and counts every row", () => {
+  it("keeps the first rows and counts every row and column", () => {
     const rows = Array.from({ length: DATA_TABLE_MAX_ROWS + 500 }, (_, i) => `${i},x`);
-    const table = parseDataTable(["id,value", ...rows].join("\n"), "big.csv");
+    // A row past the kept ones is wider than any kept row.
+    const table = parseDataTable(["id,value", ...rows, "a,b,c"].join("\n"), "big.csv");
     expect(table?.rows).toHaveLength(DATA_TABLE_MAX_ROWS);
     expect(table?.rows.at(-1)).toEqual([String(DATA_TABLE_MAX_ROWS - 1), "x"]);
-    expect(table?.totalRows).toBe(DATA_TABLE_MAX_ROWS + 500);
+    expect(table?.totalRows).toBe(DATA_TABLE_MAX_ROWS + 501);
+    expect(table?.header).toEqual(["id", "value"]);
+    expect(table?.totalColumns).toBe(3);
   });
 
-  it("stops keeping rows at the first one past the character budget", () => {
-    const wide = "x".repeat(DATA_TABLE_MAX_CHARS);
-    // The wide row doesn't fit; the short row after it isn't kept either, so the
-    // kept rows stay a prefix of the file.
-    const table = parseDataTable(`col\nshort\n${wide}\nlater\n`, "wide.csv");
+  // The kept rows stay a prefix of the file: once a row doesn't fit, later
+  // rows aren't kept either, though their rows and columns still count.
+  it.each([
+    ["a row that fills the budget", "x".repeat(DATA_TABLE_MAX_CHARS)],
+    ["one cell bigger than the whole budget", "x".repeat(DATA_TABLE_MAX_CHARS * 2)],
+  ])("stops keeping rows at %s", (_label, wide) => {
+    const table = parseDataTable(`col\nshort\n${wide},y,z\nlater\n`, "wide.csv");
     expect(table?.rows).toEqual([["short"]]);
     expect(table?.totalRows).toBe(3);
+    expect(table?.totalColumns).toBe(3);
   });
 
   it("keeps an oversized header as the header, its text cut at the budget", () => {
@@ -98,13 +104,6 @@ describe("parseDataTable", () => {
     // The header spent the budget, so no row is kept, though every row is counted.
     expect(table?.rows).toEqual([]);
     expect(table?.totalRows).toBe(1);
-  });
-
-  it("keeps the rows before one cell bigger than the whole budget", () => {
-    const huge = "x".repeat(DATA_TABLE_MAX_CHARS * 2);
-    const table = parseDataTable(`col\nsmall\n${huge}\nafter\n`, "huge.tsv");
-    expect(table?.rows).toEqual([["small"]]);
-    expect(table?.totalRows).toBe(3);
   });
 
   it("infers each column's type", () => {
@@ -206,5 +205,19 @@ describe("inferColumnType and compareCells", () => {
         compareCells(a, b, "date"),
       ),
     ).toEqual(["2025-12-31T23:00:00Z", "2026-01-15", "2026-03-01", ""]);
+  });
+
+  it("orders a date before a time later that day, whatever the viewer's time zone", () => {
+    const zone = process.env.TZ;
+    process.env.TZ = "Asia/Tokyo";
+    try {
+      expect(
+        ["2024-01-01 05:00", "2024-01-01", "2024-01-01T04:00:00+09:00"].sort((a, b) =>
+          compareCells(a, b, "date"),
+        ),
+      ).toEqual(["2024-01-01T04:00:00+09:00", "2024-01-01", "2024-01-01 05:00"]);
+    } finally {
+      process.env.TZ = zone;
+    }
   });
 });

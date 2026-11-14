@@ -47,6 +47,7 @@ const DELIMITER_LABELS: Record<string, string> = {
 /** Widest a column starts out; dragging its edge can widen it further. */
 const DEFAULT_MAX_COLUMN_WIDTH = 512;
 const MIN_COLUMN_WIDTH = 64;
+const MAX_COLUMN_WIDTH = 2048;
 const KEYBOARD_RESIZE_STEP = 16;
 
 async function copyText(text: string, what: string) {
@@ -171,7 +172,10 @@ function DataTableView({
       return next;
     });
   const setWidth = (column: number, width: number) =>
-    setWidths((current) => ({ ...current, [column]: Math.max(MIN_COLUMN_WIDTH, width) }));
+    setWidths((current) => ({
+      ...current,
+      [column]: Math.min(MAX_COLUMN_WIDTH, Math.max(MIN_COLUMN_WIDTH, width)),
+    }));
 
   const startResize = (column: number, event: PointerEvent<HTMLDivElement>) => {
     const header = event.currentTarget.parentElement;
@@ -340,6 +344,12 @@ function DataTableView({
                       role="separator"
                       aria-orientation="vertical"
                       aria-label={`Resize ${name}`}
+                      aria-valuemin={MIN_COLUMN_WIDTH}
+                      aria-valuemax={MAX_COLUMN_WIDTH}
+                      aria-valuenow={width === undefined ? undefined : Math.round(width)}
+                      aria-valuetext={
+                        width === undefined ? "Fits its content" : `${Math.round(width)} pixels`
+                      }
                       tabIndex={0}
                       onPointerDown={(event) => startResize(column, event)}
                       onKeyDown={(event) => resizeByKey(column, event)}
