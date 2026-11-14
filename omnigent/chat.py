@@ -706,7 +706,7 @@ def _remote_headers(
          (populated by ``omnigent login <apps-url>``) — mints a
          fresh workspace OAuth token via the SDK
       4. ambient Databricks CLI / ``~/.databrickscfg`` credentials
-         (the SDK's default resolution; no profile is threaded)
+         (only when no workspace pairing is stored for the server)
 
     This lets ``omnigent run --server <apps-url>`` work against
     Databricks Apps after a one-time ``omnigent login <apps-url>``,
@@ -749,10 +749,13 @@ def _remote_headers(
             if record_token:
                 headers["Authorization"] = f"Bearer {record_token}"
     if "Authorization" not in headers:
-        # 4. Ambient ~/.databrickscfg credentials.
-        creds = _read_databrickscfg(None)
-        if creds is not None and creds.token:
-            headers["Authorization"] = f"Bearer {creds.token}"
+        from omnigent.cli_auth import load_databricks_workspace_host
+
+        # A saved workspace stays authoritative when its credentials cannot mint.
+        if not server_url or load_databricks_workspace_host(server_url) is None:
+            creds = _read_databrickscfg(None)
+            if creds is not None and creds.token:
+                headers["Authorization"] = f"Bearer {creds.token}"
     # Workspace routing: when a ?o= selector was recorded at login, name the
     # workspace or the request routes to the account. Merged onto the result
     # because these ad-hoc requests carry no httpx Auth. ``host_id`` pins a
