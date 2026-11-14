@@ -438,6 +438,7 @@ describe("inline skill completion", () => {
       commands: { "/goal": "View or set the goal" },
       skills: { "/goal": "Project goal skill" },
       builtinNames: new Set(["/goal"]),
+      labels: { "/goal": "Workspace helper" },
     });
     expect(view.result.current.matches).toEqual(["/goal"]);
     expect(view.result.current.builtinNames.has("/goal")).toBe(true);
@@ -448,6 +449,14 @@ describe("inline skill completion", () => {
     expect(view.result.current.matches).toEqual(["/goal"]);
     expect(view.result.current.builtinNames.has("/goal")).toBe(false);
     expect(view.result.current.commands["/goal"]).toBe("Project goal skill");
+
+    view.rerender({ ...props, text: "/workspace" });
+    expect(view.result.current.matches).toEqual([]);
+    expect(view.result.current.labels["/goal"]).toBeUndefined();
+
+    view.rerender({ ...props, text: "please /workspace" });
+    expect(view.result.current.matches).toEqual(["/goal"]);
+    expect(view.result.current.labels["/goal"]).toBe("Workspace helper");
   });
 
   it.each(["please /rev", "please\n/rev", "please\t/rev"])("finds skills in %j", (text) => {

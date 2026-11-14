@@ -795,6 +795,8 @@ async def _set_codex_goal(client: CodexAppServerClient, *, thread_id: str, objec
     try:
         await client.request("thread/goal/set", {"threadId": thread_id, "objective": objective})
     except Exception as exc:
+        if isinstance(exc, CodexAppServerResponseError) and is_server_draining_error(exc):
+            raise
         raise _CodexNativeInputUndelivered(
             CodexStartupFailure(message=f"Codex goal request failed: {exc}"),
             preserve_session=True,

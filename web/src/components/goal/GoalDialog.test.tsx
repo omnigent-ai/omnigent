@@ -1,6 +1,6 @@
 import type * as GoalApiModule from "@/lib/goalApi";
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GoalDialog, parseGoalBudget } from "./GoalDialog";
 import type { Goal } from "@/lib/goalApi";
@@ -96,15 +96,6 @@ describe("GoalDialog", () => {
     expect(objective).toHaveClass("wrap-anywhere");
   });
 
-  it("gives the scroll region room for the fields' focus ring", async () => {
-    renderDialog();
-
-    await waitFor(() => expect(mockGetGoal).toHaveBeenCalledWith("conv_codex"));
-    const scrollRegion = screen.getByTestId("goal-objective").closest(".overflow-y-auto");
-    if (!scrollRegion) throw new Error("goal scroll region not found");
-    expect(scrollRegion).toHaveClass("p-1", "-m-1");
-  });
-
   it("saves a trimmed objective, token budget, and selected status", async () => {
     const updatedGoal = { ...ACTIVE_GOAL, objective: "Finish tests", status: "paused" };
     mockSetGoal.mockResolvedValueOnce({ goal: updatedGoal });
@@ -178,6 +169,134 @@ describe("GoalDialog", () => {
         expect.objectContaining({ status: undefined }),
       ),
     );
+  });
+
+  it.each(["complete", "blocked", "usageLimited"])(
+    "does not overwrite an untouched %s mode when saving an objective edit",
+    async (status) => {
+      const props = {
+        open: true,
+        conversationId: "conv_codex",
+        readOnly: false,
+        goal: ACTIVE_GOAL,
+        onGoalChange: vi.fn(),
+        onOpenChange: vi.fn(),
+      };
+      const { rerender } = render(<GoalDialog {...props} />);
+      await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
+      fireEvent.change(screen.getByTestId("goal-objective"), {
+        target: { value: "My edited objective" },
+      });
+
+      rerender(<GoalDialog {...props} goal={{ ...ACTIVE_GOAL, status, tokenBudget: 50000 }} />);
+      expect(screen.getByTestId("goal-mode-keep")).toHaveAttribute("aria-checked", "true");
+      expect(screen.getByTestId("goal-token-budget")).toHaveValue(50000);
+      fireEvent.click(screen.getByTestId("goal-save"));
+
+      await waitFor(() =>
+        expect(mockSetGoal).toHaveBeenCalledWith("conv_codex", {
+          objective: "My edited objective",
+          tokenBudget: 50000,
+          status: undefined,
+        }),
+      );
+    },
+  );
+
+  it.each(["reopen", "session switch"])(
+    "discards old drafts on %s even when the new read fails",
+    async (boundary) => {
+      const props = {
+        open: true,
+        conversationId: "conv_codex",
+        readOnly: false,
+        goal: ACTIVE_GOAL,
+        onGoalChange: vi.fn(),
+        onOpenChange: vi.fn(),
+      };
+      const { rerender } = render(<GoalDialog {...props} />);
+      await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
+      fireEvent.change(screen.getByTestId("goal-objective"), {
+        target: { value: "Cancelled objective" },
+      });
+      fireEvent.change(screen.getByTestId("goal-token-budget"), { target: { value: "123" } });
+      fireEvent.click(screen.getByTestId("goal-mode-paused"));
+      mockGetGoal.mockRejectedValueOnce(new Error("runner unavailable"));
+
+      const nextGoal = {
+        ...ACTIVE_GOAL,
+        objective: boundary === "reopen" ? "Updated while closed" : "Another session",
+        tokenBudget: 777,
+      };
+      const nextId = boundary === "reopen" ? props.conversationId : "conv_other";
+      if (boundary === "reopen") rerender(<GoalDialog {...props} open={false} />);
+      rerender(<GoalDialog {...props} goal={nextGoal} conversationId={nextId} />);
+
+      await screen.findByText("Could not read goal: runner unavailable");
+      expect(screen.getByTestId("goal-objective")).toHaveValue(nextGoal.objective);
+      expect(screen.getByTestId("goal-token-budget")).toHaveValue(nextGoal.tokenBudget);
+      expect(screen.getByTestId("goal-mode-active")).toHaveAttribute("aria-checked", "true");
+      fireEvent.click(screen.getByTestId("goal-save"));
+      await waitFor(() =>
+        expect(mockSetGoal).toHaveBeenCalledWith(nextId, {
+          objective: nextGoal.objective,
+          tokenBudget: nextGoal.tokenBudget,
+          status: "active",
+        }),
+      );
+    },
+  );
+
+  it("does not restore a deleted goal after reopening with a failed read", async () => {
+    const props = {
+      open: true,
+      conversationId: "conv_codex",
+      readOnly: false,
+      goal: ACTIVE_GOAL,
+      onGoalChange: vi.fn(),
+      onOpenChange: vi.fn(),
+    };
+    const { rerender } = render(<GoalDialog {...props} />);
+    await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
+    rerender(<GoalDialog {...props} open={false} />);
+    mockGetGoal.mockRejectedValueOnce(new Error("runner unavailable"));
+    rerender(<GoalDialog {...props} goal={null} />);
+
+    await screen.findByText("Could not read goal: runner unavailable");
+    expect(screen.getByTestId("goal-objective")).toHaveValue("");
+    expect(screen.getByTestId("goal-token-budget")).toHaveValue(null);
+    fireEvent.click(screen.getByTestId("goal-save"));
+    expect(screen.getByText("Goal objective cannot be empty.")).toBeInTheDocument();
+    expect(mockSetGoal).not.toHaveBeenCalled();
+  });
+
+  it("ignores an opening read that finishes after switching sessions", async () => {
+    let resolveOldRead!: (response: { goal: Goal | null }) => void;
+    mockGetGoal.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveOldRead = resolve;
+      }),
+    );
+    const props = {
+      open: true,
+      conversationId: "conv_codex",
+      readOnly: false,
+      goal: ACTIVE_GOAL,
+      onGoalChange: vi.fn(),
+      onOpenChange: vi.fn(),
+    };
+    const { rerender } = render(<GoalDialog {...props} />);
+    const nextGoal = { ...ACTIVE_GOAL, objective: "Current session", tokenBudget: 777 };
+    mockGetGoal.mockResolvedValueOnce({ goal: nextGoal });
+    rerender(<GoalDialog {...props} goal={nextGoal} conversationId="conv_other" />);
+    await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
+
+    await act(async () => resolveOldRead({ goal: ACTIVE_GOAL }));
+
+    expect(screen.getByTestId("goal-objective")).toHaveValue(nextGoal.objective);
+    expect(screen.getByTestId("goal-token-budget")).toHaveValue(nextGoal.tokenBudget);
+    expect(props.onGoalChange).toHaveBeenCalledTimes(1);
+    expect(props.onGoalChange).toHaveBeenCalledWith(nextGoal);
   });
 
   it("shows validation errors without calling the API", async () => {

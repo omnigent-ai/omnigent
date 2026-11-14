@@ -173,4 +173,18 @@ describe("useGoalState", () => {
     expect(mockGetGoal).toHaveBeenCalledTimes(1);
     expect(mockGetGoal).toHaveBeenCalledWith("conv");
   });
+
+  it("does not resurrect an old goal when the reconnect read fails", async () => {
+    mockGetGoal.mockResolvedValueOnce({ goal: GOAL }).mockRejectedValueOnce(new Error("offline"));
+    const { result, rerender } = renderHook(({ reachable }) => useGoalState("conv", reachable), {
+      initialProps: { reachable: true },
+    });
+    await waitFor(() => expect(result.current.goal).toEqual(GOAL));
+
+    rerender({ reachable: false });
+    rerender({ reachable: true });
+    await waitFor(() => expect(mockGetGoal).toHaveBeenCalledTimes(2));
+
+    expect(result.current.goal).toBeNull();
+  });
 });

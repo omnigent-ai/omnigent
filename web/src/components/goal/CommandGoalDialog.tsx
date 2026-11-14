@@ -63,9 +63,7 @@ export function CommandGoalDialog({
             </DialogDescription>
           </DialogHeader>
 
-          {/* p-1/-m-1 give the field's 3px focus ring room to paint:
-              overflow-y-auto clips on every side at the padding box. */}
-          <div className="-m-1 min-h-0 space-y-1.5 overflow-y-auto p-1">
+          <div className="min-h-0 space-y-1.5 overflow-y-auto">
             <label className="text-sm font-medium text-muted-foreground" htmlFor="goal-condition">
               Completion condition
             </label>

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { getGoal, type Goal } from "@/lib/goalApi";
 
 interface UseGoalStateResult {
@@ -11,7 +11,12 @@ export function useGoalState(conversationId: string | null, enabled: boolean): U
   const [snapshot, setSnapshot] = useState<{ sessionId: string; goal: Goal | null } | null>(null);
   const updateVersion = useRef(0);
   const activeSession = useRef<string | null>(null);
-  activeSession.current = enabled ? conversationId : null;
+  useLayoutEffect(() => {
+    activeSession.current = enabled ? conversationId : null;
+    return () => {
+      activeSession.current = null;
+    };
+  }, [conversationId, enabled]);
   const setGoal = useCallback(
     (goal: Goal | null) => {
       if (!conversationId || activeSession.current !== conversationId) return;
@@ -24,7 +29,10 @@ export function useGoalState(conversationId: string | null, enabled: boolean): U
   useEffect(() => {
     let cancelled = false;
     let inFlight = false;
-    if (!enabled || !conversationId) return;
+    if (!enabled || !conversationId) {
+      setSnapshot(null);
+      return;
+    }
     const refresh = async () => {
       if (cancelled || inFlight || document.visibilityState === "hidden") return;
       inFlight = true;

@@ -154,8 +154,13 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   existing message path. Sessions without the control keep sending the text
   or invoking a same-named skill. States: no goal, existing goal, read-only.
   Drafts with attachments are sent as ordinary messages and do not set a goal.
+  Leading `/goal` takes precedence over a same-named slash skill; inline goal
+  skills and Codex native `$goal` skills remain available. Mixed-case and
+  newline-separated goal commands use the same canonical message path.
   In Codex native Chat, the goal indicator follows commands and native goal
-  changes without reopening the dialog. Refreshes preserve unsaved dialog edits.
+  changes without reopening the dialog. Refreshes preserve edited dialog fields
+  while untouched fields follow current goal state. Reopening or switching
+  sessions discards old drafts, including when the opening read fails.
 - `slash-rewind`: in claude-sdk and Claude Code native sessions, `/rewind` opens
   a searchable list of the session's prompts, newest first. Choosing one
   continues the conversation in a new session holding only the history before

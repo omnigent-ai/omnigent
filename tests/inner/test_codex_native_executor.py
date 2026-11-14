@@ -1426,6 +1426,46 @@ def test_failed_goal_command_does_not_deliver_input_or_interrupt_native_work(
 
 
 @pytest.mark.parametrize(
+    ("active_turn_id", "live_injection"),
+    [(None, False), ("turn_existing", False), ("turn_existing", True)],
+    ids=["idle", "active-turn", "live-queue"],
+)
+def test_goal_draining_refusal_retains_restart_remediation(
+    active_turn_id: str | None,
+    live_injection: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class _GoalDrainingClient(_FakeCodexNativeClient):
+        requests = []
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            await super().request(method, params)
+            raise CodexAppServerResponseError(
+                {"code": -32600, "message": "Server is draining; retry after reconnecting"}
+            )
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _GoalDrainingClient
+    )
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    if live_injection:
+        assert not asyncio.run(executor.enqueue_session_message("main", "/goal Finish tests"))
+    [failure] = _collect_turn_events(executor, "/goal Finish tests")
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.code == CODEX_APP_SERVER_STOPPED.code
+    assert failure.remediation == CODEX_APP_SERVER_STOPPED.remediation
+    assert failure.undelivered is True
+    assert failure.preserve_session is (active_turn_id is not None)
+    assert _GoalDrainingClient.requests == [
+        ("thread/goal/set", {"threadId": "thread_123", "objective": "Finish tests"})
+    ] * (2 if live_injection else 1)
+
+
+@pytest.mark.parametrize(
     ("active_turn_id", "live_injection", "completed"),
     [
         (None, False, False),

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { CheckIcon, Loader2Icon, PauseCircleIcon, PlayCircleIcon, TargetIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -385,38 +385,66 @@ function useGoalDialogState({
   const [clearing, setClearing] = useState(false);
   const [statusUpdating, setStatusUpdating] = useState<GoalStatusUpdate | null>(null);
   const [error, setError] = useState<string | null>(null);
-
-  const refreshGoal = useCallback(async () => {
-    if (!conversationId) return;
-    setLoading(true);
-    setError(null);
-    try {
-      const response = await getGoal(conversationId);
-      onGoalChange(response.goal);
-      setObjective(response.goal?.objective ?? "");
-      setTokenBudget(response.goal?.tokenBudget?.toString() ?? "");
-      setModeDraftState(goalModeDraftForGoal(response.goal));
-    } catch (err) {
-      setError(goalError("Could not read goal", err));
-    } finally {
-      setLoading(false);
-    }
-  }, [conversationId, onGoalChange]);
+  const draftSession = useRef<string | null | undefined>(undefined);
+  const dirtyFields = useRef(new Set<"objective" | "tokenBudget" | "mode">());
 
   useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      draftSession.current = undefined;
+      return;
+    }
+    if (draftSession.current !== conversationId) {
+      draftSession.current = conversationId;
+      dirtyFields.current.clear();
+    }
+    if (!dirtyFields.current.has("objective")) setObjective(goal?.objective ?? "");
+    if (!dirtyFields.current.has("tokenBudget")) {
+      setTokenBudget(goal?.tokenBudget?.toString() ?? "");
+    }
+    if (!dirtyFields.current.has("mode")) setModeDraftState(goalModeDraftForGoal(goal));
+  }, [conversationId, goal, open]);
+
+  useEffect(() => {
+    if (!open || !conversationId) return;
+    let cancelled = false;
+    const refreshGoal = async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const response = await getGoal(conversationId);
+        if (cancelled) return;
+        onGoalChange(response.goal);
+        if (!dirtyFields.current.has("objective")) setObjective(response.goal?.objective ?? "");
+        if (!dirtyFields.current.has("tokenBudget")) {
+          setTokenBudget(response.goal?.tokenBudget?.toString() ?? "");
+        }
+        if (!dirtyFields.current.has("mode")) {
+          setModeDraftState(goalModeDraftForGoal(response.goal));
+        }
+      } catch (err) {
+        if (!cancelled) setError(goalError("Could not read goal", err));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
     void refreshGoal();
-  }, [open, refreshGoal]);
+    return () => {
+      cancelled = true;
+    };
+  }, [conversationId, onGoalChange, open]);
 
   const setObjectiveDraft = (value: string) => {
+    dirtyFields.current.add("objective");
     setObjective(value);
     if (error !== null) setError(null);
   };
   const setTokenBudgetDraft = (value: string) => {
+    dirtyFields.current.add("tokenBudget");
     setTokenBudget(value);
     if (error !== null) setError(null);
   };
   const setModeDraft = (value: GoalModeDraft) => {
+    dirtyFields.current.add("mode");
     setModeDraftState(value);
     if (error !== null) setError(null);
   };
@@ -443,6 +471,7 @@ function useGoalDialogState({
         tokenBudget: parsedBudget,
         status: modeDraft === "keep" ? undefined : modeDraft,
       });
+      dirtyFields.current.clear();
       onGoalChange(response.goal);
       setObjective(response.goal?.objective ?? trimmedObjective);
       setTokenBudget(response.goal?.tokenBudget?.toString() ?? tokenBudget.trim());
@@ -460,6 +489,7 @@ function useGoalDialogState({
     setError(null);
     try {
       await clearGoal(conversationId);
+      dirtyFields.current.clear();
       onGoalChange(null);
       setObjective("");
       setTokenBudget("");
@@ -477,6 +507,7 @@ function useGoalDialogState({
     setError(null);
     try {
       const response = await updateGoalStatus(conversationId, status);
+      dirtyFields.current.clear();
       onGoalChange(response.goal);
       setObjective(response.goal?.objective ?? "");
       setTokenBudget(response.goal?.tokenBudget?.toString() ?? "");
@@ -550,9 +581,7 @@ export function GoalDialog({
           </DialogTitle>
         </DialogHeader>
 
-        {/* p-1/-m-1 give the fields' 3px focus ring room to paint:
-            overflow-y-auto clips on every side at the padding box. */}
-        <div className="-m-1 min-h-0 space-y-3 overflow-y-auto p-1">
+        <div className="min-h-0 space-y-3 overflow-y-auto">
           <GoalSummary loading={loading} goal={goal} />
           <GoalEditor
             objective={state.objective}

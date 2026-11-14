@@ -2332,6 +2332,16 @@ export function buildSlashCommandMap(
   return m;
 }
 
+/** Build the same skill descriptions for leading and inline completion. */
+function buildSkillCommandMap(
+  skills: readonly SkillSummary[],
+  prefix: "/" | "$",
+): Record<string, string> {
+  return Object.fromEntries(
+    skills.map((skill) => [`${prefix}${skill.name}`, skillMenuDescription(skill)]),
+  );
+}
+
 /**
  * Whether the composer offers ``/clear`` for a session on *harness*.
  *
@@ -3189,30 +3199,22 @@ function ComposerImpl(
       showGoal,
     ],
   );
-  const builtinCommandNames = useMemo(
-    () => new Set(Object.keys(offeredBuiltinCommands)),
-    [offeredBuiltinCommands],
-  );
+  const goalBuiltinNames = useMemo(() => new Set(showGoal ? ["/goal"] : []), [showGoal]);
   const commandSkills = useMemo(
     () =>
-      skills.filter(
-        (skill) => !builtinCommandNames.has(`${skillPrefix}${skill.name}`.toLowerCase()),
-      ),
-    [skills, builtinCommandNames, skillPrefix],
+      showGoal && skillPrefix === "/"
+        ? skills.filter((skill) => skill.name.toLowerCase() !== "goal")
+        : skills,
+    [skills, showGoal, skillPrefix],
   );
   const skillCommands = useMemo(
-    () =>
-      Object.fromEntries(
-        skills.map((skill) => [`${skillPrefix}${skill.name}`, skillMenuDescription(skill)]),
-      ),
+    () => buildSkillCommandMap(skills, skillPrefix),
     [skills, skillPrefix],
   );
   const slashCommands = useMemo(
     () => ({
       ...offeredBuiltinCommands,
-      ...Object.fromEntries(
-        commandSkills.map((skill) => [`${skillPrefix}${skill.name}`, skillMenuDescription(skill)]),
-      ),
+      ...buildSkillCommandMap(commandSkills, skillPrefix),
     }),
     [offeredBuiltinCommands, commandSkills, skillPrefix],
   );
@@ -3904,7 +3906,7 @@ function ComposerImpl(
     text: value,
     commands: slashCompletionCommands,
     skills: skillCommands,
-    builtinNames: builtinCommandNames,
+    builtinNames: goalBuiltinNames,
     labels: skillLabels,
     textareaRef,
     prefix: skillPrefix,

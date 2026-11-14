@@ -1074,25 +1074,6 @@ describe("Composer goal slash command", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
-  it("shows an existing built-in instead of a colliding help skill", () => {
-    const onSendSlashCommand = vi.fn();
-    setComposerState({
-      sessionHarness: "codex",
-      skills: [{ name: "help", description: "Project help skill" }],
-    });
-    renderWithTooltips(<Composer {...composerProps({ onSendSlashCommand })} />);
-
-    fireEvent.change(textarea(), { target: { value: "/hel" } });
-    expect(screen.getByTestId("slash-menu-item-help")).toHaveTextContent(
-      BUILTIN_SLASH_COMMANDS["/help"],
-    );
-    expect(screen.queryByText("Project help skill")).toBeNull();
-    fireEvent.keyDown(textarea(), { key: "Enter" });
-
-    expect(textarea()).toHaveValue("");
-    expect(onSendSlashCommand).not.toHaveBeenCalled();
-  });
-
   it.each(["/Goal Fix CI", "/goal"])(
     "keeps an attached %s draft on the ordinary message path",
     (text) => {
