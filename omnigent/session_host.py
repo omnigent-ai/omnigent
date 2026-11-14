@@ -38,17 +38,25 @@ _SLICE_KEY_QUERY_PARAM = "omnigent_slice_key"
 _session_hosts: dict[str, str] = {}
 
 
+def _cache_key(session_id: str) -> str:
+    """One entry per session, whether its id is canonical, dashed, or legacy-prefixed."""
+    try:
+        return normalize_session_id(session_id)
+    except ValueError:
+        return session_id
+
+
 def set_session_host(session_id: str, host_id: str | None) -> None:
     """Record a session's host; an absent host clears stale routing."""
     if host_id:
-        _session_hosts[session_id] = host_id
+        _session_hosts[_cache_key(session_id)] = host_id
     else:
-        _session_hosts.pop(session_id, None)
+        _session_hosts.pop(_cache_key(session_id), None)
 
 
 def get_session_host(session_id: str) -> str | None:
     """Return the last observed host, or None for an unknown or hostless session."""
-    return _session_hosts.get(session_id)
+    return _session_hosts.get(_cache_key(session_id))
 
 
 def session_routing_headers(url: str) -> dict[str, str]:

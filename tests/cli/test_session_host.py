@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import uuid
+
 import httpx
 import pytest
 
@@ -133,24 +135,39 @@ async def test_sdk_client_keys_each_session_by_its_own_host(
         assert OMNIGENT_SLICE_KEY_HEADER not in client._http.headers
 
 
+@pytest.mark.parametrize(
+    ("refusal", "expected_keys"),
+    [
+        # Named: retried on that host once, and later requests go there directly.
+        ({"slice_key": "host_owner"}, ["client_key", "host_owner", "host_owner"]),
+        # Unnamed: the host is looked up, then the request is retried on it.
+        ({}, ["client_key", "lookup", "host_owner", "host_owner"]),
+        # Null: one keyless resend per request, nothing cached, no further retries.
+        ({"slice_key": None}, ["client_key", None, "client_key", None]),
+    ],
+    ids=["named", "unnamed", "keyless"],
+)
 @pytest.mark.asyncio
-async def test_sdk_client_follows_a_refusal_to_the_sessions_host(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_sdk_client_recovers_once_from_a_wrong_replica_refusal(
+    monkeypatch: pytest.MonkeyPatch, refusal: dict[str, str | None], expected_keys: list
 ) -> None:
-    """A refusal naming the session's host is retried there once, and later requests go there."""
+    """The REPL's client follows each refusal form once, after the CLI auth keyed the request."""
     monkeypatch.setenv("OMNIGENT_REMOTE_AUTH_TOKEN", "test-token")
     monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
     mount = "https://workspace.example.com/api/2.0/omnigent"
+    owner = refusal.get("slice_key", "host_owner")
     keys: list[str | None] = []
+    session = {"id": NEW_SESSION, "agent_id": "ag", "status": "idle", "created_at": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["Authorization"] == "Bearer test-token"
+        if "include_liveness" in request.url.params:
+            keys.append("lookup")
+            return httpx.Response(200, json={**session, "host_id": "host_owner"})
         keys.append(request.headers.get(OMNIGENT_SLICE_KEY_HEADER))
-        if keys[-1] != "host_owner":
-            error = {"code": "wrong_replica", "slice_key": "host_owner"}
-            return httpx.Response(400, json={"error": error})
-        return httpx.Response(
-            200, json={"id": NEW_SESSION, "agent_id": "ag", "status": "idle", "created_at": 0}
-        )
+        if keys[-1] != owner:
+            return httpx.Response(400, json={"error": {"code": "wrong_replica", **refusal}})
+        return httpx.Response(200, json=session)
 
     async with open_sdk_client(
         mount, auth=_DatabricksTokenAuth(server_url=mount), transport=httpx.MockTransport(handler)
@@ -158,8 +175,18 @@ async def test_sdk_client_follows_a_refusal_to_the_sessions_host(
         assert (await client.sessions.get(NEW_SESSION)).id == NEW_SESSION
         assert (await client.sessions.get(NEW_SESSION)).id == NEW_SESSION
 
-    assert keys == ["client_key", "host_owner", "host_owner"]
-    assert get_session_host(NEW_SESSION) == "host_owner"
+    assert keys == expected_keys
+    assert get_session_host(NEW_SESSION) == (owner and "host_owner")
+
+
+def test_session_host_cache_shares_one_entry_across_id_spellings() -> None:
+    """A host recorded under a dashed or legacy-prefixed id routes the canonical id too."""
+    dashed = str(uuid.UUID(NEW_SESSION))
+    set_session_host(dashed, "host_abc")
+    assert get_session_host(NEW_SESSION) == "host_abc"
+    assert get_session_host(f"conv_{NEW_SESSION}") == "host_abc"
+    set_session_host(f"conv_{NEW_SESSION}", None)
+    assert get_session_host(dashed) is None
 
 
 _WRONG_REPLICA = {"error": {"code": "wrong_replica"}}
