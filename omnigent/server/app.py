@@ -101,6 +101,7 @@ from omnigent.server.background_session_titles import (
 )
 from omnigent.server.disconnect_evidence import DisconnectEvidence, drop_attributes
 from omnigent.server.feature_flags import (
+    DeploymentGate,
     Feature,
     FeatureFlags,
     deployment_gate_enabled,
@@ -131,8 +132,12 @@ from omnigent.server.routes.extension_assets import create_extension_assets_rout
 from omnigent.server.routes.extensions import create_extensions_router
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
+from omnigent.server.routes.inbox_items import create_inbox_items_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.preferences import create_preferences_router
+from omnigent.server.routes.proactive_agent_settings import (
+    create_proactive_agent_settings_router,
+)
 from omnigent.server.routes.projects import create_projects_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
@@ -188,9 +193,11 @@ from omnigent.stores.conversation_store import (
     runner_seen_is_fresh,
 )
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.inbox_item_store import InboxItemStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 from omnigent.stores.preference_store import PreferenceStore
+from omnigent.stores.proactive_agent_settings_store import ProactiveAgentSettingsStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 from omnigent.stores.scheduled_task_store.dispatch import ScheduledTaskDispatchStore
@@ -294,6 +301,9 @@ class ServerInfoResponse(BaseModel):
     installable_harnesses: list[str]
     # Whether the scheduled-tasks routes are mounted and enabled for this caller.
     automations_enabled: bool = False
+    # Whether the deployment offers the proactive agent to this caller; each
+    # user's own on/off state is at ``GET /v1/proactive-agent/settings``.
+    proactive_agent_available: bool = False
     dictation_available: bool
     # Scheduled tasks accept the optional random-worktree base ref.
     scheduled_task_worktrees: bool = True
@@ -1803,6 +1813,9 @@ def create_app(
     preference_policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
     scheduled_task_dispatch: ScheduledTaskDispatchHooks | None = None,
     scheduled_task_scheduler_config: ScheduledTaskSchedulerConfig | None = None,
+    inbox_item_store: InboxItemStore | None = None,
+    proactive_agent: DeploymentGate | None = None,
+    proactive_agent_settings_store: ProactiveAgentSettingsStore | None = None,
     session_mcp_selection: SessionMcpSelection | None = None,
 ) -> FastAPI:
     """
@@ -1830,6 +1843,8 @@ def create_app(
         token-bound runner id, which is the shared remote-server
         behavior.
     :param comment_store: Store for per-conversation review comments.
+    :param inbox_item_store: Store for agent-posted Inbox items; ``None`` leaves
+        the Inbox item routes unmounted.
     :param policy_store: Store for server-persisted policies
         (session-scoped and server-wide defaults). ``None``
         disables both the session policy and default policy
@@ -1847,6 +1862,16 @@ def create_app(
         When off, the ``/v1/scheduled-tasks`` routes return 404 and ``GET /v1/info``
         reports ``automations_enabled`` false. Scheduling of existing tasks is not
         affected.
+    :param proactive_agent: Whether the deployment offers the proactive agent and
+        agent-posted Inbox items to this request's caller. A static bool or a
+        zero-arg callable resolved per request; ``None`` follows the
+        ``proactive_agent`` release feature (off by default). When off,
+        ``/v1/inbox/items`` and ``/v1/proactive-agent/settings`` return 404 and
+        ``GET /v1/info`` reports ``proactive_agent_available`` false.
+    :param proactive_agent_settings_store: The workspace and per-user on/off
+        settings. Where the deployment offers the agent, a user gets it only when
+        both are on. ``None`` leaves the settings routes unmounted and turns the
+        agent off, whatever ``proactive_agent`` says.
     :param scheduled_task_dispatch: Overrides for automations_v2: host ownership,
         the owner identity fires act under, or a replacement executor. ``None``
         uses the built-in executor with every host owned by this replica.
@@ -2561,6 +2586,37 @@ def create_app(
         )
 
     app.state.automations_available = automations_available
+    proactive_agent_gate: DeploymentGate = (
+        resolved_feature_flags.enabled(Feature.PROACTIVE_AGENT)
+        if proactive_agent is None
+        else proactive_agent
+    )
+
+    def proactive_agent_available() -> bool:
+        """Whether the deployment offers the proactive agent to this request's caller.
+
+        Both stores are needed: the web client reads the settings before it
+        shows any Inbox item, so an offer without settings routes would never
+        be used.
+        """
+        return (
+            inbox_item_store is not None
+            and proactive_agent_settings_store is not None
+            and deployment_gate_enabled(proactive_agent_gate, "proactive_agent")
+        )
+
+    def proactive_agent_enabled_for(user_id: str) -> bool:
+        """Whether the agent and its Inbox items are on for *user_id*.
+
+        Evaluated in that user's request or identity scope, since the
+        deployment gate may read the current user.
+        """
+        if not proactive_agent_available() or proactive_agent_settings_store is None:
+            return False
+        return all(proactive_agent_settings_store.read(user_id))
+
+    app.state.proactive_agent_available = proactive_agent_available
+    app.state.proactive_agent_enabled_for = proactive_agent_enabled_for
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
     # Separate from dispatch: schedulers accept one-time rules from this release on,
     # and creating them waits until every scheduler on the database does.
@@ -3930,6 +3986,7 @@ def create_app(
                 "session_organize_source_checks": True,
                 "sibling_other_project_standalone": True,
                 "automations_enabled": automations_enabled,
+                "proactive_agent_available": app.state.proactive_agent_available(),
                 "automation_trigger_poll_minutes": trigger_poll_minutes,
                 "branding": branding_snapshot.config(),
                 "picker": picker_curation.config(),
@@ -4189,6 +4246,31 @@ def create_app(
         prefix="/v1",
         tags=["session_mcp_servers"],
     )
+    if inbox_item_store is not None:
+        app.include_router(
+            create_inbox_items_router(
+                inbox_item_store,
+                enabled=proactive_agent_enabled_for,
+                conversation_store=conversation_store,
+                agent_store=agent_store,
+                agent_cache=agent_cache,
+                permission_store=permission_store,
+                auth_provider=auth_provider,
+            ),
+            prefix="/v1",
+            tags=["inbox_items"],
+        )
+        if proactive_agent_settings_store is not None:
+            app.include_router(
+                create_proactive_agent_settings_router(
+                    proactive_agent_settings_store,
+                    offered=proactive_agent_available,
+                    auth_provider=auth_provider,
+                    permission_store=permission_store,
+                ),
+                prefix="/v1",
+                tags=["proactive_agent"],
+            )
     if comment_store is not None:
         app.include_router(
             create_comments_router(
