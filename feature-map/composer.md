@@ -25,7 +25,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   **Copy message to new session** opens it with a one-time `?handoff=` token
   instead, naming an in-memory copy of the message's text and attachments. That
   copy replaces the whole parked draft, even with no text or no attachments; the
-  token leaves the URL and is released once the composer takes it.
+  token leaves the URL and is released once the composer takes it. An agent
+  suggestion's action button in the Inbox uses the same handoff with the action's
+  prompt, so the viewer edits and sends it.
 - `offline-hosts`: the new-session host picker keeps other offline hosts collapsed,
   revealing five at a time in server recency order in a scrollable list. The selected
   offline host and desktop reconnect action stay visible. Closing the menu resets it.
@@ -424,6 +426,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   deployment stays under its mount path. Browser proof:
   `tests/browser_ui/chat/test_prompt_url.py`; router and draft edge cases:
   `web/src/shell/NewChatDialog.test.tsx` (`prompt URL handoff`).
+- From the Inbox, expand an Omni Advisor suggestion and click one of its action
+  buttons. The New Chat composer opens with the action's prompt as an editable
+  draft, through the same one-time handoff token; nothing is sent until Send.
+  Component proof: `web/src/pages/InboxPage.test.tsx` (`takes an agent action
+  and opens the composer with its prompt`).
 
 - In the managed desktop app, choose **Arclet Sandbox** and submit a task with
   missing or expired laptop credentials. Click **Refresh dbcert** in the yellow
@@ -562,6 +569,13 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/browser_ui/chat/test_composer_geometry_contract.py::test_landing_and_live_cards_share_the_geometry_contract`
   uses the built SPA with mocked APIs (no server required), comparing touch and
   mouse input at phone, tablet, and desktop widths.
+
+- **`prompt-link`, Inbox action handoff:** with an Omni Advisor suggestion in
+  the Inbox, expand it and click an action. The New Chat composer should open
+  with the action's prompt filled in and editable, the handoff token gone from
+  the URL, and no session created until Send. Component coverage:
+  `web/src/pages/InboxPage.test.tsx` (`takes an agent action and opens the
+  composer with its prompt`).
 
 - **`blocked-start`:** on a fresh new-session page with no working directory,
   enter a prompt or attach a file. Hover disabled Start, click it, then move

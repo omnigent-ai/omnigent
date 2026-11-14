@@ -126,6 +126,7 @@ import { MenuItem } from "@/components/ui/menu-item";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTitlesPreferences";
+import { timezoneRequestHeaders } from "@/lib/timezones";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { managedSandboxHostId } from "@/lib/managedSandboxHost";
 import { randomUUID } from "@/lib/randomUUID";
@@ -6603,6 +6604,7 @@ function NewChatLandingContent({
           headers: {
             ...(createForm === null ? { "Content-Type": "application/json" } : {}),
             ...backgroundSessionTitlesRequestHeaders(),
+            ...timezoneRequestHeaders(),
           },
           body: createForm ?? createPayload,
         });

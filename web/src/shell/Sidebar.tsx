@@ -780,10 +780,11 @@ export function useMigrateLocalPinsToServer(
   }, [pinnedLoaded, filterHonored, ownedIds]);
 }
 
-function inboxBadgeLabel(count: number, incomplete: boolean): string {
-  const label = count === 1 ? "1 inbox item waiting" : `${count} inbox items waiting`;
-  if (incomplete) return `${label}; more automations not yet checked`;
-  return label;
+function inboxBadgeLabel(count: number, incomplete: boolean, capped: boolean): string {
+  const items = count === 1 ? "1 inbox item waiting" : `${count} inbox items waiting`;
+  // The server stops counting suggestions at its limit, so the total is a floor.
+  const label = capped ? `At least ${items}` : items;
+  return incomplete ? `${label}; more automations not yet checked` : label;
 }
 
 function SidebarImpl({
@@ -904,6 +905,7 @@ function SidebarImpl({
   );
   const inboxCount = sidebarData.inboxCount + unreadInboxCount;
   const inboxCountIncomplete = sidebarData.inboxCountIncomplete;
+  const inboxCountCapped = sidebarData.inboxCountCapped;
 
   // The scrollable list container — used as the IntersectionObserver root for
   // infinite scroll (auto-loading the next page as the sentinel nears view).
@@ -1490,7 +1492,11 @@ function SidebarImpl({
                       title={
                         inboxCountIncomplete ? "Open Inbox to check older automations." : undefined
                       }
-                      aria-label={inboxBadgeLabel(inboxCount, inboxCountIncomplete)}
+                      aria-label={inboxBadgeLabel(
+                        inboxCount,
+                        inboxCountIncomplete,
+                        inboxCountCapped,
+                      )}
                       className={cn(
                         "ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-10 font-medium text-[var(--sidebar-active-foreground)] tabular-nums",
                         // The active Inbox row already paints the translucent
@@ -1500,7 +1506,7 @@ function SidebarImpl({
                       )}
                     >
                       {inboxCount > 0 ? inboxCount : ""}
-                      {inboxCountIncomplete ? "+" : ""}
+                      {inboxCountIncomplete || inboxCountCapped ? "+" : ""}
                     </span>
                   )}
                 </Link>

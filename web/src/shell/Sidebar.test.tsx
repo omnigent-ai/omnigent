@@ -10,6 +10,7 @@ vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import { conversationPage } from "@/test/sidebarMockHelpers";
 import * as automationInboxHook from "@/hooks/useAutomationInbox";
+import * as proactiveInboxHook from "@/hooks/useProactiveInbox";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 // Integration tests for the Sidebar's session list. The search box no
@@ -1228,6 +1229,44 @@ describe("Sidebar session list", () => {
       }
     },
   );
+
+  it("calls a capped suggestion count a floor, since the server stopped counting at it", () => {
+    const proactiveInbox = vi.spyOn(proactiveInboxHook, "useProactiveInbox");
+    const base = proactiveInbox.getMockImplementation()?.(true);
+    proactiveInbox.mockReturnValue({
+      ...(base as ReturnType<typeof proactiveInboxHook.useProactiveInbox>),
+      items: [],
+      unreadCount: 100,
+      unreadCountCapped: true,
+    });
+    try {
+      mockConversations([]);
+      renderSidebar();
+      const inbox = within(screen.getByTestId("inbox-button"));
+      expect(inbox.getByLabelText("At least 100 inbox items waiting")).toHaveTextContent("100+");
+      cleanup();
+
+      // Unchecked automations qualify the same label rather than replacing it.
+      const automationInbox = vi.spyOn(automationInboxHook, "useAutomationInbox");
+      automationInbox.mockReturnValue({
+        items: [],
+        hasNextPage: true,
+      } as unknown as ReturnType<typeof automationInboxHook.useAutomationInbox>);
+      try {
+        mockConversations([]);
+        renderSidebar();
+        expect(
+          within(screen.getByTestId("inbox-button")).getByLabelText(
+            "At least 100 inbox items waiting; more automations not yet checked",
+          ),
+        ).toHaveTextContent("100+");
+      } finally {
+        automationInbox.mockRestore();
+      }
+    } finally {
+      proactiveInbox.mockRestore();
+    }
+  });
 
   it.each(["/", "/inbox"])("counts an unread session in the Inbox badge on %s", (route) => {
     seedReadState([{ id: "conv_unread", viewer_last_seen: 199 }]);

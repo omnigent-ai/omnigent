@@ -59,6 +59,8 @@ const mocks = vi.hoisted(() => ({
   bootFallback: false,
   sessionTitleInstructions: false,
   nestedAgents: false,
+  advisorAvailable: false,
+  authenticatedFetch: vi.fn(),
   // Identity from the mode-agnostic `/v1/me` probe (resolveIdentity returns
   // the id, getCurrentIsAdmin the flag). null → unauthenticated.
   me: { id: "alice", is_admin: false } as { id: string; is_admin: boolean } | null,
@@ -95,6 +97,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
           sibling_sessions: mocks.nestedAgents,
           enabled_connections: mocks.enabledConnections,
           session_title_instructions: mocks.sessionTitleInstructions,
+          proactive_agent_available: mocks.advisorAvailable,
         },
 }));
 vi.mock("@/components/SessionTitleInstructionsControl", () => ({
@@ -108,6 +111,7 @@ vi.mock("@/lib/accountsApi", () => ({
   changePassword: vi.fn(),
 }));
 vi.mock("@/lib/identity", () => ({
+  authenticatedFetch: (...args: unknown[]) => mocks.authenticatedFetch(...args),
   resolveIdentity: () => Promise.resolve(mocks.me?.id ?? null),
   getCurrentIsAdmin: () => mocks.effectiveAdmin ?? mocks.me?.is_admin ?? false,
   getCurrentAdminEligibility: () => mocks.me?.is_admin ?? false,
@@ -294,6 +298,8 @@ beforeEach(() => {
   mocks.bootFallback = false;
   mocks.sessionTitleInstructions = false;
   mocks.nestedAgents = false;
+  mocks.advisorAvailable = false;
+  mocks.authenticatedFetch.mockReset();
   mocks.importSessionsPanel.mockClear();
   mocks.enabledConnections = [];
   mocks.loginUrl = "/login";
@@ -329,6 +335,34 @@ describe("Import sessions", () => {
     expect(screen.getByRole("heading", { name: "Import from a machine" })).toBeTruthy();
     expect(mocks.importSessionsPanel).toHaveBeenCalled();
     expect(screen.queryByRole("heading", { name: "Harness imports" })).toBeNull();
+  });
+});
+
+describe("Omni Advisor", () => {
+  it("shows a settings load failure with a retry instead of dropping the switch", async () => {
+    mocks.advisorAvailable = true;
+    mocks.authenticatedFetch.mockRejectedValueOnce(new Error("offline")).mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          workspace_enabled: true,
+          user_enabled: true,
+          enabled: true,
+          can_manage_workspace: false,
+        }),
+        { status: 200 },
+      ),
+    );
+    renderPage();
+
+    const group = await screen.findByTestId("settings-group-proactive-agent");
+    expect(await within(group).findByRole("alert")).toHaveTextContent(
+      "Couldn’t load Omni Advisor settings.",
+    );
+    expect(within(group).queryByRole("switch")).toBeNull();
+
+    fireEvent.click(within(group).getByRole("button", { name: "Retry" }));
+    expect(await within(group).findByRole("switch", { name: "Omni Advisor" })).toBeChecked();
+    expect(mocks.authenticatedFetch).toHaveBeenCalledTimes(2);
   });
 });
 
