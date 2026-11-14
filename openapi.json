@@ -4672,7 +4672,7 @@
             "title": "Enabled"
           },
           "harness": {
-            "description": "Harness family that loads it: `claude`, `codex`, `cursor`, or `pi`.",
+            "description": "Harness family that loads it: `claude`, `codex`, `cursor`, `pi`, or `antigravity`.",
             "title": "Harness",
             "type": "string"
           },
