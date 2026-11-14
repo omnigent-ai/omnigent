@@ -120,6 +120,26 @@ def _split_session_path(request: httpx.Request) -> tuple[str, str] | None:
     return unquote(base_path), route
 
 
+def _resends_from_its_files(stream: object) -> bool:
+    """Whether a body is a multipart upload httpx can resend by re-reading its files.
+
+    httpx rewinds each seekable file of a multipart body every time it sends it, so a
+    retry needs no in-memory copy. Any other body, or one with a non-seekable file, is
+    buffered instead; so is a multipart body if httpx stops exposing its ``fields``.
+    """
+    fields = getattr(stream, "fields", None)
+    if not isinstance(fields, list):
+        return False
+    for field in fields:
+        file = getattr(field, "file", None)
+        if file is None or isinstance(file, (str, bytes)):
+            continue
+        seekable = getattr(file, "seekable", None)
+        if not callable(seekable) or not seekable():
+            return False
+    return True
+
+
 def _session_key(route: str) -> str | None:
     """The canonical id of the session a route names, or None for collection routes."""
     segment = route.split("/")[1] if route.startswith("/") else ""
@@ -198,8 +218,9 @@ class SessionRoutingTransport(httpx.AsyncBaseTransport):
         parts = _split_session_path(request)
         if parts is None:
             return await self._send(request)
-        # Read the body once so a retry can resend it; only session routes need that.
-        await request.aread()
+        if not _resends_from_its_files(request.stream):
+            # Read the body once so a retry can resend it; only session routes need that.
+            await request.aread()
         base_path, route = parts
         base_url = str(request.url.copy_with(path=base_path, query=None))
         if request.extensions.get(UNKEYED_REQUEST_EXTENSION):

@@ -179,6 +179,36 @@ async def test_sdk_client_recovers_once_from_a_wrong_replica_refusal(
     assert get_session_host(NEW_SESSION) == (owner and "host_owner")
 
 
+@pytest.mark.asyncio
+async def test_sdk_upload_follows_a_refusal_with_the_whole_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """The REPL's attachment upload is retried on the session's host with the full file."""
+    monkeypatch.setenv("OMNIGENT_REMOTE_AUTH_TOKEN", "test-token")
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
+    mount = "https://workspace.example.com/api/2.0/omnigent"
+    path = tmp_path / "notes.txt"
+    content = b"attachment line\n" * 8192
+    path.write_bytes(content)
+    sends: list[tuple[str | None, bool]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        key = request.headers.get(OMNIGENT_SLICE_KEY_HEADER)
+        sends.append((key, content in request.content))
+        if key != "host_owner":
+            error = {"code": "wrong_replica", "slice_key": "host_owner"}
+            return httpx.Response(400, json={"error": error})
+        return httpx.Response(201, json={"id": "file_1", "metadata": {"filename": path.name}})
+
+    async with open_sdk_client(
+        mount, auth=_DatabricksTokenAuth(server_url=mount), transport=httpx.MockTransport(handler)
+    ) as client:
+        uploaded = await client.files.for_session(NEW_SESSION).upload(str(path))
+
+    assert uploaded.id == "file_1"
+    assert sends == [("client_key", True), ("host_owner", True)]
+
+
 def test_session_host_cache_shares_one_entry_across_id_spellings() -> None:
     """A host recorded under a dashed or legacy-prefixed id routes the canonical id too."""
     dashed = str(uuid.UUID(NEW_SESSION))

@@ -1,6 +1,7 @@
 """Session-scoped runner requests are keyed by the target session's host."""
 
 import asyncio
+import io
 import time
 from uuid import uuid4
 
@@ -497,3 +498,62 @@ async def test_json_refusal_before_stream_establishment_can_recover():
         async with client.stream("GET", f"/v1/sessions/{CHILD}/stream") as response:
             assert await response.aread() == b"data: ok\n\n"
     assert sends == [TARGET_HOST, MOVED_HOST]
+
+
+class UploadSource(io.BytesIO):
+    """An upload's file, counting how often its content is read from the start."""
+
+    def __init__(self, data: bytes, *, seekable: bool) -> None:
+        super().__init__(data)
+        self._seekable = seekable
+        self.passes = 0
+
+    def seekable(self) -> bool:
+        return self._seekable
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        if not self._seekable:
+            raise io.UnsupportedOperation("seek")
+        return super().seek(offset, whence)
+
+    def read(self, size: int | None = -1) -> bytes:
+        if self.tell() == 0 and size != 0:
+            self.passes += 1
+        return super().read(size)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("seekable", "passes"), [(True, 2), (False, 1)], ids=["file-streams", "pipe-buffered"]
+)
+async def test_refused_upload_reaches_the_host_with_the_whole_file(
+    seekable: bool, passes: int
+) -> None:
+    """A file is re-read for the retry instead of held in memory; a pipe is buffered once."""
+    data = bytes(range(256)) * 1024
+    source = UploadSource(data, seekable=seekable)
+    bodies: list[tuple[str | None, bool]] = []
+
+    class Network(httpx.AsyncBaseTransport):
+        """Reads each body as a socket send does; MockTransport would buffer it first."""
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            key = request.headers.get(OMNIGENT_SLICE_KEY_HEADER)
+            assert isinstance(request.stream, httpx.AsyncByteStream)
+            body = b"".join([chunk async for chunk in request.stream])
+            bodies.append((key, data in body))
+            if key != TARGET_HOST:
+                return named_refusal(TARGET_HOST)
+            return httpx.Response(201, json={"id": "file_1"})
+
+    async with httpx.AsyncClient(
+        transport=SessionRoutingTransport(transport=Network()),
+        base_url="http://server",
+        headers={OMNIGENT_SLICE_KEY_HEADER: RUNNER_HOST},
+    ) as client:
+        response = await client.post(
+            f"/v1/sessions/{CHILD}/resources/files", files={"file": ("a.bin", source)}
+        )
+    assert response.status_code == 201
+    assert bodies == [(RUNNER_HOST, True), (TARGET_HOST, True)]
+    assert source.passes == passes
