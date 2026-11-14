@@ -1880,7 +1880,7 @@ function WorkspacePanelImpl({
           )}
           {showOpenTabs && (
             <>
-              {/* Open tabs fill the space before the pinned trailing controls. */}
+              {/* Open tabs shrink and scroll only once they reach the trailing controls. */}
               <WorkspaceTabsScroller>
                 {visibleOpenPanels.map((tab) => {
                   const { label, icon: Icon } = WORKSPACE_PANEL_TABS[tab];
