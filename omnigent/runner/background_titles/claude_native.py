@@ -74,7 +74,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
     if settings:
         args.extend(("--settings", json.dumps(settings)))
 
-    command, launch_args = resolve_claude_launch("claude", args)
+    command, launch_args = await asyncio.to_thread(resolve_claude_launch, "claude", args)
     if command == "claude":
         # Mirrors the check in _auto_create_claude_terminal: this bare
         # "claude" is resolved against this process's PATH by
@@ -82,10 +82,12 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         # binary that will actually run. Degrades to a skipped title
         # (like the config-resolution fallback above) rather than raising,
         # since a background title is best-effort, not session-critical.
-        resolved_claude = resolve_cli_binary("claude")
+        resolved_claude = await asyncio.to_thread(resolve_cli_binary, "claude")
         if resolved_claude is not None:
             try:
-                validate_claude_hook_interpreter_compatibility(resolved_claude)
+                await asyncio.to_thread(
+                    validate_claude_hook_interpreter_compatibility, resolved_claude
+                )
             except ClaudeNativeHookInterpreterMismatchError:
                 _logger.warning(
                     "background Claude Code title skipped: %s is Windows-native "
