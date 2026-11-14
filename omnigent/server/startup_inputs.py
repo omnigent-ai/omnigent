@@ -7,7 +7,7 @@ import contextlib
 import logging
 import re
 import weakref
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from typing import Any
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -148,7 +148,8 @@ class StartupInputContext:
 
 
 StartupDispatch = Callable[
-    [StartupInputContext, str, SessionEventInput], Coroutine[Any, Any, dict[str, bool | str]]
+    [StartupInputContext, str, SessionEventInput],
+    Coroutine[Any, Any, Mapping[str, bool | str | list[str]]],
 ]
 
 

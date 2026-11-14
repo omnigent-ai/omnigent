@@ -84,6 +84,12 @@ export interface PostEventResponse {
   recovered?: boolean;
   /** Machine-readable recovery outcome for retry_session control events. */
   recovery?: "already_connected" | "native_terminal_ready" | "runner_relaunched";
+  /**
+   * Pending-input ids a `stop_session` settled: native web messages queued
+   * when the stop landed, which get no `session.input.consumed`. Absent when
+   * it settled none, and from servers that predate it.
+   */
+  settledPendingIds?: string[];
   /** The session a claude-sdk `clear` continued in; absent for other events. */
   sessionId?: string;
 }
@@ -531,6 +537,7 @@ function postEventResponseFromWire(wire: {
   pending_id?: string;
   recovered?: boolean;
   recovery?: PostEventResponse["recovery"];
+  settled_pending_ids?: string[];
   session_id?: string;
 }): PostEventResponse {
   return {
@@ -540,6 +547,7 @@ function postEventResponseFromWire(wire: {
     pendingId: wire.pending_id,
     recovered: wire.recovered,
     recovery: wire.recovery,
+    settledPendingIds: wire.settled_pending_ids,
     sessionId: wire.session_id,
   };
 }
@@ -1768,6 +1776,7 @@ export async function postEvent(
     pending_id?: string;
     recovered?: boolean;
     recovery?: PostEventResponse["recovery"];
+    settled_pending_ids?: string[];
     session_id?: string;
   };
   return postEventResponseFromWire(body);
