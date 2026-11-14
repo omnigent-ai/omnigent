@@ -155,7 +155,9 @@ Click a workflow on the **Workflows** page to open it: its steps as a graph,
 and its runs, newest first. Each run links to its session and shows how many
 of its tasks are done, or that it's waiting for you. A run is listed once the
 agent writes the saved workflow's steps as its plan, so runs from before this
-release don't appear.
+release don't appear. Hover a step in the graph to see all of it. In a run's
+graph, the card says where the task stands, as the strip's does, and a step's
+**⋯** menu has its task's action.
 
 ## Automations
 
@@ -206,8 +208,8 @@ with tasks the agent could still run says "Stopped" ("Run ended" after an
 automation run), so it never looks about to run. Then a play button at the top,
 beside "Updated …", asks the agent to continue the plan from where it left off,
 and while the agent works a stop button there stops it. A run's row on a
-workflow's or an automation's page has the same buttons, and its strip the same
-task menus, which message the run's session. A summary line and a strip
+workflow's or an automation's page has the same buttons, and its strip and its
+graph the same task menus, which message the run's session. A summary line and a strip
 count the tasks in each state, and stay at the top as you scroll: hover a
 segment of the strip for a card with that task's status and its **⋯** menu, or
 click it to jump to the task. In

@@ -42,6 +42,7 @@ import {
   RunPlanButton,
   RunTimeline,
   RunWorkflowButton,
+  useRunTaskMenus,
 } from "@/components/workflows/RunTasks";
 import { planRunControl } from "@/shell/PlanRunButton";
 import { WorkflowGraphOverlay } from "@/components/workflows/WorkflowStepsGraph";
@@ -741,6 +742,8 @@ function RunRow({
     scheduledTaskRunsKey(run.scheduledTaskId),
     ["scheduled-task-run-steps", run.scheduledTaskId],
   ];
+  // Its tasks' ⋯ menus, on the timeline's cards and the graph's nodes.
+  const taskMenus = useRunTaskMenus(sessionId, refreshKeys);
   // Room on the row's link for the buttons over its right end.
   const buttonPadding = ["", "pr-11", "pr-18", "pr-25"][
     1 + (workflowId ? 1 : 0) + (control ? 1 : 0)
@@ -848,7 +851,7 @@ function RunRow({
           <RunTimeline
             sessionId={sessionId}
             progress={progress}
-            refreshKeys={refreshKeys}
+            menuActionFor={taskMenus}
             className="pr-3 pb-2.5 pl-10"
           />
           <div className="absolute top-1.5 right-2 z-10 flex items-center gap-0.5">
@@ -882,6 +885,7 @@ function RunRow({
           }
           steps={steps.steps}
           progress={progress}
+          menuActionFor={taskMenus}
           onClose={() => setGraphOpen(false)}
         />
       )}

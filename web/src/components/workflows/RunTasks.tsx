@@ -12,7 +12,7 @@ import { Link, useNavigate } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { continuePlanMessage, taskActionMessage } from "@/lib/workflow";
 import { PlanRunButton, type PlanRunControl } from "@/shell/PlanRunButton";
-import { ProgressStrip, taskMenuAction } from "@/shell/TasksPanel";
+import { ProgressStrip, taskMenuAction, type TaskMenuAction } from "@/shell/TasksPanel";
 import { openTasksTab } from "@/store/sessionTasksActions";
 
 /** The queries that list a run, e.g. `["workflow-runs", workflowId]`. */
@@ -51,26 +51,43 @@ function useRunSession(sessionId: string, refreshKeys: RunRefreshKeys) {
 }
 
 /**
+ * A run's task menus, for its timeline's cards and its graph's nodes: each
+ * runs, continues, retries or stops its task in the run's session.
+ *
+ * @param sessionId - The run's session; null when it has none, or takes no actions.
+ * @returns What a task's ⋯ menu offers, or undefined without a session.
+ */
+export function useRunTaskMenus(
+  sessionId: string | null | undefined,
+  refreshKeys: RunRefreshKeys,
+): ((item: StepProgress) => TaskMenuAction | undefined) | undefined {
+  const session = useRunSession(sessionId ?? "", refreshKeys);
+  if (!sessionId) return undefined;
+  return (item) =>
+    taskMenuAction(
+      item,
+      (action, taskName) => session.send(taskActionMessage(action, taskName)),
+      session.stop,
+    );
+}
+
+/**
  * A run's tasks as the Tasks tab's timeline, above the row's link. A segment
- * opens that task in the run's session, and its card's ⋯ menu runs, continues,
- * retries or stops the task there.
+ * opens that task in the run's session.
  */
 export function RunTimeline({
   sessionId,
   progress,
-  refreshKeys,
-  actionable = true,
+  menuActionFor,
   className,
 }: {
   sessionId: string;
   progress: readonly StepProgress[];
-  refreshKeys: RunRefreshKeys;
-  /** False when the run takes no actions, e.g. an archived one. */
-  actionable?: boolean;
+  /** What a task's card offers in its ⋯ menu, from {@link useRunTaskMenus}; none when absent. */
+  menuActionFor?: (item: StepProgress) => TaskMenuAction | undefined;
   className?: string;
 }) {
   const navigate = useNavigate();
-  const session = useRunSession(sessionId, refreshKeys);
   return (
     <div className={cn("relative z-10", className)}>
       <ProgressStrip
@@ -80,16 +97,7 @@ export function RunTimeline({
           openTasksTab(sessionId, stepId);
           navigate(`/c/${encodeURIComponent(sessionId)}`);
         }}
-        menuActionFor={
-          actionable
-            ? (item) =>
-                taskMenuAction(
-                  item,
-                  (action, taskName) => session.send(taskActionMessage(action, taskName)),
-                  session.stop,
-                )
-            : undefined
-        }
+        menuActionFor={menuActionFor}
       />
     </div>
   );

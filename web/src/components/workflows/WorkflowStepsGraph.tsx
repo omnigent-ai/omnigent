@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useMemo, useState } from "react";
+import { createContext, type ReactNode, useContext, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   Background,
@@ -13,6 +13,7 @@ import {
 import { FullscreenIcon } from "@/components/ai-elements/MermaidBlock";
 import { GraphZoomControls } from "@/components/GraphZoomControls";
 import { Button } from "@/components/ui/button";
+import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { getEmbedRoot } from "@/lib/host";
 import { failedUpstream, type StepProgress, type StepState } from "@/lib/sessionJournal";
 import { cn } from "@/lib/utils";
@@ -22,7 +23,15 @@ import {
   type StepNodeData,
   type WorkflowStep,
 } from "@/lib/workflowGraphLayout";
-import { CantStart, SEGMENT_COLORS, STATE_LABELS, StepGlyph } from "@/shell/TasksPanel";
+import {
+  CantStart,
+  SEGMENT_COLORS,
+  STATE_LABELS,
+  StepGlyph,
+  TaskCardDetails,
+  TaskMenu,
+  type TaskMenuAction,
+} from "@/shell/TasksPanel";
 
 import "@xyflow/react/dist/style.css";
 
@@ -47,37 +56,110 @@ const NODE_TINT: Record<StepState, string> = {
 // The states a run's legend explains, in the order work moves through them.
 const LEGEND: readonly StepState[] = ["waiting", "running", "needs_input", "done", "failed"];
 
-function StepNode({ data }: NodeProps<Node<StepNodeData>>) {
+// A node's ⋯ button; React Flow leaves a press on it alone rather than panning.
+const NODE_MENU_BUTTON =
+  "nodrag nopan -my-0.5 -mr-1.5 shrink-0 cursor-pointer rounded-md p-0.5 text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50";
+
+/** What the nodes show beyond their layout: in a run, where each step stands and its ⋯ action. */
+interface StepsGraphContextValue {
+  /** How many steps the graph has, e.g. for "Task 2 of 5". */
+  total: number;
+  run?: {
+    /** Each step's progress, by step ID. */
+    progress: ReadonlyMap<string, StepProgress>;
+    /** The steps each waits on that aren't done, by name, by step ID. */
+    pending: ReadonlyMap<string, readonly string[]>;
+    menuActionFor?: (item: StepProgress) => TaskMenuAction | undefined;
+  };
+}
+
+const StepsGraphContext = createContext<StepsGraphContextValue>({ total: 0 });
+
+/**
+ * A step's box. Hovering it shows a card with all of the step, as a task's
+ * timeline segment does; in a run, its ⋯ menu offers the task's action.
+ */
+function StepNode({ id, data }: NodeProps<Node<StepNodeData>>) {
+  const graph = useContext(StepsGraphContext);
+  const item = graph.run?.progress.get(id);
+  const menuAction = item && graph.run?.menuActionFor?.(item);
+  const [cardOpen, setCardOpen] = useState(false);
+  // The card steps aside while the node's menu is open.
+  const [menuOpen, setMenuOpen] = useState(false);
   return (
     <>
       <Handle type="target" position={Position.Top} className={HANDLE_CLASS} />
-      <div
-        className={cn(
-          "flex items-start gap-2 rounded-lg border bg-card px-3 py-2 shadow-sm transition-colors",
-          NODE_TINT[data.state ?? "waiting"],
-        )}
-        style={{ width: STEP_NODE_WIDTH }}
-        title={data.goal ?? undefined}
-        data-testid="workflow-step-node"
-        data-state={data.state}
+      <HoverCard
+        open={cardOpen && !menuOpen}
+        onOpenChange={setCardOpen}
+        openDelay={300}
+        closeDelay={100}
       >
-        <StepGlyph state={data.state ?? "waiting"} number={data.number} />
-        <div className="min-w-0 flex-1">
-          <p className="truncate text-sm font-medium leading-[18px]">{data.name}</p>
-          {/* A step that can't start says why in place of its goal, which stays on hover. */}
-          {data.failedNames ? (
-            <p className="mt-0.5 line-clamp-2 text-xs leading-snug text-muted-foreground">
-              <CantStart failedNames={data.failedNames} />
-            </p>
+        <HoverCardTrigger asChild>
+          <div
+            className={cn(
+              "flex items-start gap-2 rounded-lg border bg-card px-3 py-2 shadow-sm transition-colors",
+              NODE_TINT[data.state ?? "waiting"],
+            )}
+            style={{ width: STEP_NODE_WIDTH }}
+            data-testid="workflow-step-node"
+            data-state={data.state}
+          >
+            <StepGlyph state={data.state ?? "waiting"} number={data.number} />
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-sm font-medium leading-[18px]">{data.name}</p>
+              {/* A step that can't start says why in place of its goal, which its card shows. */}
+              {data.failedNames ? (
+                <p className="mt-0.5 line-clamp-2 text-xs leading-snug text-muted-foreground">
+                  <CantStart failedNames={data.failedNames} />
+                </p>
+              ) : (
+                data.goal && (
+                  <p className="mt-0.5 line-clamp-2 text-xs leading-snug text-muted-foreground">
+                    {data.goal}
+                  </p>
+                )
+              )}
+            </div>
+            {menuAction && (
+              <TaskMenu
+                taskName={item.step.name}
+                menuAction={menuAction}
+                testIdPrefix="workflow-step-node"
+                className={NODE_MENU_BUTTON}
+                onOpenChange={setMenuOpen}
+              />
+            )}
+          </div>
+        </HoverCardTrigger>
+        <HoverCardContent
+          side="right"
+          align="start"
+          sideOffset={8}
+          className="flex w-fit max-w-72 flex-col items-start gap-1 px-3 py-2 text-sm"
+          data-testid="workflow-step-card"
+        >
+          {item ? (
+            // The card names the step as its box does.
+            <TaskCardDetails
+              item={{ ...item, step: { ...item.step, name: data.name, goal: data.goal } }}
+              number={data.number}
+              total={graph.total}
+              pending={graph.run?.pending.get(id) ?? []}
+              failedNames={data.failedNames ?? []}
+              full
+            />
           ) : (
-            data.goal && (
-              <p className="mt-0.5 line-clamp-2 text-xs leading-snug text-muted-foreground">
-                {data.goal}
-              </p>
-            )
+            <>
+              <span className="text-muted-foreground">
+                Step {data.number} of {graph.total}
+              </span>
+              <span className="break-words font-medium">{data.name}</span>
+              {data.goal && <span className="break-words text-muted-foreground">{data.goal}</span>}
+            </>
           )}
-        </div>
-      </div>
+        </HoverCardContent>
+      </HoverCard>
       <Handle type="source" position={Position.Bottom} className={HANDLE_CLASS} />
     </>
   );
@@ -85,18 +167,24 @@ function StepNode({ data }: NodeProps<Node<StepNodeData>>) {
 
 const nodeTypes: NodeTypes = { step: StepNode };
 
-/** The steps drawn with React Flow; *full* means the view owns the wheel, to zoom. */
+/**
+ * The steps drawn with React Flow; *full* means the view owns the wheel, to zoom.
+ *
+ * @param menuActionFor - In a run, what a step's ⋯ menu offers; none when absent.
+ */
 function StepsFlow({
   steps,
   progress,
   full = false,
+  menuActionFor,
 }: {
   steps: readonly WorkflowStep[];
   progress?: readonly StepProgress[];
   full?: boolean;
+  menuActionFor?: (item: StepProgress) => TaskMenuAction | undefined;
 }) {
-  const { nodes, edges } = useMemo(() => {
-    if (!progress) return layoutWorkflowSteps(steps);
+  const { nodes, edges, pending } = useMemo(() => {
+    if (!progress) return { ...layoutWorkflowSteps(steps), pending: undefined };
     // Name a failed step as its box does; a step the run added has only the run's name.
     const names = new Map([
       ...progress.map((item) => [item.step.id, item.step.name] as const),
@@ -108,47 +196,76 @@ function StepsFlow({
         failed.map((failedId) => names.get(failedId) ?? failedId),
       ]),
     );
-    return layoutWorkflowSteps(
-      steps,
-      new Map(progress.map((item) => [item.step.id, item.state])),
-      failedNames,
+    const done = new Set(
+      progress.filter((item) => item.state === "done").map((item) => item.step.id),
     );
+    return {
+      ...layoutWorkflowSteps(
+        steps,
+        new Map(progress.map((item) => [item.step.id, item.state])),
+        failedNames,
+      ),
+      pending: new Map(
+        progress.map((item) => [
+          item.step.id,
+          item.step.depends_on.filter((id) => !done.has(id)).map((id) => names.get(id) ?? id),
+        ]),
+      ),
+    };
   }, [steps, progress]);
+  const graph = useMemo<StepsGraphContextValue>(
+    () => ({
+      total: steps.length,
+      run:
+        progress && pending
+          ? {
+              progress: new Map(progress.map((item) => [item.step.id, item])),
+              pending,
+              menuActionFor,
+            }
+          : undefined,
+    }),
+    [steps, progress, pending, menuActionFor],
+  );
   return (
-    <ReactFlow
-      nodes={nodes}
-      edges={edges}
-      nodeTypes={nodeTypes}
-      fitView
-      fitViewOptions={{ padding: FIT_PADDING, maxZoom: 1 }}
-      panOnDrag
-      panOnScroll={false}
-      zoomOnScroll={full}
-      preventScrolling={full}
-      zoomOnDoubleClick={false}
-      nodesDraggable={false}
-      nodesConnectable={false}
-      elementsSelectable={false}
-      proOptions={{ hideAttribution: true }}
-      minZoom={0.2}
-      maxZoom={2}
-    >
-      <Background bgColor="var(--card)" />
-      <GraphZoomControls />
-    </ReactFlow>
+    <StepsGraphContext.Provider value={graph}>
+      <ReactFlow
+        nodes={nodes}
+        edges={edges}
+        nodeTypes={nodeTypes}
+        fitView
+        fitViewOptions={{ padding: FIT_PADDING, maxZoom: 1 }}
+        panOnDrag
+        panOnScroll={false}
+        zoomOnScroll={full}
+        preventScrolling={full}
+        zoomOnDoubleClick={false}
+        nodesDraggable={false}
+        nodesConnectable={false}
+        elementsSelectable={false}
+        proOptions={{ hideAttribution: true }}
+        minZoom={0.2}
+        maxZoom={2}
+      >
+        <Background bgColor="var(--card)" />
+        <GraphZoomControls />
+      </ReactFlow>
+    </StepsGraphContext.Provider>
   );
 }
 
 /**
  * A workflow's graph over the whole window, as a diagram's "View fullscreen"
  * opens it. Given a run's progress, each step shows where it stands, with a
- * legend. Escape or the corner button closes it.
+ * legend, and given `menuActionFor`, its ⋯ menu. Escape or the corner button
+ * closes it.
  */
 export function WorkflowGraphOverlay({
   title,
   subtitle,
   steps,
   progress,
+  menuActionFor,
   onClose,
 }: {
   title: string;
@@ -156,11 +273,14 @@ export function WorkflowGraphOverlay({
   subtitle?: ReactNode;
   steps: readonly WorkflowStep[];
   progress?: readonly StepProgress[];
+  /** What a step's ⋯ menu offers in the run, as its task's row does. */
+  menuActionFor?: (item: StepProgress) => TaskMenuAction | undefined;
   onClose: () => void;
 }) {
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      // An open menu or card takes the first Escape.
+      if (event.key === "Escape" && !event.defaultPrevented) onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -197,7 +317,7 @@ export function WorkflowGraphOverlay({
         </Button>
       </div>
       <div className="relative mx-6 mb-6 min-h-0 flex-1 overflow-hidden rounded-xl border border-border bg-card">
-        <StepsFlow steps={steps} progress={progress} full />
+        <StepsFlow steps={steps} progress={progress} menuActionFor={menuActionFor} full />
         {progress && (
           <div className="absolute bottom-3 left-3 z-10 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md border bg-card/90 px-2.5 py-1.5 text-xs text-muted-foreground shadow-sm backdrop-blur">
             {LEGEND.map((state) => (

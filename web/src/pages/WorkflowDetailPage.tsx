@@ -22,7 +22,12 @@ import {
   type WorkflowSessionRequest,
   WorkflowSessionDialog,
 } from "@/components/workflows/WorkflowSessionDialog";
-import { RunGraphButton, RunPlanButton, RunTimeline } from "@/components/workflows/RunTasks";
+import {
+  RunGraphButton,
+  RunPlanButton,
+  RunTimeline,
+  useRunTaskMenus,
+} from "@/components/workflows/RunTasks";
 import { planRunControl } from "@/shell/PlanRunButton";
 import {
   WorkflowGraphOverlay,
@@ -324,6 +329,8 @@ function WorkflowRunRow({
     ? null
     : planRunControl(progress, run.statuses, run.sessionStatus === "running");
   const refreshKeys = [["workflow-runs", workflowId]];
+  // Its tasks' ⋯ menus, on the timeline's cards and the graph's nodes; an archived run has none.
+  const taskMenus = useRunTaskMenus(run.archived ? null : run.sessionId, refreshKeys);
   const [graphOpen, setGraphOpen] = useState(false);
   const sessionPath = `/c/${encodeURIComponent(run.sessionId)}`;
   const title = run.title || "Untitled session";
@@ -363,8 +370,7 @@ function WorkflowRunRow({
             <RunTimeline
               sessionId={run.sessionId}
               progress={progress}
-              refreshKeys={refreshKeys}
-              actionable={!run.archived}
+              menuActionFor={taskMenus}
               className="mt-3 pr-1"
             />
           )}
@@ -400,6 +406,7 @@ function WorkflowRunRow({
           }
           steps={run.steps}
           progress={progress}
+          menuActionFor={taskMenus}
           onClose={() => setGraphOpen(false)}
         />
       )}

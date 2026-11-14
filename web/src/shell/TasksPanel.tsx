@@ -396,8 +396,8 @@ export function taskMenuAction(
   return { action, onSelect: () => onTaskAction(action, item.step.name) };
 }
 
-/** A task's ⋯ menu, on its row and on its timeline card: the action its state offers. */
-function TaskMenu({
+/** A task's ⋯ menu, on its row, its timeline card and its graph node: the action its state offers. */
+export function TaskMenu({
   taskName,
   menuAction,
   testIdPrefix,
@@ -643,6 +643,61 @@ function statusLine(
   }
 }
 
+/**
+ * What a task's hover card says: which task it is, where it stands, and its
+ * newest result or its goal.
+ *
+ * @param pending - The tasks it waits on that aren't done, by name.
+ * @param failedNames - The failed tasks it waits on, by name, when that's why it can't start.
+ * @param full - Also show the goal beside a result, uncut, for a graph node whose box cuts both short.
+ * @param menu - Its ⋯ menu, in the top corner.
+ */
+export function TaskCardDetails({
+  item,
+  number,
+  total,
+  pending,
+  failedNames,
+  full = false,
+  menu,
+}: {
+  item: StepProgress;
+  number: number;
+  total: number;
+  pending: readonly string[];
+  failedNames: readonly string[];
+  full?: boolean;
+  menu?: ReactNode;
+}) {
+  const text = item.status ? textOf(item.status) : null;
+  const detail =
+    item.state === "waiting" || item.state === "ready" ? item.step.goal : (text ?? item.step.goal);
+  const goal = full && detail !== item.step.goal ? item.step.goal : null;
+  return (
+    <>
+      <span className="flex w-full items-center justify-between gap-3">
+        <span className="text-muted-foreground">
+          Task {number} of {total}
+        </span>
+        {menu}
+      </span>
+      <span className="break-words font-medium">{item.step.name}</span>
+      <span className="flex items-center gap-1.5">
+        <StepGlyph state={item.state} number={number} />
+        <span className={STATUS_LINE_COLORS[item.state]}>
+          {statusLine(item, pending, failedNames)}
+        </span>
+      </span>
+      {detail && (
+        <span className={cn("break-words text-muted-foreground", !full && "line-clamp-3")}>
+          {detail}
+        </span>
+      )}
+      {goal && <span className="break-words text-muted-foreground">Goal: {goal}</span>}
+    </>
+  );
+}
+
 /** Past this many tasks, the strip has no room for links between its segments. */
 const MAX_LINKED_TASKS = 40;
 /** How high a hover arc rises above the strip at most, in pixels. */
@@ -750,11 +805,6 @@ export function ProgressStrip({
           .filter((id) => !done.has(id))
           .map((id) => names.get(id) ?? id);
         const failedNames = (blocked.get(item.step.id) ?? []).map((id) => names.get(id) ?? id);
-        const text = item.status ? textOf(item.status) : null;
-        const detail =
-          item.state === "waiting" || item.state === "ready"
-            ? item.step.goal
-            : (text ?? item.step.goal);
         const menuAction = menuActionFor?.(item);
         const stepId = item.step.id;
         return (
@@ -806,34 +856,28 @@ export function ProgressStrip({
               className="flex w-fit max-w-72 flex-col items-start gap-1 px-3 py-2 text-sm"
               data-testid="tasks-progress-card"
             >
-              <span className="flex w-full items-center justify-between gap-3">
-                <span className="text-muted-foreground">
-                  Task {index + 1} of {progress.length}
-                </span>
-                {menuAction && (
-                  <TaskMenu
-                    taskName={item.step.name}
-                    menuAction={menuAction}
-                    testIdPrefix="tasks-progress"
-                    className={CARD_MENU_BUTTON}
-                    onOpenChange={(open) => {
-                      setMenuStep(open ? stepId : null);
-                      // Picking an action, or closing the menu, puts the card away too.
-                      if (!open) setCardStep(null);
-                    }}
-                  />
-                )}
-              </span>
-              <span className="break-words font-medium">{item.step.name}</span>
-              <span className="flex items-center gap-1.5">
-                <StepGlyph state={item.state} number={index + 1} />
-                <span className={STATUS_LINE_COLORS[item.state]}>
-                  {statusLine(item, pending, failedNames)}
-                </span>
-              </span>
-              {detail && (
-                <span className="line-clamp-3 break-words text-muted-foreground">{detail}</span>
-              )}
+              <TaskCardDetails
+                item={item}
+                number={index + 1}
+                total={progress.length}
+                pending={pending}
+                failedNames={failedNames}
+                menu={
+                  menuAction && (
+                    <TaskMenu
+                      taskName={item.step.name}
+                      menuAction={menuAction}
+                      testIdPrefix="tasks-progress"
+                      className={CARD_MENU_BUTTON}
+                      onOpenChange={(open) => {
+                        setMenuStep(open ? stepId : null);
+                        // Picking an action, or closing the menu, puts the card away too.
+                        if (!open) setCardStep(null);
+                      }}
+                    />
+                  )
+                }
+              />
             </HoverCardContent>
           </HoverCard>
         );
