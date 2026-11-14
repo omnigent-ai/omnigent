@@ -3535,15 +3535,6 @@ class CreateWorkflowRequest(BaseModel):
     steps: list[WorkflowStep] = Field(default_factory=list)
 
 
-class SetWorkflowPlanningSessionRequest(BaseModel):
-    """Attach a real planning session; name the previous session when replacing it."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    session_id: str
-    expected_session_id: str | None = None
-
-
 class UpdateWorkflowRequest(BaseModel):
     """
     Request body for ``PATCH /v1/workflows/{workflow_id}``; ``None`` keeps a field.
@@ -3551,6 +3542,7 @@ class UpdateWorkflowRequest(BaseModel):
     :param name: A new name.
     :param description: A new description.
     :param steps: New steps, replacing the old ones.
+    :param planning_session_id: The private owned session for iterating on the plan.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -3558,6 +3550,7 @@ class UpdateWorkflowRequest(BaseModel):
     name: str | None = None
     description: str | None = None
     steps: list[WorkflowStep] | None = None
+    planning_session_id: str | None = None
 
 
 class WorkflowDeleted(BaseModel):

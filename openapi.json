@@ -12651,32 +12651,6 @@
         "title": "SetSharingRequest",
         "type": "object"
       },
-      "SetWorkflowPlanningSessionRequest": {
-        "additionalProperties": false,
-        "description": "Attach a real planning session; name the previous session when replacing it.",
-        "properties": {
-          "expected_session_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Expected Session Id"
-          },
-          "session_id": {
-            "title": "Session Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "session_id"
-        ],
-        "title": "SetWorkflowPlanningSessionRequest",
-        "type": "object"
-      },
       "SideChatList": {
         "description": "Paginated list of side chats; `data` is a page of `SideChatSummary`.",
         "properties": {
@@ -13969,6 +13943,18 @@
             ],
             "description": "A new name.",
             "title": "Name"
+          },
+          "planning_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The private owned session for iterating on the plan.",
+            "title": "Planning Session Id"
           },
           "steps": {
             "anyOf": [
@@ -24830,17 +24816,6 @@
               ],
               "title": "Name"
             }
-          },
-          {
-            "description": "Include workflows with no saved plan in the editor list.",
-            "in": "query",
-            "name": "include_drafts",
-            "required": false,
-            "schema": {
-              "default": false,
-              "title": "Include Drafts",
-              "type": "boolean"
-            }
           }
         ],
         "responses": {
@@ -25041,59 +25016,6 @@
           }
         },
         "summary": "Update Workflow",
-        "tags": [
-          "workflows"
-        ]
-      }
-    },
-    "/v1/workflows/{workflow_id}/planning-session": {
-      "put": {
-        "description": "Keep planning conversations separate from execution runs.",
-        "operationId": "set_planning_session_v1_workflows__workflow_id__planning_session_put",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "workflow_id",
-            "required": true,
-            "schema": {
-              "title": "Workflow Id",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/SetWorkflowPlanningSessionRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/WorkflowObject"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Set Planning Session",
         "tags": [
           "workflows"
         ]

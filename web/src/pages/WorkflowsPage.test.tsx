@@ -229,7 +229,6 @@ describe("WorkflowsPage", () => {
   it("lists drafts but disables their execution actions", () => {
     mockWorkflows({ workflows: [{ ...WORKFLOWS[0]!, is_draft: true }] });
     render(<WorkflowsPage />);
-    expect(useSavedWorkflows).toHaveBeenCalledWith({ includeDrafts: true });
     expect(screen.getByText("Draft · No saved plan")).toBeInTheDocument();
     openMenu(rows()[0]!);
     expect(screen.getByTestId("workflow-run")).toHaveAttribute("aria-disabled", "true");

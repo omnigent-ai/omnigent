@@ -48,10 +48,6 @@ class WorkflowNameTakenError(Exception):
     """The owner already has a workflow with this name."""
 
 
-class WorkflowPlanningSessionConflictError(Exception):
-    """Another tab attached a planning session while this one was launching."""
-
-
 def _owned(workflow_id: str, user_id: str | None) -> tuple[ColumnElement[bool], ...]:
     """Match one workflow by its primary key, and only if ``user_id`` owns it."""
     return (
@@ -181,7 +177,6 @@ class WorkflowStore:
         limit: int,
         after: str | None = None,
         name: str | None = None,
-        include_drafts: bool = False,
     ) -> tuple[list[Workflow], bool]:
         """Return one page of the owner's workflows by name, without their steps.
 
@@ -189,7 +184,6 @@ class WorkflowStore:
         :param limit: Page size, 1 to :data:`WORKFLOW_PAGE_MAX`.
         :param after: The previous page's last workflow ID.
         :param name: Only the workflow with this exact name.
-        :param include_drafts: Include drafts; run pickers omit them by default.
         :returns: ``(workflows, has_more)``.
         :raises InvalidWorkflowError: If ``after`` isn't one of the owner's workflows.
         """
@@ -202,8 +196,6 @@ class WorkflowStore:
             )
             if name is not None:
                 stmt = stmt.where(SqlWorkflow.name == name)
-            if not include_drafts:
-                stmt = stmt.where(SqlWorkflow.is_draft.is_(False))
             if after is not None:
                 try:
                     uuid_to_bytes(after)
@@ -228,14 +220,16 @@ class WorkflowStore:
         name: object = None,
         description: object = None,
         steps: object = None,
+        planning_session_id: str | None = None,
     ) -> Workflow | None:
-        """Change an owned workflow's name, description or steps.
+        """Change an owned workflow's metadata, steps or planning session.
 
         :param workflow_id: The workflow, e.g. ``"0123…cdef"``.
         :param user_id: The owner, or ``None`` in single-user mode.
         :param name: A new name, or ``None`` to keep it.
         :param description: A new description, or ``None`` to keep it.
         :param steps: New steps replacing the old ones, or ``None`` to keep them.
+        :param planning_session_id: An owner-checked planning session, or ``None`` to keep it.
         :returns: The updated workflow, or ``None`` if the owner has no such workflow.
         :raises InvalidWorkflowError: If a field is invalid or the steps are too large.
         :raises WorkflowNameTakenError: If another of the owner's workflows has the name.
@@ -264,40 +258,12 @@ class WorkflowStore:
             if steps is not None:
                 row.plan = _plan_text(workflow_steps)
                 row.is_draft = not workflow_steps
+            if planning_session_id is not None:
+                row.planning_session_id = planning_session_id
             row.updated_at = now_epoch()
             return _to_workflow(row, with_steps=True)
 
         return run_write_transaction(self._session_immediate, "update_workflow", write)
-
-    def set_planning_session(
-        self,
-        workflow_id: str,
-        *,
-        user_id: str | None,
-        session_id: str,
-        expected_session_id: str | None,
-    ) -> Workflow | None:
-        """Attach an owner-checked session without replacing another tab's chat."""
-
-        def write(session: Session) -> Workflow | None:
-            row = session.execute(
-                select(SqlWorkflow)
-                .where(*_owned(workflow_id, user_id))
-                .options(undefer(SqlWorkflow.plan))
-                .with_for_update()
-            ).scalar_one_or_none()
-            if row is None:
-                return None
-            require_active_account(session, user_id)
-            if row.planning_session_id not in (expected_session_id, session_id):
-                raise WorkflowPlanningSessionConflictError(
-                    "A planning chat was already opened. Reopen it from the workflow."
-                )
-            row.planning_session_id = session_id
-            row.updated_at = now_epoch()
-            return _to_workflow(row, with_steps=True)
-
-        return run_write_transaction(self._session_immediate, "set_planning_session", write)
 
     def delete(self, workflow_id: str, *, user_id: str | None) -> bool:
         """Delete an owned workflow; ``False`` if the owner has no such workflow."""

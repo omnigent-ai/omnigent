@@ -90,12 +90,10 @@ export function useSaveWorkflowPlan(workflowId: string) {
 /** Persist the planning chat so reopening the workflow restores it on any device. */
 export function useSetWorkflowPlanningSession(workflowId: string) {
   const onSuccess = useWorkflowSaved();
-  const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (body: { session_id: string; expected_session_id: string | null }) =>
-      writeWorkflow(`${workflowPath(workflowId)}/planning-session`, "PUT", body),
+    mutationFn: (planningSessionId: string) =>
+      writeWorkflow(workflowPath(workflowId), "PATCH", { planning_session_id: planningSessionId }),
     onSuccess,
-    onError: () => queryClient.invalidateQueries({ queryKey: ["workflow", workflowId] }),
   });
 }
 

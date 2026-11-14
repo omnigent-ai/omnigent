@@ -141,8 +141,7 @@ def test_a_draft_becomes_runnable_when_its_plan_is_saved(store: WorkflowStore) -
     draft = store.create(user_id=ALICE, name="draft", description="Plan a release.", steps=[])
     assert draft.is_draft and draft.steps == []
     assert store.get(draft.id, user_id=ALICE) == draft
-    assert store.list_page(user_id=ALICE, limit=10) == ([], False)
-    page, _ = store.list_page(user_id=ALICE, limit=10, include_drafts=True)
+    page, _ = store.list_page(user_id=ALICE, limit=10)
     assert len(page) == 1 and page[0].is_draft and page[0].steps is None
 
     renamed = store.update(draft.id, user_id=ALICE, name="release")

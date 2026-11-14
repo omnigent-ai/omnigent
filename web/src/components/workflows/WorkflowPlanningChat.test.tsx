@@ -94,12 +94,12 @@ afterEach(() => {
 
 it("attaches the real session before seeding its first message, and restores it after reopening", async () => {
   let stored = WORKFLOW;
-  vi.mocked(authenticatedFetch).mockImplementation(async (_url, options) => {
-    if (options?.method === "PUT") {
+  vi.mocked(authenticatedFetch).mockImplementation(async (url, options) => {
+    expect(url).toBe(`/v1/workflows/${WORKFLOW.id}`);
+    if (options?.method === "PATCH") {
       expect(useChatStore.getState().sideChatDrafts[SESSION]).toBeUndefined();
       expect(JSON.parse(String(options.body))).toEqual({
-        session_id: SESSION,
-        expected_session_id: null,
+        planning_session_id: SESSION,
       });
       stored = { ...stored, planning_session_id: SESSION };
     }

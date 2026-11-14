@@ -50,7 +50,7 @@ export function WorkflowPlanningChat({
             request={{ kind: "plan", workflow }}
             onClose={() => (replacing ? setReplacing(false) : onClose())}
             onStarted={async (created, initialPrompt) => {
-              await attach.mutateAsync({ session_id: created.id, expected_session_id: sessionId });
+              await attach.mutateAsync(created.id);
               if (initialPrompt) {
                 useChatStore.setState((state) => ({
                   sideChatDrafts: { ...state.sideChatDrafts, [created.id]: initialPrompt },

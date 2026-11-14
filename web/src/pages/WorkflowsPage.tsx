@@ -32,7 +32,7 @@ import { useNavigate } from "@/lib/routing";
 import { useCreateWorkflowDraft } from "@/hooks/useWorkflow";
 
 export function WorkflowsPage() {
-  const { workflows, isLoading, isError, refresh } = useSavedWorkflows({ includeDrafts: true });
+  const { workflows, isLoading, isError, refresh } = useSavedWorkflows();
   const createDraft = useCreateWorkflowDraft();
   const deleteWorkflow = useDeleteWorkflow();
   const navigate = useNavigate();

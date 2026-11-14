@@ -22,7 +22,7 @@ const NO_WORKFLOWS: readonly SavedWorkflow[] = [];
 const SAVED_WORKFLOWS_KEY = ["saved-workflows"];
 
 /**
- * The user's saved workflows, by name, for Run a workflow. Empty on servers
+ * The user's workflows, including drafts, by name. Empty on servers
  * without saved workflows.
  *
  * @param enabled - Whether to load them now, e.g. while the session offers workflows.
@@ -30,10 +30,7 @@ const SAVED_WORKFLOWS_KEY = ["saved-workflows"];
  *   it failed; and `refresh`, which reloads them, e.g. as the "+" menu opens after the
  *   agent saved one.
  */
-export function useSavedWorkflows({
-  enabled = true,
-  includeDrafts = false,
-}: { enabled?: boolean; includeDrafts?: boolean } = {}): {
+export function useSavedWorkflows({ enabled = true }: { enabled?: boolean } = {}): {
   workflows: readonly SavedWorkflow[];
   isLoading: boolean;
   isError: boolean;
@@ -42,14 +39,11 @@ export function useSavedWorkflows({
   const serverInfo = useServerInfo();
   const supported = serverInfo !== "loading" && serverInfo.workflows === true;
   const query = useQuery<SavedWorkflow[]>({
-    queryKey: [...SAVED_WORKFLOWS_KEY, includeDrafts],
+    queryKey: SAVED_WORKFLOWS_KEY,
     queryFn: async ({ signal }) => {
-      const res = await authenticatedFetch(
-        `/v1/workflows?limit=${SAVED_WORKFLOWS_PAGE}${includeDrafts ? "&include_drafts=true" : ""}`,
-        {
-          signal,
-        },
-      );
+      const res = await authenticatedFetch(`/v1/workflows?limit=${SAVED_WORKFLOWS_PAGE}`, {
+        signal,
+      });
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
       const body = (await res.json()) as { data?: SavedWorkflow[] };
       return (body.data ?? []).map(({ id, name, description, is_draft }) => ({
