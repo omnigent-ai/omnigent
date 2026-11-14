@@ -405,6 +405,39 @@ github_access:
       - "fix/*"
 ```
 
+### GitLab
+
+#### `gitlab_policy`
+
+Controls GitLab access through `git` and `glab` shell commands on gitlab.com and self-managed or Dedicated hosts. It takes the same allowlists as `github_policy`. Projects may be nested (`group/sub/project`) and match case-insensitively. A bare entry matches that path on every configured host, and a URL entry pins it to one host; an entry that is not a project on a configured host is rejected when the policy loads. `git` commands addressed to another forge's built-in host (such as github.com) are left to that forge's policy, so `github_policy` and `gitlab_policy` can be attached together. The reverse does not hold: `github_policy` returns ASK for a `git push` to a host it does not own, so with both attached an allowlisted GitLab push still asks. Remotes on unknown hosts, unlisted `glab` actions, and `glab` calls redirected to another host (`--hostname`, `GITLAB_HOST`, `GITLAB_URI`, `GL_HOST`, `GITLAB_API_HOST`, or `glab config set host`) return ASK. GitLab MCP tools and raw HTTP calls to the GitLab API are not covered.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `hosts` | string[] | `["gitlab.com"]` | GitLab hosts this policy owns |
+| `read_all` | boolean | `true` | Allow all reads |
+| `read_repos` | string[] | `[]` | Projects readable when `read_all` is false (`group/project` or URLs) |
+| `write_repos` | string[] | `[]` | Projects the agent may write to |
+| `write_branches` | string[] | `[]` | Branches writable within allowed projects (empty = any) |
+| `allow_destructive` | boolean | `false` | Allow deletes (`glab repo delete`, `glab api -X DELETE`, `git push --delete` / `--prune` / `--mirror`, `glab mr merge -d`) |
+| `deny_tag_push` | boolean | `true` | Deny `--tags`, `--follow-tags`, and `refs/tags/` pushes |
+| `deny_force_push` | boolean | `true` | Deny `--force`, `-f`, `--force-with-lease`, `--force-if-includes`, bundled flags such as `-uf`, and `+refspec` pushes |
+| `shell_tools` | string[] | every harness's shell tool | Shell tools whose commands are parsed for git/glab |
+
+```yaml
+gitlab_access:
+  type: function
+  handler: omnigent.policies.builtins.gitlab.gitlab_policy
+  factory_params:
+    hosts:
+      - gitlab.com
+      - gitlab.example.com
+    write_repos:
+      - my-group/frontend
+      - https://gitlab.example.com/platform/infra/backend
+    write_branches:
+      - main
+```
+
 ### Google Workspace
 
 #### `gdrive_policy`
