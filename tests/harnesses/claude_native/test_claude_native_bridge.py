@@ -9658,6 +9658,32 @@ def test_record_model_vocabulary_never_materializes_an_unprepared_bridge(
     assert not bridge_dir.exists()
 
 
+def test_record_model_vocabulary_cancellation_after_read_preserves_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
+    config_path = bridge_dir / "bridge.json"
+    original = config_path.read_bytes()
+    cancelled = threading.Event()
+    read = claude_native_bridge._read_json_file
+
+    def cancel_after_read(path: Path) -> Any:
+        config = read(path)
+        if path == config_path:
+            cancelled.set()
+        return config
+
+    monkeypatch.setattr(claude_native_bridge, "_read_json_file", cancel_after_read)
+    with (
+        claude_native_bridge.cancellable_injection(cancelled),
+        pytest.raises(claude_native_bridge.ClaudeInjectionCancelled),
+    ):
+        claude_native_bridge.record_model_vocabulary(
+            bridge_dir, launch_env=None, launch_model=None, picker_values=["new-model"]
+        )
+    assert config_path.read_bytes() == original
+
+
 def test_picker_values_round_trip_from_either_launch_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -14176,6 +14202,38 @@ def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouch
         ),
         ("opus[1m]", "opus[1m]", "system.ai.claude-opus-5-5[1m]", {}, "claude-opus-5-5", True),
         (
+            "OPUS[1M]",
+            "opus[1m]",
+            "system.ai.claude-opus-5-5[1m]",
+            {},
+            "claude-opus-5-5[1m]",
+            True,
+        ),
+        (
+            "opus[1m]",
+            "opus[1m]",
+            "system.ai.claude-opus-5-5[1M]",
+            {"ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-5-5[1M]"},
+            "claude-opus-5-5",
+            True,
+        ),
+        (
+            "OPUS[1M]",
+            "opus[1m]",
+            "system.ai.claude-opus-5-5[1m]",
+            {},
+            "claude-opus-5-5",
+            True,
+        ),
+        (
+            "SYSTEM.AI.CLAUDE-OPUS-5-5[1M]",
+            "opus[1m]",
+            "system.ai.claude-opus-5-5[1m]",
+            {},
+            "claude-opus-5-5",
+            True,
+        ),
+        (
             "claude-opus-5-5",
             "opus",
             "system.ai.claude-opus-5-5[1m]",
@@ -14197,6 +14255,14 @@ def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouch
             "private/model-B[large]",
             {},
             "private/model-B[large]",
+            True,
+        ),
+        (
+            "Private/Model-B[1M]",
+            "Private/Model-B[1M]",
+            "Private/Model-B[1M]",
+            {},
+            "Private/Model-B[1M]",
             True,
         ),
         (
@@ -14236,9 +14302,14 @@ def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouch
     ids=[
         "pinned-alias",
         "context-alias",
+        "uppercase-bracket-alias",
+        "uppercase-pin-marker",
+        "unmarked-status-for-uppercase-bracket-alias",
+        "uppercase-public-prefix-context",
         "pinned-public-prefix",
         "public-prefix-context",
         "exact-private-id",
+        "private-context-marker-is-literal",
         "private-prefix-is-not-public",
         "private-case-is-exact",
         "different-public-generation",
@@ -14301,14 +14372,110 @@ def test_model_command_verifies_alias_context_and_private_model_identity(
 
 
 @pytest.mark.parametrize(
+    ("picker_values", "concrete", "label", "already_selected"),
+    [
+        (("opusplan", "sonnet"), "claude-sonnet-5-5", "Sonnet 5.5", False),
+        (("best", "opus[1m]", "opus"), "claude-opus-5-5[1m]", "Opus", True),
+    ],
+    ids=["ordinary-alias-before-plan-mode", "deduplicated-context-alias-already-selected"],
+)
+def test_model_command_accepts_equivalent_picker_descriptors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    picker_values: tuple[str, ...],
+    concrete: str,
+    label: str,
+    already_selected: bool,
+) -> None:
+    ordinary = picker_values[1]
+    composer = _SessionModelComposer(cache_cost_label=None if already_selected else label)
+    composer.options = ["private-initial-model", ordinary]
+    composer.picker_labels[ordinary] = label
+    composer.resolved_models[ordinary] = concrete
+    composer.model = concrete if already_selected else composer.options[0]
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    claude_native_bridge.record_model_vocabulary(
+        bridge_dir,
+        launch_env=None,
+        launch_model=None,
+        picker_values=list(picker_values),
+        picker_options=[
+            {
+                "value": value,
+                "model": concrete.removesuffix("[1m]") if value == "opus" else concrete,
+                "display_name": (
+                    "Best"
+                    if value == "best"
+                    else "Opus (plan mode)"
+                    if value == "opusplan"
+                    else label
+                ),
+                "enabled": True,
+                "provenance": "structured",
+            }
+            for value in picker_values
+        ],
+    )
+    composer.install(monkeypatch)
+
+    result = claude_native_bridge.inject_model_command(bridge_dir, model=concrete)
+
+    assert result.picker_value == ordinary
+    assert result.resolved_model == result.status_model == composer.model == concrete
+    assert result.already_selected is already_selected
+    assert composer.submitted == (["/status"] if already_selected else ["/model", "/status"])
+    assert composer.confirmations == int(not already_selected)
+
+
+@pytest.mark.parametrize(
+    ("requested", "descriptors"),
+    [
+        (
+            "sonnet",
+            (("sonnet", "claude-sonnet-5-5"), ("sonnet", "claude-sonnet-5-4")),
+        ),
+        (
+            "claude-sonnet-5-5",
+            (("sonnet", "system.ai.claude-sonnet-5-5"), ("other", "databricks-claude-sonnet-5-5")),
+        ),
+        ("private-model", (("first", "private-model"), ("second", "private-model"))),
+    ],
+    ids=["different-concrete-models", "different-provider-targets", "no-proven-ordinary-alias"],
+)
+def test_model_target_refuses_descriptors_without_one_proven_ordinary_choice(
+    requested: str, descriptors: tuple[tuple[str, str], ...]
+) -> None:
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
+        claude_model_switch._target(
+            requested,
+            [
+                {"value": value, "model": concrete, "display_name": value, "enabled": True}
+                for value, concrete in descriptors
+            ],
+            [],
+            {},
+        )
+    assert caught.value.unsupported
+
+
+@pytest.mark.parametrize(
     ("requested", "value", "concrete", "pins"),
     [
         ("opus[1m]", "opus", "claude-opus-5-5", {}),
         ("opus", "opus", "claude-opus-4-8", {"ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5-5"}),
         ("claude-opus-5-5", "private-claude-opus-5-5", "private-claude-opus-5-5", {}),
         ("Private/model", "private/model", "private/model", {}),
+        ("Private/model[1M]", "Private/model[1m]", "Private/model[1m]", {}),
+        ("claude-sonnet-5-5", "opusplan", "claude-sonnet-5-5", {}),
     ],
-    ids=["missing-context-variant", "stale-pin-resolution", "private-prefix", "private-case"],
+    ids=[
+        "missing-context-variant",
+        "stale-pin-resolution",
+        "private-prefix",
+        "private-case",
+        "private-context-case",
+        "plan-mode-is-not-an-ordinary-model",
+    ],
 )
 def test_model_command_refuses_unproven_model_equivalence_before_keys(
     tmp_path: Path,
@@ -14777,6 +14944,7 @@ def test_model_command_confirms_versioned_cache_cost_for_managed_row(
     [
         ("system.ai.claude-sonnet-5-5", "Sonnet 5.5"),
         ("system.ai.claude-sonnet-5-5[1m]", "Sonnet 5.5"),
+        ("SYSTEM.AI.CLAUDE-SONNET-5-5[1M]", "Sonnet 5.5"),
         ("databricks-claude-opus-5-5", "Opus 5.5"),
         ("claude-haiku-5-5", "Haiku 5.5"),
         ("claude-fable-5-1", "Fable 5.1"),

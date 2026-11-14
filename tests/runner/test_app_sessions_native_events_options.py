@@ -7,6 +7,7 @@ import json
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -1922,6 +1923,71 @@ async def test_events_model_change_metadata_failure_refuses_before_the_picker(
     assert response.status_code == 503, response.text
     assert response.json()["error"] == "claude_native_model_failed"
     assert "private metadata-write details" not in response.text
+
+
+@pytest.mark.parametrize("stop", ["deadline", "cancellation"])
+async def test_events_model_change_settles_held_metadata_lock_without_late_writes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stop: str
+) -> None:
+    import threading
+
+    from omnigent.native import native_bridge_common
+
+    started = threading.Event()
+    finished = threading.Event()
+    metadata: list[tuple[Path, bytes]] = []
+    locks = ExitStack()
+    record = claude_native_bridge.record_model_vocabulary
+    monkeypatch.setattr(
+        native_controls, "_CLAUDE_CONTROL_BUDGET_S", 0.2 if stop == "deadline" else 5.0
+    )
+
+    async def hold_metadata_lock(_client: httpx.AsyncClient) -> None:
+        bridge_dir = claude_native_bridge.prepare_bridge_dir(_BOOT_SESSION_ID, workspace=tmp_path)
+        config_path = bridge_dir / "bridge.json"
+        metadata.append((config_path, config_path.read_bytes()))
+        locks.enter_context(native_bridge_common.bridge_dir_preparation_lock(bridge_dir))
+
+    def record_until_stopped(*args: Any, **kwargs: Any) -> None:
+        try:
+            assert _injection_deadline() is not None
+            started.set()
+            record(*args, **kwargs)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(claude_native_bridge, "record_model_vocabulary", record_until_stopped)
+    task = asyncio.create_task(
+        _post_claude_control(
+            monkeypatch,
+            tmp_path,
+            lambda *a, **k: pytest.fail("The picker ran after metadata preparation stopped"),
+            catalog_rows=[{"id": "claude-opus-4-7", "model": "claude-opus-4-7"}],
+            before_control=hold_metadata_lock,
+        )
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        if stop == "cancellation":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 2)
+        else:
+            response = await asyncio.wait_for(task, 2)
+            assert response.status_code == 503, response.text
+            assert response.json()["error"] == "claude_native_model_failed"
+        assert finished.is_set()
+        assert len(metadata) == 1
+        config_path, original = metadata[0]
+        assert config_path.read_bytes() == original
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        locks.close()
+        if started.is_set():
+            assert await asyncio.to_thread(finished.wait, 2)
+    assert config_path.read_bytes() == original
 
 
 @pytest.mark.parametrize("phase", ["preflight", "picker", "commit", "status"])

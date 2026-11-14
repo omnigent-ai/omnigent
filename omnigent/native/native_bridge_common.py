@@ -66,10 +66,27 @@ def _bridge_dir_lock(bridge_dir: Path) -> FileLock:
 
 
 @contextmanager
-def bridge_dir_preparation_lock(bridge_dir: Path) -> Iterator[None]:
+def bridge_dir_preparation_lock(
+    bridge_dir: Path, *, check_cancelled: Callable[[], None] | None = None
+) -> Iterator[None]:
     """Prevent orphan cleanup while a runner prepares a bridge directory."""
-    with _bridge_dir_lock(bridge_dir):
+    lock = _bridge_dir_lock(bridge_dir)
+    if check_cancelled is None:
+        with lock:
+            yield
+        return
+    while True:
+        check_cancelled()
+        try:
+            lock.acquire(timeout=0.1)
+            break
+        except FileLockTimeout:
+            continue
+    try:
+        check_cancelled()
         yield
+    finally:
+        lock.release()
 
 
 @contextmanager

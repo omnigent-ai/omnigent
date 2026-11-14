@@ -1408,7 +1408,8 @@ def build_native_controls(
         )
         try:
             if rows is not None:
-                await asyncio.to_thread(
+                await _drive_claude_pane(
+                    deadline,
                     record_model_vocabulary,
                     bridge_dir,
                     launch_env=None,

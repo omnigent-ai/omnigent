@@ -2426,6 +2426,7 @@ def record_model_vocabulary(
             config["launch_model"] = launch_model
             changed = True
         if changed:
+            _check_injection_cancelled()
             _write_json_file(bridge_dir / _CONFIG_FILE, config)
 
 
@@ -2436,7 +2437,9 @@ def _bridge_metadata_write_lock(bridge_dir: Path) -> Iterator[None]:
     Shares bridge-dir preparation's on-disk lock, so metadata updates and
     :func:`prepare_bridge_dir` exclude each other across processes.
     """
-    with native_bridge_common.bridge_dir_preparation_lock(bridge_dir):
+    with native_bridge_common.bridge_dir_preparation_lock(
+        bridge_dir, check_cancelled=_check_injection_cancelled
+    ):
         yield
 
 
