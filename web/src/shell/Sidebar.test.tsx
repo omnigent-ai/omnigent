@@ -280,6 +280,7 @@ function renderSidebar(
   extensions: ExtensionCatalogItem[] = [],
   onClose = vi.fn(),
   config: SidebarConfig = sidebarConfig,
+  onNewSession?: () => void,
 ) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const tree = () => (
@@ -289,7 +290,12 @@ function renderSidebar(
           <ExtensionCatalogProvider extensions={extensions}>
             <TooltipProvider>
               <MemoryRouter initialEntries={[initialEntry]}>
-                <Sidebar open={open} onClose={onClose} onOpenSearch={onOpenSearch} />
+                <Sidebar
+                  open={open}
+                  onClose={onClose}
+                  onOpenSearch={onOpenSearch}
+                  onNewSession={onNewSession}
+                />
               </MemoryRouter>
             </TooltipProvider>
           </ExtensionCatalogProvider>
@@ -2443,6 +2449,22 @@ describe("Sidebar tabs", () => {
     expect(screen.getByText("conv_mine")).toBeInTheDocument();
     expect(screen.queryByText("conv_shared")).toBeNull();
   });
+
+  it.each(["new-chat-button", "sessions-new-session"])(
+    "hands a plain click on %s to onNewSession but lets modified clicks open a tab",
+    (testId) => {
+      mockConversations(THREE_TYPE_CONVERSATIONS);
+      const onNewSession = vi.fn();
+      renderSidebar(true, "/", undefined, undefined, [], vi.fn(), sidebarConfig, onNewSession);
+      const link = screen.getByTestId(testId);
+
+      expect(fireEvent.click(link, { metaKey: true })).toBe(true);
+      expect(onNewSession).not.toHaveBeenCalled();
+
+      expect(fireEvent.click(link)).toBe(false);
+      expect(onNewSession).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("drops the Shared filter option on a single-user (local) server", () => {
     // A loopback-only server can't share sessions, so that one option is

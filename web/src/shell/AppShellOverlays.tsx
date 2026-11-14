@@ -8,6 +8,7 @@ import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { updateOverlayToastOffset } from "@/lib/updateOverlayInset";
 import { CommandPalette } from "./CommandPalette";
+import { NewSessionProjectSheet } from "./NewSessionProjectSheet";
 import { RecentSessionsSwitcher } from "./RecentSessionsSwitcher";
 
 // Dev-only preview; lazy so the sample data never ships in production bundles.
@@ -19,6 +20,12 @@ export interface AppShellOverlaysProps {
   isEmbedded: boolean;
   serverInfo: ServerInfo | "loading";
   sessionSearch: boolean;
+  /** Open the palette on its "which project?" step for a new session. */
+  projectStep: boolean;
+  onNewSession: () => void;
+  /** The phone's bottom-sheet form of the project step. */
+  projectSheetOpen: boolean;
+  setProjectSheetOpen: (open: boolean) => void;
   commandPaletteOpen: boolean;
   setCommandPaletteOpen: (open: boolean) => void;
   toggleLeftSidebar: () => void;
@@ -38,6 +45,10 @@ export function AppShellOverlays({
   isEmbedded,
   serverInfo,
   sessionSearch,
+  projectStep,
+  onNewSession,
+  projectSheetOpen,
+  setProjectSheetOpen,
   commandPaletteOpen,
   setCommandPaletteOpen,
   toggleLeftSidebar,
@@ -67,14 +78,17 @@ export function AppShellOverlays({
           there even though the ⌘K hotkey is disabled (it belongs to the
           host page). */}
       <CommandPalette
-        key={sessionSearch ? "sessions" : "commands"}
+        key={projectStep ? "project" : sessionSearch ? "sessions" : "commands"}
         sessionsOnly={sessionSearch}
+        projectStep={projectStep}
+        onNewSession={onNewSession}
         open={commandPaletteOpen}
         onOpenChange={setCommandPaletteOpen}
         onToggleLeftSidebar={toggleLeftSidebar}
         onToggleRightSidebar={toggleRightPanel}
         rightSidebarShortcutEnabled={!gridRoute}
       />
+      <NewSessionProjectSheet open={projectSheetOpen} onOpenChange={setProjectSheetOpen} />
       <RecentSessionsSwitcher
         conversations={allConversations}
         activeSessionId={serverConversationId ?? null}

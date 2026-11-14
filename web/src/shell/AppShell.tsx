@@ -38,6 +38,7 @@ import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
 import { useHistoryNavigation } from "@/hooks/useHistoryNavigation";
 import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
+import { useShouldPromptForProject } from "@/hooks/useNewChatProjectPrompt";
 import { useNewShellHotkey } from "@/hooks/useNewShellHotkey";
 import { useSettingsHotkey } from "@/hooks/useSettingsHotkey";
 import { useIsEmbedded } from "@/lib/embedded";
@@ -2052,6 +2053,8 @@ function AppShellImpl() {
   // Bound here where the palette's open-state lives.
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [sessionSearch, setSessionSearch] = useState(false);
+  const [projectStep, setProjectStep] = useState(false);
+  const [projectSheetOpen, setProjectSheetOpen] = useState(false);
   // Stable handlers so the memoized Sidebar doesn't re-render on AppShell's
   // frequent re-renders (chatStore status churn during a bind). Inline
   // callbacks would give it fresh props each time and defeat the memo.
@@ -2068,22 +2071,44 @@ function AppShellImpl() {
   );
   const handleOpenSearch = useCallback(() => {
     setSessionSearch(false);
+    setProjectStep(false);
     setCommandPaletteOpen(true);
   }, []);
+  // Every "new session" entry point lands here: with projects to choose from,
+  // the palette (a bottom sheet on phones) asks which one first; otherwise
+  // the plain composer opens.
+  const shouldPromptForProject = useShouldPromptForProject();
+  const navigate = useNavigate();
+  const handleNewSession = useCallback(() => {
+    if (!shouldPromptForProject()) {
+      navigate("/");
+      return;
+    }
+    if (mobileViewport) {
+      setCommandPaletteOpen(false);
+      setProjectSheetOpen(true);
+      return;
+    }
+    setSessionSearch(false);
+    setProjectStep(true);
+    setCommandPaletteOpen(true);
+  }, [mobileViewport, navigate, shouldPromptForProject]);
   const isEmbedded = useIsEmbedded();
   useCommandPaletteHotkey(
     () => {
       setSessionSearch(false);
-      setCommandPaletteOpen((prev) => sessionSearch || !prev);
+      setProjectStep(false);
+      setCommandPaletteOpen((prev) => sessionSearch || projectStep || !prev);
     },
     true,
     undefined,
     () => {
       setSessionSearch(true);
-      setCommandPaletteOpen((prev) => !sessionSearch || !prev);
+      setProjectStep(false);
+      setCommandPaletteOpen((prev) => !sessionSearch || projectStep || !prev);
     },
   );
-  useNewSessionHotkey();
+  useNewSessionHotkey(true, undefined, handleNewSession);
   useSettingsHotkey();
   useHistoryNavigation();
 
@@ -3033,6 +3058,7 @@ function AppShellImpl() {
               dragProgress={sidebarDragProgress}
               onClose={handleSidebarClose}
               onOpenSearch={handleOpenSearch}
+              onNewSession={handleNewSession}
             />
 
             {/* Content region (everything right of the sidebar): a relative
@@ -3411,6 +3437,10 @@ function AppShellImpl() {
             isEmbedded={isEmbedded}
             serverInfo={serverInfo}
             sessionSearch={sessionSearch}
+            projectStep={projectStep}
+            onNewSession={handleNewSession}
+            projectSheetOpen={projectSheetOpen}
+            setProjectSheetOpen={setProjectSheetOpen}
             commandPaletteOpen={commandPaletteOpen}
             setCommandPaletteOpen={setCommandPaletteOpen}
             toggleLeftSidebar={toggleLeftSidebar}
