@@ -1071,7 +1071,19 @@ async def test_kiro_native_model_options_use_cli_catalog(
         response = await client.get(f"/v1/sessions/{conv_id}/kiro-model-options")
 
     assert response.status_code == 200
-    assert response.json() == {"models": expected}
+    assert response.json() == {
+        "models": [
+            {
+                **model,
+                "source": {
+                    "kind": "cli-config",
+                    "label": "CLI config",
+                    "name": "kiro-cli native CLI configuration",
+                },
+            }
+            for model in expected
+        ]
+    }
 
 
 @pytest.mark.asyncio
@@ -1254,6 +1266,11 @@ async def test_opencode_native_model_options_reads_server_catalog(
                 "displayName": "opencode-go/glm-5.2",
                 "name": "GLM 5.2",
                 "isDefault": False,
+                "source": {
+                    "kind": "cli-config",
+                    "label": "CLI config",
+                    "name": "opencode native CLI configuration",
+                },
             }
         ]
     }
