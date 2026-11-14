@@ -104,6 +104,8 @@ async def test_private_sender_can_message_shared_receiver(
         return
     assert result.get("queued") is True, result
     assert "Please inspect the PR" in json.dumps(captured)
+    # The receiving runner must not forward the reply to the receiver's parent.
+    assert '"peer_message": true' in json.dumps(captured)
     items = await auth_client.get(f"/v1/sessions/{target['id']}/items")
     assert f"[Message from session {source['id']}]" in items.text
     assert '"created_by":"alice"' in items.text
