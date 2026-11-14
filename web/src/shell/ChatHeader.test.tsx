@@ -711,8 +711,10 @@ describe("ChatHeader — Chat/Terminal switcher wiring", () => {
 });
 
 describe("ChatHeader — floating mobile controls", () => {
-  it("adds glass to the mobile sidebar and shared action container", () => {
+  it.each(["iOS", "Android", "browser"])("shares protected mobile glass on %s", (platform) => {
     isMobileMock.mockReturnValue(true);
+    isIOSShellMock.mockReturnValue(platform === "iOS");
+    isAndroidShellMock.mockReturnValue(platform === "Android");
     const onOpenSidebar = vi.fn();
     renderHeader({ sidebarOpen: false, conversationId: "conv-1", canShare: true, onOpenSidebar });
 
@@ -725,11 +727,14 @@ describe("ChatHeader — floating mobile controls", () => {
           .closest("[data-mobile-header-group]")
           ?.querySelector<HTMLElement>(".glass-surface"))!;
       expect(surface.parentElement).toHaveAttribute("aria-hidden", "true");
+      expect(surface.parentElement).toHaveClass("omni-glass-layer");
       expect(surface).toHaveClass("glass-surface--fallback");
       expect(surface).toHaveClass("[&>.glass-surface\\_\\_sheen]:opacity-0");
       expect(surface.querySelector(".glass-surface__sheen")).not.toBeNull();
       expect(surface.style.getPropertyValue("--glass-frost")).toBe("0");
-      expect(surface.style.background).toBe("var(--omni-glass-background, hsl(0 0% 100% / 0%))");
+      expect(surface.style.background).toBe(
+        "var(--omni-glass-background, color-mix(in srgb, var(--card-solid) 88%, transparent))",
+      );
       expect(surface.style.backdropFilter).toBe(
         "blur(var(--omni-glass-blur, 8px)) saturate(calc(var(--glass-saturation, 1) * 1.4)) brightness(var(--omni-glass-brightness, 1.04))",
       );
@@ -850,7 +855,7 @@ describe("ChatHeader — floating mobile controls", () => {
     expect(screen.getByTestId("session-actions-menu")).toHaveClass("rounded-full");
   });
 
-  it("keeps the fallback menu legible over scrolling content", () => {
+  it("keeps the fallback mobile menu solid", () => {
     isMobileMock.mockReturnValue(true);
     renderHeader({
       sidebarOpen: true,
@@ -861,10 +866,10 @@ describe("ChatHeader — floating mobile controls", () => {
     });
 
     fireEvent.pointerDown(screen.getByTestId("session-actions-menu"), { button: 0 });
-    expect(screen.getByRole("menu")).toHaveClass(
-      "max-md:bg-background/70",
-      "max-md:backdrop-blur-xl",
-    );
+    const menu = screen.getByRole("menu");
+    expect(menu).toHaveClass("max-md:bg-[var(--card-solid)]!", "max-md:backdrop-filter-none!");
+    expect(menu).not.toHaveClass("mobile-menu-glass");
+    expect(menu.parentElement?.querySelector(".mobile-menu-glass-layer")).toBeNull();
     expect(screen.getByLabelText("Working directory: /Users/ajay/projects/omni")).toHaveTextContent(
       "omni",
     );

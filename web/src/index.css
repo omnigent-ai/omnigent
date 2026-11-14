@@ -843,10 +843,40 @@
   padding: 0;
 }
 
-/* Keep glass readable when the browser cannot diffuse the content behind it. */
+/* Glass owns its foreground pair as well as its palette-tinted backing. */
+:has(> .omni-glass-layer) {
+  --foreground: #27272a;
+  --muted-foreground: #45454b;
+  --card-foreground: var(--foreground);
+  --popover-foreground: var(--foreground);
+  --sidebar-foreground: var(--foreground);
+  --sidebar-active-foreground: var(--foreground);
+  color: var(--foreground);
+}
+
+.dark :has(> .omni-glass-layer) {
+  --foreground: #f5f5f4;
+  --muted-foreground: #d4d4d8;
+}
+
+/* Opaque material when diffusion is unavailable or unwanted. */
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
   .omni-glass-surface {
     --omni-glass-background: var(--card-solid);
+  }
+}
+
+@supports not (background: color-mix(in srgb, white 88%, transparent)) {
+  .omni-glass-surface {
+    --omni-glass-background: var(--card-solid);
+  }
+}
+
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
+  .omni-glass-surface {
+    --omni-glass-background: var(--card-solid);
+    -webkit-backdrop-filter: none !important;
+    backdrop-filter: none !important;
   }
 }
 
