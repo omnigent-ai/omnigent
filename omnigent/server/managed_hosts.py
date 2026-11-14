@@ -34,7 +34,7 @@ stores into ``create_app``):
 
        sandbox:
          # lakebox|databricks|modal|daytona|blaxel|boxlite|cwsandbox|islo|
-         # e2b|openshell|kubernetes|microsandbox|gensee
+         # e2b|openshell|kubernetes|microsandbox|gensee|boat
          provider: modal
          server_url: https://omnigent.example.com
          # For SEVERAL providers, replace `provider:` with a `providers:`
@@ -150,7 +150,9 @@ stores into ``create_app``):
    launcher reads ``DAYTONA_API_KEY`` (plus optional
    ``DAYTONA_API_URL`` / ``DAYTONA_TARGET``), and the Islo launcher
    reads ``ISLO_API_KEY`` (plus optional ``ISLO_BASE_URL``) from the
-   server process environment. Gensee reads the environment variable named by
+   server process environment. The Boat launcher reads ``BOAT_API_KEY``
+   (plus optional ``BOAT_API_URL``) from the same environment. Gensee
+   reads the environment variable named by
    ``sandbox.gensee.api_token_env`` (``GENSEE_CONTROLLER_API_TOKEN`` by
    default). The Blaxel launcher reads ``BL_WORKSPACE``
    and ``BL_API_KEY`` or the local ``bl login`` profile. The OpenShell
@@ -246,6 +248,7 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
         "lakebox",
         "databricks",
         "modal",
+        "boat",
         "daytona",
         "blaxel",
         "boxlite",
@@ -264,6 +267,7 @@ PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
     {
         "databricks",
         "modal",
+        "boat",
         "daytona",
         "blaxel",
         "boxlite",
@@ -337,6 +341,12 @@ DATABRICKS_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # deleted by managed-session teardown; use the same 7-day policy bound
 # as Daytona for long-lived hosts and stale-token cleanup.
 ISLO_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
+# Launch-token lifetime for the YAML boat path. Boat sandboxes are
+# deleted by managed-session teardown and resume after archival; use the
+# same 7-day policy bound as Daytona for long-lived hosts and stale-token
+# cleanup.
+BOAT_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
 # Launch-token lifetime for the YAML openshell path. OpenShell sandboxes
 # run until deleted (no platform lifetime cap), so the bound is policy,
@@ -2098,6 +2108,12 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             host_ports=_resolve_microsandbox_host_ports(raw, server_url),
         )
         token_ttl_s = MICROSANDBOX_MANAGED_TOKEN_TTL_S
+    elif provider == "boat":
+        section = _parse_provider_section(raw, provider)
+        if section is not None:
+            _reject_unknown_keys(section, set(), "sandbox.boat")
+        launcher_factory = _registry_launcher_factory(provider, None)
+        token_ttl_s = BOAT_MANAGED_TOKEN_TTL_S
     elif provider == "lambda_microvm":
         from omnigent.onboarding.sandboxes.lambda_microvm import managed_token_ttl_s
 
