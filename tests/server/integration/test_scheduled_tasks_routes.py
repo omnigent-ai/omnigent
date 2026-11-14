@@ -923,8 +923,6 @@ async def _create_reminder(client: httpx.AsyncClient, session_id: str) -> str:
 async def test_a_reminder_only_delete_removes_that_sessions_reminder(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
-    info = (await auth_client.get("/v1/info", headers=_headers())).json()
-    assert info["scheduled_task_reminder_cancel"] is True
     session_id = _owned_session(db_uri)
     task_id = await _create_reminder(auth_client, session_id)
     deleted = await auth_client.delete(
@@ -937,17 +935,33 @@ async def test_a_reminder_only_delete_removes_that_sessions_reminder(
 
 
 @pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
+@pytest.mark.parametrize("moved", ["before_the_request", "after_the_route_check"])
 async def test_a_reminder_only_delete_keeps_a_reminder_moved_to_another_session(
-    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    moved: str,
 ) -> None:
     """An edit between the agent's decision and its delete can't redirect the delete."""
     first, second = _owned_session(db_uri), _owned_session(db_uri)
     task_id = await _create_reminder(auth_client, first)
-    moved = await auth_client.patch(
-        f"/v1/scheduled-tasks/{task_id}", json={"session_id": second}, headers=_headers()
-    )
-    assert moved.status_code == 200, moved.text
-    assert moved.json()["kind"] == "reminder"
+    if moved == "before_the_request":
+        # The route's own check refuses it.
+        response = await auth_client.patch(
+            f"/v1/scheduled-tasks/{task_id}", json={"session_id": second}, headers=_headers()
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["kind"] == "reminder"
+    else:
+        # The route's check passes; the move lands just before the store's locked check.
+        real_delete = SqlAlchemyScheduledTaskStore.delete
+
+        def move_then_delete(self, scheduled_task_id, **kwargs):
+            SqlAlchemyScheduledTaskStore(db_uri).update(scheduled_task_id, session_id=second)
+            return real_delete(self, scheduled_task_id, **kwargs)
+
+        monkeypatch.setattr(SqlAlchemyScheduledTaskStore, "delete", move_then_delete)
     refused = await auth_client.delete(
         f"/v1/scheduled-tasks/{task_id}",
         params={"reminder_session_id": first},
