@@ -4,7 +4,7 @@
 
 ### The open-source meta-harness for all your AI agents.
 
-Omnigent is an open-source **meta-harness** that gives you a common orchestration layer over Claude Code, Codex, Cursor, OpenCode, Goose, Antigravity, GitHub Copilot, Devin, Kiro, Qwen Code, Kimi Code, Grok Build, Jcode, Hermes, Pi, OpenAI Agents / Open Responses, and the agents you write yourself: swap or combine harnesses without rewriting, enforce policies and sandboxing, and collaborate in real time from any device — terminal, browser, phone, or the native desktop app.
+Omnigent is an open-source **meta-harness** that gives you a common orchestration layer over Claude Code, Codex, Command Code, Cursor, OpenCode, Goose, Antigravity, GitHub Copilot, Devin, Kiro, Qwen Code, Kimi Code, Grok Build, Jcode, Hermes, Pi, OpenAI Agents / Open Responses, and the agents you write yourself: swap or combine harnesses without rewriting, enforce policies and sandboxing, and collaborate in real time from any device — terminal, browser, phone, or the native desktop app.
 
 [![PyPI version](https://img.shields.io/pypi/v/omnigent.svg)](https://pypi.org/project/omnigent/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/omnigent-ai/omnigent/blob/main/LICENSE)
@@ -29,7 +29,8 @@ Omnigent lets you:
   follow you: start in your terminal, continue in the browser, pick it up on
   your phone. Messages, sub-agents, terminals, and files stay in sync.
 
-- **🤖 Supervise multiple agents.** Mix Claude Code, Codex, Cursor, OpenCode,
+- **🤖 Supervise multiple agents.** Mix Claude Code, Codex, Command Code,
+  Cursor, OpenCode,
   Goose, Antigravity, GitHub Copilot, Devin, Kiro, Qwen Code, Kimi Code, Grok
   Build, Jcode, Hermes, Pi, OpenAI Agents / Open Responses, and custom agents
   (defined in YAML) together in the same session. Ask one agent to review another's work, or split a task across
@@ -161,7 +162,7 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
   one-time approvals also appear as Chat cards. See
   `docs/kiro-native-elicitation.md`.
 - **`tmux`**, required by the native `omnigent <harness>` terminal wrappers
-  (`claude`, `codex`, `cursor`, `devin`, `hermes`, `kiro`, `pi`)
+  (`claude`, `codex`, `commandcode`, `cursor`, `devin`, `hermes`, `kiro`, `pi`)
   (`brew install tmux` / `apt install tmux`; the installer offers
   to install it for you).
 - **`bubblewrap`** (`bwrap`), **Linux only**. The native `omnigent <harness>`
@@ -291,6 +292,7 @@ Or launch a specific agent runtime:
 ```bash
 omnigent claude                      # Claude Code, in a session your team can join
 omnigent codex                       # Codex
+omnigent commandcode                 # Command Code (aliases: omni cmd, omni cmdc)
 omnigent cursor                      # Cursor
 omnigent agy                         # Antigravity
 omnigent opencode                    # OpenCode
@@ -350,6 +352,9 @@ See the [native agy gateway guide](docs/native-agy-gateways.md) for compatibilit
 requirements, model and authentication behavior, troubleshooting, and smoke
 steps. These settings configure native agy; the Antigravity Python SDK retains
 its separate key/Vertex setup.
+`omnigent commandcode` requires the Command Code CLI (`npm i -g command-code@latest`)
+and its own sign-in (`cmd login`, or `COMMAND_CODE_API_KEY`).
+
 `omnigent opencode` requires OpenCode 2.0.x (`npm i -g @opencode/cli@2.0.32`).
 Its free models need no sign-in; run `opencode auth login` to add your own
 providers. See the [OpenCode harness guide](docs/opencode-native.md).

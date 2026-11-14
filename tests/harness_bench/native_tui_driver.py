@@ -138,7 +138,7 @@ class NativeVendor:
 
 
 # These vendors create external_session_id only after the first message.
-_LAZY_CHAT_HARNESSES: frozenset[str] = frozenset({"cursor-native"})
+_LAZY_CHAT_HARNESSES: frozenset[str] = frozenset({"cursor-native", "commandcode-native"})
 
 _NATIVE_OMNIGENT_MCP_HARNESSES = frozenset(
     {

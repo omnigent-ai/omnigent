@@ -549,6 +549,14 @@ def test_configured_harness_map_covers_all_spellings(
         # Native Kimi (``omnigent kimi``) — gates on the kimi CLI.
         "kimi-native",
         "native-kimi",
+        # Native Command Code (``omni commandcode`` / ``omni cmd``) — gates on the
+        # ``cmd`` binary. The bare ``commandcode`` spelling and the ``cmd`` /
+        # ``cmdc`` binary-name aliases canonicalize onto ``commandcode-native``.
+        "commandcode",
+        "commandcode-native",
+        "native-commandcode",
+        "cmd",
+        "cmdc",
         # Native Antigravity (agy) CLI-wrapping harness, both spellings and aliases.
         "antigravity-native",
         "native-antigravity",

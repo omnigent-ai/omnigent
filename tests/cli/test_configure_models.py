@@ -12,9 +12,10 @@ add/set-default/remove write paths surfaces here rather than silently.
 harness on a single compact row — the name on the left, then an aligned
 ``✓``/``✗`` status column — in 0.3 priority order: ``1=Claude``,
 ``2=Codex``, ``3=Cursor``, ``4=OpenCode``, ``5=Hermes``, ``6=Pi``,
-``7=Antigravity``, ``8=Qwen Code``, ``9=Goose``, ``10=Copilot``, ``11=Kiro``,
-``12=Kimi Code``, ``13=Import from OpenClaw``, ``14=Custom ACP agent``,
-``15=Quit``. There is no "More" folding — every harness is visible at once —
+``7=Antigravity``, ``8=Qwen Code``, ``9=Goose``, ``10=Devin``, ``11=Grok Build``,
+``12=Jcode``, ``13=Copilot``, ``14=Kiro``, ``15=Kimi Code``, ``16=Command Code``,
+``17=Import from OpenClaw``, ``18=Custom ACP agent``, ``19=Quit``. There is no
+"More" folding — every harness is visible at once —
 and the actionable hint (install command / next step)
 renders only for the highlighted row, as the selector's description line.
 Selecting a harness drills into level 2 — its configured credentials, then ``+ Add a
@@ -1804,6 +1805,7 @@ def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeyp
         "Copilot",
         "Kiro",
         "Kimi Code",
+        "Command Code",
         "Import from OpenClaw",
         "Custom ACP agent",
         "Quit",
@@ -1970,9 +1972,10 @@ def test_setup_imports_openclaw_agents(isolated_config) -> None:
         encoding="utf-8",
     )
 
-    # 16 is the OpenClaw import row: hiding Devin's builtin ACP row moved every
-    # row after it one lower (see the dispatch table's note).
-    stdin = "\n".join(["16", "", "", "q"]) + "\n"
+    # 17 is the OpenClaw import row: Command Code's row sits between Kimi and
+    # the import row, moving every row after it one lower (see the dispatch
+    # table's note).
+    stdin = "\n".join(["17", "", "", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -1994,7 +1997,7 @@ def test_setup_imports_openclaw_agents_from_user_selected_path(isolated_config) 
         encoding="utf-8",
     )
 
-    stdin = "\n".join(["16", "", str(selected), "", "q"]) + "\n"
+    stdin = "\n".join(["17", "", str(selected), "", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -2011,7 +2014,7 @@ def test_setup_rejects_user_selected_unrelated_file(isolated_config) -> None:
     selected = isolated_config / "package.json"
     selected.write_text('{"name": "unrelated"}', encoding="utf-8")
 
-    stdin = "\n".join(["16", "", str(selected), "2", "q"]) + "\n"
+    stdin = "\n".join(["17", "", str(selected), "2", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -2212,7 +2215,9 @@ def test_overview_truncates_long_status_for_narrow_terminal(isolated_config, mon
         ("13", "_manage_copilot_harness"),
         ("14", "_manage_kiro_harness"),
         ("15", "_manage_kimi_harness"),
-        ("17", "_add_acp_agent"),
+        # 16 is the Command Code row (commandcode-native); it has no drill-in
+        # sentinel of its own here, so the ACP-agent row moved one lower.
+        ("18", "_add_acp_agent"),
     ],
 )
 def test_overview_dispatches_to_correct_manager(

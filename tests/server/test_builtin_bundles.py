@@ -253,6 +253,8 @@ _EXPECTED_BUILTIN_AGENT_IDS = {
     # every id above is byte-identical to before, so no persisted
     # conversation.agent_id row is orphaned and no migration is owed.
     "devin-native-ui": "010b5eea4b105dc0af6fb62f46065894",
+    # Added with the commandcode-native harness — likewise an addition.
+    "commandcode-native-ui": "c474a17d2f55a2b55cd89c790a7c75b9",
 }
 
 

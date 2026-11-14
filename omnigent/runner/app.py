@@ -1569,6 +1569,7 @@ def create_runner_app(
     _claude_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _antigravity_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _devin_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    _commandcode_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     app.state.antigravity_terminal_ensure_locks = _antigravity_terminal_ensure_locks
     # Keyed by native agent key, which is also the pane's terminal name. Launch
     # and ensure paths take a session's lock here; so does the idle pane reaper.
@@ -1586,6 +1587,7 @@ def create_runner_app(
             "qwen": _qwen_terminal_ensure_locks,
             "kimi": _kimi_terminal_ensure_locks,
             "devin": _devin_terminal_ensure_locks,
+            "commandcode": _commandcode_terminal_ensure_locks,
         }
     )
     app.state.native_terminal_ensure_locks = _native_terminal_ensure_locks
@@ -4096,6 +4098,7 @@ def create_runner_app(
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
+        _commandcode_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
         await _native_runtime.teardown_codex_native_app_server(session_id)
@@ -8682,6 +8685,7 @@ def create_runner_app(
         _antigravity_terminal_ensure_locks=_antigravity_terminal_ensure_locks,
         _claude_terminal_ensure_locks=_claude_terminal_ensure_locks,
         _codex_terminal_ensure_locks=_codex_terminal_ensure_locks,
+        _commandcode_terminal_ensure_locks=_commandcode_terminal_ensure_locks,
         _cursor_terminal_ensure_locks=_cursor_terminal_ensure_locks,
         _devin_terminal_ensure_locks=_devin_terminal_ensure_locks,
         _discard_comment_relay=_discard_comment_relay,
@@ -8988,6 +8992,7 @@ def create_runner_app(
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
+        _commandcode_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         if process_manager is not None:
             await process_manager.release(session_id)
@@ -9019,6 +9024,7 @@ def create_runner_app(
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
+        _commandcode_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         await _teardown_session_terminals(session_id)
         if process_manager is not None:
