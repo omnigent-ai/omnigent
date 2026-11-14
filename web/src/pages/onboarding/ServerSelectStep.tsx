@@ -165,7 +165,7 @@ export function ServerSelectStep({
   /** Remove a recent server from the list, if the shell supports it. */
   onRemove?: (url: string) => void;
   /** Copy text to the clipboard (native shell bridge — file:// blocks navigator.clipboard). */
-  onCopy: (text: string) => void;
+  onCopy: (text: string) => void | Promise<unknown>;
   /** Advisory reachability probe for a just-added server or the local install. */
   onCheckServer: (url: string) => Promise<ServerCheckResult>;
 }) {
@@ -552,7 +552,13 @@ function DetailRow({
 
 /** Inline server-detail body (icon-labeled rows). Shared by the list accordion
  *  and the single-server detail step. Mock org/admin fields for remote servers. */
-export function ServerDetails({ url, onCopy }: { url: string; onCopy: (text: string) => void }) {
+export function ServerDetails({
+  url,
+  onCopy,
+}: {
+  url: string;
+  onCopy: (text: string) => void | Promise<unknown>;
+}) {
   const name = displayName(url);
   return (
     <div className="mt-2.5 flex flex-col border-t border-border pt-2.5 text-base">
@@ -561,7 +567,10 @@ export function ServerDetails({ url, onCopy }: { url: string; onCopy: (text: str
           <span className="truncate text-right text-foreground">{name}</span>
           <button
             type="button"
-            onClick={() => onCopy(url)}
+            onClick={() => {
+              // A failed copy has no UI here; keep it from becoming an unhandled rejection.
+              Promise.resolve(onCopy(url)).catch(() => {});
+            }}
             className="flex size-3.5 shrink-0 items-center justify-center text-muted-foreground hover:text-foreground"
             aria-label={`Copy ${name}`}
           >
