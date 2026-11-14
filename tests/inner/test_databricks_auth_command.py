@@ -19,6 +19,7 @@ def _run_generated_helper(
     force_refresh_works: bool,
     cached_token_works: bool,
     bearer: str | None = None,
+    arguments_path: Path | None = None,
 ) -> str:
     """
     Run *command* against a fake ``databricks`` CLI and return its stdout.
@@ -30,6 +31,7 @@ def _run_generated_helper(
         is the stale-refresh-token case.
     :param cached_token_works: Whether plain ``auth token`` succeeds.
     :param bearer: Value for ``DATABRICKS_BEARER``, or ``None`` to unset it.
+    :param arguments_path: Optional file receiving the CLI's NUL-separated arguments.
     :returns: The helper's stdout, stripped.
     """
     import os
@@ -38,6 +40,8 @@ def _run_generated_helper(
     fake = tmp_path / "databricks"
     fake.write_text(
         "#!/bin/sh\n"
+        'if [ -n "${AUTH_TEST_ARGUMENTS_PATH:-}" ]; then '
+        'printf \'%s\\0\' "$@" > "$AUTH_TEST_ARGUMENTS_PATH"; fi\n'
         'case "$*" in *--help*) echo "  --force-refresh"; exit 0;; esac\n'
         'case "$*" in *--force-refresh*)\n'
         '  [ "$FORCE_OK" = 1 ] && { echo \'{"access_token":"fresh"}\'; exit 0; }\n'
@@ -65,6 +69,8 @@ def _run_generated_helper(
     env["DATABRICKS_CONFIG_FILE"] = str(tmp_path / "nonexistent-databrickscfg")
     if bearer is not None:
         env["DATABRICKS_BEARER"] = bearer
+    if arguments_path is not None:
+        env["AUTH_TEST_ARGUMENTS_PATH"] = str(arguments_path)
     result = subprocess.run(
         ["sh", "-c", command], env=env, capture_output=True, text=True, check=False
     )
@@ -134,17 +140,42 @@ def test_the_generated_helper_selects_by_profile_when_one_is_named() -> None:
     """
     from omnigent.inner.databricks_executor import databricks_bearer_token_command
 
-    named = databricks_bearer_token_command("https://example.databricks.com", "agent")
+    named = databricks_bearer_token_command("https://workspace.example.com", "agent")
     # Scope to the CLI mint's selector: it selects by profile (host lookup is
     # ambiguous when two profiles share a workspace). The sdk fallback separately
     # passes --host for its own workspace guard, so assert on the mint, not the
     # whole command.
-    assert 'databricks auth token --profile "agent"' in named
+    assert "databricks auth token --profile agent" in named
     assert "databricks auth token --host" not in named
 
-    unnamed = databricks_bearer_token_command("https://example.databricks.com/", None)
-    assert 'databricks auth token --host "https://example.databricks.com"' in unnamed
+    unnamed = databricks_bearer_token_command("https://workspace.example.com/", None)
+    assert "databricks auth token --host https://workspace.example.com" in unnamed
     assert "databricks auth token --profile" not in unnamed
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize("profile", ["team$PROFILE", "équipe", "team\nprofile", "team 'profile'"])
+@pytest.mark.parametrize("mint_path", ["refresh", "cached", "ambient"])
+def test_the_generated_helper_passes_the_literal_profile_to_the_cli(
+    tmp_path: Path, profile: str, mint_path: str
+) -> None:
+    """Every CLI mint must select the configured profile without shell expansion."""
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    arguments_path = tmp_path / "arguments"
+    command = databricks_bearer_token_command("https://workspace.example.com", profile)
+    token = _run_generated_helper(
+        command,
+        tmp_path,
+        force_refresh_works=mint_path == "refresh",
+        cached_token_works=True,
+        bearer="ambient" if mint_path == "ambient" else None,
+        arguments_path=arguments_path,
+    )
+
+    assert token == ("fresh" if mint_path == "refresh" else "cached")
+    arguments = arguments_path.read_bytes().decode().split("\0")[:-1]
+    assert arguments[arguments.index("--profile") + 1] == profile
 
 
 @pytest.mark.posix_only

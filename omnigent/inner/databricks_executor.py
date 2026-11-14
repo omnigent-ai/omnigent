@@ -358,7 +358,9 @@ def databricks_bearer_token_command(
     fallbacks.append(_databricks_sdk_token_command(host, profile))
 
     selector = (
-        f"--profile {json.dumps(profile)}" if profile else f"--host {json.dumps(host.rstrip('/'))}"
+        f"--profile {shlex.quote(profile)}"
+        if profile
+        else f"--host {shlex.quote(host.rstrip('/'))}"
     )
     mint = f"env -u DATABRICKS_CONFIG_PROFILE databricks auth token {selector}"
     fallback = "".join(
