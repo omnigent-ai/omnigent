@@ -84,6 +84,7 @@ def build_session_history(
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
         """
+        previous_anchor = _last_server_item_id.get(session_id)
         try:
             resp = await server_client.get(
                 f"/v1/sessions/{session_id}/items",
@@ -108,7 +109,8 @@ def build_session_history(
             )
             return
         last_id = page_items[0].get("id") if page_items else None
-        if last_id:
+        # Live item persistence or session cleanup can finish during the read.
+        if last_id and _last_server_item_id.get(session_id) == previous_anchor:
             _last_server_item_id[session_id] = last_id
 
     async def _load_history_as_input(
