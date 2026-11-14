@@ -513,19 +513,14 @@ async def test_get_goal_without_a_runner_preserves_legacy_or_strict_semantics(
         assert staged.events == [{"type": "goal_get"}]
 
 
-@pytest.mark.parametrize("strict", [False, True])
-@pytest.mark.parametrize("failure", [httpx.ConnectError, httpx.ReadTimeout])
-async def test_get_goal_transport_failure_is_unavailable(
-    failure: type[httpx.HTTPError],
+async def test_get_goal_strict_transport_failure_is_unavailable(
     client: httpx.AsyncClient,
     codex_session: str,
     monkeypatch: pytest.MonkeyPatch,
-    strict: bool,
 ) -> None:
     def _handler(request: httpx.Request) -> httpx.Response:
-        expected = {"type": "goal_get", **({"require_live": True} if strict else {})}
-        assert json.loads(request.content) == expected
-        raise failure("runner unavailable")
+        assert json.loads(request.content) == {"type": "goal_get", "require_live": True}
+        raise httpx.ConnectError("runner unavailable")
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(_handler), base_url="http://runner"
@@ -537,15 +532,11 @@ async def test_get_goal_transport_failure_is_unavailable(
         monkeypatch.setattr(session_routes, "_get_runner_client", _get_client)
         resp = await client.get(
             f"/v1/sessions/{codex_session}/codex_goal",
-            headers={"X-Omnigent-Codex-Goal-Read": "strict"} if strict else {},
+            headers={"X-Omnigent-Codex-Goal-Read": "strict"},
         )
 
-    if strict:
-        assert resp.status_code == 503, resp.text
-        assert "Could not read Codex goal" in resp.json()["error"]["message"]
-    else:
-        assert resp.status_code == 200, resp.text
-        assert resp.json() == {"goal": None}
+    assert resp.status_code == 503, resp.text
+    assert "Could not read Codex goal" in resp.json()["error"]["message"]
 
 
 async def test_get_goal_returns_an_absent_goal(

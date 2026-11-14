@@ -396,6 +396,7 @@ function useGoalDialogState({
   const draftSession = useRef<string | null | undefined>(undefined);
   const dirtyFields = useRef(new Set<"objective" | "tokenBudget" | "mode">());
   const dialogBinding = useRef<object | null>(null);
+  const activeMutation = useRef<object | null>(null);
   const currentRefreshGoal = useRef(refreshGoal);
 
   useLayoutEffect(() => {
@@ -403,12 +404,20 @@ function useGoalDialogState({
   }, [refreshGoal]);
 
   useLayoutEffect(() => {
-    // New dialog or goal-owner bindings invalidate pending operations.
-    dialogBinding.current = open && conversationId ? {} : null;
-    setLoading(false);
+    // Pending writes belong to this open dialog, across runner reconnects.
+    activeMutation.current = null;
     setSaving(false);
     setClearing(false);
     setStatusUpdating(null);
+    return () => {
+      activeMutation.current = null;
+    };
+  }, [conversationId, open]);
+
+  useLayoutEffect(() => {
+    // New dialog or goal-owner bindings invalidate async responses.
+    dialogBinding.current = open && conversationId ? {} : null;
+    setLoading(false);
     setReadError(null);
     setOperationError(null);
     return () => {
@@ -488,7 +497,7 @@ function useGoalDialogState({
 
   const saveGoal = async () => {
     const binding = dialogBinding.current;
-    if (!conversationId || !binding) return;
+    if (!conversationId || !binding || activeMutation.current) return;
     const trimmedObjective = objective.trim();
     if (!trimmedObjective) {
       setOperationError("Goal objective cannot be empty.");
@@ -501,6 +510,8 @@ function useGoalDialogState({
       setOperationError(err instanceof Error ? err.message : String(err));
       return;
     }
+    const mutation = {};
+    activeMutation.current = mutation;
     setSaving(true);
     setReadError(null);
     setOperationError(null);
@@ -520,13 +531,18 @@ function useGoalDialogState({
       if (dialogBinding.current === binding)
         setOperationError(goalError("Could not set goal", err));
     } finally {
-      if (dialogBinding.current === binding) setSaving(false);
+      if (activeMutation.current === mutation) {
+        activeMutation.current = null;
+        setSaving(false);
+      }
     }
   };
 
   const clearCurrentGoal = async () => {
     const binding = dialogBinding.current;
-    if (!conversationId || !binding) return;
+    if (!conversationId || !binding || activeMutation.current) return;
+    const mutation = {};
+    activeMutation.current = mutation;
     setClearing(true);
     setReadError(null);
     setOperationError(null);
@@ -542,13 +558,18 @@ function useGoalDialogState({
       if (dialogBinding.current === binding)
         setOperationError(goalError("Could not clear goal", err));
     } finally {
-      if (dialogBinding.current === binding) setClearing(false);
+      if (activeMutation.current === mutation) {
+        activeMutation.current = null;
+        setClearing(false);
+      }
     }
   };
 
   const updateStatus = async (status: GoalStatusUpdate) => {
     const binding = dialogBinding.current;
-    if (!conversationId || !binding) return;
+    if (!conversationId || !binding || activeMutation.current) return;
+    const mutation = {};
+    activeMutation.current = mutation;
     setStatusUpdating(status);
     setReadError(null);
     setOperationError(null);
@@ -565,7 +586,10 @@ function useGoalDialogState({
       if (dialogBinding.current === binding)
         setOperationError(goalError(`Could not ${action} goal`, err));
     } finally {
-      if (dialogBinding.current === binding) setStatusUpdating(null);
+      if (activeMutation.current === mutation) {
+        activeMutation.current = null;
+        setStatusUpdating(null);
+      }
     }
   };
 

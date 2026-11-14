@@ -349,7 +349,7 @@ describe("useGoalState", () => {
     }
   });
 
-  it("backs off repeated failures through a repeated sixty-second cap", async () => {
+  it("backs off through a repeated sixty-second cap and resets polling after recovery", async () => {
     vi.useFakeTimers();
     mockGetGoal.mockResolvedValueOnce({ goal: GOAL }).mockRejectedValue(new Error("offline"));
     const { result } = renderHook(() => useGoalState("conv", true));
@@ -367,18 +367,12 @@ describe("useGoalState", () => {
       expect(result.current.goal).toEqual(GOAL);
     }
     /* oxlint-enable no-await-in-loop */
-  });
-
-  it("resets polling to five seconds after recovering from the maximum backoff", async () => {
-    vi.useFakeTimers();
-    mockGetGoal.mockResolvedValueOnce({ goal: GOAL }).mockRejectedValue(new Error("offline"));
-    const { result } = renderHook(() => useGoalState("conv", true));
-    await act(async () => {});
-    await act(() => vi.advanceTimersByTimeAsync(195_000));
-    expect(mockGetGoal).toHaveBeenCalledTimes(7);
     const pausedGoal = { ...GOAL, status: "paused" as const };
     mockGetGoal.mockResolvedValue({ goal: pausedGoal });
-    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    await act(() => vi.advanceTimersByTimeAsync(59_999));
+    expect(mockGetGoal).toHaveBeenCalledTimes(7);
+    expect(result.current.goal).toEqual(GOAL);
+    await act(() => vi.advanceTimersByTimeAsync(1));
     expect(result.current.goal).toEqual(pausedGoal);
     expect(mockGetGoal).toHaveBeenCalledTimes(8);
     await act(() => vi.advanceTimersByTimeAsync(4_999));
