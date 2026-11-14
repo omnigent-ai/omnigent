@@ -76,12 +76,8 @@ class JournalEntryTooLargeError(InvalidJournalEntryError):
         self.limit = limit
 
 
-# Statuses that need every step the step depends on to be done first.
-STATUSES_NEEDING_DEPENDENCIES: frozenset[str] = frozenset({"started", "done"})
-
-
 class StepNotReadyError(InvalidJournalEntryError):
-    """A step can't start or be done yet: steps it depends on aren't done.
+    """A step can't take a status yet: steps it depends on aren't done.
 
     :param step: The step, e.g. ``"ls-video"``.
     :param waiting: The steps it depends on that aren't done, in plan order.

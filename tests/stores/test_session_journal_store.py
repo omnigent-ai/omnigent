@@ -117,7 +117,7 @@ def test_a_status_without_a_step_names_the_only_step_of_the_plan(
         journal.append(SESSION, "plan", _plan("a"), idempotency_key="tool:6", step="a")
 
 
-def test_a_step_starts_or_finishes_only_after_its_dependencies_are_done(
+def test_a_step_takes_a_status_only_after_its_dependencies_are_done(
     journal: SessionJournalStore,
 ) -> None:
     steps = [
@@ -134,15 +134,18 @@ def test_a_step_starts_or_finishes_only_after_its_dependencies_are_done(
     with pytest.raises(StepNotReadyError, match="verify waits on deploy") as raised:
         status("k1", "verify", "started")
     assert raised.value.waiting == ["deploy"]
-    # Waiting for the user and failed need nothing done first.
-    status("k1b", "video", "needs_input", "Which region should the video show?")
-    status("k2", "video", "failed", "The swap never came up")
+    # Waiting for the user and failed need them done too.
+    with pytest.raises(StepNotReadyError, match="video waits on verify"):
+        status("k1b", "video", "needs_input", "Which region should the video show?")
+    with pytest.raises(StepNotReadyError, match="video waits on verify"):
+        status("k2", "video", "failed", "The swap never came up")
     status("k3", "deploy", "started")
     status("k4", "deploy", "failed", "Build broke")
     with pytest.raises(StepNotReadyError):
         status("k5", "verify", "started")
     status("k6", "deploy", "done", "Pod 1/1")
     status("k7", "verify", "done", "Routed")
+    status("k7b", "video", "needs_input", "Which region should the video show?")
     status("k8", "video", "started")
     # A step outside the current plan waits on nothing here.
     status("k9", "extra", "started")

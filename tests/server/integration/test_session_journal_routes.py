@@ -663,6 +663,16 @@ async def test_a_workflow_question_marks_its_task_and_returns_the_answer(
     await run("sys_journal_write_plan", _ONE_TASK_PLAN)
     elsewhere = await run("sys_workflow_request_input", {**ask, "step": "verify"})
     assert elsewhere["error"] == "invalid_input: step 'verify' isn't in the current plan"
+    # A task that can't start yet takes no question, and none reaches the Inbox.
+    build_first = [
+        {"id": "build", "name": "Build", "depends_on": []},
+        {"id": "deploy", "name": "Deploy to prod", "depends_on": ["build"]},
+    ]
+    await run("sys_journal_write_plan", {"name": "Ship it", "steps": build_first})
+    early = await run("sys_workflow_request_input", ask)
+    assert early["error"].startswith("step_not_ready: deploy waits on build, not done yet")
+    assert not pending_elicitations.snapshot_for(session_id)
+    await run("sys_journal_write_plan", _ONE_TASK_PLAN)
 
     asking = asyncio.create_task(run("sys_workflow_request_input", ask, call_id="call_ask"))
     # The server raises the question before it answers the runner, which then
