@@ -155,8 +155,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   or invoking a same-named skill. States: no goal, existing goal, read-only.
   Drafts with attachments are sent as ordinary messages and do not set a goal.
   Leading `/goal` takes precedence over a same-named slash skill; inline goal
-  skills and Codex native `$goal` skills remain available. Mixed-case and
-  newline-separated goal commands use the same canonical message path.
+  skills and Codex native `$goal` skills remain available. For plain-text drafts
+  without quotes, mentions or review comments, mixed-case and newline-separated
+  goal commands use the same canonical message path. Drafts carrying that
+  context retain their existing handling.
   In Codex native Chat, the goal indicator follows commands and native goal
   changes without reopening the dialog. Refreshes preserve edited dialog fields
   while untouched fields follow current goal state. Reopening or switching
