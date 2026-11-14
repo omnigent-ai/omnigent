@@ -30,8 +30,9 @@ schema revision the build does not know.
 
 Rollback: stop the servers, downgrade with a build that includes this
 migration (``OMNIGENT_DB_URL=<uri> alembic -c omnigent/db/alembic.ini
-downgrade a7d4c2e9f610``), then start the older build. Downgrade drops both
-tables and every journal entry.
+downgrade 5d872cd6632a@a7d4c2e9f610``), then start the older build. This branch-qualified
+target drops the journal tables and their workflow descendants while preserving
+the automation branch's inbox, sharing and task-kind data.
 """
 
 from __future__ import annotations

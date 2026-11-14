@@ -61,6 +61,7 @@ from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 _FRAMING_BYTES = 32
 _PLAN_KIND = encode_journal_entry_kind("plan")
 _STATUS_KIND = encode_journal_entry_kind("status")
+_PLAN_STATUS_KIND = encode_journal_entry_kind("plan_status")
 # A fork doesn't own the parent's workers, so their dispatches stay behind.
 _KINDS_A_FORK_LEAVES = frozenset(
     encode_journal_entry_kind(kind) for kind in ("dispatch", "dispatch_result")
@@ -272,13 +273,36 @@ class SessionJournalStore:
             return []
         # A saved workflow starts fresh; replans retain progress within that run.
         run = self._newest_plan_row(session, conversation_id, workflow_only=True)
+        # Forks retain run boundaries without attributing copied plans to a workflow.
+        entries = SqlSessionJournalEntry
+        copied_run_position = session.execute(
+            _using(
+                select(entries.position)
+                .where(
+                    entries.workspace_id == current_workspace_id(),
+                    entries.conversation_id == conversation_id,
+                    entries.kind == _PLAN_STATUS_KIND,
+                )
+                .order_by(entries.position.desc())
+                .limit(1),
+                "ix_session_journal_entries_kind",
+            )
+        ).scalar_one_or_none()
+        start_position = max(
+            (
+                position
+                for position in (run.position if run else None, copied_run_position)
+                if position is not None
+            ),
+            default=None,
+        )
         waiting = []
         for dependency in current["depends_on"]:
             newest = self._newest_status_row(
                 session,
                 conversation_id,
                 dependency,
-                start_position=run.position if run is not None else None,
+                start_position=start_position,
             )
             if newest is None or self._entries([newest])[0].content.get("status") != "done":
                 waiting.append(dependency)
@@ -675,14 +699,14 @@ def copy_journal_for_fork(
 
     The fork's entries get their own IDs and positions from 0, keep their times,
     steps and contents, and drop their automation run and workflow, so a run's or
-    a workflow's history lists each entry once. Dispatches and their results stay
-    with the parent.
+    a workflow's history lists each entry once. Internal plan-status markers
+    retain the run boundaries. Dispatches and their results stay with the parent.
 
     :param source_id: The session being forked.
     :param fork_id: The new fork, which has no journal yet.
     :param created_through: Copy only entries written at or before this epoch
         second, the time of the fork's last copied item; ``None`` copies them all.
-    :returns: How many entries were copied.
+    :returns: How many entries the fork starts with, including run boundaries.
     """
     scope = (
         SqlSessionJournalEntry.workspace_id == current_workspace_id(),
@@ -705,26 +729,32 @@ def copy_journal_for_fork(
         if last is None:
             return 0
         query = query.where(SqlSessionJournalEntry.position <= last)
-    copies = [
-        SqlSessionJournalEntry(
-            workspace_id=row.workspace_id,
-            conversation_id=fork_id,
-            position=position,
-            created_at=row.created_at,
-            id=uuid.uuid4().hex,
-            kind=row.kind,
-            scheduled_task_run_id=None,
-            workflow_id=None,
-            step=row.step,
-            idempotency_key=row.idempotency_key,
-            content=row.content,
-        )
-        for position, row in enumerate(
-            row
-            for row in session.execute(_using(query, "PRIMARY")).scalars()
-            if row.kind not in _KINDS_A_FORK_LEAVES
-        )
-    ]
+    copies = []
+    for row in session.execute(_using(query, "PRIMARY")).scalars():
+        if row.kind in _KINDS_A_FORK_LEAVES:
+            continue
+        records = [(row.kind, row.idempotency_key, row.content)]
+        if row.kind == _PLAN_KIND and row.workflow_id is not None:
+            records.insert(
+                0,
+                (_PLAN_STATUS_KIND, f"fork-run:{row.id}", _stored_content({"status": "started"})),
+            )
+        for kind, key, content in records:
+            copies.append(
+                SqlSessionJournalEntry(
+                    workspace_id=row.workspace_id,
+                    conversation_id=fork_id,
+                    position=len(copies),
+                    created_at=row.created_at,
+                    id=uuid.uuid4().hex,
+                    kind=kind,
+                    scheduled_task_run_id=None,
+                    workflow_id=None,
+                    step=row.step,
+                    idempotency_key=key,
+                    content=content,
+                )
+            )
     if copies:
         session.add_all(copies)
         session.add(

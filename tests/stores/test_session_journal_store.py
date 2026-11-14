@@ -120,6 +120,7 @@ def test_a_status_without_a_step_names_the_only_step_of_the_plan(
 @pytest.mark.parametrize("saved_workflow", [False, True])
 def test_a_step_takes_a_status_only_after_its_dependencies_are_done(
     journal: SessionJournalStore,
+    conversations: SqlAlchemyConversationStore,
     saved_workflow: bool,
 ) -> None:
     steps = [
@@ -172,6 +173,31 @@ def test_a_step_takes_a_status_only_after_its_dependencies_are_done(
         for value in ("started", "done", "needs_input", "failed"):
             with pytest.raises(StepNotReadyError, match="verify waits on deploy"):
                 status(f"next-run-{replanned}-{value}", "verify", value)
+    fork = conversations.fork_conversation(SESSION)
+    nested = conversations.fork_conversation(fork.id)
+    for session_id in (fork.id, nested.id):
+        with pytest.raises(StepNotReadyError, match="verify waits on deploy"):
+            journal.append(
+                session_id,
+                "status",
+                {"status": "started"},
+                idempotency_key="verify",
+                step="verify",
+            )
+        journal.append(
+            session_id,
+            "status",
+            {"status": "done", "text": "Deployed in fork"},
+            idempotency_key="deploy",
+            step="deploy",
+        )
+        journal.append(
+            session_id, "status", {"status": "started"}, idempotency_key="verify", step="verify"
+        )
+        assert all(entry.workflow_id is None for entry in journal.list_entries(session_id).entries)
+    assert {plan.conversation_id for plan in journal.list_workflow_runs(WORKFLOW).plans} == {
+        SESSION
+    }
     status("next-run-deployed", "deploy", "done")
     status("next-run-verify", "verify", "started")
 

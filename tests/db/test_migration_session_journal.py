@@ -59,7 +59,15 @@ def test_upgrade_matches_models_and_downgrade_drops_tables(tmp_path: Path) -> No
         if "workflow_id" not in columns:
             assert columns[-2:] == ["position", "created_at"], index["name"]
 
-    _migrate(uri, engine, "a7d4c2e9f610", down=True)
-    assert not {_ENTRIES, _HEADS} & set(sa.inspect(engine).get_table_names())
+    _migrate(uri, engine, "5d872cd6632a@a7d4c2e9f610", down=True)
+    rolled_back = sa.inspect(engine)
+    tables = set(rolled_back.get_table_names())
+    assert not {_ENTRIES, _HEADS} & tables
+    assert {"inbox_items", "scheduled_task_shares"} <= tables
+    assert "kind" in {column["name"] for column in rolled_back.get_columns("scheduled_tasks")}
+    with engine.connect() as connection:
+        assert connection.execute(
+            sa.text("SELECT version_num FROM alembic_version")
+        ).scalars().all() == ["27d16059fab9"]
     engine.dispose()
     clear_engine_cache()
