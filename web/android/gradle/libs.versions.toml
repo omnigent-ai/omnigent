@@ -4,7 +4,7 @@
 agp = "9.4.1"
 androidxCore = "1.19.1"
 androidxActivity = "1.12.4"
-androidxWebkit = "1.15.0"
+androidxWebkit = "1.18.0"
 androidxBrowser = "1.10.0"
 androidxAppcompat = "1.8.0"
 junit = "4.13.2"
