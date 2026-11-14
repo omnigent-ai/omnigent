@@ -19474,6 +19474,91 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/export": {
+      "get": {
+        "description": "Download a session as a Jupyter notebook.\n\nMessages become Markdown cells and what the agent ran becomes code\ncells (see `omnigent.session_notebook`). Reads at most 20,000\nitems; the notebook says when the session has more.\n\n**Returns:** The notebook as an `.ipynb` attachment.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 without READ; 404 when no session exists.",
+        "operationId": "export_session_v1_sessions__session_id__export_get",
+        "parameters": [
+          {
+            "description": "Session to export, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The export format; only `\"ipynb\"` today.",
+            "in": "query",
+            "name": "format",
+            "required": true,
+            "schema": {
+              "description": "The export format; only `\"ipynb\"` today.",
+              "pattern": "^ipynb$",
+              "title": "Format",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Whether code cells keep the outputs the agent saw.",
+            "in": "query",
+            "name": "outputs",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Outputs",
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The session's shareable URL, shown in the notebook's header.",
+            "in": "query",
+            "name": "link",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 2048,
+                  "pattern": "^https?://\\S+$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The session's shareable URL, shown in the notebook's header.",
+              "title": "Link"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Export Session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/items": {
       "get": {
         "description": "List items in a session with cursor-based pagination.\n\nDelegates to the conversation items store \u2014 session_id is\nthe conversation_id. Same pagination contract as\n`GET /v1/conversations/{id}/items`.\n\n**Returns:** A page of flattened conversation items, documented as `SessionItemList`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists.",

@@ -7546,6 +7546,7 @@ def session(ctx: click.Context) -> None:
     Examples:
       omnigent session export --id conv_abc123
       omnigent session export --id conv_abc123 --output transcript.jsonl
+      omnigent session export --id conv_abc123 --format ipynb
       omnigent session export --id conv_abc123 --server https://myserver.com
     """
     if ctx.invoked_subcommand is None:
@@ -7566,7 +7567,25 @@ def session(ctx: click.Context) -> None:
     "output",
     default=None,
     metavar="FILE",
-    help="Output file path.  Defaults to <SESSION_ID>.jsonl in the current directory.",
+    help=(
+        "Output file path.  Defaults to <SESSION_ID>.jsonl (or .ipynb) in the current directory."
+    ),
+)
+@click.option(
+    "--format",
+    "export_format",
+    type=click.Choice(["jsonl", "ipynb"]),
+    default="jsonl",
+    show_default=True,
+    help=(
+        "jsonl: a transcript that 'omnigent session import' reads back. ipynb: a Jupyter notebook."
+    ),
+)
+@click.option(
+    "--no-outputs",
+    is_flag=True,
+    default=False,
+    help="For ipynb: leave out the outputs of the code the agent ran.",
 )
 @click.option(
     "--server",
@@ -7576,21 +7595,34 @@ def session(ctx: click.Context) -> None:
         "Defaults to the configured server, or a local server already running."
     ),
 )
-def session_export(session_id: str, output: str | None, server: str | None) -> None:
-    """Export a session transcript to a portable JSONL file.
+def session_export(
+    session_id: str,
+    output: str | None,
+    export_format: str,
+    no_outputs: bool,
+    server: str | None,
+) -> None:
+    """Export a session as a portable JSONL transcript or a Jupyter notebook.
 
-    Each line of the output is a JSON object.  The first line carries
-    the session metadata (``"record_type": "session_meta"``); every
-    subsequent line is one conversation item
-    (``"record_type": "item"``).  The file preserves full turn order
-    and is independent of ``omnigent import``, which reads native harness history.
+    JSONL: each line is a JSON object.  The first line carries the session
+    metadata (``"record_type": "session_meta"``); every subsequent line is
+    one conversation item (``"record_type": "item"``).  The file preserves
+    full turn order and is independent of ``omnigent import``, which reads
+    native harness history.
+
+    ipynb: messages become Markdown cells and the commands the agent ran
+    become code cells, with their outputs unless ``--no-outputs``.
 
     \b
     Examples:
       omnigent session export --id conv_abc123
       omnigent session export --id conv_abc123 --output my_session.jsonl
+      omnigent session export --id conv_abc123 --format ipynb --no-outputs
       omnigent session export --id conv_abc123 --server https://myserver.com
     """
+    if no_outputs and export_format != "ipynb":
+        raise click.UsageError("--no-outputs applies only to --format ipynb.")
+
     import httpx
 
     from omnigent.chat import _remote_headers
@@ -7602,7 +7634,7 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
         resolved_server = ServerUrl(startup.url)
 
     base_url = resolved_server.api_base
-    out_path = Path(output) if output else Path(f"{session_id}.jsonl")
+    out_path = Path(output) if output else Path(f"{session_id}.{export_format}")
 
     with httpx.Client(
         base_url=base_url,
@@ -7624,13 +7656,8 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
         resp.raise_for_status()
         session_data = resp.json()
 
-        n_items = 0
-        with out_path.open("w", encoding="utf-8") as fh:
-            # First line: session metadata.
-            meta_record = {"record_type": "session_meta", **session_data}
-            fh.write(json.dumps(meta_record) + "\n")
-
-            # Remaining lines: items in ascending order, paginated.
+        def session_items() -> Iterator[dict[str, Any]]:
+            """The session's items in ascending order, a page at a time."""
             after: str | None = None
             while True:
                 params: dict[str, str | int] = {"limit": 500, "order": "asc"}
@@ -7639,13 +7666,34 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
                 items_resp = client.get(f"/v1/sessions/{session_id}/items", params=params)
                 items_resp.raise_for_status()
                 page = items_resp.json()
-                for item in page["data"]:
-                    item_record = {"record_type": "item", **item}
-                    fh.write(json.dumps(item_record) + "\n")
-                    n_items += 1
+                yield from page["data"]
                 if not page.get("has_more"):
-                    break
+                    return
                 after = page.get("last_id")
+
+        if export_format == "ipynb":
+            from omnigent.conversation_browser import conversation_url
+            from omnigent.session_notebook import session_notebook
+
+            items = list(session_items())
+            notebook = session_notebook(
+                session_data,
+                items,
+                include_outputs=not no_outputs,
+                session_url=conversation_url(base_url, session_id),
+            )
+            out_path.write_text(json.dumps(notebook, indent=1) + "\n", encoding="utf-8")
+            n_items = len(items)
+        else:
+            n_items = 0
+            with out_path.open("w", encoding="utf-8") as fh:
+                # First line: session metadata.
+                meta_record = {"record_type": "session_meta", **session_data}
+                fh.write(json.dumps(meta_record) + "\n")
+                # Remaining lines: items in ascending order.
+                for item in session_items():
+                    fh.write(json.dumps({"record_type": "item", **item}) + "\n")
+                    n_items += 1
 
     click.echo(f"Exported {n_items} item(s) from {session_id} to {out_path}")
 

@@ -1,4 +1,4 @@
-"""E2E: the session kebab menu offers Export and it saves the transcript.
+"""E2E: the session kebab menu offers Export, saving the transcript or a notebook.
 
 The chat-header session actions menu is the only in-app place to act on a
 conversation; without an Export item a conversation cannot be saved as a
@@ -14,6 +14,7 @@ format unchanged (a JSONL export JSON-escapes newlines and quotes).
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -93,25 +94,39 @@ def test_header_session_menu_offers_export(
     """The session kebab menu contains an Export action."""
     base_url, session_id = transcript_session
     _open_session_menu(page, base_url, session_id)
-    expect(page.get_by_role("menuitem", name="Export")).to_be_visible()
+    expect(page.get_by_role("menuitem", name="Export", exact=True)).to_be_visible()
+    expect(page.get_by_role("menuitem", name="Export as notebook (.ipynb)")).to_be_visible()
 
 
+@pytest.mark.parametrize(
+    ("item_name", "extension"),
+    [("Export", ".jsonl"), ("Export as notebook (.ipynb)", ".ipynb")],
+    ids=["transcript", "notebook"],
+)
 def test_header_export_downloads_transcript(
     page: Page,
     transcript_session: tuple[str, str],
+    item_name: str,
+    extension: str,
 ) -> None:
     """Export saves a local file preserving turn order, code, and links."""
     base_url, session_id = transcript_session
     _open_session_menu(page, base_url, session_id)
 
-    export_item = page.get_by_role("menuitem", name="Export")
+    export_item = page.get_by_role("menuitem", name=item_name, exact=True)
     expect(export_item).to_be_visible()
     with page.expect_download() as download_info:
         export_item.click()
     download = download_info.value
-    assert download.suggested_filename
+    assert download.suggested_filename == f"{session_id}{extension}"
 
     exported = Path(str(download.path())).read_text(encoding="utf-8")
+    if extension == ".ipynb":
+        notebook = json.loads(exported)
+        assert (notebook["nbformat"], notebook["nbformat_minor"]) == (4, 5)
+        # The header links back to the session at the address the browser used.
+        assert f"- **Link:** {base_url}/c/{session_id}" in notebook["cells"][0]["source"]
+        exported = "\n".join(cell["source"] for cell in notebook["cells"])
     positions = [exported.find(marker) for marker in _MARKERS_IN_ORDER]
     missing = [m for m, pos in zip(_MARKERS_IN_ORDER, positions, strict=True) if pos == -1]
     assert not missing, f"export is missing transcript content: {missing}"

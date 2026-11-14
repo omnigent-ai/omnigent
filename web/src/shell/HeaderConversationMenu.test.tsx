@@ -36,6 +36,7 @@ const mocks = vi.hoisted(() => ({
   markUnread: vi.fn(),
   fork: vi.fn(),
   exportTranscript: vi.fn(),
+  exportNotebook: vi.fn(),
   triggerDownload: vi.fn(),
   toastError: vi.fn(),
 }));
@@ -82,7 +83,11 @@ vi.mock("@/hooks/useUnseenConversations", async (importOriginal) => {
 
 vi.mock("@/lib/sessionsApi", async (importOriginal) => {
   const actual = await importOriginal<typeof SessionsApiModule>();
-  return { ...actual, exportSessionTranscript: mocks.exportTranscript };
+  return {
+    ...actual,
+    exportSessionTranscript: mocks.exportTranscript,
+    exportSessionNotebook: mocks.exportNotebook,
+  };
 });
 
 vi.mock("@/hooks/useFileContent", async (importOriginal) => {
@@ -226,6 +231,7 @@ describe("HeaderConversationMenu", () => {
       "Share",
       "Fork",
       "Export",
+      "Export as notebook (.ipynb)",
       "Rename",
       "Mark as unread",
       "Add to project",
@@ -363,6 +369,35 @@ describe("HeaderConversationMenu", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: "Export" }));
 
     await waitFor(() => expect(mocks.toastError).toHaveBeenCalledWith("Export failed"));
+    expect(mocks.triggerDownload).not.toHaveBeenCalled();
+  });
+
+  it("downloads the session as <session-id>.ipynb from Export as notebook", async () => {
+    const notebook = new Blob(['{"nbformat":4}'], { type: "application/x-ipynb+json" });
+    mocks.exportNotebook.mockResolvedValueOnce(notebook);
+    renderMenu();
+    openMenu();
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "Export as notebook (.ipynb)" }));
+
+    await waitFor(() =>
+      expect(mocks.triggerDownload).toHaveBeenCalledWith(notebook, "conv-1.ipynb"),
+    );
+    expect(mocks.exportNotebook).toHaveBeenCalledWith(
+      "conv-1",
+      `${window.location.origin}/c/conv-1`,
+    );
+    expect(mocks.toastError).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a notebook export failure as a toast and downloads nothing", async () => {
+    mocks.exportNotebook.mockRejectedValueOnce(new Error("boom"));
+    renderMenu();
+    openMenu();
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "Export as notebook (.ipynb)" }));
+
+    await waitFor(() => expect(mocks.toastError).toHaveBeenCalledWith("Notebook export failed"));
     expect(mocks.triggerDownload).not.toHaveBeenCalled();
   });
 
@@ -668,6 +703,7 @@ describe("HeaderConversationMenu", () => {
       "Share",
       "Fork",
       "Export",
+      "Export as notebook (.ipynb)",
       "Rename",
       "Mark as unread",
       "Add to project",
@@ -693,6 +729,7 @@ describe("HeaderConversationMenu", () => {
       "Share",
       "Fork",
       "Export",
+      "Export as notebook (.ipynb)",
       "Rename",
       "Mark as unread",
       "Add to project",

@@ -1088,6 +1088,7 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
       "Pin",
       "Export",
+      "Export as notebook (.ipynb)",
       "Rename",
       "Mark as unread",
       "Add to project",
