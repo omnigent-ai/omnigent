@@ -1016,7 +1016,9 @@ export function ChatPage() {
         ? "codex-native"
         : fallbackPickerKind === "pi"
           ? "pi-native"
-          : null;
+          : fallbackPickerKind === "omp"
+            ? "omp-native"
+            : null;
   const sandboxPreviewOptions = useSandboxLaunchModelOptions(
     sandboxStatus,
     activeSession?.hostId ?? null,
@@ -3556,12 +3558,14 @@ function ComposerImpl(
         if (
           (sessionHarness === "codex-native" ||
             sessionHarness === "claude-sdk" ||
-            sessionHarness === "pi-native") &&
+            sessionHarness === "pi-native" ||
+            sessionHarness === "omp-native") &&
           arg
         ) {
           const harnessName = {
             "codex-native": "Codex",
             "pi-native": "Pi",
+            "omp-native": "OMP",
             "claude-sdk": "Claude SDK",
           }[sessionHarness];
           setCommandError(`/compact does not accept arguments for ${harnessName}`);
@@ -3589,9 +3593,10 @@ function ComposerImpl(
           sessionHarness === "claude-native" ||
           sessionHarness === "claude-sdk" ||
           sessionHarness === "codex-native" ||
-          sessionHarness === "pi-native"
+          sessionHarness === "pi-native" ||
+          sessionHarness === "omp-native"
         ) {
-          // Use the message queue; the store dispatches SDK, Codex and Pi as controls.
+          // Use the message queue; the store dispatches these harnesses as controls.
           const command = arg ? `/compact ${arg}` : "/compact";
           appendEntry(command);
           onSend(command);
@@ -5638,7 +5643,7 @@ function SessionHarnessPicker({
     onSelect: (effort: string) => void,
   ): ComposerConfigSection => ({
     testId: "composer-agent-efforts",
-    header: modelPickerKind === "pi" ? "Thinking level" : "Effort",
+    header: modelPickerKind === "pi" || modelPickerKind === "omp" ? "Thinking level" : "Effort",
     choices: levels.map((effort) => ({
       key: effort,
       label: formatStatusEffortLabel(effort) ?? effort,
@@ -5980,6 +5985,7 @@ function useResolvedComposerModel(
     modelPickerKind === "cursor" ||
     modelPickerKind === "kiro" ||
     modelPickerKind === "pi" ||
+    modelPickerKind === "omp" ||
     modelPickerKind === "opencode" ||
     modelPickerKind === "devin" ||
     modelPickerKind === "acp" ||
@@ -6011,7 +6017,10 @@ function useResolvedComposerModel(
     : nativeVendorOwnsModel
       ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
         ? sessionModelOverride
-        : modelPickerKind === "opencode" || modelPickerKind === "pi" || modelPickerKind === "devin"
+        : modelPickerKind === "opencode" ||
+            modelPickerKind === "pi" ||
+            modelPickerKind === "omp" ||
+            modelPickerKind === "devin"
           ? (sessionModelOverride ?? llmModel)
           : null
       : isReportedModelPicker

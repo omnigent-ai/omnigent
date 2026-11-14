@@ -9,6 +9,7 @@ import { HermesIcon } from "@/components/icons/HermesIcon";
 import { KimiIcon } from "@/components/icons/KimiIcon";
 import { KiroIcon } from "@/components/icons/KiroIcon";
 import { NessieIcon } from "@/components/icons/NessieIcon";
+import { OmpIcon } from "@/components/icons/OmpIcon";
 import { OpenCodeIcon } from "@/components/icons/OpenCodeIcon";
 import { PiIcon } from "@/components/icons/PiIcon";
 import type { ComponentType, SVGProps } from "react";
@@ -38,6 +39,7 @@ export function iconForAgent(
   if (nativeAgent?.iconKind === "codex") return CodexIcon;
   if (nativeAgent?.iconKind === "opencode") return OpenCodeIcon;
   if (nativeAgent?.iconKind === "pi") return PiIcon;
+  if (nativeAgent?.iconKind === "omp") return OmpIcon;
   if (nativeAgent?.iconKind === "cursor") return CursorIcon;
   if (nativeAgent?.iconKind === "kiro") return KiroIcon;
   if (nativeAgent?.iconKind === "goose") return GooseIcon;

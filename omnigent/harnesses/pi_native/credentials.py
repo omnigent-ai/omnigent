@@ -344,7 +344,9 @@ class PiProviderConfig:
             "start a new Pi session."
         )
 
-    def to_models_config(self, *, client_surface: str | None = None) -> _PiModelsConfig:
+    def to_models_config(
+        self, *, client_surface: str | None = None, coding_agent: str = PI_AGENT
+    ) -> _PiModelsConfig:
         """Render this provider as a Pi ``models.json`` mapping."""
         models: list[_PiModelEntry] = list(self.extra_models)
         additional: dict[str, _PiProviderPayload] = dict(self.additional_providers)
@@ -400,7 +402,7 @@ class PiProviderConfig:
                 # Copy rather than mutate: additional payloads are shared across renders.
                 headers = with_gateway_attribution(
                     payload.get("headers"),
-                    PI_AGENT,
+                    coding_agent,
                     payload["baseUrl"],
                     client_surface=client_surface,
                 )
@@ -626,6 +628,13 @@ def pi_native_model_options(
         provider = resolve_pi_native_provider(config_loader=config_loader)
     if provider is None:
         return pi_own_login_model_options()
+    return _native_provider_model_options(provider, transport=transport)
+
+
+def _native_provider_model_options(
+    provider: PiProviderConfig, *, transport: httpx.BaseTransport | None = None
+) -> list[dict[str, object]]:
+    """List a resolved native provider without consulting either CLI's login."""
     provider = replace(
         provider, extra_models=_live_family_model_entries(provider, transport=transport)
     )
@@ -1689,6 +1698,8 @@ def resolve_pi_native_provider(
     model: str | None = None,
     config_loader: Callable[[], dict[str, object]] = load_config,
     auth: ExecutorAuth | None = None,
+    harness: str = "pi-native",
+    own_login_serves_reference: Callable[[str | None], bool] | None = None,
 ) -> PiProviderConfig | None:
     """Resolve the omnigent-configured provider for a native Pi session.
 
@@ -1723,7 +1734,7 @@ def resolve_pi_native_provider(
         _LOGGER.warning("pi-native: failed to read provider configuration", exc_info=True)
         return None
     config = load_runtime_inference_config(base_config)
-    binding = binding_for_harness(config, "pi-native")
+    binding = binding_for_harness(config, harness)
     selection = _split_pi_native_model_selection(model)
     if selection is not None:
         _, stripped = selection
@@ -1732,8 +1743,8 @@ def resolve_pi_native_provider(
         if allowlist is None or stripped in allowlist or model not in allowlist:
             model = stripped
     if binding is not None:
-        entry = resolve_bound_provider(config, "pi-native", auth)
-        selected = resolve_bound_model(config, "pi-native", model)
+        entry = resolve_bound_provider(config, harness, auth)
+        selected = resolve_bound_model(config, harness, model)
         if entry is None:
             raise ValueError("The Pi inference binding has no configured provider.")
         resolved = _inline_family_pi_provider(entry, model=selected, preserve_model_ids=True)
@@ -1787,7 +1798,8 @@ def resolve_pi_native_provider(
         )
     try:
         # Preserve Pi-login references unless they name a configured provider.
-        if bare and not names_configured_provider and pi_own_login_serves_reference(model):
+        own_login_serves = own_login_serves_reference or pi_own_login_serves_reference
+        if bare and not names_configured_provider and own_login_serves(model):
             # Warn: the same id could also be served by the configured default
             # provider, so this routes credentials/billing by host login state.
             _LOGGER.warning(
@@ -1805,7 +1817,8 @@ def resolve_pi_native_provider(
         # cli-config Databricks Unity Gateway through (it is pi-consumable via
         # ``_cli_config_pi_provider``), so an unrelated anthropic-family default
         # no longer shadows it.
-        entry = default_provider_for_harness(config, PI_SURFACE)
+        surface = PI_SURFACE if harness == "pi-native" else harness
+        entry = default_provider_for_harness(config, surface)
         if entry is None:
             # A global ApiKeyAuth means "use Pi's own login", not "route Pi
             # through the owner's gateway" — so don't let the managed-connect
@@ -1973,6 +1986,48 @@ class PiNativeLaunch(NamedTuple):
     effort_warning: str | None = None
 
 
+def _native_model_selection(
+    provider: PiProviderConfig,
+    rendered: _PiModelsConfig,
+    selection: str | None,
+) -> tuple[str, str]:
+    """Resolve the provider and model against the generated native inventory."""
+    selection_parts = (
+        None if provider.inference_bound else _split_pi_native_model_selection(selection)
+    )
+    if selection_parts is None:
+        return _default_model_provider_id(provider, rendered), provider.model
+    candidate_provider, candidate_model = selection_parts
+    serving = [
+        provider_id
+        for provider_id, configured in rendered["providers"].items()
+        if any(model.get("id") == candidate_model for model in configured.get("models", []))
+    ]
+    if not serving:
+        raise ValueError(
+            f"Native model selection {selection!r} is not available in managed configuration"
+        )
+    return (
+        candidate_provider if candidate_provider in serving else serving[0],
+        candidate_model,
+    )
+
+
+def _native_thinking_args(
+    reasoning_effort: str | None, *, harness: str = "pi"
+) -> tuple[list[str], str | None]:
+    """Translate shared native CLI thinking flags and retain validation notices."""
+    if not reasoning_effort or reasoning_effort in EFFORT_CLEAR_VALUES:
+        return [], None
+    try:
+        effort = validate_effort(reasoning_effort, harness, PI_EFFORTS)
+    except ValueError as exc:
+        _LOGGER.warning("%s-native: %s", harness, exc)
+        return [], str(exc)
+    thinking = to_pi_thinking_level(effort) if effort is not None else None
+    return (["--thinking", thinking] if thinking is not None else []), None
+
+
 def pi_native_provider_launch(
     agent_dir: Path,
     provider: PiProviderConfig,
@@ -2006,29 +2061,7 @@ def pi_native_provider_launch(
     # Resolve which provider the selected model lives in. Non-Claude models
     # (GLM, GPT, Llama…) are in secondary providers; Claude models are in the
     # primary provider. Read the rendered config so family fallbacks agree.
-    selected_model = provider.model
-    selection_parts = (
-        None if provider.inference_bound else _split_pi_native_model_selection(selection)
-    )
-    if selection_parts is not None:
-        candidate_provider, candidate_model = selection_parts
-        serving = [
-            provider_id
-            for provider_id, configured in rendered["providers"].items()
-            if any(model.get("id") == candidate_model for model in configured.get("models", []))
-        ]
-        if not serving:
-            raise ValueError(
-                f"Pi model selection {selection!r} is not available in managed configuration"
-            )
-        # A selection names the provider that served the model when it was
-        # picked. The workspace listing may since have routed the model to another
-        # surface, or discovery may have failed and folded it back into the
-        # primary; follow the model, which the rendered config already routed.
-        model_provider_id = candidate_provider if candidate_provider in serving else serving[0]
-        selected_model = candidate_model
-    else:
-        model_provider_id = _default_model_provider_id(provider, rendered)
+    model_provider_id, selected_model = _native_model_selection(provider, rendered, selection)
     write_pi_models_config(agent_dir, provider, rendered)
     # Session effort or Pi's default selects thinking; don't inherit a global
     # thinking preference that may belong to a different provider.
@@ -2064,19 +2097,8 @@ def pi_native_provider_launch(
         f"{model_provider_id}/{selected_model}" if "/" in selected_model else selected_model
     )
     args = ["--provider", model_provider_id, "--model", model_arg]
-    thinking: str | None = None
-    effort_warning: str | None = None
-    if reasoning_effort and reasoning_effort not in EFFORT_CLEAR_VALUES:
-        try:
-            effort = validate_effort(reasoning_effort, "pi", PI_EFFORTS)
-        except ValueError as exc:
-            effort = None
-            effort_warning = str(exc)
-            _LOGGER.warning("pi-native: %s", exc)
-        if effort is not None:
-            thinking = to_pi_thinking_level(effort)
-    if thinking is not None:
-        args.extend(["--thinking", thinking])
+    thinking_args, effort_warning = _native_thinking_args(reasoning_effort)
+    args.extend(thinking_args)
     from omnigent.inner.pi_gateway import pi_gateway_extension_args
 
     args.extend(pi_gateway_extension_args(agent_dir, rendered))

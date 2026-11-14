@@ -109,6 +109,7 @@ def _isolate_cli_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
 
     monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
     monkeypatch.delenv("OMNIGENT_PI_PATH", raising=False)
+    monkeypatch.delenv("OMNIGENT_OMP_PATH", raising=False)
     monkeypatch.delenv("HARNESS_PI_PATH", raising=False)
     monkeypatch.setattr(platform, "_cli_fallback_dirs", lambda: ())
     # Native readiness also requires tmux; pin a supported one ahead of the
@@ -159,6 +160,8 @@ def _all_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
                 version = "opencode v2.0.18\n"
             elif argv[0].endswith("cursor-agent") or argv[0].endswith("hermes"):
                 version = "2026.07.01\n"
+            elif argv[0].endswith("omp"):
+                version = "18.19.0\n"
             else:
                 version = "9.9.9\n"
             return subprocess.CompletedProcess(args=argv, returncode=0, stdout=version, stderr="")
@@ -517,6 +520,9 @@ def test_configured_harness_map_covers_all_spellings(
         "pi",
         "pi-native",
         "native-pi",
+        "omp",
+        "omp-native",
+        "native-omp",
         "cursor",
         # Native Cursor (``omni cursor``) — gates on the cursor-agent CLI.
         "cursor-native",
@@ -702,6 +708,10 @@ def test_configured_harness_map_all_true_with_clis(
     monkeypatch.setattr(
         "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: True
     )
+    monkeypatch.setattr(
+        "omnigent.harnesses.omp_native.credentials.omp_native_model_options",
+        lambda: [{"id": "openai/gpt-5.5"}],
+    )
     # Supply a real entry so generic and per-slug ACP readiness are true.
     from omnigent.onboarding.acp_auth import AcpAgentEntry
 
@@ -715,6 +725,21 @@ def test_configured_harness_map_all_true_with_clis(
     result = configured_harness_map()
     not_ready = {k: v for k, v in result.items() if v is not True}
     assert not not_ready, f"expected every spelling ready, got {not_ready}"
+
+
+@pytest.mark.parametrize("authenticated", [False, True])
+def test_omp_picker_requires_its_own_available_models(
+    monkeypatch: pytest.MonkeyPatch,
+    authenticated: bool,
+) -> None:
+    _all_clis_installed(monkeypatch)
+    monkeypatch.setattr(
+        "omnigent.harnesses.omp_native.credentials.omp_native_model_options",
+        lambda: [{"id": "openai/gpt-5.5"}] if authenticated else [],
+    )
+    result = configured_harness_map()
+    for harness in ("omp-native", "omp", "native-omp"):
+        assert result[harness] is True if authenticated else result[harness] == HARNESS_NEEDS_AUTH
 
 
 def test_configured_harness_map_enumerates_configured_acp_slugs(

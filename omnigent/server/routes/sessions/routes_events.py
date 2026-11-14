@@ -288,6 +288,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _persist_host_launch_failure_turn,
     _persist_native_terminal_failure,
     _recover_side_chat_runner_via_source,
+    _require_current_native_generation,
     _resolve_elicitation,
     _runner_live_on_another_replica_from_conversations,
     _session_is_moving,
@@ -413,6 +414,7 @@ def _is_batchable_external_item(event: SessionEventInput) -> bool:
         event.type != _EXTERNAL_CONVERSATION_ITEM_TYPE
         or event.created_by is not None
         or event.tools
+        or event.data.get("_omnigent_native_session_id") is not None
     ):
         return False
     item_type = event.data.get("item_type")
@@ -1329,6 +1331,7 @@ def register_events_routes(
                 _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             ),
         )
+        _require_current_native_generation(conv, body)
         native_harness = (
             await asyncio.to_thread(
                 _native_pane_harness, conv, agent_store=agent_store, agent_cache=agent_cache

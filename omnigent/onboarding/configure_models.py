@@ -41,6 +41,7 @@ from omnigent.onboarding.provider_config import (
     GEMINI_FAMILY,
     KEY_KIND,
     LOCAL_KIND,
+    OMP_SURFACE,
     OPENAI_FAMILY,
     PI_SURFACE,
     SUBSCRIPTION_KIND,
@@ -108,6 +109,7 @@ _FAMILY_LABEL: dict[str, str] = {
     OPENAI_FAMILY: "Codex",
     GEMINI_FAMILY: "Gemini",
     PI_SURFACE: "Pi",
+    OMP_SURFACE: "OMP",
 }
 
 # The concrete harness ids each surface powers, shown as a dim annotation
@@ -118,6 +120,7 @@ _FAMILY_HARNESS_IDS: dict[str, str] = {
     OPENAI_FAMILY: "codex, native-codex, openai-agents",
     GEMINI_FAMILY: "antigravity-native (agy)",
     PI_SURFACE: "pi",
+    OMP_SURFACE: "omp-native",
 }
 
 
@@ -288,7 +291,9 @@ def cli_display_name(cli: str) -> str:
         or ``"ChatGPT"`` for ``codex`` (the ChatGPT plan drives codex).
         Falls back to a title-cased form for any other value.
     """
-    return {"claude": "Claude (Pro/Max)", "codex": "ChatGPT", "pi": "Pi"}.get(cli, cli.title())
+    return {"claude": "Claude (Pro/Max)", "codex": "ChatGPT", "pi": "Pi", "omp": "OMP"}.get(
+        cli, cli.title()
+    )
 
 
 def kind_glyph(kind: str) -> str:
@@ -494,6 +499,12 @@ def add_menu_options() -> list[AddOption]:
             SUBSCRIPTION_KIND,
             cli="pi",
         ),
+        _opt(
+            "OMP — original auth",
+            "Use OMP's own provider login and configuration without managing it in Omnigent.",
+            SUBSCRIPTION_KIND,
+            cli="omp",
+        ),
         # Cross-vendor extras, alphabetical (Gateway before OpenRouter).
         _opt(
             "Gateway — custom base URL + key",
@@ -552,7 +563,7 @@ def _add_option_families(opt: AddOption) -> frozenset[str]:
         ``{"anthropic", "openai", "gemini", "pi"}``.
     """
     if opt.kind in {GATEWAY_KIND, DATABRICKS_KIND}:
-        return frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE})
+        return frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE, OMP_SURFACE})
     if opt.kind == BEDROCK_KIND:
         # Bedrock mode drives only the native Claude terminal (anthropic
         # family); codex/pi reject it, so it never serves their surfaces.
@@ -564,11 +575,13 @@ def _add_option_families(opt: AddOption) -> frozenset[str]:
             return frozenset({OPENAI_FAMILY})
         if opt.cli == "pi":
             return frozenset({PI_SURFACE})
+        if opt.cli == "omp":
+            return frozenset({OMP_SURFACE})
         return frozenset()
     if opt.kind == KEY_KIND:
         if opt.other:
             # The catch-all tail (Groq, DeepSeek, …) are all openai-family.
-            return frozenset({OPENAI_FAMILY, PI_SURFACE})
+            return frozenset({OPENAI_FAMILY, PI_SURFACE, OMP_SURFACE})
         if opt.provider is not None:
             family = family_for_key_provider(opt.provider)
             # The Gemini surface (antigravity) is not a pi model family — pi
@@ -577,7 +590,7 @@ def _add_option_families(opt: AddOption) -> frozenset[str]:
             # pi.
             if family == GEMINI_FAMILY:
                 return frozenset({GEMINI_FAMILY})
-            return frozenset({family, PI_SURFACE})
+            return frozenset({family, PI_SURFACE, OMP_SURFACE})
     return frozenset()
 
 
@@ -664,7 +677,7 @@ def render_provider_listing_by_harness(
     if not providers:
         console.print("  [dim]none configured yet[/dim]")
         return
-    for family in (ANTHROPIC_FAMILY, OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE):
+    for family in (ANTHROPIC_FAMILY, OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE, OMP_SURFACE):
         console.print(f"  [bold]{_FAMILY_LABEL[family]}[/]")
         serving = [
             (name, entry)
@@ -703,7 +716,7 @@ def _provider_default_families(entry: ProviderEntry, config: dict[str, object]) 
         ``[anthropic, openai, gemini, pi]`` order, e.g. ``["anthropic", "pi"]``.
     """
     result: list[str] = []
-    for family in (ANTHROPIC_FAMILY, OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE):
+    for family in (ANTHROPIC_FAMILY, OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE, OMP_SURFACE):
         default = surface_default_provider(config, family)
         if default is not None and default.name == entry.name:
             result.append(family)

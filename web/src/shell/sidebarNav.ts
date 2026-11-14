@@ -119,6 +119,7 @@ export type ConversationIconKind =
   | "codex"
   | "opencode"
   | "pi"
+  | "omp"
   | "cursor"
   | "kiro"
   | "goose"

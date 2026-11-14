@@ -301,6 +301,7 @@ omnigent kimi                        # Kimi Code
 omnigent devin                       # Devin
 omnigent hermes                      # Hermes Agent (Nous Research)
 omnigent pi                          # Pi
+omnigent omp                         # OMP (Oh My Pi), native TUI
 omnigent copilot                     # GitHub Copilot (SDK harness, via `omnigent run`)
 ```
 
@@ -706,7 +707,7 @@ executor:
                                # goose-native, kiro-native, antigravity,
                                # antigravity-native, copilot, devin-native,
                                # qwen, qwen-native, kimi, kimi-native, hermes,
-                               # hermes-native, pi, pi-native, grok, jcode,
+                               # hermes-native, pi, pi-native, omp-native, grok, jcode,
                                # openai-agents, open-responses, acp:<slug>
 
 tools:

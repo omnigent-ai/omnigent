@@ -149,6 +149,7 @@ _NATIVE_OMNIGENT_MCP_HARNESSES = frozenset(
         "goose-native",
         "hermes-native",
         "kiro-native",
+        "omp-native",
         "qwen-native",
     }
 )
@@ -160,6 +161,12 @@ _MCP_TOOL_PROMPT = (
 _MCP_TOOL_RETRY_PROMPT = (
     "Call the available tool named sys_session_list now with an empty argument object. "
     "This is required; do not answer from memory and do not use any other tool."
+)
+_INLINE_MCP_TOOL_PROMPT = (
+    "You must call the available Omnigent tool sys_session_list exactly once with an "
+    "empty argument object. It is registered directly as a native tool, not with an "
+    "MCP client prefix. Do not use a shell or any other tool. After it returns, reply "
+    "with done."
 )
 
 
@@ -647,7 +654,7 @@ class NativeTuiDriver:
         return result
 
     def _drive_mcp_tool_turn(self, *, timeout: float = _TOOL_TURN_TIMEOUT_S) -> TurnResult:
-        """Call the read-only Omnigent MCP relay tool for this native harness."""
+        """Call the read-only Omnigent relay, via MCP or inline native tools."""
         assert self._vendor is not None
         result = TurnResult()
         if self._vendor.harness not in _NATIVE_OMNIGENT_MCP_HARNESSES:
@@ -658,7 +665,10 @@ class NativeTuiDriver:
             return result
 
         baseline = self._tool_item_count()
-        for prompt in (_MCP_TOOL_PROMPT, _MCP_TOOL_RETRY_PROMPT):
+        initial_prompt = (
+            _INLINE_MCP_TOOL_PROMPT if self._vendor.harness == "omp-native" else _MCP_TOOL_PROMPT
+        )
+        for prompt in (initial_prompt, _MCP_TOOL_RETRY_PROMPT):
             calls_before = len(result.tool_calls)
             self._post_message(prompt)
             self._poll_new_tool_calls(baseline, result, timeout=timeout)

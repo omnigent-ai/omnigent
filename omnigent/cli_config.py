@@ -51,7 +51,7 @@ if TYPE_CHECKING:
 # the product the login authenticates, not the CLI name (the codex CLI logs in
 # a ChatGPT subscription). Keyed by the ambient detection name; these are the
 # only two subscription CLIs ambient detection emits.
-_CLI_LOGIN_BRAND: dict[str, str] = {"claude": "Claude", "codex": "ChatGPT"}
+_CLI_LOGIN_BRAND: dict[str, str] = {"claude": "Claude", "codex": "ChatGPT", "omp": "OMP"}
 
 
 def _load_global_config() -> dict[str, Any]:  # type: ignore[explicit-any]
@@ -491,12 +491,13 @@ def _credential_source_hint(entry: ProviderEntry, family: str) -> str | None:
     """
     from omnigent.onboarding.provider_config import (
         ANTHROPIC_FAMILY,
+        OMP_SURFACE,
         OPENAI_FAMILY,
         PI_SURFACE,
     )
 
     raw = entry.families.get(family)
-    if raw is None and family == PI_SURFACE:
+    if raw is None and family in {PI_SURFACE, OMP_SURFACE}:
         # The pi surface carries no family block of its own — pi consumes
         # the credential of whichever family it routes through (anthropic
         # preferred), so describe that family's source instead.
@@ -618,6 +619,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         CLI_CONFIG_KIND,
         DATABRICKS_KIND,
         GEMINI_FAMILY,
+        OMP_SURFACE,
         OPENAI_FAMILY,
         PI_SURFACE,
         RESPONSES_WIRE_API,
@@ -846,7 +848,9 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         if cli_name in _CLI_LOGIN_BRAND:
             from omnigent.onboarding.harness_install import harness_install_spec, harness_login
 
-            login_family = {agent: fam for fam, agent in _FAMILY_UCODE_AGENT.items()}.get(cli_name)
+            login_family = {agent: fam for fam, agent in _FAMILY_UCODE_AGENT.items()}.get(
+                cli_name
+            ) or ("omp" if cli_name == "omp" else None)
             if login_family is None:
                 raise click.ClickException(f"internal: no login family for cli {cli_name!r}")
             spec = harness_install_spec(login_family)
@@ -1088,12 +1092,18 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         )
 
         _routed = f"{family_label(family)}'s" if family is not None else "your harnesses'"
-        console.print(
-            f"  [dim]Routes {_routed} model calls through this workspace's "
-            "Databricks Unity Gateway (via ucode), so usage is governed and "
-            "billed there. This signs you into the workspace and runs "
-            "`ucode configure` for it.[/dim]"
-        )
+        if family == OMP_SURFACE:
+            console.print(
+                "  [dim]Routes OMP through this workspace's native model gateway "
+                "using your Databricks login, without changing another CLI's config.[/dim]"
+            )
+        else:
+            console.print(
+                f"  [dim]Routes {_routed} model calls through this workspace's "
+                "Databricks Unity Gateway (via ucode), so usage is governed and "
+                "billed there. This signs you into the workspace and runs "
+                "`ucode configure` for it.[/dim]"
+            )
         workspace_url = prompt_text(
             "Databricks workspace URL (e.g. https://example.cloud.databricks.com)"
         ).strip()
@@ -1117,19 +1127,18 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         #    name) and 2. run `ucode configure` against it for model serving —
         #    scoped to the harness the user drilled into (or both when added
         #    from the un-scoped menu), so ucode configures only what's needed.
-        if family is not None:
-            ucode_agents = [_FAMILY_UCODE_AGENT[family]]
-        else:
-            ucode_agents = sorted(_FAMILY_UCODE_AGENT.values())
         profile = login_databricks_workspace(workspace_url, console=console)
-        configure_ucode_for_workspace(workspace_url, agents=ucode_agents)
-        # Fail loud if ucode didn't actually record state for the workspace —
-        # otherwise routing would silently fall back and confuse the user.
-        if not ucode_workspace_exists(workspace_url):
-            raise click.ClickException(
-                f"`ucode configure` finished but recorded no state for {workspace_url}. "
-                "Re-run and check the ucode output above."
-            )
+        if family != OMP_SURFACE:
+            if family is not None:
+                ucode_agents = [_FAMILY_UCODE_AGENT[family]]
+            else:
+                ucode_agents = sorted(_FAMILY_UCODE_AGENT.values())
+            configure_ucode_for_workspace(workspace_url, agents=ucode_agents)
+            if not ucode_workspace_exists(workspace_url):
+                raise click.ClickException(
+                    f"`ucode configure` finished but recorded no state for {workspace_url}. "
+                    "Re-run and check the ucode output above."
+                )
         # Wipe the verbose login + ucode output so the menu we return to (with a
         # "✓ Added databricks" status) renders on a clean screen.
         clear_screen()
@@ -1441,6 +1450,8 @@ def _credential_label(name: str, entry: ProviderEntry) -> str:
             return gateway
     if entry.kind == SUBSCRIPTION_KIND and entry.cli == "pi":
         return "Pi original auth"
+    if entry.kind == SUBSCRIPTION_KIND and entry.cli == "omp":
+        return "OMP original auth"
     return credential_label(
         entry.kind, name, profile=entry.profile, display_name=entry.display_name
     )
@@ -3845,6 +3856,7 @@ def _run_configure_harnesses_interactive() -> None:
     from omnigent.onboarding.provider_config import (
         ANTHROPIC_FAMILY,
         GEMINI_FAMILY,
+        OMP_SURFACE,
         OPENAI_FAMILY,
         PI_SURFACE,
         surface_default_provider,
@@ -3911,7 +3923,7 @@ def _run_configure_harnesses_interactive() -> None:
     _ACP_ADD = "\x00acp-add"
     _ACP_AGENT_PREFIX = "\x00acp-agent:"
     _ACP_CLI_PREFIX = "\x00acp-cli:"
-    families = [ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE]
+    families = [ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE, OMP_SURFACE]
 
     # Status glyph + Rich color per readiness kind: "ready" is a configured,
     # launchable harness (green ✓); "missing" is an absent CLI/SDK (red ✗);
@@ -3977,6 +3989,11 @@ def _run_configure_harnesses_interactive() -> None:
             )
         default = surface_default_provider(config, fam)
         if default is None:
+            if fam == OMP_SURFACE:
+                from omnigent.harnesses.omp_native.credentials import omp_native_model_options
+
+                if omp_native_model_options():
+                    return (fam, name, "OMP CLI login", "ready", "")
             return (fam, name, "Not configured", "warn", "Open to add a credential.")
         label = _family_credential_label(config, fam, default.name, default)
         return (fam, name, label, "ready", "")
@@ -4088,6 +4105,7 @@ def _run_configure_harnesses_interactive() -> None:
             )
 
         rows.append(_family_row(PI_SURFACE))
+        rows.append(_family_row(OMP_SURFACE))
 
         # Native providers resolve independently of the SDK's legacy API key.
         from omnigent.harnesses.antigravity_native.credentials import antigravity_credentials_ready

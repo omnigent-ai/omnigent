@@ -2223,6 +2223,17 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def transition_external_session_id(
+        self, conversation_id: str, previous: str | None, value: str
+    ) -> Conversation:
+        """CAS a native identity during an authenticated in-TUI transition.
+
+        Same-value retries are idempotent. A stale ``previous`` raises
+        ``ValueError``; ordinary writes must still use ``set_external_session_id``.
+        """
+        ...
+
+    @abstractmethod
     def create_session_with_agent(
         self,
         *,

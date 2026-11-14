@@ -165,6 +165,15 @@ class _UniformStop:
 # enqueue_interrupt + OSError and no timeout; the rest inject_interrupt +
 # RuntimeError + timeout_s.
 _UNIFORM_INTERRUPT: dict[str, _UniformInterrupt] = {
+    "omp": _UniformInterrupt(
+        "omnigent.harnesses.omp_native.bridge",
+        "enqueue_interrupt",
+        "omp_native_interrupt_failed",
+        "omp-native interrupt",
+        (OSError,),
+        False,
+        log_on_error=True,
+    ),
     "pi": _UniformInterrupt(
         "omnigent.harnesses.pi_native.bridge",
         "enqueue_interrupt",
@@ -406,7 +415,7 @@ class NativeInterruptRunner:
         key = agent.key
         if key == "claude":
             return await self._claude_stop(conv_id)
-        if key in ("codex", "pi", "opencode"):
+        if key in ("codex", "pi", "omp", "opencode"):
             return await self.interrupt(harness_name, conv_id)
         spec = _UNIFORM_STOP.get(key)
         if spec is None:

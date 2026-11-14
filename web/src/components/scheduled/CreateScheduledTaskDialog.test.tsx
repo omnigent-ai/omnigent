@@ -5733,6 +5733,7 @@ describe("automation harness settings", () => {
   it.each([
     ["codex-native", true, true, true],
     ["pi-native", true, true, false],
+    ["omp-native", true, true, false],
     ["devin-native", true, true, true],
     ["cursor-native", false, false, true],
     ["antigravity-native", false, false, true],
@@ -6019,7 +6020,7 @@ describe("automation harness settings", () => {
     );
   }
 
-  it.each(["claude-native", "pi-native"])(
+  it.each(["claude-native", "pi-native", "omp-native"])(
     "uses provider effort support for %s sandbox models",
     (harness) => {
       const agent = mockHarness(harness);

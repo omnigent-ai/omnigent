@@ -81,6 +81,7 @@ Canonical `executor.harness` ids:
 | Kimi Code | `kimi` | `kimi-native` |
 | Hermes | `hermes` | `hermes-native` |
 | Pi | `pi` | `pi-native` |
+| OMP (Oh My Pi) | — | `omp-native` |
 | Grok Build | `grok` | — |
 | Jcode | `jcode` | — |
 | OpenAI | `openai-agents`, `open-responses` | — |
@@ -88,6 +89,7 @@ Canonical `executor.harness` ids:
 
 Aliases such as `claude`, `opencode`, `devin`, `agy`, `github-copilot`,
 `kimi-code`, `qwen-code`, `grok-build` and `native-goose` resolve to these ids.
+`omp` and `native-omp` resolve to `omp-native`.
 
 Set the Databricks profile under `executor.auth`. The older top-level
 `executor.profile` shorthand is legacy and should not be used in new specs.
@@ -136,12 +138,13 @@ executor:
     api_key: ${GEMINI_API_KEY}     # or ANTIGRAVITY_API_KEY
 ```
 
-### Pi context files
+### Pi and OMP context files
 
 With `harness: pi` or `pi-native`, Pi automatically appends context files such
 as `AGENTS.md` and `CLAUDE.md` from the workspace, its ancestors, and Pi's global
 agent directory. Regular `pi` also loads context from the agent bundle's root.
-To disable this discovery for an agent, set `context_files: false`:
+Native OMP (`harness: omp-native`) supports the same `context_files` option,
+using OMP's own context discovery. To disable discovery, set `context_files: false`:
 
 ```yaml
 name: focused-agent
@@ -169,7 +172,7 @@ The default is `true`; the value must be a YAML boolean. Explicit `prompt:` or
 `instructions:` content (including an explicitly referenced `AGENTS.md`) and
 Omnigent's runtime instructions are still sent to Pi. This option maps to Pi's
 `--no-context-files` flag. It does not disable skills, extensions, or Pi's
-separate `SYSTEM.md` discovery. It supports `pi` and `pi-native` only.
+separate `SYSTEM.md` discovery. It supports `pi`, `pi-native`, and `omp-native`.
 
 ### Pi bundle resources
 
@@ -256,8 +259,52 @@ Both modes preserve explicit agent instructions. Replacement removes Pi's defaul
 tool summaries and coding guidelines; tool schemas and execution still work.
 `context_files` is independent and still defaults to `true`. Skills, the working
 directory footer, and extension hooks remain active; extensions can modify the
-final prompt. This setting supports `pi` and `pi-native` only. Native settings
+final prompt. This setting supports `pi`, `pi-native`, and `omp-native`. Native settings
 apply on the next terminal launch; explicit native CLI arguments remain available.
+
+### OMP (Oh My Pi)
+
+`harness: omp-native` runs the real OMP TUI in a shared terminal, not the Pi SDK.
+It requires `omp` 18.19.0 or newer and a supported `tmux`. Install OMP with
+`npm install -g @oh-my-pi/pi-coding-agent`, then use `omnigent omp` (or `omni omp`).
+Set `OMNIGENT_OMP_PATH` to override the executable.
+
+```yaml
+name: omp-agent
+executor:
+  harness: omp-native
+  context_files: false
+  system_prompt_mode: append
+prompt: |
+  Follow the project's coding conventions.
+```
+
+Run `omp login` to use OMP's own authentication, or select a managed provider
+in `omnigent setup`. The `omp` provider-default scope is independent of `pi`;
+OMP never borrows a Pi CLI login. Managed Anthropic/OpenAI-compatible providers
+and Databricks connections use the same routing as other native harnesses.
+
+Bridge and session-specific configuration live under `~/.omnigent/omp-native`.
+OMP's original profile settings and authentication database remain OMP-owned.
+Authored instructions support append and replacement modes; replacement requires
+non-empty instructions. Workspace trust and resource discovery follow OMP's
+rules, not Pi's `--approve` flags.
+
+Image uploads reach OMP as native image blocks and use its normal image
+preprocessing. Usage includes cache reads and cache creation; the session API
+reports cache reads separately from input tokens. Native cost reports are
+retained when available.
+
+OMP's native `ask` forms appear as safe, typed controls in Omnigent, including
+multiline text, numeric fields, and single/multiple choices. OMP validates the
+submitted values; raw HTML is not rendered in the browser. Timeouts follow OMP's
+current/default-value behavior, while explicit cancellation never submits defaults.
+
+Native tools and Omnigent relay tools pass through centralized call and result
+policies. A result requiring approval is withheld from the model and ordinary
+transcript while the approval card is open. **Result approval expires after
+25 seconds and fails closed**, below OMP's fixed 30-second result-hook deadline.
+Call approvals are not subject to that result-review deadline.
 
 ### GitHub Copilot
 

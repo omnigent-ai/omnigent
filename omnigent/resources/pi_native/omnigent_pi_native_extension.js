@@ -2,6 +2,15 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { AsyncLocalStorage } = require("node:async_hooks");
+
+// One lexical scope per host/child: OMP rebinds factories in the same process.
+module.exports = function (pi, options = {}) {
+const harness = options.harness || "pi-native";
+const displayName = options.displayName || "Pi";
+const nativeKey = harness === "pi-native" ? "pi" : "omp";
+const configEnv = options.configEnv || "OMNIGENT_PI_NATIVE_CONFIG";
+const eventIdentity = new AsyncLocalStorage();
 
 // Tuning for the TOOL_CALL policy long-poll (see evalNativePolicyHttp).
 //
@@ -90,17 +99,17 @@ function sleep(ms, signal) {
 }
 
 function readConfig() {
-  const configPath = process.env.OMNIGENT_PI_NATIVE_CONFIG;
+  const configPath = process.env[configEnv] || process.env.OMNIGENT_NATIVE_CONFIG;
   if (!configPath) return null;
   try {
-    return JSON.parse(fs.readFileSync(configPath, "utf8"));
+    return { ...JSON.parse(fs.readFileSync(configPath, "utf8")), harness, displayName };
   } catch (_err) {
     return null;
   }
 }
 
 function nativeAuthFailure(message, ctx) {
-  const authDir = process.env.OMNIGENT_PI_NATIVE_AUTH_DIR;
+  const authDir = process.env[options.authDirEnv || "OMNIGENT_PI_NATIVE_AUTH_DIR"];
   const error = message && message.errorMessage;
   const provider =
     (message && message.provider) || (ctx && ctx.model && ctx.model.provider);
@@ -130,7 +139,7 @@ function nativeAuthFailure(message, ctx) {
     )
       return null;
     const reasons = {
-      timeout: "timed out before Pi's ten-second deadline",
+      timeout: `timed out before ${displayName}'s ten-second deadline`,
       failed_exit: "exited unsuccessfully",
       empty: "returned an empty token",
       invalid_output: "returned invalid UTF-8",
@@ -143,8 +152,8 @@ function nativeAuthFailure(message, ctx) {
     if (!reason) return null;
     fs.unlinkSync(resultPath);
     return {
-      code: `pi_auth_${result.kind}`,
-      message: `Pi authentication helper ${reason}. Check the configured token command, then send another message to retry. Your session is preserved.`,
+      code: `${nativeKey}_auth_${result.kind}`,
+      message: `${displayName} authentication helper ${reason}. Check the configured token command, then send another message to retry. Your session is preserved.`,
     };
   } catch (_) {
     return null;
@@ -170,6 +179,7 @@ function freshAuthHeaders(fallback) {
 // so policy POSTs can use the relay's non-expiring local token instead of a
 // baked server bearer.
 function relayCredentials() {
+  if (nativeChild) return null;
   const cfg = readConfig();
   if (
     cfg &&
@@ -182,7 +192,7 @@ function relayCredentials() {
 }
 
 function mintPiUiElicitationId() {
-  return `elicit_pi_${crypto.randomBytes(16).toString("hex")}`;
+  return `${harness === "omp-native" ? "elicit_omp_" : "elicit_pi_"}${crypto.randomBytes(16).toString("hex")}`;
 }
 
 const _UNSUPPORTED_ENDPOINT = Symbol("unsupported endpoint");
@@ -355,33 +365,42 @@ function wrapExtensionUi(ctx, config) {
     if (verdict === _UNSUPPORTED_ENDPOINT) return original.editor(title, prefill, opts);
     return extensionUiValue(verdict);
   };
+  if (typeof options.formDialog === "function") {
+    ui.formDialog = (html, opts) => options.formDialog(html, opts, async (request, dialogOptions) => {
+      const response = await parkPiExtensionUiHttp(config, request, dialogOptions);
+      return response === _UNSUPPORTED_ENDPOINT ? null : response;
+    });
+  }
 }
 
 // A missing verdict blocks native tools; declining an ordinary dialog does not.
-async function evalNativePolicyHttp(config, toolName, args) {
+async function evalNativePolicyHttp(config, toolName, args, opts = {}) {
   if (!config || !config.serverUrl || !config.sessionId || typeof fetch !== "function") {
-    return null;
+    return options.strictPolicyRequired ? failClosedVerdict() : null;
   }
+  const resultPhase = opts.phase === "PHASE_TOOL_RESULT";
   const payload = {
     event: {
-      type: "PHASE_TOOL_CALL",
-      target: "",
-      data: { name: toolName, arguments: args },
+      type: opts.phase || "PHASE_TOOL_CALL",
+      target: toolName,
+      data: resultPhase ? { result: opts.result, is_error: !!opts.isError } : { name: toolName, arguments: args },
+      ...(resultPhase ? { request_data: { name: toolName, arguments: args } } : {}),
       context: {},
     },
     _omnigent_elicitation_id: mintEvaluateElicitationId(),
   };
-  const parkDeadline = Date.now() + _PARK_TOTAL_BUDGET_MS;
+  const parkDeadline = Date.now() + (opts.timeoutMs || _PARK_TOTAL_BUDGET_MS);
   for (let round = 0; round < _MAX_RAW_ASK_ROUNDS; round += 1) {
     const json = await postParkedJson(config, "/policies/evaluate", "/policies/evaluate", payload, {
-      parkDeadline,
+      parkDeadline, signal: opts.signal,
     });
-    if (!json || json === _UNSUPPORTED_ENDPOINT) return failClosedVerdict();
+    if (opts.signal?.aborted || Date.now() >= parkDeadline || !json || json === _UNSUPPORTED_ENDPOINT) return failClosedVerdict();
     if (json.result === "POLICY_ACTION_DENY") {
       return { block: true, reason: json.reason || "blocked by Omnigent policy" };
     }
-    if (json.result !== "POLICY_ACTION_ASK") return { block: false, reason: "" };
-    if (round + 1 < _MAX_RAW_ASK_ROUNDS) await sleep(_TRANSIENT_RETRY_INITIAL_BACKOFF_MS);
+    if (json.result === "POLICY_ACTION_ALLOW" || json.result === "POLICY_ACTION_UNSPECIFIED") return { block: false, reason: "" };
+    if (json.result !== "POLICY_ACTION_ASK") return failClosedVerdict();
+    if (round + 1 < _MAX_RAW_ASK_ROUNDS) await sleep(_TRANSIENT_RETRY_INITIAL_BACKOFF_MS, opts.signal);
   }
   return failClosedVerdict();
 }
@@ -426,19 +445,15 @@ function piResultFromMcpResponse(json) {
     };
   }
   if (result && Array.isArray(result.content)) {
-    const parts = [];
+    const content = [];
     for (const block of result.content) {
-      if (
-        block &&
-        typeof block === "object" &&
-        typeof block.text === "string"
-      ) {
-        parts.push(block.text);
+      if (block && typeof block.text === "string") content.push({ type: "text", text: block.text });
+      else if (block?.type === "image" && typeof block.data === "string" && typeof block.mimeType === "string") {
+        content.push({ type: "image", data: block.data, mimeType: block.mimeType });
       }
     }
-    const text = parts.join("\n");
     return {
-      content: [{ type: "text", text: text || safeJsonStringify(result) }],
+      content: content.length ? content : [{ type: "text", text: safeJsonStringify(result) }],
       isError: result.isError === true,
     };
   }
@@ -787,8 +802,16 @@ function bashExecutionText(message) {
   return text;
 }
 
+function nativeUserContent(text, images = []) {
+  return [
+    ...(text ? [{ type: "input_text", text }] : []),
+    ...images.filter((block) => block?.type === "image" && typeof block.data === "string" && typeof block.mimeType === "string")
+      .map((block) => ({ type: "input_image", image_url: `data:${block.mimeType};base64,${block.data}` })),
+  ];
+}
+
 // Pi's model context in the item shapes forwarded live, so any harness can replay it.
-// Like live forwarding, it keeps text only: images and tool-result error flags are dropped.
+// OMP also keeps native user images in replacement-context checkpoints.
 function compactionSnapshotItems(messages) {
   const items = [];
   const addUserText = (text) => {
@@ -811,7 +834,10 @@ function compactionSnapshotItems(messages) {
         break;
       case "user":
       case "custom":
-        addUserText(textFromMessage(message));
+        if (options.isolateChildren) {
+          const content = nativeUserContent(textFromMessage(message), contentBlocks(message));
+          if (content.length) items.push({ type: "message", role: "user", content });
+        } else addUserText(textFromMessage(message));
         break;
       case "assistant": {
         const text = textFromMessage(message);
@@ -961,6 +987,12 @@ async function postEventChecked(config, body, signal) {
     typeof fetch !== "function"
   )
     return;
+  if (options.isolateChildren && (eventIdentity.getStore() || config.nativeSessionId)) {
+    body = { ...body, data: {
+      _omnigent_native_session_id: eventIdentity.getStore() || config.nativeSessionId,
+      ...body.data,
+    } };
+  }
   const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/events`;
   const request = {
     method: "POST",
@@ -1112,6 +1144,10 @@ function createHistoryQueue(config) {
 
   return {
     enqueue(data, sourceId, { onAccepted, dependency, onFailure, previous } = {}) {
+      if (options.isolateChildren) data = {
+        _omnigent_native_session_id: eventIdentity.getStore() || config.nativeSessionId,
+        ...data,
+      };
       const existing = pending.get(sourceId);
       if (existing) return existing;
       const bytes = previous?.bytes ??
@@ -1177,12 +1213,15 @@ async function patchExternalSessionId(config, nativeSessionId) {
     return;
   const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}`;
   try {
-    await fetch(url, {
+    const response = await fetch(url, {
       method: "PATCH",
       headers: headers(config),
       body: JSON.stringify({ external_session_id: nativeSessionId }),
     });
-  } catch (_err) {}
+    return response.ok;
+  } catch (_err) {
+    return false;
+  }
 }
 
 function setOmnigentStatus(config, ctx, state) {
@@ -1220,9 +1259,9 @@ async function triggerCompaction(config, ctx, customInstructions) {
           source: "execution",
           code: "pi_compact_unavailable",
           message:
-            "Omnigent: /compact is unavailable for this Pi session. The " +
-            "resident Pi context exposes no compaction API, so the model or " +
-            "Pi version may not support it.",
+            `Omnigent: /compact is unavailable for this ${displayName} session. The ` +
+            `resident ${displayName} context exposes no compaction API, so the model or ` +
+            `${displayName} version may not support it.`,
         },
       },
     });
@@ -1233,15 +1272,19 @@ async function triggerCompaction(config, ctx, customInstructions) {
       type: "external_compaction_status",
       data: { status: "in_progress" },
     });
-    await new Promise((resolve, reject) => {
-      ctx.compact({
-        onComplete: resolve,
-        onError: reject,
-        ...(typeof customInstructions === "string" && customInstructions.trim()
-          ? { customInstructions }
-          : {}),
+    if (options.asyncCompaction) {
+      await ctx.compact(customInstructions);
+    } else {
+      await new Promise((resolve, reject) => {
+        ctx.compact({
+          onComplete: resolve,
+          onError: reject,
+          ...(typeof customInstructions === "string" && customInstructions.trim()
+            ? { customInstructions }
+            : {}),
+        });
       });
-    });
+    }
     await postEvent(config, {
       type: "external_compaction_status",
       data: { status: "completed" },
@@ -1282,7 +1325,7 @@ const inferenceProviderIds = new Set([
 ]);
 
 function hasInferenceBinding() {
-  return process.env.OMNIGENT_PI_INFERENCE_BOUND === "1";
+  return process.env[options.inferenceBoundEnv || "OMNIGENT_PI_INFERENCE_BOUND"] === "1";
 }
 
 async function applyModelChange(pi, config, ctx, modelId, thinkingLevel) {
@@ -1304,8 +1347,8 @@ async function applyModelChange(pi, config, ctx, modelId, thinkingLevel) {
   if (!pi || typeof pi.setModel !== "function" || !listModels) {
     await postModelChangeError(
       config,
-      `Omnigent: could not switch to model "${id}" — this Pi session exposes ` +
-        "no model-switch API (the model or Pi version may not support it).",
+      `Omnigent: could not switch to model "${id}" — this ${displayName} session exposes ` +
+        `no model-switch API (the model or ${displayName} version may not support it).`,
     );
     return false;
   }
@@ -1353,7 +1396,7 @@ async function applyModelChange(pi, config, ctx, modelId, thinkingLevel) {
   if (!model) {
     await postModelChangeError(
       config,
-      `Omnigent: model "${id}" is not available in this Pi session.`,
+      `Omnigent: model "${id}" is not available in this ${displayName} session.`,
     );
     return false;
   }
@@ -1375,7 +1418,7 @@ async function applyModelChange(pi, config, ctx, modelId, thinkingLevel) {
   } catch (_err) {
     await postModelChangeError(
       config,
-      `Omnigent: switching to model "${id}" failed inside Pi.`,
+      `Omnigent: switching to model "${id}" failed inside ${displayName}.`,
     );
     return false;
   }
@@ -1394,7 +1437,7 @@ async function routeTurn(config, prompt, model) {
     const resp = await fetch(url, {
       method: "POST",
       headers: headers(config),
-      body: JSON.stringify({ harness: "pi-native", prompt, model: model || null }),
+      body: JSON.stringify({ harness, prompt, model: model || null }),
       signal: AbortSignal.timeout(_ROUTE_TURN_TIMEOUT_MS),
     });
     return resp.ok ? await resp.json() : null;
@@ -1516,7 +1559,9 @@ function startInboxPoller(
   // re-read+re-throw the same file forever (the turn is already reported done).
   const deliverAttempts = new Map();
   const MAX_DELIVER_ATTEMPTS = 5;
-  pi.__omnigentInboxPoller = setInterval(() => {
+  const delivering = new Set();
+  let interrupting = false;
+  pi.__omnigentInboxPoller = setInterval(async () => {
     let files = [];
     try {
       files = fs
@@ -1528,6 +1573,7 @@ function startInboxPoller(
     }
     for (const file of files) {
       const fullPath = path.join(config.inboxDir, file);
+      if (delivering.has(fullPath)) continue;
       let payload;
       try {
         payload = JSON.parse(fs.readFileSync(fullPath, "utf8"));
@@ -1553,23 +1599,19 @@ function startInboxPoller(
       }
       if (
         payload.type === "user_message" &&
-        typeof payload.content === "string"
+        (typeof payload.content === "string" || (options.isolateChildren && Array.isArray(payload.content)))
       ) {
-        // Mid-turn messages must STEER into the active turn: the Pi SDK
-        // holds deliverAs "followUp" until the whole agent loop finishes, so
-        // a web "Send now" delivered as a follow-up stays visibly queued in
-        // the Pi CLI even though the web UI already reported success. When
-        // the agent is idle, keep "followUp" — it starts the next turn
-        // immediately, preserving initiating-message behavior. A turn ending
-        // between this check and the send is benign: the message still
-        // reaches Pi's queue, and a throw leaves the file for the next tick,
-        // which recomputes the mode.
-        const deliverAs =
-          typeof isTurnActive === "function" && isTurnActive()
-            ? "steer"
-            : "followUp";
+        // OMP's abort unwinds asynchronously. A prompt steered into that
+        // unwind is stranded instead of starting the next turn.
+        if (interrupting && (delivering.size || isTurnActive())) continue;
+        interrupting = false;
+        // OMP explicit modes only queue; an idle delivery must omit the mode.
+        const active = typeof isTurnActive === "function" && isTurnActive();
+        const deliveryOptions = active ? { deliverAs: "steer" }
+          : options.omitIdleDeliveryMode ? undefined : { deliverAs: "followUp" };
+        delivering.add(fullPath);
         try {
-          pi.sendUserMessage(payload.content, { deliverAs });
+          await pi.sendUserMessage(payload.content, deliveryOptions);
         } catch (_err) {
           // Leave the file to retry next tick, capped by attempt count.
           const key = id ?? fullPath;
@@ -1602,7 +1644,7 @@ function startInboxPoller(
                 code: "pi_followup_delivery_dropped",
                 message:
                   `Omnigent: a queued follow-up message (id ${droppedId}) could ` +
-                  `not be delivered to Pi after ${MAX_DELIVER_ATTEMPTS} attempts ` +
+                  `not be delivered to ${displayName} after ${MAX_DELIVER_ATTEMPTS} attempts ` +
                   `and was dropped. Content preview: ${JSON.stringify(preview)}`,
               },
             },
@@ -1611,6 +1653,8 @@ function startInboxPoller(
             fs.unlinkSync(fullPath);
           } catch (_err) {}
           continue;
+        } finally {
+          delivering.delete(fullPath);
         }
         deliverAttempts.delete(id ?? fullPath);
       }
@@ -1624,7 +1668,10 @@ function startInboxPoller(
         // turn (idle interrupts are dropped, not armed — see F18), so a turn
         // already in flight still gets aborted via replay without poisoning the
         // next freshly-started turn.
-        if (typeof handleInterrupt === "function") handleInterrupt();
+        if (typeof handleInterrupt === "function") {
+          const accepted = handleInterrupt();
+          if (options.isolateChildren && accepted) interrupting = true;
+        }
       }
       if (payload.type === "compact") {
         // Point-in-time like an interrupt: one delivery attempt against the
@@ -1671,23 +1718,91 @@ function startInboxPoller(
   }, 250);
 }
 
-module.exports = function (pi) {
-  process.env.OMNIGENT_PI_NATIVE_PID = String(process.pid);
-  const config = readConfig();
-  const history = createHistoryQueue(config);
-  pi.on("session_shutdown", () => history.close());
-  pi.on("session_compact", async (_event, ctx) => {
+  process.env[options.pidEnv || "OMNIGENT_PI_NATIVE_PID"] = String(process.pid);
+  const config = readConfig() || {};
+  let contextReady;
+  let contextInitialized = false;
+  let nativeChild = false;
+  let contextChanging = false;
+  if (options.isolateChildren) {
+    const on = pi.on.bind(pi);
+    pi.on = (name, handler) => on(name, async (event, ctx) => {
+      // A result arriving before session setup must not wait behind a network
+      // initialization and hit OMP's fail-open result-handler timeout.
+      if (name === "tool_result" && !contextInitialized) {
+        const denied = { content: [{ type: "text", text: "Omnigent blocked an unlinked tool result." }], details: {}, isError: true };
+        if (Array.isArray(event?.content)) event.content.splice(0, event.content.length, ...denied.content);
+        if (event?.details && typeof event.details === "object") {
+          for (const key of Object.keys(event.details)) delete event.details[key];
+        }
+        return denied;
+      }
+      if (ctx && !contextReady) contextReady = initializeContext(ctx);
+      if (contextReady) await contextReady;
+      contextInitialized = true;
+      const identity = ctx?.sessionManager?.getSessionId?.() || config.nativeSessionId;
+      return eventIdentity.run(identity, () => handler(event, ctx));
+    });
+  }
+  async function initializeContext(ctx) {
+    if (ctx.agent?.kind !== "sub") {
+      if ("previousExternalSessionId" in config) {
+        config.nativeSessionId = config.previousExternalSessionId;
+        await syncNativeSession({}, ctx);
+        delete config.previousExternalSessionId;
+        return;
+      }
+      const identity = ctx.sessionManager?.getSessionId?.();
+      if (identity && await patchExternalSessionId(config, identity)) config.nativeSessionId = identity;
+      else config.sessionId = null;
+      return;
+    }
+    nativeChild = true;
+    const parentId = config.sessionId;
+    // Child hooks must never use the parent's inbox, usage checkpoint or relay.
+    delete config.inboxDir;
+    delete config.bridgeDir;
+    delete config.usageBaseline;
+    delete config.relayUrl;
+    delete config.relayToken;
+    config.sessionId = null;
+    if (!parentId || !config.serverUrl) return;
+    try {
+      const response = await fetch(`${config.serverUrl}/v1/sessions/${encodeURIComponent(parentId)}/hooks/omp-child`, {
+        method: "POST", headers: headers(config),
+        body: JSON.stringify({
+          native_session_id: ctx.sessionManager?.getSessionId?.(),
+          agent_id: ctx.agent.id, name: ctx.agent.name,
+        }),
+        signal: AbortSignal.timeout(5_000),
+      });
+      const child = response.ok ? await response.json() : null;
+      if (typeof child?.session_id === "string") {
+        config.sessionId = child.session_id;
+        config.nativeSessionId = ctx.sessionManager.getSessionId();
+      }
+    } catch (_) {
+      // No child row means no telemetry and every tool fails closed.
+    }
+  }
+  let history = createHistoryQueue(config);
+  let policyController = new AbortController();
+  pi.on("session_shutdown", () => {
+    policyController.abort();
+    clearInterval(pi.__omnigentInboxPoller);
+    return history.close();
+  });
+  pi.on("session_compact", async (event, ctx) => {
     const manager = ctx?.sessionManager;
-    if (typeof manager?.buildSessionProjection !== "function") return;
+    if (!manager?.buildSessionProjection && !manager?.buildSessionContext) return;
     const notifyFailure = () =>
       ctx.ui?.notify?.("Omnigent could not save the compaction checkpoint.", "error");
     let checkpoint;
     let compactedMessages;
     let sourceId;
     try {
-      const projection = manager.buildSessionProjection();
-      // Pi 1.3's event can name an older entry when summaries repeat.
-      checkpoint = projection?.entries?.[0]?.sourceEntry;
+      const projection = manager.buildSessionProjection?.() || manager.buildSessionContext();
+      checkpoint = options.asyncCompaction ? event.compactionEntry : projection?.entries?.[0]?.sourceEntry;
       if (checkpoint?.type !== "compaction" || typeof checkpoint.summary !== "string") {
         throw new Error("Pi's projection does not start with a compaction checkpoint");
       }
@@ -1737,7 +1852,7 @@ module.exports = function (pi) {
   let pendingSettingsChange = Promise.resolve();
   function queueSettingsChange(change) {
     pendingSettingsChange = pendingSettingsChange.then(change).catch(async () => {
-      await postModelChangeError(config, "Omnigent: updating Pi settings failed.");
+      await postModelChangeError(config, `Omnigent: updating ${displayName} settings failed.`);
     });
     return pendingSettingsChange;
   }
@@ -2178,6 +2293,7 @@ module.exports = function (pi) {
     if (turnIsIdle) return false;
     const accepted = interruptActiveContext(ctx);
     if (!accepted) return false;
+    policyController.abort();
     pendingInterruptUntil = Date.now() + pendingInterruptMs;
     return true;
   }
@@ -2205,7 +2321,7 @@ module.exports = function (pi) {
         response_id: responseId,
         item_type: "function_call",
         item_data: {
-          agent: "Pi",
+          agent: displayName,
           name,
           arguments: safeJsonStringify(
             toolCall.arguments ?? toolCall.input ?? {},
@@ -2237,6 +2353,11 @@ module.exports = function (pi) {
     const callId = String(event.toolCallId || event.id || "");
     if (!callId) return;
     const known = toolCallsById.get(callId);
+    if (options.enforceResultPolicy && !bridgedTools.has(event.toolName || known?.name)) {
+      const authorized = authorizedResults.get(callId);
+      if (!authorized) return;
+      event = { ...event, ...authorized };
+    }
     const key = known && known.key ? known.key : `${responseId}:${callId}`;
     if (postedToolResults.has(key)) return;
     const dependency = known?.item ||
@@ -2276,7 +2397,7 @@ module.exports = function (pi) {
         response_id: responseId,
         item_type: "reasoning",
         item_data: {
-          agent: "Pi",
+          agent: displayName,
           summary: [],
           content: [{ type: "reasoning_text", text }],
         },
@@ -2393,6 +2514,7 @@ module.exports = function (pi) {
 
   pi.on("session_start", async (_event, ctx) => {
     rememberContext(ctx);
+    if (options.strictPolicyRequired && !config.sessionId) throw new Error("OMP bridge session registration failed");
     restoreCumulativeUsage();
     wrapExtensionUi(ctx, config);
     registerTaskToolIfMissing();
@@ -2434,7 +2556,7 @@ module.exports = function (pi) {
         const idle = safeIsIdle(latestContext);
         return idle === null ? agentRunning : !idle;
       },
-      () => compacting,
+      () => compacting || contextChanging || (options.strictPolicyRequired && !config.sessionId),
     );
     markInputReady(config);
     const nativeSessionId =
@@ -2463,7 +2585,61 @@ module.exports = function (pi) {
     // Only agent_end publishes idle so startup cannot complete a child task.
   });
 
+  async function syncNativeSession(_event, ctx) {
+    const manager = ctx?.sessionManager;
+    const current = manager?.getSessionId?.();
+    const previous = config.nativeSessionId;
+    if (!current || !config.sessionId) throw new Error("OMP session is not linked");
+    policyController.abort();
+    turnOutcomeController.abort();
+    contextChanging = true;
+    try {
+      await history.close();
+      const transitionId = crypto.randomBytes(16).toString("hex");
+      const snapshot = manager.buildSessionContext();
+      const response = await fetch(`${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/hooks/omp-session`, {
+        method: "POST", headers: headers(config),
+        body: JSON.stringify({
+          previous_session_id: previous, native_session_id: current,
+          transition_id: transitionId, model: modelReference(ctx.model) || null,
+          compacted_messages: compactionSnapshotItems(snapshot.messages || []),
+        }),
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!response.ok) throw new Error("OMP context checkpoint was rejected");
+      config.nativeSessionId = current;
+      history = createHistoryQueue(config);
+      clearPendingInterrupt();
+      activeResponseId = null;
+      turnStatusResponseId = null;
+      turnResult = null;
+      agentRunning = false;
+      postedToolCalls.clear();
+      postedToolResults.clear();
+      toolCallsById.clear();
+      authorizedResults.clear();
+      postedReasoning.clear();
+      postedAssistantMessages.clear();
+      streamedReasoningBlocks.clear();
+      streamedTextIndex.clear();
+      finalizedTextBlocks.clear();
+      policyController = new AbortController();
+      await postModelOptions(config, ctx);
+    } catch (error) {
+      config.sessionId = null;
+      ctx.ui?.notify?.("OMP context could not be synchronized; Omnigent tools are blocked. Restart the linked session.", "error");
+      throw error;
+    } finally {
+      contextChanging = false;
+    }
+  }
+  if (options.isolateChildren) {
+    pi.on("session_switch", syncNativeSession);
+    pi.on("session_branch", syncNativeSession);
+  }
+
   pi.on("session_tree", async (_event, ctx) => {
+    if (options.isolateChildren) await syncNativeSession(_event, ctx);
     restoreTaskList(ctx);
     await publishTaskList();
   });
@@ -2497,6 +2673,9 @@ module.exports = function (pi) {
     // this loop and can still arm/replay; agent_end clears once the loop
     // completes. See F18.
     clearPendingInterrupt();
+    policyController.abort();
+    policyController = new AbortController();
+    authorizedResults.clear();
     turnOutcomeController.abort();
     turnOutcomeController = new AbortController();
     agentRunning = true;
@@ -2571,8 +2750,8 @@ module.exports = function (pi) {
     const deliveryFailed = !drained || (Boolean(result?.output) && !result.item?.accepted);
     const status = deliveryFailed || outcome === "failed" ? "failed" : "idle";
     const output = deliveryFailed
-      ? "Omnigent could not save the Pi turn output; see host logs."
-      : (result?.output ?? (cancelled ? "" : "Pi turn ended without a final response."));
+      ? `Omnigent could not save the ${displayName} turn output; see host logs.`
+      : (result?.output ?? (cancelled ? "" : `${displayName} turn ended without a final response.`));
     try {
       await postEventWithRetry(config, {
         type: "external_session_status",
@@ -2587,7 +2766,7 @@ module.exports = function (pi) {
     } catch (error) {
       if (outcomeSignal.aborted) return;
       console.error("[pi-native] Failed to deliver turn outcome:", error);
-      ctx?.ui?.notify?.("Omnigent could not deliver the Pi turn outcome; see host logs.", "error");
+      ctx?.ui?.notify?.(`Omnigent could not deliver the ${displayName} turn outcome; see host logs.`, "error");
     }
   });
 
@@ -2637,6 +2816,17 @@ module.exports = function (pi) {
     replayPendingInterrupt(ctx);
   });
 
+  function denyNativeCall(event, reason) {
+    if (options.enforceResultPolicy && event?.toolCallId) {
+      authorizedResults.set(event.toolCallId, {
+        callDenied: true, isError: true, details: {},
+        content: [{ type: "text", text: reason }],
+      });
+      while (authorizedResults.size > _HISTORY_QUEUE_MAX_ITEMS) authorizedResults.delete(authorizedResults.keys().next().value);
+    }
+    return { block: true, reason };
+  }
+
   pi.on("tool_call", async (event, ctx) => {
     rememberContext(ctx);
     const blocked = replayPendingInterrupt(ctx);
@@ -2650,7 +2840,7 @@ module.exports = function (pi) {
       responseId,
     );
     if (blocked) {
-      return { block: true, reason: "Interrupted by user" };
+      return denyNativeCall(event, "Interrupted by user");
     }
     // Bridged Omnigent tools (registered via pi.registerTool above) are
     // policy-evaluated server-side inside the /mcp proxy when execute() runs,
@@ -2669,20 +2859,78 @@ module.exports = function (pi) {
       config,
       (event && event.toolName) || "",
       (event && event.input) || {},
+      { signal: policyController.signal },
     );
     if (verdict && verdict.block) {
-      return {
-        block: true,
-        reason: verdict.reason || "blocked by Omnigent policy",
-      };
+      return denyNativeCall(event, verdict.reason || "blocked by Omnigent policy");
     }
   });
 
+  // OMP drops late result-handler returns at 30s. Quarantine shared references
+  // before awaiting anything and settle our gate at 25s, never releasing late ALLOW.
+  const authorizedResults = new Map();
   pi.on("tool_result", async (event, ctx) => {
     rememberContext(ctx);
-    replayPendingInterrupt(ctx);
-    await syncTaskListFromResult(event);
-    await postToolResult(event, currentResponseId());
+    const interrupted = replayPendingInterrupt(ctx);
+    const knownDenial = authorizedResults.get(event?.toolCallId);
+    if (knownDenial?.callDenied) {
+      const { callDenied: _denied, ...safe } = knownDenial;
+      if (Array.isArray(event.content)) event.content.splice(0, event.content.length, ...safe.content);
+      void postToolResult({ ...event, ...safe }, currentResponseId());
+      return safe;
+    }
+    if (!options.enforceResultPolicy || bridgedTools.has(event?.toolName)) {
+      await syncTaskListFromResult(event);
+      await postToolResult(event, currentResponseId());
+      return;
+    }
+    const original = {
+      content: Array.isArray(event.content) ? event.content.slice() : [],
+      details: event.details && typeof event.details === "object"
+        ? (Array.isArray(event.details) ? event.details.slice() : { ...event.details })
+        : event.details,
+      isError: event.isError,
+    };
+    const withheld = { content: [{ type: "text", text: "Omnigent withheld this tool result pending policy authorization." }], details: {}, isError: true };
+    // emitToolResult and ExtensionToolWrapper share these arrays/objects.
+    // Assignment alone would leave the wrapper's original result intact.
+    if (Array.isArray(event.content)) event.content.splice(0, event.content.length, ...withheld.content);
+    if (event.details && typeof event.details === "object") {
+      for (const key of Object.keys(event.details)) delete event.details[key];
+    }
+    const controller = new AbortController();
+    const policySignal = policyController.signal;
+    const signal = AbortSignal.any([controller.signal, policySignal]);
+    let timer;
+    const expired = new Promise((resolve) => {
+      timer = setTimeout(() => { controller.abort(); resolve(failClosedVerdict()); }, options.resultPolicyTimeoutMs || 25_000);
+    });
+    let verdict;
+    try {
+      verdict = interrupted ? { block: true } : await Promise.race([
+        evalNativePolicyHttp(config, event.toolName || "", event.input || {}, {
+          phase: "PHASE_TOOL_RESULT", result: safeJsonStringify(original),
+          isError: original.isError, signal, timeoutMs: options.resultPolicyTimeoutMs || 25_000,
+        }).catch(() => failClosedVerdict()),
+        expired,
+      ]);
+    } finally {
+      clearTimeout(timer);
+      controller.abort();
+    }
+    const approved = verdict && !verdict.block && !policySignal.aborted &&
+      (!options.isolateChildren || eventIdentity.getStore() === config.nativeSessionId);
+    const result = approved ? original : {
+      ...withheld, content: [{ type: "text", text: "Omnigent blocked this tool result." }],
+    };
+    authorizedResults.set(event.toolCallId, result);
+    // Keep bounded, and never fall back to an unverified native result.
+    while (authorizedResults.size > _HISTORY_QUEUE_MAX_ITEMS) authorizedResults.delete(authorizedResults.keys().next().value);
+    // Telemetry cannot extend this security-critical handler past the host cap.
+    void syncTaskListFromResult({ ...event, ...result })
+      .then(() => postToolResult({ ...event, ...result }, currentResponseId()))
+      .catch(() => console.error(`[${harness}] Failed to mirror an authorized result`));
+    return result;
   });
 
   pi.on("tool_execution_end", async (event, ctx) => {
@@ -2699,7 +2947,7 @@ module.exports = function (pi) {
   const unconsumedMirroredPrompts = [];
   const UNCONSUMED_MIRRORED_PROMPTS_CAP = 64;
 
-  function mirrorUserPrompt(text) {
+  function mirrorUserPrompt(text, images = []) {
     const responseId = newResponseId("user");
     history.enqueue(
       {
@@ -2707,7 +2955,7 @@ module.exports = function (pi) {
         item_type: "message",
         item_data: {
           role: "user",
-          content: [{ type: "input_text", text }],
+          content: nativeUserContent(text, images),
         },
       },
       `pi:user:${responseId}`,
@@ -2718,10 +2966,10 @@ module.exports = function (pi) {
     rememberContext(ctx);
     setOmnigentStatus(config, ctx, "running");
     const text = event && typeof event.text === "string" ? event.text : "";
-    if (!text) return;
+    if (!text && !event.images?.length) return;
     // Mirror before any await: Pi runs the prompt even when this handler
     // fails later, so a settings or routing failure must not drop it from Chat.
-    mirrorUserPrompt(text);
+    mirrorUserPrompt(text, options.isolateChildren ? event.images || [] : []);
     unconsumedMirroredPrompts.push(text);
     if (unconsumedMirroredPrompts.length > UNCONSUMED_MIRRORED_PROMPTS_CAP) {
       unconsumedMirroredPrompts.shift();
@@ -2745,7 +2993,7 @@ module.exports = function (pi) {
     if (messageRole(message) !== "user") return;
     rememberContext(ctx);
     const text = textFromMessage(message);
-    if (!text) return;
+    if (!text && !contentBlocks(message).some((block) => block.type === "image")) return;
     // Pi expands skill commands and prompt templates after ``input``, so the
     // consumed text can differ from the accepted one; the oldest unconsumed
     // prompt is then the one being consumed.
@@ -2754,7 +3002,7 @@ module.exports = function (pi) {
       unconsumedMirroredPrompts.splice(index === -1 ? 0 : index, 1);
       return;
     }
-    mirrorUserPrompt(text);
+    mirrorUserPrompt(text, options.isolateChildren ? contentBlocks(message) : []);
   });
 
   pi.on("message_end", async (event, ctx) => {
@@ -2803,12 +3051,12 @@ module.exports = function (pi) {
           item_data: {
             source: "execution",
             code: authFailure ? authFailure.code : "RuntimeError",
-            message: `Pi model error: ${errorMessage}`,
+            message: `${displayName} model error: ${errorMessage}`,
           },
         },
         assistantMessageSourceId(message, responseId, errorMessage),
       );
-      turnResult = { item, outcome: "failed", output: `Pi model error: ${errorMessage}` };
+      turnResult = { item, outcome: "failed", output: `${displayName} model error: ${errorMessage}` };
       return;
     }
     const text = textFromMessage(message);
@@ -2829,7 +3077,7 @@ module.exports = function (pi) {
         item_type: "message",
         item_data: {
           role: "assistant",
-          agent: "Pi",
+          agent: displayName,
           content: [{ type: "output_text", text }],
         },
       },

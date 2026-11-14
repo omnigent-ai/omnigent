@@ -282,7 +282,9 @@ def pi_session_records_from_session_items(
             continue
         snapshot = _compaction_snapshot_items(item)
         tail_start = index + 1
-        if not snapshot:
+        # An explicitly empty snapshot is authoritative (native /new or /clear),
+        # not an unavailable conversion that may revive the old audit history.
+        if not snapshot and item.get("compacted_messages") != []:
             summary = cast(str, item["summary"]).strip()
             if not summary or _COMPACTION_NOTICE_RE.fullmatch(summary):
                 break

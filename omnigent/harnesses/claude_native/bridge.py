@@ -870,6 +870,15 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
             trusted_parent = pi_root.parent.parent
         return _absolute_syntactic_path(trusted_parent)
 
+    from omnigent.harnesses.omp_native.bridge import bridge_root as omp_bridge_root
+
+    omp_root = _absolute_syntactic_path(omp_bridge_root())
+    if target.is_relative_to(omp_root):
+        trusted_parent = omp_root.parent
+        if omp_root.name == "omp-native" and omp_root.parent.name == ".omnigent":
+            trusted_parent = omp_root.parent.parent
+        return _absolute_syntactic_path(trusted_parent)
+
     from omnigent.harnesses.cursor_native.bridge import bridge_root as cursor_bridge_root
 
     cursor_root = _absolute_syntactic_path(cursor_bridge_root())
@@ -961,7 +970,7 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
 
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
-        f"({claude_root!s}, {codex_root!s}, {pi_root!s}, {cursor_root!s}, "
+        f"({claude_root!s}, {codex_root!s}, {pi_root!s}, {omp_root!s}, {cursor_root!s}, "
         f"{devin_root!s}, {antigravity_root!s}, {qwen_root!s}, {hermes_root!s}, "
         f"{opencode_root!s}, {kiro_root!s}, {acp_root!s}, {router_root!s})"
     )

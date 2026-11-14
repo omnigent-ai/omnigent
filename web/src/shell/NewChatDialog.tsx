@@ -1172,7 +1172,7 @@ type ModelCatalogAvailability = "available" | "unavailable" | "unknown";
 // list from whatever is launchable rather than showing an empty group.
 const PRIMARY_HARNESS_ORDER: readonly string[] = ["claude", "cursor", "codex"];
 // Preferred order within the "Other..." submenu.
-const SECONDARY_HARNESS_ORDER: readonly string[] = ["opencode", "pi"];
+const SECONDARY_HARNESS_ORDER: readonly string[] = ["opencode", "pi", "omp"];
 // How many rows the backfill promotes — matches the inline list's usual size.
 const INLINE_HARNESS_FALLBACK = PRIMARY_HARNESS_ORDER.length;
 
@@ -3580,6 +3580,8 @@ function NewChatLandingContent({
   // The selected native harness persists and restores harness-specific model,
   // effort, and permission knobs.
   const selectedNativeHarness = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
+  const thinkingNativeHarness = selectedNativeHarness === "omp-native" ? "omp-native" : "pi-native";
+  const supportsThinkingLevel = selectedNativeHarness === thinkingNativeHarness;
   // Probe only the selected, available harness. Older hosts without readiness
   // metadata remain eligible, matching the picker's setup warnings. A CLI that
   // missed its version check still launches, so its catalog stays loadable.
@@ -3608,9 +3610,9 @@ function NewChatLandingContent({
   });
   const { data: hostPiModelOptions, isLoading: hostPiModelsLoading } = useHostModelOptions(
     selectedHostId,
-    "pi-native",
-    canLoadHostModels("pi-native"),
-    { poll: selectedNativeHarness === "pi-native" },
+    thinkingNativeHarness,
+    canLoadHostModels(thinkingNativeHarness),
+    { poll: supportsThinkingLevel },
   );
   // Keep this host's cached choices while requests wait for readiness.
   // A fetched catalog, including an empty one, takes precedence.
@@ -3651,10 +3653,10 @@ function NewChatLandingContent({
     cachedHostModels?.codex,
   );
   const availablePiModels = availableHostModels(
-    "pi-native",
+    thinkingNativeHarness,
     hostPiModelOptions,
     hostPiModelsLoading,
-    cachedHostModels?.pi,
+    thinkingNativeHarness === "omp-native" ? cachedHostModels?.omp : cachedHostModels?.pi,
   );
   const {
     data: hostDevinModelOptions,
@@ -3923,7 +3925,7 @@ function NewChatLandingContent({
       const thinkingLevelValue = normalizeEffortLabel(pickedEffort);
       return [
         { label: "Model", value: modelValue },
-        ...(selectedNativeHarness === "pi-native" && thinkingLevelValue
+        ...(supportsThinkingLevel && thinkingLevelValue
           ? [{ label: "Thinking level", value: thinkingLevelValue }]
           : []),
         ...sourceRows(piModelOptions),
@@ -4043,6 +4045,7 @@ function NewChatLandingContent({
     agySkipMode,
     pickedHarness,
     selectedNativeHarness,
+    supportsThinkingLevel,
   ]);
   const harnessTriggerDetails = configSummary.filter(
     (row) =>
@@ -4060,7 +4063,7 @@ function NewChatLandingContent({
       ? claudeModelOptions
       : selectedNativeHarness === "devin-native"
         ? devinModelOptions
-        : selectedNativeHarness === "pi-native"
+        : supportsThinkingLevel
           ? piModelOptions
           : selectedNativeHarness === "codex-native"
             ? codexModelOptions
@@ -4073,7 +4076,7 @@ function NewChatLandingContent({
         ? hostClaudeModelsLoading
         : selectedNativeHarness === "codex-native"
           ? hostCodexModelsLoading
-          : selectedNativeHarness === "pi-native"
+          : supportsThinkingLevel
             ? hostPiModelsLoading
             : selectedNativeHarness === "devin-native"
               ? hostDevinModelsLoading
@@ -4161,7 +4164,9 @@ function NewChatLandingContent({
             models: {
               claude: availableClaudeModels,
               codex: availableCodexModels,
-              pi: availablePiModels,
+              pi: thinkingNativeHarness === "pi-native" ? availablePiModels : cachedHostModels?.pi,
+              omp:
+                thinkingNativeHarness === "omp-native" ? availablePiModels : cachedHostModels?.omp,
             },
           }
         : null,
@@ -4174,6 +4179,8 @@ function NewChatLandingContent({
       availableClaudeModels,
       availableCodexModels,
       availablePiModels,
+      thinkingNativeHarness,
+      cachedHostModels,
     ],
   );
   useEffect(() => {
@@ -4409,7 +4416,7 @@ function NewChatLandingContent({
     pickerEffortOptions.length > 0
       ? {
           testId: "new-chat-landing-agent-efforts",
-          header: selectedNativeHarness === "pi-native" ? "Thinking level" : "Effort",
+          header: supportsThinkingLevel ? "Thinking level" : "Effort",
           choices: [
             {
               key: "__default__",
@@ -4520,7 +4527,9 @@ function NewChatLandingContent({
   const hostModelCatalogs: Record<string, NativeModelOption[] | undefined> = {
     "claude-native": availableClaudeModels,
     "codex-native": availableCodexModels,
-    "pi-native": availablePiModels,
+    "pi-native": thinkingNativeHarness === "pi-native" ? availablePiModels : cachedHostModels?.pi,
+    "omp-native":
+      thinkingNativeHarness === "omp-native" ? availablePiModels : cachedHostModels?.omp,
     "devin-native": hostDevinModelOptions,
   };
   const pickerEntrySummaries = Object.fromEntries(
@@ -4539,8 +4548,10 @@ function NewChatLandingContent({
           ? claudeModelOptions
           : native.iconKind === "codex"
             ? codexModelOptions
-            : native.iconKind === "pi"
-              ? piModelOptions
+            : native.key === "pi" || native.key === "omp"
+              ? native.harness === thinkingNativeHarness
+                ? piModelOptions
+                : []
               : native.iconKind === "devin"
                 ? devinModelOptions
                 : [];
@@ -4561,7 +4572,8 @@ function NewChatLandingContent({
             ? nativeModelLabel(model)
             : defaultModelLabel(catalog),
       );
-      const efforts = native.iconKind === "pi" ? PI_NATIVE_EFFORTS : CLAUDE_NATIVE_EFFORTS;
+      const efforts =
+        native.key === "pi" || native.key === "omp" ? PI_NATIVE_EFFORTS : CLAUDE_NATIVE_EFFORTS;
       const effort =
         native.iconKind === "codex"
           ? normalizeEffortLabel(saved.effort ?? "")
@@ -4641,16 +4653,15 @@ function NewChatLandingContent({
   // An unknown/retired stored id must behave as "no project default": the
   // model seed falls back to the remembered pick, and the remembered-routing
   // seed below stays live (an invalid pin must not suppress it).
-  const projectModelVocab =
-    selectedNativeHarness === "pi-native"
-      ? piModelOptions
-      : selectedNativeHarness === "claude-native"
-        ? claudeModelOptions
-        : selectedNativeHarness === "devin-native"
-          ? devinModelOptions
-          : selectedNativeHarness === "codex-native"
-            ? codexModelOptions
-            : [];
+  const projectModelVocab = supportsThinkingLevel
+    ? piModelOptions
+    : selectedNativeHarness === "claude-native"
+      ? claudeModelOptions
+      : selectedNativeHarness === "devin-native"
+        ? devinModelOptions
+        : selectedNativeHarness === "codex-native"
+          ? codexModelOptions
+          : [];
   const projectDefaultModelValid =
     projectDefaultModel != null && projectModelVocab.some((m) => m.id === projectDefaultModel)
       ? projectDefaultModel
@@ -4729,7 +4740,7 @@ function NewChatLandingContent({
       if (projectEffort != null) _setCostControlMode((mode) => (mode === "on" ? null : mode));
       setPickedEffort(projectEffort ?? fallback);
     };
-    if (selectedNativeHarness === "pi-native") {
+    if (supportsThinkingLevel) {
       setPickedModel(
         projectSeed(piModelOptions) ??
           (stored.model != null && piModelOptions.some((model) => model.id === stored.model)
@@ -4819,6 +4830,7 @@ function NewChatLandingContent({
     claudeModelOptions,
     codexModelOptions,
     piModelOptions,
+    supportsThinkingLevel,
     projectDefaultModel,
     projectDefaultEffort,
     readRememberedHarnessOptions,
@@ -6276,7 +6288,7 @@ function NewChatLandingContent({
         !routingOwnsModel &&
         (sandboxDefaultModelsEnabled ||
           agentSupportsPermissionMode ||
-          selectedNativeHarness === "pi-native" ||
+          supportsThinkingLevel ||
           nativeAgent?.harness === "codex-native" ||
           nativeAgent?.harness === "devin-native") &&
         pickedEffort
@@ -6694,8 +6706,7 @@ function NewChatLandingContent({
           supportsCursorMode: agentSupportsCursorMode,
           supportsAgySkipPermissions: agentSupportsAgySkip,
           supportsModelPicker: agentSupportsModelPicker || nativeAgent?.harness === "codex-native",
-          supportsEffortPicker:
-            selectedNativeHarness === "pi-native" || selectedNativeHarness === "codex-native",
+          supportsEffortPicker: supportsThinkingLevel || selectedNativeHarness === "codex-native",
           permissionMode,
           approvalMode,
           bypassSandbox,

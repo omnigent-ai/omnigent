@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from tests.harness_bench.driver import TurnResult
@@ -139,6 +141,37 @@ def _driver_with_fake(harness: str, client: _FakeClient) -> NativeTuiDriver:
 
 def _function_call_item(name: str) -> dict:
     return {"type": "function_call", "data": {"call_id": "c1", "name": name, "arguments": "{}"}}
+
+
+def test_omp_native_forwarder_uses_omp_terminal_and_binds_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _driver_with_fake("omp-native", _FakeClient())
+    launches: list[tuple[str, Path]] = []
+    terminal_requests: list[dict] = []
+
+    def _launch(host_id: str, workspace: Path) -> str:
+        launches.append((host_id, workspace))
+        return "runner_omp"
+
+    def _handle(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            assert request.url.path == "/v1/sessions/conv_test/resources/terminals"
+            terminal_requests.append(json.loads(request.content))
+            return httpx.Response(200, json={})
+        assert request.url.path == "/v1/sessions/conv_test"
+        return httpx.Response(200, json={"external_session_id": "omp_session"})
+
+    monkeypatch.setattr(driver, "_launch_and_bind_runner", _launch)
+    with httpx.Client(base_url="http://bench", transport=httpx.MockTransport(_handle)) as client:
+        driver._client = client
+        driver._wire_native_forwarder("host_omp", Path("/workspace"))
+
+    assert launches == [("host_omp", Path("/workspace"))]
+    assert driver._runner_id == "runner_omp"
+    assert terminal_requests == [
+        {"terminal": "omp", "session_key": "main", "ensure_native_terminal": True}
+    ]
 
 
 def test_tool_turn_observes_function_call_item() -> None:
@@ -354,6 +387,38 @@ def test_mcp_tool_turn_observes_prefixed_omnigent_tool() -> None:
     assert result.completed
     assert [call["name"] for call in result.tool_calls] == ["mcp__omnigent__sys_session_list"]
     assert "mcp__omnigent__sys_session_list" in str(client.posted_events[-1])
+
+
+async def test_omp_mcp_probe_observes_inline_relay_tool() -> None:
+    client = _FakeClient(items=[_function_call_item("sys_session_list")])
+    driver = _driver_with_fake("omp-native", client)
+
+    result = await OmnigentMcpProbe().run(driver, driver._profile)
+
+    assert result.verdict is Verdict.SUPPORTED
+    assert result.detail["matched_calls"] == ["sys_session_list"]
+    assert len(client.posted_events) == 1
+    prompt = client.posted_events[0]["data"]["content"][0]["text"]
+    assert "sys_session_list" in prompt
+    assert "mcp__omnigent__" not in prompt
+
+
+async def test_omp_mcp_probe_does_not_infer_support_from_another_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeClient(items=[_function_call_item("bash")])
+    driver = _driver_with_fake("omp-native", client)
+
+    async def _turn() -> TurnResult:
+        return driver._drive_mcp_tool_turn(timeout=0.01)
+
+    monkeypatch.setattr(driver, "run_mcp_tool_turn", _turn)
+
+    result = await OmnigentMcpProbe().run(driver, driver._profile)
+
+    assert result.verdict is Verdict.SKIPPED
+    assert result.detail["tool_calls"] == ["bash"]
+    assert result.detail["matched_calls"] == []
 
 
 def test_mcp_tool_turn_rejects_unrelated_suffix_match() -> None:

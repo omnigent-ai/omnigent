@@ -1086,3 +1086,30 @@ async def test_fetch_paginates(tmp_path: Path) -> None:
         items = await fetch_all_session_items_for_pi_resume(client, "conv_abc")
     assert calls["n"] == 2
     assert [i["id"] for i in items] == ["u1", "a1"]
+
+
+@pytest.mark.parametrize("with_tail", [False, True])
+@pytest.mark.parametrize("summary", ["", "Native context cleared", "[OMP compaction — context was compacted]"])
+def test_empty_compaction_snapshot_is_authoritative_after_native_clear(
+    with_tail: bool, summary: str,
+) -> None:
+    """Cold resume must never resurrect the old audit trail after OMP /new."""
+    tail = [_user_item("after clear", item_id="after")] if with_tail else []
+    records = pi_session_records_from_session_items(
+        [
+            _user_item("old secret", item_id="old"),
+            _assistant_item("old answer"),
+            {
+                "id": "clear-checkpoint", "type": "compaction",
+                "summary": summary, "compacted_messages": [],
+            },
+            *tail,
+        ],
+        session_id="conv_clear", external_session_id=_EXTERNAL_ID,
+        cwd=Path("/workspace"),
+    )
+    assert len(records) == (2 if with_tail else 1)
+    assert "old secret" not in json.dumps(records)
+    assert "old answer" not in json.dumps(records)
+    if with_tail:
+        assert records[1]["message"]["content"][0]["text"] == "after clear"

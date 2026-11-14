@@ -66,6 +66,8 @@ def harness_account_key(harness: str | None) -> str | None:
         return "codex"
     if canonical in {"pi", "pi-native"}:
         return "pi"
+    if canonical == "omp-native":
+        return "omp"
     if canonical in {"opencode", "opencode-native"}:
         return "opencode"
     return None

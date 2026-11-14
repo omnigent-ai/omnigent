@@ -64,6 +64,25 @@ _SESSION_LABELS = {
 }
 
 
+@dataclass(frozen=True)
+class NativeTuiIdentity:
+    """Identity of a native terminal sharing the Pi-compatible lifecycle."""
+
+    key: str
+    display_name: str
+
+    @property
+    def harness(self) -> str:
+        return f"{self.key}-native"
+
+    @property
+    def agent_name(self) -> str:
+        return f"{self.harness}-ui"
+
+
+PI_NATIVE_IDENTITY = NativeTuiIdentity("pi", "Pi")
+
+
 class PiNativeCliOutdatedError(RuntimeError):
     """The installed Pi CLI is below Omnigent's supported floor.
 
@@ -250,6 +269,7 @@ def run_pi_native(
     pi_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     auto_open_conversation: bool = False,
+    identity: NativeTuiIdentity = PI_NATIVE_IDENTITY,
 ) -> None:
     """
     Launch Pi TUI in an Omnigent terminal.
@@ -268,11 +288,14 @@ def run_pi_native(
     _preflight_local_tools()
     if server is None:
         raise click.ClickException(
-            "Pi requires a resolved Omnigent server URL. The CLI should call "
+            f"{identity.display_name} requires a resolved Omnigent server URL. "
+            "The CLI should call "
             "_ensure_backend before run_pi_native."
         )
-    with TemporaryDirectory(prefix="omnigent-pi-native-") as tmpdir:
-        spec_path = _materialize_pi_agent_spec(Path(tmpdir))
+    with TemporaryDirectory(prefix=f"omnigent-{identity.harness}-") as tmpdir:
+        spec_path = _materialize_pi_agent_spec(
+            Path(tmpdir), **({"identity": identity} if identity != PI_NATIVE_IDENTITY else {})
+        )
         _run_with_remote_server(
             server.rstrip("/"),
             spec_path,
@@ -280,24 +303,28 @@ def run_pi_native(
             resume_picker=resume_picker,
             pi_args=pi_args,
             auto_open_conversation=auto_open_conversation,
+            **({"identity": identity} if identity != PI_NATIVE_IDENTITY else {}),
         )
 
 
-def _materialize_pi_agent_spec(tmpdir: Path) -> Path:
+def _materialize_pi_agent_spec(
+    tmpdir: Path, *, identity: NativeTuiIdentity = PI_NATIVE_IDENTITY
+) -> Path:
     """
     Write the terminal-first agent spec used by ``omnigent pi``.
 
     :param tmpdir: Temporary directory for the generated YAML file.
     :returns: Path to the generated YAML spec.
     """
-    yaml_path = tmpdir / "pi-native-ui.yaml"
+    yaml_path = tmpdir / f"{identity.agent_name}.yaml"
     raw: _JsonObject = {
-        "name": _AGENT_NAME,
+        "name": identity.agent_name,
         "prompt": (
-            "Pi is running in the session terminal. Web UI messages are "
-            "forwarded into that Pi process through the native extension bridge."
+            f"{identity.display_name} is running in the session terminal. Web UI messages are "
+            f"forwarded into that {identity.display_name} process "
+            "through the native extension bridge."
         ),
-        "executor": {"harness": "pi-native"},
+        "executor": {"harness": identity.harness},
         "spawn": True,
         "os_env": {
             "type": "caller_process",
@@ -320,6 +347,7 @@ def _run_with_remote_server(
     resume_picker: bool,
     pi_args: tuple[str, ...],
     auto_open_conversation: bool = False,
+    identity: NativeTuiIdentity = PI_NATIVE_IDENTITY,
 ) -> None:
     """
     Launch Pi on an Omnigent server via a daemon-spawned runner.
@@ -342,12 +370,15 @@ def _run_with_remote_server(
             headers=headers,
             session_id=session_id,
             resume_picker=resume_picker,
+            **({"identity": identity} if identity != PI_NATIVE_IDENTITY else {}),
         )
         if resolved_session_id is None and resume_picker and session_id is None:
             return
 
         async def _drive() -> None:
-            with runner_startup_progress(initial_message="Preparing Pi...") as progress:
+            with runner_startup_progress(
+                initial_message=f"Preparing {identity.display_name}..."
+            ) as progress:
                 _update_startup_progress(progress, "Connecting to local daemon...")
                 _ensure_host_daemon(base_url)
                 host_id = load_or_create_host_identity().host_id
@@ -361,6 +392,7 @@ def _run_with_remote_server(
                     host_id=host_id,
                     workspace=str(Path.cwd().resolve()),
                     startup_progress=progress,
+                    **({"identity": identity} if identity != PI_NATIVE_IDENTITY else {}),
                 )
             click.echo(f"Web UI: {conversation_url(base_url, prepared.session_id)}", err=True)
             open_conversation_link_if_enabled(
@@ -372,7 +404,7 @@ def _run_with_remote_server(
             await _attach_terminal_resource(prepared)
             if resolved_session_id is None:
                 echo_native_resume_hint(
-                    native_command="pi",
+                    native_command=identity.key,
                     session_id=prepared.session_id,
                     server=base_url,
                 )
@@ -396,6 +428,7 @@ async def _prepare_pi_terminal_via_daemon(
     host_id: str,
     workspace: str,
     startup_progress: RunnerStartupProgress | None = None,
+    identity: NativeTuiIdentity = PI_NATIVE_IDENTITY,
 ) -> PreparedPiTerminal:
     """
     Create or resume a Pi-native session through a daemon runner.
@@ -417,36 +450,50 @@ async def _prepare_pi_terminal_via_daemon(
         fresh_session = session_id is None
         if session_id is None:
             if session_bundle is None:
-                raise click.ClickException("Creating a Pi session requires a session bundle.")
-            _update_startup_progress(startup_progress, "Creating Pi session...")
+                raise click.ClickException(
+                    f"Creating a {identity.display_name} session requires a session bundle."
+                )
+            _update_startup_progress(
+                startup_progress, f"Creating {identity.display_name} session..."
+            )
             session_id, _ = await asyncio.gather(
                 _create_pi_session(
                     client,
                     session_bundle,
                     terminal_launch_args=persist_args or None,
+                    **({"identity": identity} if identity != PI_NATIVE_IDENTITY else {}),
                 ),
                 wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S),
             )
         else:
-            _update_startup_progress(startup_progress, "Loading Pi session...")
+            _update_startup_progress(
+                startup_progress, f"Loading {identity.display_name} session..."
+            )
             payload = await _fetch_pi_session(client, session_id)
             labels = payload.get("labels") if isinstance(payload, dict) else None
             if (
                 not isinstance(labels, dict)
-                or labels.get(_WRAPPER_LABEL_KEY) != _WRAPPER_LABEL_VALUE
+                or labels.get(_WRAPPER_LABEL_KEY) != identity.agent_name
             ):
                 raise click.ClickException(
                     f"Conversation {session_id!r} is not a pi-native session."
                 )
-            existing_terminal = await _find_running_pi_terminal(client, session_id)
+            existing_terminal = await _find_running_pi_terminal(
+                client,
+                session_id,
+                **({"identity": identity} if identity != PI_NATIVE_IDENTITY else {}),
+            )
             if existing_terminal is not None:
                 if persist_args:
                     click.echo(
-                        "Ignoring Pi launch args for an already-running terminal; "
+                        f"Ignoring {identity.display_name} launch args "
+                        "for an already-running terminal; "
                         "restart the session terminal to apply them.",
                         err=True,
                     )
-                _update_startup_progress(startup_progress, "Pi terminal ready.")
+                _update_startup_progress(
+                    startup_progress, f"{identity.display_name} terminal ready."
+                )
                 return PreparedPiTerminal(
                     session_id=session_id,
                     terminal_id=existing_terminal.terminal_id,
@@ -455,7 +502,9 @@ async def _prepare_pi_terminal_via_daemon(
                     reattached=True,
                 )
             if persist_args:
-                _update_startup_progress(startup_progress, "Updating Pi session...")
+                _update_startup_progress(
+                    startup_progress, f"Updating {identity.display_name} session..."
+                )
                 resp = await client.patch(
                     f"/v1/sessions/{url_component(session_id)}",
                     json={"terminal_launch_args": persist_args},
@@ -479,14 +528,19 @@ async def _prepare_pi_terminal_via_daemon(
         _update_startup_progress(startup_progress, "Waiting for runner...")
         await wait_for_runner_online(client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S)
         await _bind_session_runner(client, session_id, runner_id)
-        _update_startup_progress(startup_progress, "Starting Pi terminal...")
-        await _ensure_pi_terminal_on_runner(client, session_id)
+        _update_startup_progress(startup_progress, f"Starting {identity.display_name} terminal...")
+        await _ensure_pi_terminal_on_runner(
+            client,
+            session_id,
+            **({"identity": identity} if identity != PI_NATIVE_IDENTITY else {}),
+        )
         terminal = await _wait_for_pi_terminal_ready(
             client,
             session_id,
             timeout_s=_DAEMON_TERMINAL_READY_TIMEOUT_S,
+            **({"identity": identity} if identity != PI_NATIVE_IDENTITY else {}),
         )
-        _update_startup_progress(startup_progress, "Pi terminal ready.")
+        _update_startup_progress(startup_progress, f"{identity.display_name} terminal ready.")
     return PreparedPiTerminal(
         session_id=session_id,
         terminal_id=terminal.terminal_id,
@@ -501,6 +555,7 @@ async def _create_pi_session(
     bundle: bytes,
     *,
     terminal_launch_args: list[str] | None = None,
+    identity: NativeTuiIdentity = PI_NATIVE_IDENTITY,
 ) -> str:
     """
     Create a bundled terminal-first Pi session.
@@ -510,13 +565,15 @@ async def _create_pi_session(
     :param terminal_launch_args: Pass-through Pi CLI args to persist.
     :returns: New Omnigent session id.
     """
-    metadata: _JsonObject = {"labels": dict(_SESSION_LABELS)}
+    metadata: _JsonObject = {
+        "labels": {"omnigent.ui": "terminal", _WRAPPER_LABEL_KEY: identity.agent_name}
+    }
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args
     resp = await client.post(
         "/v1/sessions",
         data={"metadata": json.dumps(metadata)},
-        files={"bundle": ("pi-native-ui.tar.gz", bundle, "application/gzip")},
+        files={"bundle": (f"{identity.agent_name}.tar.gz", bundle, "application/gzip")},
         timeout=120.0,
     )
     if resp.status_code >= 400:
@@ -526,7 +583,9 @@ async def _create_pi_session(
     body = resp.json()
     new_session_id = body.get("session_id")
     if not isinstance(new_session_id, str) or not new_session_id:
-        raise click.ClickException("Pi session creation response did not include session_id.")
+        raise click.ClickException(
+            f"{identity.display_name} session creation response did not include session_id."
+        )
     return new_session_id
 
 
@@ -545,12 +604,14 @@ async def _fetch_pi_session(client: httpx.AsyncClient, session_id: str) -> _Json
     return payload
 
 
-async def _ensure_pi_terminal_on_runner(client: httpx.AsyncClient, session_id: str) -> None:
+async def _ensure_pi_terminal_on_runner(
+    client: httpx.AsyncClient, session_id: str, *, identity: NativeTuiIdentity = PI_NATIVE_IDENTITY
+) -> None:
     """Ask the bound runner to ensure the Pi terminal exists."""
     resp = await client.post(
         f"/v1/sessions/{url_component(session_id)}/resources/terminals",
         json={
-            "terminal": _TERMINAL_NAME,
+            "terminal": identity.key,
             "session_key": _TERMINAL_SESSION_KEY,
             "ensure_native_terminal": True,
         },
@@ -567,12 +628,17 @@ async def _wait_for_pi_terminal_ready(
     session_id: str,
     *,
     timeout_s: float,
+    identity: NativeTuiIdentity = PI_NATIVE_IDENTITY,
 ) -> LaunchedPiTerminal:
     """Wait until the runner exposes the Pi terminal resource."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s
     while loop.time() < deadline:
-        terminal = await _find_running_pi_terminal(client, session_id)
+        terminal = await _find_running_pi_terminal(
+            client,
+            session_id,
+            **({"identity": identity} if identity != PI_NATIVE_IDENTITY else {}),
+        )
         if terminal is not None:
             return terminal
         await asyncio.sleep(0.2)
@@ -584,9 +650,10 @@ async def _wait_for_pi_terminal_ready(
 async def _find_running_pi_terminal(
     client: httpx.AsyncClient,
     session_id: str,
+    identity: NativeTuiIdentity = PI_NATIVE_IDENTITY,
 ) -> LaunchedPiTerminal | None:
     """Return the existing running Pi terminal id if present."""
-    terminal_id = pi_terminal_resource_id()
+    terminal_id = terminal_resource_id(identity.key, _TERMINAL_SESSION_KEY)
     resp = await client.get(
         f"/v1/sessions/{url_component(session_id)}"
         f"/resources/terminals/{url_component(terminal_id)}"
@@ -680,6 +747,7 @@ def _resolve_session_id_for_resume(
     headers: dict[str, str],
     session_id: str | None,
     resume_picker: bool,
+    identity: NativeTuiIdentity = PI_NATIVE_IDENTITY,
 ) -> str | None:
     """Translate resume inputs into a concrete Pi-native session id."""
     if session_id is not None:
@@ -708,8 +776,8 @@ def _resolve_session_id_for_resume(
         ) as client:
             return await pick_conversation_by_wrapper_label_from_sdk(
                 client,
-                wrapper_value=_WRAPPER_LABEL_VALUE,
-                agent_name=_AGENT_NAME,
+                wrapper_value=identity.agent_name,
+                agent_name=identity.agent_name,
                 host_id=invoking_host_id,
             )
 

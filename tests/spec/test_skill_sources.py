@@ -61,6 +61,9 @@ def _ctx(
         ("pi", "pi"),
         ("pi-native", "pi"),
         ("native-pi", "pi"),
+        ("omp-native", "omp"),
+        ("native-omp", "omp"),
+        ("omp", "omp"),
         ("openai-agents", None),
         # Only the agy CLI reads ~/.gemini plugins; the in-process Gemini SDK
         # harness (bare "antigravity") does not, so it stays unmapped.
@@ -77,6 +80,40 @@ def _ctx(
 )
 def test_harness_family(harness: str | None, expected: str | None) -> None:
     assert _harness_family(harness) == expected
+
+
+@pytest.mark.parametrize("harness", ["omp-native", "native-omp", "omp"])
+def test_omp_skill_precedence_names_and_filters(tmp_path: Path, harness: str) -> None:
+    home = tmp_path / "home"
+    root = tmp_path / "repo"
+    workspace = root / "app"
+    workspace.mkdir(parents=True)
+    (root / ".git").mkdir()
+    for skills_dir, directory, frontmatter in (
+        (workspace / ".omp" / "skills", "local-dir", "name: shared\ndescription: closest"),
+        (root / ".omp" / "skills", "ancestor", "name: shared\ndescription: ancestor"),
+        (home / ".omp" / "agent" / "skills", "user", "name: shared\ndescription: user"),
+        (home / ".omp" / "agent" / "skills", "nameless", "description: fallback name"),
+        (home / ".omp" / "agent" / "skills", "disabled", "description: hidden\nenabled: false"),
+        (home / ".omp" / "agent" / "skills", "empty", "name: empty"),
+        (home / ".omp" / "agent" / "skills", "invalid", "name: bad/name\ndescription: invalid"),
+        (home / ".omp" / "agent" / "managed-skills", "learned", "description: learned"),
+    ):
+        directory_path = skills_dir / directory
+        directory_path.mkdir(parents=True)
+        (directory_path / "SKILL.md").write_text(f"---\n{frontmatter}\n---\nbody\n")
+    # Native OMP scans direct children, not the generic scanner's namespace tree.
+    _write_skill(home / ".omp" / "agent" / "skills" / "nested", "not-loaded")
+    _write_skill(home / ".pi" / "agent" / "skills", "pi-only")
+    _write_skill(home / ".claude" / "skills", "claude-only")
+    ctx = _ctx(workspace, home)
+    skills = resolve_harness_skills(ctx, harness)
+    assert [(skill.name, skill.description) for skill in skills] == [
+        ("shared", "closest"), ("nameless", "fallback name"), ("learned", "learned")
+    ]
+    assert skills[0].skill_dir == workspace / ".omp" / "skills" / "local-dir"
+    assert [skill.name for skill in resolve_harness_skills(_ctx(workspace, home, ["shared"]), harness)] == ["shared"]
+    assert resolve_harness_skills(_ctx(workspace, home, "none"), harness) == []
 
 
 def test_devin_provider_lists_the_cli_reported_skills(

@@ -72,7 +72,7 @@ def bridge_root() -> Path:
     return _BRIDGE_ROOT
 
 
-def bridge_dir_for_session_id(session_id: str) -> Path:
+def bridge_dir_for_session_id(session_id: str, *, root: Path | None = None) -> Path:
     """
     Return the bridge directory for a native Pi session.
 
@@ -80,17 +80,17 @@ def bridge_dir_for_session_id(session_id: str) -> Path:
     :returns: Absolute bridge directory under ``~/.omnigent/pi-native``.
     """
     digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
-    return _BRIDGE_ROOT / digest
+    return (root if root is not None else _BRIDGE_ROOT) / digest
 
 
-def prepare_bridge_dir(session_id: str) -> Path:
+def prepare_bridge_dir(session_id: str, *, root: Path | None = None) -> Path:
     """
     Create the bridge directory and inbox for *session_id*.
 
     :param session_id: Omnigent conversation id.
     :returns: Prepared bridge directory.
     """
-    bridge_dir = bridge_dir_for_session_id(session_id)
+    bridge_dir = bridge_dir_for_session_id(session_id, root=root)
     with native_bridge_common.bridge_dir_preparation_lock(bridge_dir):
         bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(bridge_dir, 0o700)
@@ -215,7 +215,7 @@ def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
     return bool(config) and (Path(config).parent / _INPUT_READY_FILE).is_file()
 
 
-def enqueue_user_message(bridge_dir: Path, content: str) -> str:
+def enqueue_user_message(bridge_dir: Path, content: str | list[_JsonObject]) -> str:
     """
     Queue a web-originated user message for the resident Pi extension.
 
@@ -224,7 +224,7 @@ def enqueue_user_message(bridge_dir: Path, content: str) -> str:
     plus atomic rename keeps the poller from reading partial JSON.
 
     :param bridge_dir: Native Pi bridge directory.
-    :param content: Plain text user message.
+    :param content: Plain text or native text/image blocks for the user message.
     :returns: Opaque message id.
     """
     message_id = f"msg_{uuid.uuid4().hex}"
@@ -379,6 +379,9 @@ def write_extension_files(
     auth_headers: dict[str, str] | None = None,
     tools: list[_JsonObject] | None = None,
     usage_baseline: dict[str, int | float] | None = None,
+    harness: str | None = None,
+    display_name: str | None = None,
+    extension_filename: str = _EXTENSION_FILE,
 ) -> tuple[Path, Path]:
     """
     Write the Pi extension and config used by a native Pi terminal.
@@ -410,13 +413,18 @@ def write_extension_files(
         "authHeaders": auth_headers or {},
         "tools": tools or [],
     }
+    if harness is not None:
+        payload["harness"] = harness
+    if display_name is not None:
+        payload["displayName"] = display_name
     if usage_baseline is not None:
         payload["usageBaseline"] = usage_baseline
     # A marker left by a previous Pi process would report this launch ready early.
     (bridge_dir / _INPUT_READY_FILE).unlink(missing_ok=True)
     _atomic_json(config_path(bridge_dir), payload)
-    _atomic_text(extension_path(bridge_dir), _extension_source())
-    return extension_path(bridge_dir), config_path(bridge_dir)
+    generated_extension = bridge_dir / extension_filename
+    _atomic_text(generated_extension, _extension_source())
+    return generated_extension, config_path(bridge_dir)
 
 
 def write_agent_instructions(bridge_dir: Path, instructions: str | None) -> Path | None:

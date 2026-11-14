@@ -30,6 +30,7 @@ export function sessionActionRestrictions(
 const CLAUDE_NATIVE_WRAPPER = "claude-code-native-ui";
 const CODEX_NATIVE_WRAPPER = "codex-native-ui";
 const PI_NATIVE_WRAPPER = "pi-native-ui";
+const OMP_NATIVE_WRAPPER = "omp-native-ui";
 const DEVIN_NATIVE_WRAPPER = "devin-native-ui";
 
 // Reasoning-effort ladder per server ``EffortFamily`` (``/v1/harnesses`` →
@@ -89,10 +90,16 @@ export function supportsEffortControl(
     wrapper === CLAUDE_NATIVE_WRAPPER ||
     wrapper === CODEX_NATIVE_WRAPPER ||
     wrapper === PI_NATIVE_WRAPPER ||
+    wrapper === OMP_NATIVE_WRAPPER ||
     // Devin has no --effort flag: effort is a model-variant suffix the executor
     // recombines and re-applies via /model, so the in-chat effort dial is live.
     wrapper === DEVIN_NATIVE_WRAPPER ||
-    (wrapper == null && session?.harness === "codex-native")
+    (wrapper == null && session?.harness === "codex-native") ||
+    (wrapper == null &&
+      session?.parentSessionId == null &&
+      (session?.harness === "omp-native" ||
+        session?.harness === "omp" ||
+        session?.harness === "native-omp"))
   ) {
     return true;
   }

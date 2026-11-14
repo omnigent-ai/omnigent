@@ -7,7 +7,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, type UseQueryResult } from "@tanstack/react-query";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -26,6 +26,7 @@ import {
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useSession } from "@/hooks/useSession";
 import { useHosts, useHostModelOptions, type Host } from "@/hooks/useHosts";
+import type { NativeModelOption } from "@/lib/types";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import {
@@ -1016,6 +1017,37 @@ describe("ForkSessionDialog", () => {
       config: { terminalLaunchArgs: ["--permission-mode", "plan"] },
       sandbox: undefined,
     });
+  });
+
+  it("forks into OMP with its model and thinking level, without Claude permission flags", async () => {
+    setAgents(
+      [testAgent("ag_omp", "omp-native-ui", { display_name: "OMP", harness: "omp-native" })],
+      "claude-sdk",
+    );
+    useHostModelOptionsMock.mockReturnValue({
+      data: [{ id: "provider/model", displayName: "OMP model" }],
+      isLoading: false,
+      error: null,
+    } as UseQueryResult<NativeModelOption[]>);
+    forkSessionMock.mockResolvedValue({ id: "conv_fork" } as ForkResponse);
+    renderDialog();
+    openAgentSelect();
+    fireEvent.click(screen.getByTestId("fork-session-agent-option-ag_omp"));
+    expect(screen.queryByTestId("fork-session-config-permission")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("fork-session-config-model"));
+    fireEvent.click(await screen.findByRole("option", { name: "OMP model" }));
+    fireEvent.click(screen.getByTestId("fork-session-config-effort"));
+    fireEvent.click(screen.getByRole("option", { name: "Minimal" }));
+    fireEvent.click(screen.getByTestId("fork-session-submit"));
+    await waitFor(() =>
+      expect(forkSessionMock).toHaveBeenCalledWith(
+        "conv_src",
+        expect.objectContaining({
+          agentId: "ag_omp",
+          config: { modelOverride: "provider/model", reasoningEffort: "minimal" },
+        }),
+      ),
+    );
   });
 
   it("arms Codex bypass only on an explicit pick, with a danger banner", async () => {
