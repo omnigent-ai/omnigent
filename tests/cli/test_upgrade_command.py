@@ -543,6 +543,36 @@ def test_upgrade_git_confirmed_behind_but_repull_noop_fails(
     assert "✓ Updated" not in result.output
 
 
+def test_upgrade_git_install_dry_run_prints_without_running(
+    monkeypatch: pytest.MonkeyPatch, _wheel_install: None
+) -> None:
+    """``--dry-run`` on a git install prints the re-pull plan and exits before any side effects."""
+    monkeypatch.setattr("omnigent.update_check._read_installed_wheel_info", _git_install_info)
+    monkeypatch.setattr("omnigent.update_check._remote_git_head", lambda _url: "b" * 40)
+
+    def _must_not_run(*_a: object, **_k: object) -> int:
+        raise AssertionError("--dry-run must not run the upgrade")
+
+    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _must_not_run)
+    stopped: list[bool] = []
+    monkeypatch.setattr(
+        "omnigent.cli._stop_local_server_and_daemon",
+        lambda *, force: stopped.append(force) or False,
+    )
+
+    result = CliRunner().invoke(cli, ["upgrade", "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    assert "Detected installer: uv" in result.output
+    assert "Detected extras: (none)" in result.output
+    assert (
+        f"Would run: uv tool install --reinstall{_UV_PY} "
+        "git+https://github.com/omnigent-ai/omnigent.git"
+    ) in result.output
+    assert "Running:" not in result.output
+    assert stopped == []
+
+
 def _nightly_ls_remote(*names: str) -> str:
     """Synthesize ``git ls-remote --tags`` output for the given tag names."""
     sha = "0" * 40
