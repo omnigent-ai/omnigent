@@ -69,37 +69,6 @@ async def route_known_session_request(request: httpx.Request) -> None:
         request.headers.update(session_routing_headers(str(request.url)))
 
 
-async def route_session_request(request: httpx.Request) -> None:
-    """Route a session request by its host without changing shared client headers."""
-    path = request.url.raw_path.split(b"?", 1)[0].decode("ascii")
-    base_path, separator, route = path.partition("/v1/sessions")
-    if not separator or (route and not route.startswith("/")):
-        return
-    if request.extensions.get(UNKEYED_REQUEST_EXTENSION):
-        request.headers.pop(OMNIGENT_SLICE_KEY_HEADER, None)
-        return
-    host_id = None
-    if (
-        not route
-        and request.method == "POST"
-        and "application/json" in request.headers.get("content-type", "")
-    ):
-        try:
-            body = json.loads(request.content)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            body = None
-        if isinstance(body, dict) and isinstance(body.get("host_id"), str):
-            host_id = body["host_id"]
-    elif route.startswith("/"):
-        host_id = get_session_host(unquote(route.split("/")[1]))
-    request.headers.pop(OMNIGENT_SLICE_KEY_HEADER, None)
-    request.headers.update(
-        databricks_request_headers(
-            str(request.url.copy_with(path=unquote(base_path), query=None)), host_id=host_id
-        )
-    )
-
-
 def normalize_session_id(value: object) -> str:
     """Preserve managed numeric IDs and canonicalize OSS UUIDs for session routes."""
     if not isinstance(value, str):

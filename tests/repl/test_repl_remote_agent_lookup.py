@@ -17,8 +17,12 @@ from omnigent_ui_sdk import TerminalHost
 
 import omnigent.host.identity as identity
 from omnigent import session_host
+from omnigent.cli_auth import databricks_request_headers
 from omnigent.repl._repl import _SessionsChatReplAdapter
-from omnigent.session_host import route_session_request
+from omnigent.session_host import SessionRoutingTransport
+
+FIRST_SESSION = "a1" * 16
+NEXT_SESSION = "b2" * 16
 
 
 @pytest.mark.asyncio
@@ -90,9 +94,10 @@ async def _remote_adapter(
     async def _stream() -> None:
         return
 
+    # The CLI's auth adds the default routing headers; the transport keys session requests.
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler),
-        event_hooks={"request": [route_session_request]},
+        headers=databricks_request_headers("http://srv"),
+        transport=SessionRoutingTransport(transport=httpx.MockTransport(handler)),
     ) as http:
         adapter = _SessionsChatReplAdapter(
             SimpleNamespace(sessions=SessionsNamespace(http, "http://srv")),  # type: ignore[arg-type]
@@ -274,7 +279,7 @@ async def test_new_session_does_not_inherit_previous_launch_routing(
     monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
     monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", "host_unrelated")
     first = {
-        "id": "conv_first",
+        "id": FIRST_SESSION,
         "agent_id": "ag_selected",
         "runner_id": "runner_launched",
         "host_id": "host_local",
@@ -282,15 +287,20 @@ async def test_new_session_does_not_inherit_previous_launch_routing(
         "status": "idle",
         "created_at": 0,
     }
-    second = {**first, "id": "conv_next", "host_id": "host_next"}
+    second = {**first, "id": NEXT_SESSION, "host_id": "host_next"}
     responses = iter(
         [
-            ("GET", "/v1/runners", None, {"data": []}),
-            ("GET", "/v1/hosts", None, {"hosts": [{"host_id": "host_local", "status": "online"}]}),
+            ("GET", "/v1/runners", "host_unrelated", {"data": []}),
+            (
+                "GET",
+                "/v1/hosts",
+                "host_unrelated",
+                {"hosts": [{"host_id": "host_local", "status": "online"}]},
+            ),
             ("POST", "/v1/sessions", "host_local", first),
-            ("PATCH", "/v1/sessions/conv_first", "host_local", first),
+            ("PATCH", f"/v1/sessions/{FIRST_SESSION}", "host_local", first),
             ("POST", "/v1/sessions", "host_unrelated", second),
-            ("GET", "/v1/sessions/conv_next", "host_next", second),
+            ("GET", f"/v1/sessions/{NEXT_SESSION}", "host_next", second),
         ]
     )
     created: list[dict[str, object]] = []
@@ -306,10 +316,10 @@ async def test_new_session_does_not_inherit_previous_launch_routing(
         return httpx.Response(200, json=body)
 
     async with _remote_adapter(monkeypatch, handler) as adapter:
-        assert await adapter._ensure_session() == "conv_first"
+        assert await adapter._ensure_session() == FIRST_SESSION
         await adapter.start_new_conversation()
-        assert await adapter._ensure_session() == "conv_next"
-        await adapter._client.sessions.get("conv_next")
+        assert await adapter._ensure_session() == NEXT_SESSION
+        await adapter._client.sessions.get(NEXT_SESSION)
         assert created == [
             {"agent_id": "ag_selected", "workspace": os.getcwd(), "host_id": "host_local"},
             {"agent_id": "ag_selected", "workspace": os.getcwd()},
