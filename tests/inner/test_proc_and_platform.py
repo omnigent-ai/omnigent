@@ -373,6 +373,38 @@ def test_killpg_refuses_the_broadcast_group(monkeypatch: pytest.MonkeyPatch) -> 
     assert sent == []
 
 
+@pytest.mark.posix_only
+@pytest.mark.parametrize("stop_tree", [_proc.terminate_tree, _proc.kill_tree])
+def test_tree_teardown_preserves_other_members_of_an_unowned_group(stop_tree) -> None:
+    """A target sharing another process's group owns only its descendant tree."""
+    supervisor = subprocess.Popen(
+        [sys.executable, "-c", "input(); print('still alive', flush=True)"],
+        process_group=0,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    target = None
+    try:
+        target = subprocess.Popen(_spin_cmd(), process_group=supervisor.pid)
+        assert os.getpgid(target.pid) == supervisor.pid != os.getpgid(0)
+        _proc.remember_process_group(target)
+
+        stop_tree(target)
+        target.wait(timeout=5)
+
+        stdout, stderr = supervisor.communicate("ping\n", timeout=5)
+        assert supervisor.returncode == 0, stderr
+        assert stdout == "still alive\n"
+    finally:
+        for process in (target, supervisor):
+            if process is not None:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
+
+
 def test_identity_census_skips_reused_pid(monkeypatch: pytest.MonkeyPatch) -> None:
     reused = Mock()
     reused.create_time.return_value = 200.0
