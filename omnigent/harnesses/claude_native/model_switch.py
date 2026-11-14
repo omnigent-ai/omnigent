@@ -365,12 +365,25 @@ class SessionOnlyModelSwitch:
 
     def pane(self) -> str:
         self.check()
+        self.raise_if_exited()
         pane = self.bridge._capture_pane(self.info["socket_path"], self.info["tmux_target"])
         self.check()
         self.bridge._raise_if_user_prompt_pending(
             self.bridge_dir, pane, nothing_typed=not self.control_attempted
         )
         return pane
+
+    def raise_if_exited(self) -> None:
+        if not self.info or self.deadline.is_set():
+            return
+        self.check()
+        state = self.bridge._claude_pane_state(self.info["socket_path"], self.info["tmux_target"])
+        self.check()
+        if state.exited:
+            raise self.bridge.ClaudeTerminalExited(
+                "Claude Code's terminal exited before the dependent prompt was sent.",
+                exit_status=state.exit_status,
+            )
 
     def send(self, key: str, *, literal: bool = False) -> None:
         self.check()
@@ -572,10 +585,13 @@ class SessionOnlyModelSwitch:
     def run(self) -> ClaudeModelSwitchResult:
         try:
             return self._run()
+        except self.bridge.ClaudeTerminalExited:
+            raise
         except ClaudeModelSwitchRefused:
             self.cleanup_owned_control()
             raise
         except (RuntimeError, OSError, ValueError) as exc:
+            self.raise_if_exited()
             if self.phase == "preflight" and not self.submitted and not self.control_attempted:
                 if (
                     (isinstance(exc, self.bridge.ClaudeUserPromptPending) and exc.nothing_typed)

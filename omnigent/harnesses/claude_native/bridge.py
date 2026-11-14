@@ -801,6 +801,21 @@ class ClaudeComposerNotCleared(ClaudeMessageNotAccepted):
     """A draft left in Claude's input box could not be cleared, so nothing was sent."""
 
 
+# Finish a held delivery before the server's 600 s pending-input lifetime ends.
+CLAUDE_INPUT_HOLD_S = 8 * 60.0
+
+
+def can_hold_input_refusal(
+    exc: ClaudeUserPromptPending | ClaudeTerminalDialog | ClaudeComposerNotCleared,
+) -> bool:
+    """Only refusals before typing can safely resume the same delivery."""
+    if isinstance(exc, ClaudeUserPromptPending):
+        return exc.nothing_typed
+    if isinstance(exc, ClaudeTerminalDialog):
+        return isinstance(exc, ClaudeInputBoxOccupied) or exc.awaits_answer
+    return True
+
+
 class ClaudeSubmitBlockedUnconfirmed(RuntimeError):
     """A fresh matching native refusal stops retries without proving web ownership."""
 
@@ -6723,7 +6738,7 @@ def _claude_pane_state(socket_path: str, tmux_target: str) -> _ClaudePaneState:
             check=False,
             capture_output=True,
             text=True,
-            timeout=_TMUX_SEND_TIMEOUT_S,
+            timeout=_tmux_injection_timeout_s(),
         )
     except (subprocess.SubprocessError, OSError):
         return _ClaudePaneState(None)

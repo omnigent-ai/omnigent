@@ -13520,6 +13520,14 @@ class _SessionModelComposer(_EditableComposer):
         self.cache_cost_label = cache_cost_label
         self.confirmations = 0
 
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        super().install(monkeypatch)
+        monkeypatch.setattr(
+            claude_native_bridge,
+            "_claude_pane_state",
+            lambda *_: claude_native_bridge._ClaudePaneState(True),
+        )
+
     def _run_tmux(self, socket_path: str, *args: str) -> None:
         claude_native_bridge._check_injection_cancelled()
         self.sends.append(args)
@@ -15338,7 +15346,7 @@ def test_model_control_parser_refuses_unowned_or_incomplete_cache_cost_confirmat
     assert not claude_model_switch._cache_cost_confirmation(pane, "Sonnet 5.5")
 
 
-@pytest.mark.parametrize("operation", ["send", "capture"])
+@pytest.mark.parametrize("operation", ["send", "capture", "liveness"])
 def test_model_switch_caps_each_tmux_subprocess_to_its_remaining_parent_deadline(
     monkeypatch: pytest.MonkeyPatch, operation: str
 ) -> None:
@@ -15360,8 +15368,10 @@ def test_model_switch_caps_each_tmux_subprocess_to_its_remaining_parent_deadline
             claude_native_bridge._run_tmux(
                 "/tmp/example/tmux.sock", "send-keys", "-t", "main", "s"
             )
-        else:
+        elif operation == "capture":
             assert claude_native_bridge._capture_pane("/tmp/example/tmux.sock", "main") == "pane"
+        else:
+            claude_native_bridge._claude_pane_state("/tmp/example/tmux.sock", "main")
 
     with claude_native_bridge.cancellable_injection(deadline):
         invoke()
@@ -15372,6 +15382,78 @@ def test_model_switch_caps_each_tmux_subprocess_to_its_remaining_parent_deadline
             invoke()
 
     assert timeouts == pytest.approx([0.4, 0.1])
+
+
+@pytest.mark.parametrize("stage", ["preflight", "picker", "status", "send-failure"])
+async def test_routed_model_switch_reaps_a_confirmed_dead_pane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    from omnigent.inner import claude_native_executor
+    from omnigent.inner.executor import ExecutorConfig, ExecutorError
+
+    composer = _SessionModelComposer()
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+    failed_send = False
+
+    def state(*args: object) -> claude_native_bridge._ClaudePaneState:
+        dead = stage == "preflight" or composer.overlay == stage or failed_send
+        return claude_native_bridge._ClaudePaneState(
+            not dead, exited=dead, exit_status="7" if dead else None
+        )
+
+    def send(socket: str, *args: str) -> None:
+        nonlocal failed_send
+        if stage == "send-failure" and args[-1] == "Down":
+            failed_send = True
+            raise RuntimeError("tmux send failed after the pane exited")
+        composer._run_tmux(socket, *args)
+
+    killed: list[Path] = []
+    monkeypatch.setattr(claude_native_bridge, "_claude_pane_state", state)
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", send)
+    monkeypatch.setattr(
+        claude_native_executor, "kill_session", lambda path, **kwargs: killed.append(path)
+    )
+    monkeypatch.setattr(
+        claude_native_executor,
+        "inject_user_message",
+        lambda *a, **k: pytest.fail("A dead pane must receive no prompt"),
+    )
+    executor = claude_native_executor.ClaudeNativeExecutor(bridge_dir)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[],
+            system_prompt="",
+            config=ExecutorConfig(model="private-glm[1m]"),
+        )
+    ]
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert events[0].undelivered and not events[0].preserve_session
+    assert killed == [bridge_dir]
+    assert all(text in {"/model", "/status"} for text in composer.submitted)
+
+
+@pytest.mark.parametrize("alive", [None, False])
+def test_model_switch_preserves_an_unconfirmed_pane_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, alive: bool | None
+) -> None:
+    composer = _SessionModelComposer()
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_claude_pane_state",
+        lambda *_: claude_native_bridge._ClaudePaneState(alive),
+    )
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_: "")
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused):
+        claude_native_bridge.inject_model_command(
+            bridge_dir, model="private-glm[1m]", ready_timeout_s=0.1
+        )
+    assert composer.sends == []
 
 
 def test_confirm_tui_dialog_polls_instead_of_sleeping_a_fixed_interval(

@@ -41,6 +41,12 @@ from omnigent.harnesses.claude_native.bridge import (
     read_transcript_path,
     terminal_dialog_pending,
 )
+from omnigent.harnesses.claude_native.bridge import (
+    CLAUDE_INPUT_HOLD_S as _MESSAGE_HOLD_S,
+)
+from omnigent.harnesses.claude_native.bridge import (
+    can_hold_input_refusal as _can_hold_refusal,
+)
 from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.inner.executor import (
     EnqueuedContent,
@@ -78,9 +84,6 @@ _STALE_SESSION_MESSAGE = (
     "open the latest conversation and retry."
 )
 
-# Hold refusals raised before typing until the person answers or frees the box.
-# Report the result before the server's 600 s pending-input lifetime ends.
-_MESSAGE_HOLD_S = 8 * 60.0
 _MESSAGE_HOLD_POLL_S = 1.0
 # How often a message held for the input box asks Claude Code to repaint it.
 _INPUT_BOX_REPAINT_INTERVAL_S = 10.0
@@ -93,17 +96,6 @@ _HOST_DISK_WAIT_MESSAGE = (
     "The host's disk is full, so Claude Code can't save this conversation. "
     "Free up disk space on the host; this message will be sent when there is room."
 )
-
-
-def _can_hold_refusal(
-    exc: ClaudeUserPromptPending | ClaudeTerminalDialog | ClaudeComposerNotCleared,
-) -> bool:
-    """Return whether a refusal came before typing, so the message can be held and retried."""
-    if isinstance(exc, ClaudeUserPromptPending):
-        return exc.nothing_typed
-    if isinstance(exc, ClaudeTerminalDialog):
-        return isinstance(exc, ClaudeInputBoxOccupied) or exc.awaits_answer
-    return True
 
 
 class ClaudeNativeExecutor(Executor):

@@ -1049,6 +1049,9 @@ def clear_pending_replay(bridge_dir: Path) -> None:
 
 # ── The replay ─────────────────────────────────────────────────────────────
 
+_ReplayKey = tuple[asyncio.AbstractEventLoop, Path, str, str, str | None, str | None, str | None]
+_replay_tasks: dict[_ReplayKey, asyncio.Task[None]] = {}
+
 
 def schedule_replay(
     session_id: str,
@@ -1113,7 +1116,12 @@ def schedule_replay(
         taking the blocked turn id. ``None`` picks one by *harness*.
     :returns: The scheduled task (tests await it; callers ignore it).
     """
-    return asyncio.get_running_loop().create_task(
+    loop = asyncio.get_running_loop()
+    key = (loop, bridge_dir.absolute(), session_id, prompt, blocked_turn_id, harness, model)
+    current = _replay_tasks.get(key)
+    if current is not None and not current.done():
+        return current
+    task = loop.create_task(
         _replay(
             session_id,
             prompt=prompt,
@@ -1126,6 +1134,14 @@ def schedule_replay(
         ),
         name=f"turn-routing-replay-{session_id}",
     )
+    _replay_tasks[key] = task
+
+    def finished(_: asyncio.Task[None]) -> None:
+        if _replay_tasks.get(key) is task:
+            _replay_tasks.pop(key, None)
+
+    task.add_done_callback(finished)
+    return task
 
 
 async def _replay(
@@ -1423,47 +1439,82 @@ async def _apply_routed_model(
     if harness != "claude-native" or not model:
         return True
     from omnigent.harnesses.claude_native.bridge import (
+        CLAUDE_INPUT_HOLD_S,
+        ClaudeComposerNotCleared,
         ClaudeModelSwitchResult,
+        ClaudeTerminalDialog,
+        ClaudeUserPromptPending,
+        ModelSwitchDeadline,
+        can_hold_input_refusal,
         cancellable_injection,
         inject_model_command,
     )
 
-    pending = read_pending_replay(bridge_dir)
-    owned_draft = (
-        pending.prompt
-        if pending is not None
-        and pending.session_id == session_id
-        and pending.model == model
-        and pending.prompt == blocked_prompt
-        and pending.blocked_turn_id == blocked_turn_id
-        and turn_routing_marker_present(bridge_dir, session_id)
-        else None
-    )
-    cancelled = threading.Event()
-    with cancellable_injection(cancelled):
-        worker = asyncio.create_task(
-            asyncio.to_thread(
-                inject_model_command, bridge_dir, model=model, owned_draft=owned_draft
+    loop = asyncio.get_running_loop()
+    hold_deadline: float | None = None
+    while True:
+        pending = read_pending_replay(bridge_dir)
+        owned_draft = (
+            pending.prompt
+            if pending is not None
+            and pending.session_id == session_id
+            and pending.model == model
+            and pending.prompt == blocked_prompt
+            and pending.blocked_turn_id == blocked_turn_id
+            and turn_routing_marker_present(bridge_dir, session_id)
+            else None
+        )
+        if hold_deadline is not None and (owned_draft is None or loop.time() >= hold_deadline):
+            return False
+        cancelled = (
+            ModelSwitchDeadline(hold_deadline - loop.time(), None, time.monotonic)
+            if hold_deadline is not None
+            else threading.Event()
+        )
+        with cancellable_injection(cancelled):
+            worker = asyncio.create_task(
+                asyncio.to_thread(
+                    inject_model_command, bridge_dir, model=model, owned_draft=owned_draft
+                )
             )
-        )
-    try:
-        receipt = await asyncio.shield(worker)
-    except asyncio.CancelledError:
-        cancelled.set()
-        while not worker.done():
+        try:
+            receipt = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancelled.set()
+            while not worker.done():
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await asyncio.shield(worker)
             with contextlib.suppress(Exception, asyncio.CancelledError):
-                await asyncio.shield(worker)
-        with contextlib.suppress(Exception, asyncio.CancelledError):
-            worker.result()
-        raise
-    except (RuntimeError, ValueError, OSError):
-        _logger.warning(
-            "route-turn: could not confirm session=%s on %s; the prompt remains pending",
-            session_id,
-            model,
-            exc_info=True,
-        )
-        return False
+                worker.result()
+            raise
+        except (ClaudeUserPromptPending, ClaudeTerminalDialog, ClaudeComposerNotCleared) as exc:
+            if owned_draft is None or not can_hold_input_refusal(exc):
+                return False
+            if hold_deadline is None:
+                hold_deadline = loop.time() + CLAUDE_INPUT_HOLD_S
+                _logger.info(
+                    "route-turn: holding session=%s replay until the Claude input is free",
+                    session_id,
+                )
+            remaining = hold_deadline - loop.time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(REPLAY_POLL_S, remaining))
+            continue
+        except (RuntimeError, ValueError, OSError):
+            _logger.warning(
+                "route-turn: could not confirm session=%s on %s; the prompt remains pending",
+                session_id,
+                model,
+                exc_info=True,
+            )
+            return False
+        if hold_deadline is not None and (
+            read_pending_replay(bridge_dir) != pending
+            or not turn_routing_marker_present(bridge_dir, session_id)
+        ):
+            return False
+        break
     if not isinstance(receipt, ClaudeModelSwitchResult) or receipt.requested_model != model:
         _logger.warning(
             "route-turn: model switch returned no fresh receipt for session=%s", session_id

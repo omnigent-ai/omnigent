@@ -1111,6 +1111,228 @@ async def test_replay_refused_model_switch_can_be_explicitly_retried(
     assert turn_routing.read_pending_replay(tmp_path) is None
 
 
+@pytest.mark.parametrize("surface", ["permission", "dialog"])
+async def test_replay_resumes_after_an_untouched_prompt_is_answered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
+) -> None:
+    import threading
+
+    from omnigent.harnesses.claude_native import bridge
+
+    _mark(tmp_path)
+    write_pending_replay(
+        tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id=None, model="private-model"
+    )
+    client = _FakeServerClient()
+    refused = asyncio.Event()
+    answered = threading.Event()
+    loop = asyncio.get_running_loop()
+    selections: list[str | None] = []
+
+    def select(
+        _bridge: Path, *, model: str, owned_draft: str | None
+    ) -> bridge.ClaudeModelSwitchResult:
+        assert not client.posts
+        selections.append(owned_draft)
+        if not answered.is_set():
+            loop.call_soon_threadsafe(refused.set)
+            if surface == "permission":
+                raise bridge.ClaudeUserPromptPending("Answer the question", nothing_typed=True)
+            raise bridge.ClaudeTerminalDialog("Answer the terminal dialog", awaits_answer=True)
+        return bridge.ClaudeModelSwitchResult(model, model, model, model, "native-session")
+
+    async def answer() -> None:
+        await refused.wait()
+        assert not client.posts
+        assert read_pending_replay(tmp_path) is not None
+        answered.set()
+
+    monkeypatch.setattr(bridge, "inject_model_command", select)
+    answer_task = asyncio.create_task(answer())
+    await asyncio.wait_for(
+        schedule_replay(
+            "conv_1",
+            prompt="hello",
+            bridge_dir=tmp_path,
+            blocked_turn_id=None,
+            server_client=client,
+            harness="claude-native",
+            model="private-model",
+            idle=lambda _: True,
+        ),
+        timeout=2,
+    )
+    await answer_task
+
+    assert selections == ["hello", "hello"]
+    assert len(client.posts) == 1
+    assert client.posts[0][1]["model_override"] == "private-model"
+    assert read_pending_replay(tmp_path) is None
+
+
+async def test_replay_hold_does_not_authorize_delivery_without_a_fresh_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.claude_native import bridge
+
+    _mark(tmp_path)
+    write_pending_replay(
+        tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id=None, model="private-model"
+    )
+    client = _FakeServerClient()
+    attempts = 0
+
+    def select(_bridge: Path, **kwargs: object) -> bridge.ClaudeModelSwitchResult:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise bridge.ClaudeUserPromptPending("Answer the question", nothing_typed=True)
+        return bridge.ClaudeModelSwitchResult("another-model", "other", "other", "other", "native")
+
+    monkeypatch.setattr(bridge, "inject_model_command", select)
+    await asyncio.wait_for(
+        schedule_replay(
+            "conv_1",
+            prompt="hello",
+            bridge_dir=tmp_path,
+            blocked_turn_id=None,
+            server_client=client,
+            harness="claude-native",
+            model="private-model",
+            idle=lambda _: True,
+        ),
+        timeout=2,
+    )
+    assert attempts == 2
+    assert not client.posts
+    assert read_pending_replay(tmp_path) is not None
+
+
+async def test_replay_deduplicates_an_already_scheduled_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    from omnigent.harnesses.claude_native import bridge
+
+    _mark(tmp_path)
+    write_pending_replay(
+        tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id=None, model="private-model"
+    )
+    client = _FakeServerClient()
+    entered = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    attempts = 0
+
+    def select(_bridge: Path, *, model: str, **kwargs: object) -> bridge.ClaudeModelSwitchResult:
+        nonlocal attempts
+        attempts += 1
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(timeout=2)
+        return bridge.ClaudeModelSwitchResult(model, model, model, model, "native-session")
+
+    def replay() -> asyncio.Task[None]:
+        return schedule_replay(
+            "conv_1",
+            prompt="hello",
+            bridge_dir=tmp_path,
+            blocked_turn_id=None,
+            server_client=client,
+            harness="claude-native",
+            model="private-model",
+            idle=lambda _: True,
+        )
+
+    monkeypatch.setattr(bridge, "inject_model_command", select)
+    first = replay()
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    second = replay()
+    release.set()
+    await asyncio.wait_for(asyncio.gather(first, second), timeout=2)
+    assert attempts == 1
+    assert len(client.posts) == 1
+    assert read_pending_replay(tmp_path) is None
+
+
+async def test_replay_hold_keeps_a_replacement_pending_prompt_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.claude_native import bridge
+
+    _mark(tmp_path)
+    write_pending_replay(
+        tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id=None, model="private-model"
+    )
+    client = _FakeServerClient()
+    attempts = 0
+
+    def select(_bridge: Path, **kwargs: object) -> bridge.ClaudeModelSwitchResult:
+        nonlocal attempts
+        attempts += 1
+        write_pending_replay(
+            tmp_path,
+            session_id="conv_1",
+            prompt="replacement",
+            blocked_turn_id=None,
+            model="private-model",
+        )
+        raise bridge.ClaudeUserPromptPending("Answer the question", nothing_typed=True)
+
+    monkeypatch.setattr(bridge, "inject_model_command", select)
+    await asyncio.wait_for(
+        schedule_replay(
+            "conv_1",
+            prompt="hello",
+            bridge_dir=tmp_path,
+            blocked_turn_id=None,
+            server_client=client,
+            harness="claude-native",
+            model="private-model",
+            idle=lambda _: True,
+        ),
+        timeout=2,
+    )
+    assert attempts == 1
+    assert not client.posts
+    pending = read_pending_replay(tmp_path)
+    assert pending is not None and pending.prompt == "replacement"
+
+
+async def test_replay_hold_expires_without_sending_or_discarding_the_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.claude_native import bridge
+
+    _mark(tmp_path)
+    write_pending_replay(
+        tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id=None, model="private-model"
+    )
+    client = _FakeServerClient()
+    attempts = 0
+
+    def select(_bridge: Path, **kwargs: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise bridge.ClaudeUserPromptPending("Answer the question", nothing_typed=True)
+
+    monkeypatch.setattr(bridge, "inject_model_command", select)
+    monkeypatch.setattr(bridge, "CLAUDE_INPUT_HOLD_S", 0)
+    await schedule_replay(
+        "conv_1",
+        prompt="hello",
+        bridge_dir=tmp_path,
+        blocked_turn_id=None,
+        server_client=client,
+        harness="claude-native",
+        model="private-model",
+        idle=lambda _: True,
+    )
+    assert attempts == 1
+    assert not client.posts
+    assert read_pending_replay(tmp_path) is not None
+
+
 async def test_replay_leaves_the_model_alone_for_codex(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
