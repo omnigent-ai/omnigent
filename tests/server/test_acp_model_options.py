@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -749,3 +751,43 @@ async def test_host_model_options_route_preserves_acp_slug() -> None:
     assert resp.status_code == 200, resp.text
     assert proxied == ["acp:antigravity"]
     assert resp.json()["models"] == [{"id": "ag-pro", "displayName": "AG Pro"}]
+
+
+@pytest.mark.asyncio
+async def test_prefetch_acp_model_options_respects_store_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconnect prefetch bounds concurrent store reads via ``store_slots``."""
+    from omnigent.server.routes._sessions import helpers
+
+    store_slots = asyncio.Semaphore(2)
+    in_flight = 0
+    peak = 0
+
+    def slow_resolve(_conv: object, _agent_store: object) -> bool:
+        return False
+
+    async def tracked_to_thread(fn: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        try:
+            await asyncio.sleep(0)
+            return fn(*args, **kwargs)
+        finally:
+            in_flight -= 1
+
+    monkeypatch.setattr(orch, "_resolve_harness_impl_is_acp", slow_resolve)
+    monkeypatch.setattr(helpers.asyncio, "to_thread", tracked_to_thread)
+
+    client = MagicMock()
+    convs = [_conv(id=f"conv_slot_{idx}", agent_id="ag_1") for idx in range(6)]
+    for conv in convs:
+        helpers.prefetch_session_acp_model_options(
+            conv.id, conv, client, agent_store=MagicMock(), store_slots=store_slots
+        )
+
+    tasks = list(helpers._model_options_inflight.values())
+    assert len(tasks) == 6
+    await asyncio.gather(*tasks)
+    assert peak <= 2

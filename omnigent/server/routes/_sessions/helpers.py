@@ -12814,6 +12814,7 @@ async def _prefetch_acp_model_options_task(
     conv: Conversation,
     runner_client: httpx.AsyncClient,
     agent_store: AgentStore | None,
+    store_slots: asyncio.Semaphore | None = None,
 ) -> None:
     """Resolve and publish live ACP model/effort options when a runner binds."""
     from omnigent.server.routes._sessions.orchestration import (
@@ -12821,13 +12822,15 @@ async def _prefetch_acp_model_options_task(
         _resolve_harness_impl_is_acp,
     )
 
-    is_acp = await asyncio.to_thread(_resolve_harness_impl_is_acp, conv, agent_store)
-    if not is_acp:
-        return
-    if session_id not in _model_options_stale and session_id not in _model_options_cache:
-        curated = await _load_acp_model_options(session_id, conv, agent_store)
-        if curated:
+    slot_ctx = store_slots if store_slots is not None else contextlib.nullcontext()
+    async with slot_ctx:
+        is_acp = await asyncio.to_thread(_resolve_harness_impl_is_acp, conv, agent_store)
+        if not is_acp:
             return
+        if session_id not in _model_options_stale and session_id not in _model_options_cache:
+            curated = await _load_acp_model_options(session_id, conv, agent_store)
+            if curated:
+                return
     _acp_dynamic_options_probed.discard(session_id)
     await _load_model_options(
         runner_client,
@@ -12844,6 +12847,7 @@ def prefetch_session_acp_model_options(
     runner_client: httpx.AsyncClient,
     *,
     agent_store: AgentStore | None = None,
+    store_slots: asyncio.Semaphore | None = None,
 ) -> None:
     """Eagerly fetch and publish ACP model/effort options when a runner connects."""
     if conv.archived:
@@ -12866,7 +12870,9 @@ def prefetch_session_acp_model_options(
 
     task = asyncio.create_task(
         _run_catalog_prefetch(
-            _prefetch_acp_model_options_task(session_id, conv, runner_client, agent_store),
+            _prefetch_acp_model_options_task(
+                session_id, conv, runner_client, agent_store, store_slots=store_slots
+            ),
             session_id,
         )
     )

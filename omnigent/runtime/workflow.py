@@ -2022,7 +2022,14 @@ def _build_acp_spawn_env(
             env_passthrough=parse_env_passthrough(embedded.get("env_passthrough")),
         )
     else:
-        agent = resolve_acp_harness_entry(raw_harness or "acp")
+        from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+
+        entry_harness = (
+            raw_harness
+            if raw_harness.startswith("acp:") or raw_harness in ACP_CLI_HARNESSES
+            else "acp"
+        )
+        agent = resolve_acp_harness_entry(entry_harness)
         if raw_harness.startswith("acp:") and agent is None:
             raise OmnigentError(
                 f"ACP agent {slug!r} is not configured on this runner. "
