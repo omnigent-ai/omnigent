@@ -3,6 +3,7 @@
 import os
 import subprocess
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -48,8 +49,30 @@ def test_startup_exit_reports_log_and_reaps_child(tmp_path: Path, monkeypatch: p
     assert len(children) == 1 and children[0].returncode == 23
 
 
-@pytest.mark.parametrize("inherit_env", [True, False])
-@pytest.mark.parametrize("failing_process", ["server", "runner"])
+def test_host_identity_overrides_are_rejected_before_spawn(monkeypatch: pytest.MonkeyPatch):
+    from tests._helpers.server_runner import ServerRunner
+
+    stack = ServerRunner.__new__(ServerRunner)
+    stack.host = None
+    spawn = Mock(side_effect=AssertionError("Host identity overrides must not spawn"))
+    monkeypatch.setattr(stack, "_spawn", spawn)
+    for key in ("OMNIGENT_HOST_ID", "OMNIGENT_HOST_NAME"):
+        for value in ("invalid", None):
+            with pytest.raises(ValueError, match="Host identity is owned"):
+                stack.start_host(env={key: value})
+            assert stack.host is None
+    spawn.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("failing_process", "inherit_env"),
+    [
+        ("server", True),
+        ("runner", True),
+        ("server", False),
+        ("runner", False),
+    ],
+)
 def test_stack_startup_failure_closes_started_processes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing_process: str, inherit_env: bool
 ):
