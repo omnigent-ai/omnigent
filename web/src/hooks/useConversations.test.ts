@@ -4404,6 +4404,34 @@ it("fetches and deduplicates pins across mine and shared scopes", async () => {
   expect(params.every((p) => p.get("limit") === "30" && p.get("pinned") === "true")).toBe(true);
 });
 
+it("shows owned pins on a first load before the shared pins arrive", async () => {
+  const row = (id: string) => ({
+    id,
+    object: "conversation",
+    title: id,
+    created_at: 0,
+    updated_at: 1,
+    labels: { [PINNED_LABEL_KEY]: "1" },
+  });
+  let releaseShared: (response: Response) => void = () => {};
+  fetchMock
+    .mockResolvedValueOnce(mockResponse({ data: [row("mine")] }))
+    .mockReturnValueOnce(new Promise<Response>((resolve) => (releaseShared = resolve)));
+  const queryClient = new QueryClient();
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(QueryClientProvider, { client: queryClient }, children);
+
+  const { result } = renderHook(() => usePinnedConversations(true), { wrapper });
+
+  await waitFor(() =>
+    expect(result.current.data?.conversations.map((c) => c.id)).toEqual(["mine"]),
+  );
+  expect(result.current.data?.partial).toBe(true);
+  releaseShared(mockResponse({ data: [{ ...row("shared"), permission_level: 1 }] }));
+  await waitFor(() => expect(result.current.data?.partial).toBeUndefined());
+  expect(result.current.data?.conversations.map((c) => c.id).sort()).toEqual(["mine", "shared"]);
+});
+
 it.each([29, 30])("counts %s pin units without charging for family context", async (count) => {
   const queryClient = new QueryClient();
   const conversations = Array.from(

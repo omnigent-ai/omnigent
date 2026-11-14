@@ -960,7 +960,9 @@ function SidebarImpl({
   // they follow the user across devices. `usePinnedConversations` is the
   // authoritative pinned set (independent of the paginated window); the toggle
   // mutation flips the label and refreshes that query.
-  const { data: pinnedData, isSuccess: pinnedLoaded } = sidebarData.pinned;
+  const { data: pinnedData, isSuccess: pinnedQuerySucceeded } = sidebarData.pinned;
+  // Owned pins can render before shared pins arrive; the migration waits for the full set.
+  const pinnedLoaded = pinnedQuerySucceeded && !pinnedData?.partial;
   // Stable empty fallback so downstream memos don't re-fire on every render
   // while the query is still loading (`pinnedData` undefined).
   const pinnedFamilyRows = pinnedData?.conversations ?? EMPTY_CONVERSATIONS;

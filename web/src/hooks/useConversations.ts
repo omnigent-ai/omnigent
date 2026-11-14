@@ -1784,6 +1784,8 @@ export interface PinnedConversationsResult {
    */
   filterHonored: boolean;
   filterHonoredByScope?: { mine: boolean; shared?: boolean };
+  /** True while only the viewer's own pins have loaded and shared pins are still in flight. */
+  partial?: boolean;
 }
 
 /**
@@ -1859,14 +1861,10 @@ async function fetchPinnedScope(
   return { conversations, filterHonored };
 }
 
-export async function fetchPinnedConversations(
-  sharedEnabled = true,
-  limit = sidebarConfig.pinCap,
-): Promise<PinnedConversationsResult> {
-  const [mine, shared] = await Promise.all([
-    fetchPinnedScope("mine", limit),
-    sharedEnabled ? fetchPinnedScope("shared", limit) : Promise.resolve(undefined),
-  ]);
+function mergePinnedScopes(
+  mine: PinnedConversationsResult,
+  shared: PinnedConversationsResult | undefined,
+): PinnedConversationsResult {
   const byId = new Map(
     [...mine.conversations, ...(shared?.conversations ?? [])].map((row) => [row.id, row]),
   );
@@ -1885,13 +1883,39 @@ export async function fetchPinnedConversations(
   };
 }
 
+/**
+ * Fetch the viewer's pins across both scopes. The shared scope's query is the
+ * slower of the two, so `onMinePinned` receives the owned pins as soon as they
+ * arrive (marked `partial`) while the shared pins are still loading.
+ */
+export async function fetchPinnedConversations(
+  sharedEnabled = true,
+  limit = sidebarConfig.pinCap,
+  onMinePinned?: (partial: PinnedConversationsResult) => void,
+): Promise<PinnedConversationsResult> {
+  const mineRequest = fetchPinnedScope("mine", limit);
+  const sharedRequest = sharedEnabled ? fetchPinnedScope("shared", limit) : undefined;
+  // Observe a shared failure now so it isn't unhandled while `mine` is awaited.
+  sharedRequest?.catch(() => undefined);
+  const mine = await mineRequest;
+  if (!sharedRequest) return mergePinnedScopes(mine, undefined);
+  onMinePinned?.({ ...mergePinnedScopes(mine, undefined), partial: true });
+  return mergePinnedScopes(mine, await sharedRequest);
+}
+
 /** Server-authoritative list of the viewer's pinned sessions. */
 export function usePinnedConversations(sharedEnabled = true, limit = sidebarConfig.pinCap) {
   const viewerId = useViewerId();
+  const queryClient = useQueryClient();
   const query = useQuery<PinnedConversationsResult>({
     queryKey: PINNED_CONVERSATIONS_KEY,
     retry: retryListFetch,
-    queryFn: () => fetchPinnedConversations(sharedEnabled, limit),
+    queryFn: () =>
+      fetchPinnedConversations(sharedEnabled, limit, (partial) => {
+        // Only a first load shows owned pins early; a refetch keeps the full set until it lands.
+        if (queryClient.getQueryData(PINNED_CONVERSATIONS_KEY) === undefined)
+          queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, partial);
+      }),
     select: (data) =>
       sharedEnabled
         ? data
