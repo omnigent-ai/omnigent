@@ -49,7 +49,7 @@ llms/
   adapters/
     __init__.py            # get_adapter() registry
     base.py                # BaseAdapter ABC
-    openai.py              # OpenAI + OpenAI-compatible (Groq, DeepSeek, xAI, OpenRouter, Ollama)
+    openai.py              # OpenAI + OpenAI-compatible (Groq, DeepSeek, xAI, OpenRouter, Ollama, llama-server)
     anthropic.py           # Anthropic Messages API
     gemini.py              # Gemini generateContent API
     bedrock.py             # AWS Bedrock Converse API
@@ -216,6 +216,7 @@ Chat Completions IS the native format. Minimal translation (add model to payload
 | `xai` | `https://api.x.ai/v1` | `XAI_API_KEY` |
 | `openrouter` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
 | `ollama` | `http://localhost:11434/v1` | (none) |
+| `llama-server` | `http://localhost:8080/v1` | (none) |
 
 HTTP via sync `httpx` (already a project dependency).
 
