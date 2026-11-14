@@ -273,9 +273,11 @@ def _fail_if_path_reads_before_offset(
     monkeypatch.setattr(Path, "open", _open_with_tracking)
 
 
+@pytest.mark.parametrize("malformed_lifecycle", [False, True], ids=["valid", "malformed"])
 def test_prepare_bridge_dir_preserves_token_and_updates_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    malformed_lifecycle: bool,
 ) -> None:
     """
     Bridge setup is stable across wrapper re-runs for one session.
@@ -324,9 +326,13 @@ def test_prepare_bridge_dir_preserves_token_and_updates_runtime(
         pending = json.loads(lifecycle_path.read_text())
         assert pending["incarnation"] == json.loads(first_lifecycle)["incarnation"]
         assert pending["delete_for_session"] == "conv_abc"
+        if malformed_lifecycle:
+            lifecycle_path.write_text("{")
         prepare_bridge_dir("conv_abc", workspace=tmp_path)
         reactivated = lifecycle_path.read_bytes()
-        assert json.loads(reactivated)["incarnation"] == pending["incarnation"]
+        assert (json.loads(reactivated)["incarnation"] == pending["incarnation"]) is (
+            not malformed_lifecycle
+        )
         assert json.loads(reactivated)["admission_epoch"] != pending["admission_epoch"]
         assert "delete_for_session" not in json.loads(reactivated)
         assert json.loads((first / "bridge.json").read_text())["token"] == first_config["token"]
@@ -344,6 +350,103 @@ def test_prepare_bridge_dir_preserves_token_and_updates_runtime(
         json.loads(lifecycle_path.read_text())["incarnation"]
         != json.loads(reactivated)["incarnation"]
     )
+
+
+@pytest.mark.parametrize("switch", ["write_active_session_id", "prepare_bridge_dir"])
+@pytest.mark.parametrize(
+    "state",
+    [
+        "future-schema",
+        "unknown-field",
+        "symlink",
+        "directory",
+        pytest.param(
+            "fifo",
+            marks=pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires POSIX FIFOs"),
+        ),
+        "oversized",
+        "invalid-encoding",
+        "write-failure",
+    ],
+)
+def test_claude_settings_reactivation_preserves_unrecoverable_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, switch: str, state: str
+) -> None:
+    import stat
+
+    bridge_dir = prepare_bridge_dir("conv_old", workspace=tmp_path)
+    lifecycle_path = bridge_dir / ".claude-settings-lifecycle.json"
+    lifecycle = json.loads(lifecycle_path.read_text())
+    if state == "symlink":
+        target = tmp_path / "lifecycle-target"
+        lifecycle_path.rename(target)
+        lifecycle_path.symlink_to(target)
+    elif state in {"directory", "fifo"}:
+        lifecycle_path.unlink()
+        if state == "directory":
+            lifecycle_path.mkdir()
+        else:
+            os.mkfifo(lifecycle_path)
+    elif state == "oversized":
+        lifecycle_path.write_bytes(b" " * (claude_native_bridge._CALLER_SETTINGS_MAX_BYTES + 1))
+    elif state == "invalid-encoding":
+        lifecycle_path.write_bytes(b"\xff")
+    elif state == "write-failure":
+        lifecycle_path.write_text("{")
+        write_json = claude_native_bridge._write_json_file
+
+        def fail_lifecycle_write(path: Path, *args: Any, **kwargs: Any) -> None:
+            if path == lifecycle_path:
+                raise OSError("lifecycle write failed")
+            write_json(path, *args, **kwargs)
+
+        monkeypatch.setattr(claude_native_bridge, "_write_json_file", fail_lifecycle_write)
+    else:
+        if state == "future-schema":
+            lifecycle["schema"] = 3
+        else:
+            lifecycle["unknown"] = {"ownership": "newer-runner"}
+        lifecycle_path.write_text(json.dumps(lifecycle))
+    unknown_claim = bridge_dir / "claude-settings-unknown.terminal-retained.owner"
+    unknown_claim.write_bytes(b"unknown ownership")
+    bridge_inode = bridge_dir.stat().st_ino
+    metadata_info = lifecycle_path.lstat()
+    metadata_bytes = (
+        lifecycle_path.read_bytes()
+        if stat.S_ISREG(metadata_info.st_mode) or stat.S_ISLNK(metadata_info.st_mode)
+        else None
+    )
+    snapshot = {
+        path.name: (path.stat().st_ino, path.read_bytes())
+        for path in bridge_dir.iterdir()
+        if path != lifecycle_path
+    }
+    message = (
+        "compatible Omnigent runner"
+        if state in {"future-schema", "unknown-field"}
+        else "lifecycle write failed"
+        if state == "write-failure"
+        else None
+    )
+    with pytest.raises((OSError, ValueError), match=message):
+        if switch == "write_active_session_id":
+            claude_native_bridge.write_active_session_id(bridge_dir, "conv_new")
+        else:
+            prepare_bridge_dir("conv_new", bridge_id="conv_old", workspace=tmp_path)
+    assert bridge_dir.stat().st_ino == bridge_inode
+    preserved = lifecycle_path.lstat()
+    assert (preserved.st_dev, preserved.st_ino, preserved.st_mode) == (
+        metadata_info.st_dev,
+        metadata_info.st_ino,
+        metadata_info.st_mode,
+    )
+    if metadata_bytes is not None:
+        assert lifecycle_path.read_bytes() == metadata_bytes
+    assert {
+        path.name: (path.stat().st_ino, path.read_bytes())
+        for path in bridge_dir.iterdir()
+        if path != lifecycle_path
+    } == snapshot
 
 
 def test_prepare_bridge_dir_preserves_permission_hook_config(
@@ -18064,9 +18167,17 @@ async def test_late_no_policy_allow_cannot_reopen_window_after_sys_add_policy(
     ["write_active_session_id", "prepare_bridge_dir"],
     ids=["rotation", "re_preparation"],
 )
-@pytest.mark.parametrize("pending_deletion", [False, True], ids=["active", "deleting"])
+@pytest.mark.parametrize(
+    ("pending_deletion", "lifecycle_state"),
+    [(False, "valid"), (True, "valid"), (False, "malformed"), (True, "bad-epoch")],
+    ids=["active", "deleting", "malformed", "bad-epoch-deleting"],
+)
 def test_active_session_switch_closes_allow_window(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, switch: str, pending_deletion: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    switch: str,
+    pending_deletion: bool,
+    lifecycle_state: str,
 ) -> None:
     """Every path that changes the bridge's session closes its window.
 
@@ -18076,6 +18187,7 @@ def test_active_session_switch_closes_allow_window(
     from omnigent.harnesses.claude_native.settings_generation import (
         ClaudeSettingsRequest,
         acquire_claude_settings_request,
+        has_live_claude_settings_owners,
         request_claude_bridge_deletion,
     )
 
@@ -18098,6 +18210,15 @@ def test_active_session_switch_closes_allow_window(
         owners.callback(retained.close)
         retained_fd = retained._fd
         assert retained_fd is not None
+        request.mark_dispatched()
+        unknown_claim = bridge_dir / "claude-settings-unknown.terminal-retained.owner"
+        unknown_claim.write_bytes(b"unknown ownership")
+        owned = {
+            path.name: (path.stat().st_ino, path.read_bytes())
+            for path in bridge_dir.glob("claude-settings-*")
+        }
+        bridge_inode = bridge_dir.stat().st_ino
+        token = json.loads((bridge_dir / "bridge.json").read_text())["token"]
         baseline = request.settings_path(bridge_dir)
         baseline_bytes = baseline.read_bytes()
         lifecycle_path = bridge_dir / ".claude-settings-lifecycle.json"
@@ -18106,6 +18227,12 @@ def test_active_session_switch_closes_allow_window(
         pending = lifecycle_path.read_bytes()
         claude_native_bridge.write_active_session_id(bridge_dir, "conv_old")
         assert lifecycle_path.read_bytes() == pending
+        if lifecycle_state == "malformed":
+            lifecycle_path.write_text("{")
+        elif lifecycle_state == "bad-epoch":
+            damaged = json.loads(pending)
+            damaged["admission_epoch"] = "invalid"
+            lifecycle_path.write_text(json.dumps(damaged))
 
         if switch == "write_active_session_id":
             claude_native_bridge.write_active_session_id(bridge_dir, "conv_new")
@@ -18115,7 +18242,29 @@ def test_active_session_switch_closes_allow_window(
         assert policy_allow_cache._read_state(bridge_dir)[0] == 0
         rotated = lifecycle_path.read_bytes()
         assert json.loads(rotated)["incarnation"] != json.loads(pending)["incarnation"]
+        assert json.loads(rotated)["admission_epoch"] != json.loads(pending)["admission_epoch"]
         assert "delete_for_session" not in json.loads(rotated)
+        assert bridge_dir.stat().st_ino == bridge_inode
+        assert json.loads((bridge_dir / "bridge.json").read_text())["token"] == token
+        with pytest.raises(ValueError, match="expired"):
+            acquire_claude_settings_request(bridge_dir, request.generation)
+        with pytest.raises(ValueError, match="expired"):
+            request.mark_dispatched()
+        with pytest.raises(ValueError, match="expired"):
+            retained.attach(SimpleNamespace(add_resource_cleanup=callbacks.append))
+        assert request.acknowledge(request.generation)
+        assert {
+            path.name: (path.stat().st_ino, path.read_bytes())
+            for path in bridge_dir.glob("claude-settings-*")
+        } == owned
+        with ClaudeSettingsRequest.create(bridge_dir) as current:
+            augment_claude_args(
+                (), bridge_dir=bridge_dir, defer_caller_settings=True, settings_request=current
+            )
+            current.mark_dispatched()
+            with acquire_claude_settings_request(bridge_dir, current.generation):
+                pass
+            assert current.acknowledge(current.generation)
         claude_native_bridge.write_active_session_id(bridge_dir, "conv_old")
         returned = lifecycle_path.read_bytes()
         assert json.loads(returned)["incarnation"] != json.loads(pending)["incarnation"]
@@ -18136,6 +18285,10 @@ def test_active_session_switch_closes_allow_window(
     assert baseline.read_bytes() == baseline_bytes
     assert lifecycle_path.read_bytes() == returned
     assert (bridge_dir / "bridge.json").exists()
+    assert has_live_claude_settings_owners(bridge_dir)
+    request_claude_bridge_deletion(bridge_dir, "conv_old")
+    assert bridge_dir.exists()
+    assert unknown_claim.read_bytes() == b"unknown ownership"
 
 
 @pytest.mark.asyncio

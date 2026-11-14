@@ -357,11 +357,18 @@ without copying credential-bearing settings. File age, runner-PID death and free
 locks do not establish reclaimability. If consumer completion cannot be proved,
 retain the files and escalate to the host maintainer.
 
-Unknown claims and malformed, unknown-version or future lifecycle metadata
-remain unresolved recovery cases; do not unlink claims or reset metadata to
-bypass them. Disk lifecycle schema 2 is distinct from the advertised ownership
-wire protocol 1. Wire-v2 reconciliation, rollout and mixed-version recovery
-remain open work rather than guarantees of this cleanup protocol.
+Explicit bridge preparation and session rotation replace malformed lifecycle
+JSON or damaged supported-schema fields with a fresh admission identity. They
+retain settings files, locks and ownership claims, so existing terminals keep
+their inputs and stale launches must rebuild their requests. This recovery
+assumes the sender and receiver use a coordinated release; it does not reconcile
+legacy or unknown claims.
+
+Future schemas, unknown fields and files that cannot be read safely remain
+blocked. Use a compatible runner; do not unlink claims or reset metadata to
+bypass the block. Disk lifecycle schema 2 is distinct from the advertised
+ownership wire protocol 1. Wire-v2 reconciliation, rollout and mixed-version
+recovery remain open work rather than guarantees of this cleanup protocol.
 
 </details>
 

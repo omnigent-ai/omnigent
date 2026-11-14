@@ -40,6 +40,13 @@ class ClaudeSettingsRequestExpired(ValueError):
         super().__init__("Claude settings request has expired; rebuild the terminal request")
 
 
+class _ClaudeSettingsLifecycleFormatError(ValueError):
+    """Readable lifecycle data is damaged without a known incompatible format."""
+
+    def __init__(self) -> None:
+        super().__init__("Claude settings lifecycle metadata is invalid")
+
+
 @dataclass(frozen=True)
 class _ClaudeSettingsLifecycle:
     incarnation: str
@@ -57,20 +64,28 @@ def _read_lifecycle(bridge_dir: Path) -> _ClaudeSettingsLifecycle | None:
     from omnigent.harnesses.claude_native.bridge import _read_caller_settings
 
     try:
-        payload = json.loads(_read_caller_settings(bridge_dir / _LIFECYCLE_FILE, nofollow=True))
+        raw = _read_caller_settings(bridge_dir / _LIFECYCLE_FILE, nofollow=True)
     except FileNotFoundError:
         return None
-    except ValueError as exc:
-        raise ValueError("Claude settings lifecycle metadata is invalid") from exc
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise _ClaudeSettingsLifecycleFormatError() from exc
     if not isinstance(payload, dict):
-        raise ValueError("Claude settings lifecycle metadata is invalid")
+        raise _ClaudeSettingsLifecycleFormatError()
     fields = {"schema", "incarnation", "delete_for_session"}
     if payload.get("schema") == 2:
         fields |= {"admission_epoch", "session_id", "bridge_identity"}
+    if set(payload) - fields or (
+        type(payload.get("schema")) is int and payload["schema"] not in {1, 2}
+    ):
+        raise ValueError(
+            "Claude settings lifecycle metadata requires a compatible Omnigent runner. "
+            "Use the runner version that created it, or stop all related runners and "
+            "terminals before manual recovery."
+        )
     if (
-        set(payload) - fields
-        or type(payload.get("schema")) is not int
-        or payload["schema"] not in {1, 2}
+        type(payload.get("schema")) is not int
         or not isinstance(payload.get("incarnation"), str)
         or not _GENERATION.fullmatch(payload["incarnation"])
         or (
@@ -81,7 +96,7 @@ def _read_lifecycle(bridge_dir: Path) -> _ClaudeSettingsLifecycle | None:
             )
         )
     ):
-        raise ValueError("Claude settings lifecycle metadata is invalid")
+        raise _ClaudeSettingsLifecycleFormatError()
     if payload["schema"] == 1:
         # Legacy request locks bind directly to the ownership incarnation.
         return _ClaudeSettingsLifecycle(payload["incarnation"], payload.get("delete_for_session"))
@@ -99,7 +114,7 @@ def _read_lifecycle(bridge_dir: Path) -> _ClaudeSettingsLifecycle | None:
         or any(type(value) is not int or value < 0 for value in identity)
         or identity[1] == 0
     ):
-        raise ValueError("Claude settings lifecycle metadata is invalid")
+        raise _ClaudeSettingsLifecycleFormatError()
     return _ClaudeSettingsLifecycle(
         payload["incarnation"],
         payload.get("delete_for_session"),
@@ -159,7 +174,13 @@ def prepare_claude_settings_lifecycle(
     bridge_dir: Path, *, reactivate: bool = False, session_id: str | None = None
 ) -> str:
     """Keep verified same-session owners while a new epoch expires old admissions."""
-    lifecycle = _read_lifecycle(bridge_dir)
+    try:
+        lifecycle = _read_lifecycle(bridge_dir)
+    except _ClaudeSettingsLifecycleFormatError:
+        if not reactivate:
+            raise
+        # Fresh metadata fences admissions without removing any ownership files.
+        lifecycle = None
     identity = _directory_identity(bridge_dir)
     same_session = (
         lifecycle is not None
