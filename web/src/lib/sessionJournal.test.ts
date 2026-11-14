@@ -5,6 +5,7 @@ import {
   failedUpstream,
   finishedTaskCount,
   isRestart,
+  latestStatusText,
   linkedToPrevious,
   mergeJournalEntries,
   nativeTaskProgress,
@@ -41,6 +42,30 @@ describe("mergeJournalEntries", () => {
     );
     expect(merged.map((entry) => entry.position)).toEqual([0, 1, 2]);
     expect(merged[2].payload.body).toBe("newer copy");
+  });
+});
+
+describe("latestStatusText", () => {
+  it("is the words of the status written last, whichever step it is on", () => {
+    const entries = [
+      status(4, "explore", "done", { payload: { status: "done", text: "Found it" } }),
+      status(9, "fix", "failed", { payload: { status: "failed", text: "CI is down" } }),
+      status(6, "test", "done", { payload: { status: "done", text: "Tests pass" } }),
+    ];
+    expect(latestStatusText(entries)).toEqual({ status: "failed", text: "CI is down" });
+  });
+
+  it("skips a status with no words, such as started, and anything that isn't a status", () => {
+    const entries = [
+      status(2, "explore", "done", { payload: { status: "done", text: " Found it " } }),
+      status(5, "fix", "started", { payload: { status: "started", text: null } }),
+      status(7, "test", "done", { payload: { status: "done", text: "  " } }),
+      journalEntry(8, { kind: "note", payload: { body: "A note" } }),
+      status(9, "ship", "done", { payload: { status: "paused", text: "Unknown status" } }),
+    ];
+    expect(latestStatusText(entries)).toEqual({ status: "done", text: "Found it" });
+    expect(latestStatusText([entries[1]!, entries[3]!])).toBeNull();
+    expect(latestStatusText([])).toBeNull();
   });
 });
 

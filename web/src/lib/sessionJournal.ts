@@ -16,6 +16,34 @@ const STEP_STATUSES: readonly string[] = ["started", "done", "needs_input", "fai
 /** What a task waiting for the user says, in pink: the sidebar's Needs response color. */
 export const WAITING_FOR_YOU = "Waiting for you";
 
+/** What an agent last wrote about its work: a step's status and the few words it gave. */
+export interface StatusText {
+  status: StepStatus;
+  text: string;
+}
+
+/**
+ * The newest status text among *statuses*: the words the agent gave for the
+ * status it wrote last, e.g. "Opened 2 PRs". A status without text, such as
+ * `started`, doesn't count. `null` when no status has any.
+ *
+ * @param statuses - Status entries, e.g. each step's newest from a run's plan.
+ */
+export function latestStatusText(statuses: readonly JournalEntry[]): StatusText | null {
+  let newest: JournalEntry | null = null;
+  let found: StatusText | null = null;
+  for (const entry of statuses) {
+    const status = statusOf(entry);
+    const text = textOf(entry)?.trim();
+    if (entry.kind !== "status" || !status || !text) continue;
+    if (newest === null || entry.position > newest.position) {
+      newest = entry;
+      found = { status, text };
+    }
+  }
+  return found;
+}
+
 /** One plan step, as a plan entry's payload lists it. */
 export interface JournalPlanStep {
   id: string;
