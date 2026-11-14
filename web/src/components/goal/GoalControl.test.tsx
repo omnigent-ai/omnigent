@@ -48,6 +48,7 @@ function renderControl(conversationId: string | null = "conv") {
         conversationId={conversationId}
         readOnly={false}
         goal={GOAL}
+        goalRevision={1}
         onGoalChange={vi.fn()}
         refreshGoal={vi.fn().mockResolvedValue(undefined)}
       />

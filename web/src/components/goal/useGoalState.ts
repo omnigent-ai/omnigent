@@ -5,6 +5,7 @@ const GOAL_POLL_INTERVAL_MS = 5_000;
 
 interface UseGoalStateResult {
   goal: Goal | null;
+  goalRevision: number;
   setGoal: (goal: Goal | null) => void;
   refreshGoal: () => Promise<void>;
 }
@@ -15,9 +16,11 @@ interface GoalBinding {
 
 /** Keep Chat's goal indicator current when commands or the native terminal change it. */
 export function useGoalState(conversationId: string | null, enabled: boolean): UseGoalStateResult {
-  const [snapshot, setSnapshot] = useState<{ binding: GoalBinding; goal: Goal | null } | null>(
-    null,
-  );
+  const [snapshot, setSnapshot] = useState<{
+    binding: GoalBinding;
+    goal: Goal | null;
+    revision: number;
+  } | null>(null);
   const updateVersion = useRef(0);
   const lastSuccessfulVersion = useRef(0);
   const activeBinding = useRef<GoalBinding | null>(null);
@@ -37,9 +40,11 @@ export function useGoalState(conversationId: string | null, enabled: boolean): U
   const setGoal = useCallback(
     (goal: Goal | null) => {
       if (!binding || activeBinding.current !== binding) return;
-      updateVersion.current += 1;
-      lastSuccessfulVersion.current = updateVersion.current;
-      setSnapshot((current) => (activeBinding.current === binding ? { binding, goal } : current));
+      const version = ++updateVersion.current;
+      lastSuccessfulVersion.current = version;
+      setSnapshot((current) =>
+        activeBinding.current === binding ? { binding, goal, revision: version } : current,
+      );
     },
     [binding],
   );
@@ -53,7 +58,9 @@ export function useGoalState(conversationId: string | null, enabled: boolean): U
       const response = await getGoal(binding.conversationId);
       if (isCurrent()) {
         lastSuccessfulVersion.current = version;
-        setSnapshot((current) => (isCurrent() ? { binding, goal: response.goal } : current));
+        setSnapshot((current) =>
+          isCurrent() ? { binding, goal: response.goal, revision: version } : current,
+        );
       }
     } catch (error) {
       if (activeBinding.current === binding && lastSuccessfulVersion.current < version) throw error;
@@ -91,11 +98,11 @@ export function useGoalState(conversationId: string | null, enabled: boolean): U
     };
   }, [conversationId, enabled, refreshGoal]);
 
-  const goal =
-    enabled &&
-    snapshot?.binding === activeBinding.current &&
-    snapshot?.binding.conversationId === conversationId
-      ? snapshot.goal
-      : null;
-  return { goal, setGoal, refreshGoal };
+  const currentSnapshot = binding !== null && snapshot?.binding === binding ? snapshot : null;
+  return {
+    goal: currentSnapshot?.goal ?? null,
+    goalRevision: currentSnapshot?.revision ?? 0,
+    setGoal,
+    refreshGoal,
+  };
 }

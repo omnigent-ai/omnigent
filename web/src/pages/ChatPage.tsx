@@ -2956,6 +2956,7 @@ function ComposerImpl(
   useEffect(() => setGoalDialogOpen(false), [conversationId]);
   const {
     goal,
+    goalRevision,
     setGoal: setGoalState,
     refreshGoal,
   } = useGoalState(composerSessionId, showGoalControl && runnerOnline === true);
@@ -4984,6 +4985,7 @@ function ComposerImpl(
           conversationId={composerSessionId}
           readOnly={isReadOnly}
           goal={goal}
+          goalRevision={goalRevision}
           onGoalChange={setGoalState}
           refreshGoal={refreshGoal}
         />

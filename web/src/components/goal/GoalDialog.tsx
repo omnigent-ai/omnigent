@@ -34,6 +34,7 @@ export interface GoalDialogProps {
   conversationId: string | null;
   readOnly: boolean;
   goal: Goal | null;
+  goalRevision: number;
   onGoalChange: (goal: Goal | null) => void;
   refreshGoal: () => Promise<void>;
 }
@@ -375,11 +376,12 @@ function useGoalDialogState({
   open,
   conversationId,
   goal,
+  goalRevision,
   onGoalChange,
   refreshGoal,
 }: Pick<
   GoalDialogProps,
-  "open" | "conversationId" | "goal" | "onGoalChange" | "refreshGoal"
+  "open" | "conversationId" | "goal" | "goalRevision" | "onGoalChange" | "refreshGoal"
 >): GoalDialogState {
   const [objective, setObjective] = useState(goal?.objective ?? "");
   const [tokenBudget, setTokenBudget] = useState(goal?.tokenBudget?.toString() ?? "");
@@ -388,7 +390,8 @@ function useGoalDialogState({
   const [saving, setSaving] = useState(false);
   const [clearing, setClearing] = useState(false);
   const [statusUpdating, setStatusUpdating] = useState<GoalStatusUpdate | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [readError, setReadError] = useState<string | null>(null);
+  const [operationError, setOperationError] = useState<string | null>(null);
   const draftSession = useRef<string | null | undefined>(undefined);
   const dirtyFields = useRef(new Set<"objective" | "tokenBudget" | "mode">());
   const dialogBinding = useRef<object | null>(null);
@@ -400,11 +403,16 @@ function useGoalDialogState({
     setSaving(false);
     setClearing(false);
     setStatusUpdating(null);
-    setError(null);
+    setReadError(null);
+    setOperationError(null);
     return () => {
       dialogBinding.current = null;
     };
   }, [conversationId, open, refreshGoal]);
+
+  useEffect(() => {
+    setReadError(null);
+  }, [goalRevision]);
 
   useEffect(() => {
     if (!open) {
@@ -428,12 +436,12 @@ function useGoalDialogState({
     let cancelled = false;
     const refresh = async () => {
       setLoading(true);
-      setError(null);
+      setReadError(null);
       try {
         await refreshGoal();
       } catch (err) {
         if (!cancelled && dialogBinding.current === binding) {
-          setError(goalError("Could not read goal", err));
+          setReadError(goalError("Could not read goal", err));
         }
       } finally {
         if (!cancelled && dialogBinding.current === binding) setLoading(false);
@@ -445,20 +453,30 @@ function useGoalDialogState({
     };
   }, [conversationId, refreshGoal, open]);
 
+  const canApplyMutationResult = (binding: object) => {
+    if (dialogBinding.current === binding) return true;
+    // Re-read current state instead of applying a closed dialog's response.
+    void refreshGoal().catch(() => {});
+    return false;
+  };
+
   const setObjectiveDraft = (value: string) => {
     dirtyFields.current.add("objective");
     setObjective(value);
-    if (error !== null) setError(null);
+    setReadError(null);
+    setOperationError(null);
   };
   const setTokenBudgetDraft = (value: string) => {
     dirtyFields.current.add("tokenBudget");
     setTokenBudget(value);
-    if (error !== null) setError(null);
+    setReadError(null);
+    setOperationError(null);
   };
   const setModeDraft = (value: GoalModeDraft) => {
     dirtyFields.current.add("mode");
     setModeDraftState(value);
-    if (error !== null) setError(null);
+    setReadError(null);
+    setOperationError(null);
   };
 
   const saveGoal = async () => {
@@ -466,32 +484,34 @@ function useGoalDialogState({
     if (!conversationId || !binding) return;
     const trimmedObjective = objective.trim();
     if (!trimmedObjective) {
-      setError("Goal objective cannot be empty.");
+      setOperationError("Goal objective cannot be empty.");
       return;
     }
     let parsedBudget: number | null;
     try {
       parsedBudget = parseGoalBudget(tokenBudget);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setOperationError(err instanceof Error ? err.message : String(err));
       return;
     }
     setSaving(true);
-    setError(null);
+    setReadError(null);
+    setOperationError(null);
     try {
       const response = await setGoal(conversationId, {
         objective: trimmedObjective,
         tokenBudget: parsedBudget,
         status: modeDraft === "keep" ? undefined : modeDraft,
       });
-      if (dialogBinding.current !== binding) return;
+      if (!canApplyMutationResult(binding)) return;
       dirtyFields.current.clear();
       onGoalChange(response.goal);
       setObjective(response.goal?.objective ?? trimmedObjective);
       setTokenBudget(response.goal?.tokenBudget?.toString() ?? tokenBudget.trim());
       setModeDraftState(goalModeDraftForGoal(response.goal));
     } catch (err) {
-      if (dialogBinding.current === binding) setError(goalError("Could not set goal", err));
+      if (dialogBinding.current === binding)
+        setOperationError(goalError("Could not set goal", err));
     } finally {
       if (dialogBinding.current === binding) setSaving(false);
     }
@@ -501,17 +521,19 @@ function useGoalDialogState({
     const binding = dialogBinding.current;
     if (!conversationId || !binding) return;
     setClearing(true);
-    setError(null);
+    setReadError(null);
+    setOperationError(null);
     try {
       await clearGoal(conversationId);
-      if (dialogBinding.current !== binding) return;
+      if (!canApplyMutationResult(binding)) return;
       dirtyFields.current.clear();
       onGoalChange(null);
       setObjective("");
       setTokenBudget("");
       setModeDraftState("active");
     } catch (err) {
-      if (dialogBinding.current === binding) setError(goalError("Could not clear goal", err));
+      if (dialogBinding.current === binding)
+        setOperationError(goalError("Could not clear goal", err));
     } finally {
       if (dialogBinding.current === binding) setClearing(false);
     }
@@ -521,10 +543,11 @@ function useGoalDialogState({
     const binding = dialogBinding.current;
     if (!conversationId || !binding) return;
     setStatusUpdating(status);
-    setError(null);
+    setReadError(null);
+    setOperationError(null);
     try {
       const response = await updateGoalStatus(conversationId, status);
-      if (dialogBinding.current !== binding) return;
+      if (!canApplyMutationResult(binding)) return;
       dirtyFields.current.clear();
       onGoalChange(response.goal);
       setObjective(response.goal?.objective ?? "");
@@ -532,7 +555,8 @@ function useGoalDialogState({
       setModeDraftState(goalModeDraftForGoal(response.goal));
     } catch (err) {
       const action = status === "paused" ? "pause" : "resume";
-      if (dialogBinding.current === binding) setError(goalError(`Could not ${action} goal`, err));
+      if (dialogBinding.current === binding)
+        setOperationError(goalError(`Could not ${action} goal`, err));
     } finally {
       if (dialogBinding.current === binding) setStatusUpdating(null);
     }
@@ -546,7 +570,7 @@ function useGoalDialogState({
     saving,
     clearing,
     statusUpdating,
-    error,
+    error: operationError ?? readError,
     setObjectiveDraft,
     setTokenBudgetDraft,
     setModeDraft,
@@ -566,6 +590,7 @@ function useGoalDialogState({
  * @param props.conversationId - Active session id, e.g. ``"conv_abc123"``.
  * @param props.readOnly - ``true`` when write actions must be disabled.
  * @param props.goal - Current goal state, or ``null`` when none is set.
+ * @param props.goalRevision - Local revision of the latest accepted goal snapshot.
  * @param props.onGoalChange - Called after successful set, clear, or status updates.
  * @param props.refreshGoal - Refresh through the owner of the current goal snapshot.
  * @returns Goal dialog.
@@ -576,6 +601,7 @@ export function GoalDialog({
   conversationId,
   readOnly,
   goal,
+  goalRevision,
   onGoalChange,
   refreshGoal,
 }: GoalDialogProps) {
@@ -583,6 +609,7 @@ export function GoalDialog({
     open,
     conversationId,
     goal,
+    goalRevision,
     onGoalChange,
     refreshGoal,
   });
@@ -602,7 +629,7 @@ export function GoalDialog({
           </DialogTitle>
         </DialogHeader>
 
-        <div className="min-h-0 space-y-3 overflow-y-auto">
+        <div className="-m-1 min-h-0 space-y-3 overflow-y-auto p-1">
           <GoalSummary loading={loading} goal={goal} />
           <GoalEditor
             objective={state.objective}
