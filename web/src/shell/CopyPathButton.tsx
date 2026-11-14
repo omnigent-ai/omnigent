@@ -23,6 +23,8 @@ interface CopyPathButtonProps {
    * Tailwind ``group`` class. Omit for always-visible placements (the header).
    */
   revealOnHover?: boolean;
+  /** Tooltip placement for constrained surfaces such as the Info dialog. */
+  tooltipSide?: "top" | "right" | "bottom" | "left";
 }
 
 /**
@@ -41,6 +43,7 @@ export function CopyPathButton({
   path,
   label = "Copy path",
   revealOnHover = false,
+  tooltipSide = "bottom",
 }: CopyPathButtonProps) {
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState(false);
@@ -88,6 +91,7 @@ export function CopyPathButton({
           aria-label={`${label}: ${filename}`}
           className={cn(
             "transition-opacity",
+            revealOnHover && "pointer-coarse:pointer-events-none",
             copyError
               ? "text-destructive opacity-100"
               : copied
@@ -105,7 +109,7 @@ export function CopyPathButton({
           {copied ? <CheckIcon /> : <CopyIcon />}
         </Button>
       </TooltipTrigger>
-      <TooltipContent side="bottom">
+      <TooltipContent side={tooltipSide}>
         {copyError ? "Copy failed" : copied ? "Copied" : label}
       </TooltipContent>
     </Tooltip>
