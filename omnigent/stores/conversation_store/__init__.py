@@ -84,6 +84,10 @@ FORK_CARRY_HISTORY_LABEL_KEY = "omnigent.fork.carry_history"
 # normal approval/sandbox stance.
 CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 
+# Per-session Copilot SDK permission stance (``"default"`` / ``"bypassPermissions"``)
+# stamped on sessions launched by automations or explicit session-create picks.
+COPILOT_PERMISSION_MODE_LABEL_KEY = "omnigent.copilot.permission_mode"
+
 # Codex collaboration mode of a codex-native session (``"plan"`` / ``"default"``),
 # persisted by the in-session Plan toggle or seeded by the New Session screen.
 CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY = "omnigent.codex_native.collaboration_mode"
@@ -228,6 +232,7 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
         "omnigent.last_context_window",
         "omnigent.startup",
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+        COPILOT_PERMISSION_MODE_LABEL_KEY,
     }
 )
 

@@ -281,6 +281,9 @@ from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY as _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
 )
 from omnigent.stores.conversation_store import (
+    COPILOT_PERMISSION_MODE_LABEL_KEY as _COPILOT_PERMISSION_MODE_LABEL_KEY,
+)
+from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
@@ -3618,6 +3621,7 @@ def register_core_routes(
             or body.permission_mode is not None
             or body.approval_mode is not None
             or _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY in (body.labels or {})
+            or _COPILOT_PERMISSION_MODE_LABEL_KEY in (body.labels or {})
         )
         set_share_workspace = "share_workspace_files" in body.model_fields_set
         pin_only = body.model_fields_set == {"labels"} and set(body.labels or {}) == {
@@ -5099,6 +5103,7 @@ def register_core_routes(
             dropped_label_keys_set |= {
                 _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
                 _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+                _COPILOT_PERMISSION_MODE_LABEL_KEY,
             }
         # The claude-native permission-mode label is Claude-specific; on an
         # agent switch (which already drops the source's launch args) it would
@@ -5108,6 +5113,7 @@ def register_core_routes(
             from omnigent.mcp_selection import MCP_SELECTION_PREFIX
 
             dropped_label_keys_set.add(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+            dropped_label_keys_set.add(_COPILOT_PERMISSION_MODE_LABEL_KEY)
             dropped_label_keys_set.update(
                 key for key in source.labels if key.startswith(MCP_SELECTION_PREFIX)
             )

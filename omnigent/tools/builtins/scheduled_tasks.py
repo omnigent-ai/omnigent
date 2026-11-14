@@ -118,12 +118,13 @@ class SysScheduledTaskCreateTool(Tool):
                         "permission_mode": {
                             "type": ["string", "null"],
                             "description": (
-                                "Optional permission mode for native coding agents that "
+                                "Optional permission mode for harnesses that "
                                 "support one. Use the selected harness's vocabulary: "
                                 "Claude Code (e.g. 'acceptEdits'), Codex ('default', "
                                 "'ask-for-approval', 'approve-for-me', 'read-only'), "
                                 "Cursor (e.g. 'auto-review'), "
-                                "Antigravity ('default', 'skip'), or Devin (e.g. 'smart'). "
+                                "Antigravity ('default', 'skip'), Devin (e.g. 'smart'), "
+                                "or Copilot ('default', 'bypassPermissions'). "
                                 "Other harnesses, such as claude-sdk, have no automation "
                                 "permission modes. "
                                 "Runs are unattended, so a prompting mode ('default'/'plan') "
@@ -319,7 +320,8 @@ class SysScheduledTaskUpdateTool(Tool):
                                 "New permission mode using the selected harness's vocabulary: "
                                 "Claude Code (e.g. 'acceptEdits'), Codex (e.g. 'read-only'), "
                                 "Cursor (e.g. 'auto-review'), Antigravity ('default', 'skip'), "
-                                "or Devin (e.g. 'smart'). Other harnesses, such as "
+                                "Devin (e.g. 'smart'), or Copilot ('default', "
+                                "'bypassPermissions'). Other harnesses, such as "
                                 "claude-sdk, have no automation permission modes. Send JSON "
                                 "null (not the string 'null') for the agent default, and "
                                 "always for a harness without modes. Required for approval "

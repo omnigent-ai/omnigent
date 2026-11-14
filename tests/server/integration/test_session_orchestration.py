@@ -19,6 +19,7 @@ from omnigent.server.feature_flags import (
 from omnigent.server.sharing_settings import write_peer_session_messaging_override
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+    COPILOT_PERMISSION_MODE_LABEL_KEY,
     CREATED_BY_SESSION_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
@@ -540,6 +541,7 @@ async def test_scheduled_origin_allows_new_controls_children_and_reads(
     for labels in (
         {SCHEDULED_TASK_ORIGIN_LABEL_KEY: ""},
         {SCHEDULED_TASK_ORIGIN_LABEL_KEY: "other"},
+        {COPILOT_PERMISSION_MODE_LABEL_KEY: "bypassPermissions"},
     ):
         response = await auth_client.patch(f"/v1/sessions/{scheduled_id}", json={"labels": labels})
         assert response.status_code == 400, response.text
@@ -748,6 +750,86 @@ async def test_requested_permission_mode_wins_over_the_automation_mode(
     worker = conversations.get_conversation(result["conversation_id"])
     assert worker.terminal_launch_args == launch_args
     assert CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY not in worker.labels
+
+
+async def test_copilot_automation_worker_inherits_mode_and_fork_drops_it(
+    auth_client, auth_app, peers, db_uri, monkeypatch
+):
+    from omnigent.server.routes.sessions import routes_core
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+    from tests._helpers.session import post_session_bundle
+    from tests.server.helpers import build_agent_bundle
+
+    source, _target, _captured = peers
+    uploaded = await post_session_bundle(
+        auth_client.post,
+        "/v1/sessions",
+        build_agent_bundle("copilot-worker", executor={"config": {"harness": "copilot"}}),
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    copilot_agent_id = uploaded.json()["agent_id"]
+
+    schedules = SqlAlchemyScheduledTaskStore(db_uri)
+    task = schedules.create(
+        scheduled_task_id=uuid4().hex,
+        name="Copilot watcher",
+        prompt="Start a Copilot worker",
+        rrule="FREQ=HOURLY",
+        user_id="alice",
+        agent_id=copilot_agent_id,
+        timezone="UTC",
+        execution_target="managed_sandbox",
+        permission_mode="bypassPermissions",
+    )
+    monkeypatch.setattr(auth_app.state, "scheduled_task_store", schedules)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conversations.set_labels(source["id"], {SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id})
+    schedules.create_run(
+        uuid4().hex, task.id, "running", scheduled_at=1, conversation_id=source["id"], fired_at=1
+    )
+
+    async def launch(**kwargs):
+        pass
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    inherited = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": copilot_agent_id, "placement": "managed"}),
+            server_client=auth_client,
+            conversation_id=source["id"],
+        )
+    )
+    assert inherited.get("conversation_id"), inherited
+    inherited_conv = conversations.get_conversation(inherited["conversation_id"])
+    assert inherited_conv.labels.get(COPILOT_PERMISSION_MODE_LABEL_KEY) == "bypassPermissions"
+
+    # An explicit gated request ("default") overrides the automation's bypassPermissions.
+    explicit_default = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {
+                    "agent_id": copilot_agent_id,
+                    "placement": "managed",
+                    "permission_mode": "default",
+                }
+            ),
+            server_client=auth_client,
+            conversation_id=source["id"],
+        )
+    )
+    assert explicit_default.get("conversation_id"), explicit_default
+    default_conv = conversations.get_conversation(explicit_default["conversation_id"])
+    assert default_conv.labels.get(COPILOT_PERMISSION_MODE_LABEL_KEY) == "default"
+
+    # Forking a bypass-labeled Copilot session never carries the permission-mode label over.
+    fork_resp = await auth_client.post(
+        f"/v1/sessions/{inherited['conversation_id']}/fork", json={}
+    )
+    assert fork_resp.status_code == 201, fork_resp.text
+    fork_conv = conversations.get_conversation(fork_resp.json()["id"])
+    assert COPILOT_PERMISSION_MODE_LABEL_KEY not in fork_conv.labels
 
 
 async def test_worker_started_before_a_legacy_run_is_recorded_uses_the_automation_mode(

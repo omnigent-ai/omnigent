@@ -11247,6 +11247,7 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
         )
     from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
     from omnigent.stores.conversation_store import (
+        COPILOT_PERMISSION_MODE_LABEL_KEY,
         CREATED_BY_SESSION_LABEL_KEY,
         FAMILY_PIN_LABEL_PREFIX,
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
@@ -11263,6 +11264,7 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
         SCHEDULED_TASK_SOURCE_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
         CREATED_BY_SESSION_LABEL_KEY,
+        COPILOT_PERMISSION_MODE_LABEL_KEY,
     ):
         if key in labels:
             raise OmnigentError(

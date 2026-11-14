@@ -146,6 +146,7 @@ from omnigent.server.schemas import SessionEventInput
 from omnigent.server.session_mcp_selection import SessionMcpSelection, session_mcp_selection
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+    COPILOT_PERMISSION_MODE_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
@@ -1148,6 +1149,9 @@ def session_approval_skipping_mode(conv: Conversation) -> str | None:
     claude_mode = conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
     if claude_mode:
         return claude_mode if claude_mode in APPROVAL_SKIPPING_PERMISSION_MODES else None
+    copilot_mode = conv.labels.get(COPILOT_PERMISSION_MODE_LABEL_KEY)
+    if copilot_mode:
+        return copilot_mode if copilot_mode in APPROVAL_SKIPPING_PERMISSION_MODES else None
     if conv.labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1":
         return "bypass"
     launch_args = list(getattr(conv, "terminal_launch_args", None) or [])

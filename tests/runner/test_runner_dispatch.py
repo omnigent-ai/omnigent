@@ -2179,6 +2179,100 @@ def test_build_spawn_env_routes_hermes(tmp_path: Path, monkeypatch: pytest.Monke
 
 
 @pytest.mark.asyncio
+async def test_copilot_permission_mode_override_reaches_runner_turns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Session-scoped Copilot permission-mode labels override spec defaults across turns."""
+    from omnigent.stores.conversation_store import COPILOT_PERMISSION_MODE_LABEL_KEY
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_test")
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="copilot-agent",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "copilot", "permission_mode": "bypassPermissions"},
+        ),
+    )
+    # Direct builder check: session override wins over the spec's permission_mode.
+    base_env = _build_spawn_env_from_spec(spec, "copilot")
+    default_env = _build_spawn_env_from_spec(spec, "copilot", permission_mode_override="default")
+    assert base_env is not None and default_env is not None
+    assert base_env["HARNESS_COPILOT_PERMISSION_MODE"] == "bypassPermissions"
+    assert default_env["HARNESS_COPILOT_PERMISSION_MODE"] == "default"
+
+    seen_envs: list[dict[str, str] | None] = []
+
+    class _CapturingProcessManager(_FakeProcessManager):
+        async def get_client(
+            self,
+            conversation_id: str,
+            harness_name: str,
+            *,
+            env: dict[str, str] | None = None,
+        ) -> _FakeHarnessClient:
+            seen_envs.append(dict(env) if env is not None else None)
+            return await super().get_client(conversation_id, harness_name, env=env)
+
+    class _LabeledSessionServerClient(NullServerClient):
+        async def get(self, url: str, **kwargs: Any) -> Any:
+            del kwargs
+            if url == "/v1/sessions/conv_copilot_auto":
+                resp = NullServerClient._Response()
+                resp.json = lambda: {  # type: ignore[method-assign]
+                    "id": "conv_copilot_auto",
+                    "agent_id": "ag_copilot",
+                    "created_at": 1000,
+                    "labels": {COPILOT_PERMISSION_MODE_LABEL_KEY: "bypassPermissions"},
+                }
+                return resp
+            return await super().get(url)
+
+    async def _spec_resolver(_agent_id: str, _session_id: str | None = None) -> AgentSpec:
+        return AgentSpec(
+            spec_version=1,
+            name="copilot-default-spec",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "copilot"}),
+        )
+
+    sse_done = 'data: {"type":"session.status","status":"idle"}\n\n'
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _CapturingProcessManager(_FakeHarnessClient([sse_done])),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=_LabeledSessionServerClient(),  # type: ignore[arg-type]
+    )
+
+    conv = "conv_copilot_auto"
+    async with _runner_test_client(app) as http:
+        init_resp = await http.post(
+            "/v1/sessions", json={"session_id": conv, "agent_id": "ag_copilot"}
+        )
+        assert init_resp.status_code == 201
+        turn_resp = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_copilot",
+                "content": [{"role": "user", "content": "run scheduled check"}],
+            },
+        )
+        assert turn_resp.status_code == 202
+        await _await_bg_turn_task(conv)
+
+    assert len(seen_envs) == 2
+    assert seen_envs[0] is not None and seen_envs[1] is not None
+    assert seen_envs[0]["HARNESS_COPILOT_PERMISSION_MODE"] == "bypassPermissions"
+    assert seen_envs[1]["HARNESS_COPILOT_PERMISSION_MODE"] == "bypassPermissions"
+
+
+@pytest.mark.asyncio
 @pytest.mark.asyncio
 @pytest.mark.asyncio
 async def test_resolve_harness_config_applies_harness_override(
