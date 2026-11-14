@@ -7,10 +7,10 @@ CSV and TSV files open as a read-only table in the file viewer instead of as hig
 - `table-open`: `.csv` and `.tsv` files open on the table; the shared Preview ↔ Source toggle switches to the raw text and back.
 - `table-summary`: row count, column count, the delimiter (comma, semicolon, tab or pipe, detected from the first lines; always tab for `.tsv`), and the encoding when it isn't UTF-8.
 - `table-types`: each column is labeled number, date or text from its non-empty cells; number columns align right.
-- `table-sort`: clicking a column header sorts ascending, then descending, then back to file order. Numbers and dates sort by value, text naturally; empty cells stay last.
+- `table-sort`: clicking a column header sorts ascending, then descending, then back to file order. Numbers and dates sort by value, text naturally; empty cells stay last. A date or time without an offset sorts as UTC, so a date comes before times later that day in any time zone.
 - `table-filter`: each column has a filter that keeps rows whose cell contains the text, case-insensitively; the summary shows how many rows match.
 - `table-copy`: clicking a cell selects it and offers Copy cell and Copy row (tab-separated).
-- `table-bounds`: only the first 1,000 rows, the first 500 columns and 200,000 cells (within a text budget) are kept, so a wide file keeps fewer rows. A note says "Showing the first N of M rows" and, for a wide file, "the first 500 of M columns". When the server sent only the start of a large file, the count reads "At least N rows" and the shared banner says the file is truncated.
+- `table-bounds`: only the first 1,000 rows, the first 500 columns and 200,000 cells (within a text budget) are kept, so a wide file keeps fewer rows. A note says "Showing the first N of M rows" and, for a wide file, "the first 500 of M columns", counting the widest row anywhere in the file. When the server sent only the start of a large file, the count reads "At least N rows" and the shared banner says the file is truncated.
 - `table-encoding`: files the server sends as base64 (not valid UTF-8) are decoded in the browser: UTF-16 by its byte-order mark, else UTF-8, else Windows-1252.
 
 ## How to get to it (user POV)
@@ -20,7 +20,7 @@ CSV and TSV files open as a read-only table in the file viewer instead of as hig
 - Deep link: open a conversation URL with `?file=results.csv`.
 - Content search: a match inside a CSV opens the file in Source at the matching line; View preview switches to the table.
 - Find: with the table open, press Cmd/Ctrl+F; matches refresh after sorting, filtering or a file change, and the table scrolls sideways to a match in a hidden column.
-- Keyboard: Tab reaches the table as one stop; arrow keys and Home/End move between cells, and focusing a cell selects it for Copy cell and Copy row. A column's resize handle takes Left and Right.
+- Keyboard: Tab reaches the table as one stop; arrow keys and Home/End move between cells, and focusing a cell selects it for Copy cell and Copy row. A column's resize handle takes Left and Right and reports its width (64–2,048 pixels) to assistive technology.
 - Mobile web: the same entry points at a narrow viewport; the table scrolls horizontally.
 
 ## Driving it with the repro environment

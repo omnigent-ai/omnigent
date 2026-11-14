@@ -126,7 +126,7 @@ export function detectDelimiter(text: string, path: string): string {
  * while their field text fits in *keepChars*; the first record that doesn't
  * ends keeping, so the kept records are always a prefix. The first record is
  * kept, its text cut at *keepChars*. Each kept record keeps at most
- * *keepFields* fields; *widest* counts every field of the kept records.
+ * *keepFields* fields; *widest* counts the fields of every record, kept or not.
  */
 function parseRecords(
   text: string,
@@ -169,13 +169,13 @@ function parseRecords(
     // A blank line, or the newline that ends the file, is not a record.
     if (recordHasContent || fieldHasChars) {
       count += 1;
+      widest = Math.max(widest, fieldCount + 1);
       if (keeping) {
         if (fields.length < keepFields) fields.push(field);
         // The header is kept even cut short; any later record that overflows ends keeping.
         if (records.length === 0 || !recordOverflowed) {
           records.push(fields);
           keptChars += recordChars + field.length;
-          widest = Math.max(widest, fieldCount + 1);
           keeping = records.length < keepRecords;
         } else {
           keeping = false;
@@ -243,9 +243,20 @@ export function cellNumber(value: string): number {
   return Number.parseFloat(trimmed.replace(/,/g, "").replace(/%$/, ""));
 }
 
-function isDateCell(value: string): boolean {
+/**
+ * A date cell's time in milliseconds. A date or time without an offset is read
+ * as UTC, so a date sorts as the midnight starting it whatever the viewer's zone.
+ */
+function cellDate(value: string): number {
   const trimmed = value.trim();
-  return DATE_PATTERN.test(trimmed) && !Number.isNaN(Date.parse(trimmed));
+  if (!DATE_PATTERN.test(trimmed)) return Number.NaN;
+  const iso = trimmed.replace(" ", "T");
+  if (!iso.includes("T")) return Date.parse(`${iso}T00:00Z`);
+  return Date.parse(/(Z|[+-]\d{2}:?\d{2})$/.test(iso) ? iso : `${iso}Z`);
+}
+
+function isDateCell(value: string): boolean {
+  return !Number.isNaN(cellDate(value));
 }
 
 /**
@@ -272,7 +283,7 @@ export function compareCells(a: string, b: string, type: DataColumnType): number
   const bEmpty = b.trim() === "";
   if (aEmpty || bEmpty) return Number(aEmpty) - Number(bEmpty);
   if (type === "number") return cellNumber(a) - cellNumber(b);
-  if (type === "date") return Date.parse(a.trim()) - Date.parse(b.trim());
+  if (type === "date") return cellDate(a) - cellDate(b);
   return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
 }
 

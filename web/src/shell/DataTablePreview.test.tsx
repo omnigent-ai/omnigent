@@ -190,12 +190,19 @@ describe("DataTablePreview", () => {
     const handle = screen.getByRole("separator", { name: "Resize units" });
     const header = screen.getAllByRole("columnheader")[1];
     expect(header.style.width).toBe("");
+    expect(handle).not.toHaveAttribute("aria-valuenow");
+    expect(handle).toHaveAttribute("aria-valuetext", "Fits its content");
 
     // jsdom has no layout, so the first step starts from zero and clamps to the minimum.
     fireEvent.keyDown(handle, { key: "ArrowRight" });
     expect(header.style.width).toBe("64px");
     fireEvent.keyDown(handle, { key: "ArrowRight" });
     expect(header.style.width).toBe("80px");
+    // Assistive technology hears the width and its bounds.
+    expect(handle).toHaveAttribute("aria-valuenow", "80");
+    expect(handle).toHaveAttribute("aria-valuetext", "80 pixels");
+    expect(handle).toHaveAttribute("aria-valuemin", "64");
+    expect(handle).toHaveAttribute("aria-valuemax", "2048");
     fireEvent.keyDown(handle, { key: "ArrowLeft" });
     expect(header.style.width).toBe("64px");
   });

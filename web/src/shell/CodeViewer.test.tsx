@@ -1263,30 +1263,53 @@ describe("CodeViewer data-file routing", () => {
     expect(screen.queryByText(/Preview not available/)).toBeNull();
   });
 
-  it("opens find in the table when the viewer's find is requested", () => {
-    renderViewer(CITIES, true, "sales.csv", { viewMode: "preview", searchOpen: true });
-    expect(screen.getByPlaceholderText("Find…")).toBeDefined();
-  });
-
-  it("finds again in the rows left after filtering, and in a file emptied since", () => {
+  it("opens find in the table and finds again after filtering, sorting or emptying", () => {
     // jsdom has neither layout nor the CSS Custom Highlight API the find bar uses.
     const rangeRect = Object.getOwnPropertyDescriptor(Range.prototype, "getBoundingClientRect");
     const scrollBy = Object.getOwnPropertyDescriptor(Element.prototype, "scrollBy");
     Range.prototype.getBoundingClientRect = () => ({ top: 0, bottom: 0 }) as DOMRect;
     Element.prototype.scrollBy = () => {};
-    vi.stubGlobal("Highlight", function Highlight() {});
-    vi.stubGlobal("CSS", { highlights: { set: () => {}, delete: () => {} } });
+    // The text of the cell holding the current match.
+    let currentCell: string | null = null;
+    vi.stubGlobal(
+      "Highlight",
+      class {
+        ranges: Range[];
+        constructor(...ranges: Range[]) {
+          this.ranges = ranges;
+        }
+      },
+    );
+    vi.stubGlobal("CSS", {
+      highlights: {
+        set: (name: string, highlight: { ranges: Range[] }) => {
+          if (name.endsWith("-current")) {
+            currentCell = highlight.ranges[0]?.startContainer.textContent ?? null;
+          }
+        },
+        delete: () => {},
+      },
+    });
     try {
+      // The viewer's find request opens find in the table.
       const options = { viewMode: "preview", searchOpen: true } as const;
       const view = renderViewer("name\nalpha\nbeta\nalpha two\n", true, "sales.csv", options);
       fireEvent.change(screen.getByPlaceholderText("Find…"), { target: { value: "alpha" } });
       expect(screen.getByText("1 / 2")).toBeDefined();
+      expect(currentCell).toBe("alpha");
 
       const filter = screen.getByRole("textbox", { name: "Filter name" });
       fireEvent.change(filter, { target: { value: "beta" } });
       expect(screen.getByText("No results")).toBeDefined();
       fireEvent.change(filter, { target: { value: "" } });
       expect(screen.getByText("1 / 2")).toBeDefined();
+
+      // Sorted descending, "alpha two" comes before "alpha", and find follows.
+      const sort = screen.getByRole("button", { name: "Sort by name" });
+      fireEvent.click(sort);
+      fireEvent.click(sort);
+      expect(screen.getByText("1 / 2")).toBeDefined();
+      expect(currentCell).toBe("alpha two");
 
       // The file is emptied on disk and refreshed at the same path.
       view.rerender(viewerElement("", true, "sales.csv", options));
