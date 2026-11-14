@@ -6792,9 +6792,11 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("catalog_state", ["missing", "empty", "populated"])
 async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    catalog_state: str,
 ) -> None:
     """
     Fresh sessions (no ``session_id``) must not be marked ``cold_resumed``.
@@ -6840,16 +6842,41 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
         del _client, _session_id, _claude_args, command, bridge_dir, claude_config
         return "terminal_claude_main"
 
+    async def _fake_read_tmux(
+        _client: object, session_id: str
+    ) -> claude_native._ClaudeTerminalTmux:
+        assert session_id == "conv_new"
+        return claude_native._ClaudeTerminalTmux(socket=None, target=None)
+
+    option = {
+        "value": "private-model",
+        "model": "private-model",
+        "display_name": "Private model",
+        "enabled": True,
+        "provenance": "structured",
+    }
+    rows = (
+        None
+        if catalog_state == "missing"
+        else [{"id": "private-model", "_claude_picker_options": [option]}]
+        if catalog_state == "populated"
+        else []
+    )
+    vocabulary: dict[str, object] = {}
+
+    def _prepare_bridge(
+        session_id: str, *, bridge_id: str | None = None, workspace: Path, **values: object
+    ) -> Path:
+        assert workspace == Path.cwd()
+        vocabulary.update(values)
+        return tmp_path / (bridge_id or session_id)
+
     monkeypatch.setattr(claude_native, "_create_claude_session", _fake_create_session)
     monkeypatch.setattr(claude_native, "_bind_session_runner", _fake_bind_session_runner)
     monkeypatch.setattr(claude_native, "_launch_claude_terminal", _fake_launch_claude_terminal)
-    monkeypatch.setattr(
-        claude_native,
-        "prepare_bridge_dir",
-        lambda session_id, *, bridge_id=None, workspace, **_vocabulary: (
-            tmp_path / (bridge_id or session_id)
-        ),
-    )
+    monkeypatch.setattr(claude_native, "_read_claude_terminal_tmux", _fake_read_tmux)
+    monkeypatch.setattr(claude_native, "prepare_bridge_dir", _prepare_bridge)
+    monkeypatch.setattr(claude_native, "stored_claude_catalog_rows", lambda _config: rows)
     monkeypatch.setattr(
         claude_native,
         "reset_transcript_forward_state",
@@ -6877,6 +6904,9 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
     # claude writes on cold start), the first turn would be dropped.
     assert prepared.cold_resumed is False
     assert prepared.reattached is False
+    assert vocabulary["picker_options"] == (
+        None if catalog_state == "missing" else [option] if catalog_state == "populated" else []
+    )
 
 
 def test_wrapper_spec_startup_instructions_resolves_prompt(tmp_path: Path) -> None:

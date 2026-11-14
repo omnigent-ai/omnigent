@@ -266,6 +266,7 @@ class SessionOnlyModelSwitch:
         self.owned_draft = owned_draft
         self.phase = "preflight"
         self.submitted = False
+        self.control_attempted = False
         self.commit_attempted = False
         self.info: dict[str, str] = {}
         self.active_session: str | None = None
@@ -306,12 +307,15 @@ class SessionOnlyModelSwitch:
         self.check()
         pane = self.bridge._capture_pane(self.info["socket_path"], self.info["tmux_target"])
         self.check()
-        self.bridge._raise_if_user_prompt_pending(self.bridge_dir, pane)
+        self.bridge._raise_if_user_prompt_pending(
+            self.bridge_dir, pane, nothing_typed=not self.control_attempted
+        )
         return pane
 
     def send(self, key: str, *, literal: bool = False) -> None:
         self.check()
         args = ["send-keys", *(["-l"] if literal else []), "-t", self.info["tmux_target"], key]
+        self.control_attempted = True
         self.bridge._run_tmux(self.info["socket_path"], *args)
 
     def wait(self, accept: Callable[[str], bool], *, seconds: float | None = None) -> str:
@@ -359,6 +363,7 @@ class SessionOnlyModelSwitch:
         assert box is not None and box.framed
         self.check()
         # One verified burst only; changed or partially cleared drafts get no retry.
+        self.control_attempted = True
         self.bridge._send_composer_clear_keys(
             self.info["socket_path"], self.info["tmux_target"], rows=len(box.rows)
         )
@@ -469,6 +474,14 @@ class SessionOnlyModelSwitch:
             self.cleanup_owned_control()
             raise
         except (RuntimeError, OSError, ValueError) as exc:
+            if self.phase == "preflight" and not self.submitted and not self.control_attempted:
+                if (
+                    (isinstance(exc, self.bridge.ClaudeUserPromptPending) and exc.nothing_typed)
+                    or isinstance(exc, self.bridge.ClaudeInputBoxOccupied)
+                    or (isinstance(exc, self.bridge.ClaudeTerminalDialog) and exc.awaits_answer)
+                    or isinstance(exc, self.bridge.ClaudeComposerNotCleared)
+                ):
+                    raise
             self.cleanup_owned_control()
             raise self.refuse(
                 "Claude could not finish the session-only model selection. Inspect the terminal "

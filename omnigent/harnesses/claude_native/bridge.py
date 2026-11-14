@@ -174,7 +174,9 @@ def _cancellable_injection_lock(lock: threading.Lock | FileLock) -> Iterator[Non
         lock.release()
 
 
-def _serialize_bridge_injection(function: _InjectionFunction) -> _InjectionFunction:
+def _serialize_bridge_injection(
+    function: _InjectionFunction, *, recover_composer_height: bool = True
+) -> _InjectionFunction:
     """Serialize complete tmux injection operations across threads and processes."""
 
     @functools.wraps(function)
@@ -186,6 +188,8 @@ def _serialize_bridge_injection(function: _InjectionFunction) -> _InjectionFunct
             try:
                 return function(bridge_dir, *args, **kwargs)
             except ClaudeComposerNotCleared:
+                if not recover_composer_height:
+                    raise
                 # The refused paste sent nothing. Give a clipped composer room,
                 # then recheck readiness and pending prompts before retrying.
                 info = _wait_for_tmux_info(bridge_dir, timeout_s=_TMUX_READY_TIMEOUT_S)
@@ -196,6 +200,10 @@ def _serialize_bridge_injection(function: _InjectionFunction) -> _InjectionFunct
                     return function(bridge_dir, *args, **kwargs)
 
     return cast(_InjectionFunction, wrapped)
+
+
+def _serialize_model_injection(function: _InjectionFunction) -> _InjectionFunction:
+    return _serialize_bridge_injection(function, recover_composer_height=False)
 
 
 # Bind/advertise coordinates for the bridge's HTTP servers (the tool relay and
@@ -5687,7 +5695,7 @@ def inject_model_command(
         ) from exc
 
 
-@_serialize_bridge_injection
+@_serialize_model_injection
 def _inject_model_command_locked(
     bridge_dir: Path, transaction: SessionOnlyModelSwitch
 ) -> ClaudeModelSwitchResult:

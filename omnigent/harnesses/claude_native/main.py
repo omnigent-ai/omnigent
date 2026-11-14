@@ -5496,6 +5496,7 @@ async def _prepare_claude_terminal(
                 "session runner bound",
                 startup_progress=startup_progress,
             )
+        picker_catalog = stored_claude_catalog_rows(claude_config)
         bridge_dir = prepare_bridge_dir(
             session_id,
             bridge_id=bridge_id,
@@ -5503,7 +5504,9 @@ async def _prepare_claude_terminal(
             launch_model=claude_config.model if claude_config else None,
             launch_env=claude_config.env if claude_config else None,
             picker_values=stored_claude_picker_values(claude_config),
-            picker_options=picker_model_options(stored_claude_catalog_rows(claude_config) or ()),
+            picker_options=(
+                picker_model_options(picker_catalog) if picker_catalog is not None else None
+            ),
         )
         _mark_startup_step(
             startup_profiler,
