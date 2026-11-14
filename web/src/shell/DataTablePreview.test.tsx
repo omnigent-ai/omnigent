@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DataTablePreview } from "./DataTablePreview";
-import { DATA_TABLE_MAX_COLUMNS, DATA_TABLE_MAX_ROWS } from "./dataTable";
+import { DATA_TABLE_MAX_CHARS, DATA_TABLE_MAX_COLUMNS, DATA_TABLE_MAX_ROWS } from "./dataTable";
 
 const toast = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }));
 vi.mock("sonner", () => ({ toast }));
@@ -147,6 +147,13 @@ describe("DataTablePreview", () => {
       "Showing the first 1,000 of 1,500 rows. Download the file to see every row.",
     );
     expect(columnValues(0)).toHaveLength(DATA_TABLE_MAX_ROWS);
+  });
+
+  it("says when text past the limit is cut", () => {
+    renderTable(`${"h".repeat(DATA_TABLE_MAX_CHARS + 1)},b\n1,2\n`);
+    expect(screen.getByRole("note")).toHaveTextContent(
+      "Text past the preview's limit is cut short. Download the file to see all of it.",
+    );
   });
 
   it("gives only a lower bound when the server sent part of the file", () => {

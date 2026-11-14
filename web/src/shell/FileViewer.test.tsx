@@ -2757,6 +2757,22 @@ describe("FileViewer 3D model files", () => {
     },
   );
 
+  it.each(["sales.xlsx", "events.parquet"])(
+    "opens a changed %s on its table even when the link asks for the diff",
+    (path) => {
+      vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+        data: {
+          available: true,
+          data: [{ path, bytes: 10, modified_at: null, name: path, status: "modified" }],
+        },
+      } as ReturnType<typeof useWorkspaceChangedFiles>);
+      renderViewer({ open: true, path, initialSearch: "diff=1" });
+      expect(viewModeOf()).toBe("preview");
+      expect(screen.queryByTestId("diff-viewer")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Show diff" })).toBeNull();
+    },
+  );
+
   it("suppresses the diff toggle for a model file even when it is a changed file", () => {
     // Report the model as a changed file — an ordinary changed file would get a
     // "Show diff" button; a model must not.

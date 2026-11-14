@@ -282,11 +282,17 @@ export function DataTableView({
           </span>
         )}
       </div>
-      {notes.length > 0 && (
+      {(notes.length > 0 || table.textCut) && (
         // A truncated file also gets the viewer's shared truncation banner.
         <div role="note" className="border-b bg-muted/40 px-4 py-1.5 text-sm text-muted-foreground">
-          {`Showing ${notes.join(" and ")}.`}
-          {truncated ? "" : ` Download the file to see ${columnsCut ? "all of it" : "every row"}.`}
+          {[
+            notes.length > 0 && `Showing ${notes.join(" and ")}.`,
+            table.textCut && "Text past the preview's limit is cut short.",
+            !truncated &&
+              `Download the file to see ${columnsCut || table.textCut ? "all of it" : "every row"}.`,
+          ]
+            .filter(Boolean)
+            .join(" ")}
         </div>
       )}
       {/* Only the table scrolls, so the summary and its copy buttons stay in view. */}

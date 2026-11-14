@@ -1264,7 +1264,7 @@ describe("CodeViewer data-file routing", () => {
     expect(screen.queryByText(/Preview not available/)).toBeNull();
   });
 
-  it("opens find in the table and finds again after filtering, sorting or emptying", () => {
+  it("opens find in the table and finds again after filtering, sorting or emptying", async () => {
     // jsdom has neither layout nor the CSS Custom Highlight API the find bar uses.
     const rangeRect = Object.getOwnPropertyDescriptor(Range.prototype, "getBoundingClientRect");
     const scrollBy = Object.getOwnPropertyDescriptor(Element.prototype, "scrollBy");
@@ -1315,6 +1315,17 @@ describe("CodeViewer data-file routing", () => {
       // The file is emptied on disk and refreshed at the same path.
       view.rerender(viewerElement("", true, "sales.csv", options));
       expect(screen.getByText(/This file has no rows/)).toBeDefined();
+      expect(screen.getByText("No results")).toBeDefined();
+
+      // A workbook refreshed into one the preview can't read leaves no stale matches.
+      const book = { ...options, encoding: "base64" } as const;
+      const workbook = readFileSync("src/shell/__fixtures__/sales.xlsx").toString("base64");
+      view.rerender(viewerElement(workbook, true, "sales.xlsx", book));
+      await screen.findByRole("tab", { name: "Sales" });
+      fireEvent.change(screen.getByPlaceholderText("Find…"), { target: { value: "West" } });
+      expect(screen.getByText("1 / 1")).toBeDefined();
+      view.rerender(viewerElement(btoa("not a zip"), true, "sales.xlsx", book));
+      await screen.findByRole("alert");
       expect(screen.getByText("No results")).toBeDefined();
     } finally {
       vi.unstubAllGlobals();
