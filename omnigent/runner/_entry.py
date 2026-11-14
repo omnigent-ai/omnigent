@@ -2253,19 +2253,32 @@ async def _run_tunnel_from_env() -> None:
                 exit_reason or "shutdown requested",
                 extra={"session_id": runner_primary_session_id()},
             )
-        for task in wait_tasks:
-            task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await stop_task
-        with contextlib.suppress(asyncio.CancelledError):
-            await tunnel_task
-        if idle_task is not None:
+        try:
+            for task in wait_tasks:
+                task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await idle_task
-        if direct_attach_listener is not None:
-            with contextlib.suppress(Exception):
-                await direct_attach_listener.stop()
-        await _lifespan_cm.__aexit__(None, None, None)
+                await stop_task
+            with contextlib.suppress(asyncio.CancelledError):
+                await tunnel_task
+            if idle_task is not None:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await idle_task
+        finally:
+            # Reaping a failed task can raise again; owned services still need cleanup.
+            unwinding = sys.exc_info()[0] is not None
+            if direct_attach_listener is not None:
+                with contextlib.suppress(Exception):
+                    await direct_attach_listener.stop()
+            try:
+                await _lifespan_cm.__aexit__(None, None, None)
+            except Exception:
+                if not unwinding:
+                    raise
+                _logger.warning(
+                    "runner teardown failed while exiting",
+                    exc_info=True,
+                    extra={"session_id": runner_primary_session_id()},
+                )
 
 
 def _install_signal_handlers(
