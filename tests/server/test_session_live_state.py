@@ -475,11 +475,19 @@ class _FakeScheduledTaskStore:
         return type("_Run", (), {"id": run_id, "status": status})()
 
 
-def test_scheduled_run_completion_idle_transitions_to_succeeded() -> None:
+@pytest.mark.parametrize("legacy_run", [False, True])
+def test_scheduled_run_completion_idle_transitions_to_succeeded(legacy_run: bool) -> None:
     """A terminal ``idle`` edge flips the conversation's running run to succeeded."""
     sched = _FakeScheduledTaskStore({"conv_1": "run_1"})
     conversations = _RecordingStore()
-    conversations.labels["conv_1"] = {SCHEDULED_TASK_ACTIVITY_LABEL_KEY: "run_1"}
+    conversations.labels["conv_1"] = (
+        {}
+        if legacy_run
+        else {
+            SCHEDULED_TASK_RUN_LABEL_KEY: "run_1",
+            SCHEDULED_TASK_ACTIVITY_LABEL_KEY: "run_1",
+        }
+    )
     session_live_state.configure(conversations, sched)  # type: ignore[arg-type]
     try:
         session_live_state.persist_scheduled_run_completion("conv_1", "succeeded")

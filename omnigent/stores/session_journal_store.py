@@ -228,7 +228,7 @@ class SessionJournalStore:
 
     @staticmethod
     def _newest_kind_row(
-        session: Session, conversation_id: str, kind: int
+        session: Session, conversation_id: str, kind: int, *, before_position: int | None = None
     ) -> SqlSessionJournalEntry | None:
         statement = (
             select(SqlSessionJournalEntry)
@@ -240,6 +240,8 @@ class SessionJournalStore:
             .order_by(SqlSessionJournalEntry.position.desc())
             .limit(1)
         )
+        if before_position is not None:
+            statement = statement.where(SqlSessionJournalEntry.position < before_position)
         return session.execute(
             _using(statement, "ix_session_journal_entries_kind")
         ).scalar_one_or_none()
@@ -325,6 +327,7 @@ class SessionJournalStore:
         step: str | None = None,
         scheduled_task_run_id: str | None = None,
         workflow_id: str | None = None,
+        start_run: bool = True,
     ) -> JournalAppend:
         """Append an entry to the session's journal.
 
@@ -341,6 +344,7 @@ class SessionJournalStore:
         :param workflow_id: The saved workflow a plan starts a run of, e.g.
             ``"0123…cdef"``. Only a plan names one; a status or note takes the
             current plan's.
+        :param start_run: False to associate a saved workflow with ongoing work.
         :returns: The entry, and whether this call appended it.
         :raises InvalidJournalEntryError: If a field is invalid.
         :raises JournalEntryTooLargeError: If the stored content is too large.
@@ -399,7 +403,7 @@ class SessionJournalStore:
                 )
                 entry_content = {"version": version, **fields}
                 entry_text = _stored_content(entry_content)
-                starts_run = workflow_id is not None
+                starts_run = workflow_id is not None and start_run
                 if scheduled_task_run_id is not None and not starts_run:
                     boundary = self._newest_kind_row(session, conversation_id, _PLAN_STATUS_KIND)
                     starts_run = (
@@ -654,7 +658,7 @@ class SessionJournalStore:
     def plan_step_statuses(self, plans: Sequence[JournalEntry]) -> list[dict[str, JournalEntry]]:
         """For each plan, its steps' newest statuses before the next run starts.
 
-        One kind lookup per plan and one kind-and-step lookup per step keep
+        Two kind lookups per plan and one kind-and-step lookup per step keep
         runs with reused step IDs separate while retaining progress through replans.
 
         :param plans: Plan entries, e.g. a page of a workflow's runs.
@@ -665,6 +669,9 @@ class SessionJournalStore:
         entries = SqlSessionJournalEntry
         with self._session("read_plan_step_statuses") as session:
             for plan in plans:
+                boundary = self._newest_kind_row(
+                    session, plan.conversation_id, _PLAN_STATUS_KIND, before_position=plan.position
+                )
                 next_position = session.execute(
                     _using(
                         select(entries.position)
@@ -685,7 +692,7 @@ class SessionJournalStore:
                         session,
                         plan.conversation_id,
                         step["id"],
-                        start_position=plan.position,
+                        start_position=boundary.position if boundary is not None else None,
                         end_position=next_position,
                     )
                     if row is not None:

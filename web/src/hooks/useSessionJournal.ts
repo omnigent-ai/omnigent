@@ -26,7 +26,7 @@ import { isSessionStreamOpen, subscribeSessionStreams } from "@/lib/sessionStrea
 import { isTempConvId } from "@/lib/tempConversationId";
 
 const PAGE_SIZE = "100";
-/** How often the tab catches up while the session's stream is down. */
+/** How often the tab catches up while its stream is down or synchronization failed. */
 export const JOURNAL_FALLBACK_REFETCH_MS = 30_000;
 // A catch-up reads at most this many pages; past that the tab refetches instead.
 const CATCH_UP_MAX_PAGES = 5;
@@ -177,20 +177,25 @@ export function useSessionJournal(
     () => (conversationId ? isSessionStreamOpen(conversationId) : false),
     () => false,
   );
+  const { error: catchUpError, refetch: catchUp } = useQuery({
+    queryKey: [...sessionJournalKey(conversationId), "catch-up"],
+    queryFn: async () => {
+      await catchUpSessionJournal(queryClient, conversationId!);
+      return true;
+    },
+    enabled: false,
+  });
   useEffect(() => {
     if (!active) return;
     return subscribeSessionStreams((id, reopened) => {
-      if (id === conversationId && reopened) void catchUpSessionJournal(queryClient, id);
+      if (id === conversationId && reopened) void catchUp();
     });
-  }, [active, conversationId, queryClient]);
+  }, [active, conversationId, catchUp]);
   useEffect(() => {
-    if (!active || streamOpen || query.status !== "success") return;
-    const timer = window.setInterval(
-      () => void catchUpSessionJournal(queryClient, conversationId!),
-      JOURNAL_FALLBACK_REFETCH_MS,
-    );
+    if (!active || (streamOpen && !catchUpError) || query.status !== "success") return;
+    const timer = window.setInterval(() => void catchUp(), JOURNAL_FALLBACK_REFETCH_MS);
     return () => window.clearInterval(timer);
-  }, [active, streamOpen, conversationId, queryClient, query.status]);
+  }, [active, streamOpen, catchUpError, catchUp, query.status]);
 
   // When older pages exist, the current plan and its steps' statuses may be
   // among them, so read those two kinds on their own. Shares the journal's key
@@ -236,12 +241,14 @@ export function useSessionJournal(
   return {
     entries: error ? [] : entries,
     isLoading: active && (query.isPending || (olderExist && planAndStatuses.isPending)),
-    error,
+    error: error ?? catchUpError,
     hasOlder: query.hasNextPage,
     loadingOlder: query.isFetchingNextPage,
     loadOlder: () => void query.fetchNextPage(),
     retry: () => {
-      if (active) void reloadNewestPage(queryClient, conversationId);
+      if (!active) return;
+      if (catchUpError && !error) void catchUp();
+      else void reloadNewestPage(queryClient, conversationId);
     },
   };
 }

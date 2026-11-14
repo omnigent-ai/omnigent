@@ -49,7 +49,10 @@ from typing import TYPE_CHECKING, Any
 
 from omnigent.db.enum_codecs import SESSION_LIVE_STATUS
 from omnigent.db.workspace_cache import WorkspaceScopedCache
-from omnigent.stores.conversation_store import SCHEDULED_TASK_ACTIVITY_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
+    SCHEDULED_TASK_RUN_LABEL_KEY,
+)
 
 if TYPE_CHECKING:
     from omnigent.stores import ConversationStore
@@ -324,9 +327,12 @@ def _agent_worked_on_run(conversation_id: str, run_id: str) -> bool:
     if conversations is None:
         return True
     conversation = conversations.get_conversation(conversation_id)
+    if conversation is None:
+        return False
+    # Runs launched before run labels existed retain their idle-completion behavior.
     return (
-        conversation is not None
-        and conversation.labels.get(SCHEDULED_TASK_ACTIVITY_LABEL_KEY) == run_id
+        SCHEDULED_TASK_RUN_LABEL_KEY not in conversation.labels
+        or conversation.labels.get(SCHEDULED_TASK_ACTIVITY_LABEL_KEY) == run_id
     )
 
 

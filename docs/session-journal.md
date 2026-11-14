@@ -311,7 +311,9 @@ A saved workflow is a named plan its owner can run, private to that owner, with
 steps in the plan's step format. Running one will copy its steps into the
 session's journal as the plan, and the entries written under it carry its ID in
 `workflow_id`. Saving a session's plan as a workflow names it the same way, so
-the Tasks tab marks the plan with a Workflow chip either way. Workflows have no
+the Tasks tab marks the plan with a Workflow chip either way. Saving uses
+`start_run: false` on the journal append and preserves completed steps and their
+dependencies; invoking the workflow again starts fresh. Workflows have no
 versions: an edit rewrites the workflow, and each run's journal keeps the plan
 it ran.
 

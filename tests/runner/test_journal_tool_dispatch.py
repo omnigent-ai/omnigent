@@ -507,6 +507,7 @@ async def test_a_save_names_the_sessions_plan_after_the_new_workflow(
     # The same plan, now naming the workflow, so the Tasks tab can show it.
     assert body["kind"] == "plan"
     assert body["workflow_id"] == _WORKFLOW_ID
+    assert body["start_run"] is False
     assert body["content"]["name"] == "Triage the upload tests"
     assert [step["id"] for step in body["content"]["steps"]] == ["explore", "fix"]
     assert body["idempotency_key"] == "tool:call_1:plan"

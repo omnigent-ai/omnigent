@@ -586,7 +586,9 @@ def test_plan_step_statuses_reads_each_steps_newest_status(
         idempotency_key="k5",
         workflow_id=next_workflow,
     ).entry
-    assert journal.plan_step_statuses([later]) == [{}]
+    assert journal.plan_step_statuses([later]) == (
+        [statuses[0]] if next_workflow is None else [{}]
+    )
     journal.append(SESSION, "status", {"status": "started"}, idempotency_key="k6", step="a")
     journal.append(
         SESSION, "status", {"status": "done", "text": "Finished c"}, idempotency_key="k7", step="c"
@@ -601,7 +603,11 @@ def test_plan_step_statuses_reads_each_steps_newest_status(
     assert [
         {step: entry.content["status"] for step, entry in current.items()}
         for current in journal.plan_step_statuses([later, other, plan])
-    ] == [{"a": "started", "c": "done"}, {}, original_statuses]
+    ] == [
+        original_statuses if next_workflow is None else {"a": "started", "c": "done"},
+        {},
+        original_statuses,
+    ]
 
 
 def test_an_automation_runs_start_plan_is_its_first(journal: SessionJournalStore) -> None:

@@ -251,6 +251,7 @@ async def _write(
     conversation_id: str,
     call_id: str | None,
     publish_event: _Publisher | None,
+    start_run: bool = True,
 ) -> str:
     try:
         body = _write_request(tool_name, args)
@@ -259,6 +260,8 @@ async def _write(
     except InvalidJournalEntryError as exc:
         return _error(f"invalid_entry: {exc}")
     body["idempotency_key"] = _idempotency_key(call_id)
+    if not start_run:
+        body["start_run"] = False
     url = _journal_url(conversation_id)
     response = await _post_with_retries(server_client, url, body, conversation_id)
     if isinstance(response, str):
@@ -649,6 +652,7 @@ async def _name_plan_workflow(
         conversation_id=conversation_id,
         call_id=f"{call_id}:plan" if call_id else None,
         publish_event=publish_event,
+        start_run=False,
     )
 
 

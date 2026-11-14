@@ -179,32 +179,45 @@ describe("useSessionJournal", () => {
     expect(result.current.error).toBeNull();
   });
 
-  it("catches up when the stream reopens, and polls only while it is down", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    noteSessionStreamOpen(SESSION, false);
-    respond(journalPage([journalEntry(0)]));
-    const { result } = renderHook(() => useSessionJournal(SESSION, true), { wrapper });
-    await waitFor(() => expect(result.current.entries).toHaveLength(1));
+  it.each(["none", "automatic", "manual"])(
+    "catches up after reopening, with %s recovery",
+    async (recovery) => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      noteSessionStreamOpen(SESSION, false);
+      respond(journalPage([journalEntry(0)]));
+      const { result } = renderHook(() => useSessionJournal(SESSION, true), { wrapper });
+      await waitFor(() => expect(result.current.entries).toHaveLength(1));
 
-    // Open stream: no polling.
-    await act(async () => vi.advanceTimersByTimeAsync(JOURNAL_FALLBACK_REFETCH_MS * 2));
-    expect(authenticatedFetch).toHaveBeenCalledTimes(1);
+      // Open stream: no polling.
+      await act(async () => vi.advanceTimersByTimeAsync(JOURNAL_FALLBACK_REFETCH_MS * 2));
+      expect(authenticatedFetch).toHaveBeenCalledTimes(1);
 
-    // Down: catch up every 30 s from the newest entry.
-    act(() => noteSessionStreamClosed(SESSION));
-    respond(journalPage([journalEntry(1)]));
-    await act(async () => vi.advanceTimersByTimeAsync(JOURNAL_FALLBACK_REFETCH_MS));
-    await waitFor(() => expect(result.current.entries).toHaveLength(2));
-    expect(requestedQueries()[1].get("after")).toBe("e0");
+      // Down: catch up every 30 s from the newest entry.
+      act(() => noteSessionStreamClosed(SESSION));
+      respond(journalPage([journalEntry(1)]));
+      await act(async () => vi.advanceTimersByTimeAsync(JOURNAL_FALLBACK_REFETCH_MS));
+      await waitFor(() => expect(result.current.entries).toHaveLength(2));
+      expect(requestedQueries()[1].get("after")).toBe("e0");
 
-    // Reopened: one catch-up, and polling stops.
-    respond(journalPage([journalEntry(2)]));
-    act(() => noteSessionStreamOpen(SESSION, true));
-    await waitFor(() => expect(result.current.entries).toHaveLength(3));
-    expect(requestedQueries()[2].get("after")).toBe("e1");
-    await act(async () => vi.advanceTimersByTimeAsync(JOURNAL_FALLBACK_REFETCH_MS * 2));
-    expect(authenticatedFetch).toHaveBeenCalledTimes(3);
-  });
+      // Reopened: one catch-up, and polling stops.
+      respond(journalPage([journalEntry(2)]));
+      if (recovery !== "none") {
+        vi.mocked(authenticatedFetch).mockResolvedValueOnce(new Response(null, { status: 500 }));
+      }
+      act(() => noteSessionStreamOpen(SESSION, true));
+      if (recovery !== "none") {
+        await waitFor(() => expect(result.current.error).toBeInstanceOf(Error));
+        expect(result.current.entries.map((entry) => entry.position)).toEqual([0, 1]);
+        if (recovery === "manual") act(() => result.current.retry());
+        else await act(async () => vi.advanceTimersByTimeAsync(JOURNAL_FALLBACK_REFETCH_MS));
+      }
+      await waitFor(() => expect(result.current.entries).toHaveLength(3));
+      expect(result.current.error).toBeNull();
+      expect(requestedQueries()[2].get("after")).toBe("e1");
+      await act(async () => vi.advanceTimersByTimeAsync(JOURNAL_FALLBACK_REFETCH_MS * 2));
+      expect(authenticatedFetch).toHaveBeenCalledTimes(recovery === "none" ? 3 : 4);
+    },
+  );
 
   it("reads nothing while disabled or for a provisional session", () => {
     renderHook(() => useSessionJournal(SESSION, false), { wrapper });

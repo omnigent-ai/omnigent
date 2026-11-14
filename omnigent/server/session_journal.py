@@ -273,6 +273,7 @@ def create_session_journal_router(
         step: str | None,
         user_id: str | None,
         workflow_id: str | None = None,
+        start_run: bool = True,
     ) -> JournalEntry:
         store = _store()
         if kind == "status" and content.get("status") == "needs_input":
@@ -287,6 +288,7 @@ def create_session_journal_router(
                     step=step,
                     scheduled_task_run_id=_run_id(session),
                     workflow_id=workflow_id,
+                    start_run=start_run,
                 )
             )
         except JournalSessionNotFoundError as exc:
@@ -322,6 +324,7 @@ def create_session_journal_router(
             step=body.step,
             user_id=get_user_id(request, auth_provider),
             workflow_id=body.workflow_id,
+            start_run=body.start_run,
         )
         return entry_to_response(entry)
 

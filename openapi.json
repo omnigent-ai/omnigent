@@ -9836,6 +9836,12 @@
             "title": "Kind",
             "type": "string"
           },
+          "start_run": {
+            "default": true,
+            "description": "False when saving the current plan as a workflow, preserving its progress; True when invoking a saved workflow again.",
+            "title": "Start Run",
+            "type": "boolean"
+          },
           "step": {
             "anyOf": [
               {
@@ -9857,7 +9863,7 @@
                 "type": "null"
               }
             ],
-            "description": "For a plan that starts a run of one of the user's saved workflows, that workflow's ID.",
+            "description": "The saved workflow associated with a plan.",
             "title": "Workflow Id"
           }
         },

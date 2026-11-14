@@ -3604,8 +3604,9 @@ class SessionJournalAppendRequest(BaseModel):
     :param step: The plan step the entry is about.
     :param idempotency_key: Names the write, e.g. ``"tool:<tool call ID>"``; a
         retry with the same key returns the first attempt's entry.
-    :param workflow_id: For a plan that starts a run of one of the user's saved
-        workflows, that workflow's ID.
+    :param workflow_id: The saved workflow associated with a plan.
+    :param start_run: False when saving the current plan as a workflow, preserving
+        its progress; True when invoking a saved workflow again.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -3615,6 +3616,7 @@ class SessionJournalAppendRequest(BaseModel):
     step: str | None = None
     idempotency_key: str = Field(min_length=1, max_length=128)
     workflow_id: str | None = None
+    start_run: bool = True
 
 
 class SessionJournalInputRequest(BaseModel):

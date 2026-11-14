@@ -1016,12 +1016,22 @@ async def test_saving_a_workflow_names_the_sessions_plan_after_it(
     ]
     plan = {"name": "Fix the upload flakes", "steps": steps}
     assert (await run("sys_journal_write_plan", plan))["version"] == 1
+    assert "error" not in await run(
+        "sys_journal_write_status",
+        {"step": "explore", "status": "done", "text": "Found the failure."},
+    )
     workflow = {
         "name": "Triage flaky tests",
         "description": "Finds and fixes them.",
         "steps": steps,
     }
     saved = await run("sys_workflow_save", workflow)
+    assert "error" not in await run(
+        "sys_journal_write_status", {"step": "fix", "status": "started"}
+    )
+    runs_url = f"/v1/workflows/{saved['id']}/runs"
+    progress = (await client.get(runs_url)).json()["data"][0]["progress"]
+    assert progress == {"total": 2, "started": 1, "done": 1, "needs_input": 0, "failed": 0}
 
     url = f"/v1/sessions/{session_id}/journal"
     plans = (await client.get(url, params={"kind": "plan"})).json()["data"]
@@ -1032,8 +1042,19 @@ async def test_saving_a_workflow_names_the_sessions_plan_after_it(
     assert plans[1]["content"]["name"] == "Fix the upload flakes"
     assert [step["id"] for step in plans[1]["content"]["steps"]] == ["explore", "fix"]
     items = conversations.list_items(session_id, limit=50).data
-    markers = [item.data.resource for item in items if item.type == "resource_event"]
+    markers = [
+        item.data.resource
+        for item in items
+        if item.type == "resource_event" and item.data.event_type == "session.journal.plan"
+    ]
     assert [marker.get("change") for marker in markers] == ["made"]
+    assert (await run("sys_journal_write_plan", {**plan, "workflow_id": saved["id"]}))[
+        "version"
+    ] == 3
+    blocked = await run("sys_journal_write_status", {"step": "fix", "status": "started"})
+    assert "step_not_ready" in blocked["error"]
+    runs = (await client.get(runs_url)).json()["data"]
+    assert [run["progress"]["done"] for run in runs] == [0, 1]
 
 
 async def test_a_workflows_runs_list_the_sessions_that_ran_it(
