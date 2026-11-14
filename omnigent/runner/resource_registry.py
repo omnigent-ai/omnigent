@@ -81,6 +81,7 @@ QWEN_NATIVE_TERMINAL_ROLE = "qwen-native"
 KIMI_NATIVE_TERMINAL_ROLE = "kimi-native"
 HERMES_NATIVE_TERMINAL_ROLE = "hermes-native"
 DEVIN_NATIVE_TERMINAL_ROLE = "devin-native"
+GROK_NATIVE_TERMINAL_ROLE = "grok-native"
 
 #: Terminal roles whose PTY-activity watcher drives the session's working
 #: status (pane activity → ``running``, quiescence → ``idle``), not just the
@@ -102,6 +103,9 @@ _STATUS_EMITTING_TERMINAL_ROLES: frozenset[str] = frozenset(
         QWEN_NATIVE_TERMINAL_ROLE,
         KIMI_NATIVE_TERMINAL_ROLE,
         HERMES_NATIVE_TERMINAL_ROLE,
+        # grok-native is also absent: its serve-process pane shows ACP server
+        # logs, not turn boundaries; its forwarder posts running/idle edges
+        # from session/prompt and session/update instead.
         # devin-native is deliberately ABSENT: its hook stream carries exact turn
         # boundaries (UserPromptSubmit -> Stop), so its forwarder posts
         # running/idle itself. Pane quiescence would flip the session to idle

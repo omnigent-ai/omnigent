@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "underwright": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "underwright",
+        "serve"
+      ],
+      "env": {
+        "UNDERWRIGHT_DB": "underwright.db"
+      }
+    }
+  }
+}

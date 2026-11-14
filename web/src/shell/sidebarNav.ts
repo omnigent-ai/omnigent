@@ -122,6 +122,7 @@ export type ConversationIconKind =
   | "cursor"
   | "kiro"
   | "goose"
+  | "grok"
   | "antigravity"
   | "qwen"
   | "kimi"

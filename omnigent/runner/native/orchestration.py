@@ -96,6 +96,7 @@ from omnigent.runner.resource_registry import (
     CURSOR_NATIVE_TERMINAL_ROLE,
     DEVIN_NATIVE_TERMINAL_ROLE,
     GOOSE_NATIVE_TERMINAL_ROLE,
+    GROK_NATIVE_TERMINAL_ROLE,
     HERMES_NATIVE_TERMINAL_ROLE,
     KIMI_NATIVE_TERMINAL_ROLE,
     KIRO_NATIVE_TERMINAL_ROLE,
@@ -10669,6 +10670,221 @@ async def _launch_opencode(ctx: NativeLaunchContext) -> SessionResourceView:
         agent_spec=ctx.agent_spec,
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
+    )
+
+
+async def _auto_create_grok_terminal(
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, _JsonObject], None],
+    *,
+    server_client: httpx.AsyncClient | None,
+    ensure_comment_relay: _EnsureCommentRelay | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
+) -> SessionResourceView:
+    """
+    Auto-create the grok-native serve terminal for a grok-native session.
+
+    Launches ``grok agent serve --bind 127.0.0.1:<port> --secret <secret>``
+    as the runner-owned terminal resource (the serve process IS the pane),
+    connects the ACP-over-WS client, creates (or resumes) the grok session,
+    publishes the endpoint in bridge state for the harness executor, and
+    starts the forwarder that mirrors ``session/update`` items into the
+    Omnigent conversation. Auth is Grok's own (``grok login`` / XAI_API_KEY).
+
+    :param session_id: Session/conversation identifier.
+    :param resource_registry: Session resource registry for launching the terminal.
+    :param publish_event: Runner session event publisher.
+    :param server_client: Runner Omnigent server client.
+    :param agent_spec: The session's resolved agent spec; its ``os_env`` is
+        inherited by the terminal.
+    :returns: Created terminal resource view.
+    """
+    from omnigent.harnesses.grok_native.bridge import (
+        GROK_NATIVE_BRIDGE_DIR_ENV_VAR,
+        GrokBridgeState,
+        prepare_bridge_dir,
+        write_bridge_state,
+    )
+    from omnigent.harnesses.grok_native.client import GrokAcpClient, GrokAcpError
+    from omnigent.harnesses.grok_native.credentials import resolve_grok_executable
+    from omnigent.harnesses.grok_native.forwarder import start_updates_follower
+    from omnigent.harnesses.grok_native.probe import wait_for_grok_serve
+    from omnigent.harnesses.grok_native.serve import (
+        build_grok_serve_endpoint,
+        grok_serve_argv,
+    )
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+
+    # Tear down any forwarder left from a prior terminal for this session so
+    # old and new tasks can't both mirror (double-posting).
+    await _cancel_auto_forwarder_task(session_id)
+    bridge_dir = prepare_bridge_dir(session_id)
+
+    launch_config = await _pi_native_launch_config(
+        session_id=session_id,
+        server_client=server_client,
+    )
+    workspace = os.path.realpath(str(launch_config.workspace))
+    grok_command = resolve_grok_executable()
+    if grok_command is None:
+        raise RuntimeError("grok CLI not found; install per `omnigent grok` guidance.")
+    endpoint = build_grok_serve_endpoint()
+
+    # Policy bridge: a per-session plugin under ~/.grok/plugins (auto-trusted)
+    # carrying a PreToolUse command hook that consults the Omnigent policy +
+    # permission routes, so ALLOW/DENY/ASK gate every tool call.
+    from omnigent.harnesses.grok_native.hooks_config import write_grok_policy_plugin
+
+    plugin_dir = write_grok_policy_plugin(session_id)
+    runner_server_url = _required_runner_env("RUNNER_SERVER_URL").rstrip("/")
+    policy_env = {
+        GROK_NATIVE_BRIDGE_DIR_ENV_VAR: str(bridge_dir),
+        "OMNIGENT_POLICY_EVALUATE_URL": (
+            f"{runner_server_url}/v1/sessions/{session_id}/policies/evaluate"
+        ),
+        "OMNIGENT_PERMISSION_URL": (
+            f"{runner_server_url}/v1/sessions/{session_id}/hooks/permission-request"
+        ),
+        "OMNIGENT_AGENT_CONTENTS_URL": (
+            f"{runner_server_url}/v1/sessions/{session_id}/agent/contents"
+        ),
+    }
+    argv = grok_serve_argv(
+        grok_command,
+        port=endpoint.port,
+        secret=endpoint.secret,
+        extra_args=(
+            "--plugin-dir",
+            str(plugin_dir),
+            *tuple(launch_config.terminal_launch_args or []),
+        ),
+    )
+    # Start the Omnigent builtin-tool relay BEFORE the vendor session exists so
+    # ``tool_relay.json`` is present when grok's serve-mcp stdio MCP server is
+    # handed to ``session/new`` — the sys_* / load_skill / web_fetch surface,
+    # with policy enforced server-side on each call.
+    if server_client is not None and ensure_comment_relay is not None:
+        await ensure_comment_relay(
+            session_id,
+            explicit_bridge_dir=bridge_dir,
+            await_notify=False,
+        )
+
+    agent_os_env = _agent_os_env_from_spec(agent_spec)
+    terminal_view = await resource_registry.launch_required_terminal(
+        session_id=session_id,
+        terminal_name="grok",
+        session_key="main",
+        resource_role=GROK_NATIVE_TERMINAL_ROLE,
+        parent_os_env=agent_os_env,
+        spec=TerminalEnvSpec(
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=workspace,
+                sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+            ),
+            command=argv[0],
+            args=argv[1:],
+            env=policy_env,
+            scrollback=100_000,
+            tmux_allow_passthrough=True,
+            tmux_start_on_attach=False,
+        ),
+    )
+
+    # Wait for the serve port, connect, then create-or-resume the vendor
+    # session. A persisted external_session_id means this Omnigent session
+    # already has a grok session to reload; the load fails open to a fresh
+    # session when the vendor store lacks it.
+    try:
+        await wait_for_grok_serve(endpoint.port, timeout_s=30.0)
+    except TimeoutError as exc:
+        raise RuntimeError(
+            f"grok agent serve did not bind {endpoint.port}; check `grok login`."
+        ) from exc
+    client = await GrokAcpClient.connect(endpoint.ws_url)
+    external_id = launch_config.external_session_id
+    grok_session_id: str | None = None
+    if external_id:
+        try:
+            await client.session_load(session_id=external_id, cwd=workspace)
+            grok_session_id = external_id
+        except (GrokAcpError, OSError, RuntimeError):
+            _logger.warning(
+                "grok session/load failed for %s; starting a fresh session",
+                external_id,
+            )
+    if grok_session_id is None:
+        grok_session_id = await client.session_new(
+            cwd=workspace,
+            mcp_servers=[
+                {
+                    "name": "omnigent",
+                    "command": sys.executable,
+                    "args": [
+                        "-I",
+                        "-m",
+                        "omnigent.harnesses.claude_native.bridge",
+                        "serve-mcp",
+                        "--bridge-dir",
+                        str(bridge_dir),
+                    ],
+                    "env": {"PYTHONUNBUFFERED": "1"},
+                }
+            ],
+        )
+        if server_client is not None and grok_session_id:
+            with contextlib.suppress(Exception):
+                await server_client.patch(
+                    f"/v1/sessions/{session_id}",
+                    json={"external_session_id": grok_session_id},
+                )
+    write_bridge_state(
+        bridge_dir,
+        GrokBridgeState(
+            ws_url=endpoint.ws_url,
+            session_id=grok_session_id or "",
+            pid=0,
+            server_url=(runner_server_url or ""),
+            headers=(dict(server_client.headers) if server_client is not None else {}),
+        ),
+    )
+
+    # Forwarder: tail the session's persisted updates.jsonl -> mirrored items.
+    # ``session/update`` only reaches the prompting WS connection (verified),
+    # so the durable session log is the transport-independent mirror source.
+    if server_client is not None and grok_session_id:
+        forwarder_task = start_updates_follower(
+            server_client,
+            base_url=str(server_client.base_url).rstrip("/"),
+            headers={},
+            session_id=session_id,
+            workspace=workspace,
+            grok_session_id=grok_session_id,
+            bridge_dir=bridge_dir,
+        )
+        _register_auto_forwarder_task(session_id, forwarder_task)
+
+    publish_event(
+        session_id,
+        {
+            "type": "session.resource.created",
+            "resource": session_resource_view_to_dict(terminal_view),
+        },
+    )
+    return terminal_view
+
+
+async def _launch_grok(ctx: NativeLaunchContext) -> SessionResourceView:
+    """Adapter: build the grok-native terminal from a launch context."""
+    return await _auto_create_grok_terminal(
+        ctx.session_id,
+        ctx.resource_registry,
+        ctx.publish_event,
+        server_client=ctx.server_client,
+        ensure_comment_relay=ctx.ensure_comment_relay,
+        agent_spec=ctx.agent_spec,
     )
 
 
