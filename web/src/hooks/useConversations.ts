@@ -37,6 +37,7 @@ import {
   findCachedListRow,
   lastIdAfterFiltering,
   insertNewRowsIntoPages,
+  LIST_ROW_QUERY_ROOTS,
   markRecentlyCreated,
   mergeItemsIntoPages,
   overlayArchivedIntoCaches,
@@ -1987,32 +1988,58 @@ function refuseOverlappingPinWrite(queryClient: QueryClient) {
   }
 }
 
-// Restore only the pin label across rendered caches (each row's own copy).
-function restorePinLabelInCaches(queryClient: QueryClient, id: string, pin: string | undefined) {
-  const withPin = (labels: Record<string, string> | undefined) => {
-    const rest = Object.fromEntries(
-      Object.entries(labels ?? {}).filter(([k]) => k !== PINNED_LABEL_KEY),
-    );
-    return pin === undefined ? rest : { ...rest, [PINNED_LABEL_KEY]: pin };
+/**
+ * Set one label on every cached copy of a session row — list pages, project
+ * folders, the pinned list, the open-session row and its snapshot — keeping
+ * each copy's other labels. `value` undefined removes the label.
+ */
+export function overlayLabelIntoCaches(
+  queryClient: QueryClient,
+  id: string,
+  key: string,
+  value: string | undefined,
+): void {
+  const withLabel = (labels: Record<string, string> | undefined) => {
+    const rest = Object.fromEntries(Object.entries(labels ?? {}).filter(([k]) => k !== key));
+    return value === undefined ? rest : { ...rest, [key]: value };
   };
-  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-    queryKey: ["conversations"],
-  })) {
-    const row = data?.pages.flatMap((p) => p.data).find((c) => c.id === id);
-    if (!row) continue;
-    const { data: next } = mergeItemsIntoPages(
-      data,
-      new Map([[id, { id, labels: withPin(row.labels) } satisfies SessionListWireItem]]),
-      filtersFromConversationQueryKey(key),
-    );
-    if (next !== data) queryClient.setQueryData(key, next);
+  for (const root of LIST_ROW_QUERY_ROOTS) {
+    for (const [queryKey, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+      queryKey: [root],
+    })) {
+      const row = data?.pages.flatMap((p) => p.data).find((c) => c.id === id);
+      if (!row) continue;
+      const { data: next } = mergeItemsIntoPages(
+        data,
+        new Map([[id, { id, labels: withLabel(row.labels) } satisfies SessionListWireItem]]),
+        root === "conversations"
+          ? filtersFromConversationQueryKey(queryKey)
+          : filtersFromProjectQueryKey(queryKey),
+      );
+      if (next !== data) queryClient.setQueryData(queryKey, next);
+    }
   }
+  queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
+    old?.conversations.some((c) => c.id === id)
+      ? {
+          ...old,
+          conversations: old.conversations.map((c) =>
+            c.id === id ? { ...c, labels: withLabel(c.labels) } : c,
+          ),
+        }
+      : old,
+  );
   queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
-    old ? { ...old, labels: withPin(old.labels) } : old,
+    old ? { ...old, labels: withLabel(old.labels) } : old,
   );
   queryClient.setQueryData<Session>(["session", id], (old) =>
-    old ? { ...old, labels: withPin(old.labels) } : old,
+    old ? { ...old, labels: withLabel(old.labels) } : old,
   );
+}
+
+// Restore only the pin label across rendered caches (each row's own copy).
+function restorePinLabelInCaches(queryClient: QueryClient, id: string, pin: string | undefined) {
+  overlayLabelIntoCaches(queryClient, id, PINNED_LABEL_KEY, pin);
 }
 
 // Apply a pin/unpin to every cache that renders the row. `labels` is the

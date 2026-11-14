@@ -28,6 +28,7 @@ vi.mock("@/pages/ChatPage", () => ({
 }));
 vi.mock("@/pages/NotFoundPage", () => ({ NotFoundPage: () => <div>not found</div> }));
 vi.mock("@/pages/UsagePage", () => ({ UsagePage: () => <div>usage page</div> }));
+vi.mock("@/pages/BoardPage", () => ({ BoardPage: () => <div>board page</div> }));
 vi.mock("@/pages/TaskDetailPage", () => ({ TaskDetailPage: () => <div>task detail page</div> }));
 vi.mock("@/pages/WorkflowsPage", () => ({ WorkflowsPage: () => <div>workflows page</div> }));
 vi.mock("@/pages/WorkflowDetailPage", () => ({
@@ -364,6 +365,20 @@ describe("Usage release feature route", () => {
   it("registers /usage while the feature is on", async () => {
     renderUsageRoute(true);
     expect(await screen.findByText("usage page")).toBeInTheDocument();
+    expect(screen.queryByText("not found")).toBeNull();
+  });
+});
+
+describe("Board release feature route", () => {
+  it("renders not found at /board while the feature is off", async () => {
+    renderRoute("/board");
+    expect(await screen.findByText("not found")).toBeInTheDocument();
+    expect(screen.queryByText("board page")).toBeNull();
+  });
+
+  it("renders the board at /board while the feature is on", async () => {
+    renderRoute("/board", { session_board: true });
+    expect(await screen.findByText("board page")).toBeInTheDocument();
     expect(screen.queryByText("not found")).toBeNull();
   });
 });

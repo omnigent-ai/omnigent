@@ -948,6 +948,53 @@ async def test_patch_session_pins_and_unpins(
     assert user_key not in conv.labels
 
 
+async def test_patch_board_acceptance_label_keeps_activity_time(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """The web Board stores acceptance as the session's ``updated_at`` in the
+    ``omnigent.board.accepted`` label and compares the two, so writing or
+    clearing that label must not count as session activity."""
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlConversation
+
+    # Age the row so a same-second bump can't hide a regression.
+    accepted_at = 1_700_000_000
+    with make_managed_session_maker(get_or_create_engine(db_uri))() as session:
+        session.execute(
+            update(SqlConversation)
+            .where(SqlConversation.id == session_id)
+            .values(updated_at=accepted_at)
+        )
+        session.commit()
+
+    async def listed_row() -> dict:
+        resp = await client.get("/v1/sessions")
+        assert resp.status_code == 200, resp.text
+        return next(row for row in resp.json()["data"] if row["id"] == session_id)
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.board.accepted": str(accepted_at)}},
+    )
+    assert resp.status_code == 200, resp.text
+    row = await listed_row()
+    assert row["labels"]["omnigent.board.accepted"] == str(accepted_at)
+    assert row["updated_at"] == accepted_at
+
+    # Reopening clears the value without bumping the activity time either.
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.board.accepted": ""}},
+    )
+    assert resp.status_code == 200, resp.text
+    row = await listed_row()
+    assert row["labels"].get("omnigent.board.accepted", "") == ""
+    assert row["updated_at"] == accepted_at
+
+
 async def test_archiving_clears_the_callers_pin(
     client: httpx.AsyncClient,
     session_id: str,

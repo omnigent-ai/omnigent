@@ -92,6 +92,7 @@ import {
   SmilePlusIcon,
   SquareIcon,
   SquareCheckIcon,
+  SquareKanbanIcon,
   Trash2Icon,
   UserRoundIcon,
   UsersIcon,
@@ -601,6 +602,7 @@ interface SidebarProps {
 function useActiveNavItem(): {
   isNewChatPage: boolean;
   isInboxPage: boolean;
+  isBoardPage: boolean;
   isCanvasPage: boolean;
   isTasksPage: boolean;
   isWorkflowsPage: boolean;
@@ -620,6 +622,7 @@ function useActiveNavItem(): {
   const leaf = segments.at(-1);
   const isExtensionRoute = extensionPathParts(location.pathname) !== null;
   const isInboxPage = !isExtensionRoute && leaf === "inbox";
+  const isBoardPage = !isExtensionRoute && leaf === "board";
   const isCanvasPage =
     !isExtensionRoute && isCanvasPathname(location.pathname, rebasePath("/canvas"));
   // True for both /tasks (list) and /tasks/:taskId (detail). Basename-agnostic:
@@ -635,6 +638,7 @@ function useActiveNavItem(): {
     activeConversationId == null &&
     (gridId == null || !isFeatureEnabled(serverInfo, "grid_sessions_display_ui")) &&
     !isInboxPage &&
+    !isBoardPage &&
     !isCanvasPage &&
     !isTasksPage &&
     !isWorkflowsPage &&
@@ -651,6 +655,7 @@ function useActiveNavItem(): {
   return {
     isNewChatPage,
     isInboxPage,
+    isBoardPage,
     isCanvasPage,
     isTasksPage,
     isWorkflowsPage,
@@ -812,6 +817,7 @@ function SidebarImpl({
   const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
   const workflowsPageEnabled = isFeatureEnabled(serverInfo, "workflows");
   const canvasEnabled = isFeatureEnabled(serverInfo, "canvas");
+  const boardEnabled = isFeatureEnabled(serverInfo, "session_board");
   const [searchParams] = useSearchParams();
   const canvasDestination = canvasLocation(searchParams.get(CANVAS_QUERY_PARAM) ?? MAIN_CANVAS_ID);
   const [selectionMode, setSelectionMode] = useState(false);
@@ -950,6 +956,7 @@ function SidebarImpl({
   const {
     isNewChatPage,
     isInboxPage,
+    isBoardPage,
     isCanvasPage,
     isTasksPage,
     isWorkflowsPage,
@@ -1544,6 +1551,17 @@ function SidebarImpl({
                   )}
                 </Link>
               </Button>
+              {boardEnabled && (
+                <PrimaryNavLink
+                  to="/board"
+                  label="Board"
+                  icon={SquareKanbanIcon}
+                  active={isBoardPage}
+                  onClick={onNavClick}
+                  componentId="sidebar.board"
+                  testId="board-nav"
+                />
+              )}
               {canvasEnabled && (
                 <PrimaryNavLink
                   to={canvasDestination.pathname + canvasDestination.search}

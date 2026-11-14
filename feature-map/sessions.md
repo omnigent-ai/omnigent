@@ -264,6 +264,13 @@ the header menu), and each place is a separate entry point.
   a third of its width, or after a quick flick, closes it; a shorter drag springs
   back. List scrolling, row taps, long-press reordering and horizontal scrollers
   keep their own touch handling.
+- `session-board`: behind the `session_board` release flag (off by default),
+  **Board** shows the viewer's own loaded sessions as cards in **Running**,
+  **Needs you** (approvals, terminal prompts, failed turns), **Needs review**
+  and **Done** columns, each card linking to its session. **Accept** moves an
+  idle or failed session to Done; **Reopen** moves it back. New session activity
+  after acceptance also moves it out of Done. Shared sessions are not shown.
+  Empty, loading and **Load more sessions** states mirror the Inbox.
 - `session-overview`: behind the `session_overview` release flag (off by
   default), the desktop chat header shows the session cost as a `$x.xx` chip.
   Clicking it shows or hides a **Session overview** card with the session cost
@@ -709,6 +716,11 @@ composer and support interleaved comments and pasted images too. A viewer whose
 composer is read-only (for example a Read grant) gets neither **Reply** nor
 **Ask in side chat** when selecting parent text.
 
+**Board:** enable `OMNIGENT_FEATURES=session_board`, reload, and choose
+**Board** in the sidebar's primary navigation (desktop and the mobile drawer),
+or open `/board` directly. With the flag off the route shows Page not found and
+the sidebar has no Board row.
+
 **Desktop browser:** choose **+ → Browser** in the Workspace panel or press
 ⌘/Ctrl+T. Agent browser requests and chat links with in-app opening enabled
 create or select a closable Browser soft tab automatically.
@@ -752,6 +764,19 @@ plain `uv run pytest`, which starts a private server for the test.
   `web/src/grid/GridSessionPane.test.tsx`. To check manually, inject a render
   exception into one chat or terminal, confirm the other views stay usable,
   clear the fault, and choose **Try again** in the failed view.
+
+- **`session-board`:** column placement, Accept and Reopen requests, unread
+  marking, shared-session exclusion, and the empty and load-more states have
+  component coverage in `web/src/pages/BoardPage.test.tsx`; the column rules in
+  `web/src/lib/sessionBoard.test.ts`; the optimistic label write and rollback in
+  `web/src/hooks/useBoardAcceptance.test.tsx`; and the route and sidebar gate in
+  `web/src/App.test.tsx` and `web/src/shell/Sidebar.test.tsx`. That a label
+  write leaves the session's activity time alone is checked by
+  `tests/server/routes/test_sessions_crud.py::test_patch_board_acceptance_label_keeps_activity_time`.
+  To check manually, enable `session_board` on the isolated server, run one
+  session to idle, open **Board**, and confirm the card sits in Needs review.
+  Choose **Accept**: it moves to Done and stays there after a reload. Send the
+  session another message: the card moves to Running, then back to Needs review.
 
 - **`pin`:**
   `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_unpin_moves_session_back_to_recent`
@@ -1361,6 +1386,12 @@ its discoverability.
   carries the recovered prompt and attachments into the ordinary composer.
 - Sandbox expiry and explicit whole-host destruction remain separate from
   deleting one session. Shared compute means a shared filesystem, not history.
+
+- The Board's Done column compares the acceptance label with the session's
+  `updated_at`. Renaming, archiving, filing a session into a project, or
+  changing its model, effort or harness also bumps `updated_at`, so those
+  actions move an accepted card back to Needs review. The board lists only the sessions the sidebar has loaded; use **Load
+  more sessions** for older ones.
 
 - Existing side chats on separate runners must still be closed individually.
   Hostless CLI Stop keeps its existing per-conversation behavior.

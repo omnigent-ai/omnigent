@@ -102,6 +102,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "sidebar_windowed_rows": False,
         "workflows": False,
         "session_overview": False,
+        "session_board": False,
         "project_repository_creation": True,
         "session_orchestration": True,
         "sibling_sessions": True,
