@@ -54,6 +54,7 @@ async function resolveAppIconDataUrl({
  * @param {typeof import("electron").BrowserWindow} deps.BrowserWindow
  * @param {import("electron").IpcMain} deps.ipcMain
  * @param {import("electron").NativeTheme} deps.nativeTheme
+ * @param {import("electron").Shell} deps.shell
  * @param {{ getStatus: Function, checkForUpdates: Function,
  *   downloadUpdate: Function, installUpdateNow: Function }} deps.updater
  * @param {() => string} deps.getDesktopVersion
@@ -69,6 +70,7 @@ function createAboutWindow({
   BrowserWindow,
   ipcMain,
   nativeTheme,
+  shell,
   updater,
   getDesktopVersion,
   getAppIconDataUrl,
@@ -143,7 +145,14 @@ function createAboutWindow({
     });
     if (platform === "darwin") about.excludedFromShownWindowsMenu = true;
 
-    about.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+    about.webContents.setWindowOpenHandler(({ url }) => {
+      if (url === "https://omnigent.ai/releases") {
+        void shell.openExternal(url).catch((error) => {
+          console.warn("Unable to open release notes:", error);
+        });
+      }
+      return { action: "deny" };
+    });
     about.webContents.on("will-navigate", (event, targetUrl) => {
       if (targetUrl !== aboutPageUrl.href) event.preventDefault();
     });
