@@ -4115,7 +4115,8 @@ async def test_codex_forwarder_auth_keeps_tunnel_pings_responsive(
         httpx,
         "AsyncClient",
         lambda **kwargs: real_async_client(
-            transport=httpx.MockTransport(lambda _request: httpx.Response(200)), **kwargs
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200)),
+            **{key: value for key, value in kwargs.items() if key != "transport"},
         ),
     )
     kwargs: dict[str, Any] = {
@@ -4268,6 +4269,7 @@ async def test_codex_discover_thread_and_forward_marks_its_pane_for_replacement(
     real_async_client = httpx.AsyncClient
 
     def _mock_client(**kwargs: Any) -> httpx.AsyncClient:
+        kwargs.pop("transport", None)
         return real_async_client(
             transport=httpx.MockTransport(lambda _r: httpx.Response(200)), **kwargs
         )
@@ -4505,6 +4507,7 @@ async def test_codex_discover_thread_and_forward_waits_while_terminal_alive(
     real_async_client = httpx.AsyncClient
 
     def _mock_client(**kwargs: Any) -> httpx.AsyncClient:
+        kwargs.pop("transport", None)
         return real_async_client(
             transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={})),
             **kwargs,
@@ -4636,6 +4639,7 @@ async def test_codex_discover_thread_and_forward_records_a_sign_in_prompt_before
     real_async_client = httpx.AsyncClient
 
     def _mock_client(**kwargs: Any) -> httpx.AsyncClient:
+        kwargs.pop("transport", None)
         return real_async_client(
             transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={})),
             **kwargs,
@@ -4846,6 +4850,7 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
         return httpx.Response(200, json={})
 
     def _mock_client(**kwargs: Any) -> httpx.AsyncClient:
+        kwargs.pop("transport", None)
         return real_async_client(transport=httpx.MockTransport(_handle_patch), **kwargs)
 
     async def _fake_wait(*_args: object, **kwargs: object) -> str:

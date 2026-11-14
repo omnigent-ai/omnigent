@@ -3459,20 +3459,28 @@ def test_remote_headers_prefers_explicit_remote_token_env(monkeypatch: pytest.Mo
     }
 
 
-def test_remote_headers_falls_back_to_ambient_databricks_creds(
+@pytest.mark.parametrize(
+    ("workspace_host", "record_token", "expected_token"),
+    [
+        (None, None, "ambient-token"),
+        ("https://workspace.example.test", "paired-token", "paired-token"),
+        ("https://workspace.example.test", None, None),
+    ],
+    ids=["unpaired-ambient", "paired-available", "paired-unavailable"],
+)
+def test_remote_headers_prefers_paired_databricks_creds_before_ambient(
     monkeypatch: pytest.MonkeyPatch,
+    workspace_host: str | None,
+    record_token: str | None,
+    expected_token: str | None,
 ) -> None:
-    """No env token + no stored login record → ambient Databricks credentials.
-
-    Bottom of the resolution chain: with ``OMNIGENT_REMOTE_AUTH_TOKEN``
-    unset, no stored OIDC token, and no stored Databricks Apps pointer
-    record for the server, ``_remote_headers`` must fall back to
-    ``_read_databrickscfg(None)`` (the SDK's ambient resolution — no
-    profile is threaded anymore) and put its token in the bearer header.
-    """
+    """A saved workspace stays authoritative when its credentials are unavailable."""
     monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
     monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
-    monkeypatch.setattr(chat_module, "_stored_databricks_record_token", lambda _url: None)
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_workspace_host", lambda _url: workspace_host
+    )
+    monkeypatch.setattr(chat_module, "_stored_databricks_record_token", lambda _url: record_token)
     read_calls: list[object] = []
 
     def _fake_read(profile: object) -> DatabricksCredentials:
@@ -3484,11 +3492,11 @@ def test_remote_headers_falls_back_to_ambient_databricks_creds(
 
     headers = _remote_headers(server_url="https://srv.example.com", host_id=None)
 
-    # The ambient token reached the Authorization header.
-    assert headers == {"Authorization": "Bearer ambient-token", "User-Agent": client_user_agent()}
-    # Ambient resolution: exactly one lookup, with no profile threaded
-    # (None) — a non-None value here means profile plumbing came back.
-    assert read_calls == [None]
+    expected_headers = {"User-Agent": client_user_agent()}
+    if expected_token is not None:
+        expected_headers["Authorization"] = f"Bearer {expected_token}"
+    assert headers == expected_headers
+    assert read_calls == ([None] if workspace_host is None else [])
 
 
 def test_remote_headers_adds_org_id_header(monkeypatch: pytest.MonkeyPatch) -> None:
