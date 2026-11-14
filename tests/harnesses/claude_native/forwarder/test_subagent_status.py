@@ -721,6 +721,99 @@ async def test_subagent_idle_observation_preserves_timing_and_deduplication(
             assert len(status_events) == count
 
 
+@pytest.mark.parametrize("ending", ["reply", "handback", "interrupt"])
+async def test_subagent_idle_observation_waits_out_an_open_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ending: str
+) -> None:
+    """An open tool step keeps the child running past the short gap; a turn end restores it."""
+    now = 1000.0
+    monkeypatch.setattr(
+        forwarder, "time", SimpleNamespace(time=lambda: now, monotonic=time.monotonic)
+    )
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.touch()
+    child_path = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="tool-worker",
+        agent_type="Explore",
+        description="long-running tool",
+        tool_use_id="toolu_worker",
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "tool-worker": forwarder.SubagentEntry(
+                subagent_id="tool-worker", child_conversation_id="conv_child"
+            )
+        }
+    )
+    statuses: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if isinstance(body, list):
+            return httpx.Response(202, json=[{"item_id": "item"} for _ in body])
+        statuses.append("idle" if body["type"] == "subagent.status" else body["data"]["status"])
+        return httpx.Response(202, json={"queued": False})
+
+    def append(record_type: str, uuid: str, content: list[dict[str, Any]]) -> None:
+        with child_path.open("a", encoding="utf-8") as handle:
+            message = {"role": record_type, "content": content}
+            record = {"isSidechain": True, "type": record_type, "uuid": uuid, "message": message}
+            handle.write(json.dumps(record) + "\n")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+
+        async def tick() -> None:
+            nonlocal state
+            state = await forwarder._forward_available_subagents(
+                client=client,
+                parent_session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                transcript_path=transcript_path,
+                state=state,
+                agent_name="claude-native-ui",
+                start_retry_tracker=forwarder._PostRetryTracker(),
+                item_retry_tracker=forwarder._PostRetryTracker(),
+                status_retry_tracker=forwarder._PostRetryTracker(),
+                status_capability=forwarder._SubagentStatusCapability(),
+            )
+
+        tool_use = {"type": "tool_use", "id": "toolu_bash", "name": "Bash", "input": {}}
+        append("assistant", "call", [tool_use])
+        await tick()
+        now += forwarder._SUBAGENT_IDLE_THRESHOLD_S + 1
+        await tick()
+        tool_result = {"type": "tool_result", "tool_use_id": "toolu_bash", "content": "ok"}
+        append("user", "result", [tool_result])
+        await tick()
+        now += forwarder._SUBAGENT_IDLE_THRESHOLD_S + 1
+        state = forwarder._read_subagent_forward_state(bridge_dir)
+        await tick()
+        assert statuses == ["running"]
+        now += forwarder._SUBAGENT_MID_TURN_IDLE_THRESHOLD_S
+        await tick()
+        assert statuses == ["running", "idle"]
+
+        if ending == "reply":
+            append("assistant", "reply", [{"type": "text", "text": "done"}])
+        elif ending == "handback":
+            handback = {"type": "tool_use", "id": "toolu_back", "name": "SubagentHandback"}
+            append("assistant", "handback", [{**handback, "input": {"message": "done"}}])
+            await tick()
+            delivered = {"type": "tool_result", "tool_use_id": "toolu_back", "content": "ok"}
+            append("user", "handback-result", [delivered])
+        else:
+            interrupt = "[Request interrupted by user for tool use]"
+            append("user", "interrupt", [{"type": "text", "text": interrupt}])
+        await tick()
+        now += forwarder._SUBAGENT_IDLE_THRESHOLD_S + 1
+        await tick()
+        assert statuses == ["running", "idle", "running", "idle"]
+
+
 async def test_subagent_idle_unsupported_cache_covers_other_children(tmp_path: Path) -> None:
     """One old-server rejection suppresses other children's idle events, not failures."""
     transcript_path = tmp_path / "session.jsonl"
