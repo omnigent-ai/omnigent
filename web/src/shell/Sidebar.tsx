@@ -159,7 +159,6 @@ import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/h
 import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
-  DropdownMenuLabel,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuRadioGroup,
@@ -544,11 +543,6 @@ const SIDEBAR_FILTER_EMPTY: Record<SidebarTab, string> = {
   archived: "No sessions",
 };
 
-// Bulk-selection targets either the flat "Sessions" list or the sessions
-// nested inside project folders; the active scope decides which rows show
-// checkboxes and where the bulk-action bar renders.
-type SelectionScope = "sessions" | "projects";
-
 interface SidebarProps {
   open: boolean;
   onClose: () => void;
@@ -803,10 +797,6 @@ function SidebarImpl({
   const [searchParams] = useSearchParams();
   const canvasDestination = canvasLocation(searchParams.get(CANVAS_QUERY_PARAM) ?? MAIN_CANVAS_ID);
   const [selectionMode, setSelectionMode] = useState(false);
-  // Which rows the current selection targets: the flat "Sessions" list, or the
-  // sessions nested inside project folders. Set when selection mode is entered
-  // (from the Sessions header or the Projects header kebab, respectively).
-  const [selectionScope, setSelectionScope] = useState<SelectionScope>("sessions");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   // A loopback-only server has one user, so "Shared" is meaningless there —
   // the filter menu drops that option. Mirrors AppShell's `shareDisabled`.
@@ -846,15 +836,12 @@ function SidebarImpl({
 
   const exitSelectionMode = useCallback(() => {
     setSelectionMode(false);
-    setSelectionScope("sessions");
     setSelectedIds(new Set());
     lastSelectedIdRef.current = null;
   }, []);
 
-  // Enter selection mode targeting a given scope; clear any prior selection so
-  // rows from the previous scope don't linger.
-  const enterSelectionMode = useCallback((scope: SelectionScope) => {
-    setSelectionScope(scope);
+  // Enter selection mode with a fresh selection.
+  const enterSelectionMode = useCallback(() => {
     setSelectedIds(new Set());
     lastSelectedIdRef.current = null;
     setSelectionMode(true);
@@ -1590,7 +1577,6 @@ function SidebarImpl({
                     onTogglePinned={togglePinnedConversation}
                     onEnterSelectionMode={enterSelectionMode}
                     selectionMode={selectionMode}
-                    selectionScope={selectionScope}
                     selectedIds={selectedIds}
                     onToggleSelected={toggleSelected}
                     onDeselectAll={deselectAll}
@@ -2092,9 +2078,8 @@ interface ConversationListProps {
   // which has no order), so drag-to-reorder is off there.
   pinReorderEnabled: boolean;
   onTogglePinned: (conversationId: string) => void;
-  onEnterSelectionMode: (scope: SelectionScope) => void;
+  onEnterSelectionMode: () => void;
   selectionMode: boolean;
-  selectionScope: SelectionScope;
   selectedIds: Set<string>;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   onDeselectAll: () => void;
@@ -2132,7 +2117,6 @@ function ConversationList({
   onTogglePinned,
   onEnterSelectionMode,
   selectionMode,
-  selectionScope,
   selectedIds,
   onToggleSelected,
   onDeselectAll,
@@ -2166,9 +2150,7 @@ function ConversationList({
   const defaultProjectHostId =
     hosts.find((host) => host.status === "online" && !host.sandbox_provider)?.host_id ?? null;
   // Grouping / ordering / show options from the filter menu, seeded from the
-  // persisted per-device preference. With the release flag off the sidebar
-  // keeps its default layout and ignores any stored choice.
-  const groupingUi = isFeatureEnabled(serverInfo, "sidebar_grouping_ui");
+  // persisted per-device preference.
   const { view, updateView: saveView, sortBy, customOrder, loadedRows } = useSidebarData();
   const updateView = useStableCallback((patch: Partial<SidebarViewPreferences>) => {
     // Regrouping swaps which sections (and selection scopes) exist, so leave
@@ -2427,7 +2409,7 @@ function ConversationList({
     const custom = moveCustomOrder(order, rows, fromId, toId, activeOverride, frozenKeys);
     if (custom) saveView({ ordering: "custom", custom });
   });
-  const reorderable = groupingUi && !selectionMode;
+  const reorderable = !selectionMode;
 
   // Build sections: Pinned and Archived are peeled off; the rest splits into
   // the viewer's own sessions (Chats) and ones shared with them. Archived
@@ -2525,7 +2507,7 @@ function ConversationList({
     };
     // Grouped views fold Shared into the groups too, so the first group takes
     // the Projects header's place.
-    const splitShared = groupingUi && !grouped;
+    const splitShared = !grouped;
     const shared = splitShared ? allOrdered.filter((c) => !isOwnedByViewer(c, viewerId)) : [];
     const ordered = splitShared
       ? allOrdered.filter((c) => isOwnedByViewer(c, viewerId))
@@ -2596,7 +2578,6 @@ function ConversationList({
     projects,
     activeTab,
     viewerId,
-    groupingUi,
     grouped,
     groupOrder,
     harnessLabel,
@@ -2650,15 +2631,11 @@ function ConversationList({
     );
   }, [loadedSections.groupTitles, sections.sessions, groupOrder, statusView]);
 
-  // Scope-active flags: which section owns the current selection UI (checkboxes
-  // + bulk-action bar). Only one is true at a time unless the selection is unified.
-  const sessionsSelecting = selectionMode && selectionScope === "sessions";
-  // With sidebar_grouping_ui on, the default grouping's one "Select sessions" (on
-  // the Projects header) selects project folders, Shared and Sessions together.
-  // The Shared filter hides Projects, so its list owns selection alone.
-  const unifiedSelection = groupingUi && !grouped && activeTab !== "shared";
-  const projectsSelecting =
-    selectionMode && (selectionScope === "projects" || (unifiedSelection && sessionsSelecting));
+  // The default grouping's one "Select sessions" (on the Projects header) selects
+  // project folders, Shared and Sessions together, under the Projects header. The
+  // Shared filter and grouped views hide Projects, so their first list owns selection.
+  const unifiedSelection = !grouped && activeTab !== "shared";
+  const projectsSelecting = selectionMode && unifiedSelection;
 
   // Collapsed section titles — persisted like pins so the preference
   // survives reloads. Lifted here (not per-section state) because the
@@ -3032,14 +3009,10 @@ function ConversationList({
   // the global window (only a genuinely empty pool exits).
   useEffect(() => {
     if (!selectionMode || conversationsQuery.isFetching) return;
-    const pool =
-      selectionScope === "projects"
-        ? projectSessionPool.length
-        : displayPagination.rows.length + (unifiedSelection ? projectSessionPool.length : 0);
+    const pool = displayPagination.rows.length + (unifiedSelection ? projectSessionPool.length : 0);
     if (pool === 0) onExitSelectionMode();
   }, [
     selectionMode,
-    selectionScope,
     unifiedSelection,
     displayPagination.rows.length,
     projectSessionPool.length,
@@ -3093,7 +3066,6 @@ function ConversationList({
         orderSessionFamilies(folderListedRows(g), collapsedFamilies).map((c) => c.id),
       );
     };
-    if (selectionScope === "projects") return projectIds();
     const visibleIds = (title: string, list: readonly Conversation[]) =>
       effectiveCollapsedSections.includes(title)
         ? []
@@ -3163,8 +3135,8 @@ function ConversationList({
     </p>
   ) : undefined;
   const showShared = activeTab === "shared";
-  // The Shared section replaces Sessions on the Shared filter (release-flagged).
-  const sharedListOnly = groupingUi && !grouped && showShared;
+  // The Shared section replaces Sessions on the Shared filter.
+  const sharedListOnly = !grouped && showShared;
   // The paginated list sections on screen, by collapse key: Shared, then Sessions or its groups.
   const listSectionKeys = [
     ...(sections.shared.length > 0 || sharedListOnly ? ["Shared"] : []),
@@ -3182,13 +3154,13 @@ function ConversationList({
     sessionShortcutSlots,
     onRowClick,
     onTogglePinned,
-    selectionMode: sessionsSelecting,
+    selectionMode,
     selectedIds,
     onToggleSelected,
     onProjectAssigned: expandProject,
   };
   const sessionsBulkBar =
-    sessionsSelecting && !unifiedSelection ? (
+    selectionMode && !unifiedSelection ? (
       <BulkActionBar
         selectedIds={selectedIds}
         allConversations={displayPagination.rows}
@@ -3211,7 +3183,7 @@ function ConversationList({
           className="text-muted-foreground mobile-touch-target"
           onClick={(event) => {
             event.stopPropagation();
-            onEnterSelectionMode("sessions");
+            onEnterSelectionMode();
           }}
         >
           <ListChecksIcon className="size-3.5" />
@@ -3258,7 +3230,7 @@ function ConversationList({
       value={activeTab}
       onChange={onActiveTabChange}
       multiUser={multiUser}
-      view={groupingUi ? view : null}
+      view={view}
       onViewChange={updateView}
     />
   );
@@ -3434,24 +3406,20 @@ function ConversationList({
                       </PinOrderContext.Provider>
                     </PinDropZone>
                   )}
-                  {/* Projects: one collapsible folder per project. With sidebar_grouping_ui on
-              it holds the one filter menu; Shared and grouped views hide it, and the
+                  {/* Projects: one collapsible folder per project. It holds the one
+              filter menu; Shared and grouped views hide it, and the
               first list section takes its place. */}
                   {!grouped && !showShared && (
                     <SectionGroup
                       title="Projects"
                       collapsed={effectiveCollapsedSections.includes("Projects")}
                       onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
-                      persistentHeaderAction={groupingUi ? sessionsFilterMenu : undefined}
+                      persistentHeaderAction={sessionsFilterMenu}
                       afterHeader={
                         projectsSelecting ? (
                           <BulkActionBar
                             selectedIds={selectedIds}
-                            allConversations={
-                              unifiedSelection
-                                ? [...projectSessionPool, ...displayPagination.rows]
-                                : projectSessionPool
-                            }
+                            allConversations={[...projectSessionPool, ...displayPagination.rows]}
                             onDeselectAll={onDeselectAll}
                             onExit={onExitSelectionMode}
                             onProjectAssigned={expandProject}
@@ -3484,19 +3452,11 @@ function ConversationList({
                               projectNames={sections.projectGroups.map((group) => group.name)}
                               collapsed={effectiveCollapsedSections.includes("Projects")}
                               expandedProjects={expandedProjects}
-                              // A unified selection starts from the header's own button.
-                              hasProjectSessions={
-                                !unifiedSelection &&
-                                sections.projectGroups.some(
-                                  (group) => group.conversations.length > 0,
-                                )
-                              }
                               onExpandAll={expandAllProjects}
                               onCollapseAll={collapseAllProjects}
                               onProjectCreated={expandProject}
-                              onEnterSelectionMode={() => onEnterSelectionMode("projects")}
                             />
-                            {unifiedSelection && selectSessionsButton}
+                            {selectSessionsButton}
                           </>
                         ) : undefined
                       }
@@ -3633,9 +3593,7 @@ function ConversationList({
                           afterHeader={sessionsBulkBar}
                           headerAction={sessionsHeaderActions}
                           headerStatus={importStatus}
-                          persistentHeaderAction={
-                            groupingUi && !grouped ? undefined : sessionsFilterMenu
-                          }
+                          persistentHeaderAction={grouped ? sessionsFilterMenu : undefined}
                           reorderGroup={reorderable ? "Sessions" : undefined}
                           {...sessionRowProps}
                         />
@@ -4105,11 +4063,10 @@ function SessionFilterMenu({
   value: SidebarTab;
   onChange: (value: SidebarTab) => void;
   multiUser: boolean;
-  /** Null while the sidebar_grouping_ui release flag is off: only Display is offered. */
-  view: SidebarViewPreferences | null;
+  view: SidebarViewPreferences;
   onViewChange: (patch: Partial<SidebarViewPreferences>) => void;
 }) {
-  const triggerLabel = view === null ? "Filter sessions" : "Group, sort, and filter sessions";
+  const triggerLabel = "Group, sort, and filter sessions";
   const [menuOpen, setMenuOpen] = useState(false);
   const [openPage, setOpenPage] = useState<string | null>(null);
   const isMobile = useIsMobileViewport();
@@ -4162,90 +4119,82 @@ function SessionFilterMenu({
           {triggerLabel}
         </TooltipContent>
       </Tooltip>
-      {view === null ? (
-        // Remove with the sidebar_grouping_ui flag (review by 0.19.0).
-        <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitemradio]]:text-ui">
-          <DropdownMenuLabel className="text-muted-foreground text-sm">Display</DropdownMenuLabel>
-          {displayOptions}
-        </DropdownMenuContent>
-      ) : (
-        <DropdownMenuContent align="end" className="min-w-56">
-          <FilterMenuSub
-            label="Grouping"
-            value={GROUPING_LABELS[view.grouping]}
-            testId="session-grouping-menu"
-            pages={pages}
+      <DropdownMenuContent align="end" className="min-w-56">
+        <FilterMenuSub
+          label="Grouping"
+          value={GROUPING_LABELS[view.grouping]}
+          testId="session-grouping-menu"
+          pages={pages}
+        >
+          <DropdownMenuRadioGroup
+            value={view.grouping}
+            onValueChange={(next) => onViewChange({ grouping: next as SidebarGrouping })}
           >
-            <DropdownMenuRadioGroup
-              value={view.grouping}
-              onValueChange={(next) => onViewChange({ grouping: next as SidebarGrouping })}
-            >
-              {SIDEBAR_GROUPINGS.map((grouping) => (
-                <DropdownMenuRadioItem
-                  className="mobile-touch-target"
-                  key={grouping}
-                  value={grouping}
-                  data-testid={`session-grouping-${grouping}`}
-                >
-                  {GROUPING_LABELS[grouping]}
-                </DropdownMenuRadioItem>
-              ))}
-            </DropdownMenuRadioGroup>
-          </FilterMenuSub>
-          <FilterMenuSub
-            label="Display"
-            value={filters.find((filter) => filter.value === value)?.label}
-            testId="session-display-menu"
-            pages={pages}
-          >
-            {displayOptions}
-          </FilterMenuSub>
-          <FilterMenuSub
-            label="Ordering"
-            value={ORDERING_LABELS[view.ordering]}
-            testId="session-ordering-menu"
-            pages={pages}
-          >
-            <DropdownMenuRadioGroup
-              value={view.ordering}
-              onValueChange={(next) => onViewChange({ ordering: next as SidebarOrdering })}
-            >
-              {Object.entries(ORDERING_LABELS).map(([ordering, label]) => (
-                <DropdownMenuRadioItem
-                  className="mobile-touch-target"
-                  key={ordering}
-                  value={ordering}
-                  data-testid={`session-ordering-${ordering}`}
-                >
-                  {label}
-                </DropdownMenuRadioItem>
-              ))}
-            </DropdownMenuRadioGroup>
-          </FilterMenuSub>
-          {!pages?.open && <DropdownMenuSeparator />}
-          <FilterMenuSub label="Show" testId="session-show-menu" pages={pages}>
-            {SIDEBAR_SHOW_FIELDS.map((field) => (
-              <DropdownMenuCheckboxItem
+            {SIDEBAR_GROUPINGS.map((grouping) => (
+              <DropdownMenuRadioItem
                 className="mobile-touch-target"
-                key={field}
-                checked={view.show.includes(field)}
-                data-testid={`session-show-${field}`}
-                // Keep the menu open so several fields can be toggled in one go.
-                onSelect={(event) => event.preventDefault()}
-                onCheckedChange={(checked) =>
-                  onViewChange({
-                    show: SIDEBAR_SHOW_FIELDS.filter((f) =>
-                      f === field ? checked : view.show.includes(f),
-                    ),
-                  })
-                }
+                key={grouping}
+                value={grouping}
+                data-testid={`session-grouping-${grouping}`}
               >
-                {SHOW_LABELS[field]}
-              </DropdownMenuCheckboxItem>
+                {GROUPING_LABELS[grouping]}
+              </DropdownMenuRadioItem>
             ))}
-          </FilterMenuSub>
-        </DropdownMenuContent>
-      )}
+          </DropdownMenuRadioGroup>
+        </FilterMenuSub>
+        <FilterMenuSub
+          label="Display"
+          value={filters.find((filter) => filter.value === value)?.label}
+          testId="session-display-menu"
+          pages={pages}
+        >
+          {displayOptions}
+        </FilterMenuSub>
+        <FilterMenuSub
+          label="Ordering"
+          value={ORDERING_LABELS[view.ordering]}
+          testId="session-ordering-menu"
+          pages={pages}
+        >
+          <DropdownMenuRadioGroup
+            value={view.ordering}
+            onValueChange={(next) => onViewChange({ ordering: next as SidebarOrdering })}
+          >
+            {Object.entries(ORDERING_LABELS).map(([ordering, label]) => (
+              <DropdownMenuRadioItem
+                className="mobile-touch-target"
+                key={ordering}
+                value={ordering}
+                data-testid={`session-ordering-${ordering}`}
+              >
+                {label}
+              </DropdownMenuRadioItem>
+            ))}
+          </DropdownMenuRadioGroup>
+        </FilterMenuSub>
+        {!pages?.open && <DropdownMenuSeparator />}
+        <FilterMenuSub label="Show" testId="session-show-menu" pages={pages}>
+          {SIDEBAR_SHOW_FIELDS.map((field) => (
+            <DropdownMenuCheckboxItem
+              className="mobile-touch-target"
+              key={field}
+              checked={view.show.includes(field)}
+              data-testid={`session-show-${field}`}
+              // Keep the menu open so several fields can be toggled in one go.
+              onSelect={(event) => event.preventDefault()}
+              onCheckedChange={(checked) =>
+                onViewChange({
+                  show: SIDEBAR_SHOW_FIELDS.filter((f) =>
+                    f === field ? checked : view.show.includes(f),
+                  ),
+                })
+              }
+            >
+              {SHOW_LABELS[field]}
+            </DropdownMenuCheckboxItem>
+          ))}
+        </FilterMenuSub>
+      </DropdownMenuContent>
     </DropdownMenu>
   );
 }
@@ -4260,11 +4209,9 @@ function ProjectHeaderActions({
   projectNames,
   collapsed,
   expandedProjects,
-  hasProjectSessions,
   onExpandAll,
   onCollapseAll,
   onProjectCreated,
-  onEnterSelectionMode,
 }: {
   hostId: string | null;
   hosts: Host[];
@@ -4275,20 +4222,16 @@ function ProjectHeaderActions({
   projectNames: string[];
   collapsed: boolean;
   expandedProjects: string[];
-  /** Whether any project holds sessions — gates the "Select sessions" item, so
-      it isn't offered when there's nothing under any folder to select. */
-  hasProjectSessions: boolean;
   onExpandAll: (projectNames: string[]) => void;
   onCollapseAll: () => void;
   onProjectCreated: (projectName: string) => void;
-  onEnterSelectionMode: () => void;
 }) {
   const showExpandControls = !collapsed && projectNames.length > 0;
   const allExpanded =
     projectNames.length > 0 && projectNames.every((name) => expandedProjects.includes(name));
   const anyExpanded = projectNames.some((name) => expandedProjects.includes(name));
-  // Hide the menu when there are no projects or sessions to organize.
-  const showMenu = showExpandControls || hasProjectSessions || projectNames.length > 0;
+  // Hide the menu when there are no projects to organize.
+  const showMenu = projectNames.length > 0;
 
   return (
     <div className="flex items-center gap-0.5">
@@ -4343,15 +4286,6 @@ function ProjectHeaderActions({
               <DropdownMenuItem data-testid="collapse-all-projects" onSelect={onCollapseAll}>
                 <Minimize2Icon className="size-3.5" />
                 Collapse all
-              </DropdownMenuItem>
-            )}
-            {hasProjectSessions && (
-              <DropdownMenuItem
-                data-testid="projects-select-sessions"
-                onSelect={() => onEnterSelectionMode()}
-              >
-                <ListChecksIcon className="size-3.5" />
-                Select sessions
               </DropdownMenuItem>
             )}
           </DropdownMenuContent>
@@ -4535,7 +4469,6 @@ function ConversationSection({
   const visibleFamilyRows = orderSessionFamilies(rows, collapsedFamilies);
   const reorderRows = visibleFamilyRows.filter((row) => !isNestedFamilyRow(row));
 
-  const groupingEmptyState = isFeatureEnabled(useContext(ServerInfoContext), "sidebar_grouping_ui");
   const grids = useGridSessions();
   const gridMembers = new Set(grids?.activeGrid ? gridSessionIds(grids.activeGrid.layout) : []);
   // A provisional row has no server id yet, so it can't be a Move up/down target.
@@ -4626,15 +4559,13 @@ function ConversationSection({
                   className={cn(
                     SIDEBAR_ROW,
                     "relative flex w-full flex-col justify-center text-left text-muted-foreground",
-                    groupingEmptyState && "items-center text-center",
+                    "items-center text-center",
                   )}
                 >
-                  {groupingEmptyState && (
-                    <span
-                      aria-hidden
-                      className="pointer-events-none absolute inset-0 rounded-[var(--radius-otto-button)] border border-dashed border-border"
-                    />
-                  )}
+                  <span
+                    aria-hidden
+                    className="pointer-events-none absolute inset-0 rounded-[var(--radius-otto-button)] border border-dashed border-border"
+                  />
                   <p>{emptyMessage}</p>
                 </div>
               </div>
@@ -5457,58 +5388,6 @@ function SessionHarnessIcon({
   );
 }
 
-// The tooltip before the sidebar_grouping_ui release flag; remove with the flag
-// (review by 0.19.0).
-function LegacySessionTooltipContent({
-  conversation,
-  hostsById,
-  hasError,
-  shared,
-}: {
-  conversation: Conversation;
-  hostsById: ReadonlyMap<string, Host>;
-  hasError: boolean;
-  shared: boolean;
-}) {
-  return (
-    <TooltipContent
-      side="right"
-      align="start"
-      sideOffset={8}
-      data-testid="session-tooltip-content"
-      // Mirror PinnedProjectFlyoutContent's compact HoverCard look: title,
-      // then muted, small-icon metadata lines.
-      className="menu-surface w-64 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg p-2.5 text-popover-foreground whitespace-normal shadow-menu"
-    >
-      <p className="sidebar-compact-text line-clamp-3 font-medium">
-        {conversation.title ?? conversation.id}
-        <span className="font-normal text-muted-foreground">
-          {" · "}
-          {relativeTime(conversation.updated_at * 1000)}
-        </span>
-      </p>
-      <p
-        data-testid="session-tooltip-location"
-        className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
-      >
-        <LaptopIcon aria-hidden className="size-3.5 shrink-0" />
-        <span className="truncate">{sessionLocationLabel(conversation, hostsById)}</span>
-      </p>
-      {conversation.git_branch && (
-        <p
-          data-testid="session-tooltip-branch"
-          className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
-        >
-          <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
-          <span className="truncate">{conversation.git_branch}</span>
-        </p>
-      )}
-      {shared && <SessionSharedHint />}
-      {hasError && <SessionErrorHint />}
-    </TooltipContent>
-  );
-}
-
 function SessionTooltipContent({
   conversation,
   hostsById,
@@ -5520,17 +5399,6 @@ function SessionTooltipContent({
   hasError: boolean;
   shared: boolean;
 }) {
-  const serverInfo = useContext(ServerInfoContext);
-  if (!isFeatureEnabled(serverInfo, "sidebar_grouping_ui")) {
-    return (
-      <LegacySessionTooltipContent
-        conversation={conversation}
-        hostsById={hostsById}
-        hasError={hasError}
-        shared={shared}
-      />
-    );
-  }
   return (
     <TooltipContent
       side="right"

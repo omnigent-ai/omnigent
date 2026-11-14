@@ -19,7 +19,7 @@ _logger = logging.getLogger(__name__)
 FEATURES_ENV_VAR = "OMNIGENT_FEATURES"
 _REMOVED_HARNESS_INSTALL_ENV_VAR = "OMNIGENT_HARNESS_INSTALL_ENABLED"
 # Features made unconditional; leftover names or ``-name`` kill switches are ignored.
-_RETIRED_FEATURES = frozenset({"custom_agents_settings_ui"})
+_RETIRED_FEATURES = frozenset({"custom_agents_settings_ui", "sidebar_grouping_ui"})
 
 
 class Feature(StrEnum):
@@ -39,7 +39,6 @@ class Feature(StrEnum):
     CANVAS = "canvas"
     ARCA_SHUTDOWN_WARNINGS = "arca_shutdown_warnings"
     IMPORT_REVIEW = "import_review"
-    SIDEBAR_GROUPING_UI = "sidebar_grouping_ui"
     CLAUDE_OSC_STATUS = "claude_osc_status"
     WORKSPACE_CONTENT_SEARCH = "workspace_content_search"
     GRID_SESSIONS_DISPLAY_UI = "grid_sessions_display_ui"
@@ -196,14 +195,6 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Auto-opening import review modal for a newly connected host's context",
         owner="onboarding",
         review_by_release="0.18.0",
-    ),
-    FeatureDefinition(
-        feature=Feature.SIDEBAR_GROUPING_UI,
-        description="Sidebar grouping, ordering and row metadata options, Shared section",
-        owner="web",
-        # On by default; remove the flag and its off path in 0.23.0.
-        review_by_release="0.23.0",
-        default_enabled=True,
     ),
     FeatureDefinition(
         feature=Feature.CLAUDE_OSC_STATUS,

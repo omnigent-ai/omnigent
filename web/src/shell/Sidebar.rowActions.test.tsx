@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { selectSessionFilter } from "@/test/sidebarTestHelpers";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
@@ -281,13 +282,7 @@ function renderSidebar(
 
 /** Switch the session list to sessions shared with the viewer. */
 function openSharedTab() {
-  // Radix Tabs triggers activate on mousedown (primary button), not click.
-  fireEvent.pointerDown(screen.getByTestId("session-filter"), {
-    button: 0,
-    ctrlKey: false,
-    pointerType: "mouse",
-  });
-  fireEvent.click(screen.getByTestId("session-filter-shared"));
+  selectSessionFilter("shared");
 }
 
 beforeEach(() => {
@@ -633,12 +628,7 @@ describe("rename shortcut", () => {
     mockConversations([{ ...CONV, owner: "someone-else@example.com" }]);
     renderSidebar("conv_1", undefined, { header });
     // Shared sessions list under the Shared filter.
-    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
-      button: 0,
-      ctrlKey: false,
-      pointerType: "mouse",
-    });
-    fireEvent.click(screen.getByTestId("session-filter-shared"));
+    selectSessionFilter("shared");
     expect(screen.getByRole("link", { name: /My Session/ })).toBeTruthy();
 
     pressRenameShortcut();
@@ -799,12 +789,7 @@ describe("double-click to rename", () => {
     mockConversations([{ ...CONV, owner: "other@example.com" }]);
     renderSidebar();
     // Radix Tabs triggers activate on mousedown (primary button), not click.
-    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
-      button: 0,
-      ctrlKey: false,
-      pointerType: "mouse",
-    });
-    fireEvent.click(screen.getByTestId("session-filter-shared"));
+    selectSessionFilter("shared");
 
     fireEvent.dblClick(screen.getByRole("link", { name: /My Session/ }));
 
@@ -952,12 +937,7 @@ describe("leave a shared session", () => {
     // The default filter is "My sessions", which scopes out this owner:other
     // row; the single-user menu still offers "All sessions", so switch to it to
     // surface the row this test is about.
-    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
-      button: 0,
-      ctrlKey: false,
-      pointerType: "mouse",
-    });
-    fireEvent.click(screen.getByTestId("session-filter-all"));
+    selectSessionFilter("all");
 
     fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
 
@@ -975,12 +955,7 @@ describe("quick-archive owner gate", () => {
     mockConversations([{ ...CONV, owner: "other@example.com" }]);
     renderSidebar();
     // Non-owned rows live on the "Shared with me" tab (activates on mousedown).
-    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
-      button: 0,
-      ctrlKey: false,
-      pointerType: "mouse",
-    });
-    fireEvent.click(screen.getByTestId("session-filter-shared"));
+    selectSessionFilter("shared");
 
     expect(screen.getByRole("link", { name: /My Session/ })).toBeInTheDocument();
     expect(screen.queryByTestId("quick-archive-conversation")).toBeNull();

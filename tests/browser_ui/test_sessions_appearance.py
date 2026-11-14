@@ -86,7 +86,6 @@ def test_custom_order_keeps_the_list_and_commits_on_drop(
     browser_contract: BrowserContract,
 ) -> None:
     """Custom keeps the Updated list, moves a row only on drop, and adds new sessions above."""
-    appearance_features["sidebar_grouping_ui"] = True
     sessions = [
         {
             "id": f"{index + 1:032x}",
@@ -181,12 +180,6 @@ def test_custom_order_keeps_the_list_and_commits_on_drop(
     choose("session-grouping-menu", "Default")
     page.reload()
     expect(rows).to_have_text([*titles("New session"), *custom])
-
-    appearance_features["sidebar_grouping_ui"] = False
-    page.reload()
-    expect(rows).to_have_text(
-        titles("New session", "Quiet session", "Busy session", "Recent session")
-    )
 
 
 @pytest.fixture
