@@ -54,8 +54,13 @@ def _no_guardrails_spec(
             },
             PolicyAction.ASK,
         ),
+        (
+            "sys_reminder_set",
+            {"message": "Check CI on PR #12.", "delay_seconds": 2700},
+            PolicyAction.ASK,
+        ),
     ],
-    ids=["add_policy_control", "create", "update"],
+    ids=["add_policy_control", "create", "update", "reminder"],
 )
 async def test_scheduled_task_mutation_asks_without_guardrails(
     tmp_path: Path,
@@ -82,7 +87,12 @@ async def test_scheduled_task_mutation_asks_without_guardrails(
 
 @pytest.mark.parametrize(
     "tool_name",
-    ["sys_add_policy", "sys_scheduled_task_create", "sys_scheduled_task_update"],
+    [
+        "sys_add_policy",
+        "sys_scheduled_task_create",
+        "sys_scheduled_task_update",
+        "sys_reminder_set",
+    ],
 )
 def test_no_policy_fast_path_keeps_mutation_gates(
     tmp_path: Path,

@@ -7,8 +7,8 @@
 // sidebar no longer renders a "disconnected" badge and `getSessionState`
 // no longer reads runner liveness.
 //
-// Errors are independent of read state. Native sessions can settle to idle
-// after an error, so callers also inspect the latest conversation message.
+// Errors are independent of read state and use live activity, server labels,
+// and the failed lifecycle status.
 
 import type { Conversation } from "@/hooks/useConversations";
 import type { LatestSessionError } from "@/lib/sessionError";

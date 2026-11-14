@@ -31,6 +31,7 @@ import uvicorn
 from connectrpc.code import Code
 from connectrpc.errors import ConnectError
 from connectrpc.request import RequestContext
+from google.protobuf.message import Message
 from google.protobuf.timestamp_pb2 import Timestamp
 
 from omnigent.api.workspace.v1alpha1.workspace_connect import WorkspaceServiceASGIApplication
@@ -48,6 +49,7 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     ReadFileRequest,
     ReadFileResponse,
 )
+from omnigent.host.frames import HostWorkspaceCallFrame, HostWorkspaceReplyFrame
 from omnigent.host.workspace_tokens import new_token_key, verify_token
 from omnigent.inner.async_utils import run_sync_on_thread
 from omnigent.util.uvicorn_server import NoSignalServer
@@ -65,7 +67,8 @@ _ERROR_CODES = {400: Code.INVALID_ARGUMENT, 404: Code.NOT_FOUND}
 _SOCKET_STARTUP_TIMEOUT_S = 5.0
 _SOCKET_SHUTDOWN_TIMEOUT_S = 2.0
 
-ReaderForCall = Callable[[RequestContext], WorkspaceReader]
+# The context is ``None`` for calls that arrive over the host tunnel.
+ReaderForCall = Callable[[RequestContext | None], WorkspaceReader]
 _Params = ParamSpec("_Params")
 _T = TypeVar("_T")
 
@@ -91,14 +94,14 @@ class WorkspaceService:
     async def get_capabilities(
         self,
         _request: GetCapabilitiesRequest,
-        _ctx: RequestContext[GetCapabilitiesRequest, GetCapabilitiesResponse],
+        _ctx: RequestContext[GetCapabilitiesRequest, GetCapabilitiesResponse] | None,
     ) -> GetCapabilitiesResponse:
         return GetCapabilitiesResponse(capabilities=_CAPABILITIES)
 
     async def list_directory(
         self,
         request: ListDirectoryRequest,
-        ctx: RequestContext[ListDirectoryRequest, ListDirectoryResponse],
+        ctx: RequestContext[ListDirectoryRequest, ListDirectoryResponse] | None,
     ) -> ListDirectoryResponse:
         if request.page_size < 0:
             raise ConnectError(Code.INVALID_ARGUMENT, "page_size must not be negative")
@@ -126,7 +129,7 @@ class WorkspaceService:
     async def read_file(
         self,
         request: ReadFileRequest,
-        ctx: RequestContext[ReadFileRequest, ReadFileResponse],
+        ctx: RequestContext[ReadFileRequest, ReadFileResponse] | None,
     ) -> AsyncIterator[ReadFileResponse]:
         if not request.path:
             raise ConnectError(Code.INVALID_ARGUMENT, "path is required")
@@ -142,6 +145,58 @@ class WorkspaceService:
         )
         for start in range(0, len(file.data), _READ_CHUNK_BYTES):
             yield ReadFileResponse(data=file.data[start : start + _READ_CHUNK_BYTES])
+
+
+def _reader_at(
+    reader_for_workspace: Callable[[str], WorkspaceReader], workspace: str
+) -> WorkspaceReader:
+    """Return the reader for a recorded workspace that exists on this host."""
+    expanded = os.path.expanduser(workspace)
+    if not os.path.isdir(expanded):
+        raise ConnectError(Code.NOT_FOUND, "The session's workspace is not on this host")
+    return reader_for_workspace(expanded)
+
+
+async def _call(service: WorkspaceService, method: str, request: bytes) -> AsyncIterator[Message]:
+    """Run one serialized call against ``service``, yielding its responses."""
+    if method == "GetCapabilities":
+        yield await service.get_capabilities(GetCapabilitiesRequest.FromString(request), None)
+    elif method == "ListDirectory":
+        yield await service.list_directory(ListDirectoryRequest.FromString(request), None)
+    elif method == "ReadFile":
+        async for response in service.read_file(ReadFileRequest.FromString(request), None):
+            yield response
+    else:
+        raise ConnectError(Code.UNIMPLEMENTED, f"Unknown workspace method {method!r}")
+
+
+async def serve_tunnel_call(
+    reader_for_workspace: Callable[[str], WorkspaceReader], frame: HostWorkspaceCallFrame
+) -> AsyncIterator[HostWorkspaceReplyFrame]:
+    """Answer a workspace call the server forwarded over the host tunnel.
+
+    The server has already authorized the caller and chosen the workspace.
+    Yields one reply per response message, then a final ``done`` reply that
+    carries the error, if any.
+    """
+    service = WorkspaceService(lambda _ctx: _reader_at(reader_for_workspace, frame.workspace))
+    request_id = frame.request_id
+    try:
+        async for response in _call(service, frame.method, frame.request):
+            yield HostWorkspaceReplyFrame(request_id, message=response.SerializeToString())
+    except ConnectError as exc:
+        yield HostWorkspaceReplyFrame(
+            request_id, done=True, error_code=exc.code.value, error_message=exc.message
+        )
+        return
+    except Exception:
+        # The server would otherwise wait out its timeout for a reply that never comes.
+        _logger.exception("Workspace call %s failed", frame.method)
+        yield HostWorkspaceReplyFrame(
+            request_id, done=True, error_code="internal", error_message="Workspace call failed"
+        )
+        return
+    yield HostWorkspaceReplyFrame(request_id, done=True)
 
 
 class WorkspaceSocket:
@@ -185,8 +240,9 @@ async def start_workspace_socket(
     """
     token_key = new_token_key()
 
-    def reader_for(ctx: RequestContext) -> WorkspaceReader:
-        scheme, _, token = (ctx.request_headers.get("authorization") or "").partition(" ")
+    def reader_for(ctx: RequestContext | None) -> WorkspaceReader:
+        authorization = (ctx.request_headers.get("authorization") if ctx else None) or ""
+        scheme, _, token = authorization.partition(" ")
         grant = (
             verify_token(token_key, token, host_id=host_id)
             if scheme.lower() == "bearer" and token
@@ -194,10 +250,7 @@ async def start_workspace_socket(
         )
         if grant is None:
             raise ConnectError(Code.UNAUTHENTICATED, "A valid workspace token is required")
-        workspace = os.path.expanduser(grant.workspace)
-        if not os.path.isdir(workspace):
-            raise ConnectError(Code.NOT_FOUND, "The session's workspace is not on this host")
-        return reader_for_workspace(workspace)
+        return _reader_at(reader_for_workspace, grant.workspace)
 
     # Bind here rather than in uvicorn, whose bind failure calls sys.exit().
     directory: Path | None = None

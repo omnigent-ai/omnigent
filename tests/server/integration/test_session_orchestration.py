@@ -1555,7 +1555,7 @@ async def test_peer_message_readdresses_across_replicas(
 
     from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, open_server_client
     from omnigent.runner._entry import _RunnerDatabricksAuth
-    from omnigent.server.routes import sessions
+    from omnigent.server.routes import _host_launch, sessions
     from omnigent.server.routes._sessions.helpers import _get_runner_client_impl
     from tests.server.integration.test_sessions_permissions import _register_online_host
 
@@ -1567,6 +1567,7 @@ async def test_peer_message_readdresses_across_replicas(
     host_id = uuid4().hex
     _register_online_host(stack.tunnel_replica, host_id, "alice")
     stack.conv_store.set_host_id(target["id"], host_id, workspace="/worker")
+    monkeypatch.setattr(_host_launch, "_host_sharded", True)
     captured = _stub_late_runner_bind(monkeypatch)
     capture_client = sessions._get_runner_client
 
@@ -1617,6 +1618,7 @@ async def test_peer_message_readdresses_across_replicas(
         assert client.headers[OMNIGENT_SLICE_KEY_HEADER] == "sender-host"
     assert result.get("queued") is True, result
     posts = [(key, status) for method, path, key, status in received if method == "POST"]
+    # The first attempt uses the sender's key; a refusal re-resolves the target's host.
     assert posts == (
         [("sender-host", 400), (host_id, 400), (None, 202)]
         if legacy_host
@@ -1625,6 +1627,113 @@ async def test_peer_message_readdresses_across_replicas(
     delivered = [body for path, body in captured.get("posts", []) if path.endswith("/events")]
     assert len(delivered) == 1
     assert f"[Message from session {source['id']}]" in json.dumps(delivered)
+
+
+@pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
+@pytest.mark.parametrize("primed", [True, False], ids=["create_response_cached", "other_host"])
+@pytest.mark.parametrize("keyed", [True, False], ids=["keyed_create", "unkeyed_create"])
+async def test_sub_agent_requests_are_keyed_by_its_host_across_replicas(
+    two_replica_stack, db_uri, monkeypatch, primed, keyed
+):
+    import httpx
+
+    from omnigent import session_host
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, open_server_client
+    from omnigent.runner._entry import _RunnerDatabricksAuth
+    from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
+    from omnigent.server.routes import _host_launch, sessions
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes._sessions.helpers import _get_runner_client_impl
+    from omnigent.stores.host_store import HostStore
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    stack = two_replica_stack
+    parent = await _create_session_as(stack.keyless_client, "", "alice")
+    sub_agent = await _create_session_as(stack.tunnel_client, "", "alice")
+    headers = {"X-Forwarded-Email": "alice", **_bind_runner(db_uri, parent["id"])}
+    _bind_runner(db_uri, sub_agent["id"])
+    host_id = uuid4().hex
+    _register_online_host(stack.tunnel_replica, host_id, "alice")
+    HostStore(db_uri).bind_sandbox(host_id, provider="modal", sandbox_id="sandbox-b")
+    stack.conv_store.set_host_id(sub_agent["id"], host_id, workspace="/worker")
+    if keyed:
+        # A create that requested this host id keys it: the refusal then names the host.
+        stack.conv_store.set_labels(sub_agent["id"], {REQUESTED_HOST_ID_LABEL_KEY: host_id})
+    monkeypatch.setattr(_host_launch, "_host_sharded", True)
+    if primed:
+        # The managed create response names the sub-agent's host; the runner caches it.
+        session_host.set_session_host(sub_agent["id"], host_id)
+    captured = _stub_late_runner_bind(monkeypatch)
+    capture_client = sessions._get_runner_client
+
+    async def resolve_runner(session_id, router, **kwargs):
+        if router is stack.tunnel_replica.state.runner_router:
+            return await capture_client(session_id, router, **kwargs)
+        return await _get_runner_client_impl(session_id, router, **kwargs)
+
+    monkeypatch.setattr(sessions, "_get_runner_client", resolve_runner)
+    # A resumable sandbox provider: a host with no tunnel on the replica is woken, not refused.
+    monkeypatch.setattr(orchestration, "host_resume_supported", lambda host, config: True)
+    forced_wakes: list[str] = []
+
+    async def count_wake(woken_host_id, *args, force=False, **kwargs):
+        if force:
+            forced_wakes.append(woken_host_id)
+
+    monkeypatch.setattr("omnigent.server.managed_hosts.resume_managed_host", count_wake)
+    captured.clear()
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
+    monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", "parent-host")
+    transports = [
+        httpx.ASGITransport(app=app) for app in (stack.keyless_replica, stack.tunnel_replica)
+    ]
+    # Every request about the sub-agent: (round, method, key, status, wrong_replica, is_lookup).
+    seen: list[tuple[int, str, str | None, int, bool, bool]] = []
+    current_round = 0
+
+    async def ingress(request):
+        key = request.headers.get(OMNIGENT_SLICE_KEY_HEADER)
+        on_target = key == host_id
+        response = await transports[int(on_target)].handle_async_request(request)
+        await response.aread()
+        if f"/v1/sessions/{sub_agent['id']}" in request.url.path:
+            wrong = response.status_code == 400 and "wrong_replica" in response.text
+            is_lookup = "include_items" in request.url.params
+            seen.append(
+                (current_round, request.method, key, response.status_code, wrong, is_lookup)
+            )
+        return response
+
+    async with open_server_client(
+        "http://sharded",
+        headers=headers,
+        auth=_RunnerDatabricksAuth(lambda: "test-bearer", "http://sharded"),
+        transport=httpx.MockTransport(ingress),
+    ) as client:
+        for current_round in (1, 2, 3):
+            result = await _send(client, parent, sub_agent, message=f"Round {current_round}")
+            assert result.get("queued") is True, result
+            items = await client.get(f"/v1/sessions/{sub_agent['id']}/items")
+            assert items.status_code == 200, items.text
+            status = await client.get(f"/v1/sessions/{sub_agent['id']}")
+            assert status.status_code == 200, status.text
+
+    wrong = [entry for entry in seen if entry[4]]
+    if primed:
+        # The cached host keys round 1 from its first request: no refusal, no lookup.
+        assert wrong == [] and not any(entry[5] for entry in seen), seen
+    else:
+        # The runner's key is refused first, fast and without a wake, then the host serves.
+        assert len(wrong) == 1 and wrong[0][0] == 1, seen
+        assert seen[0][4] and seen[0][2] == "parent-host", seen
+        # A refusal that names the host is retried on it directly; an unnamed one costs a lookup.
+        assert sum(entry[5] for entry in seen) == (0 if keyed else 1), seen
+    settled = [entry for entry in seen if not entry[4] and not entry[5]]
+    assert settled and all(key == host_id for _, _, key, *_ in settled), seen
+    # The keyless replica refuses the runner's key before any wake is kicked, primed or not.
+    assert forced_wakes == [], forced_wakes
+    delivered = [body for path, body in captured.get("posts", []) if path.endswith("/events")]
+    assert len(delivered) == 3
 
 
 @pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
