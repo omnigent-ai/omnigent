@@ -2027,10 +2027,12 @@ async def test_claude_native_model_options_use_session_launch_catalog(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("empty", [False, True])
+@pytest.mark.parametrize("route", ["claude-model-options", "model-options"])
 async def test_claude_native_model_options_refresh_the_bridge_vocabulary(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     empty: bool,
+    route: str,
 ) -> None:
     """Serving the session listing rewrites the bridge's picker vocabulary.
 
@@ -2150,9 +2152,13 @@ async def test_claude_native_model_options_refresh_the_bridge_vocabulary(
             json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
-        listing = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+        listing = await client.get(f"/v1/sessions/{conv_id}/{route}")
+        cached = await client.get(f"/v1/sessions/{conv_id}/{route}")
 
     assert listing.status_code == 200, listing.text
+    assert cached.status_code == 200, cached.text
+    assert cached.json() == listing.json()
+    assert all(not key.startswith("_") for row in listing.json()["models"] for key in row)
     assert recorded, "the listing must refresh the bridge vocabulary"
     bridge_dir, launch_env, launch_model, picker_values, picker_options = recorded[-1]
     assert bridge_dir == claude_bridge.bridge_dir_for_bridge_id(conv_id)

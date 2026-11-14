@@ -14040,8 +14040,20 @@ def test_model_command_cancels_only_its_recognized_unselectable_picker(
 
 
 @pytest.mark.parametrize("stop", ["cancel", "deadline"])
-@pytest.mark.parametrize("phase", ["draft", "picker", "commit", "status"])
-def test_model_command_stops_all_keys_at_cancellation_or_deadline(
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "draft",
+        "picker",
+        "highlight",
+        "observed-picker",
+        "commit",
+        "status-draft",
+        "status",
+        "observed-status",
+    ],
+)
+def test_model_command_stops_selection_at_cancellation_or_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop: str, phase: str
 ) -> None:
     composer = _SessionModelComposer()
@@ -14049,6 +14061,14 @@ def test_model_command_stops_all_keys_at_cancellation_or_deadline(
     composer.install(monkeypatch)
     cancelled = threading.Event()
     stopped_after: list[tuple[str, ...]] = []
+    picker_reads = status_reads = 0
+
+    def stop_here() -> None:
+        stopped_after.extend(composer.sends)
+        if stop == "cancel":
+            cancelled.set()
+        else:
+            claude_native_bridge.time.sleep(1)
 
     def send(socket_path: str, *args: str) -> None:
         composer._run_tmux(socket_path, *args)
@@ -14056,27 +14076,78 @@ def test_model_command_stops_all_keys_at_cancellation_or_deadline(
         reached = (
             (phase == "draft" and key == "/model")
             or (phase == "picker" and key == "Enter" and composer.overlay == "picker")
+            or (phase == "highlight" and key == "Down")
             or (phase == "commit" and key == "s")
+            or (phase == "status-draft" and key == "/status")
             or (phase == "status" and key == "Enter" and composer.overlay == "status")
         )
         if reached:
-            stopped_after.extend(composer.sends)
-            if stop == "cancel":
-                cancelled.set()
-            else:
-                claude_native_bridge.time.sleep(1)
+            stop_here()
+
+    def capture(socket_path: str, target: str) -> str:
+        nonlocal picker_reads, status_reads
+        pane = composer._capture_pane(socket_path, target)
+        if composer.overlay == "picker" and composer.highlight == 1:
+            picker_reads += 1
+            if phase == "observed-picker" and picker_reads == 2:
+                stop_here()
+        if composer.overlay == "status":
+            status_reads += 1
+            if phase == "observed-status" and status_reads == 2:
+                stop_here()
+        return pane
 
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", send)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
     with claude_native_bridge.cancellable_injection(cancelled):
         with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
             claude_native_bridge.inject_model_command(
                 bridge_dir, model="private-glm[1m]", timeout_s=0.5
             )
+        assert claude_native_bridge._INJECTION_CANCEL_EVENT.get() is cancelled
 
-    assert stopped_after and composer.sends == stopped_after
-    assert not any(args[-1] == "Escape" for args in composer.sends)
-    assert caught.value.model_may_have_changed is (phase in {"commit", "status"})
+    assert stopped_after and composer.sends[: len(stopped_after)] == stopped_after
+    cleanup = [args[-1] for args in composer.sends[len(stopped_after) :]]
+    if phase in {"draft", "status-draft"}:
+        assert cleanup == [_CLEAR_ONE_ROW_COMPOSER]
+    elif phase in {"observed-picker", "observed-status"}:
+        assert cleanup == ["Escape"]
+    else:
+        assert cleanup == []
+    assert caught.value.model_may_have_changed is (
+        phase in {"commit", "status-draft", "status", "observed-status"}
+    )
     assert [args[-1] for args in composer.sends].count("s") <= 1
+    assert composer.overlay == (
+        "picker" if phase in {"picker", "highlight"} else "status" if phase == "status" else None
+    )
+
+
+def test_cancelled_model_switch_cleanup_is_bounded_without_retrying_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    composer = _SessionModelComposer()
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+    cancelled = threading.Event()
+
+    def send(socket_path: str, *args: str) -> None:
+        if args[-1] == "/model":
+            composer._run_tmux(socket_path, *args)
+            cancelled.set()
+        else:
+            composer.sends.append(args)
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", send)
+    with claude_native_bridge.cancellable_injection(cancelled):
+        with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused):
+            claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+        assert claude_native_bridge._INJECTION_CANCEL_EVENT.get() is cancelled
+
+    assert claude_native_bridge.time.monotonic() == pytest.approx(1.0)
+    assert [args[-1] for args in composer.sends] == ["/model", _CLEAR_ONE_ROW_COMPOSER]
+    assert composer.text == "/model"
+    assert composer.submitted == []
 
 
 @pytest.mark.parametrize("replacement", [False, True], ids=["own-draft", "replacement-draft"])
@@ -14105,6 +14176,129 @@ def test_model_command_cleans_only_its_exact_unsubmitted_command(
     assert composer.submitted == []
     assert not any(args[-1] in {"Enter", "Escape", "s"} for args in composer.sends)
     assert len(composer.sends) == (1 if replacement else 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller", ["executor", "native-control"])
+@pytest.mark.parametrize("phase", ["draft", "picker", "commit", "status-draft", "status"])
+@pytest.mark.parametrize("replacement", [False, True], ids=["owned", "replaced"])
+async def test_cancelled_model_switch_cleans_only_observed_owned_controls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caller: str,
+    phase: str,
+    replacement: bool,
+) -> None:
+    from omnigent.inner import claude_native_executor
+    from omnigent.runner import native_controls
+
+    composer = _SessionModelComposer(busy=True)
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+    started, release = threading.Event(), threading.Event()
+    initial_model = composer.model
+    observed_picker = observed_status = 0
+    cancelled_at: list[tuple[str, ...]] = []
+    killed: list[Path] = []
+
+    def pause() -> None:
+        if started.is_set():
+            return
+        cancelled_at.extend(composer.sends)
+        started.set()
+        assert release.wait(5), "the test did not release its fake pane operation"
+
+    def send(socket_path: str, *args: str) -> None:
+        composer._run_tmux(socket_path, *args)
+        if (
+            (phase == "draft" and args[-1] == "/model")
+            or (phase == "commit" and args[-1] == "s")
+            or (phase == "status-draft" and args[-1] == "/status")
+        ):
+            pause()
+
+    def capture(socket_path: str, target: str) -> str:
+        nonlocal observed_picker, observed_status
+        pane = composer._capture_pane(socket_path, target)
+        if composer.overlay == "picker" and composer.highlight == 1:
+            observed_picker += 1
+            if phase == "picker" and observed_picker == 2:
+                pause()
+        if composer.overlay == "status":
+            observed_status += 1
+            if phase == "status" and observed_status == 2:
+                pause()
+        return pane
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", send)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+    monkeypatch.setattr(
+        claude_native_executor, "kill_session", lambda path, **kwargs: killed.append(path)
+    )
+    monkeypatch.delenv(claude_native_bridge.REQUEST_SESSION_ID_ENV_VAR, raising=False)
+    executor = claude_native_executor.ClaudeNativeExecutor(bridge_dir)
+    prompt = Mock(side_effect=AssertionError("a cancelled model switch sent its prompt"))
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", prompt)
+
+    async def deliver() -> None:
+        if caller == "executor":
+            await executor._inject_turn("dependent prompt", [], "private-glm[1m]")
+        else:
+            await native_controls._drive_claude_pane(
+                native_controls._ClaudeControlDeadline(),
+                claude_native_bridge.inject_model_command,
+                bridge_dir,
+                model="private-glm[1m]",
+            )
+
+    task = asyncio.create_task(deliver())
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        assert claude_native_bridge._bridge_injection_lock(bridge_dir).locked()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done(), "cancellation released an in-flight pane worker"
+        if caller == "executor":
+            assert executor._inject_lock.locked()
+        if replacement:
+            if phase in {"draft", "status-draft"}:
+                composer.text = "a person's replacement draft"
+                composer.cursor = len(composer.text)
+            elif phase == "picker":
+                composer.options[0] = "a-persons-replacement-model"
+            else:
+                composer.overlay = "status"
+                composer.session = "a-persons-replacement-session"
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(task), 2)
+        assert composer.sends[: len(cancelled_at)] == cancelled_at
+        cleanup = [args[-1] for args in composer.sends[len(cancelled_at) :]]
+        expected = (
+            []
+            if replacement or phase == "commit"
+            else [_CLEAR_ONE_ROW_COMPOSER if phase in {"draft", "status-draft"} else "Escape"]
+        )
+        assert cleanup == expected
+        assert [args[-1] for args in composer.sends].count("s") == (
+            1 if phase in {"commit", "status-draft", "status"} else 0
+        )
+        assert composer.model == (
+            "private-glm[1m]" if phase in {"commit", "status-draft", "status"} else initial_model
+        )
+        if not replacement:
+            assert composer.text == "" and composer.overlay is None
+        assert composer.busy
+        assert killed == []
+        assert not executor._inject_lock.locked()
+        assert not claude_native_bridge._bridge_injection_lock(bridge_dir).locked()
+        prompt.assert_not_called()
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        with suppress(asyncio.CancelledError, RuntimeError):
+            await asyncio.wait_for(task, 2)
 
 
 def test_model_command_never_repeats_an_ambiguous_session_only_commit(

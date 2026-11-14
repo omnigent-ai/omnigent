@@ -365,10 +365,19 @@ class SessionOnlyModelSwitch:
         self.wait(lambda text: _draft(text) == "", seconds=1.0)
 
     def cleanup_owned_control(self) -> None:
-        if self.deadline.is_set() or not self.info:
+        if not self.info:
             return
         if not (self.command_draft or self.owned_picker or self.owned_status):
             return
+        original_deadline = self.deadline
+        self.deadline = ModelSwitchDeadline(1.0, None, original_deadline.clock)
+        try:
+            with self.bridge.cancellable_injection(self.deadline):
+                self._cleanup_owned_control()
+        finally:
+            self.deadline = original_deadline
+
+    def _cleanup_owned_control(self) -> None:
         with contextlib.suppress(RuntimeError, OSError, ValueError):
             pane = self.pane()
             if self.command_draft and _draft(pane) == self.command_draft:
