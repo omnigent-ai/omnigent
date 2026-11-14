@@ -8,6 +8,23 @@ import {
   ComposerSendButton,
   COMPOSER_LABELS_MIN_GAP_PX,
 } from "./ChatComposer";
+import { swipeDown } from "@/test/touchGestures";
+
+function renderInShell() {
+  render(
+    <div className="app-shell">
+      <p>Transcript</p>
+      <ChatComposer
+        keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
+        input={{ "aria-label": "Draft", defaultValue: "Keep this draft" }}
+        actions={{ leading: null, trailing: null }}
+      />
+    </div>,
+  );
+  const input = screen.getByRole("textbox");
+  act(() => input.focus());
+  return input;
+}
 
 describe("ChatComposer", () => {
   function renderEditor(initial: string, submitWithModEnter = false) {
@@ -369,6 +386,12 @@ describe("ChatComposer", () => {
     expect(input).toHaveValue("draft");
   });
 
+  it("keeps focus on a downward swipe outside the mobile layout", () => {
+    const input = renderInShell();
+    act(() => swipeDown(screen.getByText("Transcript")));
+    expect(input).toHaveFocus();
+  });
+
   describe("mobile expansion", () => {
     beforeEach(() => {
       vi.stubGlobal("matchMedia", (query: string) => ({
@@ -455,6 +478,14 @@ describe("ChatComposer", () => {
       expect(card).toHaveAttribute("data-mobile-composer", "expanded");
       rerender(composer(false));
       expect(card).toHaveAttribute("data-mobile-composer", "collapsed");
+    });
+
+    it("drops focus when the user swipes down across the page", () => {
+      const input = renderInShell();
+      expect(input).toHaveFocus();
+      act(() => swipeDown(screen.getByText("Transcript")));
+      expect(input).not.toHaveFocus();
+      expect(input).toHaveValue("Keep this draft");
     });
 
     it("also retains an uncontrolled draft after blur", () => {

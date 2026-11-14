@@ -27,6 +27,8 @@ import { setSessionHost } from "@/lib/sessionHost";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { swipeDown } from "@/test/touchGestures";
+import { mockMobileViewport } from "@/test/viewport";
 import { handleSessionEvent, useChatStore, type ChatState } from "@/store/chatStore";
 import {
   clearSessionDrafts,
@@ -305,6 +307,27 @@ const CLAUDE_MODEL_OPTIONS = [
 /** The composer textarea, located by its aria-label. */
 function textarea() {
   return screen.getByLabelText("Message the agent") as HTMLTextAreaElement;
+}
+
+/** Render on a phone-sized viewport inside the app shell the swipe gesture listens on. */
+function renderMobileInShell(ui: ReactElement) {
+  mockMobileViewport();
+  return render(
+    <MemoryRouter>
+      <div className="app-shell">{ui}</div>
+    </MemoryRouter>,
+  );
+}
+
+/** Swiping down inside an open composer menu keeps focus, draft, and menu,
+ * while the same swipe elsewhere in the shell still dismisses. */
+function expectSwipeKeepsMenu(menuTestId: string, draft: string) {
+  act(() => swipeDown(screen.getByTestId(menuTestId)));
+  expect(textarea()).toHaveFocus();
+  expect(textarea()).toHaveValue(draft);
+  expect(screen.getByTestId(menuTestId)).toBeVisible();
+  act(() => swipeDown(document.querySelector(".app-shell")!));
+  expect(textarea()).not.toHaveFocus();
 }
 
 function forceDesktopCoarsePointer(): () => void {
@@ -1125,6 +1148,13 @@ describe("Composer slash-command menu", () => {
     expect(onNewSession).toHaveBeenCalledOnce();
     expect(onSend).not.toHaveBeenCalled();
     expect(textarea()).toHaveValue("");
+  });
+
+  it("keeps the keyboard up while the mobile command menu scrolls", () => {
+    renderMobileInShell(<Composer {...composerProps()} />);
+    act(() => textarea().focus());
+    fireEvent.change(textarea(), { target: { value: "/" } });
+    expectSwipeKeepsMenu("slash-command-menu", "/");
   });
 
   it("rejects /new arguments without navigating or sending", () => {
@@ -4095,6 +4125,28 @@ describe("Composer MCP status command", () => {
       error: null,
       clearError: vi.fn(),
     });
+  });
+
+  it("keeps the keyboard up while the mobile MCP panel scrolls", () => {
+    setComposerState({ boundAgentId: "agent_mcp" });
+    renderMobileInShell(
+      <Composer
+        {...composerProps({
+          agents: [
+            {
+              id: "agent_mcp",
+              name: "MCP agent",
+              mcp_servers: [{ name: "github", transport: "http" }],
+            },
+          ],
+          selectedAgentId: "agent_mcp",
+        })}
+      />,
+    );
+    act(() => textarea().focus());
+    fireEvent.change(textarea(), { target: { value: "/" } });
+    fireEvent.click(screen.getByTestId("slash-menu-item-mcp"));
+    expectSwipeKeepsMenu("mcp-server-menu", "/mcp");
   });
 
   it("shows the effective session MCPs in a read-only panel", () => {

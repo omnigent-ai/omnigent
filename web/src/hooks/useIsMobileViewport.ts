@@ -10,7 +10,7 @@ import { useSyncExternalStore } from "react";
 
 // Mirror Tailwind's `max-md` variant exactly so this hook stays in lockstep
 // with the `max-md:` / `md:` classes already used across the shell.
-const MOBILE_QUERY = "(max-width: 767.98px)";
+export const MOBILE_QUERY = "(max-width: 767.98px)";
 
 function subscribe(callback: () => void): () => void {
   if (typeof window === "undefined" || !window.matchMedia) return () => {};
