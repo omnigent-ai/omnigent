@@ -188,6 +188,8 @@ SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY = "omnigent.scheduled_task_worktree_sou
 # Server-owned: the automation run this session serves, set before each run's
 # prompt is sent. Journal entries the session records are attributed to it.
 SCHEDULED_TASK_RUN_LABEL_KEY = "omnigent.scheduled_task_run"
+# Last transcript item copied into a run, before its agent starts.
+SCHEDULED_TASK_HISTORY_BOUNDARY_LABEL_KEY = "omnigent.scheduled_task_history_boundary"
 
 # Server-owned: marks the copy an automation starts each run from (its source
 # session). The value is the task id; runs never inherit it.
@@ -260,6 +262,7 @@ _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY = "omnigent.sandbox.requested_host_id"
 _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     CREATED_BY_SESSION_LABEL_KEY,
     SCHEDULED_TASK_RUN_LABEL_KEY,
+    SCHEDULED_TASK_HISTORY_BOUNDARY_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     # A fork of an automation's copy isn't what the automation runs from.
     SCHEDULED_TASK_SOURCE_LABEL_KEY,

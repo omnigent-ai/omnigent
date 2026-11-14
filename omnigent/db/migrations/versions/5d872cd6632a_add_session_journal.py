@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.dialects.mysql import VARBINARY
 
 from omnigent.db.db_models import Uuid16
 
@@ -83,7 +84,9 @@ def upgrade() -> None:
         sa.Column("workflow_id", Uuid16(), nullable=True),
         sa.Column("step", sa.String(64), nullable=True),
         sa.Column("idempotency_key", sa.String(128), nullable=False),
-        sa.Column("content", sa.LargeBinary(), nullable=False),
+        sa.Column(
+            "content", sa.LargeBinary().with_variant(VARBINARY(16_383), "mysql"), nullable=False
+        ),
         sa.PrimaryKeyConstraint("workspace_id", "conversation_id", "position", "created_at"),
     )
     for name, columns in _INDEXES.items():

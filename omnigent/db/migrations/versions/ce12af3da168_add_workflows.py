@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.dialects.mysql import VARBINARY
 
 from omnigent.db.db_models import Uuid16
 
@@ -48,7 +49,9 @@ def upgrade() -> None:
         sa.Column("user_id", sa.String(128), nullable=True),
         sa.Column("name", sa.String(80), nullable=False),
         sa.Column("description", sa.String(2000), nullable=False),
-        sa.Column("plan", sa.LargeBinary(), nullable=False),
+        sa.Column(
+            "plan", sa.LargeBinary().with_variant(VARBINARY(16_383), "mysql"), nullable=False
+        ),
         sa.Column("created_at", sa.BigInteger(), nullable=False),
         sa.Column("updated_at", sa.BigInteger(), nullable=False),
         sa.PrimaryKeyConstraint("workspace_id", "id"),

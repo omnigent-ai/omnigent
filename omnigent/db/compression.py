@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import zstandard
 from sqlalchemy import LargeBinary
+from sqlalchemy.dialects.mysql import VARBINARY
 from sqlalchemy.types import TypeDecorator
 
 # Leading byte marking a framed (post-migration) value. Legacy text never
@@ -124,13 +125,21 @@ class CompressedText(TypeDecorator[str]):
     impl = LargeBinary
     cache_ok = True
 
-    def __init__(self, max_stored_bytes: int | None = None) -> None:
+    def __init__(
+        self, max_stored_bytes: int | None = None, *, bounded_binary: bool = False
+    ) -> None:
         """
         :param max_stored_bytes: Largest framed (compressed) value to write, e.g.
             ``65_535`` for a MySQL ``BLOB``; ``None`` leaves writes unbounded.
+        :param bounded_binary: Use a length-bounded MySQL column for a new payload.
         """
         super().__init__()
         self.max_stored_bytes = max_stored_bytes
+        self.bounded_binary = bounded_binary
+        if bounded_binary:
+            if max_stored_bytes is None or not 0 < max_stored_bytes < 16_384:
+                raise ValueError("Bounded binary columns require a limit below 16,384 bytes")
+            self.impl = LargeBinary().with_variant(VARBINARY(max_stored_bytes), "mysql")
 
     def process_bind_param(self, value: str | None, dialect: object) -> bytes | None:
         """Compress on the way into the database, enforcing ``max_stored_bytes``."""

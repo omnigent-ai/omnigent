@@ -119,9 +119,15 @@ def _same_session(left: str, right: str) -> bool:
 
 def _require_attended_session(conversations: ConversationStore, session: Conversation) -> None:
     """Follow automation provenance through sub-agents and independently created workers."""
-    if session_provenance(conversations, session).automation_session is not None:
+    provenance = session_provenance(conversations, session)
+    if provenance.execution_source != "interactive":
+        reason = (
+            "This session is part of an automation."
+            if provenance.execution_source == "automation"
+            else "Could not establish that this session is interactive."
+        )
         raise OmnigentError(
-            "unattended_input_not_allowed: This session is part of an automation. "
+            f"unattended_input_not_allowed: {reason} "
             "No one can answer questions or approve requests. Do not ask for input or "
             "write needs_input. Choose an option within the user's authorization and "
             "record the decision, or mark the step failed with the blocker. Continue "

@@ -1850,7 +1850,8 @@ class SqlSessionJournalEntry(OmnigentBase):
     step: Mapped[str | None] = mapped_column(String(64), nullable=True)
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     content: Mapped[str] = mapped_column(
-        CompressedText(max_stored_bytes=MAX_STORED_VALUE_BYTES), nullable=False
+        CompressedText(max_stored_bytes=MAX_STORED_VALUE_BYTES, bounded_binary=True),
+        nullable=False,
     )
 
     # Every index is non-unique and ends with the primary key: the heads lock,
@@ -1985,7 +1986,9 @@ class SqlWorkflow(OmnigentBase):
     description: Mapped[str] = mapped_column(String(2000), nullable=False)
     # Deferred so callers load the compressed plan explicitly.
     plan: Mapped[str] = mapped_column(
-        CompressedText(max_stored_bytes=MAX_STORED_VALUE_BYTES), nullable=False, deferred=True
+        CompressedText(max_stored_bytes=MAX_STORED_VALUE_BYTES, bounded_binary=True),
+        nullable=False,
+        deferred=True,
     )
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)

@@ -18,11 +18,13 @@ from __future__ import annotations
 import threading
 import time
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
 from omnigent.runtime import pending_elicitations
 from omnigent.server import session_live_state
+from omnigent.stores.conversation_store import SCHEDULED_TASK_HISTORY_BOUNDARY_LABEL_KEY
 
 
 def _wait_until(predicate, *, timeout_s: float = 10.0) -> None:
@@ -61,11 +63,25 @@ class _RecordingStore:
         self.clears: list[tuple[str, int | None]] = []
         # conversation_id -> transcript items, oldest first.
         self.transcripts: dict[str, list[SimpleNamespace]] = {}
+        self.history_boundaries: dict[str, str] = {}
+
+    def get_conversation(self, conversation_id: str) -> SimpleNamespace:
+        boundary = self.history_boundaries.get(conversation_id)
+        return SimpleNamespace(labels={SCHEDULED_TASK_HISTORY_BOUNDARY_LABEL_KEY: boundary})
 
     def list_items(
-        self, conversation_id: str, limit: int = 100, order: str = "asc", **_: object
+        self,
+        conversation_id: str,
+        limit: int = 100,
+        order: str = "asc",
+        before: str | None = None,
+        **_: object,
     ) -> SimpleNamespace:
         items = self.transcripts.get(conversation_id, [])
+        if before is not None:
+            assert order == "desc"
+            boundary = next(index for index, item in enumerate(items) if item.id == before)
+            items = items[boundary + 1 :]
         return SimpleNamespace(data=(items[::-1] if order == "desc" else items)[:limit])
 
     def set_session_live_status(self, conversation_id: str, status: str) -> None:
@@ -423,7 +439,9 @@ _FIRED_AT = 1_000
 
 
 def _transcript_item(type: str, created_at: int, role: str | None = None) -> SimpleNamespace:
-    return SimpleNamespace(type=type, created_at=created_at, data=SimpleNamespace(role=role))
+    return SimpleNamespace(
+        id=uuid4().hex, type=type, created_at=created_at, data=SimpleNamespace(role=role)
+    )
 
 
 # A run's session as a fire leaves it: runner bookkeeping, then the prompt.
@@ -432,6 +450,7 @@ _RUN_STARTED = [
     _transcript_item("message", _FIRED_AT + 4, "user"),
 ]
 _RUN_ANSWERED = [*_RUN_STARTED, _transcript_item("message", _FIRED_AT + 90, "assistant")]
+_SAME_SECOND_HISTORY = [_transcript_item("message", _FIRED_AT, "assistant")]
 
 
 class _FakeScheduledTaskStore:
@@ -487,11 +506,11 @@ def test_scheduled_run_completion_idle_transitions_to_succeeded() -> None:
 
 
 @pytest.mark.parametrize(
-    ("transcript", "ends_the_run"),
+    ("transcript", "ends_the_run", "copied_items"),
     [
         # Claude Code reports idle while it starts, before it has read the prompt.
-        pytest.param(_RUN_STARTED[:1], False, id="agent-starting"),
-        pytest.param(_RUN_STARTED, False, id="prompt-not-yet-read"),
+        pytest.param(_RUN_STARTED[:1], False, 0, id="agent-starting"),
+        pytest.param(_RUN_STARTED, False, 0, id="prompt-not-yet-read"),
         # A run started from a copy of a session: the copy keeps its history's times.
         pytest.param(
             [
@@ -500,23 +519,41 @@ def test_scheduled_run_completion_idle_transitions_to_succeeded() -> None:
                 *_RUN_STARTED,
             ],
             False,
+            2,
             id="copied-history",
         ),
         pytest.param(
             [*_RUN_STARTED, _transcript_item("function_call", _FIRED_AT + 9)],
             True,
+            0,
             id="stopped-after-a-tool-call",
         ),
-        pytest.param(_RUN_ANSWERED, True, id="agent-replied"),
+        pytest.param(_RUN_ANSWERED, True, 0, id="agent-replied"),
+        pytest.param(_SAME_SECOND_HISTORY, False, 1, id="same-second-history-before-prompt"),
+        pytest.param(
+            [*_SAME_SECOND_HISTORY, *_RUN_STARTED], False, 1, id="same-second-history-before-work"
+        ),
+        pytest.param(
+            [
+                *_SAME_SECOND_HISTORY,
+                _transcript_item("message", _FIRED_AT, "user"),
+                _transcript_item("message", _FIRED_AT, "assistant"),
+            ],
+            True,
+            1,
+            id="same-second-new-reply",
+        ),
     ],
 )
 def test_an_idle_edge_ends_a_scheduled_run_only_after_its_agent_worked(
-    transcript: list[SimpleNamespace], ends_the_run: bool
+    transcript: list[SimpleNamespace], ends_the_run: bool, copied_items: int
 ) -> None:
     """An idle edge ends the run only once its agent has written to the session."""
     sched = _FakeScheduledTaskStore({"conv_1": "run_1"})
     conversations = _RecordingStore()
     conversations.transcripts["conv_1"] = transcript
+    if copied_items:
+        conversations.history_boundaries["conv_1"] = transcript[copied_items - 1].id
     session_live_state.configure(conversations, sched)  # type: ignore[arg-type]
     try:
         session_live_state.persist_scheduled_run_completion("conv_1", "succeeded")

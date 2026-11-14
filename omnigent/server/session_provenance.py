@@ -13,6 +13,8 @@ from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_RUN_LABEL_KEY,
 )
 
+MAX_PROVENANCE_LOOKUPS = 32
+
 
 @dataclass(frozen=True)
 class SessionProvenance:
@@ -30,6 +32,7 @@ def session_provenance(
     seen: set[str] = set()
     active: set[str] = set()
     missing = False
+    lookups = 0
     while pending:
         current, finished = pending.pop()
         if finished:
@@ -57,6 +60,10 @@ def session_provenance(
                 missing = True
             if not ancestor_id or ancestor_id in seen:
                 continue
+            if lookups >= MAX_PROVENANCE_LOOKUPS:
+                missing = True
+                continue
+            lookups += 1
             ancestor = conversations.get_conversation(ancestor_id)
             if ancestor is None:
                 missing = True

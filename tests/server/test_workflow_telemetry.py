@@ -6,6 +6,9 @@ from uuid import uuid4
 
 import pytest
 
+from omnigent.errors import OmnigentError
+from omnigent.server.session_journal import _require_attended_session
+from omnigent.server.session_provenance import MAX_PROVENANCE_LOOKUPS
 from omnigent.server.workflow_telemetry import log_journal_entry
 from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
@@ -25,6 +28,7 @@ from tests.debug_log_helpers import capture_debug_rows
         ("shared_ancestor", "interactive"),
         ("automation_and_missing", "automation"),
         ("lookup_failure", "unknown"),
+        ("over_budget", "unknown"),
     ],
 )
 def test_incomplete_ancestry_is_not_reported_as_interactive(
@@ -41,6 +45,12 @@ def test_incomplete_ancestry_is_not_reported_as_interactive(
         creator = conversations.create_conversation().id
     if ancestry == "automation_and_missing":
         conversations.set_labels(root.id, {SCHEDULED_TASK_ORIGIN_LABEL_KEY: uuid4().hex})
+    if ancestry == "over_budget":
+        creator = root.id
+        for _ in range(MAX_PROVENANCE_LOOKUPS + 1):
+            creator = conversations.create_conversation(
+                labels={CREATED_BY_SESSION_LABEL_KEY: creator}
+            ).id
     conversations.set_labels(session.id, {CREATED_BY_SESSION_LABEL_KEY: creator})
     session = conversations.get_conversation(session.id)
     assert session is not None
@@ -61,6 +71,15 @@ def test_incomplete_ancestry_is_not_reported_as_interactive(
 
         # The committed journal fact remains observable during a metadata-read outage.
         monkeypatch.setattr(conversations, "get_conversation", unavailable)
+    lookups: list[str] = []
+    if ancestry == "over_budget":
+        get_conversation = conversations.get_conversation
+
+        def count_lookup(session_id: str):
+            lookups.append(session_id)
+            return get_conversation(session_id)
+
+        monkeypatch.setattr(conversations, "get_conversation", count_lookup)
     with capture_debug_rows("server") as rows:
         log_journal_entry(conversations, session, plan, None, user_id="alice@example.com")
     [row] = [row for row in rows if row["event_name"] == "workflow_plan_written"]
@@ -69,3 +88,7 @@ def test_incomplete_ancestry_is_not_reported_as_interactive(
     if expected == "automation":
         assert row["attributes"]["automation_session_id"] == root.id
     assert "Private" not in str(row) and "private-step" not in str(row)
+    if ancestry == "over_budget":
+        assert len(lookups) == MAX_PROVENANCE_LOOKUPS
+        with pytest.raises(OmnigentError, match="Could not establish"):
+            _require_attended_session(conversations, session)

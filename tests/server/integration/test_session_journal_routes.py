@@ -585,11 +585,16 @@ async def test_a_missing_session_is_not_found(client: httpx.AsyncClient) -> None
     assert (await client.post(url, json=body, headers=_runner(session_id))).status_code == 404
 
 
-async def test_clients_cannot_set_the_run_label(client: httpx.AsyncClient, db_uri: str) -> None:
+@pytest.mark.parametrize(
+    "label", [SCHEDULED_TASK_RUN_LABEL_KEY, "omnigent.scheduled_task_history_boundary"]
+)
+async def test_clients_cannot_set_the_run_label(
+    client: httpx.AsyncClient, db_uri: str, label: str
+) -> None:
     session_id = _session(db_uri)
     resp = await client.patch(
         f"/v1/sessions/{session_id}",
-        json={"labels": {SCHEDULED_TASK_RUN_LABEL_KEY: uuid.uuid4().hex}},
+        json={"labels": {label: uuid.uuid4().hex}},
         headers=_headers(),
     )
     assert resp.status_code == 400, resp.text

@@ -2,16 +2,50 @@
 
 from __future__ import annotations
 
+from importlib import import_module
+from io import StringIO
 from pathlib import Path
 
+import pytest
 import sqlalchemy as sa
 from alembic import command
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
+from sqlalchemy.dialects import mysql
 
-from omnigent.db.db_models import SqlSessionJournalEntry, SqlSessionJournalHead
+from omnigent.db.db_models import SqlSessionJournalEntry, SqlSessionJournalHead, SqlWorkflow
 from omnigent.db.utils import _build_alembic_config, clear_engine_cache
 
 _ENTRIES = "session_journal_entries"
 _HEADS = "session_journal_heads"
+
+
+@pytest.mark.parametrize(
+    ("revision", "column"),
+    [
+        ("5d872cd6632a_add_session_journal", SqlSessionJournalEntry.__table__.c.content),
+        ("ce12af3da168_add_workflows", SqlWorkflow.__table__.c.plan),
+    ],
+)
+def test_mysql_payload_types_are_bounded_and_keep_the_codec(
+    revision: str, column: sa.Column
+) -> None:
+    output = StringIO()
+    context = MigrationContext.configure(
+        dialect_name="mysql", opts={"as_sql": True, "output_buffer": output}
+    )
+    with Operations.context(context):
+        import_module(f"omnigent.db.migrations.versions.{revision}").upgrade()
+    dialect = mysql.dialect()
+    assert str(column.type.compile(dialect=dialect)) == "VARBINARY(16383)"
+    assert f"{column.name} VARBINARY(16383) NOT NULL" in output.getvalue()
+    codec = column.type.dialect_impl(dialect)
+    bind = codec.bind_processor(dialect)
+    read = codec.result_processor(dialect, None)
+    value = '{"steps": []}'
+    assert bind is not None and read is not None
+    assert isinstance(bind(value), bytes)
+    assert read(bind(value)) == value
 
 
 def _migrate(uri: str, engine: sa.Engine, revision: str, *, down: bool = False) -> None:

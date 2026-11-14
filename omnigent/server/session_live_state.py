@@ -49,6 +49,7 @@ from typing import TYPE_CHECKING, Any
 
 from omnigent.db.enum_codecs import SESSION_LIVE_STATUS
 from omnigent.db.workspace_cache import WorkspaceScopedCache
+from omnigent.stores.conversation_store import SCHEDULED_TASK_HISTORY_BOUNDARY_LABEL_KEY
 
 if TYPE_CHECKING:
     from omnigent.stores import ConversationStore
@@ -331,7 +332,7 @@ def _agent_worked_since(conversation_id: str, since: int) -> bool:
     """Whether the agent has written to the session since *since*.
 
     Runner bookkeeping and the prompt itself don't count, and neither does a
-    copied session's history, which keeps its original times.
+    copied session's history, even when it was written in the same second.
 
     :param conversation_id: The fired session.
     :param since: Unix epoch seconds the run fired.
@@ -340,9 +341,17 @@ def _agent_worked_since(conversation_id: str, since: int) -> bool:
     conversations = _store
     if conversations is None:
         return True
-    page = conversations.list_items(conversation_id, limit=_RUN_TRANSCRIPT_ITEMS, order="desc")
+    conversation = conversations.get_conversation(conversation_id)
+    boundary = (
+        conversation.labels.get(SCHEDULED_TASK_HISTORY_BOUNDARY_LABEL_KEY)
+        if conversation is not None
+        else None
+    )
+    page = conversations.list_items(
+        conversation_id, limit=_RUN_TRANSCRIPT_ITEMS, order="desc", before=boundary
+    )
     for item in page.data:
-        if item.created_at < since:
+        if boundary is None and item.created_at < since:
             return False
         if item.type in _AGENT_WORK_ITEM_TYPES or (
             item.type == "message" and getattr(item.data, "role", None) == "assistant"
