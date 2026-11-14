@@ -90,6 +90,23 @@ def test_repro_agent_requires_a_recorder_attempt_once_the_preflight_check_passed
     assert '"The recorder was not stood up"' in instructions
 
 
+def test_symptom_captured_from_a_terminal_pane_must_be_filmed() -> None:
+    instructions = _loaded_repro_instructions()
+    lanes = _normalized(_DEV / "recording-lanes.md")
+
+    assert "Judge the surface by where the symptom shows, not where the defect" in instructions
+    assert "including a leaked pane the app can no longer open" in instructions
+    assert "or a screenshot), stamp the facet `terminal` and film it" in instructions
+    assert "A symptom seen in a terminal pane must be filmed" in instructions
+    assert "of the symptom in your evidence rules this reason out" in instructions
+    assert "A pane capture that shows the symptom means the facet must be filmed" in lanes
+    assert "`tmux -S <socket> attach -E -r -t <target>`" in lanes
+    assert "never another run's or user's socket" in lanes
+    assert "declare it with `capture_mode: vhs_user_command`" in lanes
+    assert "`Wait+Screen /<symptom text>/`: a plain `Wait` checks only the last line" in lanes
+    assert "Do not claim there is no visible surface when your own pane capture" in lanes
+
+
 def test_repro_agent_loads_the_screen_evidence_caption_rule_as_instructions() -> None:
     spec = load(_REPRO_AGENT, expand_env=False)
     assert "Caption the screen from screen evidence" in spec.instructions
