@@ -99,7 +99,9 @@ def test_exec_launcher_freezes_phoenix_proc_choice(
     monkeypatch.setenv(HOST_SANDBOX_BACKEND_ENV, "phoenix-kubernetes")
     monkeypatch.setattr(
         "omnigent.inner.sandbox._launcher_inline_source",
-        lambda _target, resolved, *, cwd=None: captured.append(resolved) or "pass",
+        lambda _target, resolved, *, cwd=None, target_environment_path=None: (
+            captured.append(resolved) or "pass"
+        ),
     )
 
     path = pathlib.Path(create_exec_launcher(sys.executable, policy))

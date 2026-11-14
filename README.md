@@ -305,6 +305,74 @@ omnigent copilot                     # GitHub Copilot (SDK harness, via `omnigen
 ```
 
 <details>
+<summary>Claude Code caller settings and launch errors</summary>
+
+Pass Claude Code settings files or inline JSON through `--settings`:
+
+```bash
+omnigent claude --settings ./settings.json
+```
+
+For launches with inspectable arguments, Omnigent merges repeated `--settings`
+options in order and composes them with the required bridge settings. Validation
+uses the selected CLI's public, read-only `--bare doctor` command before launch.
+Support is checked by capability, including whether the command diagnoses invalid
+settings. The protocol has been verified with Claude Code 2.1.322 and 2.1.323;
+the version number alone does not establish compatibility.
+
+The plain Claude CLI and supported, parsed `env` wrappers can validate without a
+sandbox. Other wrappers require an active sandbox for validation. Use the plain
+CLI or a supported `env` wrapper, or configure a sandbox, if this requirement
+blocks your launch.
+
+If settings are rejected, check your `--settings` values with the selected CLI
+and retry. Hooks must be an object whose event values are lists, and
+`disableAllHooks` and `allowManagedHooksOnly` must leave Omnigent's bridge hooks
+enabled. If validation is unavailable, update the CLI and wrapper to versions
+that support the read-only check, or check their startup and sandbox
+configuration. These errors leave the launch arguments and bridge settings
+unchanged. Explicit CLI terminal launch requests and automatic native terminal
+startup return fixed guidance without settings values, private paths, or vendor
+diagnostics. Automatic startup also retains its runner-log reference and error ID
+for further diagnosis.
+
+Launches whose arguments are hidden inside serialized shell commands retain
+their existing behavior; this merge and validation apply to inspectable
+invocations.
+
+Request and terminal owners on the host release their own settings generations
+during normal cleanup. Legacy launches without the ownership capability create
+generations without request locks, which per-generation pruning skips. A crash
+can also leave dispatch or terminal claims that retain settings indefinitely.
+Investigating those leftovers is the host operator's responsibility; there is
+no automatic reconciliation of these claims.
+
+Before reclaiming a legacy generation or crash-left claim, the operator must
+identify its bridge, session, generation and peer versions, and establish that
+every possible consumer has finished: the sender, any in-flight launch or
+admitted receiver, and detached terminals, including older clients. Prefer each
+known owner's normal release path, and establish that queued launches or resumes
+cannot reuse its settings operands. Retain identity and completion evidence
+without copying credential-bearing settings. File age, runner-PID death and free
+locks do not establish reclaimability. If consumer completion cannot be proved,
+retain the files and escalate to the host maintainer.
+
+Explicit bridge preparation and session rotation replace malformed lifecycle
+JSON or damaged supported-schema fields with a fresh admission identity. They
+retain settings files, locks and ownership claims, so existing terminals keep
+their inputs and stale launches must rebuild their requests. This recovery
+assumes the sender and receiver use a coordinated release; it does not reconcile
+legacy or unknown claims.
+
+Future schemas, unknown fields and files that cannot be read safely remain
+blocked. Use a compatible runner; do not unlink claims or reset metadata to
+bypass the block. Disk lifecycle schema 2 is distinct from the advertised
+ownership wire protocol 1. Wire-v2 reconciliation, rollout and mixed-version
+recovery remain open work rather than guarantees of this cleanup protocol.
+
+</details>
+
+<details>
 <summary>Forward variables from your shell to one session</summary>
 
 Sessions run under the host daemon, which may have started from a different

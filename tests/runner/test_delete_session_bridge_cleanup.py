@@ -28,6 +28,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -106,16 +107,78 @@ async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
         yield c
 
 
+@pytest.mark.parametrize("endpoint", ["", "/resources"])
+@pytest.mark.parametrize(
+    "owner",
+    [
+        "absent",
+        "removed-before-lock",
+        "none",
+        "pending",
+        "undelivered",
+        "unacknowledged",
+        "admitted",
+        "failed-close",
+        "timed-out-close",
+        "reactivated",
+    ],
+)
 async def test_delete_session_removes_native_bridge_dir(
     client: httpx.AsyncClient,
+    app: FastAPI,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    endpoint: str,
+    owner: str,
 ) -> None:
-    """``DELETE`` must remove the token-bearing claude-native bridge dir."""
+    """Delete retains settings until pending requests and terminals release them."""
+    from omnigent.harnesses.claude_native import settings_generation
+    from omnigent.harnesses.claude_native.bridge import augment_claude_args
+    from omnigent.harnesses.claude_native.settings_generation import (
+        ClaudeSettingsRequest,
+        acquire_claude_settings_request,
+        settings_generation_path,
+    )
+    from omnigent.inner.terminal import TerminalInstance
+    from omnigent.terminals import TerminalRegistry
+
     session_id = f"conv_{uuid.uuid4().hex}"
+    if owner in {"absent", "removed-before-lock"}:
+        bridge_dir = bridge_dir_for_bridge_id(session_id)
+        lock_file = bridge_dir.parent / ".locks" / f"{bridge_dir.name}.lock"
+        assert not bridge_dir.exists()
+        assert not lock_file.exists()
+        locked = []
+        if owner == "removed-before-lock":
+            bridge_dir.mkdir(parents=True)
+            original_lock = settings_generation.bridge_dir_preparation_lock
+
+            @contextlib.contextmanager
+            def remove_before_deletion_check(path: Path):
+                with original_lock(path):
+                    locked.append(path)
+                    path.rmdir()
+                    yield
+
+            monkeypatch.setattr(
+                settings_generation, "bridge_dir_preparation_lock", remove_before_deletion_check
+            )
+        response = await client.delete(f"/v1/sessions/{session_id}{endpoint}")
+        assert response.status_code == 200
+        assert not bridge_dir.exists()
+        if owner == "absent":
+            assert not lock_file.exists()
+        else:
+            assert locked == [bridge_dir]
+        return
     bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
     assert bridge_dir == bridge_dir_for_bridge_id(session_id)
     # prepare_bridge_dir writes a bridge.json holding the bridge token.
     assert (bridge_dir / "bridge.json").exists()
+    credentials = bridge_dir / "permission_hook.json"
+    credential_bytes = json.dumps(
+        {"ap_auth_headers": {"Authorization": "Bearer synthetic-delete-test-credential"}}
+    ).encode()
     cached = materialize_attachment(
         {
             "type": "input_file",
@@ -126,11 +189,106 @@ async def test_delete_session_removes_native_bridge_dir(
     )
     assert cached is not None
 
-    resp = await client.delete(f"/v1/sessions/{session_id}")
-    assert resp.status_code == 200
+    request = None
+    reader = None
+    instance = None
+    revoked = []
+    if owner != "none":
+        request = ClaudeSettingsRequest.create(bridge_dir)
+        augment_claude_args(
+            (), bridge_dir=bridge_dir, defer_caller_settings=True, settings_request=request
+        )
+        baseline = settings_generation_path(bridge_dir, request.generation)
+        baseline_bytes = baseline.read_bytes()
+        if owner in {"undelivered", "unacknowledged", "admitted"}:
+            request.mark_dispatched()
+            if owner == "undelivered":
+                request.cancel_undelivered_dispatch()
+            elif owner == "admitted":
+                reader = acquire_claude_settings_request(bridge_dir, request.generation)
+            request.close()
+        if owner in {"failed-close", "timed-out-close", "reactivated"}:
+            private_dir = tmp_path / "terminal"
+            private_dir.mkdir()
+            output = private_dir / "retained-settings.json"
+            output.write_text("{}")
+            instance = TerminalInstance(
+                name="claude",
+                session_key="main",
+                private_dir=private_dir,
+                socket_path=private_dir / "tmux.sock",
+                running=owner != "reactivated",
+            )
+            with acquire_claude_settings_request(bridge_dir, request.generation) as lease:
+                lease.attach(instance)
+            request.close()
 
-    assert not bridge_dir.exists(), "bridge dir (with token) must be deleted"
-    assert not cached.exists()
+            if owner != "reactivated":
+
+                async def stop_tmux(*_args: str) -> None:
+                    if owner == "failed-close":
+                        raise RuntimeError("termination unconfirmed")
+                    await asyncio.Event().wait()
+
+                monkeypatch.setattr(instance, "_tmux", stop_tmux)
+                monkeypatch.setattr(
+                    instance, "_stop_network_brokers", lambda: revoked.append(True)
+                )
+                monkeypatch.setattr("omnigent.terminals.registry._CLOSE_TIMEOUT_S", 0.02)
+                terminals = TerminalRegistry()
+                terminals._by_conversation[session_id] = {("claude", "main"): instance}
+                monkeypatch.setattr(
+                    app.state.session_resource_registry, "_terminal_registry", terminals
+                )
+
+    credentials.write_bytes(credential_bytes)
+    url = f"/v1/sessions/{session_id}{endpoint}"
+    try:
+        resp = await client.delete(url)
+        assert resp.status_code == 200
+        assert not cached.exists()
+        if request is not None and owner != "undelivered":
+            assert baseline.read_bytes() == baseline_bytes
+            assert credentials.read_bytes() == credential_bytes
+            if instance is not None:
+                if owner == "reactivated":
+                    bridge_inode = bridge_dir.stat().st_ino
+                    prepare_bridge_dir(session_id, workspace=tmp_path)
+                    assert bridge_dir.stat().st_ino == bridge_inode
+                    assert baseline.read_bytes() == baseline_bytes
+                    assert credentials.read_bytes() == credential_bytes
+                    assert (await client.delete(url)).status_code == 200
+                else:
+                    assert instance._resource_cleanup_task is not None
+                    await asyncio.wait_for(instance._resource_cleanup_task, timeout=5)
+                    assert revoked == [True]
+                assert output.exists()
+                monkeypatch.setattr(instance, "_tmux", AsyncMock())
+                await instance.close()
+                assert not output.exists()
+                if owner == "reactivated":
+                    assert not list(bridge_dir.glob("claude-settings-*.terminal-*.owner"))
+            if reader is not None:
+                reader.close()
+            request.close()
+        if owner == "unacknowledged":
+            assert (await client.delete(url)).status_code == 200
+            assert baseline.with_suffix(".dispatch.owner").exists()
+            assert credentials.read_bytes() == credential_bytes
+        else:
+            assert not bridge_dir.exists(), "released bridge dir (with token) must be deleted"
+    finally:
+        if instance is not None:
+            monkeypatch.setattr(instance, "_tmux", AsyncMock())
+            await instance.close()
+        if request is not None:
+            request.close()
+        if reader is not None:
+            reader.close()
+        if owner == "unacknowledged":
+            # Discard the synthetic claim after checking uncertain delivery retention.
+            baseline.with_suffix(".dispatch.owner").unlink(missing_ok=True)
+        await client.delete(url)
 
 
 @pytest.mark.parametrize("family", sorted(BRIDGE_DIR_RESOLVERS))

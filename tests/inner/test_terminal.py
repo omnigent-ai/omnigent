@@ -920,7 +920,26 @@ async def test_async_idle_watcher_treats_confirmation_start_failure_as_unknown(
 
 
 @pytest.mark.asyncio
-async def test_close_kills_tmux_when_socket_exists_after_running_cleared(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "success",
+        "target-gone",
+        "error",
+        "cancelled-before-kill",
+        "cancelled-kill",
+        "cancelled-kill-overlap",
+        "cancelled-kill-overlap-cancelled-retry",
+        "cancelled-kill-overlap-cleanup-error",
+        "interrupted-spawn",
+        "interrupted-spawn-retry",
+        "client-settled-success",
+        "client-settled-target-gone",
+    ],
+)
+async def test_close_kills_tmux_when_socket_exists_after_running_cleared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
     """Cleanup kills a surviving tmux server even after a watcher marked it dead."""
     private_dir = tmp_path / "terminal"
     private_dir.mkdir()
@@ -934,15 +953,165 @@ async def test_close_kills_tmux_when_socket_exists_after_running_cleared(tmp_pat
         running=False,
     )
     commands: list[tuple[str, ...]] = []
+    retired = []
+    revoked = []
+    overlap = "-overlap" in outcome
+    cleanup_started = threading.Event()
+    release_cleanup = threading.Event()
+    cleanup_error = RuntimeError("first resource cleanup failed")
+    output = private_dir / "retained-settings.json"
+    output.write_text("{}")
+    instance.add_resource_cleanup(lambda: retired.append(True))
+
+    def revoke_brokers() -> None:
+        revoked.append(True)
+        if overlap and len(revoked) == 1:
+            cleanup_started.set()
+            if not release_cleanup.wait(timeout=5):
+                raise TimeoutError("resource cleanup was not released")
+            if outcome.endswith("cleanup-error"):
+                raise cleanup_error
+
+    monkeypatch.setattr(instance, "_stop_network_brokers", revoke_brokers)
+    if outcome == "cancelled-before-kill":
+        monkeypatch.setattr(
+            instance, "_stop_idle_watcher", AsyncMock(side_effect=asyncio.CancelledError)
+        )
+    launch_errors: list[BaseException] = []
+    client_settles_during_kill = outcome.startswith("client-settled-")
+    kill_started = asyncio.Event()
+    release_kill = asyncio.Event()
+    if client_settles_during_kill:
+        instance._launch_started = True
+        instance._launch_incomplete = True
+    if outcome.startswith("interrupted-spawn"):
+        launch_errors.append(asyncio.CancelledError())
+        if outcome == "interrupted-spawn-retry":
+            launch_errors.append(FileNotFoundError(errno.ENOENT, "cannot spawn", "tmux"))
+    for error in launch_errors:
+        with monkeypatch.context() as launch_patch:
+            launch_patch.setattr(
+                terminal_mod,
+                "asyncio",
+                SimpleNamespace(
+                    **{
+                        **vars(asyncio),
+                        "create_subprocess_exec": AsyncMock(side_effect=error),
+                    }
+                ),
+            )
+            with pytest.raises(type(error)):
+                await instance.launch()
 
     async def _tmux(*args: str) -> None:
         commands.append(args)
+        if client_settles_during_kill and len(commands) == 1:
+            kill_started.set()
+            await release_kill.wait()
+        if outcome in {"target-gone", "client-settled-target-gone"}:
+            raise terminal_mod._tmux_command_failed_error(
+                ["tmux", *args], 1, b"no server running on example socket"
+            )
+        if outcome == "error":
+            raise RuntimeError("termination unconfirmed")
+        if outcome.startswith("cancelled-kill"):
+            raise asyncio.CancelledError
 
     instance._tmux = _tmux  # type: ignore[method-assign]
 
-    await instance.close()
+    if client_settles_during_kill:
+        closing = asyncio.create_task(instance.close())
+        try:
+            await asyncio.wait_for(kill_started.wait(), timeout=5)
+            # The client settles after this kill was already issued.
+            instance._launch_incomplete = False
+            release_kill.set()
+            await closing
+            assert output.exists()
+            assert retired == []
+            await instance.close()
+            assert commands == [("kill-server",), ("kill-server",)]
+            assert retired == [True]
+            assert not private_dir.exists()
+        finally:
+            release_kill.set()
+            await asyncio.gather(closing, return_exceptions=True)
+        return
 
-    assert commands == [("kill-server",)]
+    if overlap:
+        first_close = asyncio.create_task(instance.close())
+        retry = None
+        termination_confirmed = asyncio.Event()
+
+        async def kill_on_retry(*args: str) -> None:
+            commands.append(args)
+            termination_confirmed.set()
+
+        try:
+            assert await asyncio.to_thread(cleanup_started.wait, 2)
+            assert output.exists()
+            assert retired == []
+            monkeypatch.setattr(instance, "_tmux", kill_on_retry)
+            retry = asyncio.create_task(instance.close())
+            await asyncio.wait_for(termination_confirmed.wait(), timeout=1)
+            await asyncio.sleep(0)
+            assert not retry.done()
+            assert output.exists()
+            assert retired == []
+            if outcome.endswith("cancelled-retry"):
+                for _ in range(3):
+                    retry.cancel()
+            release_cleanup.set()
+            first_result, retry_result = await asyncio.gather(
+                first_close, retry, return_exceptions=True
+            )
+            cleanup_task = instance._resource_cleanup_task
+            assert cleanup_task is not None
+            (cleanup_result,) = await asyncio.gather(cleanup_task, return_exceptions=True)
+        finally:
+            release_cleanup.set()
+            await asyncio.gather(
+                first_close, *([retry] if retry is not None else []), return_exceptions=True
+            )
+            if instance._resource_cleanup_task is not None:
+                await asyncio.gather(instance._resource_cleanup_task, return_exceptions=True)
+
+        assert commands == [("kill-server",), ("kill-server",)]
+        if outcome.endswith("cleanup-error"):
+            assert first_result is cleanup_error
+            assert retry_result is cleanup_error
+            assert cleanup_result is cleanup_error
+        else:
+            assert isinstance(first_result, asyncio.CancelledError)
+            assert (
+                isinstance(retry_result, asyncio.CancelledError)
+                if outcome.endswith("cancelled-retry")
+                else retry_result is None
+            )
+            assert cleanup_result is None
+        assert retired == [True]
+        assert not private_dir.exists()
+        await instance.close()
+        assert retired == [True]
+        return
+
+    if outcome.startswith("cancelled"):
+        with pytest.raises(asyncio.CancelledError):
+            await instance.close()
+    else:
+        await instance.close()
+
+    assert commands == ([] if outcome == "cancelled-before-kill" else [("kill-server",)])
+    assert revoked == [True] * (1 + len(launch_errors))
+    if outcome not in {"success", "target-gone"}:
+        assert output.exists()
+        assert retired == []
+        if outcome.startswith("interrupted-spawn"):
+            return
+        monkeypatch.setattr(instance, "_tmux", AsyncMock())
+        monkeypatch.setattr(instance, "_stop_idle_watcher", AsyncMock())
+        await instance.close()
+    assert retired == [True]
     assert not private_dir.exists()
 
 

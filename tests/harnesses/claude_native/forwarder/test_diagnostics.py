@@ -156,14 +156,23 @@ def _observe_at_error_deadline(bridge_dir: Path) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "settings_name",
+    [
+        "claude-settings.json",
+        f"claude-settings-{'a' * 32}.json",
+        f"claude-settings-{'a' * 32}-{'b' * 32}.json",
+    ],
+)
 def test_idle_pane_at_error_deadline_logs_warning(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    settings_name: str,
 ) -> None:
     """No hooks file, settings present, no stderr: an unused pane, not a failure."""
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
-    (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
+    (bridge_dir / settings_name).write_text("{}", encoding="utf-8")
     caplog.set_level(logging.INFO, logger=forwarder.__name__)
 
     _observe_at_error_deadline(bridge_dir)

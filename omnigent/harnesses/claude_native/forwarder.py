@@ -35,6 +35,7 @@ from omnigent.harnesses.claude_native.bridge import (
     _transcript_items_from_entry,
     _transcript_timestamp,
     compute_transcript_cumulative_cost,
+    has_claude_invocation_settings,
     read_active_session_id,
     read_bridge_id,
     read_claude_context_state,
@@ -91,7 +92,6 @@ _SUBAGENT_STATE_FILE = "subagent_forwarder.json"
 _DELTA_STATE_FILE = "message_deltas_forwarder.json"
 _COMPACTION_STATE_FILE = "compaction_forwarder.json"
 _HOOKS_FILE = "hooks.jsonl"
-_INVOCATION_SETTINGS_FILE = "claude-settings.json"
 
 # Keep child-history requests below the server's 10 MiB API ceiling to bound
 # per-request latency and retry cost while still accommodating large events.
@@ -317,7 +317,7 @@ def _observe_transcript_discovery(
 
     hooks_size = _diagnostic_file_size(bridge_dir / _HOOKS_FILE)
     stderr_size = _diagnostic_file_size(bridge_dir / OBSERVER_HOOK_STDERR_FILE)
-    settings_present = (bridge_dir / _INVOCATION_SETTINGS_FILE).is_file()
+    settings_present = has_claude_invocation_settings(bridge_dir)
     args = (
         max(0.0, elapsed_s),
         session_id,

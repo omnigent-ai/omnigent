@@ -17,7 +17,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol, cast
 
-from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
+from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS, strip_runner_auth_secrets
 from omnigent.util.json_types import JsonValue
 
 from .agent_env import DESKTOP_SESSION_ENV_VARS
@@ -61,6 +61,7 @@ HOST_SANDBOX_BACKEND_ENV = "OMNIGENT_HOST_SANDBOX_BACKEND"
 # work ``activate_sandbox`` does. ``none`` is a no-op backend so it
 # doesn't need a wrap.
 _SPAWN_WRAP_BACKENDS = frozenset({"linux_bwrap", "darwin_seatbelt"})
+_MAX_LAUNCHER_TARGET_ENV_BYTES = 1024 * 1024
 
 
 def _json_string_list(values: Sequence[object]) -> list[JsonValue]:
@@ -1144,8 +1145,43 @@ def cleanup_private_tmpdir(tmpdir: Path | None) -> None:
     shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _launcher_target_environment(path: str) -> dict[str, str]:
+    """Read bounded environment operations for the final target only."""
+    with open(path, "rb") as stream:
+        payload = stream.read(_MAX_LAUNCHER_TARGET_ENV_BYTES + 1)
+    if len(payload) > _MAX_LAUNCHER_TARGET_ENV_BYTES:
+        raise ValueError("Target environment payload is too large")
+    data = json.loads(payload)
+    if not isinstance(data, dict) or set(data) != {"inherit", "unset", "variables", "overrides"}:
+        raise ValueError("Invalid target environment payload")
+    inherit, unset = data["inherit"], data["unset"]
+    variables, overrides = data["variables"], data["overrides"]
+    if not isinstance(inherit, bool) or not isinstance(unset, list):
+        raise ValueError("Invalid target environment operations")
+    if any(not isinstance(name, str) for name in unset) or any(
+        not isinstance(values, dict)
+        or any(
+            not isinstance(name, str) or not isinstance(value, str)
+            for name, value in values.items()
+        )
+        for values in (variables, overrides)
+    ):
+        raise ValueError("Invalid target environment values")
+    environment: dict[str, str] = strip_runner_auth_secrets(os.environ) if inherit else {}
+    for name in unset:
+        environment.pop(name, None)
+    environment.update(variables)
+    environment.update(overrides)
+    return environment
+
+
 def run_launcher(
-    encoded_sandbox: str, target_path: str, argv: list[str], *, cwd: str | None = None
+    encoded_sandbox: str,
+    target_path: str,
+    argv: list[str],
+    *,
+    cwd: str | None = None,
+    target_environment_path: str | None = None,
 ) -> int:
     """
     Activate the sandbox and exec the wrapped target inside it.
@@ -1157,9 +1193,8 @@ def run_launcher(
     *argv* and returns its exit code.
 
     First strips the runner-auth secret from ``os.environ`` so it reaches
-    neither the bwrap re-exec nor the final ``subprocess.run`` (both
-    inherit ``os.environ``): the runner tunnel binding token must never
-    reach the agent's target.
+    neither the bwrap re-exec nor the final ``subprocess.run``: the runner
+    tunnel binding token must never reach the agent's target.
 
     :param encoded_sandbox: JSON-encoded :class:`SandboxPolicy`, as
         produced by ``_encode_json_arg(sandbox.to_jsonable())``.
@@ -1167,6 +1202,8 @@ def run_launcher(
         inside the sandbox, e.g. ``"/usr/bin/python3"``.
     :param argv: Arguments passed to *target_path* (the launcher's own
         ``sys.argv[1:]``).
+    :param target_environment_path: Optional caller-owned environment payload,
+        read only after sandbox activation and applied only to the final target.
     :returns: The target process's exit code.
     :raises ValueError: If *encoded_sandbox* does not decode to a dict.
     """
@@ -1263,7 +1300,13 @@ def run_launcher(
                 f"sys.path.insert(0, {project_root}); "
                 "from omnigent.inner.sandbox import run_launcher; "
                 f"raise SystemExit(run_launcher({encoded_sandbox!r}, "
-                f"{target_path!r}, sys.argv[1:]))"
+                f"{target_path!r}, sys.argv[1:]"
+                + (
+                    f", target_environment_path={target_environment_path!r}"
+                    if target_environment_path is not None
+                    else ""
+                )
+                + "))"
             )
             # -P keeps the wrap's cwd (the workspace) off sys.path, as in
             # the host-side launcher script.
@@ -1343,7 +1386,16 @@ def run_launcher(
     try:
         activate_sandbox(sandbox)
         logger.info("[omnigent-sandbox] activated; spawning target=%s", target_path)
-        completed = subprocess.run(target_argv)
+        if target_environment_path is None:
+            completed = subprocess.run(target_argv)
+        else:
+            target_environment = _launcher_target_environment(target_environment_path)
+            target_environment.pop(SHARED_ENVIRONMENT_VAR, None)
+            for secret_name in RUNNER_AUTH_SECRET_ENV_VARS:
+                target_environment.pop(secret_name, None)
+            if sandbox.active:
+                target_environment.pop(HOST_SANDBOX_BACKEND_ENV, None)
+            completed = subprocess.run(target_argv, env=target_environment)
         logger.info("[omnigent-sandbox] target exited rc=%s", completed.returncode)
         return int(completed.returncode)
     finally:
@@ -1351,7 +1403,11 @@ def run_launcher(
 
 
 def _launcher_inline_source(
-    target_path: str, sandbox: SandboxPolicy, *, cwd: str | None = None
+    target_path: str,
+    sandbox: SandboxPolicy,
+    *,
+    cwd: str | None = None,
+    target_environment_path: str | None = None,
 ) -> str:
     """Build the ``python -c`` program the exec launcher runs.
 
@@ -1364,12 +1420,22 @@ def _launcher_inline_source(
         f"sys.path.insert(0, {str(_project_root())!r}); "
         "logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stderr); "
         "from omnigent.inner.sandbox import run_launcher; "
-        f"raise SystemExit(run_launcher({encoded!r}, {target_path!r}, sys.argv[1:], cwd={cwd!r}))"
+        f"raise SystemExit(run_launcher({encoded!r}, {target_path!r}, sys.argv[1:], cwd={cwd!r}"
+        + (
+            f", target_environment_path={target_environment_path!r}"
+            if target_environment_path is not None
+            else ""
+        )
+        + "))"
     )
 
 
 def create_exec_launcher(
-    target_path: str, sandbox: SandboxPolicy, *, cwd: str | None = None
+    target_path: str,
+    sandbox: SandboxPolicy,
+    *,
+    cwd: str | None = None,
+    target_environment_path: str | None = None,
 ) -> str:
     """Write an executable launcher that runs ``target_path`` inside ``sandbox``.
 
@@ -1380,6 +1446,10 @@ def create_exec_launcher(
 
     :param target_path: The real binary the launcher ultimately spawns.
     :param sandbox: Policy baked into the launcher and applied before the spawn.
+    :param target_environment_path: Optional absolute path to a caller-owned,
+        sandbox-visible JSON file containing final-target environment operations.
+        Only its path enters launcher argv; the caller owns its permissions,
+        lifetime, and existing policy visibility. No read grants are added.
     :returns: Path to the launcher script; the caller owns deleting it.
     :raises OSError: If the running interpreter cannot be named in the
         launcher, which would produce an unrunnable script.
@@ -1387,6 +1457,8 @@ def create_exec_launcher(
     """
     if sandbox.tcp_egress and sandbox.tcp_egress_socket_path is None:
         raise ValueError("tcp_egress requires its parent broker before creating a launcher")
+    if target_environment_path is not None and not Path(target_environment_path).is_absolute():
+        raise ValueError("Target environment payload path must be absolute")
     launcher_dir = Path(tempfile.gettempdir()).resolve(strict=False)
     if sandbox.active:
         for root in [*sandbox.write_roots, *sandbox.write_files]:
@@ -1399,7 +1471,9 @@ def create_exec_launcher(
             # Path-based spawners may filter the launcher environment. Freeze
             # host-local choices here, immediately before encoding the policy.
             sandbox = get_backend(sandbox.backend_type).prepare_launcher_policy(sandbox)
-    inline = _launcher_inline_source(target_path, sandbox, cwd=cwd)
+    inline = _launcher_inline_source(
+        target_path, sandbox, cwd=cwd, target_environment_path=target_environment_path
+    )
     interpreter = sys.executable
     if not interpreter:
         raise OSError(

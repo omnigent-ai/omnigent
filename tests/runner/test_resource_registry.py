@@ -3932,12 +3932,15 @@ async def test_claude_native_acknowledges_billing_notice_after_input_was_ready(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transfer", [False, True])
-@pytest.mark.parametrize("replace_during_tick", [False, True])
+@pytest.mark.parametrize(
+    "cli_request,replace_during_tick", [(False, False), (False, True), (True, False)]
+)
 async def test_claude_native_billing_acknowledgement_uses_original_launch_bridge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     transfer: bool,
     replace_during_tick: bool,
+    cli_request: bool,
 ) -> None:
     import omnigent.harnesses.claude_native.bridge as claude_bridge
 
@@ -3945,7 +3948,14 @@ async def test_claude_native_billing_acknowledgement_uses_original_launch_bridge
     instance = registry.terminal_registry.get("source", "claude", "main")
     assert instance is not None
     original_bridge = tmp_path / "cli-direct-bridge"
+    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path)
     instance.args = ["--settings", str(original_bridge / "claude-settings.json")]
+    if cli_request:
+        from omnigent.harnesses.claude_native.main import _claude_terminal_request
+
+        instance.args = _claude_terminal_request((), command="claude", bridge_dir=original_bridge)[
+            "spec"
+        ]["args"]
     resolve_conversation_bridge = Mock(side_effect=AssertionError("wrong bridge identity"))
     acknowledge = Mock(return_value=True)
     monkeypatch.setattr(

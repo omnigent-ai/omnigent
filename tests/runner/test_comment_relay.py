@@ -18,6 +18,8 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
+import shlex
 import shutil
 import subprocess
 import threading
@@ -189,6 +191,7 @@ class _StubResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: object | None = None,
         resource_role: str | None = None,
+        prepare_terminal: Any = None,
     ) -> SessionResourceView:
         """Return a required terminal resource view for a fake instance."""
         return await self._launch(
@@ -1913,3 +1916,707 @@ async def test_failed_launch_rolls_back_only_new_relay(
                 await c.delete(f"/v1/sessions/{session_id}")
         shutil.rmtree(bridge_dir, ignore_errors=True)
         shutil.rmtree(next_bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "wrapped",
+        "legacy",
+        "declared-identical",
+        "declared-identical-invalid",
+    ],
+)
+async def test_cli_caller_settings_finalize_under_terminal_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, terminal_registry_singleton
+) -> None:
+    from omnigent.harnesses.claude_native import settings_validation
+    from omnigent.harnesses.claude_native.main import _claude_terminal_request
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    monkeypatch.setattr(settings_validation, "validate_caller_settings", AsyncMock())
+
+    agent_id = "settings-agent"
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    spec = _spec_without_terminals()
+    spec.os_env = OSEnvSpec(
+        type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+    )
+    app = _switch_app(tmp_path, _SwitchableServerClient(agent_id), {agent_id: spec})
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    settings_file = tmp_path / "caller.json"
+    settings_file.write_text(json.dumps({"env": {"ORDER": "file", "FROM_FILE": "yes"}}))
+    monkeypatch.chdir(tmp_path)
+    if mode in {"wrapped", "legacy"}:
+        monkeypatch.setattr(
+            "omnigent.harnesses.claude_native.main.resolve_claude_launch",
+            lambda command, args: ("claude-wrapper", ["claude", "--", *args]),
+        )
+    caller_args = ("--settings", str(settings_file), '--settings={"env":{"ORDER":"inline"}}')
+    body = _claude_terminal_request(
+        caller_args,
+        command="claude",
+        bridge_dir=bridge_dir,
+    )
+    if mode.startswith("declared-"):
+        spec.terminals = {
+            body["terminal"]: TerminalEnvSpec(
+                command=body["spec"]["command"],
+                args=list(body["spec"]["args"]),
+                os_env=spec.os_env,
+            )
+        }
+    generation = body["claude_settings_generation"]
+    baseline_path = bridge_dir / f"claude-settings-{generation}.json"
+    boundary = baseline_path.with_suffix(".boundary.json").read_text()
+    assert str(settings_file) not in boundary
+    assert "ORDER" not in boundary
+    if mode == "declared-identical-invalid":
+        body["claude_settings_generation"] = "../previous-launch"
+    # The CLI has not consumed files before the runner selects its policy.
+    assert str(settings_file) in body["spec"]["args"]
+    baseline = json.loads(baseline_path.read_text())
+    assert "FROM_FILE" not in baseline.get("env", {})
+    if mode == "legacy":
+        # An older client cannot refresh the previous launch's boundary metadata.
+        body.pop("claude_settings_generation")
+        legacy_path = bridge_dir / "claude-settings.json"
+        legacy_path.write_text(json.dumps(baseline))
+        (bridge_dir / "claude-settings-boundary.json").write_text(boundary)
+        body["spec"]["args"] = [
+            str(legacy_path) if arg == str(baseline_path) else arg for arg in body["spec"]["args"]
+        ] + ["--resume", "older-client-session"]
+    finalized = []
+    terminal_owners = contextlib.AsyncExitStack()
+    original = bridge.finalize_claude_caller_settings
+
+    async def record(instance, **kwargs):
+        assert instance.sandbox_policy is None
+        assert instance.os_env.cwd == tmp_path
+        await original(instance, **kwargs)
+        finalized.append(instance.args)
+
+    original_launch = _StubResourceRegistry.launch_required_terminal
+
+    async def launch(self, **kwargs):
+        from omnigent.inner.terminal import create_terminal_instance
+
+        created = create_terminal_instance(
+            kwargs["terminal_name"],
+            kwargs["session_key"],
+            kwargs["spec"],
+            parent_os_env_spec=kwargs["parent_os_env"],
+        )
+        try:
+            await kwargs["prepare_terminal"](created.instance)
+            kwargs["spec"].args = created.instance.args
+            resource = await original_launch(self, **kwargs)
+        except BaseException:
+            await created.instance.close()
+            raise
+        terminal_owners.push_async_callback(created.instance.close)
+        return resource
+
+    monkeypatch.setattr(_StubResourceRegistry, "launch_required_terminal", launch)
+
+    monkeypatch.setattr(bridge, "finalize_claude_caller_settings", record)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            response = await client.post(
+                f"/v1/sessions/{session_id}/resources/terminals", json=body
+            )
+            if mode == "declared-identical-invalid":
+                assert response.status_code == 500, response.text
+                assert response.json()["error"]["code"] == "terminal_launch_failed"
+                assert not finalized
+                assert not (bridge_dir / _TOOL_RELAY_FILE).exists()
+            else:
+                assert response.status_code == 200, response.text
+                assert len(finalized) == 1
+                final_args = finalized[0]
+                settings_index = max(i for i, arg in enumerate(final_args) if arg == "--settings")
+                settings = json.loads(Path(final_args[settings_index + 1]).read_text())
+                assert json.loads(baseline_path.read_text()) == baseline
+                if mode == "legacy":
+                    assert finalized[0] == body["spec"]["args"]
+                    assert settings == baseline
+                else:
+                    assert str(settings_file) not in finalized[0]
+                    assert settings["env"]["FROM_FILE"] == "yes"
+                    assert settings["env"]["ORDER"] == "inline"
+                    assert settings["hooks"] == baseline["hooks"]
+                if mode == "wrapped":
+                    assert finalized[0][:2] == ["claude", "--"]
+            await client.delete(f"/v1/sessions/{session_id}")
+    finally:
+        try:
+            await terminal_owners.aclose()
+        finally:
+            shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "prepared",
+        "opaque",
+        "abandoned",
+        "expired",
+        "expired-before-admission",
+        "expired-after-admission",
+        "failure",
+        "declared-replacement",
+        "invalid-settings",
+        "validation-unavailable",
+        "unexpected-validator-error",
+    ],
+)
+async def test_cli_settings_request_ownership_survives_admission_and_terminal_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, terminal_registry_singleton
+) -> None:
+    from omnigent.harnesses.claude_native import settings_validation
+    from omnigent.harnesses.claude_native.main import _claude_terminal_request
+    from omnigent.harnesses.claude_native.settings_generation import (
+        ClaudeSettingsRequest,
+        prune_unused_claude_settings,
+        request_claude_bridge_deletion,
+        settings_generation_path,
+    )
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.terminal import TerminalInstance
+    from omnigent.terminals import TerminalRegistry
+
+    private_diagnostic = "private-validator-value /private/example/settings.json"
+    if mode in {"invalid-settings", "validation-unavailable"}:
+        fault = (
+            settings_validation._InvalidSettings(private_diagnostic)
+            if mode == "invalid-settings"
+            else OSError(private_diagnostic)
+        )
+        monkeypatch.setattr(settings_validation, "_run_doctor", AsyncMock(side_effect=fault))
+    else:
+        monkeypatch.setattr(
+            settings_validation,
+            "validate_caller_settings",
+            AsyncMock(
+                side_effect=(
+                    ValueError(private_diagnostic)
+                    if mode == "unexpected-validator-error"
+                    else None
+                )
+            ),
+        )
+    monkeypatch.chdir(tmp_path)
+    if mode == "opaque":
+        monkeypatch.setattr(
+            "omnigent.harnesses.claude_native.main.resolve_claude_launch",
+            lambda command, args: ("sh", ["-c", shlex.join([command, *args])]),
+        )
+    spec = _spec_without_terminals()
+    spec.os_env = OSEnvSpec(cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    app = _switch_app(
+        tmp_path, _SwitchableServerClient("settings-agent"), {"settings-agent": spec}
+    )
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    request = ClaudeSettingsRequest.create(bridge_dir)
+    caller = {
+        "env": {"EXAMPLE": "caller", "FROM_FILE": "yes", "ORDER": "file"},
+        **({"disableAllHooks": True} if mode == "failure" else {}),
+    }
+    caller_file = tmp_path / "caller.json"
+    caller_file.write_text(json.dumps(caller))
+    caller_reads = []
+    policy_selected = False
+    original_read = bridge._read_caller_settings
+
+    def read_caller_settings(path, **kwargs):
+        if path == caller_file:
+            assert policy_selected
+            caller_reads.append(path)
+        return original_read(path, **kwargs)
+
+    monkeypatch.setattr(bridge, "_read_caller_settings", read_caller_settings)
+    body = _claude_terminal_request(
+        ("--settings", str(caller_file), '--settings={"env":{"ORDER":"inline"}}'),
+        command="claude",
+        bridge_dir=bridge_dir,
+        settings_request=request,
+    )
+    baseline = settings_generation_path(bridge_dir, request.generation)
+    baseline_bytes = baseline.read_bytes()
+    boundary_path = baseline.with_suffix(".boundary.json")
+    if mode == "opaque":
+        assert not boundary_path.exists()
+    else:
+        boundary = boundary_path.read_text()
+        assert str(caller_file) not in boundary
+        assert "FROM_FILE" not in boundary
+        assert "ORDER" not in boundary
+    assert "FROM_FILE" not in json.loads(baseline_bytes).get("env", {})
+    assert caller_reads == []
+    if mode != "expired":
+        request.mark_dispatched()
+    if mode == "declared-replacement":
+        spec.terminals = {body["terminal"]: TerminalEnvSpec(command="bash", args=["-l"])}
+    launched = []
+    prepared = []
+
+    async def spawn(instance, *, cwd=None):
+        launched.append(instance)
+        instance.running = True
+
+    monkeypatch.setattr(TerminalInstance, "launch", spawn)
+    monkeypatch.setattr(TerminalInstance, "is_alive", AsyncMock(return_value=True))
+    monkeypatch.setattr(TerminalInstance, "_tmux", AsyncMock(return_value=""))
+    terminals = TerminalRegistry()
+    original_launch = _StubResourceRegistry.launch_required_terminal
+
+    async def launch(self, **kwargs):
+        if mode == "abandoned" and kwargs["spec"].args == body["spec"]["args"]:
+            request.close()
+        if mode == "expired-after-admission":
+            request_claude_bridge_deletion(bridge_dir, session_id)
+            prepare_bridge_dir(session_id, workspace=tmp_path)
+
+        async def prepare(instance):
+            nonlocal policy_selected
+
+            assert instance.sandbox_policy is None
+            assert instance.os_env.cwd == tmp_path
+            prepared.append((instance, list(instance.args)))
+            policy_selected = True
+            try:
+                await kwargs["prepare_terminal"](instance)
+            finally:
+                policy_selected = False
+
+        await terminals.launch(
+            session_id,
+            kwargs["terminal_name"],
+            kwargs["session_key"],
+            kwargs["spec"],
+            parent_os_env=kwargs["parent_os_env"],
+            prepare_terminal=prepare,
+        )
+        return await original_launch(self, **kwargs)
+
+    monkeypatch.setattr(_StubResourceRegistry, "launch_required_terminal", launch)
+    if mode == "expired":
+        request.close()
+    elif mode == "expired-before-admission":
+        lifecycle_path = bridge_dir / ".claude-settings-lifecycle.json"
+        before_reactivation = json.loads(lifecycle_path.read_text())
+        bridge_identity = bridge_dir.stat().st_dev, bridge_dir.stat().st_ino
+        request_claude_bridge_deletion(bridge_dir, session_id)
+        prepare_bridge_dir(session_id, workspace=tmp_path)
+        after_reactivation = json.loads(lifecycle_path.read_text())
+        assert after_reactivation["incarnation"] == before_reactivation["incarnation"]
+        assert after_reactivation["admission_epoch"] != before_reactivation["admission_epoch"]
+        assert (bridge_dir.stat().st_dev, bridge_dir.stat().st_ino) == bridge_identity
+        assert baseline.with_suffix(".dispatch.owner").is_file()
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            url = f"/v1/sessions/{session_id}/resources/terminals"
+            response = await client.post(url, json=body)
+            if mode in {
+                "expired",
+                "expired-before-admission",
+                "expired-after-admission",
+                "failure",
+                "invalid-settings",
+                "validation-unavailable",
+                "unexpected-validator-error",
+            }:
+                assert response.status_code == (
+                    409
+                    if mode in {"expired", "expired-before-admission", "expired-after-admission"}
+                    else 500
+                ), response.text
+                if mode not in {"expired", "expired-before-admission"}:
+                    assert response.json()["claude_settings_request_ack"] == request.generation
+                    assert response.json()["error"]["code"] == (
+                        "conflict"
+                        if mode == "expired-after-admission"
+                        else "terminal_launch_failed"
+                    )
+                    assert len(prepared) == 1
+                    instance, original_args = prepared[0]
+                    assert instance.args == original_args
+                    assert baseline.read_bytes() == baseline_bytes
+                    assert not list(instance.private_dir.glob("claude-finalized-settings-*.json"))
+                message = response.json()["error"]["message"]
+                assert "private-validator-value" not in response.text
+                assert "/private/example/settings.json" not in response.text
+                assert launched == []
+                assert not (bridge_dir / _TOOL_RELAY_FILE).exists()
+                if mode == "expired-before-admission":
+                    assert prepared == []
+                    assert caller_reads == []
+                    assert baseline.read_bytes() == baseline_bytes
+                    assert not baseline.with_suffix(".dispatch.owner").exists()
+                request.close()
+                if mode == "expired-before-admission":
+                    assert baseline.read_bytes() == baseline_bytes
+                    request_claude_bridge_deletion(bridge_dir, session_id)
+                    assert not bridge_dir.exists()
+                if mode == "expired-after-admission":
+                    assert baseline.read_bytes() == baseline_bytes
+                    assert prune_unused_claude_settings(bridge_dir) == 1
+                assert not list(bridge_dir.glob(f"claude-settings-{request.generation}*"))
+                if mode in {"expired", "expired-before-admission", "expired-after-admission"}:
+                    assert response.json()["error"]["code"] == "conflict"
+                    assert "expired" in message
+                    assert ("claude_settings_request_ack" in response.json()) is (
+                        mode == "expired-after-admission"
+                    )
+                elif mode == "failure":
+                    assert message == (
+                        "Caller disableAllHooks=true or allowManagedHooksOnly=true disables "
+                        "required Omnigent bridge hooks. Keep these hooks enabled in --settings, "
+                        "then retry; the launch arguments and bridge settings were left unchanged."
+                    )
+                elif mode == "invalid-settings":
+                    assert message == (
+                        "Claude rejected the merged caller settings. Check --settings "
+                        "with the selected Claude CLI, then retry; the launch arguments "
+                        "and bridge settings were left unchanged."
+                    )
+                elif mode == "validation-unavailable":
+                    assert message == (
+                        "Cannot validate caller settings with the selected Claude CLI. "
+                        "The CLI and wrapper must support the read-only '--bare doctor' check; "
+                        "update them or check their startup and sandbox configuration, then retry."
+                    )
+                elif mode == "unexpected-validator-error":
+                    assert message.startswith(
+                        "Request failed on the runner; see the runner log for details: "
+                    )
+                return
+            assert response.status_code == 200, response.text
+            assert response.json()["claude_settings_request_ack"] == request.generation
+            assert not baseline.with_suffix(".dispatch.owner").exists()
+            assert len(launched) == 1
+            instance = launched[0]
+            request.close()
+            if mode == "declared-replacement":
+                assert instance.args == ["-l"]
+                assert not baseline.exists()
+                assert caller_reads == []
+            else:
+                assert baseline.read_bytes() == baseline_bytes
+                assert instance.private_dir.exists()
+                if mode == "opaque":
+                    assert str(baseline) in instance.args[-1]
+                    assert caller_reads == []
+                else:
+                    settings_index = max(
+                        i for i, arg in enumerate(instance.args) if arg == "--settings"
+                    )
+                    output = Path(instance.args[settings_index + 1])
+                    assert output.parent == instance.private_dir
+                    settings = json.loads(output.read_text())
+                    assert settings["env"]["EXAMPLE"] == "caller"
+                    assert settings["env"]["FROM_FILE"] == "yes"
+                    assert settings["env"]["ORDER"] == "inline"
+                    assert settings["hooks"] == json.loads(baseline_bytes)["hooks"]
+                    assert str(caller_file) not in instance.args
+                    assert caller_reads == [caller_file]
+            replay = await client.post(url, json=body)
+            assert replay.status_code == 409, replay.text
+            assert replay.json()["error"]["code"] == "conflict"
+            assert "expired" in replay.json()["error"]["message"]
+            assert len(launched) == 1
+            with ClaudeSettingsRequest.create(bridge_dir) as unused:
+                unused_body = _claude_terminal_request(
+                    (), command="claude", bridge_dir=bridge_dir, settings_request=unused
+                )
+                unused.mark_dispatched()
+                reused = await client.post(url, json=unused_body)
+                assert reused.status_code == 200, reused.text
+                assert len(launched) == 1
+            assert not list(bridge_dir.glob(f"claude-settings-{unused.generation}*"))
+            assert terminals.transfer(session_id, "moved", "claude", "main")
+            await terminals.cleanup_conversation(session_id)
+            assert instance.private_dir.exists()
+            if mode != "declared-replacement":
+                assert baseline.read_bytes() == baseline_bytes
+            await terminals.cleanup_conversation("moved")
+            assert not instance.private_dir.exists()
+            assert not list(bridge_dir.glob(f"claude-settings-{request.generation}*"))
+    finally:
+        request.close()
+        await terminals.shutdown()
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            await client.delete(f"/v1/sessions/{session_id}")
+        shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["admission", "attachment"])
+async def test_cancelled_settings_route_disposes_late_owner_before_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    from omnigent.harnesses.claude_native import settings_generation
+    from omnigent.harnesses.claude_native.main import _claude_terminal_request
+    from omnigent.harnesses.claude_native.settings_generation import (
+        ClaudeSettingsLease,
+        ClaudeSettingsRequest,
+    )
+
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(bridge, "start_tool_relay", Mock())
+    finalize = AsyncMock()
+    monkeypatch.setattr(bridge, "finalize_claude_caller_settings", finalize)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.resolve_claude_launch",
+        lambda cmd, args: (cmd, args),
+    )
+    session_id = "conv_cancelled_settings"
+    registry = _StubResourceRegistry(tmp_path)
+    app = _switch_app(
+        tmp_path,
+        _SwitchableServerClient("settings-agent"),
+        {"settings-agent": _spec_without_terminals()},
+        resource_registry=registry,
+    )
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    request = ClaudeSettingsRequest.create(bridge_dir)
+    body = _claude_terminal_request(
+        (), command="claude", bridge_dir=bridge_dir, settings_request=request
+    )
+    baseline = request.settings_path(bridge_dir)
+    baseline_bytes = baseline.read_bytes()
+    request.mark_dispatched()
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    started = asyncio.Event()
+    disposing = asyncio.Event()
+    release_owner = threading.Event()
+    release_disposal = threading.Event()
+    late_owners: list[ClaudeSettingsLease] = []
+    worker_threads: list[int] = []
+    cleanup_order: list[str] = []
+    terminal = Mock()
+    acquire = settings_generation.acquire_claude_settings_request
+    retain = ClaudeSettingsLease._retain_for_terminal
+    close = ClaudeSettingsLease.close
+
+    def late_owner(owner: ClaudeSettingsLease) -> ClaudeSettingsLease:
+        late_owners.append(owner)
+        worker_threads.append(threading.get_ident())
+        loop.call_soon_threadsafe(started.set)
+        if threading.get_ident() != loop_thread and not release_owner.wait(timeout=5):
+            raise TimeoutError("settings owner was not released")
+        return owner
+
+    def acquire_owner(*args) -> ClaudeSettingsLease:
+        owner = acquire(*args)
+        return late_owner(owner) if phase == "admission" else owner
+
+    def retain_owner(self) -> ClaudeSettingsLease:
+        return late_owner(retain(self))
+
+    def close_owner(self) -> None:
+        worker_threads.append(threading.get_ident())
+        if late_owners and self is late_owners[0]:
+            loop.call_soon_threadsafe(disposing.set)
+            if threading.get_ident() != loop_thread and not release_disposal.wait(timeout=5):
+                raise TimeoutError("settings disposal was not released")
+            close(self)
+            cleanup_order.append("disposed")
+        else:
+            close(self)
+            cleanup_order.append("released")
+
+    async def prepare_before_launch(**kwargs):
+        try:
+            await kwargs["prepare_terminal"](terminal)
+        finally:
+            cleanup_order.append("rollback")
+
+    monkeypatch.setattr(settings_generation, "acquire_claude_settings_request", acquire_owner)
+    monkeypatch.setattr(ClaudeSettingsLease, "_retain_for_terminal", retain_owner)
+    monkeypatch.setattr(ClaudeSettingsLease, "close", close_owner)
+    monkeypatch.setattr(registry, "launch_required_terminal", prepare_before_launch)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        task = asyncio.create_task(
+            client.post(f"/v1/sessions/{session_id}/resources/terminals", json=body)
+        )
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            owner = late_owners[0]
+            descriptors = [owner._fd, owner._bridge_fd, owner._claim_fd]
+            for gate in (release_owner, release_disposal):
+                for _attempt in range(3):
+                    task.cancel()
+                    checkpoint = loop.create_future()
+                    loop.call_soon(checkpoint.set_result, None)
+                    await checkpoint
+                    assert not task.done()
+                    assert cleanup_order == []
+                    assert baseline.read_bytes() == baseline_bytes
+                    assert owner._fd is not None
+                    terminal.add_resource_cleanup.assert_not_called()
+                gate.set()
+                if gate is release_owner:
+                    await asyncio.wait_for(disposing.wait(), timeout=5)
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=5)
+            assert all(thread != loop_thread for thread in worker_threads)
+            assert cleanup_order == (
+                ["disposed"] if phase == "admission" else ["disposed", "rollback", "released"]
+            )
+            assert owner._fd is owner._bridge_fd is owner._claim_fd is None
+            for fd in descriptors:
+                if fd is not None:
+                    with pytest.raises(OSError):
+                        os.fstat(fd)
+            assert not list(bridge_dir.glob("*.terminal-*.owner"))
+            assert not baseline.with_suffix(".dispatch.owner").exists()
+            finalize.assert_not_awaited()
+            request.close()
+            assert not list(bridge_dir.glob("claude-settings-*"))
+        finally:
+            release_owner.set()
+            release_disposal.set()
+            await asyncio.gather(task, return_exceptions=True)
+            for owner in late_owners:
+                close(owner)
+            request.close()
+
+
+@pytest.mark.asyncio
+async def test_settings_route_publishes_before_cancelled_admission_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.claude_native import settings_generation
+    from omnigent.harnesses.claude_native.main import _claude_terminal_request
+    from omnigent.harnesses.claude_native.settings_generation import (
+        ClaudeSettingsLease,
+        ClaudeSettingsRequest,
+    )
+
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(bridge, "start_tool_relay", Mock())
+    monkeypatch.setattr(bridge, "finalize_claude_caller_settings", AsyncMock())
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.resolve_claude_launch",
+        lambda command, args: (command, args),
+    )
+    session_id = "conv_successful_settings_release"
+    registry = _StubResourceRegistry(tmp_path)
+    app = _switch_app(
+        tmp_path,
+        _SwitchableServerClient("settings-agent"),
+        {"settings-agent": _spec_without_terminals()},
+        resource_registry=registry,
+    )
+    terminal = Mock(running=True, socket_path=tmp_path / "terminal.sock", tmux_target="claude:0.0")
+    registry.terminal_registry = Mock()
+    registry.terminal_registry.get.return_value = terminal
+    callbacks: list[Callable[[], None]] = []
+    terminal.add_resource_cleanup.side_effect = callbacks.append
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    request = ClaudeSettingsRequest.create(bridge_dir)
+    body = _claude_terminal_request(
+        (), command="claude", bridge_dir=bridge_dir, settings_request=request
+    )
+    baseline = request.settings_path(bridge_dir)
+    baseline_bytes = baseline.read_bytes()
+    request.mark_dispatched()
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    closing = asyncio.Event()
+    release_close = threading.Event()
+    admitted: list[ClaudeSettingsLease] = []
+    retained: list[ClaudeSettingsLease] = []
+    close_threads: list[int] = []
+    acquire = settings_generation.acquire_claude_settings_request
+    retain = ClaudeSettingsLease._retain_for_terminal
+    close = ClaudeSettingsLease.close
+    launch = registry.launch_required_terminal
+
+    def acquire_owner(*args) -> ClaudeSettingsLease:
+        owner = acquire(*args)
+        admitted.append(owner)
+        return owner
+
+    def retain_owner(self) -> ClaudeSettingsLease:
+        owner = retain(self)
+        retained.append(owner)
+        return owner
+
+    def paused_close(self) -> None:
+        if admitted and self is admitted[0]:
+            close_threads.append(threading.get_ident())
+            loop.call_soon_threadsafe(closing.set)
+            if threading.get_ident() != loop_thread and not release_close.wait(timeout=5):
+                raise TimeoutError("admission release was not resumed")
+        close(self)
+
+    async def prepare_and_register(**kwargs):
+        await kwargs["prepare_terminal"](terminal)
+        return await launch(**kwargs)
+
+    monkeypatch.setattr(settings_generation, "acquire_claude_settings_request", acquire_owner)
+    monkeypatch.setattr(ClaudeSettingsLease, "_retain_for_terminal", retain_owner)
+    monkeypatch.setattr(ClaudeSettingsLease, "close", paused_close)
+    monkeypatch.setattr(registry, "launch_required_terminal", prepare_and_register)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        task = asyncio.create_task(
+            client.post(f"/v1/sessions/{session_id}/resources/terminals", json=body)
+        )
+        try:
+            await asyncio.wait_for(closing.wait(), timeout=5)
+            target = bridge.read_tmux_target(bridge_dir)
+            assert target == {
+                "socket_path": str(terminal.socket_path),
+                "tmux_target": "claude:0.0",
+            }
+            assert len(callbacks) == len(retained) == 1
+            for _attempt in range(3):
+                task.cancel()
+                checkpoint = loop.create_future()
+                loop.call_soon(checkpoint.set_result, None)
+                await checkpoint
+                assert not task.done()
+                assert admitted[0]._fd is not None
+                assert retained[0]._fd is not None
+                assert baseline.read_bytes() == baseline_bytes
+            release_close.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=5)
+            assert close_threads and all(thread != loop_thread for thread in close_threads)
+            assert admitted[0]._fd is admitted[0]._bridge_fd is None
+            assert retained[0]._fd is not None
+            assert bridge.read_tmux_target(bridge_dir) == target
+            await asyncio.to_thread(request.close)
+            assert baseline.read_bytes() == baseline_bytes
+            await asyncio.to_thread(callbacks[0])
+            assert retained[0]._fd is None
+            assert not list(bridge_dir.glob("claude-settings-*"))
+        finally:
+            release_close.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            for callback in callbacks:
+                await asyncio.to_thread(callback)
+            for owner in admitted:
+                await asyncio.to_thread(close, owner)
+            await asyncio.to_thread(request.close)
