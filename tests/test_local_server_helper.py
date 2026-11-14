@@ -187,7 +187,28 @@ def test_routable_host_waits_for_its_own_tunnel_and_names_the_failure() -> None:
         assert routable_host(client, host_id=mine) is None
         assert routable_host(client, host_id=mine)["host_id"] == mine
         probes.clear()
+        # A zero timeout still polls once, so the message names the failed probe.
         expected = f"host {mine} online but its tunnel probe returned 400"
         with pytest.raises(AssertionError, match=expected):
-            wait_for_routable_host(client, host_id=mine, timeout=0.01, poll_interval=0.05)
+            wait_for_routable_host(client, host_id=mine, timeout=0)
     assert other not in probes
+
+
+def test_routable_host_skips_a_host_whose_tunnel_probe_raises() -> None:
+    """A probe that times out on one host doesn't hide a later host whose tunnel answers."""
+    import httpx
+
+    from tests._helpers.host import routable_host
+
+    dead, healthy = "a" * 32, "b" * 32
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/hosts":
+            hosts = [{"host_id": h, "status": "online"} for h in (dead, healthy)]
+            return httpx.Response(200, json={"hosts": hosts})
+        if request.url.path.split("/")[3] == dead:
+            raise httpx.ReadTimeout("probe timed out", request=request)
+        return httpx.Response(200, json={"entries": []})
+
+    with httpx.Client(base_url="http://test", transport=httpx.MockTransport(respond)) as client:
+        assert routable_host(client)["host_id"] == healthy
