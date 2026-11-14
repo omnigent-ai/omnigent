@@ -305,6 +305,54 @@ describe("markConversationRead", () => {
   });
 });
 
+describe("markConversationsRead / restoreReadState", () => {
+  it("marks many read in one write, then Undo restores each prior state", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 4_000 }]);
+    mod.markConversationUnread("conv-2", 5_000);
+    vi.useFakeTimers({ now: 6_000_000 });
+    authFetch.mockClear();
+
+    const undo = mod.markConversationsRead([
+      { id: "conv-1", updatedAt: 5_000 },
+      { id: "conv-2", updatedAt: 5_000 },
+    ]);
+
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
+    expect(mod.isConversationUnseen("conv-2", 5_000, "idle")).toBe(false);
+    expect(putCount()).toBe(2);
+
+    mod.restoreReadState(undo);
+
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(false);
+    expect(mod.isConversationUnseen("conv-2", 5_000, "idle")).toBe(true);
+    expect(mod.isExplicitlyUnread("conv-2")).toBe(true);
+    expect(lastPutBody()).toEqual({ last_seen: 4_999, unread: true });
+  });
+
+  it("leaves a conversation read again after the bulk mark alone on Undo", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([
+      { id: "conv-1", viewer_last_seen: 4_000 },
+      { id: "conv-2", viewer_last_seen: 4_000 },
+    ]);
+    vi.useFakeTimers({ now: 6_000_000 });
+    const undo = mod.markConversationsRead([
+      { id: "conv-1", updatedAt: 5_000 },
+      { id: "conv-2", updatedAt: 5_000 },
+    ]);
+    // A new turn on conv-1 is read in a later second, before Undo.
+    vi.setSystemTime(7_000_000);
+    mod.markConversationRead("conv-1", 6_500);
+
+    mod.restoreReadState(undo);
+
+    expect(mod.isConversationUnseen("conv-1", 6_500, "idle")).toBe(false);
+    expect(mod.isConversationUnseen("conv-2", 5_000, "idle")).toBe(true);
+  });
+});
+
 describe("clearUnreadOverride", () => {
   it("removes the override, PUTs the cleared state, and re-enables mark-seen", async () => {
     const mod = await loadFresh();
