@@ -18,6 +18,7 @@ import pytest
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.claude_native import bridge
 from omnigent.harnesses.claude_native import main as claude_native
+from omnigent.harnesses.claude_native.status import sync_raw_status_context
 from omnigent.models import model_catalog_store
 from omnigent.runner import create_runner_app
 from omnigent.spec.types import AgentSpec, ExecutorSpec
@@ -62,6 +63,14 @@ async def _wait_for_picker(socket_path: Path) -> str:
 
 
 def _status_model_matches(bridge_dir: Path, expected: str) -> bool:
+    try:
+        raw = json.loads((bridge_dir / bridge.CONTEXT_RAW_FILE).read_text())
+    except (OSError, ValueError):
+        return False
+    native_session = bridge.read_claude_session_id(bridge_dir)
+    if not isinstance(raw, dict) or not native_session or raw.get("session_id") != native_session:
+        return False
+    sync_raw_status_context(bridge_dir, None)
     # Recent Claude builds omit the context-window suffix in statusLine model IDs.
     actual = bridge.read_claude_status_model(bridge_dir)
     return actual is not None and actual.removesuffix("[1m]") == expected.removesuffix("[1m]")
@@ -73,6 +82,11 @@ async def _wait_for_model(
     deadline = asyncio.get_running_loop().time() + 30
     while asyncio.get_running_loop().time() < deadline:
         if _status_model_matches(bridge_dir, expected):
+            native_session = bridge.read_claude_session_id(bridge_dir)
+            assert any(
+                record.event_name == "SessionStart" and record.claude_session_id == native_session
+                for record in bridge.read_hook_events_since_with_position(bridge_dir, 0).records
+            ), "the terminal did not record a matching real SessionStart hook"
             return
         await asyncio.sleep(0.1)
     pane = _capture_pane(socket_path, target)
@@ -85,22 +99,6 @@ def _saved_model_matches(settings_path: Path, expected: str) -> bool:
     except (OSError, ValueError):
         return False
     return isinstance(settings, dict) and settings.get("model") == expected
-
-
-def _status_line_config(bridge_dir: Path) -> dict[str, str]:
-    """Capture only this pane's model status in its own directory."""
-    return {
-        "type": "command",
-        "command": shlex.join(
-            [
-                sys.executable,
-                "-m",
-                "omnigent.harnesses.claude_native.status",
-                "--bridge-dir",
-                str(bridge_dir),
-            ]
-        ),
-    }
 
 
 async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
@@ -135,6 +133,7 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
     )
     # This models an existing terminal whose launch predates picker metadata.
     assert bridge.read_model_picker_values(bridge_dir) == []
+    assert bridge.read_claude_session_id(bridge_dir) is None
     (config_dir / ".claude.json").write_text(
         json.dumps(
             {
@@ -156,7 +155,6 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
                         {"model": _TARGET_MODEL, "label": "Managed target"},
                     ],
                 },
-                "statusLine": _status_line_config(bridge_dir),
             }
         )
     )
@@ -193,15 +191,20 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
     )
     socket_path = tmp_path / "tmux.sock"
     bridge.write_tmux_target(bridge_dir, socket_path=socket_path, tmux_target="model-switch:0.0")
+    augmented = bridge.augment_claude_args(
+        ("--model", _INITIAL_MODEL),
+        bridge_dir=bridge_dir,
+        python_executable=sys.executable,
+    )
+    settings_index = augmented.index("--settings")
+    mcp_args = ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+    # Use production hooks and status capture without starting the MCP relay.
     command = [
         "claude",
         "--model",
         _INITIAL_MODEL,
-        "--settings",
-        str(settings_path),
-        "--strict-mcp-config",
-        "--mcp-config",
-        '{"mcpServers":{}}',
+        *augmented[settings_index : settings_index + 2],
+        *mcp_args,
     ]
     subprocess.run(
         [
@@ -227,6 +230,8 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
     )
     try:
         await _wait_for_model(bridge_dir, _INITIAL_MODEL, socket_path)
+        native_session_id = bridge.read_claude_session_id(bridge_dir)
+        assert native_session_id
         (tmp_path / "before-switch.txt").write_text(_capture_pane(socket_path))
         (tmp_path / "saved-default-before.json").write_text(
             json.dumps({"model": json.loads(settings_path.read_text())["model"]})
@@ -251,6 +256,8 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
             catalog = await client.get(f"/v1/sessions/{session_id}/claude-model-options")
             assert catalog.status_code == 200, catalog.text
             assert _TARGET_MODEL in {row["id"] for row in catalog.json()["models"]}
+            assert all(not key.startswith("_") for row in catalog.json()["models"] for key in row)
+            assert _TARGET_MODEL in bridge.read_model_picker_values(bridge_dir)
             for model in (_TARGET_MODEL, _INITIAL_MODEL):
                 response = await client.post(
                     f"/v1/sessions/{session_id}/events",
@@ -261,7 +268,33 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
                 await poll_until_async(lambda: _saved_model_matches(settings_path, _INITIAL_MODEL))
                 assert _status_model_matches(bridge_dir, model)
             await asyncio.to_thread(bridge.inject_slash_command, bridge_dir, command="/model")
-            (tmp_path / "open-model-picker.txt").write_text(await _wait_for_picker(socket_path))
+            open_picker = await _wait_for_picker(socket_path)
+            (tmp_path / "open-model-picker.txt").write_text(open_picker)
+            saved_settings = settings_path.read_bytes()
+            refused = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={"type": "model_change", "model": _TARGET_MODEL},
+            )
+            assert refused.status_code == 503, refused.text
+            assert refused.json()["error"] == "claude_native_model_failed"
+            refused_picker = _capture_pane(socket_path)
+            assert "Select model" in refused_picker
+            assert (
+                refused_picker.split("Select model", 1)[1]
+                == open_picker.split("Select model", 1)[1]
+            )
+            assert _status_model_matches(bridge_dir, _INITIAL_MODEL)
+            assert settings_path.read_bytes() == saved_settings
+            (tmp_path / "refused-model-picker.txt").write_text(refused_picker)
+            # The person dismisses their picker before retrying the web selection.
+            subprocess.run(
+                ["tmux", "-S", str(socket_path), "send-keys", "-t", "model-switch:0.0", "Escape"],
+                check=True,
+                timeout=5,
+            )
+            await poll_until_async(
+                lambda: bridge._claude_prompt_rendered(_capture_pane(socket_path))
+            )
             recovered = await client.post(
                 f"/v1/sessions/{session_id}/events",
                 json={"type": "model_change", "model": _TARGET_MODEL},
@@ -278,14 +311,18 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
                 json.dumps({"model": json.loads(settings_path.read_text())["model"]})
             )
 
-        # A statusLine-only override leaves the saved model as the fresh pane's default.
+        # No invocation model leaves the saved model as the fresh pane's default.
         fresh_bridge_dir = tmp_path / "fresh-bridge"
         fresh_bridge_dir.mkdir()
-        fresh_settings = tmp_path / "fresh-settings.json"
-        fresh_settings.write_text(
-            json.dumps({"statusLine": _status_line_config(fresh_bridge_dir)})
+        fresh_augmented = bridge.augment_claude_args(
+            (), bridge_dir=fresh_bridge_dir, python_executable=sys.executable
         )
-        standalone = [command[0], "--settings", str(fresh_settings), *command[5:]]
+        fresh_settings_index = fresh_augmented.index("--settings")
+        standalone = [
+            "claude",
+            *fresh_augmented[fresh_settings_index : fresh_settings_index + 2],
+            *mcp_args,
+        ]
         subprocess.run(
             [
                 "tmux",
@@ -307,6 +344,7 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
         await _wait_for_model(
             fresh_bridge_dir, _INITIAL_MODEL, socket_path, "model-switch:fresh-default"
         )
+        assert bridge.read_claude_session_id(fresh_bridge_dir) != native_session_id
         fresh_pane = _capture_pane(socket_path, "model-switch:fresh-default")
         (tmp_path / "fresh-session.txt").write_text(fresh_pane)
         (tmp_path / "fresh-model.json").write_text(

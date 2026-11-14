@@ -734,15 +734,18 @@ Cross-harness journeys:
   `web/src/shell/NewChatDialog.test.tsx`.
 - **`model-and-effort`, Claude runtime selection (own environment):**
   `tests/e2e/test_claude_native_managed_model_switch.py::test_runner_switches_managed_glm_in_a_real_claude_terminal`
-  uses real Claude catalog discovery, tmux, statusLine and the runner event
-  endpoint. With the per-session options cache still cold, repeated `opus` and
-  `opus[1m]` selections retain the exact launch-pinned generation and context.
-  It then switches to a managed GLM picker ID and back, opens Claude's model
-  picker, and confirms another switch reclaims that surface successfully.
+  uses real Claude catalog discovery, production invocation settings, a real
+  SessionStart identity matching statusLine, tmux and the runner event endpoint.
+  With the per-session options cache still cold, repeated `opus` and `opus[1m]`
+  selections retain the exact launch-pinned generation and context. It then
+  switches to a managed GLM picker ID and back. A model picker opened in the
+  terminal causes a refusal and stays open with the applied model and saved
+  default unchanged; dismiss it with Escape, then retry the web selection.
+  A fresh terminal still starts on the saved default.
   Run `OMNIGENT_E2E_CLAUDE_NATIVE=1 uv run --no-sync pytest tests/e2e/test_claude_native_managed_model_switch.py --reruns 0`.
-  Requires Claude Code and tmux; use a clean container if machine-managed
-  settings override the fixture's picker. It makes no model calls and does not
-  verify browser rendering or live gateway servability.
+  Requires Claude Code 2.1.323 or newer and tmux; use a clean container if
+  machine-managed settings override the fixture's picker. It makes no model
+  calls and does not verify browser rendering or live gateway servability.
 - **`model-and-effort`, Claude browser selection and refusal (nightly):**
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_picker_repeated_pins_reach_the_real_terminal`
   proves alias picks through the gear, model pill and Ctrl+Shift+M using
