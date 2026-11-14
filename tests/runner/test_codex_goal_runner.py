@@ -318,17 +318,28 @@ async def test_get_allows_absent_goal() -> None:
 
 
 @pytest.mark.parametrize("require_live", [False, True])
-async def test_get_preserves_unavailable_reads(require_live: bool) -> None:
-    runner = _make_runner()
-    runner._request = AsyncMock(  # type: ignore[method-assign]
-        return_value={"goal": None, "available": False}
+async def test_get_preserves_unavailable_reads(
+    monkeypatch: pytest.MonkeyPatch, require_live: bool
+) -> None:
+    fake_client = _FakeCodexClient(response={"result": {"goal": None, "available": False}})
+    monkeypatch.setitem(
+        sys.modules,
+        "omnigent.harnesses.codex_native.app_server",
+        SimpleNamespace(client_for_transport=lambda *_args, **_kwargs: fake_client),
     )
+    runner = _make_runner()
 
     response = await runner.get("conv_1", require_live=require_live)
 
+    assert fake_client.connect_calls == 1
+    assert fake_client.request_calls == [("thread/goal/get", {"threadId": "thread_1"})]
+    assert fake_client.closed is True
     if require_live:
         assert response.status_code == 503
-        assert _json_response(response)["error"] == "codex_native_goal_failed"
+        assert _json_response(response) == {
+            "error": "codex_native_goal_failed",
+            "detail": "Codex-native goal read requires a live Codex bridge.",
+        }
     else:
         assert response.status_code == 200
         assert _json_response(response) == {"goal": None, "available": False}

@@ -156,7 +156,7 @@ async function requestCodexGoal<T>(url: string, init: RequestInit = {}): Promise
     const request = authenticatedFetch(url, { ...init, signal: controller.signal }).then(
       readJsonOrThrow<T>,
     );
-    // Custom fetchers and response bodies can ignore abort, so bound the entire read.
+    // Custom fetchers and response bodies can ignore abort, so bound the entire request.
     return await Promise.race([request, timeout]);
   } finally {
     clearTimeout(timer);
