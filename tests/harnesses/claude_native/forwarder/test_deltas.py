@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -68,7 +70,10 @@ def _delta_capture_client(
     return httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://ap")
 
 
-async def test_forward_available_deltas_batches_and_advances_offset(tmp_path: Path) -> None:
+@pytest.mark.parametrize("slow_file_io", [False, True])
+async def test_forward_available_deltas_batches_and_advances_offset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, slow_file_io: bool
+) -> None:
     """
     Chunks available in one poll are POSTed in one ordered batch.
 
@@ -88,14 +93,48 @@ async def test_forward_available_deltas_batches_and_advances_offset(tmp_path: Pa
     )
     captured: list[_CapturedDeltaPost] = []
     seen: dict[tuple[str, int], None] = {}
+    entered = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    loop = asyncio.get_running_loop()
+    original_stat = Path.stat
+    original_open = Path.open
+
+    def block_delta_io(path: Path) -> None:
+        if slow_file_io and path == bridge_dir / "message_deltas.jsonl" and not finished.is_set():
+            loop.call_soon_threadsafe(entered.set)
+            release.wait(timeout=5.0)
+            finished.set()
+
+    def slow_stat(path: Path, *args: Any, **kwargs: Any) -> Any:
+        block_delta_io(path)
+        return original_stat(path, *args, **kwargs)
+
+    def slow_open(path: Path, *args: Any, **kwargs: Any) -> Any:
+        block_delta_io(path)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", slow_stat)
+    monkeypatch.setattr(Path, "open", slow_open)
     async with _delta_capture_client(captured) as client:
-        new_state = await forwarder._forward_available_deltas(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            state=forwarder.DeltaForwardState(),
-            seen_keys=seen,
+        task = asyncio.create_task(
+            forwarder._forward_available_deltas(
+                client=client,
+                session_id="conv_x",
+                bridge_dir=bridge_dir,
+                state=forwarder.DeltaForwardState(),
+                seen_keys=seen,
+            )
         )
+        try:
+            if slow_file_io:
+                await asyncio.wait_for(entered.wait(), timeout=10.0)
+                assert not finished.is_set(), "delta file I/O blocked the event loop"
+                release.set()
+            new_state = await task
+        finally:
+            release.set()
+            await task
 
     assert [c.url_path for c in captured] == ["/v1/sessions/conv_x/events"]
     # Full event shape proves every field survived hook → file → POST.
