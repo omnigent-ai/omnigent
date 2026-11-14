@@ -234,6 +234,21 @@ def test_pending_tool_poll_waits_for_this_turn(monkeypatch, previous_call) -> No
             ("synthetic-bearer-tail",),
             id="bearer-only-leaf",
         ),
+        pytest.param(
+            {"detail": r'{"\u0070assphrase":"synthetic-encoded-json-tail"}'},
+            ("synthetic-encoded-json-tail",),
+            id="encoded-json-string",
+        ),
+        pytest.param(
+            {"details": [r'["\u0070assword", "synthetic-encoded-array-tail"]']},
+            ("synthetic-encoded-array-tail",),
+            id="encoded-json-array-string",
+        ),
+        pytest.param(
+            {"detail": json.dumps(r'{"\u0070assphrase":"synthetic-nested-encoded-tail"}')},
+            ("synthetic-nested-encoded-tail",),
+            id="multiply-encoded-json-string",
+        ),
         *[
             pytest.param(
                 {"details": f"{label}=synthetic-assignment-tail"}
@@ -295,15 +310,43 @@ def test_redacted_response_text_omits_credentials(
     assert response.json() == payload
 
 
+def test_redacted_response_text_keeps_distinct_redacted_fields() -> None:
+    payload = {
+        "password": "synthetic-first-tail",
+        "api_key": "synthetic-second-tail",
+        "[REDACTED]": "safe context",
+    }
+    response = httpx.Response(400, json=payload)
+
+    diagnostic = json.loads(_redacted_response_text(response))
+
+    assert len(diagnostic) == len(payload)
+    assert list(diagnostic.values()).count("[REDACTED]") == 2
+    assert "safe context" in diagnostic.values()
+    assert "synthetic-" not in json.dumps(diagnostic)
+    assert response.json() == payload
+
+
+def test_redacted_response_text_keeps_decoded_unicode_context() -> None:
+    payload = {"message": "Clôture complete — ready"}
+    response = httpx.Response(400, json=payload)
+
+    assert json.loads(_redacted_response_text(response)) == payload
+    assert response.json() == payload
+
+
 @pytest.mark.parametrize(
-    "invalid_metadata", [False, True], ids=["long-api-key", "metadata-validation"]
+    "failure_kind", ["long-api-key", "metadata-validation", "encoded-json-string"]
 )
 def test_native_create_failure_keeps_bounded_redacted_response(
-    invalid_metadata: bool, monkeypatch: pytest.MonkeyPatch
+    failure_kind: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     message = "host did not respond to workspace stat"
     credential_tails = ()
-    if invalid_metadata:
+    if failure_kind == "encoded-json-string":
+        credential_tails = ("synthetic-encoded-note-tail",)
+        message = r'{"\u0070assphrase":"synthetic-encoded-note-tail"}'
+    elif failure_kind == "metadata-validation":
         from omnigent.errors import OmnigentError
         from omnigent.server.routes._sessions.helpers import _parse_session_create_metadata
 
@@ -366,7 +409,7 @@ def test_native_create_failure_keeps_bounded_redacted_response(
     assert error.response.json() == payload
     note = "\n".join(error.__notes__)
     assert "invalid_input" in note
-    if not invalid_metadata:
+    if failure_kind == "long-api-key":
         assert message in note
     assert "diagnostic-after-redaction" in note
     assert "[REDACTED]" in note

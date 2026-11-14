@@ -34,6 +34,7 @@ _SENSITIVE_RESPONSE_KEY_PATTERN = re.compile(
     r"|(?:api|private)[\s_.-]*key",
     re.IGNORECASE,
 )
+_ENCODED_RESPONSE_ESCAPE_PATTERN = re.compile(r"\\(?:u[0-9a-f]{4}|x[0-9a-f]{2})", re.IGNORECASE)
 _MAX_DIAGNOSTIC_RESPONSE_BYTES = 16 * 1024
 
 
@@ -45,15 +46,24 @@ def _redacted_response_text(response: httpx.Response) -> str:
         if isinstance(value, dict):
             result = {}
             for key, item in value.items():
-                result[redact(key)] = (
-                    "[REDACTED]" if _SENSITIVE_RESPONSE_KEY_PATTERN.search(key) else redact(item)
-                )
+                safe_key = redact(key)
+                key_changed = safe_key != key
+                if key_changed:
+                    suffix = 1
+                    while safe_key in value or safe_key in result:
+                        safe_key = f"[REDACTED-{suffix}]"
+                        suffix += 1
+                result[safe_key] = "[REDACTED]" if key_changed else redact(item)
             return result
         if isinstance(value, list):
             return [redact(item) for item in value]
         if isinstance(value, str):
             # Validation strings can echo arbitrary metadata, including containers.
-            if "input_value=" in value or _SENSITIVE_RESPONSE_KEY_PATTERN.search(value):
+            if (
+                "input_value=" in value
+                or _SENSITIVE_RESPONSE_KEY_PATTERN.search(value)
+                or _ENCODED_RESPONSE_ESCAPE_PATTERN.search(value)
+            ):
                 return "[REDACTED]"
             redacted = redact_log_text(value, include_whitespace_credentials=True)
             return "[REDACTED]" if redacted != value else value
