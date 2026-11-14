@@ -924,6 +924,7 @@ async def test_async_idle_watcher_treats_confirmation_start_failure_as_unknown(
         "cancelled-before-kill",
         "cancelled-kill",
         "interrupted-spawn",
+        "interrupted-spawn-retry",
     ],
 )
 async def test_close_kills_tmux_when_socket_exists_after_running_cleared(
@@ -952,7 +953,12 @@ async def test_close_kills_tmux_when_socket_exists_after_running_cleared(
         monkeypatch.setattr(
             instance, "_stop_idle_watcher", AsyncMock(side_effect=asyncio.CancelledError)
         )
-    if outcome == "interrupted-spawn":
+    launch_errors: list[BaseException] = []
+    if outcome.startswith("interrupted-spawn"):
+        launch_errors.append(asyncio.CancelledError())
+        if outcome == "interrupted-spawn-retry":
+            launch_errors.append(FileNotFoundError(errno.ENOENT, "cannot spawn", "tmux"))
+    for error in launch_errors:
         with monkeypatch.context() as launch_patch:
             launch_patch.setattr(
                 terminal_mod,
@@ -960,11 +966,11 @@ async def test_close_kills_tmux_when_socket_exists_after_running_cleared(
                 SimpleNamespace(
                     **{
                         **vars(asyncio),
-                        "create_subprocess_exec": AsyncMock(side_effect=asyncio.CancelledError),
+                        "create_subprocess_exec": AsyncMock(side_effect=error),
                     }
                 ),
             )
-            with pytest.raises(asyncio.CancelledError):
+            with pytest.raises(type(error)):
                 await instance.launch()
 
     async def _tmux(*args: str) -> None:
@@ -987,11 +993,11 @@ async def test_close_kills_tmux_when_socket_exists_after_running_cleared(
         await instance.close()
 
     assert commands == ([] if outcome == "cancelled-before-kill" else [("kill-server",)])
-    assert revoked == [True] * (2 if outcome == "interrupted-spawn" else 1)
+    assert revoked == [True] * (1 + len(launch_errors))
     if outcome not in {"success", "target-gone"}:
         assert output.exists()
         assert retired == []
-        if outcome == "interrupted-spawn":
+        if outcome.startswith("interrupted-spawn"):
             return
         monkeypatch.setattr(instance, "_tmux", AsyncMock())
         monkeypatch.setattr(instance, "_stop_idle_watcher", AsyncMock())

@@ -65,22 +65,66 @@ def _launch_failed_event(caplog: pytest.LogCaptureFixture) -> logging.LogRecord:
 
 
 @requires_tmux
+@pytest.mark.parametrize("retained_preparation", [False, True])
 async def test_missing_tmux_during_spawn_releases_private_resources(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    retained_preparation: bool,
 ) -> None:
+    from omnigent.harnesses.claude_native.bridge import augment_claude_args
+    from omnigent.harnesses.claude_native.settings_generation import (
+        ClaudeSettingsRequest,
+        acquire_claude_settings_request,
+        settings_generation_path,
+    )
+
     created = _capture_instances(monkeypatch)
     terminal_registry = TerminalRegistry()
     empty_bin = tmp_path / "empty-bin"
     empty_bin.mkdir()
+    released = []
+    request = None
+    if retained_preparation:
+        bridge_root = tmp_path / "claude-native"
+        monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", bridge_root)
+        bridge_dir = bridge_root / "prepared"
+        request = ClaudeSettingsRequest.create(bridge_dir)
+        augment_claude_args(
+            (), bridge_dir=bridge_dir, defer_caller_settings=True, settings_request=request
+        )
+        baseline = settings_generation_path(bridge_dir, request.generation)
+        monkeypatch.setattr(
+            asyncio,
+            "create_subprocess_exec",
+            AsyncMock(side_effect=FileNotFoundError(errno.ENOENT, "cannot spawn", "tmux")),
+        )
+
+    async def prepare(instance: TerminalInstance) -> None:
+        assert request is not None
+        with acquire_claude_settings_request(bridge_dir, request.generation) as lease:
+            lease.attach(instance)
+        instance.add_resource_cleanup(lambda: released.append(instance))
+        (instance.private_dir / "prepared-settings.json").write_text("{}")
+        request.close()
+        assert baseline.exists()
+
     caplog.set_level(logging.WARNING, logger=registry.__name__)
     try:
         with pytest.raises(FileNotFoundError) as raised:
             await terminal_registry.launch(
-                "owned-session", "shell", "main", _spec(tmp_path, env={"PATH": str(empty_bin)})
+                "owned-session",
+                "shell",
+                "main",
+                _spec(tmp_path, env={"PATH": str(empty_bin)}),
+                prepare_terminal=prepare if retained_preparation else None,
             )
         assert raised.value.filename == "tmux"
         assert len(created) == 1
         assert not created[0].private_dir.exists()
+        if request is not None:
+            assert released == created
+            assert not list(bridge_dir.glob(f"claude-settings-{request.generation}*"))
         assert terminal_registry.list_for_conversation("owned-session") == []
         assert terminal_registry.active_conversation_ids() == []
         record = _launch_failed_event(caplog)
@@ -90,7 +134,11 @@ async def test_missing_tmux_during_spawn_releases_private_resources(
         assert str(empty_bin) not in json.dumps(record.attributes)
     finally:
         for instance in created:
+            monkeypatch.setattr(instance, "_tmux", AsyncMock())
             await instance.close()
+        if request is not None:
+            request.close()
+    assert released == (created if retained_preparation else [])
 
 
 @pytest.mark.parametrize(

@@ -1786,6 +1786,8 @@ class TerminalInstance:
         try:
             if self._clipboard_bridge is not None:
                 self._clipboard_bridge.start()
+            previous_launch_started = self._launch_started
+            previous_launch_incomplete = self._launch_incomplete
             self._launch_started = True
             self._launch_incomplete = True
             try:
@@ -1796,7 +1798,9 @@ class TerminalInstance:
                     env=env,
                 )
             except OSError:
-                self._launch_incomplete = False
+                # This attempt created no consumer; an earlier attempt may still be uncertain.
+                self._launch_started = previous_launch_started
+                self._launch_incomplete = previous_launch_incomplete
                 raise
             _, stderr = await proc.communicate()
             self._launch_incomplete = False
