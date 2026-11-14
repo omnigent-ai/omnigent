@@ -316,13 +316,17 @@ export function compareCells(a: string, b: string, type: DataColumnType): number
   return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
 }
 
+function textLength(cells: string[]): number {
+  return cells.reduce((total, cell) => total + cell.length, 0);
+}
+
 /**
  * Build the preview table from records whose first is the header.
  *
- * Keeps at most ``DATA_TABLE_MAX_COLUMNS`` columns and as many rows as fit in
- * ``DATA_TABLE_MAX_CELLS``, since padding fills every row to the widest one.
- * Short rows are padded and long ones keep their extra cells under generated
- * column names.
+ * Keeps at most ``DATA_TABLE_MAX_COLUMNS`` columns, and as many rows as fit in
+ * ``DATA_TABLE_MAX_CELLS`` (padding fills every row to the widest one) and in
+ * ``DATA_TABLE_MAX_CHARS`` of text. Short rows are padded and long ones keep
+ * their extra cells under generated column names.
  *
  * @param records - The header, then at most ``DATA_TABLE_MAX_ROWS`` data rows.
  * @param totalRows - Data rows in the file, kept or not.
@@ -343,16 +347,27 @@ export function tableFromRecords(
     Math.max(header.length, ...parsedRows.map((row) => row.length)),
   );
   const rows = parsedRows.slice(0, Math.max(1, Math.floor(DATA_TABLE_MAX_CELLS / width) - 1));
-  const columns = Array.from(
-    { length: width },
-    (_, index) => header[index] ?? `column ${index + 1}`,
-  );
-  const padded = rows.map((row) =>
-    row.length === width
-      ? row
-      : row.length > width
-        ? row.slice(0, width)
-        : [...row, ...Array<string>(width - row.length).fill("")],
+  // One text budget covers the header and the kept rows, so a value repeated in
+  // many cells can't multiply past it. The header is cut to fit; rows are kept
+  // while they fit, so the kept rows stay a prefix of the file.
+  let budget = DATA_TABLE_MAX_CHARS;
+  const columns = Array.from({ length: width }, (_, index) => {
+    const name = header[index];
+    if (name === undefined) return `column ${index + 1}`;
+    const kept = name.slice(0, budget);
+    budget -= kept.length;
+    return kept;
+  });
+  const kept: string[][] = [];
+  for (const row of rows) {
+    const cells = row.length > width ? row.slice(0, width) : row;
+    const length = textLength(cells);
+    if (length > budget) break;
+    budget -= length;
+    kept.push(cells);
+  }
+  const padded = kept.map((row) =>
+    row.length === width ? row : [...row, ...Array<string>(width - row.length).fill("")],
   );
   return {
     header: columns,
