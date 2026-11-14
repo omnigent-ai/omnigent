@@ -193,14 +193,24 @@ describe("TasksPanel", () => {
     expect(screen.queryByText("Scratch item")).toBeNull();
   });
 
-  it("shows the agent's own list on a server that keeps no journal", () => {
-    vi.mocked(useServerInfo).mockReturnValue({ session_journal: false } as never);
-    showJournal([journalPlan(0, ["profile"])]);
-    setSession({ todos: [{ content: "Only item", status: "pending", activeForm: "" }] });
-    renderPanel();
-    expect(screen.getByTestId("tasks-row").textContent).toContain("Only item");
-    expect(vi.mocked(useSessionJournal)).toHaveBeenLastCalledWith("conv", false);
-  });
+  it.each([true, false, undefined])(
+    "gates the agent's own list without a journal on workflows=%s",
+    (workflows) => {
+      vi.mocked(useServerInfo).mockReturnValue({
+        session_journal: false,
+        features: workflows === undefined ? {} : { workflows },
+      } as never);
+      showJournal([journalPlan(0, ["profile"])]);
+      setSession({ todos: [{ content: "Only item", status: "pending", activeForm: "" }] });
+      renderPanel();
+      if (workflows) {
+        expect(screen.getByTestId("tasks-row")).toHaveTextContent("Only item");
+      } else {
+        expect(screen.queryByTestId("tasks-row")).toBeNull();
+      }
+      expect(vi.mocked(useSessionJournal)).toHaveBeenLastCalledWith("conv", false);
+    },
+  );
 
   it("lists the plan's steps in order, each once, with where it stands", () => {
     showJournal([
