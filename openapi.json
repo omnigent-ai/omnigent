@@ -19603,6 +19603,18 @@
             }
           },
           {
+            "description": "`\"full\"` (default) returns every item as stored. `\"preview\"` keeps only the first 400 characters of each `function_call_output` and adds `output_length` and `output_truncated=true` to the items it shortened; the full item stays available from `GET /sessions/{id}/items/{item_id}`. Tool output dominates the bytes of a transcript page, so a preview page costs a small fraction of a full one.",
+            "in": "query",
+            "name": "tool_output",
+            "required": false,
+            "schema": {
+              "default": "full",
+              "pattern": "^(full|preview)$",
+              "title": "Tool Output",
+              "type": "string"
+            }
+          },
+          {
             "description": "Only items of this type, e.g. `\"message\"`; `None` lists every type. An unknown type is a 422.",
             "in": "query",
             "name": "type",
@@ -19654,6 +19666,60 @@
           }
         },
         "summary": "List Session Items",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/items/{item_id}": {
+      "get": {
+        "description": "Return one committed item with its full payload.\n\nLets a client that listed items with `tool_output=preview`\nfetch a tool output in full when the reader expands it.\n\n**Returns:** The item in the same flat shape as the list route.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists, or the item is not a committed item of this session.",
+        "operationId": "get_session_item_v1_sessions__session_id__items__item_id__get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Item identifier from the list route, e.g. `\"fco_abc123\"`.",
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "title": "Item Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionItem"
+                }
+              }
+            },
+            "description": "The item, flat as in the list route."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Item",
         "tags": [
           "sessions"
         ]

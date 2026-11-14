@@ -95,6 +95,10 @@ export type RenderItem =
       state: ToolState;
       startedAt: number | null;
       duration: number | undefined;
+      /** Id of the persisted result item, when the output came from one. */
+      resultItemId?: string;
+      /** Stored output length when `output` is only a lean history page's preview. */
+      truncatedOutputLength?: number;
     }
   | {
       kind: "native_tool";
@@ -1959,7 +1963,20 @@ function toolItem(
     state = "no-output";
   }
 
-  return { kind: "tool", itemId, execution, output, state, startedAt, duration };
+  return {
+    kind: "tool",
+    itemId,
+    execution,
+    output,
+    state,
+    startedAt,
+    duration,
+    // Primitives only, so an unchanged tool stays shallow-equal across rebuilds.
+    ...(result?.ctx.itemId ? { resultItemId: result.ctx.itemId } : {}),
+    ...(result?.truncatedOutputLength !== undefined
+      ? { truncatedOutputLength: result.truncatedOutputLength }
+      : {}),
+  };
 }
 
 /** Same keys, each value strictly equal. */

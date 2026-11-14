@@ -68,7 +68,7 @@ describe("fetchConversationSnapshot", () => {
     );
     expect(getPage).toHaveBeenCalledWith(
       "conv-1",
-      expect.objectContaining({ limit: INITIAL_WINDOW_ITEMS }),
+      expect.objectContaining({ limit: INITIAL_WINDOW_ITEMS, toolOutput: "preview" }),
     );
     expect(client.getQueryData(["session", "conv-1"])).toEqual(session("fresh"));
   });

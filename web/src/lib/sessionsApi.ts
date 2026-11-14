@@ -11,7 +11,13 @@ import type { SandboxProfile } from "./sandboxProfilesApi";
 // helpers below convert at the boundary so callers never see raw
 // wire fields.
 
-import { isMessageItem, type ConversationItem } from "./conversationItems";
+import {
+  type ConversationItem,
+  isFunctionCallItem,
+  isFunctionCallOutputItem,
+  isMessageItem,
+} from "./conversationItems";
+import { TOOLS_RENDERED_FROM_OUTPUT } from "./itemsToBlocks";
 import type { SideChatModelSettings } from "./sideChat";
 import type { MessageContentBlock } from "./blocks";
 import type { McpServerStartup } from "./events";
@@ -1608,18 +1614,95 @@ export async function fetchSessionItemsPage(
     olderThan,
     limit = SESSION_HISTORY_PAGE_SIZE,
     signal,
-  }: { olderThan?: string; limit?: number; signal?: AbortSignal } = {},
+    toolOutput = "full",
+  }: {
+    olderThan?: string;
+    limit?: number;
+    signal?: AbortSignal;
+    /**
+     * `"preview"` asks for lean items: tool outputs longer than the server's
+     * preview come back cut to its head with `output_truncated` and
+     * `output_length` set, and are fetched in full on demand
+     * (`fetchSessionItem`). Tool output is most of a transcript page's bytes.
+     * Tools whose card is built from the result are inflated here, so callers
+     * see complete items for them.
+     */
+    toolOutput?: "full" | "preview";
+  } = {},
 ): Promise<SessionItemsPage> {
   const params = new URLSearchParams({ limit: String(limit), order: "desc" });
   // "Older than the cursor" within a descending scan = items after it.
   if (olderThan) params.set("after", olderThan);
+  if (toolOutput === "preview") params.set("tool_output", "preview");
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
     { signal },
   );
   const page = await readJsonOrThrow<SessionItemsResponseWire>(res);
   // Server returns newest-first; reverse to chronological for rendering.
-  return { items: [...page.data].reverse(), hasMore: page.has_more };
+  const items = [...page.data].reverse();
+  return {
+    items:
+      toolOutput === "preview"
+        ? await inflateOutputsRenderedAsCards(sessionId, items, signal)
+        : items,
+    hasMore: page.has_more,
+  };
+}
+
+/**
+ * Fetch one committed item in full via `GET /v1/sessions/{id}/items/{item_id}`.
+ *
+ * The counterpart of a `toolOutput: "preview"` page: the same flat item
+ * shape, with the tool output as stored.
+ */
+export async function fetchSessionItem(
+  sessionId: string,
+  itemId: string,
+  signal?: AbortSignal,
+): Promise<ConversationItem> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/items/${encodeURIComponent(itemId)}`,
+    { signal },
+  );
+  return readJsonOrThrow<ConversationItem>(res);
+}
+
+/**
+ * Replace the truncated results of tools in `TOOLS_RENDERED_FROM_OUTPUT`, and
+ * of calls not on this page, with the full items, fetched in parallel. A result whose fetch fails
+ * keeps its preview; the card falls back to the plain tool row rather than
+ * failing the whole page.
+ */
+async function inflateOutputsRenderedAsCards(
+  sessionId: string,
+  items: ConversationItem[],
+  signal?: AbortSignal,
+): Promise<ConversationItem[]> {
+  const callIds = new Set<string>();
+  const cardCallIds = new Set<string>();
+  for (const item of items) {
+    if (!isFunctionCallItem(item)) continue;
+    callIds.add(item.call_id);
+    if (TOOLS_RENDERED_FROM_OUTPUT.has(item.name)) cardCallIds.add(item.call_id);
+  }
+  // A result whose call sits on an older page may belong to a card tool too,
+  // and that page will not revisit it; read it in full now.
+  const truncated = items.filter(
+    (item) =>
+      isFunctionCallOutputItem(item) &&
+      item.output_truncated === true &&
+      (cardCallIds.has(item.call_id) || !callIds.has(item.call_id)),
+  );
+  if (truncated.length === 0) return items;
+  const settled = await Promise.allSettled(
+    truncated.map((item) => fetchSessionItem(sessionId, item.id, signal)),
+  );
+  const fullById = new Map<string, ConversationItem>();
+  for (const result of settled) {
+    if (result.status === "fulfilled") fullById.set(result.value.id, result.value);
+  }
+  return items.map((item) => fullById.get(item.id) ?? item);
 }
 
 /**

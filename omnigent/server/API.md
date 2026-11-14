@@ -847,6 +847,41 @@ snapshot does not start a detached usage worker.
 Older servers omit `usage_included` and ignore `include_usage`; their snapshot
 already includes usage, so clients should not issue the separate request.
 
+### List Session Items
+
+```
+GET /v1/sessions/{session_id}/items[?limit=100&after=...&before=...&order=asc&tool_output=full]
+
+200 OK — a paginated list in the `GET /v1/conversations/{id}/items` shape.
+404 Not Found — no session with that id
+```
+
+Same pagination contract as List Conversation Items. Responses are gzipped
+for clients that send `Accept-Encoding: gzip`.
+
+  tool_output (query param, `full` | `preview`, default `full`)
+    With `preview`, each `function_call_output` whose `output` is longer
+    than 400 characters is returned with only those first 400 characters
+    plus `output_length` (the full character count) and
+    `output_truncated: true`. Shorter outputs and every other item are
+    returned exactly as with `full`, so an item without `output_truncated`
+    is complete. Tool output dominates the bytes of a transcript page; the
+    web chat loads history this way and fetches an output in full only when
+    the reader expands it.
+
+### Get Session Item
+
+```
+GET /v1/sessions/{session_id}/items/{item_id}
+
+200 OK — the item, flat, exactly as the list returns it with tool_output=full
+404 Not Found — no session with that id, or the item is not a committed item of it
+```
+
+Returns one committed item with its full payload (queued inputs are not
+items). Pairs with `tool_output=preview`: a client that listed stubs reads
+the full `output` here on demand. Gzipped like the list.
+
 ### Delete Session
 
 ```

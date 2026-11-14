@@ -71,6 +71,18 @@ import { readSubagentActivity } from "./subagentActivity";
 const ASK_USER_QUESTION_TOOL = "AskUserQuestion";
 const EXIT_PLAN_MODE_TOOL = "ExitPlanMode";
 
+/**
+ * Tools whose transcript card is built from the result text itself (the
+ * answered question / plan card, the routing plan card) rather than shown
+ * on demand. A lean history page must carry their output in full.
+ */
+export const TOOLS_RENDERED_FROM_OUTPUT: ReadonlySet<string> = new Set([
+  ASK_USER_QUESTION_TOOL,
+  EXIT_PLAN_MODE_TOOL,
+  "sys_advise_models",
+  "mcp__omnigent__sys_advise_models",
+]);
+
 // Claude Code's ExitPlanMode result opens with this when the user
 // approved; a rejection returns the feedback they typed instead.
 const PLAN_APPROVED_PREFIX = "User has approved your plan";
@@ -136,7 +148,11 @@ function agentNamesByResponseId(items: ConversationItem[]): Map<string, string |
 function toolOutputsByCallId(items: ConversationItem[]): Map<string, string> {
   const outputs = new Map<string, string>();
   for (const item of items) {
-    if (isFunctionCallOutputItem(item)) outputs.set(item.call_id, item.output);
+    // A preview is not an answer: a card built from a cut-off result would
+    // misreport what the user chose, so leave the plain tool row instead.
+    if (isFunctionCallOutputItem(item) && !item.output_truncated) {
+      outputs.set(item.call_id, item.output);
+    }
   }
   return outputs;
 }
@@ -399,6 +415,9 @@ function functionCallOutputToBlock(item: FunctionCallOutputItem): ToolResultBloc
     callId: item.call_id,
     agentName: ctx.agent ?? "",
     output: item.output,
+    ...(item.output_truncated && item.output_length !== undefined
+      ? { truncatedOutputLength: item.output_length }
+      : {}),
   };
 }
 

@@ -32,6 +32,7 @@ from starlette.datastructures import Headers
 from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
     FunctionCallData,
+    FunctionCallOutputData,
     MessageData,
     NewConversationItem,
 )
@@ -47,8 +48,10 @@ from omnigent.server.routes._sessions.helpers import (
     _NativeTerminalEnsureOutcome,
     _RunnerForwardResult,
 )
+from omnigent.server.routes.sessions.routes_items import TOOL_OUTPUT_PREVIEW_CHARS
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.spec.types import SkillSpec
+from omnigent.stores.conversation_store import PENDING_INPUT_RESPONSE_ID
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -4977,6 +4980,165 @@ async def test_list_session_items_404_for_nonexistent(
     """Items endpoint returns 404 for a session that doesn't exist."""
     resp = await client.get("/v1/sessions/ad563e906854634c49e1a6fd2fbb31d4/items")
     assert resp.status_code == 404
+
+
+def _seed_tool_call(
+    conv_store: SqlAlchemyConversationStore,
+    session_id: str,
+    *,
+    call_id: str,
+    output: str,
+    response_id: str = "seed",
+) -> tuple[str, str]:
+    """
+    Append a tool call and its output to a session, returning both item ids.
+
+    :param conv_store: Store bound to the test database.
+    :param session_id: Session to append to.
+    :param call_id: Call id shared by the pair, e.g. ``"call_1"``.
+    :param output: The tool's output text.
+    :param response_id: Turn the pair belongs to.
+    :returns: ``(function_call id, function_call_output id)``.
+    """
+    call, result = conv_store.append(
+        session_id,
+        [
+            NewConversationItem(
+                type="function_call",
+                response_id=response_id,
+                data=FunctionCallData(
+                    agent="tester", name="Read", arguments='{"file_path": "a.py"}', call_id=call_id
+                ),
+            ),
+            NewConversationItem(
+                type="function_call_output",
+                response_id=response_id,
+                data=FunctionCallOutputData(call_id=call_id, output=output),
+            ),
+        ],
+    )
+    return call.id, result.id
+
+
+async def test_list_session_items_preview_stubs_long_tool_output(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """``tool_output=preview`` shortens long tool outputs and leaves everything else alone."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], initial_message="preview")
+    await _wait_for_idle(client, session["id"])
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    long_output = "".join(f"line {n}\n" for n in range(400))
+    assert len(long_output) > TOOL_OUTPUT_PREVIEW_CHARS
+    _, long_id = _seed_tool_call(
+        conv_store, session["id"], call_id="call_long", output=long_output
+    )
+    _, short_id = _seed_tool_call(conv_store, session["id"], call_id="call_short", output="ok")
+
+    full = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    preview_resp = await client.get(
+        f"/v1/sessions/{session['id']}/items", params={"tool_output": "preview"}
+    )
+    assert preview_resp.status_code == 200
+    preview = preview_resp.json()["data"]
+
+    assert [item["id"] for item in preview] == [item["id"] for item in full]
+    by_id = {item["id"]: item for item in preview}
+    assert by_id[long_id]["output"] == long_output[:TOOL_OUTPUT_PREVIEW_CHARS]
+    assert by_id[long_id]["output_length"] == len(long_output)
+    assert by_id[long_id]["output_truncated"] is True
+    assert by_id[long_id]["call_id"] == "call_long"
+    # Short outputs and non-output items are byte-for-byte the full item.
+    full_by_id = {item["id"]: item for item in full}
+    assert by_id[short_id] == full_by_id[short_id]
+    assert "output_truncated" not in by_id[short_id]
+    for item in preview:
+        if item["id"] != long_id:
+            assert item == full_by_id[item["id"]]
+    # The default stays the full payload.
+    assert full_by_id[long_id]["output"] == long_output
+    assert "output_truncated" not in full_by_id[long_id]
+    # Only the two documented modes are accepted.
+    bad = await client.get(f"/v1/sessions/{session['id']}/items", params={"tool_output": "none"})
+    assert bad.status_code == 422
+
+
+async def test_get_session_item_returns_full_item(client: httpx.AsyncClient, db_uri: str) -> None:
+    """The per-item read returns the item as the full list does, and 404s otherwise."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], initial_message="item read")
+    await _wait_for_idle(client, session["id"])
+    other = await _create_session(client, agent["id"], initial_message="other")
+    await _wait_for_idle(client, other["id"])
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    long_output = "0123456789" * (TOOL_OUTPUT_PREVIEW_CHARS // 2)
+    call_id, output_id = _seed_tool_call(
+        conv_store, session["id"], call_id="call_1", output=long_output
+    )
+
+    resp = await client.get(f"/v1/sessions/{session['id']}/items/{output_id}")
+    assert resp.status_code == 200
+    item = resp.json()
+    assert item["id"] == output_id
+    assert item["type"] == "function_call_output"
+    assert item["output"] == long_output
+    assert "output_truncated" not in item
+    listed = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    assert item == next(listed_item for listed_item in listed if listed_item["id"] == output_id)
+    # Any committed item type is readable, not only tool output.
+    assert (await client.get(f"/v1/sessions/{session['id']}/items/{call_id}")).json()[
+        "name"
+    ] == "Read"
+
+    # Unknown id, an item of another session, and a queued input all 404.
+    missing = await client.get(f"/v1/sessions/{session['id']}/items/{'0' * 32}")
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == ErrorCode.NOT_FOUND
+    cross = await client.get(f"/v1/sessions/{other['id']}/items/{output_id}")
+    assert cross.status_code == 404
+    [queued] = conv_store.append(
+        session["id"],
+        [
+            NewConversationItem(
+                type="message",
+                response_id=PENDING_INPUT_RESPONSE_ID,
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "later"}]),
+            )
+        ],
+    )
+    pending = await client.get(f"/v1/sessions/{session['id']}/items/{queued.id}")
+    assert pending.status_code == 404
+    no_session = await client.get(f"/v1/sessions/{'a' * 32}/items/{output_id}")
+    assert no_session.status_code == 404
+
+
+async def test_session_item_reads_are_gzipped(client: httpx.AsyncClient, db_uri: str) -> None:
+    """A page of tool output and a single item compress for a gzip client."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], initial_message="gzip")
+    await _wait_for_idle(client, session["id"])
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    long_output = "".join(f"line {n} of a tool result\n" for n in range(500))
+    _, output_id = _seed_tool_call(
+        conv_store, session["id"], call_id="call_gz", output=long_output
+    )
+
+    for path in (
+        f"/v1/sessions/{session['id']}/items",
+        f"/v1/sessions/{session['id']}/items/{output_id}",
+    ):
+        # httpx asks for gzip by default; a client that declines gets identity.
+        plain = await client.get(path, headers={"Accept-Encoding": "identity"})
+        assert plain.status_code == 200
+        assert "content-encoding" not in plain.headers
+        resp = await client.get(path, headers={"Accept-Encoding": "gzip"})
+        assert resp.status_code == 200
+        assert resp.headers["content-encoding"] == "gzip"
+        assert "accept-encoding" in resp.headers.get("vary", "").lower()
+        # httpx inflates transparently, so an intact body proves the encoding
+        # header and the bytes on the wire agree.
+        assert resp.json() == plain.json()
+        assert int(resp.headers["content-length"]) < len(plain.content)
 
 
 async def test_list_session_items_big_page_survives_bounded_read_backend(

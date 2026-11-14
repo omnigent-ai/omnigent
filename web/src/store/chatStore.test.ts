@@ -305,6 +305,8 @@ let client: QueryClient;
 const fetchMock = vi.fn();
 let sessionSnapshots: Map<string, ConversationItem[]>;
 let sessionItems: Map<string, ConversationItem[]>;
+// Full items the per-item route serves, keyed by `${sessionId}/${itemId}`.
+let sessionFullItems: Map<string, ConversationItem>;
 let sessionPendingElicitations: Map<string, Record<string, unknown>[]>;
 let sessionPendingInputs: Map<
   string,
@@ -353,6 +355,14 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
   // the matched session id below.
   const path = url.split("?")[0]!;
   if (url.match(/\/v1\/sessions\/[^/]+\/stream$/)) return streamResponse();
+  // GET /v1/sessions/{id}/items/{item_id} → one full item from the seeded set.
+  const itemMatch = url.match(/^\/v1\/sessions\/([^/]+)\/items\/([^/?]+)$/);
+  if (itemMatch) {
+    const full = sessionFullItems.get(`${itemMatch[1]}/${itemMatch[2]}`);
+    return full === undefined
+      ? mockResponse({ error: { message: "Item not found" } }, { ok: false, status: 404 })
+      : mockResponse(full);
+  }
   const itemsMatch = url.match(/^\/v1\/sessions\/([^/]+)\/items(?:\?.*)?$/);
   if (itemsMatch) {
     const sessionId = itemsMatch[1]!;
@@ -566,6 +576,7 @@ beforeEach(() => {
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   sessionSnapshots = new Map();
   sessionItems = new Map();
+  sessionFullItems = new Map();
   sessionPendingElicitations = new Map();
   sessionPendingInputs = new Map();
   sessionCostControlOverrides = new Map();
@@ -2107,6 +2118,77 @@ describe("chatStore — switchTo", () => {
     );
     expect(itemFetches).toHaveLength(1);
     expect(String(itemFetches[0]![0])).toContain("order=desc");
+  });
+
+  it("hydrates history with tool-output previews and loads a result in full on demand", async () => {
+    const fullOutput = "line\n".repeat(2000);
+    const call: ConversationItem = {
+      id: "fc_1",
+      response_id: "resp_1",
+      type: "function_call",
+      status: "completed",
+      name: "Read",
+      arguments: JSON.stringify({ file_path: "/big.txt" }),
+      call_id: "c1",
+    };
+    const fullResult: ConversationItem = {
+      id: "fco_1",
+      response_id: "resp_1",
+      type: "function_call_output",
+      status: "completed",
+      call_id: "c1",
+      output: fullOutput,
+    };
+    const preview: ConversationItem = {
+      ...fullResult,
+      output: fullOutput.slice(0, 400),
+      output_truncated: true,
+      output_length: fullOutput.length,
+    };
+    seedSessionSnapshot("conv_lean", [userMessage("resp_1", "read it"), call, preview]);
+    seedSessionItems("conv_lean", [userMessage("resp_1", "read it"), call, preview]);
+    sessionFullItems.set("conv_lean/fco_1", fullResult);
+
+    await useChatStore.getState().switchTo("conv_lean");
+
+    // The open asked for lean items: tool rows render collapsed, so the
+    // bytes of every result would be paid for nothing.
+    const historyFetches = fetchMock.mock.calls
+      .map(([u]) => String(u))
+      .filter((u) => u.startsWith("/v1/sessions/conv_lean/items?"));
+    expect(historyFetches).toHaveLength(1);
+    expect(historyFetches[0]).toContain("tool_output=preview");
+    const resultBlock = () =>
+      useChatStore
+        .getState()
+        .blocks.find((b) => b.type === "tool_result" && b.ctx.itemId === "fco_1");
+    expect(resultBlock()).toMatchObject({
+      output: fullOutput.slice(0, 400),
+      truncatedOutputLength: fullOutput.length,
+    });
+
+    // Two cards expanding the same result share one request.
+    await Promise.all([
+      useChatStore.getState().loadToolOutput("fco_1"),
+      useChatStore.getState().loadToolOutput("fco_1"),
+    ]);
+    const itemFetches = () =>
+      fetchMock.mock.calls.filter(([u]) => String(u) === "/v1/sessions/conv_lean/items/fco_1");
+    expect(itemFetches()).toHaveLength(1);
+    expect(resultBlock()).toMatchObject({ output: fullOutput });
+    expect(resultBlock()).not.toHaveProperty("truncatedOutputLength");
+    // Loaded once is loaded: a later expand costs nothing.
+    await useChatStore.getState().loadToolOutput("fco_1");
+    expect(itemFetches()).toHaveLength(1);
+    // Scroll-up pages ask for previews too.
+    useChatStore.setState({ hasMoreHistory: true, oldestItemId: "fco_1" });
+    await useChatStore.getState().loadMoreHistory();
+    expect(
+      fetchMock.mock.calls
+        .map(([u]) => String(u))
+        .filter((u) => u.includes("/items?") && u.includes("after=fco_1"))
+        .every((u) => u.includes("tool_output=preview")),
+    ).toBe(true);
   });
 
   it.each([false, true])(

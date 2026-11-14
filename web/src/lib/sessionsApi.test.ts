@@ -18,6 +18,7 @@ import {
   createSideChat,
   exportSessionTranscript,
   fetchRewindPrompts,
+  fetchSessionItem,
   fetchSessionItemsPage,
   fetchSessionRepositoryBranches,
   forkSession,
@@ -1864,6 +1865,138 @@ describe("fetchSessionItemsPage", () => {
     expect(String(fetchMock.mock.calls[0]![0])).toBe(
       "/v1/sessions/conv_abc/items?limit=25&order=desc&after=msg_50",
     );
+  });
+});
+
+describe("fetchSessionItemsPage with lean tool output", () => {
+  const page = (data: Record<string, unknown>[]) =>
+    mockJsonResponse({
+      object: "list",
+      data,
+      first_id: data[0]?.id ?? null,
+      last_id: data.at(-1)?.id ?? null,
+      has_more: false,
+    });
+  const answer =
+    'Your questions have been answered: "Which library should we use?"="date-fns". ' +
+    "You can now continue with these answers in mind.";
+  // Newest first, as the server sends a desc page.
+  const leanPage = [
+    {
+      id: "fco_read",
+      response_id: "resp_1",
+      type: "function_call_output",
+      status: "completed",
+      call_id: "c_read",
+      output: "head of the file",
+      output_truncated: true,
+      output_length: 9000,
+    },
+    {
+      id: "fc_read",
+      response_id: "resp_1",
+      type: "function_call",
+      status: "completed",
+      name: "Read",
+      arguments: "{}",
+      call_id: "c_read",
+    },
+    {
+      id: "fco_ask",
+      response_id: "resp_1",
+      type: "function_call_output",
+      status: "completed",
+      call_id: "c_ask",
+      output: answer.slice(0, 40),
+      output_truncated: true,
+      output_length: answer.length,
+    },
+    {
+      id: "fc_ask",
+      response_id: "resp_1",
+      type: "function_call",
+      status: "completed",
+      name: "AskUserQuestion",
+      arguments: "{}",
+      call_id: "c_ask",
+    },
+  ];
+
+  it("asks for previews and inflates only the results that render as cards", async () => {
+    fetchMock.mockResolvedValueOnce(page(leanPage));
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ ...leanPage[2], output: answer, output_truncated: undefined }),
+    );
+
+    const result = await fetchSessionItemsPage("conv_a", { toolOutput: "preview" });
+
+    expect(String(fetchMock.mock.calls[0]![0])).toBe(
+      `/v1/sessions/conv_a/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=desc&tool_output=preview`,
+    );
+    // The answered-question card is built from the result text, so that one
+    // item is read in full; the file read stays a preview until expanded.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(String(fetchMock.mock.calls[1]![0])).toBe("/v1/sessions/conv_a/items/fco_ask");
+    expect(result.items.map((item) => item.id)).toEqual([
+      "fc_ask",
+      "fco_ask",
+      "fc_read",
+      "fco_read",
+    ]);
+    expect(result.items[1]).toMatchObject({ output: answer });
+    expect(result.items[1]).not.toHaveProperty("output_truncated", true);
+    expect(result.items[3]).toMatchObject({ output: "head of the file", output_truncated: true });
+  });
+
+  it("inflates a result whose call is on an older page", async () => {
+    // The page boundary split the call from its result; the call may be a
+    // card tool, and loading the older page later does not revisit the result.
+    const orphan = { ...leanPage[0], id: "fco_orphan", call_id: "c_older_page" };
+    fetchMock.mockResolvedValueOnce(page([orphan, ...leanPage.slice(1)]));
+    fetchMock.mockResolvedValue(mockJsonResponse({ ...orphan, output: "full" }));
+
+    const result = await fetchSessionItemsPage("conv_a", { toolOutput: "preview" });
+
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toContain(
+      "/v1/sessions/conv_a/items/fco_orphan",
+    );
+    expect(result.items.find((item) => item.id === "fco_orphan")).toMatchObject({
+      output: "full",
+    });
+  });
+
+  it("keeps the preview when a card result fails to load, instead of failing the page", async () => {
+    fetchMock.mockResolvedValueOnce(page(leanPage));
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ error: { message: "gone" } }, { ok: false, status: 404 }),
+    );
+
+    const result = await fetchSessionItemsPage("conv_a", { toolOutput: "preview" });
+
+    expect(result.items[1]).toMatchObject({ id: "fco_ask", output_truncated: true });
+  });
+
+  it("sends no tool_output parameter by default, so other readers keep full items", async () => {
+    fetchMock.mockResolvedValueOnce(page([]));
+    await fetchSessionItemsPage("conv_a");
+    expect(String(fetchMock.mock.calls[0]![0])).not.toContain("tool_output");
+  });
+});
+
+describe("fetchSessionItem", () => {
+  it("GETs the item route and returns the flat item", async () => {
+    const item = {
+      id: "fco_1",
+      response_id: "resp_1",
+      type: "function_call_output",
+      status: "completed",
+      call_id: "c1",
+      output: "the whole output",
+    };
+    fetchMock.mockResolvedValueOnce(mockJsonResponse(item));
+
+    expect(await fetchSessionItem("conv a", "fco/1")).toEqual(item);
+    expect(String(fetchMock.mock.calls[0]![0])).toBe("/v1/sessions/conv%20a/items/fco%2F1");
   });
 });
 
