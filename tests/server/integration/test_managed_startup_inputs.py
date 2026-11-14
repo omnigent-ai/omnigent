@@ -1062,7 +1062,7 @@ async def test_failed_create_launch_is_visible_to_every_replica(
 
 
 async def test_registration_timeout_fences_prompt_before_provider_hint(
-    startup_env: _Env, db_uri: str
+    startup_env: _Env, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from omnigent.server.managed_hosts import ManagedLaunchTracker
     from omnigent.server.scheduled.fire import _ClaimedRunRecorder
@@ -1072,6 +1072,8 @@ async def test_registration_timeout_fences_prompt_before_provider_hint(
     from tests.server.test_managed_hosts import _injected_config
 
     env = startup_env
+    # The hint stays blocked while the steps below run, which can exceed 1s on loaded CI.
+    monkeypatch.setattr("omnigent.server.scheduled.fire._REGISTRATION_HINT_TIMEOUT_S", 30.0)
     session_id = await _create(env)
     [saved] = env.conv_store.list_pending_inputs(session_id)
     store = SqlAlchemyScheduledTaskStore(db_uri)
