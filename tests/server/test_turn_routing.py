@@ -1111,7 +1111,7 @@ async def test_replay_refused_model_switch_can_be_explicitly_retried(
     assert turn_routing.read_pending_replay(tmp_path) is None
 
 
-@pytest.mark.parametrize("surface", ["permission", "dialog"])
+@pytest.mark.parametrize("surface", ["permission", "dialog", "occupied-input"])
 async def test_replay_resumes_after_an_untouched_prompt_is_answered(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
 ) -> None:
@@ -1138,6 +1138,10 @@ async def test_replay_resumes_after_an_untouched_prompt_is_answered(
             loop.call_soon_threadsafe(refused.set)
             if surface == "permission":
                 raise bridge.ClaudeUserPromptPending("Answer the question", nothing_typed=True)
+            if surface == "occupied-input":
+                raise bridge.ClaudeInputBoxOccupied(
+                    "Leave the prompt-history search", surface="the prompt-history search"
+                )
             raise bridge.ClaudeTerminalDialog("Answer the terminal dialog", awaits_answer=True)
         return bridge.ClaudeModelSwitchResult(model, model, model, model, "native-session")
 

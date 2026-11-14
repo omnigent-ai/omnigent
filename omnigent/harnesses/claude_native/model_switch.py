@@ -701,6 +701,13 @@ class SessionOnlyModelSwitch:
                         unsupported=True,
                     )
                 self.session, self.version = session, version
+                surface = self.bridge._occupying_surface(pane)
+                if surface in {self.bridge._SHELL_MODE_SURFACE, "the prompt-history search"}:
+                    raise self.bridge.ClaudeInputBoxOccupied(
+                        f"Claude Code's input box is occupied by {surface}, so the model "
+                        "command was not sent. Open the terminal and dismiss it to resume.",
+                        surface=surface,
+                    )
                 return _draft(pane) is not None
             return False
 

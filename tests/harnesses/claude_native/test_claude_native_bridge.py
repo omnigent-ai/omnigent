@@ -13799,6 +13799,8 @@ async def test_model_command_selects_session_only_then_reads_fresh_status(
         "answerable-dialog",
         "unanswerable-dialog",
         "occupied-box",
+        "history-search",
+        "shell-mode",
         "uncleared-box",
         "capture-error",
     ],
@@ -13846,6 +13848,10 @@ def test_model_command_refuses_unsupported_or_unowned_input_before_keys(
         "capture-error": RuntimeError("capture failed"),
     }
     refusal = refusals.get(unsupported)
+    occupied = {
+        "history-search": (_INLINE_REVERSE_SEARCH_PANE, "the prompt-history search"),
+        "shell-mode": (_SHELL_MODE_PANE, "shell mode"),
+    }.get(unsupported)
     holdable = unsupported in {
         "pending-before-typing",
         "answerable-dialog",
@@ -13858,8 +13864,12 @@ def test_model_command_refuses_unsupported_or_unowned_input_before_keys(
             raise refusal
 
         monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+    if occupied is not None:
+        monkeypatch.setattr(claude_native_bridge, "_capture_pane", Mock(return_value=occupied[0]))
 
     expected = type(refusal) if holdable else claude_native_bridge.ClaudeModelSwitchRefused
+    if occupied is not None:
+        expected = claude_native_bridge.ClaudeInputBoxOccupied
     with pytest.raises(expected) as caught:
         claude_native_bridge.inject_model_command(
             bridge_dir, model=target, timeout_s=0.4, ready_timeout_s=0.1
@@ -13867,6 +13877,9 @@ def test_model_command_refuses_unsupported_or_unowned_input_before_keys(
 
     if refusal is not None:
         assert (caught.value if holdable else caught.value.__cause__) is refusal
+    if occupied is not None:
+        assert caught.value.surface == occupied[1]
+        assert claude_native_bridge.can_hold_input_refusal(caught.value)
     height_recovery.assert_not_called()
     assert composer.sends == []
     assert composer.model == "claude-sonnet-5-5"
