@@ -1420,7 +1420,6 @@ async def forward_claude_transcript_to_session(
 
     async with (
         _forward_claude_diagnostics(bridge_dir, session_id, poll_interval_s) as diagnostic_health,
-        _keep_launch_files_fresh(bridge_dir, session_id),
         open_server_client(
             base_url,
             headers=headers,
@@ -1435,6 +1434,8 @@ async def forward_claude_transcript_to_session(
             timeout=subagent_timeout,
             event_dispatcher=event_dispatcher,
         ) as subagent_client,
+        # Last, so a client that fails to open never starts (or awaits) the upkeep.
+        _keep_launch_files_fresh(bridge_dir, session_id),
     ):
         loop_failures = 0
         loop_failure_logged_at = 0.0

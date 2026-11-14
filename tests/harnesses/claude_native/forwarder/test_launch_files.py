@@ -29,11 +29,9 @@ async def test_launch_files_refresh_repeats_until_the_forwarder_exits(
 
     async with forwarder._keep_launch_files_fresh(tmp_path, "sess-1", interval_s=0.01):
         await _wait_for(lambda: len(calls) >= 3)
-    stopped_at = len(calls)
-    await asyncio.sleep(0.05)
 
     assert calls[0] == tmp_path
-    assert len(calls) == stopped_at
+    assert not [t for t in asyncio.all_tasks() if t.get_name() == "claude-launch-files-sess-1"]
 
 
 @pytest.mark.asyncio
