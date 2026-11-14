@@ -6,6 +6,7 @@ import { GoalDialog, parseGoalBudget, type GoalDialogProps } from "./GoalDialog"
 import { useGoalState } from "./useGoalState";
 import type { Goal } from "@/lib/goalApi";
 import * as host from "@/lib/host";
+import * as identity from "@/lib/identity";
 import { clearGoal, getGoal, setGoal, updateGoalStatus } from "@/lib/goalApi";
 
 vi.mock("@/lib/goalApi", async (importOriginal) => {
@@ -137,6 +138,7 @@ describe("GoalDialog", () => {
     cleanup();
     vi.restoreAllMocks();
     vi.resetAllMocks();
+    vi.useRealTimers();
   });
 
   it("refreshes the current goal through its snapshot owner when opened", async () => {
@@ -612,6 +614,130 @@ describe("GoalDialog", () => {
           nextRequest.resolve({ goal: ACTIVE_GOAL, cleared: true });
           refreshRead.resolve({ goal: ACTIVE_GOAL });
         });
+      }
+    },
+  );
+
+  it.each(
+    [...mutations, { action: "resume", button: "goal-resume" }].flatMap((mutation) =>
+      ["success", "error"].map((late) => ({ ...mutation, late })),
+    ),
+  )(
+    "bounds a stalled $action and reconciliation after reopening, ignoring late $late",
+    async ({ action, button, late }) => {
+      vi.useFakeTimers();
+      const actualGoalApi = await vi.importActual<typeof GoalApiModule>("@/lib/goalApi");
+      mockGetGoal.mockImplementation(actualGoalApi.getGoal);
+      mockSetGoal.mockImplementation(actualGoalApi.setGoal);
+      mockClearGoal.mockImplementation(actualGoalApi.clearGoal);
+      mockUpdateGoalStatus.mockImplementation(actualGoalApi.updateGoalStatus);
+      const oldRequest = deferred<Response>();
+      const nextRequest = deferred<Response>();
+      const initialGoal = { ...ACTIVE_GOAL, status: action === "resume" ? "paused" : "active" };
+      const wireGoal = {
+        thread_id: "thread-1",
+        objective: initialGoal.objective,
+        status: initialGoal.status,
+        token_budget: initialGoal.tokenBudget,
+        tokens_used: initialGoal.tokensUsed,
+        time_used_seconds: initialGoal.timeUsedSeconds,
+      };
+      const reconciliationBody = deferred<{ goal: typeof wireGoal }>();
+      let readCount = 0;
+      let writeCount = 0;
+      const fetch = vi.spyOn(identity, "authenticatedFetch").mockImplementation((_url, init) => {
+        if ((init?.method ?? "GET") !== "GET") {
+          writeCount += 1;
+          return writeCount === 1 ? oldRequest.promise : nextRequest.promise;
+        }
+        readCount += 1;
+        return Promise.resolve(
+          readCount <= 2
+            ? Response.json({ goal: wireGoal })
+            : ({ ok: true, json: () => reconciliationBody.promise } as Response),
+        );
+      });
+      const { rerender, unmount } = render(<ManagedDialog pollingEnabled={false} />);
+      try {
+        await act(async () => {});
+        expect(screen.getByTestId("goal-save")).toBeEnabled();
+        fireEvent.click(screen.getByTestId(button));
+        const writeSignal = fetch.mock.calls[1][1]?.signal;
+        rerender(<ManagedDialog pollingEnabled={false} open={false} />);
+        rerender(<ManagedDialog pollingEnabled={false} />);
+        await act(async () => {});
+        expect(readCount).toBe(2);
+        expect(screen.getByTestId("goal-objective")).toBeDisabled();
+
+        await act(() => vi.advanceTimersByTimeAsync(59_999));
+        expect(readCount).toBe(2);
+        await act(() => vi.advanceTimersByTimeAsync(1));
+
+        expect(readCount).toBe(3);
+        expect(writeCount).toBe(1);
+        expect(writeSignal?.aborted).toBe(true);
+        const reconciliationSignal = fetch.mock.calls.at(-1)?.[1]?.signal;
+        expect(
+          fetch.mock.calls
+            .filter(([, init]) => (init?.method ?? "GET") === "GET")
+            .map(([, init]) => new Headers(init?.headers).get("X-Omnigent-Codex-Goal-Read")),
+        ).toEqual(["strict", "strict", "strict"]);
+        expect(screen.getByTestId("goal-save")).toBeDisabled();
+        await act(() => vi.advanceTimersByTimeAsync(59_999));
+        expect(screen.getByTestId("goal-save")).toBeDisabled();
+        await act(() => vi.advanceTimersByTimeAsync(1));
+
+        expect(reconciliationSignal?.aborted).toBe(true);
+        expect(
+          screen.getByText(/Could not read goal: .*uncertain.*refresh.*before.*retry/i),
+        ).toBeInTheDocument();
+        expect(screen.getByTestId("goal-save")).toBeEnabled();
+        fireEvent.change(screen.getByTestId("goal-objective"), {
+          target: { value: "Fresh saved objective" },
+        });
+        fireEvent.change(screen.getByTestId("goal-token-budget"), { target: { value: "789" } });
+        fireEvent.click(screen.getByTestId("goal-mode-paused"));
+        fireEvent.click(screen.getByTestId("goal-save"));
+        expect(writeCount).toBe(2);
+
+        await act(async () => {
+          if (late === "error") oldRequest.reject(new Error("late write failure"));
+          else
+            oldRequest.resolve(
+              Response.json({ goal: { ...wireGoal, objective: "Old reply" }, cleared: true }),
+            );
+          reconciliationBody.resolve({ goal: { ...wireGoal, objective: "Old read reply" } });
+        });
+
+        expect(screen.getByTestId("owner-goal")).toHaveTextContent(initialGoal.objective);
+        expect(screen.getByTestId("goal-objective")).toHaveValue("Fresh saved objective");
+        expect(screen.getByTestId("goal-token-budget")).toHaveValue(789);
+        expect(screen.getByTestId("goal-mode-paused")).toHaveAttribute("aria-checked", "true");
+        expect(screen.getByTestId("goal-save")).toBeDisabled();
+        expect(writeCount).toBe(2);
+        expect(readCount).toBe(3);
+        await act(async () =>
+          nextRequest.resolve(
+            Response.json({
+              goal: {
+                ...wireGoal,
+                objective: "Fresh saved objective",
+                token_budget: 789,
+                status: "paused",
+              },
+            }),
+          ),
+        );
+        expect(screen.getByTestId("owner-goal")).toHaveTextContent("Fresh saved objective");
+        expect(screen.getByTestId("goal-save")).toBeEnabled();
+      } finally {
+        unmount();
+        await act(async () => {
+          oldRequest.resolve(Response.json({ goal: wireGoal, cleared: true }));
+          nextRequest.resolve(Response.json({ goal: wireGoal }));
+          reconciliationBody.resolve({ goal: wireGoal });
+        });
+        fetch.mockRestore();
       }
     },
   );

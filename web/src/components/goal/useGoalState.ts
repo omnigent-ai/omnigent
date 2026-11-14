@@ -63,27 +63,32 @@ export function useGoalState(
     },
     [binding],
   );
-  const refreshGoal = useCallback(async () => {
-    if (!binding || activeBinding.current !== binding) {
-      throw new Error("Goal is unavailable for this session.");
-    }
-    const version = ++updateVersion.current;
-    const isCurrent = () =>
-      activeBinding.current === binding && version > lastSuccessfulVersion.current;
-    try {
-      const response = await getGoal(binding.conversationId);
-      if (isCurrent()) {
-        lastSuccessfulVersion.current = version;
-        setSnapshot((current) =>
-          activeBinding.current === binding
-            ? { binding, goal: response.goal, revision: version }
-            : current,
-        );
+  const readGoal = useCallback(
+    async (strict: boolean) => {
+      if (!binding || activeBinding.current !== binding) {
+        throw new Error("Goal is unavailable for this session.");
       }
-    } catch (error) {
-      if (activeBinding.current === binding && lastSuccessfulVersion.current < version) throw error;
-    }
-  }, [binding]);
+      const version = ++updateVersion.current;
+      const isCurrent = () =>
+        activeBinding.current === binding && version > lastSuccessfulVersion.current;
+      try {
+        const response = await getGoal(binding.conversationId, { strict });
+        if (isCurrent()) {
+          lastSuccessfulVersion.current = version;
+          setSnapshot((current) =>
+            activeBinding.current === binding
+              ? { binding, goal: response.goal, revision: version }
+              : current,
+          );
+        }
+      } catch (error) {
+        if (activeBinding.current === binding && lastSuccessfulVersion.current < version)
+          throw error;
+      }
+    },
+    [binding],
+  );
+  const refreshGoal = useCallback(() => readGoal(true), [readGoal]);
 
   useEffect(() => {
     let cancelled = false;
@@ -107,7 +112,7 @@ export function useGoalState(
       }
       inFlight = true;
       try {
-        await refreshGoal();
+        await readGoal(false);
         pollDelay = GOAL_POLL_INTERVAL_MS;
       } catch {
         // Keep the last snapshot; opening the dialog surfaces read failures.
@@ -127,7 +132,7 @@ export function useGoalState(
       window.removeEventListener("focus", onFocus);
       document.removeEventListener("visibilitychange", onFocus);
     };
-  }, [conversationId, enabled, pollingEnabled, refreshGoal]);
+  }, [conversationId, enabled, pollingEnabled, readGoal]);
 
   const currentSnapshot = owner !== null && snapshot?.binding.owner === owner ? snapshot : null;
   return {

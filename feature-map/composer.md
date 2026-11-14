@@ -167,14 +167,18 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   the current goal fields. Failed background reads keep the last goal and slow
   retries; returning to the tab retries immediately.
   Automatic refresh runs while the runner is online and Chat is visible;
-  these requests count as runner activity. Explicit dialog reads and accepted
-  updates remain available while runner status is offline or unknown. A new
-  runner connection invalidates earlier callbacks while retaining this session's
-  accepted goal; a failed reconnect read leaves that goal visible. Reconnect
+  polling and focus reads let an idle-reaped thread report no goal without
+  waking it. Explicit dialog and reconciliation reads require a live response
+  and surface runner errors. Dialog reads and updates remain available while
+  runner status is offline or unknown. A new runner connection invalidates
+  earlier callbacks while retaining this session's accepted goal; a failed
+  reconnect read leaves that goal visible. Reconnect
   preserves edited fields and visible errors in the same open dialog. A pending
   Save, Clear, Pause or Resume stays busy after closing and reopening the same
   session, including when its dialog remounts, until the request and its fresh-read
-  attempt finish. Other sessions remain independently editable. A fresh accepted
+  attempt finish. Each browser request has a sixty-second deadline, including
+  response parsing. A timeout leaves the outcome uncertain; refresh the goal
+  before retrying. Other sessions remain independently editable. A fresh accepted
   snapshot releases opening-read loading even if the original read is pending.
 - `slash-rewind`: in claude-sdk and Claude Code native sessions, `/rewind` opens
   a searchable list of the session's prompts, newest first. Choosing one

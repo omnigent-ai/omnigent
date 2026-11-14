@@ -3,6 +3,7 @@ import { ApiError } from "./sessionsApi";
 
 const CODEX_GOAL_READ_HEADER = "X-Omnigent-Codex-Goal-Read";
 const CODEX_GOAL_READ_STRICT = "strict";
+const CODEX_GOAL_REQUEST_TIMEOUT_MS = 60_000;
 
 /**
  * Raw Codex app-server goal object forwarded by the AP route.
@@ -88,6 +89,11 @@ export interface SetCodexGoalInput {
  */
 export type CodexGoalStatusUpdate = "active" | "paused";
 
+export interface CodexGoalReadOptions {
+  /** Require a live runner response. Defaults to true. */
+  strict?: boolean;
+}
+
 export async function codexGoalApiErrorFromResponse(res: Response): Promise<ApiError> {
   let message = `${res.status} ${res.statusText}`;
   let code: string | null = null;
@@ -112,6 +118,30 @@ export async function codexGoalApiErrorFromResponse(res: Response): Promise<ApiE
 async function readJsonOrThrow<T>(res: Response): Promise<T> {
   if (!res.ok) throw await codexGoalApiErrorFromResponse(res);
   return (await res.json()) as T;
+}
+
+async function requestCodexGoal<T>(url: string, init: RequestInit = {}): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(
+        new Error(
+          "Goal request timed out. The outcome is uncertain. Refresh the goal before retrying.",
+        ),
+      );
+      controller.abort();
+    }, CODEX_GOAL_REQUEST_TIMEOUT_MS);
+  });
+  try {
+    const request = authenticatedFetch(url, { ...init, signal: controller.signal }).then(
+      readJsonOrThrow<T>,
+    );
+    // Custom fetchers and response bodies can ignore abort, so bound the entire read.
+    return await Promise.race([request, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -149,14 +179,22 @@ function codexGoalResponseFromWire(wire: CodexGoalResponseWire): CodexGoalRespon
  * Read the current Codex-native thread goal for a session.
  *
  * @param sessionId - Session identifier, e.g. ``"conv_abc123"``.
+ * @param options - Background reads may allow an idle runner to return no goal.
  * @returns The current goal, or ``goal: null`` when Codex has none.
  * @throws ApiError when the runner is unavailable or the server rejects the request.
  */
-export async function getCodexGoal(sessionId: string): Promise<CodexGoalResponse> {
-  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`, {
-    headers: { [CODEX_GOAL_READ_HEADER]: CODEX_GOAL_READ_STRICT },
-  });
-  return codexGoalResponseFromWire(await readJsonOrThrow<CodexGoalResponseWire>(res));
+export async function getCodexGoal(
+  sessionId: string,
+  options: CodexGoalReadOptions = {},
+): Promise<CodexGoalResponse> {
+  const wire = await requestCodexGoal<CodexGoalResponseWire>(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`,
+    {
+      headers:
+        options.strict === false ? undefined : { [CODEX_GOAL_READ_HEADER]: CODEX_GOAL_READ_STRICT },
+    },
+  );
+  return codexGoalResponseFromWire(wire);
 }
 
 /**
@@ -181,12 +219,15 @@ export async function setCodexGoal(
   if (goal.status !== undefined) {
     body.status = goal.status;
   }
-  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  return codexGoalResponseFromWire(await readJsonOrThrow<CodexGoalResponseWire>(res));
+  const wire = await requestCodexGoal<CodexGoalResponseWire>(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+  return codexGoalResponseFromWire(wire);
 }
 
 /**
@@ -201,7 +242,7 @@ export async function updateCodexGoalStatus(
   sessionId: string,
   status: CodexGoalStatusUpdate,
 ): Promise<CodexGoalResponse> {
-  const res = await authenticatedFetch(
+  const wire = await requestCodexGoal<CodexGoalResponseWire>(
     `/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal/status`,
     {
       method: "PATCH",
@@ -209,7 +250,7 @@ export async function updateCodexGoalStatus(
       body: JSON.stringify({ status }),
     },
   );
-  return codexGoalResponseFromWire(await readJsonOrThrow<CodexGoalResponseWire>(res));
+  return codexGoalResponseFromWire(wire);
 }
 
 /**
@@ -219,8 +260,8 @@ export async function updateCodexGoalStatus(
  * @returns Whether Codex removed an existing goal.
  */
 export async function clearCodexGoal(sessionId: string): Promise<{ cleared: boolean }> {
-  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`, {
-    method: "DELETE",
-  });
-  return readJsonOrThrow<{ cleared: boolean }>(res);
+  return requestCodexGoal<{ cleared: boolean }>(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`,
+    { method: "DELETE" },
+  );
 }

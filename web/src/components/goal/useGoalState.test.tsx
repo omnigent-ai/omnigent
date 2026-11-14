@@ -42,6 +42,67 @@ afterEach(() => {
 });
 
 describe("useGoalState", () => {
+  it("uses idle-safe background reads and strict explicit refreshes", async () => {
+    vi.useFakeTimers();
+    mockGetGoal.mockResolvedValue({ goal: GOAL });
+    const { result } = renderHook(() => useGoalState("conv", true));
+    await act(async () => {});
+    expect(mockGetGoal).toHaveBeenNthCalledWith(1, "conv", { strict: false });
+
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(mockGetGoal).toHaveBeenNthCalledWith(2, "conv", { strict: false });
+    await act(async () => window.dispatchEvent(new Event("focus")));
+    expect(mockGetGoal).toHaveBeenNthCalledWith(3, "conv", { strict: false });
+    await act(async () => document.dispatchEvent(new Event("visibilitychange")));
+    expect(mockGetGoal).toHaveBeenNthCalledWith(4, "conv", { strict: false });
+
+    await act(() => result.current.refreshGoal());
+
+    expect(mockGetGoal).toHaveBeenNthCalledWith(5, "conv", { strict: true });
+    expect(result.current.goal).toEqual(GOAL);
+  });
+
+  it("accepts an idle background null but reports an unavailable explicit read through the real API", async () => {
+    vi.useFakeTimers();
+    const actualGoalApi = await vi.importActual<typeof GoalApiModule>("@/lib/goalApi");
+    mockGetGoal.mockImplementation(actualGoalApi.getGoal);
+    const fetch = vi
+      .spyOn(identity, "authenticatedFetch")
+      .mockImplementation(async (_url, init) =>
+        new Headers(init?.headers).get("X-Omnigent-Codex-Goal-Read") === "strict"
+          ? Response.json(
+              { error: "codex_native_goal_failed", detail: "runner unavailable" },
+              { status: 503 },
+            )
+          : Response.json({ goal: null }),
+      );
+    const { result, unmount } = renderHook(() => useGoalState("conv", true));
+    try {
+      await act(async () => {});
+      expect(result.current.goal).toBeNull();
+      expect(result.current.goalRevision).toBeGreaterThan(0);
+
+      await act(async () => {
+        await expect(result.current.refreshGoal()).rejects.toMatchObject({
+          status: 503,
+          message: "runner unavailable",
+        });
+      });
+      await act(() => vi.advanceTimersByTimeAsync(5_000));
+
+      expect(fetch).toHaveBeenCalledTimes(3);
+      expect(result.current.goal).toBeNull();
+      expect(
+        fetch.mock.calls.map(([, init]) =>
+          new Headers(init?.headers).get("X-Omnigent-Codex-Goal-Read"),
+        ),
+      ).toEqual([null, "strict", null]);
+    } finally {
+      unmount();
+      fetch.mockRestore();
+    }
+  });
+
   it("reflects goals created and paused outside the dialog", async () => {
     vi.useFakeTimers();
     mockGetGoal
@@ -340,9 +401,13 @@ describe("useGoalState", () => {
       await act(() => vi.advanceTimersByTimeAsync(10_000));
       expect(result.current.goal).toBeNull();
       expect(fetch).toHaveBeenCalledTimes(3);
-      expect(fetch).toHaveBeenLastCalledWith("/v1/sessions/conv/codex_goal", {
-        headers: { "X-Omnigent-Codex-Goal-Read": "strict" },
-      });
+      expect(fetch).toHaveBeenLastCalledWith(
+        "/v1/sessions/conv/codex_goal",
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+      expect(new Headers(fetch.mock.calls[2][1]?.headers).has("X-Omnigent-Codex-Goal-Read")).toBe(
+        false,
+      );
     } finally {
       unmount();
       fetch.mockRestore();
@@ -466,7 +531,7 @@ describe("useGoalState", () => {
     const { result } = renderHook(() => useGoalState("conv", true));
 
     await waitFor(() => expect(result.current.goal).toEqual(GOAL));
-    expect(mockGetGoal).toHaveBeenCalledWith("conv");
+    expect(mockGetGoal).toHaveBeenCalledWith("conv", { strict: false });
   });
 
   it("starts empty on read errors and clears state when disabled", async () => {
@@ -496,7 +561,7 @@ describe("useGoalState", () => {
 
     await waitFor(() => expect(result.current.goal).toEqual(GOAL));
     expect(mockGetGoal).toHaveBeenCalledTimes(1);
-    expect(mockGetGoal).toHaveBeenCalledWith("conv");
+    expect(mockGetGoal).toHaveBeenCalledWith("conv", { strict: false });
   });
 
   it.each(["capability", "runner"])(
