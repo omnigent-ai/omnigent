@@ -5871,11 +5871,14 @@ _BTW_FOOTER_CLOSE_HINT = "Esctoclose"
 # turns stack: "←/→ to switch" in older Claude Code, "⇧←/→ to browse" in 2.1.283.
 _BTW_FOOTER_SHIFT_GLYPH = "⇧"
 _BTW_FOOTER_HISTORY_HINTS = ("←/→toswitch", "←/→tobrowse")
+_BTW_FOOTER_OPENINGS = ("↑/↓toscroll", *_BTW_FOOTER_HISTORY_HINTS)
 # A settled overlay's footer offers copy + fork; while the answer is
 # still generating the footer carries neither and a ``✻ Answering…`` line
 # shows in the region. Both conditions gate "the exchange is complete".
 _BTW_FOOTER_COMPLETE_HINTS = ("ctocopy", "ftofork")
 _BTW_ANSWERING_HINT = "Answering"
+# The generating overlay's whole status row: a spinner glyph, then the hint.
+_BTW_ANSWERING_ROW = re.compile(rf"\S\s+{_BTW_ANSWERING_HINT}…")
 _BTW_QUESTION_PREFIX = "/btw"
 # Read-only capture cannot tell a complete tall answer from one the pane
 # clipped (both end in a blank + footer), so an overlay whose border→footer
@@ -5921,10 +5924,14 @@ class PaneSignals:
         ``"auto"``, or ``None`` when no mode footer is visible.
     :param btw_overlay: A settled ``/btw`` side-chat overlay, or ``None``
         when none is shown / it is still generating.
+    :param btw_display_ended: True when the capture shows the ``/btw``
+        overlay closed or generating a new answer, so the next settled
+        exchange is a new one even if its text repeats an earlier answer.
     """
 
     permission_mode: str | None = None
     btw_overlay: BtwOverlay | None = None
+    btw_display_ended: bool = False
 
 
 def _btw_overlay_parts(pane: str) -> tuple[list[str], str] | None:
@@ -5945,9 +5952,7 @@ def _btw_overlay_parts(pane: str) -> tuple[list[str], str] | None:
     if footer_idx is None:
         return None
     footer = "".join("".join(lines[footer_idx:]).split()).lstrip(_BTW_FOOTER_SHIFT_GLYPH)
-    if not footer.startswith(("↑/↓toscroll", *_BTW_FOOTER_HISTORY_HINTS)) or not footer.endswith(
-        _BTW_FOOTER_CLOSE_HINT
-    ):
+    if not footer.startswith(_BTW_FOOTER_OPENINGS) or not footer.endswith(_BTW_FOOTER_CLOSE_HINT):
         return None
     border_idx = next(
         (
@@ -6037,6 +6042,99 @@ def _btw_overlay_present(pane: str) -> bool:
     if any(hint in footer for hint in _BTW_FOOTER_HISTORY_HINTS):
         return True
     return any(_BTW_ANSWERING_HINT in line for line in region)
+
+
+def _btw_border_index(lines: Sequence[str]) -> int | None:
+    """Return the index of the last ``/btw`` overlay border row, or ``None``."""
+    return next(
+        (
+            index
+            for index in range(len(lines) - 1, -1, -1)
+            if _BTW_OVERLAY_BORDER_GLYPH in lines[index]
+        ),
+        None,
+    )
+
+
+def _btw_footer_span(rows: Sequence[str]) -> tuple[int, int] | None:
+    """
+    Return the ``[start, end)`` rows of the lowest ``/btw`` overlay footer.
+
+    The footer is the contiguous block ending at the lowest ``Esc to close``.
+    It opens with a scroll or history hint, possibly wrapped across rows, or is
+    only the close hint while the first answer generates. A close hint in any
+    other text yields ``None``, so question or answer text is never chrome.
+
+    :param rows: Pane rows below the overlay's border.
+    :returns: The footer's row span, or ``None`` when no footer is recognized.
+    """
+    compact = ["".join(row.split()) for row in rows]
+    end = next(
+        (
+            count
+            for count in range(len(compact), 0, -1)
+            if compact[count - 1] and "".join(compact[:count]).endswith(_BTW_FOOTER_CLOSE_HINT)
+        ),
+        None,
+    )
+    if end is None:
+        return None
+    bare = None
+    for start in range(end - 1, -1, -1):
+        if not compact[start]:
+            break
+        footer = "".join(compact[start:end]).lstrip(_BTW_FOOTER_SHIFT_GLYPH)
+        if footer.startswith(_BTW_FOOTER_OPENINGS):
+            return start, end
+        if footer == _BTW_FOOTER_CLOSE_HINT:
+            bare = start, end
+    return bare
+
+
+def _btw_answering(pane: str) -> bool:
+    """
+    Report whether a captured pane shows the ``/btw`` overlay generating.
+
+    Matches a whole spinner status row as the last row above a footer offering
+    neither copy nor fork, so question or answer text mentioning it does not
+    count. The first answer's footer reads only ``Esc to close``.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: True when the overlay shows its answering status row.
+    """
+    lines = pane.splitlines()
+    border_idx = _btw_border_index(lines)
+    if border_idx is None:
+        return False
+    rows = lines[border_idx + 1 :]
+    span = _btw_footer_span(rows)
+    if span is None:
+        return False
+    footer = "".join("".join(rows[span[0] : span[1]]).split())
+    if any(hint in footer for hint in _BTW_FOOTER_COMPLETE_HINTS):
+        return False
+    status = next((row.strip() for row in reversed(rows[: span[0]]) if row.strip()), "")
+    return _BTW_ANSWERING_ROW.fullmatch(status) is not None
+
+
+def _btw_display_ended(pane: str) -> bool:
+    """
+    Report whether a captured pane ends the previous ``/btw`` display.
+
+    True only on positive evidence: the overlay is answering anew, or no
+    overlay border is on screen and the live input box it hides is back.
+    While a border shows, a composer-shaped row belongs to the overlay's
+    text, whatever footer the capture kept. Failed captures, history
+    browsing and the copy indicator also keep the display open.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: True when a later settled exchange is a new display.
+    """
+    if _btw_answering(pane):
+        return True
+    if _btw_border_index(pane.splitlines()) is not None:
+        return False
+    return _composer_row(pane) is not None
 
 
 def _dedent_overlay_lines(overlay_lines: list[str]) -> str:
@@ -10074,6 +10172,7 @@ def read_pane_signals(bridge_dir: Path) -> PaneSignals:
     return PaneSignals(
         permission_mode=_permission_mode_from_pane(pane),
         btw_overlay=_btw_overlay_from_pane(pane),
+        btw_display_ended=_btw_display_ended(pane),
     )
 
 

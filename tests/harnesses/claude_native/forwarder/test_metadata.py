@@ -13,10 +13,12 @@ from unittest.mock import patch
 import httpx
 import pytest
 
+import omnigent.harnesses.claude_native.bridge as bridge
 import omnigent.harnesses.claude_native.forwarder as forwarder
 from omnigent.harnesses.claude_native.bridge import (
     BtwOverlay,
     ClaudeTranscriptItem,
+    write_tmux_target,
 )
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
 from tests.harnesses.claude_native.forwarder._support import (
@@ -1013,6 +1015,118 @@ async def test_forward_pane_signals_captures_once_and_relays_both(
     assert types.count("external_permission_mode_change") == 1
     assert types.count("external_btw_sidechat") == 1
     assert dedupe.posted_permission_mode == "auto"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("later_frames", "relays"),
+    [
+        pytest.param(["closed", "closed", "second", "second", "second"], 2, id="closed"),
+        pytest.param(["answering", "answering", "second", "second", "second"], 2, id="answering"),
+        pytest.param(["torn", "first", "first", "first"], 1, id="torn-capture"),
+        pytest.param(["borderless", "first", "first", "first"], 1, id="torn-borderless-capture"),
+        pytest.param(["torn-bullet", "first", "first", "first"], 1, id="torn-bullet-capture"),
+    ],
+)
+async def test_forward_pane_signals_relays_a_repeated_btw_once_per_display(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    later_frames: list[str],
+    relays: int,
+) -> None:
+    """
+    The same /btw is relayed again once the overlay closes or answers anew.
+
+    Claude Code keeps /btw history, so the second ask lists the first above it
+    and settles on the same question and answer. A display ends only on two
+    consecutive reads, so one torn capture does not end it, even when its
+    question or answer resembles the close hint, the composer or the spinner.
+    """
+    scrollback = [f"scrollback line {n}" for n in range(30)]
+    border, question = "▔" * 80, "    /btw what does Esc to close"
+    answer = [
+        "      Type it like this:",
+        "      Esc to close",
+        "",
+        "      " + "─" * 40,
+        "      ❯ example",
+    ]
+    first_ask = "\n".join(
+        [
+            *scrollback,
+            border,
+            question,
+            "",
+            *answer,
+            "",
+            "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
+        ]
+    )
+    second_ask = "\n".join(
+        [
+            *scrollback,
+            border,
+            question,
+            question,
+            "",
+            *answer,
+            "",
+            "    ⇧←/→ to browse · c to copy · f to fork · x to clear history · Esc to close",
+        ]
+    )
+    named_frames = {
+        "first": first_ask,
+        "second": second_ask,
+        "closed": "\n".join([*scrollback, "─" * 80, "❯ ", "─" * 80, "  ? for shortcuts"]),
+        "answering": "\n".join(
+            [
+                *scrollback,
+                border,
+                question,
+                question,
+                "",
+                "      ✻ Answering…",
+                "",
+                "    ⇧←/→ to browse · x to clear history · Esc to close",
+            ]
+        ),
+        "torn": "\n".join([*scrollback, border, question, "", *answer, ""]),
+        "borderless": "\n".join([*scrollback, question, "", *answer, ""]),
+        "torn-bullet": "\n".join(
+            [
+                *scrollback,
+                border,
+                question,
+                "",
+                "      * Answering is a literal bullet, not a spinner",
+                "      This intervening answer row is not a footer",
+                "      Esc to close",
+            ]
+        ),
+    }
+    frames = [first_ask] * 3 + [named_frames[name] for name in later_frames]
+    write_tmux_target(tmp_path, socket_path=tmp_path / "tmux.sock", tmux_target="claude:0.0")
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_args: frames.pop(0))
+    monkeypatch.setattr(forwarder, "_PANE_POLL_INTERVAL_S", 0.0)
+    dedupe = forwarder._ForwardDedupeState()
+    calls, transport = _btw_recording_client_calls()
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        while frames:
+            await forwarder._forward_pane_signals(
+                client,
+                session_id="conv1",
+                bridge_dir=tmp_path,
+                dedupe=dedupe,
+            )
+
+    relayed = [c["data"] for c in calls if c["type"] == "external_btw_sidechat"]
+    exchange = {
+        "question": "/btw what does Esc to close",
+        "answer": "Type it like this:\nEsc to close\n\n" + "─" * 40 + "\n❯ example",
+        "truncated": False,
+    }
+    assert relayed == [exchange] * relays
 
 
 @pytest.mark.asyncio
