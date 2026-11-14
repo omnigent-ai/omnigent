@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { readHarnessOptions, writeHarnessOption } from "./modePreferences";
+import { beginHarnessModeChange, readHarnessOptions, writeHarnessOption } from "./modePreferences";
 
 const KEY = "omnigent:last-mode-by-harness";
 
@@ -77,6 +77,43 @@ describe("modePreferences (per-harness options)", () => {
     localStorage.setItem(KEY, JSON.stringify({ "claude-native": "plan" }));
     expect(readHarnessOptions("claude-native")).toEqual({ mode: "plan" });
   });
+
+  it.each(["default", "ask-for-approval", "approve-for-me", "full-access", "read-only", "bypass"])(
+    "keeps the saved Codex %s mode unchanged",
+    (mode) => {
+      localStorage.setItem(KEY, JSON.stringify({ "codex-native": { mode } }));
+      expect(readHarnessOptions("codex-native")).toEqual({ mode });
+    },
+  );
+
+  it("remembers only a confirmed mode and preserves model and effort", () => {
+    writeHarnessOption("codex-native", { mode: "read-only", model: "coding-model" });
+    const confirm = beginHarnessModeChange("codex-native");
+    expect(readHarnessOptions("codex-native").mode).toBe("read-only");
+    writeHarnessOption("codex-native", { effort: "high" });
+
+    expect(confirm("approve-for-me")).toBe(true);
+    expect(readHarnessOptions("codex-native")).toEqual({
+      mode: "approve-for-me",
+      model: "coding-model",
+      effort: "high",
+    });
+  });
+
+  it.each(["running-session", "new-chat"])(
+    "keeps a newer %s mode when an older switch finishes later",
+    (surface) => {
+      const confirmOld = beginHarnessModeChange("codex-native");
+      if (surface === "running-session") {
+        expect(beginHarnessModeChange("codex-native")("ask-for-approval")).toBe(true);
+      } else {
+        writeHarnessOption("codex-native", { mode: "default" });
+      }
+      const saved = readHarnessOptions("codex-native");
+      expect(confirmOld("full-access")).toBe(false);
+      expect(readHarnessOptions("codex-native")).toEqual(saved);
+    },
+  );
 
   it("drops non-string fields and structurally-corrupt entries", () => {
     localStorage.setItem(

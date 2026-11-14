@@ -17,6 +17,11 @@
 
 import type * as IdentityModule from "@/lib/identity";
 import { sideChatSettingsMutationKey } from "@/lib/sideChat";
+import { readHarnessOptions, writeHarnessOption } from "@/lib/modePreferences";
+import {
+  readProjectLaunchDefaults,
+  writeProjectLaunchDefaults,
+} from "@/lib/projectLaunchPreferences";
 
 import { type InfiniteData, QueryClient, QueryObserver } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
@@ -13343,6 +13348,7 @@ describe("chatStore — session configuration scope", () => {
   });
 
   it("hydrates Codex approval mode from the label on switch", async () => {
+    writeHarnessOption("codex-native", { mode: "read-only" });
     seedSession("conv_approval_hydrate", []);
     withSnapshot("conv_approval_hydrate", {
       labels: {
@@ -13354,6 +13360,13 @@ describe("chatStore — session configuration scope", () => {
     await useChatStore.getState().switchTo("conv_approval_hydrate");
 
     expect(useChatStore.getState().codexApprovalMode).toBe("approve-for-me");
+    expect(readHarnessOptions("codex-native").mode).toBe("read-only");
+    handleSessionEvent({
+      type: "session_codex_approval_mode",
+      conversationId: "conv_approval_hydrate",
+      approvalMode: "full-access",
+    });
+    expect(readHarnessOptions("codex-native").mode).toBe("read-only");
   });
 
   it("leaves Codex approval mode empty when the label is absent", async () => {
@@ -13378,19 +13391,98 @@ describe("chatStore — session configuration scope", () => {
     expect(useChatStore.getState().codexApprovalMode).toBe("");
   });
 
-  it("PATCHes Codex approval mode and settles from the returned label", async () => {
-    seedSession("conv_approval_toggle", []);
-    withSnapshot("conv_approval_toggle", { labels: { "omnigent.wrapper": "codex-native-ui" } });
-    await useChatStore.getState().switchTo("conv_approval_toggle");
-    fetchMock.mockClear();
+  it.each(["ask-for-approval", "approve-for-me", "full-access"])(
+    "remembers a confirmed Codex %s pick for the next chat",
+    async (mode) => {
+      writeHarnessOption("codex-native", { mode: "read-only", effort: "high" });
+      seedSession("conv_approval_toggle", []);
+      withSnapshot("conv_approval_toggle", { labels: { "omnigent.wrapper": "codex-native-ui" } });
+      await useChatStore.getState().switchTo("conv_approval_toggle");
+      fetchMock.mockClear();
 
+      await useChatStore.getState().setCodexApprovalMode(mode);
+
+      expect(patchCallsFor("conv_approval_toggle")).toEqual([{ approval_mode: mode }]);
+      expect(useChatStore.getState().codexApprovalMode).toBe(mode);
+      expect(readHarnessOptions("codex-native")).toEqual({ mode, effort: "high" });
+    },
+  );
+
+  it.each([null, "ask-for-approval"])(
+    "does not remember an unconfirmed Codex choice (%s)",
+    async (confirmed) => {
+      writeHarnessOption("codex-native", { mode: "read-only" });
+      seedSession("conv_approval_unconfirmed", []);
+      await useChatStore.getState().switchTo("conv_approval_unconfirmed");
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (
+          String(input) === "/v1/sessions/conv_approval_unconfirmed" &&
+          init?.method === "PATCH"
+        ) {
+          return mockResponse({
+            id: "conv_approval_unconfirmed",
+            agent_id: "agent_xyz",
+            created_at: 0,
+            labels: confirmed ? { "omnigent.codex_native.approval_mode": confirmed } : {},
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+      await useChatStore.getState().setCodexApprovalMode("full-access");
+      expect(readHarnessOptions("codex-native").mode).toBe("read-only");
+    },
+  );
+
+  it("keeps the latest Codex choice when an older session's switch finishes later", async () => {
+    seedSession("conv_approval_slow", []);
+    seedSession("conv_approval_newer", []);
+    await useChatStore.getState().switchTo("conv_approval_slow");
+    let finishSlow: (() => void) | undefined;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === "/v1/sessions/conv_approval_slow" && init?.method === "PATCH") {
+        await new Promise<void>((resolve) => {
+          finishSlow = resolve;
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const slow = useChatStore.getState().setCodexApprovalMode("full-access");
+    await vi.waitFor(() => expect(finishSlow).toBeDefined());
+    await useChatStore.getState().switchTo("conv_approval_newer");
+    await useChatStore.getState().setCodexApprovalMode("ask-for-approval");
+    finishSlow!();
+    await slow;
+
+    expect(useChatStore.getState().codexApprovalMode).toBe("ask-for-approval");
+    expect(readHarnessOptions("codex-native").mode).toBe("ask-for-approval");
+  });
+
+  it("updates the project's next Codex launch after a confirmed live switch", async () => {
+    const launch = {
+      harness: "codex-native",
+      workspace: "/repos/project",
+      harnessOptions: { mode: "ask-for-approval", model: "coding-model" },
+    };
+    writeProjectLaunchDefaults("proj_a", launch, {});
+    seedSession("conv_approval_project", []);
+    await useChatStore.getState().switchTo("conv_approval_project");
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const response = await defaultFetchHandler(input, init);
+      if (String(input) === "/v1/sessions/conv_approval_project" && init?.method === "PATCH") {
+        return mockResponse({ ...(await response.json()), project_id: "proj_a" });
+      }
+      return response;
+    });
     await useChatStore.getState().setCodexApprovalMode("approve-for-me");
-
-    expect(patchCallsFor("conv_approval_toggle")).toEqual([{ approval_mode: "approve-for-me" }]);
-    expect(useChatStore.getState().codexApprovalMode).toBe("approve-for-me");
+    expect(readProjectLaunchDefaults("proj_a", {})).toEqual({
+      ...launch,
+      harnessOptions: { ...launch.harnessOptions, mode: "approve-for-me" },
+    });
   });
 
   it("rolls back Codex approval mode when the PATCH is rejected", async () => {
+    writeHarnessOption("codex-native", { mode: "full-access" });
     seedSession("conv_approval_failure", []);
     withSnapshot("conv_approval_failure", { labels: { "omnigent.wrapper": "codex-native-ui" } });
     await useChatStore.getState().switchTo("conv_approval_failure");
@@ -13420,6 +13512,7 @@ describe("chatStore — session configuration scope", () => {
     // Rolls back to the pre-switch value; with no label yet, that's the unset
     // empty string — never the optimistic value.
     expect(useChatStore.getState().codexApprovalMode).toBe("");
+    expect(readHarnessOptions("codex-native").mode).toBe("full-access");
     expect(sessionLabels.get("conv_approval_failure")).not.toHaveProperty(
       "omnigent.codex_native.approval_mode",
     );

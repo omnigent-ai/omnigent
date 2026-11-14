@@ -6,6 +6,7 @@ import {
   onProjectLaunchDefaultsCleared,
   projectConfigWithLaunch,
   readProjectLaunchDefaults,
+  rememberProjectHarnessMode,
   writeProjectLaunchDefaults,
   type ProjectLaunchDefaults,
 } from "./projectLaunchPreferences";
@@ -55,6 +56,29 @@ describe("projectLaunchPreferences", () => {
     ).toEqual(START);
   });
 
+  it("keeps a live permission choice for the same project without changing its launch settings", () => {
+    const config = { agent_id: "ag_codex" };
+    writeProjectLaunchDefaults("proj_a", START, config);
+    writeProjectLaunchDefaults("proj_b", START, {});
+
+    rememberProjectHarnessMode("proj_a", "codex-native", "approve-for-me");
+
+    expect(readProjectLaunchDefaults("proj_a", config)).toEqual({
+      ...START,
+      harnessOptions: { ...START.harnessOptions, mode: "approve-for-me" },
+    });
+    expect(readProjectLaunchDefaults("proj_b", {})).toEqual(START);
+    expect(readProjectLaunchDefaults("proj_a", {})).toBeNull();
+  });
+
+  it("leaves absent projects and a different harness's settings alone", () => {
+    writeProjectLaunchDefaults("proj_a", START, {});
+    const saved = localStorage.getItem(STORAGE_KEY);
+    rememberProjectHarnessMode("proj_missing", "codex-native", "full-access");
+    rememberProjectHarnessMode("proj_a", "claude-native", "plan");
+    expect(localStorage.getItem(STORAGE_KEY)).toBe(saved);
+  });
+
   it("ignores a malformed entry and overwrites a corrupt store", () => {
     writeProjectLaunchDefaults("proj_a", START, {});
     const stored = JSON.parse(localStorage.getItem(STORAGE_KEY)!);
@@ -89,6 +113,7 @@ describe("projectLaunchPreferences", () => {
       throw new Error("access denied");
     });
     expect(() => writeProjectLaunchDefaults("proj_a", START, {})).not.toThrow();
+    expect(() => rememberProjectHarnessMode("proj_a", "codex-native", "full-access")).not.toThrow();
     expect(readProjectLaunchDefaults("proj_a", {})).toBeNull();
   });
 });

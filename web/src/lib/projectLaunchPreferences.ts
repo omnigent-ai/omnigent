@@ -122,6 +122,23 @@ export function writeProjectLaunchDefaults(
   }
 }
 
+/** Keep the project's next launch on a mode explicitly chosen in a running chat. */
+export function rememberProjectHarnessMode(projectId: string, harness: string, mode: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    const all = readAll();
+    const parsed = entrySchema.safeParse(all[projectId]);
+    if (!parsed.success || parsed.data.harness !== harness) return;
+    all[projectId] = {
+      ...parsed.data,
+      harnessOptions: { ...parsed.data.harnessOptions, mode },
+    };
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(all));
+  } catch {
+    // A storage failure must not fail a mode switch that already succeeded.
+  }
+}
+
 const CLEARED_EVENT = "omnigent:project-launch-defaults-cleared";
 
 /**
