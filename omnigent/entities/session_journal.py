@@ -40,14 +40,12 @@ STEP_STATUSES: tuple[str, ...] = ("started", "done", "needs_input", "failed")
 # A step ID is short and stable, e.g. "propose"; it is stored in a column.
 STEP_ID_MAX_CHARS = 64
 _STEP_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
-STATUS_TEXT_MAX_CHARS = 80
 NOTE_BODY_MAX_BYTES = 4096
 PLAN_MAX_STEPS = 100
 PLAN_MAX_RAW_BYTES = 32 * 1024
-# A plan's name says its goal in a few words, e.g. "Cut GET /orders p95 by 20%".
+# A plan's name says its goal in a few words, e.g. "Cut GET /orders p95 by 20%". A
+# saved workflow's name, which a run's plan takes, is stored in a VARCHAR(80) column.
 PLAN_NAME_MAX_CHARS = 80
-STEP_NAME_MAX_CHARS = 80
-STEP_GOAL_MAX_CHARS = 300
 PLAN_SOURCES: tuple[str, ...] = ("agent", "workflow")
 # Names the write that appended an entry, e.g. "tool:<tool call ID>".
 IDEMPOTENCY_KEY_MAX_CHARS = 128
@@ -170,12 +168,12 @@ def _text(name: str, value: object) -> str:
     return value
 
 
-def _line(name: str, value: object, max_chars: int) -> str:
-    """Collapse a one-line value's whitespace and bound its length."""
+def _line(name: str, value: object, max_chars: int | None = None) -> str:
+    """Collapse a one-line value's whitespace, and bound its length given *max_chars*."""
     collapsed = " ".join(_text(name, value).split())
     if not collapsed:
         raise InvalidJournalEntryError(f"{name} must not be empty")
-    if len(collapsed) > max_chars:
+    if max_chars is not None and len(collapsed) > max_chars:
         raise InvalidJournalEntryError(f"{name} must be at most {max_chars} characters")
     return collapsed
 
@@ -200,8 +198,7 @@ def normalize_status(status: object, *, text: object = None) -> dict[str, Any]:
     """Check a step status and return its content.
 
     :param status: One of :data:`STEP_STATUSES`.
-    :param text: Why, in at most :data:`STATUS_TEXT_MAX_CHARS` characters;
-        required except for ``started``.
+    :param text: Why, on one line; required except for ``started``.
     :returns: ``{"status": …, "text": … | None}``.
     :raises InvalidJournalEntryError: If a field is invalid.
     """
@@ -212,7 +209,7 @@ def normalize_status(status: object, *, text: object = None) -> dict[str, Any]:
             raise InvalidJournalEntryError(f"text is required for a {status} status")
         text = None
     else:
-        text = _line("text", text, STATUS_TEXT_MAX_CHARS)
+        text = _line("text", text)
     return {"status": status, "text": text}
 
 
@@ -242,10 +239,11 @@ def _plan_step(raw: object, index: int) -> dict[str, Any]:
             f"steps[{index}] has unknown fields: {', '.join(sorted(map(str, unknown)))}"
         )
     step_id = normalize_step_id(raw.get("id"))
-    name = _line(f"steps[{index}].name", raw.get("name"), STEP_NAME_MAX_CHARS)
+    name = _line(f"steps[{index}].name", raw.get("name"))
     goal = raw.get("goal")
     if goal is not None and not (isinstance(goal, str) and not goal.strip()):
-        goal = _line(f"steps[{index}].goal", goal, STEP_GOAL_MAX_CHARS)
+        # A goal can take a few lines, such as a checklist, so it keeps its line breaks.
+        goal = _text(f"steps[{index}].goal", goal).strip()
     else:
         goal = None
     depends_on = raw.get("depends_on", [])

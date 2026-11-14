@@ -13,20 +13,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from omnigent.entities.session_journal import (
-    STATUS_TEXT_MAX_CHARS,
-    InvalidJournalEntryError,
-    _line,
-)
+from omnigent.entities.session_journal import InvalidJournalEntryError, _line
 
 QUESTIONS_MAX = 3
 OPTIONS_MIN = 2
 OPTIONS_MAX = 4
-QUESTION_MAX_CHARS = 400
-# The short chip label above a question, e.g. "Profiles".
-HEADER_MAX_CHARS = 30
-OPTION_LABEL_MAX_CHARS = 80
-OPTION_DESCRIPTION_MAX_CHARS = 240
 _RECOMMENDED_SUFFIX = " (recommended)"
 
 
@@ -36,14 +27,10 @@ def _option(raw: object, where: str) -> dict[str, Any]:
     unknown = set(raw) - {"label", "description"}
     if unknown:
         raise InvalidJournalEntryError(f"{where} has unknown fields: {', '.join(sorted(unknown))}")
-    option: dict[str, Any] = {
-        "label": _line(f"{where}.label", raw.get("label"), OPTION_LABEL_MAX_CHARS)
-    }
+    option: dict[str, Any] = {"label": _line(f"{where}.label", raw.get("label"))}
     description = raw.get("description")
     if description is not None:
-        option["description"] = _line(
-            f"{where}.description", description, OPTION_DESCRIPTION_MAX_CHARS
-        )
+        option["description"] = _line(f"{where}.description", description)
     return option
 
 
@@ -65,12 +52,12 @@ def _question(raw: object, index: int) -> dict[str, Any]:
         raise InvalidJournalEntryError(f"{where}.options must have different labels")
     recommended = raw.get("recommended")
     if recommended is not None:
-        recommended = _line(f"{where}.recommended", recommended, OPTION_LABEL_MAX_CHARS)
+        recommended = _line(f"{where}.recommended", recommended)
         if recommended not in labels:
             raise InvalidJournalEntryError(f"{where}.recommended must be one of its option labels")
     return {
-        "question": _line(f"{where}.question", raw.get("question"), QUESTION_MAX_CHARS),
-        "header": _line(f"{where}.header", raw.get("header"), HEADER_MAX_CHARS),
+        "question": _line(f"{where}.question", raw.get("question")),
+        "header": _line(f"{where}.header", raw.get("header")),
         "options": options,
         "recommended": recommended,
     }
@@ -128,11 +115,8 @@ def question_form(questions: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def status_text(questions: list[dict[str, Any]]) -> str:
-    """The ``needs_input`` text: the first question, cut to fit a status."""
-    text: str = questions[0]["question"]
-    if len(text) <= STATUS_TEXT_MAX_CHARS:
-        return text
-    return text[: STATUS_TEXT_MAX_CHARS - 1].rstrip() + "…"
+    """The ``needs_input`` text: the first question."""
+    return str(questions[0]["question"])
 
 
 def answers_from_content(

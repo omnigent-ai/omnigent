@@ -52,15 +52,18 @@ def test_status_text_is_required_except_for_started() -> None:
             normalize_status(status)
 
 
-def test_status_rejects_unknown_values_long_text_and_extra_fields() -> None:
+def test_status_rejects_unknown_values_and_extra_fields() -> None:
     # A step the agent can't get past waits for the user, so there's no "blocked".
     for status in ("running", "blocked"):
         with pytest.raises(InvalidJournalEntryError, match="status must be one of"):
             normalize_status(status, text="x")
-    with pytest.raises(InvalidJournalEntryError, match="at most 80 characters"):
-        normalize_status("done", text="x" * 81)
     with pytest.raises(InvalidJournalEntryError, match="unknown status fields: emoji"):
         normalize_content("status", {"status": "done", "text": "ok", "emoji": "✅"})
+
+
+def test_status_text_has_no_length_limit_and_stays_on_one_line() -> None:
+    text = "Ran the suite ten times:\n  every run passed. " * 20
+    assert normalize_status("done", text=text)["text"] == " ".join(text.split())
 
 
 def test_note_is_trimmed_and_capped_in_bytes() -> None:
@@ -87,6 +90,16 @@ def test_plan_keeps_its_name_and_graph_and_defaults_dependencies() -> None:
     }
     only = normalize_plan([{"id": "only", "name": "Only"}], name="Only")
     assert only["steps"][0]["depends_on"] == []
+
+
+def test_a_step_has_no_length_limit_on_its_name_or_goal_and_its_goal_keeps_its_lines() -> None:
+    name = "Profile the endpoint under load " * 5
+    goal = "p95 stays under 200 ms with:\n- 500 requests a second\n- a cold cache\n" * 20
+    [step] = normalize_plan([_step("profile", name=name, goal=f"\n  {goal}  ")], name="Plan")[
+        "steps"
+    ]
+    assert step["name"] == name.strip()
+    assert step["goal"] == goal.strip()
 
 
 @pytest.mark.parametrize(
@@ -120,7 +133,6 @@ def test_plan_needs_a_one_line_name(name: object, message: str) -> None:
         ([_step("a"), _step("b", "a", "a")], "lists a dependency twice"),
         ([_step("a", execution={"agent_id": "x"})], "unknown fields: execution"),
         ([{"id": "a", "name": "  "}], r"steps\[0\].name must not be empty"),
-        ([_step("a", goal="g" * 301)], "at most 300 characters"),
         ([_step(f"s{index}") for index in range(PLAN_MAX_STEPS + 1)], "at most 100 steps"),
         ("a", "steps must be a list"),
     ],
