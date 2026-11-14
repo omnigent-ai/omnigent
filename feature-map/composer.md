@@ -76,7 +76,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `project-session-defaults`: Project settings store a default agent and, for
   Claude Code, Codex, and Pi, a default model and reasoning effort; the
   new-session composer opened in that project (`/?project=<name>`) starts with
-  them. The Fork dialog and CLI, API, and scheduled creates don't apply model
+  them. A project created with a repository seeds its sandbox provider and
+  repository into a sandbox pick, and a managed create without those fields takes
+  them from the project. A malformed saved repository (for example a legacy bare
+  string) is ignored. The Fork dialog and CLI, API, and scheduled creates don't apply model
   or effort. States: no default, a Codex
   effort the pinned model lacks (or, with no project model, the remembered
   model lacks), an explicit composer pick, remembered Smart Routing, another
@@ -146,6 +149,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   harness as text. A claude-sdk `/clear` continues in a new, empty session on
   the same machine and the view follows it. States: loading, error/retry,
   unavailable while disconnected, and an incomplete catalog.
+- `goal-command`: in sessions with a Goal control, bare `/goal` or its slash-menu
+  row opens the same dialog as **+ → Goal**. `/goal <objective>` keeps its
+  existing message path. Sessions without the control keep sending the text
+  or invoking a same-named skill. States: no goal, existing goal, read-only.
 - `slash-rewind`: in claude-sdk and Claude Code native sessions, `/rewind` opens
   a searchable list of the session's prompts, newest first. Choosing one
   continues the conversation in a new session holding only the history before
@@ -320,6 +327,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   overlapping the stop button.
 
 ## How to get to it (user POV)
+
+- In a Codex native chat or a Polly session with a Goal control, send `/goal`,
+  choose `/goal` from the slash menu, or open **+ → Goal**.
 
 **In-session composer** (open any session):
 
@@ -608,6 +618,16 @@ Other connection providers alone do not enable the managed MCP picker.
   reply once, with no model-change error. Requires Claude Code and tmux. Use
   a clean container when machine-managed Claude settings override the mock
   endpoint; this does not establish live gateway compatibility.
+- **`model-picker`, paused Pi after server restart (own environment):**
+  Start a Pi session on a host with a configured local catalog, pause the
+  session, restart only the server, and reload the session. Open the model
+  picker through the gear, model pill, and Ctrl+Shift+M; the host models must
+  appear while the runner remains offline. Repeat for a sub-agent that inherits
+  its host from an ancestor. The component scenario
+  `tests/server/routes/test_sessions_snapshot.py::test_session_snapshot_fills_cold_pi_catalog_from_host`
+  covers direct and inherited hosts, concurrent reads and refresh publication.
+  Direct-host browser evidence is in the PR Demo; inherited-host browser and
+  live-provider resume checks remain manual gaps.
 - **`model-picker`, row hover (both composers):** no browser-level coverage;
   `web/src/lib/composerModelLabel.test.ts`. Manually: hover a row labeled with
   a family name and expect its full model ID; the Fusion row shows none.
@@ -762,6 +782,13 @@ Other connection providers alone do not enable the managed MCP picker.
   incomplete catalog:
   `tests/e2e_ui/chat/test_codex_skills_menu_inventory_failure.py::test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog`.
   claude-sdk `/clear` is in the `/clear` and `slash-rewind` recipe above.
+- **`goal-command`:**
+  `tests/e2e_ui/chat/test_codex_goal_mode.py::test_codex_goal_mode_processes_first_message_with_untrusted_hooks`
+  drives a real Codex native session through **+ → Goal**, bare `/goal`, and
+  the slash-menu row. Component coverage in `web/src/pages/ChatPage.composer.test.tsx`
+  also checks Polly's command-backed dialog, full objective forwarding, and
+  same-named skills when Goal is unavailable. New-session and side-chat
+  composers do not expose this session Goal dialog.
 - **`session-mcp-status`, in-session composer:** component coverage lives in
   `web/src/pages/ChatPage.composer.test.tsx`. Manually open a started session,
   select `/mcp`, and expect the effective MCP names and descriptions under

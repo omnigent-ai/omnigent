@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import warnings
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 
 import httpx
@@ -22,6 +22,9 @@ _MODEL_SERVICES_MAX_RESULTS = 1000
 _MODEL_SERVICES_PARENT = "schemas/system.ai"
 #: Wire API a model service must advertise for the codex Responses route to serve it.
 _CODEX_RESPONSES_API_TYPE = "codex/v1/responses"
+#: Wire API name and prefix a model service advertises for the native Gemini gateway route.
+_GEMINI_API_TYPE = "gemini"
+_GEMINI_API_TYPE_PREFIX = "gemini/"
 _PAGE_SIZE = 100
 _MAX_PAGES = 100
 _HTTP_TIMEOUT_S = 10.0
@@ -153,19 +156,38 @@ def preferred_served_claude_model(
     return _models_by_claude_family(claude_ids, marker="claude-").get(preferred_family)
 
 
+def _reported_api_types(service: dict[str, object]) -> tuple[bool, set[str]]:
+    """Return ``(has_explicit_list, normalized_values)`` for ``supported_api_types``."""
+    api_types = service.get("supported_api_types")
+    if api_types is None or api_types == []:
+        return False, set()
+    if not isinstance(api_types, list):
+        return True, set()
+    reported = {value.strip().lower() for value in api_types if isinstance(value, str)}
+    return True, reported
+
+
 def _advertises_api_type(service: dict[str, object], api_type: str) -> bool:
     """Whether *service* serves *api_type*, compared trimmed and case-insensitively.
 
     A missing, ``null`` or empty ``supported_api_types`` counts as yes, matching
     listings that predate the field; any other non-list value counts as no.
     """
-    api_types = service.get("supported_api_types")
-    if api_types is None or api_types == []:
+    has_explicit, reported = _reported_api_types(service)
+    if not has_explicit:
         return True
-    if not isinstance(api_types, list):
-        return False
-    reported = {value.strip().lower() for value in api_types if isinstance(value, str)}
     return api_type.lower() in reported
+
+
+def _is_gemini_service(service: dict[str, object], model_id: str) -> bool:
+    """Whether *service* supports the native Gemini gateway wire protocol."""
+    has_explicit, reported = _reported_api_types(service)
+    if not has_explicit:
+        return _bare_model_id(model_id).startswith("gemini-")
+    return any(
+        value == _GEMINI_API_TYPE or value.startswith(_GEMINI_API_TYPE_PREFIX)
+        for value in reported
+    )
 
 
 def _list_model_service_ids(
@@ -174,11 +196,14 @@ def _list_model_service_ids(
     headers: dict[str, str],
     *,
     api_type: str | None = None,
+    service_filter: Callable[[dict[str, object], str], bool] | None = None,
 ) -> list[str]:
     """List Databricks-managed ``system.ai`` model-service identifiers.
 
     :param api_type: When set, keep only services that advertise it, e.g.
         ``"codex/v1/responses"`` (see :func:`_advertises_api_type`).
+    :param service_filter: Optional predicate receiving each service dict and its
+        normalized ``system.ai`` model identifier.
     """
     model_ids: list[str] = []
     page_token: str | None = None
@@ -202,7 +227,9 @@ def _list_model_service_ids(
         services = payload.get("model_services")
         if isinstance(services, list):
             for service in services:
-                raw_name = service.get("name") if isinstance(service, dict) else None
+                if not isinstance(service, dict):
+                    continue
+                raw_name = service.get("name")
                 if not isinstance(raw_name, str):
                     continue
                 if api_type is not None and not _advertises_api_type(service, api_type):
@@ -210,8 +237,11 @@ def _list_model_service_ids(
                 model_id = raw_name.strip()
                 if model_id.startswith(_MODEL_SERVICE_PREFIX):
                     model_id = model_id[len(_MODEL_SERVICE_PREFIX) :]
-                if model_id.startswith(_SYSTEM_MODEL_PREFIX):
-                    model_ids.append(model_id)
+                if not model_id.startswith(_SYSTEM_MODEL_PREFIX):
+                    continue
+                if service_filter is not None and not service_filter(service, model_id):
+                    continue
+                model_ids.append(model_id)
         raw_next = payload.get("next_page_token")
         if not isinstance(raw_next, str) or not raw_next:
             break
@@ -416,12 +446,15 @@ def discover_databricks_codex_models(
 def discover_databricks_gemini_models(
     workspace_url: str, token: str, *, transport: httpx.BaseTransport | None = None
 ) -> tuple[str, ...]:
-    """List Gemini model services accepted by the native Gemini gateway route."""
+    """List model services accepted by the native Gemini gateway route."""
     with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
         models = _list_model_service_ids(
-            client, workspace_url, {"Authorization": f"Bearer {token}"}
+            client,
+            workspace_url,
+            {"Authorization": f"Bearer {token}"},
+            service_filter=_is_gemini_service,
         )
-    return tuple(model for model in models if _bare_model_id(model).startswith("gemini-"))
+    return tuple(models)
 
 
 def _codex_preference_rank(model_id: str) -> tuple[int, int, int, int, str]:

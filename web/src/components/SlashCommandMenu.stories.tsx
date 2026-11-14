@@ -10,6 +10,7 @@ const SESSION_GATED_COMMANDS = new Set([
   "/clear",
   "/permissions",
   "/rewind",
+  "/goal",
 ]);
 const defaultCommands = Object.fromEntries(
   Object.entries(BUILTIN_SLASH_COMMANDS).filter(([name]) => !SESSION_GATED_COMMANDS.has(name)),

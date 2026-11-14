@@ -8,15 +8,19 @@ import io
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import time
 import tracemalloc
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from pathlib import Path
 from typing import IO
 
 import pytest
 
+from omnigent.inner._proc import process_alive
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import (
     CallerProcessOSEnvironment,
@@ -171,17 +175,63 @@ def test_shell_impl_timeout_includes_exit_code(tmp_path: Path) -> None:
     assert shell_path is not None
 
     result = _shell_impl(
-        command="sleep 2",
+        command="printf partial-stdout; printf partial-stderr >&2; sleep 2",
         timeout=1,
         shell_path=shell_path,
         cwd=tmp_path,
     )
 
-    assert result["stdout"] == ""
-    assert result["stderr"] == ""
+    assert result["stdout"] == "partial-stdout"
+    assert result["stderr"] == "partial-stderr"
     assert result["exit_code"] is None
     assert result["timed_out"] is True
     assert result["error"] == "Command timed out after 1 seconds"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Requires POSIX shell commands and signals")
+@pytest.mark.parametrize(
+    ("command_kind", "timed_out"),
+    [("foreground", True), ("live-shell", True), ("exited-shell", True), ("redirected", False)],
+    ids=["foreground", "live-shell", "exited-shell", "successful-background"],
+)
+def test_shell_impl_child_lifetime(tmp_path: Path, command_kind: str, timed_out: bool) -> None:
+    shell_path = shutil.which("bash") or shutil.which("sh")
+    assert shell_path is not None
+    pid_file = tmp_path / "child.pid"
+    if command_kind == "foreground":
+        child_command = f"echo $$ > {shlex.quote(str(pid_file))}; exec sleep 30"
+        command = f"sh -c {shlex.quote(child_command)}; echo after"
+    else:
+        redirect = " > /dev/null 2>&1" if command_kind == "redirected" else ""
+        command = f"sleep 30{redirect} & echo $! > {shlex.quote(str(pid_file))}"
+        if command_kind == "live-shell":
+            command += "; wait"
+
+    try:
+        started = time.monotonic()
+        result = _shell_impl(
+            command=command,
+            timeout=1,
+            shell_path=shell_path,
+            cwd=tmp_path,
+        )
+
+        assert result["timed_out"] is timed_out
+        if timed_out:
+            assert time.monotonic() - started < 15
+        assert result["stdout"] == ""
+        assert result["stderr"] == ""
+        pid = int(pid_file.read_text())
+        deadline = time.monotonic() + 2
+        while timed_out and process_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert process_alive(pid) is not timed_out
+    finally:
+        if pid_file.exists():
+            pid = int(pid_file.read_text())
+            if process_alive(pid):
+                with suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
 
 
 # ---------------------------------------------------------------------------
@@ -864,12 +914,39 @@ def test_request_that_never_reached_its_helper_runs_once_on_a_new_one(
 
 
 @pytest.mark.parametrize("backend", _HELPER_BACKENDS)
+@pytest.mark.parametrize("timeout_child", [False, True], ids=["completed", "timed-out-child"])
 def test_close_stops_the_helper_and_releases_its_spawner_thread(
-    tmp_path: Path, backend: str
+    tmp_path: Path, backend: str, timeout_child: bool
 ) -> None:
     """Closing ends the helper and its spawning thread, and can be repeated."""
     (tmp_path / "notes.txt").write_text("kept\n")
     os_env = _helper_env(tmp_path.resolve(), backend)
+    if timeout_child:
+        pid_file = tmp_path / "child.pid"
+        try:
+            result = asyncio.run(
+                os_env.shell(f"sleep 30 & echo $! > {shlex.quote(str(pid_file))}", timeout=1)
+            )
+            assert result.get("timed_out") is True
+            child_pid = int(pid_file.read_text())
+            # The sandbox may have a private PID namespace; inspect it there.
+            check = (
+                "import psutil; "
+                f"print({child_pid} in [p.pid for p in psutil.process_iter(['status']) "
+                "if p.info['status'] != psutil.STATUS_ZOMBIE])"
+            )
+            status = asyncio.run(
+                os_env.shell(f"{shlex.quote(sys.executable)} -c {shlex.quote(check)}")
+            )
+            assert status.get("stdout", "").strip() == "False", status
+        except BaseException:
+            try:
+                with suppress(Exception):
+                    if pid_file.exists():
+                        asyncio.run(os_env.shell(f"kill -9 {int(pid_file.read_text())}"))
+            finally:
+                os_env.close()
+            raise
     assert asyncio.run(os_env.read("notes.txt")).get("content") == "kept\n"
     helper = os_env._helper._proc
     assert helper is not None

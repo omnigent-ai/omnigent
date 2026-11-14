@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -2530,6 +2531,31 @@ async def test_get_owner_returns_creator(
     )
     assert resp.status_code == 200
     assert resp.json()["owner"] == "bryan"
+
+
+async def test_get_owner_reads_permissions_off_event_loop(
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow permission service must not occupy the request's event loop."""
+    agent = await create_test_agent(auth_client, user="bryan")
+    session = await _create_session_as(auth_client, agent["id"], "bryan")
+    original = SqlAlchemyPermissionStore.list_for_session
+    loop_thread = threading.get_ident()
+    calls = []
+
+    def checked_read(self, *args, **kwargs):
+        assert threading.get_ident() != loop_thread
+        calls.append(args)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "list_for_session", checked_read)
+    response = await auth_client.get(
+        f"/v1/sessions/{session['id']}/owner", headers={"X-Forwarded-Email": "bryan"}
+    )
+    assert response.status_code == 200
+    assert response.json() == {"owner": "bryan"}
+    assert calls
 
 
 async def test_get_owner_forbidden_without_access(

@@ -164,6 +164,7 @@ import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDi
 import { resolveDefaultShell } from "./preferredShell";
 import { WorkspacePanel } from "./WorkspacePanel";
 import { SessionRail } from "./SessionRail";
+import { SessionCostButton, SessionOverview, useIsWideViewport } from "./SessionOverview";
 import type { RightRailTab } from "./railTabs";
 
 /**
@@ -2915,6 +2916,29 @@ function AppShellImpl() {
     !executionLogsOpen &&
     !filesPanelOpen,
   );
+  // WIP(session_overview): docks beside chat when a wide window leaves the right side
+  // free; otherwise the header cost opens it over chat.
+  const sessionOverviewEnabled =
+    serverConversationId !== undefined && isFeatureEnabled(serverInfo, "session_overview");
+  const wideViewport = useIsWideViewport();
+  const sessionOverviewDocked =
+    wideViewport &&
+    !workspacePanelVisible &&
+    !panelOpen &&
+    !executionLogsOpen &&
+    !filesPanelOpen &&
+    !canvasMode;
+  const [sessionOverviewDockedOpen, setSessionOverviewDockedOpen] = useState(true);
+  const [sessionOverviewOverlayOpen, setSessionOverviewOverlayOpen] = useState(false);
+  const sessionOverviewOpen =
+    sessionOverviewEnabled &&
+    (sessionOverviewDocked ? sessionOverviewDockedOpen : sessionOverviewOverlayOpen);
+  const toggleSessionOverview = useCallback(() => {
+    const setOpen = sessionOverviewDocked
+      ? setSessionOverviewDockedOpen
+      : setSessionOverviewOverlayOpen;
+    setOpen((open) => !open);
+  }, [sessionOverviewDocked]);
   useEffect(() => {
     if (!workspacePanelVisible || !focusWorkspaceTabsOnOpenRef.current) return;
     focusWorkspaceTabsOnOpenRef.current = false;
@@ -3046,6 +3070,14 @@ function AppShellImpl() {
               >
                 {!extensionOwnsHeader && (
                   <ChatHeader
+                    sessionOverviewControl={
+                      sessionOverviewEnabled && (
+                        <SessionCostButton
+                          expanded={sessionOverviewOpen}
+                          onToggle={toggleSessionOverview}
+                        />
+                      )
+                    }
                     // Real docked state — deliberately NOT `|| sidebarPeek`. Peek
                     // is a transient card floating over the collapsed layout (the
                     // docked sidebar stays w-0), so the header must keep its
@@ -3136,7 +3168,30 @@ function AppShellImpl() {
                       </ShellCommandContext.Provider>
                     </RenderErrorBoundary>
                   </SubagentPanelOpenerContext.Provider>
+                  {sessionOverviewOpen && !sessionOverviewDocked && (
+                    <aside
+                      aria-label="Session overview"
+                      className="absolute right-2 top-12 z-20 w-64 max-md:hidden"
+                    >
+                      <SessionOverview
+                        onClose={toggleSessionOverview}
+                        changesSessionId={showFilesPanel ? serverConversationId : undefined}
+                      />
+                    </aside>
+                  )}
                 </GridSessionMain>
+
+                {sessionOverviewOpen && sessionOverviewDocked && (
+                  <aside
+                    aria-label="Session overview"
+                    className="flex w-64 shrink-0 flex-col overflow-y-auto px-2 pb-3 pt-12"
+                  >
+                    <SessionOverview
+                      onClose={toggleSessionOverview}
+                      changesSessionId={showFilesPanel ? serverConversationId : undefined}
+                    />
+                  </aside>
+                )}
 
                 {/* Debug-mode execution-logs rail — desktop only, hidden when a
               push panel is open (the panel itself becomes the focus). Only

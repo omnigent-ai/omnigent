@@ -232,8 +232,10 @@ import {
   markConversationRead,
   markConversationUnread,
   useConversationReadState,
+  useReadStateSnapshot,
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
+import { collectUnreadInboxItems } from "@/lib/inbox";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -889,7 +891,19 @@ function SidebarImpl({
         : availableTab === "shared"
           ? sidebarData.shared
           : sidebarData.all;
-  const inboxCount = sidebarData.inboxCount;
+  const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
+  // Unread sessions as the Inbox lists them; like its row dot, the open session
+  // counts only when marked unread.
+  const unreadInboxCount = useReadStateSnapshot(
+    () =>
+      collectUnreadInboxItems(
+        sidebarData.inboxRows,
+        (id, updatedAt, status) =>
+          isConversationUnseen(id, updatedAt, status) &&
+          (id !== activeConversationId || isExplicitlyUnread(id)),
+      ).length,
+  );
+  const inboxCount = sidebarData.inboxCount + unreadInboxCount;
   const inboxCountIncomplete = sidebarData.inboxCountIncomplete;
 
   // The scrollable list container — used as the IntersectionObserver root for
@@ -3449,6 +3463,7 @@ function ConversationList({
                           <>
                             <ProjectHeaderActions
                               hostId={defaultProjectHostId}
+                              hosts={hosts}
                               hostsLoading={hostsLoading}
                               onOrderChange={(manual) => {
                                 const ranks = new Map(
@@ -4237,6 +4252,7 @@ function SessionFilterMenu({
 
 function ProjectHeaderActions({
   hostId,
+  hosts,
   hostsLoading,
   onOrderChange,
   manualOrder,
@@ -4251,6 +4267,7 @@ function ProjectHeaderActions({
   onEnterSelectionMode,
 }: {
   hostId: string | null;
+  hosts: Host[];
   hostsLoading: boolean;
   onOrderChange: (manual: boolean) => void;
   manualOrder: boolean;
@@ -4275,7 +4292,12 @@ function ProjectHeaderActions({
 
   return (
     <div className="flex items-center gap-0.5">
-      <NewProjectButton onCreated={onProjectCreated} hostId={hostId} hostsLoading={hostsLoading} />
+      <NewProjectButton
+        onCreated={onProjectCreated}
+        hostId={hostId}
+        hosts={hosts}
+        hostsLoading={hostsLoading}
+      />
       {showMenu && (
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
