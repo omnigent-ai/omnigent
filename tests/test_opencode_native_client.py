@@ -380,6 +380,48 @@ async def test_connect_provider_key() -> None:
     await client.aclose()
 
 
+class _RecordingHandler:
+    """MockTransport handler that records each request and returns one response."""
+
+    def __init__(self, response: httpx.Response) -> None:
+        self.response = response
+        self.requests: list[httpx.Request] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        return self.response
+
+
+async def test_list_integrations() -> None:
+    openai = {"id": "openai", "connections": [{"type": "credential", "id": "cred_1"}]}
+    handler = _RecordingHandler(
+        httpx.Response(200, json={"location": {"directory": "/repo"}, "data": [openai, "junk"]})
+    )
+    client = _client(handler)
+    assert await client.list_integrations() == [openai]
+    assert [(r.method, r.url.path) for r in handler.requests] == [("GET", "/api/integration")]
+    await client.aclose()
+
+
+async def test_connect_provider_key_sends_label_and_answer() -> None:
+    handler = _RecordingHandler(httpx.Response(204))
+    client = _client(handler)
+    assert (
+        await client.connect_provider_key(
+            "azure", "sk-test", label="API key", answer={"resourceName": "res"}
+        )
+        is True
+    )
+    [request] = handler.requests
+    assert (request.method, request.url.path) == ("POST", "/api/integration/azure/connect/key")
+    assert json.loads(request.content) == {
+        "key": "sk-test",
+        "label": "API key",
+        "answer": {"resourceName": "res"},
+    }
+    await client.aclose()
+
+
 async def test_stream_events_parses_v2_frames_and_skips_heartbeats() -> None:
     sse_body = (
         'data: {"id": "evt_0", "created": 1, "type": "server.connected", "data": {}}\n'

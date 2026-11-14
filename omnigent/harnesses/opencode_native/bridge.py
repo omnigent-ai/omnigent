@@ -24,6 +24,7 @@ OpenCode's persisted session history.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import hashlib
@@ -34,7 +35,7 @@ import secrets
 import sqlite3
 import tempfile
 import urllib.parse
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -45,6 +46,7 @@ _logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from omnigent.inner.terminal import TerminalInstance
+    from omnigent.onboarding.opencode_auth import OpenCodeApiKey
 
 # Env var the runner stamps on the harness process so the executor can
 # locate its bridge directory. Mirrors ``HARNESS_CODEX_NATIVE_BRIDGE_DIR``.
@@ -580,9 +582,10 @@ def seed_opencode_auth(bridge_dir: Path) -> Path | None:
     Write the user's OpenCode credentials into the per-session ``auth.json``.
 
     ``opencode serve`` runs with a per-session ``XDG_DATA_HOME`` and DB. OpenCode 2.x
-    imports ``$XDG_DATA_HOME/opencode/auth.json`` once, when that DB is created, so
-    seed it with the user's legacy ``auth.json`` plus their v2 SQLite credentials
-    (legacy shape; the DB wins on conflicts). Written ``0600``; refreshed each spawn.
+    can import ``$XDG_DATA_HOME/opencode/auth.json`` into that DB, so seed it with the
+    user's legacy ``auth.json`` plus their v2 SQLite credentials (legacy shape; the DB
+    wins on conflicts). Written ``0600``; refreshed each spawn. A fresh DB skips the
+    import; :func:`restore_user_api_keys` covers API keys after the server starts.
 
     :param bridge_dir: Native OpenCode bridge directory.
     :returns: The written path, or ``None`` when there are no credentials or the write fails.
@@ -671,6 +674,92 @@ async def connect_env_provider_keys(
         if ok:
             connected.append(provider_id)
     return connected
+
+
+class _IntegrationKeyClient(Protocol):
+    async def list_integrations(self) -> Sequence[Mapping[str, object]]: ...
+
+    async def connect_provider_key(
+        self,
+        provider_id: str,
+        api_key: str,
+        *,
+        label: str | None = None,
+        answer: Mapping[str, object] | None = None,
+    ) -> bool: ...
+
+
+def _integrations_with_credentials(integrations: Iterable[Mapping[str, object]]) -> set[str]:
+    """
+    Return the ids of the integrations that list a stored credential.
+
+    An ``env`` connection is not a stored credential and does not count.
+
+    :param integrations: v2 ``Integration.Info`` rows from ``GET /api/integration``.
+    :returns: Integration ids, e.g. ``{"openai"}``.
+    """
+    held: set[str] = set()
+    for info in integrations:
+        connections = info.get("connections")
+        if isinstance(connections, list) and any(
+            isinstance(conn, Mapping) and conn.get("type") == "credential" for conn in connections
+        ):
+            held.add(str(info.get("id")))
+    return held
+
+
+async def restore_user_api_keys(
+    client: _IntegrationKeyClient,
+    *,
+    api_keys: Mapping[str, OpenCodeApiKey] | None = None,
+) -> frozenset[str] | None:
+    """
+    Store the user's OpenCode API keys in the per-session credential DB.
+
+    OpenCode's schema bootstrap of a fresh DB (seen on 2.0.18 and 2.0.32)
+    records its ``auth.json`` import as done without running it, so the seeded
+    file never reaches the DB. Each user API key whose integration lists no
+    stored credential is connected with ``POST /api/integration/{id}/connect/key``.
+    OAuth logins are not copied (see
+    :func:`~omnigent.onboarding.opencode_auth.user_opencode_api_keys`).
+
+    :param client: The per-session OpenCode client.
+    :param api_keys: API keys to store; ``None`` reads the user's API keys.
+    :returns: Integration ids holding a credential in the session afterwards, or
+        ``None`` when the server cannot list integrations.
+    """
+    from omnigent.onboarding.opencode_auth import user_opencode_api_keys
+
+    try:
+        integrations = await client.list_integrations()
+    except Exception as exc:  # noqa: BLE001 - without the list the restore cannot skip held keys.
+        _logger.info(
+            "opencode integration list unavailable (status %s); API keys not restored",
+            getattr(exc, "status_code", None),
+        )
+        return None
+    present = _integrations_with_credentials(integrations)
+    wanted = await asyncio.to_thread(user_opencode_api_keys) if api_keys is None else api_keys
+    for integration_id, api_key in wanted.items():
+        if integration_id in present:
+            continue
+        try:
+            await client.connect_provider_key(
+                integration_id,
+                api_key.key,
+                label=api_key.label,
+                answer=api_key.configuration,
+            )
+        except Exception as exc:  # noqa: BLE001 - one failure must not stop the rest.
+            # The error body can echo the posted secret, so log only the status.
+            _logger.info(
+                "opencode credential restore failed for %s (status %s)",
+                integration_id,
+                getattr(exc, "status_code", None),
+            )
+            continue
+        present.add(integration_id)
+    return frozenset(present)
 
 
 def auth_secret_path(bridge_dir: Path) -> Path:

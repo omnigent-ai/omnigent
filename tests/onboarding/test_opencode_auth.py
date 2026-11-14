@@ -190,6 +190,67 @@ def test_stored_v2_credentials_map_to_legacy_entries(tmp_path: Path) -> None:
     }
 
 
+def test_user_opencode_api_keys_keep_v2_keys_convert_legacy_and_skip_oauth(
+    tmp_path: Path,
+) -> None:
+    oauth = {"type": "oauth", "methodID": "device", "refresh": "r", "access": "a", "expires": 99}
+    db_path = _write_db(
+        [
+            ("anthropic", {"type": "key", "key": "fresh"}, 1, 0),
+            ("github-copilot", oauth, None, 1),
+            # A winning non-key row hides older keys and the auth.json key.
+            ("openrouter", {"type": "key", "key": "old"}, None, 2),
+            ("openrouter", oauth, 1, 0),
+            ("azure", {"type": "key", "key": "old"}, None, 3),
+            ("azure", {"type": "external", "methodID": "cli"}, 1, 0),
+            ("broken", {"type": "key", "key": "old"}, None, 4),
+            ("broken", {"type": "mystery"}, 1, 0),
+            ("mistral", {"type": "key", "key": "m"}, None, 5),
+            # Key form answers are kept; metadata has no place in connect/key.
+            (
+                "cloudflare-workers-ai",
+                {
+                    "type": "key",
+                    "key": "c",
+                    "configuration": {"accountId": "acct"},
+                    "metadata": {"note": "n"},
+                },
+                None,
+                6,
+            ),
+            # A key row with no string key is not usable and hides the integration.
+            ("deepseek", {"type": "key", "key": "old"}, None, 7),
+            ("deepseek", {"type": "key"}, 1, 0),
+        ]
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE credential SET label = '' WHERE integration_id = 'mistral'")
+    _write_auth(
+        tmp_path,
+        {
+            "anthropic": {"type": "api", "key": "stale"},
+            "openrouter": {"type": "api", "key": "legacy"},
+            "broken": {"type": "api", "key": "legacy"},
+            "groq/": {"type": "api", "key": "g", "metadata": {"region": "eu"}},
+            # wellknown needs a source registration that only OpenCode's import writes.
+            "https://gateway.example/": {"type": "wellknown", "key": "k", "token": "t"},
+            "openai": {"type": "oauth", "refresh": "r", "access": "a", "expires": 1},
+        },
+    )
+    assert oc.user_opencode_api_keys() == {
+        # v2 keys keep their stored key and label, and win over auth.json.
+        "anthropic": oc.OpenCodeApiKey("x", "fresh"),
+        "mistral": oc.OpenCodeApiKey("API key", "m"),
+        "cloudflare-workers-ai": oc.OpenCodeApiKey("x", "c", {"accountId": "acct"}),
+        # Legacy keys are used too, trailing slash stripped and metadata dropped.
+        "groq": oc.OpenCodeApiKey("API key", "g"),
+    }
+
+
+def test_user_opencode_api_keys_empty_without_sources(tmp_path: Path) -> None:
+    assert oc.user_opencode_api_keys() == {}
+
+
 def test_stored_v2_credentials_empty_without_db_or_table(tmp_path: Path) -> None:
     assert oc.stored_v2_credentials() == {}
     path = oc.opencode_data_dir() / "opencode.db"

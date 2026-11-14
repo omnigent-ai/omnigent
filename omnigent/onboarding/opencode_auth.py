@@ -109,6 +109,37 @@ def _legacy_auth_entry(raw: object) -> dict[str, object] | None:
     return None
 
 
+def _v2_credential_rows(db_path: Path | None) -> list[tuple[str, str, object]]:
+    """Read ``(integration_id, label, value)`` credential rows, active then newest last.
+
+    Opens the DB read-only; any missing file, missing table or SQLite error yields ``[]``.
+
+    :param db_path: DB to read; ``None`` uses :func:`opencode_db_path`.
+    :returns: Rows with a non-empty integration id.
+    """
+    path = db_path or opencode_db_path()
+    if path is None or not path.is_file():
+        return []
+    try:
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=1.0)
+    except sqlite3.Error:
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT integration_id, label, value FROM credential WHERE integration_id IS NOT NULL"
+            " ORDER BY COALESCE(active, 0), time_updated"
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+    return [
+        (integration_id, label if isinstance(label, str) else "", raw)
+        for integration_id, label, raw in rows
+        if isinstance(integration_id, str) and integration_id
+    ]
+
+
 def stored_v2_credentials(db_path: Path | None = None) -> dict[str, dict[str, object]]:
     """Return OpenCode 2.x credentials as legacy ``auth.json`` entries.
 
@@ -118,28 +149,113 @@ def stored_v2_credentials(db_path: Path | None = None) -> dict[str, dict[str, ob
     :param db_path: DB to read; ``None`` uses :func:`opencode_db_path`.
     :returns: ``{integration_id: entry}``.
     """
-    path = db_path or opencode_db_path()
-    if path is None or not path.is_file():
-        return {}
-    try:
-        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=1.0)
-    except sqlite3.Error:
-        return {}
-    try:
-        rows = conn.execute(
-            "SELECT integration_id, value FROM credential WHERE integration_id IS NOT NULL"
-            " ORDER BY COALESCE(active, 0), time_updated"
-        ).fetchall()
-    except sqlite3.Error:
-        return {}
-    finally:
-        conn.close()
     credentials: dict[str, dict[str, object]] = {}
-    for integration_id, raw in rows:
+    for integration_id, _label, raw in _v2_credential_rows(db_path):
         entry = _legacy_auth_entry(raw)
-        if entry is not None and isinstance(integration_id, str) and integration_id:
+        if entry is not None:
             credentials[integration_id] = entry
     return credentials
+
+
+# Label OpenCode's own legacy ``auth.json`` import gives an API key.
+_KEY_CREDENTIAL_LABEL = "API key"
+
+
+@dataclass(frozen=True)
+class OpenCodeApiKey:
+    """A user API key in the shape of OpenCode's ``connect/key`` request.
+
+    :param label: Display label, e.g. ``"API key"``.
+    :param key: The secret key.
+    :param configuration: Answers to the integration's key form, e.g.
+        ``{"resourceName": "my-resource"}`` for Azure; ``None`` when there are none.
+    """
+
+    label: str
+    key: str
+    configuration: dict[str, object] | None = None
+
+
+def _legacy_api_key(entry: object) -> str | None:
+    """Return the key of a legacy ``auth.json`` ``api`` entry.
+
+    ``wellknown`` entries yield ``None`` too: OpenCode's import also registers
+    their source, which a bare key cannot reproduce. ``metadata`` is dropped,
+    because ``connect/key`` has no field for it.
+
+    :returns: The key, or ``None`` for any other entry.
+    """
+    if not isinstance(entry, dict) or entry.get("type") != "api":
+        return None
+    key = entry.get("key")
+    return key if isinstance(key, str) else None
+
+
+def _v2_credential_value(raw: object) -> dict[str, object] | None:
+    """Decode a stored v2 ``Credential.Value`` JSON object with a string ``type``."""
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else None
+    except ValueError:
+        return None
+    if isinstance(value, dict) and isinstance(value.get("type"), str):
+        return value
+    return None
+
+
+def _v2_api_key(label: str, value: dict[str, object]) -> OpenCodeApiKey | None:
+    """Return a v2 ``key`` credential value as an :class:`OpenCodeApiKey`.
+
+    ``metadata`` is dropped, because ``connect/key`` has no field for it.
+
+    :returns: The API key, or ``None`` for any other credential type.
+    """
+    key = value.get("key")
+    if value["type"] != "key" or not isinstance(key, str):
+        return None
+    configuration = value.get("configuration")
+    return OpenCodeApiKey(
+        label or _KEY_CREDENTIAL_LABEL,
+        key,
+        configuration if isinstance(configuration, dict) and configuration else None,
+    )
+
+
+def user_opencode_api_keys(db_path: Path | None = None) -> dict[str, OpenCodeApiKey]:
+    """Return the user's OpenCode API keys.
+
+    The active (then newest) v2 credential per integration wins over
+    ``auth.json``; a legacy ``auth.json`` key without a v2 row is used too. Only
+    ``key`` credentials are returned, and an integration whose winning credential
+    has another type is left out entirely. OAuth logins in particular must stay
+    out: a per-session copy of a rotating refresh token can invalidate the user's
+    own login.
+
+    :param db_path: DB to read; ``None`` uses :func:`opencode_db_path`.
+    :returns: ``{integration_id: api_key}``.
+    """
+    keys: dict[str, OpenCodeApiKey] = {}
+    try:
+        legacy = json.loads(opencode_auth_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        legacy = None
+    if isinstance(legacy, dict):
+        for raw_id, entry in legacy.items():
+            integration_id = str(raw_id).rstrip("/")
+            key = _legacy_api_key(entry)
+            if integration_id and key is not None:
+                keys[integration_id] = OpenCodeApiKey(_KEY_CREDENTIAL_LABEL, key)
+    stored: dict[str, tuple[str, dict[str, object]]] = {}
+    for integration_id, label, raw in _v2_credential_rows(db_path):
+        value = _v2_credential_value(raw)
+        if value is not None:
+            stored[integration_id] = (label, value)
+    for integration_id, (label, value) in stored.items():
+        api_key = _v2_api_key(label, value)
+        if api_key is None:
+            keys.pop(integration_id, None)
+        else:
+            keys[integration_id] = api_key
+    return keys
 
 
 def _stored_providers() -> tuple[str, ...]:
