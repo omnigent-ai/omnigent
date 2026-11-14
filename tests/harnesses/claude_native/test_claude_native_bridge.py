@@ -13506,6 +13506,8 @@ class _SessionModelComposer(_EditableComposer):
     ) -> None:
         super().__init__(draft, cursor=len(draft))
         self.options = ["claude-sonnet-5-5", "private-glm[1m]"]
+        self.picker_labels: dict[str, str] = {}
+        self.resolved_models: dict[str, str] = {}
         self.model = self.options[0]
         self.highlight = 0
         self.overlay: str | None = None
@@ -13531,7 +13533,9 @@ class _SessionModelComposer(_EditableComposer):
                 if self.cache_cost_label:
                     self.overlay = "cache-cost"
                 else:
-                    self.model = self.options[self.highlight]
+                    self.model = self.resolved_models.get(
+                        self.options[self.highlight], self.options[self.highlight]
+                    )
                     self.overlay = None
             elif key == "Escape":
                 self.overlay = None
@@ -13541,7 +13545,9 @@ class _SessionModelComposer(_EditableComposer):
         if self.overlay == "cache-cost":
             assert key == "Enter", args
             self.confirmations += 1
-            self.model = self.options[self.highlight]
+            self.model = self.resolved_models.get(
+                self.options[self.highlight], self.options[self.highlight]
+            )
             self.overlay = None
             return
         if self.overlay == "status":
@@ -13562,7 +13568,8 @@ class _SessionModelComposer(_EditableComposer):
             return _cache_cost_confirmation_pane(self.cache_cost_label)
         if self.overlay == "picker":
             rows = "\n".join(
-                f"   {'❯' if index == self.highlight else ' '} {index + 1}.  Choice {index}  "
+                f"   {'❯' if index == self.highlight else ' '} {index + 1}.  "
+                f"{self.picker_labels.get(model, f'Choice {index}')}  "
                 f"Managed by your organization ({model})"
                 for index, model in enumerate(self.options)
             )
@@ -13593,7 +13600,7 @@ def _session_model_bridge(tmp_path: Path, composer: _SessionModelComposer) -> Pa
                 "model_picker_options": [
                     {
                         "value": model,
-                        "model": model,
+                        "model": composer.resolved_models.get(model, model),
                         "display_name": f"Choice {index}",
                         "enabled": True,
                         "provenance": "structured",
@@ -13614,6 +13621,24 @@ def _session_model_bridge(tmp_path: Path, composer: _SessionModelComposer) -> Pa
         )
     )
     return bridge_dir
+
+
+def _versioned_cache_cost_bridge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[_SessionModelComposer, Path]:
+    composer = _SessionModelComposer(cache_cost_label="Sonnet 5.5")
+    picker_value = "system.ai.claude-sonnet-5-5[1m]"
+    composer.options = ["private-initial-model", picker_value]
+    composer.model = composer.options[0]
+    composer.picker_labels[picker_value] = "Sonnet"
+    composer.resolved_models[picker_value] = "system.ai.claude-sonnet-5-5"
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    config_path = bridge_dir / "bridge.json"
+    config = json.loads(config_path.read_text())
+    config["model_picker_options"][1]["display_name"] = "Sonnet"
+    config_path.write_text(json.dumps(config))
+    composer.install(monkeypatch)
+    return composer, bridge_dir
 
 
 # Claude Code 2.1.323 renders one nonbreaking prompt separator.
@@ -14710,6 +14735,150 @@ def test_model_command_confirms_cache_cost_at_most_once(
     assert [args[-1] for args in composer.sends] == ["/model", "Enter", "Down", "s", "Enter"]
 
 
+def test_model_command_confirms_versioned_cache_cost_for_managed_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    composer, bridge_dir = _versioned_cache_cost_bridge(tmp_path, monkeypatch)
+
+    result = claude_native_bridge.inject_model_command(
+        bridge_dir, model="system.ai.claude-sonnet-5-5"
+    )
+
+    assert (
+        result.requested_model
+        == result.resolved_model
+        == result.status_model
+        == ("system.ai.claude-sonnet-5-5")
+    )
+    assert result.picker_value == "system.ai.claude-sonnet-5-5[1m]"
+    assert composer.confirmations == composer.status_queries == 1
+    assert [args[-1] for args in composer.sends] == [
+        "/model",
+        "Enter",
+        "Down",
+        "s",
+        "Enter",
+        "/status",
+        "Enter",
+        "Escape",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("model", "label"),
+    [
+        ("system.ai.claude-sonnet-5-5", "Sonnet 5.5"),
+        ("system.ai.claude-sonnet-5-5[1m]", "Sonnet 5.5"),
+        ("databricks-claude-opus-5-5", "Opus 5.5"),
+        ("claude-haiku-5-5", "Haiku 5.5"),
+        ("claude-fable-5-1", "Fable 5.1"),
+        ("claude-opus-5", "Opus 5"),
+        ("private-claude-sonnet-5-5", None),
+        ("claude-other-claude-sonnet-5-5", None),
+        ("system.ai.claude-sonnet-5-5-preview", None),
+        ("system.ai.claude-sonnet-5-5-20261114", None),
+        ("claude-sonnet-5-5[10m]", None),
+        ("claude-sonnet", None),
+        ("system.ai.glm-5-3[1m]", None),
+        (None, None),
+    ],
+)
+def test_cache_cost_model_label_requires_an_exact_versioned_claude_id(
+    model: object, label: str | None
+) -> None:
+    assert claude_model_switch._cache_cost_model_label(model) == label
+
+
+@pytest.mark.parametrize(
+    "collision",
+    [
+        "catalog-version",
+        "disabled-catalog-version",
+        "catalog-confirmation-label",
+        "catalog-target-label",
+        "live-selected-label",
+        "live-confirmation-label",
+        "live-version",
+        "live-label-before-commit",
+    ],
+)
+def test_model_command_requires_unique_cache_cost_labels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, collision: str
+) -> None:
+    composer, bridge_dir = _versioned_cache_cost_bridge(tmp_path, monkeypatch)
+    config_path = bridge_dir / "bridge.json"
+    config = json.loads(config_path.read_text())
+    options = config["model_picker_options"]
+    if collision in {"catalog-version", "disabled-catalog-version"}:
+        options.append(
+            {
+                "value": "other-picker-choice",
+                "model": "databricks-claude-sonnet-5-5",
+                "display_name": "Other Sonnet",
+                "enabled": collision == "catalog-version",
+                "provenance": "structured",
+            }
+        )
+    elif collision == "catalog-confirmation-label":
+        options[0]["display_name"] = "Sonnet 5.5"
+    elif collision == "catalog-target-label":
+        options[0]["display_name"] = "Sonnet"
+    elif collision == "live-selected-label":
+        composer.picker_labels[composer.options[0]] = "Sonnet"
+    elif collision == "live-confirmation-label":
+        composer.picker_labels[composer.options[0]] = "Sonnet 5.5"
+    elif collision == "live-version":
+        composer.options.append("databricks-claude-sonnet-5-5")
+        composer.picker_labels[composer.options[-1]] = "Other Sonnet"
+    else:
+        selected_reads = 0
+
+        def capture(socket_path: str, target: str) -> str:
+            nonlocal selected_reads
+            if composer.overlay == "picker" and composer.highlight == 1:
+                selected_reads += 1
+                if selected_reads == 2:
+                    composer.picker_labels[composer.options[0]] = "Sonnet"
+            return composer._capture_pane(socket_path, target)
+
+        monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+    config_path.write_text(json.dumps(config))
+
+    if collision == "disabled-catalog-version":
+        claude_native_bridge.inject_model_command(bridge_dir, model="system.ai.claude-sonnet-5-5")
+        assert composer.confirmations == composer.status_queries == 1
+        return
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
+        claude_native_bridge.inject_model_command(bridge_dir, model="system.ai.claude-sonnet-5-5")
+
+    assert caught.value.phase == "commit" and caught.value.model_may_have_changed
+    assert composer.confirmations == composer.status_queries == 0
+    assert [args[-1] for args in composer.sends] == ["/model", "Enter", "Down", "s"]
+
+
+@pytest.mark.parametrize("dialog", ["Sonnet", "Sonnet 5.6", "Opus 5.5", "foreign-permission"])
+def test_model_command_refuses_a_different_versioned_cache_cost_dialog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dialog: str
+) -> None:
+    composer, bridge_dir = _versioned_cache_cost_bridge(tmp_path, monkeypatch)
+    if dialog == "foreign-permission":
+
+        def capture(socket_path: str, target: str) -> str:
+            pane = composer._capture_pane(socket_path, target)
+            return pane + _PERMISSION_PROMPT_PANE if composer.overlay == "cache-cost" else pane
+
+        monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+    else:
+        composer.cache_cost_label = dialog
+
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
+        claude_native_bridge.inject_model_command(bridge_dir, model="system.ai.claude-sonnet-5-5")
+
+    assert caught.value.model_may_have_changed
+    assert composer.confirmations == composer.status_queries == 0
+    assert [args[-1] for args in composer.sends] == ["/model", "Enter", "Down", "s"]
+
+
 @pytest.mark.parametrize("metadata", ["legacy", "duplicate-label", "unselected-label"])
 def test_model_command_does_not_confirm_an_unproven_cache_cost_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, metadata: str
@@ -14738,13 +14907,19 @@ def test_model_command_does_not_confirm_an_unproven_cache_cost_target(
     assert [args[-1] for args in composer.sends] == ["/model", "Enter", "Down", "s"]
 
 
+@pytest.mark.parametrize("versioned", [False, True], ids=["literal-label", "versioned-model"])
 @pytest.mark.parametrize("changed", ["dialog", "session_id", "version"])
 def test_model_command_rechecks_cache_cost_confirmation_before_enter(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed: str, versioned: bool
 ) -> None:
-    composer = _SessionModelComposer(cache_cost_label="Choice 1")
-    bridge_dir = _session_model_bridge(tmp_path, composer)
-    composer.install(monkeypatch)
+    if versioned:
+        composer, bridge_dir = _versioned_cache_cost_bridge(tmp_path, monkeypatch)
+        model = "system.ai.claude-sonnet-5-5"
+    else:
+        composer = _SessionModelComposer(cache_cost_label="Choice 1")
+        bridge_dir = _session_model_bridge(tmp_path, composer)
+        composer.install(monkeypatch)
+        model = "private-glm[1m]"
     confirmation_reads = 0
 
     def capture(socket_path: str, target: str) -> str:
@@ -14763,7 +14938,7 @@ def test_model_command_rechecks_cache_cost_confirmation_before_enter(
 
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
     with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
-        claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+        claude_native_bridge.inject_model_command(bridge_dir, model=model)
 
     assert caught.value.phase == "confirmation" and caught.value.model_may_have_changed
     assert composer.confirmations == composer.status_queries == 0
@@ -15025,18 +15200,28 @@ def test_model_command_can_use_an_exact_live_canonical_row_on_an_older_bridge(
     assert composer.submitted == ["/model", "/status"]
 
 
+@pytest.mark.parametrize("versioned", [False, True], ids=["literal-label", "versioned-model"])
 @pytest.mark.parametrize(
     "phase", ["picker", "commit", "observed-confirmation", "confirmation", "status"]
 )
 @pytest.mark.parametrize("identity", ["owning-session", "native-session", "tmux-target"])
 def test_model_command_does_not_continue_into_a_replacement_session_or_pane(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, identity: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    identity: str,
+    versioned: bool,
 ) -> None:
-    composer = _SessionModelComposer(
-        cache_cost_label="Choice 1" if "confirmation" in phase else None
-    )
-    bridge_dir = _session_model_bridge(tmp_path, composer)
-    composer.install(monkeypatch)
+    if versioned:
+        composer, bridge_dir = _versioned_cache_cost_bridge(tmp_path, monkeypatch)
+        model = "system.ai.claude-sonnet-5-5"
+    else:
+        composer = _SessionModelComposer(
+            cache_cost_label="Choice 1" if "confirmation" in phase else None
+        )
+        bridge_dir = _session_model_bridge(tmp_path, composer)
+        composer.install(monkeypatch)
+        model = "private-glm[1m]"
     sends_before_rotation: list[tuple[str, ...]] = []
     confirmation_reads = 0
 
@@ -15078,7 +15263,7 @@ def test_model_command_does_not_continue_into_a_replacement_session_or_pane(
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", send)
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
     with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused):
-        claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+        claude_native_bridge.inject_model_command(bridge_dir, model=model)
 
     assert sends_before_rotation and composer.sends == sends_before_rotation
     assert not any(args[-1] == "Escape" for args in composer.sends)

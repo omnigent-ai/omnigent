@@ -75,6 +75,7 @@ class _Target:
     model: str
     label: str | None
     structured: bool
+    confirmation_label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -154,6 +155,30 @@ def _status(pane: str) -> dict[str, str] | None:
 
 def _row_label(row: _PickerRow) -> str:
     return re.split(r"\s{2,}", row.text, maxsplit=1)[0].replace("✔", "").strip()
+
+
+def _cache_cost_model_label(model: object) -> str | None:
+    """Read the native confirmation name from one exact versioned Claude ID."""
+    if not isinstance(model, str):
+        return None
+    match = re.fullmatch(
+        r"(?:system\.ai\.|databricks-)?claude-(opus|sonnet|haiku|fable)-"
+        r"([0-9]+)(?:-([0-9]+))?(?:\[1m\])?",
+        model,
+    )
+    if match is None:
+        return None
+    family, major, minor = match.groups()
+    version = f"{major}.{minor}" if minor is not None else major
+    return f"{family.title()} {version}"
+
+
+def _cache_cost_row_labels(row: _PickerRow) -> set[str]:
+    labels = {_row_label(row)}
+    for model in re.findall(r"\(([^()]*)\)", row.text):
+        if label := _cache_cost_model_label(model):
+            labels.add(label)
+    return labels
 
 
 def _cache_cost_confirmation(pane: str, label: str) -> bool:
@@ -246,11 +271,27 @@ def _target(
                     isinstance(label, str)
                     and sum(item.get("display_name") == label for item in candidates) == 1
                 )
+                confirmation_label = (
+                    _cache_cost_model_label(concrete) or label
+                    if isinstance(label, str) and label and unique_label
+                    else None
+                )
+                if (
+                    confirmation_label
+                    and sum(
+                        item.get("display_name") == confirmation_label
+                        or _cache_cost_model_label(item.get("model")) == confirmation_label
+                        for item in candidates
+                    )
+                    != 1
+                ):
+                    confirmation_label = None
                 return _Target(
                     value,
                     concrete,
                     label if unique_label else None,
                     option.get("provenance") == "structured",
+                    confirmation_label,
                 )
     # Old bridges can select an exact canonical row, never a guessed family label.
     if options is None and resolved in values and base not in pins and resolved == requested:
@@ -470,13 +511,18 @@ class SessionOnlyModelSwitch:
         def settled(pane: str) -> bool:
             if _draft(pane) == "" and _picker(pane) is None:
                 return True
-            label = self.choice.label
+            label = self.choice.confirmation_label
+            picker = self.owned_picker
             if (
                 not self.confirmation_attempted
                 and self.choice.structured
+                and self.choice.label
                 and label
-                and self.owned_picker
-                and _row_label(self.owned_picker.selected) == label
+                and picker
+                and self.row_matches(picker.selected)
+                and label in _cache_cost_row_labels(picker.selected)
+                and sum(_row_label(row) == _row_label(picker.selected) for row in picker.rows) == 1
+                and sum(label in _cache_cost_row_labels(row) for row in picker.rows) == 1
                 and _cache_cost_confirmation(pane, label)
             ):
                 self.phase = "confirmation"
@@ -621,6 +667,7 @@ class SessionOnlyModelSwitch:
                     raise self.refuse(
                         "The highlighted model changed before selection. Retry explicitly."
                     )
+                self.owned_picker = latest
                 self.phase = "commit"
                 self.commit_attempted = True
                 self.send("s", literal=True)
