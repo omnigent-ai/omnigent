@@ -32,6 +32,7 @@ from omnigent.harnesses.opencode_native.client import (
     OpenCodeClient,
     OpenCodeEvent,
 )
+from omnigent.harnesses.opencode_native.failure_telemetry import opencode_failure_context
 from omnigent.harnesses.opencode_native.permissions import (
     OpenCodePermissionRequest,
     PolicyDecision,
@@ -134,6 +135,7 @@ class _SessionTurn:
     running_response_id: str | None = None
     # Model of the step in flight, ``provider/id``.
     step_model: str | None = None
+    observed_model: str | None = None
     # (assistantMessageID, ordinal) -> final text awaiting the step-end flush.
     pending_text: dict[tuple[str, int], str] = field(default_factory=dict)
     # (assistantMessageID, ordinal) -> text streamed so far without an end.
@@ -816,6 +818,8 @@ class OpenCodeNativeForwarder:
             return
         turn.assistant_message_id = message_id
         turn.step_model = _model_ref(event.data.get("model"))
+        if turn.step_model is not None:
+            turn.observed_model = turn.step_model
         if self._is_root(turn):
             if self._bridge_dir is not None:
                 update_active_message_id(self._bridge_dir, message_id, status="busy")
@@ -1233,9 +1237,13 @@ class OpenCodeNativeForwarder:
     async def _on_model_selected(self, event: OpenCodeEvent) -> None:
         """Handle ``session.model.selected`` — a TUI ``/model`` or API switch."""
         turn = await self._active_turn(event)
-        if turn is None or not self._is_root(turn):
+        if turn is None:
             return
-        await self._observe_model(_model_ref(event.data.get("model")), explicit=True)
+        model = _model_ref(event.data.get("model"))
+        if model is not None:
+            turn.observed_model = model
+        if self._is_root(turn):
+            await self._observe_model(model, explicit=True)
 
     async def _on_execution_failed(self, event: OpenCodeEvent) -> None:
         """Handle ``session.execution.failed`` — failed (or re-auth) status edge.
@@ -1248,7 +1256,7 @@ class OpenCodeNativeForwarder:
         if turn is None:
             return
         error = event.data.get("error")
-        _logger.warning("OpenCode session error for session=%s: %s", self._session_id, error)
+        _logger.warning("OpenCode session error for session=%s", self._session_id)
         error_map: Mapping[str, Any] = error if isinstance(error, Mapping) else {}
         error_type = error_map.get("type")
         if error_type == _ABORTED_ERROR_TYPE:
@@ -1257,8 +1265,16 @@ class OpenCodeNativeForwarder:
         message = error_map.get("message")
         if not isinstance(message, str) or not message.strip():
             message = "OpenCode session ended with an error."
-        is_auth = error_type == _AUTH_ERROR_TYPE or error_map.get("status") in _AUTH_STATUS_CODES
-        extra: _JsonObject = {"output": message.strip()}
+        context = await asyncio.to_thread(
+            opencode_failure_context,
+            error=error,
+            model=turn.observed_model,
+            bridge_dir=self._bridge_dir,
+        )
+        is_auth = (
+            error_type == _AUTH_ERROR_TYPE or context.get("http_status") in _AUTH_STATUS_CODES
+        )
+        extra: _JsonObject = {"output": message.strip(), "failure_context": context}
         if is_auth:
             extra["output"] = f"{message.strip()}\n\n{_OPENCODE_REAUTH_HINT}"
             extra["reauth_required"] = True
