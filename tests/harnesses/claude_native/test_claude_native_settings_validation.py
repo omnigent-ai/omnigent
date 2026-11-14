@@ -10,6 +10,7 @@ import shutil
 import sys
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, Mock
 
 import psutil
@@ -52,6 +53,26 @@ def _instance(tmp_path: Path) -> TerminalInstance:
     )
 
 
+@pytest.mark.parametrize("reason", list(validation.CallerSettingsErrorReason))
+def test_caller_settings_error_guidance_does_not_use_exception_text(
+    reason: validation.CallerSettingsErrorReason,
+) -> None:
+    error = validation.CallerSettingsError(reason)
+    message = error.client_message
+    assert error.reason is reason
+    assert str(error) == message
+    error.args = ("private-diagnostic /private/example/settings.json",)
+    assert error.client_message == message
+    assert "private-diagnostic" not in error.client_message
+
+
+def test_caller_settings_error_refuses_arbitrary_messages() -> None:
+    with pytest.raises(TypeError, match="reason must be a CallerSettingsErrorReason"):
+        validation.CallerSettingsError(
+            cast(validation.CallerSettingsErrorReason, "private-diagnostic")
+        )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "fault",
@@ -79,6 +100,9 @@ async def test_validator_requires_complete_controls_and_keeps_the_full_document(
         "env": {"EXAMPLE_KEY": secret},
     }
     documents = []
+    deadline_started, deadline_cancelled = asyncio.Event(), asyncio.Event()
+    if fault == "timeout":
+        monkeypatch.setattr(validation, "_VALIDATION_TIMEOUT", 0.05)
 
     async def doctor(command, args, *, cwd, env):
         assert command == "claude"
@@ -106,7 +130,11 @@ async def test_validator_requires_complete_controls_and_keeps_the_full_document(
             elif fault == "unexpected-reference":
                 body = f"settings={candidate}\n" + body
             elif fault == "timeout":
-                raise TimeoutError(secret)
+                deadline_started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    deadline_cancelled.set()
         return body, ""
 
     monkeypatch.setattr(validation, "_run_doctor", doctor)
@@ -115,10 +143,21 @@ async def test_validator_requires_complete_controls_and_keeps_the_full_document(
         assert documents == [{}, {"hooks": {"PreToolUse": [None]}}, settings]
     else:
         expected = "Claude rejected" if fault == "rejected" else "Cannot validate"
-        with pytest.raises(ValueError, match=expected) as error:
-            await validation.validate_caller_settings(instance, settings, wrapper_prefix=[])
+        with pytest.raises(validation.CallerSettingsError, match=expected) as error:
+            await asyncio.wait_for(
+                validation.validate_caller_settings(instance, settings, wrapper_prefix=[]),
+                timeout=1,
+            )
+        assert error.value.reason is (
+            validation.CallerSettingsErrorReason.INVALID_SETTINGS
+            if fault == "rejected"
+            else validation.CallerSettingsErrorReason.VALIDATION_UNAVAILABLE
+        )
         assert secret not in str(error.value)
         assert error.value.__suppress_context__
+        if fault == "timeout":
+            assert deadline_started.is_set()
+            assert deadline_cancelled.is_set()
     assert instance.args == ["original-argument"]
     assert "disableAllHooks" not in settings
     assert secret not in caplog.text
@@ -204,15 +243,29 @@ async def test_validator_preserves_selected_environment_wrapper_and_policy(
 
 
 @pytest.mark.asyncio
-async def test_validator_refuses_unknown_unsandboxed_wrapper_without_starting_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("mode", ["unknown-wrapper", "unsupported-env", "missing-environment"])
+async def test_validator_refuses_unavailable_launch_context_without_starting_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
     instance = _instance(tmp_path)
     instance.command = "selected-wrapper"
+    prefix = ["claude", "--"]
+    if mode == "unsupported-env":
+        instance.command = "env"
+        prefix = ["--unsupported-option", "claude"]
+    elif mode == "missing-environment":
+        instance.os_env = None
     doctor = AsyncMock()
     monkeypatch.setattr(validation, "_run_doctor", doctor)
-    with pytest.raises(ValueError, match="requires an active sandbox"):
-        await validation.validate_caller_settings(instance, {}, wrapper_prefix=["claude", "--"])
+    with pytest.raises(validation.CallerSettingsError) as error:
+        await validation.validate_caller_settings(instance, {}, wrapper_prefix=prefix)
+    assert error.value.reason is (
+        validation.CallerSettingsErrorReason.SANDBOX_REQUIRED
+        if mode == "unknown-wrapper"
+        else validation.CallerSettingsErrorReason.VALIDATION_UNAVAILABLE
+    )
+    if mode == "unknown-wrapper":
+        assert "requires an active sandbox" in error.value.client_message
     doctor.assert_not_awaited()
 
 

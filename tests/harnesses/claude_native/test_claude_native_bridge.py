@@ -23,6 +23,7 @@ import unicodedata
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from http.client import BadStatusLine, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import pairwise
@@ -5168,16 +5169,137 @@ def test_merge_caller_settings_validates_retention(tmp_path: Path, retention: ob
         assert str(retention) not in str(error.value)
 
 
+@pytest.mark.parametrize(
+    "hooks",
+    [
+        None,
+        False,
+        "private-hook-content",
+        [],
+        {"PrivateEvent": None},
+        {"PrivateEvent": False},
+        {"PrivateEvent": "private-hook-content"},
+        {"PrivateEvent": {"command": "private-hook-content"}},
+    ],
+    ids=[
+        "null",
+        "boolean",
+        "string",
+        "list",
+        "event-null",
+        "event-boolean",
+        "event-string",
+        "event-map",
+    ],
+)
+def test_merge_caller_settings_rejects_unmergeable_hooks(tmp_path: Path, hooks: object) -> None:
+    baseline = {"hooks": {"UserPromptSubmit": []}}
+    callers = [{"hooks": hooks}, {"hooks": {"UserPromptSubmit": []}}]
+    before = json.dumps([baseline, callers])
+
+    with pytest.raises(ValueError, match="Caller hooks must be an object") as error:
+        claude_native_bridge._merge_caller_settings(baseline, callers, tmp_path)
+
+    from omnigent.harnesses.claude_native.settings_validation import (
+        CallerSettingsError,
+        CallerSettingsErrorReason,
+    )
+
+    assert isinstance(error.value, CallerSettingsError)
+    assert error.value.reason is CallerSettingsErrorReason.INVALID_HOOKS
+    assert str(error.value) == error.value.client_message
+    assert "private-hook-content" not in str(error.value)
+    assert "PrivateEvent" not in str(error.value)
+    assert json.dumps([baseline, callers]) == before
+
+
+def test_merge_caller_settings_preserves_hook_contents(tmp_path: Path) -> None:
+    hook = {"hooks": [{"type": "command", "command": "printf caller", "futureOption": True}]}
+    merged = claude_native_bridge._merge_caller_settings(
+        {"hooks": {"UserPromptSubmit": []}},
+        [{"hooks": {"FutureEvent": [hook], "PreToolUse": [None]}}],
+        tmp_path,
+    )
+
+    assert merged["hooks"] == {
+        "FutureEvent": [hook],
+        "PreToolUse": [None],
+        "UserPromptSubmit": [],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "hooks",
+    ["private-hook-content", {"PrivateEvent": {"command": "private-hook-content"}}],
+    ids=["outer", "event"],
+)
+@pytest.mark.parametrize("source", ["inline", "file"])
+@pytest.mark.parametrize("private_output", [False, True], ids=["bridge-output", "private-output"])
+async def test_caller_hook_shapes_fail_before_finalized_output(
+    tmp_path: Path,
+    claude_settings_validator,
+    caplog: pytest.LogCaptureFixture,
+    hooks: object,
+    source: str,
+    private_output: bool,
+) -> None:
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.inner.terminal import create_terminal_instance
+
+    payload = json.dumps({"hooks": hooks})
+    if source == "file":
+        caller_file = tmp_path / "caller.json"
+        caller_file.write_text(payload)
+        value = str(caller_file)
+    else:
+        value = payload
+    args = augment_claude_args(
+        ("--settings", value), bridge_dir=tmp_path, defer_caller_settings=True
+    )
+    generation = claude_native_bridge.record_claude_settings_boundary(
+        tmp_path, args, claude_args_start=0
+    )
+    baseline = {path.name: path.read_bytes() for path in tmp_path.glob("claude-settings-*")}
+    instance = create_terminal_instance(
+        "claude",
+        "settings",
+        TerminalEnvSpec(
+            args=args,
+            os_env=OSEnvSpec(
+                type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+            ),
+        ),
+    ).instance
+    original_args = list(instance.args)
+    try:
+        with pytest.raises(ValueError, match="Caller hooks must be an object") as error:
+            await claude_native_bridge.finalize_claude_caller_settings(
+                instance, bridge_dir=tmp_path, generation=generation, private_output=private_output
+            )
+
+        assert str(error.value) == error.value.client_message
+        assert "private-hook-content" not in str(error.value)
+        assert "PrivateEvent" not in str(error.value)
+        assert "private-hook-content" not in caplog.text
+        claude_settings_validator.assert_not_awaited()
+        assert instance.args == original_args
+        assert {
+            path.name: path.read_bytes() for path in tmp_path.glob("claude-settings-*")
+        } == baseline
+        assert not list(instance.private_dir.glob("claude-finalized-settings-*.json"))
+    finally:
+        await instance.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "caller, error",
     [
         ({"cleanupPeriodDays": 0}, "cleanupPeriodDays must be a positive integer"),
         ({"language": 0}, "Claude rejected the merged caller settings"),
-        ({"hooks": {"PreToolUse": [None]}}, "Claude rejected the merged caller settings"),
-        ({"remoteTools": 0}, "Claude rejected the merged caller settings"),
     ],
-    ids=["retention", "language", "hook-null", "internal-field"],
+    ids=["retention", "vendor-rejection"],
 )
 async def test_caller_settings_validation_preserves_baseline_and_arguments(
     tmp_path: Path, claude_settings_validator, caller: dict, error: str
@@ -5205,6 +5327,10 @@ async def test_caller_settings_validation_preserves_baseline_and_arguments(
     assert baseline_path.read_bytes() == baseline_bytes
     assert json.loads(baseline_bytes)["hooks"]["UserPromptSubmit"]
     assert not list(tmp_path.glob("claude-settings-*-*.json"))
+    if "cleanupPeriodDays" in caller:
+        claude_settings_validator.assert_not_awaited()
+    else:
+        claude_settings_validator.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -5393,6 +5519,174 @@ async def test_overlapping_caller_settings_finalizers_keep_immutable_baseline(
             request.close()
         for instance in instances:
             await instance.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("private_output", [False, True], ids=["bridge-output", "private-output"])
+@pytest.mark.parametrize(
+    "cancel_worker_tasks", [False, True], ids=["parent-cancellation", "shutdown-cancellation"]
+)
+async def test_caller_settings_writes_drain_before_cancelled_launch_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claude_settings_validator,
+    private_output: bool,
+    cancel_worker_tasks: bool,
+) -> None:
+    from functools import partial
+
+    from omnigent.harnesses.claude_native.settings_generation import (
+        ClaudeSettingsRequest,
+        acquire_claude_settings_request,
+    )
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.inner.terminal import create_terminal_instance
+
+    caller = tmp_path / "caller.json"
+    caller.write_text('{"env":{"EXAMPLE_CALLER":"kept"}}')
+    request = ClaudeSettingsRequest.create(tmp_path)
+    args = augment_claude_args(
+        ("--settings", str(caller)),
+        bridge_dir=tmp_path,
+        defer_caller_settings=True,
+        settings_request=request,
+    )
+    generation = claude_native_bridge.record_claude_settings_boundary(
+        tmp_path, args, claude_args_start=0, settings_request=request
+    )
+    baseline_path = request.settings_path(tmp_path)
+    baseline_bytes = baseline_path.read_bytes()
+    instance = create_terminal_instance(
+        "claude",
+        "settings",
+        TerminalEnvSpec(
+            args=args,
+            os_env=OSEnvSpec(
+                type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+            ),
+        ),
+    ).instance
+    original_args = list(instance.args)
+    lease = acquire_claude_settings_request(tmp_path, generation)
+    lease.attach(instance)
+    request.close()
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    write_started = asyncio.Event()
+    release_write = threading.Event()
+    write_finished = threading.Event()
+    work_threads: list[tuple[str, int]] = []
+    preparation_context = ContextVar("settings_preparation", default=False)
+    work_contexts: list[bool] = []
+    worker_tasks: list[asyncio.Task[Any]] = []
+    outputs: list[Path] = []
+    written_settings: list[dict[str, Any]] = []
+    cleanup_observations: list[bool] = []
+
+    def record_step(name: str, original: Callable[..., Any], *args, **kwargs):
+        work_threads.append((name, threading.get_ident()))
+        work_contexts.append(preparation_context.get())
+        return original(*args, **kwargs)
+
+    def create_worker_task(coroutine, **kwargs):
+        task = asyncio.create_task(coroutine, **kwargs)
+        if preparation_context.get():
+            worker_tasks.append(task)
+        return task
+
+    if cancel_worker_tasks:
+        monkeypatch.setattr(
+            claude_native_bridge,
+            "asyncio",
+            SimpleNamespace(**{**vars(asyncio), "create_task": create_worker_task}),
+        )
+
+    steps = (
+        "_claude_settings_boundary",
+        "_pop_caller_settings",
+        "_read_caller_settings",
+        "_ensure_secure_dir",
+        "_merge_caller_settings",
+        "_effective_invocation_settings",
+    )
+    for name in steps:
+        original = getattr(claude_native_bridge, name)
+        monkeypatch.setattr(claude_native_bridge, name, partial(record_step, name, original))
+    writer_name = "_atomic_write_user_json" if private_output else "_write_json_file"
+    writer = getattr(claude_native_bridge, writer_name)
+
+    def paused_writer(path: Path, settings: dict[str, Any]) -> None:
+        work_threads.append((writer_name, threading.get_ident()))
+        work_contexts.append(preparation_context.get())
+        outputs.append(path)
+        loop.call_soon_threadsafe(write_started.set)
+        try:
+            # A synchronous regression must reach the outer thread assertion without stalling.
+            if threading.get_ident() != loop_thread and not release_write.wait(timeout=5):
+                raise TimeoutError("settings writer was not released")
+            writer(path, settings)
+            written_settings.append(json.loads(path.read_text()))
+        finally:
+            write_finished.set()
+
+    monkeypatch.setattr(claude_native_bridge, writer_name, paused_writer)
+
+    async def prepare_and_close() -> None:
+        preparation_context.set(True)
+        try:
+            await claude_native_bridge.finalize_claude_caller_settings(
+                instance, bridge_dir=tmp_path, generation=generation, private_output=private_output
+            )
+        finally:
+            cleanup_observations.append(write_finished.is_set())
+            lease.close()
+            await instance.close()
+
+    preparation = asyncio.create_task(prepare_and_close())
+    try:
+        await asyncio.wait_for(write_started.wait(), timeout=5)
+        assert {name for name, _thread in work_threads} == {*steps, writer_name}
+        assert all(thread != loop_thread for _name, thread in work_threads)
+        assert all(work_contexts)
+        assert not write_finished.is_set()
+        for _attempt in range(3):
+            preparation.cancel()
+            if cancel_worker_tasks and _attempt == 0:
+                for task in worker_tasks:
+                    task.cancel()
+            checkpoint = loop.create_future()
+            loop.call_soon(checkpoint.set_result, None)
+            await checkpoint
+            if cancel_worker_tasks and _attempt == 0:
+                await asyncio.wait({preparation}, timeout=1)
+            assert not preparation.done()
+            assert cleanup_observations == []
+            assert instance.private_dir.exists()
+            assert baseline_path.read_bytes() == baseline_bytes
+
+        release_write.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(preparation, timeout=5)
+        assert write_finished.is_set()
+        assert cleanup_observations == [True]
+        assert instance.args == original_args
+        assert len(outputs) == 1
+        assert not outputs[0].exists()
+        assert not instance.private_dir.exists()
+        assert not list(tmp_path.glob(f"claude-settings-{generation}*"))
+        claude_settings_validator.assert_awaited_once()
+        assert claude_settings_validator.await_args.args[1]["env"]["EXAMPLE_CALLER"] == "kept"
+        assert written_settings == [claude_settings_validator.await_args.args[1]]
+    finally:
+        release_write.set()
+        await asyncio.gather(preparation, return_exceptions=True)
+        if outputs:
+            await asyncio.to_thread(write_finished.wait, 5)
+        request.close()
+        lease.close()
+        await instance.close()
+        for output in outputs:
+            output.unlink(missing_ok=True)
 
 
 @pytest.mark.parametrize("owner", ["pending", "admitted", "dispatched", "terminal"])
@@ -5589,18 +5883,29 @@ def test_pop_caller_settings_preserves_option_values(flag: str, tmp_path: Path) 
     [(True,), (True, False), (False, True)],
     ids=["disabled", "re-enabled", "disabled-last"],
 )
-def test_augment_claude_args_rejects_settings_that_disable_bridge_hooks(
+def test_merge_caller_settings_rejects_settings_that_disable_bridge_hooks(
     tmp_path: Path, flag: str, values: tuple[bool, ...]
 ) -> None:
     """Settings cannot silently remove policy gates and lifecycle callbacks."""
-    args = tuple(part for value in values for part in ("--settings", json.dumps({flag: value})))
+    hooks = {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": "true"}]}]}
+    baseline = {"hooks": hooks}
+    callers = [{flag: value} for value in values]
     if values[-1]:
-        with pytest.raises(ValueError, match="disables required Omnigent bridge hooks"):
-            augment_claude_args(args, bridge_dir=tmp_path)
+        from omnigent.harnesses.claude_native.settings_validation import (
+            CallerSettingsError,
+            CallerSettingsErrorReason,
+        )
+
+        with pytest.raises(
+            CallerSettingsError, match="disables required Omnigent bridge hooks"
+        ) as error:
+            claude_native_bridge._merge_caller_settings(baseline, callers, tmp_path)
+        assert error.value.reason is CallerSettingsErrorReason.BRIDGE_HOOKS_DISABLED
+        assert str(error.value) == error.value.client_message
     else:
-        settings = _load_invocation_settings(augment_claude_args(args, bridge_dir=tmp_path))
+        settings = claude_native_bridge._merge_caller_settings(baseline, callers, tmp_path)
         assert settings[flag] is False
-        assert settings["hooks"]["UserPromptSubmit"]
+        assert settings["hooks"] == hooks
 
 
 @pytest.mark.parametrize(
@@ -18981,7 +19286,7 @@ async def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, 
         "omnigent.mcp_disabled_servers.apply_claude_settings", wraps=apply_claude_settings
     ) as hook:
         args = await build_args(active)
-    assert hook.call_count == (2 if deferred else 1)
+    hook.assert_called()
     assert all(
         call.kwargs == {"executor": "claude-native", "active_harnesses": active}
         for call in hook.call_args_list

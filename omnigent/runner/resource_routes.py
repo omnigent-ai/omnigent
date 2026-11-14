@@ -35,6 +35,7 @@ from omnigent.entities.session_resources import (
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import native_terminal_name
 from omnigent.harnesses.claude_native.settings_generation import ClaudeSettingsRequestExpired
+from omnigent.harnesses.claude_native.settings_validation import CallerSettingsError
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_terminal_name,
@@ -695,7 +696,11 @@ def register_resource_routes(
                 content={
                     "error": {
                         "code": "terminal_launch_failed",
-                        "message": _client_safe_error_detail(exc, context="terminal launch"),
+                        "message": (
+                            exc.client_message
+                            if isinstance(exc, CallerSettingsError)
+                            else _client_safe_error_detail(exc, context="terminal launch")
+                        ),
                     },
                     **settings_request_ack,
                 },

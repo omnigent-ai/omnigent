@@ -305,6 +305,44 @@ omnigent copilot                     # GitHub Copilot (SDK harness, via `omnigen
 ```
 
 <details>
+<summary>Claude Code caller settings and launch errors</summary>
+
+Pass Claude Code settings files or inline JSON through `--settings`:
+
+```bash
+omnigent claude --settings ./settings.json
+```
+
+For launches with inspectable arguments, Omnigent merges repeated `--settings`
+options in order and composes them with the required bridge settings. Validation
+uses the selected CLI's public, read-only `--bare doctor` command before launch.
+Support is checked by capability, including whether the command diagnoses invalid
+settings. The protocol has been verified with Claude Code 2.1.322 and 2.1.323;
+the version number alone does not establish compatibility.
+
+The plain Claude CLI and supported, parsed `env` wrappers can validate without a
+sandbox. Other wrappers require an active sandbox for validation. Use the plain
+CLI or a supported `env` wrapper, or configure a sandbox, if this requirement
+blocks your launch.
+
+If settings are rejected, check your `--settings` values with the selected CLI
+and retry. Hooks must be an object whose event values are lists, and
+`disableAllHooks` and `allowManagedHooksOnly` must leave Omnigent's bridge hooks
+enabled. If validation is unavailable, update the CLI and wrapper to versions
+that support the read-only check, or check their startup and sandbox
+configuration. These errors leave the launch arguments and bridge settings
+unchanged. Explicit CLI terminal launch requests and automatic native terminal
+startup return fixed guidance without settings values, private paths, or vendor
+diagnostics. Automatic startup also retains its runner-log reference and error ID
+for further diagnosis.
+
+Launches whose arguments are hidden inside serialized shell commands retain
+their existing behavior; this merge and validation apply to inspectable
+invocations.
+
+</details>
+
+<details>
 <summary>Forward variables from your shell to one session</summary>
 
 Sessions run under the host daemon, which may have started from a different

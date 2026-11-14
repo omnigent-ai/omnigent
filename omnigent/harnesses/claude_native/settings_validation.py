@@ -16,6 +16,7 @@ import sys
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -58,11 +59,57 @@ _DOCTOR_SUPERVISOR = (
 _DOCTOR_COMPLETION = (
     "For a full setup checkup that can also fix issues, run /doctor in a Claude Code session."
 )
-_UNAVAILABLE = (
-    "Cannot validate caller settings with the selected Claude CLI. "
-    "The CLI and wrapper must support the read-only '--bare doctor' check; "
-    "update them or check their startup and sandbox configuration, then retry."
-)
+
+
+class CallerSettingsErrorReason(Enum):
+    """Caller settings failures with fixed, client-safe remediation."""
+
+    INVALID_SETTINGS = "invalid_settings"
+    VALIDATION_UNAVAILABLE = "validation_unavailable"
+    SANDBOX_REQUIRED = "sandbox_required"
+    INVALID_HOOKS = "invalid_hooks"
+    BRIDGE_HOOKS_DISABLED = "bridge_hooks_disabled"
+
+
+_CALLER_SETTINGS_MESSAGES = {
+    CallerSettingsErrorReason.INVALID_SETTINGS: (
+        "Claude rejected the merged caller settings. Check --settings "
+        "with the selected Claude CLI, then retry; the launch arguments "
+        "and bridge settings were left unchanged."
+    ),
+    CallerSettingsErrorReason.VALIDATION_UNAVAILABLE: (
+        "Cannot validate caller settings with the selected Claude CLI. "
+        "The CLI and wrapper must support the read-only '--bare doctor' check; "
+        "update them or check their startup and sandbox configuration, then retry."
+    ),
+    CallerSettingsErrorReason.SANDBOX_REQUIRED: (
+        "Caller settings validation requires an active sandbox for this wrapper. "
+        "Use the plain Claude CLI or a supported env wrapper, or configure a sandbox."
+    ),
+    CallerSettingsErrorReason.INVALID_HOOKS: (
+        "Caller hooks must be an object whose event values are lists. Check --settings, "
+        "then retry; the launch arguments and bridge settings were left unchanged."
+    ),
+    CallerSettingsErrorReason.BRIDGE_HOOKS_DISABLED: (
+        "Caller disableAllHooks=true or allowManagedHooksOnly=true disables required "
+        "Omnigent bridge hooks. Keep these hooks enabled in --settings, then retry; "
+        "the launch arguments and bridge settings were left unchanged."
+    ),
+}
+
+
+class CallerSettingsError(ValueError):
+    """A settings failure whose client message never uses exception text."""
+
+    def __init__(self, reason: CallerSettingsErrorReason) -> None:
+        if not isinstance(reason, CallerSettingsErrorReason):
+            raise TypeError("reason must be a CallerSettingsErrorReason")
+        self.reason = reason
+        super().__init__(self.client_message)
+
+    @property
+    def client_message(self) -> str:
+        return _CALLER_SETTINGS_MESSAGES[self.reason]
 
 
 class _ValidationUnavailable(Exception):
@@ -197,7 +244,7 @@ async def validate_caller_settings(
     Unsandboxed launches support the plain CLI and parsed ``env`` layers only.
     """
     if instance.os_env is None:
-        raise ValueError(_UNAVAILABLE)
+        raise CallerSettingsError(CallerSettingsErrorReason.VALIDATION_UNAVAILABLE)
     env: dict[str, str] = terminal_pane_environment(
         inherit_env=instance.inherit_env, env=instance.env, env_unset=instance.env_unset
     )
@@ -208,7 +255,7 @@ async def validate_caller_settings(
     if Path(command).name == "env":
         wrapper = env_wrapper_launch(command, prefix, env)
         if wrapper is None:
-            raise ValueError(_UNAVAILABLE)
+            raise CallerSettingsError(CallerSettingsErrorReason.VALIDATION_UNAVAILABLE)
         command, prefix = wrapper.command, wrapper.args
         env = dict(env) if wrapper.environment.inherit else {}
         for name in wrapper.environment.unset:
@@ -219,10 +266,7 @@ async def validate_caller_settings(
     if not (sandbox is not None and sandbox.active) and (
         Path(command).name not in {"claude", "claude.exe"} or prefix
     ):
-        raise ValueError(
-            "Caller settings validation requires an active sandbox for this wrapper. "
-            "Use the plain Claude CLI or a supported env wrapper, or configure a sandbox."
-        )
+        raise CallerSettingsError(CallerSettingsErrorReason.SANDBOX_REQUIRED)
     try:
         async with asyncio.timeout(_VALIDATION_TIMEOUT):
             with tempfile.TemporaryDirectory(
@@ -381,10 +425,6 @@ async def validate_caller_settings(
     except asyncio.CancelledError:
         raise
     except _InvalidSettings:
-        raise ValueError(
-            "Claude rejected the merged caller settings. Check --settings "
-            "with the selected Claude CLI, then retry; the launch arguments "
-            "and bridge settings were left unchanged."
-        ) from None
+        raise CallerSettingsError(CallerSettingsErrorReason.INVALID_SETTINGS) from None
     except Exception:  # noqa: BLE001 - vendor errors must not expose caller settings
-        raise ValueError(_UNAVAILABLE) from None
+        raise CallerSettingsError(CallerSettingsErrorReason.VALIDATION_UNAVAILABLE) from None

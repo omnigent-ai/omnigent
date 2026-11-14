@@ -8674,6 +8674,7 @@ def _native_terminal_start_error_payload(
         extra=extra,
     )
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeHookInterpreterMismatchError
+    from omnigent.harnesses.claude_native.settings_validation import CallerSettingsError
     from omnigent.harnesses.pi_native.main import PiNativeCliOutdatedError
     from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
@@ -8705,6 +8706,11 @@ def _native_terminal_start_error_payload(
             "Claude Code is Windows-native, but Omnigent is running under WSL. "
             "Install @anthropic-ai/claude-code from WSL so a WSL-native `claude` "
             "binary wins PATH resolution, then retry."
+        )
+    elif isinstance(exc, CallerSettingsError):
+        message = (
+            f"{exc.client_message} "
+            f"See the runner log for details: {process_log_reference('runner')}"
         )
     elif isinstance(exc, PiNativeCliOutdatedError):
         # The raise site composes a client-safe message (versions + upgrade

@@ -1793,15 +1793,20 @@ async def test_auto_create_claude_terminal_cleanup_attempts_both_shutdowns(
     subagent_router = object()
     turn_router = object()
     shutdowns: list[str] = []
+    cleanup_observations: list[tuple[int, bool]] = []
     original_error = ValueError("terminal preparation failed")
     follower = Mock()
 
     async def failing_subagent_shutdown(_session_id: str, _router: object) -> None:
         if failure_stage == "launch":
-            follower.close.assert_called_once_with("conv_cleanup_failure")
-            assert any(
-                record.exc_info and record.exc_info[1] is original_error
-                for record in caplog.records
+            cleanup_observations.append(
+                (
+                    follower.close.call_count,
+                    any(
+                        record.exc_info and record.exc_info[1] is original_error
+                        for record in caplog.records
+                    ),
+                )
             )
         shutdowns.append("subagent")
         raise shutdown_error
@@ -1843,8 +1848,11 @@ async def test_auto_create_claude_terminal_cleanup_attempts_both_shutdowns(
     if failure_stage == "seed":
         registry.launch_required_terminal.assert_not_called()
         follower.close.assert_not_called()
+        assert cleanup_observations == []
     else:
         registry.launch_required_terminal.assert_awaited_once()
+        follower.close.assert_called_once_with("conv_cleanup_failure")
+        assert cleanup_observations == [(1, True)]
 
 
 @pytest.mark.parametrize(

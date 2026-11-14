@@ -57,7 +57,7 @@ import time
 import unicodedata
 import urllib.parse
 from collections.abc import Awaitable, Callable, Collection, Iterator, Mapping, Sequence
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
@@ -3664,6 +3664,20 @@ def _replace_framework_settings(
             index += 1
 
 
+async def _run_claude_settings_step[Result](operation: Callable[[], Result]) -> Result:
+    """Keep preparation work owned until its worker stops, even under cancellation."""
+    from omnigent.inner._subprocess_lifecycle import await_cleanup_task
+
+    # Loop shutdown must not cancel the completion signal before the thread finishes.
+    worker = asyncio.get_running_loop().run_in_executor(None, copy_context().run, operation)
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await await_cleanup_task(worker)
+        raise
+
+
 async def finalize_claude_caller_settings(
     instance: TerminalInstance,
     *,
@@ -3685,8 +3699,8 @@ async def finalize_claude_caller_settings(
     if generation is None:
         return
     settings_path = _generation_settings_path(bridge_dir, generation)
-    start = await asyncio.to_thread(
-        _claude_settings_boundary, bridge_dir, instance.args, generation
+    start = await _run_claude_settings_step(
+        functools.partial(_claude_settings_boundary, bridge_dir, instance.args, generation)
     )
     prefix, args = instance.args[:start], instance.args[start:]
     environment = instance.os_env
@@ -3716,7 +3730,9 @@ async def finalize_claude_caller_settings(
             paths.add(path)
         raise ValueError("settings read is deferred")
 
-    _, inline_callers = _pop_caller_settings(args, workspace=workspace, read_file=collect)
+    _, inline_callers = await _run_claude_settings_step(
+        functools.partial(_pop_caller_settings, args, workspace=workspace, read_file=collect)
+    )
     if not has_bridge_settings or not (paths or inline_callers):
         return
     contents: dict[Path, str] = {}
@@ -3726,7 +3742,9 @@ async def finalize_claude_caller_settings(
             if not path.is_absolute():
                 unavailable_reason = "unsupported_wrapper_directory"
             elif instance.sandbox_policy is None or not instance.sandbox_policy.active:
-                contents[path] = await asyncio.to_thread(_read_caller_settings, path)
+                contents[path] = await _run_claude_settings_step(
+                    functools.partial(_read_caller_settings, path)
+                )
             else:
                 result = await environment.read(
                     str(path), max_bytes=_CALLER_SETTINGS_MAX_BYTES, regular_only=True
@@ -3760,18 +3778,23 @@ async def finalize_claude_caller_settings(
             raise ValueError("settings file is unavailable under the terminal policy")
         return contents[path]
 
-    kept, callers = _pop_caller_settings(args, workspace=workspace, read_file=read_file)
-    if callers:
+    def merge_settings() -> tuple[list[str], dict[str, Any] | None]:
+        kept, callers = _pop_caller_settings(args, workspace=workspace, read_file=read_file)
+        if not callers:
+            return kept, None
         _ensure_secure_dir(bridge_dir)
         baseline = json.loads(
-            await asyncio.to_thread(_read_caller_settings, settings_path, nofollow=True),
+            _read_caller_settings(settings_path, nofollow=True),
             parse_float=_finite_settings_number,
             parse_constant=_finite_settings_number,
         )
         if not isinstance(baseline, dict):
             raise ValueError("required bridge settings are unavailable under the terminal policy")
         settings = _merge_caller_settings(baseline, callers, bridge_dir)
-        settings = _effective_invocation_settings(settings, active_harnesses=active_harnesses)
+        return kept, _effective_invocation_settings(settings, active_harnesses=active_harnesses)
+
+    kept, settings = await _run_claude_settings_step(merge_settings)
+    if settings is not None:
         from omnigent.harnesses.claude_native.settings_validation import validate_caller_settings
 
         await validate_caller_settings(instance, settings, wrapper_prefix=prefix)
@@ -3780,10 +3803,16 @@ async def finalize_claude_caller_settings(
             if private_output
             else bridge_dir / f"claude-settings-{generation}-{secrets.token_hex(16)}.json"
         )
-        if private_output:
-            _atomic_write_user_json(output_path, settings)
-        else:
-            _write_json_file(output_path, settings)
+        writer = _atomic_write_user_json if private_output else _write_json_file
+        try:
+            await _run_claude_settings_step(functools.partial(writer, output_path, settings))
+        except asyncio.CancelledError:
+            # The drained writer cannot recreate this unreferenced output after cleanup.
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await _run_claude_settings_step(
+                    functools.partial(output_path.unlink, missing_ok=True)
+                )
+            raise
         _replace_framework_settings(
             kept, settings_path, output_path, retain_baseline=private_output
         )
@@ -3805,6 +3834,7 @@ def _merge_caller_settings(
     hook controls, including environment modes and plugin-only customization,
     are passed through. These local guards enforce bridge merge requirements;
     the finalizer validates the complete document with the selected CLI.
+    Hook containers must be objects of event lists; entries remain intact.
     Caller MCP-denial lists use the last caller value; saved denials append later.
     Other maps merge direct members only; a later nested map replaces the earlier one.
 
@@ -3812,8 +3842,13 @@ def _merge_caller_settings(
     :param callers: Parsed caller settings, in flag order.
     :param bridge_dir: Bridge directory the statusLine capture writes into.
     :returns: The merged settings.
-    :raises ValueError: Either validated hook-disabling setting is true.
+    :raises ValueError: Caller hooks cannot merge or disable required bridge hooks.
     """
+    from omnigent.harnesses.claude_native.settings_validation import (
+        CallerSettingsError,
+        CallerSettingsErrorReason,
+    )
+
     caller_status: object = None
     merged: dict[str, Any] = {}
     for index, source in enumerate([*callers, settings]):
@@ -3821,15 +3856,18 @@ def _merge_caller_settings(
             caller_status = merged.get("statusLine")
         for key, value in source.items():
             previous = merged.get(key)
-            if key == "hooks" and isinstance(value, dict):
+            if key == "hooks":
+                if not isinstance(value, dict) or any(
+                    not isinstance(entries, list) for entries in value.values()
+                ):
+                    raise CallerSettingsError(CallerSettingsErrorReason.INVALID_HOOKS)
                 hooks = dict(previous) if isinstance(previous, dict) else {}
                 for event, entries in value.items():
-                    if isinstance(entries, list):
-                        existing = hooks.get(event)
-                        hooks[event] = [
-                            *(existing if isinstance(existing, list) else []),
-                            *entries,
-                        ]
+                    existing = hooks.get(event)
+                    hooks[event] = [
+                        *(existing if isinstance(existing, list) else []),
+                        *entries,
+                    ]
                 merged[key] = hooks
             elif key == "permissions" and isinstance(value, dict):
                 permissions = dict(previous) if isinstance(previous, dict) else {}
@@ -3856,7 +3894,7 @@ def _merge_caller_settings(
                 merged[key] = value
     for flag in ("disableAllHooks", "allowManagedHooksOnly"):
         if merged.get(flag) is True:
-            raise ValueError(f"Caller {flag}=true disables required Omnigent bridge hooks")
+            raise CallerSettingsError(CallerSettingsErrorReason.BRIDGE_HOOKS_DISABLED)
     if "cleanupPeriodDays" in merged:
         retention = merged["cleanupPeriodDays"]
         if (

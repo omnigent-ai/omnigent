@@ -338,8 +338,18 @@ async def test_claude_settings_prepare_reads_shared_terminal_overlay(
             resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
             prepare_terminal=prepare,
         )
-        settings_index = prepared[0].args.index("--settings") + 1
-        settings = json.loads(Path(prepared[0].args[settings_index]).read_text())
+        instance = prepared[0]
+        assert instance.os_env is not None
+        settings_index = instance.args.index("--settings") + 1
+        result = await instance.os_env.read(
+            instance.args[settings_index],
+            max_bytes=bridge._CALLER_SETTINGS_MAX_BYTES,
+            regular_only=True,
+        )
+        assert "error" not in result
+        assert not result.get("truncated")
+        assert result.get("encoding") == "utf-8"
+        settings = json.loads(result["content"])
         assert settings["env"]["SETTINGS_VIEW"] == "overlay"
         assert json.loads(settings_file.read_text())["env"]["SETTINGS_VIEW"] == "host"
     finally:

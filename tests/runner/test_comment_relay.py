@@ -2057,7 +2057,18 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "mode", ["prepared", "opaque", "abandoned", "expired", "failure", "declared-replacement"]
+    "mode",
+    [
+        "prepared",
+        "opaque",
+        "abandoned",
+        "expired",
+        "failure",
+        "declared-replacement",
+        "invalid-settings",
+        "validation-unavailable",
+        "unexpected-validator-error",
+    ],
 )
 async def test_cli_settings_request_ownership_survives_admission_and_terminal_lifecycle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, terminal_registry_singleton
@@ -2072,7 +2083,26 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
     from omnigent.inner.terminal import TerminalInstance
     from omnigent.terminals import TerminalRegistry
 
-    monkeypatch.setattr(settings_validation, "validate_caller_settings", AsyncMock())
+    private_diagnostic = "private-validator-value /private/example/settings.json"
+    if mode in {"invalid-settings", "validation-unavailable"}:
+        fault = (
+            settings_validation._InvalidSettings(private_diagnostic)
+            if mode == "invalid-settings"
+            else OSError(private_diagnostic)
+        )
+        monkeypatch.setattr(settings_validation, "_run_doctor", AsyncMock(side_effect=fault))
+    else:
+        monkeypatch.setattr(
+            settings_validation,
+            "validate_caller_settings",
+            AsyncMock(
+                side_effect=(
+                    ValueError(private_diagnostic)
+                    if mode == "unexpected-validator-error"
+                    else None
+                )
+            ),
+        )
     monkeypatch.chdir(tmp_path)
     if mode == "opaque":
         monkeypatch.setattr(
@@ -2101,6 +2131,7 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
     if mode == "declared-replacement":
         spec.terminals = {body["terminal"]: TerminalEnvSpec(command="bash", args=["-l"])}
     launched = []
+    prepared = []
 
     async def spawn(instance, *, cwd=None):
         launched.append(instance)
@@ -2115,13 +2146,18 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
     async def launch(self, **kwargs):
         if mode == "abandoned" and kwargs["spec"].args == body["spec"]["args"]:
             request.close()
+
+        async def prepare(instance):
+            prepared.append((instance, list(instance.args)))
+            await kwargs["prepare_terminal"](instance)
+
         await terminals.launch(
             session_id,
             kwargs["terminal_name"],
             kwargs["session_key"],
             kwargs["spec"],
             parent_os_env=kwargs["parent_os_env"],
-            prepare_terminal=kwargs["prepare_terminal"],
+            prepare_terminal=prepare,
         )
         return await original_launch(self, **kwargs)
 
@@ -2134,13 +2170,55 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
         ) as client:
             url = f"/v1/sessions/{session_id}/resources/terminals"
             response = await client.post(url, json=body)
-            if mode in {"expired", "failure"}:
+            if mode in {
+                "expired",
+                "failure",
+                "invalid-settings",
+                "validation-unavailable",
+                "unexpected-validator-error",
+            }:
                 assert response.status_code == (409 if mode == "expired" else 500), response.text
-                if mode == "failure":
+                if mode != "expired":
                     assert response.json()["claude_settings_request_ack"] == request.generation
+                    assert response.json()["error"]["code"] == "terminal_launch_failed"
+                    assert len(prepared) == 1
+                    instance, original_args = prepared[0]
+                    assert instance.args == original_args
+                    assert baseline.read_bytes() == baseline_bytes
+                    assert not list(instance.private_dir.glob("claude-finalized-settings-*.json"))
+                message = response.json()["error"]["message"]
+                assert "private-validator-value" not in response.text
+                assert "/private/example/settings.json" not in response.text
                 assert launched == []
+                assert not (bridge_dir / _TOOL_RELAY_FILE).exists()
                 request.close()
                 assert not list(bridge_dir.glob(f"claude-settings-{request.generation}*"))
+                if mode == "expired":
+                    assert response.json()["error"]["code"] == "conflict"
+                    assert "expired" in message
+                    assert "claude_settings_request_ack" not in response.json()
+                elif mode == "failure":
+                    assert message == (
+                        "Caller disableAllHooks=true or allowManagedHooksOnly=true disables "
+                        "required Omnigent bridge hooks. Keep these hooks enabled in --settings, "
+                        "then retry; the launch arguments and bridge settings were left unchanged."
+                    )
+                elif mode == "invalid-settings":
+                    assert message == (
+                        "Claude rejected the merged caller settings. Check --settings "
+                        "with the selected Claude CLI, then retry; the launch arguments "
+                        "and bridge settings were left unchanged."
+                    )
+                elif mode == "validation-unavailable":
+                    assert message == (
+                        "Cannot validate caller settings with the selected Claude CLI. "
+                        "The CLI and wrapper must support the read-only '--bare doctor' check; "
+                        "update them or check their startup and sandbox configuration, then retry."
+                    )
+                elif mode == "unexpected-validator-error":
+                    assert message.startswith(
+                        "Request failed on the runner; see the runner log for details: "
+                    )
                 return
             assert response.status_code == 200, response.text
             assert response.json()["claude_settings_request_ack"] == request.generation

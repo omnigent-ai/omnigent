@@ -39,6 +39,10 @@ from omnigent.harnesses.claude_native.bridge import (
     read_permission_hook_config,
 )
 from omnigent.harnesses.claude_native.main import claude_tool_env_file
+from omnigent.harnesses.claude_native.settings_validation import (
+    CallerSettingsError,
+    CallerSettingsErrorReason,
+)
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
     CodexNativeBridgeState,
@@ -70,7 +74,10 @@ from omnigent.runner.app import (
     _publish_terminal_pending,
     _terminal_lookup_miss_log_state,
 )
-from omnigent.runner.native.orchestration import _build_pi_native_args
+from omnigent.runner.native.orchestration import (
+    _build_pi_native_args,
+    _native_terminal_start_error_response,
+)
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     KIRO_NATIVE_TERMINAL_ROLE,
@@ -3884,77 +3891,94 @@ def test_publish_terminal_pending_emits_pending_then_clear() -> None:
     assert all(p.session_id == "7cef62c6518d5591cc7991974e33ec4c" for p in published)
 
 
-def test_publish_native_terminal_start_error_emits_failed_status_only(
+@pytest.mark.parametrize("surface", ["publish", "ensure"])
+@pytest.mark.parametrize(
+    "failure",
+    ["missing-cli", "invalid-settings", "validation-unavailable", "unexpected-validator"],
+)
+def test_native_terminal_start_error_guidance_and_redaction(
     caplog: pytest.LogCaptureFixture,
     pinned_runner_log: Path,
+    surface: str,
+    failure: str,
 ) -> None:
-    """
-    Native terminal startup failure publishes a generic ``failed`` status.
-
-    The runner must stay alive when terminal auto-create fails, but the
-    affected session should only receive ``session.status: failed`` from
-    this startup path. A bare ``response.error`` is turn-scoped; if the
-    runner publishes one here, Omnigent can persist an orphan transcript error
-    and then publish/persist a second error when the user message
-    fast-fails against the same terminal.
-
-    The published/returned message names the runner's log file — the raw
-    exception text (which can embed paths/CLI details) is logged there for
-    operators, not surfaced on the session stream.
-
-    :param caplog: Pytest log capture fixture, used to confirm the raw
-        cause is logged server-side.
-    :param pinned_runner_log: The log path the message must name.
-    """
+    """Only typed settings failures add safe guidance to either startup surface."""
     published: list[_PublishedEvent] = []
+    private_value = "private-validator-value"
+    private_path = "/private/example/settings.json"
+    guidance = None
+    runtime_name = "Claude"
+    if failure == "missing-cli":
+        runtime_name = "Codex"
+        raised: Exception = ImportError("Native Codex requires the 'codex' CLI on PATH.")
+    elif failure == "unexpected-validator":
+        raised = ValueError(f"{private_value} {private_path}")
+    else:
+        settings_error = CallerSettingsError(
+            CallerSettingsErrorReason.INVALID_SETTINGS
+            if failure == "invalid-settings"
+            else CallerSettingsErrorReason.VALIDATION_UNAVAILABLE
+        )
+        guidance = settings_error.client_message
+        settings_error.args = (f"{private_value} {private_path}",)
+        raised = settings_error
 
     def _capture(session_id: str, event: dict[str, Any]) -> None:
         published.append(_PublishedEvent(session_id=session_id, event=event))
 
     with caplog.at_level(logging.WARNING):
-        error = _publish_native_terminal_start_error(
-            _capture,
-            "415c9954e2fe4b9276083a4d2c66f689",
-            "Codex",
-            ImportError("Native Codex requires the 'codex' CLI on PATH."),
-        )
+        if surface == "publish":
+            error = _publish_native_terminal_start_error(
+                _capture, "415c9954e2fe4b9276083a4d2c66f689", runtime_name, raised
+            )
+        else:
+            response = _native_terminal_start_error_response(
+                raised, runtime_name, session_id="415c9954e2fe4b9276083a4d2c66f689"
+            )
+            assert response.status_code == 500
+            envelope = json.loads(response.body)
+            error = envelope["error"]
 
-    # Client-safe payload pointing at the runner log — no raw exception text.
     error_id = error["error_id"]
     assert error_id.startswith("err_")
     assert len(error_id) == 36
     int(error_id.removeprefix("err_"), 16)
+    message = (
+        f"{guidance} See the runner log for details: {pinned_runner_log}"
+        if guidance is not None
+        else (
+            f"Native {runtime_name} terminal failed to start ({type(raised).__name__}); "
+            f"see the runner log for details: {pinned_runner_log}"
+        )
+    )
     assert error == {
         "code": "native_terminal_start_failed",
         "error_id": error_id,
-        "message": (
-            "Native Codex terminal failed to start (ImportError); "
-            f"see the runner log for details: {pinned_runner_log} "
-            f"Error ID: {error_id}."
-        ),
+        "message": f"{message} Error ID: {error_id}.",
     }
-    # The raw cause must NOT leak into the surfaced message, but MUST be
-    # logged for operators. If this fails, the redaction regressed (raw
-    # text back in the payload) or the server-side log was dropped.
+    assert private_value not in json.dumps(error)
+    assert private_path not in json.dumps(error)
     assert "requires the 'codex' CLI" not in error["message"]
-    # The structured, non-sensitive cause (exception type only, here) still
-    # names the failure kind without the free-form message.
-    assert "(ImportError)" in error["message"]
-    assert "requires the 'codex' CLI on PATH." in caplog.text
+    assert str(raised) in caplog.text
     assert error_id in caplog.text
-    assert [p.event for p in published] == [
-        {
-            "type": "session.status",
-            "status": "failed",
-            "error": error,
-            "failure_context": {
-                "failure_source": "native_terminal_start",
-                "failure_id": error_id,
-                "exception_type": "ImportError",
+    failure_context = {
+        "failure_source": "native_terminal_start",
+        "failure_id": error_id,
+        "exception_type": type(raised).__name__,
+    }
+    if surface == "publish":
+        assert [p.event for p in published] == [
+            {
+                "type": "session.status",
+                "status": "failed",
+                "error": error,
+                "failure_context": failure_context,
             },
-        },
-    ]
-    assert all(p.session_id == "415c9954e2fe4b9276083a4d2c66f689" for p in published)
+        ]
+        assert all(p.session_id == "415c9954e2fe4b9276083a4d2c66f689" for p in published)
+    else:
+        assert envelope == {"error": error, "failure_context": failure_context}
+        assert not published
 
 
 def test_publish_native_terminal_start_error_redacts_mismatch_path(
