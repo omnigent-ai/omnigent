@@ -9,6 +9,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import httpx
@@ -19,14 +20,72 @@ from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_ex
 from tests._helpers.live_server import isolated_process_env, terminate_process
 
 
-def host_tunnel_registered(client: httpx.Client, host_id: str) -> bool:
+def host_tunnel_registered(
+    client: httpx.Client | ModuleType, host_id: str, *, base_url: str = ""
+) -> bool:
     """Whether a host request reaches *host_id* through the server's live tunnel.
 
     The hosts table reports "online" before the tunnel registers, and creating a
-    session on the host in that window fails with ``wrong_replica``.
+    session on the host in that window fails with ``wrong_replica``. Pass
+    *base_url* when *client* has none (e.g. the ``httpx`` module).
     """
-    response = client.get(f"/v1/hosts/{host_id}/filesystem", params={"limit": 1}, timeout=10)
+    url = f"{base_url}/v1/hosts/{host_id}/filesystem"
+    response = client.get(url, params={"limit": 1}, timeout=10)
     return response.status_code == 200
+
+
+def routable_host(
+    client: httpx.Client | ModuleType,
+    *,
+    base_url: str = "",
+    host_id: str | None = None,
+    name: str | None = None,
+    owner: str | None = None,
+) -> dict[str, Any] | None:
+    """Return the first online host row matching the filters whose tunnel answers.
+
+    Rows are filtered by whichever of *host_id*, *name* and *owner* are given.
+    Returns ``None`` while no match is online and registered; HTTP errors propagate.
+    """
+    response = client.get(f"{base_url}/v1/hosts", timeout=10)
+    if response.status_code != 200:
+        return None
+    for row in response.json().get("hosts", []):
+        if row.get("status") != "online":
+            continue
+        wanted = {"host_id": host_id, "name": name, "owner": owner}
+        if any(value is not None and row.get(key) != value for key, value in wanted.items()):
+            continue
+        if host_tunnel_registered(client, str(row["host_id"]), base_url=base_url):
+            return row
+    return None
+
+
+def wait_for_routable_host(
+    client: httpx.Client | ModuleType,
+    *,
+    timeout: float,
+    base_url: str = "",
+    host_id: str | None = None,
+    name: str | None = None,
+    owner: str | None = None,
+    poll_interval: float = 0.5,
+) -> dict[str, Any]:
+    """Poll :func:`routable_host` until it returns a row, retrying transport errors."""
+    deadline = time.monotonic() + timeout
+    last = "not polled"
+    while time.monotonic() < deadline:
+        try:
+            row = routable_host(client, base_url=base_url, host_id=host_id, name=name, owner=owner)
+            if row is not None:
+                return row
+            last = "no matching host online with a registered tunnel"
+        except httpx.TransportError as exc:
+            last = f"{type(exc).__name__}: {exc}"
+        time.sleep(poll_interval)
+    wanted = {"host_id": host_id, "name": name, "owner": owner}
+    filters = ", ".join(f"{key}={value!r}" for key, value in wanted.items() if value is not None)
+    raise AssertionError(f"No host ({filters or 'any'}) became routable within {timeout}s: {last}")
 
 
 @dataclass

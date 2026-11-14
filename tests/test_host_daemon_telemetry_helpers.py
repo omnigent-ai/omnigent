@@ -32,6 +32,8 @@ def test_waits_for_own_host_while_another_host_is_online(initial_status: str) ->
         nonlocal own_host_polls
         if request.url.path == "/v1/hosts":
             return httpx.Response(200, json={"hosts": [unrelated]})
+        if request.url.path == f"/v1/hosts/{expected_host_id}/filesystem":
+            return httpx.Response(200, json={"entries": []})
         assert request.url.path == f"/v1/hosts/{expected_host_id}"
         own_host_polls += 1
         if own_host_polls == 1 and initial_status == "missing":

@@ -52,6 +52,7 @@ from omnigent.harnesses.opencode_native.bridge import (
 from omnigent.native.native_coding_agents import OPENCODE_NATIVE_AGENT_NAME
 from omnigent.onboarding.opencode_auth import opencode_db_path
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
+from tests._helpers.host import wait_for_routable_host
 from tests.e2e import _opencode_native_helpers as oc
 from tests.e2e._native_resume_helpers import (
     cli_env,
@@ -93,15 +94,8 @@ def _spawn_host_daemon(*, log_dir: Path, live_server: str) -> subprocess.Popen[b
 
 def _online_host_id(client: httpx.Client, timeout: float = 30.0) -> str:
     """Poll ``GET /v1/hosts`` until at least one host is online."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        resp = client.get("/v1/hosts")
-        if resp.status_code == 200:
-            online = [h for h in resp.json().get("hosts", []) if h["status"] == "online"]
-            if online:
-                return str(online[0]["host_id"])
-        time.sleep(POLL_INTERVAL_S)
-    raise AssertionError(f"No host came online within {timeout}s")
+    row = wait_for_routable_host(client, timeout=timeout, poll_interval=POLL_INTERVAL_S)
+    return str(row["host_id"])
 
 
 @pytest.fixture(scope="module")

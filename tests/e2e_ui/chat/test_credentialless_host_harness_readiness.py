@@ -69,7 +69,7 @@ from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
 from tests._helpers.browser import async_user_page
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
-from tests._helpers.host import isolated_host
+from tests._helpers.host import isolated_host, routable_host
 from tests._helpers.live_server import isolated_process_env, terminate_process
 from tests.e2e_ui.chat._claude_oauth_refresh_proxy import (
     REFRESH_PATH,
@@ -447,8 +447,10 @@ class _ExpiredLoginHost:
             )
         deadline = time.monotonic() + _HOST_ONLINE_TIMEOUT_S
         while time.monotonic() < deadline and self.proc.poll() is None:
-            row = _fetch_host_row(self.base_url, self.name)
-            if row is not None and row.get("host_id") == self.host_id:
+            row = routable_host(
+                httpx, base_url=self.base_url, host_id=self.host_id, name=self.name
+            )
+            if row is not None:
                 return row
             time.sleep(1)
         raise AssertionError(
