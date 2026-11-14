@@ -194,6 +194,10 @@ When the user asks to review the plan before the work starts:
 The workflow's Stop and Continue controls send you instructions. Stopping your
 own turn is not enough: delegated work can keep running independently.
 
+- Before launching background work, retain its owning session, task/terminal
+  handle and a way to cancel it. With Codex `exec_command`, use `tty=true` for
+  long-running commands so `write_stdin` can send Ctrl+C later. Record the
+  handle in the journal; a PID alone may belong to a private process sandbox.
 - On Stop, stop starting new work and cancel this run's timers, retries and
   queued follow-ups that could restart it. Scope the stop to this workflow
   run; leave unrelated work and the automation's recurring schedule alone.
@@ -205,10 +209,14 @@ own turn is not enough: delegated work can keep running independently.
   stop its descendants too. Stop the background work you own as well.
 - Keep this main session available to coordinate cleanup. Verify that the
   workers and their descendants stopped; a queued message is not confirmation.
-  Have each worker report back after stopping its descendants. If another
-  session requested your stop, report the result to it even though your plan
-  is unfinished. Report any work you could not stop. Record worker/session IDs,
-  completed results and what remains in a journal note before ending your turn.
+  Have each worker cancel its background commands through their original
+  handles and wait for their exit results before reporting back. A closed
+  stdin, missing handle, interrupted wait, or empty process list in another
+  sandbox is not proof of shutdown. Report any such work as unverified until
+  its owning task or host confirms it exited. If another session requested
+  your stop, report the result to it even though your plan is unfinished.
+  Report any work you could not stop. Record worker/session IDs, completed
+  results and what remains in a journal note before ending your turn.
 - Leave unfinished steps that were started as `started`, and unstarted steps
   unstarted. A user stop is neither success nor failure. Wait for an explicit
   Continue without asking another question or restarting on a timer.

@@ -87,7 +87,7 @@ const TASK_ACTION_VERBS: Record<Exclude<TaskAction, "proceed">, string> = {
 };
 
 const RESUME_WORKFLOW_WORK =
-  "Resume or restart any previously stopped background tasks, subagents, and other Omnigent sessions needed for the remaining work. Tell each worker to resume or restart its own required tasks, agents, and sessions recursively. Check their current state first: reuse work that is still running, preserve completed results, and do not duplicate work. Restore any monitoring needed to finish the workflow.";
+  "Resume or restart any previously stopped background tasks, subagents, and other Omnigent sessions needed for the remaining work. Tell each worker to resume or restart its own required tasks, agents, and sessions recursively. Check their current state first: reuse work that is still running, preserve completed results, and do not duplicate work. Retain a usable cancellation handle for every background command you start. Restore any monitoring needed to finish the workflow.";
 
 /**
  * The message that asks the agent to run, continue, go ahead with or retry a
@@ -119,7 +119,7 @@ export function continuePlanMessage(planName: string | null): string {
 /** Keep the main agent available to stop delegated work and record how to resume it. */
 export function stopPlanMessage(planName: string | null): string {
   const plan = planName ? `the plan "${planName}"` : "the plan";
-  return `Stop ${plan} now. Stop all background tasks, subagents, and other Omnigent sessions working on this workflow run. Tell each worker to stop its own background tasks, agents, and Omnigent sessions recursively, verify their shutdown, and report back before it stops. Cancel this run's timers and queued follow-ups that could restart the work. Keep this main session available while you coordinate and verify that the work has stopped; report anything you could not stop. Preserve completed results and record the worker/session IDs and what remains so the workflow can resume. Leave unfinished steps that were started as started, not done or failed. Do not ask for confirmation or resume the workflow until I explicitly tell you to continue.`;
+  return `Stop ${plan} now. Stop all background tasks, subagents, and other Omnigent sessions working on this workflow run. Tell each worker to stop its own background tasks, agents, and Omnigent sessions recursively, verify their shutdown, and report back before it stops. Cancel background commands through their original task/terminal handles and wait for their exit results. A missing handle or an empty process list in another sandbox is not proof of shutdown. Cancel this run's timers and queued follow-ups that could restart the work. Keep this main session available while you coordinate and verify that the work has stopped; report anything you could not stop or verify. Preserve completed results and record the worker/session IDs and what remains so the workflow can resume. Leave unfinished steps that were started as started, not done or failed. Do not ask for confirmation or resume the workflow until I explicitly tell you to continue.`;
 }
 
 /**

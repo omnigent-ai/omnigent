@@ -34,6 +34,7 @@ describe("continuePlanMessage", () => {
     expect(message).toContain("reuse work that is still running");
     expect(message).toContain("preserve completed results");
     expect(message).toContain("do not duplicate work");
+    expect(message).toContain("usable cancellation handle");
   });
 });
 
@@ -49,6 +50,9 @@ describe("stopPlanMessage", () => {
         "its own background tasks, agents, and Omnigent sessions recursively",
       );
       expect(message).toContain("verify that the work has stopped");
+      expect(message).toContain("original task/terminal handles");
+      expect(message).toContain("wait for their exit results");
+      expect(message).toContain("empty process list in another sandbox is not proof");
       expect(message).toContain("report anything you could not stop");
       expect(message).toContain("record the worker/session IDs");
       expect(message).toContain("not done or failed");
