@@ -90,7 +90,10 @@ from omnigent.native._native_supersession import (
     unfiled_clear_replacement_body,
 )
 from omnigent.process_logging import log_info_once
-from omnigent.runner.launch_failure import is_codex_provider_auth_failure
+from omnigent.runner.launch_failure import (
+    is_codex_context_window_error,
+    is_codex_provider_auth_failure,
+)
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -350,6 +353,7 @@ _CODEX_AUTH_HTTP_STATUS_TOKEN = re.compile(r"(?<![\w-])40[13](?![\w-])")
 _CODEX_RATE_LIMIT_ERROR = re.compile(r"(?<![\w-])429(?![\w-])|too many requests|rate[ _-]limit")
 _CODEX_ERROR_KIND_AUTH = "auth"
 _CODEX_ERROR_KIND_GENERIC = "generic"
+_CODEX_ERROR_KIND_CONTEXT = "context_length_exceeded"
 _CODEX_REAUTH_HINT = "If this looks like an auth issue, running `codex login` may help."
 _CODEX_OUTPUT_LIMIT_ERROR = "Incomplete response returned, reason: max_output_tokens"
 _CODEX_OUTPUT_LIMIT_HINT = (
@@ -1460,7 +1464,7 @@ class _CodexTerminalError:
 
     :param message: Human-readable error text, e.g.
         ``"401 Unauthorized: ChatGPT login expired"``.
-    :param kind: Classification, either ``"auth"`` or ``"generic"``.
+    :param kind: Authentication, context-exhaustion or generic classification.
     """
 
     message: str
@@ -1474,12 +1478,14 @@ class _CodexTerminalError:
 
 def _classify_codex_error(error: _JsonObject, message: str) -> str:
     """
-    Classify a Codex ``turn.error`` / ``error`` item as auth-related or generic.
+    Classify an explicit Codex error as authentication, context exhaustion or generic.
 
     Prefers the structured ``codexErrorInfo`` (an ``unauthorized`` variant,
     case-insensitive, or an httpStatusCode of 401/403); falls back to a
     standalone 401/403 token or :data:`_CODEX_AUTH_ERROR_FRAGMENTS` in the
     message for versions/shapes that omit it, unless the message is a 429.
+    Context-window variants or a complete native context refusal retain their
+    canonical cause, after explicit auth and provider-token failures.
 
     Budget/quota exhaustion and IP access list refusals are checked first: the
     AI gateway returns HTTP 403 for both, which the auth checks below would
@@ -1488,15 +1494,8 @@ def _classify_codex_error(error: _JsonObject, message: str) -> str:
 
     :param error: The ``turn.error`` object.
     :param message: Its already-extracted message text.
-    :returns: :data:`_CODEX_ERROR_KIND_AUTH` or
-        :data:`_CODEX_ERROR_KIND_GENERIC`.
+    :returns: The native failure kind; unrecognized evidence remains generic.
     """
-    lowered = message.lower()
-    if any(
-        fragment in lowered
-        for fragment in (*_CODEX_BUDGET_EXHAUSTED_FRAGMENTS, *_CODEX_IP_ACCESS_LIST_FRAGMENTS)
-    ) or is_codex_provider_auth_failure(message):
-        return _CODEX_ERROR_KIND_GENERIC
     info = error.get("codexErrorInfo")
     variant: str | None = None
     http_status: object = None
@@ -1505,9 +1504,22 @@ def _classify_codex_error(error: _JsonObject, message: str) -> str:
     elif isinstance(info, dict):
         variant = info.get("type") or info.get("kind") or info.get("variant")
         http_status = info.get("httpStatusCode")
-    variant_is_auth = variant is not None and variant.lower() in _CODEX_AUTH_ERROR_INFO
-    if variant_is_auth or http_status in _CODEX_AUTH_HTTP_STATUS:
+    lowered = message.lower()
+    if any(
+        fragment in lowered
+        for fragment in (*_CODEX_BUDGET_EXHAUSTED_FRAGMENTS, *_CODEX_IP_ACCESS_LIST_FRAGMENTS)
+    ) or is_codex_provider_auth_failure(message):
+        return _CODEX_ERROR_KIND_GENERIC
+    variant_is_auth = isinstance(variant, str) and variant.lower() in _CODEX_AUTH_ERROR_INFO
+    if variant_is_auth or (type(http_status) is int and http_status in _CODEX_AUTH_HTTP_STATUS):
         return _CODEX_ERROR_KIND_AUTH
+    if isinstance(variant, str) and variant.lower() in {
+        "contextwindowexceeded",
+        "context_window_exceeded",
+    }:
+        return _CODEX_ERROR_KIND_CONTEXT
+    if is_codex_context_window_error(message):
+        return _CODEX_ERROR_KIND_CONTEXT
     if _CODEX_RATE_LIMIT_ERROR.search(lowered):
         return _CODEX_ERROR_KIND_GENERIC
     if _CODEX_AUTH_HTTP_STATUS_TOKEN.search(lowered) or any(
@@ -9094,6 +9106,7 @@ async def _post_status(
     reauth_required: bool = False,
     compaction_model: str | None = None,
     selected_model: str | None = None,
+    error_code: str | None = None,
 ) -> None:
     """
     Publish a native Codex status edge.
@@ -9112,9 +9125,12 @@ async def _post_status(
     :param compaction_model: Previous model a failed pre-turn compaction ran
         on, so the server can explain that switching models won't help.
     :param selected_model: The thread's selected model for that failure.
+    :param error_code: Canonical cause derived from an explicit native error.
     :returns: None.
     """
     data: _JsonObject = {"status": status}
+    if error_code is not None:
+        data["error_code"] = error_code
     if response_id is not None:
         data["response_id"] = response_id
     if output is not None:
@@ -9198,6 +9214,11 @@ async def _post_turn_status_edge(
             reauth_required=reauth_required,
             compaction_model=edge.compaction_model,
             selected_model=edge.selected_model,
+            error_code=(
+                _CODEX_ERROR_KIND_CONTEXT
+                if edge.error is not None and edge.error.kind == _CODEX_ERROR_KIND_CONTEXT
+                else None
+            ),
         )
 
 

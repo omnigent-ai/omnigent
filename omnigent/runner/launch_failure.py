@@ -38,6 +38,7 @@ __all__ = [
     "diagnose_codex_model_rejection",
     "diagnose_codex_provider_auth_failure",
     "diagnose_model_unavailable",
+    "is_codex_context_window_error",
     "is_codex_provider_auth_failure",
 ]
 
@@ -364,10 +365,25 @@ _CODEX_PROVIDER_AUTH_FAILURE = re.compile(
 )
 _EXIT_STATUS_PREFIX = re.compile(r"^\s*(?:exit status: -?\d+|signal: \d+[^:\n]*):?\s*")
 _STORAGE_EXHAUSTED_FRAGMENTS = ("no space left on device", "disk quota exceeded")
+_CODEX_CONTEXT_WINDOW_ERRORS = frozenset(
+    {
+        "Codex ran out of room in the model's context window. "
+        "Start a new thread or clear earlier history before retrying.",
+        "Your input exceeds the context window of this model. "
+        "Please adjust your input and try again.",
+    }
+)
+
+
 # Shells that wrap a token helper; the helper to run is in their arguments.
 _SHELL_PROGRAMS = frozenset({"sh", "bash", "zsh", "dash"})
 # Persisted error labels hold 256 characters.
 _LABEL_LIMIT = 256
+
+
+def is_codex_context_window_error(message: str) -> bool:
+    """Recognize Codex's complete native refusal without matching quoted diagnostics."""
+    return " ".join(message.replace("’", "'").split()) in _CODEX_CONTEXT_WINDOW_ERRORS
 
 
 def classify_native_turn_error(code: str, message: str) -> str:
@@ -390,10 +406,16 @@ def classify_native_turn_error(code: str, message: str) -> str:
     if code == CODEX_COMPACTION_MODEL_FAILED:
         # Its budget text names the previous model's limit; the card explains it.
         return code
-    if code in {"codex_turn_error", "codex_reauth_required"} and is_codex_provider_auth_failure(
-        message
-    ):
+    if code in {
+        "codex_turn_error",
+        "codex_reauth_required",
+        "context_length_exceeded",
+    } and is_codex_provider_auth_failure(message):
         return CODEX_PROVIDER_AUTH_FAILED
+    if code == "context_length_exceeded":
+        return code
+    if code == "codex_turn_error" and is_codex_context_window_error(message):
+        return "context_length_exceeded"
     lowered = message.lower()
     if any(fragment in lowered for fragment in _BUDGET_EXHAUSTED_FRAGMENTS):
         return "budget_exhausted"

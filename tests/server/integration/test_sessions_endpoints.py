@@ -6183,14 +6183,19 @@ async def test_post_external_session_status_failed_forwards_persisted_assistant_
 
 
 @pytest.mark.parametrize(
-    ("spec_harness", "harness_override", "expected_code"),
+    ("spec_harness", "harness_override", "expected_code", "reported_code"),
     [
-        ("codex-native", None, "codex_turn_error"),
-        ("opencode-native", None, "native_turn_error"),
-        ("claude-native", None, "native_turn_error"),
-        ("pi-native", None, "native_turn_error"),
-        ("codex-native", "opencode-native", "native_turn_error"),
-        ("opencode-native", "codex-native", "codex_turn_error"),
+        ("codex-native", None, "codex_turn_error", None),
+        ("opencode-native", None, "native_turn_error", None),
+        ("claude-native", None, "native_turn_error", None),
+        ("pi-native", None, "native_turn_error", None),
+        ("codex-native", "opencode-native", "native_turn_error", None),
+        ("opencode-native", "codex-native", "codex_turn_error", None),
+        ("codex-native", None, "context_length_exceeded", "context_length_exceeded"),
+        ("opencode-native", "codex-native", "context_length_exceeded", "context_length_exceeded"),
+        ("claude-native", None, "native_turn_error", "context_length_exceeded"),
+        ("codex-native", None, "codex_turn_error", "arbitrary_error_code"),
+        ("codex-native", None, "codex_turn_error", {"code": "context_length_exceeded"}),
     ],
 )
 async def test_post_external_session_status_failed_keeps_wire_output_and_harness_code(
@@ -6199,6 +6204,7 @@ async def test_post_external_session_status_failed_keeps_wire_output_and_harness
     spec_harness: str,
     harness_override: str | None,
     expected_code: str,
+    reported_code: object,
 ) -> None:
     """Wire output retains its detail and uses the session's resolved harness."""
     published: list[tuple[str, dict[str, Any]]] = []
@@ -6220,7 +6226,11 @@ async def test_post_external_session_status_failed_keeps_wire_output_and_harness
         f"/v1/sessions/{session['id']}/events",
         json={
             "type": "external_session_status",
-            "data": {"status": "failed", "output": detail},
+            "data": {
+                "status": "failed",
+                "output": detail,
+                **({"error_code": reported_code} if reported_code is not None else {}),
+            },
         },
     )
     assert resp.status_code == 202, resp.text
@@ -14138,3 +14148,73 @@ async def test_external_error_item_model_unavailable_card_live_and_after_reload(
         assert shown["message"] == item_data["message"]
         for field, value in card.items():
             assert shown.get(field) == value, (field, shown)
+
+
+_CODEX_CONTEXT_NATIVE_OUTPUT = (
+    "Codex ran out of room in the model's context window. "
+    "Start a new thread or clear earlier history before retrying."
+)
+
+
+@pytest.mark.parametrize(
+    "wire_output,reauth_required,expected_code",
+    [
+        (None, False, "native_turn_error"),
+        (_CODEX_CONTEXT_NATIVE_OUTPUT, False, "context_length_exceeded"),
+        (_CODEX_CONTEXT_NATIVE_OUTPUT, True, "codex_reauth_required"),
+        (True, False, "native_turn_error"),
+        ({"message": _CODEX_CONTEXT_NATIVE_OUTPUT}, False, "native_turn_error"),
+        ("   ", False, "native_turn_error"),
+    ],
+)
+async def test_codex_context_code_requires_native_wire_output(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    wire_output: object,
+    reauth_required: bool,
+    expected_code: str,
+) -> None:
+    """Fallback assistant prose cannot stand in for an explicit native context failure."""
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": "codex-native"}}
+    )
+    session = await _create_session(client, agent["id"])
+    detail = _CODEX_CONTEXT_NATIVE_OUTPUT
+    stored = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "response_id": "native_context_probe",
+                "source_id": "context_probe_source",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "codex-native-ui",
+                    "content": [{"type": "output_text", "text": detail}],
+                },
+            },
+        },
+    )
+    assert stored.status_code == 202, stored.text
+    data: dict[str, Any] = {
+        "status": "failed",
+        "error_code": "context_length_exceeded",
+        "reauth_required": reauth_required,
+    }
+    if wire_output is not None:
+        data["output"] = wire_output
+    published.clear()
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_status", "data": data},
+    )
+    assert response.status_code == 202, response.text
+    failed = [event for _, event in published if event.get("status") == "failed"]
+    assert failed[0]["error"]["code"] == expected_code
+    assert failed[0]["error"]["message"] == detail
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["status"] == "failed"
+    assert snapshot.json()["last_task_error"]["code"] == expected_code
