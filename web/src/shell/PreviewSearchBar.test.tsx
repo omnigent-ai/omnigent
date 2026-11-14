@@ -114,15 +114,23 @@ describe("PreviewSearchBar", () => {
         Object.defineProperty(Element.prototype, "getBoundingClientRect", elementRect);
     });
 
-    /** A 400px-wide scroller holding *cell*, whose text lies at 900–950px. */
-    function renderWideRow(cellStyle: CSSProperties) {
+    /** A 400×300px scroller holding *cell*, whose matched text lies at *match* (900–950px across). */
+    function renderWideRow(
+      cellStyle: CSSProperties,
+      match = { top: 100, bottom: 120, left: 900, right: 950 },
+    ) {
       const scrollBy = vi.fn();
       Element.prototype.scrollBy = scrollBy;
       Element.prototype.getBoundingClientRect = vi.fn(
         () => ({ top: 0, bottom: 300, left: 0, right: 400, width: 400, height: 300 }) as DOMRect,
       );
       Range.prototype.getBoundingClientRect = vi.fn(
-        () => ({ top: 100, bottom: 120, left: 900, right: 950, width: 50, height: 20 }) as DOMRect,
+        () =>
+          ({
+            ...match,
+            width: match.right - match.left,
+            height: match.bottom - match.top,
+          }) as DOMRect,
       );
       const containerRef = createRef<HTMLDivElement>();
       render(
@@ -150,6 +158,14 @@ describe("PreviewSearchBar", () => {
         type("fox");
       });
       expect(scrollBy).toHaveBeenCalledWith({ top: 0, left: 725, behavior: "smooth" });
+    });
+
+    it("scrolls only down to a match below the fold, already in view across", async () => {
+      const scrollBy = renderWideRow({}, { top: 500, bottom: 520, left: 100, right: 150 });
+      await act(async () => {
+        type("fox");
+      });
+      expect(scrollBy).toHaveBeenCalledWith({ top: 360, left: 0, behavior: "smooth" });
     });
 
     it("reveals a clipped cell, not the hidden tail of its text", async () => {
