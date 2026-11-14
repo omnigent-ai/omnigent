@@ -82,6 +82,7 @@ from omnigent.harnesses.claude_native.submit_verification import (
     SubmitBoundary,
     capture_submit_boundary,
     has_matching_hook_refusal,
+    read_fresh_submit_records,
 )
 from omnigent.harnesses.diagnostics import (
     SIGN_IN_RESEND_STEP,
@@ -3472,6 +3473,17 @@ def read_transcript_path(bridge_dir: Path) -> Path | None:
     if not isinstance(raw, str) or not raw:
         return None
     return Path(raw)
+
+
+def capture_model_switch_boundary(bridge_dir: Path) -> SubmitBoundary | None:
+    """Pin the native transcript before injecting a model command."""
+    transcript_path = read_transcript_path(bridge_dir)
+    native_session_id = read_claude_session_id(bridge_dir)
+    if transcript_path is None or native_session_id is None:
+        return None
+    boundary = capture_submit_boundary(transcript_path, native_session_id)
+    # A missing baseline cannot distinguish fresh records from a recreated history.
+    return boundary if boundary is not None and boundary.file_id is not None else None
 
 
 def read_claude_session_id(bridge_dir: Path) -> str | None:
@@ -6939,39 +6951,6 @@ def terminal_dialog_pending(bridge_dir: Path) -> bool:
         return False
     pane = _capture_pane(socket_path, target)
     return _terminal_dialog_headline(pane) is not None or launcher_install_prompt(pane)
-
-
-# Claude Code echoes a ``/model`` command, then prints this acknowledgement
-# under it ("Set model to Opus 5.5 and saved as your default for new sessions").
-_MODEL_SWITCH_ACKNOWLEDGEMENT = "Set model to "
-
-
-def model_switch_acknowledged(bridge_dir: Path, *, command: str) -> bool:
-    """
-    Check whether Claude Code acknowledged a ``/model`` command on the pane.
-
-    A second confirmation source next to the statusLine snapshot: the
-    acknowledgement Claude Code prints under the echoed command says the
-    switch took effect even when the snapshot spells the model differently
-    or has not been rewritten yet.
-
-    :param bridge_dir: The session's native bridge directory.
-    :param command: The injected command, e.g. ``"/model opus[1m]"``.
-    :returns: ``True`` when the acknowledgement follows the command's last
-        echo on the pane; ``False`` when it does not, the echo is not on
-        screen, or the pane cannot be read.
-    """
-    info = _read_json_file(bridge_dir / _TMUX_FILE)
-    if not isinstance(info, dict):
-        return False
-    socket_path, target = info.get("socket_path"), info.get("tmux_target")
-    if not isinstance(socket_path, str) or not isinstance(target, str):
-        return False
-    lines = _capture_pane(socket_path, target).splitlines()
-    echoes = [index for index, line in enumerate(lines) if command in line]
-    if not echoes:
-        return False
-    return any(_MODEL_SWITCH_ACKNOWLEDGEMENT in line for line in lines[echoes[-1] + 1 :])
 
 
 def auto_mode_billing_notice_visible(pane: str) -> bool:
@@ -10827,6 +10806,41 @@ def _parse_slash_command_record(content: str) -> _SlashCommandPayload | None:
     stdout_match = _COMMAND_STDOUT_RE.search(content)
     output = stdout_match.group(1) if stdout_match else None
     return _SlashCommandPayload(name=name, arguments=arguments, output=output)
+
+
+def model_switch_acknowledged(boundary: SubmitBoundary, model_arg: str) -> bool:
+    """Recognize this command's fresh echo followed by Claude's success stdout."""
+    command_seen = False
+    for entry in read_fresh_submit_records(boundary):
+        if (
+            entry.get("sessionId") != boundary.native_session_id
+            or entry.get("isSidechain") is True
+        ):
+            continue
+        content = entry.get("content")
+        if not isinstance(content, str):
+            message = entry.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, str):
+            continue
+        if _is_slash_command_echo(content):
+            payload = _parse_slash_command_record(content)
+            command_seen = (
+                payload is not None and payload.name == "model" and payload.arguments == model_arg
+            )
+        if not command_seen:
+            continue
+        stdout_match = _COMMAND_STDOUT_RE.search(content)
+        if stdout_match is None:
+            continue
+        if any(
+            line.strip().startswith("Set model to ")
+            and line.strip().removeprefix("Set model to ").strip()
+            for line in stdout_match.group(1).splitlines()
+        ):
+            return True
+        command_seen = False
+    return False
 
 
 def _is_slash_command_echo(content: str) -> bool:
