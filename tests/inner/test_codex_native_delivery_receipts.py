@@ -6,7 +6,7 @@ import asyncio
 import json
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import pytest
 from websockets.asyncio.server import ServerConnection, serve
@@ -25,6 +25,7 @@ from omnigent.native.input_diagnostics import input_delivery_scope
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 from omnigent.runtime.harnesses._scaffold import TurnContext
 from omnigent.server.schemas import CreateResponseRequest
+from tests.budgets import budget
 
 
 @pytest.mark.asyncio
@@ -44,7 +45,6 @@ from omnigent.server.schemas import CreateResponseRequest
         "thread-during-read",
         "socket-during-read",
         "read-failure",
-        "read-timeout",
         "cancel-read",
         "no-server-id",
         "explicit-rejection",
@@ -67,8 +67,6 @@ async def test_native_receipt_requires_exact_delivery_identity(
     reply_timeout = receipt_kind.startswith("reply-timeout-")
     if reply_timeout:
         monkeypatch.setattr(native_executor, "_DELIVERY_RPC_TIMEOUT_SECONDS", 0.1, raising=False)
-    if receipt_kind == "read-timeout":
-        monkeypatch.setattr(native_executor, "_DELIVERY_RECEIPT_TIMEOUT_SECONDS", 0.05)
 
     async def handle(websocket: ServerConnection) -> None:
         async for raw in websocket:
@@ -144,7 +142,7 @@ async def test_native_receipt_requires_exact_delivery_identity(
             if rpc_method == "thread/read":
                 ordering.append("receipt_read")
                 read_waiting.set()
-                if receipt_kind in {"read-timeout", "cancel-read"}:
+                if receipt_kind == "cancel-read":
                     await websocket.wait_closed()
                     return
                 if receipt_kind == "read-failure":
@@ -239,6 +237,41 @@ def _lost_reply_setup(
     )
     write_bridge_state(tmp_path, state)
     return client, request, connect, state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["turn/start", "turn/steer"])
+async def test_receipt_timeout_never_replays_native_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    """A timed-out receipt read leaves the original input ambiguous without replay."""
+    client, request, connect, state = _lost_reply_setup(tmp_path, monkeypatch)
+
+    async def lose_reply_or_wait(rpc_method: str, _params: CodexParams) -> None:
+        if rpc_method == method:
+            raise ConnectionResetError("reply lost")
+        assert rpc_method == "thread/read"
+        await asyncio.Event().wait()
+
+    request.side_effect = lose_reply_or_wait
+    # The deadline fires when the blocked mock read first yields.
+    monkeypatch.setattr(native_executor, "_DELIVERY_RECEIPT_TIMEOUT_SECONDS", 0)
+    params: CodexParams = {"threadId": state.thread_id, "input": []}
+    if method == "turn/steer":
+        params["expectedTurnId"] = "turn_accepted"
+    with input_delivery_scope({"delivery_attempt_id": "c" * 32}):
+        with pytest.raises(InjectionDeliveryAmbiguous):
+            await asyncio.wait_for(
+                native_executor._native_delivery_request_once(
+                    client, method, params, state, bridge_dir=tmp_path
+                ),
+                timeout=budget(5),
+            )
+    assert request.await_args_list == [
+        call(method, {**params, "clientUserMessageId": "c" * 32}),
+        call("thread/read", {"threadId": state.thread_id, "includeTurns": True}),
+    ]
+    connect.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
