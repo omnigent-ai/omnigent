@@ -4881,16 +4881,18 @@ async def _ensure_state_for_transcript(
     :returns: Cursor state for ``transcript_path``.
     """
     if state is not None and state.transcript_path == transcript_path:
-        validated = _validated_transcript_state(
+        validated = await asyncio.to_thread(
+            _validated_transcript_state,
             state,
             session_id=session_id,
         )
         if validated != state:
             await _write_forward_state_async(bridge_dir, validated)
         return validated
-    disk_state = _read_forward_state(bridge_dir)
+    disk_state = await asyncio.to_thread(_read_forward_state, bridge_dir)
     if disk_state is not None and disk_state.transcript_path == transcript_path:
-        validated = _validated_transcript_state(
+        validated = await asyncio.to_thread(
+            _validated_transcript_state,
             disk_state,
             session_id=session_id,
         )
@@ -4906,8 +4908,8 @@ async def _ensure_state_for_transcript(
         if cursor.transcript_path.name != transcript_path.name:
             continue
         try:
-            fingerprint = _jsonl_cursor_fingerprint(
-                transcript_path, cursor.byte_offset, missing_ok=False
+            fingerprint = await asyncio.to_thread(
+                _jsonl_cursor_fingerprint, transcript_path, cursor.byte_offset, missing_ok=False
             )
         except FileNotFoundError:
             # Keep the relocation proof while the advertised path is unavailable.
@@ -4938,7 +4940,9 @@ async def _ensure_state_for_transcript(
         transcript_path=transcript_path,
         line_cursor=0,
         byte_offset=byte_offset,
-        cursor_fingerprint=_jsonl_cursor_fingerprint(transcript_path, byte_offset),
+        cursor_fingerprint=await asyncio.to_thread(
+            _jsonl_cursor_fingerprint, transcript_path, byte_offset
+        ),
     )
     await _write_forward_state_async(bridge_dir, state)
     return state
