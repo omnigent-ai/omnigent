@@ -802,6 +802,8 @@ interface WorkspacePanelProps {
   mobileSideChatsOpen?: boolean;
   /** Open or close the mobile side-chats drawer. */
   onMobileSideChatsOpenChange?: (open: boolean) => void;
+  /** Names a side chat created from its tab during this visit, so the shell doesn't reveal it again. */
+  onSideChatShownInPlace?: (childId: string) => void;
   /** Reports whether a side-chat or sub-agent tab is open, so a phone can reach the drawer. */
   onHasSideChatTabsChange?: (hasSideChatTabs: boolean) => void;
   /** Opens a sub-agent from the Agents tab as a rail tab; absent where unsupported (Grid panes). */
@@ -931,6 +933,7 @@ function WorkspacePanelImpl({
   onShellCreateFailed,
   mobileSideChatsOpen = false,
   onMobileSideChatsOpenChange,
+  onSideChatShownInPlace,
   onHasSideChatTabsChange,
   subagentPanelOpener,
 }: WorkspacePanelProps) {
@@ -1116,10 +1119,21 @@ function WorkspacePanelImpl({
   // would cross-assign when two launches overlap; the generic path skips the
   // queue entirely and rekeys its own tab directly (see startPendingSideChat).
   const awaitingPendingIdsRef = useRef<string[]>([]);
+  // Server-side starts sent from a pending tab during this visit; leaving forgets them.
+  const startedInPlaceIdsRef = useRef(new Set<string>());
+  // The signal such a start published, matched by identity so a displaced one can't linger.
+  const shownInPlaceSignalRef = useRef<typeof sideChatToOpen>(null);
+  const signalConversationIdRef = useRef(conversationId);
   // A side chat the server just created (Codex's native fork, or the generic
   // fork) announces itself via `sideChatToOpen`. If a pending tab is awaiting,
   // rekey it in place; otherwise open a fresh tab. AppShell reveals the rail.
   useEffect(() => {
+    if (signalConversationIdRef.current !== conversationId) {
+      // A start the user navigated away from is revealed when it finishes.
+      startedInPlaceIdsRef.current.clear();
+      shownInPlaceSignalRef.current = null;
+      signalConversationIdRef.current = conversationId;
+    }
     if (sideChatToOpen === null) return;
     // Only the parent that owns this side chat consumes (and clears) the signal
     // — a fork that resolves after the user navigated elsewhere waits for its
@@ -1128,6 +1142,8 @@ function WorkspacePanelImpl({
     if (sideChatToOpen.parentId !== conversationId) return;
     const { childId } = sideChatToOpen;
     const subagentId = subagentSessionIdFromTab(childId);
+    const startedInPlace = shownInPlaceSignalRef.current === sideChatToOpen;
+    if (startedInPlace) shownInPlaceSignalRef.current = null;
     if (subagentId !== null && sideChats.tabs.includes(subagentId)) {
       // Already open as a side chat (a Codex /side fork is listed as a sub-agent).
       sideChats.select(subagentId);
@@ -1146,8 +1162,16 @@ function WorkspacePanelImpl({
       }
     }
     onRightRailTabChange("sidechat");
+    if (startedInPlace) onSideChatShownInPlace?.(childId);
     clearSideChatToOpen();
-  }, [sideChatToOpen, conversationId, sideChats, onRightRailTabChange, clearSideChatToOpen]);
+  }, [
+    sideChatToOpen,
+    conversationId,
+    sideChats,
+    onRightRailTabChange,
+    onSideChatShownInPlace,
+    clearSideChatToOpen,
+  ]);
   const sideChatSelected =
     rightRailTab === "sidechat" &&
     selectedFilePath === null &&
@@ -1220,6 +1244,8 @@ function WorkspacePanelImpl({
           if (sendFailed) throw new Error("side chat send failed");
         });
     }
+    // Native forks can't be matched to their launch, so only this path skips the shell's reveal.
+    startedInPlaceIdsRef.current.add(pendingId);
     return createSideChat(
       conversationId,
       useChatStore.getState().sideChatComposers[pendingId]?.settings,
@@ -1227,18 +1253,21 @@ function WorkspacePanelImpl({
       ({ childSessionId }) => {
         // We have the child id here, so rekey THIS pending tab directly — no
         // shared queue, so overlapping launches can't cross-assign. Seeding the
-        // draft fires sideChatToOpen, which then just re-selects + reveals.
+        // draft fires sideChatToOpen, which then just re-selects it.
         sideChats.rekey(pendingId, childSessionId);
         // The pending id is gone; drop its composer entry (and its File refs)
         // now that the text has moved to the real child. Only on success — a
         // failed create keeps it so the user can retry.
         useChatStore.getState().clearSideChatComposer(pendingId);
+        const startedInPlace = startedInPlaceIdsRef.current.delete(pendingId);
         useChatStore.getState().openSideChatWithDraft(childSessionId, text, conversationId);
+        if (startedInPlace) shownInPlaceSignalRef.current = useChatStore.getState().sideChatToOpen;
       },
       (err) => {
         // The rail path had no failure feedback (unlike the composer entry
         // points); surface it. The pending tab + typed text stay for a retry.
         toast.error("Couldn't start a side chat for this session.");
+        startedInPlaceIdsRef.current.delete(pendingId);
         throw err;
       },
     );
