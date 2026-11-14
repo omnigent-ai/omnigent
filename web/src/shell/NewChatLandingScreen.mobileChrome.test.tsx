@@ -25,9 +25,10 @@ vi.mock("@/hooks/useSidebarData", () => ({
 vi.mock("@/hooks/useSkills", () => ({
   useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
 }));
-// The landing screen's mobile chrome. One rule, about arriving at "/" on a
-// phone: the composer is not focused, so landing here — including on the way
-// back out of Settings — never throws up the keyboard unasked. (The iOS
+// The landing screen's mobile chrome. Arriving at "/" on a phone does not
+// focus the composer, so landing here — including on the way back out of
+// Settings — never throws up the keyboard unasked. The project chip under the
+// heading switches the visit's `?project=` without a search field. (The iOS
 // shell's legacy bottom Chat/Terminal bar is kept hidden app-wide at boot by
 // hideNativeChatTerminalBar in main.tsx, not per-screen here.)
 
@@ -50,11 +51,16 @@ import { MobileHeaderButtonGroup } from "./MobileHeaderButton";
 import { MobileHeaderControlsProvider, MobileHeaderControlsSlot } from "./MobileHeaderControlsSlot";
 
 const replaceSearchParamsMock = vi.fn();
+const route = vi.hoisted(() => ({
+  navigate: vi.fn(),
+  params: new URLSearchParams(),
+  projects: [] as { id: string; name: string; icon?: string | null }[],
+}));
 vi.mock("@/lib/routing", () => ({
   useLocation: () => ({ hash: "", state: null }),
   useReplaceSearchParams: () => replaceSearchParamsMock,
-  useNavigate: () => vi.fn(),
-  useSearchParams: () => [new URLSearchParams(), vi.fn()],
+  useNavigate: () => route.navigate,
+  useSearchParams: () => [route.params, vi.fn()],
 }));
 
 vi.mock("@/store/chatStore", () => ({ setPendingInitialPrompt: vi.fn() }));
@@ -91,7 +97,7 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 }));
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
-  useProjects: () => ({ data: [], isLoading: false }),
+  useProjects: () => ({ data: route.projects, isLoading: false }),
   useProjectConfig: () => ({ data: undefined, isLoading: false }),
 }));
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
@@ -116,9 +122,9 @@ function setViewport(mobile: boolean): void {
   });
 }
 
-function renderLanding(): void {
+function renderLanding() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  render(<NewChatLandingScreen />, {
+  return render(<NewChatLandingScreen />, {
     wrapper: ({ children }: { children: ReactNode }) => (
       <QueryClientProvider client={client}>
         <CapabilitiesProvider info={{ ...SERVER_INFO_OFFLINE_FALLBACK }}>
@@ -151,6 +157,9 @@ beforeEach(() => {
     ],
   } as ReturnType<typeof useAvailableAgents>);
   setViewport(false);
+  route.navigate.mockReset();
+  route.params = new URLSearchParams();
+  route.projects = [];
 });
 
 afterEach(() => {
@@ -221,5 +230,83 @@ describe("NewChatLandingScreen keyboard behaviour", () => {
     fireEvent.click(workspace);
     expect(await screen.findByTestId("new-chat-landing-workspace-open-folder")).toBeVisible();
     expect(input).toHaveValue("Keep this draft");
+  });
+});
+
+describe("NewChatLandingScreen project chip", () => {
+  async function openProjectMenu(): Promise<HTMLElement> {
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-project-chip"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    return screen.findByTestId("new-chat-landing-project-menu");
+  }
+
+  beforeEach(() => {
+    route.projects = [
+      { id: "proj_web", name: "web", icon: "🌐" },
+      { id: "proj_api", name: "api" },
+    ];
+  });
+
+  it("is not rendered on desktop, which names the project in its heading", () => {
+    route.params = new URLSearchParams("project=web");
+    renderLanding();
+    expect(screen.getByRole("heading", { name: "web" })).toBeInTheDocument();
+    expect(screen.queryByTestId("new-chat-landing-project-chip")).not.toBeInTheDocument();
+  });
+
+  it("leads the phone controls and files the visit under a picked project", async () => {
+    setViewport(true);
+    route.params = new URLSearchParams("ref=docs");
+    renderLanding();
+
+    const chip = screen.getByTestId("new-chat-landing-project-chip");
+    expect(chip).toHaveAccessibleName("Project: No project");
+    const controls = screen.getByTestId("new-chat-landing-workspace-controls");
+    expect(controls.firstElementChild).toContainElement(chip);
+
+    const menu = await openProjectMenu();
+    expect(within(menu).queryByRole("textbox")).not.toBeInTheDocument();
+    const rows = within(menu).getAllByRole("menuitemradio");
+    expect(rows.map((row) => row.textContent)).toEqual(["No project", "🌐web", "api"]);
+    expect(rows.map((row) => row.getAttribute("aria-checked"))).toEqual(["true", "false", "false"]);
+    for (const row of rows) expect(row).toHaveClass("min-h-11");
+    fireEvent.click(within(menu).getByRole("menuitemradio", { name: /api/ }));
+    expect(route.navigate).toHaveBeenCalledWith("/?ref=docs&project=api");
+  });
+
+  it("names the current project and clears only `project` for No project", async () => {
+    setViewport(true);
+    route.params = new URLSearchParams("project=web&ref=docs");
+    const { rerender } = renderLanding();
+
+    const chip = screen.getByTestId("new-chat-landing-project-chip");
+    expect(chip).toHaveAccessibleName("Project: web");
+    expect(within(chip).getByTestId("project-icon")).toHaveTextContent("🌐");
+
+    const input = screen.getByTestId("new-chat-landing-input");
+    fireEvent.change(input, { target: { value: "Keep this draft" } });
+    const menu = await openProjectMenu();
+    expect(within(menu).getByRole("menuitemradio", { name: /web/ })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    const noProject = within(menu).getByRole("menuitemradio", { name: "No project" });
+    expect(noProject).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(noProject);
+    expect(route.navigate).toHaveBeenCalledWith("/?ref=docs");
+
+    // Apply the navigation: the landing stays mounted and reseeds as a plain visit.
+    route.params = new URLSearchParams("ref=docs");
+    rerender(<NewChatLandingScreen />);
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-project-chip")).toHaveAccessibleName(
+        "Project: No project",
+      ),
+    );
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep this draft");
+    expect(document.activeElement).not.toBe(screen.getByTestId("new-chat-landing-input"));
   });
 });
