@@ -50,6 +50,7 @@ from omnigent.tools.builtins.read_skill_file import (
     ReadSkillFileTool,
 )
 from omnigent.tools.builtins.scheduled_tasks import (
+    SysReminderSetTool,
     SysScheduledTaskCreateTool,
     SysScheduledTaskDeleteTool,
     SysScheduledTaskListTool,
@@ -98,6 +99,7 @@ __all__ = [
     "SysProjectListTool",
     "SysProjectUpdateTool",
     "SysReadInboxTool",
+    "SysReminderSetTool",
     "SysScheduledTaskCreateTool",
     "SysScheduledTaskDeleteTool",
     "SysScheduledTaskListTool",

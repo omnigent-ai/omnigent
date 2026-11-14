@@ -1357,6 +1357,7 @@ function setupLandingMocks() {
   vi.mocked(useInstallingHarnesses).mockReturnValue(new Set<string>());
   setOmnigentHostConfig({});
   resetLandingDraft();
+  sessionStorage.clear();
   clearSessionDrafts();
   localStorage.clear();
   // host_1's most-recent workspace seeds the field (so submit can enable
@@ -3563,6 +3564,8 @@ describe("desktop Arclet credential preflight", () => {
       await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
       vi.mocked(getDesktopFeatures).mockReturnValueOnce(pendingFeatures);
       fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      // A prompt link arrives while the check is pending; its fallback must outlive this create.
+      fireEvent.click(screen.getByRole("button", { name: "Open another prompt link" }));
       expect(screen.getByTestId("new-chat-landing-input")).toBeDisabled();
       expect(screen.getByRole("button", { name: "Skip" })).toBeEnabled();
       expect(checkDbcert).not.toHaveBeenCalled();
@@ -3581,6 +3584,10 @@ describe("desktop Arclet credential preflight", () => {
         "conv_new",
         expect.objectContaining({ text: "Keep this task during the capability check" }),
       );
+      const keptPrompts = Object.keys(sessionStorage)
+        .filter((key) => key.startsWith("omnigent:linked-prompt"))
+        .map((key) => JSON.parse(sessionStorage.getItem(key) ?? "{}").text);
+      expect(keptPrompts).toEqual(["Another request"]);
     },
   );
 

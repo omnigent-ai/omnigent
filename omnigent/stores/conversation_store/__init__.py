@@ -16,6 +16,7 @@ from omnigent.entities import (
     PagedList,
 )
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
+from omnigent.stores.conversation_store.activity_error import LATEST_ACTIVITY_ERROR_LABEL_KEY
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY
 
 # Pending inputs share the item store, but are not harness transcript history yet.
@@ -258,6 +259,8 @@ _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     SIDE_CHAT_SOURCE_LABEL_KEY,
     _SANDBOX_REPO_LABEL_KEY,
     _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY,
+    # A truncated fork's newest item differs; its next append recomputes it.
+    LATEST_ACTIVITY_ERROR_LABEL_KEY,
 }
 
 
@@ -934,6 +937,11 @@ class ConversationStore(ABC):
         item is returned in its place — flagged ``deduplicated`` — instead
         of inserting a duplicate. The existence check rides the append's
         own transaction, so idempotency costs no extra query.
+
+        Implementations should fold the inserted items into the
+        ``LATEST_ACTIVITY_ERROR_LABEL_KEY`` label with
+        :func:`~omnigent.stores.conversation_store.activity_error.fold_activity_error`
+        in the same write. The label is maintained on append only.
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.

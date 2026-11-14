@@ -328,6 +328,10 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_mcp_services: bool = True
     # Connected hosts and continued sandbox sessions accept ten-minute schedules.
     scheduled_task_subhour: bool = True
+    # Scheduled tasks accept an explicit ``COUNT=1`` rule that fires once, such as
+    # a reminder, and ``first_run_at``. Needs the database scheduler and the
+    # ``one_time_automations`` release feature; absent on older servers.
+    scheduled_task_one_time: bool = False
     # Scheduled-task runs drop a trigger prompt's ``<!-- omnigent-trigger ... -->`` header
     # before dispatch; older servers would send it to the model.
     scheduled_task_trigger_headers: bool = True
@@ -2693,6 +2697,12 @@ def create_app(
     app.state.proactive_agent_available = proactive_agent_available
     app.state.proactive_agent_enabled_for = proactive_agent_enabled_for
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
+    # Separate from dispatch: schedulers accept one-time rules from this release on,
+    # and creating them waits until every scheduler on the database does.
+    app.state.one_time_automations_enabled = automations_v2_enabled and (
+        resolved_feature_flags.enabled(Feature.ONE_TIME_AUTOMATIONS)
+    )
+
     app.state.scheduled_task_store = scheduled_task_store
     app.state.proactive_provisioner = ProactiveProvisioner()
 
@@ -4071,6 +4081,8 @@ def create_app(
                 },
                 "scheduled_task_projects": project_store is not None,
                 "scheduled_task_inbox": automations_enabled,
+                "scheduled_task_one_time": automations_enabled
+                and bool(app.state.one_time_automations_enabled),
                 "session_move_source_checks": True,
                 "session_organize_source_checks": True,
                 "sibling_other_project_standalone": True,

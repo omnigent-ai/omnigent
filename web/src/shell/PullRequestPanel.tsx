@@ -644,9 +644,9 @@ function PullRequestCheckCounts({
   );
 }
 
-/** The Summary tab body: reviewers beside labels, then CI checks with the Merge button, then
- *  the PR description, with dividers between. When the token can't read check runs, the
- *  Checks area says so instead of counts. */
+/** The Summary tab body: reviewers beside labels (stacked when narrow), then CI checks with the
+ *  Merge button, then the PR description, with dividers between. When the token can't read
+ *  check runs, the Checks area says so instead of counts. */
 function PullRequestSummaryTab({
   reviewers,
   labels,
@@ -672,10 +672,18 @@ function PullRequestSummaryTab({
     // Blocks carry their own padding so the dividers between them span the full width.
     <div>
       {showPeople && (
-        <div className="flex">
+        <div className="flex @max-[480px]:flex-col">
           {showReviewers && <div className="min-w-0 flex-1 p-3">{reviewers}</div>}
-          {showReviewers && labels && <Separator orientation="vertical" />}
-          {labels && <div className="min-w-0 flex-1 p-3">{labels}</div>}
+          {labels && (
+            <div
+              className={cn(
+                "min-w-0 flex-1 p-3",
+                showReviewers && "border-l @max-[480px]:border-t @max-[480px]:border-l-0",
+              )}
+            >
+              {labels}
+            </div>
+          )}
         </div>
       )}
       {showPeople && showStatus && <Separator />}
