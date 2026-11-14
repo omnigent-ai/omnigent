@@ -8837,8 +8837,11 @@ def _file_change_tool_call(call_id: str, item: _JsonObject) -> _CodexToolCall | 
     )
 
 
-def _post_file_change_observer(url: str, token: str, payload: _JsonObject) -> None:
-    """POST one observer payload without the server client's auth middleware."""
+def _post_file_change_observer(bridge_dir: Path, payload: _JsonObject) -> None:
+    """Read relay configuration and POST one observer payload on a worker."""
+    relay = json.loads((bridge_dir / "tool_relay.json").read_text(encoding="utf-8"))
+    url = relay["url"].rstrip("/") + "/hook/observe-tool"
+    token = relay["token"]
     encoded = json.dumps(payload).encode("utf-8")
     if len(encoded) > 1_048_576:
         # Preserve paths when original evidence exceeds the relay body limit.
@@ -8878,9 +8881,6 @@ async def _observe_file_change(bridge_dir: Path | None, item: _JsonObject) -> No
     if not observed_changes:
         return
     try:
-        relay = json.loads((bridge_dir / "tool_relay.json").read_text(encoding="utf-8"))
-        url = relay["url"].rstrip("/") + "/hook/observe-tool"
-        token = relay["token"]
         payload: _JsonObject = {
             "hook_event_name": "PostToolUse",
             "tool_name": "apply_patch",
@@ -8889,8 +8889,7 @@ async def _observe_file_change(bridge_dir: Path | None, item: _JsonObject) -> No
         }
         await asyncio.to_thread(
             _post_file_change_observer,
-            url,
-            token,
+            bridge_dir,
             payload,
         )
     except (OSError, ValueError, KeyError, TypeError, urllib.error.URLError) as exc:

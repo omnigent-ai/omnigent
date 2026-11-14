@@ -7,6 +7,7 @@ import base64
 import contextlib
 import json
 import os
+import threading
 import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -7591,8 +7592,9 @@ def test_forwarder_posts_codex_file_change_tool_call() -> None:
     assert posted[1]["data"]["item_data"]["output"] == "add /repo/greeting.py"
 
 
-def test_forwarder_sends_file_change_to_observer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("slow_relay_read", [False, True])
+async def test_forwarder_sends_file_change_to_observer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, slow_relay_read: bool
 ) -> None:
     """A completed fileChange reaches the non-git workspace registry relay."""
     (tmp_path / "tool_relay.json").write_text(
@@ -7624,7 +7626,21 @@ def test_forwarder_sends_file_change_to_observer(
         assert request.url.path != "/hook/observe-tool"
         return httpx.Response(202, json={"queued": False})
 
-    asyncio.run(
+    entered = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    loop = asyncio.get_running_loop()
+    original_read_text = Path.read_text
+
+    def slow_read_text(path: Path, *args: Any, **kwargs: Any) -> str:
+        if slow_relay_read and path == tmp_path / "tool_relay.json":
+            loop.call_soon_threadsafe(entered.set)
+            release.wait(timeout=5.0)
+            finished.set()
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", slow_read_text)
+    task = asyncio.create_task(
         _replay_completed_item(
             {
                 "type": "fileChange",
@@ -7639,6 +7655,15 @@ def test_forwarder_sends_file_change_to_observer(
             bridge_dir=tmp_path,
         )
     )
+    try:
+        if slow_relay_read:
+            await asyncio.wait_for(entered.wait(), timeout=10.0)
+            assert not finished.is_set(), "relay metadata read blocked the event loop"
+            release.set()
+        await task
+    finally:
+        release.set()
+        await task
 
     assert observed == [
         {
