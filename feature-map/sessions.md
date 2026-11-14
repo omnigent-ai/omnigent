@@ -70,7 +70,9 @@ the header menu), and each place is a separate entry point.
   menu and right-click menu. Pin controls, including the session header menu,
   are available only for standalone sessions and family representatives.
 - `stop`: Stop session on a hosted parent ends its runner, including side chats
-  and sub-agents sharing that runner. Conversation histories are kept.
+  and sub-agents sharing that runner, and closes its side shells. On a
+  CLI-launched Claude-native or Devin-native session it closes that session's
+  side shells and leaves the runner running. Conversation histories are kept.
 - `side-chat-lifecycle`: generic side chats reuse their parent's live runner;
   closing one stops only that chat. Starting one from a stopped generic hosted
   parent relaunches the parent first, then shares its replacement runner. An
@@ -629,9 +631,10 @@ sandbox's launch progress and continues there. A message sent while it
 provisions waits for the sandbox.
 
 **Stop session:** open the parent's sidebar row menu or right-click the row and
-choose Stop session while a side chat or sub-agent is working. On mobile, open
-the sidebar drawer and long-press the row. The current-turn interrupt control is
-a separate action that leaves the session connected.
+choose Stop session while a side chat or sub-agent is working or a shell tab is
+open. On mobile, open the sidebar drawer and long-press the row. The
+current-turn interrupt control is a separate action that leaves the session
+connected.
 
 **Side-chat lifecycle:** as the session's owner, use **Workspace → + → Side
 chat**, type `/side` in the parent composer, or choose **Start a new side chat**
