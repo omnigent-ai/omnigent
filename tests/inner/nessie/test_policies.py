@@ -14,10 +14,13 @@ from typing import Any
 import pytest
 
 from omnigent.inner.nessie.policies import (
+    POLICY_REGISTRY,
     blast_radius,
+    extract_subscription_usage_guard_config,
     headless_subagent_purpose_guard,
     read_only_os,
     spawn_bounds,
+    subscription_usage_guard,
     worktree_guard,
 )
 
@@ -584,3 +587,207 @@ def test_read_only_os_allows_reads_and_shell() -> None:
     assert _result(evaluate(_tool_call("sys_os_read", path="a.py"), {})) == "ALLOW"
     assert _result(evaluate(_tool_call("sys_os_shell", command="rg secret"), {})) == "ALLOW"
     assert _result(evaluate(_tool_call("Read", file_path="a.py"), {})) == "ALLOW"
+
+
+@pytest.mark.asyncio
+async def test_subscription_usage_guard_blocks_above_threshold_and_passes_below(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """subscription_usage_guard blocks dispatches at/above threshold and passes below."""
+    from datetime import UTC, datetime, timedelta
+
+    from omnigent.host import usage_limits
+    from omnigent.host.usage_limits import AccountUsage, UsageWindow
+
+    future_reset = datetime.now(UTC) + timedelta(hours=2)
+    current_percent = 55.0
+    probe_calls: list[object] = []
+
+    async def fake_read(
+        providers: object = ("claude", "codex"),
+        *,
+        max_age_seconds: float = 60.0,
+    ) -> list[AccountUsage]:
+        del max_age_seconds
+        probe_calls.append(providers)
+        return [
+            AccountUsage(
+                provider="claude",
+                account="default",
+                status="available",
+                windows=[
+                    UsageWindow(
+                        kind="session",
+                        label="5-hour",
+                        percent_used=current_percent,
+                        resets_at=future_reset,
+                        window_minutes=300,
+                    ),
+                    UsageWindow(
+                        kind="weekly",
+                        label="Weekly",
+                        percent_used=40.0,
+                        resets_at=future_reset + timedelta(days=3),
+                        window_minutes=10080,
+                    ),
+                ],
+                observed_at=datetime.now(UTC),
+            )
+        ]
+
+    monkeypatch.setattr(usage_limits, "read_usage_limits", fake_read)
+    monkeypatch.delenv(usage_limits.USAGE_THRESHOLD_ENV, raising=False)
+    monkeypatch.delenv(usage_limits.USAGE_DISABLED_ENV, raising=False)
+
+    evaluate = subscription_usage_guard(threshold_percent=90.0)
+    below = await evaluate(
+        _tool_call("sys_session_send", agent="claude_code", args={"purpose": "implement"})
+    )
+    assert _result(below) == "ALLOW"
+    assert probe_calls == [("claude",)]
+
+    current_percent = 90.0
+    at_limit = await evaluate(
+        _tool_call("sys_session_send", agent="claude_code", args={"purpose": "implement"})
+    )
+    assert _result(at_limit) == "DENY"
+    assert "90%" in at_limit["reason"]
+    assert "5-hour" in at_limit["reason"]
+
+
+@pytest.mark.asyncio
+async def test_subscription_usage_guard_monitors_weekly_and_skips_non_subscription_workers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Weekly exhaustion denies; non-subscription or rewritten sub-agents do not probe."""
+    from datetime import UTC, datetime, timedelta
+
+    from omnigent.host import usage_limits
+    from omnigent.host.usage_limits import AccountUsage, UsageWindow
+
+    future_reset = datetime.now(UTC) + timedelta(days=2)
+    probed: list[object] = []
+
+    async def fake_read(
+        providers: object = ("claude", "codex"),
+        *,
+        max_age_seconds: float = 60.0,
+    ) -> list[AccountUsage]:
+        del max_age_seconds
+        probed.append(providers)
+        return [
+            AccountUsage(
+                provider="codex",
+                account="default",
+                status="available",
+                windows=[
+                    UsageWindow(
+                        kind="session",
+                        label="5-hour",
+                        percent_used=20.0,
+                        resets_at=future_reset,
+                        window_minutes=300,
+                    ),
+                    UsageWindow(
+                        kind="weekly",
+                        label="Weekly",
+                        percent_used=92.5,
+                        resets_at=future_reset,
+                        window_minutes=10080,
+                    ),
+                ],
+                observed_at=datetime.now(UTC),
+            )
+        ]
+
+    monkeypatch.setattr(usage_limits, "read_usage_limits", fake_read)
+    monkeypatch.delenv(usage_limits.USAGE_THRESHOLD_ENV, raising=False)
+    monkeypatch.delenv(usage_limits.USAGE_DISABLED_ENV, raising=False)
+
+    evaluate = subscription_usage_guard(threshold_percent=90.0)
+
+    # Non-subscription harnesses (opencode, pi) skip probing entirely.
+    assert _result(await evaluate(_tool_call("sys_session_send", agent="opencode"))) == "ALLOW"
+    assert _result(await evaluate(_tool_call("sys_session_send", agent="pi"))) == "ALLOW"
+    assert probed == []
+
+    # Rewritten sub-agent mapping (e.g. mock-LLM openai-agents) skips probing too.
+    rewritten_event = _tool_call("sys_session_send", agent="claude_code")
+    rewritten_event["context"] = {"sub_agent_providers": {"claude_code": None}}
+    assert _result(await evaluate(rewritten_event)) == "ALLOW"
+    assert probed == []
+
+    # In-flight session_id steering (no agent=) skips policy-level block so runner can steer WIP.
+    assert (
+        _result(await evaluate(_tool_call("sys_session_send", session_id="conv_child_1")))
+        == "ALLOW"
+    )
+    assert probed == []
+
+    # Codex weekly window >= 90% denies new dispatches and sys_session_create.
+    denied = await evaluate(_tool_call("sys_session_send", agent="codex"))
+    assert _result(denied) == "DENY"
+    assert "Weekly 92.5% used" in denied["reason"]
+    assert probed == [("codex",)]
+
+    denied_create = await evaluate(
+        _tool_call("sys_session_create", config_path="agents/codex/config.yaml")
+    )
+    assert _result(denied_create) == "DENY"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"threshold_percent": 0},
+        {"threshold_percent": 105},
+        {"threshold_percent": True},
+        {"window_kinds": []},
+        {"window_kinds": ["hourly"]},
+        {"dispatch_tools": []},
+    ],
+)
+def test_subscription_usage_guard_rejects_invalid_arguments(kwargs: dict[str, Any]) -> None:
+    """Invalid policy factory parameters fail loudly at build time."""
+    with pytest.raises(ValueError):
+        subscription_usage_guard(**kwargs)
+
+
+def test_subscription_usage_guard_registered_and_extractable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Registry exposes subscription_usage_guard and config extraction honors env override."""
+    from omnigent.host import usage_limits
+    from omnigent.spec.types import AgentSpec, FunctionPolicySpec, FunctionRef, GuardrailsSpec
+
+    handlers = {entry["handler"] for entry in POLICY_REGISTRY}
+    assert "omnigent.inner.nessie.policies.subscription_usage_guard" in handlers
+
+    monkeypatch.delenv(usage_limits.USAGE_THRESHOLD_ENV, raising=False)
+    monkeypatch.delenv(usage_limits.USAGE_DISABLED_ENV, raising=False)
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="polly",
+        guardrails=GuardrailsSpec(
+            policies=[
+                FunctionPolicySpec(
+                    name="subscription_usage_guard",
+                    on=None,
+                    function=FunctionRef(
+                        path="omnigent.inner.nessie.policies.subscription_usage_guard",
+                        arguments={"threshold_percent": 85, "window_kinds": ["session"]},
+                    ),
+                )
+            ]
+        ),
+    )
+    cfg = extract_subscription_usage_guard_config(spec)
+    assert cfg is not None
+    assert cfg.threshold_percent == 85.0
+    assert cfg.window_kinds == frozenset({"session"})
+
+    monkeypatch.setenv(usage_limits.USAGE_THRESHOLD_ENV, "72.5")
+    overridden = extract_subscription_usage_guard_config(spec)
+    assert overridden is not None
+    assert overridden.threshold_percent == 72.5

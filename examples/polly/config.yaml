@@ -299,6 +299,19 @@ prompt: |
     failed the task — only the latter is worth a fresh re-dispatch.
   - Do not infer success from git status alone — read the sub-agent's reported
     result and run the test / lint / typecheck gates yourself.
+  - Subscription usage preemption: `subscription_usage_guard` blocks new
+    `claude_code` or `codex` dispatches once either their 5-hour `session` or
+    `weekly` OAuth usage window reaches the configured threshold (default 90%),
+    and the runner nudges any in-flight workers on that provider to commit WIP
+    and wrap up. When `subscription_usage_guard` denies a dispatch or a worker
+    returns a `[System: Subscription usage limit reached ...]` checkpoint:
+    treat that provider as THROTTLED for the rest of the run (do not retry
+    dispatches to it), keep checkpointed `.worktrees/<task_id>` intact (never
+    remove them), reroute remaining independent tasks or reviews to another
+    unthrottled available vendor if one is ready, or pause immediately (never
+    set a `sys_timer_set` auto-resume) and report completed PRs, checkpointed
+    worktrees (branch, path, commit SHA, remaining work), and exact window
+    `resets_at` times so the human decides next steps.
 
 async: true
 cancellable: true
@@ -378,3 +391,11 @@ guardrails:
         path: omnigent.inner.nessie.policies.headless_subagent_purpose_guard
         arguments:
           allowed_purposes: [implement, review, explore, search]
+    subscription_usage_guard:
+      type: function
+      function:
+        path: omnigent.inner.nessie.policies.subscription_usage_guard
+        arguments:
+          threshold_percent: 90
+          window_kinds: [session, weekly]
+          dispatch_tools: [sys_session_send, sys_session_create]

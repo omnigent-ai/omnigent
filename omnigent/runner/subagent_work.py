@@ -160,6 +160,7 @@ class _SubagentWorkEntry:
     cancellation_confirmed: bool = False
     corrected_status: str | None = None
     launch_timed_out: bool = False
+    usage_spindown_nudged: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -969,11 +970,116 @@ def reap_stalled_subagent_launches(
     return reaped
 
 
+async def sweep_subagent_usage_limits(
+    *,
+    resolve_parent_spec: Callable[[str], Awaitable[object | None]],
+    session_harness_name: Callable[[str], str | None],
+    post_nudge: Callable[[_SubagentWorkEntry, str], Awaitable[bool]],
+    usage_reader: Callable[..., Awaitable[list[Any]]] | None = None,
+) -> list[_SubagentWorkEntry]:
+    """Send a one-time graceful spin-down notice to active workers whose provider hit threshold."""
+    from omnigent.host.usage_limits import (
+        ACTIVE_MONITOR_MAX_AGE_SECONDS,
+        Provider,
+        exceeded_usage_windows,
+        format_usage_spindown_message,
+        read_usage_limits,
+        subscription_provider_for_worker,
+        usage_limits_disabled,
+    )
+    from omnigent.policies.builtins.orchestration import (
+        SubscriptionUsageGuardConfig,
+        extract_subscription_usage_guard_config,
+    )
+
+    candidates = [
+        entry
+        for entry in list(_subagent_work_by_child.values())
+        if entry.status in ("running", "waiting") and not entry.usage_spindown_nudged
+    ]
+    if not candidates or usage_limits_disabled():
+        return []
+
+    parent_specs: dict[str, object | None] = {}
+    for parent_id in {entry.parent_session_id for entry in candidates}:
+        parent_specs[parent_id] = await resolve_parent_spec(parent_id)
+
+    monitored: list[tuple[_SubagentWorkEntry, Provider, SubscriptionUsageGuardConfig]] = []
+    for entry in candidates:
+        parent_spec = parent_specs.get(entry.parent_session_id)
+        guard_cfg = extract_subscription_usage_guard_config(parent_spec)
+        if guard_cfg is None:
+            continue
+        sub_spec = next(
+            (
+                sub
+                for sub in (getattr(parent_spec, "sub_agents", None) or ())
+                if getattr(sub, "name", None) == entry.agent
+            ),
+            None,
+        )
+        child_harness = session_harness_name(entry.child_session_id)
+        provider = subscription_provider_for_worker(
+            sub_spec, child_harness, sub_agent_name=entry.agent
+        )
+        if provider is not None:
+            monitored.append((entry, provider, guard_cfg))
+
+    if not monitored:
+        return []
+
+    providers = tuple(sorted({provider for _, provider, _ in monitored}))
+    reader = usage_reader or read_usage_limits
+    readings = await reader(providers, max_age_seconds=ACTIVE_MONITOR_MAX_AGE_SECONDS)
+    by_provider: dict[str, list[Any]] = {}
+    for reading in readings:
+        by_provider.setdefault(reading.provider, []).append(reading)
+
+    nudged: list[_SubagentWorkEntry] = []
+    for entry, provider, guard_cfg in monitored:
+        exceeded = [
+            window
+            for reading in by_provider.get(provider, ())
+            for window in exceeded_usage_windows(
+                reading,
+                threshold_percent=guard_cfg.threshold_percent,
+                window_kinds=guard_cfg.window_kinds,
+            )
+        ]
+        if not exceeded:
+            continue
+        message = format_usage_spindown_message(
+            provider,
+            exceeded,
+            threshold_percent=guard_cfg.threshold_percent,
+        )
+        async with in_flight_send_lock(entry.child_session_id):
+            current = _subagent_work_by_child.get(entry.child_session_id)
+            if (
+                current is not entry
+                or entry.status not in ("running", "waiting")
+                or entry.usage_spindown_nudged
+            ):
+                continue
+            if await post_nudge(entry, message):
+                entry.usage_spindown_nudged = True
+                nudged.append(entry)
+                _logger.info(
+                    "Sent subscription usage spin-down notice to sub-agent %s "
+                    "(provider=%s, child=%s)",
+                    entry.agent,
+                    provider,
+                    entry.child_session_id,
+                )
+    return nudged
+
+
 async def run_subagent_launch_reaper(
     *,
     interval_s: float = SUBAGENT_LAUNCH_REAP_INTERVAL_S,
     mark_terminal: MarkSubagentTerminalAndWake | None = None,
     reconcile_pending: Callable[[], Awaitable[None]] | None = None,
+    sweep_usage_limits: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """
     Periodically sweep for sub-agent dispatches wedged in ``launching``.
@@ -986,6 +1092,7 @@ async def run_subagent_launch_reaper(
         the entrypoint passes the app's wake-scheduling seam so a reaped
         failure wakes the parent, not just its inbox.
     :param reconcile_pending: Refresh recovered work awaiting remote completion.
+    :param sweep_usage_limits: Optional active subscription usage monitor callback.
     :returns: None.
     """
     while True:
@@ -994,6 +1101,8 @@ async def run_subagent_launch_reaper(
             reap_stalled_subagent_launches(mark_terminal=mark_terminal)
             if reconcile_pending is not None:
                 await reconcile_pending()
+            if sweep_usage_limits is not None:
+                await sweep_usage_limits()
         except Exception:  # the sweep is a backstop; never die.
             _logger.warning("sub-agent launch reaper sweep failed", exc_info=True)
 

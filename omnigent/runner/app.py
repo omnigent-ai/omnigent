@@ -204,6 +204,7 @@ from omnigent.runner.subagent_work import (
     list_subagent_work,
     mark_subagent_work_started,
     mark_subagent_work_terminal,
+    sweep_subagent_usage_limits,
     unregister_child_session,
     unregister_subagent_work_for_session,
     wrapper_label_from_labels,
@@ -9084,6 +9085,42 @@ def create_runner_app(
         terminal_registry=terminal_registry,
         wake_on_async_result=_wake_on_async_result,
     )
+
+    async def _post_usage_spindown_nudge(entry: _SubagentWorkEntry, message: str) -> bool:
+        from omnigent.runner.tool_dispatch import _post_child_message_event
+
+        try:
+            resp = await _post_child_message_event(
+                server_client,
+                entry.child_session_id,
+                content=[{"type": "input_text", "text": message}],
+                created_by=entry.created_by,
+            )
+        except httpx.HTTPError:
+            _logger.warning(
+                "Failed to send usage spin-down notice to sub-agent %s",
+                entry.child_session_id,
+                exc_info=True,
+            )
+            return False
+        if resp.status_code >= 400:
+            _logger.warning(
+                "Usage spin-down notice rejected for sub-agent %s: %s %s",
+                entry.child_session_id,
+                resp.status_code,
+                resp.text[:200],
+            )
+            return False
+        return True
+
+    async def _sweep_subagent_usage_limits() -> None:
+        await sweep_subagent_usage_limits(
+            resolve_parent_spec=_resolve_session_agent_spec_or_none,
+            session_harness_name=_session_harness_name,
+            post_nudge=_post_usage_spindown_nudge,
+        )
+
+    app.state.sweep_subagent_usage_limits = _sweep_subagent_usage_limits
 
     async def _catch_up_scan() -> None:
         global _server_accepts_inferred_status, _server_accepts_input_only_failures

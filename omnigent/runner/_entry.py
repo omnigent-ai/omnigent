@@ -1821,6 +1821,7 @@ def create_app(
             run_subagent_launch_reaper(
                 mark_terminal=app.state.mark_subagent_terminal_and_wake,
                 reconcile_pending=app.state.reconcile_pending_subagent_results,
+                sweep_usage_limits=getattr(app.state, "sweep_subagent_usage_limits", None),
             ),
             name="runner-subagent-launch-reaper",
         )
