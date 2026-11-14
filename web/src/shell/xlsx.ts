@@ -22,9 +22,11 @@ const BUILT_IN_DATE_FORMATS = new Set([
   52, 53, 54, 55, 56, 57, 58,
 ]);
 const DAY_MS = 86_400_000;
-// Day zero of each date system, in UTC. The 1900 system's epoch absorbs Excel's
-// phantom 1900-02-29, so serials from March 1900 on come out right.
+// Day zero of each date system, in UTC. Excel's 1900 system counts a 29 February
+// 1900 that never was (serial 60): this epoch is right from March 1900 on, and
+// earlier serials start a day later.
 const EPOCH_1900 = Date.UTC(1899, 11, 30);
+const PHANTOM_LEAP_DAY = 60;
 const EPOCH_1904 = Date.UTC(1904, 0, 1);
 /** The last moment Excel shows as a date: the end of 9999-12-31. */
 const LAST_DATE_MS = Date.UTC(10000, 0, 1);
@@ -82,6 +84,17 @@ function zipEntries(bytes: Uint8Array): Map<string, ZipEntry> {
   return entries;
 }
 
+/** The browser's raw-deflate decompressor; older browsers have none. */
+function rawInflater(): DecompressionStream {
+  try {
+    return new DecompressionStream("deflate-raw");
+  } catch {
+    throw new WorkbookError(
+      "This browser can't unzip Excel workbooks. Download the file, or open it in a newer browser.",
+    );
+  }
+}
+
 async function inflateRaw(data: Uint8Array): Promise<Uint8Array> {
   const source = new ReadableStream<BufferSource>({
     start(controller) {
@@ -89,7 +102,7 @@ async function inflateRaw(data: Uint8Array): Promise<Uint8Array> {
       controller.close();
     },
   });
-  const reader = source.pipeThrough(new DecompressionStream("deflate-raw")).getReader();
+  const reader = source.pipeThrough(rawInflater()).getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
   // Sequential by design: each read waits for the previous chunk.
@@ -198,13 +211,20 @@ function dateStyles(styles: Document | null): Set<number> {
  * @returns E.g. ``"2026-03-01"``, ``"12:00:00"`` or ``"2026-03-01 12:00:00"``.
  */
 export function excelSerialToText(serial: number, date1904: boolean): string {
-  const ms = (date1904 ? EPOCH_1904 : EPOCH_1900) + Math.round(serial * DAY_MS);
+  const epoch = date1904
+    ? EPOCH_1904
+    : serial < PHANTOM_LEAP_DAY
+      ? EPOCH_1900 + DAY_MS
+      : EPOCH_1900;
+  const ms = epoch + Math.round(serial * DAY_MS);
   // Excel shows no date before its epoch or past 9999; the number stays visible.
   if (!(serial >= 0 && ms < LAST_DATE_MS)) return numberText(String(serial));
   const iso = new Date(ms).toISOString().slice(0, 19).replace("T", " ");
-  const [day, time] = iso.split(" ");
+  const [isoDay, time] = iso.split(" ");
+  // Excel shows the phantom day as the date it counts.
+  const day = !date1904 && Math.floor(serial) === PHANTOM_LEAP_DAY ? "1900-02-29" : isoDay;
   if (Number.isInteger(serial)) return day;
-  return serial < 1 ? time : iso;
+  return serial < 1 ? time : `${day} ${time}`;
 }
 
 /** ``"BC"`` → 54: the zero-based column of a cell reference's letters. */

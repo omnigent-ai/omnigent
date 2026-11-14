@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
-import { DATA_TABLE_MAX_COLUMNS } from "./dataTable";
+import { describe, expect, it, vi } from "vitest";
+import { DATA_TABLE_MAX_CHARS, DATA_TABLE_MAX_COLUMNS } from "./dataTable";
 import { excelSerialToText, isDateFormatCode, readWorkbook, WorkbookError } from "./xlsx";
 
 /** A fixture's bytes, copied into this realm's buffer as the browser's base64 decode makes them. */
@@ -84,6 +84,29 @@ describe("readWorkbook", () => {
     );
   });
 
+  it("keeps a shared string repeated down the sheet within the text budget", async () => {
+    // 1,000 rows all reference one 32,767-character shared string: 33M characters.
+    const [sheet] = await readWorkbook(fixture("shared-repeated.xlsx"));
+    const rows = sheet.table?.rows ?? [];
+    const kept = rows.reduce((total, [cell]) => total + cell.length, 0);
+    expect(rows).toHaveLength(Math.floor((DATA_TABLE_MAX_CHARS - "note".length) / 32_767));
+    expect(kept).toBeLessThanOrEqual(DATA_TABLE_MAX_CHARS);
+    expect(sheet.table?.totalRows).toBe(1000);
+  });
+
+  it("says when the browser can't unzip a workbook", async () => {
+    vi.stubGlobal("DecompressionStream", undefined);
+    try {
+      await expect(readWorkbook(fixture("sales.xlsx"))).rejects.toThrow(
+        new WorkbookError(
+          "This browser can't unzip Excel workbooks. Download the file, or open it in a newer browser.",
+        ),
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("explains a file that isn't a workbook", async () => {
     await expect(readWorkbook(new TextEncoder().encode("not a zip"))).rejects.toThrow(
       WorkbookError,
@@ -96,6 +119,11 @@ describe("excelSerialToText", () => {
     [45658, false, "2025-01-01"],
     [45658.5, false, "2025-01-01 12:00:00"],
     [0.25, false, "06:00:00"],
+    // Before Excel's phantom 1900-02-29 (serial 60), serials start a day later.
+    [1, false, "1900-01-01"],
+    [59, false, "1900-02-28"],
+    [60, false, "1900-02-29"],
+    [60.5, false, "1900-02-29 12:00:00"],
     [61, false, "1900-03-01"],
     [0, true, "1904-01-01"],
     // Past 9999-12-31 or before the epoch, Excel shows no date; the number stays.

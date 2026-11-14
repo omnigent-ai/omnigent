@@ -10,6 +10,7 @@ import {
   inferColumnType,
   isDataTablePath,
   parseDataTable,
+  tableFromRecords,
 } from "./dataTable";
 
 /** Base64 of raw bytes, as the server sends a file that isn't UTF-8. */
@@ -125,6 +126,25 @@ describe("parseDataTable", () => {
       "number",
       "text",
     ]);
+  });
+});
+
+describe("tableFromRecords", () => {
+  it("keeps the header and rows within the text budget, however often a value repeats", () => {
+    // One string shared by every cell, as a workbook's shared strings or a
+    // Parquet dictionary give it: 500 columns × 1,000 rows of it.
+    const value = "v".repeat(10_000);
+    const row = Array<string>(DATA_TABLE_MAX_COLUMNS).fill(value);
+    const records = [row, ...Array.from({ length: DATA_TABLE_MAX_ROWS }, () => row)];
+
+    const table = tableFromRecords(records, DATA_TABLE_MAX_ROWS, DATA_TABLE_MAX_COLUMNS, "test");
+
+    const kept = [table?.header ?? [], ...(table?.rows ?? [])].flat().join("").length;
+    expect(kept).toBe(DATA_TABLE_MAX_CHARS);
+    // The header spent the budget, cut short; no row fits, but every row counts.
+    expect(table?.header).toHaveLength(DATA_TABLE_MAX_COLUMNS);
+    expect(table?.rows).toEqual([]);
+    expect(table?.totalRows).toBe(DATA_TABLE_MAX_ROWS);
   });
 });
 
