@@ -22,6 +22,7 @@ from fastapi import APIRouter, Query, Request
 
 from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.project_colors import with_project_color
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes.sessions import announce_projects_changed
@@ -91,6 +92,8 @@ def create_projects_router(
     ) -> dict[str, Any]:
         """Create a new, empty project owned by the caller.
 
+        Without an emoji or color, it gets the caller's least-used palette color.
+
         :param request: The incoming request, used to identify the user.
         :param body: Project payload (name).
         :returns: The created project as a serialized dict.
@@ -99,12 +102,9 @@ def create_projects_router(
         """
         user_id = require_user(request, auth_provider)
         await _require_private_source(request, user_id)
+        config = await asyncio.to_thread(with_project_color, project_store, user_id, body.config)
         project = await asyncio.to_thread(
-            project_store.create,
-            uuid.uuid4().hex,
-            body.name,
-            user_id,
-            body.config,
+            project_store.create, uuid.uuid4().hex, body.name, user_id, config
         )
         # Push the change to the owner's other connected clients so their
         # sidebars pick up the new folder without a reload.

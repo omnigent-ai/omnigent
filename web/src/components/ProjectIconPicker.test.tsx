@@ -73,23 +73,85 @@ describe("ProjectLandingIcon", () => {
       use_worktree: true,
       base_branch: "main",
     };
-    renderIcon({ config });
+    renderIcon({ config: { ...config, lucide_icon: "FlaskConical", color: "nord" } });
 
     fireEvent.click(screen.getByTestId("project-icon-tile"));
+    fireEvent.click(screen.getByTestId("project-emoji-button"));
     fireEvent.click(await screen.findByTestId("pick-fire"));
 
     await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
-    // The whole prior config survives; only `icon` is added.
+    // The whole prior config survives; the emoji replaces the lucide icon and color.
     expect(updateMock).toHaveBeenCalledWith("p_1", { ...config, icon: "🔥" });
   });
 
-  it("removes the icon while preserving the other defaults", async () => {
-    renderIcon({ config: { host_id: "h1", icon: "🔥" } });
+  it("saves a searched lucide icon and keeps the project's color", async () => {
+    renderIcon({ config: { host_id: "h1", color: "nord" } });
 
-    fireEvent.click(screen.getByTestId("project-icon-remove"));
+    fireEvent.click(screen.getByTestId("project-icon-tile"));
+    fireEvent.click(screen.getByTestId("project-lucide-button"));
+    fireEvent.change(await screen.findByRole("searchbox", { name: "Search icons" }), {
+      target: { value: "flask con" },
+    });
+    expect(screen.queryByTestId("lucide-icon-Rocket")).toBeNull();
+    fireEvent.click(screen.getByTestId("lucide-icon-FlaskConical"));
 
     await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
-    expect(updateMock).toHaveBeenCalledWith("p_1", { host_id: "h1" });
+    expect(updateMock).toHaveBeenCalledWith("p_1", {
+      host_id: "h1",
+      lucide_icon: "FlaskConical",
+      color: "nord",
+    });
+  });
+
+  it("keeps the lucide icon when a color is picked", async () => {
+    renderIcon({ config: { lucide_icon: "FlaskConical", color: "nord" } });
+
+    fireEvent.click(screen.getByTestId("project-icon-tile"));
+    fireEvent.click(screen.getByTestId("project-color-dracula"));
+
+    await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
+    expect(updateMock).toHaveBeenCalledWith("p_1", {
+      lucide_icon: "FlaskConical",
+      color: "dracula",
+    });
+  });
+
+  it("goes back to the folder from the icon grid, keeping the color", async () => {
+    renderIcon({ config: { lucide_icon: "FlaskConical", color: "nord" } });
+
+    fireEvent.click(screen.getByTestId("project-icon-tile"));
+    fireEvent.click(screen.getByTestId("project-lucide-button"));
+    expect(await screen.findByTestId("lucide-icon-FlaskConical")).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    fireEvent.click(screen.getByTestId("lucide-icon-default"));
+
+    await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
+    expect(updateMock).toHaveBeenCalledWith("p_1", { color: "nord" });
+  });
+
+  it("replaces the emoji with a picked color while preserving the other defaults", async () => {
+    renderIcon({ config: { host_id: "h1", icon: "🔥" } });
+
+    fireEvent.click(screen.getByTestId("project-icon-tile"));
+    fireEvent.click(screen.getByTestId("project-color-nord"));
+
+    await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
+    expect(updateMock).toHaveBeenCalledWith("p_1", { host_id: "h1", color: "nord" });
+  });
+
+  it("shows the picked mark while the save is in flight, without a spinner", async () => {
+    updateMock.mockReturnValue(new Promise(() => {}));
+    renderIcon({ config: { icon: "🔥" } });
+
+    fireEvent.click(screen.getByTestId("project-icon-tile"));
+    fireEvent.click(screen.getByTestId("project-color-nord"));
+
+    await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
+    const tile = screen.getByTestId("project-icon-tile");
+    expect(tile).not.toHaveTextContent("🔥");
+    expect(tile.querySelector("svg")).toHaveStyle({ color: "#5e81ac" });
   });
 
   it("does not write before the config has loaded (guards the data-loss race)", async () => {
@@ -107,12 +169,12 @@ describe("ProjectLandingIcon", () => {
     renderIcon({ projectId: null, config: undefined, configReady: true });
 
     fireEvent.click(screen.getByTestId("project-icon-tile"));
+    fireEvent.click(screen.getByTestId("project-emoji-button"));
     fireEvent.click(await screen.findByTestId("pick-fire"));
 
-    await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
-    // The label-only folder is promoted (created) first, then the icon is set
-    // on the fresh first-class id.
-    expect(createMock).toHaveBeenCalledWith("Work");
-    expect(updateMock).toHaveBeenCalledWith("p_new", { icon: "🔥" });
+    // The label-only folder is promoted by a create that carries the icon; no
+    // follow-up PATCH replaces the config the create stored.
+    await waitFor(() => expect(createMock).toHaveBeenCalledWith("Work", { icon: "🔥" }));
+    expect(updateMock).not.toHaveBeenCalled();
   });
 });

@@ -1,5 +1,5 @@
-import { type CSSProperties, useEffect, useRef, useState } from "react";
-import { ChevronRightIcon, FolderOpenIcon, PlusIcon, SmilePlusIcon } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { ChevronRightIcon, FolderOpenIcon, PlusIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
@@ -11,9 +11,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { EmojiPicker } from "@/components/ProjectIconPicker";
+import { ProjectAppearanceButton } from "@/components/ProjectIconPicker";
 import { useCreateProject, useProjects } from "@/hooks/useConversations";
 import { useCloneHostRepository, useCreateHostDirectory } from "@/hooks/useHostFilesystem";
 import type { Host } from "@/hooks/useHosts";
@@ -25,6 +24,7 @@ import {
   sandboxHostChoiceProvider,
 } from "@/lib/hostPreferences";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { type ProjectAppearance, withProjectAppearance } from "@/lib/projectColors";
 import type { ProjectConfig } from "@/lib/projectsApi";
 import type { LastSandboxRepo } from "@/lib/repoPreferences";
 import { deriveRepoName, sandboxRepoProblem } from "@/lib/sandboxRepositories";
@@ -130,6 +130,8 @@ function friendlyCloneError(error: unknown): string {
   return "The repository couldn’t be cloned. Check the details and try again.";
 }
 
+const UNMARKED: ProjectAppearance = { icon: null, lucideIcon: null, color: null };
+
 /**
  * "New project" control in the Projects group header. Opens a dialog that
  * creates an EMPTY first-class project (`POST /v1/projects`) — the capability
@@ -154,8 +156,8 @@ export function NewProjectButton({
 }) {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
-  const [icon, setIcon] = useState<string | undefined>(undefined);
-  const [emojiOpen, setEmojiOpen] = useState(false);
+  // With nothing picked, the server assigns the least-used color on create.
+  const [appearance, setAppearance] = useState<ProjectAppearance>(UNMARKED);
   // Where the project runs: a host id, or a sandbox choice (see sandboxHostChoice).
   const [runOn, setRunOn] = useState<string | null>(null);
   // A host the user picked, as opposed to the default: only a pick is saved for a name-only project.
@@ -318,8 +320,7 @@ export function NewProjectButton({
       }
     }
 
-    const config: ProjectConfig = {};
-    if (icon) config.icon = icon;
+    const config: ProjectConfig = withProjectAppearance({}, appearance);
     if (runsOnSandbox) {
       config.host_id = SANDBOX_HOST_CHOICE;
       if (sandboxProvider) config.sandbox_provider = sandboxProvider;
@@ -344,7 +345,7 @@ export function NewProjectButton({
           submissionGeneration.current += 1;
           setOpen(false);
           setName("");
-          setIcon(undefined);
+          setAppearance(UNMARKED);
           setRunOn(null);
           runOnPicked.current = false;
           setSourceMode("folder");
@@ -386,30 +387,12 @@ export function NewProjectButton({
         }
         setOpen(next);
         if (!next) {
-          setEmojiOpen(false);
           setWorkspacePickerOpen(false);
           setParentPickerOpen(false);
         }
       }}
     >
-      <DialogContent
-        className="sm:max-w-lg"
-        onClick={(e) => e.stopPropagation()}
-        // emoji-mart preventDefaults the pointer event, so Radix's own
-        // outside-dismissal never fires for clicks elsewhere in the modal.
-        // Catch them in the capture phase and close the picker ourselves,
-        // unless the pointer is inside the picker or on its trigger tile.
-        onPointerDownCapture={(e) => {
-          if (!emojiOpen) return;
-          const target = e.target as Element;
-          if (
-            target.closest('[data-slot="popover-content"]') ||
-            target.closest('[data-testid="new-project-icon"]')
-          )
-            return;
-          setEmojiOpen(false);
-        }}
-      >
+      <DialogContent className="sm:max-w-lg" onClick={(e) => e.stopPropagation()}>
         <DialogHeader>
           <DialogTitle>New project</DialogTitle>
           <DialogDescription>
@@ -417,54 +400,15 @@ export function NewProjectButton({
           </DialogDescription>
         </DialogHeader>
         <fieldset disabled={repositorySubmitting} className="contents">
-          {/* One combined control: emoji tile (left) + name (right) share a
-            single border, so it reads as a single input. */}
+          {/* One combined control: the mark tile (left) + name (right) share a
+            single border, so it reads as a single input. The tile opens the
+            color / emoji picker. */}
           <div className="flex items-stretch overflow-hidden rounded-lg border border-input">
-            <Popover open={emojiOpen} onOpenChange={setEmojiOpen}>
-              <PopoverTrigger asChild>
-                <button
-                  type="button"
-                  aria-label="Choose project icon"
-                  data-testid="new-project-icon"
-                  className="flex w-[38px] shrink-0 cursor-pointer items-center justify-center self-stretch bg-primary/10 outline-none transition-colors"
-                >
-                  {icon ? (
-                    <span className="text-xl leading-none">{icon}</span>
-                  ) : (
-                    <SmilePlusIcon className="size-4 text-primary" />
-                  )}
-                </button>
-              </PopoverTrigger>
-              <PopoverContent
-                align="start"
-                // Publish the collision-aware available viewport height (Radix
-                // exposes it as a CSS var), capped at the picker's natural size,
-                // so the .emoji-picker-popover rule in index.css shrinks
-                // emoji-mart to fit — it then scrolls its grid internally
-                // instead of clipping on short screens.
-                collisionPadding={8}
-                style={
-                  {
-                    "--emoji-picker-height":
-                      "min(420px, var(--radix-popover-content-available-height))",
-                  } as CSSProperties
-                }
-                className="emoji-picker-popover flex max-h-[var(--radix-popover-content-available-height)] w-auto flex-col overflow-hidden p-0"
-                // The Dialog's scroll lock (react-remove-scroll) preventDefaults
-                // wheel events over the picker — it can't see emoji-mart's scroll
-                // region inside shadow DOM. Stop the wheel from reaching the
-                // document-level lock so the grid scrolls.
-                onWheel={(e) => e.stopPropagation()}
-                onInteractOutside={() => setEmojiOpen(false)}
-              >
-                <EmojiPicker
-                  onSelect={(native) => {
-                    setIcon(native);
-                    setEmojiOpen(false);
-                  }}
-                />
-              </PopoverContent>
-            </Popover>
+            <ProjectAppearanceButton
+              value={appearance}
+              onChange={setAppearance}
+              testId="new-project-icon"
+            />
             <input
               autoFocus
               className="w-full bg-transparent px-3 py-2 text-ui outline-none"
@@ -764,7 +708,7 @@ export function NewProjectButton({
               e.stopPropagation();
               submissionGeneration.current += 1;
               setName("");
-              setIcon(undefined);
+              setAppearance(UNMARKED);
               setRunOn(hostId);
               runOnPicked.current = false;
               setSourceMode("folder");
