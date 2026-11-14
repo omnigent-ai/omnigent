@@ -26,6 +26,20 @@ describe("hostPreferences", () => {
     expect(readLastHostChoice()).toBe("host_abc");
   });
 
+  it("normalizes a stored choice carrying the legacy host_ id prefix", () => {
+    const bareId = "9e03c5574ba040e6b79afa47fbd59946";
+    localStorage.setItem("omnigent:last-host-choice", `host_${bareId}`);
+    expect(readLastHostChoice()).toBe(bareId);
+  });
+
+  it.each(["host_9E03C5574BA040E6B79AFA47FBD59946", "host_9e03c5574ba040e6b79afa47fbd599460"])(
+    "leaves %s untouched: only the exact host_<32 lowercase hex> spelling is rewritten",
+    (stored) => {
+      localStorage.setItem("omnigent:last-host-choice", stored);
+      expect(readLastHostChoice()).toBe(stored);
+    },
+  );
+
   it("round-trips the sandbox sentinel", () => {
     // The sandbox option has no host id, so it persists as the reserved
     // sentinel; it must survive the round trip distinctly from any host id.
