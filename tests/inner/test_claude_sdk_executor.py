@@ -7471,7 +7471,7 @@ def _make_recovery_fake_sdk():
         usage={"input_tokens": 10, "output_tokens": 5},
     )
 
-    class _FakeSDK:
+    class _FakeSDK(_SDKTools):
         AssistantMessage = _Sentinel
         UserMessage = _Sentinel
         SystemMessage = _Sentinel
@@ -7492,7 +7492,11 @@ def _make_recovery_fake_sdk():
                 return None
 
             async def query(self, prompt, session_id="default"):
-                self.prompts.append(prompt)
+                if isinstance(prompt, str):
+                    self.prompts.append(prompt)
+                else:
+                    async for message in prompt:
+                        self.prompts.append(message["message"]["content"])
 
             async def receive_response(self):
                 yield sdk_result
@@ -7624,6 +7628,90 @@ async def test_fresh_client_replays_history_within_the_turn_models_window(
         catalog_lookup.assert_called_once_with(model_override)
 
 
+@pytest.mark.parametrize("fixed_input", ["latest", "instructions", "tools", "combined", "file"])
+@pytest.mark.parametrize("fixed_chars", [3_000, 9_000])
+@pytest.mark.parametrize("rebuild", [False, True], ids=["cold-start", "effort-change"])
+async def test_fresh_replay_reserves_room_for_current_input_instructions_and_tools(
+    fixed_input, fixed_chars, rebuild
+) -> None:
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
+
+    fake_sdk = _make_recovery_fake_sdk()
+    executor = ClaudeSDKExecutor(model="test-model", context_window=4_200)
+    latest = "latest request"
+    instructions = ""
+    tools = []
+    if fixed_input in {"latest", "combined"}:
+        latest += "u" * (fixed_chars if fixed_input == "latest" else fixed_chars // 3)
+    if fixed_input in {"instructions", "combined"}:
+        instructions = "s" * (fixed_chars if fixed_input == "instructions" else fixed_chars // 3)
+    if fixed_input in {"tools", "combined"}:
+        tools = [
+            {
+                "name": "example_tool",
+                "description": "t" * (fixed_chars if fixed_input == "tools" else fixed_chars // 3),
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
+    file_text = "f" * fixed_chars
+    content = (
+        [
+            {"type": "input_text", "text": latest},
+            {
+                "type": "input_file",
+                "filename": "notes.txt",
+                "file_data": "data:text/plain;base64,"
+                + base64.b64encode(file_text.encode()).decode(),
+            },
+        ]
+        if fixed_input == "file"
+        else latest
+    )
+    messages = [*_long_prior_messages(), {"role": "user", "content": content}]
+    original_messages = json.dumps(messages)
+    if rebuild:
+        executor._clients["default"] = _ClaudeClientState(
+            client=fake_sdk.ClaudeSDKClient(options=None), model="test-model", effort="low"
+        )
+        fake_sdk.created_clients.clear()
+    with (
+        patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk),
+        patch.object(executor, "_force_close_client", new_callable=AsyncMock),
+    ):
+        events = [
+            event
+            async for event in executor.run_turn(
+                messages,
+                tools,
+                instructions,
+                ExecutorConfig(extra={"reasoning_effort": "high"}) if rebuild else None,
+            )
+        ]
+
+    assert not [event for event in events if isinstance(event, ExecutorError)]
+    [fresh] = fake_sdk.created_clients
+    [prompt] = fresh.prompts
+    text = (
+        prompt
+        if isinstance(prompt, str)
+        else "\n".join(block["text"] for block in prompt if block.get("type") == "text")
+    )
+    omitted = 3 if fixed_chars == 3_000 else 4
+    assert f"[Earlier messages omitted to fit the model's context window: {omitted}.]" in text
+    assert ("turn-3" in text) == (fixed_chars == 3_000)
+    assert "turn-2" not in text
+    assert latest in text
+    assert json.dumps(messages) == original_messages
+    if instructions:
+        assert fresh.options.system_prompt.startswith(instructions)
+    if tools:
+        [server] = fresh.options.mcp_servers.values()
+        assert server["tools"][0].description == tools[0]["description"]
+    if fixed_input == "file":
+        [document] = [block for block in prompt if block.get("type") == "document"]
+        assert document["source"]["data"] == file_text
+
+
 @pytest.mark.asyncio
 async def test_unpinned_databricks_session_replays_within_its_default_models_window() -> None:
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
@@ -7690,21 +7778,23 @@ async def test_invalid_window_override_replays_within_the_default_window(
 
 
 @pytest.mark.asyncio
-async def test_first_turn_skips_the_context_window_lookup() -> None:
+@pytest.mark.parametrize("latest", ["hi", "u" * 9_000], ids=["short", "over-replay-budget"])
+async def test_first_turn_skips_the_context_window_lookup(latest) -> None:
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
     fake_sdk = _make_recovery_fake_sdk()
-    executor = ClaudeSDKExecutor(model="claude-sonnet-4-5")
+    executor = ClaudeSDKExecutor(model="claude-sonnet-4-5", context_window=4_200)
     with (
         patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk),
         patch("omnigent.inner.claude_sdk_executor._resolve_replay_context_window") as resolve,
     ):
         events = [
-            event async for event in executor.run_turn([{"role": "user", "content": "hi"}], [], "")
+            event
+            async for event in executor.run_turn([{"role": "user", "content": latest}], [], "")
         ]
 
     assert any(isinstance(event, TurnComplete) for event in events)
-    assert fake_sdk.created_clients[0].prompts == ["hi"]
+    assert fake_sdk.created_clients[0].prompts == [latest]
     resolve.assert_not_called()
 
 

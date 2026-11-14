@@ -132,8 +132,8 @@ _CLAUDE_CODE_ENABLE_CLAUDEAI_MCP_ENV = "ENABLE_CLAUDEAI_MCP_SERVERS"
 # Claude Code floors a thinking budget at this size and requires max_tokens above it.
 _CLAUDE_CODE_MIN_THINKING_BUDGET_TOKENS = 1024
 
-# A fresh client's replayed history may fill this share of the context window,
-# leaving room for Claude Code's prompt, tools and reply before it can compact.
+# Bound replay plus current inputs to this share of the context window,
+# leaving room for Claude Code's own prompt, tools and reply before it can compact.
 _REPLAYED_HISTORY_WINDOW_SHARE = 0.5
 # Overcounts English and code tokens, and approximates one token per CJK character.
 _REPLAYED_HISTORY_BYTES_PER_TOKEN = 3
@@ -3574,7 +3574,9 @@ class ClaudeSDKExecutor(Executor):
                 after_interrupt=self._clients[session_key].interruption_marker_pending,
             )
             if resume_session
-            else await self._fresh_session_prompt(messages, cfg)
+            else await self._fresh_session_prompt(
+                messages, cfg, tools=tools, system_prompt=system_prompt
+            )
         )
         if not prompt:
             # Resumed sessions can have nothing new to say; signal turn
@@ -3601,7 +3603,9 @@ class ClaudeSDKExecutor(Executor):
             if rebuild:
                 await self._close_live_client(session_key)
                 resume_session = False
-                prompt = await self._fresh_session_prompt(messages, cfg)
+                prompt = await self._fresh_session_prompt(
+                    messages, cfg, tools=tools, system_prompt=system_prompt
+                )
 
         from omnigent.harnesses.claude_native.bridge import (
             MANAGED_MCP_RELAY_MISSING_WARNING,
@@ -4611,16 +4615,23 @@ class ClaudeSDKExecutor(Executor):
         return self._model_override
 
     async def _fresh_session_prompt(
-        self, messages: list[Message], cfg: ExecutorConfig
+        self,
+        messages: list[Message],
+        cfg: ExecutorConfig,
+        *,
+        tools: list[ToolSpec],
+        system_prompt: str,
     ) -> str | list[_JsonObject]:
         """
         Build the first prompt for a newly launched client.
 
-        Prior history is replayed within a share of the turn model's context
-        window, so a long session still fits after its client restarts.
+        Prior history shares its budget with the latest message, supplied
+        instructions and tools, leaving headroom when the client restarts.
 
         :param messages: Conversation history as inner :class:`Message` dicts.
         :param cfg: The turn's executor config, carrying any model override.
+        :param tools: Supplied MCP tool schemas that accompany this prompt.
+        :param system_prompt: Supplied instructions that accompany this prompt.
         :returns: The prompt from :meth:`_build_prompt`.
         """
         budget = None
@@ -4633,7 +4644,16 @@ class ClaudeSDKExecutor(Executor):
                 base_model,
                 cfg.model,
             )
-            budget = int(window * _REPLAYED_HISTORY_WINDOW_SHARE)
+            latest = self._extract_latest_user_content(messages)
+            latest_blocks = latest if isinstance(latest, list) else [_text_block(latest)]
+            fixed_tokens = _estimated_replay_tokens(
+                [
+                    _text_block(system_prompt),
+                    _text_block(json.dumps(tools, ensure_ascii=False)),
+                    *latest_blocks,
+                ]
+            )
+            budget = max(0, int(window * _REPLAYED_HISTORY_WINDOW_SHARE) - fixed_tokens)
         return self._build_prompt(messages, resume_session=False, history_token_budget=budget)
 
     @staticmethod
