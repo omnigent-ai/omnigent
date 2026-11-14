@@ -392,6 +392,7 @@ from omnigent.server.routes._sessions.helpers import (
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.sandbox_profile_launch import prepare_profile, record_profile, saved_profile
 from omnigent.server.schemas import (
+    AgentCost,
     BackgroundTaskInfo,
     ChildSessionSummary,
     CreatedSessionResponse,
@@ -439,6 +440,7 @@ from omnigent.stores.conversation_store import (
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
+    SpawnTreeUsage,
     pinned_label_key,
     runner_seen_is_fresh,
 )
@@ -1603,6 +1605,80 @@ def _publish_subtree_cost_to_ancestors(
         session_stream.publish(ancestor_id, event.model_dump(exclude_none=True))
 
 
+def _agent_costs(tree: Sequence[SpawnTreeUsage], session_id: str) -> list[AgentCost]:
+    """
+    Display costs for *session_id* and its descendants from one loaded tree.
+
+    An agent's cost is its priced subtree total, the figure its own session
+    displays. An agent with nothing priced instead gets the display-only
+    ``subagent_costs_usd`` estimate of its nearest ancestor that reported one
+    (a Claude session reports its nested sub-agents too), which no total sums.
+
+    :param tree: The whole spawn tree, from
+        :meth:`ConversationStore.list_spawn_tree_usage`.
+    :param session_id: Subtree root to report, e.g. ``"conv_abc123"``.
+    :returns: One :class:`AgentCost` per subtree member, in tree order.
+    """
+    by_id = {row.id: row for row in tree}
+    children: dict[str, list[SpawnTreeUsage]] = {}
+    for row in tree:
+        if row.parent_conversation_id is not None:
+            children.setdefault(row.parent_conversation_id, []).append(row)
+    # One depth-first walk of the whole tree (cycle-safe). A row is another's
+    # ancestor exactly when its entry/exit ticks enclose the other's, and rows
+    # exit after all their descendants.
+    enter: dict[str, int] = {}
+    leave: dict[str, int] = {}
+    exits: list[SpawnTreeUsage] = []
+    pending = [(row, False) for row in tree if row.parent_conversation_id not in by_id]
+    while pending:
+        row, done = pending.pop()
+        if done:
+            leave[row.id] = len(enter) + len(leave)
+            exits.append(row)
+        elif row.id not in enter:
+            enter[row.id] = len(enter) + len(leave)
+            pending.append((row, True))
+            pending.extend((child, False) for child in children.get(row.id, ()))
+
+    def is_ancestor(outer: str, inner: str) -> bool:
+        return (
+            outer in leave
+            and inner in leave
+            and enter[outer] < enter[inner]
+            and leave[inner] < leave[outer]
+        )
+
+    totals: dict[str, float] = {}
+    for row in exits:
+        cost = _priced_cost_for_display(row.session_usage)
+        if cost is not None:
+            totals[row.id] = totals.get(row.id, 0.0) + cost
+        parent_id = row.parent_conversation_id
+        if row.id in totals and parent_id is not None and parent_id in by_id:
+            totals[parent_id] = totals.get(parent_id, 0.0) + totals[row.id]
+    # Each child's estimate from its nearest reporting ancestor (latest entry tick).
+    estimates: dict[str, tuple[int, float]] = {}
+    for row in tree:
+        reported = row.session_usage.get("subagent_costs_usd")
+        if not isinstance(reported, dict):
+            continue
+        for child_id, estimate in reported.items():
+            if is_ancestor(row.id, child_id) and enter[row.id] > estimates.get(child_id, (-1,))[0]:
+                estimates[child_id] = (enter[row.id], estimate)
+    return [
+        AgentCost(
+            id=row.id,
+            cost_usd=totals.get(row.id),
+            estimated_cost_usd=(
+                estimates[row.id][1] if row.id not in totals and row.id in estimates else None
+            ),
+        )
+        for row in tree
+        if row.id == session_id or is_ancestor(session_id, row.id)
+    ]
+
+
 class _UnresolvedHarness:
     """Sentinel: the caller has not resolved the session harness yet."""
 
@@ -2072,6 +2148,45 @@ async def _persist_relay_reported_model(
     )
 
 
+# Estimates kept per session. 200 × (32-hex id + 6-decimal float) stays near 12 KB of
+# JSON, far below the 64 KB usage column, so they never fail the authoritative write.
+_MAX_SUBAGENT_COSTS = 200
+_CONVERSATION_ID_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def _subagent_costs_from_report(data: dict[str, Any]) -> dict[str, float]:
+    """
+    Read the well-formed entries of an optional ``subagent_costs_usd`` map.
+
+    The estimates are display-only, so a malformed map or entry is dropped
+    rather than failing the report whose authoritative costs it rides along.
+
+    :param data: The ``external_session_usage`` event ``data`` dict.
+    :returns: ``{child_id: usd}`` for conversation ids with finite
+        non-negative numbers, rounded to 6 decimals; empty when the key is
+        absent or holds no such entry.
+    """
+    raw = data.get("subagent_costs_usd")
+    if not isinstance(raw, dict):
+        return {}
+    costs: dict[str, float] = {}
+    for child_id, value in raw.items():
+        if (
+            not isinstance(child_id, str)
+            or not _CONVERSATION_ID_RE.fullmatch(child_id)
+            or isinstance(value, bool)
+            or not isinstance(value, (int, float))
+        ):
+            continue
+        try:
+            cost = float(value)
+        except OverflowError:  # an integer too large for a float
+            continue
+        if math.isfinite(cost) and cost >= 0:
+            costs[child_id] = round(cost, 6)
+    return costs
+
+
 def _persist_native_cumulative_usage(
     session_id: str,
     data: dict[str, Any],
@@ -2118,6 +2233,12 @@ def _persist_native_cumulative_usage(
       a token report that omits it keeps the persisted cached count.
     - ``model`` — LLM model id to price with (e.g. ``"databricks-gpt-5-5"``);
       falls back to the agent spec's model when absent.
+    - ``subagent_costs_usd`` — display-only per-child estimates, e.g.
+      claude-native's ``{"<child conversation id>": 0.55}``. This session's
+      own cost already includes them, so they are stored apart (each child's
+      maximum, for at most :data:`_MAX_SUBAGENT_COSTS` children) and never
+      summed into totals, policy or the daily rollup. Malformed entries are
+      dropped, never rejected.
 
     The ``total_cost_usd`` key is written only on the priced branches
     below (exact billing, or token-priced when the model is in the
@@ -2141,6 +2262,7 @@ def _persist_native_cumulative_usage(
     cin = _coerce_cumulative_field(data, "cumulative_input_tokens", numeric=False)
     cout = _coerce_cumulative_field(data, "cumulative_output_tokens", numeric=False)
     ccache = _coerce_cumulative_field(data, "cumulative_cache_read_input_tokens", numeric=False)
+    subagent_costs = _subagent_costs_from_report(data)
     if cost is None and policy_cost is None and cin is None and cout is None:
         return None
 
@@ -2291,6 +2413,14 @@ def _persist_native_cumulative_usage(
     # MORE enforcement, never less), which is the safe direction for a budget.
     if policy_cost is not None:
         current["policy_cost_usd"] = max(old_policy_cost, float(policy_cost))
+    if subagent_costs:
+        stored = current.get("subagent_costs_usd")
+        merged: dict[str, float] = dict(stored) if isinstance(stored, dict) else {}
+        for child_id, child_cost in subagent_costs.items():
+            # Past the cap, new children stay unestimated; known ones keep updating.
+            if child_id in merged or len(merged) < _MAX_SUBAGENT_COSTS:
+                merged[child_id] = max(float(merged.get(child_id, 0.0)), child_cost)
+        current["subagent_costs_usd"] = merged
 
     conversation_store.set_session_usage(session_id, current)
     # Per-user daily rollup. Native reports cumulative totals, so the turn's

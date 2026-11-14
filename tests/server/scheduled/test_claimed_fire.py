@@ -104,15 +104,21 @@ class _Claimed:
     clock: FakeClock
 
 
-def _claim(store: SqlAlchemyScheduledTaskStore, **kwargs: Any) -> _Claimed:
-    """Create a due task and claim its first occurrence, as the scheduler's poll would."""
+def _claim(
+    store: SqlAlchemyScheduledTaskStore, *, one_time: bool = False, **kwargs: Any
+) -> _Claimed:
+    """Create a due task and claim its first occurrence, as the scheduler's poll would.
+
+    *one_time* makes it a ``COUNT=1`` task, such as a reminder, whose claim is its
+    last occurrence and completes it.
+    """
     kwargs.setdefault("workspace", "/repo")
     kwargs.setdefault("host_id", _HOST_ID)
     created = store.create(
         uuid.uuid4().hex,
         "nightly",
         "do the thing",
-        "FREQ=HOURLY",
+        "FREQ=HOURLY;COUNT=1" if one_time else "FREQ=HOURLY",
         None,
         _AGENT_ID,
         "UTC",
@@ -124,7 +130,7 @@ def _claim(store: SqlAlchemyScheduledTaskStore, **kwargs: Any) -> _Claimed:
     run = store.claim_scheduled_run(
         task,
         now=task.next_run_at,
-        next_run_at=task.next_run_at + 3600,
+        next_run_at=None if one_time else task.next_run_at + 3600,
         host_id=occurrence_host_id(task, scheduled_trigger_key(task.next_run_at)),
         lease_seconds=_LEASE_SECONDS,
     )
@@ -428,8 +434,14 @@ async def test_delivery_log_failure_does_not_fail_the_run(store, monkeypatch) ->
     assert _runs(store, claimed.task)[0].status == "running"
 
 
-async def test_continued_session_fire_runs_on_the_claimed_run(store) -> None:
-    claimed = _claim(store, session_mode="continue", session_id=_CONV_ID)
+# A one-time task (a reminder) is already completed with no next run when its claimed
+# run continues the session; delivery and settlement must work the same.
+@pytest.mark.parametrize("one_time", [False, True])
+async def test_continued_session_fire_runs_on_the_claimed_run(store, one_time) -> None:
+    claimed = _claim(store, one_time=one_time, session_mode="continue", session_id=_CONV_ID)
+    if one_time:
+        settled = store.get(claimed.task.id)
+        assert (settled.state, settled.next_run_at) == ("completed", None)
     conversations = _ExistingConversationStore(
         _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, host_id=_HOST_ID, workspace="/repo")
     )
@@ -456,6 +468,7 @@ async def test_continued_session_fire_runs_on_the_claimed_run(store) -> None:
         None,
     )
     assert store.get(claimed.task.id).session_id == _CONV_ID
+    assert store.get(claimed.task.id).state == ("completed" if one_time else "active")
 
 
 async def test_a_continue_tasks_first_claimed_run_keeps_its_session(store) -> None:
@@ -784,6 +797,22 @@ async def test_owner_identity_failure_fails_before_creating_a_session(
     assert str(error) not in (run.error or "")
     assert conversations.created == []
     assert store.get(claimed.task.id).state == "active"
+
+
+async def test_owner_identity_failure_of_a_one_time_task_promises_no_retry(store) -> None:
+    claimed = _claim(store, one_time=True)
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=_ConversationStore()),
+        fire_identity=_failing_identity(ConnectionError("token service unavailable")),
+        launch_dispatch=AsyncMock(),
+    )
+    await executor.fire(claimed.task, claimed.lease)
+
+    [run] = _runs(store, claimed.task)
+    assert (run.status, run.error_code) == ("failed", "owner_identity_unavailable")
+    assert "tries again" not in run.error
+    assert "no later run" in run.error
+    assert store.get(claimed.task.id).state == "completed"
 
 
 async def test_revoked_identity_of_a_deleted_owner_disables_the_task(store, monkeypatch) -> None:

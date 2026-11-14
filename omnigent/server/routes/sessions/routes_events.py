@@ -2091,6 +2091,15 @@ def register_events_routes(
                 )
             return {"queued": False}
         if body.type == _STOP_SESSION_TYPE:
+            control_runner = await _get_runner_client(
+                session_id, runner_router, conversation=conv, for_control=True
+            )
+            # Shared-session control follows the runner's tunnel. Its host can
+            # reconnect elsewhere; only the owner needs host-directed termination.
+            if control_runner is None or await _owns_host_runner(conv, conversation_store):
+                await _raise_if_runner_on_another_replica(
+                    conv, request.app.state, conversation_store
+                )
             # Fence the cancelled turn, same as interrupt.
             _interrupt_fenced_sessions.add(session_id)
             # Harness-agnostic forward: the runner kills the external
@@ -2111,10 +2120,21 @@ def register_events_routes(
             if not stop_delivered:
                 # No runner resolved: nothing else lifts the fence (same as interrupt).
                 _interrupt_fenced_sessions.discard(session_id)
+            stop_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            owns_runner = stop_conv is not None and await _owns_host_runner(
+                stop_conv, conversation_store
+            )
             if (
                 stop_delivered
-                and not conv.host_id
-                and (conv.labels or {}).get(SIDE_CHAT_LABEL_KEY)
+                and not owns_runner
+                and (
+                    (conv.labels or {}).get(SIDE_CHAT_LABEL_KEY)
+                    or (
+                        conv.parent_conversation_id is not None
+                        and await asyncio.to_thread(routing_host_id, conv, conversation_store)
+                        is not None
+                    )
+                )
             ):
                 # A shared-runner chat owns its harness resources, while the
                 # parent owns the runner. Keep the persisted transcript.
@@ -2123,25 +2143,19 @@ def register_events_routes(
                         session_id, runner_router, for_control=True
                     )
                     if cleanup_client is None:
-                        raise ConnectionError("Side-chat runner is unavailable")
+                        raise ConnectionError("Shared session runner is unavailable")
                     cleanup_resp = await cleanup_client.delete(
                         f"/v1/sessions/{session_id}", timeout=60.0
                     )
                     cleanup_resp.raise_for_status()
                 except (httpx.HTTPError, ConnectionError) as exc:
                     raise OmnigentError(
-                        "Couldn't release the side chat's resources. Please try again.",
+                        "Couldn't release the session's resources. Please try again.",
                         code=ErrorCode.RUNNER_UNAVAILABLE,
                     ) from exc
             # Only the runner's owner stops it: the process serves every chat
             # bound to it, so a sub-agent riding an ancestor's runner leaves it up.
-            stop_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if (
-                stop_conv is not None
-                and stop_conv.host_id
-                and stop_conv.runner_id
-                and await _owns_host_runner(stop_conv, conversation_store)
-            ):
+            if stop_conv is not None and stop_conv.host_id and stop_conv.runner_id and owns_runner:
                 stop_host_registry = getattr(request.app.state, "host_registry", None)
                 host_stopped = await _stop_host_runner_intentionally(
                     session_id,
@@ -2193,6 +2207,25 @@ def register_events_routes(
                     conversation_store.get_session_connectivity, [session_id]
                 )
                 stop_conn = stop_connectivity.get(session_id)
+                # A child cannot stop the shared host process as fallback.
+                # A live shared runner must acknowledge its session cleanup.
+                if (
+                    stop_conn is not None
+                    and stop_conn.runner_id is not None
+                    and runner_seen_is_fresh(stop_conn.runner_last_seen)
+                    and not owns_runner
+                    and (
+                        conv.parent_conversation_id is not None
+                        or (conv.labels or {}).get(SIDE_CHAT_LABEL_KEY)
+                    )
+                    and await asyncio.to_thread(routing_host_id, conv, conversation_store)
+                    is not None
+                ):
+                    raise OmnigentError(
+                        "Couldn't reach the shared session's runner to confirm it stopped. "
+                        "Please try again.",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
                 if (
                     stop_conn is not None
                     and stop_conn.runner_id is not None
