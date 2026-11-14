@@ -88,6 +88,7 @@ import { getEmbedRoot } from "@/lib/host";
 import { hasCommandModifier } from "@/lib/hotkeys";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { MarkdownTableOfContents } from "./MarkdownTableOfContents";
+import { PdfPreviewBoundary } from "./PdfPreviewBoundary";
 import { VideoPlayer } from "@/components/VideoPlayer";
 import { isVideoFile } from "@/lib/video";
 
@@ -930,21 +931,23 @@ export function CodeViewer({
   }
   if (fileQuery.data && isPdfFile(path, fileQuery.data.content_type)) {
     return (
-      <Suspense
-        fallback={
-          <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
-            Loading…
-          </div>
-        }
-      >
-        <PdfViewer
-          data={fileQuery.data}
-          conversationId={conversationId}
-          comments={previewComments}
-          activeSelection={activeSelection}
-          onSetActiveSelection={onSetActiveSelection}
-        />
-      </Suspense>
+      <PdfPreviewBoundary key={JSON.stringify([conversationId, path])} resetKey={fileQuery.data}>
+        <Suspense
+          fallback={
+            <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
+              Loading…
+            </div>
+          }
+        >
+          <PdfViewer
+            data={fileQuery.data}
+            conversationId={conversationId}
+            comments={previewComments}
+            activeSelection={activeSelection}
+            onSetActiveSelection={onSetActiveSelection}
+          />
+        </Suspense>
+      </PdfPreviewBoundary>
     );
   }
   if (fileQuery.data && isModelFile(path, fileQuery.data.content_type)) {
