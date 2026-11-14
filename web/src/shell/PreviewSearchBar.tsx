@@ -23,6 +23,40 @@ interface PreviewSearchBarProps {
   inputRef: RefObject<HTMLInputElement | null>;
 }
 
+/**
+ * Where a match can be seen: its own rect, clipped sideways to the nearest
+ * ancestor that hides overflow, such as a truncated table cell. A match in a
+ * cell's hidden tail then reveals the cell rather than empty space past it.
+ */
+function visibleMatchRect(
+  range: Range,
+  scroller: Element,
+): Pick<DOMRect, "top" | "bottom" | "left" | "right" | "width" | "height"> {
+  const rect = range.getBoundingClientRect();
+  for (
+    let element = range.startContainer.parentElement;
+    element && element !== scroller;
+    element = element.parentElement
+  ) {
+    const style = getComputedStyle(element);
+    // The shorthand's first value is the horizontal one.
+    const shorthandX = style.overflow.split(" ")[0] || "visible";
+    if (style.overflowX === "visible" && shorthandX === "visible") continue;
+    const clip = element.getBoundingClientRect();
+    const left = Math.min(Math.max(rect.left, clip.left), clip.right);
+    const right = Math.max(Math.min(rect.right, clip.right), clip.left);
+    return {
+      top: rect.top,
+      bottom: rect.bottom,
+      height: rect.height,
+      left,
+      right,
+      width: right - left,
+    };
+  }
+  return rect;
+}
+
 export function PreviewSearchBar({
   containerRef,
   contentVersion,
@@ -76,15 +110,29 @@ export function PreviewSearchBar({
   // client rect of the current range.
   useEffect(() => {
     if (!open || matchCount === 0) return;
-    const rect = ranges[safeIndex]?.getBoundingClientRect();
-    if (!rect || (rect.width === 0 && rect.height === 0)) return;
+    const range = ranges[safeIndex];
     const container = containerRef.current;
     const scroller = container?.closest("[data-preview-scroll]") ?? container;
-    if (!scroller) return;
+    if (!range || !scroller) return;
+    const rect = visibleMatchRect(range, scroller);
+    if (rect.width === 0 && rect.height === 0) return;
     const box = scroller.getBoundingClientRect();
-    if (rect.top >= box.top && rect.bottom <= box.bottom) return; // already visible
+    // A sticky header (a data table's column names) covers the top of the scroller,
+    // so a match under it isn't shown; a match in the header itself is.
+    const sticky = scroller.querySelector("[data-preview-sticky]");
+    const belowHeader =
+      sticky && !sticky.contains(range.startContainer)
+        ? Math.max(box.top, sticky.getBoundingClientRect().bottom)
+        : box.top;
+    // A header taller than what's left of the scroller can't be scrolled past.
+    const top = box.bottom - belowHeader >= rect.height ? belowHeader : box.top;
+    // A wide table also scrolls sideways; center the match on each axis it is off.
+    const shownVertically = rect.top >= top && rect.bottom <= box.bottom;
+    const shownHorizontally = rect.left >= box.left && rect.right <= box.right;
+    if (shownVertically && shownHorizontally) return;
     scroller.scrollBy({
-      top: rect.top - box.top - box.height / 2 + rect.height / 2,
+      top: shownVertically ? 0 : rect.top - top - (box.bottom - top) / 2 + rect.height / 2,
+      left: shownHorizontally ? 0 : rect.left - box.left - box.width / 2 + rect.width / 2,
       behavior: "smooth",
     });
   }, [open, ranges, safeIndex, matchCount, containerRef]);

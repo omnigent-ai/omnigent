@@ -1052,6 +1052,11 @@ describe("resolveFileViewMode", () => {
     ],
     [{ preference: "editor", lang: "html" }, "preview"],
     [{ preference: "source", lang: "html" }, "source"],
+    [{ preference: "preview", lang: "csv" }, "preview"],
+    [
+      { preference: "preview", lang: "csv", deepLinkedComment: true, previewHidesComments: true },
+      "source",
+    ],
     [{ preference: "editor", lang: "python", isPreviewable: false }, "source"],
   ] as const)("resolves %o to %s", (overrides, expected) => {
     expect(resolveFileViewMode({ ...base, ...overrides })).toBe(expected);

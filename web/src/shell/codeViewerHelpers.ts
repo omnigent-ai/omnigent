@@ -91,6 +91,7 @@ export function resolveFileViewMode({
   largeMarkdown,
   largeMarkdownVisitMode,
   deepLinkedComment,
+  previewHidesComments = false,
   preference,
 }: {
   isPreviewable: boolean;
@@ -100,9 +101,12 @@ export function resolveFileViewMode({
   largeMarkdownVisitMode?: "preview" | "source";
   /** A ?comment= link targets this file and needs a surface that shows anchors. */
   deepLinkedComment: boolean;
+  /** The preview can't show comment anchors (a data table), so such a link opens source. */
+  previewHidesComments?: boolean;
   preference: PreviewableViewMode;
 }): PreviewableViewMode {
   if (!isPreviewable) return "source";
+  if (deepLinkedComment && previewHidesComments) return "source";
   if (lang === "markdown" && largeMarkdown) {
     if (largeMarkdownVisitMode) return largeMarkdownVisitMode;
     return deepLinkedComment || preference === "source" ? "source" : "preview";

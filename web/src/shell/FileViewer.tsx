@@ -133,6 +133,7 @@ import {
   openHtmlArtifactInNewTab,
 } from "./codeViewerHelpers";
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
+import { isDataTablePath, isSpreadsheetPath } from "./dataTable";
 import { useScrollRestore } from "./useScrollRestore";
 import { isPdfAnchor } from "./pdfCommentHelpers";
 
@@ -851,7 +852,10 @@ function FileViewerBody({
     }
   }
   const isPreviewable =
-    (lang === "markdown" && !markdownPreviewFallback) || lang === "html" || isNotebookPath(path);
+    (lang === "markdown" && !markdownPreviewFallback) ||
+    lang === "html" ||
+    isNotebookPath(path) ||
+    isDataTablePath(path);
   // Images and PDFs render through CodeViewer's own viewers regardless of view
   // mode; they have no source/diff representation, so diff is suppressed for
   // them (Monaco would otherwise render the base64 payload as garbage text).
@@ -862,6 +866,8 @@ function FileViewerBody({
   // they have no meaningful source/diff/preview text representation, so diff is
   // suppressed and they always resolve to the (viewer-owning) source surface.
   const isModel = isModelFile(path, fileQuery.data?.content_type);
+  // Excel and Parquet open only on the table: no source, diff or line view.
+  const isSpreadsheet = isSpreadsheetPath(path);
   // Binary/base64 files render CodeViewer's "Preview not available" notice, not
   // Monaco — mirrors CodeViewer's own base64/binary-path check.
   const isBinary = fileQuery.data?.encoding === "base64" || isBinaryPath(path);
@@ -871,6 +877,7 @@ function FileViewerBody({
     !isPdf &&
     !isVideo &&
     !isModel &&
+    !isSpreadsheet &&
     (changedFiles.data?.data.some((f) => f.path === path) ?? false);
   const revealTarget = useRevealTarget(path);
   const openInActions = useOpenInActions(isDeletedFile ? null : path);
@@ -938,6 +945,14 @@ function FileViewerBody({
   const [deepLinkBiasPath, setDeepLinkBiasPath] = useState<string | null>(() =>
     initialCommentIdRef.current ? path : null,
   );
+  // A data table's pull toward Source (from a picked comment) belongs to one
+  // visit: opening another file or conversation ends it, so coming back opens the
+  // table again. Other files keep their deep-link bias as before.
+  const [biasVisit, setBiasVisit] = useState({ conversationId, path });
+  if (biasVisit.conversationId !== conversationId || biasVisit.path !== path) {
+    setBiasVisit({ conversationId, path });
+    if (deepLinkBiasPath !== null && isDataTablePath(deepLinkBiasPath)) setDeepLinkBiasPath(null);
+  }
 
   // Switch a markdown file to the rich-text editor — the surface where text-
   // selection commenting works. Used by the preview's "switch to edit mode"
@@ -979,6 +994,7 @@ function FileViewerBody({
     largeMarkdown: markdownSourceFallback ?? false,
     largeMarkdownVisitMode,
     deepLinkedComment: deepLinkBiasPath === path,
+    previewHidesComments: isDataTablePath(path),
     preference: previewableViewMode,
   });
   // Local state triggers rendering; the WeakSet preserves dismissal across remounts.
@@ -995,7 +1011,13 @@ function FileViewerBody({
       : undefined;
   // Citations preserve diff mode; previewable files need source to expose line numbers.
   const viewMode: "editor" | "preview" | "source" | "diff" =
-    effectiveDiffActive && isDiffAvailable ? "diff" : filePosition ? "source" : fileViewMode;
+    effectiveDiffActive && isDiffAvailable
+      ? "diff"
+      : isSpreadsheet
+        ? "preview"
+        : filePosition
+          ? "source"
+          : fileViewMode;
   const diffViewActive = viewMode === "diff";
   // A citation opens large Markdown in editable source; keep source for the visit
   // so clearing the citation cannot drop unsaved edits by returning to Preview.
@@ -1325,9 +1347,12 @@ function FileViewerBody({
       icon: activeMode.icon,
       options: modeOptions,
     });
-  } else if ((lang === "html" || isNotebookPath(path)) && viewMode !== "diff") {
-    // HTML and notebooks have no rich-text editor — a single toggle flips
-    // preview ↔ source.
+  } else if (
+    (lang === "html" || isNotebookPath(path) || isDataTablePath(path)) &&
+    viewMode !== "diff"
+  ) {
+    // HTML, notebooks and data tables have no rich-text editor — a single toggle
+    // flips preview ↔ source.
     toolbarActions.push({
       key: "preview",
       label: viewMode === "preview" ? "View source" : "View preview",
@@ -1341,6 +1366,8 @@ function FileViewerBody({
       onSelect: () => {
         dismissFilePosition(position);
         setDismissedPosition(position);
+        // An explicit choice ends a ?comment= link's pull toward source.
+        setDeepLinkBiasPath(null);
         setPreviewableViewMode(viewMode === "preview" ? "source" : "preview");
       },
     });
@@ -2063,6 +2090,9 @@ function FileViewerBody({
               sender.mutate({ comment_ids: addressableCommentIds });
             }}
             onClickComment={(comment) => {
+              // A data table can't show comment anchors, so picking a comment
+              // opens Source as a ?comment= link does; the toggle still reaches the table.
+              if (isDataTablePath(path)) setDeepLinkBiasPath(path);
               handleSetActiveSelection({
                 start_index: comment.start_index,
                 end_index: comment.end_index,

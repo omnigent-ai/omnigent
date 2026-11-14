@@ -1,0 +1,147 @@
+"""A CSV opens as a table in real Chromium: sticky header, sorting, filtering, phone width."""
+
+from __future__ import annotations
+
+import base64
+from pathlib import Path
+
+from playwright.sync_api import Locator, Page, expect
+
+from tests.browser_ui.files.test_file_line_navigation import (
+    BrowserSession,
+    _mock_markdown_files,
+)
+from tests.browser_ui.files.test_file_line_navigation import (
+    seeded_session as seeded_session_fixture,
+)
+
+seeded_session = seeded_session_fixture
+
+_FILE_PATH = "src/regional_sales.csv"
+_COLUMNS = ["region", "units", "revenue", "closed", "account manager", "notes"]
+_ROWS = [
+    [
+        f"Region {index:03}",
+        str(index * 7 % 50),
+        f"{index * 1013 % 90000}.50",
+        "2026-03-01",
+        "Kim Lee",
+        '"a, b"',
+    ]
+    for index in range(1, 201)
+]
+_CSV = "\n".join([",".join(_COLUMNS), *(",".join(row) for row in _ROWS)])
+
+
+def _open_table(page: Page, session: BrowserSession, width: int, height: int) -> Locator:
+    """Open the CSV at the given viewport size; return its table."""
+    _mock_markdown_files(page, session, {_FILE_PATH: _CSV})
+    base_url, session_id = session
+    page.set_viewport_size({"width": width, "height": height})
+    page.goto(f"{base_url}/c/{session_id}?file={_FILE_PATH}")
+    table = page.get_by_role("table", name=_FILE_PATH)
+    expect(table).to_be_visible(timeout=30_000)
+    return table
+
+
+_FIXTURES = Path(__file__).parents[3] / "web" / "src" / "shell" / "__fixtures__"
+
+
+def _serve_binary_file(page: Page, session: BrowserSession, path: str, data: bytes) -> None:
+    """Serve *path* as the runner sends a binary workspace file: base64."""
+    _mock_markdown_files(page, session, {path: ""})
+    base_url, session_id = session
+    environment_url = f"{base_url}/v1/sessions/{session_id}/resources/environments/default"
+    session.contract.route(
+        f"{environment_url}/filesystem/{path}",
+        lambda route: route.fulfill(
+            json={
+                "object": "session.environment.filesystem.file_content",
+                "path": path,
+                "content": base64.b64encode(data).decode(),
+                "encoding": "base64",
+                "content_type": None,
+                "bytes": len(data),
+            }
+        ),
+    )
+
+
+def _scroller(table: Locator) -> Locator:
+    return table.locator("xpath=ancestor::*[@data-preview-scroll][1]")
+
+
+def test_a_csv_opens_as_a_table_with_a_sticky_header_and_resizable_columns(
+    page: Page, seeded_session: BrowserSession
+) -> None:
+    """In a real layout the header stays in view, a column resizes, and Source opens Monaco.
+
+    Sorting and filtering are covered by the component tests.
+    """
+    table = _open_table(page, seeded_session, 1500, 900)
+    viewer = page.locator('[data-testid="file-viewer"]:visible')
+    expect(viewer.get_by_test_id("data-table-summary")).to_contain_text(
+        "200 rows · 6 columns · comma-separated"
+    )
+
+    header = table.get_by_role("columnheader").first
+    top_before = header.bounding_box()["y"]
+    _scroller(table).evaluate("element => { element.scrollTop = 2000; }")
+    expect(table.get_by_role("cell", name="Region 001")).not_to_be_in_viewport()
+    assert abs(header.bounding_box()["y"] - top_before) < 2, "the header scrolled away"
+    expect(viewer.get_by_test_id("data-table-summary")).to_be_in_viewport()
+
+    units = table.get_by_role("columnheader").nth(1)
+    width_before = units.bounding_box()["width"]
+    handle = table.get_by_role("separator", name="Resize units").bounding_box()
+    page.mouse.move(handle["x"] + handle["width"] / 2, handle["y"] + handle["height"] / 2)
+    page.mouse.down()
+    page.mouse.move(handle["x"] + 120, handle["y"] + handle["height"] / 2, steps=5)
+    page.mouse.up()
+    assert units.bounding_box()["width"] > width_before + 100, "dragging didn't widen the column"
+
+    viewer.get_by_role("button", name="View source").click()
+    expect(viewer.locator(".monaco-editor")).to_be_visible(timeout=30_000)
+    expect(table).to_have_count(0)
+
+
+def test_a_wide_csv_scrolls_sideways_at_phone_width(
+    page: Page, seeded_session: BrowserSession
+) -> None:
+    """At phone width the table scrolls inside the viewer, not the page."""
+    table = _open_table(page, seeded_session, 390, 844)
+    scroller = _scroller(table)
+    assert scroller.evaluate("element => element.scrollWidth > element.clientWidth")
+    assert page.evaluate("() => document.documentElement.scrollWidth <= window.innerWidth"), (
+        "the page itself scrolls sideways"
+    )
+
+
+def test_a_workbook_opens_a_tab_per_sheet_and_parquet_as_a_table(
+    page: Page, seeded_session: BrowserSession
+) -> None:
+    """Excel and Parquet files are read in the browser and shown on the table, never as binary."""
+    base_url, session_id = seeded_session
+    _serve_binary_file(
+        page, seeded_session, "src/sales.xlsx", (_FIXTURES / "sales.xlsx").read_bytes()
+    )
+    page.set_viewport_size({"width": 1500, "height": 900})
+    page.goto(f"{base_url}/c/{session_id}?file=src/sales.xlsx")
+    viewer = page.locator('[data-testid="file-viewer"]:visible')
+    expect(viewer.get_by_role("tab")).to_have_text(["Sales", "Notes", "Empty"], timeout=30_000)
+    expect(viewer.get_by_role("cell", name="2026-01-15 09:30:00")).to_be_visible()
+    viewer.get_by_role("tab", name="Notes").click()
+    expect(viewer.get_by_role("cell", name="café, crème")).to_be_visible()
+    expect(viewer.get_by_role("button", name="View source")).to_have_count(0)
+
+    _serve_binary_file(
+        page,
+        seeded_session,
+        "src/sales.parquet",
+        (_FIXTURES / "sales.snappy.parquet").read_bytes(),
+    )
+    page.goto(f"{base_url}/c/{session_id}?file=src/sales.parquet")
+    expect(viewer.get_by_test_id("data-table-summary")).to_contain_text(
+        "3 rows · 7 columns · Parquet", timeout=30_000
+    )
+    expect(viewer.get_by_text("Preview not available")).to_have_count(0)

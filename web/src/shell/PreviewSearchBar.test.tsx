@@ -7,7 +7,7 @@
 
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createRef } from "react";
+import { createRef, type CSSProperties } from "react";
 import { PreviewSearchBar } from "./PreviewSearchBar";
 
 // Records the ranges set under each highlight name.
@@ -105,6 +105,106 @@ describe("PreviewSearchBar", () => {
     expect(screen.getByText("1 / 2")).toBeDefined();
     expect(painted.get("md-preview-search")).toBe(1); // the non-current match
     expect(painted.get("md-preview-search-current")).toBe(1);
+  });
+
+  describe("revealing a match sideways", () => {
+    const elementRect = Object.getOwnPropertyDescriptor(Element.prototype, "getBoundingClientRect");
+    afterEach(() => {
+      if (elementRect)
+        Object.defineProperty(Element.prototype, "getBoundingClientRect", elementRect);
+    });
+
+    /** A 400×300px scroller holding *cell*, whose matched text lies at *match* (900–950px across). */
+    function renderWideRow(
+      cellStyle: CSSProperties,
+      match = { top: 100, bottom: 120, left: 900, right: 950 },
+      stickyHeader = false,
+    ) {
+      const scrollBy = vi.fn();
+      Element.prototype.scrollBy = scrollBy;
+      Element.prototype.getBoundingClientRect = vi.fn(
+        () => ({ top: 0, bottom: 300, left: 0, right: 400, width: 400, height: 300 }) as DOMRect,
+      );
+      Range.prototype.getBoundingClientRect = vi.fn(
+        () =>
+          ({
+            ...match,
+            width: match.right - match.left,
+            height: match.bottom - match.top,
+          }) as DOMRect,
+      );
+      const containerRef = createRef<HTMLDivElement>();
+      render(
+        <div>
+          <div ref={containerRef}>
+            {stickyHeader && <div data-preview-sticky data-testid="sticky" />}
+            <span data-testid="cell" style={cellStyle}>
+              the fox
+            </span>
+          </div>
+          <PreviewSearchBar
+            containerRef={containerRef}
+            contentVersion="v1"
+            open
+            onClose={vi.fn()}
+            inputRef={createRef<HTMLInputElement>()}
+          />
+        </div>,
+      );
+      return scrollBy;
+    }
+
+    it("scrolls to a match in a column past the right edge", async () => {
+      const scrollBy = renderWideRow({});
+      await act(async () => {
+        type("fox");
+      });
+      expect(scrollBy).toHaveBeenCalledWith({ top: 0, left: 725, behavior: "smooth" });
+    });
+
+    it("scrolls only down to a match below the fold, already in view across", async () => {
+      const scrollBy = renderWideRow({}, { top: 500, bottom: 520, left: 100, right: 150 });
+      await act(async () => {
+        type("fox");
+      });
+      expect(scrollBy).toHaveBeenCalledWith({ top: 360, left: 0, behavior: "smooth" });
+    });
+
+    it("scrolls a match out from under a sticky header", async () => {
+      // The scroller spans 0–300px; its header covers 0–80px, over the match at 20–36px.
+      const scrollBy = renderWideRow({}, { top: 20, bottom: 36, left: 100, right: 150 }, true);
+      screen.getByTestId("sticky").getBoundingClientRect = () =>
+        ({ top: 0, bottom: 80, left: 0, right: 400, width: 400, height: 80 }) as DOMRect;
+      await act(async () => {
+        type("fox");
+      });
+      // Centered in the band below the header: 20 - 80 - 220 / 2 + 16 / 2.
+      expect(scrollBy).toHaveBeenCalledWith({ top: -162, left: 0, behavior: "smooth" });
+    });
+
+    it("leaves a match in the sticky header itself where it is", async () => {
+      const scrollBy = renderWideRow({}, { top: 20, bottom: 36, left: 100, right: 150 }, true);
+      const sticky = screen.getByTestId("sticky");
+      sticky.getBoundingClientRect = () =>
+        ({ top: 0, bottom: 80, left: 0, right: 400, width: 400, height: 80 }) as DOMRect;
+      // The matched text is a column name, inside the header.
+      sticky.append(screen.getByTestId("cell"));
+      await act(async () => {
+        type("fox");
+      });
+      expect(scrollBy).not.toHaveBeenCalled();
+    });
+
+    it("reveals a clipped cell, not the hidden tail of its text", async () => {
+      const scrollBy = renderWideRow({ overflow: "hidden" });
+      // The cell spans 500–600px; its text runs on past it, out of sight.
+      screen.getByTestId("cell").getBoundingClientRect = () =>
+        ({ top: 100, bottom: 120, left: 500, right: 600, width: 100, height: 20 }) as DOMRect;
+      await act(async () => {
+        type("fox");
+      });
+      expect(scrollBy).toHaveBeenCalledWith({ top: 0, left: 400, behavior: "smooth" });
+    });
   });
 
   it("shows 'No results' and paints nothing when nothing matches", async () => {

@@ -1,0 +1,560 @@
+// A minimal Excel (.xlsx) reader for the table preview, with no dependency:
+// the workbook is a zip of XML parts, unzipped with the browser's
+// DecompressionStream and read with DOMParser.
+
+import {
+  DATA_TABLE_MAX_COLUMNS,
+  DATA_TABLE_MAX_ROWS,
+  tableFromRecords,
+  type DataTable,
+} from "./dataTable";
+
+/** Most bytes one part may inflate to, so a zip bomb can't exhaust memory. */
+const MAX_PART_BYTES = 64 * 1024 * 1024;
+/** Most bytes all of a workbook's parts may inflate to together, bounding the work. */
+const MAX_WORKBOOK_BYTES = 256 * 1024 * 1024;
+
+const END_OF_CENTRAL_DIRECTORY = 0x06054b50;
+const CENTRAL_DIRECTORY_ENTRY = 0x02014b50;
+const LOCAL_FILE_HEADER = 0x04034b50;
+
+/** Built-in formats that show only a time of day, e.g. 21 is ``h:mm:ss``. */
+const BUILT_IN_TIME_FORMATS = new Set([18, 19, 20, 21, 45, 47]);
+/** The built-in elapsed-time format, ``[h]:mm:ss``. */
+const BUILT_IN_ELAPSED_FORMAT = 46;
+/** Excel's built-in number formats that show a date or time. */
+const BUILT_IN_DATE_FORMATS = new Set([
+  14, 15, 16, 17, 18, 19, 20, 21, 22, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 45, 46, 47, 50, 51,
+  52, 53, 54, 55, 56, 57, 58,
+]);
+const DAY_MS = 86_400_000;
+// Day zero of each date system, in UTC. Excel's 1900 system counts a 29 February
+// 1900 that never was (serial 60): this epoch is right from March 1900 on, and
+// earlier serials start a day later.
+const EPOCH_1900 = Date.UTC(1899, 11, 30);
+const PHANTOM_LEAP_DAY = 60;
+const EPOCH_1904 = Date.UTC(1904, 0, 1);
+/** The last moment Excel shows as a date: the end of 9999-12-31. */
+const LAST_DATE_MS = Date.UTC(10000, 0, 1);
+
+/** A workbook that can't be read, with a message for the person viewing it. */
+export class WorkbookError extends Error {}
+
+/** A part or workbook past the size limits. */
+class WorkbookTooLargeError extends WorkbookError {}
+
+export interface WorkbookSheet {
+  name: string;
+  /** ``null`` for a sheet with no cells, or one that couldn't be read. */
+  table: DataTable | null;
+  /** Why the sheet couldn't be read, e.g. it is too large to preview. */
+  message?: string;
+}
+
+interface ZipEntry {
+  method: number;
+  compressedSize: number;
+  uncompressedSize: number;
+  offset: number;
+}
+
+function zipEntries(bytes: Uint8Array): Map<string, ZipEntry> {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  // The directory's end record sits 22 bytes from the end, before an optional comment.
+  let end = -1;
+  for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 22 - 0xffff); i--) {
+    if (view.getUint32(i, true) === END_OF_CENTRAL_DIRECTORY) {
+      end = i;
+      break;
+    }
+  }
+  if (end < 0) {
+    throw new WorkbookError(
+      "This file isn't a readable Excel workbook. It may be password-protected or an older .xls file.",
+    );
+  }
+  const entries = new Map<string, ZipEntry>();
+  const count = view.getUint16(end + 10, true);
+  let cursor = view.getUint32(end + 16, true);
+  const names = new TextDecoder();
+  for (let n = 0; n < count; n++) {
+    if (cursor + 46 > bytes.length || view.getUint32(cursor, true) !== CENTRAL_DIRECTORY_ENTRY) {
+      throw new WorkbookError("This Excel workbook is damaged.");
+    }
+    const nameLength = view.getUint16(cursor + 28, true);
+    const name = names.decode(bytes.subarray(cursor + 46, cursor + 46 + nameLength));
+    entries.set(name, {
+      method: view.getUint16(cursor + 10, true),
+      compressedSize: view.getUint32(cursor + 20, true),
+      uncompressedSize: view.getUint32(cursor + 24, true),
+      offset: view.getUint32(cursor + 42, true),
+    });
+    cursor +=
+      46 + nameLength + view.getUint16(cursor + 30, true) + view.getUint16(cursor + 32, true);
+  }
+  return entries;
+}
+
+/** The browser's raw-deflate decompressor; older browsers have none. */
+function rawInflater(): DecompressionStream {
+  try {
+    return new DecompressionStream("deflate-raw");
+  } catch {
+    throw new WorkbookError(
+      "This browser can't unzip Excel workbooks. Download the file, or open it in a newer browser.",
+    );
+  }
+}
+
+const TOO_LARGE = "This workbook is too large to preview. Download it to open it.";
+const TOO_LARGE_SHEET = "This sheet is too large to preview. Download the workbook to open it.";
+const PAST_LIMIT = Symbol("past the size limits");
+
+/** Bytes the workbook's parts may still inflate to. */
+interface InflateBudget {
+  left: number;
+}
+
+async function inflateRaw(data: Uint8Array, limit: number): Promise<Uint8Array> {
+  const source = new ReadableStream<BufferSource>({
+    start(controller) {
+      controller.enqueue(data as Uint8Array<ArrayBuffer>);
+      controller.close();
+    },
+  });
+  const reader = source.pipeThrough(rawInflater()).getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  // Sequential by design: each read waits for the previous chunk.
+  /* oxlint-disable no-await-in-loop */
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.length;
+    if (total > limit) {
+      await reader.cancel();
+      throw new WorkbookTooLargeError(TOO_LARGE);
+    }
+    chunks.push(value);
+  }
+  /* oxlint-enable no-await-in-loop */
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return out;
+}
+
+async function readPart(
+  bytes: Uint8Array,
+  entries: Map<string, ZipEntry>,
+  name: string,
+  budget: InflateBudget,
+): Promise<Document | null> {
+  const entry = entries.get(name);
+  if (!entry) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (view.getUint32(entry.offset, true) !== LOCAL_FILE_HEADER) {
+    throw new WorkbookError("This Excel workbook is damaged.");
+  }
+  const limit = Math.min(MAX_PART_BYTES, budget.left);
+  if (entry.uncompressedSize > limit) throw new WorkbookTooLargeError(TOO_LARGE);
+  const start =
+    entry.offset +
+    30 +
+    view.getUint16(entry.offset + 26, true) +
+    view.getUint16(entry.offset + 28, true);
+  const data = bytes.subarray(start, start + entry.compressedSize);
+  let xml: Uint8Array;
+  if (entry.method === 0) xml = data;
+  else if (entry.method === 8) {
+    try {
+      xml = await inflateRaw(data, limit);
+    } catch (error) {
+      // The work done before the limit counts, so a part can't be retried for free.
+      if (error instanceof WorkbookTooLargeError) budget.left -= limit;
+      throw error;
+    }
+  } else throw new WorkbookError("This workbook uses a compression the preview can't read.");
+  if (xml.length > limit) throw new WorkbookTooLargeError(TOO_LARGE);
+  budget.left -= xml.length;
+  const parsed = new DOMParser().parseFromString(new TextDecoder().decode(xml), "application/xml");
+  // DOMParser reports malformed XML as a <parsererror> element, not by throwing.
+  if (parsed.getElementsByTagName("parsererror").length > 0) {
+    throw new WorkbookError("This Excel workbook is damaged.");
+  }
+  return parsed;
+}
+
+/**
+ * *node*'s descendants named *name*, whatever their namespace prefix: the Open
+ * XML SDK writes ``<x:row>`` where Excel writes ``<row>``.
+ */
+function descendants(node: Document | Element, name: string): Element[] {
+  return Array.from(node.getElementsByTagNameNS("*", name));
+}
+
+/** The text of *element*'s ``<t>`` runs, leaving out phonetic guides. */
+function runText(element: Element): string {
+  return descendants(element, "t")
+    .filter((run) => run.parentElement?.localName !== "rPh")
+    .map((run) => run.textContent ?? "")
+    .join("");
+}
+
+/** A format code without its quoted text, escapes and non-time brackets. */
+function bareFormat(code: string): string {
+  return code
+    .replace(/"[^"]*"/g, "")
+    .replace(/\\./g, "")
+    .replace(/\[(?!h+\]|m+\]|s+\])[^\]]*\]/gi, "");
+}
+
+/** Whether a custom number format shows a date or time, e.g. ``"yyyy-mm-dd"``. */
+export function isDateFormatCode(code: string): boolean {
+  const bare = bareFormat(code);
+  return /[dmyhs]/i.test(bare) && !/general/i.test(bare);
+}
+
+/** Whether a date or time format shows only a time of day, e.g. ``"hh:mm"``. */
+export function isTimeFormatCode(code: string): boolean {
+  const bare = bareFormat(code);
+  // ``m`` next to ``h`` or ``s`` is minutes; three or more is a month name;
+  // ``e``, ``g`` and ``b`` are era years.
+  return /[hs]/i.test(bare) && !/[dyegb]|m{3,}/i.test(bare) && !isElapsedFormatCode(code);
+}
+
+/** Whether a format counts elapsed time past a day, e.g. ``"[h]:mm:ss"`` shows 36:00:00. */
+export function isElapsedFormatCode(code: string): boolean {
+  return elapsedFormat(code) !== null;
+}
+
+/** How an elapsed format counts: its largest unit, and whether it shows seconds. */
+export interface ElapsedFormat {
+  unit: "h" | "m" | "s";
+  seconds: boolean;
+}
+
+/** ``"[mm]:ss"`` → minutes with seconds; ``null`` for a format that isn't elapsed. */
+export function elapsedFormat(code: string): ElapsedFormat | null {
+  const bare = bareFormat(code);
+  const unit = bare.match(/\[(h+|m+|s+)\]/i)?.[1]?.[0]?.toLowerCase();
+  if (unit !== "h" && unit !== "m" && unit !== "s") return null;
+  return { unit, seconds: unit === "s" || /s/i.test(bare.replace(/\[[^\]]*\]/g, "")) };
+}
+
+/** How a cell style shows a date serial: as a date (and time), a time of day, or elapsed time. */
+type DateStyle = "date" | "time" | ElapsedFormat;
+
+function dateStyles(styles: Document | null): Map<number, DateStyle> {
+  const dated = new Map<number, DateStyle>();
+  if (!styles) return dated;
+  const custom = new Map<number, string>();
+  for (const format of descendants(styles, "numFmt")) {
+    custom.set(Number(format.getAttribute("numFmtId")), format.getAttribute("formatCode") ?? "");
+  }
+  const cellFormats = descendants(styles, "cellXfs")[0];
+  if (!cellFormats) return dated;
+  descendants(cellFormats, "xf").forEach((format, index) => {
+    const id = Number(format.getAttribute("numFmtId") ?? 0);
+    const code = custom.get(id);
+    if (code !== undefined ? isDateFormatCode(code) : BUILT_IN_DATE_FORMATS.has(id)) {
+      const elapsed =
+        code !== undefined
+          ? elapsedFormat(code)
+          : id === BUILT_IN_ELAPSED_FORMAT
+            ? ({ unit: "h", seconds: true } as const)
+            : null;
+      const timeOnly = code !== undefined ? isTimeFormatCode(code) : BUILT_IN_TIME_FORMATS.has(id);
+      dated.set(index, elapsed ?? (timeOnly ? "time" : "date"));
+    }
+  });
+  return dated;
+}
+
+/**
+ * Show an Excel date serial as ISO text: a date, a time, or both.
+ *
+ * @param serial - Days since the workbook's epoch, e.g. ``46082.5``.
+ * @param date1904 - Whether the workbook uses the 1904 date system.
+ * @param timeOnly - Whether the cell's format shows only a time of day.
+ * @returns E.g. ``"2026-03-01"``, ``"12:00:00"`` or ``"2026-03-01 12:00:00"``.
+ */
+export function excelSerialToText(serial: number, date1904: boolean, timeOnly = false): string {
+  // Excel shows times to the nearest second, so the day is the rounded serial's.
+  const seconds = Math.round((serial * DAY_MS) / 1000);
+  const rounded = (seconds * 1000) / DAY_MS;
+  const epoch = date1904
+    ? EPOCH_1904
+    : rounded < PHANTOM_LEAP_DAY
+      ? EPOCH_1900 + DAY_MS
+      : EPOCH_1900;
+  const ms = epoch + seconds * 1000;
+  // Excel shows no date before its epoch or past 9999; the number stays visible.
+  if (!(serial >= 0 && ms < LAST_DATE_MS)) return numberText(String(serial));
+  const iso = new Date(ms).toISOString().slice(0, 19).replace("T", " ");
+  const [isoDay, time] = iso.split(" ");
+  // Excel shows the phantom day as the date it counts.
+  const day = !date1904 && Math.floor(rounded) === PHANTOM_LEAP_DAY ? "1900-02-29" : isoDay;
+  if (timeOnly) return time;
+  if (Number.isInteger(serial)) return day;
+  // The 1900 system's day zero isn't a date Excel names; the 1904 system's is.
+  return serial < 1 && !date1904 ? time : `${day} ${time}`;
+}
+
+/**
+ * Elapsed time counted in *format*'s largest unit, as Excel shows it: 1.5 days
+ * is ``"36:00:00"`` as ``[h]:mm:ss``, ``"36:00"`` as ``[h]:mm`` and
+ * ``"2160:00"`` as ``[mm]:ss``.
+ */
+export function elapsedText(days: number, format: ElapsedFormat): string {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  // Rounded to the smallest unit shown.
+  const step = format.seconds ? 1 : 60;
+  const total = Math.round((Math.abs(days) * 86_400) / step) * step;
+  const minutes = Math.floor(total / 60);
+  const seconds = format.seconds ? `:${pad(total % 60)}` : "";
+  const text =
+    format.unit === "h"
+      ? `${Math.floor(minutes / 60)}:${pad(minutes % 60)}${seconds}`
+      : format.unit === "m"
+        ? `${minutes}${seconds}`
+        : String(total);
+  return days < 0 ? `-${text}` : text;
+}
+
+/** ``"BC"`` → 54: the zero-based column of a cell reference's letters. */
+function columnIndex(reference: string): number {
+  let index = 0;
+  for (const char of reference) {
+    const code = char.charCodeAt(0);
+    if (code < 65 || code > 90) break;
+    index = index * 26 + (code - 64);
+  }
+  return index - 1;
+}
+
+/** A plain number as Excel shows it by default: at most 15 significant digits. */
+function numberText(value: string): string {
+  const number = Number(value);
+  return Number.isFinite(number) ? String(Number(number.toPrecision(15))) : value;
+}
+
+function cellText(
+  cell: Element,
+  sharedStrings: string[],
+  dated: Map<number, DateStyle>,
+  date1904: boolean,
+): string {
+  const type = cell.getAttribute("t");
+  if (type === "inlineStr") {
+    const inline = descendants(cell, "is")[0];
+    return inline ? runText(inline) : "";
+  }
+  const value = descendants(cell, "v")[0]?.textContent ?? "";
+  if (value === "") {
+    // A formula the writer saved without computing; show what it would compute.
+    const formula = descendants(cell, "f")[0]?.textContent;
+    return formula ? `=${formula}` : "";
+  }
+  if (type === "s") return sharedStrings[Number(value)] ?? "";
+  if (type === "b") return value === "1" ? "TRUE" : "FALSE";
+  if (type === "str" || type === "e" || type === "d") return value;
+  const style = dated.get(Number(cell.getAttribute("s") ?? -1));
+  if (style) {
+    const serial = Number(value);
+    if (Number.isFinite(serial) && typeof style === "object") return elapsedText(serial, style);
+    if (Number.isFinite(serial)) return excelSerialToText(serial, date1904, style === "time");
+  }
+  return numberText(value);
+}
+
+function sheetTable(
+  sheet: Document,
+  sharedStrings: string[],
+  dated: Map<number, DateStyle>,
+  date1904: boolean,
+): DataTable | null {
+  const records: string[][] = [];
+  let totalRows = 0;
+  let widest = 0;
+  for (const row of descendants(sheet, "row")) {
+    const cells = descendants(row, "c");
+    // Rows that only carry formatting don't count.
+    const values: string[] = [];
+    let hasValue = false;
+    let next = 0;
+    for (const cell of cells) {
+      const reference = cell.getAttribute("r");
+      const column = reference ? columnIndex(reference) : next;
+      next = column + 1;
+      const text = cellText(cell, sharedStrings, dated, date1904);
+      if (text === "") continue;
+      // Counted however far right it is; kept only within the column cap.
+      hasValue = true;
+      widest = Math.max(widest, column + 1);
+      if (column >= DATA_TABLE_MAX_COLUMNS) continue;
+      while (values.length < column) values.push("");
+      values[column] = text;
+    }
+    if (!hasValue) continue;
+    if (records.length > 0) totalRows += 1;
+    if (records.length <= DATA_TABLE_MAX_ROWS) records.push(values);
+  }
+  return tableFromRecords(records, totalRows, widest, "Excel workbook");
+}
+
+/** A sheet's ``r:id``, whatever prefix its relationships namespace has. */
+function relationshipId(sheet: Element): string | undefined {
+  return Array.from(sheet.attributes).find(
+    (attribute) => attribute.localName === "id" && attribute.namespaceURI,
+  )?.value;
+}
+
+/**
+ * Read an Excel workbook's visible sheets for the table preview.
+ *
+ * @param bytes - The ``.xlsx`` file.
+ * @returns Each visible sheet in workbook order, with its table.
+ * @throws WorkbookError When the file can't be read, with a message to show.
+ */
+export async function readWorkbook(
+  bytes: Uint8Array,
+  maxBytes = MAX_WORKBOOK_BYTES,
+): Promise<WorkbookSheet[]> {
+  try {
+    return await readSheets(bytes, maxBytes);
+  } catch (error) {
+    if (error instanceof WorkbookError) throw error;
+    // Offsets or sizes in a corrupt zip that point outside the file.
+    throw new WorkbookError("This Excel workbook is damaged.");
+  }
+}
+
+/** A package relationship, its target resolved to an archive path. */
+interface Relationship {
+  id: string;
+  type: string;
+  path: string;
+}
+
+/**
+ * *target* resolved against the part *source* that names it, e.g.
+ * ``("xl/workbook.xml", "../xl/worksheets/sheet1.xml")`` → ``"xl/worksheets/sheet1.xml"``;
+ * ``null`` for a target that climbs out of the package.
+ */
+export function resolvePartPath(source: string, target: string): string | null {
+  const segments = target.startsWith("/") ? [] : source.split("/").slice(0, -1);
+  for (const segment of target.split("/")) {
+    if (segment === "..") {
+      if (segments.length === 0) return null;
+      segments.pop();
+    } else if (segment !== "." && segment !== "") {
+      segments.push(segment);
+    }
+  }
+  return segments.join("/");
+}
+
+function decodedTarget(target: string): string {
+  try {
+    return decodeURIComponent(target);
+  } catch {
+    // A stray "%" isn't an escape.
+    return target;
+  }
+}
+
+/** ``"xl/workbook.xml"`` → ``"xl/_rels/workbook.xml.rels"``; ``""`` (the package) → ``"_rels/.rels"``. */
+function relationshipsPath(part: string): string {
+  const slash = part.lastIndexOf("/");
+  return `${part.slice(0, slash + 1)}_rels/${part.slice(slash + 1)}.rels`;
+}
+
+/** *part*'s relationships inside the archive; external targets are left out. */
+async function readRelationships(
+  bytes: Uint8Array,
+  entries: Map<string, ZipEntry>,
+  part: string,
+  budget: InflateBudget,
+): Promise<Relationship[]> {
+  const document = await readPart(bytes, entries, relationshipsPath(part), budget);
+  return (document ? descendants(document, "Relationship") : []).flatMap((relationship) => {
+    if (relationship.getAttribute("TargetMode") === "External") return [];
+    const target = relationship.getAttribute("Target") ?? "";
+    // A target may percent-encode its name; the archive entry is tried as written first.
+    const path = resolvePartPath(part, target);
+    const decoded = resolvePartPath(part, decodedTarget(target));
+    if (path === null) return [];
+    const found = entries.has(path) || decoded === null ? path : decoded;
+    return [
+      {
+        id: relationship.getAttribute("Id") ?? "",
+        type: relationship.getAttribute("Type") ?? "",
+        path: found,
+      },
+    ];
+  });
+}
+
+/** The first relationship of *type*, e.g. ``"styles"``, in either Open XML namespace. */
+function partOfType(relationships: Relationship[], type: string): string | undefined {
+  return relationships.find((relationship) => relationship.type.endsWith(`/${type}`))?.path;
+}
+
+async function readSheets(bytes: Uint8Array, maxBytes: number): Promise<WorkbookSheet[]> {
+  const entries = zipEntries(bytes);
+  const budget: InflateBudget = { left: maxBytes };
+  // Parts are found through the package's relationships, wherever the writer put them.
+  // The package's own relationships are optional: Excel's default place is the fallback.
+  const root = await readRelationships(bytes, entries, "", budget).catch((error: unknown) => {
+    if (error instanceof WorkbookTooLargeError) throw error;
+    return [];
+  });
+  const declared = partOfType(root, "officeDocument");
+  const workbookPath = declared && entries.has(declared) ? declared : "xl/workbook.xml";
+  const workbook = await readPart(bytes, entries, workbookPath, budget);
+  if (!workbook) throw new WorkbookError("This file isn't a readable Excel workbook.");
+  const relationships = await readRelationships(bytes, entries, workbookPath, budget);
+  const targets = new Map(
+    relationships.map((relationship) => [relationship.id, relationship.path]),
+  );
+  // A workbook that declares no such part may still keep it where Excel does.
+  const sharedPath = partOfType(relationships, "sharedStrings") ?? "xl/sharedStrings.xml";
+  const shared = await readPart(bytes, entries, sharedPath, budget);
+  const sharedStrings = (shared ? descendants(shared, "si") : []).map(runText);
+  const stylesPath = partOfType(relationships, "styles") ?? "xl/styles.xml";
+  const dated = dateStyles(await readPart(bytes, entries, stylesPath, budget));
+  const properties = descendants(workbook, "workbookPr")[0];
+  const date1904 = ["1", "true"].includes(properties?.getAttribute("date1904") ?? "");
+
+  const sheets: WorkbookSheet[] = [];
+  // Sheets pointing at the same part share its table instead of reading it again.
+  // A part past the size limits is remembered too, so it is tried only once.
+  const tables = new Map<string, DataTable | null | typeof PAST_LIMIT>();
+  // One sheet at a time, so only one inflated part is held at once.
+  /* oxlint-disable no-await-in-loop */
+  for (const sheet of descendants(workbook, "sheet")) {
+    if (["hidden", "veryHidden"].includes(sheet.getAttribute("state") ?? "")) continue;
+    const name = sheet.getAttribute("name") ?? `Sheet ${sheets.length + 1}`;
+    const target = targets.get(relationshipId(sheet) ?? "");
+    if (target !== undefined && !tables.has(target)) {
+      try {
+        const part = await readPart(bytes, entries, target, budget);
+        tables.set(target, part ? sheetTable(part, sharedStrings, dated, date1904) : null);
+      } catch (error) {
+        // A sheet past the size limits is marked, and the sheets that fit still show.
+        if (!(error instanceof WorkbookTooLargeError)) throw error;
+        tables.set(target, PAST_LIMIT);
+      }
+    }
+    const table = target === undefined ? null : (tables.get(target) ?? null);
+    sheets.push(
+      table === PAST_LIMIT ? { name, table: null, message: TOO_LARGE_SHEET } : { name, table },
+    );
+  }
+  /* oxlint-enable no-await-in-loop */
+  return sheets;
+}
