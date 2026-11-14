@@ -16,7 +16,7 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
-from omnigent.automations_availability import AUTOMATIONS_HEADER
+from omnigent.automations_availability import AUTOMATIONS_HEADER, USER_INBOX_HEADER
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCode, OmnigentError
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.mcp_selection import MCP_SELECTION_HEADER, MCP_SELECTION_PREFIX, selected_mcp_spec
@@ -36,6 +36,7 @@ from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
     LEVEL_READ,
+    RESERVED_USER_LOCAL,
     AuthProvider,
 )
 from omnigent.server.bundles import bundle_location, redacted_agent_bundle, validate_agent_bundle
@@ -288,6 +289,29 @@ def register_agent_routes(
         automations_available = getattr(request.app.state, "automations_available", None)
         if automations_available is not None:
             selection_headers[AUTOMATIONS_HEADER] = "1" if automations_available() else "0"
+        inbox_enabled_for = getattr(request.app.state, "proactive_agent_enabled_for", None)
+        if inbox_enabled_for is not None:
+            # Evaluate the caller's deployment gate with the root owner's settings;
+            # a failing settings read turns the optional Inbox tools off.
+            try:
+                owner = (
+                    await asyncio.to_thread(
+                        conversation_store.get_session_owner,
+                        conv.root_conversation_id,
+                        owner_only=True,
+                    )
+                    if permission_store is not None
+                    else RESERVED_USER_LOCAL
+                )
+                inbox_on = owner is not None and await asyncio.to_thread(inbox_enabled_for, owner)
+            except Exception:
+                _logger.warning(
+                    "Inbox settings check failed for session %s; offering no Inbox tools",
+                    session_id,
+                    exc_info=True,
+                )
+                inbox_on = False
+            selection_headers[USER_INBOX_HEADER] = "1" if inbox_on else "0"
         return Response(
             content=bundle_bytes,
             media_type="application/gzip",

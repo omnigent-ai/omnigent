@@ -31,6 +31,7 @@ from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlDeviceGrant,
     SqlHost,
+    SqlInboxItem,
     SqlPreference,
     SqlProject,
     SqlScheduledTask,
@@ -487,7 +488,7 @@ class SqlAlchemyAccountStore:
         In the same transaction as the tombstone this also removes
         the user's ``session_permissions`` rows, marks their scheduled
         tasks ``deleted`` (so the scheduler never fires them again),
-        revokes their device/refresh grants (so no further access tokens
+        deletes their Inbox items, revokes their device/refresh grants (so no further access tokens
         can be minted), and deletes or tombstones their hosts (so an
         unattended run has nowhere to land). Because everything shares
         one transaction, a partial failure rolls back the whole delete
@@ -534,6 +535,13 @@ class SqlAlchemyAccountStore:
                 delete(SqlPreference).where(
                     SqlPreference.workspace_id == current_workspace_id(),
                     SqlPreference.user_id == user_id,
+                )
+            )
+            # A later account with the same username must not see these.
+            session.execute(
+                delete(SqlInboxItem).where(
+                    SqlInboxItem.workspace_id == current_workspace_id(),
+                    SqlInboxItem.user_id == user_id,
                 )
             )
             target.deleted_at = int(time.time())
