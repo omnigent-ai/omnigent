@@ -50,6 +50,9 @@ _logger = logging.getLogger(__name__)
 # "turn ended, background work remains" — and must not be reused here.)
 RUNNING = "running"
 IDLE = "idle"
+# The session vocabulary's ``waiting``: the turn ended, but a background agent
+# it started still works. Never produced from the file's own ``waiting``.
+WAITING = "waiting"
 
 # Claude interactive-session status literals. The interactive writer emits
 # exactly ``busy`` / ``shell`` / ``idle`` / ``waiting``: ``busy`` while the
@@ -442,6 +445,10 @@ class SessionStatusPoller:
         ``shell`` and ``False`` when it says ``idle``, or when the file stops
         being read. ``busy`` and ``waiting`` leave it unchanged: a turn or
         dialog hides whether a shell is still alive. Fires only on change.
+    :param background_agents_after_turn: Returns whether Claude's last turn
+        ended with a background agent still running. Claude stays ``busy``
+        for that agent although its prompt is free, so such a ``busy`` reads
+        as :data:`WAITING`. ``None`` reports every ``busy`` as running.
     """
 
     def __init__(
@@ -454,6 +461,7 @@ class SessionStatusPoller:
         omnigent_session_id: str | None = None,
         on_replay: Callable[[str, str | None], None] | None = None,
         on_background: Callable[[bool], None] | None = None,
+        background_agents_after_turn: Callable[[], bool] | None = None,
     ) -> None:
         self._on_status = on_status
         self._on_replay = on_replay or on_status
@@ -464,6 +472,8 @@ class SessionStatusPoller:
         self._pane_pid_getter = pane_pid_getter
         # Claude's own session uuid, resolved lazily from the bridge.
         self._session_id_getter = session_id_getter
+        self._background_agents_after_turn = background_agents_after_turn
+        self._holding_background_agents = False
         # The Omnigent conversation id this poller watches — for debug-log
         # attribution only (distinct from Claude's session uuid above).
         self._omnigent_session_id = omnigent_session_id
@@ -498,7 +508,8 @@ class SessionStatusPoller:
         """Advance one poll: resolve if needed, then publish on change.
 
         Safe to call every poll; a no-op once resolution is exhausted, and
-        an unchanged active file costs a single ``stat``.
+        an unchanged active file costs a single ``stat`` (plus the
+        background-agent check while it reads ``busy``).
         """
         self._advance(publish_status=True)
 
@@ -608,6 +619,24 @@ class SessionStatusPoller:
             return None
         return status.blocked_on
 
+    @property
+    def holding_background_agents(self) -> bool:
+        """Whether the last ``busy`` read as waiting on a turn's background agent."""
+        return self._holding_background_agents and not self._exhausted
+
+    @property
+    def reports_idle(self) -> bool:
+        """Whether the last read mapped Claude to :data:`IDLE`.
+
+        The file is authoritative for claude-native idleness, so the terminal
+        watcher only backs off its tmux polling once this is ``True``; a stale
+        ``None``, a running status, or a vanished file keeps the base cadence.
+        """
+        if self._exhausted:
+            return False
+        status = self._last_status
+        return status is not None and status.runner_status == IDLE
+
     def _read_and_publish(self, *, publish_status: bool, reassert: bool = False) -> None:
         """Read the resolved file and fire the callbacks on a change."""
         assert self._path is not None
@@ -622,38 +651,52 @@ class SessionStatusPoller:
             self._publish_background(False)
             return
         if self._last_mtime is not None and mtime == self._last_mtime:
-            return
-        self._last_mtime = mtime
-        status = read_session_status(self._path)
-        if self._exhausted:
-            return
-        if status is None:
-            # An unrecognized literal — the file is an undocumented internal
-            # detail whose vocabulary can grow. We are now blind to this
-            # transition, so drop the dedup baseline: the next readable
-            # status must publish rather than be swallowed as a duplicate.
-            if publish_status and self._last_status is not None:
+            status = self._last_status
+            # The background-agent mark changes without rewriting a busy file.
+            if not publish_status or status is None or status.raw_status != "busy":
+                return
+        else:
+            self._last_mtime = mtime
+            status = read_session_status(self._path)
+            if self._exhausted:
+                return
+            if status is None:
+                # An unrecognized literal — the file is an undocumented internal
+                # detail whose vocabulary can grow. We are now blind to this
+                # transition, so drop the dedup baseline: the next readable
+                # status must publish rather than be swallowed as a duplicate.
+                if publish_status and self._last_status is not None:
+                    self._observation_version += 1
+                self._last_status = None
+                self._last_edge = None
+                self._holding_background_agents = False
+                return
+            # A read for the background signal alone does not observe the session's status.
+            if publish_status and status != self._last_status:
                 self._observation_version += 1
-            self._last_status = None
-            self._last_edge = None
-            return
-        # A read for the background signal alone does not observe the session's status.
-        if publish_status and status != self._last_status:
-            self._observation_version += 1
-        self._last_status = status
-        if status.raw_status == "shell":
-            self._publish_background(True)
-        elif status.raw_status == "idle":
-            self._publish_background(False)
+            self._last_status = status
+            if status.raw_status == "shell":
+                self._publish_background(True)
+            elif status.raw_status == "idle":
+                self._publish_background(False)
         if not publish_status:
             return
-        edge = (status.runner_status, status.blocked_on)
+        holding = (
+            status.raw_status == "busy"
+            and self._background_agents_after_turn is not None
+            and self._background_agents_after_turn()
+        )
+        if holding != self._holding_background_agents:
+            self._observation_version += 1
+        self._holding_background_agents = holding
+        runner_status = WAITING if holding else status.runner_status
+        edge = (runner_status, status.blocked_on)
         if edge == self._last_edge:
             if reassert:
-                self._on_replay(status.runner_status, status.blocked_on)
+                self._on_replay(runner_status, status.blocked_on)
             return
         self._last_edge = edge
-        self._on_status(status.runner_status, status.blocked_on)
+        self._on_status(runner_status, status.blocked_on)
 
     def _publish_background(self, running: bool) -> None:
         """Deliver a background-shell change to ``on_background``.

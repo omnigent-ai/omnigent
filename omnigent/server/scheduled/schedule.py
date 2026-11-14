@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -12,6 +13,7 @@ from omnigent.server.scheduled.rrule import (
     RRuleSearchError,
     RRuleValidationError,
     get_next_fire_time,
+    is_one_time_rule,
 )
 
 _logger = logging.getLogger(__name__)
@@ -80,3 +82,36 @@ def occurrence_host_id(task: ScheduledTask, trigger_key: str) -> str | None:
 def host_ownership_key(workspace_id: int, host_id: str | None) -> str:
     """Key a replica's ownership check by host, or by workspace for a task with no host."""
     return host_id if host_id is not None else str(workspace_id)
+
+
+# A task doesn't record its template, so, like the web form (``isTriggerPrompt`` in
+# web/src/components/scheduled/triggerTemplates.ts), recognize the opening sentence.
+_TRIGGER_PROMPT_OPENINGS = tuple(
+    f"This automation watches {source} and starts one Omnigent session"
+    for source in ("Jira", "Slack", "GitHub", "Linear", "PagerDuty")
+)
+# The trigger form saves its state as the prompt's first line; the model never sees it.
+# Keep in sync with TRIGGER_HEADER_PATTERN in web/src/components/scheduled/triggerTemplates.ts.
+_TRIGGER_HEADER = re.compile(r"<!-- omnigent-trigger v\d+ [^\n]* -->\n")
+
+
+def strip_trigger_header(prompt: str) -> str:
+    """Return ``prompt`` without the trigger form's header line, if it has one."""
+    match = _TRIGGER_HEADER.match(prompt)
+    return prompt[match.end() :] if match else prompt
+
+
+def fits_reminder(task: ScheduledTask) -> bool:
+    """Whether a task can be a reminder: a one-time message into a known session."""
+    return (
+        task.session_mode == "continue"
+        and task.session_id is not None
+        and is_one_time_rule(task.rrule)
+    )
+
+
+def is_trigger_automation(task: ScheduledTask) -> bool:
+    """Whether a task was set up from a trigger template and polls for new items."""
+    if task.session_mode != "continue":
+        return False
+    return strip_trigger_header(task.prompt).startswith(_TRIGGER_PROMPT_OPENINGS)

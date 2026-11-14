@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -1571,3 +1572,596 @@ def test_shell_continuation_respects_quoting(quote: str, created: bool) -> None:
     refs, was_created = extract_prs("Bash", {"command": command}, A)
     assert [pr.url for pr in refs] == [A]
     assert was_created is created
+
+
+def test_an_array_literal_is_not_a_command_for_pr_attribution() -> None:
+    refs, was_created = extract_prs(
+        "Bash",
+        {"command": "cmd=(gh pr create --fill)\necho https://github.com/example/one/pull/41"},
+        "https://github.com/example/one/pull/41\n",
+    )
+    assert refs == []
+    assert was_created is False
+    # An escaped quote inside an array element does not end its quoted region.
+    segments = _shell_segments('msg=("say \\"hi\\"") && gh pr view 41')
+    assert [segment.invocation_tokens for segment in segments] == [("gh", "pr", "view", "41")]
+    # A line continuation inside the array or the definition does not change what runs.
+    url_output = "https://github.com/example/one/pull/41\n"
+    for command in ("cmd=\\\n(gh pr create --fill)\necho https://github.com/example/one/pull/41",):
+        refs, was_created = extract_prs("Bash", {"command": command}, url_output)
+        assert refs == []
+        assert was_created is False
+
+
+def test_an_uncalled_function_body_is_not_a_command_for_pr_attribution() -> None:
+    refs, was_created = extract_prs(
+        "Bash",
+        {"command": "f() (gh pr create --fill)\necho https://github.com/example/one/pull/41"},
+        "https://github.com/example/one/pull/41\n",
+    )
+    assert refs == []
+    assert was_created is False
+    # A continuation inside the name's parentheses does not change what runs.
+    refs, was_created = extract_prs(
+        "Bash",
+        {"command": "f(\\\n) (gh pr create --fill)\necho https://github.com/example/one/pull/41"},
+        "https://github.com/example/one/pull/41\n",
+    )
+    assert refs == []
+    assert was_created is False
+    # Escaping hides the definition from the outer text, but the decoded shell still defines it.
+    refs, was_created = extract_prs(
+        "Bash",
+        {
+            "command": "bash -c f\\(\\)\\ \\(gh\\ pr\\ create\\); echo https://github.com/example/one/pull/41"
+        },
+        "https://github.com/example/one/pull/41\n",
+    )
+    assert refs == []
+    assert was_created is False
+
+
+def test_a_function_called_before_its_definition_is_not_run() -> None:
+    refs, was_created = extract_prs(
+        "Bash",
+        {
+            "command": "f; f() { gh pr create --fill; }; "
+            "echo https://github.com/example/one/pull/41"
+        },
+        "https://github.com/example/one/pull/41\n",
+    )
+    assert refs == []
+    assert was_created is False
+
+
+@pytest.mark.parametrize("operator", ["&&", "||", "|"])
+def test_a_newline_after_an_operator_continues_the_command(operator: str) -> None:
+    # A newline after an operator gives the same checkouts as a space.
+    inline = f"true {operator} cd b; git status"
+    continued = f"true {operator}\n  cd b\ngit status"
+    expected = pr_observer._git_checkouts("Bash", {"command": inline}, {}, "/repo")
+    assert pr_observer._git_checkouts("Bash", {"command": continued}, {}, "/repo") == expected
+
+
+def test_a_pipeline_stage_cd_does_not_affect_the_parent_when_continued() -> None:
+    assert pr_observer._git_checkouts("Bash", {"command": "cd b |\n git push"}, {}, "/repo") == [
+        "/repo"
+    ]
+
+
+def test_a_process_substitution_keeps_the_explicit_repository() -> None:
+    refs, was_created = extract_prs(
+        "Bash",
+        {"command": "gh pr edit 41 --body-file <(printf x) -R example/other"},
+        "",
+    )
+    assert [ref.url for ref in refs] == ["https://github.com/example/other/pull/41"]
+    assert was_created is False
+
+
+def test_a_nested_substitution_quote_is_not_a_command_for_pr_attribution() -> None:
+    refs, was_created = extract_prs(
+        "Bash",
+        {"command": "printf '%s\\n' \"$(printf '\"(gh pr create)\"')\""},
+        "https://github.com/example/one/pull/41\n",
+    )
+    assert refs == []
+    assert was_created is False
+
+
+def test_a_pattern_with_parentheses_is_not_a_command_for_pr_attribution() -> None:
+    # An extended glob is a pattern for printf, not a command that runs.
+    refs, was_created = extract_prs(
+        "Bash",
+        {
+            "command": "bash -O extglob -c \"printf '%s\\n' @(gh pr create)\"; "
+            "echo https://github.com/example/one/pull/41"
+        },
+        "https://github.com/example/one/pull/41\n",
+    )
+    assert refs == []
+    assert was_created is False
+
+
+def test_a_long_operator_free_command_lexes_in_bounded_time() -> None:
+    # The lexer rebuilt its prefix per character before, which took about 20 seconds here.
+    command = "echo " * 19_999 + "x"
+    start = time.perf_counter()
+    items = pr_observer._shell_items(command)
+    assert items is not None and len(items) == 1
+    assert time.perf_counter() - start < 5
+    # Continuation whitespace after an operator must not rescan the chunk.
+    continued = "true && " + " \n" * 49_990 + "true"
+    start = time.perf_counter()
+    assert pr_observer._shell_items(continued) is not None
+    assert time.perf_counter() - start < 5
+
+
+def test_redirect_ampersand_stays_in_its_word_and_the_pipeline_still_splits() -> None:
+    segments = _shell_segments("gh pr create --title x 2>&1 | tail -2")
+    assert [segment.invocation_tokens for segment in segments] == [
+        ("gh", "pr", "create", "--title", "x", "2>&1"),
+        ("tail", "-2"),
+    ]
+    # An escaped ``>`` is a literal, so the ``&`` after it still separates commands.
+    escaped = _shell_segments("printf \\>& gh pr view 41")
+    assert [segment.invocation_tokens for segment in escaped] == [
+        ("printf", ">"),
+        ("gh", "pr", "view", "41"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "command,words",
+    [
+        pytest.param(
+            "printf '%s' '(' gh pr view 41",
+            ["printf", "%s", "(", "gh", "pr", "view", "41"],
+            id="quoted-parenthesis",
+        ),
+        pytest.param(
+            "printf '%s' ';' '|' '&&' '||' gh pr view 41",
+            ["printf", "%s", ";", "|", "&&", "||", "gh", "pr", "view", "41"],
+            id="quoted-separators",
+        ),
+        pytest.param(
+            "printf \\( gh pr view 41",
+            ["printf", "(", "gh", "pr", "view", "41"],
+            id="escaped-parenthesis",
+        ),
+    ],
+)
+def test_quoted_operator_characters_do_not_split_a_simple_command(
+    command: str, words: list[str]
+) -> None:
+    assert [segment.invocation_tokens for segment in _shell_segments(command)] == [tuple(words)]
+
+
+@pytest.mark.parametrize(
+    "tool_name,tool_input,cwd,result,checkouts",
+    [
+        pytest.param(
+            "Bash",
+            {"command": "cd ~/w/topic && git pp 2>&1 | tail -3"},
+            "/repo",
+            {},
+            [str(Path("~/w/topic").expanduser())],
+            id="claude-cd-to-worktree",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "cd sub && git push -q"},
+            "/repo",
+            {},
+            ["/repo/sub"],
+            id="relative-cd",
+        ),
+        pytest.param(
+            "Bash", {"command": "git -C /w/topic pp"}, None, {}, ["/w/topic"], id="git-dash-C"
+        ),
+        pytest.param(
+            "exec_command",
+            {"cmd": "git push", "workdir": "topic"},
+            "/w",
+            {},
+            ["/w/topic"],
+            id="codex-workdir",
+        ),
+        pytest.param(
+            "sys_os_shell",
+            {"command": "cd /elsewhere && git pp"},
+            None,
+            {"stdout": "", "stderr": "", "exit_code": 0, "cwd": "/workspace"},
+            ["/workspace"],
+            id="runner-shell-uses-its-reported-cwd",
+        ),
+        pytest.param("Bash", {"command": "cd /w/topic && make"}, "/repo", {}, [], id="no-git"),
+        pytest.param("Bash", {"command": "git pp"}, None, {}, [], id="no-known-directory"),
+        pytest.param(
+            "Bash",
+            {"command": "cd /w/topic || exit 1\ngit pp"},
+            "/repo",
+            {},
+            ["/w/topic"],
+            id="or-exit-fallback-keeps-the-cd-directory",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "false || cd /w/topic; git pp"},
+            "/repo",
+            {},
+            ["/repo", "/w/topic"],
+            id="or-fallback-that-continues-may-run-in-either-directory",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": 'cd "$HOME/w" || exit 1\ngit pp'},
+            "/repo",
+            {},
+            [],
+            id="or-with-dynamic-directory-is-unknown",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "(cd /w/topic && git pp)"},
+            "/repo",
+            {},
+            ["/w/topic"],
+            id="subshell-cd-applies-inside-the-subshell",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "(cd /w/topic); git pp"},
+            "/repo",
+            {},
+            ["/repo"],
+            id="subshell-cd-does-not-leak-out",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": 'bash -c "cd /w/topic"; git pp'},
+            "/repo",
+            {},
+            ["/repo"],
+            id="nested-shell-cd-does-not-leak-out",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": 'eval "cd /w/topic"; git pp'},
+            "/repo",
+            {},
+            ["/w/topic"],
+            id="eval-cd-stays-in-this-shell",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "cd /w/topic || exit 1 && git pp"},
+            "/repo",
+            {},
+            ["/w/topic"],
+            id="or-exit-then-and-keeps-the-success-path",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "false && exit 1; git pp"},
+            "/repo",
+            {},
+            ["/repo"],
+            id="skipped-and-exit-keeps-the-failure-path",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "exit 0 | cat; git pp"},
+            "/repo",
+            {},
+            ["/repo"],
+            id="exit-in-a-pipeline-does-not-end-the-parent-shell",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "cd /w/topic | cat; git pp"},
+            "/repo",
+            {},
+            ["/repo"],
+            id="cd-in-a-pipeline-does-not-reach-the-parent-shell",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": 'printf "%s\\n" "(" git pp'},
+            "/repo",
+            {},
+            [],
+            id="quoted-parenthesis-is-a-word-not-a-subshell",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": 'printf "(" && git pp'},
+            "/repo",
+            {},
+            ["/repo"],
+            id="quoted-parenthesis-before-a-real-git-call",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "false || cd a; false || cd b; false || cd c; git pp"},
+            "/repo",
+            {},
+            ["/repo", "/repo/a", "/repo/b", "/repo/a/b"],
+            id="eight-possible-directories-are-tracked",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "false || cd a; false || cd b; false || cd c; false || cd d; git pp"},
+            "/repo",
+            {},
+            [],
+            id="more-than-eight-possible-directories-give-up",
+        ),
+        pytest.param(
+            "Bash",
+            {
+                "command": "git pp; false || cd a; false || cd b; false || cd c; "
+                "false || cd d; git pp"
+            },
+            "/repo",
+            {},
+            ["/repo"],
+            id="checkouts-found-before-the-cap-are-kept",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": " || ".join(f"cd d{index}" for index in range(14)) + "; git pp"},
+            "/repo",
+            {},
+            ["/repo/d0"],
+            id="chained-or-cd-stays-linear",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "if false; then exit 1; fi; cd /w/a; git pp"},
+            "/repo",
+            {},
+            ["/w/a"],
+            id="exit-in-an-unexecuted-branch-does-not-end-tracking",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": 'x=("a\\"b") && cd /w/a && git pp'},
+            "/repo",
+            {},
+            ["/w/a"],
+            id="escaped-quote-inside-an-array-keeps-the-cd",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "cd /work/repo >| /tmp/output && git pp"},
+            "/start",
+            {},
+            ["/work/repo"],
+            id="noclobber-redirect-keeps-the-cd",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "(case x in x) cd /a;; esac); git status"},
+            "/start",
+            {},
+            ["/start"],
+            id="case-pattern-paren-does-not-close-the-subshell",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "printf \\>& git -C /b status"},
+            "/start",
+            {},
+            ["/b"],
+            id="escaped-greater-then-ampersand-is-a-separator",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "printf \\>| git -C /b status"},
+            "/start",
+            {},
+            ["/b"],
+            id="escaped-greater-then-pipe-is-a-separator",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "(cd /tmp && echo a\\ #)\ngit status"},
+            "/",
+            {},
+            ["/"],
+            id="literal-hash-does-not-end-the-subshell",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "(cd /tmp && echo $(echo x)#)\ngit status"},
+            "/",
+            {},
+            ["/"],
+            id="literal-hash-after-a-substitution-does-not-end-the-subshell",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "[[ git =~ (git) ]]"},
+            "/repo",
+            {},
+            [],
+            id="double-bracket-pattern-parentheses-are-not-a-subshell",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "cd /w/topic && git pp |& tail -3; git status"},
+            "/repo",
+            {},
+            ["/w/topic"],
+            id="bash-pipe-ampersand-does-not-restore-the-directory",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "! cd / || git status"},
+            "/tmp",
+            {},
+            [],
+            id="negated-cd-is-not-tracked",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "printf '%s\\n' \"$(printf '\"(git -C /wrong status)\"')\""},
+            "/start",
+            {},
+            [],
+            id="nested-substitution-quotes-are-not-a-git-call",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "e'v'al \"cd /w/topic\"; git pp"},
+            "/start",
+            {},
+            ["/w/topic"],
+            id="quoted-eval-stays-in-this-shell",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "e\\val 'cd /w/topic'; git pp"},
+            "/start",
+            {},
+            ["/w/topic"],
+            id="escaped-eval-stays-in-this-shell",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "echo $[ (git) ]"},
+            "/tmp",
+            {},
+            [],
+            id="legacy-arithmetic-is-not-a-git-call",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "(case x in\n x) cd /a ;;\nesac\n); git status"},
+            "/start",
+            {},
+            ["/start"],
+            id="multiline-case-pattern-paren-does-not-close-the-subshell",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "f() (cd /other && git status); git status"},
+            "/start",
+            {},
+            ["/start"],
+            id="uncalled-function-body-runs-nothing",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "f() { cd /other && git status; }; git status"},
+            "/start",
+            {},
+            ["/start"],
+            id="uncalled-brace-function-body-runs-nothing",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "f() (cd /other); f; git status"},
+            "/start",
+            {},
+            ["/start"],
+            id="called-subshell-function-keeps-its-boundary",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "f() { cd /w; git push; }; cd /other || f"},
+            "/start",
+            {},
+            [],
+            id="skipped-function-body-runs-nothing",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "f() { cd /w; }; f | cat; git status"},
+            "/start",
+            {},
+            ["/start"],
+            id="function-in-a-pipeline-stays-in-its-child",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "case $x in a) cd /a;; git) echo;; esac"},
+            "/start",
+            {},
+            [],
+            id="case-pattern-words-are-not-commands",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "(if true; then case $x in a) cd /a;; esac; fi); git status"},
+            "/start",
+            {},
+            ["/start"],
+            id="case-after-then-keeps-the-subshell",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "(( git = 1 ))"},
+            "/start",
+            {},
+            [],
+            id="arithmetic-command-is-not-a-git-call",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "cd /w/topic 2>&1 && git pp"},
+            "/repo",
+            {},
+            ["/w/topic"],
+            id="stream-redirect-before-and-keeps-the-cd",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "cd /w/topic && make 2>&1; git pp"},
+            "/repo",
+            {},
+            ["/w/topic"],
+            id="stream-redirect-in-a-command-keeps-the-cd",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "cd /w/topic &>/dev/null; git pp"},
+            "/repo",
+            {},
+            ["/w/topic"],
+            id="ampersand-redirect-keeps-the-cd",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "cd /w/topic && git pp 2>&1 | tail -3"},
+            "/repo",
+            {},
+            ["/w/topic"],
+            id="pipeline-after-a-redirect-keeps-the-cd",
+        ),
+    ],
+)
+def test_shell_calls_infer_the_pr_of_each_checkout_they_ran_git_in(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    tool_input: dict[str, object],
+    cwd: str | None,
+    result: dict[str, str],
+    checkouts: list[str],
+) -> None:
+    from omnigent.runner import pr_resource
+
+    inferred: list[tuple[str, str]] = []
+    # Records requests only; pr_resource's own tests cover what inference does with them.
+    monkeypatch.setattr(pr_resource, "infer_checkout_pr", lambda *call: inferred.append(call))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
+        pr_observer.observe_tool_completion(
+            "conv_infer",
+            tool_name=tool_name,
+            arguments=tool_input,
+            result=json.dumps(result) if tool_name == "sys_os_shell" else result,
+            cwd=cwd,
+        )
+    assert inferred == [("conv_infer", checkout) for checkout in checkouts]

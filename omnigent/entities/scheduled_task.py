@@ -64,6 +64,10 @@ class ScheduledTask:
     :param permission_mode: Harness-specific permission or execution mode.
         The fire path translates it into that harness's launch options.
         ``None`` means use the agent's configured default.
+    :param mcp_services: MCP services every fired session starts with, as the
+        deployment's service names, e.g. ``("github", "linear")``. The server's
+        session MCP selection turns them into session labels at fire time.
+        Empty means fired sessions get no MCP selection.
     :param max_cost_usd: Optional per-firing cost budget in USD. When set, the
         fire path attaches a ``cost_budget`` policy to each spawned session that
         blocks all models once cumulative spend reaches this limit. ``None``
@@ -74,6 +78,9 @@ class ScheduledTask:
     :param session_id: The session a ``"continue"`` task sends its prompt to.
         ``None`` until its first firing creates one, unless the owner picked an
         existing session.
+    :param source_session_id: The session each firing copies. Every run starts a
+        new session that begins with that session's history. ``None`` for a
+        task whose runs start empty.
     :param workspace: Connected-host directory or managed-sandbox repository URL.
         ``None`` uses the execution target's default workspace.
     :param base_branch: Create a random worktree from this ref for each new
@@ -91,6 +98,9 @@ class ScheduledTask:
         firing, or ``None``.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
+    :param kind: ``"automation"``, or ``"reminder"`` for a one-time message an
+        agent set for its own session. Clients list reminders apart from
+        automations; scheduling and firing ignore it.
     """
 
     id: str
@@ -105,9 +115,12 @@ class ScheduledTask:
     model_override: str | None = None
     reasoning_effort: str | None = None
     permission_mode: str | None = None
+    mcp_services: tuple[str, ...] = ()
     max_cost_usd: float | None = None
     session_mode: str = "new"
+    kind: str = "automation"
     session_id: str | None = None
+    source_session_id: str | None = None
     workspace: str | None = None
     base_branch: str | None = None
     execution_target: str = "connected_host"

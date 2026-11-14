@@ -18,8 +18,10 @@ from omnigent.terminals.program_status import (
 _logger = logging.getLogger(__name__)
 
 # How long an error report may stand before its turn is failed without the
-# StopFailure hook. The hook normally follows within about a second.
-ERROR_HOOK_GRACE_S = 5.0
+# StopFailure hook. Process startup and forwarding can delay its detailed error.
+ERROR_HOOK_GRACE_S = 10.0
+# OSC states that keep the session running; every other state reads as idle.
+_RUNNING_STATES = frozenset({"working", "blocked"})
 
 
 def _reports_failed_turn(report: ProgramStatus) -> bool:
@@ -51,11 +53,15 @@ class ClaudeProgramStatusPoller:
         turn_activity_epoch: Callable[[], int] | None = None,
         on_failure: Callable[[str], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        background_agents_after_turn: Callable[[], bool] | None = None,
     ) -> None:
         self._reader = reader
         self._fallback = fallback
         self._on_status = on_status
         self._on_replay = on_replay or on_status
+        # Claude reports working for a background agent that outlives its turn.
+        self._background_agents_after_turn = background_agents_after_turn
+        self._holding_background_agents = False
         self._omnigent_session_id = omnigent_session_id
         self._terminal_instance_id = terminal_instance_id
         self._terminal_launch_id = terminal_launch_id
@@ -98,6 +104,25 @@ class ClaudeProgramStatusPoller:
             return None
         return blocked_reason(report) if report is not None else self._fallback.blocked_on
 
+    @property
+    def holding_background_agents(self) -> bool:
+        """Whether a working report reads as waiting on a turn's background agent."""
+        if self._retired:
+            return False
+        if self._using_osc:
+            return self._holding_background_agents
+        return self._fallback.holding_background_agents
+
+    @property
+    def reports_idle(self) -> bool:
+        """Whether the current report maps Claude to idle, so pane polling may back off."""
+        if self._retired:
+            return False
+        report = self._reader.status
+        if report is None:
+            return self._fallback.reports_idle
+        return report.state not in _RUNNING_STATES
+
     def tick(self) -> None:
         """Publish changed reports; never interpret silence as completion."""
         if self._retired:
@@ -125,15 +150,22 @@ class ClaudeProgramStatusPoller:
         self._error_observed = is_error
         if report is not None:
             self._using_osc = True
-            changed = report != self._last
+            holding = (
+                report.state == "working"
+                and self._background_agents_after_turn is not None
+                and self._background_agents_after_turn()
+            )
+            changed = report != self._last or holding != self._holding_background_agents
             if changed:
                 self._observation_version += 1
             if changed or requested:
                 self._last = report
+                self._holding_background_agents = holding
                 # The StopFailure hook owns the failed edge and carries the API
                 # error text; an error report here would fail the turn first, bare.
                 if not is_error:
-                    status = "running" if report.state in {"working", "blocked"} else "idle"
+                    working = report.state in _RUNNING_STATES
+                    status = "waiting" if holding else "running" if working else "idle"
                     publish = self._on_status if changed else self._on_replay
                     publish(status, blocked_reason(report))
             self._fail_if_hook_overdue(report)
@@ -146,6 +178,7 @@ class ClaudeProgramStatusPoller:
             if self._using_osc:
                 self._fallback.resync()
             self._using_osc = False
+            self._holding_background_agents = False
             self._last = None
             self._fail_if_hook_overdue(None)
             self._fallback.tick()

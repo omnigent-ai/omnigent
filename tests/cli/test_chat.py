@@ -47,8 +47,10 @@ from omnigent.cli import _build_resume_parts
 from omnigent.cli_diagnostics import suppresses_recovery_hint
 from omnigent.inner.databricks_executor import DatabricksCredentials
 from omnigent.models.model_resolver import ModelResolutionError
+from omnigent.session_host import SessionRoutingTransport, get_session_host
 from omnigent.spec import load as load_spec
 from omnigent.spec import validate as validate_spec
+from omnigent.telemetry.request_headers import client_user_agent
 
 # ── _is_url ──────────────────────────────────────────
 
@@ -2216,7 +2218,7 @@ def test_chat_with_server_fork_uses_source_not_catalog(
     assert requests == ["http://127.0.0.1:6767/v1/sessions/conv_source"]
     assert dispatched["agent_name"] == (session_agent or "agent")
     assert dispatched["fork_session_id"] == "conv_source"
-    assert chat_module.get_session_host("conv_source") == "host_source"
+    assert get_session_host("conv_source") == "host_source"
     assert dispatched["registered_agent"] is None
 
 
@@ -3453,24 +3455,33 @@ def test_remote_headers_prefers_explicit_remote_token_env(monkeypatch: pytest.Mo
     )
 
     assert _remote_headers(server_url="https://srv.example.com", host_id=None) == {
-        "Authorization": "Bearer env-token"
+        "Authorization": "Bearer env-token",
+        "User-Agent": client_user_agent(),
     }
 
 
-def test_remote_headers_falls_back_to_ambient_databricks_creds(
+@pytest.mark.parametrize(
+    ("workspace_host", "record_token", "expected_token"),
+    [
+        (None, None, "ambient-token"),
+        ("https://workspace.example.test", "paired-token", "paired-token"),
+        ("https://workspace.example.test", None, None),
+    ],
+    ids=["unpaired-ambient", "paired-available", "paired-unavailable"],
+)
+def test_remote_headers_prefers_paired_databricks_creds_before_ambient(
     monkeypatch: pytest.MonkeyPatch,
+    workspace_host: str | None,
+    record_token: str | None,
+    expected_token: str | None,
 ) -> None:
-    """No env token + no stored login record → ambient Databricks credentials.
-
-    Bottom of the resolution chain: with ``OMNIGENT_REMOTE_AUTH_TOKEN``
-    unset, no stored OIDC token, and no stored Databricks Apps pointer
-    record for the server, ``_remote_headers`` must fall back to
-    ``_read_databrickscfg(None)`` (the SDK's ambient resolution — no
-    profile is threaded anymore) and put its token in the bearer header.
-    """
+    """A saved workspace stays authoritative when its credentials are unavailable."""
     monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
     monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
-    monkeypatch.setattr(chat_module, "_stored_databricks_record_token", lambda _url: None)
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_workspace_host", lambda _url: workspace_host
+    )
+    monkeypatch.setattr(chat_module, "_stored_databricks_record_token", lambda _url: record_token)
     read_calls: list[object] = []
 
     def _fake_read(profile: object) -> DatabricksCredentials:
@@ -3482,11 +3493,11 @@ def test_remote_headers_falls_back_to_ambient_databricks_creds(
 
     headers = _remote_headers(server_url="https://srv.example.com", host_id=None)
 
-    # The ambient token reached the Authorization header.
-    assert headers == {"Authorization": "Bearer ambient-token"}
-    # Ambient resolution: exactly one lookup, with no profile threaded
-    # (None) — a non-None value here means profile plumbing came back.
-    assert read_calls == [None]
+    expected_headers = {"User-Agent": client_user_agent()}
+    if expected_token is not None:
+        expected_headers["Authorization"] = f"Bearer {expected_token}"
+    assert headers == expected_headers
+    assert read_calls == ([None] if workspace_host is None else [])
 
 
 def test_remote_headers_adds_org_id_header(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3511,6 +3522,8 @@ def test_remote_headers_adds_org_id_header(monkeypatch: pytest.MonkeyPatch) -> N
     assert headers == {
         "Authorization": "Bearer rec-tok",
         "X-Databricks-Org-Id": "2850744067564480",
+        "X-Databricks-Omnigent-Slice-Key": "client_key",
+        "User-Agent": client_user_agent(),
     }
 
 
@@ -3531,7 +3544,11 @@ def test_remote_headers_omits_org_when_no_record(monkeypatch: pytest.MonkeyPatch
         server_url="https://single.databricks.com/api/2.0/omnigent", host_id=None
     )
 
-    assert headers == {"Authorization": "Bearer rec-tok"}
+    assert headers == {
+        "Authorization": "Bearer rec-tok",
+        "X-Databricks-Omnigent-Slice-Key": "client_key",
+        "User-Agent": client_user_agent(),
+    }
     assert "X-Databricks-Org-Id" not in headers
 
 
@@ -3543,8 +3560,8 @@ def test_remote_headers_keys_by_host_id_on_workspace_mount(
     The native attach WebSocket handshake (claude / codex / antigravity) and
     its reconnects build their headers here, so the host_id must surface as the
     routing header to reach the replica holding the runner's tunnel. It is
-    emitted only on a host-sharded mount; no host_id, or an unsharded server,
-    sends none.
+    emitted only on a host-sharded mount; no host_id sends the machine's own
+    key, and an unsharded server sends none.
     """
     monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
     monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
@@ -3556,8 +3573,11 @@ def test_remote_headers_keys_by_host_id_on_workspace_mount(
         _remote_headers(server_url=mount, host_id="host_abc")["X-Databricks-Omnigent-Slice-Key"]
         == "host_abc"
     )
-    # No host_id → no slice-key header on the same mount.
-    assert "X-Databricks-Omnigent-Slice-Key" not in _remote_headers(server_url=mount, host_id=None)
+    # No host_id → the machine's own key on the same mount.
+    assert (
+        _remote_headers(server_url=mount, host_id=None)["X-Databricks-Omnigent-Slice-Key"]
+        == "client_key"
+    )
     # Unsharded server → no slice-key header even with a host_id.
     assert "X-Databricks-Omnigent-Slice-Key" not in _remote_headers(
         server_url="http://127.0.0.1:6767", host_id="host_abc"
@@ -3568,7 +3588,7 @@ def test_server_headers_do_not_encode_runner_affinity() -> None:
     """Runner affinity is persisted by PATCH /v1/sessions, not headers."""
     headers = chat_module._server_headers(runner_id="runner_local_test")
 
-    assert headers == {}
+    assert headers == {"User-Agent": client_user_agent()}
 
 
 def test_run_chat_remote_dispatches_without_profile_plumbing(
@@ -3686,7 +3706,7 @@ def test_run_repl_auto_opens_conversation_when_session_starts(
         del warn
         opened.append((base_url, conversation_id, enabled))
 
-    monkeypatch.setattr(chat_module, "OmnigentClient", _Client)
+    monkeypatch.setattr(chat_module, "open_sdk_client", _Client)
     monkeypatch.setattr("omnigent.repl.run_repl", _fake_run_repl)
     monkeypatch.setattr(chat_module, "open_conversation_link_if_enabled", _fake_open)
     monkeypatch.setattr("omnigent.repl._tmux_pane.register_pane", lambda **kwargs: None)
@@ -3871,7 +3891,7 @@ def _stub_run_repl_deps(
 
     monkeypatch.setattr(_repl_pkg, "run_repl", _fake_run_repl)
     monkeypatch.setattr("omnigent.repl._repl.run_repl", _fake_run_repl)
-    monkeypatch.setattr("omnigent.chat.OmnigentClient", _FakeClientCtx)
+    monkeypatch.setattr("omnigent.chat.open_sdk_client", lambda *_a, **kw: _FakeClientCtx(**kw))
     monkeypatch.setattr(
         "omnigent.chat._server_auth", lambda server_url=None, *, session_id=None: None
     )
@@ -4861,6 +4881,7 @@ def _fake_sessions_chat_cls(
     query_impl: Callable[[str], object],
     *,
     extra_turns: list[str] | None = None,
+    pending_status: str = "running",
 ) -> type:
     """
     Build a ``SessionsChat`` replacement whose ``query`` is ``query_impl``.
@@ -4877,6 +4898,8 @@ def _fake_sessions_chat_cls(
         successive ``await_turn()`` calls, simulating async orchestrator
         auto-wakes. When exhausted ``await_turn`` returns empty text and
         ``last_turn_saw_waiting`` returns ``False``.
+    :param pending_status: Snapshot status while extra turns remain, e.g.
+        ``"waiting"`` for a claude-native turn whose background agent runs.
     :returns: A class usable as a drop-in for ``SessionsChat``.
     """
     _extra = list(extra_turns or [])
@@ -4890,7 +4913,7 @@ def _fake_sessions_chat_cls(
             # Mirrors the real snapshot: "running" while sub-agents are pending
             # (the runner emits "waiting" → relay collapses to "running"),
             # "idle" when done.
-            return "running" if self._pending else "idle"
+            return pending_status if self._pending else "idle"
 
         async def refresh(self) -> None:
             pass  # status is derived from _pending; no fetch needed.
@@ -5078,6 +5101,36 @@ async def test_query_sessions_once_multi_turn_async_orchestrator(
     assert "direct answer" in result
     assert "<!-- POLLY_REVIEW_START -->" in result
     assert "Looks good." in result
+
+
+async def test_query_sessions_once_keeps_waiting_on_a_background_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A snapshot that reads ``waiting`` keeps headless ``-p`` going.
+
+    A claude-native turn that ends with a background agent running reads
+    ``waiting`` until the agent finishes and Claude reports on it. If this
+    fails, ``-p`` prints only the turn that launched the agent.
+    """
+    monkeypatch.setattr(
+        "omnigent_client.SessionsChat",
+        _fake_sessions_chat_cls(
+            _return_text,
+            extra_turns=["", "The audit found nothing."],
+            pending_status="waiting",
+        ),
+    )
+    client = _FakeAPClient([], list_items_must_not_be_called=True)
+    result = await _query_sessions_once(
+        client=client,
+        agent_name="claude-native-ui",
+        tool_handler=None,
+        prompt="audit this in the background",
+        session_bundle=b"bundle-bytes",
+        session_bundle_filename="agent.tar.gz",
+        runner_id="runner_test",
+    )
+    assert result == "direct answer\n\nThe audit found nothing."
 
 
 async def _never_return(_prompt: str) -> QueryResult:
@@ -5659,6 +5712,7 @@ async def test_one_shot_host_launch_routes_actual_http_requests(
     else:
         monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)
     base_url = "http://srv"
+    routed = "c0" * 16
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -5680,32 +5734,31 @@ async def test_one_shot_host_launch_routes_actual_http_requests(
             return httpx.Response(
                 201,
                 json={
-                    "id": "conv_routed",
+                    "id": routed,
                     "agent_id": "ag_s",
                     "host_id": "host_local",
                     "status": "idle",
                     "created_at": 0,
                 },
             )
-        if path == "/v1/sessions/conv_routed/events":
+        if path == f"/v1/sessions/{routed}/events":
             assert json.loads(request.content) == _STOP
             return httpx.Response(200, json={"queued": False})
-        assert path == "/v1/sessions/conv_routed"
+        assert path == f"/v1/sessions/{routed}"
         return httpx.Response(
             200,
-            json={"id": "conv_routed", "agent_id": "ag_s", "status": "idle", "created_at": 0},
+            json={"id": routed, "agent_id": "ag_s", "status": "idle", "created_at": 0},
         )
 
     async def turn(*, client: object, bound: object, **_kwargs: object) -> str:
-        await sessions.get("conv_routed")
+        await sessions.get(routed)
         return "pong"
 
     monkeypatch.setattr(chat_module, "_run_bound_turn", turn)
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler),
+        transport=SessionRoutingTransport(transport=httpx.MockTransport(handler)),
         headers=chat_module._server_headers(),
-        auth=chat_module._server_auth(server_url=base_url, session_id=None),
-        event_hooks={"request": [chat_module.route_session_request]},
+        auth=chat_module._server_auth(server_url=base_url),
     ) as http:
         sessions = SessionsNamespace(http, base_url)
         result = await _query_sessions_once(
@@ -5723,8 +5776,8 @@ async def test_one_shot_host_launch_routes_actual_http_requests(
         "GET /v1/runners",
         "GET /v1/hosts",
         "POST /v1/sessions",
-        "GET /v1/sessions/conv_routed",
-        "POST /v1/sessions/conv_routed/events",
+        f"GET /v1/sessions/{routed}",
+        f"POST /v1/sessions/{routed}/events",
     ]
 
 
@@ -5755,7 +5808,7 @@ def test_one_shot_host_launch_timeout_is_a_clean_cli_error(
 
     client = chat_module.OmnigentClient("http://127.0.0.1")
     monkeypatch.setattr(client._http, "_transport", httpx.MockTransport(handler))
-    monkeypatch.setattr(chat_module, "OmnigentClient", lambda **_kwargs: client)
+    monkeypatch.setattr(chat_module, "open_sdk_client", lambda *_a, **_kw: client)
     with pytest.raises(SystemExit) as excinfo:
         chat_module._run_headless_prompt(
             "http://127.0.0.1",

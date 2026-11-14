@@ -31,6 +31,7 @@ from starlette.datastructures import Headers
 
 from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
+    FunctionCallData,
     MessageData,
     NewConversationItem,
 )
@@ -136,7 +137,11 @@ def _route_to_runner(monkeypatch: pytest.MonkeyPatch, runner: httpx.AsyncClient)
     """Route sessions to this client while checking the prefetched conversation identity."""
 
     async def resolve(
-        session_id: str, runner_router: object, *, conversation: Any = None
+        session_id: str,
+        runner_router: object,
+        *,
+        conversation: Any = None,
+        for_control: bool = False,
     ) -> httpx.AsyncClient:
         assert conversation is None or conversation.id == session_id
         return runner
@@ -401,6 +406,47 @@ async def test_create_titled_session_keeps_title_after_first_message(
     message = next(item for item in items if item.get("role") == "user")
     assert message["user_authored"] is True
     assert not message.get("is_meta")
+
+
+@pytest.mark.parametrize("event_type", ["message", "external_conversation_item"])
+async def test_client_meta_and_external_messages_do_not_infer_user_authorship(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    event_type: str,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    content_text = "Client meta input" if event_type == "message" else "External input"
+    item_data: dict[str, Any] = {
+        "role": "user",
+        "content": [{"type": "input_text", "text": content_text}],
+    }
+    if event_type == "message":
+        item_data["is_meta"] = True
+        event_data = item_data
+    else:
+        event_data = {
+            "item_type": "message",
+            "item_data": item_data,
+            "response_id": "external_turn",
+        }
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={"queued": True})),
+        base_url="http://runner",
+    ) as fake_runner:
+        _route_to_runner(monkeypatch, fake_runner)
+        response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": event_type, "data": event_data},
+        )
+        assert response.status_code == 202, response.text
+
+    items_response = await client.get(f"/v1/sessions/{session['id']}/items")
+    assert items_response.status_code == 200, items_response.text
+    [message] = [item for item in items_response.json()["data"] if item["type"] == "message"]
+    assert message["content"] == item_data["content"]
+    assert message.get("is_meta", False) is (event_type == "message")
+    assert "user_authored" not in message
 
 
 async def test_sidebar_rename_wins_in_flight_background_title(
@@ -1475,6 +1521,46 @@ async def test_a_session_unbound_from_its_runner_lists_no_background_work(
     list_resp = await client.get("/v1/sessions")
     row = next(s for s in list_resp.json()["data"] if s["id"] == session["id"])
     assert row["background_work_running"] is False
+
+
+async def test_snapshot_names_the_agents_of_a_background_agent_hold(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A Claude turn waiting on its background agent reads ``running`` and names the agent.
+
+    Released headless ``-p`` clients stop polling on any status but ``running`` /
+    ``launching``, so the hold keeps the collapsed status and signals itself only
+    through the additive ``background_agents`` field. Any other ``waiting`` (an
+    SDK orchestrator parked on sub-agents) names no agents. The list row reads
+    ``running`` for both.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import BackgroundTaskInfo
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+    background_agent = BackgroundTaskInfo(id="a1", type="subagent", description="Audit")
+    try:
+        sessions_module._publish_status(sid, "waiting", background_agents=[background_agent])
+        held = (await client.get(f"/v1/sessions/{sid}")).json()
+        list_resp = await client.get("/v1/sessions")
+        row = next(s for s in list_resp.json()["data"] if s["id"] == sid)
+
+        sessions_module._publish_status(sid, "waiting")
+        parked = (await client.get(f"/v1/sessions/{sid}")).json()
+
+        assert held["status"] == "running"
+        assert [(a["id"], a["description"]) for a in held["background_agents"]] == [
+            ("a1", "Audit")
+        ]
+        assert row["status"] == "running"
+        assert parked["status"] == "running"
+        assert parked.get("background_agents") is None
+    finally:
+        sessions_module._session_status_cache.pop(sid, None)
+        sessions_module._session_background_agents_cache.pop(sid, None)
 
 
 async def test_external_background_work_lists_tasks_for_the_composer(
@@ -2785,6 +2871,8 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     items = items_resp.json()["data"]
     visible = next(item for item in items if item["type"] == "slash_command")
     meta = next(item for item in items if item["type"] == "message" and item.get("is_meta"))
+    # Explicit skill invocation marks even its hidden expansion as user-authored.
+    assert meta["user_authored"] is True
     assert visible["name"] == "grill-me"
     assert visible["kind"] == "skill"
     assert visible["arguments"] == "review this rollout"
@@ -4827,6 +4915,62 @@ async def test_list_session_items_pagination(
     assert len(page["data"]) <= 1
 
 
+async def test_list_session_items_filters_by_item_type(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``type`` keeps only items of that type, across pages; an unknown type is a 422."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    SqlAlchemyConversationStore(db_uri).append(
+        session["id"],
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_1",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+            ),
+            NewConversationItem(
+                type="function_call",
+                response_id="resp_1",
+                data=FunctionCallData(
+                    agent="test-agent", name="search", arguments="{}", call_id="call_1"
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_2",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "again"}]),
+            ),
+        ],
+    )
+    items_url = f"/v1/sessions/{session['id']}/items"
+
+    by_type = {
+        item_type: [
+            item["type"]
+            for item in (await client.get(items_url, params={"type": item_type})).json()["data"]
+        ]
+        for item_type in ("message", "function_call")
+    }
+    # The cursor of a filtered page continues with the next item of that type.
+    first = (await client.get(items_url, params={"type": "message", "limit": 1})).json()
+    second = (
+        await client.get(
+            items_url, params={"type": "message", "limit": 1, "after": first["last_id"]}
+        )
+    ).json()
+    bogus = await client.get(items_url, params={"type": "bogus"})
+
+    assert by_type == {"message": ["message", "message"], "function_call": ["function_call"]}
+    pages = [
+        ([item["content"][0]["text"] for item in page["data"]], page["has_more"])
+        for page in (first, second)
+    ]
+    assert pages == [(["hi"], True), (["again"], False)]
+    assert bogus.status_code == 422, bogus.text
+
+
 async def test_list_session_items_404_for_nonexistent(
     client: httpx.AsyncClient,
 ) -> None:
@@ -5022,6 +5166,52 @@ async def test_post_external_assistant_message_persists_and_streams(
     assert all(session_id == session["id"] for session_id, _ in published)
     assert published[0][1]["item"]["id"] == ack["item_id"]
     assert published[0][1]["item"]["model"] == "claude-native-ui"
+
+
+async def test_post_external_assistant_message_rejects_over_length_response_id(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A response_id longer than the ``String(64)`` column is a 400, not a 500.
+
+    An over-length id used to pass the non-empty check and fail the insert,
+    which the transcript forwarders retry as a transient server error. The
+    route must reject it as invalid input before persisting anything, while
+    an id exactly at the limit still round-trips.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    rejected = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_assistant_message",
+            "data": {
+                "agent": "claude-native-ui",
+                "text": "too long",
+                "response_id": "r" * 65,
+            },
+        },
+    )
+    assert rejected.status_code == 400, rejected.text
+    assert "response_id" in rejected.text
+    assert (await client.get(f"/v1/sessions/{session['id']}")).json()["items"] == []
+
+    at_limit = "r" * 64
+    accepted = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_assistant_message",
+            "data": {
+                "agent": "claude-native-ui",
+                "text": "fits",
+                "response_id": at_limit,
+            },
+        },
+    )
+    assert accepted.status_code == 202, accepted.text
+    items = (await client.get(f"/v1/sessions/{session['id']}")).json()["items"]
+    assert [item["response_id"] for item in items] == [at_limit]
 
 
 async def test_post_external_conversation_item_persists_and_streams_visible_items(
@@ -5797,12 +5987,14 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
     assert relay_bindings == [(sid, "runner_recovered")]
 
 
+@pytest.mark.parametrize("wire_output", [None, "HOOK_FINAL", ""])
 async def test_post_external_session_status_idle_forwards_persisted_assistant_output(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    wire_output: str | None,
 ) -> None:
     """
-    Native idle status forwarding includes AP-persisted assistant text.
+    A confirmed native idle keeps the hook reply; otherwise persisted text fills it.
 
     The native forwarder posts transcript items to Omnigent server, then posts
     ``external_session_status: idle``. The runner's sub-agent registry
@@ -5867,9 +6059,14 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
         assert item_resp.status_code == 202, item_resp.text
 
         forwarded.clear()
+        status_data: dict[str, Any] = {"status": "idle"}
+        if wire_output is not None:
+            # The Claude ``Stop`` edge carries its reply with ``turn_completed``.
+            status_data["output"] = wire_output
+            status_data["turn_completed"] = True
         status_resp = await client.post(
             f"/v1/sessions/{child['id']}/events",
-            json={"type": "external_session_status", "data": {"status": "idle"}},
+            json={"type": "external_session_status", "data": status_data},
         )
 
     assert status_resp.status_code == 202, status_resp.text
@@ -5878,7 +6075,11 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
             "path": f"/v1/sessions/{child['id']}/events",
             "body": {
                 "type": "external_session_status",
-                "data": {"status": "idle", "output": "AP_NATIVE_DONE"},
+                "data": (
+                    {"status": "idle", "output": "AP_NATIVE_DONE"}
+                    if wire_output is None
+                    else {"status": "idle", "output": wire_output, "turn_completed": True}
+                ),
                 "model_override": None,
                 "tools": None,
                 "created_by": None,
@@ -8880,15 +9081,15 @@ async def test_post_external_model_options_populates_picker_and_publishes(
     assert snapshot["model_options"][1]["displayName"] == "anthropic-claude-opus-4-1"
 
 
-async def test_post_external_model_options_empty_evicts_cache(
+async def test_post_external_model_options_empty_hides_picker(
     client: httpx.AsyncClient,
 ) -> None:
     """
     An empty ``data.models`` clears any prior pushed catalog; a non-list 400s.
 
-    Empty means "no catalog to show" — the entry is evicted so the picker
-    hides rather than serving a stale list. A malformed (non-list) payload
-    fails loud at the boundary.
+    Empty means "no catalog to show" — cache that authoritative result so
+    host recovery cannot restore a stale list. A malformed (non-list)
+    payload fails loud at the boundary.
     """
     from omnigent.server.routes import sessions as _mod
 
@@ -8912,7 +9113,9 @@ async def test_post_external_model_options_empty_evicts_cache(
         json={"type": "external_model_options", "data": {"models": []}},
     )
     assert cleared.status_code == 202, cleared.text
-    assert session["id"] not in _mod._pushed_model_options_cache
+    assert _mod._pushed_model_options_cache[session["id"]] == []
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["model_options"] == []
 
     bad = await client.post(
         f"/v1/sessions/{session['id']}/events",
@@ -10277,6 +10480,59 @@ async def test_post_external_conversation_item_auto_assigns_response_id(
     assert published[0][1]["type"] == "session.input.consumed"
 
 
+async def test_post_external_conversation_item_rejects_over_length_response_id(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A response_id longer than the ``String(64)`` column is a 400, not a 500.
+
+    An over-length id used to pass the non-empty check and fail the insert,
+    which the native forwarders retry as a transient server error and, for a
+    source-keyed item, loop on forever. The route must reject it as invalid
+    input before persisting anything, while an id exactly at the limit still
+    round-trips.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    rejected = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "response_id": "r" * 65,
+                "item_data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "too long"}],
+                },
+            },
+        },
+    )
+    assert rejected.status_code == 400, rejected.text
+    assert "response_id" in rejected.text
+    assert (await client.get(f"/v1/sessions/{session['id']}")).json()["items"] == []
+
+    at_limit = "r" * 64
+    accepted = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "response_id": at_limit,
+                "item_data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "fits"}],
+                },
+            },
+        },
+    )
+    assert accepted.status_code == 202, accepted.text
+    items = (await client.get(f"/v1/sessions/{session['id']}")).json()["items"]
+    assert [item["response_id"] for item in items] == [at_limit]
+
+
 async def test_external_user_message_seeds_title_on_claude_native_session(
     client: httpx.AsyncClient,
 ) -> None:
@@ -10905,6 +11161,7 @@ async def test_interrupt_forward_failure_lifts_stop_fence(
         runner_router: object,
         *,
         conversation: Any = None,
+        for_control: bool = False,
     ) -> httpx.AsyncClient | None:
         """Resolve every session to the failing fake runner (or to none)."""
         assert conversation is None or conversation.id == session_id
@@ -11250,6 +11507,7 @@ async def test_interrupt_forward_failure_keeps_queued_native_messages_pending(
         runner_router: object,
         *,
         conversation: Any = None,
+        for_control: bool = False,
     ) -> httpx.AsyncClient | None:
         """Resolve every session to the failing fake runner (or to none)."""
         del session_id, runner_router, conversation

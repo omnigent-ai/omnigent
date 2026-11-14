@@ -29,7 +29,10 @@ from omnigent.tools.builtins import (
     SysCallAsyncTool,
     SysCancelAsyncTool,
     SysListModelsTool,
+    SysProjectListTool,
+    SysProjectUpdateTool,
     SysReadInboxTool,
+    SysReminderSetTool,
     SysScheduledTaskCreateTool,
     SysScheduledTaskDeleteTool,
     SysScheduledTaskListTool,
@@ -38,10 +41,12 @@ from omnigent.tools.builtins import (
     SysSessionCreateTool,
     SysSessionGetHistoryTool,
     SysSessionGetInfoTool,
+    SysSessionLinkPrTool,
     SysSessionListTool,
     SysSessionRenameTool,
     SysSessionSendTool,
     SysSessionShareTool,
+    SysSessionUpdateTool,
     SysTimerCancelTool,
     SysTimerSetTool,
     UpdateCommentTool,
@@ -161,6 +166,7 @@ class ToolManager:
         self._register_sub_agent_tools()
         self._register_session_tools()
         self._register_agent_mgmt_tools()
+        self._register_project_tools()
         self._register_os_env_tools(schema_only=os_env_schema_only)
         self._register_terminal_tools()
         self._register_local_tools(workdir)
@@ -214,10 +220,10 @@ class ToolManager:
         Auto-register the scheduled-task management builtins.
 
         Registered without spec opt-in so an agent can create, list,
-        update, and delete recurring scheduled tasks at runtime;
-        ``tool_groups.scheduled_tasks: false`` drops all four. The runner
-        dispatches them via the Omnigent server's ``/v1/scheduled-tasks``
-        REST endpoints.
+        update, and delete recurring scheduled tasks, and set one-time
+        reminders, at runtime; ``tool_groups.scheduled_tasks: false`` drops
+        all five. The runner dispatches them via the Omnigent server's
+        ``/v1/scheduled-tasks`` REST endpoints.
         """
         if not self._spec.tool_groups.scheduled_tasks:
             return
@@ -226,6 +232,7 @@ class ToolManager:
             SysScheduledTaskListTool(),
             SysScheduledTaskUpdateTool(),
             SysScheduledTaskDeleteTool(),
+            SysReminderSetTool(),
         ):
             self._tools[tool.name()] = tool
 
@@ -517,17 +524,17 @@ class ToolManager:
 
     def _register_agent_mgmt_tools(self) -> None:
         """
-        Register the read-only ``sys_agent_*`` discovery tools.
+        Register the ``sys_agent_*`` discovery and bundle tools.
 
         ``sys_agent_get``, ``sys_agent_download``, and ``sys_agent_list``
         are registered without spec opt-in, mirroring the always-on
         session reads in :meth:`_register_sub_agent_tools`;
-        ``tool_groups.agent_discovery: false`` drops all three. They are
-        global reads bounded by the server's per-user permission model —
-        they proxy auth-gated ``GET /v1/sessions/{id}/agent``,
+        ``tool_groups.agent_discovery: false`` drops all three. They proxy
+        auth-gated ``GET /v1/sessions/{id}/agent``,
         ``.../agent/contents``, and ``GET /v1/agents`` + ``/v1/sessions``
         endpoints (``sys_agent_list`` also scans the agent's own local
-        config dir), so registration grants no access the caller didn't
+        config dir). Bundle download requires READ access and redacts without
+        EDIT; metadata reads accept READ access. Registration grants no access the caller didn't
         already have. They are runner-dispatched and need no
         construction-time wiring.
         """
@@ -536,6 +543,21 @@ class ToolManager:
         self._tools[SysAgentGetTool.name()] = SysAgentGetTool()
         self._tools[SysAgentDownloadTool.name()] = SysAgentDownloadTool()
         self._tools[SysAgentListTool.name()] = SysAgentListTool()
+
+    def _register_project_tools(self) -> None:
+        """
+        Register the project and session organizing tools.
+
+        They proxy the owner-gated projects and session PATCH endpoints the
+        sidebar uses, so they grant no access the caller lacks;
+        ``tool_groups.projects: false`` drops the pair.
+        """
+        if not self._spec.tool_groups.projects:
+            return
+        self._tools[SysProjectListTool.name()] = SysProjectListTool()
+        self._tools[SysSessionLinkPrTool.name()] = SysSessionLinkPrTool()
+        self._tools[SysSessionUpdateTool.name()] = SysSessionUpdateTool()
+        self._tools[SysProjectUpdateTool.name()] = SysProjectUpdateTool()
 
     def _register_task_lifecycle_tools(self) -> None:
         """

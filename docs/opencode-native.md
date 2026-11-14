@@ -90,9 +90,11 @@ prompt: |
 Every tool call asks: the runner writes a `permissions` rule
 `{action: "*", resource: "*", effect: "ask"}` into the per-conversation config
 and never passes `--auto`. This routes every call through the Omnigent policy
-engine. Omnigent's relay tools, and any MCP servers merged from your own
-OpenCode config, run with Code Mode off, so each call is asked under its own
-`<server>_<tool>` name and a policy can gate it by name. OpenCode's own MCP
+engine. Native sessions include only the agent-declared MCP servers and the
+Omnigent relay; ambient MCP servers from your global OpenCode config are not
+inherited. Your providers, default model, and plugins still merge normally.
+The declared servers and relay run with Code Mode off, so each call is asked
+under its own `<server>_<tool>` name and a policy can gate it by name. OpenCode's own MCP
 builtins (`opencode_list_mcp_resources`, `opencode_read_mcp_resource`) can
 still reach any configured server and have no config switch to turn them off.
 They are gated as OS tools: `ask_on_os_tools` asks before each one.

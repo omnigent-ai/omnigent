@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, NoReturn, TextIO
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     CLAUDE_FRAMEWORK_CONTEXT_FILE,
+    CLAUDE_STARTUP_CONTEXT_FILE,
     approval_wait_marker_path,
     hold_approval_wait_marker,
     read_active_session_id,
@@ -225,8 +226,8 @@ def main(argv: list[str] | None = None) -> int:
         return _main_evaluate_policy(raw_argv[1:])
     if raw_argv and raw_argv[0] == "route-turn":
         return _main_route_turn(raw_argv[1:])
-    if raw_argv and raw_argv[0] == "framework-context":
-        return _main_framework_context(raw_argv[1:])
+    if raw_argv and raw_argv[0] in ("framework-context", "startup-context"):
+        return _main_framework_context(raw_argv[1:], startup=raw_argv[0] == "startup-context")
     # Backwards compat: older bridge dirs may still reference the
     # pre-tool-use subcommand before the terminal is restarted.
     if raw_argv and raw_argv[0] == "pre-tool-use":
@@ -451,9 +452,7 @@ def _rotate_session_on_clear(bridge_dir: Path) -> str | None:
     # _RunnerDatabricksAuth, so key the reused headers dict from the runner-env
     # host_id (databricks_request_headers reads OMNIGENT_RUNNER_SLICE_KEY when no
     # explicit host_id; emitted only on the workspace mount).
-    from omnigent.cli_auth import databricks_request_headers
-
-    headers.update(databricks_request_headers(ap_server_url))
+    _merge_identity_headers(headers, ap_server_url)
     from omnigent.native.native_policy_hook import is_loopback_url
 
     try:
@@ -513,9 +512,7 @@ def _rotate_session_on_fork(bridge_dir: Path) -> str | None:
     # _RunnerDatabricksAuth, so key the reused headers dict from the runner-env
     # host_id (databricks_request_headers reads OMNIGENT_RUNNER_SLICE_KEY when no
     # explicit host_id; emitted only on the workspace mount).
-    from omnigent.cli_auth import databricks_request_headers
-
-    headers.update(databricks_request_headers(ap_server_url))
+    _merge_identity_headers(headers, ap_server_url)
     from omnigent.native.native_policy_hook import is_loopback_url
 
     try:
@@ -746,6 +743,23 @@ def _sleep_before_retry(backoff_s: float, retry_by: float) -> None:
         start after, e.g. the retry deadline.
     """
     time.sleep(max(0.0, min(backoff_s, retry_by - time.monotonic())))
+
+
+def _merge_identity_headers(headers: dict[str, str], server_url: str) -> None:
+    """Merge this hook's routing and identity headers into *headers*, in place.
+
+    *headers* is often a snapshot persisted by the CLI that launched Claude, whose
+    ``user-agent`` names that CLI. The hook's own User-Agent replaces it in any casing,
+    so the request carries exactly one.
+
+    :param headers: Request headers, mutated in place.
+    :param server_url: Omnigent server URL the request targets.
+    """
+    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.telemetry.request_headers import pop_client_user_agent
+
+    headers.update(databricks_request_headers(server_url))
+    headers["User-Agent"] = pop_client_user_agent(headers)
 
 
 def _post_hook_with_reattach(
@@ -1086,9 +1100,7 @@ def _main_permission_request(argv: list[str]) -> int:
     # registry on the replica holding this session's runner tunnel; an unkeyed
     # POST lands elsewhere and the approval is silently lost. Key from the
     # runner-env host_id (reads OMNIGENT_RUNNER_SLICE_KEY; workspace mount only).
-    from omnigent.cli_auth import databricks_request_headers
-
-    headers.update(databricks_request_headers(ap_server_url))
+    _merge_identity_headers(headers, ap_server_url)
     url = (
         f"{ap_server_url.rstrip('/')}/v1/sessions/"
         f"{url_component(session_id)}/hooks/permission-request"
@@ -1143,12 +1155,13 @@ def _skip_httpx_cli_import() -> None:
 def _main_evaluate_policy(argv: list[str]) -> int:
     """
     Evaluate a Claude Code ``PreToolUse`` / ``PostToolUse`` /
-    ``UserPromptSubmit`` hook against Omnigent policies.
+    ``PostToolUseFailure`` / ``UserPromptSubmit`` hook against Omnigent
+    policies.
 
     Reads the hook JSON payload from stdin, converts it into the
     proto-compatible ``EvaluationRequest`` schema (``PHASE_TOOL_CALL``
-    for PreToolUse, ``PHASE_TOOL_RESULT`` for PostToolUse,
-    ``PHASE_REQUEST`` for UserPromptSubmit), POSTs to
+    for PreToolUse, ``PHASE_TOOL_RESULT`` for PostToolUse and
+    PostToolUseFailure, ``PHASE_REQUEST`` for UserPromptSubmit), POSTs to
     ``/v1/sessions/{id}/policies/evaluate``, and converts the
     ``EvaluationResponse`` back into Claude Code's hook output format.
 
@@ -1167,9 +1180,9 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     drops the prompt before the model sees it; ASK is resolved
     server-side; ALLOW proceeds with no output.
 
-    For ``PostToolUse``, policy denials are surfaced as
-    ``additionalContext`` (Claude sees the warning but the tool result
-    is already committed — PostToolUse hooks are observational).
+    For ``PostToolUse`` and ``PostToolUseFailure``, policy denials are
+    surfaced as ``additionalContext`` (Claude sees the warning but the
+    tool result is already committed — these hooks are observational).
 
     Failure handling is phase-aware (mirroring the runner-side default
     from PR #163). Once the session is known to be governed (an active
@@ -1179,7 +1192,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     a ``PreToolUse`` (``PHASE_TOOL_CALL``) call fails CLOSED with a
     ``deny`` (this hook is the sole enforcement point for native tools, so
     a transient outage must not silently let a gated call through), while
-    ``UserPromptSubmit`` and ``PostToolUse`` fail OPEN. Pre-evaluation
+    ``UserPromptSubmit`` blocks and the tool-result hooks fail OPEN. Pre-evaluation
     conditions that mean the session simply is not governed — no active
     session, no ``ap_server_url``, an unparseable hook payload, or an
     ``mcp__omnigent__*`` tool already gated on the relay path — still
@@ -1263,9 +1276,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         # This posts to the session's policy registry on the replica holding its
         # tunnel; key from the runner-env host_id so it isn't misrouted. (The
         # relay branch above targets a relay token URL, so it needs no key.)
-        from omnigent.cli_auth import databricks_request_headers
-
-        headers.update(databricks_request_headers(ap_server_url))
+        _merge_identity_headers(headers, ap_server_url)
         session_component = url_component(session_id)
         url = f"{ap_server_url.rstrip('/')}/v1/sessions/{session_component}/policies/evaluate"
         reauth = policy_hook_reauth(ap_server_url, headers)
@@ -1315,14 +1326,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _main_framework_context(argv: list[str]) -> int:
-    """Add pending framework context to one submitted prompt."""
+def _main_framework_context(argv: list[str], *, startup: bool = False) -> int:
+    """Return persistent startup context or consume one pending prompt notice."""
     args = _parse_evaluate_policy_args(argv)
     sys.stdin.read()
-    path = Path(args.bridge_dir) / CLAUDE_FRAMEWORK_CONTEXT_FILE
+    filename = CLAUDE_STARTUP_CONTEXT_FILE if startup else CLAUDE_FRAMEWORK_CONTEXT_FILE
+    path = Path(args.bridge_dir) / filename
     try:
         text = path.read_text(encoding="utf-8")
-        path.unlink(missing_ok=True)
+        if not startup:
+            path.unlink(missing_ok=True)
     except OSError:
         return 0
     if text:
@@ -1330,7 +1343,7 @@ def _main_framework_context(argv: list[str]) -> int:
             json.dumps(
                 {
                     "hookSpecificOutput": {
-                        "hookEventName": "UserPromptSubmit",
+                        "hookEventName": "SessionStart" if startup else "UserPromptSubmit",
                         "additionalContext": text,
                     }
                 }

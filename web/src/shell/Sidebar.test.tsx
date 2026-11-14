@@ -1,7 +1,14 @@
+import {
+  addNestedSessionDraft,
+  updateNestedSessionDraft,
+  removeNestedSessionDraft,
+} from "@/lib/nestedSessionDrafts";
+import type { Session } from "@/lib/types";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
+import { conversationPage } from "@/test/sidebarMockHelpers";
 import * as automationInboxHook from "@/hooks/useAutomationInbox";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
@@ -36,6 +43,7 @@ import type * as PullRequestsModule from "@/hooks/usePullRequests";
 import {
   markConversationRead,
   markConversationSeen,
+  markConversationUnread,
   resetReadStateForTests,
   seedReadState,
 } from "@/hooks/useUnseenConversations";
@@ -48,7 +56,6 @@ import {
   writeProjectFolderCollapse,
   writeProjectFolderPageSize,
 } from "@/lib/projectFolderPaginationPreferences";
-import * as sessionsApi from "@/lib/sessionsApi";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { ExtensionCatalogProvider } from "@/extensions/ExtensionProvider";
 import type { ExtensionCatalogItem } from "@/extensions/types";
@@ -224,6 +231,9 @@ function conv(id: string, agentName: string, partial: Partial<Conversation> = {}
   };
 }
 
+// The server's latest-activity label: the sole source of the sidebar error badge.
+const ERROR_LABELS = { "omnigent.latest_activity_error": "error" };
+
 // Three distinct agent types, mirroring the user's report
 // (databricks_coding_agent / Claude Code / Codex).
 const THREE_TYPE_CONVERSATIONS = [
@@ -259,6 +269,9 @@ function mockConversations(convs: Conversation[]) {
   useConvMock.mockImplementation(() => result(convs));
 }
 
+/** Server info with automations on, which the Automations nav row requires. */
+const AUTOMATIONS_INFO: ServerInfo = { ...FALLBACK_SERVER_INFO, automations_enabled: true };
+
 function renderSidebar(
   open = true,
   initialEntry = "/",
@@ -286,7 +299,7 @@ function renderSidebar(
   );
   const result = render(tree());
   // Re-render the same tree, as a query does when the hook mocks return new data.
-  return { ...result, refresh: () => result.rerender(tree()) };
+  return { ...result, queryClient: qc, refresh: () => result.rerender(tree()) };
 }
 
 // Session scope lives in the Sessions heading's filter menu; pick an option to
@@ -449,7 +462,7 @@ describe("Sidebar scroll divider", () => {
     fireEvent.scroll(screen.getByRole("navigation"), { target: { scrollTop: 100 } });
     expect(screen.getByTestId("sidebar-scroll-divider")).toHaveClass("opacity-100");
 
-    fireEvent.click(screen.getByTestId("sidebar-settings-float"));
+    fireEvent.click(screen.getByTestId("sidebar-profile-settings"));
     expect(screen.queryByTestId("sidebar-scroll-divider")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("link", { name: /back/i }));
@@ -1087,13 +1100,12 @@ describe("Sidebar session list", () => {
     );
   });
 
-  it("renders Search, Settings, and Collapse as compact header actions", () => {
+  it("keeps navigation controls in the header and moves Settings to the footer", async () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
 
     const headerActions = screen.getByTestId("sidebar-header-actions");
     const search = within(headerActions).getByTestId("sidebar-search-button");
-    const settings = screen.getByTestId("settings-button");
 
     expect(search).toHaveAttribute("aria-label", "Search");
     expect(search).toHaveAttribute("data-size", "icon-xs");
@@ -1101,29 +1113,29 @@ describe("Sidebar session list", () => {
     expect(search).not.toHaveClass("rounded-sm");
     expect(search.querySelector("svg")).toHaveClass("size-4");
     expect(search.querySelector("svg")).not.toHaveClass("ui-icon");
-    expect(settings).toHaveAttribute("aria-label", "Settings");
-    expect(settings).toHaveAttribute("data-size", "icon-xs");
-    expect(settings).toHaveClass("size-6", "rounded-[8px]");
-    expect(settings.querySelector("svg")).toHaveClass("size-4");
-    expect(settings.querySelector("svg")).not.toHaveClass("ui-icon");
+    expect(within(headerActions).queryByLabelText("Settings")).toBeNull();
     const collapse = within(headerActions).getByRole("button", { name: "Close sidebar" });
     expect(collapse).toHaveAttribute("data-size", "icon-xs");
     expect(collapse).toHaveClass("size-6", "rounded-[var(--radius-md)]");
+    const historyNavigation = within(headerActions).getByTestId("history-navigation-buttons");
+    expect(within(historyNavigation).getByRole("button", { name: "Back" })).toHaveClass("size-6");
+    expect(within(historyNavigation).getByRole("button", { name: "Forward" })).toHaveClass(
+      "size-6",
+    );
     expect(within(headerActions).queryByTestId("inbox-button")).toBeNull();
+    expect(await screen.findByTestId("sidebar-profile-settings")).toHaveAttribute(
+      "href",
+      "/settings",
+    );
   });
 
-  it("omits the desktop server picker outside the Electron shell", async () => {
-    // The picker is Electron-only: it self-hides when the native bridge
-    // reports no connected server (a plain browser tab, as in tests), leaving
-    // the sidebar ending with the session list exactly as before.
+  it("renders the profile footer outside the Electron shell", async () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
 
-    // Anchor on something that DOES render, so a silently-empty sidebar can't
-    // make this assertion pass for the wrong reason.
-    expect(await screen.findByTestId("settings-button")).toBeInTheDocument();
-    expect(screen.queryByTestId("sidebar-server-picker")).toBeNull();
-    expect(screen.queryByTestId("sidebar-server-picker-row")).toBeNull();
+    expect(await screen.findByTestId("sidebar-profile-settings")).toBeInTheDocument();
+    expect(screen.getByTestId("sidebar-server-picker")).toBeInTheDocument();
+    expect(screen.getByTestId("sidebar-server-picker-row")).toBeInTheDocument();
   });
 
   it("renders Inbox as its own primary navigation row", () => {
@@ -1216,6 +1228,18 @@ describe("Sidebar session list", () => {
       }
     },
   );
+
+  it.each(["/", "/inbox"])("counts an unread session in the Inbox badge on %s", (route) => {
+    seedReadState([{ id: "conv_unread", viewer_last_seen: 199 }]);
+    mockConversations([conv("conv_unread", "Codex", { status: "idle", updated_at: 200 })]);
+    renderSidebar(true, route);
+
+    const row = screen.getByRole("link", { name: /conv_unread/ }).closest("li")!;
+    expect(within(row).getByRole("img", { name: "New messages" })).toBeInTheDocument();
+    expect(
+      within(screen.getByTestId("inbox-button")).getByLabelText("1 inbox item waiting"),
+    ).toHaveTextContent("1");
+  });
 
   it("lets the active Inbox row show through the count badge", () => {
     // On /inbox the row itself paints the translucent --sidebar-active wash.
@@ -1341,7 +1365,7 @@ describe("Sidebar session list", () => {
 
   it("renders the 'Automations' nav row directly under 'New session' and routes to /tasks", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
-    renderSidebar();
+    renderSidebar(true, "/", undefined, AUTOMATIONS_INFO);
 
     const scheduled = screen.getByTestId("scheduled-tasks-nav");
     // Full-width nav ROW (a link), labeled "Automations", pointing at /tasks —
@@ -1387,9 +1411,17 @@ describe("Sidebar session list", () => {
     );
   });
 
+  it("hides the 'Automations' nav row when automations are off for the caller", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/", undefined, { ...AUTOMATIONS_INFO, automations_enabled: false });
+
+    expect(screen.queryByTestId("scheduled-tasks-nav")).toBeNull();
+    expect(screen.getByTestId("new-chat-button")).toBeInTheDocument();
+  });
+
   it("marks the 'Automations' nav row active when on /tasks", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
-    renderSidebar(true, "/tasks");
+    renderSidebar(true, "/tasks", undefined, AUTOMATIONS_INFO);
 
     // Active/selected state uses the SAME shared active-highlight as the sibling
     // nav rows (New session / Inbox) — the `--sidebar-active` pill, not an
@@ -1424,7 +1456,7 @@ describe("Sidebar session list", () => {
 
   it("leaves the primary nav unchanged for an empty extension catalog", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
-    renderSidebar();
+    renderSidebar(true, "/", undefined, AUTOMATIONS_INFO);
 
     expect(screen.queryByTestId(/^extension-nav-/)).toBeNull();
     expect(screen.getByTestId("new-chat-button")).toBeInTheDocument();
@@ -1434,7 +1466,7 @@ describe("Sidebar session list", () => {
 
   it("marks Automations active (not New session) on /tasks/:taskId (detail route)", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
-    renderSidebar(true, "/tasks/task_abc123");
+    renderSidebar(true, "/tasks/task_abc123", undefined, AUTOMATIONS_INFO);
 
     // Automations is highlighted on the detail route — same pill as the list page.
     expect(screen.getByTestId("scheduled-tasks-nav").className).toContain(
@@ -1464,7 +1496,7 @@ describe("Sidebar session list", () => {
         </SidebarDataProvider>
       </QueryClientProvider>,
     );
-    fireEvent.click(screen.getByTestId("settings-button"));
+    fireEvent.click(screen.getByTestId("sidebar-profile-settings"));
     expect(onClose).not.toHaveBeenCalled();
   });
 
@@ -1482,8 +1514,8 @@ describe("Sidebar session list", () => {
     // Active sessions still render in the Sessions list.
     const recentSection = screen.getByText("Sessions").closest("section")!;
     expect(within(recentSection).getByText("conv_active")).toBeInTheDocument();
-    // The header Settings link points at the settings page.
-    expect(screen.getByTestId("settings-button")).toHaveAttribute("href", "/settings");
+    // The footer Settings link points at the settings page.
+    expect(screen.getByTestId("sidebar-profile-settings")).toHaveAttribute("href", "/settings");
   });
 
   it("renders sessions in one flat list with no connection grouping", () => {
@@ -1787,8 +1819,9 @@ describe("Sidebar failed session indicator", () => {
 
   it("replaces an unread dot with the error icon and keeps it after marking read", () => {
     const session = conv("conv_error", "Codex", {
-      status: "failed",
+      status: "idle",
       updated_at: 200,
+      labels: ERROR_LABELS,
     });
     seedReadState([{ id: session.id, viewer_last_seen: 199 }]);
     mockConversations([session]);
@@ -1809,8 +1842,9 @@ describe("Sidebar failed session indicator", () => {
 
   it("keeps the error icon on the active, already-read session", () => {
     const session = conv("conv_error", "Codex", {
-      status: "failed",
+      status: "idle",
       updated_at: 200,
+      labels: ERROR_LABELS,
     });
     seedReadState([{ id: session.id, viewer_last_seen: session.updated_at }]);
     mockConversations([session]);
@@ -1824,26 +1858,27 @@ describe("Sidebar failed session indicator", () => {
     );
   });
 
-  it("updates a mounted row when only the session status changes", () => {
+  it("updates a mounted row when only the error label changes", () => {
     // Stable project contexts keep unrelated context updates from bypassing
     // the row's render-field comparator.
     projectRowsRef.current = [];
     const session = conv("conv_error", "Codex", {
-      status: "failed",
+      status: "idle",
       updated_at: 200,
+      labels: ERROR_LABELS,
     });
     mockConversations([session]);
     const { refresh } = renderSessionSidebar();
     const row = screen.getByRole("link", { name: "conv_error" }).closest("li")!;
     expect(within(row).getByTestId("session-state-badge")).toHaveAttribute("data-state", "error");
 
-    mockConversations([{ ...session, status: "idle" }]);
+    mockConversations([{ ...session, labels: {} }]);
     refresh();
 
     expect(screen.getByRole("link", { name: "conv_error" }).closest("li")).toBe(row);
     expect(within(row).queryByTestId("session-state-badge")).toBeNull();
 
-    mockConversations([{ ...session, status: "failed" }]);
+    mockConversations([{ ...session, labels: ERROR_LABELS }]);
     refresh();
 
     expect(screen.getByRole("link", { name: "conv_error" }).closest("li")).toBe(row);
@@ -1854,7 +1889,7 @@ describe("Sidebar failed session indicator", () => {
     { status: "running" as const, pending: 0, expected: "running" },
     { status: "failed" as const, pending: 2, expected: "awaiting" },
   ])("lets $expected take precedence over a previous error", ({ status, pending, expected }) => {
-    const session = conv("conv_error", "Codex", { status: "failed" });
+    const session = conv("conv_error", "Codex", { status: "idle", labels: ERROR_LABELS });
     mockConversations([session]);
     const { refresh } = renderSessionSidebar();
     const row = screen.getByRole("link", { name: "conv_error" }).closest("li")!;
@@ -1874,10 +1909,11 @@ describe("Sidebar failed session indicator", () => {
     const wakingId = `conv_error_retry_${startup.status}_${startup.terminalPending}`;
     mockConversations([
       conv(wakingId, "Codex", {
-        status: "failed",
+        status: "idle",
         updated_at: 200,
+        labels: ERROR_LABELS,
       }),
-      conv("conv_other", "Codex", { status: "failed" }),
+      conv("conv_other", "Codex", { status: "idle", labels: ERROR_LABELS }),
     ]);
     seedReadState([{ id: wakingId, viewer_last_seen: 199 }]);
     useChatStore.setState({ conversationId: wakingId, ...startup });
@@ -1897,7 +1933,7 @@ describe("Sidebar failed session indicator", () => {
 
   it("shows the error icon on a pinned session", () => {
     seedPins(["conv_error"]);
-    mockConversations([conv("conv_error", "Codex", { status: "failed" })]);
+    mockConversations([conv("conv_error", "Codex", { status: "idle", labels: ERROR_LABELS })]);
     renderSidebar();
 
     const pinnedSection = screen.getByRole("button", { name: /^Pinned/ }).closest("section")!;
@@ -1918,9 +1954,9 @@ describe("Sidebar failed session indicator", () => {
       }
       mockConversations([
         conv(id, "Codex", {
-          status: state === "running" ? "running" : "failed",
+          status: state === "running" ? "running" : "idle",
           pending_elicitations_count: state === "awaiting" ? 1 : 0,
-          labels: pinned ? { omni_project: "Customer X" } : {},
+          labels: { ...(pinned ? { omni_project: "Customer X" } : {}), ...ERROR_LABELS },
         }),
       ]);
       if (state === "starting") {
@@ -1956,57 +1992,67 @@ describe("Sidebar failed session indicator", () => {
   });
 });
 
-describe("Sidebar idle latest-message error", () => {
-  beforeEach(() => {
-    vi.spyOn(sessionsApi, "fetchSessionItemsPage").mockResolvedValue({
-      items: [
-        {
-          id: "native_error",
-          response_id: "response1",
-          type: "message",
-          status: "completed",
-          role: "assistant",
-          content: [{ type: "output_text", text: "API Error: Request rejected (429)" }],
-        },
-      ],
-      hasMore: true,
+describe("Sidebar latest-activity error label", () => {
+  it("shows the icon for an unopened idle session and keeps it after marking read", () => {
+    const session = conv("conv_idle_error", "Claude Code", {
+      status: "idle",
+      updated_at: 200,
+      labels: ERROR_LABELS,
     });
-  });
-  afterEach(() => vi.mocked(sessionsApi.fetchSessionItemsPage).mockRestore());
-
-  it("shows the icon for an unopened idle session and keeps it after marking read", async () => {
-    const session = conv("conv_idle_error", "Claude Code", { status: "idle", updated_at: 200 });
     seedReadState([{ id: session.id, viewer_last_seen: 199 }]);
     mockConversations([session]);
     renderSidebar();
     const row = screen.getByRole("link", { name: /conv_idle_error/ }).closest("li")!;
-    const badge = await within(row).findByRole("img", { name: "Latest message is an error" });
+    const badge = within(row).getByRole("img", { name: "Latest message is an error" });
     expect(badge).toHaveAttribute("data-state", "error");
     expect(badge.querySelector("svg")).toHaveClass("text-destructive", "size-3.5");
     expect(within(row).getByText("(unread)")).toBeInTheDocument();
     act(() => markConversationSeen(session.id, session.updated_at));
     expect(within(row).queryByText("(unread)")).toBeNull();
     expect(within(row).getByRole("img", { name: "Latest message is an error" })).toBe(badge);
-    expect(sessionsApi.fetchSessionItemsPage).toHaveBeenCalledTimes(1);
   });
 
-  it("shows an idle message error on a collapsed project's marker", async () => {
+  it("shows a hidden folder row's error once Show more reveals it", () => {
+    projectsMock.push("Customer X");
+    const filed = Array.from({ length: PROJECT_FOLDER_PAGE_SIZE + 1 }, (_, i) =>
+      conv(`conv_filed_${i}`, "Claude Code", {
+        status: "idle",
+        updated_at: 100 - i,
+        labels: {
+          omni_project: "Customer X",
+          ...(i === PROJECT_FOLDER_PAGE_SIZE ? ERROR_LABELS : {}),
+        },
+      }),
+    );
+    mockConversations(filed);
+    renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
+    const hiddenId = filed.at(-1)!.id;
+    expect(screen.queryByRole("link", { name: hiddenId })).toBeNull();
+
+    const showMore = screen.getByRole("button", { name: /Show more/ });
+    expect(within(showMore).getByRole("img", { name: "Latest message is an error" })).toBeVisible();
+    fireEvent.click(showMore);
+    expect(showMore).not.toBeInTheDocument();
+    const row = screen.getByRole("link", { name: hiddenId }).closest("li")!;
+    expect(within(row).getByRole("img", { name: "Latest message is an error" })).toBeVisible();
+  });
+
+  it("shows a project's error on its collapsed marker and in the expanded row", () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_idle_error", "Claude Code", {
         status: "idle",
-        labels: { omni_project: "Customer X" },
+        labels: { omni_project: "Customer X", ...ERROR_LABELS },
       }),
     ]);
     renderSidebar();
     const header = screen.getByRole("button", { name: /^Customer X/ });
-    await within(header).findByRole("img", { name: "Latest message is an error" });
+    expect(within(header).getByRole("img", { name: "Latest message is an error" })).toBeVisible();
+
     fireEvent.click(header);
     const row = screen.getByRole("link", { name: "conv_idle_error" }).closest("li")!;
-    expect(
-      within(row).getByRole("img", { name: "Latest message is an error" }),
-    ).toBeInTheDocument();
-    expect(sessionsApi.fetchSessionItemsPage).toHaveBeenCalledTimes(1);
+    expect(within(row).getByRole("img", { name: "Latest message is an error" })).toBeVisible();
   });
 });
 
@@ -2059,78 +2105,247 @@ describe("Sidebar sections", () => {
     expect(screen.queryByText("conv_only_mine")).toBeNull();
   });
 
-  it.each([false, true])(
-    "moves personal pins out of their family until unpinned (project: %s)",
-    (inProject) => {
-      const family = { id: "family", representative_id: "conv_parent", pinned: false };
-      if (inProject) projectsMock.push("Customer X");
-      const projectLabels: Record<string, string> = inProject ? { omni_project: "Customer X" } : {};
-      mockConversations([
-        conv("conv_parent", "Claude Code", { family, labels: projectLabels }),
-        conv("conv_peer", "Codex", { family, labels: projectLabels }),
-        conv("conv_sibling", "Codex", {
-          family,
-          labels: { ...projectLabels, "omnigent.pinned": "1" },
-        }),
-      ]);
-      seedPins(["conv_sibling"]);
-      const { refresh } = renderSidebar();
-      if (inProject) fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
-
-      const link = screen.getByText("conv_parent").closest("a")!;
-      const surface = link.parentElement!;
-      const chevron = screen.getByRole("button", { name: "Collapse session family" });
-      expect(surface).toHaveClass("relative");
-      expect(surface).toContainElement(chevron);
-      expect(link).not.toContainElement(chevron);
-      const pinnedSection = screen.getByText("Pinned").closest("section")!;
-      expect(screen.getAllByText("conv_sibling")).toHaveLength(1);
-      expect(within(pinnedSection).getByText("conv_sibling").closest("li")).not.toHaveAttribute(
-        "data-sibling-session",
-      );
-      expect(
-        within(pinnedSection).queryByRole("button", { name: "Collapse session family" }),
-      ).toBeNull();
-
-      const setFamilyPinned = (pinned: boolean) => {
-        mockConversations([
-          conv("conv_parent", "Claude Code", {
-            family: { ...family, pinned },
-            labels: projectLabels,
-          }),
-          conv("conv_peer", "Codex", { family: { ...family, pinned }, labels: projectLabels }),
-          conv("conv_sibling", "Codex", {
-            family: { ...family, pinned },
-            labels: { ...projectLabels, "omnigent.pinned": "1" },
-          }),
-        ]);
-        seedPins(pinned ? ["conv_parent", "conv_sibling"] : ["conv_sibling"]);
-        refresh();
+  it.each([
+    "sessions",
+    "project",
+    "pinned",
+    "pinned-shared",
+    "source-off-page",
+    "pinned-local-backfill",
+    "pinned-bundled-backfill",
+    "project-local-backfill",
+    "pinned-legacy",
+  ])(
+    "expands a collapsed family for its draft in %s, replaces it in place, and removes cancelled drafts",
+    async (scope) => {
+      const family = {
+        id: "family",
+        representative_id: "conv_parent",
+        pinned: scope.startsWith("pinned") && scope !== "pinned-legacy",
       };
-      setFamilyPinned(true);
-      fireEvent.click(
-        within(pinnedSection).getByRole("button", { name: "Collapse session family" }),
-      );
-      expect(within(pinnedSection).getByText("conv_sibling")).toBeInTheDocument();
-      expect(within(pinnedSection).queryByText("conv_peer")).toBeNull();
-      setFamilyPinned(false);
-      expect(within(pinnedSection).getByText("conv_sibling").closest("li")).not.toHaveAttribute(
-        "data-sibling-session",
-      );
-      mockConversations([
-        conv("conv_parent", "Claude Code", { family, labels: projectLabels }),
-        conv("conv_peer", "Codex", { family, labels: projectLabels }),
-        conv("conv_sibling", "Codex", { family, labels: projectLabels }),
+      const labels: Record<string, string> = scope.startsWith("project")
+        ? { omni_project: "Example project" }
+        : {};
+      if (scope.startsWith("project")) projectsMock.push("Example project");
+      if (scope === "pinned-legacy") labels[PINNED_LABEL_KEY] = "1";
+      if (scope.startsWith("pinned")) seedPins(["conv_parent", "conv_peer", "created"]);
+      const members = [
+        conv("conv_parent", "Claude Code", { family, labels }),
+        conv("conv_peer", "Codex", { family, labels }),
+        ...(scope === "source-off-page" ? [conv("conv_other", "Codex", { family, labels })] : []),
+      ];
+      const load = (rows: Conversation[]) => {
+        mockConversations(rows);
+        if (scope === "pinned-shared") useConvMock.mockReturnValue(conversationPage([]));
+      };
+      load(members.filter((row) => scope !== "source-off-page" || row.id !== "conv_peer"));
+      const { queryClient, refresh } = renderSidebar();
+      if (scope === "pinned-shared") showSharedTab();
+      if (scope.startsWith("project"))
+        fireEvent.click(screen.getByRole("button", { name: /^Example project/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Collapse session family" }));
+      if (scope.startsWith("project"))
+        fireEvent.click(screen.getByRole("button", { name: /^Example project/ }));
+      if (scope === "pinned-legacy")
+        fireEvent.click(screen.getByRole("button", { name: /^Pinned/ }));
+      const source = {
+        id: scope === "source-off-page" ? "conv_peer" : "conv_parent",
+        title: "conv_parent",
+        createdAt: 1,
+        labels,
+        permissionLevel: null,
+        family,
+      } as Session;
+      if (scope === "source-off-page") {
+        const fetch = vi
+          .spyOn(identity, "authenticatedFetch")
+          .mockImplementation(async () => new Response(JSON.stringify(members[1])));
+        onTestFinished(() => fetch.mockRestore());
+      }
+      act(() => addNestedSessionDraft(queryClient, "temp:nested", source));
+      const placeholder = await screen.findByText("New nested agent");
+      expect(placeholder.closest("li")).toHaveAttribute("data-sibling-session", "true");
+      expect(placeholder.closest("a")).toHaveAttribute("href", `/?sibling=${source.id}`);
+      expect(await screen.findByText("conv_peer")).toBeInTheDocument();
+      const rowNode = placeholder.closest("li");
+      expect(rowNode).toHaveClass("ml-9");
+      if (scope.endsWith("backfill")) {
+        const fetch = vi.spyOn(identity, "authenticatedFetch").mockResolvedValue(
+          new Response(
+            JSON.stringify(
+              conv("created", "Codex", {
+                family,
+                labels,
+                permission_level: 4,
+                title: "New task",
+              }),
+            ),
+          ),
+        );
+        onTestFinished(() => fetch.mockRestore());
+      }
+      if (scope === "project-local-backfill") {
+        load([...members, conv("temp:nested", "Codex", { title: null, provisional: true })]);
+        refresh();
+        expect(screen.getByText("New nested agent").closest("li")).toBe(rowNode);
+        expect(
+          within(screen.getByText("Example project").closest("section")!).getByText(
+            "New nested agent",
+          ),
+        ).toBeInTheDocument();
+      }
+      act(() => updateNestedSessionDraft(queryClient, "temp:nested", "created"));
+      if (scope.endsWith("backfill")) {
+        load([
+          ...members,
+          ...(scope.endsWith("local-backfill")
+            ? [conv("created", "Codex", { title: "Optimistic title" })]
+            : []),
+        ]);
+        refresh();
+        await waitFor(() =>
+          expect(queryClient.getQueryData(["conversation-backfill", "created"])).toMatchObject({
+            family,
+          }),
+        );
+        expect(queryClient.getQueryData(["nested-session-drafts"])).toEqual([
+          expect.objectContaining({ id: "created", created: true }),
+        ]);
+        expect(screen.getByText("New task").closest("li")).toBe(rowNode);
+        expect(rowNode).toHaveAttribute("data-sibling-session", "true");
+        expect(
+          within(
+            screen
+              .getByText(scope.startsWith("project") ? "Example project" : "Pinned")
+              .closest("section")!,
+          ).getByText("New task"),
+        ).toBeInTheDocument();
+      }
+      load([
+        ...members.filter((row) => scope !== "source-off-page" || row.id !== source.id),
+        conv("created", "Codex", { family, labels, title: "New task" }),
       ]);
-      seedPins([]);
       refresh();
-      expect(screen.queryByText("conv_sibling")).toBeNull();
-      fireEvent.click(screen.getByRole("button", { name: "Expand session family" }));
-      expect(screen.getAllByText("conv_sibling")).toHaveLength(1);
-      expect(screen.getByText("conv_sibling").closest("li")).toHaveAttribute(
+      await waitFor(() => expect(screen.queryByText("New nested agent")).toBeNull());
+      expect(screen.getByText("New task").closest("li")).toBe(rowNode);
+      await waitFor(() => expect(queryClient.getQueryData(["nested-session-drafts"])).toEqual([]));
+      if (scope === "source-off-page") expect(screen.queryByText("conv_peer")).toBeNull();
+      if (scope === "pinned-shared") {
+        load([...members, conv("created", "Codex", { family, title: "Renamed task" })]);
+        refresh();
+        expect(screen.getByText("Renamed task")).toBeInTheDocument();
+        expect(screen.queryByText("New task")).toBeNull();
+        load(members);
+        refresh();
+        expect(screen.queryByText("Renamed task")).toBeNull();
+      }
+      act(() => addNestedSessionDraft(queryClient, "temp:cancelled", source));
+      expect(await screen.findByText("New nested agent")).toBeInTheDocument();
+      act(() => removeNestedSessionDraft(queryClient, "temp:cancelled"));
+      await waitFor(() => expect(screen.queryByText("New nested agent")).toBeNull());
+    },
+  );
+
+  it.each(["deleted", "archived", "not-owned", "source-deleted"])(
+    "retires a draft confirmed %s before a list refresh",
+    async (reason) => {
+      const parent = conv("conv_parent", "Codex", {
+        family: { id: "family", representative_id: "conv_parent", pinned: false },
+      });
+      mockConversations([parent]);
+      const fetch = vi.spyOn(identity, "authenticatedFetch").mockImplementation(async () =>
+        reason === "deleted" || reason === "source-deleted"
+          ? new Response(null, { status: 404 })
+          : new Response(
+              JSON.stringify(
+                conv("deleted", "Codex", {
+                  family: parent.family,
+                  archived: reason === "archived",
+                  permission_level: reason === "not-owned" ? 1 : 4,
+                  owner: null,
+                }),
+              ),
+            ),
+      );
+      onTestFinished(() => fetch.mockRestore());
+      const { queryClient } = renderSidebar();
+      act(() =>
+        addNestedSessionDraft(queryClient, "temp:deleted", {
+          id: reason === "source-deleted" ? "missing-source" : parent.id,
+          createdAt: 1,
+          labels: {},
+          family: parent.family,
+        } as Session),
+      );
+      expect(queryClient.getQueryData(["nested-session-drafts"])).toHaveLength(1);
+      if (reason !== "source-deleted")
+        act(() => updateNestedSessionDraft(queryClient, "temp:deleted", "deleted"));
+      await waitFor(() => expect(queryClient.getQueryData(["nested-session-drafts"])).toEqual([]));
+      expect(fetch).toHaveBeenCalledWith(
+        expect.stringContaining(
+          `/v1/sessions/${reason === "source-deleted" ? "missing-source" : "deleted"}?`,
+        ),
+      );
+      expect(screen.queryByText("New nested agent")).toBeNull();
+    },
+  );
+
+  it.each([
+    { inProject: false, legacyRepresentative: false },
+    { inProject: true, legacyRepresentative: false },
+    { inProject: false, legacyRepresentative: true },
+  ])(
+    "keeps legacy pins grouped (project: $inProject, representative pin: $legacyRepresentative)",
+    ({ inProject, legacyRepresentative }) => {
+      const family = { id: "family", representative_id: "conv_parent", pinned: false };
+      if (inProject) projectsMock.push("Example project");
+      const labels: Record<string, string> = inProject ? { omni_project: "Example project" } : {};
+      const members = ["conv_parent", "conv_peer", "conv_nested"].map((id, index) =>
+        conv(id, "Claude Code", {
+          family,
+          created_at: index + 1,
+          labels: {
+            ...labels,
+            ...(id === "conv_nested" || (legacyRepresentative && id === "conv_parent")
+              ? { "omnigent.pinned": "1" }
+              : {}),
+          },
+        }),
+      );
+      mockConversations(members);
+      seedPins(["conv_nested", ...(legacyRepresentative ? ["conv_parent"] : [])]);
+      const { refresh } = renderSidebar();
+      if (inProject) fireEvent.click(screen.getByRole("button", { name: /^Example project/ }));
+      expect(screen.getAllByText("conv_nested")).toHaveLength(1);
+      if (legacyRepresentative) {
+        const pinned = screen.getByText("Pinned").closest("section")!;
+        for (const row of members) expect(within(pinned).getByText(row.id)).toBeInTheDocument();
+      }
+      expect(screen.getByText("conv_nested").closest("li")).toHaveAttribute(
         "data-sibling-session",
         "true",
       );
+      expect(
+        within(screen.getByText("conv_nested").closest("li")!).queryByTestId(
+          "quick-pin-conversation",
+        ),
+      ).toBeNull();
+      expect(
+        screen.getByRole("button", { name: "Collapse session family" }).closest("a"),
+      ).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Collapse session family" }));
+      expect(screen.queryByText("conv_nested")).toBeNull();
+      mockConversations(members.map((row) => ({ ...row, family: { ...family, pinned: true } })));
+      seedPins(["conv_parent", "conv_nested"]);
+      refresh();
+      const pinnedSection = screen.getByText("Pinned").closest("section")!;
+      expect(within(pinnedSection).getByText("conv_parent")).toBeInTheDocument();
+      expect(within(pinnedSection).queryByText("conv_nested")).toBeNull();
+      fireEvent.click(within(pinnedSection).getByRole("button", { name: "Expand session family" }));
+      for (const id of ["conv_parent", "conv_peer", "conv_nested"]) {
+        expect(screen.getAllByText(id)).toHaveLength(1);
+        expect(within(pinnedSection).getByText(id)).toBeInTheDocument();
+      }
     },
   );
 
@@ -2642,7 +2857,7 @@ describe("Sidebar project sections", () => {
     expect(screen.queryByText("conv_filed")).toBeNull();
   });
 
-  it("auto-expands the project folder holding the selected session", () => {
+  it("holds the selected session under its collapsed project folder", () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
@@ -2665,10 +2880,9 @@ describe("Sidebar project sections", () => {
       </QueryClientProvider>,
     );
 
-    // No click: the folder opens because its session is selected, and the row
-    // is visible under the project section.
+    // Selecting the session doesn't open the folder; its row stays listed under it.
     const header = screen.getByRole("button", { name: /^Customer X/ });
-    expect(header).toHaveAttribute("aria-expanded", "true");
+    expect(header).toHaveAttribute("aria-expanded", "false");
     const projectSection = screen.getByText("Customer X").closest("section")!;
     expect(within(projectSection).getByText("conv_filed")).toBeInTheDocument();
   });
@@ -2843,6 +3057,34 @@ describe("Sidebar project sections", () => {
     openProjectsMenu();
     fireEvent.click(screen.getByTestId("projects-select-sessions"));
     expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
+  });
+
+  it("bulk-deletes a folder session as its lists last fetched it", () => {
+    projectsMock.push("Alpha");
+    const fetched = (labels: Record<string, string>) => {
+      const row = conv("conv_a", "Claude Code", { labels: { omni_project: "Alpha", ...labels } });
+      mockConversations([row, conv("conv_loose", "Claude Code")]);
+      projectSessionsMock.current.Alpha = [row];
+    };
+    fetched({ "omnigent.scheduled_task_source": "st_1" });
+    const view = renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
+    openProjectsMenu();
+    fireEvent.click(screen.getByTestId("projects-select-sessions"));
+    fireEvent.click(within(screen.getByText("Alpha").closest("section")!).getByText("conv_a"));
+
+    fireEvent.click(screen.getByTestId("bulk-delete"));
+    expect(
+      screen.getByRole("heading", { name: "Delete 1 session and 1 automation?" }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    // The automation is deleted, and the lists refetch the row without its label.
+    fetched({});
+    view.refresh();
+    fireEvent.click(screen.getByTestId("bulk-delete"));
+    expect(screen.getByRole("heading", { name: "Delete 1 session(s)?" })).toBeInTheDocument();
+    expect(screen.queryByTestId("bulk-automation-source-delete-notice")).toBeNull();
   });
 
   it("deletes a project (and all its sessions) from the folder kebab after confirming", async () => {
@@ -3185,9 +3427,10 @@ describe("Sidebar project Show more", () => {
   it("lists the open session when it sits past the first five", () => {
     projectsMock.push("Customer X");
     mockConversations(filedSessions(12));
+    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(["Customer X"]));
     renderOnSession("conv_filed_7");
 
-    // The folder auto-expands for the open session and grows a whole page to list it.
+    // The expanded folder grows a whole page to list the open session.
     expect(folderRowIds()).toEqual(filedIds(10));
     expect(screen.getByTestId("project-show-more")).toBeInTheDocument();
   });
@@ -3297,8 +3540,8 @@ describe("Sidebar collapsed project marker", () => {
     seedReadState([{ id: "conv_unread", viewer_last_seen: 199 }]);
     mockConversations([
       conv("conv_error", "Codex", {
-        labels: { omni_project: "Customer X" },
-        status: "failed",
+        labels: { omni_project: "Customer X", ...ERROR_LABELS },
+        status: "idle",
       }),
       conv("conv_unread", "Codex", {
         labels: { omni_project: "Customer X" },
@@ -3363,8 +3606,8 @@ describe("Sidebar collapsed project marker", () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_error", "Codex", {
-        labels: { omni_project: "Customer X" },
-        status: "failed",
+        labels: { omni_project: "Customer X", ...ERROR_LABELS },
+        status: "idle",
       }),
     ]);
     useChatStore.setState({ conversationId: "conv_error", ...startup });
@@ -3387,8 +3630,8 @@ describe("Sidebar collapsed project marker", () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_error", "Codex", {
-        labels: { omni_project: "Customer X" },
-        status: "failed",
+        labels: { omni_project: "Customer X", ...ERROR_LABELS },
+        status: "idle",
       }),
       conv("conv_awaiting", "Codex", {
         labels: { omni_project: "Customer X" },
@@ -3750,6 +3993,22 @@ describe("Sidebar active-row auto-scroll", () => {
 
     const row = screen.getByText("Active draft").closest("li")!;
     expect(within(row).queryByTestId("conversation-draft-indicator")).toBeNull();
+    vi.restoreAllMocks();
+  });
+
+  it("leaves the open session out of the Inbox badge until it is marked unread", () => {
+    vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(() => {});
+    seedReadState([{ id: "conv_active", viewer_last_seen: 199 }]);
+    mockConversations([conv("conv_active", "Codex", { status: "idle", updated_at: 200 })]);
+
+    renderAtRoute("/c/conv_active");
+
+    const inbox = screen.getByTestId("inbox-button");
+    expect(within(inbox).queryByLabelText(/inbox items? waiting/)).toBeNull();
+    act(() => markConversationUnread("conv_active", 200));
+    expect(within(inbox).getByLabelText("1 inbox item waiting")).toHaveTextContent("1");
+    act(() => markConversationRead("conv_active", 200));
+    expect(within(inbox).queryByLabelText(/inbox items? waiting/)).toBeNull();
     vi.restoreAllMocks();
   });
 
@@ -4262,6 +4521,59 @@ describe("Sidebar view options", () => {
         .getAllByRole("link", { name: /^conv_/ })
         .map((link) => link.textContent),
     ).toEqual(["conv_done_new", "conv_done_old", "conv_running"]);
+  });
+
+  it("opens view submenus in place of the main menu on a mobile viewport", () => {
+    const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      ...mediaQuery,
+      media: query,
+      matches: query === "(max-width: 767.98px)",
+    }));
+    try {
+      mockConversations([conv("conv_idle", "Codex", { status: "idle" })]);
+      renderGroupingSidebar();
+      const openMenu = () => {
+        fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+          button: 0,
+          ctrlKey: false,
+          pointerType: "mouse",
+        });
+        return screen.getByRole("menu");
+      };
+      const menu = openMenu();
+
+      fireEvent.click(within(menu).getByTestId("session-grouping-menu"));
+      expect(screen.getAllByRole("menu")).toEqual([menu]);
+      expect(within(menu).getByRole("menuitem", { name: "Back from Grouping" })).toHaveTextContent(
+        "Grouping",
+      );
+      expect(within(menu).getByRole("menuitemradio", { name: "Harness" })).toBeInTheDocument();
+      expect(within(menu).queryByTestId("session-ordering-menu")).toBeNull();
+
+      fireEvent.click(within(menu).getByTestId("session-filter-menu-back"));
+      expect(within(menu).queryByRole("menuitemradio")).toBeNull();
+      fireEvent.click(within(menu).getByTestId("session-show-menu"));
+      fireEvent.click(within(menu).getByTestId("session-show-branch"));
+      expect(within(menu).getByTestId("session-show-repo")).toBeInTheDocument();
+
+      fireEvent.click(within(menu).getByTestId("session-filter-menu-back"));
+      fireEvent.click(within(menu).getByTestId("session-ordering-menu"));
+      fireEvent.click(within(menu).getByRole("menuitemradio", { name: "Created" }));
+      expect(screen.queryByRole("menu")).toBeNull();
+      expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!)).toMatchObject({
+        ordering: "created",
+        show: ["branch"],
+      });
+      // Reopening starts from the main list, not the last submenu.
+      const reopened = openMenu();
+      fireEvent.click(within(reopened).getByTestId("session-grouping-menu"));
+      fireEvent.keyDown(reopened, { key: "Escape" });
+      expect(screen.queryByRole("menu")).toBeNull();
+      expect(within(openMenu()).getByTestId("session-grouping-menu")).toBeInTheDocument();
+    } finally {
+      matchMedia.mockRestore();
+    }
   });
 
   it.each(["default", "status", "created", "updated"])(

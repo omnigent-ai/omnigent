@@ -16,6 +16,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
 import { writeOpenSubagentsInPanel } from "@/lib/subagentPanelPreferences";
+import type * as UseAgentCostsModule from "@/hooks/useAgentCosts";
+import type { AgentCosts } from "@/hooks/useAgentCosts";
 import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { iconForAgentType, SubagentsPanel } from "./SubagentsPanel";
 
@@ -26,6 +28,12 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   useChildSessions: vi.fn(),
 }));
 
+// The panel reads costs through this hook; tests set what it returns.
+const agentCosts = vi.hoisted(() => ({ current: undefined as AgentCosts | undefined }));
+vi.mock("@/hooks/useAgentCosts", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseAgentCostsModule>()),
+  useAgentCosts: () => ({ data: agentCosts.current }),
+}));
 vi.mock("@/hooks/useSession", () => ({
   useSession: vi.fn(),
 }));
@@ -135,6 +143,7 @@ const ICON_CASES: [string | null, ReturnType<typeof iconForAgentType>][] = [
 ];
 
 beforeEach(() => {
+  agentCosts.current = undefined;
   useChildSessionsMock.mockReset();
   useSessionMock.mockReset();
   // Default: parent's status is idle. Tests override per-case.
@@ -170,6 +179,27 @@ function CurrentPath() {
 }
 
 describe("SubagentsPanel", () => {
+  it("shows each agent's cost, marking estimates, and omits unknown costs", () => {
+    mockChildTree({
+      conv_parent: [childInfo({ id: "conv_a" }), childInfo({ id: "conv_b" })],
+      conv_a: [childInfo({ id: "conv_c" })],
+    });
+    agentCosts.current = new Map([
+      ["conv_parent", { costUsd: 1.5, estimated: false }],
+      ["conv_a", { costUsd: 0.4, estimated: false }],
+      ["conv_b", { costUsd: null, estimated: false }],
+      ["conv_c", { costUsd: 0.25, estimated: true }],
+    ]);
+    const { container } = renderPanel();
+
+    const costOf = (element: Element | null) =>
+      element?.querySelector('[data-testid="subagent-cost"]')?.textContent ?? null;
+    expect(costOf(screen.getByTestId("subagent-main-row"))).toBe("$1.50");
+    expect(costOf(childRow(container, "conv_a"))).toBe("$0.40");
+    expect(costOf(childRow(container, "conv_b"))).toBeNull();
+    expect(costOf(childRow(container, "conv_c"))).toBe("~$0.25");
+  });
+
   it("always renders a 'main' row linking to the root session", () => {
     // No children at all — the panel still shows the main link so
     // the user always has a path back to the parent.

@@ -555,6 +555,27 @@ describe("ForkSessionDialog", () => {
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
   });
 
+  it("does not fork on the Enter that confirms an IME candidate", async () => {
+    forkSessionMock.mockResolvedValue({
+      id: "conv_fork",
+    } as unknown as Awaited<ReturnType<typeof forkSession>>);
+
+    renderDialog();
+
+    openAdvanced();
+    const input = screen.getByTestId("fork-session-title-input");
+    // Chrome flags the confirming Enter with keyCode 229; Safari sends a plain
+    // Enter before compositionend, so only the tracked composition catches it.
+    fireEvent.keyDown(input, { key: "Enter", keyCode: 229 });
+    fireEvent.compositionStart(input);
+    fireEvent.keyDown(input, { key: "Enter" });
+    fireEvent.compositionEnd(input);
+    expect(forkSessionMock).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+  });
+
   it("surfaces the server error inline on failure and does not navigate", async () => {
     forkSessionMock.mockRejectedValue(new Error("403 forbidden"));
     renderDialog();
@@ -1834,6 +1855,7 @@ describe("ForkSessionDialog", () => {
           info: {
             features: { sandbox_profiles: true },
             managed_sandboxes_enabled: true,
+            request_managed_sandbox_host_id: true,
             sandbox_provider: "modal",
             sandbox_providers: ["modal", "agent_sandbox"],
           },
@@ -1873,6 +1895,7 @@ describe("ForkSessionDialog", () => {
             upToResponseId,
             sandbox: {
               provider: "agent_sandbox",
+              hostId: expect.stringMatching(/^[0-9a-f]{32}$/),
               profileId: "large",
               profileRevision: "other-revision",
               workspaces: [],
@@ -2108,7 +2131,11 @@ describe("ForkSessionDialog", () => {
       } as unknown as Awaited<ReturnType<typeof forkSession>>);
       renderDialog({
         ...CODING,
-        info: { managed_sandboxes_enabled: true, sandbox_provider: "modal" },
+        info: {
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "modal",
+          request_managed_sandbox_host_id: true,
+        },
       });
 
       selectSandbox();
@@ -2128,7 +2155,11 @@ describe("ForkSessionDialog", () => {
         agentId: undefined,
         upToResponseId: undefined,
         config: {},
-        sandbox: { provider: "modal", workspaces: ["https://github.com/org/repo#release-1.2"] },
+        sandbox: {
+          provider: "modal",
+          hostId: expect.stringMatching(/^[0-9a-f]{32}$/),
+          workspaces: ["https://github.com/org/repo#release-1.2"],
+        },
       });
       // The server provisions the host, so the dialog must NOT also try to
       // bind one — a launchRunner here would 404 on a host that doesn't exist.
@@ -2151,7 +2182,7 @@ describe("ForkSessionDialog", () => {
             hostId: "host_1",
             labels: {
               "omnigent.host_type": "managed",
-              [SANDBOX_REPO_LABEL_KEY]: "https://github.com/databricks-eng/universe",
+              [SANDBOX_REPO_LABEL_KEY]: "https://github.com/example-org/monorepo",
             },
           },
           isLoading: false,
@@ -2169,6 +2200,7 @@ describe("ForkSessionDialog", () => {
           ...CODING,
           info: {
             managed_sandboxes_enabled: true,
+            request_managed_sandbox_host_id: true,
             sandbox_providers: ["lakebox", "arclet"],
             sibling_sessions: true,
           },
@@ -2181,7 +2213,7 @@ describe("ForkSessionDialog", () => {
         expect(screen.getByTestId("fork-session-host-option-host_1")).toBeInTheDocument();
         fireEvent.click(screen.getByTestId(row));
         if (provider) {
-          expect(screen.getByTestId("fork-session-sandbox-repo-row")).toHaveTextContent("universe");
+          expect(screen.getByTestId("fork-session-sandbox-repo-row")).toHaveTextContent("monorepo");
         } else {
           expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Same sandbox");
           expect(screen.queryByTestId("fork-session-sandbox-repo-row")).not.toBeInTheDocument();
@@ -2199,7 +2231,11 @@ describe("ForkSessionDialog", () => {
           upToResponseId: undefined,
           config: {},
           sandbox: provider
-            ? { provider, workspaces: ["https://github.com/databricks-eng/universe"] }
+            ? {
+                provider,
+                hostId: expect.stringMatching(/^[0-9a-f]{32}$/),
+                workspaces: ["https://github.com/example-org/monorepo"],
+              }
             : undefined,
         });
         if (provider) {
@@ -2417,6 +2453,7 @@ describe("ForkSessionDialog", () => {
           ...CODING,
           info: {
             managed_sandboxes_enabled: true,
+            request_managed_sandbox_host_id: true,
             sandbox_provider: "agent_sandbox",
             sandbox_providers: ["agent_sandbox"],
             sandbox_provider_capabilities: { agent_sandbox: { multi_repo: true } },
@@ -2450,7 +2487,10 @@ describe("ForkSessionDialog", () => {
           ]);
         } else {
           expect(fetchSessionRepositoryBranchesMock).not.toHaveBeenCalled();
-          expect(call?.sandbox).toEqual({ provider: "agent_sandbox" });
+          expect(call?.sandbox).toEqual({
+            provider: "agent_sandbox",
+            hostId: expect.stringMatching(/^[0-9a-f]{32}$/),
+          });
         }
       },
     );
@@ -2470,6 +2510,7 @@ describe("ForkSessionDialog", () => {
         ...CODING,
         info: {
           managed_sandboxes_enabled: true,
+          request_managed_sandbox_host_id: true,
           sandbox_provider: "agent_sandbox",
           sandbox_provider_capabilities: { agent_sandbox: { multi_repo: true } },
           session_fork_workspaces: undefined,
@@ -2501,6 +2542,7 @@ describe("ForkSessionDialog", () => {
       fireEvent.click(submit);
       await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
       expect(forkSessionMock.mock.calls[0][1]?.sandbox).toEqual({
+        hostId: expect.stringMatching(/^[0-9a-f]{32}$/),
         provider: "agent_sandbox",
         workspace: "https://github.com/org/api#main",
       });
@@ -2639,6 +2681,7 @@ describe("ForkSessionDialog", () => {
           ...CODING,
           info: {
             managed_sandboxes_enabled: true,
+            request_managed_sandbox_host_id: true,
             sandbox_provider: "modal",
             session_fork_workspaces: undefined,
           },
@@ -2652,6 +2695,7 @@ describe("ForkSessionDialog", () => {
         fireEvent.click(screen.getByTestId("fork-session-submit"));
         await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
         expect(forkSessionMock.mock.calls[0][1]?.sandbox).toEqual({
+          hostId: expect.stringMatching(/^[0-9a-f]{32}$/),
           provider: "modal",
           workspace: "https://github.com/org/api#main",
         });
@@ -2913,7 +2957,11 @@ describe("ForkSessionDialog", () => {
         } as unknown as Awaited<ReturnType<typeof forkSession>>);
         renderDialog({
           ...CODING,
-          info: { managed_sandboxes_enabled: true, session_fork_workspaces: acceptsWorkspaces },
+          info: {
+            managed_sandboxes_enabled: true,
+            session_fork_workspaces: acceptsWorkspaces,
+            request_managed_sandbox_host_id: true,
+          },
         });
 
         selectSandbox();
@@ -2928,6 +2976,7 @@ describe("ForkSessionDialog", () => {
 
         await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
         expect(forkSessionMock.mock.calls[0][1]?.sandbox).toEqual({
+          hostId: expect.stringMatching(/^[0-9a-f]{32}$/),
           provider: null,
           ...(acceptsWorkspaces ? { workspaces: [] } : { workspace: null }),
         });

@@ -18,6 +18,8 @@ _logger = logging.getLogger(__name__)
 
 FEATURES_ENV_VAR = "OMNIGENT_FEATURES"
 _REMOVED_HARNESS_INSTALL_ENV_VAR = "OMNIGENT_HARNESS_INSTALL_ENABLED"
+# Features made unconditional; leftover names or ``-name`` kill switches are ignored.
+_RETIRED_FEATURES = frozenset({"custom_agents_settings_ui"})
 
 
 class Feature(StrEnum):
@@ -25,21 +27,30 @@ class Feature(StrEnum):
 
     SANDBOX_PROFILES = "sandbox_profiles"
     SESSION_ORCHESTRATION = "session_orchestration"
+    SCRIPTED_SESSIONS = "scripted_sessions"
     SIBLING_SESSIONS = "sibling_sessions"
     PEER_SESSION_MESSAGING = "peer_session_messaging"
     CODEX_PLAN_AT_LAUNCH = "codex_plan_at_launch"
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
+    MCP_DISABLED_SERVERS = "mcp_disabled_servers"
+    MCP_DISABLED_SERVERS_CLAUDE = "mcp_disabled_servers_claude"
+    MCP_DISABLED_SERVERS_CODEX = "mcp_disabled_servers_codex"
     CANVAS = "canvas"
     ARCA_SHUTDOWN_WARNINGS = "arca_shutdown_warnings"
     IMPORT_REVIEW = "import_review"
-    CUSTOM_AGENTS_SETTINGS_UI = "custom_agents_settings_ui"
     SIDEBAR_GROUPING_UI = "sidebar_grouping_ui"
     CLAUDE_OSC_STATUS = "claude_osc_status"
     WORKSPACE_CONTENT_SEARCH = "workspace_content_search"
     GRID_SESSIONS_DISPLAY_UI = "grid_sessions_display_ui"
     AUTOMATIONS_V2 = "automations_v2"
+    ONE_TIME_AUTOMATIONS = "one_time_automations"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
+    SIDEBAR_WINDOWED_ROWS = "sidebar_windowed_rows"
+    SESSION_OVERVIEW = "session_overview"
+    PROJECT_REPOSITORY_CREATION = "project_repository_creation"
+    WORKSPACE_DIRECT_ACCESS = "workspace_direct_access"
+    WORKSPACE_API_SERVER_ACCESS = "workspace_api_server_access"
 
 
 @dataclass(frozen=True)
@@ -78,10 +89,18 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         default_enabled=True,
     ),
     FeatureDefinition(
+        feature=Feature.SCRIPTED_SESSIONS,
+        description="Explicit host placement and PR linking for scripted sessions",
+        owner="server",
+        review_by_release="0.24.0",
+        frontend_visible=False,
+    ),
+    FeatureDefinition(
         feature=Feature.SIBLING_SESSIONS,
         description="Create nested agents on shared or separate compute",
         owner="server",
         review_by_release="0.24.0",
+        default_enabled=True,
     ),
     FeatureDefinition(
         feature=Feature.PEER_SESSION_MESSAGING,
@@ -101,6 +120,18 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         ),
         owner="server",
         review_by_release="0.20.0",
+        default_enabled=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.ONE_TIME_AUTOMATIONS,
+        description=(
+            "Create one-time (COUNT=1) automations, including sys_reminder_set reminders. "
+            "Every database scheduler sharing the database must already accept them; "
+            "an older one pauses them as invalid"
+        ),
+        owner="server",
+        review_by_release="0.24.0",
+        frontend_visible=False,
     ),
     FeatureDefinition(
         feature=Feature.GRID_SESSIONS_DISPLAY_UI,
@@ -127,6 +158,27 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         review_by_release="0.11.0",
     ),
     FeatureDefinition(
+        feature=Feature.MCP_DISABLED_SERVERS,
+        frontend_visible=False,
+        description="Per-harness MCP enablement in Omnigent sessions",
+        owner="server",
+        review_by_release="0.24.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.MCP_DISABLED_SERVERS_CLAUDE,
+        frontend_visible=False,
+        description="Claude MCP enablement at launch",
+        owner="server",
+        review_by_release="0.24.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.MCP_DISABLED_SERVERS_CODEX,
+        frontend_visible=False,
+        description="Codex MCP enablement at launch",
+        owner="server",
+        review_by_release="0.24.0",
+    ),
+    FeatureDefinition(
         feature=Feature.CANVAS,
         description="Web Canvas page: sessions as draggable cards grouped by project",
         owner="web",
@@ -144,13 +196,6 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Auto-opening import review modal for a newly connected host's context",
         owner="onboarding",
         review_by_release="0.18.0",
-    ),
-    FeatureDefinition(
-        feature=Feature.CUSTOM_AGENTS_SETTINGS_UI,
-        description="Manage reusable custom agents from Settings",
-        owner="web",
-        review_by_release="0.24.0",
-        default_enabled=True,
     ),
     FeatureDefinition(
         feature=Feature.SIDEBAR_GROUPING_UI,
@@ -173,6 +218,42 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Search workspace file contents through the session runner",
         owner="web",
         review_by_release="0.20.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.SIDEBAR_WINDOWED_ROWS,
+        description="Mount only the sidebar session rows near the viewport",
+        owner="web",
+        review_by_release="0.24.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.SESSION_OVERVIEW,
+        description="Session cost sidebar beside chat, toggled from a header cost chip",
+        owner="web",
+        review_by_release="0.25.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.PROJECT_REPOSITORY_CREATION,
+        description="New project repository linking: clone on a host or save for sandboxes",
+        owner="web",
+        review_by_release="0.25.0",
+        default_enabled=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.WORKSPACE_DIRECT_ACCESS,
+        description=(
+            "Owners read a session's workspace straight from its host's local socket; "
+            "the server and the host must both enable it"
+        ),
+        owner="server",
+        review_by_release="0.27.0",
+        frontend_visible=False,
+    ),
+    FeatureDefinition(
+        feature=Feature.WORKSPACE_API_SERVER_ACCESS,
+        description="Serve the workspace API through the server, answered by the session's host",
+        owner="server",
+        review_by_release="0.27.0",
+        frontend_visible=False,
     ),
 )
 
@@ -203,6 +284,7 @@ class FeatureFlags:
 # A deployment's per-request gate: a static bool, or a callable read on each request.
 DeploymentGate = bool | Callable[[], bool]
 HarnessInstallGate = DeploymentGate
+McpDisabledServersGate = DeploymentGate
 
 
 def deployment_gate_enabled(gate: DeploymentGate, name: str) -> bool:
@@ -219,12 +301,37 @@ def harness_install_enabled(gate: HarnessInstallGate) -> bool:
     return deployment_gate_enabled(gate, "harness_install")
 
 
+def mcp_disabled_servers_enabled(gate: McpDisabledServersGate) -> bool:
+    """Resolve the MCP deployment gate for the current request, failing closed."""
+    return deployment_gate_enabled(gate, "mcp_disabled_servers")
+
+
+MCP_DISABLED_SERVERS_HARNESS_FEATURES = {
+    "claude": Feature.MCP_DISABLED_SERVERS_CLAUDE,
+    "codex": Feature.MCP_DISABLED_SERVERS_CODEX,
+}
+
+
+def active_harnesses(master: McpDisabledServersGate, features: FeatureFlags) -> list[str]:
+    """Harnesses with complete launch hooks and both release gates enabled."""
+    from omnigent.mcp_disabled_servers import HARNESS_EXECUTORS
+
+    if not mcp_disabled_servers_enabled(master):
+        return []
+    return [
+        harness
+        for harness in HARNESS_EXECUTORS
+        if features.enabled(MCP_DISABLED_SERVERS_HARNESS_FEATURES[harness])
+    ]
+
+
 def resolve_feature_flags(environ: Mapping[str, str] | None = None) -> FeatureFlags:
     """Resolve ``OMNIGENT_FEATURES`` into an immutable feature snapshot.
 
     Comma-separated names enable features; ``-name`` disables them, for example
     ``usage_page,-claude_osc_status``. Unset or empty uses feature defaults.
-    Explicit disables win regardless of order. Unknown names fail startup.
+    Explicit disables win regardless of order. Retired names are ignored with
+    a warning; other unknown names fail startup.
 
     :param environ: Environment mapping; defaults to :data:`os.environ`.
     :returns: Resolved immutable feature values.
@@ -247,6 +354,9 @@ def resolve_feature_flags(environ: Mapping[str, str] | None = None) -> FeatureFl
     disabled: set[Feature] = set()
     unknown: list[str] = []
     for name in names:
+        if name.removeprefix("-") in _RETIRED_FEATURES:
+            _logger.warning("%s: %s has been retired; ignoring it", FEATURES_ENV_VAR, name)
+            continue
         try:
             if name.startswith("-"):
                 disabled.add(Feature(name[1:]))

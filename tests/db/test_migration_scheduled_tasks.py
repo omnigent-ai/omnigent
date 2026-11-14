@@ -1,11 +1,11 @@
 """Tests for scheduled-task schemas and the dispatch-field migration.
 
-Verifies the migration creates both tables with the expected shape, that
-neither carries a database-level foreign key (schema Rule R032 — the
-``agent_id`` / ``conversation_id`` / ``scheduled_task_id`` relationships are
-application-owned), that ``scheduled_tasks.rrule`` is NOT NULL and the
-``scheduled_task_runs.status`` CHECK is enforced, and that a downgrade drops both
-tables cleanly. Dispatch coverage includes occurrence deduplication,
+Verifies the migrations create the task tables and the ``scheduled_task_shares``
+table with the expected shape, that none carries a database-level foreign key
+(schema Rule R032 — the ``agent_id`` / ``conversation_id`` / ``scheduled_task_id``
+relationships are application-owned), that ``scheduled_tasks.rrule`` is NOT NULL
+and the ``scheduled_task_runs.status`` CHECK is enforced, and that a downgrade
+drops the task tables cleanly. Dispatch coverage includes occurrence deduplication,
 legacy writers, history preservation, and guarded rollback.
 """
 
@@ -21,9 +21,9 @@ import pytest
 import sqlalchemy as sa
 from alembic import command
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
-from omnigent.db.db_models import SqlScheduledTask, SqlScheduledTaskRun
+from omnigent.db.db_models import SqlScheduledTask, SqlScheduledTaskRun, SqlScheduledTaskShare
 from omnigent.db.utils import (
     _build_alembic_config,
     clear_engine_cache,
@@ -36,6 +36,14 @@ _DISPATCH_REVISION = "c8e4f2a6b901"
 _COMPLETED_STATE_REVISION = "9e82957bd115"
 _SESSION_MODE_PREVIOUS = "b2e4f6a8c013"
 _SESSION_MODE_REVISION = "d0a1f879a01d"
+_MCP_SERVICES_PREVIOUS = "1ad1db53f99d"
+_MCP_SERVICES_REVISION = "f2c6a9d1b3e8"
+_COMMENT_ANCHOR_REVISION = "f9b3e6c2a401"
+_MCP_SERVICES_MERGE_REVISION = "a7d4c2e9f610"
+_KIND_PREVIOUS = "b4e2d7a91c35"
+_KIND_REVISION = "27d16059fab9"
+_SHARES_PREVIOUS = "a7d4c2e9f610"
+_SHARES_REVISION = "a8be64286ffc"
 _SCHEMA_PATHS = [
     "migration",
     "metadata",
@@ -60,6 +68,7 @@ def db_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[Engine
         engine = sa.create_engine(uri)
         SqlScheduledTask.__table__.create(engine)
         SqlScheduledTaskRun.__table__.create(engine)
+        SqlScheduledTaskShare.__table__.create(engine)
     else:
         engine = get_or_create_engine(uri)
     try:
@@ -87,6 +96,9 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         assert columns[name]["nullable"] is (name != "created_at")
     assert columns["session_mode"]["nullable"] is False
     assert columns["session_id"]["nullable"] is True
+    assert columns["source_session_id"]["nullable"] is True
+    assert columns["mcp_services"]["nullable"] is True
+    assert columns["kind"]["nullable"] is False
     cols = set(columns)
     assert cols == {
         "workspace_id",
@@ -100,6 +112,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "model_override",
         "reasoning_effort",
         "permission_mode",
+        "mcp_services",
         "max_cost_usd",
         "workspace",
         "base_branch",
@@ -116,6 +129,8 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "delegation_ref",
         "session_mode",
         "session_id",
+        "source_session_id",
+        "kind",
     }
 
 
@@ -160,7 +175,7 @@ def test_workspace_id_leads_primary_keys(db_engine: Engine) -> None:
 
 
 def test_no_foreign_keys(db_engine: Engine) -> None:
-    """Neither table carries a DB-level FK (schema Rule R032).
+    """None of the scheduled-task tables carries a DB-level FK (schema Rule R032).
 
     ``agent_id`` / ``last_run_conversation_id`` / ``scheduled_task_id`` /
     ``conversation_id`` are plain columns; referential cleanup is
@@ -170,11 +185,94 @@ def test_no_foreign_keys(db_engine: Engine) -> None:
     insp = sa.inspect(db_engine)
     assert insp.get_foreign_keys("scheduled_tasks") == []
     assert insp.get_foreign_keys("scheduled_task_runs") == []
+    assert insp.get_foreign_keys("scheduled_task_shares") == []
+
+
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_scheduled_task_shares_columns(db_engine: Engine) -> None:
+    """``scheduled_task_shares`` has the expected columns, all NOT NULL with no DB default."""
+    columns = {c["name"]: c for c in sa.inspect(db_engine).get_columns("scheduled_task_shares")}
+    assert set(columns) == {"workspace_id", "scheduled_task_id", "user_id", "level"}
+    assert all(column["nullable"] is False for column in columns.values())
+    assert all(column["default"] is None for column in columns.values())
+    assert columns["user_id"]["type"].length == 128
+    if db_engine.dialect.name == "cockroachdb":
+        # CockroachDB reflects INT2 as INTEGER and drops the width, so read the stored type.
+        with db_engine.connect() as conn:
+            stored_type = conn.execute(
+                sa.text(
+                    "SELECT data_type FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() "
+                    "AND table_name = 'scheduled_task_shares' AND column_name = 'level'"
+                )
+            ).scalar_one()
+        assert stored_type == "smallint"
+    else:
+        assert str(columns["level"]["type"]).upper().startswith(("SMALLINT", "INT2"))
+
+
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_scheduled_task_shares_primary_key(db_engine: Engine) -> None:
+    """The PK is (workspace_id, scheduled_task_id, user_id): one row per grantee per task."""
+    pk = sa.inspect(db_engine).get_pk_constraint("scheduled_task_shares")
+    assert pk["constrained_columns"] == ["workspace_id", "scheduled_task_id", "user_id"]
+
+
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_scheduled_task_shares_rejects_duplicate_grantee(db_engine: Engine) -> None:
+    """A second share for the same (workspace, task, user) is rejected; another user is ok."""
+    shares = sa.Table("scheduled_task_shares", sa.MetaData(), autoload_with=db_engine)
+
+    def share(user_id: str, level: int) -> sa.Insert:
+        return shares.insert().values(
+            workspace_id=1, scheduled_task_id=b"a" * 16, user_id=user_id, level=level
+        )
+
+    with db_engine.begin() as conn:
+        conn.execute(share("alice@example.com", 1))
+    with pytest.raises(IntegrityError), db_engine.begin() as conn:
+        conn.execute(share("alice@example.com", 2))
+    with db_engine.begin() as conn:
+        conn.execute(share("bob@example.com", 2))
+
+
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_scheduled_task_shares_bounds_grantee_bytes(db_engine: Engine) -> None:
+    """Enforces each dialect's grantee size bound.
+
+    SQLite and D1 ignore VARCHAR(128) and cap stored bytes at 512 instead, so
+    128 characters of four-byte text (exactly 512 bytes) must still be accepted.
+    """
+    shares = sa.Table("scheduled_task_shares", sa.MetaData(), autoload_with=db_engine)
+
+    def share(user_id: str) -> sa.Insert:
+        return shares.insert().values(
+            workspace_id=1, scheduled_task_id=b"a" * 16, user_id=user_id, level=1
+        )
+
+    with pytest.raises(DBAPIError), db_engine.begin() as conn:
+        conn.execute(share("a" * 513))
+    # 129 characters and 513 bytes: over the width everywhere, and over the byte cap on SQLite.
+    with pytest.raises(DBAPIError), db_engine.begin() as conn:
+        conn.execute(share("😀" * 128 + "a"))
+    with db_engine.begin() as conn:
+        conn.execute(share("😀" * 128))
+
+
+@pytest.mark.parametrize("column", ["workspace_id", "level"])
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_scheduled_task_shares_rejects_non_integer_codes(db_engine: Engine, column: str) -> None:
+    """A non-integer value in an integer column is rejected, even where SQLite would store it."""
+    shares = sa.Table("scheduled_task_shares", sa.MetaData(), autoload_with=db_engine)
+    row = {"workspace_id": 1, "scheduled_task_id": b"a" * 16, "user_id": "alice", "level": 1}
+    row[column] = "not-a-number"
+    with pytest.raises(DBAPIError), db_engine.begin() as conn:
+        conn.execute(shares.insert().values(**row))
 
 
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
 def test_expected_indexes(db_engine: Engine) -> None:
-    """Both tables expose the indexes that back the read paths."""
+    """The scheduled-task tables expose the indexes that back the read paths."""
     insp = sa.inspect(db_engine)
     scheduled_tasks_idx = {i["name"] for i in insp.get_indexes("scheduled_tasks")}
     assert "ix_scheduled_tasks_user_scope" in scheduled_tasks_idx
@@ -219,6 +317,14 @@ def test_expected_indexes(db_engine: Engine) -> None:
         "workspace_id",
         "id",
     ]
+    # Backs the per-user "shared with me" lookup; non-unique, so it keeps the PK's columns.
+    shares_idx = {i["name"]: i for i in insp.get_indexes("scheduled_task_shares")}
+    assert shares_idx["ix_scheduled_task_shares_user_id"]["column_names"] == [
+        "workspace_id",
+        "user_id",
+        "scheduled_task_id",
+    ]
+    assert not shares_idx["ix_scheduled_task_shares_user_id"]["unique"]
     assert runs_idx_cols["ix_scheduled_task_runs_conversation_id"] == [
         "workspace_id",
         "conversation_id",
@@ -243,10 +349,10 @@ def test_expected_indexes(db_engine: Engine) -> None:
 @pytest.mark.parametrize("db_engine", ["migration", "metadata"], indirect=True)
 def test_state_default_on_omitted_insert(db_engine: Engine) -> None:
     """A raw insert omitting ``state`` / ``workspace_id`` / ``execution_target``
-    / ``session_mode`` picks up their defaults.
+    / ``session_mode`` / ``kind`` picks up their defaults.
 
     Only the integer server_defaults (``state`` / ``workspace_id`` /
-    ``execution_target`` / ``session_mode``) are exercised here — all are
+    ``execution_target`` / ``session_mode`` / ``kind``) are exercised here — all are
     omitted from the insert and must fall back to their defaults, on both the
     migrated and the model-built schema.
     """
@@ -260,9 +366,9 @@ def test_state_default_on_omitted_insert(db_engine: Engine) -> None:
                 "'FREQ=DAILY;BYHOUR=9;BYMINUTE=0', 'u', 'ag_1', 'UTC', 1)"
             )
         )
-        state, workspace_id, execution_target, session_mode, session_id = conn.execute(
+        state, workspace_id, execution_target, session_mode, session_id, kind = conn.execute(
             sa.text(
-                "SELECT state, workspace_id, execution_target, session_mode, session_id "
+                "SELECT state, workspace_id, execution_target, session_mode, session_id, kind "
                 "FROM scheduled_tasks WHERE id = X'00000000000000000000000000000de1'"
             )
         ).one()
@@ -271,6 +377,7 @@ def test_state_default_on_omitted_insert(db_engine: Engine) -> None:
     assert execution_target == 1  # 1 = 'connected_host'
     assert session_mode == 1  # 1 = 'new'
     assert session_id is None
+    assert kind == 1  # 1 = 'automation'
 
 
 def test_execution_target_check_rejects_bad_code(db_engine: Engine) -> None:
@@ -308,6 +415,26 @@ def test_session_mode_check_rejects_bad_code(db_engine: Engine) -> None:
                 agent_id=b"g" * 16,
                 timezone="UTC",
                 session_mode=3,
+                created_at=1,
+            )
+        )
+
+
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_kind_check_rejects_bad_code(db_engine: Engine) -> None:
+    """Migrated and model-built ``kind`` CHECKs both reject codes outside 1-2."""
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=db_engine)
+    # MySQL reports CHECK violations as OperationalError (3819).
+    with pytest.raises((IntegrityError, sa.exc.OperationalError)), db_engine.begin() as conn:
+        conn.execute(
+            tasks.insert().values(
+                id=b"k" * 16,
+                name="bad kind",
+                prompt=b"p",
+                rrule="FREQ=DAILY;BYHOUR=9",
+                agent_id=b"g" * 16,
+                timezone="UTC",
+                kind=3,
                 created_at=1,
             )
         )
@@ -803,6 +930,27 @@ def test_downgrade_drops_both_tables(tmp_path: Path) -> None:
     clear_engine_cache()
 
 
+def test_scheduled_task_shares_downgrade_and_reupgrade(tmp_path: Path) -> None:
+    """Downgrading the shares migration drops its table; re-upgrading restores it."""
+    uri = f"sqlite:///{tmp_path / 'shares.db'}"
+    engine = get_or_create_engine(uri)
+    assert "scheduled_task_shares" in sa.inspect(engine).get_table_names()
+
+    config = _build_alembic_config(uri)
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.downgrade(config, _SHARES_PREVIOUS)
+    assert "scheduled_task_shares" not in sa.inspect(engine).get_table_names()
+
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, _SHARES_REVISION)
+    assert "scheduled_task_shares" in sa.inspect(engine).get_table_names()
+
+    engine.dispose()
+    clear_engine_cache()
+
+
 def test_completed_state_downgrade_requires_live_connection() -> None:
     config = _build_alembic_config("postgresql://")
     config.output_buffer = StringIO()
@@ -925,3 +1073,120 @@ def test_session_mode_migration_defaults_existing_tasks_and_round_trips(
             "id",
         ],
     }
+
+
+def test_mcp_services_migration_keeps_existing_tasks_and_round_trips(
+    dispatch_migration_engine: Engine,
+) -> None:
+    engine = dispatch_migration_engine
+    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+    # Later migrations open their own autocommit blocks on PostgreSQL, so this
+    # upgrade cannot run inside an outer transaction.
+    command.upgrade(config, _MCP_SERVICES_PREVIOUS)
+    values = {
+        "name": "nightly",
+        "prompt": b"p",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "agent_id": b"g" * 16,
+        "timezone": "UTC",
+        "created_at": 1,
+    }
+    before = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        conn.execute(before.insert().values(id=b"a" * 16, **values))
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, _MCP_SERVICES_REVISION)
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    widest = '["' + "x" * 4092 + '"]'
+    with engine.begin() as conn:
+        # A task saved before the migration starts its runs with no MCP selection.
+        assert conn.execute(sa.select(tasks.c.mcp_services)).scalar_one() is None
+        conn.execute(tasks.insert().values(id=b"b" * 16, mcp_services=widest, **values))
+        stored = conn.execute(
+            sa.select(tasks.c.mcp_services).where(tasks.c.id == b"b" * 16)
+        ).scalar_one()
+    assert stored == widest
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.downgrade(config, _MCP_SERVICES_PREVIOUS)
+    columns = {c["name"] for c in sa.inspect(engine).get_columns("scheduled_tasks")}
+    assert "mcp_services" not in columns
+    with engine.begin() as conn:
+        assert conn.execute(sa.select(sa.func.count()).select_from(before)).scalar_one() == 2
+        config.attributes["connection"] = conn
+        command.upgrade(config, _MCP_SERVICES_REVISION)
+    with engine.begin() as conn:
+        assert conn.execute(sa.select(tasks.c.mcp_services)).scalars().all() == [None, None]
+
+
+def test_kind_migration_makes_existing_tasks_automations_and_round_trips(
+    dispatch_migration_engine: Engine,
+) -> None:
+    engine = dispatch_migration_engine
+    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+    # Later migrations open their own autocommit blocks on PostgreSQL, so this
+    # upgrade cannot run inside an outer transaction.
+    command.upgrade(config, _KIND_PREVIOUS)
+    values = {
+        "name": "nightly",
+        "prompt": b"p",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "agent_id": b"g" * 16,
+        "timezone": "UTC",
+        "created_at": 1,
+    }
+    before = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        conn.execute(before.insert().values(id=b"a" * 16, **values))
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, _KIND_REVISION)
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        # A task saved before the migration is an ordinary automation.
+        assert conn.execute(sa.select(tasks.c.kind)).scalar_one() == 1
+        conn.execute(tasks.insert().values(id=b"b" * 16, kind=2, **values))
+        kinds = dict(conn.execute(sa.select(tasks.c.id, tasks.c.kind)).tuples().all())
+    assert kinds == {b"a" * 16: 1, b"b" * 16: 2}
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.downgrade(config, _KIND_PREVIOUS)
+    columns = {c["name"] for c in sa.inspect(engine).get_columns("scheduled_tasks")}
+    assert "kind" not in columns
+    with engine.begin() as conn:
+        assert conn.execute(sa.select(sa.func.count()).select_from(before)).scalar_one() == 2
+        config.attributes["connection"] = conn
+        command.upgrade(config, _KIND_REVISION)
+    with engine.begin() as conn:
+        assert conn.execute(sa.select(tasks.c.kind)).scalars().all() == [1, 1]
+
+
+@pytest.mark.parametrize(
+    "starting_revision",
+    [_MCP_SERVICES_PREVIOUS, _MCP_SERVICES_REVISION, _COMMENT_ANCHOR_REVISION],
+    ids=["before-both", "mcp-services-branch", "comment-anchor-branch"],
+)
+def test_merge_reconciles_mcp_services_and_comment_anchor_branches(
+    dispatch_migration_engine: Engine, starting_revision: str
+) -> None:
+    """A database on either branch, or neither, gains both columns and one head."""
+    engine = dispatch_migration_engine
+    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+    command.upgrade(config, starting_revision)
+    command.upgrade(config, _MCP_SERVICES_MERGE_REVISION)
+
+    inspector = sa.inspect(engine)
+    assert "mcp_services" in {c["name"] for c in inspector.get_columns("scheduled_tasks")}
+    assert "anchor_metadata" in {c["name"] for c in inspector.get_columns("comments")}
+    with engine.connect() as conn:
+        assert conn.execute(
+            sa.text("SELECT version_num FROM alembic_version")
+        ).scalars().all() == [_MCP_SERVICES_MERGE_REVISION]
+
+    command.downgrade(config, _MCP_SERVICES_REVISION)
+    with engine.connect() as conn:
+        assert set(conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalars()) == {
+            _MCP_SERVICES_REVISION,
+            _COMMENT_ANCHOR_REVISION,
+        }

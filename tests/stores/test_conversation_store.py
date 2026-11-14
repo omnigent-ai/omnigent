@@ -38,6 +38,10 @@ from omnigent.session_import import (
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store import ConversationUpdateResult
+from omnigent.stores.conversation_store.activity_error import (
+    LATEST_ACTIVITY_ERROR_LABEL_KEY,
+    LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -122,6 +126,54 @@ def test_fork_drops_sandbox_repo_label(
     assert fork.labels["kept"] == "yes"
     assert MANAGED_REPO_LABEL_KEY not in fork.labels
     assert REQUESTED_HOST_ID_LABEL_KEY not in fork.labels
+
+
+def test_fork_drops_the_automation_source_label(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Deleting a session deletes the automation its label names, so a fork of an
+    automation's copy must not name that automation too."""
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
+
+    source = conversation_store.create_conversation()
+    conversation_store.set_labels(
+        source.id, {SCHEDULED_TASK_SOURCE_LABEL_KEY: "st_1", "kept": "yes"}
+    )
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert fork.labels["kept"] == "yes"
+    assert SCHEDULED_TASK_SOURCE_LABEL_KEY not in fork.labels
+
+
+@pytest.mark.parametrize("closed_by", ["label", "legacy_title"])
+def test_fork_of_a_closed_child_is_open(
+    conversation_store: SqlAlchemyConversationStore,
+    closed_by: str,
+) -> None:
+    """Forking a closed child (a stopped side chat, a closed sub-agent) is how
+    the user continues it, so the fork must not inherit the seal."""
+    from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, is_session_closed
+
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title="researcher:auth"
+    )
+    if closed_by == "label":
+        conversation_store.set_labels(child.id, {CLOSED_LABEL_KEY: "true", "kept": "yes"})
+    else:
+        conversation_store.set_labels(child.id, {"kept": "yes"})
+        conversation_store.update_conversation(
+            child.id, title=f"researcher:auth:closed:{child.id}"
+        )
+
+    fork = conversation_store.fork_conversation(child.id)
+
+    assert fork.labels["kept"] == "yes"
+    assert not is_session_closed(fork.labels, fork.title)
+    assert fork.title == "Fork of researcher:auth"
+    saved = conversation_store.get_conversation(child.id)
+    assert saved is not None and is_session_closed(saved.labels, saved.title)
 
 
 def test_fork_drops_per_repo_sandbox_labels(
@@ -407,10 +459,24 @@ def test_get_session_activity(
         kind="sub_agent", title="child", parent_conversation_id=a.id
     )
     conversation_store.set_session_usage(child.id, {"total_cost_usd": 5.0})
+    conversation_store.update_conversation(b.id, archived=True)
 
-    result = conversation_store.get_session_activity(
-        [a.id, b.id, child.id, a.id, "5eca720dc2bc6cdc3a99028d7bd0f917"]
-    )
+    statements: list[str] = []
+
+    def record_query(_conn: Any, _cursor: Any, statement: str, *_args: Any) -> None:
+        statements.append(statement.lower())
+
+    event.listen(conversation_store._engine, "before_cursor_execute", record_query)
+    try:
+        result = conversation_store.get_session_activity(
+            [a.id, b.id, child.id, a.id, "5eca720dc2bc6cdc3a99028d7bd0f917"]
+        )
+    finally:
+        event.remove(conversation_store._engine, "before_cursor_execute", record_query)
+
+    reads = [statement for statement in statements if statement.startswith("select")]
+    assert len(reads) == 2
+    assert all("conversation_labels" not in statement for statement in reads)
 
     assert set(result) == {a.id, b.id, child.id}
     assert result[a.id].updated_at == conversation_store.get_conversation(a.id).updated_at  # type: ignore[union-attr]
@@ -423,6 +489,8 @@ def test_get_session_activity(
     assert result[b.id].live_status is None
     assert result[b.id].runner_id is None
     assert result[b.id].total_cost_usd is None
+    assert result[a.id].archived is False
+    assert result[b.id].archived is True
     assert conversation_store.get_session_activity([]) == {}
 
 
@@ -3492,6 +3560,44 @@ def test_list_conversations_filtered_by_agent_id_returns_matching_only(
     assert returned_ids == {conv1.id, conv2.id}
 
 
+def test_list_conversations_agent_name_holds_one_connection_at_a_time(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+    db_uri: str,
+) -> None:
+    """
+    Filtering by agent name resolves the agent ids in their own session before
+    the listing session opens. Holding both at once would take two pooled
+    connections per request and can exhaust the pool under concurrency.
+
+    :param conversation_store: The conversation store fixture.
+    :param agent_store: The agent store fixture.
+    :param db_uri: The shared single-DB URI behind both stores.
+    """
+    gamma = agent_store.create(
+        agent_id="3c1f0e9b2a7d4c6e8f0a1b2c3d4e5f60",
+        name="gamma",
+        bundle_location="3c1f0e9b2a7d4c6e8f0a1b2c3d4e5f60/h",
+    )
+    conv = conversation_store.create_conversation(agent_id=gamma.id)
+    conversation_store.create_conversation()
+    engine = get_or_create_engine(db_uri)
+    peak_checked_out: list[int] = []
+
+    def _on_checkout(_dbapi: object, _record: object, _proxy: object) -> None:
+        peak_checked_out.append(engine.pool.checkedout())
+
+    event.listen(engine, "checkout", _on_checkout)
+    try:
+        page = conversation_store.list_conversations(agent_name="gamma")
+    finally:
+        event.remove(engine, "checkout", _on_checkout)
+
+    assert {c.id for c in page.data} == {conv.id}
+    assert peak_checked_out, "the listing must check out a connection"
+    assert max(peak_checked_out) == 1
+
+
 def test_list_conversations_agent_id_none_disables_filter(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,
@@ -5274,7 +5380,14 @@ def test_fork_marks_source_workspace_failures_as_notices(
     original = conversation_store.get_conversation(source.id)
     assert original is not None
     assert original.workspace == "/missing-workspace" and original.host_id == host_id
-    assert original.labels == source_labels
+    # The source's own latest item is still a fault; its fork drops the label.
+    assert original.labels == {
+        **source_labels,
+        LATEST_ACTIVITY_ERROR_LABEL_KEY: "error",
+        LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY: "failed_launch",
+    }
+    assert LATEST_ACTIVITY_ERROR_LABEL_KEY not in fork.labels
+    assert LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY not in fork.labels
     assert len(conversation_store.search("source_workspace_missing", conversation_id=fork.id)) == 2
     assert conversation_store.search("source_workspace_missing", conversation_id=source.id) == []
 
@@ -6371,6 +6484,47 @@ def test_fork_conversation_truncated_drops_external_session_directive(
     assert fork.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
 
 
+@pytest.mark.parametrize("cutoff", ["up_to_response_id", "before_item_id", "cross_family"])
+def test_fork_of_a_fork_drops_inherited_native_directive(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+    cutoff: str,
+) -> None:
+    """A truncated or cross-family fork drops the native directive its source inherited.
+
+    Fork A into B, then truncate B or fork it the way a cross-family fork
+    does (``resume_source_native_session=False``): an inherited directive
+    naming A's native session would make the runner clone A's full
+    transcript, bringing back discarded turns or handing the target a
+    transcript in the wrong format.
+    """
+    from omnigent.stores.conversation_store import FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY
+
+    agent_store.create(
+        agent_id="9d1f0e2c3b4a49588f7e6d5c4b3a2910",
+        name="fork-of-fork-trunc",
+        bundle_location="9d1f0e2c3b4a49588f7e6d5c4b3a2910/fakehash",
+    )
+    chat_a = conversation_store.create_conversation(agent_id="9d1f0e2c3b4a49588f7e6d5c4b3a2910")
+    conversation_store.set_external_session_id(chat_a.id, "claude-uuid-a")
+    _append_three_responses(conversation_store, chat_a.id)
+    chat_b = conversation_store.fork_conversation(chat_a.id)
+    assert chat_b.labels.get(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY) == "claude-uuid-a"
+    conversation_store.set_external_session_id(chat_b.id, "claude-uuid-b")
+
+    second_prompt_id = conversation_store.list_items(chat_b.id).data[2].id
+    cutoff_kwargs: dict[str, Any] = {
+        "up_to_response_id": {"up_to_response_id": "resp_001"},
+        "before_item_id": {"before_item_id": second_prompt_id},
+        "cross_family": {"resume_source_native_session": False},
+    }[cutoff]
+    fork = conversation_store.fork_conversation(chat_b.id, **cutoff_kwargs)
+
+    assert FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY not in fork.labels, fork.labels
+    if cutoff == "cross_family":
+        assert len(conversation_store.list_items(fork.id).data) == 6
+
+
 def test_fork_conversation_cross_family_drops_external_session_directive(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,
@@ -6474,6 +6628,7 @@ def test_fork_conversation_up_to_unknown_response_raises(
 def test_fork_conversation_before_item_drops_the_item_and_later_history(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,
+    db_uri: str,
 ) -> None:
     """``before_item_id`` copies only the items positioned before that item.
 
@@ -6505,6 +6660,20 @@ def test_fork_conversation_before_item_drops_the_item_and_later_history(
     fork = conversation_store.fork_conversation(source.id, before_item_id=second_prompt.id)
     assert fork_texts(fork.id) == ["Q1", "A1"]
     assert FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY not in fork.labels
+
+    # A rewind continues the source in place: the cutoff holds, and the fork
+    # is born on the source's host.
+    HostStore(db_uri).upsert_on_connect("f" * 32, "laptop", RESERVED_USER_LOCAL)
+    conversation_store.set_host_id(source.id, "f" * 32, "/work/repo", "main")
+    rewound = conversation_store.fork_conversation(
+        source.id, before_item_id=second_prompt.id, continue_source=True
+    )
+    assert fork_texts(rewound.id) == ["Q1", "A1"]
+    assert (rewound.host_id, rewound.workspace, rewound.git_branch) == (
+        "f" * 32,
+        "/work/repo",
+        "main",
+    )
 
     first = conversation_store.fork_conversation(source.id, before_item_id=first_prompt.id)
     assert fork_texts(first.id) == []
@@ -9855,6 +10024,56 @@ def test_spawn_tree_read_examines_rows_through_the_root_index(
             )
             assert "ix_conversations_root_conversation_id" in plan, plan
             assert "TEMP B-TREE" not in plan, plan
+
+
+def test_spawn_tree_usage_reads_hierarchy_and_usage_without_labels(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    from sqlalchemy import event
+
+    root = conversation_store.create_conversation(labels={"note": "x" * 100})
+    children = [
+        conversation_store.create_conversation(
+            kind="sub_agent", parent_conversation_id=root.id, labels={"note": "y"}
+        )
+        for _ in range(3)
+    ]
+    conversation_store.set_session_usage(children[0].id, {"total_cost_usd": 0.5})
+    statements: list[tuple[str, Any]] = []
+
+    def capture(conn: Any, cursor: Any, statement: str, params: Any, *_: Any) -> None:
+        statements.append((statement, params))
+
+    engines = {conversation_store._conv_engine, conversation_store._engine}
+    for engine in engines:
+        event.listen(engine, "before_cursor_execute", capture)
+    try:
+        full = conversation_store.list_spawn_tree_usage(root.id, limit=10)
+        capped = conversation_store.list_spawn_tree_usage(root.id, limit=2)
+    finally:
+        for engine in engines:
+            event.remove(engine, "before_cursor_execute", capture)
+
+    by_id = {row.id: row for row in full.data}
+    assert set(by_id) == {root.id, *(child.id for child in children)} and not full.has_more
+    assert by_id[root.id].parent_conversation_id is None
+    assert by_id[children[0].id].parent_conversation_id == root.id
+    assert by_id[children[0].id].session_usage == {"total_cost_usd": 0.5}
+    assert by_id[children[1].id].session_usage == {}
+    assert len(capped.data) == 2 and capped.has_more
+    # Labels can grow without bound per conversation, so this read never loads them.
+    assert statements and not any("conversation_labels" in s for s, _ in statements)
+    if conversation_store._conv_engine.dialect.name == "sqlite":
+        # The membership read walks the root index, so its limit bounds the rows examined.
+        tree_reads = [(s, p) for s, p in statements if "root_conversation_id" in s]
+        with conversation_store._conv_engine.connect() as conn:
+            for statement, params in tree_reads:
+                plan = " ".join(
+                    str(row[-1])
+                    for row in conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, params)
+                )
+                assert "ix_conversations_root_conversation_id" in plan, plan
+                assert "TEMP B-TREE" not in plan, plan
 
 
 @pytest.mark.asyncio

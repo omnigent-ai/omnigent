@@ -67,8 +67,8 @@ be able to write resources without a separate Omnigent account.
   (refused, no browser), a window connected to a server on this computer
   (`localhost`; refused in the dialog before connecting), and failures, shown
   only in the app's own window.
-  Hidden where **Run on Arca** is offered (the Databricks-internal flag on a
-  Databricks-managed server).
+  Hidden where **Run on Arca** is offered (the managed-features flag on a
+  managed server).
 - `embedded-resource-write`: an identity from a custom `AuthProvider` can
   create, rename, and reorder its own projects; unauthenticated and other users
   remain restricted.
@@ -316,6 +316,11 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   changing forwarded credentials. `host enable` saves explicitly forwarded values
   in plaintext in the per-user service definition, readable only by its owner
   (0600), so the service can retain them across logins.
+- Under a CLI wrapper (`OMNIGENT_WRAPPER_COMMAND`), `host enable` launches the
+  service through the wrapper's resolved path and the hidden `host-service-entry`
+  command, not the current interpreter, which can live in a cache venv deleted
+  between boots. Re-running `host enable` repairs a service definition that still
+  names a missing cache interpreter.
 - **Find out which credential kind the reporter's host uses before trusting a
   root cause.** A user OAuth login refreshes itself and a personal access
   token does not, so a story about a "stale pinned token" can be true for one

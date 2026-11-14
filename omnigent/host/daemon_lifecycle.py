@@ -225,9 +225,12 @@ def _read_workspace_header(url: str, *, org_id: str | None, timeout_s: float) ->
     import httpx
 
     from omnigent.cli_auth import DATABRICKS_ORG_ID_HEADER
+    from omnigent.telemetry.request_headers import client_identity_headers
     from omnigent.util.tls import client_ssl_context
 
-    headers = {DATABRICKS_ORG_ID_HEADER: org_id} if org_id else {}
+    headers = client_identity_headers()
+    if org_id:
+        headers[DATABRICKS_ORG_ID_HEADER] = org_id
     try:
         # The tunnel's trust store, so a TLS-intercepting proxy it trusts works here too.
         with httpx.stream(

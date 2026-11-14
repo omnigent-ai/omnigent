@@ -161,13 +161,18 @@ export async function grantPermission(
   sessionId: string,
   userId: string,
   level: number,
+  ensureMinimum = false,
 ): Promise<Permission> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}/permissions`,
     {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: userId, level }),
+      body: JSON.stringify({
+        user_id: userId,
+        level,
+        ...(ensureMinimum ? { ensure_minimum: true } : {}),
+      }),
     },
   );
   if (!res.ok) {

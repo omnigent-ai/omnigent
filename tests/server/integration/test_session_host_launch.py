@@ -34,7 +34,7 @@ from asgiref.testing import ApplicationCommunicator
 from fastapi import FastAPI
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.entities import Conversation
+from omnigent.entities import Conversation, MessageData, NewConversationItem
 from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.host.connect import HostProcess
 from omnigent.host.frames import (
@@ -145,6 +145,11 @@ def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
     :param tmp_path: Pytest temp dir for artifacts and cache.
     :returns: A configured FastAPI app with host routes mounted.
     """
+    return _host_app(db_uri, tmp_path)
+
+
+def _host_app(db_uri: str, tmp_path: Path) -> FastAPI:
+    """Build one server replica with independent host tunnels and shared stores."""
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     return create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
@@ -160,7 +165,9 @@ def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
     )
 
 
-async def _connect_host(app: FastAPI) -> ApplicationCommunicator:
+async def _connect_host(
+    app: FastAPI, host_id: str = _HOST_ID, *, name: str = "laptop"
+) -> ApplicationCommunicator:
     """Connect a mock host over the WebSocket tunnel and wait for it
     to register in the app's host registry.
 
@@ -168,18 +175,18 @@ async def _connect_host(app: FastAPI) -> ApplicationCommunicator:
         is the same instance the session-create launch path reads).
     :returns: The connected ASGI communicator, ready to exchange frames.
     """
-    path = f"/v1/hosts/{_HOST_ID}/tunnel"
+    path = f"/v1/hosts/{host_id}/tunnel"
     comm = ApplicationCommunicator(app, _websocket_scope(path))
     await comm.send_input({"type": "websocket.connect"})
     accepted = await comm.receive_output(timeout=budget(1.0))
     assert accepted["type"] == "websocket.accept"
 
     hello = encode_host_frame(
-        HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="laptop")
+        HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name=name)
     )
     await comm.send_input({"type": "websocket.receive", "text": hello})
     registry = app.state.host_registry
-    while registry.get(_HOST_ID) is None:
+    while registry.get(host_id) is None:
         await asyncio.sleep(0.01)
     return comm
 
@@ -1167,6 +1174,79 @@ async def _offline_native_host_session(client: httpx.AsyncClient, app: FastAPI) 
     await comm.wait(timeout=budget(5.0))
     assert app.state.host_registry.get(_HOST_ID) is None
     return response.json()["id"]
+
+
+@pytest.mark.parametrize(
+    ("host_state", "expected_status"),
+    [
+        ("offline", "running"),
+        ("expired", "idle"),
+        ("unreadable", "running"),
+    ],
+)
+async def test_list_preserves_resumable_offline_host_turn(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    host_state: str,
+    expected_status: str,
+) -> None:
+    """A list read cannot end a bounded hold or turn unreachable Stop into success."""
+    from dataclasses import replace
+
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions.orchestration import HOST_OFFLINE_HOLD_S
+    from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
+
+    session_id = await _offline_native_host_session(client, app)
+    hosts = app.state.host_store
+    get_host = hosts.get_host
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.get_conversation(session_id)
+    assert conv is not None and conv.runner_id is not None
+    store.clear_runner_liveness(conv.runner_id)
+    if host_state == "expired":
+        old_stamp = int(time.time() - HOST_OFFLINE_HOLD_S - 2 * RUNNER_LIVENESS_TTL_S - 120)
+        host = get_host(_HOST_ID)
+        assert host is not None
+        old_host = replace(host, created_at=old_stamp - 100, updated_at=old_stamp)
+        monkeypatch.setattr(hosts, "get_host", lambda _host_id: old_host)
+    await asyncio.wrap_future(
+        session_live_state.submit(
+            "test_offline_read_running", store.set_session_live_status, session_id, "running"
+        )
+    )
+    sessions_module._session_status_cache.pop(session_id, None)
+    if host_state == "unreadable":
+
+        def unreadable_host(_host_id: str) -> None:
+            raise OSError("host lookup unavailable")
+
+        monkeypatch.setattr(hosts, "get_host", unreadable_host)
+    completions: list[str] = []
+    monkeypatch.setattr(
+        session_live_state,
+        "persist_scheduled_run_completion",
+        lambda _session_id, status, **_kwargs: completions.append(status),
+    )
+
+    response = await client.get("/v1/sessions")
+    assert response.status_code == 200, response.text
+    item = next(row for row in response.json()["data"] if row["id"] == session_id)
+    assert item["status"] == expected_status
+    assert store.get_conversation(session_id).live_status == expected_status  # type: ignore[union-attr]
+    assert completions == ([] if expected_status == "running" else ["failed"])
+    if expected_status == "running":
+        monkeypatch.setattr(hosts, "get_host", get_host)
+        stopped = await client.post(
+            f"/v1/sessions/{session_id}/events", json={"type": "stop_session", "data": {}}
+        )
+        assert stopped.status_code == 503, stopped.text
+        assert stopped.json()["error"]["code"] == "runner_unavailable"
+        assert store.get_conversation(session_id).live_status == "running"  # type: ignore[union-attr]
+        assert completions == []
 
 
 @pytest.mark.parametrize("has_runner_binding", [True, False])
@@ -4481,9 +4561,9 @@ async def test_relaunch_recovers_only_a_rejected_enqueue(
     real_replace = store.replace_runner_id
     bound_runner_ids: list[str] = []
 
-    def record_binding(session_id: str, runner_id: str) -> Conversation:
+    def record_binding(session_id: str, runner_id: str, **kwargs: Any) -> Conversation:
         bound_runner_ids.append(runner_id)
-        return real_replace(session_id, runner_id)
+        return real_replace(session_id, runner_id, **kwargs)
 
     async def replace_during_admission(conn: HostConnection, session_id: str) -> None:
         admissions.append(conn)
@@ -4769,19 +4849,61 @@ def _shared_runner_family(
 async def test_archiving_child_does_not_stop_parents_shared_runner(
     client: httpx.AsyncClient,
     app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
     _shared_runner_family: dict[str, str],
 ) -> None:
-    """A child's archive must end only the child, not the runner its parent is on."""
+    """An idle child's archive releases its backend without stopping its parent."""
+    from omnigent.runner import create_runner_app
+    from omnigent.runner.native import orchestration as native
+    from omnigent.server.routes import sessions as sessions_module
+
     comm = await _connect_host(app)
     parent = await _inline_launch_session(client, comm)
     async with _HostFrameResponder(comm) as host:
         child = await _inline_child_session(client, parent["id"])
         _shared_runner_family.update(parent=parent["id"], child=child["id"])
+        transcript_content = [{"type": "input_text", "text": "Remember the completed worker."}]
+        (transcript_item,) = SqlAlchemyConversationStore(db_uri).append(
+            child["id"],
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="resp_completed_worker",
+                    data=MessageData(role="user", content=transcript_content),
+                )
+            ],
+        )
+        sessions_module._session_status_cache[child["id"]] = "idle"
+        child_backend = Mock(close=AsyncMock())
+        parent_backend = Mock(close=AsyncMock())
+        monkeypatch.setitem(native._AUTO_CODEX_APP_SERVERS, child["id"], child_backend)
+        monkeypatch.setitem(native._AUTO_CODEX_APP_SERVERS, parent["id"], parent_backend)
+        runner_app = create_runner_app(server_client=client)
+        resources = runner_app.state.session_resource_registry
+        cleanup = AsyncMock(wraps=resources.cleanup_session)
+        monkeypatch.setattr(resources, "cleanup_session", cleanup)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=runner_app), base_url="http://runner"
+        ) as runner:
+            resolve = AsyncMock(return_value=runner)
+            monkeypatch.setattr(sessions_module, "_get_runner_client", resolve)
+            archive = await client.patch(f"/v1/sessions/{child['id']}", json={"archived": True})
+            assert archive.status_code == 200, archive.text
+            await _drain_detached_stops()
 
-        archive = await client.patch(f"/v1/sessions/{child['id']}", json={"archived": True})
-        assert archive.status_code == 200, archive.text
-        await _drain_detached_stops()
+        cleanup.assert_awaited_once_with(child["id"])
+        child_backend.close.assert_awaited_once()
+        parent_backend.close.assert_not_awaited()
+        assert child["id"] not in native._AUTO_CODEX_APP_SERVERS
+        assert resolve.await_args.kwargs["for_control"] is True
 
+    child_row = (await client.get(f"/v1/sessions/{child['id']}")).json()
+    assert child_row["archived"] is True
+    transcript = await client.get(f"/v1/sessions/{child['id']}/items")
+    assert transcript.status_code == 200, transcript.text
+    retained = next(item for item in transcript.json()["data"] if item["id"] == transcript_item.id)
+    assert retained["content"] == transcript_content
     parent_row = (await client.get(f"/v1/sessions/{parent['id']}")).json()
     assert parent_row["archived"] is False
     assert parent["runner_id"] not in host.stopped_runner_ids, (
@@ -4844,37 +4966,85 @@ async def test_unbinding_child_before_archive_does_not_stop_parents_shared_runne
     )
 
 
+@pytest.mark.parametrize(
+    ("host_placement", "cleanup_status"),
+    [("local", 204), ("remote", 204), ("hostless", 204), ("local", 503)],
+    ids=["local", "remote", "hostless", "cleanup-rejected"],
+)
 async def test_stopping_child_does_not_stop_parents_shared_runner(
     client: httpx.AsyncClient,
     app: FastAPI,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     _shared_runner_family: dict[str, str],
+    host_placement: str,
+    cleanup_status: int,
 ) -> None:
-    """``stop_session`` on a child ends the child's work, not the parent's runner."""
-    from omnigent.runtime import set_runner_client
+    """Child control follows its runner even when the host reconnects elsewhere."""
+    from omnigent.runner.routing import RunnerRouter
 
     comm = await _connect_host(app)
     parent = await _inline_launch_session(client, comm)
-    async with _HostFrameResponder(comm) as host:
+    async with _HostFrameResponder(comm):
         child = await _inline_child_session(client, parent["id"])
-        _shared_runner_family.update(parent=parent["id"], child=child["id"])
-        fake_runner = httpx.AsyncClient(
-            transport=httpx.MockTransport(lambda _request: httpx.Response(204)),
-            base_url="http://runner",
-        )
-        set_runner_client(fake_runner)
-        try:
-            stop = await client.post(
+    _shared_runner_family.update(parent=parent["id"], child=child["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    app.state.tunnel_registry.register(parent["runner_id"], _NoopRunnerWS(), _runner_hello())
+    host_app = app
+    if host_placement == "remote":
+        await comm.send_input({"type": "websocket.disconnect", "code": 1001})
+        await comm.wait(timeout=budget(5.0))
+        host_app = _host_app(db_uri, tmp_path)
+        comm = await _connect_host(host_app)
+        assert app.state.host_registry.get(_HOST_ID) is None
+        assert host_app.state.tunnel_registry.get(parent["runner_id"]) is None
+    elif host_placement == "hostless":
+        for session_id in (child["id"], parent["id"]):
+            store.clear_host_binding(session_id, keep_runner=True)
+
+    requests: list[tuple[str, str]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        return httpx.Response(cleanup_status if request.method == "DELETE" else 204)
+
+    async with (
+        _HostFrameResponder(comm) as host,
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(respond), base_url="http://runner"
+        ) as runner,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=host_app), base_url="http://host-replica"
+        ) as host_client,
+    ):
+        # Keep the real replica-local routing; only replace its HTTP transport.
+        monkeypatch.setattr(RunnerRouter, "_client_for_runner", lambda self, runner_id: runner)
+        if host_placement == "remote":
+            store.touch_runner_liveness([parent["runner_id"]], int(time.time()))
+            misplaced = await host_client.post(
                 f"/v1/sessions/{child['id']}/events", json={"type": "stop_session"}
             )
-        finally:
-            set_runner_client(None)
-            await fake_runner.aclose()
-        assert stop.status_code in (200, 202), stop.text
-
-    assert parent["runner_id"] not in host.stopped_runner_ids, (
-        f"stopping child {child['id']} asked the host to stop the parent's runner "
-        f"{parent['runner_id']} (stops: {host.stopped_runner_ids})"
-    )
+            assert misplaced.status_code == 503, misplaced.text
+            assert misplaced.json()["error"]["code"] == "runner_unavailable"
+            assert requests == []
+            assert host.stopped_runner_ids == []
+            assert store.get_conversation(child["id"]).runner_id == parent["runner_id"]
+        stop = await client.post(
+            f"/v1/sessions/{child['id']}/events", json={"type": "stop_session"}
+        )
+        if cleanup_status >= 400:
+            assert stop.status_code == 503, stop.text
+            assert stop.json()["error"]["code"] == "runner_unavailable"
+            assert store.get_conversation(child["id"]).runner_id == parent["runner_id"]
+        else:
+            assert stop.status_code in (200, 202), stop.text
+        expected_requests = [("POST", f"/v1/sessions/{child['id']}/events")]
+        if host_placement != "hostless":
+            expected_requests.append(("DELETE", f"/v1/sessions/{child['id']}"))
+        assert requests == expected_requests
+        assert host.stopped_runner_ids == []
+        assert store.get_conversation(parent["id"]).runner_id == parent["runner_id"]
 
 
 async def test_child_relaunch_does_not_stop_parents_shared_runner(
@@ -5259,3 +5429,78 @@ async def test_side_chat_message_rebinds_to_already_relaunched_source_runner(
     side_chat_after = store.get_conversation(side_chat_id)
     assert side_chat_after is not None and side_chat_after.runner_id == replacement
     assert f"/v1/sessions/{side_chat_id}/events" in [path for path, _ in runners.posts]
+
+
+@pytest.mark.parametrize(
+    "runner_on_target", [False, True], ids=["runner-absent", "runner-on-target"]
+)
+async def test_switch_host_stops_before_releasing_the_old_binding(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _shared_runner_family: dict[str, str],
+    runner_on_target: bool,
+) -> None:
+    """A routed Stop reaches the old replica before the move forgets its runner."""
+    from omnigent.runner.routing import RunnerRouter
+
+    first_comm = await _connect_host(app)
+    session = await _inline_launch_session(client, first_comm)
+    _shared_runner_family["moving"] = session["id"]
+    target_app = _host_app(db_uri, tmp_path)
+    target_host_id = "b2345678901234567890123456789012"
+    second_comm = await _connect_host(target_app, target_host_id, name="workstation")
+    if runner_on_target:
+        target_app.state.tunnel_registry.register(
+            session["runner_id"], _NoopRunnerWS(), _runner_hello()
+        )
+        SqlAlchemyConversationStore(db_uri).touch_runner_liveness(
+            [session["runner_id"]], int(time.time())
+        )
+    assert target_app.state.host_registry.get(_HOST_ID) is None
+    assert app.state.tunnel_registry.get(session["runner_id"]) is None
+    requests: list[tuple[str, str]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        return httpx.Response(204)
+
+    async with (
+        _HostFrameResponder(first_comm) as first_host,
+        _HostFrameResponder(second_comm) as second_host,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=target_app), base_url="http://target"
+        ) as target_client,
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(respond), base_url="http://runner"
+        ) as runner,
+    ):
+        monkeypatch.setattr(RunnerRouter, "_client_for_runner", lambda self, runner_id: runner)
+        misplaced = await target_client.post(
+            f"/v1/sessions/{session['id']}/events", json={"type": "stop_session"}
+        )
+        assert misplaced.status_code == 400, misplaced.text
+        assert misplaced.json()["error"]["code"] == "wrong_replica"
+        assert requests == []
+        assert first_host.stopped_runner_ids == []
+        assert second_host.stopped_runner_ids == []
+        bound = (await client.get(f"/v1/sessions/{session['id']}")).json()
+        assert bound["runner_id"] == session["runner_id"]
+        stopped = await client.post(
+            f"/v1/sessions/{session['id']}/events", json={"type": "stop_session"}
+        )
+        assert stopped.status_code in (200, 202), stopped.text
+        assert first_host.stopped_runner_ids == [session["runner_id"]]
+        released = await client.patch(f"/v1/sessions/{session['id']}", json={"runner_id": ""})
+        assert released.status_code == 200, released.text
+        launched = await target_client.post(
+            f"/v1/hosts/{target_host_id}/runners",
+            json={"session_id": session["id"], "workspace": _WORKSPACE},
+        )
+        assert launched.status_code == 200, launched.text
+    assert len(second_host.launch_frames) == 1
+    moved = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert moved["host_id"] == target_host_id
+    assert moved["runner_id"] == launched.json()["runner_id"]
