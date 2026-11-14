@@ -6,9 +6,12 @@ import { toast } from "sonner";
 import { FullscreenIcon } from "@/components/ai-elements/MermaidBlock";
 import { Button } from "@/components/ui/button";
 import { useSavedWorkflows } from "@/hooks/useSavedWorkflows";
+import { workflowQuestionStep } from "@/lib/blocks";
+import { messageDeepLinkParams } from "@/lib/messageDeepLink";
 import type { StepProgress } from "@/lib/sessionJournal";
-import { interrupt, sendUserMessage } from "@/lib/sessionsApi";
+import { getSession, interrupt, sendUserMessage } from "@/lib/sessionsApi";
 import { Link, useNavigate } from "@/lib/routing";
+import { parseEvent } from "@/lib/sse";
 import { cn } from "@/lib/utils";
 import { continuePlanMessage, taskActionMessage } from "@/lib/workflow";
 import { PlanRunButton, type PlanRunControl } from "@/shell/PlanRunButton";
@@ -36,18 +39,35 @@ function useRunSession(sessionId: string, refreshKeys: RunRefreshKeys) {
       setPending(false);
     }
   };
+  const post = async (text: string) => {
+    const result = await sendUserMessage(sessionId, text);
+    if (result.denied) toast.error("A policy blocked the message.");
+  };
   return {
     pending,
-    send: (text: string) =>
-      void act(async () => {
-        const result = await sendUserMessage(sessionId, text);
-        if (result.denied) toast.error("A policy blocked the message.");
-      }),
+    act: (request: () => Promise<void>) => void act(request),
+    send: (text: string) => void act(() => post(text)),
+    post,
     stop: () =>
       void act(async () => {
         await interrupt(sessionId);
       }),
   };
+}
+
+/** The question `sessionId`'s agent asked about a task and waits on, if one is pending. */
+async function pendingQuestionFor(sessionId: string, stepId: string): Promise<string | null> {
+  const session = await getSession(sessionId);
+  for (const raw of session.pendingElicitations ?? []) {
+    const event = parseEvent("response.elicitation_request", raw);
+    if (
+      event?.type === "elicitation_request" &&
+      workflowQuestionStep(event, sessionId) === stepId
+    ) {
+      return event.elicitationId;
+    }
+  }
+  return null;
 }
 
 /**
@@ -62,13 +82,30 @@ export function useRunTaskMenus(
   refreshKeys: RunRefreshKeys,
 ): ((item: StepProgress) => TaskMenuAction | undefined) | undefined {
   const session = useRunSession(sessionId ?? "", refreshKeys);
+  const navigate = useNavigate();
   if (!sessionId) return undefined;
-  return (item) =>
-    taskMenuAction(
+  // The agent can't read a message while it waits on the task's question, so
+  // Continue opens the session at the question instead.
+  const proceed = (item: StepProgress) =>
+    session.act(async () => {
+      const questionId = await pendingQuestionFor(sessionId, item.step.id);
+      if (questionId === null) {
+        await session.post(taskActionMessage("proceed", item.step.name));
+        return;
+      }
+      const search = messageDeepLinkParams(new URLSearchParams(), questionId);
+      navigate(`/c/${encodeURIComponent(sessionId)}?${search}`);
+    });
+  return (item) => {
+    const menuAction = taskMenuAction(
       item,
       (action, taskName) => session.send(taskActionMessage(action, taskName)),
       session.stop,
     );
+    return menuAction?.action === "proceed"
+      ? { ...menuAction, onSelect: () => proceed(item) }
+      : menuAction;
+  };
 }
 
 /**

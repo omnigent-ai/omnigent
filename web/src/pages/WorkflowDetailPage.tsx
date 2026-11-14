@@ -18,6 +18,7 @@ import {
 
 import { PageScroll } from "@/components/PageScroll";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
+import { DeleteWorkflowDialog } from "@/components/workflows/DeleteWorkflowDialog";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { showToast } from "@/components/ui/toast";
@@ -37,7 +38,6 @@ import {
   WorkflowStepsGraph,
 } from "@/components/workflows/WorkflowStepsGraph";
 import { useNow } from "@/hooks/useNow";
-import { useDeleteWorkflow } from "@/hooks/useSavedWorkflows";
 import {
   useWorkflow,
   useWorkflowRuns,
@@ -74,7 +74,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const now = useNow();
   const { data: workflow, isLoading, isError, error, refetch } = useWorkflow(workflowId);
   const runs = useWorkflowRuns(workflowId);
-  const deleteWorkflow = useDeleteWorkflow();
+  const [deleteOpen, setDeleteOpen] = useState(false);
   // The request stays set while its dialog closes, as on the Workflows page.
   const [sessionRequest, setSessionRequest] = useState<WorkflowSessionRequest | null>(null);
   const [sessionOpen, setSessionOpen] = useState(false);
@@ -180,13 +180,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
               size="icon-sm"
               aria-label="Delete workflow"
               data-testid="workflow-detail-delete"
-              disabled={deleteWorkflow.isPending}
-              onClick={() =>
-                deleteWorkflow.mutate(workflow.id, {
-                  onSuccess: () => navigate("/workflows"),
-                  onError: () => showToast(`Couldn’t delete “${workflow.name}”.`),
-                })
-              }
+              onClick={() => setDeleteOpen(true)}
             >
               <Trash2Icon className="size-4" />
             </Button>
@@ -317,6 +311,13 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
           </>
         )}
 
+        {deleteOpen && (
+          <DeleteWorkflowDialog
+            workflow={workflow}
+            onClose={() => setDeleteOpen(false)}
+            onDeleted={() => navigate("/workflows")}
+          />
+        )}
         <WorkflowSessionDialog
           request={sessionRequest}
           open={sessionOpen}

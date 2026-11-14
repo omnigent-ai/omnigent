@@ -18,10 +18,12 @@ import { useSession } from "@/hooks/useSession";
 import { useSessionJournal } from "@/hooks/useSessionJournal";
 import type * as SessionJournalHooks from "@/hooks/useSessionJournal";
 import { authenticatedFetch } from "@/lib/identity";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import type * as IdentityModule from "@/lib/identity";
 import type * as RoutingModule from "@/lib/routing";
 import { sessionJournalKey, type JournalEntry, type StepProgress } from "@/lib/sessionJournal";
-import { sendUserMessage } from "@/lib/sessionsApi";
+import { getSession, sendUserMessage } from "@/lib/sessionsApi";
 import type * as SessionsApi from "@/lib/sessionsApi";
 import { openTasksTab } from "@/store/sessionTasksActions";
 import type * as TasksActions from "@/store/sessionTasksActions";
@@ -68,10 +70,10 @@ vi.mock("@/store/sessionTasksActions", async (importOriginal) => {
 });
 vi.mock("@/lib/sessionsApi", async (importOriginal) => {
   const actual = await importOriginal<typeof SessionsApi>();
-  return { ...actual, interrupt: vi.fn(), sendUserMessage: vi.fn() };
+  return { ...actual, getSession: vi.fn(), interrupt: vi.fn(), sendUserMessage: vi.fn() };
 });
 vi.mock("@/hooks/useNow", () => ({ useNow: () => new Date("2026-11-12T18:00:00Z") }));
-vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: () => "loading" }));
+vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: vi.fn(() => "loading") }));
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 // The graph has its own tests; here it lists the steps it was given, and the
 // full-screen view where each stands.
@@ -196,6 +198,7 @@ function renderPage(client = new QueryClient()) {
 
 describe("WorkflowDetailPage", () => {
   beforeEach(() => {
+    vi.mocked(useServerInfo).mockReturnValue("loading");
     navigate.mockClear();
     deleteWorkflow.mockClear();
     vi.mocked(openTasksTab).mockClear();
@@ -462,6 +465,57 @@ describe("WorkflowDetailPage", () => {
     expect(screen.queryByTestId("tasks-progress-menu")).toBeNull();
   });
 
+  it("opens a run's session at the question a waiting task's agent waits on", async () => {
+    vi.mocked(sendUserMessage).mockClear().mockResolvedValue({ queued: true });
+    const session = "a".repeat(32);
+    const pendingQuestion = {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_fix",
+      params: {
+        mode: "form",
+        message: "Waiting for you on Fix the test",
+        phase: "workflow_request_input",
+        journal_step: "fix",
+      },
+    };
+    vi.mocked(getSession).mockResolvedValue({ pendingElicitations: [pendingQuestion] } as never);
+    mockWorkflow({});
+    mockRuns([
+      run(session, "Fix the upload test", { done: 1, needsInput: 1 }, [
+        status("explore", "done"),
+        status("fix", "needs_input"),
+      ]),
+    ]);
+    renderPage();
+
+    const openCard = async () => {
+      fireEvent.focus(
+        within(screen.getByTestId("workflow-run")).getAllByTestId("tasks-progress-segment")[1]!,
+      );
+      fireEvent.pointerDown(await screen.findByTestId("tasks-progress-menu"), { button: 0 });
+      fireEvent.click(screen.getByTestId("tasks-progress-proceed"));
+    };
+    await openCard();
+    await waitFor(() => expect(navigate).toHaveBeenCalled());
+    const [path, search] = String(navigate.mock.calls[0]![0]).split("?");
+    expect(path).toBe(`/c/${session}`);
+    expect(new URLSearchParams(search).get("message")).toBe("elicit_fix");
+    expect(sendUserMessage).not.toHaveBeenCalled();
+
+    // Once the question is gone, Continue asks the agent to go ahead.
+    vi.mocked(getSession).mockResolvedValue({ pendingElicitations: [] } as never);
+    navigate.mockClear();
+    await waitFor(() => expect(screen.queryByTestId("tasks-progress-card")).toBeNull());
+    await openCard();
+    await waitFor(() =>
+      expect(sendUserMessage).toHaveBeenCalledWith(
+        session,
+        expect.stringContaining('continue the task "Fix the test"'),
+      ),
+    );
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
   it("shows a run on the workflow's graph, where each task stands", () => {
     mockWorkflow({});
     mockRuns([
@@ -494,7 +548,11 @@ describe("WorkflowDetailPage", () => {
     expect(fetchNextPage).toHaveBeenCalled();
   });
 
-  it("runs it, makes an automation of it, or deletes it and goes back", () => {
+  it("runs it, makes an automation of it, or confirms deletion and goes back", () => {
+    vi.mocked(useServerInfo).mockReturnValue({
+      ...FALLBACK_SERVER_INFO,
+      automations_enabled: false,
+    });
     mockWorkflow({});
     mockRuns([]);
     renderPage();
@@ -508,12 +566,15 @@ describe("WorkflowDetailPage", () => {
     expect(screen.getByTestId("new-automation-dialog")).toHaveTextContent("Triage flaky tests");
 
     fireEvent.click(screen.getByRole("button", { name: "Delete workflow" }));
+    expect(deleteWorkflow).not.toHaveBeenCalled();
+    const dialog = screen.getByRole("dialog", { name: "Delete workflow?" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Delete workflow" }));
     const [id, { onSuccess, onError }] = deleteWorkflow.mock.calls[0] as [
       string,
       { onSuccess: () => void; onError: () => void },
     ];
     expect(id).toBe(WORKFLOW.id);
-    onSuccess();
+    act(onSuccess);
     expect(navigate).toHaveBeenCalledWith("/workflows");
     onError();
     expect(showToast).toHaveBeenCalledWith("Couldn’t delete “Triage flaky tests”.");

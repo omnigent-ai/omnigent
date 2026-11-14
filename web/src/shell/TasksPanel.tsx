@@ -1,7 +1,7 @@
 // The Tasks tab: where the session's tasks stand, one row each. Tasks are a
 // plan's steps, or the agent's own task list when the session has no plan.
 
-import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   CheckIcon,
   ChevronRightIcon,
@@ -26,9 +26,11 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { useConversationEntryValue } from "@/hooks/useConversationEntryState";
 import { useNow } from "@/hooks/useNow";
 import { useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import { useSessionTasks } from "@/hooks/useSessionTasks";
+import { pendingWorkflowQuestions } from "@/lib/blocks";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
@@ -933,7 +935,7 @@ function TasksHeader({
   onSelect,
   onSaveWorkflow,
   onContinuePlan,
-  onTaskAction,
+  menuActionFor,
   onStop,
 }: {
   plan: JournalEntry | null;
@@ -947,8 +949,8 @@ function TasksHeader({
   onSaveWorkflow?: () => void;
   /** Asks the agent to continue the plan; absent when this viewer can't send. */
   onContinuePlan?: () => void;
-  /** The composer's Run, Continue or Retry for a task's card; absent when this viewer can't send. */
-  onTaskAction?: (action: TaskAction, taskName: string) => void;
+  /** What a task's card offers in its ⋯ menu, as its row does. */
+  menuActionFor: (item: StepProgress) => TaskMenuAction | undefined;
   /** Stops the agent; offered only while it works. */
   onStop?: () => void;
 }) {
@@ -1085,7 +1087,7 @@ function TasksHeader({
         progress={progress}
         fromPlan={plan !== null}
         onSelect={onSelect}
-        menuActionFor={(item) => taskMenuAction(item, onTaskAction, onStop)}
+        menuActionFor={menuActionFor}
       />
     </header>
   );
@@ -1097,18 +1099,15 @@ function TaskList({
   names,
   flashStep,
   onShowInChat,
-  onTaskAction,
-  onStop,
+  menuActionFor,
 }: {
   progress: readonly StepProgress[];
   entries: readonly JournalEntry[];
   names: ReadonlyMap<string, string>;
   flashStep: string | null;
   onShowInChat: (markerId: string) => void;
-  /** The composer's Run, Continue or Retry, given a task's name; absent when this viewer can't send. */
-  onTaskAction?: (action: TaskAction, taskName: string) => void;
-  /** The composer's Stop; present only while the agent works. */
-  onStop?: () => void;
+  /** What a task's ⋯ menu offers: Run, Continue, Retry or Stop; none when absent. */
+  menuActionFor: (item: StepProgress) => TaskMenuAction | undefined;
 }) {
   const blocked = failedUpstream(progress);
   return (
@@ -1124,7 +1123,7 @@ function TaskList({
             names={names}
             flash={flashStep === item.step.id}
             onShowInChat={onShowInChat}
-            menuAction={taskMenuAction(item, onTaskAction, onStop)}
+            menuAction={menuActionFor(item)}
             failedNames={blocked.get(item.step.id)?.map((id) => names.get(id) ?? id)}
           />
         ))}
@@ -1196,6 +1195,24 @@ export function TasksPanel({
     },
     [onShowInChat, setSearchParams],
   );
+  // The question each waiting task's agent waits on, by step ID. A string, so the
+  // selection only changes when the questions do.
+  const questionsJson = useConversationEntryValue(conversationId, (state) =>
+    JSON.stringify(pendingWorkflowQuestions(state.blocks, conversationId)),
+  );
+  const questions = useMemo(
+    () => new Map<string, string>(JSON.parse(questionsJson) as [string, string][]),
+    [questionsJson],
+  );
+  // The agent can't read a message while it waits on a task's question, so that
+  // task's Continue shows the question instead.
+  const menuActionFor = (item: StepProgress) => {
+    const menuAction = taskMenuAction(item, taskAction, stopWork);
+    const questionId = item.state === "needs_input" ? questions.get(item.step.id) : undefined;
+    return menuAction && questionId
+      ? { ...menuAction, onSelect: () => showInChat(questionId) }
+      : menuAction;
+  };
 
   return (
     <div
@@ -1263,7 +1280,7 @@ export function TasksPanel({
                 saveWorkflow && plan ? () => saveWorkflow(planName(plan) ?? "") : undefined
               }
               onContinuePlan={continuePlan && (() => continuePlan(planName(plan)))}
-              onTaskAction={taskAction}
+              menuActionFor={menuActionFor}
               onStop={stopWork}
             />
             <TaskList
@@ -1272,8 +1289,7 @@ export function TasksPanel({
               names={names}
               flashStep={flashStep}
               onShowInChat={showInChat}
-              onTaskAction={taskAction}
-              onStop={stopWork}
+              menuActionFor={menuActionFor}
             />
           </>
         )}

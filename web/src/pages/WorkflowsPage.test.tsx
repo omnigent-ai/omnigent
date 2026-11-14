@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render, screen, within, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { showToast } from "@/components/ui/toast";
@@ -107,12 +108,23 @@ describe("WorkflowsPage", () => {
     ).toBeInTheDocument();
   });
 
-  it("deletes a workflow from its menu, and says when that fails", () => {
+  it("confirms deleting a workflow from its menu, and says when that fails", () => {
     mockWorkflows({ workflows: WORKFLOWS });
-    render(<WorkflowsPage />);
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <CapabilitiesProvider
+          info={{ ...SERVER_INFO_OFFLINE_FALLBACK, automations_enabled: false }}
+        >
+          <WorkflowsPage />
+        </CapabilitiesProvider>
+      </QueryClientProvider>,
+    );
 
     openMenu(rows()[0]!);
     fireEvent.click(screen.getByTestId("workflow-delete"));
+    expect(deleteWorkflow).not.toHaveBeenCalled();
+    const dialog = screen.getByRole("dialog", { name: "Delete workflow?" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Delete workflow" }));
     expect(deleteWorkflow).toHaveBeenCalledWith("fix-flaky-tests", expect.anything());
 
     const { onError } = deleteWorkflow.mock.calls[0]![1] as { onError: () => void };
