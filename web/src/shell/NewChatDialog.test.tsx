@@ -4378,7 +4378,7 @@ describe("NewChatLandingScreen", () => {
       "[&::-webkit-scrollbar]:hidden",
     );
     expect(screen.getByTestId("new-chat-landing-input")).not.toHaveClass("block");
-    expect(screen.getByTestId("new-chat-landing-input").parentElement).toHaveClass(
+    expect(screen.getByTestId("new-chat-landing-input").parentElement?.parentElement).toHaveClass(
       "overflow-hidden",
       "px-3",
       "pt-3",
@@ -4506,7 +4506,9 @@ describe("NewChatLandingScreen", () => {
     const leftControls = screen.getByTestId("new-chat-landing-left-controls");
     const rightControls = screen.getByTestId("new-chat-landing-right-controls");
     const card = screen.getByTestId("new-chat-landing-composer");
-    expect(screen.getByTestId("new-chat-landing-input").parentElement?.parentElement).toBe(card);
+    expect(
+      screen.getByTestId("new-chat-landing-input").parentElement?.parentElement?.parentElement,
+    ).toBe(card);
     expect(actions.parentElement).toBe(card);
     const [widthProbe, ...groups] = Array.from(actions.children);
     expect(widthProbe).toHaveClass("h-0");
@@ -10667,6 +10669,93 @@ describe("NewChatLandingScreen @-file-mention", () => {
     renderLanding();
     fireEvent.change(input(), { target: { value: "@", selectionStart: 1 } });
     expect(screen.queryByTitle("Open omnigent")).not.toBeInTheDocument();
+  });
+
+  it("repaints the layer when a tag is swapped for one of the same length, or for text", async () => {
+    useConversationsMock.mockReturnValue({
+      data: {
+        pages: [
+          {
+            data: [
+              { id: "s_alpha", object: "conversation", title: "Alpha", labels: {} },
+              { id: "s_bravo", object: "conversation", title: "Bravo", labels: {} },
+            ],
+          },
+        ],
+      },
+    });
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    const typeDraft = (value: string) =>
+      fireEvent.change(input(), { target: { value, selectionStart: value.length } });
+    const overlayText = () => screen.getByTestId("composer-highlight-overlay").textContent;
+    typeDraft("look @Alp");
+    fireEvent.click(screen.getByTitle("Tag session Alpha"));
+    expect(overlayText()).toBe("look @Alpha ");
+    typeDraft("look @Bra");
+    fireEvent.click(screen.getByTitle("Tag session Bravo"));
+    expect((input() as HTMLTextAreaElement).value).toBe("look @Bravo ");
+    expect(overlayText()).toBe("look @Bravo ");
+    typeDraft("look aaaaaa **now**");
+    expect(screen.queryByTestId("composer-mention-token")).toBeNull();
+    expect(overlayText()).toBe("look aaaaaa **now**");
+  });
+
+  it("shows tagged tokens that read as Markdown verbatim, focused and blurred", async () => {
+    const title = "Fix `useAuth` **now** _later_ my_var";
+    useHostFilesystemMock.mockImplementation(((_hostId: string | null, path: string | null) => ({
+      data: {
+        entries: path === ROOT ? [file(`${ROOT}/__init__.py`), file(`${ROOT}/README.md`)] : [],
+        truncated: false,
+      },
+      isLoading: false,
+      error: null,
+      isPlaceholderData: false,
+    })) as unknown as typeof useHostFilesystem);
+    useConversationsMock.mockReturnValue({
+      data: { pages: [{ data: [{ id: "s_md", object: "conversation", title, labels: {} }] }] },
+    });
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    const typeDraft = (value: string) =>
+      fireEvent.change(input(), { target: { value, selectionStart: value.length } });
+    const draft = () => (input() as HTMLTextAreaElement).value;
+    typeDraft("open @__init");
+    fireEvent.click(screen.getByTitle("Attach __init__.py"));
+    typeDraft(`${draft()}and @Fix`);
+    fireEvent.click(screen.getByTitle(`Tag session ${title}`));
+    typeDraft(`${draft()}then **go**`);
+    const expected = ["@__init__.py", `@${title}`];
+    const pills = (root: ParentNode) =>
+      Array.from(
+        root.querySelectorAll('[data-testid="composer-mention-token"]'),
+        (pill) => pill.textContent,
+      );
+    expect(draft()).toBe(`open @__init__.py and @${title} then **go**`);
+    // Focused: the highlight layer paints each token whole, with no Markdown inside.
+    const overlay = screen.getByTestId("composer-highlight-overlay");
+    expect(pills(overlay)).toEqual(expected);
+    expect(overlay.textContent).toBe(draft());
+    // Blurred (focus moved elsewhere): the compact preview drops only real markers.
+    await act(async () => {});
+    const elsewhere = document.body.appendChild(document.createElement("button"));
+    try {
+      act(() => elsewhere.focus());
+      await act(async () => {
+        await new Promise((resolve) => {
+          setTimeout(resolve, 0);
+        });
+      });
+      const view = screen.getByTestId("composer-compact-view");
+      expect(view.textContent).toBe(`open @__init__.py and @${title} then go`);
+      expect(pills(view)).toEqual(expected);
+    } finally {
+      elsewhere.remove();
+    }
   });
 
   it("tags a loaded session for any agent and delivers its marker", async () => {

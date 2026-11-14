@@ -1,4 +1,4 @@
-import { forwardRef, type ReactNode, type RefObject, useLayoutEffect } from "react";
+import { forwardRef, type ReactNode, type RefObject, useLayoutEffect, useMemo } from "react";
 
 import { findMentionTokens } from "@/lib/composerMentions";
 
@@ -27,6 +27,31 @@ export function renderMentionTokens(text: string, tokens: readonly string[]): Re
   }
   parts.push(text.slice(at));
   return parts;
+}
+
+const NO_TOKEN_RANGES: readonly { start: number; end: number }[] = [];
+
+/**
+ * Draft ranges of the tagged tokens in ``text``, for the composer's highlight
+ * layer to draw as pills. The array keeps its identity while no token moves.
+ */
+export function useMentionTokenRanges(
+  text: string,
+  tokens: readonly string[],
+  enabled = true,
+): readonly { start: number; end: number }[] {
+  const key = enabled
+    ? findMentionTokens(text, tokens)
+        .map((range) => `${range.start}:${range.end}`)
+        .join(",")
+    : "";
+  return useMemo(() => {
+    if (!key) return NO_TOKEN_RANGES;
+    return key.split(",").map((pair) => {
+      const [start, end] = pair.split(":").map(Number);
+      return { start, end };
+    });
+  }, [key]);
 }
 
 /**
