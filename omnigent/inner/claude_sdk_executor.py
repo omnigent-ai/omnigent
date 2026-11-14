@@ -2256,6 +2256,7 @@ class ClaudeSDKExecutor(Executor):
         api_key_helper: str | None = None,
         system_prompt_preset: str | None = None,
         context_window: int | None = None,
+        session_persistence: bool = False,
     ) -> None:
         """Create a ClaudeSDKExecutor.
 
@@ -2273,6 +2274,11 @@ class ClaudeSDKExecutor(Executor):
             context_window: The spec's declared context window in tokens,
                 e.g. ``1000000``. Sizes the history a fresh client replays;
                 ``None`` resolves the window from the model.
+            session_persistence: Let Claude Code write its own session
+                transcript under ``~/.claude/projects``. Off by default:
+                Omnigent owns conversation persistence and never resumes
+                from that file, so it only matters to tooling that reads
+                the transcript for per-request usage.
             permission_mode: SDK permission mode (default: auto
                 so the agent runs autonomously with background safety checks).
             gateway: If True, route through a vendor-neutral gateway
@@ -2347,6 +2353,7 @@ class ClaudeSDKExecutor(Executor):
         if system_prompt_preset not in (None, "claude_code"):
             raise ValueError("system_prompt_preset must be 'claude_code' or unset")
         self._system_prompt_preset = system_prompt_preset
+        self._session_persistence = session_persistence
         self._cwd = cwd
         self._os_env_spec = os_env
         self._os_env = os_env is not None
@@ -3772,6 +3779,13 @@ class ClaudeSDKExecutor(Executor):
         if max_output_tokens is not None:
             max_output_tokens = int(max_output_tokens)
             env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(max_output_tokens)
+        # Opting in lets the CLI write its own ``<session>.jsonl`` transcript,
+        # which per-request usage tooling reads. Omnigent still never resumes
+        # from it (no ``--resume``/``--continue``), so its store stays the
+        # source of truth and the file is write-only for observers.
+        extra_args: dict[str, str | None] = {}
+        if not self._session_persistence:
+            extra_args["no-session-persistence"] = None
         options_kwargs: dict[str, Any] = {  # type: ignore[explicit-any]  # ClaudeAgentOptions accepts mixed-typed kwargs (str / list / dict / callable / etc.)
             "tools": base_tools,
             "system_prompt": system_prompt or None,
@@ -3786,7 +3800,7 @@ class ClaudeSDKExecutor(Executor):
             "include_hook_events": True,
             "skills": resolved.skills,
             "plugins": bundle_plugins,
-            "extra_args": {"no-session-persistence": None},
+            "extra_args": extra_args,
             "max_buffer_size": 10 * 1024 * 1024,
         }
         if self._system_prompt_preset == "claude_code":

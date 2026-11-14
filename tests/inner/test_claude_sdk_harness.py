@@ -145,6 +145,40 @@ def test_executor_factory_reads_env_vars(
     assert os_env_value.sandbox.type == "none"
 
 
+@pytest.mark.parametrize(
+    "raw,expected",
+    [("true", True), ("1", True), ("YES", True), ("false", False), ("", False), (None, False)],
+)
+def test_executor_factory_reads_session_persistence(
+    monkeypatch: pytest.MonkeyPatch,
+    raw: str | None,
+    expected: bool,
+) -> None:
+    """The opt-in env var reaches the executor, and anything else stays off.
+
+    An agent that never asked for Claude Code transcripts must keep
+    ``--no-session-persistence``, so a missing or falsey value cannot be
+    read as consent.
+    """
+    if raw is None:
+        monkeypatch.delenv("HARNESS_CLAUDE_SDK_SESSION_PERSISTENCE", raising=False)
+    else:
+        monkeypatch.setenv("HARNESS_CLAUDE_SDK_SESSION_PERSISTENCE", raw)
+
+    captured: dict[str, Any] = {}
+
+    def _fake_init(self: Any, *, session_persistence: bool = False, **_kwargs: Any) -> None:
+        captured["session_persistence"] = session_persistence
+
+    with patch(
+        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
+        _fake_init,
+    ):
+        claude_sdk_harness._build_claude_sdk_executor()
+
+    assert captured["session_persistence"] is expected
+
+
 def test_executor_factory_cwd_falls_back_to_runner_workspace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
