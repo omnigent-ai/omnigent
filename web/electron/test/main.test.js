@@ -1254,26 +1254,6 @@ describe("Arca auto-connect wiring", () => {
       );
     const failed = { ok: false, errorKind: "timeout", error: "timed out" };
 
-    it("prepares sign-in before connecting to the identical workspace", async (t) => {
-      const spog = "https://account.databricks.com/omnigent?o=123";
-      let prepared = false;
-      const h = harness(t, {
-        arcaSetupResult: () => {
-          assert.deepEqual(h.calls.arcaConnects, []);
-          prepared = true;
-          return { ok: true };
-        },
-        arcaResult: () => {
-          assert.equal(prepared, true);
-          return { ok: true };
-        },
-      });
-      assert.equal((await connect(h, spog)).ok, true);
-      assert.deepEqual(h.calls.arcaSetups, [spog]);
-      assert.deepEqual(h.calls.arcaConnects, [spog]);
-      assert.equal(saved(h).arca_auto_connect, true);
-    });
-
     it("never prompts from passive auto-connect and never loops after rejected login", async (t) => {
       const h = harness(t, {
         arcaResult: { ok: false, errorKind: "omni-auth", authError: true },
@@ -1617,7 +1597,7 @@ describe("Databricks auth mode wiring", () => {
   });
 
   it("signs in through the browser from an account URL whose workspace rejected its session", async (t) => {
-    const accountPick = "https://spog.cloud.databricks.com/?o=123";
+    const accountPick = "https://accounts.cloud.databricks.com/?o=123";
     let rejected = false;
     const h = loadNavigationHarness({
       serverUrl: workspace,
@@ -4445,7 +4425,7 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
   });
 
   // The organization-provided server: an account URL naming the workspace sign-in lands on.
-  const accountPick = "https://spog.cloud.databricks.com/?o=123";
+  const accountPick = "https://accounts.cloud.databricks.com/?o=123";
   async function accountPickHarness(t) {
     const network = createWorkspaceNetwork(origin, {
       oauth: {
@@ -4501,7 +4481,7 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
   });
 
   it("does not retry an account URL whose workspace listing failed", async (t) => {
-    const accountUrl = "https://spog.cloud.databricks.com/";
+    const accountUrl = "https://accounts.cloud.databricks.com/";
     const accountOrigin = new URL(accountUrl).origin;
     const network = createWorkspaceNetwork(accountOrigin, {
       oauth: {

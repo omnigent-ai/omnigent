@@ -1,6 +1,6 @@
-// Account workspaces lookup for SPOG (account-first) login.
+// Account workspaces lookup for account-first login.
 //
-// An account-scoped token can't hit /auth/session/create on the account/SPOG
+// An account-scoped token can't hit /auth/session/create on the account
 // host (the edge serves the account console SPA there). DB One resolves a
 // workspace FQDN from the account workspaces API and bridges against that host
 // instead. Mirrors genie-one-desktop/src/main/accountWorkspaces.ts.

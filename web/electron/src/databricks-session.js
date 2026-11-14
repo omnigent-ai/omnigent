@@ -39,7 +39,7 @@ const NETWORK_TIMEOUT_MS = 20_000;
  * - Explicit connect/login (``interactive: true``): try the stored credentials
  *   for ``storedOrigin`` or else the entered origin (unless
  *   ``useStoredCredentials: false``), else authenticate fresh in the browser.
- *   Tokens are keyed by WORKSPACE origin, so a SPOG URL re-runs the account
+ *   Tokens are keyed by WORKSPACE origin, so an account URL re-runs the account
  *   flow + picker for THIS window unless the caller names the workspace it
  *   reached before as ``storedOrigin``. The result is persisted keyed by the
  *   resolved workspace origin.
@@ -124,7 +124,7 @@ async function ensureDatabricksSession(
       accountScoped: Boolean(account),
     });
     if (account) {
-      // Account-scoped (SPOG): the account host has no /auth/session/create, so
+      // Account-scoped: the account host has no /auth/session/create, so
       // resolve the account's workspaces, let the user pick, and bridge to that
       // workspace. Persist keyed by the workspace origin (with the account
       // context) so silent refresh later hits the account token endpoint.
