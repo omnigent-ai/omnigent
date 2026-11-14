@@ -1383,6 +1383,19 @@ describe("WorkspacePanel tab-strip layout (regression)", () => {
     expect(divider).not.toHaveClass("ml-auto");
   });
 
+  it("renders the drag live region before the app, outside the Workspace", () => {
+    // After the app it broke double-click word selection in the Markdown editor;
+    // inside the Workspace it would be a second status region there.
+    declaresShell();
+    renderWorkspace({ openFiles: ["src/App.tsx"] });
+    const toolbar = screen.getByRole("toolbar", { name: "Workspace tabs" });
+    const liveRegion = screen.getByRole("status");
+    expect(toolbar).not.toContainElement(liveRegion);
+    expect(
+      liveRegion.compareDocumentPosition(toolbar) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
   it("renders only populated tab strips in the scroll viewport", () => {
     // FileTabsStrip / TerminalTabsStrip must return null when empty — an empty
     // wrapper would still occupy a slot in the scroller's gap and offset the
@@ -1737,6 +1750,28 @@ describe("WorkspacePanel mobile side chats", () => {
     expect(onMobileSideChatsOpenChange).toHaveBeenCalledWith(false);
   });
 
+  it("gives a pinned drawer tab an unpin button instead of close, and reorders from its menu", async () => {
+    isMobileMock.mockReturnValue(true);
+    writeSessionWorkspaceState("conv_ws", {
+      openSideChats: ["conv_side_a", "conv_side_b"],
+      pinnedSideChats: ["conv_side_a"],
+    });
+    renderWorkspace({ rightRailTab: "sidechat", mobileSideChatsOpen: true });
+
+    const drawer = screen.getByTestId("side-chats-panel-drawer");
+    expect(within(drawer).queryByRole("button", { name: "Close Side chat 1" })).toBeNull();
+    fireEvent.click(within(drawer).getByRole("button", { name: "Unpin Side chat 1" }));
+    expect(readSessionWorkspaceState("conv_ws").pinnedSideChats).toBeUndefined();
+    expect(within(drawer).getByRole("button", { name: "Close Side chat 1" })).toBeVisible();
+
+    fireEvent.contextMenu(within(drawer).getByRole("tab", { name: "Side chat 1" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Move right" }));
+    expect(readSessionWorkspaceState("conv_ws").openSideChats).toEqual([
+      "conv_side_b",
+      "conv_side_a",
+    ]);
+  });
+
   it("renders the drawer inside the app subtree, beside the hidden rail", () => {
     // The embed scopes its stylesheet to its own root, and native shells scope
     // safe-area insets to the app shell, so a drawer portaled to the body
@@ -1774,6 +1809,94 @@ describe("WorkspacePanel mobile side chats", () => {
   });
 });
 
+describe("WorkspacePanel side-chat tab arrangement", () => {
+  const rail = () => screen.getByRole("complementary", { name: "Workspace" });
+  // Open tabs in strip order: side chats by name, file tabs by path.
+  const tabNames = () =>
+    Array.from(
+      rail()
+        .querySelector("[data-workspace-tabs-viewport]")!
+        .querySelectorAll<HTMLElement>('[role="tab"], [aria-current]'),
+    ).map((tab) => tab.getAttribute("aria-label") ?? tab.getAttribute("title"));
+  const openSideChats = (ids: string[]) =>
+    writeSessionWorkspaceState("conv_ws", {
+      openSideChats: ids,
+      selectedSideChatId: ids.at(-1) ?? null,
+    });
+
+  it("keeps the other side chats' names when an earlier one closes", async () => {
+    vi.spyOn(sessionsApi, "stopSession").mockResolvedValue({ queued: false });
+    openSideChats(["conv_side_a", "conv_side_b", "conv_side_c"]);
+    renderWorkspace({ rightRailTab: "sidechat" });
+
+    fireEvent.click(within(rail()).getByRole("button", { name: "Close Side chat 1" }));
+
+    await waitFor(() => expect(tabNames()).toEqual(["Side chat 2", "Side chat 3"]));
+    expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_c");
+  });
+
+  it("pins a side chat ahead of the other open tabs from its context menu", async () => {
+    openSideChats(["conv_side_a", "conv_side_b"]);
+    renderWorkspace({ rightRailTab: "sidechat", openFiles: ["src/App.tsx"] });
+
+    fireEvent.contextMenu(within(rail()).getByRole("tab", { name: "Side chat 2" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Pin tab" }));
+
+    expect(tabNames()).toEqual(["Side chat 2", "src/App.tsx", "Side chat 1"]);
+    expect(readSessionWorkspaceState("conv_ws").pinnedSideChats).toEqual(["conv_side_b"]);
+    // A pinned tab trades its close button for an unpin button.
+    expect(within(rail()).queryByRole("button", { name: "Close Side chat 2" })).toBeNull();
+    fireEvent.click(within(rail()).getByRole("button", { name: "Unpin Side chat 2" }));
+    expect(readSessionWorkspaceState("conv_ws").pinnedSideChats).toBeUndefined();
+    expect(tabNames()).toEqual(["src/App.tsx", "Side chat 2", "Side chat 1"]);
+  });
+
+  it("moves a side chat left and right from its context menu", async () => {
+    openSideChats(["conv_side_a", "conv_side_b", "conv_side_c"]);
+    renderWorkspace({ rightRailTab: "sidechat" });
+
+    fireEvent.contextMenu(within(rail()).getByRole("tab", { name: "Side chat 3" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Move left" }));
+    expect(tabNames()).toEqual(["Side chat 1", "Side chat 3", "Side chat 2"]);
+
+    fireEvent.contextMenu(within(rail()).getByRole("tab", { name: "Side chat 1" }));
+    expect(await screen.findByRole("menuitem", { name: "Move left" })).toHaveAttribute(
+      "data-disabled",
+    );
+    fireEvent.click(screen.getByRole("menuitem", { name: "Move right" }));
+    expect(tabNames()).toEqual(["Side chat 3", "Side chat 1", "Side chat 2"]);
+    expect(readSessionWorkspaceState("conv_ws").openSideChats).toEqual([
+      "conv_side_c",
+      "conv_side_a",
+      "conv_side_b",
+    ]);
+  });
+
+  it.each([
+    [3, "Side chat 3", 3, false],
+    [5, "5", 5, false],
+    [8, "8", 1, false],
+    [3, "Side chat 3", 3, true],
+    [8, "8", 1, true],
+  ])(
+    "packs %i side chats with visible labels like %j and %i close buttons (mobile: %s)",
+    (count, lastVisibleText, closeButtons, mobile) => {
+      isMobileMock.mockReturnValue(mobile);
+      openSideChats(Array.from({ length: count }, (_, index) => `conv_side_${index}`));
+      renderWorkspace({ rightRailTab: "sidechat", mobileSideChatsOpen: mobile });
+
+      const surface = mobile ? screen.getByTestId("side-chats-panel-drawer") : rail();
+      const tabs = within(surface).getAllByRole("tab", { name: /^Side chat \d+$/ });
+      expect(tabs).toHaveLength(count);
+      expect(tabs.at(-1)).toHaveTextContent(new RegExp(`^${lastVisibleText}$`));
+      if (!mobile) expect(tabs.at(-1)).toHaveAttribute("title", `Side chat ${count}`);
+      expect(within(surface).getAllByRole("button", { name: /^Close Side chat/ })).toHaveLength(
+        closeButtons,
+      );
+    },
+  );
+});
+
 describe("WorkspacePanel sub-agent tabs", () => {
   const SUBAGENT_TAB = subagentTabId("conv_child");
 
@@ -1801,6 +1924,23 @@ describe("WorkspacePanel sub-agent tabs", () => {
 
     expect(within(rail).getAllByRole("tab", { name: "Research agent" })).toHaveLength(1);
     expect(onRightRailTabChange).toHaveBeenCalledWith("sidechat");
+  });
+
+  it("counts sub-agent tabs toward density and offers them only Close tab", async () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openSideChats: ["conv_side_a", "conv_side_b", "conv_side_c"],
+      openSubagentTabs: [SUBAGENT_TAB],
+      selectedSideChatId: "conv_side_c",
+    });
+    renderWorkspace({ rightRailTab: "sidechat", queryClient: clientWithSubagent() });
+    const rail = screen.getByRole("complementary", { name: "Workspace" });
+
+    // Three side chats plus one sub-agent tab reach the compact threshold.
+    expect(within(rail).getByRole("tab", { name: "Side chat 3" })).toHaveTextContent(/^3$/);
+    fireEvent.contextMenu(within(rail).getByRole("tab", { name: "Research agent" }));
+    expect(await screen.findByRole("menuitem", { name: "Close tab" })).toBeVisible();
+    expect(screen.queryByRole("menuitem", { name: "Pin tab" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Move left" })).toBeNull();
   });
 
   it("shows the sub-agent's whole session with a full-screen link", () => {
@@ -1919,6 +2059,7 @@ describe("WorkspacePanel sub-agent tabs", () => {
     expect(readSessionWorkspaceState("conv_ws")).toEqual({
       openSideChats: ["conv_child"],
       selectedSideChatId: "conv_child",
+      sideChatNumbers: { conv_child: 1 },
     });
   });
 
@@ -2607,6 +2748,35 @@ describe("WorkspacePanel desktop menu commands", () => {
     expect(openFileViewer).toHaveBeenCalledWith("src/a.ts");
     expect(openTerminalTab).toHaveBeenCalledWith("terminal:zsh");
     expect(onReveal).toHaveBeenCalledTimes(2);
+  });
+
+  it("steps through pinned and reordered side chats in their strip order", () => {
+    writePinnedWorkspaceTabs(["files"]);
+    // Strip: Files, pinned Side chat 3, the open file, then Side chat 2 and 1 as reordered.
+    writeSessionWorkspaceState("conv_ws", {
+      openSideChats: ["conv_side_c", "conv_side_b", "conv_side_a"],
+      pinnedSideChats: ["conv_side_c"],
+      sideChatNumbers: { conv_side_a: 1, conv_side_b: 2, conv_side_c: 3 },
+      selectedSideChatId: "conv_side_b",
+    });
+    const { openFileViewer, onRightRailTabChange } = renderWorkspace({
+      rightRailTab: "sidechat",
+      openFiles: ["src/a.ts"],
+    });
+    const selectedSideChat = () => readSessionWorkspaceState("conv_ws").selectedSideChatId;
+    const step = (command: "next-tab" | "previous-tab") =>
+      act(() => sendCommand({ command, browserViewId: null }));
+
+    step("next-tab");
+    expect(selectedSideChat()).toBe("conv_side_a");
+    step("previous-tab");
+    expect(selectedSideChat()).toBe("conv_side_b");
+    step("previous-tab");
+    expect(openFileViewer).toHaveBeenCalledWith("src/a.ts");
+
+    fireEvent.click(screen.getByRole("tab", { name: "Side chat 3" }));
+    step("previous-tab");
+    expect(onRightRailTabChange).toHaveBeenLastCalledWith("files");
   });
 
   it("steps from a file with unsaved edits to another tab only once its viewer allows it", () => {

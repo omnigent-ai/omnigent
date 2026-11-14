@@ -50,6 +50,10 @@ export interface SessionWorkspaceState {
   openSubagentTabs?: string[];
   /** The active side-chat tab (null = a file/scope/other view is active). */
   selectedSideChatId?: string | null;
+  /** Each open side chat's label number, so closing one never renames the others. */
+  sideChatNumbers?: Record<string, number>;
+  /** Side chats pinned to the start of the tab strip, in strip order. */
+  pinnedSideChats?: string[];
   /** Split panes of the main terminal view; absent while unsplit. */
   terminalSplit?: TerminalSplitState;
 }
@@ -93,6 +97,18 @@ function uniqueIds(values: unknown[]): string[] {
       values.filter((value): value is string => typeof value === "string" && value !== ""),
     ),
   ];
+}
+
+/** The positive integer label numbers in `value`, or undefined when there are none. */
+function parseSideChatNumbers(value: unknown): Record<string, number> | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const numbers: Record<string, number> = {};
+  for (const [id, number] of Object.entries(value)) {
+    if (id !== "" && Number.isSafeInteger(number) && (number as number) > 0) {
+      numbers[id] = number as number;
+    }
+  }
+  return Object.keys(numbers).length > 0 ? numbers : undefined;
 }
 
 function sanitize(entry: unknown): SessionWorkspaceState {
@@ -140,6 +156,10 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   if (record.selectedSideChatId === null || typeof record.selectedSideChatId === "string") {
     state.selectedSideChatId = record.selectedSideChatId;
   }
+  const sideChatNumbers = parseSideChatNumbers(record.sideChatNumbers);
+  if (sideChatNumbers) state.sideChatNumbers = sideChatNumbers;
+  if (Array.isArray(record.pinnedSideChats))
+    state.pinnedSideChats = uniqueIds(record.pinnedSideChats);
   const terminalSplit = parseTerminalSplitState(record.terminalSplit);
   if (terminalSplit) state.terminalSplit = terminalSplit;
   return state;
@@ -205,9 +225,15 @@ export function saveSessionWorkspaceState(
   if (next.openBrowsers && next.openBrowsers.length > MAX_OPEN_TABS) {
     next.openBrowsers = next.openBrowsers.slice(-MAX_OPEN_TABS);
   }
-  // Same bound for side-chat tabs (also appended in open order).
+  // Same bound for side-chat tabs. Pinned tabs lead the list, so the cap drops
+  // the leftmost unpinned tabs before any pinned one.
   if (next.openSideChats && next.openSideChats.length > MAX_OPEN_TABS) {
-    next.openSideChats = next.openSideChats.slice(-MAX_OPEN_TABS);
+    const pinned = next.openSideChats.filter((id) => next.pinnedSideChats?.includes(id));
+    const unpinned = next.openSideChats.filter((id) => !pinned.includes(id));
+    const keptUnpinned = unpinned.slice(
+      Math.max(0, unpinned.length - MAX_OPEN_TABS + pinned.length),
+    );
+    next.openSideChats = [...pinned, ...keptUnpinned].slice(-MAX_OPEN_TABS);
   }
   if (next.openSubagentTabs && next.openSubagentTabs.length > MAX_OPEN_TABS) {
     next.openSubagentTabs = next.openSubagentTabs.slice(-MAX_OPEN_TABS);
