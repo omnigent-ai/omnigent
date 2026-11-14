@@ -7,81 +7,97 @@ identically to a genuinely clean tree ("No workspace changes yet"). A read that
 *could not run* was therefore indistinguishable from "nothing changed", which is
 exactly what made a real worktree report impossible to diagnose.
 
-The fix makes ``/changes`` return ``500 {error:{code:"git_status_failed", message}}``
-on failure, and the web hook (``useWorkspaceChangedFiles``) parses that body and
-throws so the panel shows "Failed to load: <reason>" (in the destructive style)
-instead of the misleading empty state.
+On failure the runner answers ``500 {error:{code:"git_status_failed", message}}``, which
+the server's runner proxy relays to the browser as ``502 {detail: message}``. The web
+hook (``useWorkspaceChangedFiles``) parses that body and throws so the panel shows
+"Failed to load: <reason>" (in the destructive style) instead of the misleading
+empty state.
 
-The failure is injected by intercepting the ``/changes`` request and fulfilling it
-with the 500 error shape the runner now returns — no real git breakage needed — so
-the test deterministically exercises the hook's error parsing and the panel's error
-branch. Everything else (environment availability, liveness) stays real so the
-changed-files query actually fires.
+The test breaks the session repository's index, so a real git failure travels
+through the live runner and server proxy without interception.
 """
 
 from __future__ import annotations
 
-import json
 import re
+import subprocess
+from collections.abc import Iterator
+from pathlib import Path
 
-from playwright.sync_api import Page, Route, expect
+import httpx
+import pytest
+from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.conftest import open_right_rail
-
-# A distinctive, realistic git-status failure reason. Mirrors the shape
-# ``GitStatusUnavailable.reason`` carries (argv + exit code + stderr) so the
-# assertions prove the *server's* message reaches the UI verbatim rather than a
-# bare status code.
-_GIT_REASON = (
-    "git status --porcelain --untracked-files=all exited 128: "
-    "fatal: detected dubious ownership in repository at '/workspace'"
+from tests._helpers.session import bind_session_runner, post_session_bundle
+from tests.e2e_ui.conftest import (
+    _build_hello_world_bundle,
+    _ensure_runner_online,
+    _server_state,
+    open_right_rail,
 )
 
 
-def test_git_status_failure_surfaces_in_files_panel(
-    page: Page,
-    seeded_session: tuple[str, str],
-) -> None:
-    """A failed ``/changes`` shows "Failed to load: <reason>", never the empty state."""
-    base_url, session_id = seeded_session
+@pytest.fixture
+def git_repository_session(
+    live_server: str,
+    tmp_path: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str, Path]]:
+    """A runner-bound session whose workspace is a git repo with one modified file."""
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src" / "app.py").write_text("VALUE = 0\n")
+    git = ["git", "-C", str(repo), "-c", "user.email=e2e@example.com", "-c", "user.name=e2e"]
+    for args in (["init", "-q", "-b", "main"], ["add", "."], ["commit", "-qm", "init"]):
+        subprocess.run([*git, *args], check=True, capture_output=True, timeout=30)
+    (repo / "src" / "app.py").write_text("VALUE = 1\n")
 
-    def _fail_changes(route: Route) -> None:
-        route.fulfill(
-            status=500,
-            headers={"content-type": "application/json"},
-            body=json.dumps({"error": {"code": "git_status_failed", "message": _GIT_REASON}}),
-        )
-
-    # Intercept ONLY the changed-files endpoint. Registered before navigation so
-    # the very first fetch fails; a plain 500 is not retried (it is not the
-    # runner-offline 503), so the query settles to its error state immediately.
-    page.route(
-        re.compile(
-            rf"/v1/sessions/{re.escape(session_id)}/resources/environments/[^/]+/changes(\?|$)"
-        ),
-        _fail_changes,
+    create = post_session_bundle(
+        httpx.post,
+        f"{live_server}/v1/sessions",
+        _build_hello_world_bundle(),
+        metadata={"workspace": str(repo)},
+        timeout=30.0,
     )
+    create.raise_for_status()
+    session_id = create.json()["session_id"]
+
+    respawned: subprocess.Popen[bytes] | None = None
+    try:
+        respawned = _ensure_runner_online(live_server, tmp_path_factory)
+        bind_session_runner(
+            httpx.patch, live_server, session_id, str(_server_state["runner_id"]), timeout=10.0
+        )
+        yield (live_server, session_id, repo)
+    finally:
+        try:
+            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        finally:
+            if respawned is not None:
+                respawned.terminate()
+                try:
+                    respawned.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    respawned.kill()
+                    respawned.wait(timeout=5)
+
+
+def test_real_git_status_failure_reason_reaches_changes_pane(
+    page: Page,
+    git_repository_session: tuple[str, str, Path],
+) -> None:
+    """A live runner's git-status failure shows its reason, not the proxy's status line."""
+    base_url, session_id, repo = git_repository_session
+    (repo / ".git" / "index").write_bytes(b"not a git index")
 
     page.goto(f"{base_url}/c/{session_id}")
-
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
-
-    # The changed-files list — where the git-status error renders — is now the
-    # Changes rail tab (a peer of Files). Select it explicitly so the assertion
-    # does not depend on the remembered tab from a prior session.
     changes_tab = rail.get_by_role("tab", name=re.compile("^Changes"))
     changes_tab.click()
     expect(changes_tab).to_have_attribute("aria-selected", "true")
-    expect(rail.get_by_role("heading", name="Changes", exact=True)).to_be_visible()
 
-    # The panel surfaces the server's reason verbatim, in the destructive style —
-    # not a bare status code and not the misleading empty state.
     error_line = rail.get_by_text(re.compile(r"^Failed to load:"))
     expect(error_line).to_be_visible(timeout=30_000)
-    expect(error_line).to_contain_text("exited 128")
-    expect(error_line).to_contain_text("dubious ownership")
-
-    # The whole point of the fix: a failed read is distinguishable from a clean
-    # tree, so the empty-state copy must NOT be shown for a git-status failure.
+    expect(error_line).to_contain_text("git status exited 128")
     expect(rail.get_by_text("No workspace changes yet")).to_have_count(0)
