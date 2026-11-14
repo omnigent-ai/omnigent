@@ -37,6 +37,7 @@ from omnigent.host.connect import (
     ModelOptionsResult,
     _build_runner_env,
     _connection_refused,
+    _read_log_tail,
     _runner_exit_error,
     _RunnerHandle,
     run_host_process,
@@ -2347,6 +2348,36 @@ async def test_live_host_repushes_when_only_gateway_inference_changes(
     assert refresh.configured_harnesses == {"codex": True}
     assert refresh.gateway_inference == {"codex": True}
     _cleanup_host(host)
+
+
+@pytest.mark.parametrize("max_bytes", [0, 4, 16])
+@pytest.mark.parametrize("contents", [b"", b"old", b"old prefix\nlatest error\n"])
+async def test_runner_log_tail_is_bounded_when_the_file_grows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, max_bytes: int, contents: bytes
+) -> None:
+    log = tmp_path / "runner.log"
+    log.write_bytes(contents)
+    original_open = Path.open
+
+    @contextlib.contextmanager
+    def open_growing_log(path: Path, mode: str) -> Iterator[SimpleNamespace]:
+        with original_open(path, mode) as handle:
+
+            def seek(offset: int, whence: int = os.SEEK_SET) -> int:
+                position = handle.seek(offset, whence)
+                if whence == os.SEEK_END:
+                    with original_open(log, "ab") as writer:
+                        writer.write(b"new output\n" * 100_000)
+                return position
+
+            yield SimpleNamespace(seek=seek, tell=handle.tell, read=handle.read)
+
+    monkeypatch.setattr(Path, "open", open_growing_log)
+
+    tail = _read_log_tail(log, max_bytes=max_bytes)
+
+    assert tail == (contents[-max_bytes:].decode() if max_bytes > 0 else "")
+    assert len(tail.encode()) <= max_bytes
 
 
 async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(

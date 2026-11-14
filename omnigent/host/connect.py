@@ -462,12 +462,14 @@ def _read_log_tail(path: Path, max_bytes: int = _LOG_TAIL_MAX_BYTES) -> str:
         unreadable log must not turn a useful "runner died with code
         1" answer into a failure.
     """
+    if max_bytes <= 0:
+        return ""
     try:
         with path.open("rb") as fh:
             fh.seek(0, os.SEEK_END)
             size = fh.tell()
             fh.seek(max(0, size - max_bytes))
-            return fh.read().decode("utf-8", errors="replace")
+            return fh.read(min(size, max_bytes)).decode("utf-8", errors="replace")
     except OSError:
         return ""
 
