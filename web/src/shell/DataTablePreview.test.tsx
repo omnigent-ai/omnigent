@@ -98,11 +98,27 @@ describe("DataTablePreview", () => {
     await vi.waitFor(() => expect(writeText).toHaveBeenCalledTimes(2));
     expect(writeText).toHaveBeenNthCalledWith(1, "East");
     expect(writeText).toHaveBeenNthCalledWith(2, "East\t2\t2026-01-15");
-    expect(toast.success).toHaveBeenCalledWith("Copied row");
+    await vi.waitFor(() => expect(toast.success).toHaveBeenCalledWith("Copied row"));
   });
 
-  it("says so when the clipboard refuses a copy", async () => {
+  it("copies through the selected-text fallback when the async clipboard refuses", async () => {
     stubClipboard(vi.fn().mockRejectedValue(new Error("denied")));
+    const execCommand = vi.fn().mockReturnValue(true);
+    Object.defineProperty(document, "execCommand", { value: execCommand, configurable: true });
+    try {
+      renderTable(SALES);
+      fireEvent.click(screen.getByRole("cell", { name: "East" }));
+      fireEvent.click(screen.getByRole("button", { name: /Copy cell/ }));
+      await vi.waitFor(() => expect(toast.success).toHaveBeenCalledWith("Copied cell"));
+      expect(execCommand).toHaveBeenCalledWith("copy");
+    } finally {
+      Reflect.deleteProperty(document, "execCommand");
+    }
+  });
+
+  it("says so when no way of copying works", async () => {
+    stubClipboard(vi.fn().mockRejectedValue(new Error("denied")));
+    // jsdom has no execCommand, so the fallback fails too.
     renderTable(SALES);
     fireEvent.click(screen.getByRole("cell", { name: "East" }));
     fireEvent.click(screen.getByRole("button", { name: /Copy cell/ }));

@@ -14,6 +14,7 @@ import { ArrowDownIcon, ArrowUpIcon, ArrowUpDownIcon, CopyIcon } from "lucide-re
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { copyText } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
 import {
   compareCells,
@@ -23,12 +24,7 @@ import {
   type DataTable,
 } from "./dataTable";
 
-// ---------------------------------------------------------------------------
-// DataTablePreview — read-only table view of a delimited data file (.csv, .tsv).
-//
-// Keeps only the first rows (see dataTable.ts) and says so; sorting and
-// filtering apply to those rows. The Source toggle shows the raw text.
-// ---------------------------------------------------------------------------
+// Sorting and filtering apply only to the rows the table keeps (see dataTable.ts).
 
 type SortDirection = "ascending" | "descending";
 
@@ -51,9 +47,9 @@ const MIN_COLUMN_WIDTH = 64;
 const MAX_COLUMN_WIDTH = 2048;
 const KEYBOARD_RESIZE_STEP = 16;
 
-async function copyText(text: string, what: string) {
+async function copyWithToast(text: string, what: string) {
   try {
-    await navigator.clipboard.writeText(text);
+    await copyText(text);
     toast.success(`Copied ${what}`);
   } catch {
     toast.error(`Couldn't copy the ${what}`);
@@ -278,14 +274,14 @@ function DataTableView({
             <Button
               variant="ghost"
               size="xs"
-              onClick={() => copyText(selected.row[selected.column], "cell")}
+              onClick={() => copyWithToast(selected.row[selected.column], "cell")}
             >
               <CopyIcon /> Copy cell
             </Button>
             <Button
               variant="ghost"
               size="xs"
-              onClick={() => copyText(rowAsTsv(selected.row), "row")}
+              onClick={() => copyWithToast(rowAsTsv(selected.row), "row")}
             >
               <CopyIcon /> Copy row
             </Button>
