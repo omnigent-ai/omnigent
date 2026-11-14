@@ -414,6 +414,168 @@ async def test_skill_bundle_fetch_survives_a_deleted_ssl_cert_file(
     assert response.request.url.path == "/v1/sessions/conv_abc/agent/contents"
 
 
+@pytest.mark.parametrize("login_repaired", [False, True])
+@pytest.mark.parametrize("factory_initialized", [False, True])
+async def test_skill_bundle_401_rediscovers_repaired_credentials(
+    monkeypatch: pytest.MonkeyPatch, login_repaired: bool, factory_initialized: bool
+) -> None:
+    """A connected host can recover bundle reads after its saved login changes."""
+    import httpx
+
+    import omnigent.runner._entry as entry_mod
+
+    credential = "rejected-token"
+    resolved: list[str] = []
+    requests: list[httpx.Request] = []
+    responses: list[httpx.Response] = []
+
+    def make_factory(*, server_url: str | None = None) -> Callable[[], str]:
+        assert server_url == "http://localhost:8000"
+        resolved.append(credential)
+        cached = credential
+        return lambda: cached
+
+    def respond(_transport: object, request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        status = 200 if request.headers["Authorization"] == "Bearer repaired-token" else 401
+        response = httpx.Response(status, content=b"bundle", request=request)
+        responses.append(response)
+        return response
+
+    monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", make_factory)
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", respond)
+    host = _make_host_process()
+    if factory_initialized:
+        host._build_connect_headers()
+    host._ever_connected = True
+    frame = HostSkillsFrame("request", "session", "/workspace", "conv_test", "agent", "1")
+    if login_repaired and factory_initialized:
+        credential = "repaired-token"
+
+    first = host._fetch_skill_bundle(frame)
+    assert first is responses[0]
+    assert first.status_code == 401
+    assert len(requests) == 1  # The rejected request is not replayed.
+
+    if login_repaired and not factory_initialized:
+        credential = "repaired-token"
+    second = host._fetch_skill_bundle(frame)
+    assert second is responses[1]
+    assert second.status_code == (200 if login_repaired else 401)
+    assert len(requests) == 2
+    assert resolved == ["rejected-token", credential]
+    assert requests[0].url == requests[1].url
+    assert requests[1].url.path == "/v1/sessions/conv_test/agent/contents"
+
+
+@pytest.mark.parametrize(
+    "status,managed,bearer",
+    [
+        (200, False, True),
+        (403, False, True),
+        (503, False, True),
+        ("timeout", False, True),
+        (401, True, True),
+        (401, True, False),
+        (401, False, False),
+    ],
+)
+async def test_skill_bundle_failure_preserves_unrelated_auth_context(
+    monkeypatch: pytest.MonkeyPatch, status: int | str, managed: bool, bearer: bool
+) -> None:
+    """Only rejected user bearers invalidate the host's retained auth context."""
+    import httpx
+
+    from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
+
+    host = _make_host_process()
+    factory = Mock(return_value="user-token" if bearer else None)
+    host._auth_token_factory = factory
+    host._auth_token_factory_resolved = True
+    if managed:
+        monkeypatch.setenv("OMNIGENT_HOST_TOKEN", "managed-token")
+    else:
+        monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    monkeypatch.setattr(
+        "omnigent.util.proxy_bearer.read_proxy_bearer",
+        lambda _url: "proxy-token" if bearer else None,
+    )
+    requests: list[httpx.Request] = []
+    failure = httpx.ReadTimeout("test timeout")
+
+    def respond(_transport: object, request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert (MANAGED_HOST_TOKEN_HEADER in request.headers) == managed
+        assert ("Authorization" in request.headers) == bearer
+        if status == "timeout":
+            raise failure
+        assert isinstance(status, int)
+        return httpx.Response(status, request=request)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", respond)
+    frame = HostSkillsFrame("request", "session", "/workspace", "conv_test", "agent", "1")
+    if status == "timeout":
+        with pytest.raises(httpx.ReadTimeout) as caught:
+            host._fetch_skill_bundle(frame)
+        assert caught.value is failure
+    else:
+        assert host._fetch_skill_bundle(frame).status_code == status
+    assert len(requests) == 1
+    assert host._auth_token_factory is factory
+    assert host._auth_token_factory_resolved
+
+
+@pytest.mark.parametrize("factory_initialized", [False, True])
+@pytest.mark.parametrize("replace_during_token", [False, True])
+async def test_skill_bundle_401_preserves_auth_replaced_during_request(
+    monkeypatch: pytest.MonkeyPatch,
+    factory_initialized: bool,
+    replace_during_token: bool,
+) -> None:
+    """A rejected bearer cannot discard credentials selected during acquisition or transport."""
+    import httpx
+
+    import omnigent.runner._entry as entry_mod
+
+    monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    host = _make_host_process()
+    repaired_factory = Mock(return_value="repaired-token")
+    requests: list[httpx.Request] = []
+    token_calls: list[str] = []
+
+    def rejected_factory() -> str:
+        token_calls.append("rejected")
+        if replace_during_token:
+            host._auth_token_factory = repaired_factory
+            host._auth_token_factory_resolved = True
+        return "rejected-token"
+
+    make_factory = Mock(return_value=rejected_factory)
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", make_factory)
+    if factory_initialized:
+        host._auth_token_factory = rejected_factory
+        host._auth_token_factory_resolved = True
+
+    def respond(_transport: object, request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.headers["Authorization"] == "Bearer rejected-token"
+        if not replace_during_token:
+            host._auth_token_factory = repaired_factory
+            host._auth_token_factory_resolved = True
+        return httpx.Response(401, request=request)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", respond)
+    frame = HostSkillsFrame("request", "session", "/workspace", "conv_test", "agent", "1")
+    assert host._fetch_skill_bundle(frame).status_code == 401
+    assert host._auth_token_factory is repaired_factory
+    assert host._auth_token_factory_resolved
+    assert len(requests) == 1
+    assert token_calls == ["rejected"]
+    assert make_factory.call_count == int(not factory_initialized)
+    repaired_factory.assert_not_called()
+
+
 async def test_host_skills_does_not_block_tunnel(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -7207,6 +7369,8 @@ def test_build_connect_headers_retains_auth_factory(
     monkeypatch.setattr(entry_mod, "_make_auth_token_factory", _make_factory)
 
     host = _host("https://app.example.databricksapps.com")
+    assert host._current_auth_token(initialize=False) is None
+    assert factory_builds == [] and token_calls == []
     first = host._build_connect_headers()
     second = host._build_connect_headers()
     launch_token = host._current_auth_token(initialize=False)
