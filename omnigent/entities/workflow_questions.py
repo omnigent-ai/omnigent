@@ -10,6 +10,7 @@ as it does Claude Code's AskUserQuestion.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from typing import Any
 
@@ -19,6 +20,12 @@ QUESTIONS_MAX = 3
 OPTIONS_MIN = 2
 OPTIONS_MAX = 4
 _RECOMMENDED_SUFFIX = " (recommended)"
+
+
+def workflow_elicitation_id(session_id: str, idempotency_key: str) -> str:
+    """Let the runner register the answer before the server publishes the question."""
+    key = f"{session_id}:{idempotency_key}".encode()
+    return f"elicit_journal_{hashlib.sha256(key).hexdigest()[:32]}"
 
 
 def _option(raw: object, where: str) -> dict[str, Any]:

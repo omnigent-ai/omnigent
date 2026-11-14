@@ -13,6 +13,7 @@ import httpx
 import jsonschema
 import pytest
 
+from omnigent.entities.workflow_questions import workflow_elicitation_id
 from omnigent.runner import pending_approvals
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.journal_tools import (
@@ -316,19 +317,27 @@ async def _answer_when_asked(elicitation_id: str, *answers: tuple[bool, dict | N
             await asyncio.sleep(0.01)
 
 
-async def test_a_question_waits_for_the_answer_and_returns_it() -> None:
+@pytest.mark.parametrize("answer_before_response", [False, True])
+async def test_a_question_waits_for_the_answer_and_returns_it(
+    answer_before_response: bool,
+) -> None:
     requests: list[dict[str, object]] = []
+    elicitation_id = workflow_elicitation_id(SESSION, "tool:toolu_9")
+    content = {"Deploy to prod now?": "Wait (recommended)"}
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(json.loads(request.content))
-        return httpx.Response(200, json={"entry": _STATUS, "elicitation_id": "elicit_journal_1"})
+        if answer_before_response:
+            assert pending_approvals.has_pending(SESSION)
+            assert pending_approvals.resolve(elicitation_id, True, content)
+        return httpx.Response(200, json={"entry": _STATUS, "elicitation_id": elicitation_id})
 
     published: list[dict[str, object]] = []
     async with _client(handler) as client:
-        answer = asyncio.create_task(
-            _answer_when_asked(
-                "elicit_journal_1", (True, {"Deploy to prod now?": "Wait (recommended)"})
-            )
+        answer = (
+            None
+            if answer_before_response
+            else asyncio.create_task(_answer_when_asked(elicitation_id, (True, content)))
         )
         result = await _run(
             client,
@@ -337,7 +346,9 @@ async def test_a_question_waits_for_the_answer_and_returns_it() -> None:
             call_id="toolu_9",
             publish_event=lambda _session, event: published.append(event),
         )
-        await answer
+        if answer is not None:
+            await answer
+    assert not pending_approvals.has_pending(SESSION)
     assert result == {
         "answered": True,
         "answers": [{"question": "Deploy to prod now?", "answer": "Wait"}],
@@ -359,10 +370,11 @@ async def test_a_question_waits_for_the_answer_and_returns_it() -> None:
 
 async def test_a_question_is_raised_again_after_the_server_reconnects() -> None:
     keys: list[object] = []
+    elicitation_id = workflow_elicitation_id(SESSION, "tool:toolu_10")
 
     def handler(request: httpx.Request) -> httpx.Response:
         keys.append(json.loads(request.content)["idempotency_key"])
-        return httpx.Response(200, json={"entry": _STATUS, "elicitation_id": "elicit_journal_2"})
+        return httpx.Response(200, json={"entry": _STATUS, "elicitation_id": elicitation_id})
 
     async def reconnect_then_answer() -> None:
         while not pending_approvals.has_pending(SESSION):
@@ -370,7 +382,7 @@ async def test_a_question_is_raised_again_after_the_server_reconnects() -> None:
         pending_approvals.notify_server_reconnect()
         while len(keys) < 2:
             await asyncio.sleep(0.01)
-        await _answer_when_asked("elicit_journal_2", (True, {"Deploy to prod now?": "Deploy"}))
+        await _answer_when_asked(elicitation_id, (True, {"Deploy to prod now?": "Deploy"}))
 
     async with _client(handler) as client:
         helper = asyncio.create_task(reconnect_then_answer())
@@ -387,15 +399,18 @@ async def test_a_question_is_raised_again_after_the_server_reconnects() -> None:
 
 
 async def test_a_dismissed_question_tells_the_agent_not_to_ask_again() -> None:
+    elicitation_id = workflow_elicitation_id(SESSION, "tool:toolu_dismiss")
+
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"entry": _STATUS, "elicitation_id": "elicit_journal_3"})
+        return httpx.Response(200, json={"entry": _STATUS, "elicitation_id": elicitation_id})
 
     async with _client(handler) as client:
-        answer = asyncio.create_task(_answer_when_asked("elicit_journal_3", (False, None)))
+        answer = asyncio.create_task(_answer_when_asked(elicitation_id, (False, None)))
         result = await _run(
             client,
             "sys_workflow_request_input",
             {"step": "deploy", "questions": [_QUESTION]},
+            call_id="toolu_dismiss",
             publish_event=lambda *_: None,
         )
         await answer

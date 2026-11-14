@@ -8,10 +8,13 @@ import { useWorkflow, type WorkflowDetail } from "@/hooks/useWorkflow";
 import { authenticatedFetch } from "@/lib/identity";
 import type * as IdentityModule from "@/lib/identity";
 import type { Session } from "@/lib/types";
+import { ApiError } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
 import { WorkflowPlanningChat } from "./WorkflowPlanningChat";
 
-const unavailableSessions = vi.hoisted(() => new Map<string, "deleted" | "archived">());
+const unavailableSessions = vi.hoisted(
+  () => new Map<string, "deleted" | "archived" | "offline" | "server-error" | "refresh-error">(),
+);
 
 // Session launch and transcript behavior are covered by their own component tests.
 vi.mock("@/components/workflows/WorkflowSessionDialog", () => ({
@@ -52,8 +55,17 @@ vi.mock("@/hooks/useSession", () => ({
     const state = id ? unavailableSessions.get(id) : undefined;
     return {
       session:
-        id && state !== "deleted" ? { id, labels: {}, archived: state === "archived" } : null,
-      error: state === "deleted" ? new Error("Session not found") : null,
+        id && state !== "deleted" && state !== "offline" && state !== "server-error"
+          ? { id, labels: {}, archived: state === "archived" }
+          : null,
+      error:
+        state === "deleted"
+          ? new ApiError("Session not found", 404, null)
+          : state === "server-error" || state === "refresh-error"
+            ? new ApiError("Unavailable", 500, null)
+            : state === "offline"
+              ? new Error("Network unavailable")
+              : null,
     };
   },
 }));
@@ -77,15 +89,15 @@ function Editor() {
 }
 
 function openEditor() {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
-    <QueryClientProvider
-      client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
-    >
+    <QueryClientProvider client={client}>
       <MemoryRouter>
         <Editor />
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return client;
 }
 
 beforeEach(() => {
@@ -140,6 +152,28 @@ it("respects the session's edit permission when reopening", async () => {
   openEditor();
   expect(await screen.findByTestId("chat")).toHaveAttribute("data-read-only", "true");
 });
+
+it.each(["offline", "server-error", "refresh-error"] as const)(
+  "keeps the planning session linked after a %s",
+  async (state) => {
+    unavailableSessions.set(SESSION, state);
+    vi.mocked(authenticatedFetch).mockImplementation(async (_url, options) => {
+      expect(options?.method).not.toBe("PATCH");
+      return new Response(JSON.stringify({ ...WORKFLOW, planning_session_id: SESSION }));
+    });
+    const client = openEditor();
+    await screen.findByRole("link", { name: "Open planning session in full" });
+    expect(screen.queryByRole("button", { name: "Start planning" })).toBeNull();
+    if (state === "refresh-error") {
+      expect(screen.getByTestId("chat")).toHaveAttribute("data-session", SESSION);
+    } else {
+      expect(screen.getByRole("alert")).toHaveTextContent("Couldn’t load the planning chat");
+      const retry = vi.spyOn(client, "invalidateQueries");
+      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+      expect(retry).toHaveBeenCalledWith({ queryKey: ["session", SESSION] });
+    }
+  },
+);
 
 it.each(["deleted", "archived"] as const)(
   "opens session setup directly when the planning session is %s and attaches its replacement",

@@ -28,7 +28,7 @@ Lifecycle contract:
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from omnigent.runtime.tool_call_deadline import pause_tool_call_deadline
@@ -252,6 +252,7 @@ async def wait_for_user_verdict(
     publish_event: Callable[[str, dict[str, object]], None],
     timeout_seconds: float | None = None,
     retry_on_server_reconnect: bool = False,
+    on_registered: Callable[[], Awaitable[None]] | None = None,
 ) -> Verdict:
     """
     Park on a registered Future until the user delivers a verdict.
@@ -286,6 +287,7 @@ async def wait_for_user_verdict(
     :param retry_on_server_reconnect: Wake with :class:`ServerReconnected`
         after a tunnel reconnect so the caller can recreate server-owned
         approval state.
+    :param on_registered: Publish a question only after its answer can be delivered.
     :returns: The user's :class:`Verdict`. Declines and timeouts
         carry ``approved=False`` and no content.
     """
@@ -301,12 +303,18 @@ async def wait_for_user_verdict(
     answered = False
     try:
         with pause_tool_call_deadline(effective_timeout):
+            if on_registered is not None:
+                await on_registered()
             verdict = await asyncio.wait_for(fut, timeout=effective_timeout)
         answered = True
     except TimeoutError:
         verdict = Verdict(approved=False)
     finally:
         cleanup(elicitation_id)
+        if not fut.done():
+            fut.cancel()
+        elif not fut.cancelled():
+            fut.exception()
         _remaining = _session_pending.get(conversation_id, 0) - 1
         if _remaining > 0:
             _session_pending[conversation_id] = _remaining

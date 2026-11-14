@@ -1,4 +1,5 @@
 import { Maximize2Icon, MessageSquareIcon, XIcon } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
 
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { Button } from "@/components/ui/button";
@@ -8,6 +9,7 @@ import { useSession } from "@/hooks/useSession";
 import { type WorkflowDetail, useSetWorkflowPlanningSession } from "@/hooks/useWorkflow";
 import { Link } from "@/lib/routing";
 import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
+import { ApiError } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
 
 /** A real session attached to a workflow, with its own scoped composer and stream. */
@@ -19,9 +21,11 @@ export function WorkflowPlanningChat({
   onClose: () => void;
 }) {
   const sessionId = workflow.planning_session_id ?? null;
+  const queryClient = useQueryClient();
   const { session, error } = useSession(sessionId);
   const attach = useSetWorkflowPlanningSession(workflow.id);
-  const needsSession = !sessionId || !!error || !!session?.archived;
+  const needsSession =
+    !sessionId || (error instanceof ApiError && error.status === 404) || !!session?.archived;
 
   return (
     <div className="flex h-full min-h-0 flex-col" data-testid="workflow-planning-chat">
@@ -56,6 +60,19 @@ export function WorkflowPlanningChat({
               useChatStore.getState().requestSideChatFocus(created.id);
             }}
           />
+        </div>
+      ) : error && !session ? (
+        <div className="flex flex-col items-start gap-2 p-4">
+          <p role="alert" className="text-sm text-destructive">
+            Couldn’t load the planning chat.
+          </p>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void queryClient.invalidateQueries({ queryKey: ["session", sessionId] })}
+          >
+            Try again
+          </Button>
         </div>
       ) : (
         <PlanningSession key={sessionId} sessionId={sessionId} />

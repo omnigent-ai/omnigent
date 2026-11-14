@@ -43,7 +43,11 @@ from omnigent.entities.session_journal import (
     normalize_step_id,
 )
 from omnigent.entities.workflow import InvalidWorkflowError, normalize_workflow
-from omnigent.entities.workflow_questions import answers_from_content, normalize_questions
+from omnigent.entities.workflow_questions import (
+    answers_from_content,
+    normalize_questions,
+    workflow_elicitation_id,
+)
 from omnigent.runner import pending_approvals
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.tools.builtins.journal import (
@@ -274,6 +278,12 @@ async def _write(
 # ── Asking the user ───────────────────────────────────
 
 
+class _InputRequestFailed(Exception):
+    def __init__(self, result: str) -> None:
+        super().__init__(result)
+        self.result = result
+
+
 def _stream_publisher(publish_event: _Publisher | None) -> _Publisher:
     if publish_event is not None:
         return publish_event
@@ -302,23 +312,34 @@ async def _request_input(
         return _error(f"invalid_input: {exc}")
     body = {"step": step, "questions": questions, "idempotency_key": _idempotency_key(call_id)}
     url = f"{_journal_url(conversation_id)}/input-requests"
-    while True:
+    elicitation_id = workflow_elicitation_id(conversation_id, body["idempotency_key"])
+
+    async def publish_question() -> None:
         response = await _post_with_retries(server_client, url, body, conversation_id)
         if isinstance(response, str):
-            return _error(f"{tool_name} failed: {response}")
+            raise _InputRequestFailed(_error(f"{tool_name} failed: {response}"))
         if _is_unrouted(response):
-            return _error(f"{tool_name}: this Omnigent server can't ask questions for workflows")
+            raise _InputRequestFailed(
+                _error(f"{tool_name}: this Omnigent server can't ask questions for workflows")
+            )
         if response.status_code >= 400:
-            return _journal_error(response, conversation_id)
+            raise _InputRequestFailed(_journal_error(response, conversation_id))
         requested = response.json()
+        if requested["elicitation_id"] != elicitation_id:
+            raise _InputRequestFailed(_error(f"{tool_name}: unexpected question ID from server"))
         _publish(publish_event, conversation_id, requested["entry"])
+
+    while True:
         try:
             verdict = await pending_approvals.wait_for_user_verdict(
-                elicitation_id=requested["elicitation_id"],
+                elicitation_id=elicitation_id,
                 conversation_id=conversation_id,
                 publish_event=_stream_publisher(publish_event),
                 retry_on_server_reconnect=True,
+                on_registered=publish_question,
             )
+        except _InputRequestFailed as exc:
+            return exc.result
         except pending_approvals.ServerReconnected:
             # The server may have lost the question; the same key raises it again.
             continue

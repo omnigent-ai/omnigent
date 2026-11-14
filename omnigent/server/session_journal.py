@@ -24,7 +24,6 @@ Routes, under ``/v1``:
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import threading
 from typing import Any, Literal
@@ -46,6 +45,7 @@ from omnigent.entities.workflow_questions import (
     normalize_questions,
     question_form,
     status_text,
+    workflow_elicitation_id,
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import (
@@ -393,8 +393,7 @@ def create_session_journal_router(
             step=step,
             user_id=get_user_id(request, auth_provider),
         )
-        key = f"{session.id}:{body.idempotency_key}".encode()
-        elicitation_id = f"elicit_journal_{hashlib.sha256(key).hexdigest()[:32]}"
+        elicitation_id = workflow_elicitation_id(session.id, body.idempotency_key)
         event = ElicitationRequestEvent(
             type="response.elicitation_request",
             elicitation_id=elicitation_id,

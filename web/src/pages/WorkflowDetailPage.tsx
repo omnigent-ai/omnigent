@@ -55,6 +55,7 @@ import { Link, useNavigate, useParams } from "@/lib/routing";
 import { formatRunTimestamp } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
 import { currentPlan, planSteps, type StepState } from "@/lib/sessionJournal";
+import { ApiError } from "@/lib/sessionsApi";
 import {
   describeWorkflowRun,
   isWorkflowRunWorking,
@@ -85,10 +86,12 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const showPlanner = plannerOpen ?? workflow?.is_draft ?? false;
   const isMobile = useIsMobileViewport();
   const { session: planningSession, error: planningSessionError } = useSession(
-    showPlanner ? workflow?.planning_session_id : null,
+    workflow?.planning_session_id,
   );
   const canReadProposal =
-    showPlanner && !!planningSession && !planningSession.archived && !planningSessionError;
+    !!planningSession &&
+    !planningSession.archived &&
+    !(planningSessionError instanceof ApiError && planningSessionError.status === 404);
   const journal = useSessionJournal(
     canReadProposal ? planningSession.id : undefined,
     canReadProposal,
@@ -227,7 +230,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
                 loading={savePlan.isPending}
                 onClick={() => {
                   if (!proposedSteps) return;
-                  setPlannerOpen(true);
+                  setPlannerOpen(showPlanner);
                   savePlan.mutate(proposedSteps, { onSuccess: () => showToast("Plan saved") });
                 }}
               >

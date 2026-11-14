@@ -15,6 +15,7 @@ import {
 } from "@/hooks/useWorkflow";
 import type * as WorkflowHooks from "@/hooks/useWorkflow";
 import { useSession } from "@/hooks/useSession";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useSessionJournal } from "@/hooks/useSessionJournal";
 import type * as SessionJournalHooks from "@/hooks/useSessionJournal";
 import { useOptionalLoadedConversations } from "@/hooks/useSidebarData";
@@ -44,6 +45,7 @@ vi.mock("@/hooks/useWorkflow", async (importOriginal) => {
 });
 vi.mock("@/hooks/useSessionJournal", () => ({ useSessionJournal: vi.fn() }));
 vi.mock("@/hooks/useSession", () => ({ useSession: vi.fn() }));
+vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: vi.fn() }));
 vi.mock("@/hooks/useSidebarData", async (importOriginal) => ({
   ...(await importOriginal<typeof SidebarDataModule>()),
   useOptionalLoadedConversations: vi.fn(),
@@ -206,6 +208,7 @@ function renderPage(client = new QueryClient()) {
 
 describe("WorkflowDetailPage", () => {
   beforeEach(() => {
+    vi.mocked(useIsMobileViewport).mockReturnValue(false);
     vi.mocked(useServerInfo).mockReturnValue("loading");
     vi.mocked(useOptionalLoadedConversations).mockReturnValue(undefined);
     navigate.mockClear();
@@ -233,77 +236,94 @@ describe("WorkflowDetailPage", () => {
   });
   afterEach(cleanup);
 
-  it("keeps a draft unrunnable until its proposed plan saves, then reopens the same chat", async () => {
-    const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
-    vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
-    mockRuns([]);
-    const planner = "a".repeat(32);
-    let stored: WorkflowDetail = {
-      ...WORKFLOW,
-      steps: [],
-      is_draft: true,
-      planning_session_id: planner,
-    };
-    let rejectSave = true;
-    vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
-      if (options?.method === "PATCH") {
-        if (rejectSave)
-          return new Response(
-            JSON.stringify({ error: { message: "Try again", type: "server_error" } }),
-            { status: 500 },
-          );
-        const body = JSON.parse(String(options.body));
-        stored = { ...stored, steps: body.steps, is_draft: false };
+  it.each([false, true])(
+    "saves a draft and later edits after closing the planner (mobile=%s)",
+    async (mobile) => {
+      vi.mocked(useIsMobileViewport).mockReturnValue(mobile);
+      const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+      vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+      mockRuns([]);
+      const planner = "a".repeat(32);
+      let stored: WorkflowDetail = {
+        ...WORKFLOW,
+        steps: [],
+        is_draft: true,
+        planning_session_id: planner,
+      };
+      let rejectSave = true;
+      vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
+        if (options?.method === "PATCH") {
+          if (rejectSave)
+            return new Response(
+              JSON.stringify({ error: { message: "Try again", type: "server_error" } }),
+              { status: 500 },
+            );
+          const body = JSON.parse(String(options.body));
+          stored = { ...stored, steps: body.steps, is_draft: false };
+        }
+        return new Response(JSON.stringify(stored));
+      });
+      const proposal: JournalEntry = {
+        id: "proposal",
+        position: 1,
+        created_at: 1,
+        scheduled_task_run_id: null,
+        step: null,
+        author: { type: "agent" },
+        kind: "plan",
+        content: { steps: WORKFLOW.steps },
+      };
+      vi.mocked(useSessionJournal).mockReturnValue({
+        entries: [proposal],
+        isLoading: false,
+        error: null,
+        hasOlder: false,
+        loadingOlder: false,
+        loadOlder: vi.fn(),
+        retry: vi.fn(),
+      });
+      renderPage();
+
+      expect(await screen.findByText("Draft")).toBeInTheDocument();
+      expect(screen.getByTestId("workflow-steps-graph")).toHaveTextContent(
+        "Explore the failures, Fix the test",
+      );
+      expect(screen.getByTestId("planning-chat")).toHaveAttribute("data-session", planner);
+      expect(screen.getByTestId("workflow-detail-run")).toBeDisabled();
+      expect(screen.getByTestId("workflow-detail-create-automation")).toBeDisabled();
+      if (mobile) {
+        fireEvent.click(screen.getByRole("button", { name: "Close planning chat" }));
+        expect(screen.queryByTestId("planning-chat")).toBeNull();
       }
-      return new Response(JSON.stringify(stored));
-    });
-    const proposal: JournalEntry = {
-      id: "proposal",
-      position: 1,
-      created_at: 1,
-      scheduled_task_run_id: null,
-      step: null,
-      author: { type: "agent" },
-      kind: "plan",
-      content: { steps: WORKFLOW.steps },
-    };
-    vi.mocked(useSessionJournal).mockReturnValue({
-      entries: [proposal],
-      isLoading: false,
-      error: null,
-      hasOlder: false,
-      loadingOlder: false,
-      loadOlder: vi.fn(),
-      retry: vi.fn(),
-    });
-    renderPage();
+      fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+      expect(await screen.findByRole("alert")).toHaveTextContent("Couldn’t save the plan");
+      expect(screen.getByTestId("workflow-detail-run")).toBeDisabled();
 
-    expect(await screen.findByText("Draft")).toBeInTheDocument();
-    expect(screen.getByTestId("workflow-steps-graph")).toHaveTextContent(
-      "Explore the failures, Fix the test",
-    );
-    expect(screen.getByTestId("planning-chat")).toHaveAttribute("data-session", planner);
-    expect(screen.getByTestId("workflow-detail-run")).toBeDisabled();
-    expect(screen.getByTestId("workflow-detail-create-automation")).toBeDisabled();
-    fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Couldn’t save the plan");
-    expect(screen.getByTestId("workflow-detail-run")).toBeDisabled();
+      rejectSave = false;
+      fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+      await waitFor(() => expect(screen.getByTestId("workflow-detail-run")).toBeEnabled());
+      expect(stored.steps).toEqual(WORKFLOW.steps);
+      if (mobile) expect(screen.queryByTestId("planning-chat")).toBeNull();
+      else expect(screen.getByTestId("planning-chat")).toBeInTheDocument();
+      expect(screen.queryByText("Draft")).toBeNull();
+      expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
 
-    rejectSave = false;
-    fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
-    await waitFor(() => expect(screen.getByTestId("workflow-detail-run")).toBeEnabled());
-    expect(stored.steps).toEqual(WORKFLOW.steps);
-    expect(screen.getByTestId("planning-chat")).toBeInTheDocument();
-    expect(screen.queryByText("Draft")).toBeNull();
-    expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
-
-    cleanup();
-    renderPage();
-    await screen.findByTestId("workflow-detail-title");
-    fireEvent.click(screen.getByRole("button", { name: "Edit workflow" }));
-    expect(screen.getByTestId("planning-chat")).toHaveAttribute("data-session", planner);
-    expect(screen.getByTestId("workflow-detail-run")).toBeEnabled();
-  });
+      cleanup();
+      renderPage();
+      await screen.findByTestId("workflow-detail-title");
+      fireEvent.click(screen.getByRole("button", { name: "Edit workflow" }));
+      expect(screen.getByTestId("planning-chat")).toHaveAttribute("data-session", planner);
+      expect(screen.getByTestId("workflow-detail-run")).toBeEnabled();
+      const edited = [
+        ...WORKFLOW.steps,
+        { id: "report", name: "Report", goal: null, depends_on: ["fix"] },
+      ];
+      proposal.content = { steps: edited };
+      fireEvent.click(screen.getByRole("button", { name: "Close planning chat" }));
+      fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+      await waitFor(() => expect(stored.steps).toEqual(edited));
+    },
+  );
 
   it("shows the workflow, its steps, and the sessions that ran it", () => {
     mockWorkflow({});
