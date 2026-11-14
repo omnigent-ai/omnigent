@@ -36,7 +36,7 @@ def _registered(spec: AgentSpec) -> set[str]:
 def _gated() -> frozenset[str]:
     """Tools the five groups control, derived from registration itself."""
     gated = frozenset(_registered(_spec(ToolGroupsConfig())) - _registered(_spec(_ALL_OFF)))
-    assert len(gated) == 17, sorted(gated)
+    assert len(gated) == 18, sorted(gated)
     return gated
 
 

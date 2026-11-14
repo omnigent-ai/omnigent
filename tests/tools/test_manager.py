@@ -94,6 +94,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_scheduled_task_update",
         "sys_scheduled_task_delete",
         "sys_reminder_set",
+        "sys_reminder_cancel",
         # Embedded-browser tools are always auto-registered (framework-
         # owned) so any agent can drive the desktop app's browser without
         # the spec opting in. Schema-only; runner-dispatched.
@@ -1727,6 +1728,7 @@ _TOOL_GROUP_MEMBERS: dict[str, frozenset[str]] = {
             "sys_scheduled_task_update",
             "sys_scheduled_task_delete",
             "sys_reminder_set",
+            "sys_reminder_cancel",
         }
     ),
     "comments": frozenset({"list_comments", "update_comment"}),
@@ -1773,7 +1775,7 @@ def test_tool_groups_all_false_keeps_the_load_bearing_tools() -> None:
     """
     names = _tool_names(_grouped_spec(**dict.fromkeys(_TOOL_GROUP_MEMBERS, False)))
     gated = frozenset().union(*_TOOL_GROUP_MEMBERS.values())
-    assert len(gated) == 21
+    assert len(gated) == 22
     assert not (gated & names)
     assert {
         "sys_session_list",

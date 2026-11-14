@@ -59,8 +59,11 @@ def _no_guardrails_spec(
             {"message": "Check CI on PR #12.", "delay_seconds": 2700},
             PolicyAction.ASK,
         ),
+        ("sys_scheduled_task_delete", {"scheduled_task_id": _TASK_ID}, PolicyAction.ASK),
+        # Cancels only the calling session's reminders, so it doesn't ask.
+        ("sys_reminder_cancel", {"scheduled_task_id": _TASK_ID}, PolicyAction.ALLOW),
     ],
-    ids=["add_policy_control", "create", "update", "reminder"],
+    ids=["add_policy_control", "create", "update", "reminder", "delete", "reminder_cancel"],
 )
 async def test_scheduled_task_mutation_asks_without_guardrails(
     tmp_path: Path,
@@ -91,6 +94,7 @@ async def test_scheduled_task_mutation_asks_without_guardrails(
         "sys_add_policy",
         "sys_scheduled_task_create",
         "sys_scheduled_task_update",
+        "sys_scheduled_task_delete",
         "sys_reminder_set",
     ],
 )
@@ -111,7 +115,7 @@ def test_no_policy_fast_path_keeps_mutation_gates(
     )
 
 
-@pytest.mark.parametrize("tool_name", ["sys_scheduled_task_list", "sys_scheduled_task_delete"])
+@pytest.mark.parametrize("tool_name", ["sys_scheduled_task_list", "sys_reminder_cancel"])
 def test_no_policy_fast_path_skips_ungated_scheduled_task_tools(
     tmp_path: Path,
     conversation_store: SqlAlchemyConversationStore,

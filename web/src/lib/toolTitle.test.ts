@@ -134,6 +134,17 @@ describe("formatToolTitle", () => {
     });
   });
 
+  it("formats sys_reminder_cancel with its task id", () => {
+    expect(formatToolTitle("sys_reminder_cancel", { scheduled_task_id: "abc123" })).toEqual({
+      verb: "Cancel reminder:",
+      body: "abc123",
+    });
+    expect(formatToolTitle("sys_reminder_cancel", {})).toEqual({
+      verb: "Cancel reminder",
+      body: "",
+    });
+  });
+
   it("formats terminal tools with `<terminal>:<session>` identity", () => {
     const args = { terminal: "tmux", session: "dev" };
     expect(formatToolTitle("sys_terminal_launch", args)).toEqual({

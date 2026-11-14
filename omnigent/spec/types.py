@@ -887,7 +887,8 @@ class ToolGroupsConfig:
     limit and stops a small model from picking an irrelevant tool.
 
     :param browser: The ``browser_*`` embedded-browser tools (5).
-    :param scheduled_tasks: The ``sys_scheduled_task_*`` tools (4) and ``sys_reminder_set``.
+    :param scheduled_tasks: The ``sys_scheduled_task_*`` tools (4), ``sys_reminder_set`` and
+        ``sys_reminder_cancel``.
     :param comments: ``list_comments`` and ``update_comment``.
     :param policies: ``sys_add_policy`` and ``sys_policy_registry``.
     :param agent_discovery: The read-only ``sys_agent_*`` tools (3).

@@ -972,11 +972,25 @@ def test_ask_on_scheduled_task_change_asks_for_update_naming_fields() -> None:
     assert "state=paused" in result["reason"]
 
 
-@pytest.mark.parametrize(
-    "tool", ["sys_scheduled_task_list", "sys_scheduled_task_delete", "web_search"]
-)
+def test_ask_on_scheduled_task_change_asks_before_a_delete() -> None:
+    """Deleting an automation removes unattended work, so the user approves it."""
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    task_id = "0123456789abcdef0123456789abcdef"
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": "sys_scheduled_task_delete",
+            "data": {"arguments": {"scheduled_task_id": task_id}},
+        }
+    )
+    assert result["result"] == "ASK"
+    assert f"delete scheduled task {task_id}" in result["reason"]
+
+
+@pytest.mark.parametrize("tool", ["sys_scheduled_task_list", "sys_reminder_cancel", "web_search"])
 def test_ask_on_scheduled_task_change_allows_other_tools(tool: str) -> None:
-    """Reads, deletes and unrelated tools pass through."""
+    """Reads, a session cancelling its own reminder, and unrelated tools pass through."""
     from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
 
     result = ask_on_scheduled_task_change(

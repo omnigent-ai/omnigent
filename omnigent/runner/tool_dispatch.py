@@ -460,7 +460,8 @@ _POLICY_TOOLS = frozenset({"sys_add_policy", "sys_policy_registry"})
 
 # Priority 5l.1: Scheduled-task management — the runner proxies the Omnigent
 # server's /v1/scheduled-tasks REST endpoints (same posture as _POLICY_TOOLS).
-# sys_reminder_set creates a one-time task that continues the calling session.
+# sys_reminder_set creates a one-time task that continues the calling session,
+# and sys_reminder_cancel deletes one.
 _SCHEDULED_TASK_TOOLS = frozenset(
     {
         "sys_scheduled_task_create",
@@ -468,6 +469,7 @@ _SCHEDULED_TASK_TOOLS = frozenset(
         "sys_scheduled_task_update",
         "sys_scheduled_task_delete",
         "sys_reminder_set",
+        "sys_reminder_cancel",
     }
 )
 
@@ -5243,8 +5245,7 @@ async def _reminder_schedule_mismatch(
         return json.dumps({"error": f"{problem}, so it was deleted; set it again"})
     return json.dumps(
         {
-            "error": f"{problem}, and deleting it failed; delete it with "
-            "sys_scheduled_task_delete",
+            "error": f"{problem}, and deleting it failed; cancel it with sys_reminder_cancel",
             "scheduled_task_id": task_id,
         }
     )
@@ -5368,9 +5369,62 @@ async def _execute_reminder_set(
             "fire_at": when.isoformat(),
             "next_run_at": task.get("next_run_at"),
             "message": message,
-            "cancel_with": "sys_scheduled_task_delete",
+            "cancel_with": "sys_reminder_cancel",
         }
     )
+
+
+async def _execute_reminder_cancel(
+    args: _JsonObject,
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str | None,
+) -> str:
+    """
+    Delete a reminder the calling session set, without the approval other deletes need.
+
+    The task is read first and deleted only when it is a reminder (``kind`` is
+    ``"reminder"``) that continues the calling session, so this path can't remove
+    any other automation. A server that omits ``kind`` predates reminders, so its
+    tasks are refused too.
+
+    :param args: Parsed arguments with ``scheduled_task_id``.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: The calling session, e.g. ``"conv_abc123"``.
+    :returns: Tool output JSON.
+    """
+    tool_name = "sys_reminder_cancel"
+    if conversation_id is None:
+        return json.dumps({"error": f"{tool_name} requires a session"})
+    task_id = args.get("scheduled_task_id")
+    task_url = _scheduled_task_url(task_id) if task_id else None
+    if task_url is None:
+        return json.dumps(
+            {"error": f"{tool_name} requires canonical 32-character hex scheduled_task_id"}
+        )
+    try:
+        found = await server_client.get(task_url, timeout=30.0)
+        if found.status_code >= 400:
+            return json.dumps(
+                {"error": f"server returned {found.status_code}", "details": found.text[:1000]}
+            )
+        task = _string_object_dict(found.json()) or {}
+        if task.get("kind") != "reminder" or task.get("session_id") != conversation_id:
+            return json.dumps(
+                {
+                    "error": f"{tool_name} only cancels reminders this session set; "
+                    "delete other tasks with sys_scheduled_task_delete, which asks the "
+                    "user first"
+                }
+            )
+        resp = await server_client.delete(task_url, timeout=30.0)
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"{tool_name} failed: {exc}"})
+    if resp.status_code >= 400:
+        return json.dumps(
+            {"error": f"server returned {resp.status_code}", "details": resp.text[:1000]}
+        )
+    return json.dumps({"status": "cancelled", "scheduled_task_id": task_id})
 
 
 async def _execute_scheduled_task_tool(
@@ -5406,6 +5460,10 @@ async def _execute_scheduled_task_tool(
         return json.dumps({"error": f"{tool_name}: arguments must be an object"})
     if tool_name == "sys_reminder_set":
         return await _execute_reminder_set(
+            args, server_client=server_client, conversation_id=conversation_id
+        )
+    if tool_name == "sys_reminder_cancel":
+        return await _execute_reminder_cancel(
             args, server_client=server_client, conversation_id=conversation_id
         )
     if tool_name in ("sys_scheduled_task_create", "sys_scheduled_task_update"):

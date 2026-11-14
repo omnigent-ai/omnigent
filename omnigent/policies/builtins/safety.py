@@ -391,11 +391,17 @@ def ask_on_add_policy(event: PolicyEvent) -> PolicyResponse:
     }
 
 
-# Agent tools that create or reshape unattended work. The builder injects
+# Agent tools that create, reshape or remove unattended work. The builder injects
 # ``ask_on_scheduled_task_change`` into every engine and exempts these names
 # from its no-policy fast path; both read this set so they cannot drift.
+# sys_reminder_cancel is left out: it deletes only the calling session's reminders.
 SCHEDULED_TASK_APPROVAL_TOOLS: frozenset[str] = frozenset(
-    {"sys_scheduled_task_create", "sys_scheduled_task_update", "sys_reminder_set"}
+    {
+        "sys_scheduled_task_create",
+        "sys_scheduled_task_update",
+        "sys_scheduled_task_delete",
+        "sys_reminder_set",
+    }
 )
 
 
@@ -565,16 +571,16 @@ def _reminder_review(args: dict[str, object]) -> PolicyResponse:
 
 
 def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
-    """ASK for user approval before an agent creates or updates a scheduled task,
-    or sets a reminder (a one-time task that continues the session).
+    """ASK for user approval before an agent creates, updates or deletes a
+    scheduled task, or sets a reminder (a one-time task that continues the session).
 
     Matches ``event["target"]`` (the dispatched tool identity) rather than
-    ``data["name"]``, which an earlier policy may have transformed. Reads
-    and ``sys_scheduled_task_delete`` are not gated here: deleting a task
-    only removes future runs instead of scheduling new unattended work.
+    ``data["name"]``, which an earlier policy may have transformed. Reads are not
+    gated, and neither is ``sys_reminder_cancel``, which deletes only reminders
+    the calling session set.
 
     :param event: Policy event dict.
-    :returns: ASK if a scheduled task is being created or updated, ALLOW
+    :returns: ASK if a scheduled task is being created, updated or deleted, ALLOW
         otherwise.
     """
     if event.get("type") != "tool_call":
@@ -588,6 +594,15 @@ def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
         args = {}
     if tool == "sys_reminder_set":
         return _reminder_review(args)
+    if tool == "sys_scheduled_task_delete":
+        task_id = _clip(str(args.get("scheduled_task_id") or "(no id)"))
+        return {
+            "result": "ASK",
+            "reason": (
+                f"Agent wants to delete scheduled task {task_id}, so it no longer runs. "
+                "This can't be undone. Approve?"
+            ),
+        }
     action = "create" if tool == "sys_scheduled_task_create" else "update"
     # Older runners expose optional review fields. Current runners enforce the
     # complete contract before dispatch, including when paired with an old server.

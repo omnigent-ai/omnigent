@@ -122,6 +122,10 @@ const FORMATTERS: Record<string, ArgFormatter> = {
       ? verbOnly("Set reminder")
       : { verb: "Set reminder:", body: `in ${seconds}s` };
   },
+  sys_reminder_cancel: (args) => {
+    const id = asString(args.scheduled_task_id);
+    return id === null ? verbOnly("Cancel reminder") : { verb: "Cancel reminder:", body: id };
+  },
 
   // Terminal multiplexer.
   sys_terminal_launch: (args) => terminalTitle("Launch terminal", args),

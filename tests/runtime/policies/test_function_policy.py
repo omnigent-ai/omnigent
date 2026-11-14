@@ -1103,8 +1103,9 @@ async def test_engine_data_chains_sequentially_across_policies(
     [
         ("sys_scheduled_task_create", PolicyAction.ASK),
         ("sys_scheduled_task_update", PolicyAction.ASK),
+        ("sys_scheduled_task_delete", PolicyAction.ASK),
         ("sys_scheduled_task_list", PolicyAction.ALLOW),
-        ("sys_scheduled_task_delete", PolicyAction.ALLOW),
+        ("sys_reminder_cancel", PolicyAction.ALLOW),
     ],
 )
 async def test_schedule_approval_uses_dispatched_tool_identity(

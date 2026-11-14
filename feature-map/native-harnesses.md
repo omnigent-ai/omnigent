@@ -1464,6 +1464,12 @@ confirm `sys_scheduled_task_list` shows no `Reminder: ...` task. Ask again,
 approve, and confirm the list shows one while the Automations page does not, that
 the message arrives as a new turn about 15 minutes later, and that
 `GET /v1/scheduled-tasks/{id}` then reports it `completed`.
+`sys_reminder_cancel` deletes a reminder the session set without approval, while
+`sys_scheduled_task_delete` parks on the gate with the task's id
+(`tests/runner/test_scheduled_task_tool_dispatch.py::test_reminder_cancel_*` and
+`tests/policies/builtins/test_safety.py::test_ask_on_scheduled_task_change_asks_before_a_delete`).
+To check by hand, set a reminder, ask the session to cancel it, and confirm it
+goes without an approval card and no longer appears in `sys_scheduled_task_list`.
 
 ## Gotchas
 

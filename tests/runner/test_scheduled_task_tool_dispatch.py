@@ -43,6 +43,7 @@ _ALL_NAMES = {
     "sys_scheduled_task_update",
     "sys_scheduled_task_delete",
     "sys_reminder_set",
+    "sys_reminder_cancel",
 }
 _TASK_ID = "0123456789abcdef0123456789abcdef"
 _REVIEW_FIELDS = {"prompt": "Review every issue.", "permission_mode": None}
@@ -802,7 +803,7 @@ async def test_reminder_creates_a_one_time_task_that_continues_this_session() ->
         "fire_at": "2026-11-10T23:01:00+00:00",
         "next_run_at": "2026-11-10T23:01:00+00:00",
         "message": "Check CI on PR #12.",
-        "cancel_with": "sys_scheduled_task_delete",
+        "cancel_with": "sys_reminder_cancel",
     }
 
 
@@ -1038,3 +1039,85 @@ async def test_a_failed_lookup_before_creating_makes_no_such_warning() -> None:
     )
     assert out["error"].startswith("sys_reminder_set failed:")
     assert "may still have been created" not in out["error"]
+
+
+# ── sys_reminder_cancel ──────────────────────────────────────────────────────
+
+
+def _task(**fields: object) -> _Resp:
+    return _Resp(body={"id": _TASK_ID, "kind": "reminder", "session_id": "conv_1", **fields})
+
+
+async def _cancel(client: _RecordingClient, *, conversation_id: str | None = "conv_1") -> dict:
+    return json.loads(
+        await _execute_scheduled_task_tool(
+            "sys_reminder_cancel",
+            json.dumps({"scheduled_task_id": _TASK_ID}),
+            server_client=client,
+            conversation_id=conversation_id,
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_reminder_cancel_deletes_a_reminder_this_session_set() -> None:
+    client = _RecordingClient(_task())
+    out = await _cancel(client)
+    assert out == {"status": "cancelled", "scheduled_task_id": _TASK_ID}
+    assert client.calls == [
+        ("GET", f"/v1/scheduled-tasks/{_TASK_ID}", None),
+        ("DELETE", f"/v1/scheduled-tasks/{_TASK_ID}", None),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "task",
+    [
+        _task(session_id="conv_other"),
+        _task(kind="automation"),
+        # A server from before reminders omits kind.
+        _Resp(body={"id": _TASK_ID, "session_id": "conv_1"}),
+    ],
+    ids=["another_sessions_reminder", "automation", "no_kind"],
+)
+async def test_reminder_cancel_refuses_anything_but_this_sessions_reminder(task: _Resp) -> None:
+    client = _RecordingClient(task)
+    out = await _cancel(client)
+    assert "only cancels reminders this session set" in out["error"]
+    assert "sys_scheduled_task_delete" in out["error"]
+    assert not [call for call in client.calls if call[0] == "DELETE"]
+
+
+@pytest.mark.asyncio
+async def test_reminder_cancel_passes_a_missing_task_through() -> None:
+    client = _RecordingClient(_Resp(status_code=404, body={"error": "not found"}))
+    out = await _cancel(client)
+    assert out["error"] == "server returned 404"
+    assert not [call for call in client.calls if call[0] == "DELETE"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "arguments,conversation_id,error",
+    [
+        ({"scheduled_task_id": _TASK_ID}, None, "requires a session"),
+        ({}, "conv_1", "requires canonical"),
+        ({"scheduled_task_id": "../other"}, "conv_1", "requires canonical"),
+    ],
+    ids=["no_session", "no_id", "bad_id"],
+)
+async def test_reminder_cancel_argument_errors_make_no_server_calls(
+    arguments: dict[str, str], conversation_id: str | None, error: str
+) -> None:
+    client = _RecordingClient(_task())
+    out = json.loads(
+        await _execute_scheduled_task_tool(
+            "sys_reminder_cancel",
+            json.dumps(arguments),
+            server_client=client,
+            conversation_id=conversation_id,
+        )
+    )
+    assert error in out["error"]
+    assert client.calls == []

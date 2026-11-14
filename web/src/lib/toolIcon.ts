@@ -62,6 +62,7 @@ export function iconForTool(fullName: string, nativeToolType?: string): LucideIc
   if (name === "sys_timer_set") return Timer;
   if (name === "sys_timer_cancel") return Ban;
   if (name === "sys_reminder_set") return CalendarClock;
+  if (name === "sys_reminder_cancel") return Ban;
   return Wrench;
 }
 

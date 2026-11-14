@@ -13,6 +13,7 @@ in-process store.
 * ``sys_reminder_set`` — send a message into the calling session once, at a
   given time. It is a scheduled task with a one-time ``COUNT=1`` rule that
   continues the session, so it survives runner exits, unlike ``sys_timer_set``.
+* ``sys_reminder_cancel`` — delete a reminder the calling session set.
 """
 
 from __future__ import annotations
@@ -416,7 +417,11 @@ class SysScheduledTaskDeleteTool(Tool):
     @classmethod
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
-        return "Delete a scheduled task so it no longer fires."
+        return (
+            "Delete a scheduled task so it no longer fires. Each call asks the user "
+            "for approval. To cancel a reminder this session set, use "
+            "sys_reminder_cancel, which doesn't."
+        )
 
     def get_schema(self) -> dict[str, Any]:
         """:returns: The OpenAI-format tool schema."""
@@ -558,7 +563,7 @@ class SysReminderSetTool(Tool):
             "Write the message for your future self: "
             "say what to check or do. The Automations page doesn't list "
             "reminders; sys_scheduled_task_list does. Cancel one with "
-            "sys_scheduled_task_delete and the returned "
+            "sys_reminder_cancel and the returned "
             "scheduled_task_id. Works in top-level sessions you own on a "
             "connected host, not in sub-agent sessions, side chats, managed sandboxes, or "
             "sessions running in a permission mode that skips approval. For "
@@ -600,6 +605,50 @@ class SysReminderSetTool(Tool):
                         },
                     },
                     "required": ["message"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+
+class SysReminderCancelTool(Tool):
+    """Cancel a reminder the calling session set. Runner-dispatched to ``DELETE`` on the task."""
+
+    @classmethod
+    def name(cls) -> str:
+        """:returns: ``"sys_reminder_cancel"``."""
+        return "sys_reminder_cancel"
+
+    @classmethod
+    def description(cls) -> str:
+        """:returns: Human-readable description of the tool."""
+        return (
+            "Cancel a reminder this session set with sys_reminder_set, so it doesn't "
+            "fire, for example when it is no longer needed. It needs no approval, and "
+            "it only deletes reminders that continue this session: any other task is "
+            "refused. Delete other automations with sys_scheduled_task_delete, which "
+            "asks the user first."
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        """:returns: The OpenAI-format tool schema."""
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name(),
+                "description": self.description(),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "scheduled_task_id": {
+                            "type": "string",
+                            "description": (
+                                "The reminder's scheduled_task_id, as sys_reminder_set "
+                                "returned it or sys_scheduled_task_list shows it."
+                            ),
+                        },
+                    },
+                    "required": ["scheduled_task_id"],
                     "additionalProperties": False,
                 },
             },

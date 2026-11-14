@@ -846,8 +846,9 @@ async def test_scheduled_changes_require_explicit_approval_without_custom_polici
         await asyncio.gather(drain, evaluate, return_exceptions=True)
 
 
-@pytest.mark.parametrize("tool_name", ["sys_scheduled_task_list", "sys_scheduled_task_delete"])
-async def test_schedule_read_and_removal_do_not_require_new_approval(
+# Deleting any other automation asks first; cancelling the session's own reminder doesn't.
+@pytest.mark.parametrize("tool_name", ["sys_scheduled_task_list", "sys_reminder_cancel"])
+async def test_schedule_read_and_reminder_cancel_do_not_require_new_approval(
     client: httpx.AsyncClient,
     tool_name: str,
 ) -> None:
