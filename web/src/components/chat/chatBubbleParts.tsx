@@ -10,6 +10,7 @@ import {
   useEffect,
   useId,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type MouseEvent as ReactMouseEvent,
@@ -22,6 +23,7 @@ import {
   CopyIcon,
   CornerDownRightIcon,
   FileTextIcon,
+  ListChecksIcon,
   Link2Icon,
   Loader2Icon,
   PencilIcon,
@@ -57,6 +59,8 @@ import {
 } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { ActivityNotice } from "@/components/blocks/TaskActivityMessage";
+import { TurnWorkPanel } from "@/components/blocks/TurnWorkPanel";
+import { hasTurnWork } from "@/lib/turnWork";
 import {
   isSystemUserContent,
   parseSystemMessage,
@@ -1452,9 +1456,23 @@ function AssistantBubble({
     [conversationId, scopedConversationId, isLastAssistant, queryClient],
   );
 
+  const hasWork = useMemo(() => hasTurnWork(bubble.items), [bubble.items]);
+  const [workOpen, setWorkOpen] = useState(false);
+  const workPanelId = useId();
+
   if (bubble.items.length === 0) return null;
 
   const markdownText = collectBubbleMarkdown(bubble.items);
+  // Settled answers only: a live turn's calls are still arriving. Native
+  // harnesses never stream into the bubble, so the session's state counts too.
+  const turnMayBeLive =
+    bubble.lifecycle === "streaming" ||
+    (isLastAssistant &&
+      (showsWorking ||
+        hasPendingElicitation ||
+        sessionStatus === "running" ||
+        sessionStatus === "waiting"));
+  const showsWork = hasWork && !turnMayBeLive;
   const ts = formatBubbleTimestamp(bubble.createdAtS);
 
   // The bubble collapses to nothing but the "Worked for" row — its text all
@@ -1600,6 +1618,22 @@ function AssistantBubble({
                     </MessageAction>
                   </DisabledActionTooltip>
                 )}
+                {showsWork && (
+                  <MessageAction
+                    tooltip="Show your work"
+                    label="Sources"
+                    size="xs"
+                    className="h-6 gap-1 px-1.5 [@media(pointer:coarse)]:h-8"
+                    aria-expanded={workOpen}
+                    aria-controls={workOpen ? workPanelId : undefined}
+                    data-testid="turn-work-toggle"
+                    onClick={() => setWorkOpen((open) => !open)}
+                    componentId="chat.message.sources"
+                  >
+                    <ListChecksIcon size={14} />
+                    <span aria-hidden>Sources</span>
+                  </MessageAction>
+                )}
                 <MessageAction
                   tooltip={isLinkCopied ? "Copied!" : "Copy link"}
                   size="icon-xxs"
@@ -1619,6 +1653,16 @@ function AssistantBubble({
               )}
             </div>
           </>
+        )}
+        {showsWork && workOpen && !foldOnly && !errorOnly && (
+          // Taps inside the panel must not toggle the bubble's mobile actions.
+          <div className="w-full" onClick={(event) => event.stopPropagation()}>
+            <TurnWorkPanel
+              id={workPanelId}
+              items={bubble.items}
+              onClose={() => setWorkOpen(false)}
+            />
+          </div>
         )}
         {trailingNotices.map((notice, index) =>
           notice.kind === "subagent_activity" ? (

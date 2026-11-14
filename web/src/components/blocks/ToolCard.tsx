@@ -173,6 +173,29 @@ export function ToolCard({
   );
 }
 
+/** A tool call's expanded body (input and full result) without its trigger row. */
+export function ToolCallDetails({
+  item,
+}: {
+  item: Extract<RenderItem, { kind: "tool" | "native_tool" }>;
+}) {
+  const isNative = item.kind === "native_tool";
+  const name = isNative ? item.label : item.execution.name;
+  const args = isNative ? item.data : item.execution.arguments;
+  const output = isNative ? null : item.output;
+  const state: ToolState = isNative ? "output-available" : item.state;
+  const view = toolViewFor(name);
+  const call = useMemo<ToolCall>(
+    () => ({ name, args, output, state }),
+    [name, args, output, state],
+  );
+  return (
+    <div className="space-y-2 text-sm [&_code]:text-sm [&_pre]:text-sm">
+      <DefaultToolBody call={call} duration={isNative ? undefined : item.duration} view={view} />
+    </div>
+  );
+}
+
 interface ToolCardBodyProps extends ToolBodyProps {
   view: ToolView | undefined;
 }
