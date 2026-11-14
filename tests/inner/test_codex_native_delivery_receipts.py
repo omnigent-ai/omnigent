@@ -215,7 +215,9 @@ async def test_native_receipt_requires_exact_delivery_identity(
         assert ordering == ["native_receipt_persisted", "rpc_reply_lost", "receipt_read"]
     receipt = json.loads(receipt_file.read_text())
     if confirmed:
-        assert receipt["thread"]["turns"][0]["items"][0]["clientId"] == "c" * 32
+        assert (
+            receipt["thread"]["turns"][0]["items"][0]["clientId"] == "omnigent:stable:" + "a" * 32
+        )
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id == "turn_newer"

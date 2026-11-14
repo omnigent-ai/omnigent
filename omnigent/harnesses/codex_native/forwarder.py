@@ -89,6 +89,7 @@ from omnigent.native._native_supersession import (
     post_clear_supersession,
     unfiled_clear_replacement_body,
 )
+from omnigent.native.input_diagnostics import native_input_identity
 from omnigent.process_logging import log_info_once
 from omnigent.runner.launch_failure import is_codex_provider_auth_failure
 from omnigent.runtime.tool_output import cap_tool_output
@@ -8389,6 +8390,9 @@ async def _post_user_message(
         item_data=item_data,
         response_id=_response_id(params),
         source_id=source_id or _source_id(params, item),
+        native_input_id=(
+            str(item["clientId"]) if native_input_identity(item.get("clientId")) else None
+        ),
     )
 
 
@@ -9020,6 +9024,7 @@ async def _post_external_item(
     response_id: str,
     message_id: str | None = None,
     source_id: str | None = None,
+    native_input_id: str | None = None,
 ) -> bool:
     """
     Post one external conversation item to AP.
@@ -9035,6 +9040,7 @@ async def _post_external_item(
     :param response_id: Response id for the mirrored Codex turn.
     :param message_id: Optional live-preview stream finalized by this item.
     :param source_id: Stable native source id for server-side idempotency.
+    :param native_input_id: Server-owned input identity echoed by Codex.
     :returns: Whether the item was accepted by the server.
     """
     data: _JsonObject = {
@@ -9046,6 +9052,8 @@ async def _post_external_item(
         data["message_id"] = message_id
     if source_id is not None:
         data["source_id"] = _bounded_source_id(source_id)
+    if native_input_id is not None:
+        data["native_input_id"] = native_input_id
 
     async def _post() -> httpx.Response | None:
         return await _post_session_event(
