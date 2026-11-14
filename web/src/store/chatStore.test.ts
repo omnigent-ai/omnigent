@@ -15273,6 +15273,51 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     );
   });
 
+  it("explains a forbidden stream without replacing a partial assistant reply", async () => {
+    const response = assistantMessage("resp_403_visible", "Partial reply");
+    seedSession("conv_403_visible", [response]);
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        return mockResponse({}, { ok: false, status: 403 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_403_visible",
+      abortController: controller,
+      sessionStatus: "running",
+      blocks: itemsToBlocks([response]),
+      activeResponse: { responseId: "resp_403_visible", state: "streaming", error: null },
+    });
+
+    const loop = startStreamPump("conv_403_visible", controller, setState, getState);
+    await vi.advanceTimersByTimeAsync(6_000);
+    await loop;
+
+    const state = useChatStore.getState();
+    expect(state.blocks.filter((block) => block.type === "error")).toEqual([
+      expect.objectContaining({
+        code: "stream_unavailable",
+        title: "Access to the live conversation was denied (403)",
+        message:
+          "Check that you're signed in with an account that can view this conversation. If you need access, ask its owner; then reload the page.",
+      }),
+    ]);
+    expect(state.sessionStatus).toBe("running");
+    expect(buildBubbles(state.blocks, state.activeResponse)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "assistant",
+          responseId: "resp_403_visible",
+          lifecycle: "failed",
+          error: null,
+        }),
+      ]),
+    );
+  });
+
   // The stream and the API reads answer with the login page, but the sign-in probe
   // reads JSON. The 60 s give-up is then the fallback, and it shows the connection card.
   it("fails a streaming reply with one connection card after persistent login pages", async () => {

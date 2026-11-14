@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from playwright.sync_api import Page, Route, expect
 
 from tests.browser_ui.chat.session_contract import ChatSessionContract, message_item
@@ -43,3 +45,32 @@ def test_a_session_that_keeps_failing_to_load_can_be_loaded_again(
 
     expect(page.get_by_text(_QUESTION)).to_be_visible(timeout=10_000)
     expect(heading).to_have_count(0)
+
+
+def test_forbidden_live_stream_explains_how_to_regain_access(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    output_path: str,
+) -> None:
+    """A stream 403 shows actionable guidance beside the existing reply."""
+    chat = chat_session_contract
+    chat.set_items(
+        [message_item("partial-answer", "assistant", "Partial reply", response_id="partial-turn")]
+    )
+    chat.contract.response(f"/v1/sessions/{chat.session_id}/stream", status=403)
+
+    page.goto(chat.url)
+
+    expect(page.get_by_text("Partial reply", exact=True)).to_be_visible()
+    pill = page.get_by_test_id("error-pill")
+    headline = "Access to the live conversation was denied (403)"
+    expect(pill.get_by_test_id("error-headline")).to_have_text(headline)
+    pill.get_by_role("button", name=headline).click()
+    expect(pill).to_contain_text("Check that you're signed in with an account")
+    expect(pill).to_contain_text("ask its owner; then reload the page")
+    expect(pill).not_to_contain_text("stream unavailable (403)")
+    page.screenshot(
+        path=str(Path(output_path) / "forbidden-live-stream.png"),
+        full_page=True,
+        animations="disabled",
+    )

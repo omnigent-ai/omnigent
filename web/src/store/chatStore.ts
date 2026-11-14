@@ -6867,7 +6867,11 @@ export async function startStreamPump(
           // surfaces as offline liveness via ConnectionIndicator.
           if (streamRes.status === 401 || streamRes.status === 403) {
             console.warn(`Session ${id}: stream unavailable (${streamRes.status}), giving up`);
-            failUnavailableStream(set, `stream unavailable (${streamRes.status})`);
+            if (streamRes.status === 403) {
+              failUnavailableStream(set, null, STREAM_ACCESS_NOTICE);
+            } else {
+              failUnavailableStream(set, `stream unavailable (${streamRes.status})`);
+            }
             set({ status: "idle" });
             break;
           }
@@ -9989,6 +9993,13 @@ const CONNECTION_NOTICE: StreamNotice = {
   title: "The live connection to the assistant is unavailable",
   message: "Reload the page to reconnect.",
 };
+/** A forbidden stream may be due to the signed-in account or session access. */
+const STREAM_ACCESS_NOTICE: StreamNotice = {
+  code: "stream_unavailable",
+  title: "Access to the live conversation was denied (403)",
+  message:
+    "Check that you're signed in with an account that can view this conversation. If you need access, ask its owner; then reload the page.",
+};
 /** The sign-in expired, which only a fresh top-level page can renew. */
 const SIGN_IN_NOTICE: StreamNotice = {
   code: SIGN_IN_EXPIRED_CODE,
@@ -10024,8 +10035,8 @@ async function streamSignInExpired(
 /**
  * Fail the live turn once its stream is gone for good. A status the bubble can
  * show (`error`) gets the standalone card only when no bubble can show it; a
- * null `error` (a login-page give-up) always gets the card. A settled turn keeps
- * its outcome.
+ * null `error` (a forbidden stream or login-page give-up) always gets the card.
+ * A settled turn keeps its outcome.
  */
 function failUnavailableStream(
   set: Setter,
