@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from omnigent.terminals.program_status import ProgramStatusReader
 
 from . import _proc
+from ._subprocess_lifecycle import await_cleanup_task, terminate_direct_subprocess
 from .agent_env import strip_desktop_session_env
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from .egress import EgressProxyHandle, apply_egress_env, start_egress_proxy
@@ -94,6 +95,8 @@ _TERMINAL_DIR_PREFIX = "omnigent-terminal-"
 # Bound for each ``tmux kill-server`` in the orphan sweep; a wedged
 # tmux must not stall runner startup.
 _REAP_KILL_TIMEOUT_S = 10.0
+_TMUX_LAUNCH_CLIENT_TERMINATE_TIMEOUT_S = 0.25
+_TMUX_LAUNCH_CLIENT_KILL_TIMEOUT_S = 1.0
 # Literal tmux empty option value. Passing this as an argv value clears
 # status segments and window formats; it is not an application sentinel.
 _TMUX_EMPTY_OPTION_VALUE = ""
@@ -1803,8 +1806,30 @@ class TerminalInstance:
                 self._launch_started = previous_launch_started
                 self._launch_incomplete = previous_launch_incomplete
                 raise
-            _, stderr = await proc.communicate()
-            self._launch_incomplete = False
+            try:
+                _, stderr = await proc.communicate()
+            except BaseException:
+                cleanup = asyncio.create_task(
+                    terminate_direct_subprocess(
+                        proc,
+                        terminate_timeout=_TMUX_LAUNCH_CLIENT_TERMINATE_TIMEOUT_S,
+                        kill_timeout=_TMUX_LAUNCH_CLIENT_KILL_TIMEOUT_S,
+                    ),
+                    name="tmux-launch-client-cleanup",
+                )
+                try:
+                    await await_cleanup_task(cleanup)
+                except (Exception, asyncio.CancelledError):
+                    logger.warning("Terminal launch client cleanup failed", exc_info=True)
+                else:
+                    if cleanup.result():
+                        self._launch_incomplete = previous_launch_incomplete
+                    else:
+                        logger.warning(
+                            "Terminal launch client was not reaped; retaining resources"
+                        )
+                raise
+            self._launch_incomplete = previous_launch_incomplete
             if proc.returncode != 0:
                 raise RuntimeError(
                     f"tmux launch failed (rc={proc.returncode}): {stderr.decode().strip()}"
@@ -2077,14 +2102,16 @@ class TerminalInstance:
             # server (or a remain-on-exit pane), so cleanup must not trust that
             # advisory flag before issuing kill-server.
             if not terminal_stopped:
+                # This kill cannot confirm a launch that only settles while it is in flight.
+                launch_was_complete = not self._launch_incomplete
                 try:
                     await self._tmux("kill-server")
                 except _TmuxTargetGoneError:
-                    terminal_stopped = not self._launch_incomplete
+                    terminal_stopped = launch_was_complete and not self._launch_incomplete
                 except RuntimeError:
                     pass
                 else:
-                    terminal_stopped = not self._launch_incomplete
+                    terminal_stopped = launch_was_complete and not self._launch_incomplete
             self.running = False
 
             if self._clipboard_bridge is not None:

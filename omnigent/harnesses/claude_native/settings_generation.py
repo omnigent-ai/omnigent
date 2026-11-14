@@ -364,14 +364,21 @@ class ClaudeSettingsRequest:
             baseline = self.settings_path(self.bridge_dir)
             _release(_open_lock(baseline.with_suffix(".dispatch.owner"), create=True))
 
-    def acknowledge(self, generation: object) -> bool:
-        """Accept only the actual receiver's matching generation acknowledgement."""
-        if generation != self.generation:
-            return False
+    def _clear_dispatch(self) -> None:
         with bridge_dir_preparation_lock(self.bridge_dir):
             _require_incarnation(self.bridge_dir, self._lease._incarnation)
             baseline = self.settings_path(self.bridge_dir)
             baseline.with_suffix(".dispatch.owner").unlink(missing_ok=True)
+
+    def cancel_undelivered_dispatch(self) -> None:
+        """Clear exposure only after the sender proves this request was never delivered."""
+        self._clear_dispatch()
+
+    def acknowledge(self, generation: object) -> bool:
+        """Accept only the actual receiver's matching generation acknowledgement."""
+        if generation != self.generation:
+            return False
+        self._clear_dispatch()
         return True
 
     @classmethod

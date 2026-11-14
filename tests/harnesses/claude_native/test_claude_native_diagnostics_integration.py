@@ -230,6 +230,10 @@ async def test_server_client_start_failure_drains_diagnostics_before_first_poll(
         (False, "cancelled"),
         (True, "rejected"),
         (True, "transport"),
+        (True, "cleanup-failure"),
+        (True, "read"),
+        (True, "write"),
+        (True, "timeout"),
         (True, "cancelled"),
         (True, "unacknowledged"),
         (True, "mismatched"),
@@ -241,6 +245,12 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
     failure_mode: str,
     owned_request: bool,
 ) -> None:
+    from omnigent.harnesses.claude_native.settings_generation import (
+        ClaudeSettingsLease,
+        ClaudeSettingsRequest,
+        acquire_claude_settings_request,
+    )
+
     monkeypatch.setenv(HARNESS_STDERR_ENABLED_ENV_VAR, "1")
     monkeypatch.setattr(claude_native, "resolve_claude_launch", lambda cmd, args: (cmd, args))
     follower = SimpleNamespace(close=Mock())
@@ -249,17 +259,36 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
         "omnigent.harnesses.claude_native.diagnostics.ClaudeDebugLogFollower", make_follower
     )
     posted: list[dict[str, object]] = []
+    original_error: BaseException | None = None
+    receiver: ClaudeSettingsLease | None = None
+    admitted_settings: bytes | None = None
+    uncertain_errors = {
+        "read": httpx.ReadError,
+        "write": httpx.WriteError,
+        "timeout": httpx.ReadTimeout,
+    }
+    if failure_mode == "cleanup-failure":
+        monkeypatch.setattr(
+            ClaudeSettingsRequest,
+            "cancel_undelivered_dispatch",
+            Mock(side_effect=OSError("simulated cleanup failure")),
+        )
 
     def launch_failure(request: httpx.Request) -> httpx.Response:
+        nonlocal original_error, receiver, admitted_settings
         if request.method == "GET":
             return httpx.Response(
                 200, json={"claude_settings_request_protocol": 1} if owned_request else {}
             )
         posted.append(json.loads(request.content))
         if failure_mode == "cancelled":
-            raise asyncio.CancelledError("launch cancelled")
-        if failure_mode == "transport":
-            raise httpx.ConnectError("simulated launch transport failure", request=request)
+            original_error = asyncio.CancelledError("launch cancelled")
+            raise original_error
+        if failure_mode in {"transport", "cleanup-failure"}:
+            original_error = httpx.ConnectError(
+                "simulated launch transport failure", request=request
+            )
+            raise original_error
         if failure_mode in {"unacknowledged", "mismatched"}:
             return httpx.Response(
                 200,
@@ -273,10 +302,17 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
                 },
             )
         if owned_request:
-            from omnigent.harnesses.claude_native.settings_generation import (
-                acquire_claude_settings_request,
-            )
-
+            if failure_mode in uncertain_errors:
+                receiver = acquire_claude_settings_request(
+                    tmp_path, posted[-1]["claude_settings_request"]
+                )
+                admitted_settings = (
+                    tmp_path / f"claude-settings-{receiver.generation}.json"
+                ).read_bytes()
+                original_error = uncertain_errors[failure_mode](
+                    "simulated failure after admission", request=request
+                )
+                raise original_error
             with acquire_claude_settings_request(tmp_path, posted[-1]["claude_settings_request"]):
                 pass
         return httpx.Response(503, json={"detail": "simulated launch rejection"})
@@ -284,30 +320,47 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
     expected_error, expected_message = {
         "rejected": (ClickException, "503"),
         "transport": (httpx.ConnectError, "simulated launch transport failure"),
+        "cleanup-failure": (httpx.ConnectError, "simulated launch transport failure"),
+        "read": (httpx.ReadError, "simulated failure after admission"),
+        "write": (httpx.WriteError, "simulated failure after admission"),
+        "timeout": (httpx.ReadTimeout, "simulated failure after admission"),
         "cancelled": (asyncio.CancelledError, "launch cancelled"),
         "unacknowledged": (ClickException, "did not acknowledge"),
         "mismatched": (ClickException, "did not acknowledge"),
     }[failure_mode]
-    async with httpx.AsyncClient(
-        base_url="http://unused.invalid", transport=httpx.MockTransport(launch_failure)
-    ) as client:
-        with pytest.raises(expected_error, match=expected_message):
-            await claude_native._launch_claude_terminal(
-                client, "failed-child", (), command="claude", bridge_dir=tmp_path
-            )
+    try:
+        async with httpx.AsyncClient(
+            base_url="http://unused.invalid", transport=httpx.MockTransport(launch_failure)
+        ) as client:
+            with pytest.raises(expected_error, match=expected_message) as raised:
+                await claude_native._launch_claude_terminal(
+                    client, "failed-child", (), command="claude", bridge_dir=tmp_path
+                )
 
-    assert len(posted) == 1
-    assert ("claude_settings_request" in posted[0]) is owned_request
-    if owned_request:
-        generation = posted[0]["claude_settings_request"]
-        if failure_mode == "rejected":
-            assert not list(tmp_path.glob("claude-settings-*"))
-        else:
-            assert (tmp_path / f"claude-settings-{generation}.json").exists()
-            assert (tmp_path / f"claude-settings-{generation}.dispatch.owner").exists()
-    assert "--debug-file" in posted[0]["spec"]["args"]
-    make_follower.assert_called_once_with(tmp_path)
-    follower.close.assert_called_once_with("failed-child")
+        if original_error is not None:
+            assert raised.value is original_error
+        assert len(posted) == 1
+        assert ("claude_settings_request" in posted[0]) is owned_request
+        if owned_request:
+            generation = posted[0]["claude_settings_request"]
+            if failure_mode in {"rejected", "transport"}:
+                assert not list(tmp_path.glob("claude-settings-*"))
+            else:
+                settings = tmp_path / f"claude-settings-{generation}.json"
+                assert settings.exists()
+                if admitted_settings is not None:
+                    assert settings.read_bytes() == admitted_settings
+                assert (tmp_path / f"claude-settings-{generation}.dispatch.owner").exists() is (
+                    failure_mode not in uncertain_errors
+                )
+        assert "--debug-file" in posted[0]["spec"]["args"]
+        make_follower.assert_called_once_with(tmp_path)
+        follower.close.assert_called_once_with("failed-child")
+    finally:
+        if receiver is not None:
+            receiver.close()
+    if failure_mode in uncertain_errors:
+        assert not list(tmp_path.glob("claude-settings-*"))
 
 
 async def test_cli_settings_request_is_released_after_acknowledgement(

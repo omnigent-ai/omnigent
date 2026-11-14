@@ -6848,11 +6848,21 @@ async def _launch_claude_terminal(
         )
         if settings_request is not None:
             settings_request.mark_dispatched()
-        resp = await client.post(
-            f"/v1/sessions/{url_component(session_id)}/resources/terminals",
-            json=body,
-            timeout=30.0,
-        )
+        try:
+            # Production uses HTTPX's default transport. Disable auth and redirect
+            # replays so ConnectError proves this fresh generation was not delivered.
+            resp = await client.post(
+                f"/v1/sessions/{url_component(session_id)}/resources/terminals",
+                json=body,
+                timeout=30.0,
+                auth=httpx.Auth(),
+                follow_redirects=False,
+            )
+        except httpx.ConnectError:
+            if settings_request is not None:
+                with contextlib.suppress(Exception):
+                    settings_request.cancel_undelivered_dispatch()
+            raise
         acknowledged = False
         if settings_request is not None:
             try:

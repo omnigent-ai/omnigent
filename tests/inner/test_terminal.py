@@ -928,6 +928,8 @@ async def test_async_idle_watcher_treats_confirmation_start_failure_as_unknown(
         "cancelled-kill-overlap-cleanup-error",
         "interrupted-spawn",
         "interrupted-spawn-retry",
+        "client-settled-success",
+        "client-settled-target-gone",
     ],
 )
 async def test_close_kills_tmux_when_socket_exists_after_running_cleared(
@@ -971,6 +973,12 @@ async def test_close_kills_tmux_when_socket_exists_after_running_cleared(
             instance, "_stop_idle_watcher", AsyncMock(side_effect=asyncio.CancelledError)
         )
     launch_errors: list[BaseException] = []
+    client_settles_during_kill = outcome.startswith("client-settled-")
+    kill_started = asyncio.Event()
+    release_kill = asyncio.Event()
+    if client_settles_during_kill:
+        instance._launch_started = True
+        instance._launch_incomplete = True
     if outcome.startswith("interrupted-spawn"):
         launch_errors.append(asyncio.CancelledError())
         if outcome == "interrupted-spawn-retry":
@@ -992,7 +1000,10 @@ async def test_close_kills_tmux_when_socket_exists_after_running_cleared(
 
     async def _tmux(*args: str) -> None:
         commands.append(args)
-        if outcome == "target-gone":
+        if client_settles_during_kill and len(commands) == 1:
+            kill_started.set()
+            await release_kill.wait()
+        if outcome in {"target-gone", "client-settled-target-gone"}:
             raise terminal_mod._tmux_command_failed_error(
                 ["tmux", *args], 1, b"no server running on example socket"
             )
@@ -1002,6 +1013,25 @@ async def test_close_kills_tmux_when_socket_exists_after_running_cleared(
             raise asyncio.CancelledError
 
     instance._tmux = _tmux  # type: ignore[method-assign]
+
+    if client_settles_during_kill:
+        closing = asyncio.create_task(instance.close())
+        try:
+            await asyncio.wait_for(kill_started.wait(), timeout=5)
+            # The client settles after this kill was already issued.
+            instance._launch_incomplete = False
+            release_kill.set()
+            await closing
+            assert output.exists()
+            assert retired == []
+            await instance.close()
+            assert commands == [("kill-server",), ("kill-server",)]
+            assert retired == [True]
+            assert not private_dir.exists()
+        finally:
+            release_kill.set()
+            await asyncio.gather(closing, return_exceptions=True)
+        return
 
     if overlap:
         first_close = asyncio.create_task(instance.close())

@@ -108,7 +108,18 @@ async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
 
 
 @pytest.mark.parametrize("endpoint", ["", "/resources"])
-@pytest.mark.parametrize("owner", ["none", "pending", "failed-close", "timed-out-close"])
+@pytest.mark.parametrize(
+    "owner",
+    [
+        "none",
+        "pending",
+        "undelivered",
+        "unacknowledged",
+        "admitted",
+        "failed-close",
+        "timed-out-close",
+    ],
+)
 async def test_delete_session_removes_native_bridge_dir(
     client: httpx.AsyncClient,
     app: FastAPI,
@@ -132,6 +143,10 @@ async def test_delete_session_removes_native_bridge_dir(
     assert bridge_dir == bridge_dir_for_bridge_id(session_id)
     # prepare_bridge_dir writes a bridge.json holding the bridge token.
     assert (bridge_dir / "bridge.json").exists()
+    credentials = bridge_dir / "permission_hook.json"
+    credential_bytes = json.dumps(
+        {"ap_auth_headers": {"Authorization": "Bearer synthetic-delete-test-credential"}}
+    ).encode()
     cached = materialize_attachment(
         {
             "type": "input_file",
@@ -143,6 +158,7 @@ async def test_delete_session_removes_native_bridge_dir(
     assert cached is not None
 
     request = None
+    reader = None
     instance = None
     revoked = []
     if owner != "none":
@@ -152,7 +168,14 @@ async def test_delete_session_removes_native_bridge_dir(
         )
         baseline = settings_generation_path(bridge_dir, request.generation)
         baseline_bytes = baseline.read_bytes()
-        if owner != "pending":
+        if owner in {"undelivered", "unacknowledged", "admitted"}:
+            request.mark_dispatched()
+            if owner == "undelivered":
+                request.cancel_undelivered_dispatch()
+            elif owner == "admitted":
+                reader = acquire_claude_settings_request(bridge_dir, request.generation)
+            request.close()
+        if owner in {"failed-close", "timed-out-close"}:
             private_dir = tmp_path / "terminal"
             private_dir.mkdir()
             output = private_dir / "retained-settings.json"
@@ -182,13 +205,15 @@ async def test_delete_session_removes_native_bridge_dir(
                 app.state.session_resource_registry, "_terminal_registry", terminals
             )
 
+    credentials.write_bytes(credential_bytes)
     url = f"/v1/sessions/{session_id}{endpoint}"
     try:
         resp = await client.delete(url)
         assert resp.status_code == 200
         assert not cached.exists()
-        if request is not None:
+        if request is not None and owner != "undelivered":
             assert baseline.read_bytes() == baseline_bytes
+            assert credentials.read_bytes() == credential_bytes
             if instance is not None:
                 assert instance._resource_cleanup_task is not None
                 await asyncio.wait_for(instance._resource_cleanup_task, timeout=5)
@@ -197,14 +222,26 @@ async def test_delete_session_removes_native_bridge_dir(
                 monkeypatch.setattr(instance, "_tmux", AsyncMock())
                 await instance.close()
                 assert not output.exists()
+            if reader is not None:
+                reader.close()
             request.close()
-        assert not bridge_dir.exists(), "released bridge dir (with token) must be deleted"
+        if owner == "unacknowledged":
+            assert (await client.delete(url)).status_code == 200
+            assert baseline.with_suffix(".dispatch.owner").exists()
+            assert credentials.read_bytes() == credential_bytes
+        else:
+            assert not bridge_dir.exists(), "released bridge dir (with token) must be deleted"
     finally:
         if instance is not None:
             monkeypatch.setattr(instance, "_tmux", AsyncMock())
             await instance.close()
         if request is not None:
             request.close()
+        if reader is not None:
+            reader.close()
+        if owner == "unacknowledged":
+            # Discard the synthetic claim after checking uncertain delivery retention.
+            baseline.with_suffix(".dispatch.owner").unlink(missing_ok=True)
         await client.delete(url)
 
 

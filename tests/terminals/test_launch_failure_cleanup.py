@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -290,6 +291,170 @@ async def test_caller_cancellation_during_cleanup_finishes_close_then_propagates
     assert record.attributes["exception_type"] == "FileNotFoundError"
     assert record.attributes["launch_cleanup_outcome"] == "closed"
     assert record.attributes["cancelled_during_cleanup"] is True
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ["reaped-success", "reaped-target-gone", "unreaped", "cleanup-error", "prior-unknown"],
+)
+async def test_interrupted_tmux_client_drains_before_unregistered_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    outcome: str,
+) -> None:
+    from omnigent.inner import terminal as terminal_mod
+    from omnigent.inner._subprocess_lifecycle import terminate_direct_subprocess
+
+    private_dir = tmp_path / "terminal"
+    private_dir.mkdir()
+    instance = _stub_instance(private_dir)
+    output = private_dir / "prepared-settings.json"
+    released = []
+    communicating = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    commands = []
+    original_cancellation = "launch interrupted"
+
+    class LaunchClient:
+        returncode: int | None = None
+        terminate_calls = 0
+        wait_calls = 0
+
+        async def communicate(self):
+            communicating.set()
+            await asyncio.Event().wait()
+
+        def terminate(self):
+            self.terminate_calls += 1
+
+        async def wait(self):
+            self.wait_calls += 1
+            self.returncode = -15
+            return self.returncode
+
+    process = LaunchClient()
+    if outcome == "prior-unknown":
+        with monkeypatch.context() as prior:
+            prior.setattr(
+                terminal_mod,
+                "asyncio",
+                SimpleNamespace(
+                    **{
+                        **vars(asyncio),
+                        "create_subprocess_exec": AsyncMock(side_effect=asyncio.CancelledError),
+                    }
+                ),
+            )
+            with pytest.raises(asyncio.CancelledError):
+                await instance.launch()
+    monkeypatch.setattr(
+        terminal_mod,
+        "asyncio",
+        SimpleNamespace(
+            **{**vars(asyncio), "create_subprocess_exec": AsyncMock(return_value=process)}
+        ),
+    )
+
+    async def cleanup_client(client, **kwargs):
+        assert client is process
+        cleanup_started.set()
+        await release_cleanup.wait()
+        if outcome == "unreaped":
+            return False
+        if outcome == "cleanup-error":
+            raise OSError("client reap failed")
+        return await terminate_direct_subprocess(client, **kwargs)
+
+    monkeypatch.setattr(terminal_mod, "terminate_direct_subprocess", cleanup_client, raising=False)
+
+    async def tmux(*args):
+        commands.append(args)
+        if outcome.startswith("reaped-") and len(commands) == 1:
+            raise RuntimeError("server termination unconfirmed")
+        if outcome == "reaped-target-gone":
+            raise terminal_mod._tmux_command_failed_error(
+                ["tmux", *args], 1, b"no server running on example socket"
+            )
+
+    async def prepare(created):
+        assert created is instance
+        output.write_text("{}")
+        instance.add_resource_cleanup(lambda: released.append(instance))
+
+    monkeypatch.setattr(instance, "_tmux", tmux)
+    monkeypatch.setattr(
+        registry,
+        "create_terminal_instance",
+        lambda *_args, **_kwargs: TerminalCreateResult(instance, tmp_path),
+    )
+    terminals = TerminalRegistry()
+    task = asyncio.create_task(
+        terminals.launch(
+            "owned-session", "shell", "main", _spec(tmp_path), prepare_terminal=prepare
+        )
+    )
+    try:
+        await asyncio.wait_for(communicating.wait(), timeout=5)
+        task.cancel(original_cancellation)
+        await asyncio.wait_for(cleanup_started.wait(), timeout=5)
+        for _ in range(3):
+            task.cancel("cleanup interrupted")
+            checkpoint = asyncio.get_running_loop().create_future()
+            asyncio.get_running_loop().call_soon(checkpoint.set_result, None)
+            await checkpoint
+            assert not task.done()
+            assert process.returncode is None
+            assert output.exists()
+            assert released == []
+            assert commands == []
+        release_cleanup.set()
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await task
+        assert cancelled.value.args == (original_cancellation,)
+        assert instance._launch_started
+        assert output.exists()
+        assert released == []
+        assert commands == [("kill-server",)]
+        assert terminals.get("owned-session", "shell", "main") is None
+        assert instance._launch_incomplete == (not outcome.startswith("reaped-"))
+        if outcome not in {"unreaped", "cleanup-error"}:
+            assert process.returncode == -15
+            assert process.terminate_calls == process.wait_calls == 1
+        else:
+            assert process.returncode is None
+            assert "client" in caplog.text.lower()
+        await instance.close()
+        assert commands == [("kill-server",), ("kill-server",)]
+        if outcome.startswith("reaped-"):
+            assert released == [instance]
+            assert not private_dir.exists()
+            await instance.close()
+            assert released == [instance]
+        else:
+            assert output.exists()
+            assert released == []
+            if outcome == "prior-unknown":
+                completed = SimpleNamespace(
+                    returncode=0, communicate=AsyncMock(return_value=(b"", b""))
+                )
+                monkeypatch.setattr(
+                    terminal_mod.asyncio,
+                    "create_subprocess_exec",
+                    AsyncMock(return_value=completed),
+                )
+                await instance.launch()
+                assert instance._launch_incomplete
+                await instance.close()
+                assert output.exists()
+                assert released == []
+    finally:
+        release_cleanup.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await instance.close()
 
 
 async def test_immediate_exit_closes_once_and_keeps_exit_evidence(
