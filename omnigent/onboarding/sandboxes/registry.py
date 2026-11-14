@@ -32,11 +32,6 @@ class SandboxRegistryError(Exception):
     """A provider registry operation failed."""
 
 
-class _WorkspaceHostLauncherFactory(Protocol):
-    def __call__(self, *, workspace_host: str) -> SandboxHostLauncher:
-        pass
-
-
 class _ServerUrlLauncherFactory(Protocol):
     def __call__(self, *, server_url: str) -> SandboxHostLauncher:
         pass
@@ -138,12 +133,7 @@ def _builtin_contribution() -> SandboxProviderContribution:
     return SandboxProviderContribution(
         name="omnigent",
         providers={
-            "lakebox": SandboxProviderMetadata(
-                name="lakebox",
-                launcher_class="omnigent.onboarding.sandboxes.lakebox:LakeboxLauncher",
-            ),
-            # Databricks Sandbox provider over the REST command-execution API (no
-            # SSH). Distinct from `lakebox`.
+            # Databricks Sandbox provider over the REST command-execution API.
             "databricks": SandboxProviderMetadata(
                 name="databricks",
                 launcher_class=(
@@ -337,15 +327,12 @@ def get_provider_metadata(name: str) -> SandboxProviderMetadata | None:
 def instantiate(
     name: str,
     *,
-    workspace_host: str | None = None,
     server_url: str | None = None,
     config: Mapping[str, object] | None = None,
 ) -> SandboxHostLauncher:
     """Import and instantiate a registered provider's launcher class.
 
     :param name: Registered provider name.
-    :param workspace_host: Optional Databricks workspace host passed
-        to the Lakebox launcher constructor.
     :param server_url: Optional CLI target passed to the microsandbox launcher
         so it can scope guest-to-host access before provisioning.
     :param config: The provider's ``sandbox.<name>`` block, or ``None``.
@@ -374,9 +361,6 @@ def instantiate(
             f"sandbox provider '{name}' resolved to {launcher_cls!r}, "
             f"which is not a SandboxHostLauncher subclass"
         )
-    if name == "lakebox" and workspace_host is not None:
-        launcher_factory = cast(_WorkspaceHostLauncherFactory, launcher_cls)
-        return launcher_factory(workspace_host=workspace_host)
     if name == "microsandbox" and server_url is not None:
         launcher_factory = cast(_ServerUrlLauncherFactory, launcher_cls)
         return launcher_factory(server_url=server_url)

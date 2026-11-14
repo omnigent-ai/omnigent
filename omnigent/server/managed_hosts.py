@@ -33,7 +33,7 @@ stores into ``create_app``):
    ``<data_dir>/config.yaml``)::
 
        sandbox:
-         # lakebox|databricks|modal|daytona|blaxel|boxlite|cwsandbox|islo|
+         # databricks|modal|daytona|blaxel|boxlite|cwsandbox|islo|
          # e2b|openshell|kubernetes|microsandbox|gensee
          provider: modal
          server_url: https://omnigent.example.com
@@ -170,9 +170,7 @@ stores into ``create_app``):
    The ``lambda_microvm`` launcher reads AWS credentials from the server's
    ambient boto3 chain (profile / environment / instance role) and needs a
    prebuilt MicroVM image (``sandbox.lambda_microvm.image_identifier``).
-   Every provider except
-   ``lakebox`` has managed-launch support; ``lakebox`` parses but
-   rejects at launch.
+   Every built-in provider has managed-launch support.
 
 2. **Direct construction** (embedding deployments): build
    :class:`ManagedSandboxConfig` with a custom
@@ -243,7 +241,6 @@ _logger = logging.getLogger(__name__)
 # their launcher factory IS the support.)
 SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
     {
-        "lakebox",
         "databricks",
         "modal",
         "daytona",
@@ -762,17 +759,14 @@ class ManagedSandboxConfig:
         outage. Tokens expire after the last renewal plus this window.
     :param managed_launch_supported: Whether ``launcher_factory`` can
         actually serve a managed launch. The YAML path sets this from
-        :data:`PROVIDERS_WITH_MANAGED_LAUNCH` — staged providers
-        (``lakebox``) parse but get ``False``, since their factory
-        rejects at launch. Defaults to ``True`` for
+        :data:`PROVIDERS_WITH_MANAGED_LAUNCH`. Defaults to ``True`` for
         directly-constructed configs (an embedding deployment's
         custom factory IS the support). Drives the unauthenticated
         ``managed_sandboxes_enabled`` capability flag on
         ``GET /v1/info``, which gates the web UI's sandbox option.
     :param provider: Short provider name surfaced to the web UI so the
         new-session sandbox option can be labeled per provider (e.g.
-        ``"modal"`` → "Modal Sandbox", ``"lakebox"`` → "Databricks
-        Sandbox"). The YAML path sets it from the parsed
+        ``"modal"`` → "Modal Sandbox"). The YAML path sets it from the parsed
         ``sandbox.provider``. ``None`` for directly-constructed
         embedding configs that don't name a provider — the UI then
         falls back to the generic "New Sandbox" label. Exposed (when
@@ -956,7 +950,7 @@ class ManagedSandboxDeployment:
 
         Prefers the first launch-capable provider, so the default
         launcher and the :attr:`managed_launch_supported` flag agree
-        even when a staged provider (e.g. ``lakebox``) is listed first.
+        even when an unavailable provider is listed first.
         Falls back to the first entry when none supports launch, so a
         deployment of only staged providers still resolves.
 
@@ -1011,7 +1005,7 @@ class ManagedSandboxDeployment:
         """
         Names of every offered provider that can actually serve a launch.
 
-        Excludes staged providers (parse-but-reject, e.g. ``lakebox``) and
+        Excludes unavailable providers and
         configs naming no provider, so this is exactly what a client may
         choose from.
 
@@ -2136,11 +2130,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         # import time, so this only has to validate the config block and build
         # the factory.
         #
-        # Deliberately below every built-in branch and gated on `community`,
-        # which excludes anything in SUPPORTED_SANDBOX_PROVIDERS. Built-ins
-        # that are listed but have no branch - `lakebox` today - must keep
-        # falling through to the staged rejection below rather than silently
-        # gaining a launcher.
+        # Keep community providers separate from the built-in launchers.
         section = _parse_provider_section(raw, provider)
         _parse_registry_config(provider, section)
         launcher_factory = _registry_launcher_factory(provider, section)

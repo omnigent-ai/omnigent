@@ -1316,7 +1316,6 @@ async def test_managed_creation_uses_default_provider_and_saves_private_first_ta
         {
             "server_url": "https://managed-test.example.com",
             "providers": [
-                {"provider": "lakebox"},
                 {"provider": "modal" if provider == "embedding" else provider},
             ],
         }
