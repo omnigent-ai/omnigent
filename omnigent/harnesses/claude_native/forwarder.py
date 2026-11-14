@@ -202,7 +202,7 @@ _HTTP_POST_RETRY_MAX_DELAY_S = 30.0
 # attempt 6 — so 32 leaves the schedule identical while staying far inside float
 # range for any realistic max_delay_s / base_delay_s ratio.
 _HTTP_POST_RETRY_MAX_BACKOFF_EXPONENT = 32
-_HTTP_TRANSIENT_STATUS_CODES = {408, 409, 425, 429}
+_HTTP_TRANSIENT_STATUS_CODES = {401, 408, 409, 425, 429}
 _FORWARDER_REJECTION_REASONS = frozenset(
     {
         ErrorCode.FORBIDDEN,
@@ -7300,6 +7300,13 @@ def _is_permanent_http_error(exc: httpx.HTTPError) -> bool:
     if not isinstance(exc, httpx.HTTPStatusError):
         return False
     status_code = exc.response.status_code
+    if status_code == 403:
+        # Databricks Apps uses 403 Invalid Token for an expired bearer.
+        try:
+            if exc.response.text.strip().casefold() == "invalid token":
+                return False
+        except httpx.ResponseNotRead:
+            pass
     return 400 <= status_code < 500 and status_code not in _HTTP_TRANSIENT_STATUS_CODES
 
 

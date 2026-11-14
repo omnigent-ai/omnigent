@@ -590,17 +590,25 @@ def test_generic_503_without_not_confirmed_body_never_exhausts() -> None:
         assert tracker.record_failure("k", exc, session_id="conv_retry").exhausted is False
 
 
-def test_unbounded_transient_retries_keep_delay_capped_without_overflow() -> None:
-    # A transport-level failure is neither permanent nor not-confirmed, so it
-    # retries with no give-up budget and `attempts` grows without bound. The
-    # backoff exponent must be clamped before `2 ** n` is evaluated: min()
-    # computes both operands, so an unclamped exponent overflows float at
-    # attempt ~1025 and raises OverflowError out of record_failure.
+@pytest.mark.parametrize(
+    "http_status", [None, 401, 403], ids=["transport", "unauthorized", "invalid-token"]
+)
+def test_unbounded_transient_retries_keep_delay_capped_without_overflow(
+    http_status: int | None,
+) -> None:
+    # A long credential/network outage retains its item while the delay saturates.
+    # Clamp before exponentiation so a long outage cannot overflow.
     tracker = forwarder._PostRetryTracker(base_delay_s=1.0, max_delay_s=30.0)
-    exc = httpx.RequestError("Databricks token refresh returned no token")
+    if http_status is None:
+        exc: httpx.HTTPError = httpx.RequestError("Databricks token refresh returned no token")
+    else:
+        request = httpx.Request("POST", "http://omnigent/v1/sessions/conv_retry/events")
+        response = httpx.Response(http_status, text="Invalid Token", request=request)
+        exc = httpx.HTTPStatusError("credentials rejected", request=request, response=response)
     for _ in range(2000):
         decision = tracker.record_failure("k", exc, session_id="conv_retry")
         assert decision.exhausted is False
+        assert decision.permanent is False
         assert decision.delay_s <= 30.0
     # The schedule still saturates at the cap instead of decaying.
     assert decision.delay_s == 30.0
