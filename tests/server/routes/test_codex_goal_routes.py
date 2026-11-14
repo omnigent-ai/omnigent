@@ -110,6 +110,39 @@ def test_unstructured_runner_error_becomes_a_502() -> None:
     assert "malformed error response with status 500" in body["error"]["message"]
 
 
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        {"type": "missing"},
+        {"loc": ["body", "nested"]},
+        {"ctx": {"discriminator": "'type'", "tag": "goal_set"}},
+        {"ctx": {"discriminator": "'kind'", "tag": "goal_get"}},
+        {"ctx": {"tag": "goal_get"}},
+        {"ctx": None},
+        {"ctx": "invalid"},
+    ],
+)
+def test_other_validation_failures_are_not_reported_as_legacy_runners(
+    replacement: dict[str, Any],
+) -> None:
+    detail: dict[str, Any] = {
+        "type": "union_tag_invalid",
+        "loc": ["body"],
+        "ctx": {"discriminator": "'type'", "tag": "goal_get"},
+    }
+    detail.update(replacement)
+    status, body = _status_and_body(_payload_or_response(_result(422, {"detail": [detail]})))
+    assert status == 502
+    assert "malformed error response with status 422" in body["error"]["message"]
+
+
+@pytest.mark.parametrize("body", ["{invalid", "[]", "null", "{}", '{"detail":[null,1]}'])
+def test_malformed_422_bodies_remain_transport_errors(body: str) -> None:
+    status, payload = _status_and_body(_payload_or_response(_result(422, body)))
+    assert status == 502
+    assert "malformed error response" in payload["error"]["message"]
+
+
 @pytest.mark.parametrize("body", ["{not json", "[]"], ids=["invalid-json", "not-an-object"])
 def test_malformed_success_body_becomes_a_502(body: str) -> None:
     status, payload = _status_and_body(_payload_or_response(_result(200, body)))
@@ -528,6 +561,52 @@ async def test_get_goal_passes_structured_runner_errors_through(
     resp = await client.get(f"/v1/sessions/{codex_session}/codex_goal")
     assert resp.status_code == 409
     assert resp.json() == {"error": "goal_busy", "detail": "turn running"}
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "event_type", "body"),
+    [
+        ("GET", "", "goal_get", None),
+        ("PUT", "", "goal_set", {"objective": "keep tests green"}),
+        ("PATCH", "/status", "goal_status", {"status": "paused"}),
+        ("DELETE", "", "goal_clear", None),
+    ],
+)
+async def test_goal_routes_explain_unsupported_legacy_runner_events(
+    client: httpx.AsyncClient,
+    codex_session: str,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    path: str,
+    event_type: str,
+    body: dict[str, str] | None,
+) -> None:
+    staged = _StagedForward(
+        monkeypatch,
+        _result(
+            422,
+            {
+                "detail": [
+                    {
+                        "type": "union_tag_invalid",
+                        "loc": ["body"],
+                        "input": {"type": event_type},
+                        "ctx": {"discriminator": "'type'", "tag": event_type},
+                    }
+                ]
+            },
+        ),
+    )
+    response = await client.request(
+        method, f"/v1/sessions/{codex_session}/codex_goal{path}", json=body
+    )
+    assert response.status_code == 409, response.text
+    message = response.json()["error"]["message"]
+    assert "runner does not support Codex goal controls" in message
+    assert "Update the host's Omnigent installation" in message
+    assert "malformed" not in message
+    assert len(staged.events) == 1
+    assert staged.events[0]["type"] == event_type
 
 
 async def test_set_goal_forwards_only_the_fields_the_caller_sent(

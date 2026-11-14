@@ -48,6 +48,12 @@ _logger = logging.getLogger(__name__)
 
 
 _CODEX_NATIVE_GOAL_ERROR = "codex_native_goal_failed"
+_CODEX_GOAL_EVENT_BY_ACTION = {
+    "read": "goal_get",
+    "set": "goal_set",
+    "update status": "goal_status",
+    "clear": "goal_clear",
+}
 
 
 def _codex_goal_error(status_code: int, *, detail: str) -> JSONResponse:
@@ -71,6 +77,33 @@ def _runner_error_payload(body: str) -> dict[str, Any] | None:
     if isinstance(error, str) and isinstance(detail, str):
         return {"error": error, "detail": detail}
     return None
+
+
+def _runner_rejected_goal_event(body: str, *, action: str) -> bool:
+    """Recognize an older runner's rejection of the goal event discriminator."""
+    event_type = _CODEX_GOAL_EVENT_BY_ACTION.get(action)
+    if event_type is None:
+        return False
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return False
+    details = payload.get("detail") if isinstance(payload, dict) else None
+    if not isinstance(details, list):
+        return False
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
+        context = detail.get("ctx")
+        if (
+            detail.get("type") == "union_tag_invalid"
+            and detail.get("loc") == ["body"]
+            and isinstance(context, dict)
+            and context.get("discriminator") == "'type'"
+            and context.get("tag") == event_type
+        ):
+            return True
+    return False
 
 
 def _require_codex_goal_runner_payload(
@@ -109,6 +142,17 @@ def _require_codex_goal_runner_payload(
             return JSONResponse(
                 status_code=runner_result.status_code,
                 content=structured_error,
+            )
+        if runner_result.status_code == 422 and _runner_rejected_goal_event(
+            runner_result.body, action=action
+        ):
+            return _codex_goal_error(
+                409,
+                detail=(
+                    f"Could not {action} Codex goal: this session's runner does not "
+                    "support Codex goal controls. Update the host's Omnigent "
+                    "installation, then reconnect the session before using goal controls."
+                ),
             )
         return _codex_goal_error(
             502,
