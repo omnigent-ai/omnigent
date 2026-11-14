@@ -140,6 +140,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 - [Workspace content search](./workspace-content-search.md) covers runner-backed
   text search, result navigation and its release flag.
 
+- [Vega-Lite charts](./vega-lite-charts.md) covers agent chart fences in chat,
+  chart file previews, downloads, safety limits and the release flag.
+
 - [Harness acceptance](./harness-acceptance.md) standardizes the SDK/native
   checklist, connects existing bench probes to user journeys, and records
   per-harness coverage gaps separately from observed results. Its

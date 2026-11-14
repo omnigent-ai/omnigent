@@ -73,6 +73,7 @@ export type FeatureKey =
   | "workflows"
   | "session_overview"
   | "project_kanban"
+  | "vega_lite_charts"
   | "project_repository_creation"
   | "workspace_direct_access"
   | "workspace_api_server_access"

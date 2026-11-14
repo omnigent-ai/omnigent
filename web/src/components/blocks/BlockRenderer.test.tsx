@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RenderItem } from "@/lib/renderItems";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
@@ -48,6 +49,27 @@ const renderMarkdownText = (text: string) =>
   );
 
 describe("BlockRenderer dispatch", () => {
+  it("draws an assistant text's vega-lite fence as a chart when charts are on", async () => {
+    const spec =
+      '{"data":{"values":[{"a":1}]},"mark":"point","encoding":{"x":{"field":"a","type":"quantitative"}}}';
+    render(
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, features: { vega_lite_charts: true } }}
+      >
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer
+            items={[
+              { kind: "text", itemId: "t1", text: `\`\`\`vega-lite\n${spec}\n\`\`\``, final: true },
+            ]}
+            sessionStatus="idle"
+          />
+        </FileViewerContext.Provider>
+      </CapabilitiesProvider>,
+    );
+
+    expect(await screen.findByTestId("vega-lite-chart")).toBeInTheDocument();
+  });
+
   it("renders a slash_command RenderItem via SlashCommandCard", () => {
     const items: RenderItem[] = [
       {

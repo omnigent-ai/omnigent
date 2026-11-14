@@ -41,6 +41,10 @@ import {
   type StreamdownProps,
 } from "streamdown";
 
+import { VegaLiteChart } from "@/components/charts/VegaLiteChart";
+import { isVegaLiteLanguage } from "@/components/charts/vegaLiteSpec";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { MarkdownErrorBoundary } from "./MarkdownErrorBoundary";
 import { mermaidOptionsForTheme } from "./MermaidError";
 import { FullscreenIcon, isMermaidPre, MermaidBlock, MERMAID_NO_FULLSCREEN } from "./MermaidBlock";
@@ -338,6 +342,8 @@ export type MessageResponseProps = Omit<StreamdownProps, "rehypePlugins" | "merm
   allowWorkspaceImages?: boolean;
   /** Allow shell drafts in assistant chat when a shell action is available. */
   allowShellCommands?: boolean;
+  /** Draw `vega-lite` fences as charts when the `vega_lite_charts` feature is on. */
+  allowCharts?: boolean;
   /** The text is still growing, so its last code fence may be open. */
   isStreaming?: boolean;
   /** Render sent review snapshots as cards; nested comment bodies remain ordinary Markdown. */
@@ -366,6 +372,7 @@ export function hasOpenCodeFence(text: string): boolean {
 }
 
 const StreamingTextContext = createContext(false);
+const ChartFenceContext = createContext(false);
 
 // Streamdown marks a block's open fence only while `isAnimating`, which also
 // disables its copy and download buttons, so mark it here for streaming text.
@@ -657,6 +664,9 @@ export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
     ""
   ).toLowerCase();
   const showShellAction = shellCommands && /^(bash|sh|zsh|fish|shell)$/.test(language);
+  const chartsEnabled = isFeatureEnabled(useServerInfo(), "vega_lite_charts");
+  const chartFences = useContext(ChartFenceContext);
+  const isChart = chartFences && chartsEnabled && isVegaLiteLanguage(language);
   // Soft-wrap long lines by default so users don't have to scroll horizontally
   // to read code blocks. The toggle restores Streamdown's native
   // horizontal-scroll view for every block, and the choice persists.
@@ -720,6 +730,9 @@ export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
     if (comment) return renderLocalReviewComment(comment);
   }
 
+  // A chart draws once its fence closes; until then the spec streams as code.
+  if (isChart && !fenceOpen) return <VegaLiteChart spec={code} source={codeBlock(block)} />;
+
   if (!isMermaid) return codeBlock(block);
 
   // Mermaid renders its own toolbar (download/copy); we replace Streamdown's
@@ -763,6 +776,7 @@ export const MessageResponse = memo(
     allowGitHubAttachmentImages = false,
     allowWorkspaceImages = false,
     allowShellCommands = false,
+    allowCharts = false,
     isStreaming = false,
     renderLocalReviewComment,
     ...props
@@ -797,27 +811,29 @@ export const MessageResponse = memo(
         <ShellCommandContext.Provider value={shellAction}>
           <LocalReviewCommentRendererContext.Provider value={renderLocalReviewComment}>
             <StreamingTextContext.Provider value={isStreaming}>
-              {/* Streamdown is memoized and its comparator ignores the mermaid prop,
+              <ChartFenceContext.Provider value={allowCharts}>
+                {/* Streamdown is memoized and its comparator ignores the mermaid prop,
               so remount on theme change to recolor already-rendered diagrams. */}
-              <Streamdown
-                key={themeMode}
-                // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
-                className={cn(
-                  "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
-                  className,
-                )}
-                plugins={STREAMDOWN_PLUGINS}
-                // Let links open on a plain click (and cmd/ctrl-click in a new tab)
-                // instead of Streamdown's default "Open external link?" modal.
-                linkSafety={CHAT_LINK_SAFETY}
-                {...props}
-                BlockComponent={StreamingTextBlock}
-                components={messageComponents}
-                controls={messageControls}
-                mermaid={mermaidOptions}
-                // Block remote image fetches that can exfiltrate data through URLs.
-                rehypePlugins={rehypePlugins}
-              />
+                <Streamdown
+                  key={themeMode}
+                  // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
+                  className={cn(
+                    "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
+                    className,
+                  )}
+                  plugins={STREAMDOWN_PLUGINS}
+                  // Let links open on a plain click (and cmd/ctrl-click in a new tab)
+                  // instead of Streamdown's default "Open external link?" modal.
+                  linkSafety={CHAT_LINK_SAFETY}
+                  {...props}
+                  BlockComponent={StreamingTextBlock}
+                  components={messageComponents}
+                  controls={messageControls}
+                  mermaid={mermaidOptions}
+                  // Block remote image fetches that can exfiltrate data through URLs.
+                  rehypePlugins={rehypePlugins}
+                />
+              </ChartFenceContext.Provider>
             </StreamingTextContext.Provider>
           </LocalReviewCommentRendererContext.Provider>
         </ShellCommandContext.Provider>

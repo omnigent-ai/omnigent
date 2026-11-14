@@ -13,6 +13,8 @@ import { AskUserQuestionForm } from "@/components/blocks/AskUserQuestionForm";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import type { AnyBlock } from "@/lib/blocks";
 import { CODE_BLOCK_WORD_WRAP_STORAGE_KEY, readCodeBlockWordWrap } from "@/lib/codeWrapPreferences";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { setEmbedRoot } from "@/lib/host";
 import { useChatStore } from "@/store/chatStore";
 import { MermaidPreview } from "@/shell/MermaidPreview";
@@ -689,6 +691,58 @@ describe("MessageResponse code-block copy", () => {
       expect(copiedText).toEqual(["const value = 1;\nconsole.log(value);\n"]);
     });
     expect(screen.getByRole("button", { name: "Download file" })).toBeInTheDocument();
+  });
+});
+
+describe("MessageResponse vega-lite charts", () => {
+  const spec = JSON.stringify({
+    data: { values: [{ team: "A", wins: 3 }] },
+    mark: "bar",
+    encoding: { x: { field: "team", type: "nominal" }, y: { field: "wins", type: "quantitative" } },
+  });
+  const closed = `Results:\n\n\`\`\`vega-lite\n${spec}\n\`\`\`\n`;
+  const response = (
+    text: string,
+    { allowCharts = true, enabled = true, isStreaming = false } = {},
+  ) => (
+    <CapabilitiesProvider
+      info={{ ...FALLBACK_SERVER_INFO, features: { vega_lite_charts: enabled } }}
+    >
+      <MessageResponse allowCharts={allowCharts} isStreaming={isStreaming}>
+        {text}
+      </MessageResponse>
+    </CapabilitiesProvider>
+  );
+
+  it("draws a closed fence as a chart", async () => {
+    const { container } = render(response(closed));
+
+    const chart = await screen.findByTestId("vega-lite-chart");
+    await waitFor(() => expect(chart.querySelector("g.mark-rect path")).not.toBeNull());
+    expect(container.querySelector('[data-streamdown="code-block"]')).toBeNull();
+  });
+
+  it.each([
+    ["the feature is off", { enabled: false }],
+    ["the surface doesn't allow charts", { allowCharts: false }],
+  ])("keeps the spec as code when %s", async (_label, options) => {
+    const { container } = render(response(closed, options));
+
+    await waitFor(() =>
+      expect(container.querySelector('[data-streamdown="code-block"]')).toHaveTextContent('"team"'),
+    );
+    expect(screen.queryByTestId("vega-lite-chart")).toBeNull();
+  });
+
+  it("streams an open fence as code and draws once it closes", async () => {
+    const open = `Results:\n\n\`\`\`vega-lite\n${spec}\n`;
+    const { container, rerender } = render(response(open, { isStreaming: true }));
+    expect(container.querySelector('[data-streamdown="code-block"]')).toHaveTextContent('"team"');
+    expect(screen.queryByTestId("vega-lite-chart")).toBeNull();
+
+    rerender(response(closed, { isStreaming: true }));
+
+    expect(await screen.findByTestId("vega-lite-chart")).toBeInTheDocument();
   });
 });
 

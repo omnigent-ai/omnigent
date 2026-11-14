@@ -144,6 +144,7 @@ import {
 } from "./codeViewerHelpers";
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
 import { isDataTablePath, isSpreadsheetPath } from "./dataTable";
+import { isVegaLitePath } from "@/components/charts/vegaLiteSpec";
 import { useScrollRestore } from "./useScrollRestore";
 import { isPdfAnchor } from "./pdfCommentHelpers";
 
@@ -875,11 +876,14 @@ function FileViewerBody({
       setLargeMarkdownMode(null);
     }
   }
+  // Vega-Lite files preview as a chart, like notebooks: preview or JSON source.
+  const isChartFile = isFeatureEnabled(useServerInfo(), "vega_lite_charts") && isVegaLitePath(path);
   const isPreviewable =
     (lang === "markdown" && !markdownPreviewFallback) ||
     lang === "html" ||
     isNotebookPath(path) ||
-    isDataTablePath(path);
+    isDataTablePath(path) ||
+    isChartFile;
   // Images and PDFs render through CodeViewer's own viewers regardless of view
   // mode; they have no source/diff representation, so diff is suppressed for
   // them (Monaco would otherwise render the base64 payload as garbage text).
@@ -1373,11 +1377,11 @@ function FileViewerBody({
       options: modeOptions,
     });
   } else if (
-    (lang === "html" || isNotebookPath(path) || isDataTablePath(path)) &&
+    (lang === "html" || isNotebookPath(path) || isDataTablePath(path) || isChartFile) &&
     viewMode !== "diff"
   ) {
-    // HTML, notebooks and data tables have no rich-text editor — a single toggle
-    // flips preview ↔ source.
+    // HTML, notebooks, data tables and charts have no rich-text editor — a single
+    // toggle flips preview ↔ source.
     toolbarActions.push({
       key: "preview",
       label: viewMode === "preview" ? "View source" : "View preview",
