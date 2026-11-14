@@ -806,6 +806,7 @@ struct OmnigentWebView: UIViewRepresentable {
       do {
         let cleanup = try workspaceBootstrap.beginSignOut(context: context, store: webStore)
         let callback = parent.signedOut
+        WatchBridge.shared.signOut()
         effectiveOrigin = nil
         workspaceSession = nil
         detach()
@@ -1119,6 +1120,8 @@ struct OmnigentWebView: UIViewRepresentable {
           return
         }
         oidcRenewalCause = nil
+        // A background renewal rotates the cookie without a page load, so hand it on here.
+        WatchBridge.shared.sync(serverURL: connection.serverURL, cookieStore: store)
         scheduleOidcRenewal()
         if reload, let webView {
           webView.load(URLRequest(url: oidcPageURL ?? connection.serverURL))
@@ -1176,6 +1179,7 @@ struct OmnigentWebView: UIViewRepresentable {
       }
       let message = OidcWebSession.signedOutMessage(host: connection.host, complete: complete)
       let signedOut = parent.serverSignedOut
+      WatchBridge.shared.signOut()
       let loadFailed = parent.loadFailed
       let initialURL = parent.initialURL
       effectiveOrigin = nil
@@ -1455,6 +1459,9 @@ struct OmnigentWebView: UIViewRepresentable {
       if pinnedOrigin != nil, webView.url?.omnigentOrigin == pinnedOrigin {
         (webView as? AccessoryFreeWebView)?.emitKeyboardViewport(force: true)
         webView.evaluateJavaScript(WorkspaceChromeScript.source)
+        WatchBridge.shared.sync(
+          serverURL: parent.serverURL ?? pinnedURL, workspaceID: workspaceSession?.workspaceID,
+          cookieStore: webView.configuration.websiteDataStore.httpCookieStore)
         parent.loadSucceeded()
       }
     }
