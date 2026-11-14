@@ -7,6 +7,7 @@ import contextlib
 import logging
 import os
 import sys
+import threading
 import uuid
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -124,15 +125,17 @@ class _RecordingCodexAppServerClient:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "event_payload,expected_params",
+    "event_payload,expected_params,blocked_read",
     [
         (
             {"type": "model_change", "model": "gpt-5.4"},
             {"threadId": "thread_codex", "model": "gpt-5.4"},
+            None,
         ),
         (
             {"type": "effort_change", "effort": "xhigh"},
             {"threadId": "thread_codex", "effort": "xhigh"},
+            None,
         ),
         (
             {"type": "plan_mode_change", "enabled": True},
@@ -147,9 +150,20 @@ class _RecordingCodexAppServerClient:
                     },
                 },
             },
+            None,
+        ),
+        (
+            {"type": "model_change", "model": "gpt-5.4"},
+            {"threadId": "thread_codex", "model": "gpt-5.4"},
+            "read_codex_config_effort",
+        ),
+        (
+            {"type": "effort_change", "effort": "xhigh"},
+            {"threadId": "thread_codex", "effort": "xhigh"},
+            "read_codex_config_model",
         ),
     ],
-    ids=["model_change", "effort_change", "plan_mode_change"],
+    ids=["model_change", "effort_change", "plan_mode_change", "held_effort", "held_model"],
 )
 async def test_events_codex_native_settings_change_uses_thread_settings_update(
     monkeypatch: pytest.MonkeyPatch,
@@ -157,6 +171,7 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
     caplog: pytest.LogCaptureFixture,
     event_payload: dict[str, Any],
     expected_params: dict[str, Any],
+    blocked_read: str | None,
 ) -> None:
     """
     Codex-native model / effort updates call ``thread/settings/update``.
@@ -223,10 +238,37 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
         )
         assert create_resp.status_code == 201, create_resp.text
 
-        resp = await client.post(
-            f"/v1/sessions/{conv_id}/events",
-            json=event_payload,
+        entered = threading.Event()
+        release = threading.Event()
+        if blocked_read is not None:
+            original_read = getattr(codex_native_bridge, blocked_read)
+
+            def held_read(*args: Any, **kwargs: Any) -> Any:
+                entered.set()
+                release.wait()
+                return original_read(*args, **kwargs)
+
+            monkeypatch.setattr(codex_native_bridge, blocked_read, held_read)
+
+        # Release outside the event loop so a blocked-loop regression also terminates.
+        safety_release = threading.Timer(budget(3.0), release.set)
+        safety_release.start()
+        settings_change = asyncio.create_task(
+            client.post(f"/v1/sessions/{conv_id}/events", json=event_payload)
         )
+        try:
+            if blocked_read is not None:
+                assert await asyncio.to_thread(entered.wait, budget(3.0))
+                health = await client.get("/health")
+                assert health.status_code == 200
+                assert not release.is_set(), "Codex config I/O blocked the runner"
+                assert fake_client.requests == [], "settings were submitted before config loaded"
+            release.set()
+            resp = await settings_change
+        finally:
+            release.set()
+            safety_release.cancel()
+            await settings_change
 
     assert resp.status_code == 204, (
         f"codex-native {event_payload['type']} must return 204; "
