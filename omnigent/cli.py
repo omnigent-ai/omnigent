@@ -3583,6 +3583,30 @@ def _live_daemon_conflict(record: _HostDaemonRecord) -> _HostDaemonRecord | None
     return None
 
 
+def _managed_host_slot_holder(record: _HostDaemonRecord) -> _HostDaemonRecord | None:
+    """
+    Find a live daemon of another host id holding a managed host's registry record.
+
+    The server keeps one tunnel per host id, so a managed sandbox host can run
+    beside the sandbox user's own daemon without taking its record.
+
+    :param record: Foreground daemon record this process wants to claim.
+    :returns: The live record of another host id, or ``None`` when this is not
+        a managed launch or no such daemon holds the target.
+    """
+    from omnigent.host.identity import HOST_TOKEN_ENV_VAR, host_identity_env_override_active
+
+    if not os.environ.get(HOST_TOKEN_ENV_VAR) or not host_identity_env_override_active():
+        return None
+    holder = _find_daemon_record(record.target)
+    if holder is None or holder.pid == record.pid or not _daemon_owner_is_live(holder):
+        return None
+    ours, theirs = normalize_uuid(record.host_id), normalize_uuid(holder.host_id)
+    if ours is None or theirs is None or ours == theirs:
+        return None
+    return holder
+
+
 def _claim_foreground_daemon_record(
     record: _HostDaemonRecord,
 ) -> _HostDaemonRecord | None:
@@ -3683,7 +3707,11 @@ _FOREGROUND_WORKSPACE_LOCK_WAIT_S = WORKSPACE_DISCOVERY_BUDGET_S + 1.0
 
 
 def _claim_foreground_workspace(
-    record: _HostDaemonRecord, server_url: str, *, workspace_id: str | None
+    record: _HostDaemonRecord,
+    server_url: str,
+    *,
+    workspace_id: str | None,
+    write_record: bool = True,
 ) -> DaemonLifecycleLock | None:
     """
     Hold the one-daemon-per-workspace lock for a foreground host.
@@ -3692,6 +3720,8 @@ def _claim_foreground_workspace(
     :param server_url: Server URL the host connects to.
     :param workspace_id: Workspace *server_url* reaches, e.g. ``"123"``, or
         ``None`` when unknown.
+    :param write_record: Whether to record *workspace_id* in this process's
+        registry record; ``False`` when another daemon owns that record.
     :returns: The held lock, or ``None`` when the workspace is unknown.
     :raises click.ClickException: If another daemon holds the workspace.
     """
@@ -3720,6 +3750,8 @@ def _claim_foreground_workspace(
             )
         # A daemon starting on another URL may yield to this host's record.
         time.sleep(0.2)
+    if not write_record:
+        return lock
     try:
         _write_daemon_record(_HostDaemonRecord(**{**asdict(record), "workspace_id": workspace_id}))
     except BaseException:
@@ -9966,7 +9998,16 @@ def host(
         server_url=server,
         host_id=_load_or_create_host_id(),
     )
-    previous = _claim_foreground_daemon_record(record)
+    slot_holder = _managed_host_slot_holder(record)
+    owns_record = slot_holder is None
+    if slot_holder is not None:
+        click.echo(
+            "A host daemon with another host id already serves this server "
+            f"({_describe_pid(slot_holder.pid)}). This managed host runs beside it "
+            "and leaves its registry record in place.",
+            err=True,
+        )
+    previous = _claim_foreground_daemon_record(record) if owns_record else None
     # Only offer to stop the local server after a clean stop (Ctrl-C / normal
     # exit). A connection failure (SystemExit) leaves this False so we don't
     # prompt over an error.
@@ -9991,7 +10032,8 @@ def host(
                 record = _HostDaemonRecord(
                     **{**asdict(record), "org_pin": _host_databricks_org_pin(server)}
                 )
-                _write_daemon_record(record)
+                if owns_record:
+                    _write_daemon_record(record)
             # A first sign-in is what records the workspace id, so check again.
             workspace_id = resolve_daemon_workspace_id(server)
             sibling = _same_workspace_daemon(
@@ -9999,7 +10041,9 @@ def host(
             )
             if sibling is not None:
                 _raise_live_daemon_conflict(record, sibling)
-            workspace_lock = _claim_foreground_workspace(record, server, workspace_id=workspace_id)
+            workspace_lock = _claim_foreground_workspace(
+                record, server, workspace_id=workspace_id, write_record=owns_record
+            )
         _maybe_open_host_web_ui(
             server,
             non_interactive=non_interactive,
@@ -10008,7 +10052,9 @@ def host(
             cfg=cfg,
         )
         run_host_process(
-            server_url=server, daemon_target=target, server_still_ours=server_still_ours
+            server_url=server,
+            daemon_target=target if owns_record else None,
+            server_still_ours=server_still_ours,
         )
         stopped_cleanly = True
     except KeyboardInterrupt:

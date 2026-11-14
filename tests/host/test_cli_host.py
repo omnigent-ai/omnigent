@@ -1931,6 +1931,79 @@ def test_foreground_host_connects_once_a_starting_daemon_yields_the_workspace(
     assert seen == ["1"]
 
 
+@pytest.mark.parametrize(
+    ("launch_token", "env_identity", "daemon_host_id", "coexists"),
+    [
+        pytest.param("launch-token", True, "b" * 32, True, id="managed-host-other-id"),
+        pytest.param("launch-token", True, "a" * 32, False, id="managed-host-same-id"),
+        pytest.param(None, True, "b" * 32, False, id="env-identity-without-launch-token"),
+        pytest.param(
+            "launch-token", False, "b" * 32, False, id="launch-token-without-env-identity"
+        ),
+    ],
+)
+def test_foreground_managed_host_runs_beside_a_daemon_of_another_host_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    launch_token: str | None,
+    env_identity: bool,
+    daemon_host_id: str,
+    coexists: bool,
+) -> None:
+    """A managed host runs beside a daemon of another host id, which keeps its record.
+
+    Only a daemon with the managed host's own id is a duplicate.
+    """
+    from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
+
+    _foreground_workspace_setup(monkeypatch, tmp_path)
+    if launch_token is None:
+        monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_HOST_TOKEN", launch_token)
+    if not env_identity:
+        monkeypatch.delenv("OMNIGENT_HOST_ID")
+        monkeypatch.delenv("OMNIGENT_HOST_NAME")
+    monkeypatch.setattr(
+        "omnigent.cli._pid_is_recorded_daemon",
+        lambda record: record.pid in {os.getpid(), _SAME_WORKSPACE_PID},
+    )
+    daemon = cli_module._HostDaemonRecord(
+        pid=_SAME_WORKSPACE_PID,
+        target=cli_module._normalize_daemon_target(_VANITY_API),
+        mode="server",
+        server_url=_VANITY_API,
+        log_path=str(tmp_path / "user-daemon.log"),
+        started_at=int(time.time()),
+        host_id=daemon_host_id,
+        workspace_id="1",
+    )
+    cli_module._write_daemon_record(daemon)
+    runs: list[object] = []
+
+    def _run(server_url: str, **kwargs: object) -> None:
+        assert cli_module._find_daemon_record(_VANITY_API) == daemon
+        own_workspace = DaemonLifecycleLock.for_workspace("a" * 32, "1", base_dir=tmp_path)
+        assert own_workspace.try_acquire() is False
+        runs.append(kwargs["daemon_target"])
+
+    with patch("omnigent.host.connect.run_host_process", _run):
+        result = CliRunner().invoke(
+            cli, ["host", "--server", _VANITY_API, "--no-open"], standalone_mode=False
+        )
+
+    assert cli_module._find_daemon_record(_VANITY_API) == daemon
+    if coexists:
+        assert result.exit_code == 0, result.exception
+        assert runs == [None]
+        assert f"pid={_SAME_WORKSPACE_PID}" in result.output
+        assert "runs beside it" in result.output
+    else:
+        assert isinstance(result.exception, click.ClickException)
+        assert "already running for this server" in result.exception.format_message()
+        assert runs == []
+
+
 def test_claim_foreground_workspace_names_the_daemon_holding_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
