@@ -68,6 +68,23 @@ persistence, not unanswered network pings; that worker is separate from the
 application keepalive loop. Diagnostic attribution never establishes harmless
 session impact or changes KPI eligibility.
 
+## Forkserver loss (`source = 'host'`)
+
+`runner_zygote_control_lost` records the first failed exchange in a forkserver
+generation. It includes `host_pid`, `zygote_pid`, `zygote_generation`,
+`zygote_state` (`running`, `exited`, or `unknown`), the observed
+`zygote_returncode`, `control_command`, `runner_pid` for poll requests, and
+`error_type`. It does not include request payloads or raw exception text.
+
+The return code belongs to the forkserver, not its runners. The host's fallback
+runner status 254 means the runner is gone and its status cannot be retrieved
+through the forkserver; it is not an observed OS exit code. A negative forkserver return
+code identifies its terminating signal, not the signal sender or an OOM cause.
+A live forkserver with failed control does not establish process death. The
+event does not close the control socket, restart the parent, or replay work.
+Correlate its host PID with host lifecycle events and obtain machine-level
+termination evidence separately.
+
 ## Runner events (`source = 'runner'`)
 
 - `runner_connected`: `connection_id`, `reconnect` (an earlier connection on
