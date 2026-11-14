@@ -118,6 +118,7 @@ async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
         "admitted",
         "failed-close",
         "timed-out-close",
+        "reactivated",
     ],
 )
 async def test_delete_session_removes_native_bridge_dir(
@@ -175,7 +176,7 @@ async def test_delete_session_removes_native_bridge_dir(
             elif owner == "admitted":
                 reader = acquire_claude_settings_request(bridge_dir, request.generation)
             request.close()
-        if owner in {"failed-close", "timed-out-close"}:
+        if owner in {"failed-close", "timed-out-close", "reactivated"}:
             private_dir = tmp_path / "terminal"
             private_dir.mkdir()
             output = private_dir / "retained-settings.json"
@@ -185,25 +186,29 @@ async def test_delete_session_removes_native_bridge_dir(
                 session_key="main",
                 private_dir=private_dir,
                 socket_path=private_dir / "tmux.sock",
-                running=True,
+                running=owner != "reactivated",
             )
             with acquire_claude_settings_request(bridge_dir, request.generation) as lease:
                 lease.attach(instance)
             request.close()
 
-            async def stop_tmux(*_args: str) -> None:
-                if owner == "failed-close":
-                    raise RuntimeError("termination unconfirmed")
-                await asyncio.Event().wait()
+            if owner != "reactivated":
 
-            monkeypatch.setattr(instance, "_tmux", stop_tmux)
-            monkeypatch.setattr(instance, "_stop_network_brokers", lambda: revoked.append(True))
-            monkeypatch.setattr("omnigent.terminals.registry._CLOSE_TIMEOUT_S", 0.02)
-            terminals = TerminalRegistry()
-            terminals._by_conversation[session_id] = {("claude", "main"): instance}
-            monkeypatch.setattr(
-                app.state.session_resource_registry, "_terminal_registry", terminals
-            )
+                async def stop_tmux(*_args: str) -> None:
+                    if owner == "failed-close":
+                        raise RuntimeError("termination unconfirmed")
+                    await asyncio.Event().wait()
+
+                monkeypatch.setattr(instance, "_tmux", stop_tmux)
+                monkeypatch.setattr(
+                    instance, "_stop_network_brokers", lambda: revoked.append(True)
+                )
+                monkeypatch.setattr("omnigent.terminals.registry._CLOSE_TIMEOUT_S", 0.02)
+                terminals = TerminalRegistry()
+                terminals._by_conversation[session_id] = {("claude", "main"): instance}
+                monkeypatch.setattr(
+                    app.state.session_resource_registry, "_terminal_registry", terminals
+                )
 
     credentials.write_bytes(credential_bytes)
     url = f"/v1/sessions/{session_id}{endpoint}"
@@ -215,13 +220,23 @@ async def test_delete_session_removes_native_bridge_dir(
             assert baseline.read_bytes() == baseline_bytes
             assert credentials.read_bytes() == credential_bytes
             if instance is not None:
-                assert instance._resource_cleanup_task is not None
-                await asyncio.wait_for(instance._resource_cleanup_task, timeout=5)
-                assert revoked == [True]
+                if owner == "reactivated":
+                    bridge_inode = bridge_dir.stat().st_ino
+                    prepare_bridge_dir(session_id, workspace=tmp_path)
+                    assert bridge_dir.stat().st_ino == bridge_inode
+                    assert baseline.read_bytes() == baseline_bytes
+                    assert credentials.read_bytes() == credential_bytes
+                    assert (await client.delete(url)).status_code == 200
+                else:
+                    assert instance._resource_cleanup_task is not None
+                    await asyncio.wait_for(instance._resource_cleanup_task, timeout=5)
+                    assert revoked == [True]
                 assert output.exists()
                 monkeypatch.setattr(instance, "_tmux", AsyncMock())
                 await instance.close()
                 assert not output.exists()
+                if owner == "reactivated":
+                    assert not list(bridge_dir.glob("claude-settings-*.terminal-*.owner"))
             if reader is not None:
                 reader.close()
             request.close()

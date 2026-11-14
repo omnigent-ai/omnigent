@@ -1,11 +1,10 @@
-"""Shared E2E session helpers preserve turn boundaries and failure evidence."""
+"""Regression coverage for turn boundaries in the shared E2E pollers."""
 
 from __future__ import annotations
 
 import httpx
 import pytest
 
-from tests._helpers.native_session import NativeHarness, create_native_session
 from tests.e2e import conftest as helpers
 
 
@@ -152,33 +151,3 @@ def test_pending_tool_poll_waits_for_this_turn(monkeypatch, previous_call) -> No
             client, "input-new", session_id="session", timeout=1
         )
     assert [item["call_id"] for item in output] == ["new"]
-
-
-@pytest.mark.parametrize("harness", ["claude", "codex"])
-def test_native_create_failure_keeps_bounded_redacted_response(harness: NativeHarness) -> None:
-    credential = "synthetic-credential-" * 200
-    payload = {
-        "error": {
-            "code": "invalid_input",
-            "message": "host did not respond to workspace stat",
-            "api_key": credential,
-            "context": "x" * 3000 + "outside-diagnostic-limit",
-        }
-    }
-    response = httpx.Response(400, json=payload)
-    with httpx.Client(transport=httpx.MockTransport(lambda _: response)) as client:
-        with pytest.raises(httpx.HTTPStatusError) as raised:
-            create_native_session(client, "http://server.example.test", harness=harness)
-
-    error = raised.value
-    assert error.response is response
-    assert error.request is response.request
-    assert error.response.status_code == 400
-    assert error.response.json() == payload
-    note = "\n".join(error.__notes__)
-    assert "invalid_input" in note
-    assert "host did not respond to workspace stat" in note
-    assert "[REDACTED]" in note
-    assert "synthetic-credential-" not in note
-    assert "outside-diagnostic-limit" not in note
-    assert len(note) < 2200

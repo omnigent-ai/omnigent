@@ -1947,7 +1947,7 @@ def prepare_bridge_dir(
     bridge_dir = bridge_dir_for_bridge_id(resolved_bridge_id)
     with native_bridge_common.bridge_dir_preparation_lock(bridge_dir):
         _ensure_secure_dir(bridge_dir)
-        prepare_claude_settings_lifecycle(bridge_dir, reactivate=True)
+        prepare_claude_settings_lifecycle(bridge_dir, reactivate=True, session_id=conversation_id)
         # A parked permission hook only touches files in this root, so the runner
         # owns creating and validating it before any hook can fire. Derived from the
         # bridge dir just validated rather than read from the module global, so it
@@ -2418,7 +2418,7 @@ def write_active_session_id(bridge_dir: Path, session_id: str) -> None:
         if not config:
             raise RuntimeError(f"bridge config missing: {bridge_dir / _CONFIG_FILE}")
         if (config.get("active_session_id") or config.get("conversation_id")) != session_id:
-            prepare_claude_settings_lifecycle(bridge_dir, reactivate=True)
+            prepare_claude_settings_lifecycle(bridge_dir, reactivate=True, session_id=session_id)
         config["active_session_id"] = session_id
         config["conversation_id"] = session_id
         config["updated_at"] = time.time()

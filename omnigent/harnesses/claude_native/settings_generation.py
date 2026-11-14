@@ -11,7 +11,7 @@ import secrets
 import shutil
 import stat
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -44,6 +44,13 @@ class ClaudeSettingsRequestExpired(ValueError):
 class _ClaudeSettingsLifecycle:
     incarnation: str
     delete_for_session: str | None = None
+    admission_epoch: str | None = None
+    session_id: str | None = None
+    bridge_identity: tuple[int, int] | None = None
+
+    @property
+    def epoch(self) -> str:
+        return self.admission_epoch or self.incarnation
 
 
 def _read_lifecycle(bridge_dir: Path) -> _ClaudeSettingsLifecycle | None:
@@ -55,11 +62,15 @@ def _read_lifecycle(bridge_dir: Path) -> _ClaudeSettingsLifecycle | None:
         return None
     except ValueError as exc:
         raise ValueError("Claude settings lifecycle metadata is invalid") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Claude settings lifecycle metadata is invalid")
+    fields = {"schema", "incarnation", "delete_for_session"}
+    if payload.get("schema") == 2:
+        fields |= {"admission_epoch", "session_id", "bridge_identity"}
     if (
-        not isinstance(payload, dict)
-        or set(payload) - {"schema", "incarnation", "delete_for_session"}
+        set(payload) - fields
         or type(payload.get("schema")) is not int
-        or payload["schema"] != 1
+        or payload["schema"] not in {1, 2}
         or not isinstance(payload.get("incarnation"), str)
         or not _GENERATION.fullmatch(payload["incarnation"])
         or (
@@ -71,31 +82,121 @@ def _read_lifecycle(bridge_dir: Path) -> _ClaudeSettingsLifecycle | None:
         )
     ):
         raise ValueError("Claude settings lifecycle metadata is invalid")
-    return _ClaudeSettingsLifecycle(payload["incarnation"], payload.get("delete_for_session"))
+    if payload["schema"] == 1:
+        # Legacy request locks bind directly to the ownership incarnation.
+        return _ClaudeSettingsLifecycle(payload["incarnation"], payload.get("delete_for_session"))
+    identity = payload.get("bridge_identity")
+    if (
+        not isinstance(payload.get("admission_epoch"), str)
+        or not _GENERATION.fullmatch(payload["admission_epoch"])
+        or "session_id" not in payload
+        or (
+            payload["session_id"] is not None
+            and (not isinstance(payload["session_id"], str) or not payload["session_id"])
+        )
+        or not isinstance(identity, list)
+        or len(identity) != 2
+        or any(type(value) is not int or value < 0 for value in identity)
+        or identity[1] == 0
+    ):
+        raise ValueError("Claude settings lifecycle metadata is invalid")
+    return _ClaudeSettingsLifecycle(
+        payload["incarnation"],
+        payload.get("delete_for_session"),
+        payload["admission_epoch"],
+        payload["session_id"],
+        (identity[0], identity[1]),
+    )
 
 
 def _write_lifecycle(bridge_dir: Path, lifecycle: _ClaudeSettingsLifecycle) -> None:
     from omnigent.harnesses.claude_native.bridge import _write_json_file
 
     payload: dict[str, object] = {"schema": 1, "incarnation": lifecycle.incarnation}
+    if lifecycle.admission_epoch is not None:
+        assert lifecycle.bridge_identity is not None
+        payload.update(
+            schema=2,
+            admission_epoch=lifecycle.admission_epoch,
+            session_id=lifecycle.session_id,
+            bridge_identity=list(lifecycle.bridge_identity),
+        )
     if lifecycle.delete_for_session is not None:
         payload["delete_for_session"] = lifecycle.delete_for_session
     _write_json_file(bridge_dir / _LIFECYCLE_FILE, payload)
 
 
-def prepare_claude_settings_lifecycle(bridge_dir: Path, *, reactivate: bool = False) -> str:
-    """Initialize identity under the bridge lock; activation supersedes pending deletion."""
+def _directory_identity(bridge_dir: Path) -> tuple[int, int]:
+    info = bridge_dir.stat(follow_symlinks=False)
+    if not stat.S_ISDIR(info.st_mode):
+        raise ValueError("Claude settings ownership requires a bridge directory")
+    return info.st_dev, info.st_ino
+
+
+def _bridge_session_id(bridge_dir: Path) -> str | None:
+    from omnigent.harnesses.claude_native.bridge import _read_caller_settings
+
+    try:
+        config = json.loads(_read_caller_settings(bridge_dir / "bridge.json", nofollow=True))
+    except FileNotFoundError:
+        return None
+    if not isinstance(config, dict):
+        raise ValueError("Claude bridge session metadata is invalid")
+    active = config.get("active_session_id")
+    if active is None:
+        active = config.get("conversation_id")
+    return active if isinstance(active, str) and active else None
+
+
+def _lifecycle_matches_bridge(bridge_dir: Path, lifecycle: _ClaudeSettingsLifecycle) -> bool:
+    return (
+        lifecycle.bridge_identity is None
+        or lifecycle.bridge_identity == _directory_identity(bridge_dir)
+    ) and (lifecycle.session_id is None or lifecycle.session_id == _bridge_session_id(bridge_dir))
+
+
+def prepare_claude_settings_lifecycle(
+    bridge_dir: Path, *, reactivate: bool = False, session_id: str | None = None
+) -> str:
+    """Keep verified same-session owners while a new epoch expires old admissions."""
     lifecycle = _read_lifecycle(bridge_dir)
-    if lifecycle is None or (reactivate and lifecycle.delete_for_session is not None):
-        lifecycle = _ClaudeSettingsLifecycle(secrets.token_hex(16))
+    identity = _directory_identity(bridge_dir)
+    same_session = (
+        lifecycle is not None
+        and lifecycle.admission_epoch is not None
+        and session_id is not None
+        and lifecycle.session_id == session_id
+        and lifecycle.bridge_identity == identity
+        and _bridge_session_id(bridge_dir) == session_id
+    )
+    if lifecycle is None or (reactivate and not same_session):
+        incarnation = secrets.token_hex(16)
+        lifecycle = _ClaudeSettingsLifecycle(
+            incarnation,
+            admission_epoch=incarnation,
+            session_id=session_id,
+            bridge_identity=identity,
+        )
+        _write_lifecycle(bridge_dir, lifecycle)
+    elif reactivate and lifecycle.delete_for_session is not None:
+        lifecycle = replace(
+            lifecycle, admission_epoch=secrets.token_hex(16), delete_for_session=None
+        )
         _write_lifecycle(bridge_dir, lifecycle)
     return lifecycle.incarnation
 
 
-def _require_incarnation(bridge_dir: Path, incarnation: str) -> None:
+def _require_incarnation(
+    bridge_dir: Path, incarnation: str, *, admission_epoch: str | None = None
+) -> _ClaudeSettingsLifecycle:
     lifecycle = _read_lifecycle(bridge_dir)
-    if lifecycle is None or lifecycle.incarnation != incarnation:
+    if (
+        lifecycle is None
+        or lifecycle.incarnation != incarnation
+        or (admission_epoch is not None and lifecycle.epoch != admission_epoch)
+    ):
         raise ClaudeSettingsRequestExpired()
+    return lifecycle
 
 
 def _session_matches(bridge_dir: Path, session_id: str) -> bool:
@@ -111,12 +212,14 @@ def _session_matches(bridge_dir: Path, session_id: str) -> bool:
     return active is None or active == session_id
 
 
-def _complete_bridge_deletion(bridge_dir: Path, incarnation: str) -> None:
+def _complete_bridge_deletion(bridge_dir: Path, incarnation: str, *, admission_epoch: str) -> None:
     """Complete only the current intent while the caller holds the stable bridge lock."""
     lifecycle = _read_lifecycle(bridge_dir)
     if (
         lifecycle is None
         or lifecycle.incarnation != incarnation
+        or lifecycle.epoch != admission_epoch
+        or not _lifecycle_matches_bridge(bridge_dir, lifecycle)
         or lifecycle.delete_for_session is None
         or not _session_matches(bridge_dir, lifecycle.delete_for_session)
         or has_live_claude_settings_owners(bridge_dir)
@@ -134,8 +237,9 @@ def request_claude_bridge_deletion(bridge_dir: Path, session_id: str) -> None:
             if not _session_matches(bridge_dir, session_id):
                 return
             incarnation = prepare_claude_settings_lifecycle(bridge_dir)
-            _write_lifecycle(bridge_dir, _ClaudeSettingsLifecycle(incarnation, session_id))
-            _complete_bridge_deletion(bridge_dir, incarnation)
+            lifecycle = _require_incarnation(bridge_dir, incarnation)
+            _write_lifecycle(bridge_dir, replace(lifecycle, delete_for_session=session_id))
+            _complete_bridge_deletion(bridge_dir, incarnation, admission_epoch=lifecycle.epoch)
         except ValueError:
             _logger.warning("Claude bridge deletion metadata is invalid", exc_info=True)
 
@@ -161,6 +265,29 @@ def _open_lock(path: Path, *, create: bool = False) -> int:
         os.close(fd)
         raise
     return fd
+
+
+def _open_bridge(bridge_dir: Path) -> int:
+    return os.open(
+        bridge_dir,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+
+
+def _fd_identity(fd: int) -> tuple[int, int]:
+    info = os.fstat(fd)
+    return info.st_dev, info.st_ino
+
+
+def _file_matches_fd(path: Path, fd: int) -> bool:
+    try:
+        info = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return stat.S_ISREG(info.st_mode) and (info.st_dev, info.st_ino) == _fd_identity(fd)
 
 
 def _release(fd: int | None) -> None:
@@ -287,25 +414,78 @@ class ClaudeSettingsLease:
     _fd: int | None
     _incarnation: str
     _terminal_claim: Path | None = None
+    _admission_epoch: str | None = None
+    _bridge_fd: int | None = None
+    _claim_fd: int | None = None
+    _session_id: str | None = None
+
+    def _identity_matches(
+        self, lifecycle: _ClaudeSettingsLifecycle, *, lease_fd: int | None = None
+    ) -> bool:
+        lease_fd = self._fd if lease_fd is None else lease_fd
+        if (
+            self._bridge_fd is None
+            or _fd_identity(self._bridge_fd) != _directory_identity(self.bridge_dir)
+            or lifecycle.session_id != self._session_id
+            or not _lifecycle_matches_bridge(self.bridge_dir, lifecycle)
+            or lease_fd is None
+            or not _file_matches_fd(
+                settings_generation_path(self.bridge_dir, self.generation).with_suffix(
+                    ".lease.lock"
+                ),
+                lease_fd,
+            )
+        ):
+            return False
+        if self._terminal_claim is not None:
+            if self._claim_fd is None or not _file_matches_fd(
+                self._terminal_claim, self._claim_fd
+            ):
+                return False
+        return True
+
+    def _require_current(self) -> _ClaudeSettingsLifecycle:
+        lifecycle = _require_incarnation(
+            self.bridge_dir,
+            self._incarnation,
+            admission_epoch=self._admission_epoch or self._incarnation,
+        )
+        if not self._identity_matches(lifecycle):
+            raise ClaudeSettingsRequestExpired()
+        return lifecycle
 
     def attach(self, instance: TerminalInstance) -> None:
         """Retain inputs until confirmed terminal termination, including after transfer."""
         with bridge_dir_preparation_lock(self.bridge_dir):
             if self._fd is None:
                 raise ValueError("Claude settings request ownership has ended")
-            _require_incarnation(self.bridge_dir, self._incarnation)
+            self._require_current()
             path = settings_generation_path(self.bridge_dir, self.generation)
             fd = _open_lock(path.with_suffix(".lease.lock"))
             claim = path.with_suffix(f".terminal-{secrets.token_hex(16)}.owner")
+            bridge_fd: int | None = None
+            claim_fd: int | None = None
             try:
                 assert fcntl is not None
                 fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                _release(_open_lock(claim, create=True))
+                assert self._bridge_fd is not None
+                bridge_fd = os.dup(self._bridge_fd)
+                claim_fd = _open_lock(claim, create=True)
             except BaseException:
                 _release(fd)
+                _release(bridge_fd)
+                _release(claim_fd)
                 raise
         retained = ClaudeSettingsLease(
-            self.bridge_dir, self.generation, fd, self._incarnation, claim
+            self.bridge_dir,
+            self.generation,
+            fd,
+            self._incarnation,
+            claim,
+            _admission_epoch=self._admission_epoch,
+            _bridge_fd=bridge_fd,
+            _claim_fd=claim_fd,
+            _session_id=self._session_id,
         )
         try:
             instance.add_resource_cleanup(retained.close)
@@ -323,17 +503,34 @@ class ClaudeSettingsLease:
                 lifecycle = _read_lifecycle(self.bridge_dir)
                 if lifecycle is None or lifecycle.incarnation != self._incarnation:
                     return
+                if not self._identity_matches(lifecycle, lease_fd=fd):
+                    return
+                same_epoch = lifecycle.epoch == (self._admission_epoch or self._incarnation)
+                if not same_epoch and (
+                    lifecycle.session_id is None or lifecycle.bridge_identity is None
+                ):
+                    return
                 if self._terminal_claim is not None:
                     self._terminal_claim.unlink(missing_ok=True)
                     self._terminal_claim = None
                 _release(fd)
                 fd = None
-                _retire_unused(self.bridge_dir, self.generation)
-                _complete_bridge_deletion(self.bridge_dir, self._incarnation)
+                # Expired admissions may release claims without retiring their operand generation.
+                if same_epoch:
+                    _retire_unused(self.bridge_dir, self.generation)
+                _complete_bridge_deletion(
+                    self.bridge_dir,
+                    self._incarnation,
+                    admission_epoch=lifecycle.epoch,
+                )
         except (OSError, ValueError):
             _logger.warning("Claude settings resource cleanup failed", exc_info=True)
         finally:
             _release(fd)
+            _release(self._bridge_fd)
+            self._bridge_fd = None
+            _release(self._claim_fd)
+            self._claim_fd = None
 
     def __enter__(self) -> ClaudeSettingsLease:
         return self
@@ -360,13 +557,13 @@ class ClaudeSettingsRequest:
     def mark_dispatched(self) -> None:
         """Retain exposed operands until the actual receiver acknowledges admission."""
         with bridge_dir_preparation_lock(self.bridge_dir):
-            _require_incarnation(self.bridge_dir, self._lease._incarnation)
+            self._lease._require_current()
             baseline = self.settings_path(self.bridge_dir)
             _release(_open_lock(baseline.with_suffix(".dispatch.owner"), create=True))
 
     def _clear_dispatch(self) -> None:
         with bridge_dir_preparation_lock(self.bridge_dir):
-            _require_incarnation(self.bridge_dir, self._lease._incarnation)
+            self._lease._require_current()
             baseline = self.settings_path(self.bridge_dir)
             baseline.with_suffix(".dispatch.owner").unlink(missing_ok=True)
 
@@ -388,30 +585,44 @@ class ClaudeSettingsRequest:
 
         request_fd: int | None = None
         lease_fd: int | None = None
+        bridge_fd: int | None = None
         with bridge_dir_preparation_lock(bridge_dir):
             _ensure_secure_dir(bridge_dir)
             incarnation = prepare_claude_settings_lifecycle(bridge_dir)
+            lifecycle = _require_incarnation(bridge_dir, incarnation)
+            if not _lifecycle_matches_bridge(bridge_dir, lifecycle):
+                raise ClaudeSettingsRequestExpired()
             _prune_unused(bridge_dir)
             generation = secrets.token_hex(16)
             baseline = settings_generation_path(bridge_dir, generation)
             try:
+                bridge_fd = _open_bridge(bridge_dir)
                 request_fd = _open_lock(baseline.with_suffix(".request.lock"), create=True)
                 lease_fd = _open_lock(baseline.with_suffix(".lease.lock"), create=True)
                 assert fcntl is not None
                 fcntl.flock(request_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 fcntl.flock(lease_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                if os.write(request_fd, incarnation.encode("ascii")) != 32:
+                if os.write(request_fd, lifecycle.epoch.encode("ascii")) != 32:
                     raise OSError("Claude settings request binding was not fully written")
             except BaseException:
                 _release(request_fd)
                 _release(lease_fd)
+                _release(bridge_fd)
                 _retire_unused(bridge_dir, generation)
                 raise
         return cls(
             bridge_dir,
             generation,
             request_fd,
-            ClaudeSettingsLease(bridge_dir, generation, lease_fd, incarnation),
+            ClaudeSettingsLease(
+                bridge_dir,
+                generation,
+                lease_fd,
+                incarnation,
+                _admission_epoch=lifecycle.epoch,
+                _bridge_fd=bridge_fd,
+                _session_id=lifecycle.session_id,
+            ),
         )
 
     def close(self) -> None:
@@ -439,20 +650,32 @@ def acquire_claude_settings_request(bridge_dir: Path, generation: str) -> Claude
     baseline = settings_generation_path(bridge_dir, generation)
     with bridge_dir_preparation_lock(bridge_dir):
         lifecycle = _read_lifecycle(bridge_dir)
-        if lifecycle is None:
+        if lifecycle is None or not _lifecycle_matches_bridge(bridge_dir, lifecycle):
             raise ClaudeSettingsRequestExpired()
-        live, incarnation = _live_request_incarnation(baseline.with_suffix(".request.lock"))
+        live, admission_epoch = _live_request_incarnation(baseline.with_suffix(".request.lock"))
         if not live or not baseline.is_file():
             _retire_unused(bridge_dir, generation)
             raise ClaudeSettingsRequestExpired()
-        if incarnation is None or incarnation != lifecycle.incarnation:
+        if admission_epoch is None or admission_epoch != lifecycle.epoch:
             raise ClaudeSettingsRequestExpired()
-        fd = _open_lock(baseline.with_suffix(".lease.lock"))
+        fd: int | None = None
+        bridge_fd: int | None = None
         try:
+            bridge_fd = _open_bridge(bridge_dir)
+            fd = _open_lock(baseline.with_suffix(".lease.lock"))
             assert fcntl is not None
             fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
             baseline.with_suffix(".dispatch.owner").unlink(missing_ok=True)
         except BaseException:
             _release(fd)
+            _release(bridge_fd)
             raise
-    return ClaudeSettingsLease(bridge_dir, generation, fd, incarnation)
+    return ClaudeSettingsLease(
+        bridge_dir,
+        generation,
+        fd,
+        lifecycle.incarnation,
+        _admission_epoch=admission_epoch,
+        _bridge_fd=bridge_fd,
+        _session_id=lifecycle.session_id,
+    )

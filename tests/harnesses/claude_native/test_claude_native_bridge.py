@@ -22,7 +22,7 @@ import time
 import unicodedata
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import AsyncExitStack, contextmanager, suppress
+from contextlib import AsyncExitStack, ExitStack, contextmanager, suppress
 from contextvars import ContextVar
 from http.client import BadStatusLine, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -326,7 +326,8 @@ def test_prepare_bridge_dir_preserves_token_and_updates_runtime(
         assert pending["delete_for_session"] == "conv_abc"
         prepare_bridge_dir("conv_abc", workspace=tmp_path)
         reactivated = lifecycle_path.read_bytes()
-        assert json.loads(reactivated)["incarnation"] != pending["incarnation"]
+        assert json.loads(reactivated)["incarnation"] == pending["incarnation"]
+        assert json.loads(reactivated)["admission_epoch"] != pending["admission_epoch"]
         assert "delete_for_session" not in json.loads(reactivated)
         assert json.loads((first / "bridge.json").read_text())["token"] == first_config["token"]
         with pytest.raises(ValueError, match="expired"):
@@ -5723,13 +5724,19 @@ async def test_caller_settings_writes_drain_before_cancelled_launch_cleanup(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reactivate", "delete_again"),
+    [(False, False), (True, True), (True, False)],
+    ids=["current", "reactivated", "reactivated-active"],
+)
 @pytest.mark.parametrize("last_owner", ["request", "terminal"])
 async def test_claude_bridge_deletion_waits_for_every_settings_owner(
-    tmp_path: Path, last_owner: str
+    tmp_path: Path, last_owner: str, reactivate: bool, delete_again: bool
 ) -> None:
     from omnigent.harnesses.claude_native.settings_generation import (
         ClaudeSettingsRequest,
         acquire_claude_settings_request,
+        prune_unused_claude_settings,
         request_claude_bridge_deletion,
     )
     from omnigent.inner.terminal import TerminalInstance
@@ -5753,9 +5760,49 @@ async def test_claude_bridge_deletion_waits_for_every_settings_owner(
     )
     lease = acquire_claude_settings_request(bridge_dir, first.generation)
     lease.attach(instance)
+    claim = next(bridge_dir.glob(f"claude-settings-{first.generation}.terminal-*.owner"))
+    bridge_inode = bridge_dir.stat().st_ino
+    claim_inode = claim.stat().st_ino
+    lifecycle_path = bridge_dir / ".claude-settings-lifecycle.json"
+    original_lifecycle = json.loads(lifecycle_path.read_text())
     config_bytes = (bridge_dir / "bridge.json").read_bytes()
     try:
         request_claude_bridge_deletion(bridge_dir, "conv_owned")
+        if reactivate:
+            assert first._request_fd is not None
+            binding = os.pread(first._request_fd, 33, 0)
+            assert len(binding) == 32
+            assert binding.decode() == original_lifecycle.get(
+                "admission_epoch", original_lifecycle["incarnation"]
+            )
+            prepare_bridge_dir("conv_owned", workspace=tmp_path)
+            reactivated = json.loads(lifecycle_path.read_text())
+            assert bridge_dir.stat().st_ino == bridge_inode
+            assert claim.stat().st_ino == claim_inode
+            assert os.pread(first._request_fd, 33, 0) == binding
+            with pytest.raises(ValueError, match="expired"):
+                acquire_claude_settings_request(bridge_dir, first.generation)
+            with pytest.raises(ValueError, match="expired"):
+                first.mark_dispatched()
+            with pytest.raises(ValueError, match="expired"):
+                first.acknowledge(first.generation)
+            with pytest.raises(ValueError, match="expired"):
+                lease.attach(instance)
+            with ClaudeSettingsRequest.create(bridge_dir) as current:
+                augment_claude_args(
+                    (), bridge_dir=bridge_dir, defer_caller_settings=True, settings_request=current
+                )
+                assert current._request_fd is not None
+                assert (
+                    os.pread(current._request_fd, 33, 0).decode() == reactivated["admission_epoch"]
+                )
+                current.mark_dispatched()
+                with acquire_claude_settings_request(bridge_dir, current.generation):
+                    pass
+                assert current.acknowledge(current.generation)
+            if delete_again:
+                request_claude_bridge_deletion(bridge_dir, "conv_owned")
+            config_bytes = (bridge_dir / "bridge.json").read_bytes()
         first.close()
         assert [path.read_bytes() for path in baselines] == baseline_bytes
         lease.close()
@@ -5763,17 +5810,32 @@ async def test_claude_bridge_deletion_waits_for_every_settings_owner(
         if last_owner == "terminal":
             second.close()
             assert baselines[0].read_bytes() == baseline_bytes[0]
-            assert not baselines[1].exists()
+            if reactivate:
+                assert baselines[1].read_bytes() == baseline_bytes[1]
+            else:
+                assert not baselines[1].exists()
         else:
             await instance.close()
-            assert not baselines[0].exists()
+            assert not claim.exists()
+            if reactivate:
+                assert baselines[0].read_bytes() == baseline_bytes[0]
+            else:
+                assert not baselines[0].exists()
             assert baselines[1].read_bytes() == baseline_bytes[1]
         assert (bridge_dir / "bridge.json").read_bytes() == config_bytes
         if last_owner == "terminal":
             await instance.close()
         else:
             second.close()
+        assert not claim.exists()
+        if reactivate and not delete_again:
+            assert [path.read_bytes() for path in baselines] == baseline_bytes
+            assert prune_unused_claude_settings(bridge_dir) == 2
+            request_claude_bridge_deletion(bridge_dir, "conv_owned")
         assert not bridge_dir.exists()
+        if reactivate:
+            assert reactivated["incarnation"] == original_lifecycle["incarnation"]
+            assert reactivated["admission_epoch"] != binding.decode()
         assert (bridge_dir.parent / ".locks" / f"{bridge_dir.name}.lock").exists()
         request_claude_bridge_deletion(bridge_dir, "conv_owned")
         assert not bridge_dir.exists()
@@ -5784,8 +5846,9 @@ async def test_claude_bridge_deletion_waits_for_every_settings_owner(
         await instance.close()
 
 
+@pytest.mark.parametrize("owner", ["admission", "terminal"])
 def test_stale_claude_settings_release_cannot_mutate_recreated_bridge(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owner: str
 ) -> None:
     from omnigent.harnesses.claude_native import settings_generation
     from omnigent.harnesses.claude_native.settings_generation import (
@@ -5802,6 +5865,12 @@ def test_stale_claude_settings_release_cannot_mutate_recreated_bridge(
     )
     old_baseline = old.settings_path(bridge_dir)
     lease = acquire_claude_settings_request(bridge_dir, old.generation)
+    reader = lease
+    if owner == "terminal":
+        callbacks = []
+        lease.attach(SimpleNamespace(add_resource_cleanup=callbacks.append))
+        lease = callbacks[0].__self__
+        reader.close()
     old.close()
     saved_fd = lease._fd
     assert saved_fd is not None
@@ -5844,6 +5913,9 @@ def test_stale_claude_settings_release_cannot_mutate_recreated_bridge(
                 assert fd is not None
                 os.close(fd)
                 setattr(resource, attribute, None)
+            if replacement._lease._bridge_fd is not None:
+                os.close(replacement._lease._bridge_fd)
+                replacement._lease._bridge_fd = None
             # Matching old-generation paths expose mutation before a final rmtree guard.
             for path in (
                 old_baseline,
@@ -5852,7 +5924,9 @@ def test_stale_claude_settings_release_cannot_mutate_recreated_bridge(
                 old_baseline.with_suffix(".lease.lock"),
             ):
                 path.write_text("replacement-owned")
-            assert not has_live_claude_settings_owners(bridge_dir)
+            if lease._terminal_claim is not None:
+                lease._terminal_claim.write_text("replacement-owned")
+            assert has_live_claude_settings_owners(bridge_dir) == (owner == "terminal")
             snapshot = {path.name: path.read_bytes() for path in bridge_dir.iterdir()}
             lock_inode = (bridge_dir.parent / ".locks" / f"{bridge_dir.name}.lock").stat().st_ino
             resume.set()
@@ -5862,6 +5936,8 @@ def test_stale_claude_settings_release_cannot_mutate_recreated_bridge(
             assert closed.value.errno == errno.EBADF
             assert {path.name: path.read_bytes() for path in bridge_dir.iterdir()} == snapshot
             lease.close()
+            if lease._terminal_claim is not None:
+                lease._terminal_claim.unlink()
             request_claude_bridge_deletion(bridge_dir, "conv_new")
             assert not bridge_dir.exists()
             assert (
@@ -5874,6 +5950,7 @@ def test_stale_claude_settings_release_cannot_mutate_recreated_bridge(
                 replacement.close()
             old.close()
             lease.close()
+            reader.close()
 
 
 @pytest.mark.parametrize("deletion_owner", ["unowned", "last-release"])
@@ -5946,7 +6023,7 @@ def test_claude_bridge_preparation_waits_for_final_deletion(
 
 @pytest.mark.parametrize(
     "binding",
-    [None, b"", b"g" * 32, b"0" * 31, b"0" * 33, b"0" * 32],
+    [None, b"", b"g" * 32, b"0" * 31, b"0" * 33, b"0" * 32, "legacy-bound"],
     ids=[
         "legacy-no-lifecycle",
         "legacy-empty",
@@ -5954,10 +6031,11 @@ def test_claude_bridge_preparation_waits_for_final_deletion(
         "short",
         "long",
         "different-incarnation",
+        "legacy-bound",
     ],
 )
 def test_claude_settings_admission_preserves_unbound_live_requests(
-    tmp_path: Path, binding: bytes | None
+    tmp_path: Path, binding: bytes | str | None
 ) -> None:
     from omnigent.harnesses.claude_native.settings_generation import (
         ClaudeSettingsRequest,
@@ -5969,12 +6047,22 @@ def test_claude_settings_admission_preserves_unbound_live_requests(
         augment_claude_args(
             (), bridge_dir=bridge_dir, defer_caller_settings=True, settings_request=request
         )
+        if binding == "legacy-bound":
+            lifecycle_path = bridge_dir / ".claude-settings-lifecycle.json"
+            incarnation = json.loads(lifecycle_path.read_text())["incarnation"]
+            lifecycle_path.write_text(json.dumps({"schema": 1, "incarnation": incarnation}))
+            snapshot = {path.name: path.read_bytes() for path in bridge_dir.iterdir()}
+            with acquire_claude_settings_request(bridge_dir, request.generation):
+                pass
+            assert {path.name: path.read_bytes() for path in bridge_dir.iterdir()} == snapshot
+            return
         request.mark_dispatched()
         assert request._request_fd is not None
         os.ftruncate(request._request_fd, 0)
         if binding is None:
             (bridge_dir / ".claude-settings-lifecycle.json").unlink()
         else:
+            assert isinstance(binding, bytes)
             os.pwrite(request._request_fd, binding, 0)
         snapshot = {path.name: path.read_bytes() for path in bridge_dir.iterdir()}
         with pytest.raises(ValueError, match="expired"):
@@ -6067,10 +6155,18 @@ def test_claude_bridge_deletion_preserves_standalone_settings_owners(
         "malformed",
         "wrong-schema",
         "bad-incarnation",
+        "bad-admission-epoch",
         "different-incarnation",
         "unknown-field",
         "removed-bridge",
         "claim-unlink-failure",
+        "changed-session",
+        "claim-replaced",
+        "claim-symlink",
+        "lease-replaced",
+        "changed-bridge-identity",
+        "legacy-reactivated",
+        "unknown-session-reactivated",
     ],
 )
 async def test_claude_settings_close_preserves_uncertain_bridge_state(
@@ -6080,6 +6176,7 @@ async def test_claude_settings_close_preserves_uncertain_bridge_state(
         ClaudeSettingsRequest,
         acquire_claude_settings_request,
         request_claude_bridge_deletion,
+        settings_generation_path,
     )
     from omnigent.inner.terminal import TerminalInstance
 
@@ -6103,6 +6200,8 @@ async def test_claude_settings_close_preserves_uncertain_bridge_state(
     retained = cleanup.call_args.args[0].__self__
     saved_fd = retained._fd
     assert saved_fd is not None
+    saved_fds = [saved_fd, retained._bridge_fd, retained._claim_fd]
+    assert all(fd is not None for fd in saved_fds)
     request.close()
     request_claude_bridge_deletion(bridge_dir, "conv_state")
     lifecycle_path = bridge_dir / ".claude-settings-lifecycle.json"
@@ -6113,6 +6212,40 @@ async def test_claude_settings_close_preserves_uncertain_bridge_state(
         lifecycle_path.write_text("{")
     elif state == "removed-bridge":
         shutil.rmtree(bridge_dir)
+    elif state == "changed-session":
+        config_path = bridge_dir / "bridge.json"
+        config = json.loads(config_path.read_text())
+        config["active_session_id"] = "conv_other"
+        config["conversation_id"] = "conv_other"
+        config_path.write_text(json.dumps(config))
+    elif state in {"legacy-reactivated", "unknown-session-reactivated"}:
+        if state == "legacy-reactivated":
+            lifecycle_path.write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "incarnation": lifecycle["incarnation"],
+                        "delete_for_session": "conv_state",
+                    }
+                )
+            )
+        else:
+            (bridge_dir / "bridge.json").unlink()
+        prepare_bridge_dir("conv_state", workspace=tmp_path)
+    elif state in {"claim-replaced", "claim-symlink"}:
+        claim = retained._terminal_claim
+        assert claim is not None
+        claim.rename(tmp_path / "original-claim")
+        if state == "claim-replaced":
+            claim.write_text("replacement-owned")
+        else:
+            claim.symlink_to(tmp_path / "original-claim")
+    elif state == "lease-replaced":
+        lock_path = settings_generation_path(bridge_dir, request.generation).with_suffix(
+            ".lease.lock"
+        )
+        lock_path.rename(tmp_path / "original-lease")
+        lock_path.write_text("replacement-owned")
     elif state == "claim-unlink-failure":
         unlink = Path.unlink
 
@@ -6127,8 +6260,12 @@ async def test_claude_settings_close_preserves_uncertain_bridge_state(
             lifecycle["schema"] = True
         elif state == "bad-incarnation":
             lifecycle["incarnation"] = "invalid"
+        elif state == "bad-admission-epoch":
+            lifecycle["admission_epoch"] = "invalid"
         elif state == "different-incarnation":
             lifecycle["incarnation"] = "0" * 32
+        elif state == "changed-bridge-identity":
+            lifecycle["bridge_identity"] = [0, 1]
         else:
             lifecycle["unknown"] = True
         lifecycle_path.write_text(json.dumps(lifecycle))
@@ -6142,9 +6279,11 @@ async def test_claude_settings_close_preserves_uncertain_bridge_state(
             with pytest.raises(ValueError):
                 retained.attach(instance)
         await instance.close()
-        with pytest.raises(OSError) as closed:
-            os.fstat(saved_fd)
-        assert closed.value.errno == errno.EBADF
+        for fd in saved_fds:
+            assert fd is not None
+            with pytest.raises(OSError) as closed:
+                os.fstat(fd)
+            assert closed.value.errno == errno.EBADF
         await instance.close()
         if snapshot is None:
             assert not bridge_dir.exists()
@@ -6173,7 +6312,7 @@ def test_claude_bridge_deletion_io_failure_releases_settings_fds(
     augment_claude_args(
         (), bridge_dir=bridge_dir, defer_caller_settings=True, settings_request=request
     )
-    fds = [request._request_fd, request._lease._fd]
+    fds = [request._request_fd, request._lease._fd, request._lease._bridge_fd]
     config_bytes = (bridge_dir / "bridge.json").read_bytes()
     if failure == "intent-write":
         original_writer = claude_native_bridge._write_json_file
@@ -17675,8 +17814,9 @@ async def test_late_no_policy_allow_cannot_reopen_window_after_sys_add_policy(
     ["write_active_session_id", "prepare_bridge_dir"],
     ids=["rotation", "re_preparation"],
 )
+@pytest.mark.parametrize("pending_deletion", [False, True], ids=["active", "deleting"])
 def test_active_session_switch_closes_allow_window(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, switch: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, switch: str, pending_deletion: bool
 ) -> None:
     """Every path that changes the bridge's session closes its window.
 
@@ -17685,6 +17825,7 @@ def test_active_session_switch_closes_allow_window(
     """
     from omnigent.harnesses.claude_native.settings_generation import (
         ClaudeSettingsRequest,
+        acquire_claude_settings_request,
         request_claude_bridge_deletion,
     )
 
@@ -17696,14 +17837,22 @@ def test_active_session_switch_closes_allow_window(
     prepare_bridge_dir("conv_old", bridge_id="bridge_rotation", workspace=tmp_path)
     assert policy_allow_cache._read_state(bridge_dir)[0] > 0
 
-    with ClaudeSettingsRequest.create(bridge_dir) as request:
+    with ClaudeSettingsRequest.create(bridge_dir) as request, ExitStack() as owners:
         augment_claude_args(
             (), bridge_dir=bridge_dir, defer_caller_settings=True, settings_request=request
         )
+        callbacks = []
+        with acquire_claude_settings_request(bridge_dir, request.generation) as lease:
+            lease.attach(SimpleNamespace(add_resource_cleanup=callbacks.append))
+        retained = callbacks[0].__self__
+        owners.callback(retained.close)
+        retained_fd = retained._fd
+        assert retained_fd is not None
         baseline = request.settings_path(bridge_dir)
         baseline_bytes = baseline.read_bytes()
         lifecycle_path = bridge_dir / ".claude-settings-lifecycle.json"
-        request_claude_bridge_deletion(bridge_dir, "conv_old")
+        if pending_deletion:
+            request_claude_bridge_deletion(bridge_dir, "conv_old")
         pending = lifecycle_path.read_bytes()
         claude_native_bridge.write_active_session_id(bridge_dir, "conv_old")
         assert lifecycle_path.read_bytes() == pending
@@ -17718,12 +17867,21 @@ def test_active_session_switch_closes_allow_window(
         assert json.loads(rotated)["incarnation"] != json.loads(pending)["incarnation"]
         assert "delete_for_session" not in json.loads(rotated)
         claude_native_bridge.write_active_session_id(bridge_dir, "conv_old")
+        returned = lifecycle_path.read_bytes()
+        assert json.loads(returned)["incarnation"] != json.loads(pending)["incarnation"]
         request_claude_bridge_deletion(bridge_dir, "conv_new")
-        assert lifecycle_path.read_bytes() == rotated
+        assert lifecycle_path.read_bytes() == returned
+        snapshot = {path.name: path.read_bytes() for path in bridge_dir.iterdir()}
+        retained.close()
+        with pytest.raises(OSError) as closed:
+            os.fstat(retained_fd)
+        assert closed.value.errno == errno.EBADF
+        retained.close()
+        assert {path.name: path.read_bytes() for path in bridge_dir.iterdir()} == snapshot
 
     assert policy_allow_cache._read_state(bridge_dir)[0] == 0
     assert baseline.read_bytes() == baseline_bytes
-    assert lifecycle_path.read_bytes() == rotated
+    assert lifecycle_path.read_bytes() == returned
     assert (bridge_dir / "bridge.json").exists()
 
 
