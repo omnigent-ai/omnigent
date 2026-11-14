@@ -1221,9 +1221,12 @@ def _with_model_configuration_source(
     models: list[dict[str, object]], harness: str
 ) -> list[dict[str, object]]:
     source = _model_configuration_source_for_harness(harness)
+    public_models = [
+        {key: value for key, value in model.items() if not key.startswith("_")} for model in models
+    ]
     if source is None:
-        return models
-    return [{**model, "source": source} for model in models]
+        return public_models
+    return [{**model, "source": source} for model in public_models]
 
 
 @dataclass

@@ -26,7 +26,6 @@ if TYPE_CHECKING:
 import httpx
 from fastapi.responses import JSONResponse, Response
 
-from omnigent.debug_logging import debug_event
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import native_terminal_name
 from omnigent.harnesses.codex_native.timeouts import (
@@ -72,15 +71,6 @@ _CLAUDE_PANE_READY_TIMEOUT_S = 30.0
 _CLAUDE_PANE_READY_POLL_S = 0.25
 
 
-# Claude-native model switch confirmation: how long to watch the pane's
-# statusLine snapshot for the switched model after typing ``/model``, and how
-# often to re-read it. Module-level so tests can patch the pacing.
-_CLAUDE_MODEL_CONFIRM_TIMEOUT_S = 10.0
-
-
-_CLAUDE_MODEL_CONFIRM_POLL_S = 0.25
-
-
 # A session woken for a control may still be booting its TUI, so typing waits for
 # the prompt, capped so the rest fits the server's ~20s wait for the control.
 _CLAUDE_CONTROL_PROMPT_WAIT_S = 9.0
@@ -120,17 +110,30 @@ async def _drive_claude_pane(
     from omnigent.harnesses.claude_native.bridge import cancellable_injection
 
     with cancellable_injection(deadline):
-        return await asyncio.to_thread(function, *args, **kwargs)
+        worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        deadline.set()
+        while not worker.done():
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.shield(worker)
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            worker.result()
+        raise
 
 
 def _claude_waits_on_person(exc: BaseException) -> bool:
     """Whether the switch was refused only because the pane awaits the person's answer."""
     from omnigent.harnesses.claude_native.bridge import (
+        ClaudeModelSwitchRefused,
         ClaudeSignInPending,
         ClaudeTerminalDialog,
         ClaudeUserPromptPending,
     )
 
+    if isinstance(exc, ClaudeModelSwitchRefused) and exc.__cause__ is not None:
+        exc = exc.__cause__
     return isinstance(exc, ClaudeSignInPending | ClaudeTerminalDialog | ClaudeUserPromptPending)
 
 
@@ -143,6 +146,7 @@ def _claude_model_change_blocked_detail(exc: BaseException) -> str | None:
         captured, or ``None`` for failures with no person-actionable cause.
     """
     from omnigent.harnesses.claude_native.bridge import (
+        ClaudeModelSwitchRefused,
         ClaudePromptTimeout,
         ClaudeSignInPending,
         ClaudeTerminalDialog,
@@ -151,6 +155,8 @@ def _claude_model_change_blocked_detail(exc: BaseException) -> str | None:
         terminal_failure_tail,
     )
 
+    if isinstance(exc, ClaudeModelSwitchRefused) and exc.__cause__ is not None:
+        exc = exc.__cause__
     if isinstance(exc, ClaudeSignInPending):
         # The bridge's remediation targets the chat card's live link, which this reply lacks.
         return f"{exc.title}. Finish the sign-in in the terminal, then switch models again."
@@ -175,16 +181,6 @@ def _claude_model_change_blocked_detail(exc: BaseException) -> str | None:
     else:
         return None
     return next_step + terminal_failure_tail(str(exc))
-
-
-# How long the detached watcher keeps answering a /model confirm dialog that
-# pops after the active turn settles (a mid-turn switch queues in the
-# composer), and how often it looks. Long turns are common; the watch is
-# cheap (one tmux capture per poll) and never types blind.
-_CLAUDE_MODEL_LATE_DIALOG_BUDGET_S = 1200.0
-
-
-_CLAUDE_MODEL_LATE_DIALOG_POLL_S = 2.0
 
 
 # Settle delay between keystrokes when driving Codex TUI popups. The
@@ -360,7 +356,6 @@ def build_native_controls(
     _ingest_next_seq: dict[str, int],
     _ingest_now_serving: dict[str, int],
     _load_history_as_input: _LoadHistoryAsInputFn,
-    _model_dialog_watchers: set[asyncio.Task[None]],
     _native_cost_popup_config_file: Callable[[str, str], Coroutine[Any, Any, Path]],
     _native_pane_status: dict[str, str],
     _opencode_terminal_ensure_locks: dict[str, asyncio.Lock],
@@ -1364,73 +1359,20 @@ def build_native_controls(
             )
         return Response(status_code=204)
 
-    async def _watch_late_model_dialog(
-        conv_id: str,
-        bridge_dir: Path,
-        expected: set[str],
-    ) -> None:
-        """Answer a ``/model`` confirm dialog that pops after the active turn.
-
-        A mid-turn switch queues in Claude's composer; the confirm dialog
-        renders only when the turn settles — potentially minutes after the
-        injection's own watch and the request's confirm window. This watcher
-        presses Enter ONLY when the model dialog is verifiably on screen
-        (never blind), stops as soon as the statusLine reports one of the
-        expected spellings, and gives up quietly after its budget — the
-        persisted request and the forwarder's verbatim report remain the
-        authoritative record either way.
-        """
-        from omnigent.harnesses.claude_native.bridge import (
-            SWITCH_MODEL_DIALOG_HINT,
-            confirm_dialog_if_open,
-            read_claude_status_model,
-        )
-
-        deadline = time.monotonic() + _CLAUDE_MODEL_LATE_DIALOG_BUDGET_S
-        while time.monotonic() < deadline:
-            try:
-                current = await asyncio.to_thread(read_claude_status_model, bridge_dir)
-                if current and current in expected:
-                    return
-                await asyncio.to_thread(
-                    confirm_dialog_if_open, bridge_dir, hint=SWITCH_MODEL_DIALOG_HINT
-                )
-            except Exception:
-                _logger.debug(
-                    "late model-dialog watch errored for session=%s",
-                    conv_id,
-                    exc_info=True,
-                    extra={"session_id": conv_id},
-                )
-                return
-            await asyncio.sleep(_CLAUDE_MODEL_LATE_DIALOG_POLL_S)
-        _logger.info(
-            "late model-dialog watch for session=%s ended without a confirmed switch",
-            conv_id,
-            extra={"session_id": conv_id},
-        )
-
     async def _handle_claude_native_model_change(
         conv_id: str,
         model: str | None,
     ) -> Response:
         from omnigent.harnesses.claude_native.bridge import (
-            SWITCH_MODEL_DIALOG_HINT,
-            ClaudeInjectionCancelled,
-            ClaudePromptTimeout,
+            ClaudeModelSwitchRefused,
+            ClaudeModelSwitchResult,
             bridge_dir_for_bridge_id,
-            confirm_dialog_if_open,
-            inject_slash_command,
-            model_switch_acknowledged,
-            read_claude_status_model,
-            read_model_env,
-            read_model_picker_values,
-            wait_for_input_ready,
+            inject_model_command,
+            record_model_vocabulary,
         )
         from omnigent.harnesses.claude_native.main import (
             resolve_claude_native_model_selection,
             stored_claude_catalog_rows,
-            stored_claude_picker_values,
         )
         from omnigent.inference_config import (
             binding_for_harness,
@@ -1438,21 +1380,15 @@ def build_native_controls(
             resolve_bound_model,
         )
         from omnigent.models.claude_model_vocabulary import (
-            alias_pins,
-            canonical_claude_id,
-            claude_model_command_arg,
-            normalized_model_id,
             picker_command_values,
+            picker_model_options,
         )
 
         if model is None or not model.strip():
             return Response(status_code=204)
-        # The server rolls the pick back after its forward timeout, so no key may
-        # reach the terminal past this deadline.
         deadline = _ClaudeControlDeadline()
         bridge_id = await _claude_native_bridge_id_for_session(
-            server_client=server_client,
-            session_id=conv_id,
+            server_client=server_client, session_id=conv_id
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
         await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
@@ -1461,265 +1397,66 @@ def build_native_controls(
         resolved_model = (
             resolve_claude_native_model_selection(selected_model, claude_config) or selected_model
         )
-        # Translate through the pane's picker values, aliases, and custom slot.
-        # An unknown spelling must fail before any command reaches the terminal.
-        env = read_model_env(bridge_dir) or None
-        cached_options = _claude_model_options_rows.get(conv_id)
-        if cached_options is not None:
-            picker_values = picker_command_values(cached_options[1])
-        else:
-            stored_rows = stored_claude_catalog_rows(claude_config)
-            if stored_rows is not None and not stored_rows:
-                # Discovery stored an authoritative empty catalog (every
-                # picker entry disabled): launch-recorded bridge values are
-                # stale vocabulary, so nothing is switchable.
-                picker_values: list[str] = []
-            else:
-                picker_values = read_model_picker_values(bridge_dir)
-                if not picker_values:
-                    picker_values = stored_claude_picker_values(claude_config, stored_rows)
-        model_arg = claude_model_command_arg(resolved_model, env, picker_values=picker_values)
         inference_config = load_runtime_inference_config()
-        bound_model = binding_for_harness(inference_config, "claude-native") is not None
-        if bound_model:
+        if binding_for_harness(inference_config, "claude-native") is not None:
             resolved_model = resolve_bound_model(inference_config, "claude-native", selected_model)
-            model_arg = resolved_model
-        if model_arg is None:
-            _logger.warning(
-                "claude-native model change: %r has no spelling session=%s accepts "
-                "(pins=%s, picker=%s)",
-                resolved_model,
-                conv_id,
-                sorted(env or ()),
-                picker_values,
-                extra={"session_id": conv_id},
+        cached_options = _claude_model_options_rows.get(conv_id)
+        rows = (
+            cached_options[1]
+            if cached_options is not None
+            else stored_claude_catalog_rows(claude_config)
+        )
+        try:
+            if rows is not None:
+                await _drive_claude_pane(
+                    deadline,
+                    record_model_vocabulary,
+                    bridge_dir,
+                    launch_env=None,
+                    launch_model=None,
+                    picker_values=picker_command_values(rows),
+                    picker_options=picker_model_options(rows),
+                )
+            receipt = await _drive_claude_pane(
+                deadline,
+                inject_model_command,
+                bridge_dir,
+                model=resolved_model,
+                timeout_s=deadline.remaining_s(),
+                ready_timeout_s=min(_CLAUDE_CONTROL_PROMPT_WAIT_S, deadline.remaining_s()),
             )
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "claude_native_model_unsupported",
-                    "detail": (
-                        f"This Claude terminal cannot switch to {resolved_model}: "
-                        "its /model picker has no spelling for that model."
-                    ),
-                },
-            )
-        command = f"/model {model_arg}"
-
-        def _model_failed(exc: BaseException) -> JSONResponse:
-            # Always log the full cause; the reply carries it only when actionable.
+            if (
+                not isinstance(receipt, ClaudeModelSwitchResult)
+                or receipt.requested_model != resolved_model
+            ):
+                raise ClaudeModelSwitchRefused(
+                    "Claude did not provide a fresh session-only model-selection receipt."
+                )
+        except (RuntimeError, ValueError, OSError) as exc:
             safe_detail = _client_safe_error_detail(exc, context="claude-native model change")
+            if isinstance(exc, ClaudeModelSwitchRefused):
+                safe_detail = str(exc)
+            error_code = (
+                "claude_native_model_unsupported"
+                if isinstance(exc, ClaudeModelSwitchRefused) and exc.unsupported
+                else "claude_native_model_failed"
+            )
+            detail = _claude_model_change_blocked_detail(exc) or safe_detail
+            if isinstance(exc, ClaudeModelSwitchRefused) and exc.model_may_have_changed:
+                error_code = "claude_native_model_unconfirmed"
+                detail = (
+                    "Claude may have changed the session model, but the selection could not "
+                    "be confirmed. Check the terminal's current model before retrying."
+                )
             return JSONResponse(
                 status_code=503,
                 content={
-                    "error": "claude_native_model_failed",
-                    "detail": _claude_model_change_blocked_detail(exc) or safe_detail,
+                    "error": error_code,
+                    "detail": detail,
                     **({"waiting_on_person": True} if _claude_waits_on_person(exc) else {}),
                 },
             )
-
-        # A session woken for this change may still be booting its TUI, which drops
-        # typed keys. Wait for the prompt first, so the baseline below is the booted
-        # pane's model rather than an empty or leftover snapshot.
-        prompt_budget_s = min(_CLAUDE_CONTROL_PROMPT_WAIT_S, deadline.remaining_s())
-        wait_started = time.monotonic()
-        wait_error: Exception | None = None
-        try:
-            await _drive_claude_pane(
-                deadline,
-                wait_for_input_ready,
-                bridge_dir,
-                ready_timeout_s=prompt_budget_s,
-                timeout_s=1.0,
-            )
-        except (RuntimeError, OSError) as exc:
-            wait_error = exc
-        waited_s = time.monotonic() - wait_started
-        _logger.info(
-            "claude-native model change for session=%s waited %.1fs for the Claude prompt: %s",
-            conv_id,
-            waited_s,
-            "ready" if wait_error is None else type(wait_error).__name__,
-            extra=debug_event(
-                "claude_native_model_change_prompt_wait",
-                session_id=conv_id,
-                waited_ms=round(waited_s * 1000),
-                budget_ms=round(prompt_budget_s * 1000),
-                timed_out=isinstance(wait_error, ClaudePromptTimeout),
-                error_type=None if wait_error is None else type(wait_error).__name__,
-            ),
-        )
-        if wait_error is not None:
-            return _model_failed(wait_error)
-        baseline = await asyncio.to_thread(read_claude_status_model, bridge_dir)
-        # Verify against the statusLine snapshot the forwarder already polls:
-        # Claude rewrites it on every render, including right after ``/model``.
-        # Expected spellings come from this session's own catalog rows (every
-        # row's ``model`` is the harness's own resolution), plus the typed arg
-        # and its selection mapping. Success replies only after the pane
-        # actually switched; the swallowed-dialog case answers non-2xx so the
-        # server surfaces it instead of the row silently claiming the pick.
-        expected = {value for value in (resolved_model, model_arg) if value}
-        cached_rows = _claude_model_options_rows.get(conv_id)
-        for row in cached_rows[1] if cached_rows is not None else []:
-            if row.get("id") in (selected_model, resolved_model) or row.get("model") in (
-                selected_model,
-                resolved_model,
-            ):
-                row_model = row.get("model")
-                if isinstance(row_model, str) and row_model:
-                    expected.add(row_model)
-        # Claude Code's statusLine names a 1M model without its ``[1m]`` marker,
-        # so once the marker reached the pane, the unmarked name confirms it.
-        unmarked_expected: set[str] = set()
-        if not bound_model:
-            # A repeated alias pick keeps the same model; its launch pin proves
-            # the exact generation even when the options cache is cold.
-            long_context_requested = any(
-                value.lower().endswith("[1m]")
-                for value in (selected_model, resolved_model or "", model_arg)
-            )
-            pinned = alias_pins(env or {}).get(model_arg.lower().removesuffix("[1m]"))
-            # A translation that dropped the marker leaves the pane on the plain
-            # model, which must not confirm a 1M pick.
-            marker_sent = any(
-                value.lower().endswith("[1m]") for value in (model_arg, pinned or "")
-            )
-            if pinned:
-                if long_context_requested and not pinned.lower().endswith("[1m]"):
-                    pinned += "[1m]"
-                expected.add(pinned)
-            if long_context_requested:
-                expected = {value for value in expected if value.lower().endswith("[1m]")}
-            if marker_sent:
-                unmarked_expected = {normalized_model_id(value) for value in expected}
-            expected.update(
-                canonical for value in tuple(expected) if (canonical := canonical_claude_id(value))
-            )
-        elif model_arg.lower().endswith("[1m]"):
-            # A bound 1M pick is typed with its marker too, and the statusLine
-            # names the model without it; the unmarked name confirms the pick.
-            unmarked_expected = {normalized_model_id(value) for value in expected}
-
-        def _switched(current: str | None) -> bool:
-            comparable = current if bound_model or not current else canonical_claude_id(current)
-            return bool(
-                current
-                and (
-                    current in expected
-                    or comparable in expected
-                    or (
-                        not current.lower().endswith("[1m]")
-                        and normalized_model_id(current) in unmarked_expected
-                    )
-                    or (baseline and current != baseline)
-                )
-            )
-
-        try:
-            # Accepted trade-off: ``/model <id>`` also saves the pick as the
-            # person's global default in ``~/.claude/settings.json``. Driving
-            # the interactive picker instead avoided that write but needed
-            # ~35s of fragile tmux automation, so the write stands.
-            await _drive_claude_pane(
-                deadline,
-                inject_slash_command,
-                bridge_dir,
-                command=command,
-                timeout_s=1.0,
-                # A boot that used the prompt budget still leaves the injection a
-                # short wait for a torn capture right after the prompt rendered.
-                ready_timeout_s=min(deadline.remaining_s(), max(1.0, prompt_budget_s - waited_s)),
-                auto_confirm=True,
-                confirm_hint=SWITCH_MODEL_DIALOG_HINT,
-            )
-        except ClaudeInjectionCancelled as exc:
-            # The budget can lapse in the dialog watch after ``/model`` was submitted;
-            # a pane that already switched must not be rolled back. Read only, no keys.
-            if _switched(await asyncio.to_thread(read_claude_status_model, bridge_dir)):
-                return Response(status_code=204)
-            return _model_failed(exc)
-        except (RuntimeError, ValueError, OSError) as exc:
-            return _model_failed(exc)
-        # The prompt wait comes out of this window, keeping the whole request
-        # inside the server's forward timeout.
-        confirm_window_s = min(_CLAUDE_MODEL_CONFIRM_TIMEOUT_S, deadline.remaining_s())
-        confirm_deadline = time.monotonic() + confirm_window_s
-        # A switch typed into a busy pane is queued; its turn may settle before the deadline.
-        was_busy = _native_pane_status.get(conv_id) in ("running", "waiting")
-        while True:
-            current = await asyncio.to_thread(read_claude_status_model, bridge_dir)
-            if _switched(current):
-                # The pane switched. When it landed somewhere other than the
-                # expected spelling, the forwarder's verbatim report is the
-                # truth the UI will settle on — the command still took effect.
-                return Response(status_code=204)
-            if await asyncio.to_thread(model_switch_acknowledged, bridge_dir, command=command):
-                # Claude Code acknowledged the command on the pane while the
-                # statusLine snapshot still reads otherwise; the forwarder's
-                # report settles the row on what the pane actually runs.
-                _logger.info(
-                    "claude-native model change for session=%s confirmed by Claude Code's "
-                    "acknowledgement; statusLine still reports %r",
-                    conv_id,
-                    current,
-                    extra={"session_id": conv_id},
-                )
-                return Response(status_code=204)
-            if baseline is None and current is None:
-                # No statusLine snapshot on either side of the injection: a
-                # live wrapper-managed pane writes one on every render, so
-                # this is a shape without the wrapper — the switch is
-                # unverifiable, not failed. Report success and leave the
-                # forwarder to reconcile the row.
-                _logger.warning(
-                    "claude-native model change for session=%s could not be verified: "
-                    "no statusLine snapshot",
-                    conv_id,
-                    extra={"session_id": conv_id},
-                )
-                return Response(status_code=204)
-            # The dialog can render after the injection's short watch; answer it
-            # inside the window. A lapsed budget ends the window like a timeout.
-            if deadline.is_set():
-                break
-            await _drive_claude_pane(
-                deadline, confirm_dialog_if_open, bridge_dir, hint=SWITCH_MODEL_DIALOG_HINT
-            )
-            if _native_pane_status.get(conv_id) in ("running", "waiting"):
-                was_busy = True
-            if time.monotonic() >= confirm_deadline:
-                break
-            await asyncio.sleep(_CLAUDE_MODEL_CONFIRM_POLL_S)
-        if was_busy:
-            # Mid-turn switch: Claude queues the typed command and applies it
-            # when the turn settles — its confirm dialog can pop minutes from
-            # now. Not a failure: answer success, keep a detached watcher on
-            # the late dialog, and let the forwarder's report settle the
-            # picker when the switch actually lands.
-            watcher = asyncio.create_task(
-                _watch_late_model_dialog(conv_id, bridge_dir, expected),
-                name=f"claude-model-dialog-{conv_id}",
-            )
-            _model_dialog_watchers.add(watcher)
-            watcher.add_done_callback(_model_dialog_watchers.discard)
-            _logger.info(
-                "claude-native model change for session=%s is queued behind an active "
-                "turn; watching for the late confirm dialog",
-                conv_id,
-                extra={"session_id": conv_id},
-            )
-            return Response(status_code=204)
-        return JSONResponse(
-            status_code=503,
-            content={
-                "error": "claude_native_model_unconfirmed",
-                "detail": (
-                    f"the terminal did not confirm the switch to {model_arg} within "
-                    f"{confirm_window_s:.0f}s — a dialog may be open in the pane"
-                ),
-            },
-        )
+        return Response(status_code=204)
 
     async def _handle_cursor_native_model_change(
         conv_id: str,

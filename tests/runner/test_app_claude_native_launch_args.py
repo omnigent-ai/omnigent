@@ -1507,7 +1507,7 @@ async def test_auto_create_claude_terminal_cleans_routers_when_trust_seeding_fai
     turn_started: bool,
 ) -> None:
     """
-    A trust-seeding failure releases only the routers this launch started.
+    A trust-seeding failure releases only this launch's routers.
 
     Seeding runs after the subagent and turn routers start but before the
     forwarder that normally shuts them down exists, so a malformed config must
@@ -1533,7 +1533,7 @@ async def test_auto_create_claude_terminal_cleans_routers_when_trust_seeding_fai
     async def record_turn_shutdown(_session_id: str, router: object) -> None:
         shutdowns.append(("turn", router))
 
-    def failing_seed(_workspace: Path, env: dict[str, str] | None = None) -> None:
+    def failing_settings_operation(*_args: object, **_kwargs: object) -> None:
         raise ValueError("config is not a JSON object")
 
     monkeypatch.setattr(
@@ -1547,7 +1547,8 @@ async def test_auto_create_claude_terminal_cleans_routers_when_trust_seeding_fai
     monkeypatch.setattr(orchestration, "_shutdown_session_router_async", record_subagent_shutdown)
     monkeypatch.setattr(orchestration, "_shutdown_session_turn_router_async", record_turn_shutdown)
     monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", failing_seed
+        "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted",
+        failing_settings_operation,
     )
     registry = Mock(spec=SessionResourceRegistry)
     registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}

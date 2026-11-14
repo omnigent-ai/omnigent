@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.harnesses.claude_native.bridge import (
     _TMUX_FILE,
     bridge_dir_for_conversation_id,
@@ -17,6 +18,7 @@ from omnigent.harnesses.claude_native.bridge import (
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner.native.orchestration import _readvertise_live_claude_tmux_target
 from omnigent.terminals import TerminalRegistry
+from tests._helpers.providers import isolate_provider_resolution
 from tests.runner.conftest import _runner_client
 from tests.runner.test_app_sessions_native_session_change_heal import (
     _open_claude_native_session,
@@ -49,11 +51,62 @@ def _inject_requiring_advertisement(
     return _inject
 
 
+def _mock_model_picker(
+    monkeypatch: pytest.MonkeyPatch,
+    config_home: Path,
+    captured: list[tuple[str, dict[str, str]]],
+    *,
+    failed_waits: list[tuple[str, claude_native_bridge.TmuxSessionNotAdvertised]] | None = None,
+) -> None:
+    """Return a session-only picker receipt after the real advertisement wait."""
+    isolate_provider_resolution(monkeypatch, config_home)
+    monkeypatch.setattr(claude_native, "resolve_native_claude_config", lambda **kwargs: None)
+    picker_model = "claude-opus-4-7"
+    rows = [
+        {
+            "id": picker_model,
+            "model": picker_model,
+            "_claude_picker_options": [
+                {
+                    "value": picker_model,
+                    "model": picker_model,
+                    "display_name": "Opus 4.7",
+                    "enabled": True,
+                    "provenance": "structured",
+                }
+            ],
+        }
+    ]
+    monkeypatch.setattr(claude_native, "stored_claude_catalog_rows", lambda _: rows)
+
+    def _select(
+        inject_bridge_dir: Path,
+        *,
+        model: str,
+        timeout_s: float,
+        ready_timeout_s: float | None = None,
+        owned_draft: str | None = None,
+    ) -> claude_native_bridge.ClaudeModelSwitchResult:
+        del timeout_s, ready_timeout_s, owned_draft
+        try:
+            info = claude_native_bridge._wait_for_tmux_info(inject_bridge_dir, timeout_s=0.2)
+        except claude_native_bridge.TmuxSessionNotAdvertised as exc:
+            if failed_waits is not None:
+                failed_waits.append((model, exc))
+            raise
+        captured.append((model, info))
+        return claude_native_bridge.ClaudeModelSwitchResult(
+            model, model, model, model, "native-session"
+        )
+
+    monkeypatch.setattr(claude_native_bridge, "inject_model_command", _select)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("event", "expected_command"),
+    ("event", "expected_input"),
     [
-        ({"type": "model_change", "model": "claude-opus-4-7"}, "/model claude-opus-4-7"),
+        ({"type": "model_change", "model": "claude-opus-4-7"}, "claude-opus-4-7"),
         ({"type": "effort_change", "effort": "high"}, "/effort high"),
     ],
     ids=["model_change", "effort_change"],
@@ -62,7 +115,7 @@ async def test_live_unadvertised_pane_is_readvertised_before_inject(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     event: dict[str, Any],
-    expected_command: str,
+    expected_input: str,
 ) -> None:
     """Restore a live pane's missing advertisement before injecting, without recreating it."""
     conv_id = "e5f60718293a4b5c6d7e8f901a2b3c4d"
@@ -78,9 +131,12 @@ async def test_live_unadvertised_pane_is_readvertised_before_inject(
     (bridge_dir / _TMUX_FILE).unlink()
 
     captured: list[tuple[str, dict[str, str]]] = []
-    monkeypatch.setattr(
-        claude_native_bridge, "inject_slash_command", _inject_requiring_advertisement(captured)
-    )
+    if event["type"] == "model_change":
+        _mock_model_picker(monkeypatch, tmp_path / "config", captured)
+    else:
+        monkeypatch.setattr(
+            claude_native_bridge, "inject_slash_command", _inject_requiring_advertisement(captured)
+        )
 
     async with _runner_client(app) as client:
         resp = await client.post(f"/v1/sessions/{conv_id}/events", json=event)
@@ -92,7 +148,7 @@ async def test_live_unadvertised_pane_is_readvertised_before_inject(
     assert auto_create_calls == [], (
         "a live pane must be re-advertised in place, never torn down and recreated"
     )
-    assert captured == [(expected_command, _advertisement_of(instance))], (
+    assert captured == [(expected_input, _advertisement_of(instance))], (
         f"inject must see the live pane's re-advertised target; got {captured!r}"
     )
     # The heal is durable: the advertisement survives for subsequent injects.
@@ -120,9 +176,7 @@ async def test_stale_advertisement_is_rewritten_for_the_live_pane(
     assert read_tmux_target(bridge_dir) != _advertisement_of(instance)
 
     captured: list[tuple[str, dict[str, str]]] = []
-    monkeypatch.setattr(
-        claude_native_bridge, "inject_slash_command", _inject_requiring_advertisement(captured)
-    )
+    _mock_model_picker(monkeypatch, tmp_path / "config", captured)
 
     async with _runner_client(app) as client:
         resp = await client.post(
@@ -132,7 +186,7 @@ async def test_stale_advertisement_is_rewritten_for_the_live_pane(
 
     assert resp.status_code == 204, resp.text
     assert auto_create_calls == []
-    assert captured == [("/model claude-opus-4-7", _advertisement_of(instance))], captured
+    assert captured == [("claude-opus-4-7", _advertisement_of(instance))], captured
 
 
 @pytest.mark.asyncio
@@ -152,7 +206,7 @@ async def test_failed_readvertise_keeps_pane_and_surfaces_inject_failure(
     )
     auto_create_calls.clear()
     bridge_dir = bridge_dir_for_conversation_id(conv_id)
-    _plant_live_claude_pane(registry, conv_id, tmp_path, bridge_dir)
+    instance = _plant_live_claude_pane(registry, conv_id, tmp_path, bridge_dir)
     (bridge_dir / _TMUX_FILE).unlink()
 
     def _write_fails(*_args: object, **_kwargs: object) -> None:
@@ -160,9 +214,8 @@ async def test_failed_readvertise_keeps_pane_and_surfaces_inject_failure(
 
     monkeypatch.setattr(claude_native_bridge, "write_tmux_target", _write_fails)
     captured: list[tuple[str, dict[str, str]]] = []
-    monkeypatch.setattr(
-        claude_native_bridge, "inject_slash_command", _inject_requiring_advertisement(captured)
-    )
+    failed_waits: list[tuple[str, claude_native_bridge.TmuxSessionNotAdvertised]] = []
+    _mock_model_picker(monkeypatch, tmp_path / "config", captured, failed_waits=failed_waits)
 
     async with _runner_client(app) as client:
         resp = await client.post(
@@ -171,8 +224,14 @@ async def test_failed_readvertise_keeps_pane_and_surfaces_inject_failure(
         )
 
     assert resp.status_code == 503, resp.text
+    assert resp.json()["error"] == "claude_native_model_failed", resp.text
+    assert len(failed_waits) == 1, "the model picker must reach the real advertisement wait"
+    model, failure = failed_waits[0]
+    assert model == "claude-opus-4-7"
+    assert "Claude terminal tmux target is not advertised yet" in str(failure)
     assert captured == [], "the inject must have waited on the still-missing advertisement"
     assert auto_create_calls == [], "a failed repair must not recreate the live pane"
+    assert registry.get(conv_id, "claude", "main") is instance
     assert read_tmux_target(bridge_dir) is None
 
 
@@ -196,18 +255,8 @@ async def test_live_advertised_pane_advertisement_is_left_untouched(
     )
     advertised_before = (bridge_dir / _TMUX_FILE).read_text(encoding="utf-8")
 
-    def _inject_records(
-        inject_bridge_dir: Path,
-        *,
-        command: str,
-        timeout_s: float,
-        ready_timeout_s: float | None = None,
-        auto_confirm: bool = False,
-        confirm_hint: str | None = None,
-    ) -> None:
-        del inject_bridge_dir, command, timeout_s, ready_timeout_s, auto_confirm, confirm_hint
-
-    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _inject_records)
+    captured: list[tuple[str, dict[str, str]]] = []
+    _mock_model_picker(monkeypatch, tmp_path / "config", captured)
 
     async with _runner_client(app) as client:
         resp = await client.post(
@@ -217,6 +266,7 @@ async def test_live_advertised_pane_advertisement_is_left_untouched(
 
     assert resp.status_code == 204, resp.text
     assert auto_create_calls == []
+    assert captured == [("claude-opus-4-7", _advertisement_of(instance))], captured
     assert (bridge_dir / _TMUX_FILE).read_text(encoding="utf-8") == advertised_before, (
         "a valid advertisement must not be rewritten on every inject"
     )

@@ -77,6 +77,12 @@ from omnigent.harnesses.claude_native import (
 )
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
+from omnigent.harnesses.claude_native.model_switch import (
+    ClaudeModelSwitchRefused,
+    ClaudeModelSwitchResult,
+    ModelSwitchDeadline,
+    SessionOnlyModelSwitch,
+)
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
 from omnigent.harnesses.claude_native.submit_verification import (
     SubmitBoundary,
@@ -168,7 +174,9 @@ def _cancellable_injection_lock(lock: threading.Lock | FileLock) -> Iterator[Non
         lock.release()
 
 
-def _serialize_bridge_injection(function: _InjectionFunction) -> _InjectionFunction:
+def _serialize_bridge_injection(
+    function: _InjectionFunction, *, recover_composer_height: bool = True
+) -> _InjectionFunction:
     """Serialize complete tmux injection operations across threads and processes."""
 
     @functools.wraps(function)
@@ -180,6 +188,8 @@ def _serialize_bridge_injection(function: _InjectionFunction) -> _InjectionFunct
             try:
                 return function(bridge_dir, *args, **kwargs)
             except ClaudeComposerNotCleared:
+                if not recover_composer_height:
+                    raise
                 # The refused paste sent nothing. Give a clipped composer room,
                 # then recheck readiness and pending prompts before retrying.
                 info = _wait_for_tmux_info(bridge_dir, timeout_s=_TMUX_READY_TIMEOUT_S)
@@ -190,6 +200,10 @@ def _serialize_bridge_injection(function: _InjectionFunction) -> _InjectionFunct
                     return function(bridge_dir, *args, **kwargs)
 
     return cast(_InjectionFunction, wrapped)
+
+
+def _serialize_model_injection(function: _InjectionFunction) -> _InjectionFunction:
+    return _serialize_bridge_injection(function, recover_composer_height=False)
 
 
 # Bind/advertise coordinates for the bridge's HTTP servers (the tool relay and
@@ -785,6 +799,21 @@ class ClaudeMessageNotAccepted(RuntimeError):
 
 class ClaudeComposerNotCleared(ClaudeMessageNotAccepted):
     """A draft left in Claude's input box could not be cleared, so nothing was sent."""
+
+
+# Finish a held delivery before the server's 600 s pending-input lifetime ends.
+CLAUDE_INPUT_HOLD_S = 8 * 60.0
+
+
+def can_hold_input_refusal(
+    exc: ClaudeUserPromptPending | ClaudeTerminalDialog | ClaudeComposerNotCleared,
+) -> bool:
+    """Only refusals before typing can safely resume the same delivery."""
+    if isinstance(exc, ClaudeUserPromptPending):
+        return exc.nothing_typed
+    if isinstance(exc, ClaudeTerminalDialog):
+        return isinstance(exc, ClaudeInputBoxOccupied) or exc.awaits_answer
+    return True
 
 
 class ClaudeSubmitBlockedUnconfirmed(RuntimeError):
@@ -1898,6 +1927,7 @@ def prepare_bridge_dir(
     launch_model: str | None = None,
     launch_env: Mapping[str, str] | None = None,
     picker_values: Sequence[str] | None = None,
+    picker_options: Sequence[Mapping[str, object]] | None = None,
     sandbox: OSEnvSandboxSpec | None = None,
 ) -> Path:
     """
@@ -1925,6 +1955,8 @@ def prepare_bridge_dir(
         offers, e.g. ``["system.ai.glm-5-3"]``. Persisted for the same
         translation: a gateway-managed picker names rows by served id, and
         no pin spells those.
+    :param picker_options: Actual picker descriptors with raw display labels
+        and provenance, excluding synthesized default catalog rows.
     :param sandbox: Resolved ``os_env.sandbox`` for this session (the
         agent spec's declared sandbox, already overridden by any
         ``enforce_sandbox``/``force_sandbox`` policy verdict). Persisted
@@ -1968,6 +2000,8 @@ def prepare_bridge_dir(
             payload["model_env"] = model_env
         if picker_values is not None:
             payload["model_picker_values"] = list(picker_values)
+        if picker_options is not None:
+            payload["model_picker_options"] = [dict(option) for option in picker_options]
         if sandbox is not None:
             payload["sandbox"] = _bridge_sandbox_payload(sandbox)
         _write_json_file(bridge_dir / _CONFIG_FILE, payload)
@@ -2046,6 +2080,26 @@ def claude_global_config_path(
         return legacy_path
     suffix = "-custom-oauth" if env.get("CLAUDE_CODE_CUSTOM_OAUTH_URL") else ""
     return _claude_joined_path(base, config_dir or home_value, f".claude{suffix}.json")
+
+
+def claude_user_settings_path(
+    cwd: Path | None = None, env: Mapping[str, str] | None = None
+) -> Path:
+    """
+    Return the user ``settings.json`` Claude saves its default model to.
+
+    :param cwd: Claude's working directory, e.g. ``Path("/home/user/repo")``.
+        ``None`` uses this process's working directory.
+    :param env: Claude's launch environment. ``None`` uses this process's.
+    :returns: ``$CLAUDE_CONFIG_DIR/settings.json``, else
+        ``$HOME/.claude/settings.json``, resolved the way Claude joins paths.
+    """
+    env = os.environ if env is None else env
+    base = cwd if cwd is not None else Path.cwd()
+    config_dir = env.get("CLAUDE_CONFIG_DIR")
+    if config_dir is None:
+        config_dir = os.path.join(env.get("HOME") or str(_account_home_dir()), ".claude")
+    return _claude_joined_path(base, config_dir, "settings.json")
 
 
 def _claude_joined_path(cwd: Path, directory: str, name: str) -> Path:
@@ -2302,12 +2356,22 @@ def read_model_picker_values(bridge_dir: Path) -> list[str]:
     return [value for value in values if isinstance(value, str) and value]
 
 
+def read_model_picker_options(bridge_dir: Path) -> list[dict[str, object]] | None:
+    """Read actual picker descriptors; ``None`` means an older unknown catalog."""
+    config = _read_json_file(bridge_dir / _CONFIG_FILE)
+    options = config.get("model_picker_options") if isinstance(config, dict) else None
+    if not isinstance(options, list):
+        return None
+    return [option for option in options if isinstance(option, dict)]
+
+
 def record_model_vocabulary(
     bridge_dir: Path,
     *,
     launch_env: Mapping[str, str] | None,
     launch_model: str | None,
     picker_values: Sequence[str] | None = None,
+    picker_options: Sequence[Mapping[str, object]] | None = None,
 ) -> None:
     """
     Persist the launch's model vocabulary after the bridge dir exists.
@@ -2326,6 +2390,8 @@ def record_model_vocabulary(
         ``None``.
     :param picker_values: The ``/model`` spellings this session's picker
         offers, or ``None`` when the catalog is unknown. An empty list clears it.
+    :param picker_options: Actual picker descriptors, including raw labels and
+        provenance. An empty list clears previously recorded descriptors.
     :returns: None.
     """
     # Read-modify-write under the bridge dir's cross-process lock so a
@@ -2351,10 +2417,16 @@ def record_model_vocabulary(
         if picker_values is not None and config.get("model_picker_values") != list(picker_values):
             config["model_picker_values"] = list(picker_values)
             changed = True
+        if picker_options is not None and config.get("model_picker_options") != list(
+            picker_options
+        ):
+            config["model_picker_options"] = [dict(option) for option in picker_options]
+            changed = True
         if launch_model and config.get("launch_model") != launch_model:
             config["launch_model"] = launch_model
             changed = True
         if changed:
+            _check_injection_cancelled()
             _write_json_file(bridge_dir / _CONFIG_FILE, config)
 
 
@@ -2365,7 +2437,9 @@ def _bridge_metadata_write_lock(bridge_dir: Path) -> Iterator[None]:
     Shares bridge-dir preparation's on-disk lock, so metadata updates and
     :func:`prepare_bridge_dir` exclude each other across processes.
     """
-    with native_bridge_common.bridge_dir_preparation_lock(bridge_dir):
+    with native_bridge_common.bridge_dir_preparation_lock(
+        bridge_dir, check_cancelled=_check_injection_cancelled
+    ):
         yield
 
 
@@ -5627,6 +5701,45 @@ def wait_for_input_ready(
     )
 
 
+def inject_model_command(
+    bridge_dir: Path,
+    *,
+    model: str,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+    ready_timeout_s: float | None = None,
+    owned_draft: str | None = None,
+) -> ClaudeModelSwitchResult:
+    """Select a model for this session and require a fresh local status receipt.
+
+    ``owned_draft`` is only for the exact persisted prompt whose routing hook
+    proved it blocked. Unrelated drafts and dialogs receive no clearing keys.
+    The timeout covers lock waits and every step; no dependent prompt is sent.
+    """
+    deadline = ModelSwitchDeadline(timeout_s, _INJECTION_CANCEL_EVENT.get(), time.monotonic)
+    transaction = SessionOnlyModelSwitch(
+        bridge_dir,
+        model=model,
+        deadline=deadline,
+        ready_timeout_s=ready_timeout_s,
+        owned_draft=owned_draft,
+    )
+    try:
+        with cancellable_injection(deadline):
+            return _inject_model_command_locked(bridge_dir, transaction)
+    except ClaudeInjectionCancelled as exc:
+        raise transaction.refuse(
+            "Claude's model switch was cancelled; the prompt was not sent."
+        ) from exc
+
+
+@_serialize_model_injection
+def _inject_model_command_locked(
+    bridge_dir: Path, transaction: SessionOnlyModelSwitch
+) -> ClaudeModelSwitchResult:
+    del bridge_dir
+    return transaction.run()
+
+
 @_serialize_bridge_injection
 def inject_slash_command(
     bridge_dir: Path,
@@ -5685,6 +5798,10 @@ def inject_slash_command(
         raise ValueError(f"slash command must start with '/'; got {command!r}")
     if "\n" in command:
         raise ValueError("slash command must be a single line")
+    if re.match(r"^/model\s+\S", command):
+        raise ClaudeModelSwitchRefused(
+            "Automated model selections must use the session-only picker."
+        )
     dialog_hint: str | None = None
     if auto_confirm:
         if not confirm_hint:
@@ -5708,17 +5825,13 @@ def inject_slash_command(
             "Answer the pending Claude question or permission request before changing settings.",
             nothing_typed=True,
         )
-    # Clear any draft the user is mid-typing; otherwise the command below
-    # concatenates with their text and Enter submits
-    # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
-    # not interrupt an in-flight generation.
+    # Clear the user's draft so the command is not appended to it.
+    # Unlike Escape, this leaves an in-flight generation running.
     _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
     # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
-    # Same delivery hazards as inject_user_message: a coalesced or dropped
-    # Enter leaves the command drafted while the persisted session value
-    # claims it applied. Wait for the command to render, submit, verify it
-    # left the box; an unidentifiable draft falls through to a blind submit.
+    # A dropped Enter can leave the command drafted: wait for rendering, submit,
+    # and verify it left the box. An unidentifiable draft gets a blind submit.
     needle = _submit_needle(command)
     draft_seen = False
     deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
@@ -5745,10 +5858,12 @@ def inject_slash_command(
             what="slash command",
             bridge_dir=bridge_dir,
         ):
+            # Not cancelled: Enters queued in a stalled pane can still submit it.
             raise RuntimeError(
-                f"Claude Code did not accept the slash command within "
-                f"{_SUBMIT_VERIFY_TIMEOUT_S}s (the command is still in the "
-                "input box). The command was not delivered."
+                f"Claude Code could not confirm submission of the slash command within "
+                f"{_SUBMIT_VERIFY_TIMEOUT_S}s (the command is still in the input box). "
+                "Queued Enter presses may still submit it. Check the terminal state before "
+                "explicitly retrying the command."
             )
     if dialog_hint is not None:
         _confirm_tui_dialog(socket_path, tmux_target, hint=dialog_hint, bridge_dir=bridge_dir)
@@ -6417,6 +6532,17 @@ class _UnixHTTPConnection(HTTPConnection):
         self.sock = sock
 
 
+def _tmux_injection_timeout_s() -> float:
+    deadline = _INJECTION_CANCEL_EVENT.get()
+    if isinstance(deadline, ModelSwitchDeadline):
+        _check_injection_cancelled()
+        remaining = deadline.remaining_s()
+        if remaining <= 0:
+            raise ClaudeInjectionCancelled("Claude's model-switch deadline expired.")
+        return min(_TMUX_SEND_TIMEOUT_S, remaining)
+    return _TMUX_SEND_TIMEOUT_S
+
+
 def _run_tmux(socket_path: str, *args: str, allow_missing_target: bool = False) -> None:
     """
     Invoke ``tmux -S <socket_path> <args...>`` and raise on failure.
@@ -6444,17 +6570,18 @@ def _run_tmux(socket_path: str, *args: str, allow_missing_target: bool = False) 
         target = args[args.index("-t") + 1]
         args = ("copy-mode", "-q", "-t", target, ";", *args)
     cmd = ["tmux", "-S", socket_path, *args]
+    timeout_s = _tmux_injection_timeout_s()
     try:
         proc = subprocess.run(
             cmd,
             check=False,
             capture_output=True,
             text=True,
-            timeout=_TMUX_SEND_TIMEOUT_S,
+            timeout=timeout_s,
         )
     except subprocess.TimeoutExpired as exc:
-        delivery_diagnostics.record_tmux_failure(operation, timeout_s=_TMUX_SEND_TIMEOUT_S)
-        raise RuntimeError(f"tmux command timed out after {_TMUX_SEND_TIMEOUT_S}s") from exc
+        delivery_diagnostics.record_tmux_failure(operation, timeout_s=timeout_s)
+        raise RuntimeError(f"tmux command timed out after {timeout_s}s") from exc
     except OSError as exc:
         delivery_diagnostics.record_tmux_failure(operation, os_errno=exc.errno)
         raise
@@ -6573,7 +6700,7 @@ def _capture_pane(socket_path: str, tmux_target: str, *, join_wrapped: bool = Fa
             check=False,
             capture_output=True,
             text=True,
-            timeout=_TMUX_SEND_TIMEOUT_S,
+            timeout=_tmux_injection_timeout_s(),
         )
     except (subprocess.SubprocessError, OSError):
         return ""
@@ -6633,7 +6760,7 @@ def _claude_pane_state(socket_path: str, tmux_target: str) -> _ClaudePaneState:
             check=False,
             capture_output=True,
             text=True,
-            timeout=_TMUX_SEND_TIMEOUT_S,
+            timeout=_tmux_injection_timeout_s(),
         )
     except (subprocess.SubprocessError, OSError):
         return _ClaudePaneState(None)

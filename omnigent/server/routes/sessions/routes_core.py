@@ -4469,6 +4469,23 @@ def register_core_routes(
             # full rationale. live_forward (== not silent) already excludes
             # bind-time auto-applies, so only an explicit /model lands a note.
             if _is_native_terminal_session(updated):
+                if (
+                    _model_forward is not None
+                    and _runner_reply_field(_model_forward.body, "error")
+                    == "claude_native_model_unconfirmed"
+                ):
+                    from omnigent.server.routes.sessions.routes_events import (
+                        _raise_if_runner_re_tunnelled_to_another_replica,
+                    )
+
+                    await _raise_if_runner_re_tunnelled_to_another_replica(
+                        session_id, updated.runner_id, conversation_store
+                    )
+                    raise OmnigentError(
+                        "Claude may have changed the session model, but the selection could "
+                        "not be confirmed. Check the terminal's current model before retrying.",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
                 # Neither a lost request nor a refusal confirms a model switch, but an
                 # unconfirmed Codex update may still apply; the next turn re-applies it.
                 unconfirmed = _model_forward is not None and _codex_update_unconfirmed(

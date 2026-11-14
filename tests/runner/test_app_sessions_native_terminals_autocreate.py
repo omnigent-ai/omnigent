@@ -6173,6 +6173,7 @@ async def _run_auto_create_claude_terminal_for_routing_class(
             _FakeResourceRegistry(),
             lambda _sid, _evt: None,
             server_client=fake_client,
+            auth_token_factory=lambda: None,
         )
     finally:
         from omnigent.runner import subagent_routing, turn_routing
@@ -6221,9 +6222,27 @@ async def test_auto_create_claude_terminal_loads_workspace_agents_skills(
     assert [path.read_text() for path in exposed] == [skill.read_text()]
 
 
+@pytest.mark.parametrize("catalog_state", ["missing", "empty", "populated"])
 async def test_a_plain_claude_native_launch_carries_no_spawn_routing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, catalog_state: str
 ) -> None:
+    option = {
+        "value": "private-model",
+        "model": "private-model",
+        "display_name": "Private model",
+        "enabled": True,
+        "provenance": "structured",
+    }
+    rows = (
+        None
+        if catalog_state == "missing"
+        else [{"id": "private-model", "_claude_picker_options": [option]}]
+        if catalog_state == "populated"
+        else []
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.stored_claude_catalog_rows", lambda _config: rows
+    )
     spec = await _run_auto_create_claude_terminal_for_routing_class(
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
@@ -6237,6 +6256,10 @@ async def test_a_plain_claude_native_launch_carries_no_spawn_routing(
     assert all("claude_router_hook" not in command for command in _claude_hook_commands(spec))
     # The workspace's own picker row survives untouched.
     assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "workspace-picker-row"
+    bridge_dir = bridge_dir_for_bridge_id("4a1c9b1d1f0e4c5da0a1b2c3d4e5f601")
+    assert claude_native_bridge.read_model_picker_options(bridge_dir) == (
+        None if catalog_state == "missing" else [option] if catalog_state == "populated" else []
+    )
 
 
 async def test_a_routed_claude_native_launch_keeps_the_spawn_gate_and_the_pin(

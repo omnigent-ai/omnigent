@@ -199,6 +199,18 @@ def picker_command_values(options: Iterable[Mapping[str, Any]]) -> list[str]:
     return values
 
 
+def picker_model_options(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, object]]:
+    """Read private actual-picker descriptors, excluding synthetic catalog rows."""
+    options: list[dict[str, object]] = []
+    for row in rows:
+        descriptors = row.get("_claude_picker_options")
+        if isinstance(descriptors, list):
+            for option in descriptors:
+                if isinstance(option, dict) and option not in options:
+                    options.append(dict(option))
+    return options
+
+
 def picker_value_for_model(model: str, values: Iterable[str]) -> str | None:
     """Which of a session's picker values spells *model*.
 

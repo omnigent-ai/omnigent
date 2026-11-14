@@ -38,6 +38,7 @@ from omnigent._startup_profile import StartupProfiler
 from omnigent._terminal_picker_theme import PICKER_ACCENT, PICKER_MUTED
 from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.inner.native_attachments import attachment_cache_dir
+from omnigent.models.claude_model_vocabulary import picker_model_options
 from omnigent.models.databricks_model_discovery import DatabricksClaudeCatalog
 from omnigent.native import native_terminal
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
@@ -51,6 +52,7 @@ from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_NOT_FOUND,
 )
 from tests._helpers.managed_mcp import expand_entry_value
+from tests._helpers.providers import isolate_provider_resolution
 from tests._image_fixtures import (
     _TINY_CMYK_JPEG_BASE64,
     _TINY_GIF_BASE64,
@@ -6793,9 +6795,11 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("catalog_state", ["missing", "empty", "populated"])
 async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    catalog_state: str,
 ) -> None:
     """
     Fresh sessions (no ``session_id``) must not be marked ``cold_resumed``.
@@ -6841,16 +6845,41 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
         del _client, _session_id, _claude_args, command, bridge_dir, claude_config
         return "terminal_claude_main"
 
+    async def _fake_read_tmux(
+        _client: object, session_id: str
+    ) -> claude_native._ClaudeTerminalTmux:
+        assert session_id == "conv_new"
+        return claude_native._ClaudeTerminalTmux(socket=None, target=None)
+
+    option = {
+        "value": "private-model",
+        "model": "private-model",
+        "display_name": "Private model",
+        "enabled": True,
+        "provenance": "structured",
+    }
+    rows = (
+        None
+        if catalog_state == "missing"
+        else [{"id": "private-model", "_claude_picker_options": [option]}]
+        if catalog_state == "populated"
+        else []
+    )
+    vocabulary: dict[str, object] = {}
+
+    def _prepare_bridge(
+        session_id: str, *, bridge_id: str | None = None, workspace: Path, **values: object
+    ) -> Path:
+        assert workspace == Path.cwd()
+        vocabulary.update(values)
+        return tmp_path / (bridge_id or session_id)
+
     monkeypatch.setattr(claude_native, "_create_claude_session", _fake_create_session)
     monkeypatch.setattr(claude_native, "_bind_session_runner", _fake_bind_session_runner)
     monkeypatch.setattr(claude_native, "_launch_claude_terminal", _fake_launch_claude_terminal)
-    monkeypatch.setattr(
-        claude_native,
-        "prepare_bridge_dir",
-        lambda session_id, *, bridge_id=None, workspace, **_vocabulary: (
-            tmp_path / (bridge_id or session_id)
-        ),
-    )
+    monkeypatch.setattr(claude_native, "_read_claude_terminal_tmux", _fake_read_tmux)
+    monkeypatch.setattr(claude_native, "prepare_bridge_dir", _prepare_bridge)
+    monkeypatch.setattr(claude_native, "stored_claude_catalog_rows", lambda _config: rows)
     monkeypatch.setattr(
         claude_native,
         "reset_transcript_forward_state",
@@ -6878,6 +6907,9 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
     # claude writes on cold start), the first turn would be dropped.
     assert prepared.cold_resumed is False
     assert prepared.reattached is False
+    assert vocabulary["picker_options"] == (
+        None if catalog_state == "missing" else [option] if catalog_state == "populated" else []
+    )
 
 
 def test_wrapper_spec_startup_instructions_resolves_prompt(tmp_path: Path) -> None:
@@ -11714,7 +11746,9 @@ async def test_probe_claude_model_options_uses_harness_startup_config(
     with_launcher: bool,
 ) -> None:
     """Enumeration and alias resolution use the terminal's command and base args."""
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    isolate_provider_resolution(monkeypatch, tmp_path)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    monkeypatch.setattr("omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
     monkeypatch.delenv("OMNIGENT_CLAUDE_LAUNCHER", raising=False)
     monkeypatch.delenv("OMNIGENT_CLAUDE_PATH", raising=False)
     if path_override is not None:
@@ -11759,7 +11793,20 @@ async def test_probe_claude_model_options_uses_harness_startup_config(
     probe = await claude_native.probe_claude_model_options(None)
 
     assert probe is not None
-    assert probe.alias_rows == [
+    assert picker_model_options(probe.alias_rows) == [
+        {
+            "value": value,
+            "model": value,
+            "display_name": None,
+            "enabled": True,
+            "provenance": "structured",
+        }
+        for value in ("sonnet", "opus")
+    ]
+    assert [
+        {key: value for key, value in row.items() if key != "_claude_picker_options"}
+        for row in probe.alias_rows
+    ] == [
         {"id": "sonnet", "model": "sonnet", "displayName": "sonnet"},
         {"id": "opus", "model": "opus", "displayName": "opus"},
     ]
@@ -11768,6 +11815,7 @@ async def test_probe_claude_model_options_uses_harness_startup_config(
 
 async def test_probe_claude_model_options_resolves_each_alias_via_the_harness(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Every kept alias gets its own ``--model`` resolution run.
 
@@ -11779,6 +11827,10 @@ async def test_probe_claude_model_options_resolves_each_alias_via_the_harness(
     its own Default choice), and a failing resolution leaves that alias's
     bare row, never the whole probe.
     """
+    isolate_provider_resolution(monkeypatch, tmp_path)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    monkeypatch.delenv("OMNIGENT_CLAUDE_LAUNCHER", raising=False)
+    monkeypatch.setattr("omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
     resolutions = {
         "sonnet": ("claude-sonnet-5", "Sonnet 5"),
         "opus": ("claude-opus-5", "Opus 5"),
@@ -11834,7 +11886,30 @@ async def test_probe_claude_model_options_resolves_each_alias_via_the_harness(
 
     assert probe is not None
     alias_rows = probe.alias_rows
-    assert alias_rows == [
+    assert picker_model_options(alias_rows) == [
+        {
+            "value": value,
+            "model": resolutions[value][0] if value != "haiku" else "haiku",
+            "display_name": None,
+            "enabled": True,
+            "provenance": "structured",
+        }
+        for value in (
+            "sonnet",
+            "opusplan",
+            "opus",
+            "haiku",
+            "fable",
+            "best",
+            "fable[1m]",
+            "sonnet[1m]",
+            "opus[1m]",
+        )
+    ]
+    assert [
+        {key: value for key, value in row.items() if key != "_claude_picker_options"}
+        for row in alias_rows
+    ] == [
         {"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5"},
         {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5"},
         {"id": "haiku", "model": "haiku", "displayName": "haiku"},
@@ -11859,8 +11934,10 @@ async def test_probe_claude_model_options_runs_the_harness_under_the_launch_env(
     apiKeyHelper is delivered via ``--settings`` — so the enumeration
     answers for the session the user would actually get.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    isolate_provider_resolution(monkeypatch, tmp_path)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
     monkeypatch.setenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+    monkeypatch.delenv("OMNIGENT_CLAUDE_LAUNCHER", raising=False)
     monkeypatch.setenv("CLAUDECODE", "1")
     captured: dict[str, Any] = {}
 
@@ -11888,7 +11965,22 @@ async def test_probe_claude_model_options_runs_the_harness_under_the_launch_env(
     probe = await claude_native.probe_claude_model_options(_gateway_probe_config())
 
     assert probe is not None
-    assert probe.alias_rows == [{"id": "opus", "model": "opus", "displayName": "opus"}]
+    assert probe.alias_rows == [
+        {
+            "id": "opus",
+            "model": "opus",
+            "displayName": "opus",
+            "_claude_picker_options": [
+                {
+                    "value": "opus",
+                    "model": "opus",
+                    "display_name": None,
+                    "enabled": True,
+                    "provenance": "structured",
+                }
+            ],
+        }
+    ]
     args = captured["args"]
     probe_start = args.index("-p")
     assert args[probe_start : probe_start + 3] == ["-p", "--input-format", "stream-json"]
@@ -11908,7 +12000,8 @@ async def test_probe_claude_model_options_omits_mcp_flags_under_managed_mcp_conf
     tmp_path: Path,
 ) -> None:
     """Claude Code rejects ``--strict-mcp-config`` when ``managed-mcp.json`` exists."""
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    isolate_provider_resolution(monkeypatch, tmp_path)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
     _install_managed_mcp_config(tmp_path, monkeypatch)
     spawned_args: list[list[str]] = []
 
@@ -11928,7 +12021,22 @@ async def test_probe_claude_model_options_omits_mcp_flags_under_managed_mcp_conf
     probe = await claude_native.probe_claude_model_options(_gateway_probe_config())
 
     assert probe is not None
-    assert probe.alias_rows == [{"id": "opus", "model": "opus", "displayName": "opus"}]
+    assert probe.alias_rows == [
+        {
+            "id": "opus",
+            "model": "opus",
+            "displayName": "opus",
+            "_claude_picker_options": [
+                {
+                    "value": "opus",
+                    "model": "opus",
+                    "display_name": None,
+                    "enabled": True,
+                    "provenance": "structured",
+                }
+            ],
+        }
+    ]
     assert spawned_args
     for args in spawned_args:
         assert "--strict-mcp-config" not in args

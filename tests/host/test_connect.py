@@ -561,6 +561,15 @@ async def test_handle_model_options_serves_the_claude_catalog(
                     "id": "sonnet",
                     "model": "system.ai.claude-sonnet-5",
                     "displayName": "Sonnet 5",
+                    "_claude_picker_options": [
+                        {
+                            "value": "sonnet",
+                            "model": "system.ai.claude-sonnet-5",
+                            "display_name": "Sonnet 5",
+                            "enabled": True,
+                            "provenance": "structured",
+                        }
+                    ],
                 }
             ],
             default_model="system.ai.claude-sonnet-5",
@@ -8752,7 +8761,14 @@ async def test_handle_model_options_claude_sdk_rides_the_probe_when_endpoints_li
 
     async def _fake_probed() -> ModelOptionsResult:
         return ModelOptionsResult(
-            models=[{"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5"}],
+            models=[
+                {
+                    "id": "sonnet",
+                    "model": "claude-sonnet-5",
+                    "displayName": "Sonnet 5",
+                    "_claude_picker_options": [{"value": "sonnet", "provenance": "structured"}],
+                }
+            ],
             routable_models=[],
         )
 
@@ -8786,8 +8802,14 @@ async def test_handle_model_options_claude_sdk_serves_the_replayed_store_rows(
     from omnigent.models.model_catalog import ModelEntry, ModelListing
 
     monkeypatch.setattr(model_catalog_store, "_data_dir", lambda: tmp_path)
-    rows = [
+    public_rows = [
         {"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5", "isDefault": True}
+    ]
+    rows = [
+        {
+            **public_rows[0],
+            "_claude_picker_options": [{"value": "sonnet", "provenance": "structured"}],
+        }
     ]
     fingerprint = claude_native.claude_catalog_fingerprint(None)
     model_catalog_store.write_catalog("claude-native", fingerprint, rows)
@@ -8834,7 +8856,7 @@ async def test_handle_model_options_claude_sdk_serves_the_replayed_store_rows(
         assert result == HostModelOptionsResultFrame(
             request_id="req_sdk_store",
             status="ok",
-            models=rows,
+            models=public_rows,
             routable_models=["claude-sonnet-5"],
         )
     finally:
@@ -8844,6 +8866,7 @@ async def test_handle_model_options_claude_sdk_serves_the_replayed_store_rows(
             await refresh
     assert probed_configs == ([None] if stale else [])
     assert not model_catalog_store.catalog_is_stale("claude-native", fingerprint)
+    assert model_catalog_store.read_catalog("claude-native", fingerprint) == rows
     _cleanup_host(host)
 
 

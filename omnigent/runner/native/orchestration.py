@@ -9801,7 +9801,15 @@ async def _auto_create_claude_terminal(
     # ambient env (the CLI path records these at prepare time; the runner
     # resolves its config only after the bridge exists).
     from omnigent.harnesses.claude_native.bridge import record_model_vocabulary
-    from omnigent.harnesses.claude_native.main import stored_claude_picker_values
+    from omnigent.harnesses.claude_native.main import (
+        stored_claude_catalog_rows,
+        stored_claude_picker_values,
+    )
+    from omnigent.models.claude_model_vocabulary import picker_model_options
+
+    picker_catalog = (
+        launch_catalog if launch_catalog is not None else stored_claude_catalog_rows(claude_config)
+    )
 
     await asyncio.to_thread(
         record_model_vocabulary,
@@ -9812,6 +9820,9 @@ async def _auto_create_claude_terminal(
         # spellings a later ``/model`` can type — a managed picker names
         # rows no pin covers.
         picker_values=stored_claude_picker_values(claude_config, launch_catalog),
+        picker_options=(
+            picker_model_options(picker_catalog) if picker_catalog is not None else None
+        ),
     )
     _logger.info(
         "Claude terminal provider config resolved: session=%s configured=%s "
@@ -9989,10 +10000,9 @@ async def _auto_create_claude_terminal(
     )
     # Seed trust and onboarding in the config selected by the terminal's launch environment.
     try:
-        ensure_claude_workspace_trusted(
-            _claude_terminal_launch_cwd(env_spec, agent_os_env),
-            env=_claude_terminal_launch_env(env_spec),
-        )
+        launch_cwd = _claude_terminal_launch_cwd(env_spec, agent_os_env)
+        launch_env = _claude_terminal_launch_env(env_spec)
+        ensure_claude_workspace_trusted(launch_cwd, env=launch_env)
     except BaseException as seed_error:
         # No forwarder owns the routers yet, so release the ones this launch started.
         # A ``None`` handle would shut down whichever router is registered now.

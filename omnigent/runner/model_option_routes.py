@@ -47,6 +47,11 @@ _CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S = 2.5
 _CLAUDE_MODEL_OPTIONS_CACHE_TTL_S = 15.0
 
 
+def _public_model_rows(rows: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
+    """Keep private picker descriptors out of public catalog responses."""
+    return [{key: value for key, value in row.items() if not key.startswith("_")} for row in rows]
+
+
 def register_model_option_routes(
     app: FastAPI,
     *,
@@ -267,7 +272,9 @@ def register_model_option_routes(
         if cached is not None:
             expires_at, cached_rows = cached
             if time.monotonic() < expires_at:
-                return JSONResponse(status_code=200, content={"models": cached_rows})
+                return JSONResponse(
+                    status_code=200, content={"models": _public_model_rows(cached_rows)}
+                )
         try:
             claude_config = await _resolve_session_claude_launch_config(session_id)
         except click.ClickException as exc:
@@ -342,7 +349,10 @@ def register_model_option_routes(
                 bridge_dir_for_bridge_id,
                 record_model_vocabulary,
             )
-            from omnigent.models.claude_model_vocabulary import picker_command_values
+            from omnigent.models.claude_model_vocabulary import (
+                picker_command_values,
+                picker_model_options,
+            )
 
             bridge_id = await _claude_native_bridge_id_for_session(
                 server_client=server_client,
@@ -354,6 +364,7 @@ def register_model_option_routes(
                 launch_env=None,
                 launch_model=None,
                 picker_values=picker_command_values(rows),
+                picker_options=picker_model_options(rows),
             )
         except Exception:  # vocabulary refresh is advisory
             _logger.debug(
@@ -362,7 +373,7 @@ def register_model_option_routes(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
-        return JSONResponse(status_code=200, content={"models": rows})
+        return JSONResponse(status_code=200, content={"models": _public_model_rows(rows)})
 
     @app.get("/v1/sessions/{session_id}/model-options")
     async def get_session_model_options(session_id: str) -> JSONResponse:

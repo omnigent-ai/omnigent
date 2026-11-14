@@ -138,6 +138,7 @@ from omnigent.models.claude_model_vocabulary import (
     CUSTOM_MODEL_OPTION_NAME_ENV_VAR,
     LEGACY_CUSTOM_SLOT_ROW_ID,
     claude_model_alias,
+    picker_model_options,
     served_canonical_overrides,
 )
 from omnigent.native._native_resume_hint import echo_native_resume_hint
@@ -1365,6 +1366,7 @@ async def probe_claude_model_options(
     """
     text = await _run_claude_model_probe(claude_config, stream_input=True)
     models = _parse_claude_picker_models(text) if text is not None else None
+    structured = models is not None
     empty_picker = models is not None and not any(
         model.get("disabled") is not True for model in models
     )
@@ -1405,8 +1407,22 @@ async def probe_claude_model_options(
         if isinstance(label, str) and label:
             resolution["label"] = label
         row = _claude_alias_row(alias, resolution)
-        if row["model"] in disabled_models or row["model"] in seen_models:
+        descriptor = {
+            "value": alias,
+            "model": row["model"],
+            "display_name": label if isinstance(label, str) and label else None,
+            "enabled": model.get("disabled") is not True,
+            "provenance": "structured" if structured else "legacy",
+        }
+        if row["model"] in disabled_models:
             continue
+        if row["model"] in seen_models:
+            existing = next(item for item in alias_rows if item["model"] == row["model"])
+            descriptors = existing["_claude_picker_options"]
+            assert isinstance(descriptors, list)
+            descriptors.append(descriptor)
+            continue
+        row["_claude_picker_options"] = [descriptor]
         seen_models.add(row["model"])
         alias_rows.append(row)
     return ClaudeModelProbe(
@@ -1442,7 +1458,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     ambient_transport = claude_ambient_transport() if uses_cli_settings else None
     return fingerprint_of(
         "claude-native",
-        "control-picker-v3",
+        "control-picker-v4",
         sorted(claude_config.env.items()) if claude_config is not None else None,
         claude_config.api_key_helper if claude_config is not None else None,
         claude_config.model if claude_config is not None else None,
@@ -5484,6 +5500,7 @@ async def _prepare_claude_terminal(
                 "session runner bound",
                 startup_progress=startup_progress,
             )
+        picker_catalog = stored_claude_catalog_rows(claude_config)
         bridge_dir = prepare_bridge_dir(
             session_id,
             bridge_id=bridge_id,
@@ -5491,6 +5508,9 @@ async def _prepare_claude_terminal(
             launch_model=claude_config.model if claude_config else None,
             launch_env=claude_config.env if claude_config else None,
             picker_values=stored_claude_picker_values(claude_config),
+            picker_options=(
+                picker_model_options(picker_catalog) if picker_catalog is not None else None
+            ),
         )
         _mark_startup_step(
             startup_profiler,

@@ -29,12 +29,26 @@ from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import create_runner_app, native_controls
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
+from tests._helpers.providers import isolate_provider_resolution
 from tests.runner.conftest import (
     _FakeProcessManager,
     _runner_client,
     _ScriptedHarnessClient,
 )
 from tests.runner.helpers import NullServerClient
+
+
+@pytest.fixture(autouse=True)
+def _isolate_native_session_configuration(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    isolate_provider_resolution(monkeypatch, tmp_path / "config")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.resolve_native_claude_config", lambda **kwargs: None
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.stored_claude_catalog_rows", lambda _: None
+    )
 
 
 def _native_spec() -> AgentSpec:
@@ -169,9 +183,9 @@ async def _open_claude_native_session(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("event", "expected_command"),
+    ("event", "expected_input"),
     [
-        ({"type": "model_change", "model": "claude-opus-4-7"}, "/model claude-opus-4-7"),
+        ({"type": "model_change", "model": "claude-opus-4-7"}, "claude-opus-4-7"),
         ({"type": "effort_change", "effort": "high"}, "/effort high"),
     ],
     ids=["model_change", "effort_change"],
@@ -180,7 +194,7 @@ async def test_session_change_heals_dead_registered_missing_tmux_socket(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     event: dict[str, Any],
-    expected_command: str,
+    expected_input: str,
 ) -> None:
     """Dead registry + missing sock must heal, then inject, not 503.
 
@@ -223,6 +237,16 @@ async def test_session_change_heals_dead_registered_missing_tmux_socket(
     monkeypatch.setattr(
         claude_native_bridge, "inject_slash_command", _inject_hits_missing_sock_until_heal
     )
+
+    def select(inject_bridge_dir: Path, *, model: str, **kwargs: Any) -> Any:
+        assert auto_create_calls, "The model picker must run after the stale pane was healed"
+        assert inject_bridge_dir == bridge_dir
+        captured.append(model)
+        return claude_native_bridge.ClaudeModelSwitchResult(
+            model, model, model, model, "native-session"
+        )
+
+    monkeypatch.setattr(claude_native_bridge, "inject_model_command", select)
     monkeypatch.setattr(
         claude_native_bridge,
         "claude_pane_ready",
@@ -239,8 +263,8 @@ async def test_session_change_heals_dead_registered_missing_tmux_socket(
         f"_ensure_native_terminal_for_turn must recreate the pane; "
         f"got auto_create_calls={auto_create_calls!r}"
     )
-    assert captured == [expected_command], (
-        f"healed pane must receive {expected_command!r}; got {captured!r}"
+    assert captured == [expected_input], (
+        f"healed pane must receive {expected_input!r}; got {captured!r}"
     )
 
 
@@ -303,24 +327,15 @@ async def test_model_change_heals_before_read_model_env(
     bridge_dir = bridge_dir_for_conversation_id(conv_id)
     _plant_dead_claude_pane(registry, conv_id, tmp_path, bridge_dir)
 
-    real_inject = claude_native_bridge.inject_slash_command
+    def select(inject_bridge_dir: Path, *, model: str, **kwargs: Any) -> Any:
+        assert auto_create_calls, "The model picker must run after the stale pane was healed"
+        env = claude_native_bridge.read_model_env(inject_bridge_dir)
+        assert env == {"ANTHROPIC_CUSTOM_MODEL_OPTION": "claude-opus-4-7"}
+        return claude_native_bridge.ClaudeModelSwitchResult(
+            model, model, model, model, "native-session"
+        )
 
-    def _inject_hits_missing_sock_until_heal(
-        inject_bridge_dir: Path,
-        *,
-        command: str,
-        timeout_s: float = 1.0,
-        auto_confirm: bool = False,
-        confirm_hint: str | None = None,
-        ready_timeout_s: float | None = None,
-    ) -> None:
-        del command, timeout_s, auto_confirm, confirm_hint, ready_timeout_s
-        if not auto_create_calls:
-            real_inject(inject_bridge_dir, command="/model claude-opus-4-7", timeout_s=1.0)
-
-    monkeypatch.setattr(
-        claude_native_bridge, "inject_slash_command", _inject_hits_missing_sock_until_heal
-    )
+    monkeypatch.setattr(claude_native_bridge, "inject_model_command", select)
     monkeypatch.setattr(
         claude_native_bridge,
         "claude_pane_ready",

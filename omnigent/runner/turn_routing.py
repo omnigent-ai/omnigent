@@ -1049,6 +1049,9 @@ def clear_pending_replay(bridge_dir: Path) -> None:
 
 # ── The replay ─────────────────────────────────────────────────────────────
 
+_ReplayKey = tuple[asyncio.AbstractEventLoop, Path, str, str, str | None, str | None, str | None]
+_replay_tasks: dict[_ReplayKey, asyncio.Task[None]] = {}
+
 
 def schedule_replay(
     session_id: str,
@@ -1113,7 +1116,12 @@ def schedule_replay(
         taking the blocked turn id. ``None`` picks one by *harness*.
     :returns: The scheduled task (tests await it; callers ignore it).
     """
-    return asyncio.get_running_loop().create_task(
+    loop = asyncio.get_running_loop()
+    key = (loop, bridge_dir.absolute(), session_id, prompt, blocked_turn_id, harness, model)
+    current = _replay_tasks.get(key)
+    if current is not None and not current.done():
+        return current
+    task = loop.create_task(
         _replay(
             session_id,
             prompt=prompt,
@@ -1126,6 +1134,14 @@ def schedule_replay(
         ),
         name=f"turn-routing-replay-{session_id}",
     )
+    _replay_tasks[key] = task
+
+    def finished(_: asyncio.Task[None]) -> None:
+        if _replay_tasks.get(key) is task:
+            _replay_tasks.pop(key, None)
+
+    task.add_done_callback(finished)
+    return task
 
 
 async def _replay(
@@ -1165,7 +1181,22 @@ async def _replay(
             blocked_turn_id,
             session_id,
         )
-    await _apply_routed_model(session_id, bridge_dir=bridge_dir, harness=harness, model=model)
+    if (
+        await _apply_routed_model(
+            session_id,
+            bridge_dir=bridge_dir,
+            harness=harness,
+            model=model,
+            blocked_prompt=prompt,
+            blocked_turn_id=blocked_turn_id,
+        )
+        is not True
+    ):
+        _logger.warning(
+            "route-turn: required model switch refused for session=%s; the prompt stays pending",
+            session_id,
+        )
+        return
     if not await _deliver_prompt(
         session_id, prompt=prompt, server_client=server_client, model=model
     ):
@@ -1401,81 +1432,95 @@ async def _apply_routed_model(
     bridge_dir: Path,
     harness: str | None,
     model: str | None,
+    blocked_prompt: str | None = None,
+    blocked_turn_id: str | None = None,
 ) -> bool:
-    """Put the pane on the routed model, for harnesses whose hook cannot.
-
-    Codex's hook switches the thread itself (an RPC to the app-server,
-    which accepts a second client mid-turn), so nothing is left to do here.
-    Claude's cannot: its only mid-session switch is a keystroke into the
-    tmux pane, and the pane is frozen waiting on the hook subprocess that
-    would be typing. So the switch moves here — after the block is in
-    effect, before the replayed prompt exists.
-
-    Fails open: a switch that does not take is logged and the prompt is
-    still delivered, on the pane's current model. Losing the prompt is
-    worse, and the recorded decision already names the routed model.
-
-    Accepted trade-off: ``/model <id>`` also saves the pick as the person's
-    global default in ``~/.claude/settings.json``.
-
-    :param session_id: Session/conversation identifier.
-    :param bridge_dir: Session bridge directory.
-    :param harness: Harness the blocked prompt came from.
-    :param model: Routed model id, or ``None`` to skip.
-    :returns: ``True`` when the pane was switched (or needed no switch).
-    """
+    """Apply a required switch before delivery; refusal keeps the replay pending."""
     if harness != "claude-native" or not model:
         return True
     from omnigent.harnesses.claude_native.bridge import (
-        SWITCH_MODEL_DIALOG_HINT,
-        inject_slash_command,
-        read_claude_status_model,
-        read_model_env,
-        read_model_picker_values,
-    )
-    from omnigent.models.claude_model_vocabulary import (
-        claude_model_command_arg,
-        normalized_model_id,
+        CLAUDE_INPUT_HOLD_S,
+        ClaudeComposerNotCleared,
+        ClaudeModelSwitchResult,
+        ClaudeTerminalDialog,
+        ClaudeUserPromptPending,
+        ModelSwitchDeadline,
+        can_hold_input_refusal,
+        cancellable_injection,
+        inject_model_command,
     )
 
-    live = read_claude_status_model(bridge_dir)
-    if live and normalized_model_id(live) == normalized_model_id(model):
-        # Already there. Skipping keeps a needless ``/model`` echo out of the
-        # transcript, which otherwise sits ahead of the very first turn.
-        _logger.info(
-            "route-turn: session=%s pane is already on %s; no switch typed", session_id, model
+    loop = asyncio.get_running_loop()
+    hold_deadline: float | None = None
+    while True:
+        pending = read_pending_replay(bridge_dir)
+        owned_draft = (
+            pending.prompt
+            if pending is not None
+            and pending.session_id == session_id
+            and pending.model == model
+            and pending.prompt == blocked_prompt
+            and pending.blocked_turn_id == blocked_turn_id
+            and turn_routing_marker_present(bridge_dir, session_id)
+            else None
         )
-        return True
-    env = read_model_env(bridge_dir) or None
-    picker_values = read_model_picker_values(bridge_dir)
-    arg = claude_model_command_arg(model, env, picker_values=picker_values)
-    if arg is None:
+        if hold_deadline is not None and (owned_draft is None or loop.time() >= hold_deadline):
+            return False
+        cancelled = (
+            ModelSwitchDeadline(hold_deadline - loop.time(), None, time.monotonic)
+            if hold_deadline is not None
+            else threading.Event()
+        )
+        with cancellable_injection(cancelled):
+            worker = asyncio.create_task(
+                asyncio.to_thread(
+                    inject_model_command, bridge_dir, model=model, owned_draft=owned_draft
+                )
+            )
+        try:
+            receipt = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancelled.set()
+            while not worker.done():
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await asyncio.shield(worker)
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                worker.result()
+            raise
+        except (ClaudeUserPromptPending, ClaudeTerminalDialog, ClaudeComposerNotCleared) as exc:
+            if owned_draft is None or not can_hold_input_refusal(exc):
+                return False
+            if hold_deadline is None:
+                hold_deadline = loop.time() + CLAUDE_INPUT_HOLD_S
+                _logger.info(
+                    "route-turn: holding session=%s replay until the Claude input is free",
+                    session_id,
+                )
+            remaining = hold_deadline - loop.time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(REPLAY_POLL_S, remaining))
+            continue
+        except (RuntimeError, ValueError, OSError):
+            _logger.warning(
+                "route-turn: could not confirm session=%s on %s; the prompt remains pending",
+                session_id,
+                model,
+                exc_info=True,
+            )
+            return False
+        if hold_deadline is not None and (
+            read_pending_replay(bridge_dir) != pending
+            or not turn_routing_marker_present(bridge_dir, session_id)
+        ):
+            return False
+        break
+    if not isinstance(receipt, ClaudeModelSwitchResult) or receipt.requested_model != model:
         _logger.warning(
-            "route-turn: routed model %r has no spelling session=%s accepts "
-            "(pins=%s, picker=%s); replaying on the launch model",
-            model,
-            session_id,
-            sorted(env or ()),
-            picker_values,
+            "route-turn: model switch returned no fresh receipt for session=%s", session_id
         )
         return False
-    try:
-        await asyncio.to_thread(
-            inject_slash_command,
-            bridge_dir,
-            command=f"/model {arg}",
-            auto_confirm=True,
-            confirm_hint=SWITCH_MODEL_DIALOG_HINT,
-        )
-    except (RuntimeError, ValueError):
-        _logger.warning(
-            "route-turn: could not switch session=%s onto %s; replaying on the launch model",
-            session_id,
-            model,
-            exc_info=True,
-        )
-        return False
-    _logger.info("route-turn: session=%s pane switched onto %s", session_id, model)
+    _logger.info("route-turn: session=%s confirmed on %s", session_id, receipt.resolved_model)
     return True
 
 

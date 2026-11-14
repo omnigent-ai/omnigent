@@ -464,27 +464,26 @@ def rollout_turn_contexts(session_id: str) -> list[dict[str, Any]]:
 # ── Isolation guards ────────────────────────────────────────────────────────
 
 
-def claude_settings_apart_from_the_model() -> str | None:
-    """Return the developer's ``~/.claude/settings.json`` minus its ``model`` key.
+def claude_settings_snapshot(path: Path, *, include_model: bool = False) -> str:
+    """Snapshot the launched Claude settings file, optionally including its model.
 
-    Routing writes nothing into the user's global Claude settings — hook
-    registration lives in the per-session bridge dir. Claude Code's own
-    response to ``/model <id>`` does rewrite the file's ``model`` key, which
-    is the accepted trade-off for the switch, so that one key is excluded and
-    everything else is compared before and after each claude CUJ.
+    Hook registration lives in the per-session bridge dir. Session-only
+    selection leaves the saved default unchanged; callers include the model
+    when checking that default alongside the other settings.
 
-    :returns: A canonical rendering of the remaining settings, or ``None``
-        when the file does not exist.
+    :param path: Settings path resolved from the launch environment and workspace.
+    :param include_model: Include the saved default in the snapshot.
+
+    :returns: Canonical settings, treating a missing file as an empty object.
     """
-    path = Path.home() / ".claude" / "settings.json"
     if not path.exists():
-        return None
+        return "{}"
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         # Unreadable is still comparable — hash the bytes.
         return hashlib.md5(path.read_bytes(), usedforsecurity=False).hexdigest()
-    if isinstance(payload, dict):
+    if isinstance(payload, dict) and not include_model:
         payload = {key: value for key, value in payload.items() if key != "model"}
     return json.dumps(payload, sort_keys=True)
 

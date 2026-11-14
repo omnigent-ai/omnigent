@@ -11,16 +11,18 @@ import threading
 from collections.abc import AsyncIterator, Callable
 from functools import partial
 from pathlib import Path
+from typing import TypeVar
 
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
     CLAUDE_FRAMEWORK_CONTEXT_FILE,
     MANAGED_SANDBOX_SIGN_IN_REMEDY,
     REQUEST_SESSION_ID_ENV_VAR,
-    SWITCH_MODEL_DIALOG_HINT,
     ClaudeComposerNotCleared,
     ClaudeInputBoxOccupied,
     ClaudeMessageNotAccepted,
+    ClaudeModelSwitchRefused,
+    ClaudeModelSwitchResult,
     ClaudePromptTimeout,
     ClaudeSignInPending,
     ClaudeTerminalDialog,
@@ -30,18 +32,20 @@ from omnigent.harnesses.claude_native.bridge import (
     cancellable_injection,
     claude_pane_ready,
     has_pending_user_prompt,
-    inject_slash_command,
+    inject_model_command,
     inject_user_message,
     input_box_reads_clear,
     is_auth_slash_command,
     kill_session,
     read_active_session_id,
-    read_claude_status_model,
-    read_launch_model,
-    read_model_env,
-    read_model_picker_values,
     read_transcript_path,
     terminal_dialog_pending,
+)
+from omnigent.harnesses.claude_native.bridge import (
+    CLAUDE_INPUT_HOLD_S as _MESSAGE_HOLD_S,
+)
+from omnigent.harnesses.claude_native.bridge import (
+    can_hold_input_refusal as _can_hold_refusal,
 )
 from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.inner.executor import (
@@ -62,9 +66,9 @@ from omnigent.inner.native_attachments import (
     attachment_reference_line,
     framework_notices,
 )
-from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
 
 _logger = logging.getLogger(__name__)
+_InjectionResult = TypeVar("_InjectionResult")
 
 _AUTH_COMMAND_GUIDANCE = (
     "Claude Code's sign-in runs in its own terminal, so /login and /logout do "
@@ -80,9 +84,6 @@ _STALE_SESSION_MESSAGE = (
     "open the latest conversation and retry."
 )
 
-# Hold refusals raised before typing until the person answers or frees the box.
-# Report the result before the server's 600 s pending-input lifetime ends.
-_MESSAGE_HOLD_S = 8 * 60.0
 _MESSAGE_HOLD_POLL_S = 1.0
 # How often a message held for the input box asks Claude Code to repaint it.
 _INPUT_BOX_REPAINT_INTERVAL_S = 10.0
@@ -95,17 +96,6 @@ _HOST_DISK_WAIT_MESSAGE = (
     "The host's disk is full, so Claude Code can't save this conversation. "
     "Free up disk space on the host; this message will be sent when there is room."
 )
-
-
-def _can_hold_refusal(
-    exc: ClaudeUserPromptPending | ClaudeTerminalDialog | ClaudeComposerNotCleared,
-) -> bool:
-    """Return whether a refusal came before typing, so the message can be held and retried."""
-    if isinstance(exc, ClaudeUserPromptPending):
-        return exc.nothing_typed
-    if isinstance(exc, ClaudeTerminalDialog):
-        return isinstance(exc, ClaudeInputBoxOccupied) or exc.awaits_answer
-    return True
 
 
 class ClaudeNativeExecutor(Executor):
@@ -141,10 +131,6 @@ class ClaudeNativeExecutor(Executor):
         self._inject_lock = asyncio.Lock()
         # Set while ``run_turn`` holds a refused message (see ``_hold_message``).
         self._holding_message = False
-        # The model the pane is currently on, so a routing turn only types
-        # ``/model`` when the model actually changes. Seeded lazily from the
-        # spawn ``launch_model`` on the first turn (``None`` = not yet known).
-        self._applied_model: str | None = None
 
     def supports_streaming(self) -> bool:
         """:returns: ``False`` because output is emitted by the transcript forwarder."""
@@ -193,31 +179,25 @@ class ClaudeNativeExecutor(Executor):
         text: str,
         notices: list[str],
         wanted_model: str | None,
-        wanted_model_arg: str | None,
     ) -> None:
         """Apply a routed ``/model`` switch, then inject the message, in one lock hold."""
         async with self._inject_lock:
             self._require_active_session()
             context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
             context_path.unlink(missing_ok=True)
-            if wanted_model_arg is not None:
-                # Accepted trade-off: ``/model <id>`` also saves the
-                # pick as the person's global default for new Claude
-                # sessions. Runs to completion before the message
-                # inject below (same lock), so its confirm Enter can't
-                # race the message.
-                await self._inject(
-                    partial(
-                        inject_slash_command,
-                        self._bridge_dir,
-                        command=f"/model {wanted_model_arg}",
-                        auto_confirm=True,
-                        confirm_hint=SWITCH_MODEL_DIALOG_HINT,
-                    )
+            if wanted_model:
+                receipt = await self._inject(
+                    partial(inject_model_command, self._bridge_dir, model=wanted_model),
+                    preserve_session_on_cancel=True,
                 )
-                # Track the routed id, not the alias: the next turn's
-                # comparison is against what routing asked for.
-                self._applied_model = wanted_model
+                if (
+                    not isinstance(receipt, ClaudeModelSwitchResult)
+                    or receipt.requested_model != wanted_model
+                ):
+                    raise ClaudeModelSwitchRefused(
+                        "Claude did not provide a fresh model-selection receipt; "
+                        "the prompt was not sent."
+                    )
             await self._inject_prompt(text, notices)
 
     async def _hold_message(self, refusal: RuntimeError, deadline: float) -> bool:
@@ -452,15 +432,12 @@ class ClaudeNativeExecutor(Executor):
         # box and verifies its submit) delivers the message — in order,
         # once.
         wanted_model = config.model if config is not None else None
-        # ``/model`` only accepts this session's picker values, aliases, and
-        # custom slot; anything else is ignored and the pane keeps its model.
-        wanted_model_arg = self._model_command_arg(wanted_model)
         try:
             with telemetry.span("claude_native.inject"):
                 hold_deadline: float | None = None
                 while True:
                     try:
-                        await self._inject_turn(text, notices, wanted_model, wanted_model_arg)
+                        await self._inject_turn(text, notices, wanted_model)
                         break
                     except (
                         ClaudeUserPromptPending,
@@ -474,7 +451,6 @@ class ClaudeNativeExecutor(Executor):
                             hold_deadline = asyncio.get_running_loop().time() + _MESSAGE_HOLD_S
                         if not await self._hold_message(exc, hold_deadline):
                             raise
-                        wanted_model_arg = self._model_command_arg(wanted_model)
         except ClaudeTerminalExited as exc:
             # Claude Code exits 0 on /quit or a closed window. The turn still
             # fails, but the person's own teardown is not a defect; a pane that
@@ -551,6 +527,15 @@ class ClaudeNativeExecutor(Executor):
             )
             yield ExecutorError(message=describe_exception(exc), undelivered=True)
             return
+        except ClaudeModelSwitchRefused as exc:
+            _logger.warning(
+                "claude-native: session-only model switch refused delivery; message not delivered",
+                extra={"session_id": self._request_session_id},
+            )
+            yield ExecutorError(
+                message=describe_exception(exc), undelivered=True, preserve_session=True
+            )
+            return
         except RuntimeError as exc:
             _logger.exception(
                 "claude-native: failed to deliver message to harness",
@@ -560,13 +545,18 @@ class ClaudeNativeExecutor(Executor):
             return
         yield TurnComplete(response=None)
 
-    async def _inject(self, operation: Callable[[], None]) -> None:
+    async def _inject(
+        self,
+        operation: Callable[[], _InjectionResult],
+        *,
+        preserve_session_on_cancel: bool = False,
+    ) -> _InjectionResult:
         """Drain cancelled delivery workers before releasing the pane's injection lock."""
         cancelled = threading.Event()
         with cancellable_injection(cancelled):
             worker = asyncio.create_task(asyncio.to_thread(operation))
         try:
-            await asyncio.shield(worker)
+            return await asyncio.shield(worker)
         except asyncio.CancelledError:
             cancelled.set()
             while not worker.done():
@@ -574,7 +564,8 @@ class ClaudeNativeExecutor(Executor):
                     await asyncio.shield(worker)
             with contextlib.suppress(Exception, asyncio.CancelledError):
                 worker.result()
-            self._reap_failed_turn()
+            if not preserve_session_on_cancel:
+                self._reap_failed_turn()
             raise
 
     def _reap_failed_turn(self, *, expected_close: bool = False) -> str | None:
@@ -594,111 +585,6 @@ class ClaudeNativeExecutor(Executor):
             )
             return describe_exception(exc)
         return None
-
-    def _model_command_arg(self, wanted_model: str | None) -> str | None:
-        """
-        Return the ``/model`` argument for this turn, or ``None`` to skip.
-
-        Two gates: the switch must be needed at all
-        (:meth:`_should_switch_model`), and the routed catalog id must
-        translate into vocabulary ``/model`` accepts — the session's
-        picker values, its family aliases, or the exact id of its custom
-        picker slot. Both the pinning and the picker come from the launch,
-        recorded in the bridge config because this process doesn't share
-        the terminal's env.
-
-        An untranslatable id fails open: the message still goes in, on
-        the current model, with a warning. Typing a value the CLI won't
-        take leaves the pane on its old model while reporting success.
-
-        :param wanted_model: The turn's routed model, or ``None``.
-        :returns: A ``/model`` argument, or ``None`` when no switch
-            should be typed.
-        """
-        if wanted_model is None:
-            _logger.info(
-                "claude-native: turn carries no routed model; not typing /model",
-                extra={"session_id": self._request_session_id},
-            )
-            return None
-        if not self._should_switch_model(wanted_model):
-            _logger.info(
-                "claude-native: skipping /model — pane is already on %s",
-                wanted_model,
-                extra={"session_id": self._request_session_id},
-            )
-            return None
-        env = read_model_env(self._bridge_dir) or None
-        # The launch recorded this pane's picker, which is the only
-        # vocabulary that spells a managed model of no Claude family.
-        picker_values = read_model_picker_values(self._bridge_dir)
-        wanted_arg = claude_model_command_arg(wanted_model, env, picker_values=picker_values)
-        if wanted_arg is None:
-            _logger.warning(
-                "claude-native: skipping /model — routed model %r has no spelling this "
-                "session accepts (pins=%s, picker=%s); sending the turn on the current model",
-                wanted_model,
-                sorted(env or ()),
-                picker_values,
-                extra={"session_id": self._request_session_id},
-            )
-            return None
-        if (
-            self._applied_model is not None
-            and claude_model_command_arg(self._applied_model, env, picker_values=picker_values)
-            == wanted_arg
-        ):
-            # Resolves to the model the pane is already on, so the switch
-            # would be a pointless prompt (and can pop a confirm dialog).
-            _logger.info(
-                "claude-native: skipping /model — %r resolves to %r, already applied",
-                wanted_model,
-                wanted_arg,
-                extra={"session_id": self._request_session_id},
-            )
-            return None
-        _logger.info(
-            "claude-native: typing /model %s for routed model %s",
-            wanted_arg,
-            wanted_model,
-            extra={"session_id": self._request_session_id},
-        )
-        return wanted_arg
-
-    def _should_switch_model(self, wanted_model: str | None) -> bool:
-        """
-        Return whether this turn must type ``/model`` before the message.
-
-        Only switches when routing named a model AND it differs from the
-        model the pane is already on. The baseline is tracked per turn in
-        ``_applied_model``, seeded lazily so turn 1's routed pick is compared
-        against what the pane is actually on — not blindly re-issued.
-
-        The LIVE model (the statusLine capture) is the seed, falling back to
-        the launch model. ``launch_model`` alone was wrong for a routed first
-        message: the turn router blocks the prompt, switches the pane itself
-        and then replays the prompt with the same override, so a baseline
-        frozen at bridge-prepare time still named the pre-switch model and the
-        replay typed a second, redundant ``/model``.
-
-        :param wanted_model: The turn's routed model, or ``None`` when the
-            turn carries no override (routing off / already-pinned session).
-        :returns: ``True`` when a ``/model`` switch is required.
-        """
-        if not wanted_model:
-            return False
-        if self._applied_model is None:
-            # Both reads are best-effort (no statusLine capture yet, no ucode
-            # profile); an unknown baseline means we switch to be safe — a
-            # redundant ``/model`` to the current model is a harmless no-op.
-            self._applied_model = read_claude_status_model(self._bridge_dir) or read_launch_model(
-                self._bridge_dir
-            )
-        if self._applied_model is None:
-            return True
-        # The statusLine reports a display spelling ("Sonnet 5") where routing
-        # names a catalog id, so compare normalized.
-        return normalized_model_id(wanted_model) != normalized_model_id(self._applied_model)
 
 
 def _bridge_dir_from_env() -> Path:
