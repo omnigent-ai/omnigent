@@ -2111,13 +2111,15 @@ class HostProcess:
             )
 
             assert frame.harness is not None
-            missing = await asyncio.to_thread(
-                missing_harness_cli, frame.harness, READINESS_CLI_PROBE_TIMEOUT_S
+            missing = await self._run_host_subprocess_in_thread(
+                functools.partial(
+                    missing_harness_cli, frame.harness, READINESS_CLI_PROBE_TIMEOUT_S
+                )
             )
             harness_ready = missing is None
         else:
-            harness_ready = frame.harness is None or await asyncio.to_thread(
-                harness_is_configured, frame.harness
+            harness_ready = frame.harness is None or await self._run_host_subprocess_in_thread(
+                functools.partial(harness_is_configured, frame.harness)
             )
         if frame.harness in {"pi", "pi-native"}:
             from omnigent.harnesses.pi_native.main import (
@@ -2132,7 +2134,7 @@ class HostProcess:
             except click.ClickException:
                 version = None
             else:
-                version = await asyncio.to_thread(pi_version, executable)
+                version = await self._run_host_subprocess_in_thread(lambda: pi_version(executable))
             if version is not None:
                 try:
                     check_pi_cli_version_floor(version)
@@ -2141,7 +2143,9 @@ class HostProcess:
                         frame, str(exc), error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE
                     )
         if not harness_ready:
-            setup_hint = await asyncio.to_thread(harness_setup_hint, frame.harness)
+            setup_hint = await self._run_host_subprocess_in_thread(
+                lambda: harness_setup_hint(frame.harness)
+            )
             return self._launch_failed(
                 frame,
                 (
@@ -2191,9 +2195,8 @@ class HostProcess:
             )
 
         runner_id = token_bound_runner_id(frame.binding_token)
-        initial_auth_token = await asyncio.to_thread(
-            self._current_auth_token,
-            initialize=False,
+        initial_auth_token = await self._run_host_subprocess_in_thread(
+            lambda: self._current_auth_token(initialize=False)
         )
         session_env = (
             await asyncio.to_thread(

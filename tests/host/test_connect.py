@@ -3346,6 +3346,94 @@ async def test_cancelled_readiness_probe_keeps_orphan_reaper_paused(
     assert host._host_subprocess_tasks == set()
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="observes an unreaped Linux child")
+@pytest.mark.parametrize("cancel_launch", [False, True])
+@pytest.mark.parametrize("stage", ["configured", "bound_cli", "pi_version", "setup_hint", "auth"])
+async def test_launch_probes_preserve_subprocess_exit_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    cancel_launch: bool,
+) -> None:
+    """Launch probes retain child ownership, including after request cancellation."""
+    import psutil
+
+    from omnigent.harnesses.pi_native import main as pi_native
+    from tests._helpers.polling import poll_until_async
+
+    host = _make_host_process()
+    probe_started = threading.Event()
+    probe_release = threading.Event()
+    probe_finished = threading.Event()
+    children: list[subprocess.Popen[bytes]] = []
+    exit_codes: list[int] = []
+
+    def _probe(*_args: object, **_kwargs: object) -> None:
+        try:
+            with subprocess.Popen([sys.executable, "-c", "raise SystemExit(42)"]) as child:
+                children.append(child)
+                probe_started.set()
+                if not probe_release.wait(timeout=10):
+                    raise AssertionError("test did not release launch probe")
+                exit_codes.append(child.wait())
+            raise RuntimeError("launch probe finished")
+        finally:
+            probe_finished.set()
+
+    monkeypatch.setattr("omnigent.host.connect.harness_is_configured", lambda _h: True)
+    harness = "claude-native"
+    inference_config = None
+    if stage == "configured":
+        monkeypatch.setattr("omnigent.host.connect.harness_is_configured", _probe)
+    elif stage == "bound_cli":
+        inference_config = {
+            "providers": {"work": {"kind": "subscription", "cli": "claude"}},
+            "inference": {"harnesses": {"claude-native": {"provider": "work"}}},
+        }
+        monkeypatch.setattr(harness_install, "missing_harness_cli", _probe)
+    elif stage == "pi_version":
+        harness = "pi-native"
+        monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "/usr/bin/pi")
+        monkeypatch.setattr(pi_native, "pi_version", _probe)
+    elif stage == "setup_hint":
+        monkeypatch.setattr("omnigent.host.connect.harness_is_configured", lambda _h: False)
+        monkeypatch.setattr("omnigent.host.connect.harness_setup_hint", _probe)
+    else:
+        monkeypatch.setattr(host, "_current_auth_token", _probe)
+    launch = asyncio.create_task(
+        host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="launch-probe",
+                binding_token="test-binding-token",
+                workspace=str(tmp_path),
+                harness=harness,
+                inference_config=inference_config,
+            )
+        )
+    )
+    try:
+        assert await asyncio.to_thread(probe_started.wait, 5)
+        child = children[0]
+        await poll_until_async(lambda: psutil.Process(child.pid).status() == psutil.STATUS_ZOMBIE)
+        if cancel_launch:
+            launch.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await launch
+        reaped = host._reap_orphans_once([child.pid])
+    finally:
+        probe_release.set()
+        assert await asyncio.to_thread(probe_finished.wait, 5)
+        await asyncio.gather(launch, return_exceptions=True)
+        await poll_until_async(lambda: not host._host_subprocess_tasks)
+
+    assert reaped == 0
+    assert exit_codes == [42]
+    assert host._owned_subprocess_ops == 0
+    if not cancel_launch:
+        with pytest.raises(RuntimeError, match="launch probe finished"):
+            launch.result()
+
+
 async def test_cancelled_account_probe_request_does_not_block_disconnect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
