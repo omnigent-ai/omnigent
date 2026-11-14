@@ -21,6 +21,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Collection
@@ -134,6 +135,10 @@ _CATALOG_STALE_IF_ERROR_SECONDS = 7 * 24 * 60 * 60
 _CATALOG_DISK_SCHEMA_VERSION = 1
 _CATALOG_UPSTREAM_SCHEMA_MAJOR = 1
 _CATALOG_CACHE_PROVIDER_RE = re.compile(r"^[a-z0-9_-]+$")
+# Providers are looked up one after another, so after a failed download skip the
+# network briefly instead of paying the 5s timeout again for each provider.
+_CATALOG_DOWNLOAD_BACKOFF_SECONDS = 60.0
+_catalog_download_failed_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -292,6 +297,12 @@ def _catalog_age_seconds(entry: _DiskCatalogEntry, now: float) -> float:
     return max(0.0, now - entry.fetched_at)
 
 
+def _catalog_download_backing_off() -> bool:
+    """Whether a recent unreachable download is still suppressing new attempts."""
+    failed_at = _catalog_download_failed_at
+    return failed_at is not None and _catalog_now() - failed_at < _CATALOG_DOWNLOAD_BACKOFF_SECONDS
+
+
 def _download_provider_catalog(provider: str) -> dict[str, Any] | None:
     """
     Fetch ``{provider}.json`` from the MLflow GitHub Release catalog.
@@ -303,6 +314,7 @@ def _download_provider_catalog(provider: str) -> dict[str, Any] | None:
     :returns: Parsed JSON dict (the full catalog file), or ``None`` on
         any network or parse error or when the lookup is disabled.
     """
+    global _catalog_download_failed_at
     if os.environ.get("OMNIGENT_DISABLE_CATALOG_LOOKUP") == "1":
         return None
     url = _catalog_source_url(provider)
@@ -313,6 +325,12 @@ def _download_provider_catalog(provider: str) -> dict[str, Any] | None:
             _logger.warning("Ignoring incompatible model catalog payload for %s", provider)
             return None
         return result
+    except urllib.error.HTTPError:
+        return None
+    except OSError:
+        # Unreachable or timed out: every other provider would wait as long.
+        _catalog_download_failed_at = _catalog_now()
+        return None
     except Exception:
         return None
 
@@ -352,6 +370,14 @@ def _fetch_provider_catalog(provider: str) -> dict[str, Any]:
         with _catalog_cache_lock:
             _catalog_cache[provider] = disk_entry
         return disk_entry.catalog
+    if _catalog_download_backing_off():
+        # Skipped rather than failed: cache nothing so the next request downloads.
+        if (
+            disk_entry is not None
+            and _catalog_age_seconds(disk_entry, now) <= _CATALOG_STALE_IF_ERROR_SECONDS
+        ):
+            return disk_entry.catalog
+        return {}
     result = _download_provider_catalog(provider)
     live_entry: _DiskCatalogEntry | None = None
     if result is not None and _valid_catalog_payload(result):

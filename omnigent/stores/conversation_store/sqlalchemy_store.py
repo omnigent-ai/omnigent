@@ -120,9 +120,14 @@ from omnigent.stores.conversation_store import (
     ProfileHostBinding,
     SessionActivity,
     SessionConnectivity,
+    SpawnTreeUsage,
     family_pinned_label_key,
     pinned_label_key,
     runner_seen_is_fresh,
+)
+from omnigent.stores.conversation_store.activity_error import (
+    LATEST_ACTIVITY_ERROR_LABEL_KEY,
+    fold_activity_error,
 )
 from omnigent.stores.conversation_store.overrides import (
     decode_session_overrides as _decode_session_overrides,
@@ -141,6 +146,7 @@ from omnigent.stores.sandbox_profile_store import (
     reject_profile_labels,
     same_profile_identity,
 )
+from omnigent.util.session_lifecycle import title_without_closed_marker
 
 _logger = logging.getLogger(__name__)
 
@@ -1506,7 +1512,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         unique_ids = list(set(conversation_ids))
         with self._conv_session("get_session_activity") as session:
             updated = session.execute(
-                select(SqlConversation.id, SqlConversation.updated_at).where(
+                select(
+                    SqlConversation.id, SqlConversation.updated_at, SqlConversation.archived
+                ).where(
                     SqlConversation.workspace_id == current_workspace_id(),
                     SqlConversation.id.in_(unique_ids),
                 )
@@ -1548,6 +1556,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 total_cost_usd=costs.get(row.id),
                 pending_elicitation_count=pending_counts.get(row.id),
                 runner_id=runner_ids.get(row.id),
+                archived=bool(row.archived),
             )
         return activity
 
@@ -3246,6 +3255,7 @@ class SqlAlchemyConversationStore(ConversationStore):
 
             fts_rows: list[tuple[str, str, str]] = []
             row_values: list[dict[str, object]] = []
+            fresh_items: list[tuple[int, NewConversationItem]] = []
             batch_stable: dict[str, ConversationItem] = {}
             for item, prepared, search in prepared_rows:
                 if item.stable_id is not None:
@@ -3268,6 +3278,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 else:
                     next_pos += 1
                 values["position"] = position
+                fresh_items.append((position, item))
                 item_id = cast(str, values["id"])
                 if search:
                     fts_rows.append((item_id, conversation_id, search))
@@ -3292,6 +3303,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             if row_values:
                 session.execute(insert(SqlConversationItem), row_values)
             insert_fts_bulk(session, fts_rows)
+            self._fold_latest_activity_error(session, conversation_id, fresh_items, now)
 
             # Persist the advanced counter so the next append reads it instead
             # of scanning; this also lazily backfills a pre-counter conversation.
@@ -3304,6 +3316,40 @@ class SqlAlchemyConversationStore(ConversationStore):
             self._conv_session_immediate,
             "append_conversation_items",
             write,
+        )
+
+    def _fold_latest_activity_error(
+        self,
+        session: Session,
+        conversation_id: str,
+        fresh_items: list[tuple[int, NewConversationItem]],
+        stamp: int,
+    ) -> None:
+        """
+        Fold newly inserted items into the latest-activity-error label.
+
+        Runs inside the append transaction under the conversation row lock. The
+        stored value is read once and rewritten only when the fold changes it.
+
+        :param session: The append's open write session.
+        :param conversation_id: The conversation being appended to.
+        :param fresh_items: ``(position, item)`` for every inserted item, in order.
+        :param stamp: The append's timestamp, e.g. ``1753900000``.
+        """
+        value = fold_activity_error(item for _, item in fresh_items)
+        if value is None:
+            return
+        stored = session.scalar(
+            select(SqlConversationLabel.value).where(
+                SqlConversationLabel.workspace_id == current_workspace_id(),
+                SqlConversationLabel.conversation_id == conversation_id,
+                SqlConversationLabel.key == LATEST_ACTIVITY_ERROR_LABEL_KEY,
+            )
+        )
+        if stored == value:
+            return
+        _upsert_prepared_labels(
+            session, conversation_id, {LATEST_ACTIVITY_ERROR_LABEL_KEY: value}, stamp
         )
 
     def list_projects(
@@ -3637,12 +3683,28 @@ class SqlAlchemyConversationStore(ConversationStore):
                 if cursor_id:
                     self._require_cursor_grant(cursor_id, cursor_viewer)
 
+        agent_ids_for_name: list[str] | None = None
+        if agent_name is not None:
+            # Agents live in the Omnigent DB — resolve to IDs first, then filter
+            # on the conversations.agent_id column directly. Resolved before the
+            # conversation session opens so a single-DB request never holds two
+            # pooled connections at once.
+            with self._session("list_conversations") as agent_sess:
+                agent_ids_for_name = list(
+                    agent_sess.execute(
+                        select(SqlAgent.id).where(
+                            SqlAgent.workspace_id == current_workspace_id(),
+                            SqlAgent.name == agent_name,
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+
         with self._conv_session("list_conversations") as session:
-            # Bound the content-search scan server-side (Postgres only). SET
-            # LOCAL scopes to this transaction and reverts on commit, so it
-            # can't leak to the connection's next pooled use. See
-            # _SEARCH_STATEMENT_TIMEOUT_MS. A worker-thread query is not stopped
-            # by a client disconnect, so this is the only server-side bound.
+            # Bound the content-search scan server-side (Postgres only), the only
+            # bound a client disconnect can't skip; see _SEARCH_STATEMENT_TIMEOUT_MS.
+            # SET LOCAL ends with the transaction (a shared_read_scope commit), not later.
             is_postgres = session.bind is not None and is_postgresql_family(
                 session.bind.dialect.name
             )
@@ -3727,20 +3789,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             if has_agent_id is True:
                 stmt = stmt.where(SqlConversation.agent_id.is_not(None))
-            if agent_name is not None:
-                # Agents live in the Omnigent DB — resolve to IDs first, then
-                # filter on the conversations.agent_id column directly.
-                with self._session("list_conversations") as agent_sess:
-                    agent_ids_for_name = list(
-                        agent_sess.execute(
-                            select(SqlAgent.id).where(
-                                SqlAgent.workspace_id == current_workspace_id(),
-                                SqlAgent.name == agent_name,
-                            )
-                        )
-                        .scalars()
-                        .all()
-                    )
+            if agent_ids_for_name is not None:
                 stmt = stmt.where(SqlConversation.agent_id.in_(agent_ids_for_name))
             if agent_id is not None:
                 # Conversations without an agent binding (legacy rows) correctly
@@ -4012,6 +4061,53 @@ class SqlAlchemyConversationStore(ConversationStore):
             first_id=rows[0].id if rows else None,
             last_id=rows[-1].id if rows else None,
             has_more=page.has_more,
+        )
+
+    def list_spawn_tree_usage(
+        self, root_conversation_id: str, *, limit: int
+    ) -> PagedList[SpawnTreeUsage]:
+        """Walk the root index for ids and parents, then read usage by those ids."""
+        with self._conv_session("list_spawn_tree_usage") as session:
+            members = session.execute(
+                select(SqlConversation.id, SqlConversation.parent_conversation_id)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.root_conversation_id == root_conversation_id,
+                )
+                .order_by(SqlConversation.id)
+                .limit(limit + 1)
+            ).all()
+        has_more = len(members) > limit
+        members = members[:limit]
+        usage_by_id: dict[str, str | None] = {}
+        if members:
+            with self._session("list_spawn_tree_usage") as session:
+                usage_by_id = {
+                    str(row.id): row.session_usage
+                    for row in session.execute(
+                        select(
+                            SqlConversationMetadata.id, SqlConversationMetadata.session_usage
+                        ).where(
+                            SqlConversationMetadata.workspace_id == current_workspace_id(),
+                            SqlConversationMetadata.id.in_([row.id for row in members]),
+                        )
+                    ).all()
+                }
+        rows = [
+            SpawnTreeUsage(
+                id=str(row.id),
+                parent_conversation_id=(
+                    str(row.parent_conversation_id) if row.parent_conversation_id else None
+                ),
+                session_usage=json.loads(usage) if (usage := usage_by_id.get(str(row.id))) else {},
+            )
+            for row in members
+        ]
+        return PagedList(
+            data=rows,
+            first_id=rows[0].id if rows else None,
+            last_id=rows[-1].id if rows else None,
+            has_more=has_more,
         )
 
     @staticmethod
@@ -4808,6 +4904,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         *,
         expected_runner_id: str | None = None,
         expected_binding: Conversation | None = None,
+        expected_runner: Conversation | None = None,
     ) -> Conversation:
         """
         Atomically overwrite ``conversations.runner_id``.
@@ -4820,16 +4917,19 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
         :param runner_id: New runner id, e.g. ``"runner_abc123"``.
+        :param expected_runner: Require its runner (``None`` included) to still be
+            the current one, whatever the host is now, checked under the row lock.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             exists for ``conversation_id``.
+        :raises ValueError: If *expected_binding* or *expected_runner* no longer matches.
         """
 
         def write(session: Session) -> SqlConversationMetadata:
             meta = session.get(
                 SqlConversationMetadata,
                 (current_workspace_id(), conversation_id),
-                with_for_update=expected_binding is not None,
+                with_for_update=expected_binding is not None or expected_runner is not None,
             )
             if meta is None:
                 raise ConversationNotFoundError(
@@ -4839,6 +4939,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 meta.runner_id != expected_binding.runner_id
                 or meta.host_id != expected_binding.host_id
             ):
+                raise ValueError("The session binding changed; retry the request")
+            if expected_runner is not None and meta.runner_id != expected_runner.runner_id:
                 raise ValueError("The session binding changed; retry the request")
             if expected_runner_id is None:
                 _bind_runner(meta, runner_id)
@@ -4872,13 +4974,20 @@ class SqlAlchemyConversationStore(ConversationStore):
         return _to_conversation(ap_row, meta, labels)
 
     def clear_runner_id(
-        self, conversation_id: str, *, expected_binding: Conversation | None = None
+        self,
+        conversation_id: str,
+        *,
+        expected_binding: Conversation | None = None,
+        expected_runner: Conversation | None = None,
     ) -> Conversation:
         """
         Null out ``conversations.runner_id``. Atomic last-write-wins.
 
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
+        :param expected_binding: Require its runner and host to still be current.
+        :param expected_runner: Require its runner (``None`` included) to still be
+            the current one, whatever the host is now.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             exists for ``conversation_id``.
@@ -4888,7 +4997,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta = session.get(
                 SqlConversationMetadata,
                 (current_workspace_id(), conversation_id),
-                with_for_update=expected_binding is not None,
+                with_for_update=expected_binding is not None or expected_runner is not None,
             )
             if meta is None:
                 raise ConversationNotFoundError(
@@ -4898,6 +5007,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 meta.runner_id != expected_binding.runner_id
                 or meta.host_id != expected_binding.host_id
             ):
+                raise ValueError("The session binding changed; retry the request")
+            if expected_runner is not None and meta.runner_id != expected_runner.runner_id:
                 raise ValueError("The session binding changed; retry the request")
             _bind_runner(meta, None)
             return meta
@@ -4918,6 +5029,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         *,
         expected_host_id: str | None = None,
         expected_sandbox_id: str | None = None,
+        expected_runner_id: str | None = None,
+        keep_runner: bool = False,
         clear_profile: bool = False,
     ) -> Conversation:
         """
@@ -4932,6 +5045,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             e.g. ``"conv_abc123"``.
         :param expected_host_id: When supplied, clear only if the current host
             still matches this identity; otherwise leave every binding field unchanged.
+        :param expected_runner_id: When supplied, clear only if the current
+            runner is still this one; otherwise leave every binding field unchanged.
+        :param keep_runner: Leave ``runner_id`` in place and clear only the host fields.
         :returns: The current :class:`Conversation` after the conditional clear.
         :raises ConversationNotFoundError: If no conversation row
             exists for ``conversation_id``.
@@ -4960,6 +5076,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             if expected_host_id is not None and meta.host_id != expected_host_id:
                 return meta
+            if expected_runner_id is not None and meta.runner_id != expected_runner_id:
+                return meta
             if expected_sandbox_id is not None and (
                 host is None or host.sandbox_id != expected_sandbox_id
             ):
@@ -4975,7 +5093,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta.host_id = None
             meta.workspace = None
             meta.git_branch = None
-            _bind_runner(meta, None)
+            if not keep_runner:
+                _bind_runner(meta, None)
             return meta
 
         meta = run_write_transaction(self._session_immediate, "clear_host_binding", write)
@@ -5430,11 +5549,14 @@ class SqlAlchemyConversationStore(ConversationStore):
         host_id: str,
         workspace: str | None = None,
         git_branch: str | None = None,
+        *,
+        expected_runner_id: str | None = None,
     ) -> Conversation:
         """
         Set the host that launched (or should launch) the runner.
 
-        Last-write-wins — mirrors :meth:`replace_runner_id`.
+        Last-write-wins — mirrors :meth:`replace_runner_id` — unless
+        *expected_runner_id* is set.
 
         ``workspace`` is updated together with ``host_id`` when
         provided so the row never violates
@@ -5458,9 +5580,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             resume path). ``None`` preserves the branch on the same
             host/workspace, but clears it when the host or an explicitly
             supplied workspace changes.
+        :param expected_runner_id: Bind only while the session's runner is
+            still this one and it has no other host, checked under the row lock.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             exists for ``conversation_id``.
+        :raises ValueError: If *expected_runner_id* is set and the session
+            has another runner or another host.
         :raises IntegrityError: If the resulting row violates
             ``ck_conversations_workspace_required_for_host`` (i.e.
             ``host_id`` is being set on a row with no ``workspace``
@@ -5478,6 +5604,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
+            if expected_runner_id is not None and (
+                meta.runner_id != expected_runner_id
+                or (meta.host_id is not None and meta.host_id != host_id)
+            ):
+                raise ValueError("The session binding changed; retry the request")
             if meta.host_id is not None and meta.host_id != host_id:
                 with self._profile_label_session(session, read_only=True) as labels:
                     profiled = has_profile_reference(
@@ -5813,6 +5944,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
         copy_terminal_launch_args: bool = True,
+        copy_inference_snapshot: bool = True,
         override_model_override: str | None = None,
         override_model_override_set: bool = False,
         override_reasoning_effort: str | None = None,
@@ -5885,6 +6017,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             the bound agent's defaults — used when the fork switches to
             an agent in a different provider family, where the source's
             model id is meaningless (a model is provider-bound).
+        :param copy_inference_snapshot: When ``True`` (default), the fork
+            keeps the source's saved provider binding. When ``False``, it has
+            none and resolves its provider like a new session: used when the
+            fork binds another agent, whose provider may differ.
         :param override_model_override: Explicit ``model_override`` for the
             fork, applied only when ``override_model_override_set`` is
             ``True`` — then it supersedes the ``copy_model_settings`` copy
@@ -5999,6 +6135,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             cloned_agent_description=cloned_agent_description,
             copy_model_settings=copy_model_settings,
             copy_terminal_launch_args=copy_terminal_launch_args,
+            copy_inference_snapshot=copy_inference_snapshot,
             override_model_override=override_model_override,
             override_model_override_set=override_model_override_set,
             override_reasoning_effort=override_reasoning_effort,
@@ -6032,6 +6169,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
         copy_terminal_launch_args: bool = True,
+        copy_inference_snapshot: bool = True,
         override_model_override: str | None = None,
         override_model_override_set: bool = False,
         override_reasoning_effort: str | None = None,
@@ -6069,9 +6207,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                 SqlConversationMetadata, (current_workspace_id(), source_conversation_id)
             )
 
-        _validate_inference_snapshot(
-            source_meta_ref.inference_snapshot if source_meta_ref else None
-        )
+        if copy_inference_snapshot:
+            _validate_inference_snapshot(
+                source_meta_ref.inference_snapshot if source_meta_ref else None
+            )
 
         with self._conv_session("prepare_fork_conversation") as session:
             source = session.get(SqlConversation, (current_workspace_id(), source_conversation_id))
@@ -6082,8 +6221,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             fork_title = (
                 title
                 if title is not None
+                # A legacy closed child's title carries the closed marker,
+                # which would seal the fork as well.
                 else (
-                    f"Fork of {source.title}"
+                    f"Fork of {title_without_closed_marker(source.title)}"
                     if source.title
                     else f"Fork of {source_conversation_id[:16]}…"
                 )
@@ -6469,6 +6610,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             # copied items instead.
             if source_ext_session and not truncated and resume_source_native_session:
                 fork_labels[FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY] = source_ext_session
+            elif truncated or not resume_source_native_session:
+                # A directive the source inherited from its own fork source
+                # would resume that ancestor's full transcript instead.
+                fork_labels.pop(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY, None)
             # When the fork binds a native target, mark it so the runner
             # rebuilds the native transcript (clone the source's native
             # transcript when same-family, else build from the copied
@@ -6527,7 +6672,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 kind=encoded_default_kind,
                 terminal_launch_args=source_terminal_args,
                 inference_snapshot=(
-                    source_meta_ref.inference_snapshot if source_meta_ref else None
+                    source_meta_ref.inference_snapshot
+                    if source_meta_ref and copy_inference_snapshot
+                    else None
                 ),
                 project_id=project_id,
                 side_chat_parent_id=side_chat_parent_id,

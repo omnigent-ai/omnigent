@@ -52,6 +52,7 @@ from omnigent.runner.transports.ws_tunnel.serve import (
     _websocket_http_status,
     serve_tunnel,
 )
+from omnigent.telemetry.request_headers import client_user_agent
 
 
 @dataclass
@@ -1311,6 +1312,8 @@ async def test_serve_tunnel_once_sends_bearer_header(
             "Authorization": "Bearer tok-auth",
             RUNNER_TUNNEL_TOKEN_HEADER: "bind-token",
         },
+        # Passed separately so websockets sends the runner's UA instead of adding its own.
+        "user_agent_header": client_user_agent(),
         "close_timeout": serve_module._RUNNER_TUNNEL_CLOSE_TIMEOUT_S,
         "open_timeout": serve_module._RUNNER_TUNNEL_OPEN_TIMEOUT_S,
         "max_size": serve_module.RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
@@ -1327,6 +1330,9 @@ async def test_serve_tunnel_once_sends_bearer_header(
     from omnigent.harnesses.codex_native.side_chat import CAP_SIDE_CHAT_SETTINGS
 
     assert CAP_SIDE_CHAT_SETTINGS in hello.capabilities
+    from omnigent.runner.background_titles.service import CAP_LONG_BACKGROUND_TITLE_INSTRUCTIONS
+
+    assert CAP_LONG_BACKGROUND_TITLE_INSTRUCTIONS in hello.capabilities
 
     # A reconnect's row carries the id the loop minted, the streak position
     # and the outage it ended, measured from when the previous connection

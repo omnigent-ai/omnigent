@@ -25,26 +25,70 @@ to customize.
   senders, or the one group DM with exactly the listed people (two or more; no
   operator). A pink `#` or `@` precedes the input, and pasted prefixes are stripped.
   Switching between channel and people events clears the scope; DMs hide Author.
+- `change-events`: GitHub **Review requested from [reviewer]** (me, a username, or
+  `org/team`; required) fires on each request or re-request on open, non-draft pull
+  requests, and Jira **Assignee changed to [assignee]** (empty means anyone) fires on
+  each assignment. Both skip changes made before the automation existed (a "Watching
+  since" line, kept in every reply, bounds the search overlap), show their own
+  help text, and hide the Assignee condition; review requests start with link-back off.
+  Pull request opened gains an optional Reviewer filter with a hint that it only sees
+  reviewers requested before the first check after opening.
+- `jira-custom-field`: Jira's **Add condition → Custom field** row shows a field-name
+  input (a Jira field name or a `cf[10010]` ID) before the operator, which is equals,
+  doesn't equal, is empty, or is set. Create stays disabled and the incomplete-condition
+  hint shows until the row has a name, even for is empty and is set.
 - `link-posting`: a checkbox below the trigger controls posting the session link
   back to Jira, Slack, GitHub, Linear, or PagerDuty (as an incident note). Sessions
   start whether it is checked or not.
-- `prompt-editing`: the detail page and edit dialog show Your prompt first. System
-  prompt starts collapsed, expands into a read-only preview, and requires Edit
-  system prompt to change it. Done editing system prompt returns to the read-only
-  preview without collapsing. Posting instructions for each session stay in the
-  worker instructions when their text changes. Saving preserves both parts;
-  reopening collapses and locks the system prompt again. Edit as prompt during creation uses the same
-  separation. Unrecognized or ambiguous prompt formats remain fully editable
-  as a single Instructions field in the modal (Prompt on the detail page). For a recognized trigger creation call, **Harness for matching sessions**, Model,
-  and Effort update future worker instructions without rebinding the polling session.
-  Existing worker sessions retain their settings. Customized or ambiguous creation calls
-  keep **Edit worker instructions**, which opens System prompt or the full Instructions field in the modal. Clicking it again refocuses an already-open editor. Edits that remove the template signature or add
-  ambiguous section headings show a notice before saving as a single prompt.
-  Your prompt must contain text; clearing it shows a required-field message.
-  Explicitly clearing only the posting-rule body in System prompt is supported
-  and preserves the separate prompts when saved and reopened.
-  The detail page also keeps the system prompt collapsed by default, with a
-  bounded read-only preview when expanded; use Edit automation to change it.
+- `task-session`: when creating a trigger, Advanced shows **Start a new session for
+  each match**, on by default. Turning it off sends every match to one task session,
+  titled after the automation and started on the first match; later matches arrive
+  there as messages from the polling session. The instructions field becomes
+  Instructions for the task session, and Advanced's summary shows One task session.
+  The choice is saved in the prompt, survives switching integrations, and isn't
+  offered on edit. Archiving the task session makes the next match start a new one.
+- `prompt-editing`: the rendered template prompt is never shown or editable; there is
+  no System prompt, Preview prompt, or Edit as prompt. A trigger saves its form state
+  as a one-line `<!-- omnigent-trigger v1 {...} -->` header above the rendered prompt.
+  Edit automation reads that header and reopens the trigger form with its scope,
+  conditions, instructions, link-back and worker settings; saving re-renders the
+  prompt from the form. The server strips the header before the message reaches the
+  model. The header carries a fingerprint of its fields and the prompt below it; if
+  either was changed outside the form (for example through the REST API), Edit and the
+  detail page ignore the header and show the full prompt as one editable field, and
+  saving keeps that text. Triggers saved before headers open as their Instructions only, with the
+  template text kept hidden and unchanged on save; prompts that can't be split stay
+  one editable Instructions field (Prompt on the detail page). For a recognized trigger
+  creation call, **Harness for matching sessions**, Model, Effort, and Permissions
+  update future worker instructions without rebinding the polling session.
+  Permissions offers only modes that keep approval, and only on servers that advertise
+  `session_create_permission_modes`. New templates give workers the automation's mode when
+  it keeps approval and the server supports it; otherwise workers use their agent's default.
+  Existing worker sessions retain their settings. Customized creation calls in a single
+  Instructions field keep **Edit worker instructions**, which focuses that field. Edits
+  that remove the template signature or add ambiguous section headings show a notice
+  before saving as a single prompt. Instructions must contain text; clearing them shows
+  a required-field message. The detail page shows a trigger's instructions only.
+- `polling-and-worker-settings`: a trigger's polling session (the automation's model,
+  effort, and permissions, used by the session that checks for matches) and its
+  **Matching sessions** (**Task session** for one task session) have separate settings, so
+  polling can use a lighter model. During creation the agent, model, and permissions
+  pickers beside Run on set the polling session, and Advanced settings has a Matching
+  sessions group whose values copy the polling settings until changed; another agent or
+  Run on target resets them. On edit, which hides those pickers, Advanced settings shows a
+  **Polling session** group above Matching sessions. It stays locked while the current
+  polling session is reused and unlocks with **Start a new session on the next run**;
+  worker changes never rebind the poller. Polling and worker controls use
+  `task-polling-*` and `task-worker-*` test ids.
+- `source-switching`: editing a recognized trigger whose worker settings can be
+  read shows Trigger type with the five integrations (not Schedule). Picking another one opens that integration's
+  form with the instructions, Harness for matching sessions, worker placement, and
+  the task-session choice carried over and empty conditions; a default name follows the source, a custom
+  name is kept. Each integration's draft
+  comes back unchanged when switching back and forth, and switching back to the
+  saved source restores its prompt. A note warns that saving replaces the old trigger, and the
+  save always starts a new polling session (the reset checkbox is locked on); a
+  task-session trigger's first match after that starts a new task session.
 - `default-project`: new automations select Omnigent Automation. Saving reuses or
   creates that project; canceling creates nothing. The project picker can choose
   another project or remove the default. Editing preserves the saved project.
@@ -85,15 +129,14 @@ to customize.
   show polling cadence instead of schedule controls, Run now, or next-run times.
   New templates use `automation_trigger_poll_minutes` from the server (10–240 minutes,
   default 10), otherwise hourly when the requested cadence is unsupported; saved
-  schedules are preserved. The initial search covers at least one polling interval
-  or one hour, whichever is longer, plus the indexing overlap. Both row-menu and detail-page editing keep schedule
-  controls hidden, including while customizing the system prompt. Unsupported
+  schedules are preserved. For creation events, the initial search covers at least one polling interval
+  or one hour, whichever is longer, plus the indexing overlap; change events start from a
+  recorded "Watching since" time and never search before it. Both row-menu and detail-page editing keep schedule
+  controls hidden. Unsupported
   polling offers an explicit Use server default action without exposing schedule
   fields or changing session mode.
-  Edit as prompt → turn **Start each run in a new session** on to restore the
-  scheduling controls, even when the prompt retains its template signature.
-  Replacing the template’s opening sentence also restores regular scheduling
-  controls after saving and reopening.
+  Replacing the template’s opening sentence in an older trigger's single
+  Instructions field restores regular scheduling controls after saving and reopening.
 - `schedule`: Repeat → Interval exposes the minute interval directly in the Time row,
   with no timezone selector. Minute schedules preserve their timezone internally and
   expose it beside the end date only when Ends is On date.
@@ -116,7 +159,7 @@ to customize.
 - `responsive`: gallery items have icons, descriptions, access requirements,
   pointer cursors, and keyboard focus indicators. Continued trigger cadence is
   fixed; other tasks expose schedule controls. Name comes first, followed by
-  Trigger type during creation. The modal opens with Instructions focused.
+  Trigger type during creation and when editing a recognized trigger. The modal opens with Instructions focused.
   Agent sits directly below Run on, outside Advanced. When editing a recognized
   trigger, Harness for matching sessions appears there instead. Run on and session
   mode precede Repeat and Time because both determine the minimum interval. Time
@@ -140,7 +183,8 @@ to customize.
   by default; use Trigger type to select an integration and reveal its conditions
   and session instructions. Returning to Schedule restores the schedule draft.
   Choose Run on, Agent, and session mode above Repeat. Expand Advanced to change
-  model, effort, permissions, or an ending. With `automations_v2` on a server
+  model, effort, permissions, or an ending; for an integration trigger it also has
+  **Start a new session for each match**. With `automations_v2` on a server
   supporting sub-hour schedules, use Repeat → Interval
   for a connected host or a continued sandbox session.
 - **Editing:** open Edit automation from a row menu or a task's detail page;
@@ -166,12 +210,12 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   covers the preview and Templates tab with reload, plus New automation's
   trigger selector on desktop and mobile. It creates
   a Jira automation and cross-checks the saved schedule and prompt through REST
-  with trigger controls always active. The gallery variants also convert a template to new-session mode and verify schedule controls, list
-  Run now/next-run, and detail Run now/next-run remain available.
+  with trigger controls always active.
   The mobile preview uses equals with one project; the desktop Templates path selects in with two
   comma-separated projects and verifies that both appear in the saved query.
-  The gallery variants edit the user prompt through the row menu and the system prompt through
-  the detail page, check persistence through REST, and reopen the editor. The
+  The gallery variants reopen the trigger form through the row menu and the detail
+  page, edit the instructions and a condition, check the saved header and prompt
+  through REST, and confirm no rendered prompt is shown. The
   preview entry runs at mobile width; the Templates entry runs at desktop width.
 - `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_ten_minute_host_schedule_round_trip`
   covers new-session host creation, nine-minute rejection, reopening, and switching
@@ -188,8 +232,9 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   saved workspace, and sandbox creation with offline connected hosts. It also
   covers repository/default selections, legacy edits, target switching, and
   continued-session setting locks, plus Random worktree on/off in the shared modal.
-  Prompt coverage includes expansion before explicit editing, preserving the
-  system prompt on user-only edits, discarding canceled edits, and Edit as prompt.
+  Prompt coverage includes reopening a trigger from its header, saving edited
+  conditions and worker settings into it, and preserving an older trigger's hidden
+  template text on instruction-only edits.
 - `tests/browser_ui/test_automation_sandbox_repository.py::test_automation_sandbox_repository`
   uses its own built-SPA browser contract, with a synthetic provider catalog,
   to cover repository creation, replacement, clearing, and reopening on desktop
@@ -200,9 +245,10 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   with **Start each run in a new session** on and check that the sessions have distinct
   worktree paths. Disable the option and run again: the new session uses the selected
   directory. With **Start each run in a new session** off, later runs reuse its worktree.
-- In any integration template, fill in the scope and session instructions, then
-  expand Preview prompt. Toggle the link checkbox below the trigger and check
-  that only the comment or reply step changes; sessions still start either way.
+- In any integration template, fill in the scope, a condition and session instructions,
+  save, then choose Edit: the trigger form reopens with the same values and no
+  rendered prompt. Toggle the link checkbox below the trigger, save, and check through
+  REST that only the comment or reply step changes; sessions still start either way.
   Hover, focus, or tap the warning icon beside Instructions for each session to
   read the integration requirement;
   Escape dismisses it without closing the modal. The source and link-posting

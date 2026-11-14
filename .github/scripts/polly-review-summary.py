@@ -10,6 +10,7 @@ from pathlib import Path, PurePosixPath
 
 TESTS = "Tests and test support"
 CATEGORIES = (TESTS, "Documentation", "Dependencies and lockfiles", "Implementation / other")
+TEST_FIELD_COUNT = 5
 LINKED_ISSUE_BODY_LIMIT = 4096
 LINKED_ISSUES_QUERY = """query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) { pullRequest(number: $number) {
@@ -109,6 +110,81 @@ def collapse_test_assessment(summary_body: str) -> str:
     )
 
 
+def _pipes(body: str, honor_code_spans: bool) -> list[tuple[int, bool]]:
+    """Return (index, inside_code_span) for each pipe not immediately preceded by a backslash."""
+    pipes = []
+    i = 0
+    while i < len(body):
+        char = body[i]
+        escaped = i > 0 and body[i - 1] == "\\"
+        if char == "`" and honor_code_spans and not escaped:
+            run = re.match(r"`+", body[i:])[0]
+            closing = re.compile(rf"(?<!`){run}(?!`)").search(body, i + len(run))
+            if closing is None:
+                i += len(run)
+                continue
+            # A pipe preceded by a backslash inside a code span is already escaped.
+            pipes.extend(
+                (j, True)
+                for j in range(i + len(run), closing.start())
+                if body[j] == "|" and body[j - 1] != "\\"
+            )
+            i = closing.end()
+            continue
+        if char == "|" and not escaped:
+            pipes.append((i, False))
+        i += 1
+    return pipes
+
+
+def _honors_code_spans(body: str) -> bool:
+    """Code spans are honored only when that yields the expected number of test fields."""
+    delimiters = [index for index, in_code in _pipes(body, True) if not in_code]
+    return len(delimiters) + 1 == TEST_FIELD_COUNT
+
+
+def split_table_row(body: str) -> list[str]:
+    honor = _honors_code_spans(body)
+    cells = []
+    start = 0
+    for index, in_code in _pipes(body, honor):
+        if not in_code:
+            cells.append(body[start:index])
+            start = index + 1
+    cells.append(body[start:])
+    return cells
+
+
+def _escape_code_span_pipes(body: str) -> str:
+    if not _honors_code_spans(body):
+        return body
+    pieces = []
+    last = 0
+    for index, in_code in _pipes(body, True):
+        if in_code:
+            pieces += [body[last:index], "\\|"]
+            last = index + 1
+    pieces.append(body[last:])
+    return "".join(pieces)
+
+
+def escape_tests_table(text: str) -> str:
+    """Escape pipes inside code spans in table rows, so GitHub renders them as cell text."""
+    lines = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("|"):
+            body = stripped.strip("|")
+            body_start = (len(line) - len(line.lstrip())) + (
+                len(stripped) - len(stripped.lstrip("|"))
+            )
+            line = (
+                line[:body_start] + _escape_code_span_pipes(body) + line[body_start + len(body) :]
+            )
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def compose_review(review: str, stats: dict) -> str:
     summaries = list(re.finditer(r"^## Summary\s*$", review, re.MULTILINE))
     if len(summaries) != 1:
@@ -116,6 +192,7 @@ def compose_review(review: str, stats: dict) -> str:
     summary = summaries[0]
     body = re.split(r"^## ", review[summary.end() :], maxsplit=1, flags=re.MULTILINE)[0]
     sections = {}
+    section_starts = {}
     for name in ("Changes", "Tests", "Scope"):
         matches = list(re.finditer(rf"^### {name}\s*$", body, re.MULTILINE))
         if len(matches) != 1:
@@ -124,6 +201,7 @@ def compose_review(review: str, stats: dict) -> str:
         if not text.strip():
             raise ValueError(f"Incomplete Polly review: empty '{name}' assessment.")
         sections[name] = text
+        section_starts[name] = summary.end() + matches[0].end()
     rows = []
     if stats["test_files"]:
         header = ["test / case", "behavior protected", "layer", "needed?", "action / rationale"]
@@ -131,13 +209,13 @@ def compose_review(review: str, stats: dict) -> str:
         for line in sections["Tests"].splitlines():
             if not line.strip().startswith("|"):
                 continue
-            cells = [cell.strip() for cell in re.split(r"(?<!\\)\|", line.strip().strip("|"))]
+            cells = [cell.strip() for cell in split_table_row(line.strip().strip("|"))]
             if [cell.lower() for cell in cells] == header:
                 header_seen = True
                 continue
             if all(re.fullmatch(r":?-+:?", cell) for cell in cells):
                 continue
-            if len(cells) != 5 or not all(cells):
+            if len(cells) != TEST_FIELD_COUNT or not all(cells):
                 raise ValueError(
                     "Incomplete Polly review: test rows need all five assessment fields."
                 )
@@ -171,6 +249,12 @@ def compose_review(review: str, stats: dict) -> str:
             missing = []
     if missing:
         raise ValueError(f"Incomplete Polly review: unassessed test files: {', '.join(missing)}")
+    tests_start = section_starts["Tests"]
+    review = (
+        review[:tests_start]
+        + escape_tests_table(sections["Tests"])
+        + review[tests_start + len(sections["Tests"]) :]
+    )
     result = (
         review[: summary.end()].rstrip()
         + "\n\n"

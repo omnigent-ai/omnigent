@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
+import { browserPageLabel } from "@/lib/browserPageLabel";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
-import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
+import { AGENT_BROWSER_TAB_ID, browserViewId, browserViewOwnerId } from "@/lib/browserTabs";
 import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
 import { type BrowserHostOptions, navigationHostOptions } from "@/lib/nativeBridge";
 import { onInAppLinkOpen } from "@/lib/openLinkInApp";
@@ -34,6 +36,14 @@ interface BrowserTabsBridge {
   onBrowserUrlChanged?: (
     callback: (page: BrowserPage & { conversationId: string }) => void,
   ) => () => void;
+  onBrowserOpenTab?: (
+    callback: (request: { conversationId: string; url: string }) => void,
+  ) => () => void;
+  browserSetOpenTabSupported?: (supported: boolean) => Promise<unknown>;
+}
+
+function browserTabsBridge(): BrowserTabsBridge | undefined {
+  return (window as unknown as { omnigentDesktop?: BrowserTabsBridge }).omnigentDesktop;
 }
 
 const agentNavigationEpochs = new Map<string, number>();
@@ -90,6 +100,84 @@ export function openAgentBrowserTab(conversationId: string): BrowserTabsState {
   return openBrowserTab(conversationId, AGENT_BROWSER_TAB_ID);
 }
 
+function updateBrowserTabs(
+  conversationId: string,
+  mutate: (current: BrowserTabsState) => BrowserTabsState,
+): void {
+  const next = mutate(readBrowserTabsState(conversationId));
+  // Saving is best effort; mounted rails take the new state either way.
+  writeSessionWorkspaceState(conversationId, {
+    openBrowsers: next.tabs,
+    selectedBrowserId: next.selected,
+  });
+  for (const listener of browserTabsListeners) listener(conversationId, next);
+}
+
+/**
+ * Open a new tab at `url`. The tab is added only once its view opened, so a refusal
+ * (too many views, a blocked URL) leaves no blank tab behind. `mayShow` lets the caller
+ * veto selecting it, such as after the user moved elsewhere in the workspace meanwhile.
+ */
+async function openBrowserTabAt(
+  conversationId: string,
+  url: string,
+  { mayShow = () => true }: { mayShow?: () => boolean } = {},
+): Promise<{ ok: boolean; error?: string }> {
+  const tabId = crypto.randomUUID();
+  const selection = browserSelections.get(conversationId) ?? 0;
+  const request = (reopenRequests.get(conversationId) ?? 0) + 1;
+  reopenRequests.set(conversationId, request);
+  // The session's host lets the shell open its localhost pages, as the address bar does.
+  const hostId = await fetchSessionHostId(conversationId);
+  const result = await browserTabsBridge()
+    ?.browserOpenOrNavigate?.(browserViewId(conversationId, tabId), url, undefined, {
+      force: true,
+      ...navigationHostOptions(hostId),
+    })
+    .catch((error: unknown) => ({ ok: false, error: String(error) }));
+  if (result && !result.ok) return result;
+  // The tab comes back either way. It's selected only if nothing was picked since and
+  // no later reopen's tab is already shown; a later one that failed doesn't count.
+  const latest =
+    (browserSelections.get(conversationId) ?? 0) === selection &&
+    request > (shownReopens.get(conversationId) ?? 0) &&
+    mayShow();
+  if (latest) shownReopens.set(conversationId, request);
+  updateBrowserTabs(conversationId, (current) => ({
+    tabs: [...current.tabs, tabId],
+    selected: latest ? tabId : current.selected,
+  }));
+  return { ok: true };
+}
+
+// Mounted rails sharing one shell subscription, so each modifier-clicked link opens one tab.
+let openTabRequestRetainers = 0;
+let stopOpenTabRequests: (() => void) | undefined;
+
+/** Open Cmd/Ctrl- or middle-clicked page links as background tabs of the clicked view's session. */
+function retainOpenTabRequests(): () => void {
+  const bridge = browserTabsBridge();
+  if (!bridge?.onBrowserOpenTab) return () => undefined;
+  openTabRequestRetainers += 1;
+  if (openTabRequestRetainers === 1) {
+    stopOpenTabRequests = bridge.onBrowserOpenTab(({ conversationId: viewId, url }) => {
+      void openBrowserTabAt(browserViewOwnerId(viewId), url, { mayShow: () => false }).then(
+        ({ ok, error }) => {
+          if (!ok) toast.error(`Couldn't open the link in a new tab${error ? `: ${error}` : "."}`);
+        },
+      );
+    });
+    void bridge.browserSetOpenTabSupported?.(true).catch(() => undefined);
+  }
+  return () => {
+    openTabRequestRetainers -= 1;
+    if (openTabRequestRetainers > 0) return;
+    stopOpenTabRequests?.();
+    stopOpenTabRequests = undefined;
+    void bridge.browserSetOpenTabSupported?.(false).catch(() => undefined);
+  };
+}
+
 export function useBrowserTabs(conversationId: string) {
   const [state, setState] = useState(() => readBrowserTabsState(conversationId));
   // Reload on a conversation switch during render, so the session's first frame
@@ -120,6 +208,7 @@ export function useBrowserTabs(conversationId: string) {
       browserTabsListeners.delete(listener);
     };
   }, []);
+  useEffect(() => retainOpenTabRequests(), []);
 
   useEffect(() => {
     const viewIds = new Set<string>(JSON.parse(viewIdsKey));
@@ -128,7 +217,7 @@ export function useBrowserTabs(conversationId: string) {
       const retained = entries.filter(([viewId]) => viewIds.has(viewId));
       return retained.length === entries.length ? current : Object.fromEntries(retained);
     });
-    const bridge = (window as unknown as { omnigentDesktop?: BrowserTabsBridge }).omnigentDesktop;
+    const bridge = browserTabsBridge();
     if (!bridge || viewIds.size === 0) return;
     let active = true;
     const updated = new Set<string>();
@@ -165,40 +254,12 @@ export function useBrowserTabs(conversationId: string) {
     };
   }, [viewIdsKey]);
 
-  const labelFor = (tabId: string, index: number): string => {
-    const page = pages[browserViewId(conversationId, tabId)];
-    const title = page?.title?.trim();
-    if (page?.url) {
-      try {
-        const hostname = new URL(page.url).hostname;
-        // Chromium supplies the URL as the title for untitled documents.
-        const urlTitle = page.url.replace(/^https?:\/\//, "");
-        if (
-          title &&
-          title !== page.url &&
-          title !== urlTitle &&
-          title !== urlTitle.replace(/\/$/, "")
-        ) {
-          return title;
-        }
-        if (hostname) return hostname;
-      } catch {
-        // Blank or invalid URLs keep the numbered placeholder.
-      }
-    }
-    return title && title !== "about:blank" ? title : `Browser ${index + 1}`;
-  };
+  const labelFor = (tabId: string, index: number): string =>
+    browserPageLabel(pages[browserViewId(conversationId, tabId)], `Browser ${index + 1}`);
 
   const update = useCallback(
-    (mutate: (current: BrowserTabsState) => BrowserTabsState) => {
-      const next = mutate(readBrowserTabsState(conversationId));
-      // Saving is best effort; mounted rails take the new state either way.
-      writeSessionWorkspaceState(conversationId, {
-        openBrowsers: next.tabs,
-        selectedBrowserId: next.selected,
-      });
-      for (const listener of browserTabsListeners) listener(conversationId, next);
-    },
+    (mutate: (current: BrowserTabsState) => BrowserTabsState) =>
+      updateBrowserTabs(conversationId, mutate),
     [conversationId],
   );
 
@@ -231,8 +292,7 @@ export function useBrowserTabs(conversationId: string) {
     noteBrowserSelection(conversationId);
     const selected = crypto.randomUUID();
     if (url) {
-      const bridge = (window as unknown as { omnigentDesktop?: BrowserTabsBridge }).omnigentDesktop;
-      void bridge
+      void browserTabsBridge()
         ?.browserOpenOrNavigate?.(browserViewId(conversationId, selected), url, undefined, {
           force: true,
         })
@@ -242,45 +302,9 @@ export function useBrowserTabs(conversationId: string) {
     return selected;
   };
 
-  /**
-   * Reopen a closed tab at `url`. The tab is added only once its view opened, so a
-   * refusal (too many views, a blocked URL) leaves no blank tab behind.
-   */
-  /**
-   * Reopen a closed tab at `url`. `mayShow` lets the caller veto selecting it when the
-   * view opens, such as after the user moved elsewhere in the workspace meanwhile.
-   */
-  const reopen = async (
-    url: string,
-    { mayShow = () => true }: { mayShow?: () => boolean } = {},
-  ): Promise<{ ok: boolean; error?: string }> => {
-    const tabId = crypto.randomUUID();
-    const selection = browserSelections.get(conversationId) ?? 0;
-    const request = (reopenRequests.get(conversationId) ?? 0) + 1;
-    reopenRequests.set(conversationId, request);
-    const bridge = (window as unknown as { omnigentDesktop?: BrowserTabsBridge }).omnigentDesktop;
-    // The session's host lets the shell reopen its localhost pages, as the address bar does.
-    const hostId = await fetchSessionHostId(conversationId);
-    const result = await bridge
-      ?.browserOpenOrNavigate?.(browserViewId(conversationId, tabId), url, undefined, {
-        force: true,
-        ...navigationHostOptions(hostId),
-      })
-      .catch((error: unknown) => ({ ok: false, error: String(error) }));
-    if (result && !result.ok) return result;
-    // The tab comes back either way. It's selected only if nothing was picked since and
-    // no later reopen's tab is already shown; a later one that failed doesn't count.
-    const latest =
-      (browserSelections.get(conversationId) ?? 0) === selection &&
-      request > (shownReopens.get(conversationId) ?? 0) &&
-      mayShow();
-    if (latest) shownReopens.set(conversationId, request);
-    update((current) => ({
-      tabs: [...current.tabs, tabId],
-      selected: latest ? tabId : current.selected,
-    }));
-    return { ok: true };
-  };
+  /** Reopen a closed tab at `url`; see `openBrowserTabAt`. */
+  const reopen = (url: string, options?: { mayShow?: () => boolean }) =>
+    openBrowserTabAt(conversationId, url, options);
 
   /**
    * The page a tab shows. Before the strip has loaded it (just after returning to a
@@ -291,8 +315,9 @@ export function useBrowserTabs(conversationId: string) {
     // A snapshot without a URL (the view didn't exist yet when the strip looked) asks again.
     const known = pages[viewId]?.url;
     if (known) return known;
-    const bridge = (window as unknown as { omnigentDesktop?: BrowserTabsBridge }).omnigentDesktop;
-    const page = await bridge?.browserHasView?.(viewId).catch(() => undefined);
+    const page = await browserTabsBridge()
+      ?.browserHasView?.(viewId)
+      .catch(() => undefined);
     if (!page?.exists) return undefined;
     return page.url && page.url !== "about:blank" ? page.url : page.pendingUrl;
   };

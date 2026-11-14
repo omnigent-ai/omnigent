@@ -570,6 +570,8 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
           ? data.background_task_count
           : undefined;
       const backgroundTasks = parseBackgroundTasks(data.background_tasks);
+      const backgroundAgents =
+        status === "waiting" ? parseBackgroundTasks(data.background_agents) : undefined;
       const rawError = data.error;
       // Parse via parseErrorInfo so a classified failure's optional
       // title/cause/remediation flow through, but keep the guard that both
@@ -592,6 +594,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         responseId,
         backgroundTaskCount,
         ...(backgroundTasks !== undefined ? { backgroundTasks } : {}),
+        ...(backgroundAgents !== undefined ? { backgroundAgents } : {}),
         ...(blockedOn !== undefined ? { blockedOn } : {}),
         ...(error !== undefined ? { error } : {}),
       } satisfies SessionStatusEvent;
@@ -905,7 +908,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       type: "session_superseded",
       conversationId,
       targetConversationId,
-      reason: "clear",
+      reason: data.reason === "rewind" ? "rewind" : "clear",
     } satisfies SessionSupersededEvent;
   }
   if (eventType === "session.btw_sidechat") {
@@ -1131,6 +1134,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       ...(p.native_delivery
         ? { nativeDelivery: parseNativePermissionDelivery(p.native_delivery) }
         : {}),
+      ...(p.is_blocking === false ? { isBlocking: false as const } : {}),
       elicitationId,
       targetSessionId:
         typeof targetSessionId === "string" && targetSessionId ? targetSessionId : null,

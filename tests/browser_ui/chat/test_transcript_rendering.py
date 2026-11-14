@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 from itertools import pairwise
@@ -1071,7 +1072,9 @@ def test_tool_rows_read_as_actions_with_their_outcome(
 
     issue.click()
     read = page.get_by_role("button", name=f"Read {_LONG_TOOL_PATH}", exact=True)
-    edit = page.get_by_role("button", name=re.compile(r"^Edit "))
+    edit = page.get_by_role("button", name=re.compile(r"^Edit ")).filter(
+        has=page.get_by_test_id("tool-line-counts")
+    )
     counts = edit.get_by_test_id("tool-line-counts")
     expect(counts).to_have_text("+2 -1")
     for row in (read, edit):
@@ -1359,3 +1362,55 @@ def test_automation_context_is_hidden_from_transcript(
     expect(user).to_contain_text("Summarize today's changes.")
     expect(user).not_to_contain_text("no one is watching")
     expect(user).not_to_contain_text("omnigent-automation-context")
+
+
+@pytest.mark.parametrize("width", [1280, 390], ids=["desktop", "mobile"])
+def test_view_image_tool_opens_image(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    width: int,
+) -> None:
+    """A persisted Codex imageView call opens the existing file image preview."""
+    chat = chat_session_contract
+    chat.harness = "codex-native"
+    image_path = "/browser-workspace/screenshot.png"
+    chat.set_items(
+        list(
+            reversed(
+                tool_call_items(
+                    "image-view",
+                    "view_image",
+                    {"path": image_path},
+                    image_path,
+                    response_id="image-view-response",
+                )
+            )
+        )
+    )
+    environment_api = f"/v1/sessions/{chat.session_id}/resources/environments/default"
+    chat.contract.json(environment_api, {"metadata": {"root": "/browser-workspace"}})
+    for resource in ("changes", "filesystem"):
+        chat.contract.json(f"{environment_api}/{resource}", list_payload([]))
+    chat.contract.json(f"/v1/sessions/{chat.session_id}/comments", [])
+    image = (Path(__file__).resolve().parents[2] / "resources/test_image.png").read_bytes()
+    chat.contract.json(
+        f"{environment_api}/filesystem/screenshot.png",
+        {
+            "object": "session.environment.filesystem.file_content",
+            "path": "screenshot.png",
+            "content": base64.b64encode(image).decode(),
+            "content_type": "image/png",
+            "encoding": "base64",
+            "bytes": len(image),
+        },
+    )
+    page.set_viewport_size({"width": width, "height": 844})
+    page.goto(chat.url)
+    page.get_by_role("button", name="Called 1 tool", exact=True).click()
+    row = page.get_by_role("button", name=re.compile(r"^View image "))
+    expect(row).to_be_visible()
+    row.get_by_role("link", name="screenshot.png", exact=True).click()
+    preview = page.locator('[data-testid="file-viewer"]:visible').get_by_role("img")
+    expect(preview).to_be_visible()
+    expect(preview).to_have_js_property("naturalWidth", 100)
+    expect(row).to_have_attribute("aria-expanded", "false")

@@ -104,15 +104,21 @@ class _Claimed:
     clock: FakeClock
 
 
-def _claim(store: SqlAlchemyScheduledTaskStore, **kwargs: Any) -> _Claimed:
-    """Create a due task and claim its first occurrence, as the scheduler's poll would."""
+def _claim(
+    store: SqlAlchemyScheduledTaskStore, *, one_time: bool = False, **kwargs: Any
+) -> _Claimed:
+    """Create a due task and claim its first occurrence, as the scheduler's poll would.
+
+    *one_time* makes it a ``COUNT=1`` task, such as a reminder, whose claim is its
+    last occurrence and completes it.
+    """
     kwargs.setdefault("workspace", "/repo")
     kwargs.setdefault("host_id", _HOST_ID)
     created = store.create(
         uuid.uuid4().hex,
         "nightly",
         "do the thing",
-        "FREQ=HOURLY",
+        "FREQ=HOURLY;COUNT=1" if one_time else "FREQ=HOURLY",
         None,
         _AGENT_ID,
         "UTC",
@@ -124,7 +130,7 @@ def _claim(store: SqlAlchemyScheduledTaskStore, **kwargs: Any) -> _Claimed:
     run = store.claim_scheduled_run(
         task,
         now=task.next_run_at,
-        next_run_at=task.next_run_at + 3600,
+        next_run_at=None if one_time else task.next_run_at + 3600,
         host_id=occurrence_host_id(task, scheduled_trigger_key(task.next_run_at)),
         lease_seconds=_LEASE_SECONDS,
     )
@@ -428,8 +434,14 @@ async def test_delivery_log_failure_does_not_fail_the_run(store, monkeypatch) ->
     assert _runs(store, claimed.task)[0].status == "running"
 
 
-async def test_continued_session_fire_runs_on_the_claimed_run(store) -> None:
-    claimed = _claim(store, session_mode="continue", session_id=_CONV_ID)
+# A one-time task (a reminder) is already completed with no next run when its claimed
+# run continues the session; delivery and settlement must work the same.
+@pytest.mark.parametrize("one_time", [False, True])
+async def test_continued_session_fire_runs_on_the_claimed_run(store, one_time) -> None:
+    claimed = _claim(store, one_time=one_time, session_mode="continue", session_id=_CONV_ID)
+    if one_time:
+        settled = store.get(claimed.task.id)
+        assert (settled.state, settled.next_run_at) == ("completed", None)
     conversations = _ExistingConversationStore(
         _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, host_id=_HOST_ID, workspace="/repo")
     )
@@ -456,6 +468,7 @@ async def test_continued_session_fire_runs_on_the_claimed_run(store) -> None:
         None,
     )
     assert store.get(claimed.task.id).session_id == _CONV_ID
+    assert store.get(claimed.task.id).state == ("completed" if one_time else "active")
 
 
 async def test_a_continue_tasks_first_claimed_run_keeps_its_session(store) -> None:
@@ -786,6 +799,22 @@ async def test_owner_identity_failure_fails_before_creating_a_session(
     assert store.get(claimed.task.id).state == "active"
 
 
+async def test_owner_identity_failure_of_a_one_time_task_promises_no_retry(store) -> None:
+    claimed = _claim(store, one_time=True)
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=_ConversationStore()),
+        fire_identity=_failing_identity(ConnectionError("token service unavailable")),
+        launch_dispatch=AsyncMock(),
+    )
+    await executor.fire(claimed.task, claimed.lease)
+
+    [run] = _runs(store, claimed.task)
+    assert (run.status, run.error_code) == ("failed", "owner_identity_unavailable")
+    assert "tries again" not in run.error
+    assert "no later run" in run.error
+    assert store.get(claimed.task.id).state == "completed"
+
+
 async def test_revoked_identity_of_a_deleted_owner_disables_the_task(store, monkeypatch) -> None:
     claimed = _claim(store)
     monkeypatch.setattr(fire_mod, "_owner_is_deleted", AsyncMock(return_value=True))
@@ -865,6 +894,11 @@ async def test_managed_fire_hands_off_once_the_sandbox_host_is_bound(
     if outcome == "bound":
         assert (run.status, run.conversation_id) == ("running", conversations.ids[0])
         assert startup.launch_failures == []
+        # The session routes by the host id it launched under, from its first request.
+        from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
+
+        labels = conversations.existing[conversations.ids[0]].labels
+        assert labels[REQUESTED_HOST_ID_LABEL_KEY] == run.host_id
     else:
         # The failure stage: creating the sandbox, or starting its runner once bound.
         error_code, reason = {
@@ -1020,6 +1054,214 @@ async def test_replacement_registration_timeout_preserves_provider_guidance(
     assert fake.host_starts[0].host_name == "durable-host"
     assert fake.terminated == ["old-sandbox", "sb-fake-1"]
     assert hosts.get_host(host_id) is None
+
+
+@pytest.mark.parametrize("same_server", [True, False])
+async def test_the_run_after_an_unregistered_sandbox_starts_a_new_session(
+    store, db_uri, monkeypatch, same_server
+) -> None:
+    """Nothing ran in a session whose sandbox never connected, so the next run of a
+    continue task starts a new session and sandbox instead of failing on it."""
+    from omnigent.server.routes import sessions
+
+    claimed = _claim(
+        store,
+        execution_target="managed_sandbox",
+        session_mode="continue",
+        host_id=None,
+        workspace=None,
+    )
+    second = _second_claim(store, claimed)
+    leases = (claimed.lease, second)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    launched: list[str] = []
+
+    async def launch(**kwargs: Any) -> None:
+        session_id, tracker = kwargs["session_id"], kwargs["tracker"]
+        launched.append(session_id)
+        if len(launched) == 1:
+            await asyncio.Event().wait()  # The first sandbox never registers.
+        conversations.set_host_id(session_id, kwargs["host_id"], workspace="/workspace")
+        tracker.get(session_id).bound.set()
+        tracker.finish(session_id)
+
+    monkeypatch.setattr(sessions, "_run_managed_launch", AsyncMock(side_effect=launch))
+    _bound_unstarted_session_waits(monkeypatch)
+
+    tracker = ManagedLaunchTracker()
+    first = _unregistered_executor(store, conversations, tracker)
+    try:
+        await asyncio.wait_for(first.fire(claimed.task, claimed.lease), 10)
+        unstarted = store.get(claimed.task.id)
+        next_tracker = tracker if same_server else ManagedLaunchTracker()
+        # Only the stalled first sandbox should reach the short registration timeout.
+        replacement_executor = _unregistered_executor(
+            store, conversations, next_tracker, registration_timeout_s=5
+        )
+        await asyncio.wait_for(replacement_executor.fire(unstarted, second), 10)
+    finally:
+        await _drain_managed_launches()
+
+    replacement = store.get(claimed.task.id).session_id
+    runs = {run.id: run for run in _runs(store, claimed.task)}
+    assert [(runs[lease.run.id].status, runs[lease.run.id].error_code) for lease in leases] == [
+        ("failed", "sandbox_registration_timeout"),
+        ("running", None),
+    ]
+    assert replacement not in (None, unstarted.session_id)
+    assert runs[second.run.id].conversation_id == replacement
+    assert launched == [unstarted.session_id, replacement]
+    assert conversations.get_conversation(replacement).host_id == continued_sandbox_host_id(
+        claimed.task.id, claimed.task.workspace_id
+    )
+    # The unstarted session stays, with the reason its prompt never ran.
+    assert conversations.get_conversation(unstarted.session_id).labels[STARTUP_LABEL] == "failed"
+
+
+async def test_a_run_during_an_unregistered_sandboxs_teardown_keeps_the_session(
+    store, db_uri, monkeypatch
+) -> None:
+    """A replica without the abandoned launch must not start a sandbox under its host
+    until the run tearing that sandbox down finishes."""
+    from omnigent.server.routes import sessions
+
+    claimed = _claim(
+        store,
+        execution_target="managed_sandbox",
+        session_mode="continue",
+        host_id=None,
+        workspace=None,
+    )
+    second = _second_claim(store, claimed)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    launched: list[str] = []
+
+    async def launch(**kwargs: Any) -> None:
+        launched.append(kwargs["session_id"])
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(sessions, "_run_managed_launch", AsyncMock(side_effect=launch))
+    _bound_unstarted_session_waits(monkeypatch)
+    tearing_down, torn_down = asyncio.Event(), asyncio.Event()
+    terminate = fire_mod._terminate_run_sandbox
+
+    async def slow_teardown(*args: Any) -> None:
+        if not tearing_down.is_set():
+            tearing_down.set()
+            await torn_down.wait()
+        await terminate(*args)
+
+    monkeypatch.setattr(fire_mod, "_terminate_run_sandbox", slow_teardown)
+    tracker = ManagedLaunchTracker()
+
+    first = asyncio.create_task(
+        _unregistered_executor(store, conversations, tracker).fire(claimed.task, claimed.lease)
+    )
+    try:
+        await asyncio.wait_for(tearing_down.wait(), 10)
+        unstarted = store.get(claimed.task.id)
+        assert conversations.get_conversation(unstarted.session_id).labels[STARTUP_LABEL] == (
+            "failed"
+        )
+        # Requests waiting on the abandoned launch settle only once its sandbox is gone.
+        abandoned = tracker.get(unstarted.session_id)
+        assert abandoned is not None
+        assert not abandoned.settled.is_set()
+        await asyncio.wait_for(
+            _unregistered_executor(store, conversations, ManagedLaunchTracker()).fire(
+                unstarted, second
+            ),
+            10,
+        )
+        torn_down.set()
+        await asyncio.wait_for(first, 10)
+    finally:
+        torn_down.set()
+        await _drain_managed_launches()
+
+    # The overlapping run fails on the session instead; the run after it replaces it.
+    runs = {run.id: run for run in _runs(store, claimed.task)}
+    assert [
+        (run.status, run.error_code, run.conversation_id)
+        for run in (runs[claimed.lease.run.id], runs[second.run.id])
+    ] == [
+        ("failed", "sandbox_registration_timeout", unstarted.session_id),
+        ("failed", "launch_failed", unstarted.session_id),
+    ]
+    assert store.get(claimed.task.id).session_id == unstarted.session_id
+    assert launched == [unstarted.session_id]
+    assert abandoned.settled.is_set()
+    assert abandoned.error == runs[claimed.lease.run.id].error
+
+
+async def test_an_unregistered_sandbox_whose_teardown_fails_still_settles_its_launch(
+    store, db_uri, monkeypatch
+) -> None:
+    """Requests waiting on the abandoned launch get its failure even when teardown
+    raises, and the run stays for recovery to fail once its lease expires."""
+    from omnigent.server.routes import sessions
+
+    claimed = _claim(
+        store,
+        execution_target="managed_sandbox",
+        session_mode="continue",
+        host_id=None,
+        workspace=None,
+    )
+    conversations = SqlAlchemyConversationStore(db_uri)
+
+    async def launch(**kwargs: Any) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(sessions, "_run_managed_launch", AsyncMock(side_effect=launch))
+    monkeypatch.setattr(
+        fire_mod, "_terminate_run_sandbox", AsyncMock(side_effect=RuntimeError("provider down"))
+    )
+    tracker = ManagedLaunchTracker()
+    executor = _unregistered_executor(store, conversations, tracker)
+    try:
+        with pytest.raises(RuntimeError, match="provider down"):
+            await asyncio.wait_for(executor.fire(claimed.task, claimed.lease), 10)
+    finally:
+        await _drain_managed_launches()
+
+    unstarted = store.get(claimed.task.id).session_id
+    abandoned = tracker.get(unstarted)
+    assert abandoned is not None
+    assert abandoned.settled.is_set()
+    assert abandoned.error == "the sandbox did not register within 0.2 seconds"
+    run = next(run for run in _runs(store, claimed.task) if run.id == claimed.lease.run.id)
+    assert (run.status, run.conversation_id) == ("starting", unstarted)
+    assert await executor.recover(run) == "failed"
+
+
+def _bound_unstarted_session_waits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bound the waits a run continuing an unstarted session makes."""
+    from omnigent.server import managed_hosts
+
+    monkeypatch.setattr(managed_hosts, "MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(fire_mod, "_LAUNCH_START_WAIT_S", 0.5)
+
+
+def _unregistered_executor(
+    store: SqlAlchemyScheduledTaskStore,
+    conversations: SqlAlchemyConversationStore,
+    tracker: ManagedLaunchTracker,
+    registration_timeout_s: float = 0.2,
+) -> ClaimedRunExecutor:
+    """An executor that abandons a sandbox not registered within *registration_timeout_s*."""
+    from omnigent.server.startup_inputs import ManagedStartupInputs
+
+    return ClaimedRunExecutor(
+        _deps(
+            store,
+            conversation_store=conversations,
+            sandbox_config=_managed_sandbox_config(),
+            managed_launches=tracker,
+            startup_inputs=ManagedStartupInputs(conversations, None),
+        ),
+        registration_timeout_s=registration_timeout_s,
+    )
 
 
 async def test_lost_lease_during_the_binding_wait_leaves_the_launch_running(

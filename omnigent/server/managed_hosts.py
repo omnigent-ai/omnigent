@@ -44,6 +44,13 @@ stores into ``create_app``):
                                   # shutting-down server waits for in-flight
                                   # launches to bind their host; needs another
                                   # replica to take the host (default: 0)
+         stop_on_archive: false   # optional; per provider (a top-level value
+                                  # is every `providers:` entry's default).
+                                  # Stop (not delete) a session's sandbox when
+                                  # the session is archived and no other
+                                  # session uses its host; the next message
+                                  # resumes it. Only for providers that can
+                                  # resume a stopped sandbox (default: false)
          reaper:                  # optional; deployment-wide, not per-provider
            enabled: true          # default: false
            terminate_after_offline_days: 30  # default: 30 days
@@ -209,9 +216,11 @@ from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.db.utils import builtin_agent_id, now_epoch
 from omnigent.onboarding.sandboxes.base import (
     OwnerCredentialMissingError,
+    SandboxCapabilityError,
     SandboxGoneError,
     resolve_managed_keepalive_interval_s,
 )
+from omnigent.onboarding.sandboxes.profiles import PROFILE_ID_PATTERN
 
 # RepoWorkspace lives in the launcher's own package so a launcher can accept it
 # without importing omnigent.server; re-exported here (its parser is here) so
@@ -222,6 +231,7 @@ from omnigent.stores.host_store import Host, HostStore, host_is_live
 if TYPE_CHECKING:
     from omnigent.onboarding.sandboxes import SandboxHostLauncher
     from omnigent.stores.agent_store import AgentStore
+    from omnigent.stores.conversation_store import Conversation, ConversationStore
 
 _logger = logging.getLogger(__name__)
 
@@ -391,6 +401,43 @@ MANAGED_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 # Server-owned routing id from a managed create's or fork's ``host_id``:
 # available before the host binds, and never copied from a fork's source.
 REQUESTED_HOST_ID_LABEL_KEY = "omnigent.sandbox.requested_host_id"
+
+# A move onto a new sandbox holds the session's runner with an id of this shape
+# until the sandbox binds. It keeps the token-bound prefix, so checks that
+# require a runner's tunnel token stay strict, but no real token-bound id (hex
+# after the prefix) can equal it, so every replica can tell a move is underway.
+MOVE_CLAIM_RUNNER_ID_PREFIX = "runner_token_move_"
+# Only the move releases its claim, so nothing else can take the session while
+# it settles. A claim older than this was left by a server that stopped
+# mid-move, and may be cleared: longer than any provider's provisioning plus
+# the host-registration wait and the runner's start.
+MOVE_CLAIM_LEASE_S = MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S + 3600
+# Hex digits of the claim's creation time (seconds), after the prefix.
+_MOVE_CLAIM_TIME_DIGITS = 12
+
+
+def new_move_claim() -> str:
+    """Return a fresh runner id for a move to claim a session with."""
+    created = f"{int(time.time()):0{_MOVE_CLAIM_TIME_DIGITS}x}"
+    return MOVE_CLAIM_RUNNER_ID_PREFIX + created + secrets.token_hex(16)
+
+
+def is_move_claim(runner_id: str | None) -> bool:
+    """Whether *runner_id* is a move's claim rather than a real runner."""
+    return runner_id is not None and runner_id.startswith(MOVE_CLAIM_RUNNER_ID_PREFIX)
+
+
+def move_claim_is_live(runner_id: str | None) -> bool:
+    """Whether *runner_id* is a move's claim still within its lease."""
+    if not is_move_claim(runner_id):
+        return False
+    assert runner_id is not None
+    start = len(MOVE_CLAIM_RUNNER_ID_PREFIX)
+    try:
+        created = int(runner_id[start : start + _MOVE_CLAIM_TIME_DIGITS], 16)
+    except ValueError:
+        return False
+    return time.time() - created < MOVE_CLAIM_LEASE_S
 
 
 def managed_host_name(host_id: str) -> str:
@@ -609,6 +656,10 @@ class ManagedLaunch:
     settled: asyncio.Event
     error: str | None = None
     bound: asyncio.Event = dataclass_field(default_factory=asyncio.Event)
+    # Set when another host took the session before its sandbox was ready.
+    superseded: bool = False
+    # The sandbox host this launch bound the session to, once it has.
+    host_id: str | None = None
     host_online_failure_hint: Callable[[], str | None] | None = None
 
 
@@ -750,6 +801,14 @@ class ManagedSandboxConfig:
         the picker then blocks launch instead of offering Default.
     :param manages_profiles: Static opt-in copied from plugin metadata. Embedding
         deployments set it explicitly for launchers that require profile selection.
+    :param default_profile_id: Profile a new managed session takes when its caller
+        names none, from ``sandbox.default_profile_id``. Authorized and saved like an
+        explicit selection. ``None`` keeps a selection mandatory.
+    :param stop_on_archive: Stop an archived session's sandbox, keeping it
+        resumable, when no other session uses its host. The
+        provider's launcher makes the final call through
+        :meth:`~omnigent.onboarding.sandboxes.base.SandboxLifecycle.stop_when_archived`
+        (see :func:`stop_archived_session_sandbox`).
     """
 
     server_url: str
@@ -765,7 +824,11 @@ class ManagedSandboxConfig:
     )
     # Request-scoped reference; teardown must not depend on launch authorization.
     profile_selection: dict[str, Any] | None = None
+    # Internal continuation permission, scoped to one already-admitted legacy host.
+    unprofiled_host_id: str | None = None
     manages_profiles: bool = False
+    default_profile_id: str | None = None
+    stop_on_archive: bool = False
 
 
 class NoReachableModels(Exception):
@@ -978,7 +1041,12 @@ class ManagedSandboxDeployment:
         for config in self.configs:
             if config.managed_launch_supported and config.provider is not None:
                 launcher = config.launcher_factory()
-                caps[config.provider] = {"multi_repo": launcher.capabilities.multi_repo}
+                caps[config.provider] = {
+                    "multi_repo": launcher.capabilities.multi_repo,
+                    # A provider that manages sandbox profiles binds one at session
+                    # create, so the move route refuses it as a destination.
+                    "accepts_session_move": not config.manages_profiles,
+                }
                 from omnigent.inference_config import parse_inference_config
                 from omnigent.server.inference_catalog import ambient_gateway_providers
 
@@ -994,6 +1062,22 @@ class ManagedSandboxDeployment:
                 ):
                     caps[config.provider]["default_models"] = True
         return caps
+
+    def provider_automation_notices(self) -> dict[str, str]:
+        """
+        Each launchable provider's ``automation_notice``, for ``/v1/info``.
+
+        Kept apart from :meth:`provider_ui_capabilities`, whose values are flags.
+
+        :returns: Notice text keyed by provider name; a provider without one is absent.
+        """
+        notices: dict[str, str] = {}
+        for config in self.configs:
+            if config.managed_launch_supported and config.provider is not None:
+                notice = config.launcher_factory().automation_notice
+                if notice:
+                    notices[config.provider] = notice
+        return notices
 
 
 @dataclass
@@ -1162,12 +1246,42 @@ def parse_repo_workspace(workspace: str) -> RepoWorkspace:
                 f"'{url}' is not a usable ssh repository URL — expected 'git@<host>:<org>/<repo>'"
             )
     else:
+        # Never echo the URL: an unrecognised scheme (e.g. ``HTTPS://``) can still carry userinfo.
         raise ValueError(
-            f"'{url}' is not a supported repository URL — use "
+            "not a supported repository URL — use "
             "'https://<host>/<org>/<repo>' or 'git@<host>:<org>/<repo>'"
         )
     branch = _validate_clone_branch(fragment) if sep else None
     return RepoWorkspace(url=url, branch=branch, repo_name=_derive_repo_name(url))
+
+
+def parse_project_repository(repository: object) -> RepoWorkspace:
+    """
+    Parse a project's saved ``{"url": ..., "branch": ...}`` repository.
+
+    The project config is opaque client JSON, so this is the only place its
+    repository shape is checked. The branch is kept apart from the URL so a
+    ``#`` in the URL is rejected rather than read as a fragment.
+
+    :param repository: The raw repository value, e.g.
+        ``{"url": "https://git.example.com/team/app.git", "branch": "main"}``.
+    :returns: The validated :class:`RepoWorkspace`.
+    :raises ValueError: When the value is not an object with a string ``url``
+        and an optional string ``branch``, or the URL or branch is malformed.
+    """
+    if not isinstance(repository, dict) or "url" not in repository:
+        raise ValueError("repository must be an object with a 'url' and an optional 'branch'")
+    if not set(repository) <= {"url", "branch"}:
+        raise ValueError("repository may only set 'url' and 'branch'")
+    url = repository["url"]
+    branch = repository.get("branch")
+    if not isinstance(url, str) or (branch is not None and not isinstance(branch, str)):
+        raise ValueError("repository 'url' and 'branch' must be strings")
+    url = url.strip()
+    if "#" in url:
+        raise ValueError("repository 'url' must not contain '#'; set 'branch' instead")
+    branch = branch.strip() if branch else ""
+    return parse_repo_workspace(f"{url}#{branch}" if branch else url)
 
 
 def _modal_launcher_factory(
@@ -1366,18 +1480,34 @@ def _apply_keep_warm(
 
 
 def deployment_with_sandbox_profile(
-    deployment: ManagedSandboxDeployment, snapshot: dict[str, Any] | None
+    deployment: ManagedSandboxDeployment,
+    snapshot: dict[str, Any] | None,
+    *,
+    unprofiled_host: Host | None = None,
 ) -> ManagedSandboxDeployment:
-    """Pass a saved provider reference to fresh launcher instances."""
-    if snapshot is None:
+    """Carry the accepted profile or an admitted legacy host into its launcher."""
+    if snapshot is not None:
+        entry = deployment.for_provider(snapshot["provider"])
+    elif unprofiled_host is not None:
+        entry = deployment.recorded(unprofiled_host.sandbox_provider)
+    else:
         return deployment
-    entry = deployment.for_provider(snapshot["provider"])
     if entry is None:
         raise HTTPException(status_code=400, detail="The sandbox profile provider is unavailable")
     return replace(
         deployment,
         configs=tuple(
-            replace(config, profile_selection=snapshot) if config is entry else config
+            replace(
+                config,
+                profile_selection=snapshot,
+                unprofiled_host_id=(
+                    unprofiled_host.host_id
+                    if snapshot is None and unprofiled_host is not None
+                    else None
+                ),
+            )
+            if config is entry
+            else config
             for config in deployment.configs
         ),
     )
@@ -1615,6 +1745,11 @@ def _parse_multi_provider_sandbox_config(
             "server config 'sandbox.providers' must be a non-empty list of "
             "provider mappings, e.g. [{provider: modal}, {provider: e2b}]"
         )
+    if "default_profile_id" in raw:
+        raise ValueError(
+            "server config 'sandbox.default_profile_id' names one provider's profile; "
+            "set it inside that provider's 'sandbox.providers' entry"
+        )
     # Shared keys describe THIS server, so they ride into every entry
     # instead of being repeated per entry.
     shared = {
@@ -1688,6 +1823,9 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
     # Validated regardless of provider (like server_url): a malformed
     # host_config should stop startup even for staged/unsupported providers.
     host_config = _parse_host_config(raw)
+    stop_on_archive = raw.get("stop_on_archive", False)
+    if not isinstance(stop_on_archive, bool):
+        raise ValueError("server config 'sandbox.stop_on_archive' must be a boolean")
     model_discovery = raw.get("model_discovery", {})
     if not isinstance(model_discovery, dict):
         raise ValueError("sandbox.model_discovery must be a mapping")
@@ -2028,6 +2166,20 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
                 "300 to 31536000 seconds (5 minutes to 365 days), or null for the provider default"
             )
         token_ttl_s = configured_token_ttl_s
+    default_profile_id = raw.get("default_profile_id")
+    if default_profile_id is not None:
+        if not manages_profiles:
+            raise ValueError(
+                "server config 'sandbox.default_profile_id' requires a provider that "
+                "manages sandbox profiles"
+            )
+        if not isinstance(default_profile_id, str) or not re.fullmatch(
+            PROFILE_ID_PATTERN, default_profile_id
+        ):
+            raise ValueError(
+                "server config 'sandbox.default_profile_id' must be a profile id: "
+                "lowercase letters, digits, '_' or '-', at most 64 characters"
+            )
     return ManagedSandboxConfig(
         server_url=server_url.strip().rstrip("/"),
         launcher_factory=launcher_factory,
@@ -2040,6 +2192,8 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         model_discovery=model_discovery,
         git_clone=git_clone,
         manages_profiles=manages_profiles,
+        default_profile_id=default_profile_id,
+        stop_on_archive=stop_on_archive,
     )
 
 
@@ -3930,6 +4084,7 @@ async def _select_launch_profile(
     owner: str,
     *,
     sandbox_id: str | None = None,
+    host_id: str | None = None,
 ) -> None:
     from omnigent.server.provider_sandbox_profiles import select_provider_profile
 
@@ -3940,7 +4095,9 @@ async def _select_launch_profile(
                 status_code=403, detail="Sandbox profile execution identity mismatch"
             )
         await asyncio.to_thread(select_provider_profile, launcher, snapshot, sandbox_id=sandbox_id)
-    elif getattr(launcher, "manages_profiles", False):
+    elif getattr(launcher, "manages_profiles", False) and not (
+        host_id is not None and entry.unprofiled_host_id == host_id
+    ):
         raise HTTPException(status_code=422, detail="Choose a sandbox profile for this provider")
 
 
@@ -4208,7 +4365,7 @@ async def _relaunch_managed_host(
     # Stay on the host's provider so the new generation is armed with ITS
     # token TTL, not the deployment default's.
     entry = config.recorded(host.sandbox_provider)
-    await _select_launch_profile(launcher, entry, host.user_id)
+    await _select_launch_profile(launcher, entry, host.user_id, host_id=host.host_id)
     repos = _apply_git_clone_options(launcher, repos, entry.git_clone)
     # ponytail: one pending cleanup slot; drain recorded generations before replacing them.
     for sandbox_id in dict.fromkeys((host.terminating_sandbox_id, host.sandbox_id)):
@@ -4803,7 +4960,9 @@ async def resume_managed_host(
         # providers retain their filesystem and do not need workspace prep.
         workspace_repos = repos if launcher.provider == "agent_sandbox" else ()
         entry = config.recorded(host.sandbox_provider)
-        await _select_launch_profile(launcher, entry, host.user_id, sandbox_id=host.sandbox_id)
+        await _select_launch_profile(
+            launcher, entry, host.user_id, sandbox_id=host.sandbox_id, host_id=host.host_id
+        )
         workspace_repos = _apply_git_clone_options(launcher, workspace_repos, entry.git_clone)
         sandbox_id = host.sandbox_id
         _logger.info(
@@ -5028,6 +5187,121 @@ async def release_session_managed_host(
     await terminate_managed_host(
         host, host_store, config, keep_if_bound=True, capture_logs=capture_logs
     )
+
+
+async def _sandbox_has_other_users(
+    host_id: str, session_id: str, conversation_store: ConversationStore
+) -> bool:
+    """
+    Whether anything but the archived *session_id* may still use *host_id*.
+
+    Only a lone sandbox is stopped: another session bound to the host, or a side
+    chat or sub-agent of the session (they run on its runner without a host
+    binding), keeps it running whether archived or not. An archived sibling may
+    still be inside its Undo grace or finishing its last turn, which only its own
+    teardown knows. The session itself must still be archived, since an unarchive
+    cannot cancel a teardown that has started.
+
+    Fails closed: a host listing that omits *session_id* (a store that can't list
+    a host's sessions) or an unknown archived state counts as in use.
+    """
+    host_sessions = await asyncio.to_thread(
+        conversation_store.list_host_conversation_ids, host_id, limit=2
+    )
+    if host_sessions != [session_id]:
+        return True
+    side_chats = await asyncio.to_thread(
+        conversation_store.list_side_chat_ids, session_id, limit=1
+    )
+    children = await asyncio.to_thread(
+        conversation_store.list_child_conversation_ids_page, session_id, limit=1
+    )
+    if side_chats or children:
+        return True
+    activity = await asyncio.to_thread(conversation_store.get_session_activity, [session_id])
+    row = activity.get(session_id)
+    return row is None or row.archived is not True
+
+
+async def stop_archived_session_sandbox(
+    conv: Conversation,
+    host_store: HostStore,
+    conversation_store: ConversationStore,
+    config: ManagedSandboxDeployment | None,
+) -> bool:
+    """
+    Best-effort stop of an opted-in archived session's sandbox, keeping it resumable.
+
+    The provider's ``stop_on_archive`` setting, passed through the launcher's
+    ``stop_when_archived`` hook, decides. Only the sandbox of a session bound to
+    it directly, and used by no other session (see
+    :func:`_sandbox_has_other_users`), is stopped; scheduled task runs are
+    skipped. Any failure before the stop leaves the sandbox running.
+
+    Nothing holds new work off while the provider stops the sandbox: a session
+    unarchived and messaged during that call can start a runner the stop then
+    ends. That turn fails, and the session's next message wakes the sandbox
+    through the normal wake path, which restores its profile and routing.
+
+    :param conv: The archived session, as re-read by the teardown.
+    :param host_store: Store holding the session's host row.
+    :param conversation_store: Store used to find other sessions on the host.
+    :param config: The deployment's sandbox config, or ``None`` when managed
+        hosts are not configured.
+    :returns: ``True`` when the provider stopped the sandbox.
+    """
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
+
+    if config is None or conv.host_id is None:
+        return False
+    if conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY):
+        return False
+    try:
+        host = await asyncio.to_thread(host_store.get_host, conv.host_id)
+        if host is None or host.sandbox_id is None:
+            return False
+        launcher = _launcher_for_teardown(host, config)
+        if launcher is None or not launcher.capabilities.resume_stopped:
+            return False
+        configured = config.recorded(host.sandbox_provider).stop_on_archive
+        # getattr: embedding deployments may inject duck-typed launchers.
+        decide = getattr(launcher, "stop_when_archived", None)
+        wanted = (
+            configured
+            if decide is None
+            else await asyncio.to_thread(decide, owner=host.user_id, configured=configured)
+        )
+        if not wanted:
+            return False
+        # After the hook, which may be slow: an unarchive can't cancel a started
+        # teardown.
+        if await _sandbox_has_other_users(host.host_id, conv.id, conversation_store):
+            return False
+        try:
+            await asyncio.to_thread(launcher.stop, host.sandbox_id)
+        except SandboxCapabilityError:
+            _logger.debug(
+                "Managed sandbox provider cannot stop sandboxes; leaving archived "
+                "session %s's sandbox running",
+                conv.id,
+                extra={"session_id": conv.id},
+            )
+            return False
+    except Exception:
+        _logger.warning(
+            "Failed to stop the managed sandbox of archived session %s",
+            conv.id,
+            exc_info=True,
+            extra={"session_id": conv.id},
+        )
+        return False
+    _logger.info(
+        "Stopped managed sandbox %s of archived session %s",
+        host.sandbox_id,
+        conv.id,
+        extra={"session_id": conv.id},
+    )
+    return True
 
 
 async def _log_sandbox_logs_best_effort(

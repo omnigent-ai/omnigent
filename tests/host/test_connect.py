@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import click
+import httpx
 import pytest
 from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosedError, InvalidStatus, InvalidURI
@@ -28,7 +29,7 @@ from websockets.frames import Close
 from websockets.http11 import Response
 
 from omnigent import debug_logging
-from omnigent.host import HOST_FATAL_EXIT_CODE
+from omnigent.host import HOST_FATAL_EXIT_CODE, daemon_launch
 from omnigent.host.connect import (
     HostConnectError,
     HostProcess,
@@ -48,6 +49,8 @@ from omnigent.host.frames import (
     SERVER_CAP_TMUX_READINESS,
     SERVER_CAPABILITIES_HEADER,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostCloneRepositoryFrame,
+    HostCloneRepositoryResultFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -104,6 +107,8 @@ from omnigent.host.git_worktree import CreatedWorktree
 from omnigent.host.identity import HostIdentity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
+from omnigent.host.session_env import session_env_handoff
+from omnigent.onboarding import harness_install
 from omnigent.onboarding.harness_install import READINESS_CLI_PROBE_TIMEOUT_S
 from omnigent.onboarding.harness_login import CodexDeviceLogin
 from omnigent.runner.identity import (
@@ -1214,6 +1219,101 @@ async def test_handle_launch_refuses_when_workspace_mkdir_denied(
     _cleanup_host(host)
 
 
+_FORWARDS_SESSION_ENV = pytest.mark.skipif(
+    sys.platform == "win32", reason="Session env forwarding is disabled on Windows"
+)
+
+
+def _relayed_launch_frame(body: dict[str, str], request_id: str) -> HostLaunchRunnerFrame:
+    """Return the launch frame a host receives for a CLI's ``POST /v1/hosts/{id}/runners``."""
+    frame = decode_host_frame(
+        encode_host_frame(
+            HostLaunchRunnerFrame(
+                request_id=request_id,
+                binding_token=f"token_{request_id}",
+                workspace=body["workspace"],
+                session_id=body["session_id"],
+                session_env_handoff_id=body.get("session_env_handoff_id"),
+            )
+        )
+    )
+    assert isinstance(frame, HostLaunchRunnerFrame)
+    return frame
+
+
+@_FORWARDS_SESSION_ENV
+async def test_cli_launch_forwards_named_shell_env_to_only_that_sessions_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Only the launching CLI's session runner gets its named variables, never the server."""
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    forwarded_names = ("ARCATERM_CAPABILITY", "MACTERM_SOCKET", "ARCATERM_PROJECTS_ROOT")
+    monkeypatch.setenv("OMNIGENT_SESSION_ENV_PASSTHROUGH", " , ".join(forwarded_names))
+    monkeypatch.setenv("ARCATERM_CAPABILITY", "capability-for-pane-1")
+    monkeypatch.setenv("MACTERM_SOCKET", "/tmp/macterm-pane-1.sock")
+    monkeypatch.delenv("ARCATERM_PROJECTS_ROOT", raising=False)
+    launch_requests: list[bytes] = []
+    spawned_envs: dict[str, dict[str, str]] = {}
+    original_popen = subprocess.Popen
+
+    async def _server(request: httpx.Request) -> httpx.Response:
+        launch_requests.append(request.content)
+        body = json.loads(request.content)
+        for name in ("OMNIGENT_SESSION_ENV_PASSTHROUGH", *forwarded_names):
+            monkeypatch.delenv(name, raising=False)
+        session_id = body["session_id"]
+
+        def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+            spawned_envs[session_id] = dict(kwargs["env"])  # type: ignore[call-overload]
+            return original_popen(
+                ["sleep", "10"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+
+        frame = _relayed_launch_frame(body, f"req_{session_id}")
+        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+            result = await host._handle_launch(frame)
+        assert result.status == "launched", result.error
+        return httpx.Response(200, json={"runner_id": result.runner_id})
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server), base_url="https://server.example"
+        ) as client:
+            for session_id in ("conv_arcaterm", "conv_plain"):
+                await daemon_launch.launch_or_reuse_daemon_runner(
+                    client,
+                    host_id="host_test_connect",
+                    session_id=session_id,
+                    workspace=str(workspace),
+                    fresh=True,
+                )
+    finally:
+        _cleanup_host(host)
+
+    assert "did not receive" not in capsys.readouterr().err
+    assert not any(b"capability-for-pane-1" in content for content in launch_requests)
+    arcaterm_body, plain_body = (json.loads(content) for content in launch_requests)
+    assert arcaterm_body.pop("session_env_handoff_id")
+    assert arcaterm_body == {"session_id": "conv_arcaterm", "workspace": str(workspace)}
+    assert plain_body == {"session_id": "conv_plain", "workspace": str(workspace)}
+    arcaterm_env = spawned_envs["conv_arcaterm"]
+    assert arcaterm_env["ARCATERM_CAPABILITY"] == "capability-for-pane-1"
+    assert arcaterm_env["MACTERM_SOCKET"] == "/tmp/macterm-pane-1.sock"
+    assert "ARCATERM_PROJECTS_ROOT" not in arcaterm_env
+    assert (
+        arcaterm_env["OMNIGENT_RUNNER_SESSION_ENV_NAMES"] == "ARCATERM_CAPABILITY,MACTERM_SOCKET"
+    )
+    plain_env = spawned_envs["conv_plain"]
+    assert not {"ARCATERM_CAPABILITY", "MACTERM_SOCKET"} & plain_env.keys()
+    assert "OMNIGENT_RUNNER_SESSION_ENV_NAMES" not in plain_env
+
+
 @pytest.mark.parametrize("binding_token", ["token_xyz", "", "   "])
 async def test_handle_launch_fails_for_bad_workspace(
     tmp_path: Path,
@@ -1472,14 +1572,14 @@ async def test_handle_launch_does_not_ask_to_install_a_resolvable_pi_that_never_
     monkeypatch.delenv("OMNIGENT_PI_PATH", raising=False)
     monkeypatch.delenv("HARNESS_PI_PATH", raising=False)
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
-    original_run = subprocess.run
+    original_run = harness_install.run_isolated
 
     def _unanswered_version(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         if argv[1:] != ["--version"]:
             return original_run(argv, **kwargs)
         raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
 
-    monkeypatch.setattr(subprocess, "run", _unanswered_version)
+    monkeypatch.setattr(harness_install, "run_isolated", _unanswered_version)
     host = _make_host_process()
     proc = Mock(spec=subprocess.Popen, pid=1234)
     proc.poll.return_value = None
@@ -1509,7 +1609,7 @@ async def test_handle_launch_bound_preflight_waits_only_the_readiness_probe_budg
     """A bound launch lets an unanswered CLI through within the readiness probe budget."""
     probe_timeouts: list[object] = []
     original_which = shutil.which
-    original_run = subprocess.run
+    original_run = harness_install.run_isolated
 
     def _resolve_claude(name: str, *args: object, **kwargs: object) -> str | None:
         return "/usr/bin/claude" if name == "claude" else original_which(name, *args, **kwargs)
@@ -1524,7 +1624,7 @@ async def test_handle_launch_bound_preflight_waits_only_the_readiness_probe_budg
     proc = Mock(spec=subprocess.Popen, pid=1234)
     proc.poll.return_value = None
     monkeypatch.setattr(shutil, "which", _resolve_claude)
-    monkeypatch.setattr(subprocess, "run", _unanswered_version)
+    monkeypatch.setattr(harness_install, "run_isolated", _unanswered_version)
     monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
     monkeypatch.setattr(
         host, "_spawn_runner_proc", Mock(return_value=(proc, tmp_path / "runner.log"))
@@ -3073,6 +3173,64 @@ async def test_fast_capability_discovery_is_included_in_hello(
     assert len(tunnel.sent) == 1
     assert hello.configured_harnesses == {"codex-native": True}
     assert hello.gateway_inference == {"codex-native": True}
+
+
+@pytest.mark.parametrize("serving", [True, False])
+async def test_hello_advertises_the_workspace_socket_only_while_it_runs(
+    monkeypatch: pytest.MonkeyPatch, serving: bool
+) -> None:
+    """The server can mint direct-access tokens only for a host that serves the socket."""
+    host = _make_host_process()
+
+    async def _discover() -> None:
+        host._capabilities_initialized = True
+
+    monkeypatch.setattr(host, "_initialize_capabilities", _discover)
+    if serving:
+        host._workspace_socket = SimpleNamespace(  # type: ignore[assignment]
+            path=Path("/tmp/omnigent-workspace-x/workspace.sock"), token_key="key-abc"
+        )
+    tunnel = _BlockingTunnel()
+    serve_task = asyncio.create_task(host._serve_frames(tunnel))  # type: ignore[arg-type]
+    try:
+        await asyncio.wait_for(tunnel.first_send.wait(), timeout=1.0)
+    finally:
+        await _cancel(serve_task)
+
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    if serving:
+        assert hello.workspace_socket == "/tmp/omnigent-workspace-x/workspace.sock"
+        assert hello.workspace_token_key == "key-abc"
+    else:
+        assert hello.workspace_socket is None
+        assert hello.workspace_token_key is None
+
+
+@pytest.mark.parametrize(
+    ("features", "enabled"),
+    [("workspace_direct_access", True), ("", False), ("not_a_feature", False)],
+)
+async def test_workspace_direct_access_follows_omnigent_features(
+    monkeypatch: pytest.MonkeyPatch, features: str, enabled: bool
+) -> None:
+    """The host opens its socket only when enabled, and an invalid list never stops the host."""
+    from omnigent.host.connect import _workspace_direct_access_enabled
+
+    monkeypatch.setenv("OMNIGENT_FEATURES", features)
+
+    assert _workspace_direct_access_enabled() is enabled
+
+
+async def test_workspace_socket_without_its_extra_leaves_the_host_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Enabling direct access without `omnigent[workspace-api]` turns it off, not the host."""
+    monkeypatch.setenv("OMNIGENT_FEATURES", "workspace_direct_access")
+    # None in sys.modules makes the import fail as if connectrpc weren't installed.
+    monkeypatch.setitem(sys.modules, "omnigent.host.workspace_service", None)
+
+    assert await _make_host_process()._start_workspace_socket() is None
 
 
 async def test_slow_capability_discovery_blocks_registration_and_frame_dispatch(
@@ -5155,6 +5313,27 @@ def test_build_runner_env_passthrough_extends_forwarded_set() -> None:
     assert "UNLISTED_SECRET" not in env
 
 
+def test_build_runner_env_session_env_bypasses_allowlist_and_overrides_daemon_values() -> None:
+    """Forwarded values bypass the allowlist and replace the daemon's own copies."""
+    env = _build_runner_env(
+        {"PATH": "/usr/bin", "SSH_AUTH_SOCK": "/tmp/daemon-agent.sock"},
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+        session_env={
+            "SSH_AUTH_SOCK": "/tmp/pane-agent.sock",
+            "ARCATERM_CAPABILITY": "capability-for-pane-1",
+        },
+    )
+
+    assert env["SSH_AUTH_SOCK"] == "/tmp/pane-agent.sock"
+    assert env["ARCATERM_CAPABILITY"] == "capability-for-pane-1"
+    assert env["RUNNER_SERVER_URL"] == "http://server"
+    assert env["OMNIGENT_RUNNER_SESSION_ENV_NAMES"] == "ARCATERM_CAPABILITY,SSH_AUTH_SOCK"
+
+
 def test_dispatch_trace_context_reaches_runner_but_not_daemon(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5197,33 +5376,36 @@ def test_dispatch_trace_context_reaches_runner_but_not_daemon(
         assert DISPATCH_TRACESTATE_ENV_VAR not in daemon_env
 
 
-def test_build_runner_env_passthrough_survives_remote_daemon_hop(
+@pytest.mark.parametrize("server", [None, "https://server.example.test"])
+@pytest.mark.parametrize(
+    "credential_name", ["DATABRICKS_LINEAR_API_KEY", "GITLAB_TOKEN", "GLAB_TOKEN"]
+)
+def test_build_runner_env_passthrough_survives_daemon_hop(
     monkeypatch: pytest.MonkeyPatch,
+    server: str | None,
+    credential_name: str,
 ) -> None:
     """OMNIGENT_RUNNER_ENV_PASSTHROUGH forwards a named var through BOTH hops.
 
-    In ``--server`` mode the env crosses two strips: CLI→daemon
+    The env crosses two strips: CLI→daemon
     (``_build_host_daemon_env``) then daemon→runner (``_build_runner_env``). The
     control var must survive the first hop or the second never sees the names it
-    lists. A named var travels via the ``DATABRICKS_`` prefix on the first hop and
-    the passthrough on the second, so it must reach the runner; an unnamed secret
-    must not.
+    lists. Only a named credential must reach the runner.
     """
     from omnigent.cli import _build_host_daemon_env
 
     monkeypatch.setenv("PATH", "/usr/bin")
-    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "DATABRICKS_LINEAR_API_KEY")
-    monkeypatch.setenv("DATABRICKS_LINEAR_API_KEY", "lin-secret")
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", credential_name)
+    monkeypatch.setenv(credential_name, "test-secret")
     monkeypatch.setenv("DATABRICKS_UNNAMED", "should-not-forward")
 
-    server = "https://example.databricksapps.com"
     daemon_env = _build_host_daemon_env(server_url=server)
     # The first hop must keep the control var (regression guard for the remote no-op).
-    assert daemon_env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] == "DATABRICKS_LINEAR_API_KEY"
+    assert daemon_env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] == credential_name
 
     runner_env = _build_runner_env(
         daemon_env,
-        server_url=server,
+        server_url=server or "http://localhost:8000",
         runner_id="runner_abc",
         binding_token="tok",
         workspace="/ws",
@@ -5231,7 +5413,7 @@ def test_build_runner_env_passthrough_survives_remote_daemon_hop(
     )
 
     # The named var reaches the runner; an unnamed one does not.
-    assert runner_env["DATABRICKS_LINEAR_API_KEY"] == "lin-secret"
+    assert runner_env[credential_name] == "test-secret"
     assert "DATABRICKS_UNNAMED" not in runner_env
 
 
@@ -5244,6 +5426,8 @@ def test_host_settings_survive_daemon_and_runner_hops(
     selectors = {
         "OMNIGENT_HOST_SANDBOX_BACKEND": "phoenix-kubernetes",
         "GLAB_CONFIG_DIR": str(tmp_path / "glab"),
+        "GITLAB_HOST": "git.example.test:8443",
+        "GLAB_HOST": "git.example.test:8443",
         "GH_CONFIG_DIR": str(tmp_path / "gh"),
         "XDG_CONFIG_HOME": str(tmp_path / "config"),
         "XDG_CONFIG_DIRS": str(tmp_path / "system-config"),
@@ -5381,7 +5565,7 @@ def test_build_runner_env_propagates_disable_keyring() -> None:
     ``keychain:<name>`` refs. If the flag didn't reach the runner it would fall
     back to the OS keyring and fail with "no stored secret named …" for a key
     the CLI just saved — the headless / file-backend deploy case (and the exact
-    failure hit while dogfooding the first-run flow).
+    failure hit while trying the first-run flow).
     """
     base = {"PATH": "/usr/bin:/bin", "OMNIGENT_DISABLE_KEYRING": "1"}
     env = _build_runner_env(
@@ -5652,6 +5836,40 @@ def test_handle_list_dir_pagination_last_page_has_more_false(
     assert result.status == "ok"
     assert len(result.entries) == 2
     assert result.has_more is False
+
+
+async def test_dispatch_clone_repository_keeps_orphan_reaper_paused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The clone worker owns its git exit status until it finishes."""
+    host = _make_host_process()
+    started = threading.Event()
+    release = threading.Event()
+    destination = str(tmp_path / "app")
+
+    def _clone(frame: HostCloneRepositoryFrame) -> HostCloneRepositoryResultFrame:
+        started.set()
+        if not release.wait(timeout=1.0):
+            raise AssertionError("test did not release the clone worker")
+        return HostCloneRepositoryResultFrame(
+            request_id=frame.request_id, status="ok", path=frame.path
+        )
+
+    monkeypatch.setattr("omnigent.host.connect.clone_repository", _clone)
+    tunnel = _FakeTunnel()
+    request = HostCloneRepositoryFrame(
+        request_id="clone-1", url="https://git.example.com/team/app.git", path=destination
+    )
+    dispatch = asyncio.create_task(host._dispatch_host_frame(tunnel, request))  # type: ignore[arg-type]
+    assert await asyncio.to_thread(started.wait, 1.0)
+    assert host._owned_subprocess_ops == 1
+
+    release.set()
+    await dispatch
+    assert host._owned_subprocess_ops == 0
+    assert decode_host_frame(tunnel.sent[0]) == HostCloneRepositoryResultFrame(
+        request_id="clone-1", status="ok", path=destination
+    )
 
 
 # ── host.create_dir handler ─────────────────────────────
@@ -7296,7 +7514,7 @@ async def test_connected_host_retries_auth_rejection_indefinitely(
 
     A host that already completed an upgrade proved its credentials and
     authorization are valid. A later 401/403 is almost always a dropped
-    VPN whose corporate proxy answers the upgrade before it reaches the
+    VPN whose proxy answers the upgrade before it reaches the
     server — killing the host would drop its live runners and force a
     manual ``omnigent host`` restart once the VPN reconnects. It must keep
     retrying past the fresh-host fatal threshold instead.
@@ -10206,6 +10424,7 @@ async def test_fatal_upgrade_error_bodyless_4xx_falls_back_to_generic() -> None:
     assert "the server rejected the host tunnel request" in str(err)
 
 
+@_FORWARDS_SESSION_ENV
 async def test_handle_launch_supersedes_previous_runner_for_same_session(
     tmp_path: Path,
 ) -> None:
@@ -10213,7 +10432,9 @@ async def test_handle_launch_supersedes_previous_runner_for_same_session(
 
     The server rotates the binding token on every relaunch, so without
     this the host accumulates one live runner per attempt — each with a
-    transcript forwarder tailing the same session (the #5182 leak).
+    transcript forwarder tailing the same session (the #5182 leak). A
+    server-driven relaunch also starts without the first launch's forwarded
+    variables.
     """
     host = _make_host_process()
     maintenance_reasons: list[str] = []
@@ -10224,21 +10445,29 @@ async def test_handle_launch_supersedes_previous_runner_for_same_session(
     workspace.mkdir()
 
     original_popen = subprocess.Popen
+    spawned_envs: list[dict[str, str]] = []
 
     def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        spawned_envs.append(dict(kwargs["env"]))  # type: ignore[call-overload]
         return original_popen(
             ["sleep", "30"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
 
-    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+    with (
+        patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen),
+        session_env_handoff(
+            "conv_super", {"ARCATERM_CAPABILITY": "capability-for-pane-1"}
+        ) as handoff_id,
+    ):
         first = await host._handle_launch(
             HostLaunchRunnerFrame(
                 request_id="req_a",
                 binding_token="tok_a",
                 workspace=str(workspace),
                 session_id="conv_super",
+                session_env_handoff_id=handoff_id,
             )
         )
         first_handle = host._runners[first.runner_id]
@@ -10268,6 +10497,11 @@ async def test_handle_launch_supersedes_previous_runner_for_same_session(
         await asyncio.sleep(0.01)
     assert maintenance_reasons == ["runner_superseded"]
     assert second.runner_id in host._runners
+    first_env, replacement_env = spawned_envs
+    assert first_env["ARCATERM_CAPABILITY"] == "capability-for-pane-1"
+    assert (
+        not {"ARCATERM_CAPABILITY", "OMNIGENT_RUNNER_SESSION_ENV_NAMES"} & replacement_env.keys()
+    )
     _cleanup_host(host)
 
 
@@ -11294,6 +11528,10 @@ def test_github_commit_ops_are_served_on_host(
             author = {"name": "Ada", "date": "2026-11-01T10:00:00Z"}
             entries = [{"sha": commit, "commit": {"message": "Fix", "author": author}}]
             return 0, json.dumps([entries]), ""
+        if "/compare/" in argv[-1]:
+            return 0, "compare-patch", ""
+        if "graphql" in argv:
+            return 1, "", "no associated PRs here"
         return 0, "commit-patch", ""
 
     monkeypatch.setattr(github_resource, "_gh", gh)
@@ -11320,13 +11558,82 @@ def test_github_commit_ops_are_served_on_host(
                 params={"pr_url": url, "commit_sha": commit},
             )
         )
+        compared = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="compare-diff",
+                op="github_compare_diff",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url, "head_sha": head, "from_sha": commit},
+            )
+        )
     finally:
         _cleanup_host(host)
 
     assert listed.status == "ok", listed
     assert [entry["sha"] for entry in listed.payload["data"]] == [commit]
+    assert compared.status == "ok", compared
+    assert compared.payload["patch"] == "compare-patch"
     assert patch.status == "ok", patch
     assert patch.payload == {"object": "session.github.pr_diff", "patch": "commit-patch"}
+
+
+def _host_with_tracked_pr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gh: Callable[..., tuple[int, str, str]]
+) -> tuple[HostProcess, str]:
+    """A host whose session tracks one PR, with every ``gh`` call going to ``gh``."""
+    from omnigent.runner import github_resource
+    from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    url = "https://github.com/example/one/pull/42"
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(url)], relationship="created", source="test"
+    )
+    return _make_host_process(), url
+
+
+def test_github_merge_on_host_runs_as_the_confirmed_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tunneled merge-as runs with the confirmed account's own token."""
+    from omnigent.host.frames import HostFsWriteFrame
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.delenv("IS_SANDBOX", raising=False)
+    calls: list[tuple[list[str], object]] = []
+
+    def gh(argv: list[str], **kwargs: object) -> tuple[int, str, str]:
+        calls.append((argv, kwargs.get("token")))
+        if argv[:2] == ["auth", "token"]:
+            return 0, f"token-{argv[3]}", ""
+        return 0, "", ""
+
+    host, url = _host_with_tracked_pr(tmp_path, monkeypatch, gh)
+    try:
+        merged = host._handle_fs_write(
+            HostFsWriteFrame(
+                request_id="merge",
+                op="github_merge_as",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={
+                    "pr_url": url,
+                    "merge_method": "rebase",
+                    "expected_head": "a" * 40,
+                    "account": "personal",
+                },
+            )
+        )
+    finally:
+        _cleanup_host(host)
+
+    assert merged.status == "ok", merged
+    argv, token = calls[-1]
+    assert argv[:2] == ["pr", "merge"]
+    assert argv[-3:] == ["--rebase", "--match-head-commit", "a" * 40]
+    assert token == "token-personal"
 
 
 def test_github_merge_ops_are_served_on_host(
@@ -11335,9 +11642,7 @@ def test_github_merge_ops_are_served_on_host(
     """The host reads merge options and merges a tracked PR when the runner is offline."""
     from omnigent.host.frames import HostFsRequestFrame, HostFsWriteFrame
     from omnigent.runner import github_resource
-    from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 
-    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(github_resource, "_pr_token", lambda *_a: None)
     calls: list[list[str]] = []
 
@@ -11351,12 +11656,7 @@ def test_github_merge_ops_are_served_on_host(
             )
         return 0, "", ""
 
-    monkeypatch.setattr(github_resource, "_gh", gh)
-    url = "https://github.com/example/one/pull/42"
-    SessionPrRegistry("session").record(
-        [PullRequestRef.from_url(url)], relationship="created", source="test"
-    )
-    host = _make_host_process()
+    host, url = _host_with_tracked_pr(tmp_path, monkeypatch, gh)
     try:
         options = host._handle_fs_request(
             HostFsRequestFrame(
@@ -11920,9 +12220,138 @@ async def test_host_publishes_stored_workspace_at_startup(
 
     server_url = "https://example.databricks.com/api/2.0/omnigent"
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
-    store_databricks_org_id(server_url, "1965859176160743")
+    store_databricks_org_id(server_url, "4242424242424242")
 
     host = _host(server_url)
 
-    assert host._origin_workspace_id == "1965859176160743"
-    assert os.environ[debug_logging.ORIGIN_WORKSPACE_ID_ENV_VAR] == "1965859176160743"
+    assert host._origin_workspace_id == "4242424242424242"
+    assert os.environ[debug_logging.ORIGIN_WORKSPACE_ID_ENV_VAR] == "4242424242424242"
+
+
+@pytest.mark.parametrize(
+    "harness,plugin", [("claude", None), ("claude", "toolkit"), ("codex", None)]
+)
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_host_saves_mcp_preference_over_tunnel(
+    tmp_path, monkeypatch, harness, plugin, enabled
+):
+    from omnigent.host.frames import (
+        HostSetMcpServerEnabledFrame,
+        HostSetMcpServerEnabledResultFrame,
+    )
+    from omnigent.host.mcp_inventory import ConfiguredMcpServer
+    from omnigent.mcp_disabled_servers import ServerKey, is_disabled
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    summary = {"name": "docs", "harness": harness, "transport": "stdio", "scope": "user"}
+    source_id = "a" * 64 if plugin else None
+    if plugin:
+        summary.update(plugin=plugin, source_id=source_id)
+    monkeypatch.setattr(
+        "omnigent.host.mcp_inventory.configured_mcp_servers",
+        lambda: [ConfiguredMcpServer(summary, {})],
+    )
+    host, ws = _make_host_process(), _RecordingWS()
+    frame = HostSetMcpServerEnabledFrame("save", harness, "docs", enabled, plugin, source_id)
+    host._start_frame_task(ws, encode_host_frame(frame))
+    await _drain_frame_tasks(host)
+    result = decode_host_frame(ws.sent[-1])
+    assert isinstance(result, HostSetMcpServerEnabledResultFrame)
+    assert result.status == "ok"
+    assert result.server["enabled"] == str(enabled).lower()
+    assert is_disabled(ServerKey(harness, "docs", plugin)) is not enabled
+
+
+@pytest.mark.parametrize(
+    "server,plugin,source_id,managed",
+    [
+        ("omnigent", None, None, False),
+        ("missing", None, None, False),
+        ("docs", None, None, True),
+        ("docs", None, "0" * 64, False),
+    ],
+)
+async def test_host_rejects_reserved_managed_or_stale_mcp(
+    tmp_path, monkeypatch, server, plugin, source_id, managed
+):
+    from omnigent.host.frames import HostSetMcpServerEnabledFrame
+    from omnigent.host.mcp_inventory import ConfiguredMcpServer
+    from omnigent.mcp_disabled_servers import FILENAME
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    summary = {"name": "docs", "harness": "claude", "transport": "stdio", "scope": "user"}
+    if managed:
+        summary["managed"] = "true"
+    monkeypatch.setattr(
+        "omnigent.host.mcp_inventory.configured_mcp_servers",
+        lambda: [ConfiguredMcpServer(summary, {})],
+    )
+    result = _make_host_process()._handle_set_mcp_server_enabled(
+        HostSetMcpServerEnabledFrame("save", "claude", server, False, plugin, source_id)
+    )
+    assert result.error_code == "invalid_server"
+    if managed:
+        assert result.error == "Managed MCP servers cannot be toggled"
+    assert not (tmp_path / FILENAME).exists()
+
+
+@pytest.mark.parametrize("stored", ["{broken", '{"version": 2, "disabled": []}'])
+async def test_host_reports_mcp_storage_failure_without_overwriting(tmp_path, monkeypatch, stored):
+    from omnigent.host.frames import (
+        HostSetMcpServerEnabledFrame,
+        HostSetMcpServerEnabledResultFrame,
+    )
+    from omnigent.host.mcp_inventory import ConfiguredMcpServer
+    from omnigent.mcp_disabled_servers import FILENAME
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    path = tmp_path / FILENAME
+    path.write_text(stored)
+    summary = {"name": "docs", "harness": "claude", "transport": "stdio", "scope": "user"}
+    monkeypatch.setattr(
+        "omnigent.host.mcp_inventory.configured_mcp_servers",
+        lambda: [ConfiguredMcpServer(summary, {})],
+    )
+    host, ws = _make_host_process(), _RecordingWS()
+    host._start_frame_task(
+        ws, encode_host_frame(HostSetMcpServerEnabledFrame("save", "claude", "docs", False))
+    )
+    await _drain_frame_tasks(host)
+    result = decode_host_frame(ws.sent[-1])
+    assert isinstance(result, HostSetMcpServerEnabledResultFrame)
+    assert result.status == "failed"
+    assert result.error_code == "io"
+    assert result.error == "Cannot update disabled MCP servers: io"
+    assert path.read_text() == stored
+
+
+@pytest.mark.parametrize("activation", [None, [], ["claude"], ["codex"], ["claude", "codex"]])
+async def test_mcp_activation_launch_frame_to_runner_environment(activation):
+    from omnigent.runner.identity import (
+        RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR,
+        runner_mcp_disabled_servers_active_harnesses,
+    )
+
+    frame = decode_host_frame(
+        encode_host_frame(
+            HostLaunchRunnerFrame(
+                "launch",
+                "binding",
+                "/repo",
+                mcp_disabled_servers_active_harnesses=activation,
+            )
+        )
+    )
+    env = _build_runner_env(
+        {RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR: '["codex"]'},
+        server_url="http://localhost",
+        runner_id="runner",
+        binding_token="binding",
+        workspace="/repo",
+        parent_pid=1,
+        mcp_disabled_servers_active_harnesses=frame.mcp_disabled_servers_active_harnesses,
+    )
+    assert runner_mcp_disabled_servers_active_harnesses(env) == activation
+    assert (RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR in env) is (
+        activation is not None
+    )

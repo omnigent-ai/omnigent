@@ -19,6 +19,8 @@ see.
 
 from __future__ import annotations
 
+import base64
+import importlib.util
 import json
 import math
 from collections.abc import Iterator
@@ -85,12 +87,18 @@ CAP_HARNESS_STARTUP = "harness_startup"
 CAP_PLUGINS = "plugins"
 CAP_SKILL_CONTENT = "skill_content"
 CAP_MCP_TOOLS = "mcp_tools"
+CAP_MCP_SERVER_ENABLED = "mcp_server_enabled"
 CAP_REFRESH_HARNESSES = "refresh_harnesses"
 CAP_HARNESS_ACCOUNTS = "harness_accounts"
 CAP_HARNESS_LOGIN = "harness_login"
 CAP_MCP_REGISTRY = "mcp_registry"
+CAP_TCP_EGRESS = "tcp_egress"
 # The host bounds a whole worktree create by ``HostCreateWorktreeFrame.timeout_s``:
 CAP_WORKTREE_CREATE_BUDGET = "worktree_create_budget"
+# The host clones a git repository into a new directory (``host.clone_repository``):
+CAP_CLONE_REPOSITORY = "clone_repository"
+# The host answers ``host.workspace_call`` (the workspace API through the server).
+CAP_WORKSPACE_API = "workspace_api"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
@@ -101,14 +109,20 @@ HOST_CAPABILITIES: list[str] = [
     CAP_PLUGINS,
     CAP_SKILL_CONTENT,
     CAP_MCP_TOOLS,
+    CAP_MCP_SERVER_ENABLED,
     CAP_MCP_REGISTRY,
+    CAP_TCP_EGRESS,
     CAP_MCP_INVENTORY,
     CAP_HARNESS_STARTUP,
     CAP_REFRESH_HARNESSES,
     CAP_WORKTREE_CREATE_BUDGET,
     CAP_HARNESS_ACCOUNTS,
     CAP_HARNESS_LOGIN,
+    CAP_CLONE_REPOSITORY,
 ]
+# The workspace API needs the optional `omnigent[workspace-api]` extra.
+if importlib.util.find_spec("connectrpc") is not None:
+    HOST_CAPABILITIES.append(CAP_WORKSPACE_API)
 
 # Server capabilities, advertised on the tunnel's WebSocket upgrade response (the
 # server sends no frame before the host's hello). Older servers send no header.
@@ -237,6 +251,8 @@ class HostFrameKind(str, Enum):
     LIST_WORKTREES_RESULT = "host.list_worktrees_result"
     CREATE_DIR = "host.create_dir"
     CREATE_DIR_RESULT = "host.create_dir_result"
+    CLONE_REPOSITORY = "host.clone_repository"
+    CLONE_REPOSITORY_RESULT = "host.clone_repository_result"
     INSTALL_HARNESS = "host.install_harness"
     INSTALL_HARNESS_RESULT = "host.install_harness_result"
     REFRESH_HARNESSES = "host.refresh_harnesses"
@@ -256,6 +272,8 @@ class HostFrameKind(str, Enum):
     DETECT_CREDENTIALS_RESULT = "host.detect_credentials_result"
     FS_REQUEST = "host.fs_request"
     FS_RESULT = "host.fs_result"
+    WORKSPACE_CALL = "host.workspace_call"
+    WORKSPACE_REPLY = "host.workspace_reply"
     FS_WRITE_REQUEST = "host.fs_write_request"
     MODEL_OPTIONS = "host.model_options"
     MODEL_OPTIONS_RESULT = "host.model_options_result"
@@ -265,6 +283,8 @@ class HostFrameKind(str, Enum):
     PLUGINS_RESULT = "host.plugins_result"
     SKILL_CONTENT = "host.skill_content"
     SKILL_CONTENT_RESULT = "host.skill_content_result"
+    SET_MCP_SERVER_ENABLED = "host.set_mcp_server_enabled"
+    SET_MCP_SERVER_ENABLED_RESULT = "host.set_mcp_server_enabled_result"
     MCP_TOOLS = "host.mcp_tools"
     MCP_TOOLS_RESULT = "host.mcp_tools_result"
     HARNESS_STARTUP = "host.harness_startup"
@@ -316,6 +336,12 @@ class HostHelloFrame:
         supported" without a version check.
     :param connection_id: Host-minted identifier for this socket, shared with
         server diagnostics. Absent from older hosts.
+    :param workspace_socket: Path of the host's workspace API socket, e.g.
+        ``"/tmp/omnigent-workspace-ab12/workspace.sock"``. ``None`` when the host
+        serves no direct workspace access.
+    :param workspace_token_key: Key the server signs direct-access tokens with
+        (see :mod:`omnigent.host.workspace_tokens`). Sent with
+        ``workspace_socket``; never logged.
     """
 
     version: str
@@ -330,6 +356,8 @@ class HostHelloFrame:
     installation_id: str | None = None
     capabilities: list[str] = field(default_factory=list)
     connection_id: str | None = None
+    workspace_socket: str | None = None
+    workspace_token_key: str | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -386,11 +414,16 @@ class HostLaunchRunnerFrame:
         :data:`HARNESS_NOT_CONFIGURED_ERROR_CODE` when not.
         ``None`` (older server, or no resolvable harness) skips
         the check — fail open.
+    :param mcp_disabled_servers_active_harnesses: Harness families whose MCP preferences
+        apply to this launch. Absent on older servers or while the feature is disabled.
     :param superseded_runner_ids: Runners this launch replaces, which the
         host stops once the new runner is alive. ``None`` (an older server)
         falls back to stopping every runner launched for ``session_id``; an
         empty tuple stops none, e.g. after /clear moved the old runner to
         another session.
+    :param session_env_handoff_id: Opaque ID of the launching CLI's local
+        forwarded-environment handoff, e.g. ``"3qA0x_7Kp2..."``. ``None`` when
+        no CLI handed values to this launch, as for a server-driven restart.
     """
 
     request_id: str
@@ -401,6 +434,8 @@ class HostLaunchRunnerFrame:
     inference_config: dict[str, Any] | None = None
     superseded_runner_ids: tuple[str, ...] | None = None
     scheduled_run: ScheduledRunLogContext | None = None
+    mcp_disabled_servers_active_harnesses: list[str] | None = None
+    session_env_handoff_id: str | None = None
 
 
 @dataclass
@@ -871,6 +906,46 @@ class HostCreateDirResultFrame:
 
 
 @dataclass
+class HostCloneRepositoryFrame:
+    """Server → host: clone a git repository into a new directory.
+
+    Backs ``POST /v1/hosts/{id}/repositories/clone``. The host refuses any
+    existing path at ``path`` so a clone never overwrites user files.
+
+    :param request_id: Correlates the result, e.g. ``"req_clone_1"``.
+    :param url: Clone URL, e.g. ``"https://git.example.com/team/app.git"``.
+    :param path: Absolute or tilde-prefixed destination, e.g.
+        ``"~/code/app"``. Its parent must already exist.
+    :param branch: Branch to check out, or ``None`` for the remote default.
+    """
+
+    request_id: str
+    url: str
+    path: str
+    branch: str | None = None
+
+
+@dataclass
+class HostCloneRepositoryResultFrame:
+    """Host → server: outcome of a clone-repository request.
+
+    :param request_id: Correlates to the :class:`HostCloneRepositoryFrame`.
+    :param status: ``"ok"`` or ``"failed"``.
+    :param path: Absolute path of the new checkout on success.
+    :param error: Human-readable failure message, ``None`` on success.
+    :param error_code: Stable failure class: ``"invalid_input"``,
+        ``"clone_destination_conflict"``, ``"clone_timeout"``, or
+        ``"clone_failed"`` for any other git failure.
+    """
+
+    request_id: str
+    status: str
+    path: str | None = None
+    error: str | None = None
+    error_code: str | None = None
+
+
+@dataclass
 class HostInstallHarnessFrame:
     """Server → host: install a harness CLI on the host.
 
@@ -1189,7 +1264,8 @@ class HostFsWriteFrame:
     (``op="github_details_update"``), comments (``op="github_comment_create"``),
     review replies (``op="github_review_thread_reply"``), description attachment uploads
     (``op="github_attachment_upload"``, the file base64-encoded in
-    ``content_base64``), merges (``op="github_merge"``),
+    ``content_base64``), merges (``op="github_merge"``, or ``op="github_merge_as"``
+    with ``account``),
     and disabling auto-merge (``op="github_disable_auto_merge"``), for every git
     provider; the op names are
     stable wire ids. The host runs the mutation against
@@ -1201,7 +1277,8 @@ class HostFsWriteFrame:
         ``"github_prs_update"``, ``"github_labels_update"``,
         ``"github_reviewers_update"``, ``"github_details_update"``, ``"github_comment_create"``,
         ``"github_review_thread_reply"``, ``"github_review_thread_create"``,
-        ``"github_attachment_upload"``, ``"github_merge"``, or ``"github_disable_auto_merge"``.
+        ``"github_attachment_upload"``, ``"github_merge"``, ``"github_merge_as"``, or
+        ``"github_disable_auto_merge"``.
     :param workspace: Absolute path to the session's workspace on the host.
     :param session_id: Session id, for parity with the read frame.
     :param params: Operation-specific arguments, e.g.
@@ -1213,6 +1290,40 @@ class HostFsWriteFrame:
     workspace: str
     session_id: str
     params: _JsonObject = field(default_factory=dict)
+
+
+@dataclass
+class HostWorkspaceCallFrame:
+    """Server → host: one workspace API call (``omnigent.api.workspace.v1alpha1``).
+
+    :param request_id: Correlates the call's replies.
+    :param workspace: The session's workspace on the host, chosen by the server.
+    :param method: Method name, e.g. ``"ReadFile"``.
+    :param request: The serialized request message.
+    """
+
+    request_id: str
+    workspace: str
+    method: str
+    request: bytes = b""
+
+
+@dataclass
+class HostWorkspaceReplyFrame:
+    """Host → server: one response message of a workspace call, or its end.
+
+    :param request_id: The call this answers.
+    :param message: A serialized response message, or ``None``.
+    :param done: Whether this is the call's last frame.
+    :param error_code: On a failed call's last frame, its Connect code, e.g. ``"not_found"``.
+    :param error_message: The failure's message.
+    """
+
+    request_id: str
+    message: bytes | None = None
+    done: bool = False
+    error_code: str | None = None
+    error_message: str | None = None
 
 
 @dataclass
@@ -1364,6 +1475,29 @@ class HostSkillContentResultFrame:
     status: str
     skill: dict[str, str | bool] | None = None
     error: str | None = None
+
+
+@dataclass
+class HostSetMcpServerEnabledFrame:
+    """Server → host: save an Omnigent-only MCP launch preference."""
+
+    request_id: str
+    harness: str
+    server: str
+    enabled: bool
+    plugin: str | None = None
+    source_id: str | None = None
+
+
+@dataclass
+class HostSetMcpServerEnabledResultFrame:
+    """Host → server: saved server summary or a stable failure code."""
+
+    request_id: str
+    status: str
+    server: dict[str, str] | None = None
+    error: str | None = None
+    error_code: str | None = None
 
 
 @dataclass
@@ -1539,6 +1673,8 @@ HostFrame = (
     | HostListWorktreesResultFrame
     | HostCreateDirFrame
     | HostCreateDirResultFrame
+    | HostCloneRepositoryFrame
+    | HostCloneRepositoryResultFrame
     | HostInstallHarnessFrame
     | HostInstallHarnessResultFrame
     | HostRefreshHarnessesFrame
@@ -1558,6 +1694,8 @@ HostFrame = (
     | HostDetectCredentialsResultFrame
     | HostFsRequestFrame
     | HostFsResultFrame
+    | HostWorkspaceCallFrame
+    | HostWorkspaceReplyFrame
     | HostFsWriteFrame
     | HostModelOptionsFrame
     | HostModelOptionsResultFrame
@@ -1567,6 +1705,8 @@ HostFrame = (
     | HostPluginsResultFrame
     | HostSkillContentFrame
     | HostSkillContentResultFrame
+    | HostSetMcpServerEnabledFrame
+    | HostSetMcpServerEnabledResultFrame
     | HostMcpToolsFrame
     | HostMcpToolsResultFrame
     | HostHarnessStartupFrame
@@ -1665,6 +1805,8 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "installation_id": frame.installation_id,
                 "capabilities": list(frame.capabilities),
                 "connection_id": frame.connection_id,
+                "workspace_socket": frame.workspace_socket,
+                "workspace_token_key": frame.workspace_token_key,
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -1694,7 +1836,12 @@ def encode_host_frame(frame: HostFrame) -> str:
             "session_id": frame.session_id,
             "harness": frame.harness,
             "inference_config": frame.inference_config,
+            "session_env_handoff_id": frame.session_env_handoff_id,
         }
+        if frame.mcp_disabled_servers_active_harnesses is not None:
+            payload["mcp_disabled_servers_active_harnesses"] = (
+                frame.mcp_disabled_servers_active_harnesses
+            )
         if frame.scheduled_run is not None:
             payload["scheduled_run"] = frame.scheduled_run.model_dump()
         if frame.superseded_runner_ids is not None:
@@ -1883,6 +2030,27 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "status": frame.status,
                 "path": frame.path,
                 "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostCloneRepositoryFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.CLONE_REPOSITORY.value,
+                "request_id": frame.request_id,
+                "url": frame.url,
+                "path": frame.path,
+                "branch": frame.branch,
+            }
+        )
+    if isinstance(frame, HostCloneRepositoryResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.CLONE_REPOSITORY_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "path": frame.path,
+                "error": frame.error,
+                "error_code": frame.error_code,
             }
         )
     if isinstance(frame, HostInstallHarnessFrame):
@@ -2076,6 +2244,29 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "params": frame.params,
             }
         )
+    if isinstance(frame, HostWorkspaceCallFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.WORKSPACE_CALL.value,
+                "request_id": frame.request_id,
+                "workspace": frame.workspace,
+                "method": frame.method,
+                "request": base64.b64encode(frame.request).decode(),
+            }
+        )
+    if isinstance(frame, HostWorkspaceReplyFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.WORKSPACE_REPLY.value,
+                "request_id": frame.request_id,
+                "message": None
+                if frame.message is None
+                else base64.b64encode(frame.message).decode(),
+                "done": frame.done,
+                "error_code": frame.error_code,
+                "error_message": frame.error_message,
+            }
+        )
     if isinstance(frame, HostFsResultFrame):
         return _encode_payload(
             {
@@ -2167,6 +2358,29 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "status": frame.status,
                 "skill": frame.skill,
                 "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostSetMcpServerEnabledFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.SET_MCP_SERVER_ENABLED.value,
+                "request_id": frame.request_id,
+                "harness": frame.harness,
+                "server": frame.server,
+                "enabled": frame.enabled,
+                "plugin": frame.plugin,
+                "source_id": frame.source_id,
+            }
+        )
+    if isinstance(frame, HostSetMcpServerEnabledResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.SET_MCP_SERVER_ENABLED_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "server": frame.server,
+                "error": frame.error,
+                "error_code": frame.error_code,
             }
         )
     if isinstance(frame, HostMcpToolsFrame):
@@ -2552,6 +2766,10 @@ def _decode_known_host_frame(
             return _decode_create_dir(msg)
         case HostFrameKind.CREATE_DIR_RESULT:
             return _decode_create_dir_result(msg)
+        case HostFrameKind.CLONE_REPOSITORY:
+            return _decode_clone_repository(msg)
+        case HostFrameKind.CLONE_REPOSITORY_RESULT:
+            return _decode_clone_repository_result(msg)
         case HostFrameKind.INSTALL_HARNESS:
             return _decode_install_harness(msg)
         case HostFrameKind.INSTALL_HARNESS_RESULT:
@@ -2635,6 +2853,22 @@ def _decode_known_host_frame(
             return _decode_fs_request(msg)
         case HostFrameKind.FS_RESULT:
             return _decode_fs_result(msg)
+        case HostFrameKind.WORKSPACE_CALL:
+            return HostWorkspaceCallFrame(
+                request_id=_required_str(msg, "request_id"),
+                workspace=_required_str(msg, "workspace"),
+                method=_required_str(msg, "method"),
+                request=base64.b64decode(_optional_nullable_str(msg, "request") or ""),
+            )
+        case HostFrameKind.WORKSPACE_REPLY:
+            message = _optional_nullable_str(msg, "message")
+            return HostWorkspaceReplyFrame(
+                request_id=_required_str(msg, "request_id"),
+                message=None if message is None else base64.b64decode(message),
+                done=_optional_bool(msg, "done"),
+                error_code=_optional_nullable_str(msg, "error_code"),
+                error_message=_optional_nullable_str(msg, "error_message"),
+            )
         case HostFrameKind.FS_WRITE_REQUEST:
             return _decode_fs_write_request(msg)
         case HostFrameKind.MODEL_OPTIONS:
@@ -2691,6 +2925,30 @@ def _decode_known_host_frame(
             )
         case HostFrameKind.SKILL_CONTENT_RESULT:
             return _decode_skill_content_result(msg)
+        case HostFrameKind.SET_MCP_SERVER_ENABLED:
+            return HostSetMcpServerEnabledFrame(
+                request_id=_required_str(msg, "request_id"),
+                harness=_required_str(msg, "harness"),
+                server=_required_str(msg, "server"),
+                enabled=_required_bool(msg, "enabled"),
+                plugin=_optional_nullable_str(msg, "plugin"),
+                source_id=_optional_nullable_str(msg, "source_id"),
+            )
+        case HostFrameKind.SET_MCP_SERVER_ENABLED_RESULT:
+            raw_server = msg.get("server")
+            servers = _decode_mcp_servers_result(
+                {
+                    **msg,
+                    "mcp_servers": [raw_server] if raw_server is not None else [],
+                }
+            ).mcp_servers
+            return HostSetMcpServerEnabledResultFrame(
+                request_id=_required_str(msg, "request_id"),
+                status=_required_str(msg, "status"),
+                server=servers[0] if servers else None,
+                error=_optional_nullable_str(msg, "error"),
+                error_code=_optional_nullable_str(msg, "error_code"),
+            )
         case HostFrameKind.MCP_TOOLS:
             return HostMcpToolsFrame(
                 request_id=_required_str(msg, "request_id"),
@@ -2737,6 +2995,8 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         installation_id=_optional_nullable_str(msg, "installation_id"),
         capabilities=_optional_str_list(msg, "capabilities"),
         connection_id=_optional_nullable_str(msg, "connection_id"),
+        workspace_socket=_optional_nullable_str(msg, "workspace_socket"),
+        workspace_token_key=_optional_nullable_str(msg, "workspace_token_key"),
     )
 
 
@@ -2776,12 +3036,18 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
         harness=_optional_nullable_str(msg, "harness"),
         inference_config=inference_config,
         scheduled_run=parse_scheduled_run(msg.get("scheduled_run")),
+        mcp_disabled_servers_active_harnesses=(
+            _optional_str_list(msg, "mcp_disabled_servers_active_harnesses")
+            if "mcp_disabled_servers_active_harnesses" in msg
+            else None
+        ),
         # Absent (an older server) is distinct from an empty list.
         superseded_runner_ids=(
             tuple(_optional_str_list(msg, "superseded_runner_ids"))
             if "superseded_runner_ids" in msg
             else None
         ),
+        session_env_handoff_id=_optional_nullable_str(msg, "session_env_handoff_id"),
     )
 
 
@@ -3097,6 +3363,35 @@ def _decode_create_dir_result(msg: _JsonObject) -> HostCreateDirResultFrame:
     )
 
 
+def _decode_clone_repository(msg: _JsonObject) -> HostCloneRepositoryFrame:
+    """Decode a host.clone_repository request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.clone_repository frame.
+    """
+    return HostCloneRepositoryFrame(
+        request_id=_required_str(msg, "request_id"),
+        url=_required_str(msg, "url"),
+        path=_required_str(msg, "path"),
+        branch=_optional_nullable_str(msg, "branch"),
+    )
+
+
+def _decode_clone_repository_result(msg: _JsonObject) -> HostCloneRepositoryResultFrame:
+    """Decode a host.clone_repository_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.clone_repository_result frame.
+    """
+    return HostCloneRepositoryResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        path=_optional_nullable_str(msg, "path"),
+        error=_optional_nullable_str(msg, "error"),
+        error_code=_optional_nullable_str(msg, "error_code"),
+    )
+
+
 def _decode_install_harness(msg: _JsonObject) -> HostInstallHarnessFrame:
     """Decode a host.install_harness request frame.
 
@@ -3325,7 +3620,7 @@ def _decode_skills_result(msg: _JsonObject) -> HostSkillsResultFrame:
 
 
 _MCP_SERVER_FIELDS = ("name", "harness", "transport", "scope")
-_MCP_SERVER_OPTIONAL_FIELDS = ("plugin", "url_host", "source_id", "managed")
+_MCP_SERVER_OPTIONAL_FIELDS = ("plugin", "url_host", "source_id", "managed", "enabled", "locked")
 #: Account states a host may report. Anything else is dropped rather than rejected, so a
 #: newer host reporting a state this build does not know degrades to "no state reported".
 MCP_AUTH_STATUSES = ("connected", "sign_in_required")
