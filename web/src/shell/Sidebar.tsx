@@ -60,6 +60,7 @@ import {
   ClockIcon,
   ClockPlusIcon,
   CircleAlertIcon,
+  Columns2Icon,
   CircleStopIcon,
   FolderGit2Icon,
   FolderIcon,
@@ -347,6 +348,8 @@ import {
 } from "./NewChatDialog";
 import { useDesktopHostId } from "./RevealInFileManager";
 import { ForkSessionDialog } from "./ForkSessionDialog";
+import { BestOfNDialog, KeepAttemptDialog, canStartBestOfN } from "./BestOfNDialog";
+import { otherBestOfNAttemptIds } from "@/lib/bestOfN";
 import { CreateAutomationFromSessionDialog } from "@/components/scheduled/CreateAutomationFromSessionDialog";
 import {
   AutomationSourceDeleteNotice,
@@ -4815,6 +4818,8 @@ function ConversationMenuItems({
   moveToProject,
   setShareOpen,
   setForkOpen,
+  setBestOfNOpen,
+  setKeepAttemptOpen,
   canCreateAutomation,
   setAutomationOpen,
   setIsEditing,
@@ -4851,6 +4856,8 @@ function ConversationMenuItems({
   moveToProject: ReturnType<typeof useMoveToProject>;
   setShareOpen: (open: boolean) => void;
   setForkOpen: (open: boolean) => void;
+  setBestOfNOpen: (open: boolean) => void;
+  setKeepAttemptOpen: (open: boolean) => void;
   /** Whether "Create automation" applies to this session. */
   canCreateAutomation: boolean;
   setAutomationOpen: (open: boolean) => void;
@@ -4885,6 +4892,11 @@ function ConversationMenuItems({
       )
     : [];
   const { forkDisabledReason } = useSessionActionRestrictions(conversation.id, conversation);
+  const keepableAttempt =
+    isFeatureEnabled(info, "best_of_n") &&
+    isOwner &&
+    !isArchived &&
+    otherBestOfNAttemptIds(conversation.id, conversation.labels).length > 0;
   const showQuickActions = useSessionRowQuickActions();
   // Mobile lacks the horizontal room for a side-opening submenu, so the
   // project picker replaces the menu body in place instead of flying out
@@ -5026,6 +5038,26 @@ function ConversationMenuItems({
           <CompactShortcutKeys keys={FORK_SESSION_KEYS} className="ml-auto pl-4" />
         )}
       </SessionActionMenuItem>
+      {canStartBestOfN(info, conversation, isOwner) && (
+        <C.Item
+          className="mobile-touch-target"
+          data-testid="best-of-n-conversation"
+          onSelect={() => setBestOfNOpen(true)}
+        >
+          <Columns2Icon className="size-3.5" />
+          Best of N…
+        </C.Item>
+      )}
+      {keepableAttempt && (
+        <C.Item
+          className="mobile-touch-target"
+          data-testid="keep-attempt-conversation"
+          onSelect={() => setKeepAttemptOpen(true)}
+        >
+          <CheckMarkIcon className="size-3.5" />
+          Keep this attempt
+        </C.Item>
+      )}
       {isOwner ? (
         <C.Item
           className="mobile-touch-target"
@@ -5726,6 +5758,8 @@ function ConversationRowImpl({
   const [deleteBranch, setDeleteBranch] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
   const [forkOpen, setForkOpen] = useState(false);
+  const [bestOfNOpen, setBestOfNOpen] = useState(false);
+  const [keepAttemptOpen, setKeepAttemptOpen] = useState(false);
   const [automationOpen, setAutomationOpen] = useState(false);
   const [leaveOpen, setLeaveOpen] = useState(false);
   const gitBranch = conversation.git_branch ?? null;
@@ -6117,6 +6151,8 @@ function ConversationRowImpl({
     moveToProject,
     setShareOpen,
     setForkOpen,
+    setBestOfNOpen,
+    setKeepAttemptOpen,
     canCreateAutomation,
     setAutomationOpen,
     setIsEditing,
@@ -6670,6 +6706,18 @@ function ConversationRowImpl({
           sourceGitBranch={conversation.git_branch}
           open
           onOpenChange={setForkOpen}
+        />
+      )}
+      {bestOfNOpen && (
+        <BestOfNDialog conversation={conversation} open onOpenChange={setBestOfNOpen} />
+      )}
+      {keepAttemptOpen && (
+        <KeepAttemptDialog
+          sessionId={conversation.id}
+          title={conversationDisplayLabel(conversation)}
+          labels={conversation.labels}
+          open
+          onOpenChange={setKeepAttemptOpen}
         />
       )}
       {automationOpen && (

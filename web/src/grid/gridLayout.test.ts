@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  gridLayoutForSessions,
   gridPanes,
   gridSessionIds,
   parseSessionGrids,
@@ -62,6 +63,43 @@ describe("session grid layouts", () => {
       expect(removeGridSession(two, "b")).toBe("a");
     },
   );
+
+  it("lays out two to four sessions left to right, then top to bottom", () => {
+    const areas = (ids: string[]) =>
+      gridPanes(gridLayoutForSessions(ids)!).map(({ sessionId, area }) => [sessionId, area]);
+    expect(areas(["a", "b"])).toEqual([
+      ["a", "1 / 1 / span 2 / span 1"],
+      ["b", "1 / 2 / span 2 / span 1"],
+    ]);
+    expect(areas(["a", "b", "c"])).toEqual([
+      ["a", "1 / 1 / span 2 / span 1"],
+      ["b", "1 / 2 / span 1 / span 1"],
+      ["c", "2 / 2 / span 1 / span 1"],
+    ]);
+    expect(areas(["a", "b", "c", "d"])).toEqual([
+      ["a", "1 / 1 / span 1 / span 1"],
+      ["b", "1 / 2 / span 1 / span 1"],
+      ["c", "2 / 1 / span 1 / span 1"],
+      ["d", "2 / 2 / span 1 / span 1"],
+    ]);
+    for (const ids of [
+      ["a", "b"],
+      ["a", "b", "c"],
+      ["a", "b", "c", "d"],
+    ]) {
+      const grid = { id: ids.join(""), layout: gridLayoutForSessions(ids)! };
+      expect(parseSessionGrids(JSON.stringify([grid]))).toEqual([grid]);
+    }
+    for (const ids of [
+      [],
+      ["a"],
+      ["a", "b", "c", "d", "e"],
+      ["a", "a"],
+      ["a", "temp:b"],
+      ["a", ""],
+    ])
+      expect(gridLayoutForSessions(ids)).toBeNull();
+  });
 
   it("reads valid local grids and rejects corrupt, duplicate and out-of-bounds layouts", () => {
     const grid = { id: "saved", name: "My work", layout: splitGrid("a", "a", "b", "right")! };

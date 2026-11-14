@@ -25,6 +25,8 @@ import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { retrySession } from "@/lib/sessionsApi";
 import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
 import { selectPullRequestInPanel } from "@/shell/PullRequestPanel";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 
 const queryClient = new QueryClient();
 const LINKED_PR = "https://github.com/example/app/pull/42";
@@ -504,6 +506,37 @@ it("cycles keyboard focus through cells and toggles the grid workspace from the 
   expect(toggle).not.toHaveAttribute("aria-label", label);
   fireEvent.keyDown(window, { code: "BracketRight", ctrlKey: true, altKey: true });
   expect(toggle).toHaveAttribute("aria-label", label);
+});
+
+it.each([
+  ["an owned attempt", true, null, true],
+  ["with the flag off", false, null, false],
+  ["a read-only viewer", true, 1, false],
+])("offers Keep in each cell of %s", (_name, enabled, permissionLevel, offered) => {
+  fixture.labels = {
+    "omnigent.best_of_n.group": "g",
+    "omnigent.best_of_n.attempts": "first,second",
+  };
+  fixture.permissionLevel = permissionLevel;
+  render(
+    <CapabilitiesProvider
+      info={{ ...FALLBACK_SERVER_INFO, features: { best_of_n: enabled as boolean } }}
+    >
+      <MemoryRouter>
+        <RearrangeableGrid
+          grid={{ id: "run", layout: splitGrid("first", "first", "second", "right")! }}
+        />
+      </MemoryRouter>
+    </CapabilitiesProvider>,
+  );
+  const second = screen.getByRole("region", { name: "second" });
+  const keep = within(second).queryByRole("button", { name: "Keep second" });
+  if (!offered) {
+    expect(keep).toBeNull();
+    return;
+  }
+  fireEvent.click(keep!);
+  expect(screen.getByTestId("keep-attempt-dialog")).toHaveTextContent("Keep this attempt?");
 });
 
 it("focuses the cell itself when its composer is not ready", () => {

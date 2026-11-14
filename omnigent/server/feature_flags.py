@@ -54,6 +54,7 @@ class Feature(StrEnum):
     WORKSPACE_DIRECT_ACCESS = "workspace_direct_access"
     WORKSPACE_API_SERVER_ACCESS = "workspace_api_server_access"
     PROACTIVE_AGENT = "proactive_agent"
+    BEST_OF_N = "best_of_n"
 
 
 @dataclass(frozen=True)
@@ -149,6 +150,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Local session grids with up to four live conversations",
         owner="web",
         review_by_release="0.20.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.BEST_OF_N,
+        description="Run one task on several agents side by side and keep one attempt",
+        owner="web",
+        review_by_release="0.27.0",
     ),
     FeatureDefinition(
         feature=Feature.SPLITTABLE_TERMINAL_VIEW_UI,

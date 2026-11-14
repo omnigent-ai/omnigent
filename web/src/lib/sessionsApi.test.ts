@@ -17,6 +17,7 @@ import {
   createSession,
   createSideChat,
   exportSessionTranscript,
+  fetchFirstUserPrompt,
   fetchRewindPrompts,
   fetchSessionItemsPage,
   fetchSessionRepositoryBranches,
@@ -425,6 +426,38 @@ describe("createSession", () => {
       host_type: "managed",
       workspaces: [],
     });
+  });
+
+  it("creates a nested worktree session on the source's host", async () => {
+    for (const id of ["conv_attempt_1", "conv_attempt_2"])
+      fetchMock.mockResolvedValueOnce(
+        mockJsonResponse({ id, agent_id: "agent_xyz", status: "idle" }),
+      );
+
+    await createSession("agent_xyz", [], {
+      siblingSourceId: "conv_source",
+      hostId: "host_1",
+      workspace: "/repo",
+      git: { branchName: "best-of-n-g-1", baseBranch: "main" },
+      labels: { "omnigent.best_of_n.group": "g" },
+    });
+    await createSession("agent_xyz", [], {
+      git: { branchName: "best-of-n-g-2", baseBranch: "" },
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      agent_id: "agent_xyz",
+      initial_items: [],
+      sibling_source_id: "conv_source",
+      host_id: "host_1",
+      workspace: "/repo",
+      git: { branch_name: "best-of-n-g-1", base_branch: "main" },
+      labels: { "omnigent.best_of_n.group": "g" },
+    });
+    // A blank base branch is omitted so the host branches from HEAD.
+    const [, second] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(JSON.parse(second.body as string).git).toEqual({ branch_name: "best-of-n-g-2" });
   });
 
   it("omits the optional fields entirely when no options are passed", async () => {
@@ -1726,6 +1759,59 @@ describe("getSessionUsage", () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 503 }));
 
     await expect(getSessionUsage("conv_abc")).rejects.toMatchObject({ status: 503 });
+  });
+});
+
+describe("fetchFirstUserPrompt", () => {
+  it("returns the oldest visible user prompt with text", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        object: "list",
+        data: [
+          {
+            id: "m0",
+            type: "message",
+            role: "user",
+            is_meta: true,
+            content: [{ type: "input_text", text: "context" }],
+          },
+          {
+            id: "m1",
+            type: "message",
+            role: "user",
+            content: [{ type: "input_file", file_id: "f" }],
+          },
+          {
+            id: "m2",
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "Hi" }],
+          },
+          {
+            id: "m3",
+            type: "message",
+            role: "user",
+            content: [
+              { type: "input_text", text: "Fix it" },
+              { type: "input_text", text: "now" },
+            ],
+          },
+        ],
+        has_more: false,
+      }),
+    );
+
+    expect(await fetchFirstUserPrompt("sess_1")).toBe("Fix it\nnow");
+    expect(fetchMock.mock.calls[0]![0]).toBe(
+      "/v1/sessions/sess_1/items?limit=20&order=asc&type=message",
+    );
+  });
+
+  it("returns null when the session has no prompt yet", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ object: "list", data: [], has_more: false }),
+    );
+    expect(await fetchFirstUserPrompt("sess_1")).toBeNull();
   });
 });
 

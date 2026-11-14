@@ -25,6 +25,14 @@ the header menu), and each place is a separate entry point.
   conversation to split left/right or top/bottom with a hover preview. Up to four
   independent chats fit in two rows and two columns. Grids live at `/grid/<id>`
   and are saved only in this browser, scoped to server and user.
+- `best-of-n`: behind `best_of_n` (with nested agents on), run one task on two
+  to four agents from an owned session on a host workspace. Each attempt is a
+  nested agent of that session in its own new worktree and branch, all from the
+  same base ref, and receives the same task. On desktop with grids enabled the
+  attempts open together in a new grid; otherwise the first attempt opens.
+  **Keep this attempt** lists and archives the other attempts (optionally deleting
+  their worktrees; branches are kept), then drops the run's saved grid. It archives
+  only sessions you own whose own labels place them in the same run.
 - `pin`: standalone sessions and family representatives move to Pinned and back;
   pinning a representative moves its whole family.
 - `pin-undo`: unpinning shows an Undo toast that re-pins the session into its
@@ -331,6 +339,15 @@ only the grid, leaving sessions untouched. Unknown local grids show a recovery l
 Grids wait for account identity; if it is unavailable, use Reload to retry.
 Failed sends restore text and supported attachments unless the cell has a newer draft.
 Quoted replies recover as serialized text.
+
+**Best of N:** enable `OMNIGENT_FEATURES=best_of_n` (add `grid_sessions_display_ui` to
+compare in a grid). In an owned session on a git workspace, open the sidebar row
+menu, right-click menu or header menu and choose **Best of N…**. The task is
+prefilled from the session's first prompt, and the base branch from a worktree
+session's branch. Pick two to four agents (the same agent may repeat), then
+**Start N attempts**. Keep an
+attempt from its grid cell's **Keep** button, or **Keep this attempt** in its row,
+right-click or header menu.
 
 **Import:** open Settings → Import sessions, or choose **Import your recent
 sessions** on the empty landing. The X beside the landing button dismisses the
@@ -753,6 +770,16 @@ plain `uv run pytest`, which starts a private server for the test.
   exception into one chat or terminal, confirm the other views stay usable,
   clear the fault, and choose **Try again** in the failed view.
 
+- **`best-of-n` (browser contract):**
+  `tests/browser_ui/chat/test_best_of_n.py` starts three attempts from the
+  sidebar row menu, checks each create, link and first message, opens the grid,
+  and keeps one attempt from its cell. Attempt creation, partial failures,
+  defaults, the flag and ownership gates, and both menus have component coverage
+  in `web/src/lib/bestOfN.test.ts`, `web/src/shell/BestOfNDialog.test.tsx`,
+  `web/src/shell/HeaderConversationMenu.test.tsx` and
+  `web/src/grid/GridSessionPane.test.tsx`. For a real-server drive, enable
+  `best_of_n,grid_sessions_display_ui` on the isolated server and start from a
+  session in a git repository; expect one `best-of-n-<group>-<n>-<agent>` worktree per attempt.
 - **`pin`:**
   `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_unpin_moves_session_back_to_recent`
 - **`pin-undo`, sidebar row:**
@@ -1347,6 +1374,12 @@ The component tests in `web/src/shell/HeaderConversationMenu.test.tsx` and
 its discoverability.
 
 ## Gotchas
+
+- **Best of N** needs a git workspace on a connected host: a non-git directory or
+  a managed sandbox source fails every create with the server's worktree error.
+  Attempts are created one after another. A blank base branch uses the
+  repository's current HEAD, and uncommitted changes in the source stay there.
+  Archived attempts keep their branches even when their worktrees are deleted.
 
 - Family membership is owner-only navigation context, not a sharing grant.
   Siblings start private even if the source has readers. Edit-shared sources

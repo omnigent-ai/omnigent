@@ -591,6 +591,10 @@ function postEventResponseFromWire(wire: {
  * @param options.terminalLaunchArgs - Native CLI flags, e.g. a permission mode.
  * @param options.modelOverride - Model to pin, e.g. "claude-opus-4-7".
  * @param options.reasoningEffort - Effort to pin, e.g. "high".
+ * @param options.siblingSourceId - Session whose family the new session
+ *   joins as a nested agent, e.g. "conv_source123".
+ * @param options.git - New worktree branch on `hostId`, created from the
+ *   repository at `workspace`, and the ref it starts from.
  */
 export async function createSession(
   agentId: string,
@@ -615,6 +619,8 @@ export async function createSession(
     terminalLaunchArgs?: string[];
     modelOverride?: string;
     reasoningEffort?: string;
+    siblingSourceId?: string;
+    git?: { branchName: string; baseBranch?: string };
   } = {},
 ): Promise<Session> {
   const body: {
@@ -627,7 +633,7 @@ export async function createSession(
     workflow_id?: string;
     host_id?: string;
     workspace?: string | null;
-    git?: null;
+    git?: null | { branch_name: string; base_branch?: string };
     host_type?: "managed";
     sandbox_provider?: string;
     sandbox_profile_id?: string;
@@ -638,6 +644,7 @@ export async function createSession(
     terminal_launch_args?: string[];
     model_override?: string;
     reasoning_effort?: string;
+    sibling_source_id?: string;
   } = { agent_id: agentId, initial_items: initialItems };
   if (options.workflowId !== undefined) body.workflow_id = options.workflowId;
   if (options.projectId !== undefined) {
@@ -667,6 +674,7 @@ export async function createSession(
   if (options.title !== undefined) {
     body.title = options.title;
   }
+  if (options.siblingSourceId !== undefined) body.sibling_source_id = options.siblingSourceId;
   if (options.hostId !== undefined) body.host_id = options.hostId;
   if (options.workspace !== undefined) body.workspace = options.workspace;
   if (options.labels !== undefined) body.labels = options.labels;
@@ -675,6 +683,12 @@ export async function createSession(
   }
   if (options.modelOverride !== undefined) body.model_override = options.modelOverride;
   if (options.reasoningEffort !== undefined) body.reasoning_effort = options.reasoningEffort;
+  if (options.git !== undefined) {
+    body.git = {
+      branch_name: options.git.branchName,
+      ...(options.git.baseBranch ? { base_branch: options.git.baseBranch } : {}),
+    };
+  }
   const res = await authenticatedFetch("/v1/sessions", {
     method: "POST",
     headers: {
@@ -1177,6 +1191,35 @@ export async function fetchRewindPrompts(
   }
   /* oxlint-enable no-await-in-loop */
   return { prompts, olderCursor: cursor };
+}
+
+/**
+ * The text of a session's first user prompt, or `null` when it has none.
+ *
+ * Reads the oldest message items (`GET /v1/sessions/{id}/items?type=message`)
+ * and skips hidden context messages, like {@link fetchRewindPrompts}.
+ *
+ * @param sessionId - Session to read, e.g. "conv_abc".
+ * @param signal - Aborts the request.
+ */
+export async function fetchFirstUserPrompt(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  const params = new URLSearchParams({ limit: "20", order: "asc", type: "message" });
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
+    { signal },
+  );
+  const body = await readJsonOrThrow<SessionItemsResponseWire>(res);
+  for (const item of body.data) {
+    if (!isMessageItem(item) || item.role !== "user" || item.is_meta) continue;
+    const text = item.content
+      .flatMap((part) => (part.type === "input_text" ? [part.text] : []))
+      .join("\n");
+    if (text.trim()) return text;
+  }
+  return null;
 }
 
 /** A file the chosen `/rewind` prompt attached, as the rewound session holds it. */

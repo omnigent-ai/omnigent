@@ -59,6 +59,15 @@ function Probe() {
       <button type="button" onClick={() => grids?.split("first", "second", "right")}>
         Split
       </button>
+      <button
+        type="button"
+        onClick={(event) => {
+          const opened = grids?.openGrid(["first", "second", "third"], "  Best of 3  ") ?? false;
+          event.currentTarget.dataset.opened = String(opened);
+        }}
+      >
+        Open run
+      </button>
       <button type="button" onClick={() => grids?.closePane("second")}>
         Close
       </button>
@@ -145,6 +154,25 @@ it.each([true, false])("persists and scopes grids (secure context: %s)", (secure
   fireEvent.click(screen.getByText("Close"));
   expect(screen.getByTestId("path")).toHaveTextContent("/c/first");
   expect(screen.getByTestId("count")).toHaveTextContent("0");
+});
+
+it("opens a new grid of given sessions, and declines without saved grids", () => {
+  const key = "omnigent:session-grids:one:alice";
+  const view = render(tree("/c/first"));
+  fireEvent.click(screen.getByText("Open run"));
+  expect(screen.getByText("Open run")).toHaveAttribute("data-opened", "true");
+  expect(screen.getByTestId("path").textContent).toMatch(/^\/grid\//);
+  expect(screen.getByTestId("order")).toHaveTextContent("first,second,third");
+  expect(screen.getByTestId("name")).toHaveTextContent(/^Best of 3$/);
+  expect(JSON.parse(localStorage.getItem(key)!)).toHaveLength(1);
+  view.unmount();
+  localStorage.clear();
+  device.mobile = true;
+  render(tree("/c/first"));
+  fireEvent.click(screen.getByText("Open run"));
+  expect(screen.getByText("Open run")).toHaveAttribute("data-opened", "false");
+  expect(screen.getByTestId("path")).toHaveTextContent("/c/first");
+  expect(localStorage.getItem(key)).toBeNull();
 });
 
 it("gates creation and keeps an unsaved grid usable when storage is full", () => {
