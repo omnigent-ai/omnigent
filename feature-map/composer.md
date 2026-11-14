@@ -196,7 +196,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   sign-in, connecting, disabled, or not loaded when the CLI omits it),
   including servers only the CLI loaded; a failed or needs-sign-in row whose
   account needs no sign-in offers **Reconnect**, which shows reconnecting,
-  then the refreshed state or the reconnect error. Before the first turn the
+  then the refreshed state or the reconnect error. A claude-native session
+  shows only the servers its Claude Code started before they were signed in,
+  as failed with **Reconnect**, which restarts Claude Code while it is idle;
+  other rows keep their account state. Before the first turn the
   panel says live status appears once the agent is running. Read-only viewers
   see the state without Reconnect. **Go to Settings** keeps the session's host
   selected even when it is a sandbox host the host picker otherwise hides.
@@ -815,6 +818,20 @@ Other connection providers alone do not enable the managed MCP picker.
   `test_claude_sdk_host_mcp_servers.py::test_claude_sdk_mcp_panel_shows_live_state_and_reconnects`,
   with the row and merge cases in `SlashCommandMenu.test.tsx` and
   `ChatPage.composer.test.tsx`.
+  A claude-native session has no in-pane reconnect, so the runner restarts its
+  Claude Code, resuming the conversation, to connect a server: start a
+  claude-native session while a Claude server needs sign-in, finish the
+  sign-in, and expect `/mcp` to show it **Failed** ("Signed in after Claude
+  Code started") with **Reconnect**, while other rows show only their account
+  state. Reconnect while Claude is idle, or send the next message, and expect
+  the terminal to restart into the same conversation with the server
+  connected. While Claude works (also on a prompt typed in the terminal), runs
+  background shells or agents, or is open in a terminal on the host, Reconnect
+  explains why it waits and nothing restarts; a stale Reconnect, for a server
+  the session already connects, restarts nothing either. This holds for a
+  session `omnigent claude` started and after `/clear`. Covered by the claude-native
+  cases in `tests/runner/test_app_sessions_native_session_change_heal.py`,
+  `tests/runner/test_claude_mcp_sign_in.py` and `ChatPage.composer.test.tsx`.
   Under an enterprise `managed-mcp.json` carrying the `omnigent` relay entry,
   `tests/e2e_ui/chat/test_claude_sdk_host_mcp_servers.py::test_claude_sdk_session_under_managed_mcp_config_keeps_omnigent_tools`
   starts a claude-sdk session, expects only the managed row in `/mcp`, flips it

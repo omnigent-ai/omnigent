@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeToolRelay
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
+    from omnigent.inner.terminal import TerminalInstance
     from omnigent.runner.mcp_manager import RunnerMcpManager
     from omnigent.terminals.registry import TerminalRegistry
 
@@ -71,6 +72,7 @@ from omnigent.harness_plugins import (
     model_env_keys,
     spawn_env_builders,
 )
+from omnigent.inner.executor import LiveMcpServerUnknown
 from omnigent.llms.errors import detect_request_size_overflow
 from omnigent.native.failure_telemetry import failure_log_attributes, normalize_failure_context
 from omnigent.native.input_diagnostics import input_attributes
@@ -151,11 +153,16 @@ from omnigent.runner.native import (
     _unwrap_resolved_spec,
 )
 from omnigent.runner.native import orchestration as _native_runtime
+from omnigent.runner.native.claude_mcp_sign_in import (
+    ClaudeMcpSignInTracker,
+    claude_sign_in_by_live_name,
+)
 from omnigent.runner.native.interrupt import NativeInterruptRunner
 from omnigent.runner.native_controls import build_native_controls
 from omnigent.runner.policy_proxy import _evaluate_policy_via_omnigent
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
+    CLAUDE_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
     TerminalExitEvent,
     TerminalLifecycle,
@@ -226,6 +233,27 @@ from omnigent.util.dedicated_executor import DedicatedExecutor
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
+
+# /mcp's answer for a claude-native session whose Claude Code isn't running.
+_CLAUDE_NOT_RUNNING: _JsonObject = {"running": False, "servers": []}
+# A restart needs Claude Code this long without output or input. Shorter than the
+# pane reaper's window: a person signs in, then asks again right away.
+_RESTART_ACTIVITY_WINDOW_S = 15.0
+# Reconnect, from waiting for its place in the session's line to its answer. The
+# server's request timeout isn't enforced over the runner tunnel, so the runner
+# bounds it: a stalled check or relaunch frees the line and says so.
+_CLAUDE_RECONNECT_DEADLINE_S = 50.0
+# A message's automatic restart, which runs while that message holds the line;
+# past it the message is delivered without the restart.
+_CLAUDE_AUTO_RESTART_DEADLINE_S = 15.0
+# What Reconnect's answer after its deadline may spend listing the servers.
+_CLAUDE_TIMEOUT_ANSWER_S = 5.0
+_CLAUDE_START_IT = "Send a message to start it."
+# What /mcp shows for a server that signed in after a claude-native session's
+# Claude Code started.
+_CLAUDE_SIGNED_IN_AFTER_START = (
+    "Signed in after Claude Code started. It connects at the next message, or reconnect now."
+)
 _BRIDGE_NOTIFICATIONS = DedicatedExecutor(max_workers=2, thread_name_prefix="runner-bridge-notify")
 
 # Allow process termination and forwarder cleanup to finish before DELETE proceeds.
@@ -1459,6 +1487,34 @@ def create_runner_app(
         tuple[str, str, str | None, str | None], asyncio.Task[JSONResponse]
     ] = {}
     _recovery_turn_ids: dict[str, set[str]] = {}
+    # session_id → claude-native MCP Reconnects in flight, which delete cancels first.
+    _claude_reconnect_tasks: dict[str, set[asyncio.Task[_JsonObject]]] = {}
+    # session_id → deletes in progress; no new Reconnect is admitted meanwhile.
+    _deleting_sessions: dict[str, int] = {}
+    # Native pane closes in progress, by session; each holds its session's launch lock.
+    _native_pane_teardowns: dict[str, set[asyncio.Task[None]]] = {}
+    app.state.native_pane_teardowns = _native_pane_teardowns
+
+    async def _settle_native_pane_teardowns(session_id: str) -> None:
+        """Wait for a native pane close still running for *session_id*.
+
+        A route about to drop the session's launch locks calls this first, so the
+        close finishes before a later launch starts a pane under the same id.
+        """
+        teardowns = _native_pane_teardowns.get(session_id)
+        if not teardowns:
+            return
+        _done, unfinished = await asyncio.wait(
+            set(teardowns), timeout=_SESSION_INIT_CANCEL_TIMEOUT_S
+        )
+        if unfinished:
+            _logger.warning(
+                "Closing the native pane of %s did not finish within %.0fs",
+                session_id,
+                _SESSION_INIT_CANCEL_TIMEOUT_S,
+                extra={"session_id": session_id},
+            )
+
     _session_init_envelopes: dict[str, tuple[float, RunnerSessionInitEnvelope]] = {}
     # session_id → canonical reasoning effort, seeded from the session-init
     # snapshot and updated by ``effort_change``. In-process harnesses learn the
@@ -1567,6 +1623,14 @@ def create_runner_app(
     _kimi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _hermes_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _claude_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    # Which Claude MCP servers needed sign-in as each session's pane started.
+    _claude_mcp_sign_in = ClaudeMcpSignInTracker()
+    app.state.claude_mcp_sign_in = _claude_mcp_sign_in
+    # Restarts an idle claude-native pane that started before an MCP sign-in, and
+    # answers /mcp for one; set up with the pane reaper, which owns closing panes.
+    _restart_claude_for_mcp_sign_in: Callable[[str], Awaitable[None]] | None = None
+    _claude_native_live_mcp: Callable[[str], Awaitable[_JsonObject | None]] | None = None
+    _reconnect_claude_native_mcp: Callable[[str, str], Awaitable[_JsonObject | None]] | None = None
     _antigravity_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _devin_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     app.state.antigravity_terminal_ensure_locks = _antigravity_terminal_ensure_locks
@@ -1619,6 +1683,7 @@ def create_runner_app(
     _ingest_next_seq: dict[str, int] = {}
     _ingest_now_serving: dict[str, int] = {}
     _ingest_cond: dict[str, asyncio.Condition] = {}
+    app.state.session_ingest_conditions = _ingest_cond
     # Server pending IDs owned by each session's current turn, including injections.
     _turn_pending_ids: dict[str, set[str]] = {}
     _interrupted_sessions: set[str] = set()
@@ -3380,6 +3445,8 @@ def create_runner_app(
                 Callable[[], Awaitable[AgentSpec | ResolvedSpec | None]] | None
             ) = None
 
+            # This launch's own sign-in record, if it gets to start the pane.
+            claude_launch_token = object()
             if harness_name == "claude-native":
 
                 async def _claude_pre_launch(has_terminal: bool) -> PreLaunchResult:
@@ -3450,6 +3517,9 @@ def create_runner_app(
                     )
                     if bundle_dir is not None:
                         _ensure_orchestrator_skills_in_bundle(bundle_dir, spec)
+                    await asyncio.to_thread(
+                        _claude_mcp_sign_in.note_launching, session_id, claude_launch_token
+                    )
                     return dataclasses.replace(
                         ctx,
                         bundle_dir=bundle_dir,
@@ -3573,14 +3643,33 @@ def create_runner_app(
                     session_id
                 )
 
-            _launch_result = await _launch_native_terminal(
-                harness_name,
-                _launch_ctx,
-                ensure_locks=_launch_locks,
-                pre_launch=_launch_pre,
-                build_context=_launch_build,
-                resolve_agent_spec=_launch_resolve_spec,
+            _claude_terminals = (
+                resource_registry.terminal_registry if harness_name == "claude-native" else None
             )
+            _claude_pane_before = (
+                _claude_terminals.get(session_id, "claude", "main")
+                if _claude_terminals is not None
+                else None
+            )
+            try:
+                _launch_result = await _launch_native_terminal(
+                    harness_name,
+                    _launch_ctx,
+                    ensure_locks=_launch_locks,
+                    pre_launch=_launch_pre,
+                    build_context=_launch_build,
+                    resolve_agent_spec=_launch_resolve_spec,
+                )
+            finally:
+                if harness_name == "claude-native":
+                    _claude_mcp_sign_in.note_launched(
+                        session_id,
+                        _claude_terminals.get(session_id, "claude", "main")
+                        if _claude_terminals is not None
+                        else None,
+                        launch=claude_launch_token,
+                        previous=_claude_pane_before,
+                    )
             # Only claude reported terminal_ready in the create-session response.
             if harness_name == "claude-native":
                 terminal_ready = _launch_result
@@ -4027,6 +4116,17 @@ def create_runner_app(
 
     @app.delete("/v1/sessions/{session_id}")
     async def delete_session(session_id: str) -> JSONResponse:
+        # Reconnects stay out while teardown runs, so none can relaunch Claude Code
+        # after the cleanup that would have removed it.
+        _deleting_sessions[session_id] = _deleting_sessions.get(session_id, 0) + 1
+        try:
+            return await _delete_session(session_id)
+        finally:
+            remaining = _deleting_sessions.pop(session_id, 1) - 1
+            if remaining:
+                _deleting_sessions[session_id] = remaining
+
+    async def _delete_session(session_id: str) -> JSONResponse:
         resource_registry.note_terminal_control_request(session_id, "delete_session")
         _cancel_claude_prompt_waiter(session_id)
         _session_message_buffers.pop(session_id, None)
@@ -4076,6 +4176,7 @@ def create_runner_app(
         _required_terminal_exit_errors.pop(session_id, None)
         _clean_terminal_exit_responses.pop(session_id, None)
         _forget_native_pane_status(session_id)
+        _claude_mcp_sign_in.forget(session_id)
         _native_interrupt_runner.clear_pending_interrupt(session_id)
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
@@ -4086,6 +4187,22 @@ def create_runner_app(
             # retirement sees it gone and ends instead of waiting forever.
             async with ingest_cond:
                 ingest_cond.notify_all()
+        # With the line gone, a Reconnect relaunching Claude Code must not bring a
+        # pane back after teardown, nor let a queued message through as it ends.
+        reconnects = _claude_reconnect_tasks.pop(session_id, set())
+        for reconnect_task in reconnects:
+            reconnect_task.cancel()
+        if reconnects:
+            _done, still_running = await asyncio.wait(
+                reconnects, timeout=_SESSION_INIT_CANCEL_TIMEOUT_S
+            )
+            if still_running:
+                _logger.warning(
+                    "Cancelled MCP reconnect for %s did not finish within %.0fs",
+                    session_id,
+                    _SESSION_INIT_CANCEL_TIMEOUT_S,
+                )
+        await _settle_native_pane_teardowns(session_id)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
@@ -5257,7 +5374,11 @@ def create_runner_app(
             _cond = asyncio.Condition()
             _ingest_cond[session_id] = _cond
         async with _cond:
-            while _ingest_now_serving.get(session_id, 0) != _seq:
+            while True:
+                if _ingest_cond.get(session_id) is not _cond:
+                    return  # The session was deleted while this waited.
+                if _ingest_now_serving.get(session_id, 0) == _seq:
+                    break
                 await _cond.wait()
         try:
             if session_id in _active_turns:
@@ -5352,7 +5473,9 @@ def create_runner_app(
                 _background_tasks.add(_turn_task)
         finally:
             async with _cond:
-                _ingest_now_serving[session_id] = _seq + 1
+                # A deleted session's counter must not outlive it into a re-created one.
+                if _ingest_cond.get(session_id) is _cond:
+                    _ingest_now_serving[session_id] = _seq + 1
                 _cond.notify_all()
 
     app.state.check_and_start_next_turn = _check_and_start_next_turn
@@ -7869,7 +7992,18 @@ def create_runner_app(
                 _cond = asyncio.Condition()
                 _ingest_cond[conversation_id] = _cond
             async with _cond:
-                while _ingest_now_serving.get(conversation_id, 0) != _seq:
+                while True:
+                    if _ingest_cond.get(conversation_id) is not _cond:
+                        # The session was deleted while this waited.
+                        return JSONResponse(
+                            status_code=410,
+                            content={
+                                "error": "session_gone",
+                                "detail": "The session was deleted.",
+                            },
+                        )
+                    if _ingest_now_serving.get(conversation_id, 0) == _seq:
+                        break
                     await _cond.wait()
             try:
                 if _message_already_taken(conversation_id, message_body):
@@ -7886,6 +8020,22 @@ def create_runner_app(
                             "detail": "Message already queued or running.",
                         },
                     )
+                if (
+                    _restart_claude_for_mcp_sign_in is not None
+                    and conversation_id not in _active_turns
+                ):
+                    # In this message's place in line, before its turn starts, so it
+                    # keeps messages in order and only other work can hold the pane.
+                    await _restart_claude_for_mcp_sign_in(conversation_id)
+                    if _ingest_cond.get(conversation_id) is not _cond:
+                        # Deleted during the restart: start no turn for it.
+                        return JSONResponse(
+                            status_code=410,
+                            content={
+                                "error": "session_gone",
+                                "detail": "The session was deleted.",
+                            },
+                        )
                 _raw_content = message_body.get("content")
                 if isinstance(_raw_content, list):
                     message_body["content"] = await _resolve_forwarded_message_content(
@@ -8041,7 +8191,9 @@ def create_runner_app(
                 )
             finally:
                 async with _cond:
-                    _ingest_now_serving[conversation_id] = _seq + 1
+                    # A deleted session's counter must not outlive it into a re-created one.
+                    if _ingest_cond.get(conversation_id) is _cond:
+                        _ingest_now_serving[conversation_id] = _seq + 1
                     _cond.notify_all()
 
         if body_type == "interrupt":
@@ -8709,6 +8861,7 @@ def create_runner_app(
         _search_registry_for_root=_search_registry_for_root,
         _session_comment_relays=_session_comment_relays,
         auth_token_factory=auth_token_factory,
+        claude_mcp_sign_in=_claude_mcp_sign_in,
         filesystem_registry=filesystem_registry,
         resource_registry=resource_registry,
         server_client=server_client,
@@ -8801,8 +8954,8 @@ def create_runner_app(
     _is_sdk_compact_body = _native_controls.is_sdk_compact_body
     _opencode_native_model_options = _native_controls.opencode_native_model_options
     _teardown_session_terminals = _native_controls.teardown_session_terminals
+    _ingest_slot = _native_controls.ingest_slot
 
-    register_live_mcp_routes(app, process_manager=process_manager)
     register_model_option_routes(
         app,
         _claude_model_options_rows=_claude_model_options_rows,
@@ -8978,6 +9131,7 @@ def create_runner_app(
     ) -> JSONResponse:
         _required_terminal_exit_errors.pop(session_id, None)
         _clean_terminal_exit_responses.pop(session_id, None)
+        await _settle_native_pane_teardowns(session_id)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
@@ -9009,6 +9163,7 @@ def create_runner_app(
     async def reset_session_state(session_id: str) -> JSONResponse:
         _required_terminal_exit_errors.pop(session_id, None)
         _clean_terminal_exit_responses.pop(session_id, None)
+        await _settle_native_pane_teardowns(session_id)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
@@ -9197,6 +9352,7 @@ def create_runner_app(
     ):
         from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
         from omnigent.native.native_cost_popup import (
+            _tmux_client_attached,
             _tmux_last_client_input_at,
             _tmux_window_activity_at,
         )
@@ -9268,7 +9424,9 @@ def create_runner_app(
             resource_registry.note_external_session_status(conv_id, status)
             return False
 
-        async def _native_pane_is_busy(pane: PaneRef) -> bool:
+        async def _native_pane_is_busy(
+            pane: PaneRef, *, activity_window_s: float = PANE_OUTPUT_BUSY_WINDOW_S
+        ) -> bool:
             conv_id = pane.conversation_id
             if conv_id in _active_turns or (
                 process_manager is not None and process_manager.has_active_turn(conv_id)
@@ -9288,20 +9446,16 @@ def create_runner_app(
             input_at = await asyncio.to_thread(
                 _tmux_last_client_input_at, str(pane.socket_path), "main"
             )
-            if input_at is not None and time.time() - input_at < PANE_OUTPUT_BUSY_WINDOW_S:
+            if input_at is not None and time.time() - input_at < activity_window_s:
                 return True
             instance = _pane_reaper_registry.get(conv_id, pane.terminal_name, "main")
-            if instance is not None and instance.client_interaction_within(
-                PANE_OUTPUT_BUSY_WINDOW_S
-            ):
+            if instance is not None and instance.client_interaction_within(activity_window_s):
                 return True
             # Output is primary evidence, independent of the status pipeline (a
             # stalled forwarder once froze it and got a live session reaped). The
             # watcher's screen diff ignores title updates and identical repaints.
             screen_changed = (
-                instance.screen_changed_within(PANE_OUTPUT_BUSY_WINDOW_S)
-                if instance is not None
-                else None
+                instance.screen_changed_within(activity_window_s) if instance is not None else None
             )
             if screen_changed is None:
                 # No fresh watcher view: tmux stamps window_activity on every byte.
@@ -9309,8 +9463,7 @@ def create_runner_app(
                     _tmux_window_activity_at, str(pane.socket_path), "main"
                 )
                 screen_changed = (
-                    activity_at is not None
-                    and time.time() - activity_at < PANE_OUTPUT_BUSY_WINDOW_S
+                    activity_at is not None and time.time() - activity_at < activity_window_s
                 )
             if screen_changed:
                 return True
@@ -9318,7 +9471,61 @@ def create_runner_app(
                 return await _server_confirms_turn_in_flight(conv_id)
             return False
 
-        async def _reap_native_pane(pane: PaneRef) -> None:
+        def _owns_launch_lock(pane: PaneRef, lock: asyncio.Lock) -> bool:
+            """Whether *lock* is still the session's launch lock, i.e. the same session."""
+            locks = _native_terminal_ensure_locks[pane.terminal_name]
+            return locks.get(pane.conversation_id) is lock
+
+        def _report_abandoned_pane_teardown(teardown: asyncio.Task[None]) -> None:
+            # Its caller was cancelled, so no one else reports a failure.
+            if not teardown.cancelled() and (error := teardown.exception()) is not None:
+                _logger.warning("native pane teardown failed", exc_info=error)
+
+        async def _tear_down_native_pane(pane: PaneRef, lock: asyncio.Lock) -> None:
+            """Close a reaped pane and its helpers, then free its launch lock."""
+            conv_id = pane.conversation_id
+            try:
+                try:
+                    await resource_registry.close_terminal(conv_id, pane.terminal_id)
+                finally:
+                    # The pane's forwarder, helper server and tool relay outlive it
+                    # otherwise; ``finally`` so a partially failed close cannot leak them.
+                    # A session deleted or reset meanwhile has dropped this lock: what is
+                    # registered under the id then belongs to a session started since.
+                    for dispose in (
+                        _native_runtime.teardown_codex_native_app_server,
+                        _cancel_auto_forwarder_task,
+                        _native_runtime.teardown_opencode_native_server,
+                    ):
+                        if _owns_launch_lock(pane, lock):
+                            await dispose(conv_id)
+                    if _owns_launch_lock(pane, lock):
+                        if binding := _session_comment_relays.get(conv_id):
+                            _discard_comment_relay(conv_id, binding.relay)
+                        _publish_terminal_deleted_event(
+                            conversation_id=conv_id,
+                            terminal_name=pane.terminal_name,
+                            session_key="main",
+                            publish_event=_publish_event,
+                        )
+            finally:
+                lock.release()
+                running = _native_pane_teardowns.get(conv_id, set())
+                running.discard(cast("asyncio.Task[None]", asyncio.current_task()))
+                if not running:
+                    _native_pane_teardowns.pop(conv_id, None)
+
+        async def _reap_native_pane(
+            pane: PaneRef,
+            *,
+            activity_window_s: float = PANE_OUTPUT_BUSY_WINDOW_S,
+            require_unattached: bool = False,
+        ) -> None:
+            """Close an idle native pane and its helpers, unless it is replaced or busy.
+
+            :param require_unattached: Leave the pane unless tmux confirms no terminal
+                on the host is attached to it.
+            """
             conv_id = pane.conversation_id
             reaped = pane.instance
             if reaped is None:
@@ -9329,7 +9536,9 @@ def create_runner_app(
             lock = _native_terminal_ensure_locks[pane.terminal_name].setdefault(
                 conv_id, asyncio.Lock()
             )
-            async with lock:
+            await lock.acquire()
+            teardown: asyncio.Task[None] | None = None
+            try:
                 current = _pane_reaper_registry.get(conv_id, pane.terminal_name, "main")
                 if current is not None and current is not reaped:
                     _logger.info(
@@ -9340,30 +9549,48 @@ def create_runner_app(
                     )
                     return
                 # A message can reuse the pane while the reap waits for the lock.
-                if await _native_pane_is_busy(pane):
+                if await _native_pane_is_busy(pane, activity_window_s=activity_window_s) or (
+                    require_unattached
+                    and await asyncio.to_thread(
+                        _tmux_client_attached, str(pane.socket_path), "main"
+                    )
+                    is not False
+                ):
                     _logger.info(
-                        "native pane reaper: pane for conversation %s became busy while "
-                        "the reap waited; leaving it",
+                        "native pane reaper: pane for conversation %s became busy, or "
+                        "attached on the host, while the reap waited; leaving it",
                         conv_id,
                         extra={"session_id": conv_id},
                     )
                     return
-                try:
-                    await resource_registry.close_terminal(conv_id, pane.terminal_id)
-                finally:
-                    # The pane's forwarder, helper server and tool relay outlive it
-                    # otherwise; ``finally`` so a partially failed close cannot leak them.
-                    await _native_runtime.teardown_codex_native_app_server(conv_id)
-                    await _cancel_auto_forwarder_task(conv_id)
-                    await _native_runtime.teardown_opencode_native_server(conv_id)
-                    if binding := _session_comment_relays.get(conv_id):
-                        _discard_comment_relay(conv_id, binding.relay)
-                    _publish_terminal_deleted_event(
-                        conversation_id=conv_id,
-                        terminal_name=pane.terminal_name,
-                        session_key="main",
-                        publish_event=_publish_event,
+                # Deleted or reset during the checks above, possibly created again since.
+                current = _pane_reaper_registry.get(conv_id, pane.terminal_name, "main")
+                if not _owns_launch_lock(pane, lock) or (
+                    current is not None and current is not reaped
+                ):
+                    _logger.info(
+                        "native pane reaper: session %s was deleted or reset while the "
+                        "reap checked it; leaving it",
+                        conv_id,
+                        extra={"session_id": conv_id},
                     )
+                    return
+                # Committed: a cancelled caller (e.g. a Reconnect past its deadline) must
+                # not leave the process or its helpers half torn down. The task frees the
+                # lock, so a replacement launch waits for it.
+                teardown = asyncio.create_task(
+                    _tear_down_native_pane(pane, lock), name=f"native-pane-teardown-{conv_id}"
+                )
+                # Registered while it runs: a route dropping the launch lock waits for it.
+                _native_pane_teardowns.setdefault(conv_id, set()).add(teardown)
+            finally:
+                if teardown is None:
+                    lock.release()
+            try:
+                await asyncio.shield(teardown)
+            except asyncio.CancelledError:
+                teardown.add_done_callback(_report_abandoned_pane_teardown)
+                raise
 
         app.state.native_pane_reaper = NativePaneReaper(
             list_native_panes=_native_panes_for_reaper,
@@ -9371,8 +9598,300 @@ def create_runner_app(
             reap=_reap_native_pane,
             idle_timeout_s=native_pane_idle_timeout_s,
         )
+
+        async def _is_claude_native_session(conv_id: str) -> bool:
+            """Whether *conv_id* runs claude-native, reading its spec if the cache was reset."""
+            harness = _session_harness_name(conv_id)
+            if harness is None:
+                # An agent-cache reset (after an MCP edit) clears it until the next turn.
+                try:
+                    await _resolve_session_spec_entry(conv_id)
+                except Exception:
+                    # An unreadable spec falls back to the pane below.
+                    _logger.debug("Re-reading the agent spec of %s failed", conv_id, exc_info=True)
+                harness = _session_harness_name(conv_id)
+            if harness is not None:
+                return harness == "claude-native"
+            # Unknown still: a pane started as claude-native is the best evidence left.
+            return (
+                resource_registry.terminal_resource_role(
+                    conv_id, terminal_resource_id("claude", "main")
+                )
+                == CLAUDE_NATIVE_TERMINAL_ROLE
+            )
+
+        async def _live_claude_native_pane(conv_id: str) -> TerminalInstance | None:
+            """The session's running claude-native pane, or ``None`` when it has none."""
+            # A session switched to another harness can keep its old Claude pane.
+            if resource_registry.terminal_resource_role(
+                conv_id, terminal_resource_id("claude", "main")
+            ) != CLAUDE_NATIVE_TERMINAL_ROLE or not await _is_claude_native_session(conv_id):
+                return None
+            instance = _pane_reaper_registry.get(conv_id, "claude", "main")
+            if instance is None or not await instance.is_alive():
+                return None
+            return instance
+
+        async def _claude_restart_refusal(pane: PaneRef) -> str | None:
+            """Why restarting a claude-native pane now would cut into work, or ``None``."""
+            from omnigent.harnesses.claude_native.bridge import (
+                has_pending_user_prompt,
+                terminal_dialog_pending,
+            )
+
+            conv_id = pane.conversation_id
+            if (
+                conv_id in _sessions_with_background_shell
+                or resource_registry.session_has_background_agents(conv_id)
+            ):
+                return "Claude still has background work running. Reconnect once it finishes."
+            # Restarting would end a person's local `omnigent claude` attach.
+            attached = await asyncio.to_thread(
+                _tmux_client_attached, str(pane.socket_path), "main"
+            )
+            if attached is None:
+                return (
+                    "Couldn't tell whether Claude Code is open in a terminal on the host. "
+                    "Reconnect again in a moment."
+                )
+            if attached:
+                return (
+                    "Claude Code is open in a terminal on the host. Restart it there, "
+                    "or close that terminal and reconnect."
+                )
+            if _message_held_for_sign_in(conv_id):
+                return "Claude Code is waiting for a sign-in. Reconnect once it's done."
+            # The pane's own bridge, which a /clear or fork successor inherits.
+            bridge_dir = await _claude_prompt_bridge_dir(conv_id)
+            if await asyncio.to_thread(has_pending_user_prompt, bridge_dir) or (
+                await asyncio.to_thread(terminal_dialog_pending, bridge_dir)
+            ):
+                return "Claude is waiting for an answer. Reconnect once it's answered."
+            if await _native_pane_is_busy(pane, activity_window_s=_RESTART_ACTIVITY_WINDOW_S):
+                return (
+                    "Claude Code is working, or was used in the last few seconds. "
+                    "Reconnect once it has been idle for a moment."
+                )
+            return None
+
+        async def _restart_idle_claude_pane(
+            conv_id: str, instance: TerminalInstance
+        ) -> str | None:
+            """Close an idle claude-native pane the way the reaper does, so it relaunches resumed.
+
+            :returns: Why the pane was left running, or ``None`` once it is closed.
+            """
+            pane = PaneRef(
+                conv_id,
+                terminal_resource_id("claude", "main"),
+                "claude",
+                instance.socket_path,
+                instance,
+                sub_agent=_is_sub_agent_session(conv_id),
+            )
+            refusal = await _claude_restart_refusal(pane)
+            if refusal is not None:
+                return refusal
+            # Rechecks busyness under the launch lock and tears down the pane's helpers.
+            await _reap_native_pane(
+                pane, activity_window_s=_RESTART_ACTIVITY_WINDOW_S, require_unattached=True
+            )
+            if _pane_reaper_registry.get(conv_id, "claude", "main") is instance:
+                # Left running by the recheck under the launch lock; say what changed.
+                refusal = await _claude_restart_refusal(pane)
+                return refusal or "Claude Code became busy. Reconnect once it finishes."
+            return None
+
+        def _claude_live_mcp_body(conv_id: str, instance: TerminalInstance) -> _JsonObject:
+            """What a claude-native pane can report: the servers it started without."""
+            signed_in = _claude_mcp_sign_in.signed_in_since_launch(conv_id, instance)
+            return {
+                "running": True,
+                # Only these are known; a server left out may be connected.
+                "partial": True,
+                "servers": [
+                    {"name": name, "status": "failed", "error": _CLAUDE_SIGNED_IN_AFTER_START}
+                    for name in sorted(signed_in)
+                ],
+            }
+
+        async def _restart_claude_for_mcp_sign_in_impl(conv_id: str) -> None:
+            """Restart an idle pane that started before an MCP server it can now use signed in."""
+            try:
+                async with asyncio.timeout(_CLAUDE_AUTO_RESTART_DEADLINE_S):
+                    instance = await _live_claude_native_pane(conv_id)
+                    if instance is None:
+                        return
+                    signed_in = await asyncio.to_thread(
+                        _claude_mcp_sign_in.signed_in_since_launch, conv_id, instance
+                    )
+                    if not signed_in:
+                        return
+                    refusal = await _restart_idle_claude_pane(conv_id, instance)
+            except TimeoutError:
+                _logger.warning(
+                    "Restarting Claude Code for %s took over %.0fs; sending the message as is",
+                    conv_id,
+                    _CLAUDE_AUTO_RESTART_DEADLINE_S,
+                    extra={"session_id": conv_id},
+                )
+                return
+            except Exception:
+                _logger.warning(
+                    "Restarting Claude Code after an MCP sign-in failed for %s",
+                    conv_id,
+                    exc_info=True,
+                    extra={"session_id": conv_id},
+                )
+                return
+            _logger.info(
+                "Claude Code for %s started before %s signed in: %s",
+                conv_id,
+                ", ".join(sorted(signed_in)),
+                f"left running ({refusal})" if refusal else "restarting it for this message",
+                extra={"session_id": conv_id},
+            )
+
+        async def _claude_native_live_mcp_impl(conv_id: str) -> _JsonObject | None:
+            """Answer ``/mcp``'s live status for a claude-native session, else ``None``."""
+            instance = await _live_claude_native_pane(conv_id)
+            if instance is None:
+                # Without a pane, only an already-known harness says it is claude-native.
+                return (
+                    _CLAUDE_NOT_RUNNING
+                    if _session_harness_name(conv_id) == "claude-native"
+                    else None
+                )
+            return await asyncio.to_thread(_claude_live_mcp_body, conv_id, instance)
+
+        async def _reconnect_claude_native_mcp_impl(conv_id: str, name: str) -> _JsonObject | None:
+            """Restart a claude-native session's Claude Code, which reconnects every MCP server.
+
+            Only while *name* is one Claude Code started without and is now signed in:
+            a stale panel must not restart a pane that already connects it. Deleting
+            the session cancels and awaits the restart before tearing the session down.
+
+            :param name: The server to reconnect, as Claude Code names it, e.g. ``"linear"``.
+            :returns: The live MCP state afterwards, with ``reconnect_error`` when the
+                pane was left running, did not start again, took past the deadline, or
+                the session was deleted;
+                ``None`` when the session has no running claude-native pane.
+            :raises LiveMcpServerUnknown: When the host has no Claude server named *name*.
+            """
+            task: asyncio.Task[_JsonObject] | None = None
+            try:
+                # The whole request: the pane check, the wait in line, the work and the answer.
+                async with asyncio.timeout(_CLAUDE_RECONNECT_DEADLINE_S):
+                    if (
+                        await _live_claude_native_pane(conv_id) is None
+                        and _session_harness_name(conv_id) != "claude-native"
+                    ):
+                        return None
+                    # Checked with no await before registering: delete refuses it or cancels it.
+                    if conv_id in _deleting_sessions:
+                        return {
+                            **_CLAUDE_NOT_RUNNING,
+                            "reconnect_error": "This session was deleted.",
+                        }
+                    task = asyncio.create_task(
+                        _reconnect_claude_in_line(conv_id, name),
+                        name=f"claude-mcp-reconnect-{conv_id}",
+                    )
+                    _claude_reconnect_tasks.setdefault(conv_id, set()).add(task)
+                    return await task
+            except TimeoutError:
+                # The deadline cancelled the work, which gave up or freed its place in line.
+                _logger.warning(
+                    "MCP reconnect for %s did not finish within %.0fs; cancelled it",
+                    conv_id,
+                    _CLAUDE_RECONNECT_DEADLINE_S,
+                    extra={"session_id": conv_id},
+                )
+                # The registry alone: a liveness probe could stall like the work did.
+                pane = _pane_reaper_registry.get(conv_id, "claude", "main")
+                if pane is None:
+                    late = f"Claude Code didn't start again in time. {_CLAUDE_START_IT}"
+                    return {**_CLAUDE_NOT_RUNNING, "reconnect_error": late}
+                too_long = "Reconnect took too long. Try again."
+                try:
+                    # Bounded too: host inventory discovery can be slow.
+                    body = await asyncio.wait_for(
+                        asyncio.to_thread(_claude_live_mcp_body, conv_id, pane),
+                        _CLAUDE_TIMEOUT_ANSWER_S,
+                    )
+                except TimeoutError:
+                    body = {"running": True, "partial": True, "servers": []}
+                return {**body, "reconnect_error": too_long}
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                # Cancelled by the session's deletion, not by this request going away.
+                if (
+                    task is not None
+                    and task.cancelled()
+                    and current is not None
+                    and not current.cancelling()
+                ):
+                    return {**_CLAUDE_NOT_RUNNING, "reconnect_error": "This session was deleted."}
+                raise
+            finally:
+                running = _claude_reconnect_tasks.get(conv_id)
+                if task is not None and running is not None:
+                    running.discard(task)
+                    if not running:
+                        _claude_reconnect_tasks.pop(conv_id, None)
+
+        async def _reconnect_claude_in_line(conv_id: str, name: str) -> _JsonObject:
+            """Check *name* and restart the pane, holding the session's place in line."""
+            # In the session's line of messages, so none is typed into the pane as it closes.
+            async with _ingest_slot(conv_id) as live:
+                instance = await _live_claude_native_pane(conv_id) if live else None
+                if instance is None:
+                    not_running = f"Claude Code isn't running. {_CLAUDE_START_IT}"
+                    return {**_CLAUDE_NOT_RUNNING, "reconnect_error": not_running}
+                # Checked in line: a message or Reconnect ahead may have restarted it.
+                sign_in = await asyncio.to_thread(claude_sign_in_by_live_name)
+                # An empty report is a failed discovery, which says nothing about the name.
+                if sign_in and name not in sign_in:
+                    raise LiveMcpServerUnknown(name)
+                signed_in = await asyncio.to_thread(
+                    _claude_mcp_sign_in.signed_in_since_launch, conv_id, instance
+                )
+                if name not in signed_in:
+                    body = await asyncio.to_thread(_claude_live_mcp_body, conv_id, instance)
+                    if sign_in.get(name) == "sign_in_required":
+                        return {**body, "reconnect_error": f"Sign in to {name} first."}
+                    return body
+                refusal = await _restart_idle_claude_pane(conv_id, instance)
+                if refusal is not None:
+                    body = await asyncio.to_thread(_claude_live_mcp_body, conv_id, instance)
+                    return {**body, "reconnect_error": refusal}
+                _logger.info(
+                    "Restarting Claude Code for %s to reconnect its MCP servers",
+                    conv_id,
+                    extra={"session_id": conv_id},
+                )
+                await _ensure_native_terminal_for_turn(conv_id, "claude-native")
+            relaunched = await _live_claude_native_pane(conv_id)
+            if relaunched is None:
+                return {
+                    "running": False,
+                    "servers": [],
+                    "reconnect_error": f"Claude Code didn't start again. {_CLAUDE_START_IT}",
+                }
+            return await asyncio.to_thread(_claude_live_mcp_body, conv_id, relaunched)
+
+        _restart_claude_for_mcp_sign_in = _restart_claude_for_mcp_sign_in_impl
+        _claude_native_live_mcp = _claude_native_live_mcp_impl
+        _reconnect_claude_native_mcp = _reconnect_claude_native_mcp_impl
     else:
         app.state.native_pane_reaper = None
+
+    register_live_mcp_routes(
+        app,
+        process_manager=process_manager,
+        claude_native_live_mcp=_claude_native_live_mcp,
+        reconnect_claude_native_mcp=_reconnect_claude_native_mcp,
+    )
 
     return app
 

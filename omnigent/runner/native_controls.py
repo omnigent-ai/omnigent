@@ -14,7 +14,7 @@ import threading
 import time
 import urllib.parse
 import weakref
-from collections.abc import Callable, Coroutine, Mapping
+from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -342,6 +342,7 @@ class NativeControls:
     is_sdk_compact_body: Callable[[dict[str, Any]], bool]
     opencode_native_model_options: Callable[[str], Coroutine[Any, Any, list[_JsonObject]]]
     teardown_session_terminals: Callable[[str], Coroutine[Any, Any, None]]
+    ingest_slot: Callable[[str], contextlib.AbstractAsyncContextManager[bool]]
 
 
 def build_native_controls(
@@ -2454,6 +2455,42 @@ def build_native_controls(
         _background_tasks.add(task)
         task.add_done_callback(_background_tasks.discard)
 
+    @contextlib.asynccontextmanager
+    async def _ingest_slot(conv_id: str) -> AsyncIterator[bool]:
+        """Wait for, and hold, the next place in *conv_id*'s line of input.
+
+        Yields ``False`` when the session was deleted while this waited; its
+        place is then not held. A cancelled wait gives up its place without
+        jumping input ahead of it.
+        """
+        seq = _ingest_next_seq.get(conv_id, 0)
+        _ingest_next_seq[conv_id] = seq + 1
+        cond = _ingest_cond.setdefault(conv_id, asyncio.Condition())
+        gone = False
+        try:
+            async with cond:
+                while True:
+                    if _ingest_cond.get(conv_id) is not cond:
+                        gone = True
+                        break
+                    if _ingest_now_serving.get(conv_id, 0) == seq:
+                        break
+                    await cond.wait()
+        except asyncio.CancelledError:
+            _retire_ingest_ticket(conv_id, seq, cond)
+            raise
+        if gone:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            async with cond:
+                # A gate torn down meanwhile must not be written back for a re-created session.
+                if _ingest_cond.get(conv_id) is cond:
+                    _ingest_now_serving[conv_id] = seq + 1
+                cond.notify_all()
+
     async def _handle_claude_sdk_clear(conv_id: str) -> Response:
         """Drop a claude-sdk session's live client and history before ``/clear``.
 
@@ -2676,4 +2713,5 @@ def build_native_controls(
         is_sdk_compact_body=_is_sdk_compact_body,
         opencode_native_model_options=_opencode_native_model_options,
         teardown_session_terminals=_teardown_session_terminals,
+        ingest_slot=_ingest_slot,
     )

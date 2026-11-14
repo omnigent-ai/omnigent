@@ -2805,14 +2805,35 @@ function ComposerImpl(
           : hostMcpQuery.isError
             ? "Couldn’t load MCP servers from this session’s host."
             : sdkAgentStatus;
-  // claude-sdk's CLI reports the connections it holds; other harnesses can't be asked.
+  // claude-sdk's CLI reports the connections it holds; for claude-native the runner
+  // reports the servers its Claude Code started without. Others can't be asked.
   const liveMcpQuery = useSessionLiveMcpServers(
     composerSessionId,
-    mcpPanelRequested && sessionHarness === "claude-sdk",
+    mcpPanelRequested && (sessionHarness === "claude-sdk" || sessionHarness === "claude-native"),
   );
   // A failed refetch keeps the last data; showing it would present old state as live.
   const liveMcp =
     !liveMcpQuery.isError && liveMcpQuery.data?.live ? liveMcpQuery.data.servers : undefined;
+  // A claude-native answer only lists what it knows; an older server drops the flag.
+  const liveMcpPartial = liveMcpQuery.data?.partial ?? sessionHarness === "claude-native";
+  // claude-native's answer follows the host's sign-in report, so a sign-in that
+  // completes while the panel is open must be re-read to offer Reconnect.
+  const hostMcpAccounts = hostMcpQuery.data
+    ?.map(
+      (server) =>
+        `${server.harness}:${server.plugin ?? ""}:${server.name}=${server.auth_status ?? ""}`,
+    )
+    .join("|");
+  // The first read counts as a change too: the live answer may predate a sign-in it reports.
+  const previousHostMcpAccounts = useRef<string | undefined>(undefined);
+  const { refetch: refetchLiveMcp } = liveMcpQuery;
+  useEffect(() => {
+    if (hostMcpAccounts === undefined) return;
+    const previous = previousHostMcpAccounts.current;
+    previousHostMcpAccounts.current = hostMcpAccounts;
+    if (previous === hostMcpAccounts) return;
+    if (mcpPanelRequested && sessionHarness === "claude-native") void refetchLiveMcp();
+  }, [hostMcpAccounts, mcpPanelRequested, sessionHarness, refetchLiveMcp]);
   const liveMcpReconnect = useReconnectLiveMcpServer(composerSessionId);
   const mcpSettingsHarness = nativeMcpHarness
     ? sessionHarness
@@ -3790,7 +3811,7 @@ function ComposerImpl(
       hasRegistryServers && registryCatalog.error
         ? "Couldn’t check MCP service connections."
         : undefined,
-      sessionHarness === "claude-sdk"
+      sessionHarness === "claude-sdk" || sessionHarness === "claude-native"
         ? liveMcpStatusNote(liveMcpQuery.data, liveMcpQuery.isError)
         : undefined,
     ]
@@ -3800,8 +3821,9 @@ function ComposerImpl(
     const liveByName = new Map((liveMcp ?? []).map((server) => [server.name, server]));
     const takeLive = (liveName: string) => {
       const live = liveByName.get(liveName);
-      // An answer that omits a server means the session did not load it.
-      if (live === undefined) return liveMcp ? { live: { status: "not-loaded" } } : {};
+      // A full answer that omits a server means the session did not load it.
+      if (live === undefined)
+        return liveMcp && !liveMcpPartial ? { live: { status: "not-loaded" } } : {};
       liveByName.delete(liveName);
       return liveMcpRowFields(live);
     };
@@ -3885,6 +3907,7 @@ function ComposerImpl(
     registryCatalog.services,
     selectedAgent?.mcp_servers,
     liveMcp,
+    liveMcpPartial,
   ]);
 
   const slashCompletionCommands = mcpPanelRequested

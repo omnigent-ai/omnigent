@@ -188,10 +188,17 @@ vi.mock("@/hooks/useHarnessInventory", async (importOriginal) => ({
   ...(await importOriginal<typeof UseHarnessInventoryModule>()),
   useHostMcpServers: hostMcpQueryMock,
 }));
+/** What the mocked live-MCP query returns; `refetch` only where a test watches it. */
+interface LiveMcpQueryResult {
+  data: UseSessionLiveMcpServersModule.SessionLiveMcpServers | undefined;
+  isError: boolean;
+  refetch?: () => unknown;
+}
 const { liveMcpQueryMock, liveMcpReconnectMock } = vi.hoisted(() => ({
-  liveMcpQueryMock: vi.fn(() => ({
-    data: undefined as UseSessionLiveMcpServersModule.SessionLiveMcpServers | undefined,
+  liveMcpQueryMock: vi.fn((): LiveMcpQueryResult => ({
+    data: undefined,
     isError: false,
+    refetch: vi.fn(),
   })),
   liveMcpReconnectMock: vi.fn(() => ({
     reconnect: vi.fn(),
@@ -4087,7 +4094,7 @@ describe("Composer MCP status command", () => {
     sessionAgentQueryMock.mockReset();
     sessionAgentQueryMock.mockReturnValue({ data: undefined, isError: false });
     liveMcpQueryMock.mockReset();
-    liveMcpQueryMock.mockReturnValue({ data: undefined, isError: false });
+    liveMcpQueryMock.mockReturnValue({ data: undefined, isError: false, refetch: vi.fn() });
     liveMcpReconnectMock.mockReset();
     liveMcpReconnectMock.mockReturnValue({
       reconnect: vi.fn(),
@@ -4784,27 +4791,61 @@ describe("Composer MCP status command", () => {
     );
   });
 
-  it("notes why a claude-sdk session shows no live state", () => {
-    const data = { live: false, reason: "not_running" as const, servers: [] };
+  it.each(["claude-sdk", "claude-native"])(
+    "notes why a %s session shows no live state",
+    (harness) => {
+      const data = { live: false, reason: "not_running" as const, servers: [] };
+      composerSessionSnapshot.hostId = "host_sdk";
+      setComposerState({ boundAgentId: "agent_sdk", sessionHarness: harness });
+      const agent = { id: "agent_sdk", name: "SDK agent", mcp_servers: [] };
+      sessionAgentQueryMock.mockReturnValue({ data: agent, isError: false });
+      liveMcpQueryMock.mockReturnValue({ data, isError: false });
+      render(
+        <MemoryRouter>
+          <Composer {...composerProps({ agents: [agent] })} />
+        </MemoryRouter>,
+      );
+      fireEvent.change(textarea(), { target: { value: "/mcp" } });
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Live connection status appears once this session’s agent is running; send a message to start it.",
+      );
+    },
+  );
+
+  it("does not re-read a claude-sdk session's live state when account states change", () => {
     composerSessionSnapshot.hostId = "host_sdk";
     setComposerState({ boundAgentId: "agent_sdk", sessionHarness: "claude-sdk" });
     const agent = { id: "agent_sdk", name: "SDK agent", mcp_servers: [] };
     sessionAgentQueryMock.mockReturnValue({ data: agent, isError: false });
-    liveMcpQueryMock.mockReturnValue({ data, isError: false });
-    render(
+    const refetch = vi.fn();
+    liveMcpQueryMock.mockReturnValue({ data: undefined, isError: false, refetch });
+    const hostRow = { name: "wiki", harness: "claude", transport: "http", scope: "user" } as const;
+    hostMcpQueryMock.mockReturnValue({
+      data: [{ ...hostRow, auth_status: "sign_in_required" }],
+      isLoading: false,
+      isError: false,
+    });
+    const view = () => (
       <MemoryRouter>
         <Composer {...composerProps({ agents: [agent] })} />
-      </MemoryRouter>,
+      </MemoryRouter>
     );
+    const { rerender } = render(view());
     fireEvent.change(textarea(), { target: { value: "/mcp" } });
-    expect(screen.getByRole("status")).toHaveTextContent(
-      "Live connection status appears once this session’s agent is running; send a message to start it.",
-    );
+    hostMcpQueryMock.mockReturnValue({
+      data: [{ ...hostRow, auth_status: "connected" }],
+      isLoading: false,
+      isError: false,
+    });
+    rerender(view());
+
+    // Its own CLI reports connections; the next turn reconnects a signed-in server.
+    expect(refetch).not.toHaveBeenCalled();
   });
 
-  it("does not ask a native harness for live MCP connections", () => {
+  it("does not ask another native harness for live MCP connections", () => {
     composerSessionSnapshot.hostId = "host_native";
-    setComposerState({ boundAgentId: "agent_native", sessionHarness: "claude-native" });
+    setComposerState({ boundAgentId: "agent_native", sessionHarness: "codex-native" });
     render(
       <MemoryRouter>
         <Composer {...composerProps({ agents: [] })} />
@@ -4812,6 +4853,190 @@ describe("Composer MCP status command", () => {
     );
     fireEvent.change(textarea(), { target: { value: "/mcp" } });
     expect(liveMcpQueryMock).toHaveBeenLastCalledWith("conv_mcp", false);
+  });
+
+  it("offers Reconnect on a claude-native server signed in after Claude Code started", () => {
+    composerSessionSnapshot.hostId = "host_native";
+    setComposerState({ boundAgentId: "agent_native", sessionHarness: "claude-native" });
+    hostMcpQueryMock.mockReturnValue({
+      data: [
+        {
+          name: "wiki",
+          harness: "claude",
+          transport: "http",
+          scope: "user",
+          auth_status: "connected",
+        },
+        {
+          name: "mail",
+          harness: "claude",
+          transport: "http",
+          scope: "user",
+          auth_status: "sign_in_required",
+        },
+      ],
+      isLoading: false,
+      isError: false,
+    });
+    const refetch = vi.fn();
+    liveMcpQueryMock.mockReturnValue({
+      data: {
+        live: true,
+        partial: true,
+        servers: [
+          { name: "wiki", status: "failed", error: "Signed in after Claude Code started." },
+        ],
+      },
+      isError: false,
+      refetch,
+    });
+    const reconnect = vi.fn();
+    liveMcpReconnectMock.mockReturnValue({
+      reconnect,
+      reconnectingName: null,
+      error: null,
+      clearError: vi.fn(),
+    });
+    const { rerender } = render(
+      <MemoryRouter>
+        <Composer {...composerProps({ agents: [] })} />
+      </MemoryRouter>,
+    );
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+
+    expect(liveMcpQueryMock).toHaveBeenLastCalledWith("conv_mcp", true);
+    expect(screen.getByTestId("mcp-live-status-wiki")).toHaveTextContent(
+      "Failed: Signed in after Claude Code started.",
+    );
+    // A partial answer says nothing about the servers it leaves out.
+    expect(screen.getByTestId("mcp-server-row-mail")).toHaveTextContent("mailSign-in required");
+    expect(screen.getByTestId("mcp-server-row-mail")).not.toHaveTextContent("Not loaded");
+    expect(screen.queryByTestId("mcp-live-status-mail")).toBeNull();
+    fireEvent.click(screen.getByTestId("mcp-reconnect-wiki"));
+    expect(reconnect).toHaveBeenCalledWith("wiki");
+
+    // Signing in to mail while the panel is open re-reads the session's live state.
+    expect(refetch).not.toHaveBeenCalled();
+    hostMcpQueryMock.mockReturnValue({
+      data: [
+        {
+          name: "wiki",
+          harness: "claude",
+          transport: "http",
+          scope: "user",
+          auth_status: "connected",
+        },
+        {
+          name: "mail",
+          harness: "claude",
+          transport: "http",
+          scope: "user",
+          auth_status: "connected",
+        },
+      ],
+      isLoading: false,
+      isError: false,
+    });
+    rerender(
+      <MemoryRouter>
+        <Composer {...composerProps({ agents: [] })} />
+      </MemoryRouter>,
+    );
+    expect(refetch).toHaveBeenCalledOnce();
+  });
+
+  it("re-reads claude-native live state when the host's first inventory arrives", () => {
+    // The live answer came back before a sign-in finished; the inventory loads after it.
+    composerSessionSnapshot.hostId = "host_native";
+    setComposerState({ boundAgentId: "agent_native", sessionHarness: "claude-native" });
+    hostMcpQueryMock.mockReturnValue({ data: undefined, isLoading: true, isError: false });
+    const refetch = vi.fn();
+    liveMcpQueryMock.mockReturnValue({
+      data: { live: true, partial: true, servers: [] },
+      isError: false,
+      refetch,
+    });
+    liveMcpReconnectMock.mockReturnValue({
+      reconnect: vi.fn(),
+      reconnectingName: null,
+      error: null,
+      clearError: vi.fn(),
+    });
+    const { rerender } = render(
+      <MemoryRouter>
+        <Composer {...composerProps({ agents: [] })} />
+      </MemoryRouter>,
+    );
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+    expect(refetch).not.toHaveBeenCalled();
+
+    hostMcpQueryMock.mockReturnValue({
+      data: [
+        {
+          name: "wiki",
+          harness: "claude",
+          transport: "http",
+          scope: "user",
+          auth_status: "connected",
+        },
+      ],
+      isLoading: false,
+      isError: false,
+    });
+    rerender(
+      <MemoryRouter>
+        <Composer {...composerProps({ agents: [] })} />
+      </MemoryRouter>,
+    );
+    expect(refetch).toHaveBeenCalledOnce();
+
+    // The re-read finds the server Claude Code started without.
+    liveMcpQueryMock.mockReturnValue({
+      data: {
+        live: true,
+        partial: true,
+        servers: [
+          { name: "wiki", status: "failed", error: "Signed in after Claude Code started." },
+        ],
+      },
+      isError: false,
+      refetch,
+    });
+    rerender(
+      <MemoryRouter>
+        <Composer {...composerProps({ agents: [] })} />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId("mcp-reconnect-wiki")).toBeInTheDocument();
+  });
+
+  it("reads a claude-native live answer without the partial flag as partial", () => {
+    // An older server forwards the runner's answer without `partial`.
+    composerSessionSnapshot.hostId = "host_native";
+    setComposerState({ boundAgentId: "agent_native", sessionHarness: "claude-native" });
+    hostMcpQueryMock.mockReturnValue({
+      data: [
+        {
+          name: "mail",
+          harness: "claude",
+          transport: "http",
+          scope: "user",
+          auth_status: "connected",
+        },
+      ],
+      isLoading: false,
+      isError: false,
+    });
+    liveMcpQueryMock.mockReturnValue({ data: { live: true, servers: [] }, isError: false });
+    render(
+      <MemoryRouter>
+        <Composer {...composerProps({ agents: [] })} />
+      </MemoryRouter>,
+    );
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+
+    expect(screen.getByTestId("mcp-server-row-mail")).toHaveTextContent("mailConnected");
+    expect(screen.queryByTestId("mcp-live-status-mail")).toBeNull();
   });
 
   it("shows only the agent's servers in a claude-sdk session with no host", () => {

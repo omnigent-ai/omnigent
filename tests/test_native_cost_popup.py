@@ -14,6 +14,7 @@ JSON body) and on the no-request invariant when the popup is dismissed.
 from __future__ import annotations
 
 import json
+import subprocess
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -611,3 +612,47 @@ def test_tmux_last_client_input_at_none_on_unparseable_output(
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
     assert native_cost_popup._tmux_last_client_input_at("/tmp/x.sock", "main") is None
+
+
+@pytest.mark.parametrize(
+    ("answer", "attached"),
+    [
+        (types.SimpleNamespace(returncode=0, stdout="0 1700000000\n", stderr=""), True),
+        (types.SimpleNamespace(returncode=0, stdout="1 1700000000\n", stderr=""), False),
+        (types.SimpleNamespace(returncode=0, stdout="", stderr=""), False),
+        (types.SimpleNamespace(returncode=1, stdout="", stderr="no server running on /x"), False),
+        (types.SimpleNamespace(returncode=1, stdout="", stderr="can't find session: main"), False),
+        (
+            types.SimpleNamespace(
+                returncode=1, stdout="", stderr="error connecting to /x (Permission denied)"
+            ),
+            None,
+        ),
+        (types.SimpleNamespace(returncode=0, stdout="#{client_control_mode}\n", stderr=""), None),
+        (subprocess.TimeoutExpired("tmux", 5), None),
+        (OSError("tmux is missing"), None),
+    ],
+    ids=[
+        "cli-attached",
+        "web-bridge-only",
+        "no-clients",
+        "server-gone",
+        "session-gone",
+        "error",
+        "unreadable",
+        "timeout",
+        "not-runnable",
+    ],
+)
+def test_tmux_client_attached_says_unknown_when_tmux_cannot_tell(
+    monkeypatch: pytest.MonkeyPatch, answer: Any, attached: bool | None
+) -> None:
+    """Only tmux's own answer says whether a CLI is attached; a failed lookup says neither."""
+
+    def _fake_run(*_a: Any, **_k: Any) -> Any:
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    assert native_cost_popup._tmux_client_attached("/tmp/x.sock", "main") is attached

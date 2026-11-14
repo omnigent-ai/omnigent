@@ -9269,6 +9269,12 @@
             "title": "Live",
             "type": "boolean"
           },
+          "partial": {
+            "default": false,
+            "description": "`True` when the harness reports only the servers it knows it can't use (claude-native), so a server missing from `servers` may well be connected rather than not loaded.",
+            "title": "Partial",
+            "type": "boolean"
+          },
           "reason": {
             "anyOf": [
               {
