@@ -650,6 +650,12 @@ _BEDROCK_ANTHROPIC_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Bedrock OpenAI ids, e.g. ``global.openai.gpt-6.1-sol`` or ``openai.gpt-oss-120b-1:0``.
+_BEDROCK_OPENAI_PATTERN = re.compile(
+    r"^(?:[a-z0-9-]{2,8}\.)?openai\.(?P<model>gpt-.+)$",
+    re.IGNORECASE,
+)
+
 # Databricks Unity Catalog system models (``system.ai.<model>``): the same
 # model the workspace serves as its ``databricks-<model>`` endpoint.
 _DATABRICKS_SYSTEM_AI_PREFIX = "system.ai."
@@ -675,6 +681,14 @@ def _catalog_lookup_targets(model: str) -> list[tuple[str, str]]:
         _add("anthropic", bare)
         _add(_inferred_catalog_provider(bare), bare)
         _add("openrouter", normalized)
+        return targets
+
+    bedrock_openai = _BEDROCK_OPENAI_PATTERN.match(normalized)
+    if bedrock_openai:
+        # The bedrock catalog lists these ids with their ``:N`` version suffix.
+        _add("bedrock", model.strip())
+        _add("bedrock", normalized)
+        _add("openai", bedrock_openai.group("model"))
         return targets
 
     if normalized.lower().startswith(_DATABRICKS_SYSTEM_AI_PREFIX):
