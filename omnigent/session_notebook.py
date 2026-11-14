@@ -10,11 +10,11 @@ than being dropped. The notebook is nbformat 4.5 JSON, written directly.
 from __future__ import annotations
 
 import base64
+import bisect
 import json
 import re
 import shlex
 import urllib.parse
-from collections import deque
 from collections.abc import Iterable, Iterator, Mapping
 from datetime import UTC, datetime
 from typing import Any
@@ -26,25 +26,34 @@ MAX_OUTPUT_CHARS = 100_000
 #: Largest image kept as a cell output, in base64 characters.
 MAX_IMAGE_CHARS = 2_000_000
 
-# ``bash -lc '…'``, as Codex wraps each command: the shell and its literal script.
+# ``bash -lc '…'``, as Codex wraps each command: the shell, its flags and its
+# literal script. Tokens are separated by spaces or tabs only; a newline would
+# end the command.
 _SHELL_WRAPPER = re.compile(
-    r"\A\s*(?:(?:/[\w.+-]+)*/)?(?P<shell>bash|sh|zsh)\s+-(?:c|lc|ic)\s+'(?P<script>[^']*)'\s*\Z"
+    r"\A\s*(?:(?:/[\w.+-]+)*/)?(?P<shell>bash|sh|zsh)[ \t]+(?P<flags>-c|-lc|-ic)"
+    r"[ \t]+'(?P<script>[^']*)'\s*\Z"
 )
 _SHELL_MAGICS = {"bash": "%%bash", "sh": "%%sh", "zsh": "%%script zsh"}
-_SHELL_SCRIPT_FLAGS = {"-c", "-lc", "-ic"}
+# A login shell reads its profile first; ``%%script <shell> -l`` does the same.
+_LOGIN_SHELL_MAGICS = {
+    "bash": "%%script bash -l",
+    "sh": "%%script sh -l",
+    "zsh": "%%script zsh -l",
+}
 # Codex's and other harnesses' shell tools beyond each harness's declared one.
 _EXTRA_SHELL_TOOLS = frozenset({"exec_command", "run_command"})
 # ``python3 - <<'EOF'`` … ``EOF``: Python fed on stdin. Only a quoted delimiter
 # (no shell expansion) with nothing else on its line runs the body as written,
 # and the shell ends the heredoc only at a line that is exactly the delimiter.
 _PYTHON_HEREDOC = re.compile(
-    r"\A\s*(?:python3?)\s+-\s*<<\s*(['\"])(\w+)\1[ \t]*\n(?P<body>.*?)\n\2\n*\Z",
+    r"\A\s*(?:python3?)[ \t]+-[ \t]*<<[ \t]*(['\"])(\w+)\1[ \t]*\n(?P<body>.*?)\n\2\n*\Z",
     re.DOTALL,
 )
 # ``python3 -c '…'``: only a quoted program the shell passes through unchanged
 # (single quotes, or double quotes with nothing to expand) and nothing after it.
 _PYTHON_C = re.compile(
-    r"""\A\s*(?:(?:/[\w.+-]+)*/)?python3?\s+-c\s+(?:'(?P<single>[^']*)'|"(?P<double>[^"$`\\]*)")\s*\Z"""
+    r"\A\s*(?:(?:/[\w.+-]+)*/)?python3?[ \t]+-c[ \t]+"
+    r"""(?:'(?P<single>[^']*)'|"(?P<double>[^"$`\\]*)")\s*\Z"""
 )
 # Argument names shell tools use for the directory a command runs in.
 _WORKING_DIRECTORY_KEYS = ("workdir", "cwd", "directory")
@@ -72,35 +81,45 @@ def _shell_tool_names() -> frozenset[str]:
     return SHELL_TOOLS | plugin_names | _EXTRA_SHELL_TOOLS
 
 
-def _shell_command(arguments: Mapping[str, Any]) -> tuple[str, str] | None:
+def _shell_command(arguments: Mapping[str, Any]) -> tuple[str, str, bool] | None:
     """
-    The cell magic and script for what a shell tool ran: ``command`` or ``cmd``,
-    a string or an argv list, e.g. ``("%%bash", "ls")``.
+    What a shell tool ran (``command`` or ``cmd``, a string or an argv list) as
+    the cell magic, the script, and whether the script may become a Python cell,
+    e.g. ``("%%bash", "ls", True)``.
     """
     command = arguments.get("command", arguments.get("cmd"))
     if isinstance(command, list) and command and all(isinstance(part, str) for part in command):
         # ``["bash", "-lc", script]`` hands the shell its script verbatim.
         shell = command[0].rsplit("/", 1)[-1]
-        if len(command) == 3 and shell in _SHELL_MAGICS and command[1] in _SHELL_SCRIPT_FLAGS:
-            return (_SHELL_MAGICS[shell], command[2]) if command[2].strip() else None
+        if len(command) == 3 and shell in _SHELL_MAGICS and command[2].strip():
+            unwrapped = _shell_cell(shell, command[1], command[2])
+            if unwrapped is not None:
+                return unwrapped
         command = shlex.join(command)
     if not isinstance(command, str) or not command.strip():
         return None
-    return _unwrap_shell(command)
-
-
-def _unwrap_shell(command: str) -> tuple[str, str]:
-    """
-    ``/bin/zsh -lc 'pwd'`` → ``("%%script zsh", "pwd")``: a login-shell wrapper's
-    script and the cell magic that runs it in the same shell.
-
-    Only a single-quoted script with nothing after it is unwrapped, since its
-    text reaches the shell unchanged; anything else is kept whole.
-    """
     wrapped = _SHELL_WRAPPER.match(command)
     if wrapped is None:
-        return "%%bash", command
-    return _SHELL_MAGICS[wrapped.group("shell")], wrapped.group("script")
+        return "%%bash", command, True
+    if not wrapped.group("script").strip():
+        return None
+    unwrapped = _shell_cell(
+        wrapped.group("shell"), wrapped.group("flags"), wrapped.group("script")
+    )
+    return unwrapped or ("%%bash", command, True)
+
+
+def _shell_cell(shell: str, flags: str, script: str) -> tuple[str, str, bool] | None:
+    """
+    *script* run as ``<shell> <flags>`` would run it: ``-c`` in the same shell,
+    ``-lc`` in a login shell, which reads a profile first, so its script stays
+    shell. An interactive ``-ic`` shell, or any other flag, isn't unwrapped.
+    """
+    if flags == "-c":
+        return _SHELL_MAGICS[shell], script, True
+    if flags == "-lc":
+        return _LOGIN_SHELL_MAGICS[shell], script, False
+    return None
 
 
 def _python_source(command: str) -> str | None:
@@ -136,13 +155,14 @@ def _sql_query(name: str, arguments: Mapping[str, Any]) -> str | None:
     return None
 
 
-# Where ``$`` is literal: fenced and inline code, link destinations, autolinks
-# and bare URLs (ASCII only, so a URL ends where unspaced text resumes).
-_MARKDOWN_CODE = re.compile(
-    r"```.*?```|~~~.*?~~~|`[^`\n]*`"
-    r"|\]\([^()\s\]]*\)|<https?://[^<>\s]*>|https?://[A-Za-z0-9\-._~:/?#@!$&'*+,;=%]+",
-    re.DOTALL,
+# Besides code, ``$`` is literal in link destinations, autolinks and bare URLs
+# (ASCII only, so a URL ends where unspaced text resumes).
+_LINK_LIKE = re.compile(
+    r"\]\([^()\s\]]*\)|<https?://[^<>\s]*>|https?://[A-Za-z0-9\-._~:/?#@!$&'*+,;=%]+"
 )
+_FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
+_BLANK_LINE = re.compile(r"\n[ \t]*\r?\n")
+_BACKTICKS = re.compile(r"`+")
 _LIST_ITEM = re.compile(r" {0,3}(?:[-*+]|\d+[.)])(?:\s|\Z)")
 _HEADING = re.compile(r" {0,3}#{1,6}(?:\s|\Z)")
 _THEMATIC_BREAK = re.compile(r" {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*\Z")
@@ -198,12 +218,83 @@ def _indented_code_spans(text: str, fences: list[tuple[int, int]]) -> Iterator[t
         offset = end + 1
 
 
+def _fenced_code_spans(text: str) -> list[tuple[int, int]]:
+    """
+    Spans of *text*'s fenced code blocks, in order: a fence closes only on a line
+    of the same character at least as long, and an unclosed one runs to the end.
+    """
+    spans: list[tuple[int, int]] = []
+    opened: tuple[str, int, int] | None = None
+    offset = 0
+    for raw in text.split("\n"):
+        end = offset + len(raw)
+        line = raw.removesuffix("\r")
+        fence = _FENCE.match(line)
+        if opened is None:
+            # A backtick fence's info string can't hold a backtick.
+            if fence and not (fence.group(1)[0] == "`" and "`" in line[fence.end() :]):
+                opened = (fence.group(1)[0], len(fence.group(1)), offset)
+        elif (
+            fence
+            and not line[fence.end() :].strip()
+            and fence.group(1)[0] == opened[0]
+            and len(fence.group(1)) >= opened[1]
+        ):
+            spans.append((opened[2], end))
+            opened = None
+        offset = end + 1
+    if opened is not None:
+        spans.append((opened[2], len(text)))
+    return spans
+
+
+def _inline_code_spans(text: str, fences: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """
+    Spans of *text*'s inline code outside *fences*: a run of n backticks closes
+    at the next run of exactly n in the same block (a blank line or a fence ends
+    a block), across lines within it; a run with no match is text.
+    """
+    fence_starts = [start for start, _ in fences]
+
+    def in_fence(position: int) -> bool:
+        index = bisect.bisect_right(fence_starts, position) - 1
+        return index >= 0 and position < fences[index][1]
+
+    boundaries = sorted(
+        [match.start() for match in _BLANK_LINE.finditer(text)]
+        + [edge for fence in fences for edge in fence]
+    )
+    runs = [match.span() for match in _BACKTICKS.finditer(text) if not in_fence(match.start())]
+    by_length: dict[tuple[int, int], list[int]] = {}
+    for index, (start, end) in enumerate(runs):
+        block = bisect.bisect_right(boundaries, start)
+        by_length.setdefault((block, end - start), []).append(index)
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index < len(runs):
+        start, end = runs[index]
+        same = by_length[(bisect.bisect_right(boundaries, start), end - start)]
+        following = bisect.bisect_right(same, index)
+        if following < len(same):
+            closing = same[following]
+            spans.append((start, runs[closing][1]))
+            index = closing + 1
+        else:
+            index += 1
+    return spans
+
+
 def _markdown_text(text: str) -> str:
     """*text* for a Markdown cell, ``$`` outside code kept from rendering as LaTeX."""
     literal = bytearray(len(text))
-    spans = [match.span() for match in _MARKDOWN_CODE.finditer(text)]
-    fences = [(start, end) for start, end in spans if text.startswith(("```", "~~~"), start)]
-    for start, end in [*spans, *_indented_code_spans(text, fences)]:
+    fences = _fenced_code_spans(text)
+    links = [match.span() for match in _LINK_LIKE.finditer(text)]
+    for start, end in [
+        *fences,
+        *_inline_code_spans(text, fences),
+        *links,
+        *_indented_code_spans(text, fences),
+    ]:
         literal[start:end] = b"\x01" * (end - start)
     return _DOLLAR.sub(
         lambda match: match.group() if literal[match.start()] else _LITERAL_DOLLAR, text
@@ -235,6 +326,13 @@ def _message_text(content: Iterable[Mapping[str, Any]]) -> str:
             label = part.get("filename") or part.get("file_id") or "a file"
             parts.append(f"*(Attached file: {label})*")
     return "\n\n".join(part for part in parts if part.strip())
+
+
+def _fenced(text: str) -> str:
+    """*text* as a fenced code block, its fence longer than any backtick run inside."""
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}\n{text.rstrip(chr(10))}\n{fence}"
 
 
 def _cut(text: str) -> str:
@@ -328,7 +426,8 @@ class _NotebookBuilder:
         self._code_cells_by_call: dict[str, dict[str, Any]] = {}
         # Each call's tool, by call id, so its output is read in that tool's shape.
         self._calls_seen: dict[str, str] = {}
-        self._pending_terminal: deque[dict[str, Any]] = deque()
+        # Typed terminal commands waiting for their output, with their turn's id.
+        self._pending_terminal: list[tuple[str | None, dict[str, Any]]] = []
         self._shell_tools = _shell_tool_names()
         self.tools_used: dict[str, int] = {}
         self.magics_used: set[str] = set()
@@ -366,7 +465,7 @@ class _NotebookBuilder:
             self._calls_seen[str(call_id)] = name
         shell = _shell_command(arguments) if name in self._shell_tools else None
         if shell is not None:
-            magic, command = shell
+            magic, command, promotable = shell
             directory = next(
                 (
                     value
@@ -375,7 +474,7 @@ class _NotebookBuilder:
                 ),
                 None,
             )
-            python = _python_source(command) if directory is None else None
+            python = _python_source(command) if directory is None and promotable else None
             if python is not None:
                 self.code(python, call_id)
             elif directory is not None:
@@ -406,14 +505,26 @@ class _NotebookBuilder:
             cell["outputs"].extend(_tool_outputs(str(item.get("output", "")), tool))
 
     def terminal_command(self, item: Mapping[str, Any]) -> None:
+        response_id = item.get("response_id") or None
         if item.get("kind") == "input":
             if item.get("input"):
-                self._pending_terminal.append(self.code(f"%%bash\n{item['input']}"))
+                cell = self.code(f"%%bash\n{item['input']}")
+                self._pending_terminal.append((response_id, cell))
             return
-        if not self._pending_terminal:
+        # An output belongs to the input of its own turn; an interrupted command
+        # left without output never takes a later command's.
+        match = next(
+            (
+                index
+                for index, (pending_id, _) in enumerate(self._pending_terminal)
+                if response_id is None or pending_id is None or pending_id == response_id
+            ),
+            None,
+        )
+        if match is None:
             self.markdown("*(Terminal output of a command that isn't in this export.)*")
             return
-        cell = self._pending_terminal.popleft()
+        _, cell = self._pending_terminal.pop(match)
         if not self.include_outputs:
             return
         if item.get("stdout"):
@@ -495,7 +606,9 @@ def session_notebook(
             builder.markdown(f"*Error: {_markdown_text(str(item.get('message', '')))}*")
         elif item_type == "slash_command":
             arguments = f" {item['arguments']}" if item.get("arguments") else ""
-            builder.markdown(f"*Command: `/{item.get('name', '')}{arguments}`*")
+            note = f"*Command: `/{item.get('name', '')}{arguments}`*"
+            output = str(item.get("output") or "").strip()
+            builder.markdown(f"{note}\n\n{_fenced(_cut(output))}" if output else note)
         elif item_type == "compaction":
             summary = str(item.get("summary") or "").strip()
             note = "*(Earlier conversation was compacted here.)*"
@@ -513,14 +626,17 @@ def session_notebook(
         needs = [
             note
             for magic, note in (
-                ("%%script zsh", "zsh for the `%%script zsh` cells"),
+                ("zsh", "zsh for the `%%script zsh` cells"),
                 (
                     "%%sql",
                     "the JupySQL extension (`%load_ext sql`) connected to the same database "
                     "for the `%%sql` cells",
                 ),
             )
-            if magic in builder.magics_used
+            if any(
+                used.startswith(f"%%script {magic}") or used == magic
+                for used in builder.magics_used
+            )
         ]
         also = f" Some cells also need {' and '.join(needs)}." if needs else ""
         builder.markdown(

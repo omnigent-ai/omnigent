@@ -112,12 +112,17 @@ def test_messages_become_markdown_and_shell_runs_become_bash_cells_with_output()
             {"command": "python3 - <<'EOF'\nimport pandas as pd\nprint(pd.__version__)\nEOF"},
             "import pandas as pd\nprint(pd.__version__)",
         ),
-        # Codex wraps each command in a login shell.
-        ("shell", {"command": "/bin/zsh -lc 'python3 -c \"print(42)\"'"}, "print(42)"),
+        # Codex wraps each command in a login shell, which reads a profile first:
+        # its script runs in a login shell too, and stays shell even when it's Python.
+        (
+            "shell",
+            {"command": "/bin/zsh -lc 'python3 -c \"print(42)\"'"},
+            '%%script zsh -l\npython3 -c "print(42)"',
+        ),
         ("run_shell_command", {"command": "ls -la"}, "%%bash\nls -la"),
-        ("Bash", {"command": "/bin/bash -lc 'pwd'"}, "%%bash\npwd"),
+        ("Bash", {"command": "/bin/bash -lc 'pwd'"}, "%%script bash -l\npwd"),
         # Codex can send the command as an argv list.
-        ("shell", {"command": ["bash", "-lc", "git status"]}, "%%bash\ngit status"),
+        ("shell", {"command": ["bash", "-lc", "git status"]}, "%%script bash -l\ngit status"),
         # A redirect after the heredoc, or an unquoted delimiter the shell
         # expands, changes what runs, so the cell keeps the whole command.
         (
@@ -161,15 +166,33 @@ def test_messages_become_markdown_and_shell_runs_become_bash_cells_with_output()
         (
             "shell",
             {"command": "/bin/zsh -lc 'print -r -- hello'"},
-            "%%script zsh\nprint -r -- hello",
+            "%%script zsh -l\nprint -r -- hello",
         ),
         ("Bash", {"command": 'bash -lc "echo $HOME"'}, '%%bash\nbash -lc "echo $HOME"'),
         # An argv list hands the shell its script verbatim, quotes and all.
-        ("shell", {"command": ["bash", "-lc", "sed -n '1,5p' f"]}, "%%bash\nsed -n '1,5p' f"),
+        (
+            "shell",
+            {"command": ["bash", "-lc", "sed -n '1,5p' f"]},
+            "%%script bash -l\nsed -n '1,5p' f",
+        ),
         (
             "shell",
             {"command": ["/bin/zsh", "-lc", "python3 - <<'PY'\nprint(1)\nPY"]},
-            "print(1)",
+            "%%script zsh -l\npython3 - <<'PY'\nprint(1)\nPY",
+        ),
+        # A plain ``-c`` wrapper runs its script in the same shell, as Python when it is.
+        ("shell", {"command": ["/bin/zsh", "-c", "print -r hi"]}, "%%script zsh\nprint -r hi"),
+        ("shell", {"command": ["bash", "-c", "python3 -c 'print(1)'"]}, "print(1)"),
+        # An interactive shell isn't unwrapped: its startup differs from a script's.
+        ("Bash", {"command": "bash -ic 'll'"}, "%%bash\nbash -ic 'll'"),
+        ("shell", {"command": ["bash", "-ic", "ll"]}, "%%bash\nbash -ic ll"),
+        # A newline between tokens ends the command; it isn't an argument separator.
+        ("Bash", {"command": "python3\n-c 'print(42)'"}, "%%bash\npython3\n-c 'print(42)'"),
+        ("Bash", {"command": "bash\n-c 'pwd'"}, "%%bash\nbash\n-c 'pwd'"),
+        (
+            "Bash",
+            {"command": "python3\n- <<'EOF'\nprint(1)\nEOF"},
+            "%%bash\npython3\n- <<'EOF'\nprint(1)\nEOF",
         ),
         # The shell ends a heredoc only at a line that is exactly the delimiter.
         (
@@ -203,6 +226,13 @@ def test_messages_become_markdown_and_shell_runs_become_bash_cells_with_output()
         "wrapper-with-expansion",
         "codex-argv-quoted-script",
         "codex-argv-python",
+        "plain-c-zsh",
+        "plain-c-python",
+        "interactive-wrapper",
+        "interactive-argv",
+        "newline-python-c",
+        "newline-wrapper",
+        "newline-heredoc",
         "heredoc-delimiter-trailing-space",
         "heredoc-delimiter-trailing-tab",
         "exec-command-cmd",
@@ -361,6 +391,15 @@ def test_nothing_is_dropped_silently() -> None:
                 "name": "review",
                 "arguments": "PR 12",
             },
+            # A command's printed output, a code fence in it included, stays with it.
+            {
+                "type": "slash_command",
+                "model": "x",
+                "kind": "command",
+                "name": "compact",
+                "arguments": "",
+                "output": "Not enough messages to compact.\n```\nnone\n```",
+            },
             {"type": "compaction", "model": "x"},
             {"type": "compaction", "model": "x", "summary": "Loaded sales.csv."},
             {"type": "terminal_command", "kind": "output", "stdout": "stray\n", "stderr": ""},
@@ -393,6 +432,10 @@ def test_nothing_is_dropped_silently() -> None:
         ("markdown", "*(Output of a tool call that isn't in this export.)*"),
         ("markdown", "*Error: The query timed out.*"),
         ("markdown", "*Command: `/review PR 12`*"),
+        (
+            "markdown",
+            "*Command: `/compact`*\n\n````\nNot enough messages to compact.\n```\nnone\n```\n````",
+        ),
         ("markdown", "*(Earlier conversation was compacted here.)*"),
         ("markdown", "*(Earlier conversation was compacted here.)*\n\nLoaded sales.csv."),
         ("markdown", "*(Terminal output of a command that isn't in this export.)*"),
@@ -418,6 +461,24 @@ def test_terminal_commands_typed_by_the_user_get_their_own_outputs_in_order() ->
     assert [(cell["source"], cell["outputs"]) for cell in notebook["cells"][1:]] == [
         ("%%bash\npwd", [{"output_type": "stream", "name": "stdout", "text": "/home\n"}]),
         ("%%bash\nls", [{"output_type": "stream", "name": "stderr", "text": "denied\n"}]),
+    ]
+
+
+def test_a_terminal_output_goes_to_its_own_turns_command_not_an_interrupted_one() -> None:
+    def terminal(kind: str, response_id: str, **fields: str) -> dict[str, Any]:
+        return {"type": "terminal_command", "kind": kind, "response_id": response_id, **fields}
+
+    notebook = _notebook(
+        [
+            # Interrupted: the first command's turn never recorded an output.
+            terminal("input", "r1", input="sleep 100"),
+            terminal("input", "r2", input="pwd"),
+            terminal("output", "r2", stdout="/home\n", stderr=""),
+        ]
+    )
+    assert [(cell["source"], cell["outputs"]) for cell in notebook["cells"][1:]] == [
+        ("%%bash\nsleep 100", []),
+        ("%%bash\npwd", [{"output_type": "stream", "name": "stdout", "text": "/home\n"}]),
     ]
 
 
@@ -460,6 +521,23 @@ def test_dollar_signs_in_text_stay_text_but_code_and_links_keep_them() -> None:
         "[chart](https://example.com/q?p=$5), <https://example.com/a$b> and "
         f"https://example.com/c$d; 见https://example.org价格{dollar}5\n\n    echo $HOME"
     )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # An unclosed fence is code to the end of the message.
+        "Run this:\n```\necho $HOME",
+        # A fence closes only on a run at least as long as its own.
+        "````\n```\necho $HOME\n```\nls $PWD\n````",
+        # A code span of n backticks closes at the next run of exactly n, across lines.
+        "Use ``a `b` $c\n$d`` here",
+    ],
+    ids=["unclosed-fence", "longer-fence", "multiline-span"],
+)
+def test_dollar_signs_stay_as_typed_in_code_markdown_still_reads_as_code(text: str) -> None:
+    [(_, source)] = _cells(_notebook([_message("assistant", text)]))
+    assert source == f"**Assistant**\n\n{text}"
 
 
 @pytest.mark.parametrize(
@@ -514,12 +592,16 @@ def test_indented_text_is_code_only_where_markdown_makes_it_code(text: str, kept
 
 
 @pytest.mark.parametrize(
-    ("script", "needs_zsh"),
-    [("print -r hi", True), ("python3 - <<'PY'\nprint(1)\nPY", False)],
-    ids=["zsh-cell", "promoted-to-python"],
+    ("argv", "needs_zsh"),
+    [
+        (["/bin/zsh", "-lc", "print -r hi"], True),
+        (["/bin/zsh", "-c", "print -r hi"], True),
+        (["/bin/zsh", "-c", "python3 - <<'PY'\nprint(1)\nPY"], False),
+    ],
+    ids=["login-zsh-cell", "zsh-cell", "promoted-to-python"],
 )
-def test_the_closing_cell_says_zsh_cells_need_zsh(script: str, needs_zsh: bool) -> None:
-    notebook = _notebook([_call("c1", "shell", {"command": ["/bin/zsh", "-lc", script]})])
+def test_the_closing_cell_says_zsh_cells_need_zsh(argv: list[str], needs_zsh: bool) -> None:
+    notebook = _notebook([_call("c1", "shell", {"command": argv})])
     closing = notebook["cells"][-1]["source"]
     assert ("zsh for the `%%script zsh` cells" in closing) is needs_zsh
 
@@ -558,3 +640,43 @@ def test_the_closing_cell_lists_every_extra_a_rerun_needs_in_one_sentence() -> N
         "Some cells also need zsh for the `%%script zsh` cells and the JupySQL extension "
         "(`%load_ext sql`) connected to the same database for the `%%sql` cells."
     ) in notebook["cells"][-1]["source"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "press ` to open the console\n\nthen $a$ costs\n\nand ` closes nothing",
+        "start `a\n```\ncode\n```\n$x$ and ` stray",
+    ],
+    ids=["across-paragraphs", "across-a-fence"],
+)
+def test_a_stray_backtick_doesnt_turn_later_paragraphs_into_code(text: str) -> None:
+    [(_, source)] = _cells(_notebook([_message("assistant", text)]))
+    assert "<span>&#36;</span>" in source
+
+
+def test_an_empty_wrapped_script_makes_no_cell() -> None:
+    notebook = _notebook(
+        [
+            _call("c1", "shell", {"command": ["bash", "-lc", ""]}),
+            _call("c2", "Bash", {"command": "bash -lc ''"}),
+        ]
+    )
+    assert [cell["cell_type"] for cell in notebook["cells"][1:-1]] == ["markdown", "markdown"]
+
+
+def test_a_terminal_output_with_an_id_reaches_an_input_without_one() -> None:
+    notebook = _notebook(
+        [
+            {"type": "terminal_command", "kind": "input", "input": "pwd"},
+            {
+                "type": "terminal_command",
+                "kind": "output",
+                "response_id": "r1",
+                "stdout": "/home\n",
+                "stderr": "",
+            },
+        ]
+    )
+    [cell] = notebook["cells"][1:]
+    assert cell["outputs"] == [{"output_type": "stream", "name": "stdout", "text": "/home\n"}]
