@@ -75,8 +75,8 @@ import { type SubagentPanelOpener, SubagentPanelOpenerContext } from "./subagent
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { useChatStore } from "@/store/chatStore";
 import { useCanStartSideChat } from "@/hooks/usePermissions";
-import { SIDE_CHAT_COMMAND_PREFIX, supportsSideChat, usesNativeSideChatFork } from "@/lib/sideChat";
-import { createSideChat, stopSession } from "@/lib/sessionsApi";
+import { supportsSideChat } from "@/lib/sideChat";
+import { startSideChat, stopSideChat } from "./sideChatLifecycle";
 import { subagentSessionIdFromTab } from "@/lib/subagentTabs";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
@@ -1187,62 +1187,17 @@ function WorkspacePanelImpl({
     : undefined;
   // First message sent in a pending side-chat tab: create the fork now. The
   // pending tab stays put and is rekeyed to the real child once it arrives (via
-  // the sideChatToOpen effect above), so there's no disappear/reappear. Codex
-  // forks in-process (its runner intercepts the `/side` message on the parent,
-  // kept prompt-cache-warm); every other harness forks server-side and reuses
-  // the parent's live runner. Rejects so the composer re-enables and keeps
-  // the typed text for a retry.
-  const startPendingSideChat = (pendingId: string, text: string): Promise<void> => {
-    if (usesNativeSideChatFork(sideChatHarness)) {
-      if (parentAgentId === null) return Promise.reject(new Error("no agent"));
-      // The child arrives asynchronously via session_created with no id to pair
-      // on, so queue this tab to be rekeyed FIFO. The question goes to the
-      // PARENT as `/side`; the native fork seeds the child's first turn. `send`
-      // resolves after its internal catch, so a failure (e.g. the host is too
-      // old to fork — the server refuses) has set `sendFailed` by the time the
-      // await returns; reject then so the pending pane resets and drop the
-      // queued tab so it never waits for a child that isn't coming.
-      awaitingPendingIdsRef.current.push(pendingId);
-      let sendFailed = false;
-      return useChatStore
-        .getState()
-        .send(SIDE_CHAT_COMMAND_PREFIX + text, parentAgentId, undefined, {
-          pinnedConversationId: conversationId,
-          onError: (message) => {
-            sendFailed = true;
-            awaitingPendingIdsRef.current = awaitingPendingIdsRef.current.filter(
-              (id) => id !== pendingId,
-            );
-            toast.error(message);
-          },
-        })
-        .then(() => {
-          if (sendFailed) throw new Error("side chat send failed");
-        });
-    }
-    return createSideChat(
+  // the sideChatToOpen effect above), so there's no disappear/reappear.
+  const startPendingSideChat = (pendingId: string, text: string): Promise<void> =>
+    startSideChat({
       conversationId,
-      useChatStore.getState().sideChatComposers[pendingId]?.settings,
-    ).then(
-      ({ childSessionId }) => {
-        // We have the child id here, so rekey THIS pending tab directly — no
-        // shared queue, so overlapping launches can't cross-assign. Seeding the
-        // draft fires sideChatToOpen, which then just re-selects + reveals.
-        sideChats.rekey(pendingId, childSessionId);
-        // The pending id is gone; drop its composer entry (and its File refs)
-        // now that the text has moved to the real child. Only on success — a
-        // failed create keeps it so the user can retry.
-        useChatStore.getState().clearSideChatComposer(pendingId);
-        useChatStore.getState().openSideChatWithDraft(childSessionId, text, conversationId);
-      },
-      (err) => {
-        // The rail path had no failure feedback (unlike the composer entry
-        // points); surface it. The pending tab + typed text stay for a retry.
-        toast.error("Couldn't start a side chat for this session.");
-        throw err;
-      },
-    );
-  };
+      harness: sideChatHarness,
+      parentAgentId,
+      draftKey: pendingId,
+      text,
+      awaitingDrafts: awaitingPendingIdsRef,
+      onCreated: (childId) => sideChats.rekey(pendingId, childId),
+    });
   // The selected side chat's pane, shown in the rail or the mobile drawer. A
   // `pending:` tab has no child yet; its first send creates the fork.
   const mobileViewport = useIsMobileViewport();
@@ -1334,30 +1289,7 @@ function WorkspacePanelImpl({
     );
   };
   const selectedSideChatPane = renderSelectedSideChatPane();
-  const closeSideChat = async (childId: string) => {
-    // Closing a sub-agent tab only hides it; the sub-agent keeps running.
-    if (subagentSessionIdFromTab(childId) !== null) {
-      sideChats.close(childId);
-      return;
-    }
-    // Take the queue first so the stop's idle status can't send it to the closing chat.
-    const queued = useChatStore.getState().clearQueuedMessages(childId);
-    if (!childId.startsWith("pending:")) {
-      try {
-        await stopSession(childId);
-      } catch {
-        useChatStore.getState().restoreQueuedMessages(queued);
-        toast.error("Couldn't close side chat. Try again.");
-        return;
-      }
-    }
-    // The tab is gone, so its unsent text/attachments, follow-ups queued during the
-    // stop, and any seeded question that never got to send have nowhere to return to.
-    useChatStore.getState().clearQueuedMessages(childId);
-    useChatStore.getState().clearSideChatComposer(childId);
-    useChatStore.getState().clearSideChatDraft(childId);
-    sideChats.close(childId);
-  };
+  const closeSideChat = (childId: string) => stopSideChat(childId, () => sideChats.close(childId));
 
   // Closing the file on screen asks its viewer first, which confirms before
   // dropping edits it hasn't saved. Other file tabs have no mounted editor.

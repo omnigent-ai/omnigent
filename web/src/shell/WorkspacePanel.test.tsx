@@ -1616,6 +1616,49 @@ describe("WorkspacePanel restored side chats", () => {
   });
 });
 
+describe("WorkspacePanel side chat start", () => {
+  it("points a pending tab at the server-forked child and seeds its question", async () => {
+    const previousHarness = useChatStore.getState().sessionHarness;
+    useChatStore.setState({
+      sessionHarness: "openai-agents",
+      sideChatComposers: { "pending:one": { text: "question", files: [] } },
+      sideChatDrafts: {},
+    });
+    const create = vi
+      .spyOn(sessionsApi, "createSideChat")
+      .mockResolvedValueOnce({ childSessionId: "conv_fork" } as Awaited<
+        ReturnType<typeof sessionsApi.createSideChat>
+      >);
+    try {
+      writeSessionWorkspaceState("conv_ws", {
+        openSideChats: ["pending:one"],
+        selectedSideChatId: "pending:one",
+      });
+      renderWorkspace({ rightRailTab: "sidechat" });
+
+      fireEvent.click(screen.getByRole("button", { name: "Start side chat" }));
+
+      await waitFor(() =>
+        expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_fork"),
+      );
+      expect(create).toHaveBeenCalledWith("conv_ws", undefined);
+      expect(useChatStore.getState().sideChatComposers["pending:one"]).toBeUndefined();
+      expect(useChatStore.getState().sideChatDrafts.conv_fork).toBe("question");
+      expect(readSessionWorkspaceState("conv_ws")).toMatchObject({
+        openSideChats: ["conv_fork"],
+        selectedSideChatId: "conv_fork",
+      });
+    } finally {
+      create.mockRestore();
+      useChatStore.setState({
+        sessionHarness: previousHarness,
+        sideChatComposers: {},
+        sideChatDrafts: {},
+      });
+    }
+  });
+});
+
 describe("WorkspacePanel mobile side chats", () => {
   const openTabs = () =>
     writeSessionWorkspaceState("conv_ws", {
