@@ -248,17 +248,24 @@ async def test_request_maps_generic_exception_to_safe_detail(
 
 
 @pytest.mark.parametrize(
-    ("method", "stage", "error", "status_code"),
+    ("method", "stage", "error", "require_live", "status_code"),
     [
-        ("thread/goal/get", "connect", ConnectionRefusedError(), 502),
-        ("thread/goal/get", "connect", FileNotFoundError(), 502),
-        ("thread/goal/get", "connect", RuntimeError("handshake failed"), 503),
-        ("thread/goal/get", "request", ConnectionRefusedError(), 503),
-        ("thread/goal/set", "connect", ConnectionRefusedError(), 503),
+        ("thread/goal/get", "connect", ConnectionRefusedError(), False, 200),
+        ("thread/goal/get", "connect", FileNotFoundError(), False, 200),
+        ("thread/goal/get", "connect", ConnectionRefusedError(), True, 502),
+        ("thread/goal/get", "connect", FileNotFoundError(), True, 502),
+        ("thread/goal/get", "connect", RuntimeError("handshake failed"), False, 503),
+        ("thread/goal/get", "request", ConnectionRefusedError(), False, 503),
+        ("thread/goal/set", "connect", ConnectionRefusedError(), False, 503),
     ],
 )
 async def test_inactive_bridge_only_changes_read_connection_refusal(
-    monkeypatch: pytest.MonkeyPatch, method: str, stage: str, error: Exception, status_code: int
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    stage: str,
+    error: Exception,
+    require_live: bool,
+    status_code: int,
 ) -> None:
     fake_client = _FakeCodexClient(
         connect_exc=error if stage == "connect" else None,
@@ -271,11 +278,16 @@ async def test_inactive_bridge_only_changes_read_connection_refusal(
     )
     runner = _make_runner(bridge_is_inactive=lambda _conv_id, _state: True)
 
-    result = await runner._request("conv_1", action="read", method=method, params={})
+    result = await runner._request(
+        "conv_1", action="read", method=method, params={}, require_live=require_live
+    )
 
-    assert isinstance(result, JSONResponse)
-    assert result.status_code == status_code
-    assert _json_response(result)["error"] == "codex_native_goal_failed"
+    if status_code == 200:
+        assert result == {"goal": None}
+    else:
+        assert isinstance(result, JSONResponse)
+        assert result.status_code == status_code
+        assert _json_response(result)["error"] == "codex_native_goal_failed"
     assert len(fake_client.request_calls) == (1 if stage == "request" else 0)
     assert fake_client.closed
 
@@ -436,8 +448,8 @@ async def test_handle_event_rejects_non_codex_session() -> None:
     }
 
 
-@pytest.mark.asyncio
-async def test_handle_event_goal_get_and_clear_delegate() -> None:
+@pytest.mark.parametrize("require_live", [False, True])
+async def test_handle_event_goal_get_and_clear_delegate(require_live: bool) -> None:
     runner = _make_runner()
     runner.get = AsyncMock(return_value=JSONResponse({"goal": None}))  # type: ignore[method-assign]
     runner.clear = AsyncMock(return_value=JSONResponse({"cleared": True}))  # type: ignore[method-assign]
@@ -445,7 +457,7 @@ async def test_handle_event_goal_get_and_clear_delegate() -> None:
     get_response = await runner.handle_event(
         "conv_1",
         "goal_get",
-        {},
+        {"require_live": True} if require_live else {},
         session_harness_name=lambda _conv_id: CODEX_NATIVE_CODING_AGENT.harness,
     )
     clear_response = await runner.handle_event(
@@ -459,7 +471,7 @@ async def test_handle_event_goal_get_and_clear_delegate() -> None:
     assert isinstance(clear_response, JSONResponse)
     assert _json_response(get_response) == {"goal": None}
     assert _json_response(clear_response) == {"cleared": True}
-    runner.get.assert_awaited_once_with("conv_1")
+    runner.get.assert_awaited_once_with("conv_1", require_live=require_live)
     runner.clear.assert_awaited_once_with("conv_1")
 
 

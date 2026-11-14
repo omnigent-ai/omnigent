@@ -294,20 +294,6 @@ async def test_omnigent_codex_goal_set_api_forwards_mode_configuration() -> None
 
 
 @pytest.mark.asyncio
-async def test_omnigent_codex_goal_get_without_live_runner_returns_503() -> None:
-    app = _codex_goal_api_app(None)
-    transport = httpx.ASGITransport(app=app)
-
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/v1/sessions/conv_codex_no_runner/codex_goal")
-
-    assert response.status_code == 503
-    assert response.json()["error"]["code"] == "codex_native_goal_failed"
-    assert "no live Codex runner" in response.json()["error"]["message"]
-    assert "X-Omnigent-Codex-Goal-Read" not in response.headers
-
-
-@pytest.mark.asyncio
 async def test_omnigent_codex_goal_put_without_live_runner_returns_503() -> None:
     app = _codex_goal_api_app(None)
     transport = httpx.ASGITransport(app=app)

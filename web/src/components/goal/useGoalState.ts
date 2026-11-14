@@ -60,7 +60,9 @@ export function useGoalState(conversationId: string | null, enabled: boolean): U
       if (isCurrent()) {
         lastSuccessfulVersion.current = version;
         setSnapshot((current) =>
-          isCurrent() ? { binding, goal: response.goal, revision: version } : current,
+          activeBinding.current === binding
+            ? { binding, goal: response.goal, revision: version }
+            : current,
         );
       }
     } catch (error) {

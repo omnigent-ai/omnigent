@@ -1426,6 +1426,15 @@ async def test_failed_goal_command_does_not_deliver_input_or_interrupt_native_wo
                 "unanswered": "timed out",
             }[goal_failure]
             assert expected_error in events[0].message
+            if goal_failure == "refused":
+                assert "may have succeeded" not in events[0].message
+                assert events[0].remediation is None
+            else:
+                assert "goal setup may have succeeded" in events[0].message
+                assert "objective input was not delivered" in events[0].message
+                assert events[0].remediation == (
+                    "Open Goal to inspect the current goal before resending this message."
+                )
 
     assert _GoalFailingClient.requests == [
         ("thread/goal/set", {"threadId": "thread_123", "objective": "Finish the tests"})

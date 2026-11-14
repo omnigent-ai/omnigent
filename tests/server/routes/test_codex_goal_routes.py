@@ -493,26 +493,38 @@ class _StagedForward:
         monkeypatch.setattr(codex, "_forward_codex_goal_event", _forward)
 
 
-async def test_get_goal_without_a_runner_is_unavailable(
-    client: httpx.AsyncClient, codex_session: str, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("read_mode", [None, "unknown", "strict"])
+async def test_get_goal_without_a_runner_preserves_legacy_or_strict_semantics(
+    client: httpx.AsyncClient,
+    codex_session: str,
+    monkeypatch: pytest.MonkeyPatch,
+    read_mode: str | None,
 ) -> None:
     staged = _StagedForward(monkeypatch, None)
-    resp = await client.get(f"/v1/sessions/{codex_session}/codex_goal")
-    assert resp.status_code == 503, resp.text
-    assert "Could not read Codex goal" in resp.json()["error"]["message"]
-    assert "X-Omnigent-Codex-Goal-Read" not in resp.headers
-    assert staged.events == [{"type": "goal_get"}]
+    headers = {"X-Omnigent-Codex-Goal-Read": read_mode} if read_mode else {}
+    resp = await client.get(f"/v1/sessions/{codex_session}/codex_goal", headers=headers)
+    if read_mode == "strict":
+        assert resp.status_code == 503, resp.text
+        assert "Could not read Codex goal" in resp.json()["error"]["message"]
+        assert staged.events == [{"type": "goal_get", "require_live": True}]
+    else:
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"goal": None}
+        assert staged.events == [{"type": "goal_get"}]
 
 
+@pytest.mark.parametrize("strict", [False, True])
 @pytest.mark.parametrize("failure", [httpx.ConnectError, httpx.ReadTimeout])
 async def test_get_goal_transport_failure_is_unavailable(
     failure: type[httpx.HTTPError],
     client: httpx.AsyncClient,
     codex_session: str,
     monkeypatch: pytest.MonkeyPatch,
+    strict: bool,
 ) -> None:
     def _handler(request: httpx.Request) -> httpx.Response:
-        assert json.loads(request.content) == {"type": "goal_get"}
+        expected = {"type": "goal_get", **({"require_live": True} if strict else {})}
+        assert json.loads(request.content) == expected
         raise failure("runner unavailable")
 
     async with httpx.AsyncClient(
@@ -523,21 +535,26 @@ async def test_get_goal_transport_failure_is_unavailable(
             return runner_client
 
         monkeypatch.setattr(session_routes, "_get_runner_client", _get_client)
-        resp = await client.get(f"/v1/sessions/{codex_session}/codex_goal")
+        resp = await client.get(
+            f"/v1/sessions/{codex_session}/codex_goal",
+            headers={"X-Omnigent-Codex-Goal-Read": "strict"} if strict else {},
+        )
 
-    assert resp.status_code == 503, resp.text
-    assert "Could not read Codex goal" in resp.json()["error"]["message"]
-    assert "X-Omnigent-Codex-Goal-Read" not in resp.headers
+    if strict:
+        assert resp.status_code == 503, resp.text
+        assert "Could not read Codex goal" in resp.json()["error"]["message"]
+    else:
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"goal": None}
 
 
-async def test_get_goal_returns_a_confirmed_absent_goal(
+async def test_get_goal_returns_an_absent_goal(
     client: httpx.AsyncClient, codex_session: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _StagedForward(monkeypatch, _result(200, {"goal": None}))
     resp = await client.get(f"/v1/sessions/{codex_session}/codex_goal")
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"goal": None}
-    assert resp.headers["X-Omnigent-Codex-Goal-Read"] == "confirmed"
 
 
 async def test_get_goal_returns_the_runner_goal(
@@ -548,7 +565,6 @@ async def test_get_goal_returns_the_runner_goal(
     assert resp.status_code == 200, resp.text
     assert resp.json()["goal"]["objective"] == "keep tests green"
     assert resp.json()["goal"]["token_budget"] == 5000
-    assert resp.headers["X-Omnigent-Codex-Goal-Read"] == "confirmed"
 
 
 @pytest.mark.parametrize("payload", [{"goal": {"objective": "no thread id"}}, {}])
@@ -562,7 +578,6 @@ async def test_get_goal_rejects_a_goal_the_model_cannot_validate(
     resp = await client.get(f"/v1/sessions/{codex_session}/codex_goal")
     assert resp.status_code == 502
     assert "malformed response" in resp.json()["error"]["message"]
-    assert "X-Omnigent-Codex-Goal-Read" not in resp.headers
 
 
 @pytest.mark.parametrize("status", [400, 409], ids=["unsupported-event", "busy"])
@@ -581,7 +596,6 @@ async def test_get_goal_passes_structured_runner_errors_through(
     resp = await client.get(f"/v1/sessions/{codex_session}/codex_goal")
     assert resp.status_code == status
     assert resp.json() == error
-    assert "X-Omnigent-Codex-Goal-Read" not in resp.headers
 
 
 async def test_set_goal_forwards_only_the_fields_the_caller_sent(

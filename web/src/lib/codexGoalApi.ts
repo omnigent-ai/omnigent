@@ -149,7 +149,9 @@ function codexGoalResponseFromWire(wire: CodexGoalResponseWire): CodexGoalRespon
  * @returns The current goal, or ``goal: null`` when Codex has none.
  */
 export async function getCodexGoal(sessionId: string): Promise<CodexGoalResponse> {
-  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`);
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`, {
+    headers: { "X-Omnigent-Codex-Goal-Read": "strict" },
+  });
   return codexGoalResponseFromWire(await readJsonOrThrow<CodexGoalResponseWire>(res));
 }
 

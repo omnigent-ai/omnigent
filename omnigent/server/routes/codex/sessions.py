@@ -481,7 +481,6 @@ def register_codex_session_routes(
     async def get_codex_goal(
         request: Request,
         session_id: str,
-        response: Response,
     ) -> CodexGoalResponse | Response:
         """
         Read the current Codex app-server goal for a Codex-native session.
@@ -491,8 +490,10 @@ def register_codex_session_routes(
             ``"conv_abc123"``.
         :returns: Current Codex goal state, or ``goal=None`` when no goal is
             set.
-        :raises OmnigentError: 400 for non-Codex sessions, 404 for missing
-            sessions, or 503 when no live Codex runner can read the goal.
+        ``X-Omnigent-Codex-Goal-Read: strict`` opts into unavailable-read errors.
+        Legacy callers keep the empty response for absent or idle runners.
+
+        :raises OmnigentError: 400 for non-Codex sessions or 404 for missing sessions.
         """
         user_id = _get_user_id(request, auth_provider)
         await _require_access(
@@ -503,10 +504,11 @@ def register_codex_session_routes(
             conversation_store,
         )
         conv = await _require_codex_native_goal_session(session_id, conversation_store)
+        require_live = request.headers.get(_CODEX_GOAL_READ_HEADER) == "strict"
         runner_result = await _forward_codex_goal_event(
             session_id=session_id,
             conv=conv,
-            event={"type": "goal_get"},
+            event={"type": "goal_get", **({"require_live": True} if require_live else {})},
             request=request,
             user_id=user_id,
             runner_router=runner_router,
@@ -514,6 +516,8 @@ def register_codex_session_routes(
             permission_store=permission_store,
             runner_exit_reports=runner_exit_reports,
         )
+        if runner_result is None and not require_live:
+            return CodexGoalResponse(goal=None)
         runner_payload = _require_codex_goal_runner_payload(
             session_id,
             action="read",
@@ -529,7 +533,6 @@ def register_codex_session_routes(
                 502,
                 detail="Could not read Codex goal: runner returned a malformed response.",
             )
-        response.headers[_CODEX_GOAL_READ_HEADER] = "confirmed"
         return goal_response
 
     @router.put(

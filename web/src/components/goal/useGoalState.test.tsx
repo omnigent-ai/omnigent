@@ -3,6 +3,7 @@ import type * as GoalApiModule from "@/lib/goalApi";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getGoal, type Goal } from "@/lib/goalApi";
+import * as identity from "@/lib/identity";
 import { useGoalState } from "./useGoalState";
 
 vi.mock("@/lib/goalApi", async (importOriginal) => {
@@ -173,6 +174,35 @@ describe("useGoalState", () => {
     },
   );
 
+  it("publishes an accepted read even when another refresh starts before React commits", async () => {
+    const accepted = deferredGoalRead();
+    const pending = deferredGoalRead();
+    mockGetGoal
+      .mockResolvedValueOnce({ goal: GOAL })
+      .mockReturnValueOnce(accepted.promise)
+      .mockReturnValueOnce(pending.promise);
+    const { result, unmount } = renderHook(() => useGoalState("conv", true));
+    await act(async () => {});
+    const paused = { ...GOAL, status: "paused" as const };
+    let pendingRefresh!: Promise<void>;
+
+    await act(async () => {
+      result.current.setGoal(GOAL);
+      const acceptedRefresh = result.current.refreshGoal();
+      accepted.resolve({ goal: paused });
+      await acceptedRefresh;
+      pendingRefresh = result.current.refreshGoal();
+    });
+
+    expect(result.current.goal).toEqual(paused);
+    await act(async () => {
+      pending.reject(new Error("newer read failed"));
+      await expect(pendingRefresh).rejects.toThrow("newer read failed");
+    });
+    expect(result.current.goal).toEqual(paused);
+    unmount();
+  });
+
   it.each(["dialog refresh", "poll", "dialog update"])(
     "ignores an old explicit read error after a newer %s succeeds",
     async (newest) => {
@@ -231,15 +261,49 @@ describe("useGoalState", () => {
     expect(result.current.goal).toBeNull();
   });
 
-  it("keeps the last goal across a transient poll failure", async () => {
+  it("clears a legacy deleted goal after retaining it through a real API read failure", async () => {
     vi.useFakeTimers();
-    mockGetGoal.mockResolvedValueOnce({ goal: GOAL }).mockRejectedValueOnce(new Error("offline"));
-    const { result } = renderHook(() => useGoalState("conv", true));
-    await act(async () => {});
-
-    await act(() => vi.advanceTimersByTimeAsync(5_000));
-
-    expect(result.current.goal).toEqual(GOAL);
+    const actualGoalApi = await vi.importActual<typeof GoalApiModule>("@/lib/goalApi");
+    mockGetGoal.mockImplementation(actualGoalApi.getGoal);
+    const fetch = vi
+      .spyOn(identity, "authenticatedFetch")
+      .mockResolvedValueOnce(
+        Response.json({
+          goal: {
+            thread_id: "thread-1",
+            objective: GOAL.objective,
+            status: GOAL.status,
+            token_budget: GOAL.tokenBudget,
+            tokens_used: GOAL.tokensUsed,
+            time_used_seconds: GOAL.timeUsedSeconds,
+          },
+        }),
+      )
+      .mockResolvedValueOnce(
+        Response.json(
+          { error: "codex_native_goal_failed", detail: "runner unavailable" },
+          { status: 503 },
+        ),
+      )
+      .mockResolvedValueOnce(Response.json({ goal: null }));
+    const { result, unmount } = renderHook(() => useGoalState("conv", true));
+    try {
+      await act(async () => {});
+      const initialGoal = result.current.goal;
+      expect(initialGoal).toEqual({ ...GOAL, threadId: "thread-1" });
+      await act(() => vi.advanceTimersByTimeAsync(5_000));
+      expect(result.current.goal).toEqual(initialGoal);
+      expect(fetch).toHaveBeenCalledTimes(2);
+      await act(() => vi.advanceTimersByTimeAsync(10_000));
+      expect(result.current.goal).toBeNull();
+      expect(fetch).toHaveBeenCalledTimes(3);
+      expect(fetch).toHaveBeenLastCalledWith("/v1/sessions/conv/codex_goal", {
+        headers: { "X-Omnigent-Codex-Goal-Read": "strict" },
+      });
+    } finally {
+      unmount();
+      fetch.mockRestore();
+    }
   });
 
   it("backs off repeated failures through a repeated sixty-second cap", async () => {

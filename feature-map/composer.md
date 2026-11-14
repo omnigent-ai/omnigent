@@ -810,6 +810,9 @@ Other connection providers alone do not enable the managed MCP picker.
   indicator follows its status; then delete the test goal. During a temporary
   goal-read failure, the indicator should remain. Restore connectivity and
   return to the tab to confirm it refreshes without reopening Goal.
+  If goal setup times out or loses its reply, the goal may already have been
+  saved even though the objective message was not delivered. Inspect Goal
+  before resending: another `/goal <objective>` sets that objective again.
 - **`session-mcp-status`, in-session composer:** component coverage lives in
   `web/src/pages/ChatPage.composer.test.tsx`. Manually open a started session,
   select `/mcp`, and expect the effective MCP names and descriptions under

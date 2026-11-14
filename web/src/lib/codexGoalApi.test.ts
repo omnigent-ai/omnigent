@@ -1,6 +1,4 @@
-import { act, renderHook } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useGoalState } from "@/components/goal/useGoalState";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   clearCodexGoal,
   codexGoalApiErrorFromResponse,
@@ -18,13 +16,12 @@ const mockAuthenticatedFetch = vi.mocked(authenticatedFetch);
 
 function mockJsonResponse(
   body: unknown,
-  init: { ok?: boolean; status?: number; statusText?: string; headers?: HeadersInit } = {},
+  init: { ok?: boolean; status?: number; statusText?: string } = {},
 ): Response {
   return {
     ok: init.ok ?? true,
     status: init.status ?? 200,
     statusText: init.statusText ?? "OK",
-    headers: new Headers(init.headers),
     json: async () => body,
   } as unknown as Response;
 }
@@ -39,10 +36,6 @@ const WIRE_GOAL = {
   created_at: 1,
   updated_at: 2,
 };
-
-afterEach(() => {
-  vi.useRealTimers();
-});
 
 describe("codex goal API", () => {
   beforeEach(() => {
@@ -64,46 +57,15 @@ describe("codex goal API", () => {
         updatedAt: 2,
       },
     });
-    expect(mockAuthenticatedFetch).toHaveBeenCalledWith("/v1/sessions/conv%20a%2Fb/codex_goal");
-  });
-
-  it("accepts a confirmed empty goal after an external deletion", async () => {
-    mockAuthenticatedFetch.mockResolvedValueOnce(
-      mockJsonResponse({ goal: null }, { headers: { "X-Omnigent-Codex-Goal-Read": "confirmed" } }),
-    );
-
-    await expect(getCodexGoal("conv")).resolves.toEqual({ goal: null });
+    expect(mockAuthenticatedFetch).toHaveBeenCalledWith("/v1/sessions/conv%20a%2Fb/codex_goal", {
+      headers: { "X-Omnigent-Codex-Goal-Read": "strict" },
+    });
   });
 
   it("accepts an empty goal from an older server without a confirmation header", async () => {
     mockAuthenticatedFetch.mockResolvedValueOnce(mockJsonResponse({ goal: null }));
 
     await expect(getCodexGoal("conv")).resolves.toEqual({ goal: null });
-  });
-
-  it("clears an externally deleted legacy goal after retaining it through a read failure", async () => {
-    vi.useFakeTimers();
-    mockAuthenticatedFetch
-      .mockResolvedValueOnce(mockJsonResponse({ goal: WIRE_GOAL }))
-      .mockResolvedValueOnce(
-        mockJsonResponse(
-          { error: "codex_native_goal_failed", detail: "runner unavailable" },
-          { ok: false, status: 503, statusText: "Service Unavailable" },
-        ),
-      )
-      .mockResolvedValueOnce(mockJsonResponse({ goal: null }));
-    const { result } = renderHook(() => useGoalState("conv", true));
-    await act(async () => {});
-    const initialGoal = result.current.goal;
-    expect(initialGoal?.objective).toBe(WIRE_GOAL.objective);
-
-    await act(() => vi.advanceTimersByTimeAsync(5_000));
-    expect(result.current.goal).toEqual(initialGoal);
-    expect(mockAuthenticatedFetch).toHaveBeenCalledTimes(2);
-
-    await act(() => vi.advanceTimersByTimeAsync(10_000));
-    expect(result.current.goal).toBeNull();
-    expect(mockAuthenticatedFetch).toHaveBeenCalledTimes(3);
   });
 
   it("sets, updates, and clears goals with the expected wire payloads", async () => {

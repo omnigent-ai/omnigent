@@ -792,18 +792,26 @@ async def _wait_for_shell_completion(
 
 
 async def _set_codex_goal(client: CodexAppServerClient, *, thread_id: str, objective: str) -> None:
-    """Keep existing native work when a goal request fails before input delivery."""
+    """Distinguish uncertain goal setup from undelivered objective input."""
     try:
         async with asyncio.timeout(_GOAL_RPC_TIMEOUT_SECONDS):
             await client.request(
                 "thread/goal/set", {"threadId": thread_id, "objective": objective}
             )
     except Exception as exc:
-        if isinstance(exc, CodexAppServerResponseError) and is_server_draining_error(exc):
-            raise
-        detail = "request timed out" if isinstance(exc, TimeoutError) else str(exc)
+        if isinstance(exc, CodexAppServerResponseError):
+            if is_server_draining_error(exc):
+                raise
+            failure = CodexStartupFailure(message=f"Codex goal request failed: {exc}")
+        else:
+            detail = "request timed out" if isinstance(exc, TimeoutError) else str(exc)
+            failure = CodexStartupFailure(
+                message=f"Codex goal setup may have succeeded: {detail}. "
+                "The objective input was not delivered.",
+                remediation="Open Goal to inspect the current goal before resending this message.",
+            )
         raise _CodexNativeInputUndelivered(
-            CodexStartupFailure(message=f"Codex goal request failed: {detail}"),
+            failure,
             preserve_session=True,
         ) from exc
 

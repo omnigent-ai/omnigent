@@ -141,6 +141,7 @@ class CodexGoalRunner:
         action: str,
         method: str,
         params: dict[str, object],
+        require_live: bool = False,
     ) -> dict[str, object] | JSONResponse:
         """Execute one Codex app-server goal JSON-RPC request."""
         from omnigent.harnesses.codex_native.app_server import client_for_transport
@@ -161,9 +162,8 @@ class CodexGoalRunner:
                     and self._bridge_is_inactive is not None
                     and self._bridge_is_inactive(conv_id, state)
                 ):
-                    # An idle bridge cannot confirm absence. Do not wake the
-                    # autonomous goal or discard the browser's last snapshot.
-                    return self._bridge_error(action)
+                    # Strict readers retain cached state without waking an idle goal.
+                    return self._bridge_error(action) if require_live else {"goal": None}
                 raise
             return self._goal_result(
                 await codex_client.request(method, {"threadId": state.thread_id, **params}),
@@ -192,13 +192,14 @@ class CodexGoalRunner:
             with contextlib.suppress(Exception):
                 await codex_client.close()
 
-    async def get(self, conv_id: str) -> Response:
+    async def get(self, conv_id: str, *, require_live: bool = False) -> Response:
         """Read the current Codex app-server goal for a loaded thread."""
         result = await self._request(
             conv_id,
             action="read",
             method="thread/goal/get",
             params={},
+            require_live=require_live,
         )
         if isinstance(result, JSONResponse):
             return result
@@ -310,7 +311,9 @@ class CodexGoalRunner:
             )
 
         if body_type == "goal_get":
-            return await self.get(conv_id)
+            return await self.get(
+                conv_id, require_live=isinstance(body, dict) and body.get("require_live") is True
+            )
 
         if body_type == "goal_clear":
             return await self.clear(conv_id)
