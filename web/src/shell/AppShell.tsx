@@ -142,6 +142,7 @@ import {
 } from "./FileViewerContext";
 import { revealFolderInFilesPanel } from "./FilesPanel";
 import { selectPullRequestInPanel } from "./PullRequestPanel";
+import { UploadWindowGuard } from "@/components/UploadWindowGuard";
 import type { ChangedSort } from "./FlatFileList";
 import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { isMobileViewport, Sidebar } from "./Sidebar";
@@ -2947,6 +2948,7 @@ function AppShellImpl() {
 
   return (
     <FileViewerContext.Provider value={fileViewerContextValue}>
+      <UploadWindowGuard />
       <TerminalFirstContextProvider value={terminalFirstContextValue}>
         <ForkDialogContextProvider value={forkDialogContextValue}>
           {/* `app-shell` paints the shared canvas behind the sidebar and
