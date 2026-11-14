@@ -1,0 +1,23 @@
+# PipesHub MCP server — search, chat, and read across your org's connected
+# knowledge sources (Slack, Drive, Confluence, etc.) through PipesHub's
+# governed connector layer.
+# Auto-discovered from tools/mcp/; no need to reference it from config.yaml.
+name: pipeshub
+description: Search and chat over your organization's PipesHub-connected knowledge sources.
+transport: http
+
+# Your PipesHub deployment's MCP endpoint, e.g. https://my-org.pipeshub.com/mcp.
+# Read from the environment when the agent loads; this file only holds the
+# template, so it can be committed as-is.
+url: ${PIPESHUB_MCP_URL}
+
+headers:
+  # Mint this from PipesHub: Workspace Settings → Developer Settings →
+  # Personal Access Tokens → New token. Runs as you, so results respect your own
+  # per-user permissions (unlike an OAuth app's client-credentials flow).
+  Authorization: "Bearer ${PIPESHUB_MCP_TOKEN}"
+
+# No `tools:` allow-list, so the agent gets every tool the server advertises:
+# pipeshub_sources, pipeshub_chat, pipeshub_search, pipeshub_download_record,
+# pipeshub_get_record_content, pipeshub_directory, pipeshub_agents.
+# To expose only some, add e.g. `tools: [pipeshub_search, pipeshub_get_record_content]`.
