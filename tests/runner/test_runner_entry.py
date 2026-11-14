@@ -3056,8 +3056,12 @@ async def test_runner_shutdown_closes_terminal_registry(
         mcp_managers.append(manager)
         return manager
 
-    def _async_client_factory(*args: Any, **kwargs: Any) -> _TrackingAsyncClient:
-        del args, kwargs
+    real_async_client = httpx.AsyncClient
+
+    def _async_client_factory(*args: Any, **kwargs: Any) -> Any:
+        if "base_url" not in kwargs:
+            # The routing transport's inner network client, which is not the runner's client.
+            return real_async_client(*args, **kwargs)
         client = _TrackingAsyncClient()
         async_clients.append(client)
         return client

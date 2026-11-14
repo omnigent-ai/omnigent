@@ -98,6 +98,9 @@ class ScheduledTask:
         firing, or ``None``.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
+    :param kind: ``"automation"``, or ``"reminder"`` for a one-time message an
+        agent set for its own session. Clients list reminders apart from
+        automations; scheduling and firing ignore it.
     """
 
     id: str
@@ -115,6 +118,7 @@ class ScheduledTask:
     mcp_services: tuple[str, ...] = ()
     max_cost_usd: float | None = None
     session_mode: str = "new"
+    kind: str = "automation"
     session_id: str | None = None
     source_session_id: str | None = None
     workspace: str | None = None

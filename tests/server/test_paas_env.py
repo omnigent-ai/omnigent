@@ -82,3 +82,12 @@ def test_detect_base_url(environ: dict[str, str], expected: str):
     wrong ``OMNIGENT_ACCOUNTS_BASE_URL`` and break magic-link / cookie flows.
     """
     assert detect_base_url(environ, host="0.0.0.0", port=8000) == expected
+
+
+@pytest.mark.parametrize("host", ["::", "::1", "[::1]", "2001:db8::1"])
+def test_detect_base_url_ipv6(host: str) -> None:
+    from urllib.parse import urlsplit
+
+    url = urlsplit(detect_base_url({}, host=host, port=8000))
+    assert url.hostname == host.strip("[]")
+    assert url.port == 8000

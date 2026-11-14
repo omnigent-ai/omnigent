@@ -103,6 +103,19 @@ class AgentCache:
             raise ValueError(f"unsafe agent id for cache path: {agent_id!r}")
         return path
 
+    def load_spec(
+        self, agent_id: str, bundle_location: str, *, expand_env: bool = False
+    ) -> AgentSpec:
+        """Read metadata from memory without resolving an execution working directory.
+
+        Cache misses use the normal validated load path. Callers that need a
+        working directory must use :meth:`load`, including its path checks.
+        """
+        cached = self._specs.get(agent_id)
+        if cached is not None and cached[0] == bundle_location:
+            return cached[1]
+        return self.load(agent_id, bundle_location, expand_env=expand_env).spec
+
     def load(
         self,
         agent_id: str,
