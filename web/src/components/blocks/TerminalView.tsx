@@ -17,6 +17,7 @@ import {
   useSyncExternalStore,
 } from "react";
 import { useTerminalIsDark } from "@/components/theme/useTerminalIsDark";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import {
@@ -53,6 +54,11 @@ import {
   type TerminalClipboardDecision,
   type TerminalClipboardPromptReason,
 } from "./TerminalClipboardPrompt";
+import {
+  type TerminalPasteResult,
+  type TerminalPasteTarget,
+  TerminalTouchClipboardBar,
+} from "./TerminalTouchClipboard";
 import {
   type ConnectionState,
   type TerminalActivityListener,
@@ -237,11 +243,14 @@ export function TerminalView({
   const clipboardRequestGenerationRef = useRef(0);
   const clipboardMountedRef = useRef(true);
   const clipboardActiveRef = useRef(active);
+  // Advances whenever a touch paste's clipboard read should no longer reach the terminal.
+  const pasteGenerationRef = useRef(0);
   const [clipboardScopeEpoch, setClipboardScopeEpoch] = useState(0);
   useLayoutEffect(() => {
     if (clipboardActiveRef.current !== active) {
       clipboardActiveRef.current = active;
       clipboardRequestGenerationRef.current += 1;
+      pasteGenerationRef.current += 1;
       if (!active) {
         setClipboardPrompt(null);
       }
@@ -255,6 +264,7 @@ export function TerminalView({
       };
       clipboardNeedsClickRef.current = false;
       clipboardRequestGenerationRef.current += 1;
+      pasteGenerationRef.current += 1;
       setClipboardPrompt(null);
       setClipboardScopeEpoch(epoch);
     }
@@ -352,11 +362,13 @@ export function TerminalView({
     return () => {
       clipboardMountedRef.current = false;
       clipboardRequestGenerationRef.current += 1;
+      pasteGenerationRef.current += 1;
     };
   }, []);
 
   // Stable dispatcher: updates local state and notifies the parent.
   const notifyState = useCallback((next: ConnectionState) => {
+    if (next.kind !== "connected") pasteGenerationRef.current += 1;
     setState(next);
     onStateChangeRef.current?.(next);
   }, []);
@@ -520,6 +532,44 @@ export function TerminalView({
     sessionRef.current?.focus();
   }, []);
 
+  const isCoarsePointer = useIsCoarsePointer();
+  const readTerminalText = useCallback(() => sessionRef.current?.bufferText() ?? "", []);
+  const isTouchCopyBlocked = useCallback(() => {
+    if (clipboardConsentRef.current.scope !== clipboardScope) {
+      return readTerminalClipboardPreference() === "block";
+    }
+    return clipboardConsentRef.current.decision === "block";
+  }, [clipboardScope]);
+  const startPaste = useCallback(() => {
+    const generation = pasteGenerationRef.current;
+    return (): TerminalPasteTarget => {
+      if (!clipboardMountedRef.current || !clipboardActiveRef.current) return "changed";
+      if (generation === pasteGenerationRef.current) return "current";
+      return stateRef.current.kind === "connected" ? "changed" : "disconnected";
+    };
+  }, []);
+  const pasteIntoTerminal = useCallback(
+    (text: string, reviewed: boolean): TerminalPasteResult => {
+      // startPaste covers a clipboard read outlasting the attachment; this covers the box.
+      const session = sessionRef.current;
+      if (
+        readOnly ||
+        !session ||
+        !clipboardMountedRef.current ||
+        !clipboardActiveRef.current ||
+        stateRef.current.kind !== "connected"
+      ) {
+        return "unavailable";
+      }
+      // Without bracketed paste, each line runs on arrival and a tab completes.
+      if (!reviewed && /[\r\n\t]/.test(text) && !session.pastesBracketed()) return "review";
+      if (!session.paste(text)) return "unavailable";
+      session.focus();
+      return "pasted";
+    },
+    [readOnly],
+  );
+
   const visibleClipboardPrompt =
     clipboardPrompt?.scope === clipboardScope &&
     clipboardPrompt.epoch === clipboardScopeEpoch &&
@@ -536,6 +586,7 @@ export function TerminalView({
   const disposeActiveSession = useCallback(() => {
     sessionRef.current?.dispose();
     sessionRef.current = null;
+    pasteGenerationRef.current += 1;
   }, []);
 
   useLayoutEffect(() => {
@@ -661,6 +712,7 @@ export function TerminalView({
           notifyFileLink,
         );
         sessionRef.current = terminalSession;
+        pasteGenerationRef.current += 1;
         // Relay-connected with a direct URL on offer: negotiate the
         // loopback upgrade in the background. In Chrome this is what
         // raises the Local Network Access prompt; the probe socket
@@ -679,6 +731,7 @@ export function TerminalView({
         upgradeCtl.abort();
         terminalSession?.dispose();
         sessionRef.current = null;
+        pasteGenerationRef.current += 1;
         onStateChangeRef.current?.(null);
       };
     },
@@ -883,6 +936,18 @@ export function TerminalView({
           />
         )}
       </div>
+      {isCoarsePointer && (
+        <TerminalTouchClipboardBar
+          key={clipboardScope}
+          backgroundColor={terminalBackground}
+          pasteAvailable={!readOnly}
+          pasteEnabled={state.kind === "connected"}
+          readText={readTerminalText}
+          isCopyBlocked={isTouchCopyBlocked}
+          startPaste={startPaste}
+          onPaste={pasteIntoTerminal}
+        />
+      )}
     </div>
   );
 }

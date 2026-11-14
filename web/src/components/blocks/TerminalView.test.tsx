@@ -11,7 +11,7 @@ import type * as TerminalsModule from "@/lib/terminals";
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { StrictMode, act, useMemo, useState, type ReactElement } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { Toaster } from "@/components/ui/sonner";
 import { FileViewerContext, type OpenFileOptions } from "@/shell/FileViewerContext";
 import { ShellCommandDraftContext } from "@/shell/ShellCommandContext";
@@ -84,6 +84,9 @@ const terminalSessionMock = vi.hoisted(() => ({
     setTheme: ReturnType<typeof vi.fn>;
     setClipboardEnabled: ReturnType<typeof vi.fn>;
     focus: ReturnType<typeof vi.fn>;
+    bufferText: ReturnType<typeof vi.fn>;
+    paste: ReturnType<typeof vi.fn>;
+    pastesBracketed: ReturnType<typeof vi.fn>;
     pasteCommand: ReturnType<typeof vi.fn>;
   }[],
 }));
@@ -97,6 +100,9 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     setTheme = vi.fn();
     setClipboardEnabled = vi.fn();
     focus = vi.fn();
+    bufferText = vi.fn(() => "$ whoami\nomni");
+    paste = vi.fn(() => true);
+    pastesBracketed = vi.fn(() => true);
     pasteCommand = vi.fn((_text: string, onResult: (error: string | null) => void) => {
       onResult(null);
       return vi.fn();
@@ -129,6 +135,9 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         setTheme: this.setTheme,
         setClipboardEnabled: this.setClipboardEnabled,
         focus: this.focus,
+        bufferText: this.bufferText,
+        paste: this.paste,
+        pastesBracketed: this.pastesBracketed,
         pasteCommand: this.pasteCommand,
       });
     }
@@ -1288,6 +1297,254 @@ describe("terminal clipboard", () => {
     await requestClipboard("next selection");
     expect(clipboardMock.copyText).toHaveBeenCalledTimes(2);
     expect(visibleClipboardConsent()).toHaveTextContent("Copy needs a click");
+  });
+});
+
+describe("touch clipboard bar", () => {
+  function setCoarsePointer(coarse: boolean): void {
+    const spy = vi.spyOn(window, "matchMedia").mockImplementation(
+      (query: string) =>
+        ({
+          matches: coarse && query === "(pointer: coarse)",
+          media: query,
+          onchange: null,
+          addListener: () => {},
+          removeListener: () => {},
+          addEventListener: () => {},
+          removeEventListener: () => {},
+          dispatchEvent: () => false,
+        }) as MediaQueryList,
+    );
+    onTestFinished(() => spy.mockRestore());
+  }
+
+  function mockClipboardRead(read: () => Promise<string>): void {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { readText: read },
+    });
+    onTestFinished(() => {
+      Reflect.deleteProperty(navigator, "clipboard");
+    });
+  }
+
+  async function renderTouchView(readOnly = false) {
+    const view = render(
+      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" readOnly={readOnly} />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    return { terminal: terminalSessionMock.instances[0], rerender: view.rerender };
+  }
+
+  it("is absent with a fine pointer", async () => {
+    setCoarsePointer(false);
+    await renderTouchView();
+    expect(screen.queryByTestId("terminal-touch-clipboard")).toBeNull();
+  });
+
+  it("copies the live terminal text and pastes into the session once connected", async () => {
+    setCoarsePointer(true);
+    const { terminal } = await renderTouchView();
+    const paste = screen.getByRole("button", { name: "Paste" });
+    expect(paste).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+    const sheet = await screen.findByTestId("terminal-copy-sheet");
+    expect(within(sheet).getByTestId("terminal-copy-text").textContent).toBe("$ whoami\nomni");
+    fireEvent.click(within(sheet).getByRole("button", { name: "Copy all" }));
+    await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledWith("$ whoami\nomni"));
+    expect(await screen.findByText("Copied terminal text")).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByTestId("terminal-copy-sheet")).toBeNull());
+    // An explicit touch copy does not grant terminal programs clipboard access.
+    expect(screen.queryByTestId("terminal-clipboard-consent")).toBeNull();
+    expect(readTerminalClipboardPreference()).toBe("ask");
+    act(() => terminal.onClipboardRequest?.("program text"));
+    await waitFor(() => expect(screen.queryByTestId("terminal-clipboard-consent")).not.toBeNull());
+    expect(clipboardMock.copyText).not.toHaveBeenCalledWith("program text");
+
+    act(() => terminal.onState({ kind: "connected" }));
+    mockClipboardRead(async () => "echo pasted");
+    fireEvent.click(screen.getByRole("button", { name: "Paste" }));
+    await waitFor(() => expect(terminal.paste).toHaveBeenCalledWith("echo pasted"));
+    expect(terminal.focus).toHaveBeenCalled();
+    expect(screen.queryByTestId("terminal-paste-box")).toBeNull();
+  });
+
+  it("drops a paste whose clipboard read outlasts the connection", async () => {
+    setCoarsePointer(true);
+    const { terminal } = await renderTouchView();
+    act(() => terminal.onState({ kind: "connected" }));
+    let finishRead!: (text: string) => void;
+    mockClipboardRead(
+      () =>
+        new Promise<string>((resolve) => {
+          finishRead = resolve;
+        }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Paste" }));
+    act(() => terminal.onState({ kind: "closed", reason: "network", code: 1006 }));
+    await act(async () => finishRead("echo late"));
+
+    expect(
+      await screen.findByText("The terminal isn't connected, so nothing was pasted."),
+    ).toBeInTheDocument();
+    expect(terminal.paste).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Paste" })).toBeDisabled();
+  });
+
+  it.each(["cd /tmp\nmake", "rm -rf bu\t"])(
+    "asks for a review before sending %j, which a shell would act on as it arrives",
+    async (text) => {
+      setCoarsePointer(true);
+      const { terminal } = await renderTouchView();
+      act(() => terminal.onState({ kind: "connected" }));
+      terminal.pastesBracketed.mockReturnValue(false);
+      mockClipboardRead(async () => text);
+
+      fireEvent.click(screen.getByRole("button", { name: "Paste" }));
+      const box = await screen.findByTestId("terminal-paste-box");
+      expect(terminal.paste).not.toHaveBeenCalled();
+      expect(within(box).getByLabelText("Text to paste")).toHaveValue(text);
+      fireEvent.click(within(box).getByRole("button", { name: "Send to terminal" }));
+
+      expect(terminal.paste).toHaveBeenCalledWith(text);
+      await waitFor(() => expect(screen.queryByTestId("terminal-paste-box")).toBeNull());
+    },
+  );
+
+  it("sends multi-line text directly when the program takes bracketed pastes", async () => {
+    setCoarsePointer(true);
+    const { terminal } = await renderTouchView();
+    act(() => terminal.onState({ kind: "connected" }));
+    mockClipboardRead(async () => "first\nsecond");
+
+    fireEvent.click(screen.getByRole("button", { name: "Paste" }));
+
+    await waitFor(() => expect(terminal.paste).toHaveBeenCalledWith("first\nsecond"));
+    expect(screen.queryByTestId("terminal-paste-box")).toBeNull();
+  });
+
+  it("drops a paste whose clipboard read outlasts the terminal being shown", async () => {
+    setCoarsePointer(true);
+    const { terminal, rerender } = await renderTouchView();
+    act(() => terminal.onState({ kind: "connected" }));
+    let finishRead!: (text: string) => void;
+    mockClipboardRead(
+      () =>
+        new Promise<string>((resolve) => {
+          finishRead = resolve;
+        }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Paste" }));
+    rerender(
+      <TerminalView
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        readOnly={false}
+        active={false}
+      />,
+    );
+    await act(async () => finishRead("echo late"));
+
+    expect(terminal.paste).not.toHaveBeenCalled();
+    expect(terminal.focus).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("terminal-paste-box")).toBeNull();
+  });
+
+  it("drops a paste whose clipboard read outlasts a reconnect", async () => {
+    setCoarsePointer(true);
+    const { terminal, rerender } = await renderTouchView();
+    act(() => terminal.onState({ kind: "connected" }));
+    terminal.pastesBracketed.mockReturnValue(false);
+    let finishRead!: (text: string) => void;
+    mockClipboardRead(
+      () =>
+        new Promise<string>((resolve) => {
+          finishRead = resolve;
+        }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Paste" }));
+    act(() => terminal.onState({ kind: "closed", reason: "network", code: 1006 }));
+    rerender(
+      <TerminalView
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        readOnly={false}
+        resumeGeneration={1}
+      />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+    const nextTerminal = terminalSessionMock.instances[1];
+    act(() => nextTerminal.onState({ kind: "connected" }));
+    await act(async () => finishRead("echo late\n"));
+
+    expect(
+      await screen.findByText(
+        "The terminal changed while the clipboard was read, so nothing was pasted.",
+      ),
+    ).toBeInTheDocument();
+    expect(terminal.paste).not.toHaveBeenCalled();
+    expect(nextTerminal.paste).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("terminal-paste-box")).toBeNull();
+  });
+
+  it("drops a paste whose clipboard read outlasts a terminal switch", async () => {
+    setCoarsePointer(true);
+    const { terminal, rerender } = await renderTouchView();
+    act(() => terminal.onState({ kind: "connected" }));
+    let finishRead!: (text: string) => void;
+    mockClipboardRead(
+      () =>
+        new Promise<string>((resolve) => {
+          finishRead = resolve;
+        }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Paste" }));
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s2" readOnly={false} />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+    const nextTerminal = terminalSessionMock.instances[1];
+    act(() => nextTerminal.onState({ kind: "connected" }));
+    await act(async () => finishRead("echo late"));
+
+    expect(terminal.paste).not.toHaveBeenCalled();
+    expect(nextTerminal.paste).not.toHaveBeenCalled();
+  });
+
+  it("follows a saved block choice", async () => {
+    writeTerminalClipboardPreference("block");
+    setCoarsePointer(true);
+    const { terminal } = await renderTouchView();
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+
+    expect(await screen.findByText("Copying from this terminal is blocked.")).toBeInTheDocument();
+    expect(terminal.bufferText).not.toHaveBeenCalled();
+  });
+
+  it("follows a block chosen for this terminal", async () => {
+    setCoarsePointer(true);
+    const { terminal } = await renderTouchView();
+    act(() => terminal.onClipboardRequest?.("program text"));
+    await waitFor(() => expect(screen.queryByTestId("terminal-clipboard-consent")).not.toBeNull());
+    fireEvent.click(screen.getByRole("checkbox", { name: "Remember my choice" }));
+    fireEvent.click(screen.getByRole("button", { name: "Block" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+
+    expect(await screen.findByText("Copying from this terminal is blocked.")).toBeInTheDocument();
+    expect(screen.queryByTestId("terminal-copy-sheet")).toBeNull();
+    expect(terminal.bufferText).not.toHaveBeenCalled();
+  });
+
+  it("offers only Copy on a read-only terminal", async () => {
+    setCoarsePointer(true);
+    await renderTouchView(true);
+    expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Paste" })).toBeNull();
   });
 });
 

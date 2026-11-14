@@ -21,6 +21,8 @@ import {
   parseTerminalClipboardMessage,
   resolveTerminalWorkspaceFileLink,
   sgrWheelReports,
+  TERMINAL_COPY_MAX_LINES,
+  terminalBufferText,
   terminalTheme,
   terminalKeyEventPayload,
   touchScrollPayload,
@@ -1355,5 +1357,71 @@ describe("TerminalSession", () => {
     const observer = FakeResizeObserver.instances[0];
     expect(observer.observed).toContain(container);
     session.dispose();
+  });
+
+  it("reads its buffer as logical lines for touch copying", async () => {
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    socket.open();
+    const longLine = `${"a".repeat(term.cols - 1)} tail`;
+    const bytes = new TextEncoder().encode(`$ echo hi   \r\nhi\r\n${longLine}\r\n\r\n`);
+    const data = new ArrayBuffer(bytes.length);
+    new Uint8Array(data).set(bytes);
+    socket.emit("message", { data });
+    await new Promise<void>((resolve) => {
+      term.write("", resolve);
+    });
+
+    // The wrapped row rejoins with its boundary space; trailing blanks drop.
+    expect(session.bufferText()).toBe(`$ echo hi\nhi\n${longLine}`);
+    expect(terminalBufferText(term.buffer.active, 2)).toBe(`hi\n${longLine}`);
+    session.dispose();
+  });
+
+  it("copies only the newest lines of a long scrollback", async () => {
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    socket.open();
+    const total = TERMINAL_COPY_MAX_LINES + 100;
+    const output = Array.from({ length: total }, (_, index) => `line-${index + 1}`).join("\r\n");
+    await new Promise<void>((resolve) => {
+      term.write(output, resolve);
+    });
+    expect(term.buffer.active.length).toBeGreaterThan(TERMINAL_COPY_MAX_LINES);
+
+    const lines = session.bufferText().split("\n");
+    expect(lines).toHaveLength(TERMINAL_COPY_MAX_LINES);
+    expect(lines[0]).toBe("line-101");
+    expect(lines.at(-1)).toBe(`line-${total}`);
+    session.dispose();
+  });
+
+  it("sends touch pastes as input, bracketed when the program asks", async () => {
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    const inputs = () =>
+      socket.sent.flatMap((frame) =>
+        typeof frame === "string" ? [] : [new TextDecoder().decode(frame)],
+      );
+    expect(session.paste("ls")).toBe(false);
+    socket.open();
+
+    expect(session.pastesBracketed()).toBe(false);
+    expect(session.paste("echo one\necho two\r\necho three")).toBe(true);
+    expect(inputs()).toEqual(["echo one\recho two\recho three"]);
+
+    await new Promise<void>((resolve) => {
+      term.write("\x1b[?2004h", resolve);
+    });
+    expect(session.pastesBracketed()).toBe(true);
+    session.paste("ls");
+    expect(inputs().at(-1)).toBe("\x1b[200~ls\x1b[201~");
+    // A pasted end marker must not close the bracket early and run what follows.
+    session.paste("a\x1b[201~rm -rf x\x07\tb");
+    expect(inputs().at(-1)).toBe("\x1b[200~a[201~rm -rf x\tb\x1b[201~");
+    session.paste("one\rtwo");
+    expect(inputs().at(-1)).toBe("\x1b[200~one\rtwo\x1b[201~");
+    session.dispose();
+    expect(session.paste("ls")).toBe(false);
   });
 });
