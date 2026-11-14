@@ -264,6 +264,7 @@ def test_template_is_unassigned_and_preserves_hardening() -> None:
     activation = next(item for item in pod["volumes"] if item["name"] == "activation")
     assert activation["emptyDir"]["medium"] == "Memory"
     bootstrap, host = pod["containers"]
+    assert bootstrap["resources"]["requests"] == {"cpu": "50m", "memory": "128Mi"}
     assert not next(m for m in bootstrap["volumeMounts"] if m["name"] == "activation").get(
         "readOnly"
     )
@@ -277,7 +278,7 @@ def test_template_preserves_storage_mount_separation_and_agent_profile(
     monkeypatch.setenv(STORAGE_CLASS_ENV_VAR, "fast-storage")
     resources = {
         "requests": {"cpu": "2", "memory": "4Gi"},
-        "limits": {"cpu": "4", "memory": "8Gi"},
+        "limits": {"cpu": "4", "memory": "8Gi", "ephemeral-storage": "10Gi"},
     }
     launcher = _launcher(
         resources=resources,
@@ -295,7 +296,11 @@ def test_template_preserves_storage_mount_separation_and_agent_profile(
     assert pod["nodeSelector"] == {"kubernetes.io/arch": "arm64"}
     assert pod["tolerations"] == [{"key": "sandbox", "operator": "Exists"}]
     bootstrap, host = pod["containers"]
-    assert bootstrap["resources"] == host["resources"] == resources
+    assert host["resources"] == resources
+    assert bootstrap["resources"] == {
+        "requests": {"cpu": "50m", "memory": "128Mi", "ephemeral-storage": "0"},
+        "limits": resources["limits"],
+    }
     assert {m["name"] for m in bootstrap["volumeMounts"]} == {"home", "activation"}
     assert {m["name"] for m in host["volumeMounts"]} == {"home", "activation", "pvc-0", "secret-0"}
     assert (
@@ -305,6 +310,49 @@ def test_template_preserves_storage_mount_separation_and_agent_profile(
     assert claim["metadata"]["name"] == "home"
     assert claim["spec"]["storageClassName"] == "fast-storage"
     assert claim["spec"]["resources"]["requests"]["storage"] == "20Gi"
+
+
+@pytest.mark.parametrize(
+    ("resources", "bootstrap_requests"),
+    [
+        (
+            {
+                "requests": {"cpu": "20m", "memory": "64Mi"},
+                "limits": {"cpu": "40m", "memory": "100Mi"},
+            },
+            {"cpu": "20m", "memory": "64Mi"},
+        ),
+        (
+            {
+                "requests": {"cpu": ".02", "memory": "100M"},
+                "limits": {"cpu": "1", "memory": "1G"},
+            },
+            {"cpu": ".02", "memory": "100M"},
+        ),
+        (
+            {"requests": {"cpu": "0.5", "memory": "1e9"}, "limits": {"cpu": "1", "memory": "2e9"}},
+            {"cpu": "50m", "memory": "128Mi"},
+        ),
+    ],
+)
+def test_bootstrap_requests_do_not_exceed_smaller_configured_resources(
+    resources: dict[str, dict[str, str]], bootstrap_requests: dict[str, str]
+) -> None:
+    bootstrap, host = _launcher(resources=resources).template_spec()["podTemplate"]["spec"][
+        "containers"
+    ]
+    assert host["resources"] == resources
+    assert bootstrap["resources"] == {
+        "requests": bootstrap_requests,
+        "limits": resources["limits"],
+    }
+
+
+@pytest.mark.parametrize("memory", ["1Gb", "1e3Mi"])
+def test_template_rejects_resource_quantities_kubernetes_cannot_parse(memory: str) -> None:
+    resources = {"requests": {"memory": memory}, "limits": {"memory": "2Gi"}}
+    with pytest.raises(click.ClickException, match=f"'{memory}' is not a valid Kubernetes"):
+        _launcher(resources=resources).template_spec()
 
 
 def test_template_profile_is_deterministic_and_changes_with_configuration() -> None:
@@ -570,6 +618,31 @@ def test_stale_template_is_rejected_before_claiming(harness: _Harness) -> None:
     with pytest.raises(click.ClickException, match="template does not match"):
         harness.launcher.provision("new-session")
     harness.custom.create_namespaced_custom_object.assert_not_called()
+
+
+def test_pools_from_the_earlier_bootstrap_profile_still_claim_and_activate(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    quantity = types.ModuleType("kubernetes.utils.quantity")
+    quantity.parse_quantity = str  # type: ignore[attr-defined]  # exact spellings only
+    monkeypatch.setitem(sys.modules, "kubernetes.utils.quantity", quantity)
+    mixed = harness.launcher.template_spec()
+    bootstrap, host = mixed["podTemplate"]["spec"]["containers"]
+    bootstrap["resources"] = copy.deepcopy(host["resources"])
+    harness.template["spec"] = mixed
+    with pytest.raises(click.ClickException, match="template does not match"):
+        harness.launcher.provision("new-session")
+    harness.custom.create_namespaced_custom_object.assert_not_called()
+
+    legacy = harness.launcher.template_spec(legacy_bootstrap=True)
+    bootstrap, host = legacy["podTemplate"]["spec"]["containers"]
+    assert bootstrap["resources"] == host["resources"]
+    _set_profile(harness, legacy)
+    execute = _exec_states(harness, monkeypatch, "waiting", "prepared")
+    handle = harness.launcher.provision("new-session")
+    assert handle == _HANDLE.encode()
+    harness.launcher.start_host(handle, **_START_ARGS)
+    assert [call.args[2] for call in execute.call_args_list].count("activate") == 1
 
 
 def test_failed_adoption_cleans_up_only_the_created_claim(harness: _Harness) -> None:
@@ -885,7 +958,9 @@ def test_exec_errors_never_surface_remote_stderr_credentials(
     connection.close.assert_called_once()
 
 
-@pytest.mark.parametrize("change", ["image", "privilege", "identity", "classifier"])
+@pytest.mark.parametrize(
+    "change", ["image", "privilege", "identity", "classifier", "bootstrap_resources"]
+)
 def test_runtime_pod_profile_is_checked_before_delivering_credentials(
     harness: _Harness, monkeypatch: pytest.MonkeyPatch, change: str
 ) -> None:
@@ -896,6 +971,14 @@ def test_runtime_pod_profile_is_checked_before_delivering_credentials(
         pod_spec["securityContext"]["runAsNonRoot"] = False
     elif change == "identity":
         pod_spec["containers"][1]["env"].append({"name": HOST_TOKEN_ENV_VAR, "value": "stale"})
+    elif change == "bootstrap_resources":
+        quantity = types.ModuleType("kubernetes.utils.quantity")
+        quantity.parse_quantity = str  # type: ignore[attr-defined]  # exact spellings only
+        monkeypatch.setitem(sys.modules, "kubernetes.utils.quantity", quantity)
+        # Earlier bootstrap resources under the current profile digest match neither rendering.
+        pod_spec["containers"][0]["resources"] = copy.deepcopy(
+            pod_spec["containers"][1]["resources"]
+        )
     else:
         harness.pod.raw["metadata"]["labels"][k8s._AGENT_LABEL] = "another-agent"
     execute = MagicMock()
