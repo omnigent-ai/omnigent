@@ -39,6 +39,7 @@ from omnigent.util.server_url import ServerUrl, is_workspace_hosted_url
 
 if TYPE_CHECKING:
     import httpx
+    from omnigent_client import OmnigentClient
 
     from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 
@@ -927,6 +928,43 @@ def open_server_client(
         trust_env=trust_env,
         **kwargs,
     )
+
+
+def open_sdk_client(
+    server_url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    auth: httpx.Auth | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> OmnigentClient:
+    """Open the Python SDK client to an Omnigent server, routed like :func:`open_server_client`.
+
+    Session requests go through :class:`~omnigent.session_host.SessionRoutingTransport`,
+    so each reaches its session's host and recovers once from a ``wrong_replica``
+    refusal. Every request carries :func:`databricks_request_headers`, so a client
+    without *auth* still sends the default routing key and any configured selectors.
+
+    :param server_url: The server base URL, e.g.
+        ``"https://workspace.example.com/api/2.0/omnigent"``.
+    :param headers: Headers sent on every request, e.g. the client ``User-Agent``.
+        Merged under the routing headers, so routing wins a collision.
+    :param auth: Optional per-request ``httpx.Auth``, e.g. the CLI's token refresher.
+    :param transport: The network transport the routing wraps; ``None`` uses the
+        default. Tests pass an ``httpx.MockTransport``.
+    :returns: An :class:`omnigent_client.OmnigentClient`, to use as an async context manager.
+    """
+    import httpx
+    from omnigent_client import OmnigentClient
+    from omnigent_client._http import is_loopback_url
+
+    from omnigent.session_host import SessionRoutingTransport
+
+    pinned = httpx.Headers(headers or {})
+    pinned.update(databricks_request_headers(server_url))
+    routing = SessionRoutingTransport(
+        transport=transport, trust_env=not is_loopback_url(server_url)
+    )
+    return OmnigentClient(base_url=server_url, headers=dict(pinned), auth=auth, transport=routing)
 
 
 def clear_token(server_url: str) -> None:

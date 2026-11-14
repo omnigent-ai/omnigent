@@ -38,17 +38,25 @@ _SLICE_KEY_QUERY_PARAM = "omnigent_slice_key"
 _session_hosts: dict[str, str] = {}
 
 
+def _cache_key(session_id: str) -> str:
+    """One entry per session, whether its id is canonical, dashed, or legacy-prefixed."""
+    try:
+        return normalize_session_id(session_id)
+    except ValueError:
+        return session_id
+
+
 def set_session_host(session_id: str, host_id: str | None) -> None:
     """Record a session's host; an absent host clears stale routing."""
     if host_id:
-        _session_hosts[session_id] = host_id
+        _session_hosts[_cache_key(session_id)] = host_id
     else:
-        _session_hosts.pop(session_id, None)
+        _session_hosts.pop(_cache_key(session_id), None)
 
 
 def get_session_host(session_id: str) -> str | None:
     """Return the last observed host, or None for an unknown or hostless session."""
-    return _session_hosts.get(session_id)
+    return _session_hosts.get(_cache_key(session_id))
 
 
 def session_routing_headers(url: str) -> dict[str, str]:
@@ -67,37 +75,6 @@ async def route_known_session_request(request: httpx.Request) -> None:
     """Prefer an observed session owner over the caller's default host."""
     if not request.extensions.get(UNKEYED_REQUEST_EXTENSION):
         request.headers.update(session_routing_headers(str(request.url)))
-
-
-async def route_session_request(request: httpx.Request) -> None:
-    """Route a session request by its host without changing shared client headers."""
-    path = request.url.raw_path.split(b"?", 1)[0].decode("ascii")
-    base_path, separator, route = path.partition("/v1/sessions")
-    if not separator or (route and not route.startswith("/")):
-        return
-    if request.extensions.get(UNKEYED_REQUEST_EXTENSION):
-        request.headers.pop(OMNIGENT_SLICE_KEY_HEADER, None)
-        return
-    host_id = None
-    if (
-        not route
-        and request.method == "POST"
-        and "application/json" in request.headers.get("content-type", "")
-    ):
-        try:
-            body = json.loads(request.content)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            body = None
-        if isinstance(body, dict) and isinstance(body.get("host_id"), str):
-            host_id = body["host_id"]
-    elif route.startswith("/"):
-        host_id = get_session_host(unquote(route.split("/")[1]))
-    request.headers.pop(OMNIGENT_SLICE_KEY_HEADER, None)
-    request.headers.update(
-        databricks_request_headers(
-            str(request.url.copy_with(path=unquote(base_path), query=None)), host_id=host_id
-        )
-    )
 
 
 def normalize_session_id(value: object) -> str:
@@ -141,6 +118,26 @@ def _split_session_path(request: httpx.Request) -> tuple[str, str] | None:
     if not separator or (route and not route.startswith("/")):
         return None
     return unquote(base_path), route
+
+
+def _resends_from_its_files(stream: object) -> bool:
+    """Whether a body is a multipart upload httpx can resend by re-reading its files.
+
+    httpx rewinds each seekable file of a multipart body every time it sends it, so a
+    retry needs no in-memory copy. Any other body, or one with a non-seekable file, is
+    buffered instead; so is a multipart body if httpx stops exposing its ``fields``.
+    """
+    fields = getattr(stream, "fields", None)
+    if not isinstance(fields, list):
+        return False
+    for field in fields:
+        file = getattr(field, "file", None)
+        if file is None or isinstance(file, (str, bytes)):
+            continue
+        seekable = getattr(file, "seekable", None)
+        if not callable(seekable) or not seekable():
+            return False
+    return True
 
 
 def _session_key(route: str) -> str | None:
@@ -221,8 +218,9 @@ class SessionRoutingTransport(httpx.AsyncBaseTransport):
         parts = _split_session_path(request)
         if parts is None:
             return await self._send(request)
-        # Read the body once so a retry can resend it; only session routes need that.
-        await request.aread()
+        if not _resends_from_its_files(request.stream):
+            # Read the body once so a retry can resend it; only session routes need that.
+            await request.aread()
         base_path, route = parts
         base_url = str(request.url.copy_with(path=base_path, query=None))
         if request.extensions.get(UNKEYED_REQUEST_EXTENSION):
