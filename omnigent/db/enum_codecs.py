@@ -119,6 +119,11 @@ SCHEDULED_TASK_EXECUTION_TARGET: dict[str, int] = {
     "managed_sandbox": 2,
 }
 
+SCHEDULED_TASK_KIND: dict[str, int] = {
+    "automation": 1,
+    "reminder": 2,
+}
+
 SCHEDULED_TASK_SESSION_MODE: dict[str, int] = {
     "new": 1,
     "continue": 2,
@@ -342,6 +347,16 @@ def encode_scheduled_task_execution_target(name: str) -> int:
 def decode_scheduled_task_execution_target(code: int) -> str:
     """Decode a ``scheduled_tasks.execution_target`` int code to its name."""
     return _decode(SCHEDULED_TASK_EXECUTION_TARGET, code, field="scheduled_tasks.execution_target")
+
+
+def encode_scheduled_task_kind(name: str) -> int:
+    """Encode a ``scheduled_tasks.kind`` name to its int code."""
+    return _encode(SCHEDULED_TASK_KIND, name, field="scheduled_tasks.kind")
+
+
+def decode_scheduled_task_kind(code: int) -> str:
+    """Decode a ``scheduled_tasks.kind`` int code to its name."""
+    return _decode(SCHEDULED_TASK_KIND, code, field="scheduled_tasks.kind")
 
 
 def encode_scheduled_task_session_mode(name: str) -> int:

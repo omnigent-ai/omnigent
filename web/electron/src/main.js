@@ -51,6 +51,7 @@ const {
   createBrowserPermissionStore,
 } = require("./browserPermissions");
 const { createBrowserPermissionPrompt } = require("./browserPermissionPrompt");
+const { attachSecurityKeyNotice } = require("./browserSecurityKeyNotice");
 const {
   normalizeUrl,
   normalizeRecentServers,
@@ -306,6 +307,10 @@ const ERR_BLOCKED_BY_CLIENT = -20;
  * shell preload's IPC bridges. See popup_preload.js.
  */
 const POPUP_PRELOAD = path.join(__dirname, "popup_preload.js");
+
+/** Reports embedded-browser WebAuthn requests; Windows draws its own WebAuthn dialog. */
+const BROWSER_VIEW_PRELOAD =
+  process.platform === "win32" ? undefined : path.join(__dirname, "browser_view_preload.js");
 
 /** Absolute path to the app icon (PNG works for the macOS dock at runtime). */
 const ICON_PNG = path.join(__dirname, "..", "icons", "icon.png");
@@ -4269,12 +4274,26 @@ function createBrowserRegistryForWindow(win) {
     registry.get(registry.activeConversationId())?.view.webContents === wc;
   const registry = createBrowserViewRegistry({
     WebContentsViewCtor: (opts) => {
+      if (BROWSER_VIEW_PRELOAD) opts.webPreferences.preload = BROWSER_VIEW_PRELOAD;
       // Install before construction: Electron otherwise auto-grants requests.
       const policy = hardenAgentPartition(opts.webPreferences.partition, win, canPrompt, () =>
         view.getBounds(),
       );
       const view = new WebContentsView(opts);
       policy.attach(view.webContents);
+      if (BROWSER_VIEW_PRELOAD) {
+        attachSecurityKeyNotice(view.webContents, {
+          canPrompt,
+          showPrompt: (options) =>
+            browserPermissionPrompt.show({
+              parent: win,
+              getAnchorBounds: () => view.getBounds(),
+              ...options,
+            }),
+          openExternal: (url) => shell.openExternal(url),
+          cookieImport: process.platform === "darwin",
+        });
+      }
       guardAgentPartitionRequests(opts.webPreferences.partition, registry);
       return view;
     },

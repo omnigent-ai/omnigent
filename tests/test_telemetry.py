@@ -983,16 +983,13 @@ def test_resolve_harness_sdk_via_config_key() -> None:
     spec.executor = executor
     spec.sub_agents = []
 
-    loaded = MagicMock()
-    loaded.spec = spec
-
     mock_store = MagicMock()
     mock_store.get.return_value = MagicMock(
         id="ag_sdk", bundle_location="ag_sdk/bundle", session_id=None
     )
 
     mock_cache = MagicMock()
-    mock_cache.load.return_value = loaded
+    mock_cache.load_spec.return_value = spec
 
     with (
         patch("omnigent.runtime._globals._agent_store", mock_store),
@@ -1020,16 +1017,13 @@ def test_resolve_harness_sdk_via_executor_type() -> None:
     spec.executor = executor
     spec.sub_agents = []
 
-    loaded = MagicMock()
-    loaded.spec = spec
-
     mock_store = MagicMock()
     mock_store.get.return_value = MagicMock(
         id="ag_sdk2", bundle_location="ag_sdk2/bundle", session_id=None
     )
 
     mock_cache = MagicMock()
-    mock_cache.load.return_value = loaded
+    mock_cache.load_spec.return_value = spec
 
     with (
         patch("omnigent.runtime._globals._agent_store", mock_store),
