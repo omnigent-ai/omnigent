@@ -20,6 +20,7 @@ from tests.e2e.resilience.lab.lab import Lab
         pytest.param("lab", "rpc-delay", id="lab"),
         pytest.param("lab", "rpc-timeout", id="lab-rpc-timeout-once"),
         pytest.param("server-runner", "rpc-delay", id="server-runner"),
+        pytest.param("server-runner", "rpc-timeout", id="server-runner-rpc-timeout-once"),
         pytest.param("server-runner", "unrelated-host", id="server-runner-unrelated-host"),
         pytest.param("server-runner", "deadline", id="server-runner-deadline"),
         pytest.param("lab", "remaining-budget", id="lab-rpc-remaining-budget"),
