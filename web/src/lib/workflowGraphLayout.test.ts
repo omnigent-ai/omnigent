@@ -101,7 +101,7 @@ describe("layoutWorkflowSteps", () => {
     ]);
   });
 
-  it("draws an edge from each step to each step that waits for it", () => {
+  it("draws the dependencies with one arrowhead at each destination", () => {
     const { edges } = layoutWorkflowSteps([...STEPS, step("lost", "gone")]);
 
     expect(edges.map((edge) => edge.id)).toEqual([
@@ -111,5 +111,40 @@ describe("layoutWorkflowSteps", () => {
       "fix->pr",
       "history->pr",
     ]);
+    expect(edges.filter((edge) => edge.markerEnd).map((edge) => edge.target)).toEqual([
+      "reproduce",
+      "fix",
+      "history",
+      "pr",
+    ]);
+  });
+
+  it("omits redundant arrows while preserving independent branches and the plan's dependencies", () => {
+    const steps = [
+      step("explore"),
+      step("reproduce", "explore"),
+      step("fix", "explore", "reproduce", "reproduce"),
+      step("history", "explore", "reproduce"),
+      step("pr", "explore", "reproduce", "fix", "history"),
+    ];
+    const dependencies = steps.map((item) => [...item.depends_on]);
+    const expected = [
+      "explore->reproduce",
+      "reproduce->fix",
+      "reproduce->history",
+      "fix->pr",
+      "history->pr",
+    ].sort();
+
+    for (const ordered of [steps, [...steps].reverse()]) {
+      const { edges } = layoutWorkflowSteps(ordered);
+      expect(edges.map((edge) => edge.id).sort()).toEqual(expected);
+    }
+    expect(steps.map((item) => item.depends_on)).toEqual(dependencies);
+  });
+
+  it("preserves the connections in a cycle", () => {
+    const { edges } = layoutWorkflowSteps([step("a", "b"), step("b", "a")]);
+    expect(edges.map((edge) => edge.id)).toEqual(["b->a", "a->b"]);
   });
 });

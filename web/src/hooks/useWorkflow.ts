@@ -162,5 +162,7 @@ export function useWorkflowRuns(workflowId: string) {
     getNextPageParam: (page) => page.nextCursor,
     enabled: workflowId !== "",
     staleTime: 10_000,
+    // Other sessions and automations can start runs while this page stays open.
+    refetchInterval: 10_000,
   });
 }

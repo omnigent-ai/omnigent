@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -14,17 +14,21 @@ import {
   WorkflowNotFoundError,
 } from "@/hooks/useWorkflow";
 import type * as WorkflowHooks from "@/hooks/useWorkflow";
+import { useSession } from "@/hooks/useSession";
 import { useSessionJournal } from "@/hooks/useSessionJournal";
+import type * as SessionJournalHooks from "@/hooks/useSessionJournal";
 import { authenticatedFetch } from "@/lib/identity";
 import type * as IdentityModule from "@/lib/identity";
 import type * as RoutingModule from "@/lib/routing";
-import type { JournalEntry, StepProgress } from "@/lib/sessionJournal";
+import { sessionJournalKey, type JournalEntry, type StepProgress } from "@/lib/sessionJournal";
 import { sendUserMessage } from "@/lib/sessionsApi";
 import type * as SessionsApi from "@/lib/sessionsApi";
 import { openTasksTab } from "@/store/sessionTasksActions";
 import type * as TasksActions from "@/store/sessionTasksActions";
 import type { WorkflowStep } from "@/lib/workflowGraphLayout";
 import type { WorkflowRun } from "@/lib/workflowRuns";
+import type { Session } from "@/lib/types";
+import { journalPage } from "@/test/journalFixtures";
 
 import { WorkflowDetailPage } from "./WorkflowDetailPage";
 
@@ -33,6 +37,7 @@ vi.mock("@/hooks/useWorkflow", async (importOriginal) => {
   return { ...actual, useWorkflow: vi.fn(), useWorkflowRuns: vi.fn() };
 });
 vi.mock("@/hooks/useSessionJournal", () => ({ useSessionJournal: vi.fn() }));
+vi.mock("@/hooks/useSession", () => ({ useSession: vi.fn() }));
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof IdentityModule>()),
   authenticatedFetch: vi.fn(),
@@ -178,10 +183,10 @@ function mockRuns(runs: WorkflowRun[], state: Record<string, unknown> = {}) {
 
 const deleteWorkflow = vi.fn();
 
-function renderPage() {
+function renderPage(client = new QueryClient()) {
   // A run's play and stop buttons refresh the runs through the query client.
   return render(
-    <QueryClientProvider client={new QueryClient()}>
+    <QueryClientProvider client={client}>
       <MemoryRouter>
         <WorkflowDetailPage />
       </MemoryRouter>
@@ -195,6 +200,11 @@ describe("WorkflowDetailPage", () => {
     deleteWorkflow.mockClear();
     vi.mocked(openTasksTab).mockClear();
     vi.mocked(showToast).mockClear();
+    vi.mocked(useSession).mockImplementation((id) => ({
+      session: id ? ({ id, archived: false, labels: {} } as Session) : null,
+      isLoading: false,
+      error: null,
+    }));
     vi.mocked(useSessionJournal).mockReturnValue({
       entries: [],
       isLoading: false,
@@ -276,7 +286,7 @@ describe("WorkflowDetailPage", () => {
     cleanup();
     renderPage();
     await screen.findByTestId("workflow-detail-title");
-    fireEvent.click(screen.getByRole("button", { name: "Plan with agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit workflow" }));
     expect(screen.getByTestId("planning-chat")).toHaveAttribute("data-session", planner);
     expect(screen.getByTestId("workflow-detail-run")).toBeEnabled();
   });
@@ -305,6 +315,54 @@ describe("WorkflowDetailPage", () => {
     expect(within(done!).getByText("Untitled session")).toBeInTheDocument();
     expect(done).toHaveAttribute("data-run-state", "done");
   });
+
+  it.each(["deleted", "archived"] as const)(
+    "keeps the saved plan without polling a %s planning session while setup is open",
+    async (state) => {
+      const journalHooks = await vi.importActual<typeof SessionJournalHooks>(
+        "@/hooks/useSessionJournal",
+      );
+      vi.mocked(useSessionJournal).mockImplementation(journalHooks.useSessionJournal);
+      const planner = "d".repeat(32);
+      mockWorkflow({ data: { ...WORKFLOW, planning_session_id: planner } });
+      mockRuns([]);
+      vi.mocked(useSession).mockReturnValue({
+        session: state === "archived" ? ({ id: planner, archived: true } as Session) : null,
+        isLoading: false,
+        error: state === "deleted" ? new Error("Session not found") : null,
+      });
+      vi.mocked(authenticatedFetch).mockReset();
+      vi.mocked(authenticatedFetch).mockImplementation(
+        async () => new Response(null, { status: 404 }),
+      );
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      client.setQueryData(sessionJournalKey(planner), {
+        pages: [journalPage([])],
+        pageParams: [null],
+      });
+
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        renderPage(client);
+        fireEvent.click(screen.getByRole("button", { name: "Edit workflow" }));
+        await act(async () =>
+          vi.advanceTimersByTimeAsync(journalHooks.JOURNAL_FALLBACK_REFETCH_MS * 2),
+        );
+
+        expect(screen.getByTestId("planning-chat")).toBeInTheDocument();
+        expect(screen.getByTestId("workflow-steps-graph")).toHaveTextContent(
+          "Explore the failures, Fix the test",
+        );
+        expect(screen.getByTestId("workflow-detail-run")).toBeEnabled();
+        expect(screen.queryByRole("alert")).toBeNull();
+        expect(authenticatedFetch).not.toHaveBeenCalled();
+      } finally {
+        cleanup();
+        client.clear();
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it("shows three lines of a long description, and the rest on request", () => {
     // jsdom lays nothing out: report a paragraph taller than its three lines.

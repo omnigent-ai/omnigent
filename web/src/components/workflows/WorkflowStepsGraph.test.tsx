@@ -1,5 +1,6 @@
 import type { ComponentType, ReactNode } from "react";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { JournalEntry, StepProgress } from "@/lib/sessionJournal";
@@ -22,7 +23,12 @@ vi.mock("@xyflow/react", () => ({
     <div data-testid="react-flow">
       {nodes.map((node) => {
         const Node = nodeTypes[node.type]!;
-        return <Node key={node.id} id={node.id} data={node.data} />;
+        // React Flow disables pointer events on read-only node wrappers.
+        return (
+          <div key={node.id} style={{ pointerEvents: "none" }}>
+            <Node id={node.id} data={node.data} />
+          </div>
+        );
       })}
       {children}
     </div>
@@ -88,7 +94,7 @@ describe("WorkflowStepsGraph", () => {
     render(<WorkflowStepsGraph steps={STEPS} title="Triage flaky tests" />);
     const fix = screen.getAllByTestId("workflow-step-node")[1]!;
     expect(within(fix).queryByTestId("workflow-step-node-menu")).toBeNull();
-    fireEvent.pointerEnter(fix);
+    await userEvent.hover(fix);
     const card = await screen.findByTestId("workflow-step-card");
     expect(card).toHaveTextContent("Step 2 of 2");
     expect(card).toHaveTextContent("Fix the test");
@@ -138,7 +144,7 @@ describe("WorkflowGraphOverlay", () => {
     expect(fix).toHaveTextContent("Can't start · Explore the failures failed");
     expect(fix).not.toHaveTextContent("The suite passes");
     // The goal is still there on hover.
-    fireEvent.pointerEnter(fix);
+    await userEvent.hover(fix);
     expect(await screen.findByTestId("workflow-step-card")).toHaveTextContent("The suite passes");
   });
 
@@ -153,7 +159,7 @@ describe("WorkflowGraphOverlay", () => {
         onClose={vi.fn()}
       />,
     );
-    fireEvent.pointerEnter(screen.getAllByTestId("workflow-step-node")[1]!);
+    await userEvent.hover(screen.getAllByTestId("workflow-step-node")[1]!);
     const card = await screen.findByTestId("workflow-step-card");
     expect(card).toHaveTextContent("Task 2 of 2");
     expect(card).toHaveTextContent("Fix the test");

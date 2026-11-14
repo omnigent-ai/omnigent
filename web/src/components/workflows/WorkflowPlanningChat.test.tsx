@@ -11,6 +11,8 @@ import type { Session } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
 import { WorkflowPlanningChat } from "./WorkflowPlanningChat";
 
+const unavailableSessions = vi.hoisted(() => new Map<string, "deleted" | "archived">());
+
 // Session launch and transcript behavior are covered by their own component tests.
 vi.mock("@/components/workflows/WorkflowSessionDialog", () => ({
   WorkflowSessionForm: ({
@@ -46,10 +48,14 @@ vi.mock("@/components/chat/SideChatPane", () => ({
 }));
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
 vi.mock("@/hooks/useSession", () => ({
-  useSession: (id: string | null) => ({
-    session: id ? { id, labels: {}, archived: false } : null,
-    error: null,
-  }),
+  useSession: (id: string | null) => {
+    const state = id ? unavailableSessions.get(id) : undefined;
+    return {
+      session:
+        id && state !== "deleted" ? { id, labels: {}, archived: state === "archived" } : null,
+      error: state === "deleted" ? new Error("Session not found") : null,
+    };
+  },
 }));
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof IdentityModule>()),
@@ -83,6 +89,7 @@ function openEditor() {
 }
 
 beforeEach(() => {
+  unavailableSessions.clear();
   vi.mocked(useCanEdit).mockReturnValue(true);
   useChatStore.getState().clearSideChatDraft(SESSION);
 });
@@ -133,3 +140,32 @@ it("respects the session's edit permission when reopening", async () => {
   openEditor();
   expect(await screen.findByTestId("chat")).toHaveAttribute("data-read-only", "true");
 });
+
+it.each(["deleted", "archived"] as const)(
+  "opens session setup directly when the planning session is %s and attaches its replacement",
+  async (state) => {
+    const previousSession = "c".repeat(32);
+    unavailableSessions.set(previousSession, state);
+    let stored = { ...WORKFLOW, planning_session_id: previousSession };
+    vi.mocked(authenticatedFetch).mockImplementation(async (url, options) => {
+      expect(url).toBe(`/v1/workflows/${WORKFLOW.id}`);
+      if (options?.method === "PATCH") {
+        expect(JSON.parse(String(options.body))).toEqual({ planning_session_id: SESSION });
+        stored = { ...stored, planning_session_id: SESSION };
+      }
+      return new Response(JSON.stringify(stored));
+    });
+
+    openEditor();
+    const start = await screen.findByRole("button", { name: "Start planning" });
+    expect(screen.queryByRole("link", { name: "Open planning session in full" })).toBeNull();
+    fireEvent.click(start);
+
+    expect(await screen.findByTestId("chat")).toHaveAttribute("data-session", SESSION);
+    expect(useChatStore.getState().sideChatDrafts[SESSION]).toBe("Draft the release plan");
+    expect(screen.getByRole("link", { name: "Open planning session in full" })).toHaveAttribute(
+      "href",
+      `/c/${SESSION}`,
+    );
+  },
+);
