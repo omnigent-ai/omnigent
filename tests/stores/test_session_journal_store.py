@@ -20,12 +20,15 @@ from omnigent.server.journal_markers import (
     record_plan_marker,
     record_status_marker,
 )
+from omnigent.stores.conversation_store import ConversationAlreadyExistsError
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.session_journal_store import (
     JOURNAL_DELETE_BATCH,
     JournalEntryTooLargeError,
     JournalSessionNotFoundError,
     SessionJournalStore,
+    copy_journal_for_fork,
+    reserve_fork_journal,
 )
 
 SESSION = "4e92b5a0c0ee6db3f874f9c4a3f855a5"
@@ -318,12 +321,12 @@ def test_deleting_a_session_deletes_its_journal_in_batches(
     assert _count(db_uri, "session_journal_heads", SESSION) == 0
 
 
-@pytest.mark.parametrize("fail_second_batch", [False, True])
+@pytest.mark.parametrize("failure", [None, "copy", "publish"])
 def test_a_fork_carries_the_journal_and_continues_it(
     conversations: SqlAlchemyConversationStore,
     journal: SessionJournalStore,
     monkeypatch: pytest.MonkeyPatch,
-    fail_second_batch: bool,
+    failure: str | None,
     db_uri: str,
 ) -> None:
     monkeypatch.setattr("omnigent.stores.session_journal_store.JOURNAL_COPY_BATCH", 2)
@@ -348,13 +351,19 @@ def test_a_fork_carries_the_journal_and_continues_it(
         ) and statement.startswith("SELECT"):
             reads += 1
             assert "LIMIT" in statement
-            if reads == 2 and fail_second_batch:
+            if reads == 2 and failure == "copy":
                 raise RuntimeError("copy interrupted")
+        if (
+            failure == "publish"
+            and (current_query_name() or "").endswith("insert_fork_conversation")
+            and statement.startswith("INSERT")
+        ):
+            raise RuntimeError("publish interrupted")
 
     sa.event.listen(conversations._engine, "before_cursor_execute", inspect_batch)
     try:
-        if fail_second_batch:
-            with pytest.raises(RuntimeError, match="copy interrupted"):
+        if failure:
+            with pytest.raises(RuntimeError, match=f"{failure} interrupted"):
                 conversations.fork_conversation(SESSION)
             assert {c.id for c in conversations.list_conversations().data} == {SESSION, OTHER}
             with sa.create_engine(db_uri).connect() as connection:
@@ -363,6 +372,12 @@ def test_a_fork_carries_the_journal_and_continues_it(
                         sa.text("SELECT COUNT(*) FROM session_journal_entries")
                     ).scalar_one()
                     == 3
+                )
+                assert (
+                    connection.execute(
+                        sa.text("SELECT COUNT(*) FROM session_journal_heads")
+                    ).scalar_one()
+                    == 1
                 )
             return
         fork = conversations.fork_conversation(SESSION)
@@ -378,12 +393,45 @@ def test_a_fork_carries_the_journal_and_continues_it(
     # A run's history lists each entry once, under the session that served it.
     assert [e.scheduled_task_run_id for e in copied] == [None, None, None]
     assert journal.current_plan(fork.id).content == journal.current_plan(SESSION).content
+    # Retrying a caller-supplied target must preserve its published journal,
+    # including when the new source has no journal to stage.
+    for source_id in (SESSION, OTHER):
+        with pytest.raises(ConversationAlreadyExistsError):
+            conversations._fork_conversation_with_id(fork.id, source_id)
+        assert journal.list_entries(fork.id).entries == copied
     # The fork goes on from where its copy ends; the parent is untouched.
     started = journal.append(
         fork.id, "status", {"status": "started"}, idempotency_key="k3", step="video"
     )
     assert started.entry.position == 3
     assert len(journal.list_entries(SESSION).entries) == 3
+
+
+@pytest.mark.parametrize("copy_journal", [False, True])
+@pytest.mark.parametrize("state", ["reserved", "staged", "orphaned"])
+def test_a_competing_fork_leaves_another_attempts_staged_journal(
+    conversations: SqlAlchemyConversationStore,
+    journal: SessionJournalStore,
+    db_uri: str,
+    copy_journal: bool,
+    state: str,
+) -> None:
+    _note(journal, "source")
+    reserve_fork_journal(conversations._session_immediate, MISSING)
+    if state != "reserved":
+        assert copy_journal_for_fork(conversations._session_immediate, SESSION, MISSING) == 1
+    if state == "orphaned":
+        with sa.create_engine(db_uri).begin() as connection:
+            connection.execute(
+                sa.text("DELETE FROM session_journal_heads WHERE conversation_id = :id"),
+                {"id": bytes.fromhex(MISSING)},
+            )
+
+    with pytest.raises(sa.exc.IntegrityError if state == "reserved" else ValueError):
+        conversations._fork_conversation_with_id(MISSING, SESSION, copy_journal=copy_journal)
+    assert _count(db_uri, "session_journal_entries", MISSING) == int(state != "reserved")
+    assert _count(db_uri, "session_journal_heads", MISSING) == int(state != "orphaned")
+    assert {c.id for c in conversations.list_conversations().data} == {SESSION, OTHER}
 
 
 def test_a_side_chat_or_an_empty_fork_starts_with_no_journal(

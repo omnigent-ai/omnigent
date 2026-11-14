@@ -709,6 +709,31 @@ def fork_journal_entry_id(fork_id: str, entry_id: str) -> str:
     return uuid.uuid5(uuid.UUID(fork_id), entry_id).hex
 
 
+def reserve_fork_journal(sessions: NamedManagedSessionMaker, fork_id: str) -> None:
+    """Claim an unused journal before staging a fork or enabling failure cleanup."""
+    with sessions("reserve_fork_journal") as session:
+        if session.get(SqlConversationMetadata, (current_workspace_id(), fork_id)) or (
+            session.execute(
+                select(SqlSessionJournalEntry.position)
+                .where(
+                    SqlSessionJournalEntry.workspace_id == current_workspace_id(),
+                    SqlSessionJournalEntry.conversation_id == fork_id,
+                )
+                .limit(1)
+            ).first()
+            is not None
+        ):
+            raise ValueError(f"fork journal already exists: {fork_id!r}")
+        # The unique head also excludes a concurrent fork of an empty journal.
+        session.add(
+            SqlSessionJournalHead(
+                workspace_id=current_workspace_id(),
+                conversation_id=fork_id,
+                next_position=0,
+            )
+        )
+
+
 def copy_journal_for_fork(
     sessions: NamedManagedSessionMaker,
     source_id: str,
@@ -724,7 +749,7 @@ def copy_journal_for_fork(
     retain the run boundaries. Dispatches and their results stay with the parent.
 
     :param source_id: The session being forked.
-    :param fork_id: The new fork, which has no journal yet.
+    :param fork_id: The new fork, whose journal this caller has reserved.
     :param through_entry_ids: Journal checkpoints in the copied transcript.
         Copy through their newest entry; ``None`` copies the whole journal.
     :returns: How many entries the fork starts with, including run boundaries.
@@ -813,31 +838,25 @@ def copy_journal_for_fork(
             raise JournalSessionNotFoundError(source_id)
         return cursor, position, cursor == last_position
 
-    try:
-        done = False
-        while not done:
-            after, copied, done = run_write_transaction(
-                sessions, "copy_fork_journal_batch", copy_batch
+    done = False
+    while not done:
+        after, copied, done = run_write_transaction(
+            sessions, "copy_fork_journal_batch", copy_batch
+        )
+    with sessions("finish_fork_journal") as session:
+        session.execute(
+            update(SqlSessionJournalHead)
+            .where(
+                SqlSessionJournalHead.workspace_id == current_workspace_id(),
+                SqlSessionJournalHead.conversation_id == fork_id,
             )
-        if copied:
-            with sessions("finish_fork_journal") as session:
-                session.add(
-                    SqlSessionJournalHead(
-                        workspace_id=current_workspace_id(),
-                        conversation_id=fork_id,
-                        next_position=copied,
-                    )
-                )
-    except BaseException:
-        discard_fork_journal(sessions, fork_id)
-        raise
+            .values(next_position=copied)
+        )
     return copied
 
 
 def discard_fork_journal(sessions: NamedManagedSessionMaker, fork_id: str) -> None:
     """Remove an unpublished fork's staged journal after a failed copy or insert."""
-    with sessions("discard_fork_journal_head") as session:
-        delete_journal_heads(session, [fork_id])
     while (
         run_write_transaction(
             sessions,
@@ -847,6 +866,9 @@ def discard_fork_journal(sessions: NamedManagedSessionMaker, fork_id: str) -> No
         == JOURNAL_DELETE_BATCH
     ):
         pass
+    # Keep the reservation until no staged rows remain, excluding competing retries.
+    with sessions("discard_fork_journal_head") as session:
+        delete_journal_heads(session, [fork_id])
 
 
 def delete_journal_heads(session: Session, conversation_ids: Sequence[str]) -> None:

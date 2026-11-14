@@ -158,6 +158,7 @@ from omnigent.stores.session_journal_store import (
     delete_journal_heads,
     discard_fork_journal,
     fork_journal_entry_id,
+    reserve_fork_journal,
 )
 from omnigent.util.session_lifecycle import title_without_closed_marker
 
@@ -6339,6 +6340,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
 
         with self._conv_session("prepare_fork_conversation") as session:
+            if session.get(SqlConversation, (current_workspace_id(), new_conv_id)) is not None:
+                raise ConversationAlreadyExistsError(
+                    f"conversation id {new_conv_id!r} already exists"
+                )
             source = session.get(SqlConversation, (current_workspace_id(), source_conversation_id))
             if source is None:
                 raise LookupError(f"conversation not found: {source_conversation_id!r}")
@@ -6840,22 +6845,22 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         # Journal rows are invisible until the conversation is published. A failed
         # batch must not expose a fork with only part of its plan history.
-        if copy_journal:
-            copy_journal_for_fork(
-                self._session_immediate,
-                source_conversation_id,
-                new_conv_id,
-                through_entry_ids=journal_through,
-            )
+        reserve_fork_journal(self._session_immediate, new_conv_id)
         try:
+            if copy_journal:
+                copy_journal_for_fork(
+                    self._session_immediate,
+                    source_conversation_id,
+                    new_conv_id,
+                    through_entry_ids=journal_through,
+                )
             new_conv = run_write_transaction(
                 self._conv_session_immediate,
                 "insert_fork_conversation",
                 insert_ap,
             )
         except BaseException:
-            if copy_journal:
-                discard_fork_journal(self._session_immediate, new_conv_id)
+            discard_fork_journal(self._session_immediate, new_conv_id)
             raise
 
         # Write fork metadata (and cloned agent if any) to the Omnigent DB.
