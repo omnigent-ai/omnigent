@@ -2830,7 +2830,16 @@ def register_core_routes(
             item.family = family_info.get(item.id)
             if item.family and item.family.pinned and item.family.representative_id == item.id:
                 item.labels[PINNED_LABEL_KEY] = item.family.pinned_at or "1"
-        # Apart from the bounded orphan-suspect probe above, the list does not
+        # A dead runner's prompts died with it, but nothing clears its stored
+        # count or this replica's index, so check rows still counting a prompt.
+        counting = [item for item in items if item.runner_id and item.pending_elicitations_count]
+        if liveness_lookup is not None and counting:
+            liveness = await asyncio.to_thread(liveness_lookup, [item.id for item in counting])
+            for item in counting:
+                live = liveness.get(item.id)
+                if live is not None and not live.runner_online:
+                    item.pending_elicitations_count = 0
+        # Apart from the bounded probes above, the list does not
         # compute per-item liveness
         # (runner_online / host_online). No list consumer reads it: the
         # sidebar no longer surfaces connection state, and the only live

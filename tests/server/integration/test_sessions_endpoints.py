@@ -16,6 +16,7 @@ import asyncio
 import json
 import math
 import threading
+import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
@@ -4679,7 +4680,9 @@ async def test_list_sessions_pending_count_falls_back_to_row_for_bound_session(
     ``pending_elicitations`` index for that session and must fall back to
     the row so a parked approval isn't hidden. ``_build_session_list_item``
     only consults the row when the session is runner-bound — this pins that
-    fallback fires for a bound session, complementing
+    fallback fires for a live bound session, and that the list stops
+    counting either source once the runner's heartbeat expires (its parked
+    prompts died with it), complementing
     ``test_list_sessions_exposes_pending_elicitations_count`` (which covers
     the index-authoritative, unbound path).
 
@@ -4688,6 +4691,7 @@ async def test_list_sessions_pending_count_falls_back_to_row_for_bound_session(
         different replica's live-state write would have.
     """
     from omnigent.runtime import pending_elicitations
+    from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
     from omnigent.stores.conversation_store.sqlalchemy_store import (
         SqlAlchemyConversationStore,
     )
@@ -4703,14 +4707,34 @@ async def test_list_sessions_pending_count_falls_back_to_row_for_bound_session(
     store = SqlAlchemyConversationStore(db_uri)
     assert store.set_runner_id(session_id, "runner_other_replica")
     store.set_pending_elicitation_count(session_id, 2)
+    now = int(time.time())
+    store.touch_runner_liveness(["runner_other_replica"], now)
 
     resp = await client.get("/v1/sessions")
     assert resp.status_code == 200
     row = next((r for r in resp.json()["data"] if r["id"] == session_id), None)
     assert row is not None
-    # Index empty + row=2 + runner-bound → fallback surfaces the row's count.
+    # Index empty + row=2 + live runner → fallback surfaces the row's count.
     assert row["pending_elicitations_count"] == 2
 
+    # The runner died without resolving: its heartbeat expires but the row keeps 2.
+    store.touch_runner_liveness(["runner_other_replica"], now - RUNNER_LIVENESS_TTL_S - 1)
+    resp = await client.get("/v1/sessions")
+    row = next((r for r in resp.json()["data"] if r["id"] == session_id), None)
+    assert row is not None
+    assert row["pending_elicitations_count"] == 0
+
+    # Nor does this replica's index outlive it, had it seen the prompt itself.
+    pending_elicitations.record_publish(
+        session_id,
+        {"type": "response.elicitation_request", "elicitation_id": "elicit_dead_runner"},
+    )
+    resp = await client.get("/v1/sessions")
+    row = next((r for r in resp.json()["data"] if r["id"] == session_id), None)
+    assert row is not None
+    assert row["pending_elicitations_count"] == 0
+
+    pending_elicitations.reset_for_tests()
     store.set_pending_elicitation_count(session_id, 0)
 
 
