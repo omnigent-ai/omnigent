@@ -5380,8 +5380,10 @@ async def test_caller_settings_validation_preserves_baseline_and_arguments(
     baseline_path = Path(args[max(i for i, arg in enumerate(args) if arg == "--settings") + 1])
     baseline_bytes = baseline_path.read_bytes()
     original_args = list(args)
-    claude_settings_validator.side_effect = ValueError(error)
-    with pytest.raises(ValueError, match=error) as raised:
+    claude_settings_validator.side_effect = CallerSettingsError(
+        CallerSettingsErrorReason.INVALID_SETTINGS
+    )
+    with pytest.raises(CallerSettingsError, match=error) as raised:
         await _finalize_test_claude_args(
             args,
             bridge_dir=tmp_path,
@@ -5398,6 +5400,7 @@ async def test_caller_settings_validation_preserves_baseline_and_arguments(
         assert raised.value.reason is CallerSettingsErrorReason.INVALID_RETENTION
         claude_settings_validator.assert_not_awaited()
     else:
+        assert raised.value.reason is CallerSettingsErrorReason.INVALID_SETTINGS
         claude_settings_validator.assert_awaited_once()
 
 
@@ -5792,8 +5795,15 @@ async def test_claude_bridge_deletion_waits_for_every_settings_owner(
                 acquire_claude_settings_request(bridge_dir, first.generation)
             with pytest.raises(ValueError, match="expired"):
                 first.mark_dispatched()
+            before_ack = {
+                path.name: path.read_bytes() for path in bridge_dir.iterdir() if path.is_file()
+            }
             with pytest.raises(ValueError, match="expired"):
-                first.acknowledge(first.generation)
+                first.cancel_undelivered_dispatch()
+            assert first.acknowledge(first.generation)
+            assert {
+                path.name: path.read_bytes() for path in bridge_dir.iterdir() if path.is_file()
+            } == before_ack
             with pytest.raises(ValueError, match="expired"):
                 lease.attach(instance)
             with ClaudeSettingsRequest.create(bridge_dir) as current:

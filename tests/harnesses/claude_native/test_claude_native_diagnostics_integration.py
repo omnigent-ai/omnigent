@@ -7,7 +7,7 @@ import contextlib
 import json
 import logging
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -229,6 +229,7 @@ async def test_server_client_start_failure_drains_diagnostics_before_first_poll(
         (False, "transport"),
         (False, "cancelled"),
         (True, "rejected"),
+        (True, "reactivated-ack"),
         (True, "transport"),
         (True, "cleanup-failure"),
         (True, "read"),
@@ -249,10 +250,17 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
         ClaudeSettingsLease,
         ClaudeSettingsRequest,
         acquire_claude_settings_request,
+        prune_unused_claude_settings,
+        request_claude_bridge_deletion,
     )
 
     monkeypatch.setenv(HARNESS_STDERR_ENABLED_ENV_VAR, "1")
     monkeypatch.setattr(claude_native, "resolve_claude_launch", lambda cmd, args: (cmd, args))
+    bridge_dir = (
+        bridge.prepare_bridge_dir("failed-child", workspace=tmp_path)
+        if failure_mode == "reactivated-ack"
+        else tmp_path
+    )
     follower = SimpleNamespace(close=Mock())
     make_follower = Mock(return_value=follower)
     monkeypatch.setattr(
@@ -304,21 +312,32 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
         if owned_request:
             if failure_mode in uncertain_errors:
                 receiver = acquire_claude_settings_request(
-                    tmp_path, posted[-1]["claude_settings_request"]
+                    bridge_dir, posted[-1]["claude_settings_request"]
                 )
                 admitted_settings = (
-                    tmp_path / f"claude-settings-{receiver.generation}.json"
+                    bridge_dir / f"claude-settings-{receiver.generation}.json"
                 ).read_bytes()
                 original_error = uncertain_errors[failure_mode](
                     "simulated failure after admission", request=request
                 )
                 raise original_error
-            with acquire_claude_settings_request(tmp_path, posted[-1]["claude_settings_request"]):
-                pass
+            generation = posted[-1]["claude_settings_request"]
+            with acquire_claude_settings_request(bridge_dir, generation):
+                if failure_mode == "reactivated-ack":
+                    request_claude_bridge_deletion(bridge_dir, "failed-child")
+                    bridge.prepare_bridge_dir("failed-child", workspace=tmp_path)
+                    return httpx.Response(
+                        409,
+                        json={
+                            "detail": "simulated launch rejection",
+                            "claude_settings_request_ack": generation,
+                        },
+                    )
         return httpx.Response(503, json={"detail": "simulated launch rejection"})
 
     expected_error, expected_message = {
         "rejected": (ClickException, "503"),
+        "reactivated-ack": (ClickException, r"\(409\): simulated launch rejection"),
         "transport": (httpx.ConnectError, "simulated launch transport failure"),
         "cleanup-failure": (httpx.ConnectError, "simulated launch transport failure"),
         "read": (httpx.ReadError, "simulated failure after admission"),
@@ -334,7 +353,7 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
         ) as client:
             with pytest.raises(expected_error, match=expected_message) as raised:
                 await claude_native._launch_claude_terminal(
-                    client, "failed-child", (), command="claude", bridge_dir=tmp_path
+                    client, "failed-child", (), command="claude", bridge_dir=bridge_dir
                 )
 
         if original_error is not None:
@@ -344,52 +363,101 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
         if owned_request:
             generation = posted[0]["claude_settings_request"]
             if failure_mode in {"rejected", "transport"}:
-                assert not list(tmp_path.glob("claude-settings-*"))
+                assert not list(bridge_dir.glob("claude-settings-*"))
             else:
-                settings = tmp_path / f"claude-settings-{generation}.json"
+                settings = bridge_dir / f"claude-settings-{generation}.json"
                 assert settings.exists()
                 if admitted_settings is not None:
                     assert settings.read_bytes() == admitted_settings
-                assert (tmp_path / f"claude-settings-{generation}.dispatch.owner").exists() is (
-                    failure_mode not in uncertain_errors
+                assert (bridge_dir / f"claude-settings-{generation}.dispatch.owner").exists() is (
+                    failure_mode not in uncertain_errors and failure_mode != "reactivated-ack"
                 )
         assert "--debug-file" in posted[0]["spec"]["args"]
-        make_follower.assert_called_once_with(tmp_path)
+        make_follower.assert_called_once_with(bridge_dir)
         follower.close.assert_called_once_with("failed-child")
     finally:
         if receiver is not None:
             receiver.close()
-    if failure_mode in uncertain_errors:
-        assert not list(tmp_path.glob("claude-settings-*"))
+    if failure_mode == "reactivated-ack":
+        prune_unused_claude_settings(bridge_dir)
+    if failure_mode in uncertain_errors or failure_mode == "reactivated-ack":
+        assert not list(bridge_dir.glob("claude-settings-*"))
 
 
+@pytest.mark.parametrize("reactivated", [False, True], ids=["current-epoch", "reactivated"])
 async def test_cli_settings_request_is_released_after_acknowledgement(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reactivated: bool
 ) -> None:
+    from omnigent.harnesses.claude_native.settings_generation import (
+        acquire_claude_settings_request,
+        prune_unused_claude_settings,
+        request_claude_bridge_deletion,
+    )
+
     monkeypatch.setattr(claude_native, "resolve_claude_launch", lambda cmd, args: (cmd, args))
+    bridge_dir = (
+        bridge.prepare_bridge_dir("acknowledged-child", workspace=tmp_path)
+        if reactivated
+        else tmp_path
+    )
     posted = []
+    terminal_closers: list[Callable[[], None]] = []
+    terminal = Mock()
+    terminal.add_resource_cleanup.side_effect = terminal_closers.append
+    reactivated_lifecycle: bytes | None = None
 
     def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal reactivated_lifecycle
         if request.method == "GET":
             return httpx.Response(200, json={"claude_settings_request_protocol": 1})
         body = json.loads(request.content)
         posted.append(body)
         generation = body["claude_settings_generation"]
-        assert (tmp_path / f"claude-settings-{generation}.json").exists()
+        assert (bridge_dir / f"claude-settings-{generation}.json").exists()
+        if reactivated:
+            with acquire_claude_settings_request(bridge_dir, generation) as receiver:
+                receiver.attach(terminal)
+            assert not (bridge_dir / f"claude-settings-{generation}.dispatch.owner").exists()
+            request_claude_bridge_deletion(bridge_dir, "acknowledged-child")
+            lifecycle_path = bridge_dir / ".claude-settings-lifecycle.json"
+            before = json.loads(lifecycle_path.read_bytes())
+            assert before["delete_for_session"] == "acknowledged-child"
+            bridge.prepare_bridge_dir("acknowledged-child", workspace=tmp_path)
+            reactivated_lifecycle = lifecycle_path.read_bytes()
+            after = json.loads(reactivated_lifecycle)
+            assert after["incarnation"] == before["incarnation"]
+            assert after["admission_epoch"] != before["admission_epoch"]
         return httpx.Response(
             200, json={"id": "terminal_claude_main", "claude_settings_request_ack": generation}
         )
 
-    async with httpx.AsyncClient(
-        base_url="http://unused.invalid", transport=httpx.MockTransport(respond)
-    ) as client:
-        terminal_id = await claude_native._launch_claude_terminal(
-            client, "acknowledged-child", (), command="claude", bridge_dir=tmp_path
-        )
+    try:
+        async with httpx.AsyncClient(
+            base_url="http://unused.invalid", transport=httpx.MockTransport(respond)
+        ) as client:
+            terminal_id = await claude_native._launch_claude_terminal(
+                client, "acknowledged-child", (), command="claude", bridge_dir=bridge_dir
+            )
 
-    assert terminal_id == "terminal_claude_main"
-    assert len(posted) == 1
-    assert not list(tmp_path.glob("claude-settings-*"))
+        assert terminal_id == "terminal_claude_main"
+        assert len(posted) == 1
+        if reactivated:
+            generation = posted[0]["claude_settings_generation"]
+            assert (bridge_dir / f"claude-settings-{generation}.json").exists()
+            assert (
+                len(list(bridge_dir.glob(f"claude-settings-{generation}.terminal-*.owner"))) == 1
+            )
+            lifecycle_path = bridge_dir / ".claude-settings-lifecycle.json"
+            assert lifecycle_path.read_bytes() == reactivated_lifecycle
+        else:
+            assert not list(bridge_dir.glob("claude-settings-*"))
+    finally:
+        for close in terminal_closers:
+            close()
+    if reactivated:
+        assert not list(bridge_dir.glob("*.terminal-*.owner"))
+        prune_unused_claude_settings(bridge_dir)
+        assert not list(bridge_dir.glob("claude-settings-*"))
 
 
 async def test_cli_logs_launch_error_before_cancellation_during_diagnostic_drain(

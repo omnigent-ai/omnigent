@@ -584,7 +584,9 @@ class ClaudeSettingsRequest:
         """Accept only the actual receiver's matching generation acknowledgement."""
         if generation != self.generation:
             return False
-        self._clear_dispatch()
+        # Completed admission stays acknowledged after bridge reactivation.
+        with contextlib.suppress(ClaudeSettingsRequestExpired):
+            self._clear_dispatch()
         return True
 
     @classmethod
