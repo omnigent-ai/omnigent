@@ -662,7 +662,7 @@ def register_resource_routes(
                             active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
                             private_output=settings_lease is not None,
                         )
-                    except CallerSettingsError:
+                    except (CallerSettingsError, ClaudeSettingsRequestExpired):
                         raise
                     except ValueError as exc:
                         raise RuntimeError("Claude caller settings preparation failed") from exc

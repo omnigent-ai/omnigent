@@ -230,6 +230,8 @@ def _complete_bridge_deletion(bridge_dir: Path, incarnation: str, *, admission_e
 
 def request_claude_bridge_deletion(bridge_dir: Path, session_id: str) -> None:
     """Remove an unowned bridge, or let its final matching owner complete deletion."""
+    if not bridge_dir.exists():
+        return
     with bridge_dir_preparation_lock(bridge_dir):
         if not bridge_dir.exists():
             return

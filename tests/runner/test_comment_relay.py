@@ -2054,7 +2054,9 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
         "opaque",
         "abandoned",
         "expired",
+        "expired-after-admission",
         "failure",
+        "invalid-retention",
         "declared-replacement",
         "invalid-settings",
         "validation-unavailable",
@@ -2068,6 +2070,8 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
     from omnigent.harnesses.claude_native.main import _claude_terminal_request
     from omnigent.harnesses.claude_native.settings_generation import (
         ClaudeSettingsRequest,
+        prune_unused_claude_settings,
+        request_claude_bridge_deletion,
         settings_generation_path,
     )
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
@@ -2111,6 +2115,7 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
     caller = {
         "env": {"EXAMPLE": "caller", "FROM_FILE": "yes", "ORDER": "file"},
         **({"disableAllHooks": True} if mode == "failure" else {}),
+        **({"cleanupPeriodDays": 0} if mode == "invalid-retention" else {}),
     }
     caller_file = tmp_path / "caller.json"
     caller_file.write_text(json.dumps(caller))
@@ -2163,6 +2168,9 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
     async def launch(self, **kwargs):
         if mode == "abandoned" and kwargs["spec"].args == body["spec"]["args"]:
             request.close()
+        if mode == "expired-after-admission":
+            request_claude_bridge_deletion(bridge_dir, session_id)
+            prepare_bridge_dir(session_id, workspace=tmp_path)
 
         async def prepare(instance):
             nonlocal policy_selected
@@ -2197,15 +2205,23 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
             response = await client.post(url, json=body)
             if mode in {
                 "expired",
+                "expired-after-admission",
                 "failure",
+                "invalid-retention",
                 "invalid-settings",
                 "validation-unavailable",
                 "unexpected-validator-error",
             }:
-                assert response.status_code == (409 if mode == "expired" else 500), response.text
+                assert response.status_code == (
+                    409 if mode in {"expired", "expired-after-admission"} else 500
+                ), response.text
                 if mode != "expired":
                     assert response.json()["claude_settings_request_ack"] == request.generation
-                    assert response.json()["error"]["code"] == "terminal_launch_failed"
+                    assert response.json()["error"]["code"] == (
+                        "conflict"
+                        if mode == "expired-after-admission"
+                        else "terminal_launch_failed"
+                    )
                     assert len(prepared) == 1
                     instance, original_args = prepared[0]
                     assert instance.args == original_args
@@ -2217,11 +2233,16 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
                 assert launched == []
                 assert not (bridge_dir / _TOOL_RELAY_FILE).exists()
                 request.close()
+                if mode == "expired-after-admission":
+                    assert baseline.read_bytes() == baseline_bytes
+                    assert prune_unused_claude_settings(bridge_dir) == 1
                 assert not list(bridge_dir.glob(f"claude-settings-{request.generation}*"))
-                if mode == "expired":
+                if mode in {"expired", "expired-after-admission"}:
                     assert response.json()["error"]["code"] == "conflict"
                     assert "expired" in message
-                    assert "claude_settings_request_ack" not in response.json()
+                    assert ("claude_settings_request_ack" in response.json()) is (
+                        mode == "expired-after-admission"
+                    )
                 elif mode == "failure":
                     assert message == (
                         "Caller disableAllHooks=true or allowManagedHooksOnly=true disables "
@@ -2233,6 +2254,13 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
                         "Claude rejected the merged caller settings. Check --settings "
                         "with the selected Claude CLI, then retry; the launch arguments "
                         "and bridge settings were left unchanged."
+                    )
+                elif mode == "invalid-retention":
+                    assert message == (
+                        "Caller cleanupPeriodDays must be a positive integer. "
+                        "Set it to at least 1 in --settings, then retry; "
+                        "the launch arguments and bridge settings "
+                        "were left unchanged."
                     )
                 elif mode == "validation-unavailable":
                     assert message == (

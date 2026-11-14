@@ -111,6 +111,8 @@ async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
 @pytest.mark.parametrize(
     "owner",
     [
+        "absent",
+        "removed-before-lock",
         "none",
         "pending",
         "undelivered",
@@ -130,6 +132,7 @@ async def test_delete_session_removes_native_bridge_dir(
     owner: str,
 ) -> None:
     """Delete retains settings until pending requests and terminals release them."""
+    from omnigent.harnesses.claude_native import settings_generation
     from omnigent.harnesses.claude_native.bridge import augment_claude_args
     from omnigent.harnesses.claude_native.settings_generation import (
         ClaudeSettingsRequest,
@@ -140,6 +143,34 @@ async def test_delete_session_removes_native_bridge_dir(
     from omnigent.terminals import TerminalRegistry
 
     session_id = f"conv_{uuid.uuid4().hex}"
+    if owner in {"absent", "removed-before-lock"}:
+        bridge_dir = bridge_dir_for_bridge_id(session_id)
+        lock_file = bridge_dir.parent / ".locks" / f"{bridge_dir.name}.lock"
+        assert not bridge_dir.exists()
+        assert not lock_file.exists()
+        locked = []
+        if owner == "removed-before-lock":
+            bridge_dir.mkdir(parents=True)
+            original_lock = settings_generation.bridge_dir_preparation_lock
+
+            @contextlib.contextmanager
+            def remove_before_deletion_check(path: Path):
+                with original_lock(path):
+                    locked.append(path)
+                    path.rmdir()
+                    yield
+
+            monkeypatch.setattr(
+                settings_generation, "bridge_dir_preparation_lock", remove_before_deletion_check
+            )
+        response = await client.delete(f"/v1/sessions/{session_id}{endpoint}")
+        assert response.status_code == 200
+        assert not bridge_dir.exists()
+        if owner == "absent":
+            assert not lock_file.exists()
+        else:
+            assert locked == [bridge_dir]
+        return
     bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
     assert bridge_dir == bridge_dir_for_bridge_id(session_id)
     # prepare_bridge_dir writes a bridge.json holding the bridge token.

@@ -68,6 +68,7 @@ class CallerSettingsErrorReason(Enum):
     VALIDATION_UNAVAILABLE = "validation_unavailable"
     SANDBOX_REQUIRED = "sandbox_required"
     INVALID_HOOKS = "invalid_hooks"
+    INVALID_RETENTION = "invalid_retention"
     BRIDGE_HOOKS_DISABLED = "bridge_hooks_disabled"
 
 
@@ -89,6 +90,11 @@ _CALLER_SETTINGS_MESSAGES = {
     CallerSettingsErrorReason.INVALID_HOOKS: (
         "Caller hooks must be an object whose event values are lists. Check --settings, "
         "then retry; the launch arguments and bridge settings were left unchanged."
+    ),
+    CallerSettingsErrorReason.INVALID_RETENTION: (
+        "Caller cleanupPeriodDays must be a positive integer. Set it to at least 1 "
+        "in --settings, then retry; the launch arguments and bridge settings "
+        "were left unchanged."
     ),
     CallerSettingsErrorReason.BRIDGE_HOOKS_DISABLED: (
         "Caller disableAllHooks=true or allowManagedHooksOnly=true disables required "

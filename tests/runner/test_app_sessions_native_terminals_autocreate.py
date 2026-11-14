@@ -3894,7 +3894,13 @@ def test_publish_terminal_pending_emits_pending_then_clear() -> None:
 @pytest.mark.parametrize("surface", ["publish", "ensure"])
 @pytest.mark.parametrize(
     "failure",
-    ["missing-cli", "invalid-settings", "validation-unavailable", "unexpected-validator"],
+    [
+        "missing-cli",
+        "invalid-settings",
+        "invalid-retention",
+        "validation-unavailable",
+        "unexpected-validator",
+    ],
 )
 def test_native_terminal_start_error_guidance_and_redaction(
     caplog: pytest.LogCaptureFixture,
@@ -3915,9 +3921,11 @@ def test_native_terminal_start_error_guidance_and_redaction(
         raised = ValueError(f"{private_value} {private_path}")
     else:
         settings_error = CallerSettingsError(
-            CallerSettingsErrorReason.INVALID_SETTINGS
-            if failure == "invalid-settings"
-            else CallerSettingsErrorReason.VALIDATION_UNAVAILABLE
+            {
+                "invalid-settings": CallerSettingsErrorReason.INVALID_SETTINGS,
+                "invalid-retention": CallerSettingsErrorReason.INVALID_RETENTION,
+                "validation-unavailable": CallerSettingsErrorReason.VALIDATION_UNAVAILABLE,
+            }[failure]
         )
         guidance = settings_error.client_message
         settings_error.args = (f"{private_value} {private_path}",)

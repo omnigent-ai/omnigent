@@ -3906,7 +3906,7 @@ def _merge_caller_settings(
             or retention <= 0
             or (isinstance(retention, float) and not retention.is_integer())
         ):
-            raise ValueError("Caller cleanupPeriodDays must be a positive integer")
+            raise CallerSettingsError(CallerSettingsErrorReason.INVALID_RETENTION)
     if isinstance(caller_status, dict):
         command = caller_status.get("command")
         if isinstance(command, str) and command.strip():
