@@ -2300,17 +2300,21 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         session_id: str,
         *,
         timeout_s: float,
+        runner_online: asyncio.Event | None = None,
     ) -> str:
         """
-        Return the Claude terminal id once the wait phase is reached.
+        Return the Claude terminal id once the runner wait reports online.
 
         :param client: HTTP client created by the prepare helper.
         :param session_id: Created conversation id.
         :param timeout_s: Timeout supplied by production.
+        :param runner_online: Event the concurrent runner wait sets.
         :returns: Fixed terminal id.
         """
         del client, timeout_s
         assert session_id == "conv_daemon_progress"
+        assert runner_online is not None
+        await asyncio.wait_for(runner_online.wait(), timeout=5.0)
         return claude_native.claude_terminal_resource_id()
 
     async def fake_read_tmux(
@@ -2991,6 +2995,83 @@ async def test_terminal_ready_wait_ignores_stale_error_items() -> None:
 
     assert "did not create the Claude terminal" in excinfo.value.message
     assert "an earlier failure" not in excinfo.value.message
+
+
+@pytest.mark.asyncio
+async def test_terminal_ready_timeout_starts_when_the_runner_connects() -> None:
+    """
+    A slow runner connect does not spend the concurrent terminal wait's budget.
+
+    Fresh launches wait for the runner and its terminal together. The
+    terminal timeout must start once the runner is online, so a slow
+    tunnel handshake reports the runner wait's error, not a missing terminal.
+    """
+
+    runner_online = asyncio.Event()
+    terminal_polls = {"before_online": 0, "after_online": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/items"):
+            return httpx.Response(200, json={"data": []})
+        terminal_polls["after_online" if runner_online.is_set() else "before_online"] += 1
+        return httpx.Response(404, json={"error": {"message": "not found"}})
+
+    async def connect_runner_late() -> None:
+        await asyncio.sleep(0.5)
+        runner_online.set()
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        connector = asyncio.create_task(connect_runner_late())
+        with pytest.raises(click.ClickException) as excinfo:
+            await claude_native._wait_for_claude_terminal_ready(
+                client, "conv_abc", timeout_s=0.2, runner_online=runner_online
+            )
+        await connector
+
+    assert "did not create the Claude terminal" in excinfo.value.message
+    # The 0.2s budget outlived the 0.5s connect: polling ran only once the runner was online.
+    assert terminal_polls["before_online"] == 0
+    assert terminal_polls["after_online"] > 0
+
+
+@pytest.mark.asyncio
+async def test_runner_failure_cancels_the_concurrent_terminal_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed runner wait cancels the terminal wait still waiting for it to connect."""
+    terminal_wait_cancelled = asyncio.Event()
+
+    async def fail_runner_wait(client: object, runner_id: str, *, timeout_s: float) -> None:
+        del client, timeout_s
+        raise click.ClickException(f"Runner {runner_id!r} failed to start: exited")
+
+    async def wait_for_terminal(
+        client: object,
+        session_id: str,
+        *,
+        timeout_s: float,
+        runner_online: asyncio.Event | None = None,
+    ) -> str:
+        del client, session_id, timeout_s
+        assert runner_online is not None
+        try:
+            await runner_online.wait()
+        except asyncio.CancelledError:
+            terminal_wait_cancelled.set()
+            raise
+        return claude_native.claude_terminal_resource_id()
+
+    monkeypatch.setattr(claude_native, "wait_for_runner_online", fail_runner_wait)
+    monkeypatch.setattr(claude_native, "_wait_for_claude_terminal_ready", wait_for_terminal)
+
+    async with httpx.AsyncClient(base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException, match="failed to start"):
+            await claude_native._wait_for_runner_and_claude_terminal(
+                client, "runner_abc", "conv_abc"
+            )
+
+    assert terminal_wait_cancelled.is_set()
 
 
 # ── same-machine tmux attach (Phase 4) ─────────────────────

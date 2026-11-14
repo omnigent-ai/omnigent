@@ -20,6 +20,7 @@ import httpx
 import pytest
 
 from omnigent import resume_dispatch
+from omnigent.cli_diagnostics import suppresses_recovery_hint
 
 # ── run_resume — top-level entry ──────────────────────────
 
@@ -730,6 +731,36 @@ def test_read_wrapper_label_remote_raises_on_404(
         )
     assert "5eca720dc2bc6cdc3a99028d7bd0f917" in excinfo.value.message
     assert "not found" in excinfo.value.message
+
+
+def test_read_wrapper_label_remote_read_timeout_omits_stale_host_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A slow server that times out the session read reports the server,
+    without the CLI's runner-tunnel HTTP 401 stale-host recovery hint.
+    """
+
+    def _fake_get(url: str, *, headers: dict[str, str], timeout: float) -> httpx.Response:
+        """Time out like a slow server."""
+        del url, headers, timeout
+        raise httpx.ReadTimeout("The read operation timed out")
+
+    monkeypatch.setattr(httpx, "get", _fake_get)
+    monkeypatch.setattr(
+        "omnigent.chat._remote_headers",
+        lambda *, server_url, host_id=None: {},
+    )
+
+    with pytest.raises(click.ClickException) as excinfo:
+        resume_dispatch._read_wrapper_label_remote(
+            server="https://example.com",
+            conv_id="5eca720dc2bc6cdc3a99028d7bd0f917",
+        )
+    assert excinfo.value.message == (
+        "Failed to reach 'https://example.com': The read operation timed out"
+    )
+    assert suppresses_recovery_hint(excinfo.value) is True
 
 
 # ── _resolve_current_user_id ──────────────────────────────
