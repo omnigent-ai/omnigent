@@ -14240,7 +14240,7 @@ snapshots:
       obug: 2.2.1
       std-env: 4.3.0
       tinyrainbow: 3.2.0
-      vitest: 4.1.12(@opentelemetry/api@1.9.1)(@types/node@24.13.3)(@vitest/coverage-v8@4.1.12)(jsdom@29.1.1(@noble/hashes@2.2.0)(canvas@3.2.3))(msw@2.15.0(@types/node@24.13.3)(typescript@6.0.3))(vite@8.1.6(@types/node@24.13.3)(esbuild@0.28.2)(jiti@2.7.0)(yaml@2.9.0))
+      vitest: 4.1.12(@opentelemetry/api@1.9.1)(@types/node@20.19.43)(@vitest/coverage-v8@4.1.12)(jsdom@29.1.1(@noble/hashes@2.2.0)(canvas@3.2.3))(msw@2.15.0(@types/node@20.19.43)(typescript@5.9.3))(vite@8.1.6(@types/node@20.19.43)(esbuild@0.28.2)(jiti@2.7.0)(yaml@2.9.0))
 
   '@vitest/expect@3.2.4':
     dependencies:
