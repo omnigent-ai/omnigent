@@ -5413,8 +5413,9 @@ async def _execute_reminder_cancel(
             return json.dumps(
                 {
                     "error": f"{tool_name}: this Omnigent server can't limit a delete to this "
-                    "session's reminders; delete it with sys_scheduled_task_delete, which "
-                    "asks the user first"
+                    "session's reminders. sys_scheduled_task_delete can remove it, but a "
+                    "server this old may run that without asking the user, so ask them "
+                    "before using it"
                 }
             )
         resp = await server_client.delete(
@@ -5436,8 +5437,9 @@ async def _execute_reminder_cancel(
             {
                 "error": f"server returned {resp.status_code}; nothing was deleted. The "
                 "reminder may already be gone, or this server can't cancel reminders: "
-                "check sys_scheduled_task_list, and delete it with "
-                "sys_scheduled_task_delete if it is still there",
+                "check sys_scheduled_task_list. If it is still there, "
+                "sys_scheduled_task_delete can remove it, but a server without this "
+                "route may run that without asking the user, so ask them first",
                 "details": resp.text[:1000],
             }
         )

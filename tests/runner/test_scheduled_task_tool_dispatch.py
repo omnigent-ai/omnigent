@@ -1103,6 +1103,8 @@ async def test_reminder_cancel_refuses_servers_that_cannot_limit_the_delete(info
     client._info = info
     out = await _cancel(client)
     assert "can't limit a delete" in out["error"]
+    # An older server doesn't gate the plain delete, so the agent is told to ask first.
+    assert "without asking the user" in out["error"]
     assert "sys_scheduled_task_delete" in out["error"]
     assert not [call for call in client.calls if call[0] == "DELETE"]
 
@@ -1126,6 +1128,7 @@ async def test_reminder_cancel_never_falls_back_to_a_plain_delete(status: int) -
     client = _CancelClient(_Resp(status_code=status, body={"detail": "Not Found"}))
     out = await _cancel(client)
     assert f"server returned {status}; nothing was deleted" in out["error"]
+    assert "without asking the user" in out["error"]
     assert "sys_scheduled_task_delete" in out["error"]
     assert "status" not in out
     assert [call for call in client.calls if call[0] == "DELETE"] == [
