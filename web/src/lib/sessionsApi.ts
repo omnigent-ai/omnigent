@@ -847,7 +847,8 @@ export async function createBundledSession(
     sandbox_profile_revision?: string;
     project_id?: string;
     sibling_source_id?: string;
-    labels?: Record<string, string>;
+    /** Initial labels; a `null` value leaves that project default off the session. */
+    labels?: Record<string, string | null>;
     initial_input?: SessionEventInput;
     terminal_launch_args?: string[];
     git?: { branch_name: string; base_branch?: string; existing_worktree?: boolean } | null;
@@ -1365,10 +1366,11 @@ export async function updateSession(
     shareWorkspaceFiles?: boolean;
     runnerId?: string;
     silent?: boolean;
-    labels?: Record<string, string>;
+    /** Labels to upsert; a `null` value deletes that label. */
+    labels?: Record<string, string | null>;
   },
 ): Promise<Session> {
-  const body: Record<string, string | boolean | null | Record<string, string>> = {};
+  const body: Record<string, string | boolean | null | Record<string, string | null>> = {};
   if ("reasoningEffort" in updates) {
     body.reasoning_effort = updates.reasoningEffort ?? "default";
   }
@@ -1397,8 +1399,8 @@ export async function updateSession(
     body.runner_id = updates.runnerId;
   }
   if (updates.labels !== undefined) {
-    // Merge-upsert on the server; an empty-string value clears a label
-    // (e.g. the pinned flag on unpin — see PATCH /v1/sessions handler).
+    // Merge-upsert on the server; `null` deletes a label, and an empty string
+    // also clears the project / pinned flags (see PATCH /v1/sessions handler).
     body.labels = updates.labels;
   }
   if (updates.silent) {

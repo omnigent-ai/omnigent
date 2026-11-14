@@ -286,25 +286,48 @@ def test_wrong_runner_token_is_rejected(
     assert COST_CONTROL_PLAN_LABEL not in conv.labels
 
 
-def test_editor_can_still_patch_ordinary_labels(
+def test_editor_cannot_delete_cost_control_plan(
     stores: tuple[SqlAlchemyConversationStore, SqlAlchemyAgentStore, SqlAlchemyPermissionStore],
 ) -> None:
-    """The gate is namespace-scoped: an editor's write of ordinary
-    labels still succeeds — over-blocking would regress every existing
-    labels client."""
+    """Deleting the plan label with a ``null`` value is gated like writing
+    it: erasing the verdict would spoof the telemetry just as well."""
     conversation_store = stores[0]
     app = _multi_user_app(stores)
     conv_id = _seed_session(stores, editor=BOB)
+    conversation_store.set_labels(conv_id, {COST_CONTROL_PLAN_LABEL: _FORGED_PLAN})
 
     resp = TestClient(app).patch(
         f"/v1/sessions/{conv_id}",
-        json={"labels": {"team": "ml"}},
+        json={"labels": {COST_CONTROL_PLAN_LABEL: None}},
+        headers={"X-Forwarded-Email": BOB},
+    )
+    assert resp.status_code == 403
+    conv = conversation_store.get_conversation(conv_id)
+    assert conv is not None
+    assert conv.labels[COST_CONTROL_PLAN_LABEL] == _FORGED_PLAN
+
+
+def test_editor_can_still_patch_ordinary_labels(
+    stores: tuple[SqlAlchemyConversationStore, SqlAlchemyAgentStore, SqlAlchemyPermissionStore],
+) -> None:
+    """The gate is namespace-scoped: an editor's write or delete of
+    ordinary labels still succeeds — over-blocking would regress every
+    existing labels client."""
+    conversation_store = stores[0]
+    app = _multi_user_app(stores)
+    conv_id = _seed_session(stores, editor=BOB)
+    conversation_store.set_labels(conv_id, {"stale": "yes"})
+
+    resp = TestClient(app).patch(
+        f"/v1/sessions/{conv_id}",
+        json={"labels": {"team": "ml", "stale": None}},
         headers={"X-Forwarded-Email": BOB},
     )
     assert resp.status_code == 200
     conv = conversation_store.get_conversation(conv_id)
     assert conv is not None
     assert conv.labels["team"] == "ml"
+    assert "stale" not in conv.labels
 
 
 # ── PATCH: the bound runner's write keeps working ────────────────────────────
