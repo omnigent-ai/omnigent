@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { CheckIcon, LogOutIcon, PlusIcon, SettingsIcon } from "lucide-react";
+import { BugIcon, CheckIcon, LogOutIcon, PlusIcon, RotateCwIcon, SettingsIcon } from "lucide-react";
 import { toast } from "sonner";
 import { signOutOfBrowserSession } from "@/lib/accountsApi";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -17,6 +17,7 @@ import {
 import {
   getServerPicker,
   openServerSetup,
+  runAuthDebugAction,
   signOutOfServer,
   supportsNativeServerPicker,
   switchServer,
@@ -85,7 +86,8 @@ function serverKey(url: string): string | null {
  *
  * A profile trigger (avatar + identity + current server) opens the existing
  * server menu, with Settings above it and Sign out below it. The adjacent gear
- * links directly to Settings.
+ * links directly to Settings. The Android shell also offers "Reload" and, in
+ * debug builds, its authentication faults.
  *
  * This deliberately lives at the bottom of the sidebar rather than in the
  * chat surface's top strip. The macOS shell hides the native title bar
@@ -129,6 +131,7 @@ export function SidebarServerPicker() {
   if (!info) return null;
 
   const managed = Array.isArray(info.managedServers) ? info.managedServers : [];
+  const debugActions = Array.isArray(info.debugActions) ? info.debugActions : [];
   const managedOrigins = new Set(managed.map(originOf).filter((origin) => origin !== null));
   // When sign-in moved hosts, the shell names the server the user picked; match
   // it by origin + workspace, since several workspaces can share that host.
@@ -328,6 +331,16 @@ export function SidebarServerPicker() {
                 </>
               ) : null}
               <DropdownMenuSeparator />
+              {info.offersReload ? (
+                <DropdownMenuItem
+                  className="gap-2"
+                  onSelect={() => window.location.reload()}
+                  data-testid="sidebar-server-reload"
+                >
+                  <RotateCwIcon className="size-4 shrink-0" />
+                  Reload
+                </DropdownMenuItem>
+              ) : null}
               <DropdownMenuItem className="gap-2" onSelect={() => openServerSetup()}>
                 <PlusIcon className="size-4 shrink-0" />
                 Connect to new server…
@@ -355,6 +368,24 @@ export function SidebarServerPicker() {
                   {nativeServerPicker ? `Sign out of ${currentHost}` : "Sign out"}
                 </span>
               </DropdownMenuItem>
+            </>
+          ) : null}
+          {debugActions.length > 0 ? (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuLabel className="text-muted-foreground">
+                Debug authentication
+              </DropdownMenuLabel>
+              {debugActions.map((action) => (
+                <DropdownMenuItem
+                  key={action.id}
+                  className="gap-2"
+                  onSelect={() => runAuthDebugAction(action.id)}
+                >
+                  <BugIcon className="size-4 shrink-0" />
+                  <span className="min-w-0 truncate">{action.label}</span>
+                </DropdownMenuItem>
+              ))}
             </>
           ) : null}
         </DropdownMenuContent>
