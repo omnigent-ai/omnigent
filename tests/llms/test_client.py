@@ -17,7 +17,7 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
-from omnigent.llms.client import Client
+from omnigent.llms.client import Client, _output_limit_kwargs
 from omnigent.llms.errors import (
     ContextWindowExceededError,
     LLMErrorDetail,
@@ -30,6 +30,215 @@ from omnigent.llms.types import (
     Response,
 )
 from omnigent.spec.types import RetryPolicy
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["openai", "databricks", "anthropic", "gemini"])
+@pytest.mark.parametrize("limit", [1, 17, 65_536])
+async def test_output_budget_reaches_provider_wire(
+    monkeypatch: pytest.MonkeyPatch, provider: str, limit: int
+) -> None:
+    from omnigent.llms.adapters import _create_adapter
+
+    adapter = _create_adapter(provider)
+    monkeypatch.setattr("omnigent.llms.client.get_adapter", lambda provider: adapter)
+    requests: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        requests.append(payload)
+        if provider == "openai":
+            assert payload["max_output_tokens"] == limit
+            assert "max_tokens" not in payload
+        elif provider == "gemini":
+            assert payload["generationConfig"]["maxOutputTokens"] == limit
+        else:
+            assert payload["max_tokens"] == limit
+            assert "max_output_tokens" not in payload
+        return httpx.Response(
+            200,
+            json={
+                "id": "response-test",
+                "model": "test-model",
+                "output": [],
+                "choices": [{"message": {"content": "ok"}}],
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+            },
+        )
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(**kwargs, transport=httpx.MockTransport(respond)),
+    )
+    inputs = [{"role": "user", "content": "preserve my complete input: 界"}]
+    await Client().responses.create(
+        input=inputs,
+        instructions="preserve system instructions",
+        model=f"{provider}/test-model",
+        connection_params={"base_url": "http://provider.test/v1", "api_key": "test"},
+        max_output_tokens=limit,
+    )
+    assert len(requests) == 1
+    assert inputs == [{"role": "user", "content": "preserve my complete input: 界"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["openai", "databricks"])
+async def test_streaming_output_budget_reaches_provider_wire(
+    monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    from omnigent.llms.adapters import _create_adapter
+
+    adapter = _create_adapter(provider)
+    monkeypatch.setattr("omnigent.llms.client.get_adapter", lambda provider: adapter)
+    requests: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        requests.append(payload)
+        assert payload["stream"] is True
+        if provider == "openai":
+            assert payload["max_output_tokens"] == 17
+            body = 'event: response.completed\ndata: {"response":{"model":"test","output":[]}}\n\n'
+        else:
+            assert payload["max_tokens"] == 17
+            assert "max_output_tokens" not in payload
+            body = (
+                'data: {"model":"test","choices":[{"delta":{"content":"ok"},'
+                '"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+            )
+        return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(**kwargs, transport=httpx.MockTransport(respond)),
+    )
+    stream = await Client().responses.create(
+        input=[{"role": "user", "content": "hi"}],
+        model=f"{provider}/test-model",
+        connection_params={"base_url": "http://provider.test/v1", "api_key": "test"},
+        max_output_tokens=17,
+        stream=True,
+    )
+    events = [event async for event in stream]
+    assert events[-1].type == "response.completed"
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native_responses", [False, True])
+@pytest.mark.parametrize("alias", ["max_tokens", "max_completion_tokens"])
+@pytest.mark.parametrize("canonical_too", [False, True])
+async def test_legacy_output_budget_routing(
+    monkeypatch: pytest.MonkeyPatch, native_responses: bool, alias: str, canonical_too: bool
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.llms.adapters.openai import OpenAIAdapter
+
+    captured: list[dict[str, Any]] = []
+    adapter = OpenAIAdapter() if native_responses else _CapturingAdapter(captured)
+    if native_responses:
+        adapter.responses_create = AsyncMock(return_value=_make_response())
+    monkeypatch.setattr("omnigent.llms.client.get_adapter", lambda provider: adapter)
+    limits = {alias: 17}
+    if canonical_too:
+        limits["max_output_tokens"] = 17
+    await Client().responses.create(
+        input=[{"role": "user", "content": "hi"}], model="openai/test-model", **limits
+    )
+    if native_responses:
+        assert adapter.responses_create.call_args.kwargs["max_output_tokens"] == 17
+        assert alias not in adapter.responses_create.call_args.kwargs
+    else:
+        assert captured == [{alias: 17}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("alias", ["max_tokens", "max_completion_tokens"])
+async def test_conflicting_output_budgets_do_not_send(
+    monkeypatch: pytest.MonkeyPatch, alias: str
+) -> None:
+    from omnigent.errors import OmnigentError
+
+    captured: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "omnigent.llms.client.get_adapter", lambda provider: _CapturingAdapter(captured)
+    )
+    with pytest.raises(OmnigentError, match="Conflicting output token limits"):
+        await Client().responses.create(
+            input=[{"role": "user", "content": "hi"}],
+            model="openai/test-model",
+            max_output_tokens=17,
+            **{alias: 18},
+        )
+    assert captured == []
+
+
+@pytest.mark.parametrize("native_responses", [False, True])
+@pytest.mark.parametrize("name", ["max_output_tokens", "max_tokens", "max_completion_tokens"])
+@pytest.mark.parametrize("limit", [0, -1, True, False, 1.0, 1.5, "1"])
+def test_invalid_output_budget_values(name: str, limit: Any, native_responses: bool) -> None:
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    with pytest.raises(OmnigentError, match=f"{name} must be a positive integer") as error:
+        _output_limit_kwargs({name: limit}, native_responses=native_responses)
+    assert error.value.code == ErrorCode.INVALID_INPUT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "limits",
+    [
+        {"max_output_tokens": 0},
+        {"max_output_tokens": 1, "max_tokens": True},
+        {"max_output_tokens": 1, "max_completion_tokens": 1.0},
+    ],
+)
+async def test_invalid_output_budgets_do_not_send(
+    monkeypatch: pytest.MonkeyPatch, provider: str, stream: bool, limits: dict[str, Any]
+) -> None:
+    from omnigent.errors import OmnigentError
+    from omnigent.llms.adapters import _create_adapter
+
+    adapter = _create_adapter(provider)
+    monkeypatch.setattr("omnigent.llms.client.get_adapter", lambda provider: adapter)
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(500)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(**kwargs, transport=httpx.MockTransport(respond)),
+    )
+    with pytest.raises(OmnigentError, match="must be a positive integer"):
+        await Client().responses.create(
+            input=[{"role": "user", "content": "hi"}],
+            model=f"{provider}/test-model",
+            connection_params={"base_url": "http://provider.test/v1", "api_key": "test"},
+            stream=stream,
+            **limits,
+        )
+    assert requests == []
+
+
+@pytest.mark.parametrize("native_responses", [False, True])
+def test_unset_output_budgets_remain_optional(native_responses: bool) -> None:
+    kwargs = {"max_output_tokens": None, "max_tokens": None, "max_completion_tokens": None}
+    assert _output_limit_kwargs(kwargs, native_responses=native_responses) == kwargs
+
 
 # ── Helpers ──────────────────────────────────────────────────
 
