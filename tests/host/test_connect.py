@@ -1652,14 +1652,33 @@ async def test_handle_launch_bound_preflight_waits_only_the_readiness_probe_budg
     assert probe_timeouts == [READINESS_CLI_PROBE_TIMEOUT_S]
 
 
-async def test_handle_launch_native_cursor_message_points_at_cursor_installer(
+@pytest.mark.parametrize(
+    ("harness", "expected", "unexpected"),
+    [
+        (
+            "cursor-native",
+            ("cursor.com/install", "cursor-agent login"),
+            ("omni setup", "Settings › Harnesses"),
+        ),
+        (
+            "codex-native",
+            ("omni setup", "set up Codex for that host in Settings › Harnesses if available"),
+            (),
+        ),
+    ],
+)
+async def test_handle_launch_native_refusal_names_the_harness_remedy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    expected: tuple[str, ...],
+    unexpected: tuple[str, ...],
 ) -> None:
     """
-    A native-Cursor refusal must name the ``cursor-agent`` installer and
-    login, not ``omni setup`` — which only configures the SDK ``cursor``
-    harness and never installs the ``cursor-agent`` CLI ``omni cursor`` boots.
+    A native-harness refusal names a remedy that can fix this host. Native
+    Cursor gets the ``cursor-agent`` installer, since ``omni setup`` never
+    installs it. Codex also gets Settings › Harnesses, because a terminal-run
+    ``omni setup`` can see a CLI the host process can't.
 
     Here ``harness_setup_hint`` is the real function (only the readiness check
     is forced False), so this exercises the connect.py → hint wiring end to end.
@@ -1667,27 +1686,29 @@ async def test_handle_launch_native_cursor_message_points_at_cursor_installer(
     host = _make_host_process()
     workspace = tmp_path / "project"
     workspace.mkdir()
+    monkeypatch.delenv("OMNIGENT_WRAPPER_COMMAND", raising=False)
     monkeypatch.setattr(
         "omnigent.host.connect.harness_is_configured",
         lambda harness: False,
     )
 
     frame = HostLaunchRunnerFrame(
-        request_id="req_cursor_native",
+        request_id="req_native_refusal",
         binding_token="token_abc",
         workspace=str(workspace),
-        harness="cursor-native",
+        harness=harness,
     )
     result = await host._handle_launch(frame)
 
     assert result.status == "failed"
     assert result.error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
     message = result.error or ""
-    assert "'cursor-native'" in message
+    assert f"{harness!r}" in message
     assert "test-laptop" in message
-    assert "cursor.com/install" in message
-    assert "cursor-agent login" in message
-    assert "omni setup" not in message
+    for text in expected:
+        assert text in message
+    for text in unexpected:
+        assert text not in message
     assert host._runners == {}
 
 

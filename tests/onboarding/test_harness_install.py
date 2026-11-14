@@ -685,15 +685,46 @@ def test_setup_hint_for_native_kiro_points_at_vendor_installer(harness: str) -> 
     assert "omni setup" not in hint
 
 
-@pytest.mark.parametrize("harness", ["codex", "pi", "claude-sdk", None])
-def test_setup_hint_defaults_to_omnigent_setup(harness: str | None) -> None:
+@pytest.mark.parametrize("harness", ["codex", "codex-native", "pi", "claude-sdk", None])
+def test_setup_hint_defaults_to_omnigent_setup(
+    harness: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Harnesses whose CLI ``omni setup`` installs (npm CLIs) — and the
     SDK / unknown / ``None`` cases — route to the ``omni setup`` hint.
 
     ``claude-native`` is absent: it names Anthropic's installer instead.
     """
+    monkeypatch.delenv("OMNIGENT_WRAPPER_COMMAND", raising=False)
     hint = hi.harness_setup_hint(harness)
     assert "omni setup" in hint
+
+
+@pytest.mark.parametrize(
+    ("harness", "display"),
+    [
+        ("codex-native", "Codex"),
+        ("claude-native", "Claude"),
+        ("pi-native", "Pi"),
+        ("opencode-native", "OpenCode"),
+        ("qwen-native", "Qwen Code"),
+    ],
+)
+def test_setup_hint_for_ui_installable_cli_names_host_harness_settings(
+    harness: str, display: str
+) -> None:
+    """A terminal-run ``omni setup`` can report a CLI ready that the host
+    process can't find, so the hint also names the host-side Settings route."""
+    hint = hi.harness_setup_hint(harness)
+    assert hint.endswith(
+        f", or set up {display} for that host in Settings › Harnesses if available"
+    )
+
+
+@pytest.mark.parametrize("harness", ["cursor-native", "kiro-native", "claude-sdk", None])
+def test_setup_hint_omits_settings_for_harnesses_the_ui_cannot_install(
+    harness: str | None,
+) -> None:
+    assert "Settings › Harnesses" not in hi.harness_setup_hint(harness)
 
 
 @pytest.mark.parametrize("harness", ["cursor", "claude-sdk", "openai-agents"])
