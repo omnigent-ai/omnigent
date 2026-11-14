@@ -292,6 +292,22 @@ def _file_matches_fd(path: Path, fd: int) -> bool:
     return stat.S_ISREG(info.st_mode) and (info.st_dev, info.st_ino) == _fd_identity(fd)
 
 
+def _dispatch_binding(
+    lifecycle: _ClaudeSettingsLifecycle, admission_epoch: str, **owner_fds: int
+) -> bytes:
+    return json.dumps(
+        {
+            "schema": 1,
+            "incarnation": lifecycle.incarnation,
+            "admission_epoch": admission_epoch,
+            "session_id": lifecycle.session_id,
+            "owner_identities": {name: list(_fd_identity(fd)) for name, fd in owner_fds.items()},
+        },
+        sort_keys=True,
+        ensure_ascii=True,
+    ).encode("ascii")
+
+
 def _release(fd: int | None) -> None:
     if fd is not None:
         with contextlib.suppress(OSError):
@@ -566,9 +582,29 @@ class ClaudeSettingsRequest:
     def mark_dispatched(self) -> None:
         """Retain exposed operands until the actual receiver acknowledges admission."""
         with bridge_dir_preparation_lock(self.bridge_dir):
-            self._lease._require_current()
+            lifecycle = self._lease._require_current()
             baseline = self.settings_path(self.bridge_dir)
-            _release(_open_lock(baseline.with_suffix(".dispatch.owner"), create=True))
+            assert self._request_fd is not None
+            assert self._lease._fd is not None and self._lease._bridge_fd is not None
+            claim = baseline.with_suffix(".dispatch.owner")
+            fd = _open_lock(claim, create=True)
+            try:
+                binding = _dispatch_binding(
+                    lifecycle,
+                    lifecycle.epoch,
+                    bridge=self._lease._bridge_fd,
+                    request=self._request_fd,
+                    lease=self._lease._fd,
+                    dispatch=fd,
+                )
+                if os.write(fd, binding) != len(binding):
+                    raise OSError("Claude settings dispatch binding was not fully written")
+            except BaseException:
+                if _file_matches_fd(claim, fd):
+                    claim.unlink(missing_ok=True)
+                raise
+            finally:
+                _release(fd)
 
     def _clear_dispatch(self) -> None:
         with bridge_dir_preparation_lock(self.bridge_dir):
@@ -656,6 +692,45 @@ class ClaudeSettingsRequest:
         self.close()
 
 
+def _reject_expired_dispatch(
+    bridge_dir: Path,
+    generation: str,
+    lifecycle: _ClaudeSettingsLifecycle,
+    admission_epoch: str,
+) -> None:
+    """Release only this live request's verified exposure after definite rejection."""
+    if lifecycle.session_id is None or lifecycle.bridge_identity is None:
+        return
+    baseline = settings_generation_path(bridge_dir, generation)
+    paths = {
+        "request": baseline.with_suffix(".request.lock"),
+        "lease": baseline.with_suffix(".lease.lock"),
+        "dispatch": baseline.with_suffix(".dispatch.owner"),
+    }
+    owner_fds: dict[str, int] = {}
+    try:
+        owner_fds["bridge"] = _open_bridge(bridge_dir)
+        for name, path in paths.items():
+            owner_fds[name] = _open_lock(path)
+        if _live_request_incarnation(paths["request"]) != (True, admission_epoch):
+            return
+        observed = os.pread(owner_fds["dispatch"], 4097, 0)
+        if observed != _dispatch_binding(lifecycle, admission_epoch, **owner_fds):
+            return
+        if (
+            _fd_identity(owner_fds["bridge"]) != lifecycle.bridge_identity
+            or not _lifecycle_matches_bridge(bridge_dir, lifecycle)
+            or not all(_file_matches_fd(path, owner_fds[name]) for name, path in paths.items())
+        ):
+            return
+        paths["dispatch"].unlink()
+    except (OSError, ValueError):
+        return
+    finally:
+        for fd in owner_fds.values():
+            _release(fd)
+
+
 def acquire_claude_settings_request(bridge_dir: Path, generation: str) -> ClaudeSettingsLease:
     """Admit a live request before registry reuse, creation or any preparation await."""
     baseline = settings_generation_path(bridge_dir, generation)
@@ -667,7 +742,10 @@ def acquire_claude_settings_request(bridge_dir: Path, generation: str) -> Claude
         if not live or not baseline.is_file():
             _retire_unused(bridge_dir, generation)
             raise ClaudeSettingsRequestExpired()
-        if admission_epoch is None or admission_epoch != lifecycle.epoch:
+        if admission_epoch is None:
+            raise ClaudeSettingsRequestExpired()
+        if admission_epoch != lifecycle.epoch:
+            _reject_expired_dispatch(bridge_dir, generation, lifecycle, admission_epoch)
             raise ClaudeSettingsRequestExpired()
         fd: int | None = None
         bridge_fd: int | None = None

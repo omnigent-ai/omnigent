@@ -2054,6 +2054,7 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
         "opaque",
         "abandoned",
         "expired",
+        "expired-before-admission",
         "expired-after-admission",
         "failure",
         "invalid-retention",
@@ -2197,6 +2198,17 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
     monkeypatch.setattr(_StubResourceRegistry, "launch_required_terminal", launch)
     if mode == "expired":
         request.close()
+    elif mode == "expired-before-admission":
+        lifecycle_path = bridge_dir / ".claude-settings-lifecycle.json"
+        before_reactivation = json.loads(lifecycle_path.read_text())
+        bridge_identity = bridge_dir.stat().st_dev, bridge_dir.stat().st_ino
+        request_claude_bridge_deletion(bridge_dir, session_id)
+        prepare_bridge_dir(session_id, workspace=tmp_path)
+        after_reactivation = json.loads(lifecycle_path.read_text())
+        assert after_reactivation["incarnation"] == before_reactivation["incarnation"]
+        assert after_reactivation["admission_epoch"] != before_reactivation["admission_epoch"]
+        assert (bridge_dir.stat().st_dev, bridge_dir.stat().st_ino) == bridge_identity
+        assert baseline.with_suffix(".dispatch.owner").is_file()
     try:
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://runner"
@@ -2205,6 +2217,7 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
             response = await client.post(url, json=body)
             if mode in {
                 "expired",
+                "expired-before-admission",
                 "expired-after-admission",
                 "failure",
                 "invalid-retention",
@@ -2213,9 +2226,11 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
                 "unexpected-validator-error",
             }:
                 assert response.status_code == (
-                    409 if mode in {"expired", "expired-after-admission"} else 500
+                    409
+                    if mode in {"expired", "expired-before-admission", "expired-after-admission"}
+                    else 500
                 ), response.text
-                if mode != "expired":
+                if mode not in {"expired", "expired-before-admission"}:
                     assert response.json()["claude_settings_request_ack"] == request.generation
                     assert response.json()["error"]["code"] == (
                         "conflict"
@@ -2232,12 +2247,21 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
                 assert "/private/example/settings.json" not in response.text
                 assert launched == []
                 assert not (bridge_dir / _TOOL_RELAY_FILE).exists()
+                if mode == "expired-before-admission":
+                    assert prepared == []
+                    assert caller_reads == []
+                    assert baseline.read_bytes() == baseline_bytes
+                    assert not baseline.with_suffix(".dispatch.owner").exists()
                 request.close()
+                if mode == "expired-before-admission":
+                    assert baseline.read_bytes() == baseline_bytes
+                    request_claude_bridge_deletion(bridge_dir, session_id)
+                    assert not bridge_dir.exists()
                 if mode == "expired-after-admission":
                     assert baseline.read_bytes() == baseline_bytes
                     assert prune_unused_claude_settings(bridge_dir) == 1
                 assert not list(bridge_dir.glob(f"claude-settings-{request.generation}*"))
-                if mode in {"expired", "expired-after-admission"}:
+                if mode in {"expired", "expired-before-admission", "expired-after-admission"}:
                     assert response.json()["error"]["code"] == "conflict"
                     assert "expired" in message
                     assert ("claude_settings_request_ack" in response.json()) is (

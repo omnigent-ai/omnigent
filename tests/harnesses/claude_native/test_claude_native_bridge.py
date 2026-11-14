@@ -6041,7 +6041,26 @@ def test_claude_bridge_preparation_waits_for_final_deletion(
 
 @pytest.mark.parametrize(
     "binding",
-    [None, b"", b"g" * 32, b"0" * 31, b"0" * 33, b"0" * 32, "legacy-bound"],
+    [
+        None,
+        b"",
+        b"g" * 32,
+        b"0" * 31,
+        b"0" * 33,
+        b"0" * 32,
+        "legacy-bound",
+        "old-epoch-legacy-dispatch",
+        "old-epoch-dispatch-replaced",
+        "old-epoch-dispatch-symlink",
+        "old-epoch-lease-replaced",
+        "old-epoch-request-replaced",
+        "old-epoch-new-session",
+        "old-epoch-recreated-bridge",
+        "old-epoch-coerced-schema",
+        "old-epoch-coerced-identity",
+        "old-epoch-malformed-dispatch",
+        "old-epoch-deep-dispatch",
+    ],
     ids=[
         "legacy-no-lifecycle",
         "legacy-empty",
@@ -6050,6 +6069,17 @@ def test_claude_bridge_preparation_waits_for_final_deletion(
         "long",
         "different-incarnation",
         "legacy-bound",
+        "old-epoch-legacy-dispatch",
+        "old-epoch-dispatch-replaced",
+        "old-epoch-dispatch-symlink",
+        "old-epoch-lease-replaced",
+        "old-epoch-request-replaced",
+        "old-epoch-new-session",
+        "old-epoch-recreated-bridge",
+        "old-epoch-coerced-schema",
+        "old-epoch-coerced-identity",
+        "old-epoch-malformed-dispatch",
+        "old-epoch-deep-dispatch",
     ],
 )
 def test_claude_settings_admission_preserves_unbound_live_requests(
@@ -6058,6 +6088,7 @@ def test_claude_settings_admission_preserves_unbound_live_requests(
     from omnigent.harnesses.claude_native.settings_generation import (
         ClaudeSettingsRequest,
         acquire_claude_settings_request,
+        request_claude_bridge_deletion,
     )
 
     bridge_dir = prepare_bridge_dir("conv_live", workspace=tmp_path)
@@ -6075,6 +6106,53 @@ def test_claude_settings_admission_preserves_unbound_live_requests(
             assert {path.name: path.read_bytes() for path in bridge_dir.iterdir()} == snapshot
             return
         request.mark_dispatched()
+        if isinstance(binding, str) and binding.startswith("old-epoch-"):
+            baseline = request.settings_path(bridge_dir)
+            dispatch = baseline.with_suffix(".dispatch.owner")
+            request_claude_bridge_deletion(bridge_dir, "conv_live")
+            prepare_bridge_dir("conv_live", workspace=tmp_path)
+            if binding == "old-epoch-legacy-dispatch":
+                dispatch.write_bytes(b"")
+            elif binding in {"old-epoch-coerced-schema", "old-epoch-coerced-identity"}:
+                claim = json.loads(dispatch.read_bytes())
+                if binding == "old-epoch-coerced-schema":
+                    claim["schema"] = True
+                else:
+                    inode = claim["owner_identities"]["request"][1]
+                    assert float(inode) == inode
+                    claim["owner_identities"]["request"][1] = float(inode)
+                dispatch.write_text(json.dumps(claim, sort_keys=True, ensure_ascii=True))
+            elif binding == "old-epoch-malformed-dispatch":
+                dispatch.write_bytes(b'{"schema":')
+            elif binding == "old-epoch-deep-dispatch":
+                dispatch.write_bytes(b"[" * 1500 + b"0" + b"]" * 1500)
+            elif binding in {"old-epoch-dispatch-replaced", "old-epoch-dispatch-symlink"}:
+                original_claim = tmp_path / "original-dispatch"
+                dispatch.rename(original_claim)
+                if binding == "old-epoch-dispatch-symlink":
+                    dispatch.symlink_to(original_claim)
+                else:
+                    dispatch.write_bytes(original_claim.read_bytes())
+            elif binding in {"old-epoch-lease-replaced", "old-epoch-request-replaced"}:
+                lock = baseline.with_suffix(
+                    ".lease.lock" if binding == "old-epoch-lease-replaced" else ".request.lock"
+                )
+                lock.rename(tmp_path / "original-lock")
+                lock.write_bytes(b"replacement-owned")
+            elif binding == "old-epoch-new-session":
+                prepare_bridge_dir("conv_other", bridge_id="conv_live", workspace=tmp_path)
+            elif binding == "old-epoch-recreated-bridge":
+                files = {path.name: path.read_bytes() for path in bridge_dir.iterdir()}
+                bridge_dir.rename(tmp_path / "original-bridge")
+                prepare_bridge_dir("conv_live", workspace=tmp_path)
+                for name, content in files.items():
+                    if name.startswith(f"claude-settings-{request.generation}"):
+                        (bridge_dir / name).write_bytes(content)
+            snapshot = {path.name: path.read_bytes() for path in bridge_dir.iterdir()}
+            with pytest.raises(ValueError, match="expired"):
+                acquire_claude_settings_request(bridge_dir, request.generation)
+            assert {path.name: path.read_bytes() for path in bridge_dir.iterdir()} == snapshot
+            return
         assert request._request_fd is not None
         os.ftruncate(request._request_fd, 0)
         if binding is None:
@@ -6346,7 +6424,10 @@ async def test_claude_settings_close_preserves_uncertain_bridge_state(
         await instance.close()
 
 
-@pytest.mark.parametrize("failure", ["intent-write", "final-remove"])
+@pytest.mark.parametrize(
+    "failure",
+    ["intent-write", "final-remove", "dispatch-short-write", "dispatch-short-write-replaced"],
+)
 def test_claude_bridge_deletion_io_failure_releases_settings_fds(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6378,6 +6459,31 @@ def test_claude_bridge_deletion_io_failure_releases_settings_fds(
         with pytest.raises(OSError, match="intent write failed"):
             request_claude_bridge_deletion(bridge_dir, "conv_io")
         monkeypatch.setattr(claude_native_bridge, "_write_json_file", original_writer)
+    elif failure.startswith("dispatch-short-write"):
+        dispatch = request.settings_path(bridge_dir).with_suffix(".dispatch.owner")
+        original_write = settings_generation.os.write
+        dispatch_fds = []
+
+        def short_write(fd: int, binding: bytes) -> int:
+            dispatch_fds.append(fd)
+            written = original_write(fd, binding[:-1])
+            if failure == "dispatch-short-write-replaced":
+                dispatch.rename(tmp_path / "original-dispatch")
+                dispatch.write_bytes(b"replacement-owned")
+            return written
+
+        with monkeypatch.context() as dispatch_patch:
+            dispatch_patch.setattr(settings_generation.os, "write", short_write)
+            with pytest.raises(OSError, match="dispatch binding was not fully written"):
+                request.mark_dispatched()
+        assert len(dispatch_fds) == 1
+        with pytest.raises(OSError) as closed:
+            os.fstat(dispatch_fds[0])
+        assert closed.value.errno == errno.EBADF
+        if failure == "dispatch-short-write-replaced":
+            assert dispatch.read_bytes() == b"replacement-owned"
+        else:
+            assert not dispatch.exists()
     else:
         request_claude_bridge_deletion(bridge_dir, "conv_io")
 
@@ -6405,6 +6511,9 @@ def test_claude_bridge_deletion_io_failure_releases_settings_fds(
         assert "delete_for_session" not in json.loads(
             (bridge_dir / ".claude-settings-lifecycle.json").read_text()
         )
+    if failure == "dispatch-short-write-replaced":
+        assert dispatch.read_bytes() == b"replacement-owned"
+        dispatch.unlink()
     request_claude_bridge_deletion(bridge_dir, "conv_io")
     assert not bridge_dir.exists()
 
