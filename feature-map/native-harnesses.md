@@ -141,6 +141,12 @@ implements them separately, so a fix for one harness does not reach the others.
     stopped by its usage or budget limit fails the session, and so does a
     system error that Codex reports outside a turn; during a turn, the turn's
     own outcome decides.
+  - Pi: automatic retry or compaction keeps the session working. An attempt
+    that Pi recovers from adds no error card; final failure and interruption
+    settle the session after Pi finishes recovery.
+    On Pi 0.84.2, Escape during retry backoff can still show the preceding
+    model error; Stop in Chat remains available. Native Escape cancellation
+    during backoff is verified on Pi 1.5.0.
   - Background work shows the working spinner with the tooltip "Working in the
     background". The composer lists running Claude background shells and Codex
     background terminals as "1 background task" with each one's command. Claude's
@@ -1227,6 +1233,14 @@ Cross-harness journeys:
   `tests/server/integration/test_codex_model_change_after_idle_reap.py` covers
   Codex reap-then-resume through a real server with a scripted app-server, not
   the Codex CLI; it crashes an xdist worker, so run it with `-p no:xdist`.
+- **`working-status`, Pi retry settlement (component):** run
+  `uv run --no-sync pytest tests/harnesses/pi_native/test_pi_native_extension.py -k native_turn_waits_for_pi_retry_settlement --reruns 0`.
+  The native extension checks recovered, exhausted and cancelled retries, including
+  Chat Stop with older Pi's settlement event. In Chat or the native terminal,
+  use a test provider that
+  truncates its first response and succeeds on retry: the session must stay
+  working until the final answer, with no error card from the recovered attempt.
+  A provider that exhausts retries must still show its final error.
 - **`working-status`, opencode-native interrupt (plain `uv run pytest`, no
   vendor model):**
   `tests/runner/test_native_subagent_turn_outcome_delivery.py::test_interrupt_then_quiescence_idle_delivers_cancelled_with_output`
