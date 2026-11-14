@@ -884,6 +884,31 @@ describe("GoalDialog", () => {
     );
   });
 
+  it.each(mutations)(
+    "refreshes its matching snapshot owner after a pending $action succeeds while closed",
+    async ({ action, button }) => {
+      const pending = deferred<GoalMutationResponse>();
+      try {
+        queueGoalMutations(action, pending.promise);
+        const { props, rerender, onGoalChange } = renderDialog();
+        await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
+        fireEvent.click(screen.getByTestId(button));
+        expect(screen.getByTestId("goal-save")).toBeDisabled();
+        rerender(<GoalDialog {...props} open={false} />);
+        const readsBeforeSettlement = mockRefreshGoal.mock.calls.length;
+
+        await act(async () => pending.resolve({ goal: ACTIVE_GOAL, cleared: true }));
+
+        expect(mockRefreshGoal).toHaveBeenCalledTimes(readsBeforeSettlement + 1);
+        expect(onGoalChange).not.toHaveBeenCalled();
+        rerender(<GoalDialog {...props} />);
+        await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
+      } finally {
+        await act(async () => pending.resolve({ goal: ACTIVE_GOAL, cleared: true }));
+      }
+    },
+  );
+
   describe.each(["session", "server", "anonymous embed"] as const)(
     "pending successful operations across a %s switch",
     (boundary) => {
@@ -906,15 +931,16 @@ describe("GoalDialog", () => {
             fireEvent.click(screen.getByTestId(button));
             expect(screen.getByTestId("goal-save")).toBeDisabled();
 
+            const nextRefreshGoal = vi.fn<() => Promise<void>>().mockResolvedValue(undefined);
             const nextGoal = { ...ACTIVE_GOAL, objective: "Current goal", tokenBudget: 777 };
             const nextProps = {
               ...props,
               conversationId: boundary === "session" ? "conv_other" : props.conversationId,
               goal: nextGoal,
+              refreshGoal: nextRefreshGoal,
             };
             if (boundary === "server") server.mockReturnValue("server-b");
             if (boundary === "anonymous embed") config.mockReturnValue({ fetcher: secondFetcher });
-            mockRefreshGoal.mockResolvedValueOnce(undefined);
             rerender(<GoalDialog {...nextProps} />);
             await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
             if (boundary === "server") server.mockReturnValue("server-a");
@@ -939,9 +965,13 @@ describe("GoalDialog", () => {
             fireEvent.change(screen.getByTestId("goal-token-budget"), { target: { value: "999" } });
             fireEvent.click(screen.getByTestId("goal-mode-paused"));
             fireEvent.click(screen.getByTestId(button));
+            const currentReads = nextRefreshGoal.mock.calls.length;
+            const originalReads = mockRefreshGoal.mock.calls.length;
             await act(async () =>
               pending.resolve({ goal: { ...ACTIVE_GOAL, status: "paused" }, cleared: true }),
             );
+            expect(nextRefreshGoal).toHaveBeenCalledTimes(currentReads);
+            expect(mockRefreshGoal).toHaveBeenCalledTimes(originalReads);
 
             rerender(
               <GoalDialog

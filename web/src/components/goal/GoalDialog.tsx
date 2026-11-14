@@ -590,10 +590,10 @@ function useGoalDialogState({
   const canApplyMutationResult = (binding: object) => {
     if (dialogBinding.current === binding) return true;
     const current = currentGoalOwner.current;
-    // Keep closed or different sessions current through their live snapshot owner.
+    // Keep a closed dialog's matching snapshot owner current.
     if (
-      current.apiScope !== apiScope ||
-      current.mutationKey !== mutationKey ||
+      current.apiScope === apiScope &&
+      current.mutationKey === mutationKey &&
       !hasGoalMutationOwner(apiScope, mutationKey)
     ) {
       void current.refreshGoal().catch(() => {});
