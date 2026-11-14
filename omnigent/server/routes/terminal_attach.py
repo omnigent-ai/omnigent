@@ -98,6 +98,7 @@ from omnigent.terminals.ws_common import (
     WS_CLOSE_INTERNAL_ERROR,
     WS_CLOSE_TERMINAL_NOT_FOUND,
     WS_CLOSE_WRONG_REPLICA,
+    normalize_ws_close,
 )
 
 _logger = logging.getLogger(__name__)
@@ -260,15 +261,11 @@ def create_terminal_attach_router(
                             ),
                         )
             except _RunnerWSClosed as closed:
-                code = (
-                    closed.code
-                    if closed.code and closed.code >= 1000
-                    else _WS_CLOSE_INTERNAL_ERROR
-                )
+                code, reason = normalize_ws_close(closed.code, closed.reason)
                 with contextlib.suppress(RuntimeError):
                     await websocket.close(
                         code=code,
-                        reason=closed.reason or "",
+                        reason=reason,
                     )
             except Exception:  # noqa: BLE001
                 with contextlib.suppress(RuntimeError):

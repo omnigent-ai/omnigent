@@ -8,6 +8,7 @@ import sys
 from dataclasses import dataclass
 
 import pytest
+from websockets.frames import OP_CLOSE, Close, Frame
 
 import omnigent.terminals.ws_common as ws_common
 from omnigent.terminals.ws_common import (
@@ -30,6 +31,50 @@ def test_importing_claude_native_does_not_import_fastapi() -> None:
         ],
         check=True,
     )
+
+
+def test_normalize_ws_close_preserves_wire_codes() -> None:
+    standard_codes = [1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014]
+    application_codes = [3000, 4400, 4404, 4405, 4500, 4999]
+    for code in standard_codes + application_codes:
+        normalized = ws_common.normalize_ws_close(code, "terminal closed")
+        assert normalized == (code, "terminal closed")
+        Frame(OP_CLOSE, Close(*normalized).serialize()).serialize(mask=False)
+
+
+def test_normalize_ws_close_replaces_non_wire_codes() -> None:
+    for code in [None, -1, 0, 999, 1004, 1005, 1006, 1015, 2000, 2999, 5000, 65536]:
+        normalized = ws_common.normalize_ws_close(code, "tunnel aborted")
+        assert normalized == (1011, "tunnel aborted"), code
+        Frame(OP_CLOSE, Close(*normalized).serialize()).serialize(mask=False)
+
+
+def test_normalize_ws_close_makes_empty_close_retryable() -> None:
+    received = Close.parse(b"")
+    assert received.code == 1005
+    normalized = ws_common.normalize_ws_close(received.code, received.reason)
+    assert normalized == (1011, "")
+    Frame(OP_CLOSE, Close(*normalized).serialize()).serialize(mask=False)
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        (None, ""),
+        ("", ""),
+        ("a" * 123, "a" * 123),
+        ("a" * 124, "a" * 123),
+        ("a" * 121 + "é", "a" * 121 + "é"),
+        ("a" * 122 + "é", "a" * 122),
+        ("🙂" * 31, "🙂" * 30),
+        ("a\ud800b", "a?b"),
+    ],
+)
+def test_normalize_ws_close_bounds_utf8_reason(reason: str | None, expected: str) -> None:
+    normalized = ws_common.normalize_ws_close(4404, reason)
+    assert normalized == (4404, expected)
+    assert len(normalized[1].encode("utf-8")) <= 123
+    Frame(OP_CLOSE, Close(*normalized).serialize()).serialize(mask=False)
 
 
 class _RecordingWebSocket:
