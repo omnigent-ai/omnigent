@@ -18,7 +18,16 @@ dependency).
    args={purpose: "implement", input: "<task + acceptance contract +
    worktree path>"})`. Use a short task-based title such as `auth-refactor` or
    `fix-sse-error`, never the raw vendor name. State the scope and that it must
-   work only inside `.worktrees/<task_id>`. The worker drives the task to green
+   work only inside `.worktrees/<task_id>`.
+   When tasks share an interface, include the same concise description of its
+   agreed shape and behavior in each relevant worker's input. Include:
+   "If completing your task requires changing an agreed shared interface or
+   assumption, report the proposed change and its impact to Polly before making
+   that change." Reconcile a proposed change and communicate the decision to
+   every affected worker using existing session messaging before work on the
+   changed interface proceeds. Use the revised assumptions in later handoffs.
+   Tasks without shared interfaces need no extra handoff content.
+   The worker drives the task to green
    and opens its OWN PR for the branch. Every commit the worker authors must
    end with a blank line followed by the exact co-sign trailer as its final
    line — `Co-authored-by: omnigent <noreply@omnigent.ai>`.
