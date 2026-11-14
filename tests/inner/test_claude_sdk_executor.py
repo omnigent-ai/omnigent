@@ -94,11 +94,11 @@ def _run(coro):
         loop.close()
 
 
-def _long_prior_messages():
-    """Four prior messages of roughly 1,000 estimated replay tokens each."""
+def _long_prior_messages(count=4):
+    """Alternating prior messages of roughly 1,000 estimated replay tokens each."""
     return [
-        {"role": role, "content": f"turn-{index} " + "x" * 3000}
-        for index, role in enumerate(("user", "assistant", "user", "assistant"))
+        {"role": ("user", "assistant")[index % 2], "content": f"turn-{index} " + "x" * 3000}
+        for index in range(count)
     ]
 
 
@@ -7448,33 +7448,35 @@ def _make_transport_with_process(returncode):
     return _Transport()
 
 
-def _make_recovery_fake_sdk():
-    """Fake SDK whose clients record construction and queried prompts."""
+def _make_recovery_fake_sdk(responses=()):
+    """Fake SDK whose clients record construction and queried prompts.
+
+    :param responses: Message lists answering the first queries in order;
+        later queries get a successful result.
+    """
+    from claude_agent_sdk.types import AssistantMessage as SDKAssistantMessage
     from claude_agent_sdk.types import (
         ClaudeAgentOptions as SDKClaudeAgentOptions,
     )
     from claude_agent_sdk.types import ResultMessage as SDKResultMessage
     from claude_agent_sdk.types import StreamEvent as SDKStreamEvent
+    from claude_agent_sdk.types import SystemMessage as SDKSystemMessage
+    from claude_agent_sdk.types import TextBlock as SDKTextBlock
+    from claude_agent_sdk.types import ToolUseBlock as SDKToolUseBlock
 
     class _Sentinel:
         pass
 
-    sdk_result = SDKResultMessage(
-        subtype="result",
-        session_id="s1",
-        result="recovered",
-        total_cost_usd=0.0,
-        duration_ms=100,
-        duration_api_ms=80,
-        is_error=False,
-        num_turns=1,
-        usage={"input_tokens": 10, "output_tokens": 5},
-    )
+    sdk_result = _sdk_result()
+    pending_responses = list(responses)
 
     class _FakeSDK:
-        AssistantMessage = _Sentinel
+        AssistantMessage = SDKAssistantMessage
+        TextBlock = SDKTextBlock
+        ThinkingBlock = _Sentinel
+        ToolUseBlock = SDKToolUseBlock
         UserMessage = _Sentinel
-        SystemMessage = _Sentinel
+        SystemMessage = SDKSystemMessage
         StreamEvent = SDKStreamEvent
         ResultMessage = SDKResultMessage
         ClaudeAgentOptions = SDKClaudeAgentOptions
@@ -7484,6 +7486,7 @@ def _make_recovery_fake_sdk():
             def __init__(self, options):
                 self.options = options
                 self.prompts = []
+                self.disconnected = False
                 self._query = None
                 self._transport = _make_transport_with_process(None)
                 _FakeSDK.created_clients.append(self)
@@ -7495,15 +7498,33 @@ def _make_recovery_fake_sdk():
                 self.prompts.append(prompt)
 
             async def receive_response(self):
-                yield sdk_result
+                for message in pending_responses.pop(0) if pending_responses else [sdk_result]:
+                    yield message
 
             async def set_model(self, model):
                 return None
 
             async def disconnect(self):
-                return None
+                self.disconnected = True
 
     return _FakeSDK
+
+
+def _sdk_result(result="recovered", *, is_error=False, model_usage=None):
+    from claude_agent_sdk.types import ResultMessage as SDKResultMessage
+
+    return SDKResultMessage(
+        subtype="result",
+        session_id="s1",
+        result=result,
+        total_cost_usd=0.0,
+        duration_ms=100,
+        duration_api_ms=80,
+        is_error=is_error,
+        num_turns=1,
+        usage={"input_tokens": 10, "output_tokens": 5},
+        model_usage=model_usage,
+    )
 
 
 @pytest.mark.asyncio
@@ -7706,6 +7727,159 @@ async def test_first_turn_skips_the_context_window_lookup() -> None:
     assert any(isinstance(event, TurnComplete) for event in events)
     assert fake_sdk.created_clients[0].prompts == ["hi"]
     resolve.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("declared_window", "model_usage", "omitted"),
+    [
+        (1_000_000, {"reported-window-model": {"contextWindow": 4_200}}, 2),
+        (1_000_000, {"concrete-model-id": {"contextWindow": 4_200}}, 2),
+        (1_000_000, {"model-a": {"contextWindow": 4_200}, "model-b": {"contextWindow": 4_200}}, 0),
+        (4_200, {"reported-window-model": {"contextWindow": 1_000_000}}, 2),
+    ],
+    ids=["same-model", "single-other-id", "unmatched-models", "larger-than-declared"],
+)
+async def test_rebuilt_executor_replays_within_the_window_claude_code_reported(
+    declared_window, model_usage, omitted
+) -> None:
+    """A rebuilt client's replay fits the smaller of the declared and reported windows."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    model = "reported-window-model"
+    reported = _sdk_result(model_usage=model_usage)
+    fake_sdk = _make_recovery_fake_sdk([[reported]])
+    messages = [*_long_prior_messages(), {"role": "user", "content": "What next?"}]
+    with (
+        patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk),
+        patch.dict("omnigent.inner.claude_sdk_executor._CLI_CONTEXT_WINDOWS", clear=True),
+    ):
+        first = ClaudeSDKExecutor(model=model, context_window=declared_window)
+        [event async for event in first.run_turn([{"role": "user", "content": "hi"}], [], "")]
+        # A fresh executor simulates a restarted runner launching a new client.
+        rebuilt = ClaudeSDKExecutor(model=model, context_window=declared_window)
+        events = [event async for event in rebuilt.run_turn(messages, [], "")]
+
+    assert not [event for event in events if isinstance(event, ExecutorError)]
+    [prompt] = fake_sdk.created_clients[1].prompts
+    assert f"turn-{omitted} " in prompt
+    if omitted:
+        marker = f"[Earlier messages omitted to fit the model's context window: {omitted}.]"
+        assert marker in prompt
+        assert f"turn-{omitted - 1} " not in prompt
+    else:
+        assert "Earlier messages omitted" not in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "kept"),
+    [
+        ("Prompt is too long", 2),
+        ("Prompt is too long · the request is ~9000 tokens (limit 2400) and ...", 1),
+        ("API Error: 400 prompt is too long: 9000 tokens > 2400 maximum", 1),
+        ("Prompt is too long · the request is ~130000 tokens (limit 100000) and ...", 2),
+    ],
+)
+@pytest.mark.parametrize("synthetic_error_reply", [False, True])
+async def test_rejected_history_replay_is_retried_once_with_less_history(
+    failure, kept, synthetic_error_reply
+) -> None:
+    """A fresh client that rejects its replay as too long retries with much less history."""
+    from claude_agent_sdk.types import AssistantMessage as SDKAssistantMessage
+    from claude_agent_sdk.types import TextBlock as SDKTextBlock
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    rejection = [_sdk_result(failure, is_error=True)]
+    if synthetic_error_reply:
+        error_reply = SDKAssistantMessage(
+            content=[SDKTextBlock(text=failure)], model="<synthetic>", error="invalid_request"
+        )
+        rejection.insert(0, error_reply)
+    fake_sdk = _make_recovery_fake_sdk([rejection])
+    # A quarter of this declared window's budget would still fit the whole history.
+    executor = ClaudeSDKExecutor(model="claude-sonnet-4-5", context_window=1_000_000)
+    messages = [*_long_prior_messages(10), {"role": "user", "content": "What next?"}]
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
+        events = [event async for event in executor.run_turn(messages, [], "")]
+
+    assert not [event for event in events if isinstance(event, ExecutorError)]
+    assert [event.response for event in events if isinstance(event, TurnComplete)] == ["recovered"]
+    rejected, retried = fake_sdk.created_clients
+    assert rejected.disconnected
+    [rejected_prompt] = rejected.prompts
+    assert "turn-0" in rejected_prompt
+    [retried_prompt] = retried.prompts
+    marker = f"[Earlier messages omitted to fit the model's context window: {10 - kept}.]"
+    assert marker in retried_prompt
+    assert f"turn-{10 - kept} " in retried_prompt
+    assert f"turn-{9 - kept} " not in retried_prompt
+    assert "What next?" in retried_prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "no-history",
+        "history-omitted",
+        "model-responded",
+        "unstreamed-reply",
+        "unstreamed-tool-use",
+        "compacted",
+        "retry-rejected",
+    ],
+)
+async def test_prompt_too_long_fails_the_turn_without_another_replay(case) -> None:
+    """Only a first replay that drew no model response or compaction is retried, once."""
+    from claude_agent_sdk.types import AssistantMessage as SDKAssistantMessage
+    from claude_agent_sdk.types import HookEventMessage as SDKHookEventMessage
+    from claude_agent_sdk.types import StreamEvent as SDKStreamEvent
+    from claude_agent_sdk.types import TextBlock as SDKTextBlock
+    from claude_agent_sdk.types import ToolUseBlock as SDKToolUseBlock
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    too_long = _sdk_result("Prompt is too long", is_error=True)
+    message_start = SDKStreamEvent(
+        uuid="event-1",
+        session_id="s1",
+        event={"type": "message_start", "message": {"usage": {"input_tokens": 10}}},
+    )
+    messages = [*_long_prior_messages(), {"role": "user", "content": "What next?"}]
+    responses = [[too_long], [too_long]]
+    if case == "no-history":
+        messages = [{"role": "user", "content": "What next?"}]
+    elif case == "history-omitted":
+        messages = [{"role": "user", "content": "x" * 40_000}, messages[-1]]
+    elif case == "model-responded":
+        responses = [[message_start, too_long]]
+    elif case == "unstreamed-reply":
+        reply = SDKAssistantMessage(content=[SDKTextBlock(text="Partial.")], model="m")
+        responses = [[reply, too_long]]
+    elif case == "unstreamed-tool-use":
+        tool_use = SDKToolUseBlock(id="tool-1", name="Bash", input={"command": "date"})
+        responses = [[SDKAssistantMessage(content=[tool_use], model="m"), too_long]]
+    elif case == "compacted":
+        pre_compact = SDKHookEventMessage(
+            subtype="hook_started",
+            data={"hook_event": "PreCompact"},
+            hook_event_name="PreCompact",
+            session_id="s1",
+            uuid="hook-1",
+        )
+        responses = [[pre_compact, too_long]]
+    fake_sdk = _make_recovery_fake_sdk(responses)
+    executor = ClaudeSDKExecutor(model="claude-sonnet-4-5", context_window=16_800)
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
+        events = [event async for event in executor.run_turn(messages, [], "")]
+
+    assert [event.message for event in events if isinstance(event, ExecutorError)] == [
+        "Prompt is too long"
+    ]
+    assert not [event for event in events if isinstance(event, TurnComplete)]
+    assert len(fake_sdk.created_clients) == (2 if case == "retry-rejected" else 1)
 
 
 @pytest.mark.asyncio

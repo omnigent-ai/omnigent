@@ -33,12 +33,14 @@ import json
 import logging
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import sys
 import tempfile
 import time
 from collections.abc import (
+    AsyncGenerator,
     AsyncIterator,
     Awaitable,
     Callable,
@@ -47,7 +49,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import ExitStack, aclosing, contextmanager, suppress
 from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, NamedTuple, Protocol, TypeAlias, cast
@@ -135,6 +137,12 @@ _CLAUDE_CODE_MIN_THINKING_BUDGET_TOKENS = 1024
 # A fresh client's replayed history may fill this share of the context window,
 # leaving room for Claude Code's prompt, tools and reply before it can compact.
 _REPLAYED_HISTORY_WINDOW_SHARE = 0.5
+# A replay Claude Code rejects as too long is retried once within this share of its budget.
+_REJECTED_REPLAY_RETRY_SHARE = 0.25
+_PROMPT_TOO_LONG = re.compile(r"prompt is too long", re.IGNORECASE)
+_PROMPT_TOO_LONG_LIMIT = re.compile(r"\(limit (\d+)\)|tokens? > (\d+)")
+# Context windows Claude Code reported per model; kept across executor rebuilds.
+_CLI_CONTEXT_WINDOWS: dict[str, int] = {}
 # Overcounts English and code tokens, and approximates one token per CJK character.
 _REPLAYED_HISTORY_BYTES_PER_TOKEN = 3
 # An image's token cost does not follow its encoded size; this also floors a PDF's estimate.
@@ -692,6 +700,43 @@ def _resolve_replay_context_window(
     return window if window and window > 0 else DEFAULT_CONTEXT_WINDOW
 
 
+def _record_cli_context_window(model: str | None, model_usage: object) -> None:
+    """
+    Remember the context window Claude Code reported using for *model*.
+
+    :param model: The model the turn requested, e.g. ``"claude-sonnet-4-5"``.
+    :param model_usage: ``ResultMessage.model_usage``, keyed by model id.
+    """
+    if not model or not isinstance(model_usage, dict):
+        return
+    usage = model_usage.get(model)
+    if usage is None and len(model_usage) == 1:
+        [usage] = model_usage.values()
+    window = usage.get("contextWindow") if isinstance(usage, dict) else None
+    if isinstance(window, int) and window > 0:
+        _CLI_CONTEXT_WINDOWS[model] = window
+
+
+def _rejected_replay_retry_budget(replayed_tokens: int, failure_text: str) -> int | None:
+    """
+    Size the single retry of a history replay Claude Code rejected as too long.
+
+    :param replayed_tokens: Estimated tokens of the history the rejected prompt replayed.
+    :param failure_text: The CLI's result text, e.g. ``"Prompt is too long ·
+        the request is ~230841 tokens (limit 200000) ..."``.
+    :returns: A budget below *replayed_tokens*, or ``None`` when the prompt was
+        not too long.
+    """
+    if not _PROMPT_TOO_LONG.search(failure_text):
+        return None
+    match = _PROMPT_TOO_LONG_LIMIT.search(failure_text)
+    if match:
+        limit_budget = int(int(match.group(1) or match.group(2)) * _REPLAYED_HISTORY_WINDOW_SHARE)
+        if limit_budget < replayed_tokens:
+            return limit_budget
+    return int(replayed_tokens * _REJECTED_REPLAY_RETRY_SHARE)
+
+
 def _render_prior_message(message: Message) -> list[_JsonObject]:
     """
     Render one prior message as role-labelled blocks for the history replay.
@@ -1092,6 +1137,13 @@ class _ClaudeClientState:
     interrupted: bool = False
     # Whether the next query must carry the runner's interruption marker.
     interruption_marker_pending: bool = False
+
+
+@dataclass
+class _RejectedReplay(ExecutorEvent):
+    """A fresh client rejected its replayed history before producing any output."""
+
+    retry_budget: int
 
 
 def _recording_consents(
@@ -3543,6 +3595,45 @@ class ClaudeSDKExecutor(Executor):
         observe the message stream and yield ExecutorEvents for the Session
         to record in History.
         """
+        rejected: _RejectedReplay | None = None
+        first_attempt = self._run_turn_attempt(messages, tools, system_prompt, config)
+        async with aclosing(first_attempt) as events:
+            async for event in events:
+                if isinstance(event, _RejectedReplay):
+                    rejected = event
+                else:
+                    yield event
+        if rejected is None:
+            return
+        logger.warning(
+            "ClaudeSDKExecutor: Claude Code rejected the replayed history as too long; "
+            "retrying within %d tokens",
+            rejected.retry_budget,
+        )
+        async with aclosing(
+            self._run_turn_attempt(
+                messages, tools, system_prompt, config, replay_budget_cap=rejected.retry_budget
+            )
+        ) as events:
+            async for event in events:
+                yield event
+
+    async def _run_turn_attempt(
+        self,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        system_prompt: str,
+        config: ExecutorConfig | None,
+        *,
+        replay_budget_cap: int | None = None,
+    ) -> AsyncGenerator[ExecutorEvent, None]:
+        """
+        Run one attempt at a turn for :meth:`run_turn`.
+
+        :param replay_budget_cap: The retry's history replay budget in
+            estimated tokens, or ``None`` on the first attempt, which may end
+            with a :class:`_RejectedReplay` instead of an error.
+        """
         sdk = cast(_ClaudeSDK, _ensure_sdk())
         from claude_agent_sdk.types import StreamEvent as _StreamEvent
 
@@ -3567,15 +3658,17 @@ class ClaudeSDKExecutor(Executor):
             return
         await self._evict_terminated_client(session_key)
         resume_session = session_key in self._clients
-        prompt = (
-            self._build_prompt(
+        replayed_history_tokens = 0
+        if resume_session:
+            prompt = self._build_prompt(
                 messages,
                 resume_session=True,
                 after_interrupt=self._clients[session_key].interruption_marker_pending,
             )
-            if resume_session
-            else await self._fresh_session_prompt(messages, cfg)
-        )
+        else:
+            prompt, replayed_history_tokens = await self._fresh_session_prompt(
+                messages, cfg, replay_budget_cap
+            )
         if not prompt:
             # Resumed sessions can have nothing new to say; signal turn
             # completion with no assistant text instead of an empty string.
@@ -3601,7 +3694,9 @@ class ClaudeSDKExecutor(Executor):
             if rebuild:
                 await self._close_live_client(session_key)
                 resume_session = False
-                prompt = await self._fresh_session_prompt(messages, cfg)
+                prompt, replayed_history_tokens = await self._fresh_session_prompt(
+                    messages, cfg, replay_budget_cap
+                )
 
         from omnigent.harnesses.claude_native.bridge import (
             MANAGED_MCP_RELAY_MISSING_WARNING,
@@ -3906,6 +4001,7 @@ class ClaudeSDKExecutor(Executor):
         # avoid double-emitting (the SDK sends both StreamEvents AND
         # the complete AssistantMessage for the same content).
         got_stream_events = False
+        got_unstreamed_reply = False
 
         # Per-API-call prompt usage from the most recent ``message_start``
         # stream event. A single user turn can drive MANY internal API
@@ -4245,6 +4341,7 @@ class ClaudeSDKExecutor(Executor):
                                     )
                         else:
                             # No streaming — emit events from the full message.
+                            got_unstreamed_reply = True
                             for block in assistant_msg.content:
                                 if isinstance(block, sdk.TextBlock):
                                     text_block = cast(_TextBlockObj, block)
@@ -4316,6 +4413,7 @@ class ClaudeSDKExecutor(Executor):
                     elif isinstance(message, sdk.ResultMessage):
                         result_msg = cast(_ResultMessageObj, message)
                         claude_session_id = getattr(result_msg, "session_id", None)
+                        _record_cli_context_window(model, getattr(result_msg, "model_usage", None))
                         logger.info(
                             "Claude CLI result received (is_error=%s)",
                             getattr(result_msg, "is_error", None),
@@ -4548,6 +4646,20 @@ class ClaudeSDKExecutor(Executor):
             return
 
         if terminal_error:
+            retry_budget = None
+            if (
+                replayed_history_tokens > 0
+                and replay_budget_cap is None
+                and not (got_stream_events or got_unstreamed_reply or compaction_occurred)
+            ):
+                retry_budget = _rejected_replay_retry_budget(
+                    replayed_history_tokens, terminal_error
+                )
+            if retry_budget is not None:
+                # No model reply or compaction started, so the retry cannot repeat work.
+                await self._close_live_client(session_key)
+                yield _RejectedReplay(retry_budget=retry_budget)
+                return
             if compaction_occurred and claude_session_id:
                 compaction_event = _build_compaction_complete_event()
                 if compaction_event is not None:
@@ -4611,30 +4723,38 @@ class ClaudeSDKExecutor(Executor):
         return self._model_override
 
     async def _fresh_session_prompt(
-        self, messages: list[Message], cfg: ExecutorConfig
-    ) -> str | list[_JsonObject]:
+        self, messages: list[Message], cfg: ExecutorConfig, budget_cap: int | None
+    ) -> tuple[str | list[_JsonObject], int]:
         """
         Build the first prompt for a newly launched client.
 
         Prior history is replayed within a share of the turn model's context
-        window, so a long session still fits after its client restarts.
+        window, so a long session still fits after its client restarts. A
+        smaller window Claude Code reported for the model takes precedence.
 
         :param messages: Conversation history as inner :class:`Message` dicts.
         :param cfg: The turn's executor config, carrying any model override.
-        :returns: The prompt from :meth:`_build_prompt`.
+        :param budget_cap: A lower replay budget in estimated tokens, or ``None``.
+        :returns: The prompt and the estimated tokens of the prior history it
+            replays, ``0`` when it replays none.
         """
-        budget = None
-        if _has_replayable_history(messages):
-            base_model = self._model_override if cfg.model else await self._spec_or_default_model()
-            # Off-loop: the window lookup may fetch the model catalog.
-            window = await run_sync_on_thread(
-                _resolve_replay_context_window,
-                self._context_window,
-                base_model,
-                cfg.model,
-            )
-            budget = int(window * _REPLAYED_HISTORY_WINDOW_SHARE)
-        return self._build_prompt(messages, resume_session=False, history_token_budget=budget)
+        if not _has_replayable_history(messages):
+            return self._extract_latest_user_content(messages), 0
+        base_model = self._model_override if cfg.model else await self._spec_or_default_model()
+        # Off-loop: the window lookup may fetch the model catalog.
+        window = await run_sync_on_thread(
+            _resolve_replay_context_window,
+            self._context_window,
+            base_model,
+            cfg.model,
+        )
+        reported_window = _CLI_CONTEXT_WINDOWS.get(cfg.model or base_model or "")
+        if reported_window is not None:
+            window = min(window, reported_window)
+        budget = int(window * _REPLAYED_HISTORY_WINDOW_SHARE)
+        if budget_cap is not None:
+            budget = min(budget, budget_cap)
+        return self._history_replay_prompt(messages, budget)
 
     @staticmethod
     def _build_prompt(
@@ -4681,7 +4801,20 @@ class ClaudeSDKExecutor(Executor):
 
         if not _has_replayable_history(messages):
             return ClaudeSDKExecutor._extract_latest_user_content(messages)
+        prompt, _ = ClaudeSDKExecutor._history_replay_prompt(messages, history_token_budget)
+        return prompt
 
+    @staticmethod
+    def _history_replay_prompt(
+        messages: list[Message], history_token_budget: int | None
+    ) -> tuple[str | list[_JsonObject], int]:
+        """
+        Serialize prior history ahead of the latest user message.
+
+        :param messages: Conversation history with at least one prior turn.
+        :param history_token_budget: As for :meth:`_build_prompt`.
+        :returns: The prompt and the estimated tokens of the prior messages it kept.
+        """
         # Check if the latest user message is multimodal — if so,
         # serialize prior history as a text prefix but preserve the
         # latest message's content blocks for native multimodal
@@ -4691,14 +4824,14 @@ class ClaudeSDKExecutor(Executor):
         prior = messages[:latest_index] + messages[latest_index + 1 :]
 
         kept: list[list[_JsonObject]] = []
-        remaining_tokens = history_token_budget
+        kept_tokens = 0
         for msg in reversed(prior):
             rendered = _render_prior_message(msg)
-            if remaining_tokens is not None:
-                remaining_tokens -= _estimated_replay_tokens(rendered)
-                if remaining_tokens < 0:
-                    break
+            tokens = _estimated_replay_tokens(rendered)
+            if history_token_budget is not None and kept_tokens + tokens > history_token_budget:
+                break
             kept.append(rendered)
+            kept_tokens += tokens
 
         prior_blocks: list[_JsonObject] = [_text_block("Conversation so far:")]
         omitted = len(prior) - len(kept)
@@ -4725,13 +4858,13 @@ class ClaudeSDKExecutor(Executor):
         prior_blocks = _coalesce_text_blocks(prior_blocks)
 
         if isinstance(latest_content, list):
-            return [*prior_blocks, *latest_content]
+            return [*prior_blocks, *latest_content], kept_tokens
         # Coalescing leaves an all-text history as the single opening block, so
         # more than one block means an attachment survived and the prompt has
         # to stay structured for its bytes to reach the model.
         if len(prior_blocks) > 1:
-            return [*prior_blocks, _text_block(f"\nuser: {latest_content}")]
-        return f"{prior_blocks[0]['text']}\n\nuser: {latest_content}"
+            return [*prior_blocks, _text_block(f"\nuser: {latest_content}")], kept_tokens
+        return f"{prior_blocks[0]['text']}\n\nuser: {latest_content}", kept_tokens
 
     @staticmethod
     def _extract_latest_user_content(
