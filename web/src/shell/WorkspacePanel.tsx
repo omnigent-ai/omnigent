@@ -91,6 +91,7 @@ import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./preferredShell";
 import { scrollTabIntoView, WorkspaceTabsScroller } from "./WorkspaceTabsScroller";
 import { FilesPanel } from "./FilesPanel";
+import { resolveWorkspaceActiveView } from "./workspaceActiveView";
 import { ContentSearchPanel } from "./ContentSearchPanel";
 import { FileViewer } from "./FileViewer";
 import { ResponsiveViewerSlot } from "./ResponsiveViewerSlot";
@@ -934,12 +935,33 @@ function WorkspacePanelImpl({
   onHasSideChatTabsChange,
   subagentPanelOpener,
 }: WorkspacePanelProps) {
-  const terminalShown = selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey);
   const contentSearchInputRef = useRef<HTMLInputElement>(null);
   const [contentSearchFocusSession, setContentSearchFocusSession] = useState<string | null>(null);
   const railRef = useRef<HTMLElement | null>(null);
   const railContentRef = useRef<HTMLDivElement | null>(null);
   const browsers = useBrowserTabs(conversationId);
+  const sideChats = useSideChats(conversationId);
+  const mobileViewport = useIsMobileViewport();
+  const isMobile = mobileViewport && !contained;
+  const activeView = resolveWorkspaceActiveView(
+    {
+      rightRailTab,
+      selectedFilePath,
+      selectedTerminalKey,
+      selectedBrowserId: browsers.selected,
+      selectedSideChatId: sideChats.selected,
+    },
+    {
+      terminalPresent: (key) => openTerminals.includes(key),
+      showBrowserTab,
+      showGithubTab,
+      showContentSearch,
+      hasAgentTree: Boolean(rootSessionId),
+      mobile: isMobile,
+    },
+  );
+  const { browserSelected, sideChatSelected } = activeView;
+  const terminalShown = activeView.terminalKey !== null;
   const returnPointRef = useRef<ReturnPoint | null>(null);
   // The latest returnFrom, so a close that finishes later uses the tabs open by then.
   const returnFromRef = useRef<(point: ReturnPoint) => void>(() => {});
@@ -991,11 +1013,6 @@ function WorkspacePanelImpl({
   useEffect(() => {
     scrollTabIntoView(activeBrowserRef.current);
   }, [browsers.selected, rightRailTab]);
-  const browserSelected =
-    rightRailTab === "browser" &&
-    browsers.selected !== null &&
-    selectedFilePath === null &&
-    selectedTerminalKey === null;
   const guardFileNavigation = useContext(FileViewerContext)?.guardFileNavigation;
   // The browser page that took keyboard focus from this page, if any. Clicking into
   // a page leaves this page's focus where it was, so only the shell can tell.
@@ -1095,7 +1112,6 @@ function WorkspacePanelImpl({
   );
 
   // ── Side chats: rail tabs backed by forked child conversations. ──────────
-  const sideChats = useSideChats(conversationId);
   // Open tabs stay reachable even where this viewer can't start a side chat.
   const hasSideChatTabs = sideChats.tabs.length > 0;
   useEffect(() => {
@@ -1148,11 +1164,6 @@ function WorkspacePanelImpl({
     onRightRailTabChange("sidechat");
     clearSideChatToOpen();
   }, [sideChatToOpen, conversationId, sideChats, onRightRailTabChange, clearSideChatToOpen]);
-  const sideChatSelected =
-    rightRailTab === "sidechat" &&
-    selectedFilePath === null &&
-    selectedTerminalKey === null &&
-    sideChats.selected !== null;
   // "New side chat" opens an EMPTY tab; the fork isn't created until the first
   // message is sent in it (startPendingSideChat below). Offered on every harness
   // that supports side chat.
@@ -1245,8 +1256,6 @@ function WorkspacePanelImpl({
   };
   // The selected side chat's pane, shown in the rail or the mobile drawer. A
   // `pending:` tab has no child yet; its first send creates the fork.
-  const mobileViewport = useIsMobileViewport();
-  const isMobile = mobileViewport && !contained;
   useEffect(() => {
     if (!showContentSearch || !showFilesPanel || pending || isMobile) return;
     const handleKeyDown = (event: globalThis.KeyboardEvent) => {
@@ -1579,20 +1588,9 @@ function WorkspacePanelImpl({
     );
   };
   // The selected tab's view, beneath any open file or shell tab.
-  const scopeView =
-    sideChatSelected && !isMobile
-      ? "sidechat"
-      : browserSelected && showBrowserTab
-        ? "browser"
-        : rightRailTab === "github" && showGithubTab
-          ? "github"
-          : rightRailTab === "subagents" && rootSessionId
-            ? "subagents"
-            : rightRailTab === null
-              ? "empty"
-              : rightRailTab === "content-search" && showContentSearch
-                ? "content-search"
-                : "files";
+  const scopeView = activeView.scope;
+  const frontTerminalKey = activeView.terminalKey;
+  const frontFilePath = activeView.filePath;
   // Stays mounted behind a file or shell to keep tree expansion, listing and scroll.
   const filesPanelMounted = showFilesPanel && !pending && scopeView === "files";
   const filesPanelActive = filesPanelMounted && !terminalShown && selectedFilePath === null;
@@ -2150,7 +2148,7 @@ function WorkspacePanelImpl({
                 conversationId={contained ? conversationId : undefined}
                 frameless
                 onFileSelect={openFileViewer}
-                flatView={rightRailTab === "changes"}
+                flatView={activeView.flat}
                 showHidden={filesPanelShowHidden}
                 onShowHiddenChange={onShowHiddenChange}
                 sort={filesPanelSort}
@@ -2163,18 +2161,18 @@ function WorkspacePanelImpl({
               <Spinner />
               <span className="text-ui">Starting workspace…</span>
             </div>
-          ) : terminalShown ? (
+          ) : frontTerminalKey !== null ? (
             // Show the selected shell's xterm only while its terminal is actually
             // present. The selection is sticky (AppShell never prunes it off the
             // list), so during a transient terminals-list churn this falls back to
             // the default view and the xterm reappears when the terminal returns.
             <RailTerminalView
               conversationId={conversationId}
-              terminalKey={selectedTerminalKey}
+              terminalKey={frontTerminalKey}
               readOnly={!isOwnerLevel(permissionLevel)}
               autoFocus={autoFocusSelectedTerminal}
             />
-          ) : selectedFilePath !== null ? (
+          ) : frontFilePath !== null ? (
             <ResponsiveViewerSlot mobile={isMobile} mobileTarget={mobileFileTarget}>
               <FileViewer
                 syncUrl={!contained}
@@ -2184,7 +2182,7 @@ function WorkspacePanelImpl({
                 open
                 mediaActive={isMobile ? mobileFileTarget != null : open}
                 conversationId={conversationId}
-                path={selectedFilePath}
+                path={frontFilePath}
                 position={filePosition}
                 onClose={isMobile && onMobileFileClose ? onMobileFileClose : onShowScopeView}
                 onCloseTab={isMobile && onMobileFileClose ? onMobileFileClose : handleCloseTab}
