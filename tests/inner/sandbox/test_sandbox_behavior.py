@@ -39,7 +39,12 @@ import pytest
 
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import create_os_environment
-from omnigent.inner.sandbox import create_exec_launcher, resolve_sandbox
+from omnigent.inner.sandbox import (
+    SandboxBackend,
+    create_exec_launcher,
+    get_backend,
+    resolve_sandbox,
+)
 from tests.inner.sandbox.conftest import run_async
 
 # ---------------------------------------------------------------------------
@@ -567,6 +572,193 @@ def test_sandbox_hides_user_dotfiles_in_cwd(
     assert "AKIA-PROBE-FAIL-IF-LEAKED" not in aws_read.get("stderr", "")
     assert venv_read["exit_code"] == 0
     assert venv_read["stdout"] == "venv-allowed"
+
+
+@pytest.mark.parametrize("declares_stability", [False, True])
+@pytest.mark.parametrize("missing_write_root", [False, True])
+def test_sandbox_helper_survives_sequential_requests(
+    tmp_path: Path,
+    active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],
+    sandbox_pythonpath_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    declares_stability: bool,
+    missing_write_root: bool,
+) -> None:
+    """Requests run on short-lived threads; the helper must outlive the one that spawned it."""
+    sandbox_spec = active_sandbox_spec_factory(
+        write_paths=[str(tmp_path / "docs" / "specs")] if missing_write_root else None
+    )
+    if not declares_stability:
+        monkeypatch.setattr(
+            type(get_backend(sandbox_spec.type)),
+            "launch_fingerprint",
+            SandboxBackend.launch_fingerprint,
+        )
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=sandbox_spec),
+        relaunch_when_stale=True,
+    )
+    # Each launch gets a fresh private scratch dir; PIDs are namespace-local under bwrap.
+    try:
+        scratch_dirs = {
+            run_async(os_env.shell('echo "$XDG_RUNTIME_DIR"'))["stdout"].strip() for _ in range(5)
+        }
+    finally:
+        os_env.close()
+
+    assert len(scratch_dirs) == (1 if declares_stability else 5)
+
+
+@pytest.mark.asyncio
+async def test_runner_shell_retires_helper_and_owned_background_processes(
+    tmp_path: Path,
+    active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],
+    sandbox_pythonpath_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed shell request closes its Linux tool-helper namespace before return."""
+    import asyncio
+
+    import psutil
+
+    from omnigent.inner.os_env import CallerProcessOSEnvironment
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+    from omnigent.spec.types import AgentSpec
+    from tests._helpers.polling import poll_until_async
+
+    passthrough_name = "TEST_HARMLESS_PASSTHROUGH"
+    monkeypatch.setenv(passthrough_name, "enabled")
+    sandbox_spec = active_sandbox_spec_factory(
+        env_passthrough=[passthrough_name], write_paths=[str(tmp_path)]
+    )
+    if sandbox_spec.type != "linux_bwrap":
+        pytest.skip("Complete descendant retirement here depends on a Linux PID namespace")
+    spec = OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=sandbox_spec)
+    registry = SessionResourceRegistry()
+    session_id = "conv_shell_retirement"
+    task: asyncio.Task[str] | None = None
+    (tmp_path / "note.txt").write_text("owned test workspace")
+    try:
+        lease = await registry.lease_tool_environment(session_id, spec)
+        assert lease is not None
+        await lease.environment.read("note.txt")
+        assert isinstance(lease.environment, CallerProcessOSEnvironment)
+        helper = lease.environment._helper._proc
+        assert helper is not None
+        allowed = await lease.environment.shell('printf "%s" "$TEST_HARMLESS_PASSTHROUGH"')
+        assert allowed["stdout"] == "enabled"
+        await lease.release(reusable=True)
+        spec.sandbox = active_sandbox_spec_factory(write_paths=[str(tmp_path)])
+        replacement = await registry.lease_tool_environment(session_id, spec)
+        assert replacement is not None and replacement is not lease
+        assert helper.poll() is not None
+        await replacement.environment.read("note.txt")
+        assert isinstance(replacement.environment, CallerProcessOSEnvironment)
+        helper = replacement.environment._helper._proc
+        assert helper is not None
+        await replacement.release(reusable=True)
+        task = asyncio.create_task(
+            _execute_os_env_tool(
+                "sys_os_shell",
+                {
+                    "command": (
+                        'printf "%s" "$TEST_HARMLESS_PASSTHROUGH"; '
+                        "sleep 30 >/dev/null 2>&1 & echo ready > started; "
+                        "while [ ! -f release ]; do sleep 0.01; done"
+                    ),
+                    "timeout": 10,
+                },
+                agent_spec=AgentSpec(spec_version=1, os_env=spec),
+                conversation_id=session_id,
+                resource_registry=registry,
+            )
+        )
+        await poll_until_async((tmp_path / "started").exists, timeout_s=5)
+        descendants = psutil.Process(helper.pid).children(recursive=True)
+        sleepers = []
+        for process in descendants:
+            try:
+                if process.cmdline() == ["sleep", "30"]:
+                    sleepers.append(process)
+            except psutil.NoSuchProcess:
+                pass
+        assert sleepers
+        (tmp_path / "release").touch()
+        result = json.loads(await task)
+        assert result["exit_code"] == 0
+        assert result["stdout"] == ""
+        assert helper.poll() is not None
+
+        def stopped(process: psutil.Process) -> bool:
+            try:
+                return not process.is_running() or process.status() == psutil.STATUS_ZOMBIE
+            except psutil.NoSuchProcess:
+                return True
+
+        await poll_until_async(lambda: all(stopped(p) for p in descendants), timeout_s=5)
+    finally:
+        (tmp_path / "release").touch()
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await registry.cleanup_session(session_id)
+
+
+def test_sandbox_hides_dotfiles_created_after_helper_start(
+    tmp_path: Path,
+    active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],
+    sandbox_pythonpath_env: None,
+) -> None:
+    """A reused helper preserves masks after new dotfiles or parent replacement."""
+    workspace = tmp_path / "workspace"
+    parent = workspace / "parent"
+    parent.mkdir(parents=True)
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    masked = parent / "secret"
+    masked.write_text("synthetic masked contents")
+    (staged / "secret").hardlink_to(masked)
+    sandbox = active_sandbox_spec_factory()
+    sandbox.mask_paths = [str(masked)]
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=sandbox,
+        ),
+        relaunch_when_stale=True,
+    )
+    # Each launch gets a fresh private scratch dir; PIDs are namespace-local under bwrap.
+    try:
+        first = run_async(os_env.shell("echo $TMPDIR"))
+        assert run_async(os_env.read("parent/secret")).get("content", "") == ""
+        (workspace / ".env").write_text("OMNI_TEST_SECRET=late-secret-value-67890")
+        assert run_async(os_env.read(".env")).get("content", "") == ""
+        late_read = run_async(os_env.shell("cat .env 2>&1; echo $TMPDIR"))
+        settled = run_async(os_env.shell("echo $TMPDIR"))
+        before = masked.stat()
+        parent.rename(tmp_path / "displaced")
+        staged.rename(parent)
+        after = masked.stat()
+        assert (after.st_dev, after.st_ino, after.st_ctime_ns) == (
+            before.st_dev,
+            before.st_ino,
+            before.st_ctime_ns,
+        )
+        assert run_async(os_env.read("parent/secret")).get("content", "") == ""
+        replaced = run_async(os_env.shell("echo $TMPDIR"))
+        stable = run_async(os_env.shell("echo $TMPDIR"))
+    finally:
+        os_env.close()
+
+    assert "late-secret-value-67890" not in late_read.get("stdout", "")
+    assert "late-secret-value-67890" not in late_read.get("stderr", "")
+    assert late_read["stdout"].split()[-1] != first["stdout"].strip()
+    assert settled["stdout"].strip() == late_read["stdout"].split()[-1]
+    if sandbox.type == "linux_bwrap":
+        assert replaced["stdout"].strip() != settled["stdout"].strip()
+    assert stable["stdout"].strip() == replaced["stdout"].strip()
 
 
 # ---------------------------------------------------------------------------

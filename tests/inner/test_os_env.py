@@ -623,7 +623,13 @@ _HELPER_BACKENDS = [
 ]
 
 
-def _helper_env(workspace: Path, backend: str) -> CallerProcessOSEnvironment:
+def _helper_env(
+    workspace: Path,
+    backend: str,
+    *,
+    relaunch_when_stale: bool = False,
+    env_passthrough: list[str] | None = None,
+) -> CallerProcessOSEnvironment:
     os_env = create_os_environment(
         OSEnvSpec(
             type="caller_process",
@@ -632,11 +638,50 @@ def _helper_env(workspace: Path, backend: str) -> CallerProcessOSEnvironment:
                 type=backend,
                 read_paths=[str(_project_root())],
                 write_paths=["."],
+                env_passthrough=env_passthrough,
             ),
-        )
+        ),
+        relaunch_when_stale=relaunch_when_stale,
     )
     assert isinstance(os_env, CallerProcessOSEnvironment)
     return os_env
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize("backend", _HELPER_BACKENDS)
+def test_reused_helper_refreshes_effective_parent_environment(
+    tmp_path: Path, backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Changed or removed inherited values relaunch; filtered-out values do not."""
+    name = "TEST_HARMLESS_PASSTHROUGH"
+    monkeypatch.setenv(name, "first")
+    os_env = _helper_env(tmp_path, backend, relaunch_when_stale=True, env_passthrough=[name])
+    command = 'printf "%s" "${TEST_HARMLESS_PASSTHROUGH-unset}"'
+    try:
+        assert asyncio.run(os_env.shell(command))["stdout"] == "first"
+        first = os_env._helper._proc
+        assert first is not None
+        monkeypatch.setenv("TEST_HARMLESS_FILTERED", "changed")
+        assert asyncio.run(os_env.shell(command))["stdout"] == "first"
+        unchanged = os_env._helper._proc
+        if backend == "none":
+            assert unchanged is not first and first.poll() is not None
+        else:
+            assert unchanged is first
+
+        monkeypatch.setenv(name, "second")
+        assert asyncio.run(os_env.shell(command))["stdout"] == "second"
+        changed = os_env._helper._proc
+        assert changed is not None and changed is not unchanged
+        assert unchanged is not None and unchanged.poll() is not None
+        monkeypatch.delenv(name)
+        assert asyncio.run(os_env.shell(command))["stdout"] == "unset"
+        removed = os_env._helper._proc
+        assert removed is not None and removed is not changed and changed.poll() is not None
+        assert asyncio.run(os_env.shell(command))["stdout"] == "unset"
+        assert os_env._helper._proc is removed
+    finally:
+        os_env.close()
 
 
 @pytest.mark.parametrize(
@@ -874,6 +919,7 @@ def test_close_stops_the_helper_and_releases_its_spawner_thread(
     tmp_path: Path, backend: str, timeout_child: bool
 ) -> None:
     """Closing ends the helper and its spawning thread, and can be repeated."""
+    (tmp_path / "notes.txt").write_text("kept\n")
     os_env = _helper_env(tmp_path.resolve(), backend)
     if timeout_child:
         pid_file = tmp_path / "child.pid"
@@ -901,7 +947,7 @@ def test_close_stops_the_helper_and_releases_its_spawner_thread(
             finally:
                 os_env.close()
             raise
-    assert asyncio.run(os_env.shell("true")).get("exit_code") == 0
+    assert asyncio.run(os_env.read("notes.txt")).get("content") == "kept\n"
     helper = os_env._helper._proc
     assert helper is not None
     spawner_threads = list(os_env._helper._spawner._threads)

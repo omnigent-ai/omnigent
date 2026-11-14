@@ -89,6 +89,7 @@ from omnigent.runner.app import (
 from omnigent.runner.policy_proxy import (
     _evaluate_policy_via_omnigent,
 )
+from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._executor_adapter import (
     _ORPHAN_RESYNC_THRESHOLD,
@@ -103,6 +104,7 @@ from omnigent.runtime.prompt import (
 from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
 from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy, ToolsConfig
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
+from tests._helpers.polling import poll_until_async
 from tests._helpers.providers import isolate_provider_resolution
 from tests.runner.conftest import (
     _FakeProcessManager as _RecoveryFakeProcessManager,
@@ -2775,12 +2777,67 @@ async def test_runner_publishes_terminal_failed_when_harness_stream_fails(
 # ── Runner-local OS env dispatch ────────────────────────
 
 
+async def _os_env_helper_pid(
+    registry: SessionResourceRegistry, spec: AgentSpec, session_id: str
+) -> int:
+    """Start the helper with a file read and inspect its process without running a shell."""
+    from omnigent.inner.os_env import CallerProcessOSEnvironment
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+
+    assert spec.os_env is not None and spec.os_env.cwd is not None
+    note = Path(spec.os_env.cwd) / "note.txt"
+    if not note.exists():
+        note.write_text("ready\n")
+    read = json.loads(
+        await _execute_os_env_tool(
+            "sys_os_read",
+            {"path": "note.txt"},
+            agent_spec=spec,
+            conversation_id=session_id,
+            resource_registry=registry,
+        )
+    )
+    assert "error" not in read
+    assert read["content"] == note.read_text()
+    lease = await registry.lease_tool_environment(session_id, spec.os_env)
+    assert lease is not None
+    try:
+        assert isinstance(lease.environment, CallerProcessOSEnvironment)
+        proc = lease.environment._helper._proc
+        assert proc is not None
+        return proc.pid
+    finally:
+        await lease.release(reusable=True)
+
+
+def _process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+async def _wait_until_dead(pid: int, timeout: float = 5.0) -> None:
+    """Wait until *pid* has exited (a zombie counts), so the next call sees it dead."""
+    import subprocess
+
+    def stopped() -> bool:
+        state = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, check=False
+        ).stdout.strip()
+        return not state or state.startswith("Z")
+
+    await poll_until_async(stopped, timeout_s=timeout, interval_s=0.02)
+
+
 @pytest.mark.asyncio
 async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
     from omnigent.spec.types import AgentSpec
 
+    registry = SessionResourceRegistry()
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         spec = AgentSpec(
@@ -2791,42 +2848,233 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
                 sandbox=OSEnvSandboxSpec(type="none"),
             ),
         )
+        try:
+            write = await _execute_os_env_tool(
+                "sys_os_write",
+                {"path": "created.txt", "content": "Привет 世界\nplanet\n"},
+                agent_spec=spec,
+                conversation_id="conv_runner_os_env_test",
+                resource_registry=registry,
+            )
+            assert json.loads(write)["created"] is True
+            assert root.joinpath("created.txt").read_text() == "Привет 世界\nplanet\n"
 
-        write = await _execute_os_env_tool(
-            "sys_os_write",
-            {"path": "note.txt", "content": "Привет 世界\nplanet\n"},
-            agent_spec=spec,
-            conversation_id="conv_runner_os_env_test",
-        )
-        assert json.loads(write)["created"] is True
-        assert root.joinpath("note.txt").read_text() == "Привет 世界\nplanet\n"
+            edit = await _execute_os_env_tool(
+                "sys_os_edit",
+                {"path": "created.txt", "oldText": "planet", "newText": "world"},
+                agent_spec=spec,
+                conversation_id="conv_runner_os_env_test",
+                resource_registry=registry,
+            )
+            assert json.loads(edit)["replacements"] == 1
 
-        edit = await _execute_os_env_tool(
+            read = await _execute_os_env_tool(
+                "sys_os_read",
+                {"path": "created.txt"},
+                agent_spec=spec,
+                conversation_id="conv_runner_os_env_test",
+                resource_registry=registry,
+            )
+            assert "Привет 世界" in read
+            assert json.loads(read)["content"] == "Привет 世界\nworld\n"
+        finally:
+            await registry.cleanup_session("conv_runner_os_env_test")
+
+
+@pytest.mark.asyncio
+@pytest.mark.posix_only
+async def test_runner_os_env_helper_retires_after_returned_error_and_shell(
+    tmp_path: Path,
+) -> None:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+        ),
+    )
+    registry = SessionResourceRegistry()
+    try:
+        helper_pid = await _os_env_helper_pid(registry, spec, "conv_retire")
+        assert await _os_env_helper_pid(registry, spec, "conv_retire") == helper_pid
+        error = await _execute_os_env_tool(
             "sys_os_edit",
-            {"path": "note.txt", "oldText": "planet", "newText": "world"},
+            {"path": "note.txt", "oldText": "absent", "newText": "unused"},
             agent_spec=spec,
-            conversation_id="conv_runner_os_env_test",
+            conversation_id="conv_retire",
+            resource_registry=registry,
         )
-        assert json.loads(edit)["replacements"] == 1
-
-        read = await _execute_os_env_tool(
-            "sys_os_read",
-            {"path": "note.txt"},
-            agent_spec=spec,
-            conversation_id="conv_runner_os_env_test",
-        )
-        assert "Привет 世界" in read
-        assert json.loads(read)["content"] == "Привет 世界\nworld\n"
+        assert json.loads(error)["error"].startswith("Could not find oldText")
+        assert not _process_exists(helper_pid)
+        assert (tmp_path / "note.txt").read_text() == "ready\n"
+        replacement = await _os_env_helper_pid(registry, spec, "conv_retire")
+        assert replacement != helper_pid
 
         shell = await _execute_os_env_tool(
             "sys_os_shell",
-            {"command": "pwd"},
+            {"command": "pwd; echo $PPID"},
             agent_spec=spec,
-            conversation_id="conv_runner_os_env_test",
+            conversation_id="conv_retire",
+            resource_registry=registry,
         )
         shell_result = json.loads(shell)
         assert shell_result["exit_code"] == 0
-        assert Path(shell_result["stdout"].strip()).resolve() == root.resolve()
+        cwd, pid = shell_result["stdout"].split()
+        assert Path(cwd).resolve() == tmp_path.resolve()
+        assert int(pid) == replacement
+        assert not _process_exists(replacement)
+        after_shell = await _os_env_helper_pid(registry, spec, "conv_retire")
+        assert after_shell != replacement
+    finally:
+        await registry.cleanup_session("conv_retire")
+    assert not _process_exists(after_shell)
+
+
+@pytest.mark.asyncio
+@pytest.mark.posix_only
+async def test_runner_os_env_helper_restarts_replaces_workspace_and_times_out(
+    tmp_path: Path,
+) -> None:
+    """A crash, workspace change or timeout replaces the helper and closes the old one."""
+    import signal
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+
+    def agent(cwd: Path) -> AgentSpec:
+        cwd.mkdir(exist_ok=True)
+        return AgentSpec(
+            spec_version=1,
+            os_env=OSEnvSpec(
+                type="caller_process", cwd=str(cwd), sandbox=OSEnvSandboxSpec(type="none")
+            ),
+        )
+
+    registry = SessionResourceRegistry()
+    try:
+        spec = agent(tmp_path / "a")
+        crashed = await _os_env_helper_pid(registry, spec, "conv_a")
+        os.kill(crashed, signal.SIGKILL)
+        # Once the death is visible the next call restarts the helper before sending;
+        # a request already in flight to it is not replayed.
+        await _wait_until_dead(crashed)
+        restarted = await _os_env_helper_pid(registry, spec, "conv_a")
+        assert restarted != crashed
+        assert await _os_env_helper_pid(registry, spec, "conv_a") == restarted
+
+        moved = await _os_env_helper_pid(registry, agent(tmp_path / "b"), "conv_a")
+        assert moved != restarted
+        assert not _process_exists(restarted)
+
+        # A timed-out command's descendants may outlive it, so its helper is retired.
+        timed_out = await _execute_os_env_tool(
+            "sys_os_shell",
+            {"command": "sleep 30", "timeout": 1},
+            agent_spec=agent(tmp_path / "b"),
+            conversation_id="conv_a",
+            resource_registry=registry,
+        )
+        assert json.loads(timed_out)["timed_out"] is True
+        assert not _process_exists(moved)
+        moved = await _os_env_helper_pid(registry, agent(tmp_path / "b"), "conv_a")
+
+    finally:
+        await registry.cleanup_session("conv_a")
+    assert not _process_exists(moved)
+
+
+@pytest.mark.asyncio
+@pytest.mark.posix_only
+async def test_runner_os_env_busy_helper_serves_concurrent_calls_and_cancellation_retires_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent calls bypass a busy session helper; a cancelled call's helper is closed."""
+    import errno
+    from unittest.mock import Mock
+
+    import omnigent.inner.os_env as os_env_module
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+        ),
+    )
+    registry = SessionResourceRegistry()
+    blocked: asyncio.Task[str] | None = None
+    gate_fd: int | None = None
+    fifo = tmp_path / "gate"
+
+    def open_gate() -> bool:
+        nonlocal gate_fd
+        try:
+            gate_fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError as exc:
+            if exc.errno == errno.ENXIO:
+                return False
+            raise
+        return True
+
+    try:
+        session_helper = await _os_env_helper_pid(registry, spec, "conv_busy")
+        os.mkfifo(fifo)
+        (tmp_path / "note.txt").write_text("hi\n")
+        blocked = asyncio.create_task(
+            _execute_os_env_tool(
+                "sys_os_shell",
+                {"command": "read line < gate; echo $PPID $line", "timeout": 10},
+                agent_spec=spec,
+                conversation_id="conv_busy",
+                resource_registry=registry,
+            )
+        )
+        await poll_until_async(open_gate, timeout_s=5)
+        fallback_closures = []
+        create_environment = os_env_module.create_os_environment
+        with monkeypatch.context() as fallback_patch:
+
+            def create_fallback(*args, **kwargs):
+                environment = create_environment(*args, **kwargs)
+                close = Mock(wraps=environment.close)
+                fallback_patch.setattr(environment, "close", close)
+                fallback_closures.append(close)
+                return environment
+
+            fallback_patch.setattr(os_env_module, "create_os_environment", create_fallback)
+            read = await _execute_os_env_tool(
+                "sys_os_read",
+                {"path": "note.txt"},
+                agent_spec=spec,
+                conversation_id="conv_busy",
+                resource_registry=registry,
+            )
+            assert json.loads(read)["content"] == "hi\n"
+            assert len(fallback_closures) == 1
+            fallback_closures[0].assert_called_once_with()
+        assert not blocked.done()
+        blocked.cancel()
+        assert gate_fd is not None
+        os.write(gate_fd, b"open\n")
+        os.close(gate_fd)
+        gate_fd = None
+        with pytest.raises(asyncio.CancelledError):
+            await blocked
+        assert not _process_exists(session_helper)
+        replacement = await _os_env_helper_pid(registry, spec, "conv_busy")
+        assert replacement != session_helper
+    finally:
+        if gate_fd is not None:
+            os.close(gate_fd)
+        if blocked is not None:
+            blocked.cancel()
+            await asyncio.gather(blocked, return_exceptions=True)
+        await registry.cleanup_session("conv_busy")
+    assert not _process_exists(replacement)
 
 
 @pytest.mark.parametrize(
@@ -2924,21 +3172,29 @@ async def test_runner_os_env_change_restoring_the_original_leaves_changes(
     )
     filesystem_registry = AgentEditFilesystemRegistry(watch_path=tmp_path)
 
-    for step, (tool_name, args) in enumerate(calls, start=1):
-        result = await _execute_os_env_tool(
-            tool_name,
-            {"path": "file.txt", **args},
-            agent_spec=spec,
-            conversation_id="conv_revert",
-            filesystem_registry=filesystem_registry,
-        )
-        assert "error" not in json.loads(result)
-        if step < len(calls):
-            assert filesystem_registry.list_changed_files("conv_revert", limit=10)
+    resource_registry = SessionResourceRegistry()
+    try:
+        helper_pid = await _os_env_helper_pid(resource_registry, spec, "conv_revert")
+        for step, (tool_name, args) in enumerate(calls, start=1):
+            result = await _execute_os_env_tool(
+                tool_name,
+                {"path": "file.txt", **args},
+                agent_spec=spec,
+                conversation_id="conv_revert",
+                filesystem_registry=filesystem_registry,
+                resource_registry=resource_registry,
+            )
+            assert "error" not in json.loads(result)
+            if step < len(calls):
+                assert filesystem_registry.list_changed_files("conv_revert", limit=10)
 
-    listed = filesystem_registry.list_changed_files("conv_revert", limit=10)
-    assert [entry["status"] for entry in listed] == statuses
-    assert filesystem_registry.get_baseline("file.txt") == baseline
+        listed = filesystem_registry.list_changed_files("conv_revert", limit=10)
+        assert [entry["status"] for entry in listed] == statuses
+        assert filesystem_registry.get_baseline("file.txt") == baseline
+
+        assert await _os_env_helper_pid(resource_registry, spec, "conv_revert") == helper_pid
+    finally:
+        await resource_registry.cleanup_session("conv_revert")
 
 
 @pytest.mark.asyncio
@@ -3062,28 +3318,42 @@ async def test_runner_os_env_surrogate_path_is_httpx_transport_safe(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("registered", [False, True], ids=["standalone", "registered"])
 async def test_runner_os_env_error_is_httpx_transport_safe(
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    registered: bool,
 ) -> None:
-    """OS-tool exception results stay readable and UTF-8 encodable."""
+    """OS-tool exceptions remain transport-safe and retire their failed environment."""
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
 
-    class _FailingEnvironment:
+    class _ReadEnvironment:
+        def __init__(self) -> None:
+            self.cwd = tmp_path.resolve()
+            self.close_count = 0
+
         async def read(self, *, path: str, offset: int, limit: object) -> dict[str, object]:
             del path, offset, limit
-            raise RuntimeError("ошибка для recording-\udcff.txt")
+            if self is environments[0]:
+                raise RuntimeError("ошибка для recording-\udcff.txt")
+            return {"content": "recovered"}
 
         def close(self) -> None:
-            return None
+            self.close_count += 1
+
+    environments: list[_ReadEnvironment] = []
+
+    def create_environment(*args: object, **kwargs: object) -> _ReadEnvironment:
+        environment = _ReadEnvironment()
+        environments.append(environment)
+        return environment
 
     caplog.set_level(logging.CRITICAL + 1, logger="omnigent.runner.tool_dispatch")
-    environment = _FailingEnvironment()
     monkeypatch.setattr(
         "omnigent.inner.os_env.create_os_environment",
-        lambda *args, **kwargs: environment,
+        create_environment,
     )
     spec = AgentSpec(
         spec_version=1,
@@ -3094,22 +3364,42 @@ async def test_runner_os_env_error_is_httpx_transport_safe(
         ),
     )
 
-    result = await _execute_os_env_tool(
-        "sys_os_read",
-        {"path": "recording-\udcff.txt"},
-        agent_spec=spec,
-        conversation_id="conv_runner_surrogate_error",
-    )
+    registry = SessionResourceRegistry()
+    session_id = "conv_runner_surrogate_error"
+    try:
+        result = await _execute_os_env_tool(
+            "sys_os_read",
+            {"path": "recording-\udcff.txt"},
+            agent_spec=spec,
+            conversation_id=session_id,
+            resource_registry=registry if registered else None,
+        )
 
-    assert "ошибка" in result
-    assert "\\udcff" in result
-    assert json.loads(result) == {"error": "ошибка для recording-\udcff.txt"}
-    request = httpx.Request(
-        "POST",
-        "https://harness.test/v1/sessions/test/events",
-        json={"type": "tool_result", "output": result},
-    )
-    request.content.decode("utf-8")
+        assert "ошибка" in result
+        assert "\\udcff" in result
+        assert json.loads(result) == {"error": "ошибка для recording-\udcff.txt"}
+        request = httpx.Request(
+            "POST",
+            "https://harness.test/v1/sessions/test/events",
+            json={"type": "tool_result", "output": result},
+        )
+        request.content.decode("utf-8")
+        assert len(environments) == 1
+        assert environments[0].close_count == 1
+
+        retry = await _execute_os_env_tool(
+            "sys_os_read",
+            {"path": "recording-\udcff.txt"},
+            agent_spec=spec,
+            conversation_id=session_id,
+            resource_registry=registry if registered else None,
+        )
+        assert json.loads(retry) == {"content": "recovered"}
+        assert len(environments) == 2
+        assert environments[1].close_count == (0 if registered else 1)
+    finally:
+        await registry.cleanup_session(session_id)
+    assert [environment.close_count for environment in environments] == [1, 1]
 
 
 @pytest.mark.asyncio

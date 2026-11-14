@@ -7,6 +7,7 @@ import base64
 import codecs
 import contextlib
 import errno
+import functools
 import json
 import logging
 import os
@@ -18,7 +19,7 @@ import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -414,8 +415,10 @@ class _HelperProcessClient:
         egress_rules: list[str] | None = None,
         egress_allow_private_destinations: bool = False,
         copy_on_write_environment: CopyOnWriteEnvironment | None = None,
+        relaunch_when_stale: bool = False,
     ) -> None:
         self._copy_on_write_environment = copy_on_write_environment
+        self._relaunch_when_stale = relaunch_when_stale
         self.cwd = cwd
         self.shell_path = shell_path
         self.sandbox = sandbox
@@ -436,6 +439,9 @@ class _HelperProcessClient:
         # helper itself. Cleared in :meth:`_stop_egress_proxy_locked`.
         self._egress_relay_port: int | None = None
         self._proc: subprocess.Popen[str] | None = None
+        # Recompute callable and value of the running helper's launch fingerprint.
+        self._launch: tuple[Callable[[], object], object] | None = None
+        self._launch_env: dict[str, str] | None = None
         # Parent-held containment handle from the sandbox backend's
         # post_spawn hook (e.g. a Windows Job Object). Closed in
         # ``_stop_locked`` to tear down the helper's process tree.
@@ -538,11 +544,29 @@ class _HelperProcessClient:
         return {"error": f"os_env helper failed: {exc}"}
 
     def _ensure_started_locked(self) -> None:
-        if self._proc is not None and self._proc.poll() is None:
+        if (
+            self._proc is not None
+            and self._proc.poll() is None
+            and not self._launch_is_stale_locked()
+        ):
             return
         if self._proc is not None:
             self._stop_locked()
         self._start_locked()
+
+    def _launch_is_stale_locked(self) -> bool:
+        """Whether a fresh launch would have different mounts or inherited values."""
+        # Proxy sources resolve at startup, including values filtered from the helper.
+        if self._relaunch_when_stale and self.sandbox.credential_proxy is not None:
+            return True
+        if self._launch_env is not None and (
+            build_helper_env(os.environ, self.sandbox) != self._launch_env
+        ):
+            return True
+        if self._launch is None:
+            return False
+        recompute, fingerprint = self._launch
+        return fingerprint is None or recompute() != fingerprint
 
     def _start_locked(self) -> None:
         try:
@@ -556,6 +580,7 @@ class _HelperProcessClient:
         if self._copy_on_write_environment is not None:
             self._copy_on_write_environment.prepare(sandbox)
         env = build_helper_env(os.environ, sandbox)
+        self._launch_env = env.copy() if self._relaunch_when_stale else None
         project_root = str(_project_root())
         existing_pythonpath = env.get("PYTHONPATH")
         env["PYTHONPATH"] = (
@@ -699,12 +724,16 @@ class _HelperProcessClient:
         # in resolve_sandbox without going through the registry).
         if sandbox.active:
             backend = get_backend(sandbox.backend_type)
-            spawn_argv = backend.wrap_launcher_argv(
-                helper_argv,
-                sandbox,
-                self.cwd,
-                chdir=helper_cwd if helper_cwd != self.cwd else None,
-            )
+            chdir = helper_cwd if helper_cwd != self.cwd else None
+            if self._relaunch_when_stale:
+                backend.prepare_launcher_filesystem(sandbox, self.cwd)
+                fingerprint = functools.partial(
+                    backend.launch_fingerprint, helper_argv, sandbox, self.cwd, chdir=chdir
+                )
+                # Taken before the wrap so a racing change errs toward a relaunch.
+                launched = fingerprint()
+                self._launch = (fingerprint, launched)
+            spawn_argv = backend.wrap_launcher_argv(helper_argv, sandbox, self.cwd, chdir=chdir)
         else:
             spawn_argv = helper_argv
         # ``pass_fds`` (POSIX only) unsets ``FD_CLOEXEC`` on ``r_fd`` so the
@@ -773,6 +802,8 @@ class _HelperProcessClient:
     def _stop_locked(self) -> None:
         proc = self._proc
         self._proc = None
+        self._launch = None
+        self._launch_env = None
         try:
             if proc is None:
                 return
@@ -978,6 +1009,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
 
     _copy_on_write_environment: CopyOnWriteEnvironment | None = None
     _owns_copy_on_write: bool = False
+    _relaunch_when_stale: bool = False
 
     @property
     def copy_on_write_environment(self) -> CopyOnWriteEnvironment | None:
@@ -1011,6 +1043,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
             egress_rules=self._egress_rules,
             egress_allow_private_destinations=self._egress_allow_private_destinations,
             copy_on_write_environment=self._copy_on_write_environment,
+            relaunch_when_stale=self._relaunch_when_stale,
         )
 
     async def read(
@@ -1134,8 +1167,15 @@ def create_os_environment(
     copy_on_write_environment: CopyOnWriteEnvironment | None = None,
     sandbox_policy: SandboxPolicy | None = None,
     additional_read_roots: Sequence[Path] = (),
+    relaunch_when_stale: bool = False,
 ) -> OSEnvironment | None:
-    """Instantiate the configured OS environment."""
+    """Instantiate the configured OS environment.
+
+    :param relaunch_when_stale: Relaunch the helper before a request once a
+        fresh launch would have different mounts or inherited environment
+        values. Credential-proxy helpers relaunch for every request to resolve
+        their sources again. A relaunch discards the helper's scratch dir.
+    """
     if spec is None:
         return None
     if spec.type != "caller_process":
@@ -1175,6 +1215,7 @@ def create_os_environment(
         _start_in_scratch=spec.start_in_scratch,
         _egress_rules=egress_rules,
         _egress_allow_private_destinations=egress_allow_private,
+        _relaunch_when_stale=relaunch_when_stale,
     )
 
 
