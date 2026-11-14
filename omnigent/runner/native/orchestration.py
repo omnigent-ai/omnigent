@@ -3387,7 +3387,10 @@ async def _auto_create_cursor_terminal(
     )
     from omnigent.harnesses.cursor_native.main import is_valid_cursor_chat_id
     from omnigent.harnesses.cursor_native.status import clear_cursor_status_state
-    from omnigent.harnesses.cursor_native.usage import clear_cursor_usage_state
+    from omnigent.harnesses.cursor_native.usage import (
+        HOOK_BRIDGE_DIR_ENV_VAR,
+        clear_cursor_usage_state,
+    )
 
     bridge_dir = bridge_dir_for_session_id(session_id)
 
@@ -3514,7 +3517,7 @@ async def _auto_create_cursor_terminal(
             ),
             command=cursor_command,
             args=cursor_args,
-            env={},
+            env={HOOK_BRIDGE_DIR_ENV_VAR: str(bridge_dir)},
             scrollback=100_000,
             tmux_allow_passthrough=True,
             tmux_start_on_attach=False,

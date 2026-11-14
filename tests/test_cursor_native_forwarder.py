@@ -16,7 +16,9 @@ import errno
 import hashlib
 import json
 import logging
+import os
 import sqlite3
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -24,7 +26,9 @@ import httpx
 import pytest
 
 from omnigent.harnesses.cursor_native import forwarder as fwd
+from omnigent.harnesses.cursor_native import status
 from omnigent.harnesses.cursor_native.forwarder import _persist_native_compaction_item
+from tests._helpers.polling import poll_until_async
 
 # Real cursor chat ids are UUIDs. Use UUID-shaped ids in fixtures so the
 # persist side (forwarder) and the resume side (runner's strict
@@ -343,11 +347,16 @@ class TestDiscoverStore:
 class TestStateRoundTrip:
     def test_write_then_read(self, tmp_path: Path) -> None:
         assert fwd._write_state(
-            tmp_path, fwd._ForwardState(store_path="/x/store.db", last_rowid=7)
+            tmp_path,
+            fwd._ForwardState(
+                store_path="/x/store.db", last_rowid=7, workspace="/ws", confirmed=True
+            ),
         )
         got = fwd._read_state(tmp_path)
         assert got.store_path == "/x/store.db"
         assert got.last_rowid == 7
+        assert got.workspace == "/ws"
+        assert got.confirmed is True
 
     def test_cold_default_when_absent(self, tmp_path: Path) -> None:
         got = fwd._read_state(tmp_path)
@@ -365,9 +374,9 @@ class TestStateRoundTrip:
 class TestChatClaim:
     """``_chat_claimed_by_other`` keeps one cursor chat → one mirroring session.
 
-    cursor keeps one chat per working dir, so two cursor-native sessions in the
-    same cwd discover the same store; this guard stops both from mirroring it
-    into two conversations (the duplicate-session bug).
+    Timestamp discovery can pick the same store for two cursor-native sessions in
+    one cwd; this guard stops both from mirroring it into two conversations (the
+    duplicate-session bug).
     """
 
     def test_yields_to_earlier_live_session(self, tmp_path: Path) -> None:
@@ -389,6 +398,26 @@ class TestChatClaim:
             later, fwd._ForwardState(store_path=store, last_rowid=0, launch_epoch_ms=2_000)
         )
         assert fwd._chat_claimed_by_other(earlier, Path(store), my_launch_ms=1_000) is False
+
+    def test_hook_confirmed_claim_outranks_earlier_guess(self, tmp_path: Path) -> None:
+        root = tmp_path / "cursor-native"
+        earlier = root / "sessA"
+        later = root / "sessB"
+        earlier.mkdir(parents=True)
+        later.mkdir(parents=True)
+        store = "/cursor/chats/h/c/store.db"
+        fwd._write_state(
+            earlier, fwd._ForwardState(store_path=store, last_rowid=3, launch_epoch_ms=1_000)
+        )
+        fwd._write_state(
+            later,
+            fwd._ForwardState(store_path=store, launch_epoch_ms=2_000, confirmed=True),
+        )
+        assert fwd._chat_claimed_by_other(earlier, Path(store), my_launch_ms=1_000) is True
+        assert (
+            fwd._chat_claimed_by_other(later, Path(store), my_launch_ms=2_000, my_confirmed=True)
+            is False
+        )
 
     def test_unrelated_store_is_not_claimed(self, tmp_path: Path) -> None:
         root = tmp_path / "cursor-native"
@@ -424,6 +453,84 @@ class TestChatClaim:
             encoding="utf-8",
         )
         assert fwd._chat_claimed_by_other(live, Path(store), my_launch_ms=2_000) is False
+
+
+class TestChatContestedByUnboundSibling:
+    """Discovery must not guess a chat a live, still-unbound sibling may have created."""
+
+    @pytest.mark.parametrize(
+        ("sibling", "contested"),
+        [
+            ({"workspace": "/ws", "launch_epoch_ms": 1_000}, True),
+            ({"workspace": "/ws", "launch_epoch_ms": 60_000}, False),
+            ({"workspace": "/elsewhere", "launch_epoch_ms": 1_000}, False),
+            ({"workspace": "/ws", "launch_epoch_ms": 1_000, "store_path": "/other.db"}, False),
+            ({"workspace": "/ws", "launch_epoch_ms": 1_000, "heartbeat_ms": 1}, False),
+        ],
+        ids=["unbound-peer", "launched-after-chat", "other-workspace", "bound-peer", "dead-peer"],
+    )
+    def test_contested_only_by_live_unbound_peer_in_workspace(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sibling: dict, contested: bool
+    ) -> None:
+        chats_root = tmp_path / "chats"
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: chats_root)
+        chat_dir = chats_root / hashlib.md5(b"/ws").hexdigest() / _CHAT_ID
+        chat_dir.mkdir(parents=True)
+        (chat_dir / "store.db").write_bytes(b"")
+        (chat_dir / "meta.json").write_text(json.dumps({"createdAtMs": 5_000}))
+        root = tmp_path / "cursor-native"
+        (root / "me").mkdir(parents=True)
+        (root / "peer").mkdir()
+        state = {"store_path": None, "heartbeat_ms": int(time.time() * 1000), **sibling}
+        (root / "peer" / fwd._STATE_FILE).write_text(json.dumps(state), encoding="utf-8")
+        assert (
+            fwd._chat_contested_by_unbound_sibling(root / "me", chat_dir / "store.db", "/ws")
+            is contested
+        )
+
+
+class TestHookNamedStore:
+    """``_hook_named_store`` resolves the chat store a stop-hook marker names."""
+
+    @pytest.mark.parametrize(
+        ("hook_chat_id", "store_workspaces", "expected_workspace"),
+        [
+            (_CHAT_ID, ["/ws", "/other"], "/ws"),
+            (_CHAT_ID, ["/other"], "/other"),
+            (_CHAT_ID, ["/other", "/third"], None),
+            (_CHAT_ID_ABSENT, ["/ws"], None),
+            ("*", ["/other"], None),
+            (None, ["/ws"], None),
+        ],
+        ids=["own-workspace", "unique-elsewhere", "ambiguous", "absent", "invalid-id", "legacy"],
+    )
+    def test_resolves_only_an_unambiguous_named_store(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        hook_chat_id: str | None,
+        store_workspaces: list[str],
+        expected_workspace: str | None,
+    ) -> None:
+        chats_root = tmp_path / "chats"
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: chats_root)
+        stores: dict[str, Path] = {}
+        for workspace in store_workspaces:
+            store = (
+                chats_root / hashlib.md5(workspace.encode()).hexdigest() / _CHAT_ID / "store.db"
+            )
+            store.parent.mkdir(parents=True)
+            store.write_bytes(b"")
+            stores[workspace] = store
+        bridge_dir = tmp_path / "bridge"
+        payload = {"status": "completed"}
+        if hook_chat_id is not None:
+            payload["conversation_id"] = hook_chat_id
+        status.record_turn_end(bridge_dir, payload)
+
+        resolved = fwd._hook_named_store(bridge_dir, "/ws", 1)
+
+        assert resolved == (stores[expected_workspace] if expected_workspace else None)
 
 
 class _RecordingClient:
@@ -1051,6 +1158,7 @@ class TestPreseedResumeState:
         assert state.store_path == str(store)
         assert state.last_rowid == 5  # all 5 rows already in store
         assert state.launch_epoch_ms == 99_000
+        assert state.confirmed is True
 
     def test_empty_store_seeds_rowid_zero(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1069,10 +1177,11 @@ class TestForwardLoopPreseedResume:
     """Forwarder uses pre-seeded bridge state on cold resume, skipping discovery."""
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("confirmed", [True, False], ids=["confirmed", "legacy-state"])
     async def test_uses_preseed_store_without_discover(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, confirmed: bool
     ) -> None:
-        """When bridge state is pre-seeded, forwarder skips _discover_store."""
+        """Pre-seeded state skips _discover_store; only a confirmed chat is PATCHed."""
         chat_id = _CHAT_ID
         store = tmp_path / chat_id / "store.db"
         store.parent.mkdir(parents=True)
@@ -1088,10 +1197,14 @@ class TestForwardLoopPreseedResume:
         bridge_dir = tmp_path / "cursor-native" / "sess"
         bridge_dir.mkdir(parents=True)
         # Pre-seed: rowid 1 already mirrored (old history), start from there.
-        fwd._write_state(
-            bridge_dir,
-            fwd._ForwardState(store_path=str(store), last_rowid=1, launch_epoch_ms=999_000),
-        )
+        state: dict[str, object] = {
+            "store_path": str(store),
+            "last_rowid": 1,
+            "launch_epoch_ms": 999_000,
+        }
+        if confirmed:
+            state |= {"workspace": "/ws", "confirmed": True}
+        (bridge_dir / fwd._STATE_FILE).write_text(json.dumps(state), encoding="utf-8")
 
         discover_calls: list = []
 
@@ -1107,8 +1220,13 @@ class TestForwardLoopPreseedResume:
         async def _collect(client: object, *, session_id: str, item: fwd._MirrorItem) -> None:
             delivered.append(item)
 
+        patches: list[tuple[str, str]] = []
+
+        async def _record_patch(client: object, *, session_id: str, chat_id: str) -> None:
+            patches.append((session_id, chat_id))
+
         monkeypatch.setattr(fwd, "_post_conversation_item", _collect)
-        monkeypatch.setattr(fwd, "_patch_external_session_id", lambda *a, **k: None)
+        monkeypatch.setattr(fwd, "_patch_external_session_id", _record_patch)
 
         task = asyncio.create_task(
             fwd.forward_cursor_store_to_session(
@@ -1123,12 +1241,7 @@ class TestForwardLoopPreseedResume:
             )
         )
         try:
-            for _ in range(2000):
-                if delivered:
-                    break
-                await asyncio.sleep(0.001)
-            else:
-                raise AssertionError("forwarder never mirrored the new message")
+            await poll_until_async(lambda: delivered, timeout_s=5.0, interval_s=0.001)
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -1138,39 +1251,22 @@ class TestForwardLoopPreseedResume:
         assert delivered[0].item_data["content"][0]["text"] == "new message"
         # _discover_store was never called (pre-seed took the fast path).
         assert not discover_calls
+        assert patches == ([("conv_1", chat_id)] if confirmed else [])
+        assert fwd._read_state(bridge_dir).confirmed is confirmed
 
 
 class TestForwardLoopExternalSessionId:
-    """The poll loop patches external_session_id once when the store is found."""
+    """The poll loop patches external_session_id once the stop hook confirms the chat."""
 
     @staticmethod
     def _seed(store: Path, text: str = "hello") -> None:
+        store.parent.mkdir(parents=True)
         writer = _make_store(store, [("u", _user(f"<user_query>\n{text}\n</user_query>"))])
         writer.close()
 
-    @pytest.mark.asyncio
-    async def test_patches_chat_id_on_first_store_discovery(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The forwarder PATCHes external_session_id with the cursor chat_id."""
-        store = tmp_path / _CHAT_ID / "store.db"
-        store.parent.mkdir(parents=True)
-        self._seed(store)
-
-        patches: list[tuple[str, dict]] = []
-
-        async def _fake_patch(client: object, *, session_id: str, chat_id: str) -> None:
-            patches.append((session_id, chat_id))
-
-        monkeypatch.setattr(fwd, "_patch_external_session_id", _fake_patch)
-        monkeypatch.setattr(fwd, "_post_conversation_item", _FakePoster(lambda _: None))
-
-        bridge_dir = tmp_path / "cursor-native" / "sess"
-        bridge_dir.mkdir(parents=True)
-        monkeypatch.setattr(fwd, "_discover_store", lambda ws, launch_ms: store)
-        monkeypatch.setattr(fwd, "_chat_claimed_by_other", lambda *a, **k: False)
-
-        task = asyncio.create_task(
+    @staticmethod
+    def _start(bridge_dir: Path) -> asyncio.Task[None]:
+        return asyncio.create_task(
             fwd.forward_cursor_store_to_session(
                 base_url="http://test",
                 headers={},
@@ -1182,21 +1278,58 @@ class TestForwardLoopExternalSessionId:
                 poll_interval_s=0.001,
             )
         )
+
+    @pytest.mark.asyncio
+    async def test_patches_the_hook_confirmed_chat_not_the_discovery_guess(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        chats_root = tmp_path / "chats"
+        chat_dir = chats_root / hashlib.md5(b"/ws").hexdigest()
+        guessed, owned = chat_dir / _CHAT_ID / "store.db", chat_dir / _CHAT_ID_2 / "store.db"
+        self._seed(guessed, "guess")
+        self._seed(owned, "mine")
+        patches: list[tuple[str, str]] = []
+
+        async def _fake_patch(client: object, *, session_id: str, chat_id: str) -> None:
+            patches.append((session_id, chat_id))
+
+        poster = _FakePoster(lambda _: None)
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: chats_root)
+        monkeypatch.setattr(fwd, "_patch_external_session_id", _fake_patch)
+        monkeypatch.setattr(fwd, "_post_conversation_item", poster)
+        monkeypatch.setattr(fwd, "_post_external_session_status", AsyncMock())
+        monkeypatch.setattr(fwd, "_discover_store", lambda ws, launch_ms: guessed)
+        bridge_dir = tmp_path / "cursor-native" / "sess"
+        bridge_dir.mkdir(parents=True)
+
+        def mirrored() -> list[str]:
+            return [item.item_data["content"][0]["text"] for item in poster.delivered]
+
+        task = self._start(bridge_dir)
         try:
-            for _ in range(2000):
-                if patches:
-                    break
-                await asyncio.sleep(0.001)
-            else:
-                raise AssertionError("external_session_id patch was never called")
+            with caplog.at_level(logging.WARNING, logger=fwd._logger.name):
+                await poll_until_async(
+                    lambda: mirrored() == ["guess"], timeout_s=5.0, interval_s=0.001
+                )
+                await asyncio.sleep(0.02)
+                assert patches == []
+                status.record_turn_end(
+                    bridge_dir, {"conversation_id": _CHAT_ID_2, "status": "completed"}
+                )
+                await poll_until_async(
+                    lambda: status.read_posted_count(bridge_dir) == 1,
+                    timeout_s=5.0,
+                    interval_s=0.001,
+                )
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
-        assert len(patches) == 1
-        session_id, chat_id = patches[0]
-        assert session_id == "conv_1"
-        assert chat_id == _CHAT_ID
+        assert patches == [("conv_1", _CHAT_ID_2)]
+        assert mirrored() == ["guess", "mine"]
+        assert any("not guessed chat" in rec.getMessage() for rec in caplog.records)
+        persisted = fwd._read_state(bridge_dir)
+        assert (persisted.store_path, persisted.confirmed) == (str(owned), True)
 
     @pytest.mark.asyncio
     async def test_patches_only_once_across_multiple_polls(
@@ -1204,9 +1337,7 @@ class TestForwardLoopExternalSessionId:
     ) -> None:
         """external_session_id is patched exactly once, not on every poll tick."""
         store = tmp_path / _CHAT_ID_2 / "store.db"
-        store.parent.mkdir(parents=True)
         self._seed(store)
-
         patch_count = 0
 
         async def _count_patches(client: object, *, session_id: str, chat_id: str) -> None:
@@ -1215,37 +1346,22 @@ class TestForwardLoopExternalSessionId:
 
         monkeypatch.setattr(fwd, "_patch_external_session_id", _count_patches)
         monkeypatch.setattr(fwd, "_post_conversation_item", _FakePoster(lambda _: None))
-
-        bridge_dir = tmp_path / "cursor-native" / "sess"
-        bridge_dir.mkdir(parents=True)
+        monkeypatch.setattr(fwd, "_post_external_session_status", AsyncMock())
         monkeypatch.setattr(fwd, "_discover_store", lambda ws, launch_ms: store)
-        monkeypatch.setattr(fwd, "_chat_claimed_by_other", lambda *a, **k: False)
+        monkeypatch.setattr(fwd, "_hook_named_store", lambda *args: store)
+        bridge_dir = tmp_path / "cursor-native" / "sess"
+        status.record_turn_end(bridge_dir, {"conversation_id": _CHAT_ID_2})
+        status.record_turn_end(bridge_dir, {"conversation_id": _CHAT_ID_2})
 
-        task = asyncio.create_task(
-            fwd.forward_cursor_store_to_session(
-                base_url="http://test",
-                headers={},
-                session_id="conv_2",
-                bridge_dir=bridge_dir,
-                agent_name="cursor-native-ui",
-                workspace="/ws",
-                launch_epoch_ms=1_000,
-                poll_interval_s=0.001,
-            )
-        )
+        task = self._start(bridge_dir)
         try:
-            # Let the loop run for several ticks after the patch fires.
-            for _ in range(2000):
-                if patch_count >= 1:
-                    break
-                await asyncio.sleep(0.001)
-            # Extra ticks to confirm it doesn't re-patch.
-            for _ in range(50):
-                await asyncio.sleep(0.001)
+            await poll_until_async(
+                lambda: status.read_posted_count(bridge_dir) == 2, timeout_s=5.0, interval_s=0.001
+            )
+            await asyncio.sleep(0.05)
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-
         assert patch_count == 1
 
 
@@ -1412,3 +1528,150 @@ async def test_persist_native_compaction_item_no_store_skips_messages() -> None:
     assert body["type"] == "compaction"
     assert body["data"]["last_item_id"] == "item_abc"
     assert "compacted_messages" not in body["data"]
+
+
+class TestSiblingSessionsInOneWorkspace:
+    """Each cursor-agent process creates its own chat; its stop hook names it."""
+
+    @pytest.mark.asyncio
+    async def test_unbound_earlier_sibling_does_not_take_new_sessions_chat(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        chats_root = tmp_path / "chats"
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: chats_root)
+        monkeypatch.setattr(fwd, "_read_last_used_model", lambda path: None)
+        posted: list[tuple[str, dict]] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                posted.append((request.url.path, json.loads(request.content)))
+            return httpx.Response(200)
+
+        real_client = httpx.AsyncClient
+        monkeypatch.setattr(
+            fwd.httpx,
+            "AsyncClient",
+            lambda **kwargs: real_client(transport=httpx.MockTransport(handle), **kwargs),
+        )
+        now_ms = int(time.time() * 1000)
+        root = tmp_path / "cursor-native"
+        signed_out, reviewer = root / "sessA", root / "sessB"
+        tasks = [
+            asyncio.create_task(
+                fwd.forward_cursor_store_to_session(
+                    base_url="http://test",
+                    headers={},
+                    session_id=session_id,
+                    bridge_dir=bridge_dir,
+                    agent_name="cursor-native-ui",
+                    workspace="/ws",
+                    launch_epoch_ms=launch_ms,
+                    poll_interval_s=0.001,
+                )
+            )
+            for bridge_dir, session_id, launch_ms in (
+                (signed_out, "first", now_ms - 5_000),
+                (reviewer, "second", now_ms),
+            )
+        ]
+        try:
+            await poll_until_async(
+                lambda: all(fwd._read_state(d).workspace == "/ws" for d in (signed_out, reviewer)),
+                timeout_s=5.0,
+                interval_s=0.001,
+            )
+            staged = tmp_path / "staged"
+            staged.mkdir()
+            (staged / "meta.json").write_text(json.dumps({"createdAtMs": now_ms + 1_000}))
+            _make_store(
+                staged / "store.db",
+                [
+                    ("u", _user("<user_query>\nreview\n</user_query>")),
+                    ("a", _assistant([{"type": "text", "text": "REVIEW-DONE"}])),
+                ],
+            ).close()
+            chat_dir = chats_root / hashlib.md5(b"/ws").hexdigest() / _CHAT_ID
+            chat_dir.parent.mkdir(parents=True)
+            os.rename(staged, chat_dir)
+            await asyncio.sleep(0.05)
+            status.record_turn_end(reviewer, {"conversation_id": _CHAT_ID, "status": "completed"})
+            await poll_until_async(
+                lambda: status.read_posted_count(reviewer) == 1, timeout_s=5.0, interval_s=0.001
+            )
+            await asyncio.sleep(0.05)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        def events(session_id: str) -> list[dict]:
+            return [body for path, body in posted if path == f"/v1/sessions/{session_id}/events"]
+
+        second = events("second")
+        assert [body["type"] for body in second] == [
+            "external_conversation_item",
+            "external_conversation_item",
+            "external_session_status",
+        ]
+        assert second[1]["data"]["item_data"]["content"][0]["text"] == "REVIEW-DONE"
+        assert events("first") == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure", ["marker-read", "chat-id-read"])
+    async def test_failed_ownership_read_keeps_the_turn_pending(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+    ) -> None:
+        chats_root = tmp_path / "chats"
+        store = chats_root / hashlib.md5(b"/ws").hexdigest() / _CHAT_ID / "store.db"
+        store.parent.mkdir(parents=True)
+        _make_store(store, [("a", _assistant([{"type": "text", "text": "REVIEW-DONE"}]))]).close()
+        bridge_dir = tmp_path / "cursor-native" / "sess"
+        status.record_turn_end(bridge_dir, {"conversation_id": _CHAT_ID, "status": "completed"})
+        events: list[str] = []
+
+        async def post_item(client: object, *, session_id: str, item: fwd._MirrorItem) -> None:
+            events.append(item.item_data["content"][0]["text"])
+
+        async def post_status(client: object, *, session_id: str, **kwargs: str) -> None:
+            events.append(kwargs["turn_outcome"])
+
+        name = "_read_marker" if failure == "marker-read" else "read_turn_chat_id"
+        real_read = getattr(status, name)
+        reads = 0
+
+        def fail_first_read(bridge: Path, turn_end: int) -> object:
+            nonlocal reads
+            reads += 1
+            if reads == 1:
+                raise OSError(errno.EIO, "marker unavailable")
+            return real_read(bridge, turn_end)
+
+        monkeypatch.setattr(status, name, fail_first_read)
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: chats_root)
+        monkeypatch.setattr(fwd, "_discover_store", lambda ws, launch_ms: store)
+        monkeypatch.setattr(fwd, "_chat_contested_by_unbound_sibling", lambda *args: True)
+        monkeypatch.setattr(fwd, "_read_last_used_model", lambda path: None)
+        monkeypatch.setattr(fwd, "_patch_external_session_id", AsyncMock())
+        monkeypatch.setattr(fwd, "_post_conversation_item", post_item)
+        monkeypatch.setattr(fwd, "_post_external_session_status", post_status)
+        task = asyncio.create_task(
+            fwd.forward_cursor_store_to_session(
+                base_url="http://test",
+                headers={},
+                session_id="reviewer",
+                bridge_dir=bridge_dir,
+                agent_name="cursor-native-ui",
+                workspace="/ws",
+                launch_epoch_ms=int(time.time() * 1000),
+                poll_interval_s=0.001,
+            )
+        )
+        try:
+            await poll_until_async(
+                lambda: status.read_posted_count(bridge_dir) == 1, timeout_s=5.0, interval_s=0.001
+            )
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        assert reads >= 2
+        assert events == ["REVIEW-DONE", "completed"]
