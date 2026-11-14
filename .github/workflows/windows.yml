@@ -200,7 +200,7 @@ jobs:
         run: >-
           uv run pytest
           tests/runner/test_runner_dispatch.py::test_runner_os_env_error_is_httpx_transport_safe
-          tests/runner/test_runner_dispatch.py::test_runner_os_env_change_restoring_the_original_leaves_changes[line-endings-changed]
+          tests/runner/test_runner_dispatch.py::test_runner_os_env_change_restoring_the_original_leaves_changes
           tests/runner/test_resource_registry.py::test_tool_environment_reuse_checks_session_spec_and_resolved_paths
           -m "not posix_only"
           --reruns 0 -p no:cacheprovider -v

@@ -3077,33 +3077,37 @@ async def test_runner_os_env_busy_helper_serves_concurrent_calls_and_cancellatio
     assert not _process_exists(replacement)
 
 
+_REVERT_NATIVE_TEXT = f"one{os.linesep}two{os.linesep}"
+_REVERT_ALTERNATE_TEXT = "one\ntwo\n" if os.linesep == "\r\n" else "one\r\ntwo\r\n"
+
+
 @pytest.mark.parametrize(
     "original,calls,statuses,read_cap,baseline",
     [
         pytest.param(
-            b"one\ntwo\n",
+            _REVERT_NATIVE_TEXT.encode(),
             [
                 ("sys_os_edit", {"oldText": "two", "newText": "three"}),
                 ("sys_os_edit", {"oldText": "three", "newText": "two"}),
             ],
             [],
             None,
-            "one\ntwo\n",
+            _REVERT_NATIVE_TEXT,
             id="edit-reverted",
         ),
         pytest.param(
-            b"one\ntwo\n",
+            _REVERT_NATIVE_TEXT.encode(),
             [
                 ("sys_os_write", {"content": "replaced\n"}),
                 ("sys_os_write", {"content": "one\ntwo\n"}),
             ],
             [],
             None,
-            "one\ntwo\n",
+            _REVERT_NATIVE_TEXT,
             id="write-reverted",
         ),
         pytest.param(
-            b"one\ntwo\n",
+            _REVERT_NATIVE_TEXT.encode(),
             [
                 ("sys_os_edit", {"oldText": "one", "newText": "uno"}),
                 ("sys_os_edit", {"oldText": "two", "newText": "dos"}),
@@ -3111,18 +3115,18 @@ async def test_runner_os_env_busy_helper_serves_concurrent_calls_and_cancellatio
             ],
             ["modified"],
             None,
-            "one\ntwo\n",
+            _REVERT_NATIVE_TEXT,
             id="partially-reverted",
         ),
         pytest.param(
-            b"one\r\ntwo\r\n",
+            _REVERT_ALTERNATE_TEXT.encode(),
             [
                 ("sys_os_edit", {"oldText": "two", "newText": "three"}),
                 ("sys_os_edit", {"oldText": "three", "newText": "two"}),
             ],
             ["modified"],
             None,
-            "one\r\ntwo\r\n",
+            _REVERT_ALTERNATE_TEXT,
             id="line-endings-changed",
         ),
         pytest.param(
@@ -3134,7 +3138,7 @@ async def test_runner_os_env_busy_helper_serves_concurrent_calls_and_cancellatio
             id="binary-original",
         ),
         pytest.param(
-            b"one\ntwo\n",
+            _REVERT_NATIVE_TEXT.encode(),
             [
                 ("sys_os_write", {"content": "replaced\n"}),
                 ("sys_os_write", {"content": "one\ntwo\n"}),
@@ -3191,6 +3195,8 @@ async def test_runner_os_env_change_restoring_the_original_leaves_changes(
         listed = filesystem_registry.list_changed_files("conv_revert", limit=10)
         assert [entry["status"] for entry in listed] == statuses
         assert filesystem_registry.get_baseline("file.txt") == baseline
+        if baseline is not None:
+            assert ((tmp_path / "file.txt").read_bytes() != original) is bool(statuses)
 
         assert await _os_env_helper_pid(resource_registry, spec, "conv_revert") == helper_pid
     finally:
