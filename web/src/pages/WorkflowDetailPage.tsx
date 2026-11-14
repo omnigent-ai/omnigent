@@ -241,9 +241,12 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
             </p>
           )}
           {canReadProposal && journal.error && (
-            <p role="alert" className="mb-3 text-sm text-destructive">
-              Couldn’t load the latest proposal. Reopen the chat to try again.
-            </p>
+            <div role="alert" className="mb-3 flex items-center gap-2 text-sm text-destructive">
+              <span>Couldn’t load the latest proposal.</span>
+              <Button variant="outline" size="sm" onClick={journal.retry}>
+                Retry
+              </Button>
+            </div>
           )}
           {(proposedSteps ?? workflow.steps).length > 0 ? (
             <WorkflowStepsGraph steps={proposedSteps ?? workflow.steps} title={workflow.name} />

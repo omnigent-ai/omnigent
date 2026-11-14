@@ -1240,9 +1240,12 @@ export function TasksPanel({
             ))}
           </div>
         ) : journal.error ? (
-          <p className="px-2 py-6 text-center text-sm text-muted-foreground">
-            {journal.error.message}
-          </p>
+          <div role="alert" className="px-2 py-6 text-center text-sm text-muted-foreground">
+            <p>{journal.error.message}</p>
+            <Button variant="outline" size="sm" className="mt-2" onClick={journal.retry}>
+              Retry
+            </Button>
+          </div>
         ) : empty ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-1.5 px-6 text-center">
             <ListChecksIcon aria-hidden className="mb-1.5 size-6 text-muted-foreground" />

@@ -1448,8 +1448,26 @@ describe("runs of a saved workflow", () => {
     vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(new Map());
   });
 
-  it("shows each run's tasks as the Tasks timeline, and the run on the graph", () => {
-    setTask(task({ prompt: WORKFLOW_PROMPT }));
+  it.each([false, true])("shows each run's tasks and graph (trigger header=%s)", (header) => {
+    const prompt = header
+      ? encodeTriggerPrompt(
+          {
+            ...emptyTriggerFields("github"),
+            source: "github",
+            scope: "example/project",
+            instructions: WORKFLOW_PROMPT,
+            worker: {
+              placement: "same_host",
+              agentId: null,
+              model: "",
+              effort: "",
+              permissionMode: "",
+            },
+          },
+          { sessionLink: "https://example.test/c/CONVERSATION_ID" },
+        )
+      : WORKFLOW_PROMPT;
+    setTask(task({ prompt }));
     setRuns([run({ id: "run_1", status: "succeeded", conversationId: "c_9" })]);
     vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(new Map([["run_1", STEPS]]));
     render(

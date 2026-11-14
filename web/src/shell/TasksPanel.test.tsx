@@ -61,6 +61,7 @@ function showJournal(entries: JournalEntry[], extra = {}) {
     hasOlder: false,
     loadingOlder: false,
     loadOlder: vi.fn(),
+    retry: vi.fn(),
     ...extra,
   };
   vi.mocked(useSessionJournal).mockReturnValue(view);

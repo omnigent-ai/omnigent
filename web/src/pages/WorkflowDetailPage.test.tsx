@@ -224,6 +224,7 @@ describe("WorkflowDetailPage", () => {
       hasOlder: false,
       loadingOlder: false,
       loadOlder: vi.fn(),
+      retry: vi.fn(),
     });
     vi.mocked(useDeleteWorkflow).mockReturnValue({
       mutate: deleteWorkflow,
@@ -273,6 +274,7 @@ describe("WorkflowDetailPage", () => {
       hasOlder: false,
       loadingOlder: false,
       loadOlder: vi.fn(),
+      retry: vi.fn(),
     });
     renderPage();
 

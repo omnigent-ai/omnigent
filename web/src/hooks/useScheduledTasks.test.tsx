@@ -314,6 +314,15 @@ describe("useScheduledTaskRuns live refresh", () => {
     rerender({ runs: current });
     await waitFor(() => expect(result.current.has("run-new")).toBe(true));
     expect(api.listScheduledTaskRunSteps).toHaveBeenCalledTimes(2);
+    const working = [{ ...RUNNING_RUN, id: "run-working" }, ...current.slice(0, 19)];
+    vi.mocked(api.listScheduledTaskRunSteps).mockResolvedValueOnce(stepsFor(working));
+    rerender({ runs: working });
+    await waitFor(() => expect(result.current.has("run-working")).toBe(true));
+    const finished = { ...stepsFor(working)[0], workflowId: "a".repeat(32) };
+    vi.mocked(api.listScheduledTaskRunSteps).mockResolvedValueOnce([finished]);
+    rerender({ runs: [{ ...SUCCEEDED_RUN, id: "run-working" }, ...current.slice(0, 19)] });
+    await waitFor(() => expect(result.current.get("run-working")).toEqual(finished));
+    expect(api.listScheduledTaskRunSteps).toHaveBeenCalledTimes(4);
   });
 
   it("keeps refetching a >20s run until it settles, WITHOUT a remount", async () => {

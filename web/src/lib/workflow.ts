@@ -1,6 +1,11 @@
 // The message that runs Omnigent's `workflow` skill from the "Run a workflow"
 // dialog, in the session composer and on the new-session page.
 
+import {
+  decodeTriggerPrompt,
+  splitTriggerPrompt,
+  stripTriggerHeader,
+} from "@/components/scheduled/triggerTemplates";
 import type { WorkflowStep } from "@/lib/workflowGraphLayout";
 
 /** The framework skill that plans and runs a workflow (`/workflow <description>`). */
@@ -185,14 +190,17 @@ const SAVED_WORKFLOW_RUN =
   /^[/$]workflow Run the saved workflow "(.+)" \(ID ([0-9a-f]{32})\)\.(?:\n\n([\s\S]*))?$/;
 
 /**
- * Read back a {@link savedWorkflowMessage}, e.g. an automation's prompt.
+ * Read back a {@link savedWorkflowMessage}, directly or inside a trigger prompt.
  *
  * @returns The workflow's ID and name and the run's details, or `null` for any other text.
  */
 export function parseSavedWorkflowMessage(
   text: string,
 ): { id: string; name: string; details: string } | null {
-  const match = SAVED_WORKFLOW_RUN.exec(text.trim());
+  const instructions =
+    decodeTriggerPrompt(text)?.instructions ??
+    splitTriggerPrompt(stripTriggerHeader(text)).userPrompt;
+  const match = SAVED_WORKFLOW_RUN.exec(instructions.trim());
   if (!match) return null;
   return { id: match[2], name: match[1], details: (match[3] ?? "").trim() };
 }

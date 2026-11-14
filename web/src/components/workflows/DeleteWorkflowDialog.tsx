@@ -1,7 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 
 import { WorkflowAutomationDeleteNotice } from "@/components/scheduled/AutomationSourceDeleteNotice";
-import { splitTriggerPrompt } from "@/components/scheduled/triggerTemplates";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -39,8 +38,7 @@ export function DeleteWorkflowDialog({
     retry: false,
   });
   const linkedAutomations = (automations.data ?? []).filter(
-    (task) =>
-      parseSavedWorkflowMessage(splitTriggerPrompt(task.prompt).userPrompt)?.id === workflow.id,
+    (task) => parseSavedWorkflowMessage(task.prompt)?.id === workflow.id,
   );
   const checking =
     info === "loading" || (automationsEnabled && (automations.isPending || automations.isFetching));

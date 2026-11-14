@@ -3,7 +3,11 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { emptyTriggerFields, renderTriggerPrompt } from "@/components/scheduled/triggerTemplates";
+import {
+  emptyTriggerFields,
+  encodeTriggerPrompt,
+  renderTriggerPrompt,
+} from "@/components/scheduled/triggerTemplates";
 import { showToast } from "@/components/ui/toast";
 import { SCHEDULED_TASKS_KEY } from "@/hooks/useScheduledTasks";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -92,19 +96,48 @@ describe("DeleteWorkflowDialog", () => {
   });
   afterEach(cleanup);
 
-  it("warns about active and paused automations, including trigger prompts, and lets the user cancel", async () => {
-    const { onClose } = renderDialog();
-    expect(deleteButton()).toBeDisabled();
-    const notice = await screen.findByTestId("workflow-automation-delete-notice");
-    expect(notice).toHaveTextContent("This workflow is used by 2 automations");
-    expect(notice).toHaveTextContent(
-      "Future runs of “Daily triage” and “Weekend triage” won’t be able to load this workflow.",
-    );
-    expect(screen.queryByText("Unrelated automation")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    expect(onClose).toHaveBeenCalledOnce();
-    expect(deletions()).toEqual([]);
-  });
+  it.each([false, true])(
+    "warns about active and paused automations, including triggers (header=%s), and lets the user cancel",
+    async (header) => {
+      if (header) {
+        const tasks = AUTOMATIONS.map((task) =>
+          task.id !== "weekend"
+            ? task
+            : {
+                ...task,
+                prompt: encodeTriggerPrompt(
+                  {
+                    ...emptyTriggerFields("github"),
+                    source: "github",
+                    scope: "example/project",
+                    instructions: savedWorkflowMessage("$", WORKFLOW, "Only urgent issues", false),
+                    worker: {
+                      placement: "same_host",
+                      agentId: null,
+                      model: "",
+                      effort: "",
+                      permissionMode: "",
+                    },
+                  },
+                  { sessionLink: "https://example.test/c/CONVERSATION_ID" },
+                ),
+              },
+        );
+        vi.mocked(authenticatedFetch).mockImplementation(async () => automationResponse(tasks));
+      }
+      const { onClose } = renderDialog();
+      expect(deleteButton()).toBeDisabled();
+      const notice = await screen.findByTestId("workflow-automation-delete-notice");
+      expect(notice).toHaveTextContent("This workflow is used by 2 automations");
+      expect(notice).toHaveTextContent(
+        "Future runs of “Daily triage” and “Weekend triage” won’t be able to load this workflow.",
+      );
+      expect(screen.queryByText("Unrelated automation")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      expect(onClose).toHaveBeenCalledOnce();
+      expect(deletions()).toEqual([]);
+    },
+  );
 
   it("links to each affected automation and closes the dialog when followed", async () => {
     const { onClose } = renderDialog();

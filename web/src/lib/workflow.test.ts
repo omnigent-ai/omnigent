@@ -1,4 +1,9 @@
 import { describe, expect, it } from "vitest";
+import {
+  emptyTriggerFields,
+  encodeTriggerPrompt,
+  stripTriggerHeader,
+} from "@/components/scheduled/triggerTemplates";
 
 import {
   REVIEW_PLAN_FIRST,
@@ -191,6 +196,45 @@ describe("parseSavedWorkflowMessage", () => {
     expect(parseSavedWorkflowMessage("Summarize overnight activity")).toBeNull();
     expect(parseSavedWorkflowMessage("/workflow Add retries")).toBeNull();
   });
+
+  it.each(["new", "continue"] as const)(
+    "reads trigger instructions in %s sessions without trusting stale headers",
+    (taskSessionMode) => {
+      const encoded = encodeTriggerPrompt(
+        {
+          ...emptyTriggerFields("github"),
+          source: "github",
+          scope: "example/project",
+          instructions: savedWorkflowMessage("/", workflow, "Only urgent issues", false),
+          taskSessionMode,
+          worker: {
+            placement: "same_host",
+            agentId: null,
+            model: "",
+            effort: "",
+            permissionMode: "",
+          },
+        },
+        { sessionLink: "https://example.test/c/CONVERSATION_ID" },
+      );
+      const body = stripTriggerHeader(encoded);
+      const header = encoded.slice(0, encoded.length - body.length);
+      for (const prompt of [encoded, body]) {
+        expect(parseSavedWorkflowMessage(prompt)).toEqual({
+          ...workflow,
+          details: "Only urgent issues",
+        });
+      }
+      expect(parseSavedWorkflowMessage(header + body.replace(workflow.id, "b".repeat(32)))).toEqual(
+        {
+          ...workflow,
+          id: "b".repeat(32),
+          details: "Only urgent issues",
+        },
+      );
+      expect(parseSavedWorkflowMessage(header + "Summarize overnight activity")).toBeNull();
+    },
+  );
 });
 
 describe("runSavedWorkflowPrompt", () => {

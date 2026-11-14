@@ -8,7 +8,9 @@ import {
   useInfiniteQuery,
   useQuery,
   useQueryClient,
+  replaceEqualDeep,
   type InfiniteData,
+  type Query,
   type QueryClient,
 } from "@tanstack/react-query";
 import { useEffect, useMemo, useSyncExternalStore } from "react";
@@ -30,6 +32,9 @@ export const JOURNAL_FALLBACK_REFETCH_MS = 30_000;
 const CATCH_UP_MAX_PAGES = 5;
 
 type JournalData = InfiniteData<JournalPage, string | null>;
+// A response can predate live events received during its fetch. Keep those
+// events until the response is installed; query GC releases abandoned buffers.
+const liveEntriesDuringFetch = new WeakMap<Query, Map<string, JournalEntry>>();
 
 function newestEntry(data: JournalData | undefined): JournalEntry | undefined {
   let newest: JournalEntry | undefined;
@@ -63,6 +68,12 @@ export function applyJournalEntry(
   entry: JournalEntry,
 ): void {
   const key = sessionJournalKey(conversationId);
+  const query = queryClient.getQueryCache().find({ queryKey: key, exact: true });
+  if (query?.state.fetchStatus === "fetching") {
+    const pending = liveEntriesDuringFetch.get(query) ?? new Map<string, JournalEntry>();
+    pending.set(entry.id, entry);
+    liveEntriesDuringFetch.set(query, pending);
+  }
   const data = queryClient.getQueryData<JournalData>(key);
   if (!data || data.pages.length === 0) return;
   queryClient.setQueryData<JournalData>(key, withEntries(data, [entry]));
@@ -109,6 +120,7 @@ export interface SessionJournalView {
   hasOlder: boolean;
   loadingOlder: boolean;
   loadOlder: () => void;
+  retry: () => void;
 }
 
 /**
@@ -138,7 +150,27 @@ export function useSessionJournal(
     // The session stream keeps it current; see the catch-up below.
     staleTime: Number.POSITIVE_INFINITY,
     refetchOnWindowFocus: false,
+    structuralSharing: (previous, incoming) => {
+      const cached = queryClient.getQueryCache().find({
+        queryKey: sessionJournalKey(conversationId),
+        exact: true,
+      });
+      const pending = cached && liveEntriesDuringFetch.get(cached);
+      return replaceEqualDeep(
+        previous,
+        pending ? withEntries(incoming as JournalData, [...pending.values()]) : incoming,
+      );
+    },
   });
+  useEffect(() => {
+    const cached = queryClient.getQueryCache().find({
+      queryKey: sessionJournalKey(conversationId),
+      exact: true,
+    });
+    if (cached?.state.status === "success" && cached.state.fetchStatus === "idle") {
+      liveEntriesDuringFetch.delete(cached);
+    }
+  }, [queryClient, conversationId, query.isFetching, query.status]);
 
   const streamOpen = useSyncExternalStore(
     (notify) => subscribeSessionStreams(notify),
@@ -200,12 +232,16 @@ export function useSessionJournal(
       ),
     [pages, extraPages],
   );
+  const error = query.error ?? (olderExist ? planAndStatuses.error : null);
   return {
-    entries,
+    entries: error ? [] : entries,
     isLoading: active && (query.isPending || (olderExist && planAndStatuses.isPending)),
-    error: query.error,
+    error,
     hasOlder: query.hasNextPage,
     loadingOlder: query.isFetchingNextPage,
     loadOlder: () => void query.fetchNextPage(),
+    retry: () => {
+      if (active) void reloadNewestPage(queryClient, conversationId);
+    },
   };
 }

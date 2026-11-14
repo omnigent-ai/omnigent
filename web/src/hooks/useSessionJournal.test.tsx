@@ -116,6 +116,69 @@ describe("useSessionJournal", () => {
     expect(authenticatedFetch).toHaveBeenCalledTimes(1);
   });
 
+  it.each(["initial", "refetch", "reset"])(
+    "keeps live entries received during an older %s snapshot",
+    async (phase) => {
+      noteSessionStreamOpen(SESSION, false);
+      let finish!: (response: Response) => void;
+      const defer = () =>
+        vi.mocked(authenticatedFetch).mockImplementationOnce(
+          () =>
+            new Promise<Response>((resolve) => {
+              finish = resolve;
+            }),
+        );
+      if (phase === "initial") defer();
+      else respond(journalPage([journalEntry(0)]));
+      const { result } = renderHook(() => useSessionJournal(SESSION, true), { wrapper });
+      if (phase !== "initial") {
+        await waitFor(() => expect(result.current.entries).toHaveLength(1));
+        defer();
+        act(() => {
+          const filter = { queryKey: sessionJournalKey(SESSION), exact: true };
+          if (phase === "reset") void queryClient.resetQueries(filter);
+          else void queryClient.refetchQueries(filter);
+        });
+      }
+      await waitFor(() => expect(finish).toBeTypeOf("function"));
+      act(() => {
+        applyJournalEntry(queryClient, SESSION, journalEntry(1));
+        applyJournalEntry(queryClient, SESSION, journalEntry(1));
+      });
+      await act(async () => finish(new Response(JSON.stringify(journalPage([journalEntry(0)])))));
+      await waitFor(() =>
+        expect(result.current.entries.map((entry) => entry.position)).toEqual([0, 1]),
+      );
+    },
+  );
+
+  it.each(["plan", "status"])("reports a failed %s supplement and retries it", async (kind) => {
+    const plan = journalPlan(0, ["a"]);
+    const done = journalEntry(1, { kind: "status", step: "a", content: { status: "done" } });
+    const newest = journalPage([journalEntry(2)], { has_more: true });
+    byKind = { plan: journalPage([plan]), "status:a": journalPage([done]) };
+    respond(newest);
+    let failing = true;
+    const fetch = vi.mocked(authenticatedFetch).getMockImplementation()!;
+    vi.mocked(authenticatedFetch).mockImplementation((...args) => {
+      const params = new URL(String(args[0]), "http://test").searchParams;
+      return failing && params.get("kind") === kind
+        ? Promise.resolve(new Response(null, { status: 500 }))
+        : fetch(...args);
+    });
+    const { result } = renderHook(() => useSessionJournal(SESSION, true), { wrapper });
+    await waitFor(() => expect(result.current.error).toBeInstanceOf(Error));
+    expect(result.current.isLoading).toBe(false);
+    expect(result.current.entries).toEqual([]);
+    failing = false;
+    respond(newest);
+    act(() => result.current.retry());
+    await waitFor(() =>
+      expect(result.current.entries.map((entry) => entry.position)).toEqual([0, 1, 2]),
+    );
+    expect(result.current.error).toBeNull();
+  });
+
   it("catches up when the stream reopens, and polls only while it is down", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     noteSessionStreamOpen(SESSION, false);

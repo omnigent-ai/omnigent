@@ -128,9 +128,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
   } = useScheduledTaskRuns(taskId, taskId !== "", awaitingRunRow);
   // An automation that runs a saved workflow shows each run's tasks.
   const savedWorkflow =
-    task && isFeatureEnabled(info, "workflows")
-      ? parseSavedWorkflowMessage(splitTriggerPrompt(task.prompt).userPrompt)
-      : null;
+    task && isFeatureEnabled(info, "workflows") ? parseSavedWorkflowMessage(task.prompt) : null;
   const runSteps = useScheduledTaskRunSteps(taskId, runs, savedWorkflow !== null);
 
   const updateMutation = useUpdateScheduledTask();
