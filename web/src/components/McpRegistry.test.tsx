@@ -61,6 +61,20 @@ describe("MCP account connections", () => {
     );
   });
 
+  it("shows a configured icon on the account card and nothing when unset", async () => {
+    vi.mocked(registryRequest).mockResolvedValue({
+      data: [
+        { ...service, icon: "/icons/tracker.png" },
+        { ...service, id: "plain", title: "Plain tracker" },
+      ],
+    });
+    const { container } = render(<McpRegistryConnections />);
+    await screen.findByText("Plain tracker");
+    const images = container.querySelectorAll("img");
+    expect([...images].map((image) => image.getAttribute("src"))).toEqual(["/icons/tracker.png"]);
+    expect(container.querySelector("svg.lucide-plug")).toBeNull();
+  });
+
   it("shows a connection failure and keeps the account controls usable", async () => {
     vi.mocked(registryRequest)
       .mockResolvedValueOnce({ data: [{ ...service, connected: true }] })
@@ -99,6 +113,32 @@ describe("MCP service selection", () => {
       "href",
       "/settings/mcp",
     );
+  });
+
+  it("shows a configured icon and falls back to the plug when it fails to load", async () => {
+    const icon = "https://cdn.example.test/tracker.svg";
+    vi.mocked(registryRequest).mockResolvedValue({
+      data: [
+        { ...service, icon, connected: true },
+        { ...service, id: "plain", title: "Plain tracker", icon: null },
+      ],
+    });
+    const { container } = render(
+      <McpRegistryPicker attached={[]} onToggle={vi.fn()} busy={false} />,
+    );
+    await screen.findByRole("switch", { name: "Plain tracker" });
+    const [image, ...others] = container.querySelectorAll("img");
+    expect(others).toHaveLength(0);
+    expect(image).toHaveAttribute("src", icon);
+    expect(image).toHaveAttribute("alt", "");
+    expect(image).toHaveAttribute("loading", "lazy");
+    expect(image).toHaveAttribute("referrerpolicy", "no-referrer");
+    expect(image).toHaveClass("size-4");
+    expect(container.querySelectorAll("svg.lucide-plug")).toHaveLength(1);
+
+    fireEvent.error(image!);
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.querySelectorAll("svg.lucide-plug")).toHaveLength(2);
   });
 
   it("reports a sign-in starting and finishing to its owner", async () => {

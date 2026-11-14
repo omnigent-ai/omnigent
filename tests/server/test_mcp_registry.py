@@ -213,6 +213,45 @@ def test_invalid_operator_configuration_fails_early(override):
         service(**override)
 
 
+@pytest.mark.parametrize(
+    ("icon", "allow_http"),
+    [
+        ("https://cdn.example.test/tracker.svg", False),
+        ("http://localhost:8080/tracker.png", True),
+        ("/static/icons/tracker.webp", False),
+        ("data:image/svg+xml;base64,PHN2Zy8+", False),
+        ("data:image/svg+xml;charset=utf-8,%3Csvg%2F%3E", False),
+        ("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'/>", False),
+        ("data:image/PNG;base64,iVBORw0KGgo=", False),
+        ("data:image/webp;base64,UklGRg==", False),
+    ],
+)
+def test_icon_accepts_https_paths_and_image_data(icon, allow_http):
+    assert service(icon=icon, allow_http=allow_http).icon == icon
+
+
+@pytest.mark.parametrize(
+    "icon",
+    [
+        "http://cdn.example.test/tracker.svg",
+        "javascript:alert(1)",
+        "data:text/html;base64,PGgxPg==",
+        "data:image/gif;base64,R0lGODlh",
+        "data:image/png;base64,not base64!",
+        "https://user:pass@cdn.example.test/tracker.svg",
+        "https://user@cdn.example.test/tracker.svg",
+        "//evil.example.test/tracker.svg",
+        "/\\evil.example.test/tracker.svg",
+        "/\t/evil.example.test/tracker.svg",
+        "tracker.svg",
+        "data:image/png;base64," + "A" * (32 * 1024),
+    ],
+)
+def test_icon_rejects_unsafe_values(icon):
+    with pytest.raises(ValidationError, match="icon must be"):
+        service(icon=icon)
+
+
 @pytest.mark.parametrize("url", ["http://public.example.test", "https://user:pass@example.test"])
 def test_invalid_public_callback_url_is_rejected(url):
     with pytest.raises(ValidationError, match="public_url"):

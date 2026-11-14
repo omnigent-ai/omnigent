@@ -4,7 +4,6 @@ import {
   CircleXIcon,
   CommandIcon,
   LoaderCircleIcon,
-  PlugIcon,
   TriangleAlertIcon,
   WandSparklesIcon,
 } from "lucide-react";
@@ -12,6 +11,7 @@ import type { SkillsStatus } from "@/lib/types";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { McpServiceIcon } from "@/components/McpServiceIcon";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { MobileMenuGlassSurface } from "./MobileMenuGlassSurface";
 
@@ -187,6 +187,8 @@ export interface McpServerRow {
   live?: McpLiveConnection;
   /** The harness's name for this server, for Reconnect; set only with a reported `live`. */
   liveName?: string;
+  /** A registry service's configured icon, shown unless the row needs attention. */
+  icon?: string | null;
 }
 
 /**
@@ -279,9 +281,11 @@ interface SlashCommandMenuProps {
 function McpConnectionIcon({
   connection,
   live,
+  icon,
 }: {
   connection?: McpServerConnection;
   live?: McpLiveConnection;
+  icon?: string | null;
 }) {
   if (live?.status === "failed")
     return <CircleXIcon aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-destructive" />;
@@ -305,12 +309,9 @@ function McpConnectionIcon({
     );
   const connected = live ? live.status === "connected" : connection === "connected";
   return (
-    <PlugIcon
-      aria-hidden="true"
-      className={cn(
-        "mt-0.5 size-3.5 shrink-0",
-        connected ? "text-emerald-500" : "text-muted-foreground",
-      )}
+    <McpServiceIcon
+      service={{ icon }}
+      className={cn("mt-0.5 size-3.5", connected ? "text-emerald-500" : "text-muted-foreground")}
     />
   );
 }
@@ -447,7 +448,7 @@ function McpServerRows({
             className="rounded-md px-2 py-1.5"
           >
             <div className="flex items-start gap-2">
-              <McpConnectionIcon connection={server.connection} live={live} />
+              <McpConnectionIcon connection={server.connection} live={live} icon={server.icon} />
               <div className="min-w-0 flex-1">
                 <div className="text-ui text-foreground">{server.name}</div>
                 {server.description && (

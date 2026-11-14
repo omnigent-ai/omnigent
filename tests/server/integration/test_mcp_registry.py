@@ -37,6 +37,48 @@ def app(runtime_init, db_uri, tmp_path):
     )
 
 
+async def test_catalog_lists_operator_icons(runtime_init, db_uri, tmp_path):
+    from omnigent.runtime import get_agent_cache, get_agent_store, get_conversation_store
+    from omnigent.server.app import create_app
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    icon = "data:image/svg+xml;base64,PHN2Zy8+"
+    registry = McpRegistry(
+        McpRegistryConfig(
+            services=[
+                McpService(
+                    id=name,
+                    title=name,
+                    url="https://example.test/mcp",
+                    auth="none",
+                    tools=["read_ticket"],
+                    icon=icon if name == "tracker" else None,
+                )
+                for name in ["tracker", "plain"]
+            ]
+        ),
+        None,
+    )
+    app = create_app(
+        agent_store=get_agent_store(),
+        conversation_store=get_conversation_store(),
+        agent_cache=get_agent_cache(),
+        artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
+        file_store=SqlAlchemyFileStore(db_uri),
+        mcp_registry=registry,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        catalog = await client.get("/v1/mcp-registry/services")
+    assert catalog.status_code == 200, catalog.text
+    assert {item["id"]: item["icon"] for item in catalog.json()["data"]} == {
+        "plain": None,
+        "tracker": icon,
+    }
+
+
 async def test_registry_tools_are_attached_discovered_and_executed_on_server(
     client, app, monkeypatch
 ):

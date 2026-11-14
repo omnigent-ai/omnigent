@@ -61,6 +61,7 @@ def create_mcp_registry_router(
                     "connected": connected,
                     "tools": entry.tools,
                     "connect_provider": f"mcp-{entry.id}" if entry.oauth else entry.auth,
+                    "icon": entry.icon,
                 }
             )
         return {
