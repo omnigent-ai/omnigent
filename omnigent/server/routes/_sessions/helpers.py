@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import json
 import math
 import re
@@ -120,6 +121,7 @@ from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_parked_elicitations,
     _harness_pre_resolved_elicitations,
+    _harness_severed_elicitations,
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.auth import (
@@ -1063,6 +1065,9 @@ def _signal_terminal_resolved_harness_elicitation_impl(
     unrelated auto-allowed same-named tool's output is harmless for the
     same reason).
 
+    A severed wait's card awaiting a hook re-park matches too, so answering
+    in the terminal clears it without waiting out the re-park grace.
+
     Best-effort and idempotent: a no-op when no parked prompt matches
     (e.g. the web UI already resolved it, the tool needed no permission,
     or it is an unrelated tool). Harness-agnostic by construction —
@@ -1077,7 +1082,9 @@ def _signal_terminal_resolved_harness_elicitation_impl(
     """
     candidates = [
         parked
-        for parked in _harness_parked_elicitations.values()
+        for parked in itertools.chain(
+            _harness_parked_elicitations.values(), _harness_severed_elicitations.values()
+        )
         if parked.session_id == session_id
         and parked.tool_name == tool_name
         and not parked.resolved_elsewhere.is_set()
@@ -1239,6 +1246,9 @@ def _signal_harness_elicitation_resolved_by_id(
     """
     Resolve or pre-resolve one parked harness elicitation by id.
 
+    A severed wait's card awaiting a hook re-park clears at once too,
+    instead of expiring as unanswered after the re-park grace.
+
     :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
     :param elicitation_id: Harness elicitation id, e.g.
         ``"elicit_codex_abc123"``.
@@ -1260,6 +1270,10 @@ def _signal_harness_elicitation_resolved_by_id(
     _prune_pre_resolved_harness_elicitations()
     parked = _harness_parked_elicitations.get(elicitation_id)
     if parked is None:
+        severed = _harness_severed_elicitations.get((session_id, elicitation_id))
+        if severed is not None:
+            # Its woken deferred clear publishes the resolved card.
+            severed.resolved_elsewhere.set()
         _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
             session_id=session_id,
             created_at=time.time(),

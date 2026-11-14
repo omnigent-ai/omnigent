@@ -46,6 +46,7 @@ from omnigent.entities.conversation import (
 )
 from omnigent.server._elicitation_registry import (
     _harness_parked_elicitations,
+    _harness_severed_elicitations,
     _ParkedHarnessElicitation,
 )
 from omnigent.server.routes import sessions as sessions_route
@@ -332,13 +333,16 @@ def _store_with_mirrored_call(
     return store, session_id
 
 
+@pytest.mark.parametrize("severed", [False, True], ids=["parked", "severed"])
 async def test_store_fallback_resolves_prompt_whose_call_another_replica_mirrored(
     db_uri: str,
+    severed: bool,
 ) -> None:
     """
     A result arriving on a replica that never cached its call (the session
     moved replicas between the call and its result) still resolves the
-    prompt parked here, from the call persisted in the store.
+    prompt parked here, from the call persisted in the store. Severed waits
+    still keeping their cards count as parked.
     """
     store, session_id = _store_with_mirrored_call(
         db_uri, "toolu_q", "AskUserQuestion", {"questions": [{"question": "Pick?"}]}
@@ -352,6 +356,11 @@ async def test_store_fallback_resolves_prompt_whose_call_another_replica_mirrore
         {"questions": [{"question": "Other?"}]},
         session_id=session_id,
     )
+    if severed:
+        for elicitation_id in ("e_q", "e_other"):
+            _harness_severed_elicitations[(session_id, elicitation_id)] = (
+                _harness_parked_elicitations.pop(elicitation_id)
+            )
     output = _function_call_output_item("toolu_q")
 
     # The per-process cache path recovers nothing on this replica.

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import itertools
 import json
 import math
 import re
@@ -141,6 +142,7 @@ from omnigent.server._elicitation_registry import (
     _harness_elicitation_registry,
     _harness_parked_elicitations,
     _harness_pre_resolved_elicitations,
+    _harness_severed_elicitations,
     _ParkedHarnessElicitation,
     _PreResolvedHarnessElicitation,
 )
@@ -498,6 +500,7 @@ async def _publish_and_wait_for_harness_elicitation(
     elicitation_id: str | None = None,
     tool_name: str | None = None,
     tool_input: dict[str, Any] | None = None,
+    repark_grace_s: float | None = None,
 ) -> ElicitationResult | None:
     """
     Publish one harness-originated elicitation and wait for web verdict.
@@ -541,6 +544,9 @@ async def _publish_and_wait_for_harness_elicitation(
     :param tool_input: Gated tool input, e.g. ``{"command": "ls"}``,
         used with ``tool_name`` to disambiguate the result when several
         same-named prompts are parked at once.
+    :param repark_grace_s: How long a severed wait's card waits for a
+        re-park, e.g. ``420.0``. ``None`` uses
+        ``_HARNESS_ELICITATION_REPARK_GRACE_S``.
     :returns: Web verdict, or ``None`` on terminal-side resolution,
         timeout, or disconnect.
     """
@@ -578,6 +584,8 @@ async def _publish_and_wait_for_harness_elicitation(
         if tombstone is not None:
             # Verdict from the un-parked gap; None = terminal answered (fail-ask).
             return tombstone.result
+        # This wait now owns the card.
+        _release_severed_harness_elicitation(session_id, elicitation_id)
         event = ElicitationRequestEvent(
             type="response.elicitation_request",
             elicitation_id=elicitation_id,
@@ -656,11 +664,16 @@ async def _publish_and_wait_for_harness_elicitation(
         ):
             # Retain the card during reconnect or native delivery. Abandoned
             # waits expire if no new hook arrives within the grace period.
+            awaiting_repark = not settled and elicitation_id not in _harness_elicitation_registry
+            if awaiting_repark:
+                _harness_severed_elicitations[(session_id, elicitation_id)] = parked
             _schedule_deferred_elicitation_clear(
                 session_id,
                 elicitation_id,
                 conversation_store,
                 native_delivery_attempt=delivery["attempt"] if delivery is not None else None,
+                severed=parked if awaiting_repark else None,
+                grace_s=repark_grace_s,
             )
         elif published_request:
             _publish_elicitation_resolved(session_id, elicitation_id, action=settled_action)
@@ -674,12 +687,30 @@ async def _publish_and_wait_for_harness_elicitation(
                 )
 
 
+def _release_severed_harness_elicitation(session_id: str, elicitation_id: str) -> None:
+    """
+    Take a card from the severed wait keeping it and wake that wait's deferred clear.
+
+    The woken clear finds its record gone and exits without publishing.
+
+    :param session_id: Session that owns the elicitation, e.g. ``"conv_abc123"``.
+    :param elicitation_id: Correlation id whose severed wait may hold the
+        card, e.g. ``"elicit_claude_0f3a..."``.
+    :returns: None.
+    """
+    severed = _harness_severed_elicitations.pop((session_id, elicitation_id), None)
+    if severed is not None:
+        severed.resolved_elsewhere.set()
+
+
 def _schedule_deferred_elicitation_clear(
     session_id: str,
     elicitation_id: str,
     conversation_store: ConversationStore | None,
     *,
     native_delivery_attempt: str | None = None,
+    severed: _ParkedHarnessElicitation | None = None,
+    grace_s: float | None = None,
 ) -> None:
     """
     Clear one elicitation's approval card after the re-park grace, unless
@@ -701,6 +732,12 @@ def _schedule_deferred_elicitation_clear(
         ancestor streams, or ``None`` to keep it session-local.
     :param native_delivery_attempt: Only expire this delivery attempt, never
         a newer attempt or a card already confirmed by the recorder.
+    :param severed: The ended wait's state, registered in
+        ``_harness_severed_elicitations``. Its ``resolved_elsewhere`` event
+        ends the grace early: a mirrored terminal answer clears the card
+        at once, and a re-park hands the card to the new wait.
+    :param grace_s: Grace in seconds, e.g. ``420.0``. ``None`` uses
+        ``_HARNESS_ELICITATION_REPARK_GRACE_S``.
     """
 
     async def _clear_after_grace() -> None:
@@ -713,7 +750,20 @@ def _schedule_deferred_elicitation_clear(
         # constant is honored here.
         from omnigent.server.routes import sessions as _facade
 
-        await asyncio.sleep(_facade._HARNESS_ELICITATION_REPARK_GRACE_S)
+        grace = _facade._HARNESS_ELICITATION_REPARK_GRACE_S if grace_s is None else grace_s
+        if severed is None:
+            await asyncio.sleep(grace)
+        else:
+            grace_task = asyncio.ensure_future(asyncio.sleep(grace))
+            woken_task = asyncio.ensure_future(severed.resolved_elsewhere.wait())
+            try:
+                await asyncio.wait({grace_task, woken_task}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                grace_task.cancel()
+                woken_task.cancel()
+        if _harness_severed_elicitations.get((session_id, elicitation_id)) is not severed:
+            return  # A re-park or a later severed wait owns the card.
+        _harness_severed_elicitations.pop((session_id, elicitation_id), None)
         if elicitation_id in _harness_elicitation_registry:
             # Re-parked — the new wait owns the eventual clear.
             return
@@ -725,14 +775,18 @@ def _schedule_deferred_elicitation_clear(
                 != native_delivery_attempt
             ):
                 return  # A receipt or a newer delivery attempt superseded this wait.
-        _publish_elicitation_resolved(session_id, elicitation_id, reason="unanswered")
+        # A terminal answer resolved it; only an elapsed grace means nobody answered.
+        reason = (
+            None if severed is not None and severed.resolved_elsewhere.is_set() else "unanswered"
+        )
+        _publish_elicitation_resolved(session_id, elicitation_id, reason=reason)
         if conversation_store is not None:
             await asyncio.to_thread(
                 _publish_elicitation_resolved_to_ancestors,
                 conversation_store,
                 session_id,
                 elicitation_id,
-                reason="unanswered",
+                reason=reason,
             )
 
     clear_coroutine = _clear_after_grace()
@@ -2764,6 +2818,8 @@ async def _resolve_elicitation(
                 )
                 _prune_pre_resolved_harness_elicitations()
     elif harness_future is None and isinstance(elicitation_id, str) and elicitation_id:
+        # The resolved fan-out below clears the card, so a severed wait no longer holds it.
+        _release_severed_harness_elicitation(session_id, elicitation_id)
         # Nothing parked (severed long-poll mid-retry, or a runner-side
         # id that just ages out) — tombstone the verdict so a re-park
         # returns it; consume is session-checked, so no cross-session use.
@@ -4543,7 +4599,9 @@ async def _drive_terminal_resolved_elicitation_from_store(
         return
     if not any(
         parked.session_id == session_id and not parked.resolved_elsewhere.is_set()
-        for parked in _harness_parked_elicitations.values()
+        for parked in itertools.chain(
+            _harness_parked_elicitations.values(), _harness_severed_elicitations.values()
+        )
     ):
         return
     try:
