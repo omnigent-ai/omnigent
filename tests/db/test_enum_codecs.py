@@ -21,6 +21,11 @@ _CODECS = [
     (ec.ITEM_TYPE, ec.encode_item_type, ec.decode_item_type),
     (ec.ITEM_STATUS, ec.encode_item_status, ec.decode_item_status),
     (ec.COMMENT_STATUS, ec.encode_comment_status, ec.decode_comment_status),
+    (
+        ec.COMMENT_REPLY_AUTHOR_KIND,
+        ec.encode_comment_reply_author_kind,
+        ec.decode_comment_reply_author_kind,
+    ),
     (ec.ACCOUNT_TOKEN_KIND, ec.encode_account_token_kind, ec.decode_account_token_kind),
     (ec.POLICY_TYPE, ec.encode_policy_type, ec.decode_policy_type),
     (ec.POLICY_SCOPE, ec.encode_policy_scope, ec.decode_policy_scope),
@@ -112,6 +117,7 @@ def test_shipped_codes_are_stable() -> None:
     }
     assert ec.ITEM_STATUS == {"completed": 1, "in_progress": 2, "incomplete": 3, "failed": 4}
     assert ec.COMMENT_STATUS == {"draft": 1, "addressed": 2}
+    assert ec.COMMENT_REPLY_AUTHOR_KIND == {"user": 1, "agent": 2}
     assert ec.ACCOUNT_TOKEN_KIND == {"invite": 1, "magic": 2}
     assert ec.POLICY_TYPE == {"python": 1, "url": 2}
     assert ec.POLICY_SCOPE == {"default": 1, "session": 2}
