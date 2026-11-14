@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { MonitorCloudIcon, WorkflowIcon } from "lucide-react";
+import { ChevronDownIcon, MonitorCloudIcon, WorkflowIcon } from "lucide-react";
 
 import {
   SandboxProfilePicker,
@@ -9,6 +9,12 @@ import {
 } from "@/components/SandboxProfilePicker";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import {
   Dialog,
   DialogContent,
@@ -27,6 +33,11 @@ import {
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+import {
+  type ProjectSummary,
+  useProjects,
+  useResolveOrCreateProjectId,
+} from "@/hooks/useConversations";
 import { useHosts } from "@/hooks/useHosts";
 import { readRecentWorkspaces, useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { markSandboxLaunch } from "@/hooks/useSandboxLaunchSelectionCheck";
@@ -73,6 +84,7 @@ import {
 } from "@/lib/workflow";
 import { ForkRunConfig, HostLabel, type ForkRunConfigValue } from "@/shell/ForkSessionDialog";
 import { ConnectHostInstructions } from "@/shell/NewChatDialog";
+import { ProjectPicker, ProjectRowIcon } from "@/shell/ProjectPicker";
 import { SandboxRepositoryPicker } from "@/shell/SandboxRepositoryPicker";
 import { resolveWorkspacePath, useResolvedHostHome } from "@/shell/WorkspacePicker";
 import { WorkspacePathField } from "@/shell/WorkspacePathField";
@@ -161,6 +173,7 @@ function pinnedValue(value: string | undefined): string | undefined {
 const CHOICES_KEY = "omnigent:workflow-session-choices";
 
 interface SessionChoices {
+  projectId: string | null;
   /** A host ID, or a sandbox row's `sandboxHostChoice` value. */
   target: string | null;
   /** The directory last used on each host, by host ID. */
@@ -206,6 +219,7 @@ function storedChoices(value: unknown): SessionChoices {
       )
     : null;
   return {
+    projectId: asString(record.projectId) ?? null,
     target: asString(record.target) ?? null,
     workspaces: Object.fromEntries(
       Object.entries(workspaces).filter(
@@ -261,6 +275,7 @@ export function WorkflowSessionForm({
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const info = useServerInfo();
+  const projectFieldId = useId();
   const hostFieldId = useId();
   const directoryFieldId = useId();
   const agentFieldId = useId();
@@ -291,6 +306,26 @@ export function WorkflowSessionForm({
   // This scope's last choices, read once as the dialog opens.
   const scope = choicesScope(request);
   const [choices] = useState(() => readSessionChoices(scope));
+  const {
+    data: projects = [],
+    isSuccess: projectsLoaded,
+    isError: projectsFailed,
+  } = useProjects({ enabled: request.kind === "run" });
+  const resolveProjectId = useResolveOrCreateProjectId();
+  // Undefined restores the last run's project; null explicitly chooses none.
+  const [pickedProject, setPickedProject] = useState<ProjectSummary | null>();
+  const project =
+    pickedProject === undefined
+      ? (projects.find((p) => choices.projectId !== null && p.id === choices.projectId) ?? null)
+      : pickedProject?.id
+        ? (projects.find((p) => p.id === pickedProject.id) ?? pickedProject)
+        : pickedProject;
+  const projectUnresolved =
+    request.kind === "run" &&
+    pickedProject === undefined &&
+    choices.projectId !== null &&
+    project === null &&
+    !projectsLoaded;
   const [workspace, setWorkspace] = useState("");
   const [browsing, setBrowsing] = useState(false);
   const { recent } = useRecentWorkspaces(hostId);
@@ -442,6 +477,7 @@ export function WorkflowSessionForm({
     : hostOnline && workspacePath !== null;
   const canRun =
     targetReady &&
+    !projectUnresolved &&
     agent !== undefined &&
     (request.kind === "run" || instructions.trim() !== "") &&
     !submitting;
@@ -463,9 +499,14 @@ export function WorkflowSessionForm({
     const modelOverride = pinnedValue(runConfig.modelOverride);
     const reasoningEffort = pinnedValue(runConfig.reasoningEffort);
     try {
+      const projectId =
+        request.kind === "run" && project
+          ? (project.id ?? (await resolveProjectId(project.name)))
+          : undefined;
       const session =
         launched.current?.session ??
         (await createSession(agent.id, [], {
+          projectId,
           // The drafting session is named for the workflow it creates.
           title:
             request.kind === "create"
@@ -510,6 +551,7 @@ export function WorkflowSessionForm({
       if (!onStarted && !serverSendsText)
         setPendingInitialPrompt(session.id, { text, skill: null, files: [] });
       writeSessionChoices(scope, {
+        projectId: projectId ?? null,
         target,
         workspaces:
           hostId !== null && workspacePath !== null
@@ -549,6 +591,49 @@ export function WorkflowSessionForm({
     <>
       {/* The room keeps the scroll area from clipping the fields' focus rings. */}
       <div className="-mx-1 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-1">
+        {request.kind === "run" && (
+          <Field label="Project (optional)" htmlFor={projectFieldId}>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  id={projectFieldId}
+                  type="button"
+                  variant="outline"
+                  className="w-full justify-start gap-2 text-sm"
+                  disabled={submitting}
+                  data-testid="workflow-session-project"
+                  componentId="workflows.run.project"
+                >
+                  <ProjectRowIcon icon={project?.icon} />
+                  <span className="flex-1 truncate text-left">
+                    {projectUnresolved
+                      ? projectsFailed
+                        ? "Project unavailable"
+                        : "Loading…"
+                      : (project?.name ?? "No project")}
+                  </span>
+                  <ChevronDownIcon className="size-4 text-muted-foreground" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" className="min-w-56">
+                {projectUnresolved && (
+                  <DropdownMenuItem onSelect={() => setPickedProject(null)}>
+                    No project
+                  </DropdownMenuItem>
+                )}
+                <ProjectPicker
+                  currentProject={project?.name ?? null}
+                  onSelect={(name) =>
+                    setPickedProject(
+                      name ? (projects.find((p) => p.name === name) ?? { id: null, name }) : null,
+                    )
+                  }
+                />
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </Field>
+        )}
+
         <Field label="Host" htmlFor={hostFieldId}>
           {hosts === undefined ? (
             <p className="text-sm text-muted-foreground">Loading hosts…</p>
