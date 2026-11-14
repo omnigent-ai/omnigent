@@ -469,6 +469,18 @@ class _HarnessEndpoint:
             self.socket_path.unlink()
 
 
+async def _cleanup_endpoint(endpoint: _HarnessEndpoint) -> None:
+    """Keep filesystem cleanup off the loop and finish before releasing ownership."""
+    cleanup = asyncio.create_task(asyncio.to_thread(endpoint.cleanup))
+    try:
+        await asyncio.shield(cleanup)
+    except asyncio.CancelledError:
+        # A late unlink must finish before the spawn lock permits socket reuse.
+        with contextlib.suppress(Exception):
+            await await_cleanup_task(cleanup)
+        raise
+
+
 class _SubprocessEntry:
     """
     Bookkeeping for one harness subprocess.
@@ -1347,7 +1359,7 @@ class HarnessProcessManager:
         # Defensive: a stale socket file from a previous spawn
         # (released but not cleaned up because of an OS quirk)
         # would block uvicorn binding. Best-effort delete (UDS only).
-        endpoint.cleanup()
+        await _cleanup_endpoint(endpoint)
 
         # Always build an explicit env dict (never ``None``): the
         # subprocess inherits AP's env (PATH, HOME, PYTHONPATH, provider
@@ -1469,7 +1481,7 @@ class HarnessProcessManager:
             with contextlib.suppress(Exception):
                 close_subprocess_transport(process)
             with contextlib.suppress(Exception):
-                endpoint.cleanup()
+                await _cleanup_endpoint(endpoint)
             raise
 
     async def _spawn_harness_process(
@@ -1578,7 +1590,7 @@ class HarnessProcessManager:
             # handles this when SIGTERM lands cleanly, but a
             # hard-killed runner won't. No-op for TCP endpoints.
             with contextlib.suppress(Exception):
-                entry.endpoint.cleanup()
+                await _cleanup_endpoint(entry.endpoint)
         if cancellation is not None:
             raise cancellation
 

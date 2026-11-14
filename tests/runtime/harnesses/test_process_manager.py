@@ -58,6 +58,7 @@ from omnigent.runtime.harnesses.process_manager import (
     _SubprocessEntry,
     sweep_orphaned_harness_processes,
 )
+from tests.budgets import budget
 
 _TEST_HARNESS_NAME = "test"
 _TEST_HARNESS_MODULE = "tests.runtime.harnesses._test_harness"
@@ -461,8 +462,11 @@ async def test_get_client_isolates_per_conversation(
         await manager.shutdown()
 
 
+@pytest.mark.parametrize("outcome", ["ready", "cancelled", "cleanup_error"])
 async def test_release_terminates_subprocess(
     manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
 ) -> None:
     """release() ends the subprocess and cleans up the socket.
 
@@ -478,11 +482,52 @@ async def test_release_terminates_subprocess(
         pid = (await client.get("/pid")).json()["pid"]
         socket_path = manager.instance_dir / "conv-conv_a.sock"
         assert socket_path.exists()
-        await manager.release("conv_a")
+        loop = asyncio.get_running_loop()
+        entered = asyncio.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        original_exists = Path.exists
+
+        def slow_exists(path: Path) -> bool:
+            if path != socket_path:
+                return original_exists(path)
+            loop.call_soon_threadsafe(entered.set)
+            try:
+                assert release.wait(budget(10)), "socket cleanup was never released"
+                if outcome == "cleanup_error":
+                    raise OSError("socket cleanup unavailable")
+                return original_exists(path)
+            finally:
+                finished.set()
+
+        monkeypatch.setattr(Path, "exists", slow_exists)
+        closing = asyncio.create_task(manager.release("conv_a"))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=budget(20))
+            assert not finished.is_set(), "socket cleanup blocked the event loop"
+            assert not _pid_alive(pid), "process must exit before socket cleanup"
+            assert manager._spawn_locks["conv_a"].locked()
+            if outcome == "cancelled":
+                closing.cancel()
+                await asyncio.sleep(0)
+                closing.cancel()
+                await asyncio.sleep(0)
+                assert not closing.done(), "cancellation abandoned socket cleanup"
+                assert manager._spawn_locks["conv_a"].locked()
+        finally:
+            release.set()
+            if outcome == "cancelled":
+                with pytest.raises(asyncio.CancelledError):
+                    await closing
+            else:
+                await closing
+            assert finished.is_set()
+            monkeypatch.setattr(Path, "exists", original_exists)
         # Socket cleanup is part of release's contract — leaving
         # the file behind would fail uvicorn binding on a
         # subsequent spawn for the same conv id.
-        assert not socket_path.exists()
+        if outcome != "cleanup_error":
+            assert not socket_path.exists()
         # Process should be gone — give the OS a brief moment
         # since SIGTERM → wait is async.
         for _ in range(20):
@@ -2152,11 +2197,13 @@ async def _cancel_pending(*tasks: asyncio.Task[object] | None) -> None:
                 del _settled
 
 
+@pytest.mark.parametrize("operation", ["owner_claim", "socket_cleanup"])
 @pytest.mark.parametrize("outcome", ["ready", "cancelled", "write_error"])
 async def test_slow_owner_claim_preserves_loop_progress_and_spawn_ownership(
     manager: HarnessProcessManager,
     monkeypatch: pytest.MonkeyPatch,
     outcome: str,
+    operation: str,
 ) -> None:
     """Slow spawn preparation keeps the loop live and drains before shutdown."""
     from omnigent.runtime.harnesses import process_manager as pm_mod
@@ -2168,18 +2215,39 @@ async def test_slow_owner_claim_preserves_loop_progress_and_spawn_ownership(
     release = threading.Event()
     finished = threading.Event()
     original_write = pm_mod.write_owner_claim
+    original_exists = Path.exists
+    expected_error = (
+        "owner claim could not be written"
+        if operation == "owner_claim"
+        else "socket cleanup unavailable"
+    )
 
     def slow_write(directory: Path, *, filename: str) -> None:
         loop.call_soon_threadsafe(entered.set)
         release.wait(timeout=5.0)
         try:
             if outcome == "write_error":
-                raise OSError("owner claim could not be written")
+                raise OSError(expected_error)
             original_write(directory, filename=filename)
         finally:
             finished.set()
 
-    monkeypatch.setattr(pm_mod, "write_owner_claim", slow_write)
+    def slow_exists(path: Path) -> bool:
+        if path.name != "conv-conv_slow_owner.sock":
+            return original_exists(path)
+        loop.call_soon_threadsafe(entered.set)
+        try:
+            assert release.wait(budget(10)), "socket cleanup was never released"
+            if outcome == "write_error":
+                raise OSError(expected_error)
+            return original_exists(path)
+        finally:
+            finished.set()
+
+    if operation == "owner_claim":
+        monkeypatch.setattr(pm_mod, "write_owner_claim", slow_write)
+    else:
+        monkeypatch.setattr(Path, "exists", slow_exists)
     spawn_process = AsyncMock(wraps=manager._spawn_harness_process)
     monkeypatch.setattr(manager, "_spawn_harness_process", spawn_process)
     spawn = asyncio.create_task(manager.get_client("conv_slow_owner", _TEST_HARNESS_NAME))
@@ -2203,7 +2271,7 @@ async def test_slow_owner_claim_preserves_loop_progress_and_spawn_ownership(
             assert shutdown is not None
             await shutdown
         elif outcome == "write_error":
-            with pytest.raises(OSError, match="owner claim could not be written"):
+            with pytest.raises(OSError, match=expected_error):
                 await spawn
         else:
             await _ping_health(await spawn)
