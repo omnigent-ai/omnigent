@@ -1922,12 +1922,56 @@ describe("FileViewer markdown preview/edit/source modes", () => {
     expect(screen.queryByRole("button", { name: /^View mode/ })).toBeNull();
   });
 
-  it("keeps HTML's preview-default and preview ↔ source toggle intact", () => {
-    renderViewer({ open: true, path: "page.html" });
-    expect(viewModeOf()).toBe("preview");
-    // In preview, the single toggle switches to source (existing behavior).
-    fireEvent.click(screen.getByRole("button", { name: "View source" }));
+  it.each(["page.html", "results.csv", "export.tsv"])(
+    "keeps %s on the preview by default, with a preview ↔ source toggle",
+    (path) => {
+      renderViewer({ open: true, path });
+      expect(viewModeOf()).toBe("preview");
+      // In preview, the single toggle switches to source (existing behavior).
+      fireEvent.click(screen.getByRole("button", { name: "View source" }));
+      expect(viewModeOf()).toBe("source");
+    },
+  );
+
+  it("opens a ?comment= link to a CSV in source, then lets the toggle reach the table", () => {
+    renderViewer({ open: true, path: "results.csv", initialSearch: "comment=c1" });
     expect(viewModeOf()).toBe("source");
+    fireEvent.click(screen.getByRole("button", { name: "View preview" }));
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it("switches a CSV opened on its table to source when a comment is picked", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+    renderViewer({ open: true, path: "results.csv" });
+    expect(viewModeOf()).toBe("preview");
+
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: "comment c1" }));
+    expect(viewModeOf()).toBe("source");
+    // The toggle still returns to the table.
+    fireEvent.click(screen.getByRole("button", { name: "View preview" }));
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it("ends a picked comment's pull toward source when another file opens", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+    const view = renderViewer({ open: true, path: "results.csv" });
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: "comment c1" }));
+    expect(viewModeOf()).toBe("source");
+
+    view.rerender(viewerTree({ open: true, path: "other.csv" }));
+    view.rerender(viewerTree({ open: true, path: "results.csv" }));
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it("keeps a Markdown comment link's pull toward its editor across a visit elsewhere", () => {
+    // Only a data table's pull ends on leaving; Markdown keeps its deep-link bias.
+    const view = renderViewer({ open: true, path: "notes.md", initialSearch: "comment=c1" });
+    expect(viewModeOf()).toBe("editor");
+    view.rerender(viewerTree({ open: true, path: "other.py", initialSearch: "comment=c1" }));
+    view.rerender(viewerTree({ open: true, path: "notes.md", initialSearch: "comment=c1" }));
+    expect(viewModeOf()).toBe("editor");
   });
 
   it("guards unsaved edits when leaving the markdown editor, switching only after Discard", () => {

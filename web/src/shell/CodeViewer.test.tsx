@@ -82,9 +82,13 @@ import * as permissions from "@/hooks/usePermissions";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function makeFileQuery(content: string, truncated = false): ReturnType<typeof useFileContent> {
+function makeFileQuery(
+  content: string,
+  truncated = false,
+  encoding: "utf-8" | "base64" = "utf-8",
+): ReturnType<typeof useFileContent> {
   return {
-    data: { content, encoding: "utf-8", truncated },
+    data: { content, encoding, truncated },
     isLoading: false,
     isError: false,
     isSuccess: true,
@@ -140,6 +144,9 @@ interface ViewerOptions {
   mediaActive?: boolean;
   position?: { line: number; endLine?: number };
   onRequestEditMode?: () => void;
+  /** How the server sent the content: text, or base64 for a non-UTF-8 or binary file. */
+  encoding?: "utf-8" | "base64";
+  searchOpen?: boolean;
 }
 
 function renderViewer(
@@ -162,13 +169,13 @@ function viewerElement(content: string, panelOpen: boolean, path: string, opts: 
       position={opts.position}
       conversationId={opts.conversationId ?? "conv_1"}
       path={path}
-      fileQuery={makeFileQuery(content, opts.truncated)}
+      fileQuery={makeFileQuery(content, opts.truncated, opts.encoding)}
       comments={[]}
       activeSelection={null}
       onSetActiveSelection={() => {}}
       panelOpen={panelOpen}
       mediaActive={opts.mediaActive}
-      searchOpen={false}
+      searchOpen={opts.searchOpen ?? false}
       setSearchOpen={() => {}}
       searchInputRef={noopRef}
       viewMode={opts.viewMode ?? "source"}
@@ -1228,6 +1235,102 @@ describe("CodeViewer .ipynb routing", () => {
     expect(screen.getByText(/Cannot render notebook/)).toBeDefined();
     // …and the shared truncation banner is stacked above it.
     expect(screen.getByText(/truncated/i)).toBeDefined();
+  });
+});
+
+describe("CodeViewer data-file routing", () => {
+  const CITIES = "city,people\nOslo,700000\n";
+
+  it("renders a CSV as a table in preview mode", () => {
+    renderViewer(CITIES, true, "sales.csv", { viewMode: "preview" });
+    expect(screen.getByRole("table", { name: "sales.csv" })).toBeDefined();
+    expect(screen.getByRole("cell", { name: "Oslo" })).toBeDefined();
+    expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+  });
+
+  it("keeps the raw text in source mode", async () => {
+    renderViewer(CITIES, true, "sales.csv", { viewMode: "source" });
+    // Monaco loads lazily.
+    expect(await screen.findByTestId("monaco-editor-stub")).toBeDefined();
+    expect(screen.queryByRole("table")).toBeNull();
+  });
+
+  it("tables a CSV the server sent as base64 instead of calling it binary", () => {
+    // "café" in Windows-1252, which isn't valid UTF-8.
+    const latin1 = btoa("name\ncaf\u00e9");
+    renderViewer(latin1, true, "sales.csv", { viewMode: "preview", encoding: "base64" });
+    expect(screen.getByRole("cell", { name: "café" })).toBeDefined();
+    expect(screen.queryByText(/Preview not available/)).toBeNull();
+  });
+
+  it("opens find in the table and finds again after filtering, sorting or emptying", () => {
+    // jsdom has neither layout nor the CSS Custom Highlight API the find bar uses.
+    const rangeRect = Object.getOwnPropertyDescriptor(Range.prototype, "getBoundingClientRect");
+    const scrollBy = Object.getOwnPropertyDescriptor(Element.prototype, "scrollBy");
+    Range.prototype.getBoundingClientRect = () => ({ top: 0, bottom: 0 }) as DOMRect;
+    Element.prototype.scrollBy = () => {};
+    // The text of the cell holding the current match.
+    let currentCell: string | null = null;
+    vi.stubGlobal(
+      "Highlight",
+      class {
+        ranges: Range[];
+        constructor(...ranges: Range[]) {
+          this.ranges = ranges;
+        }
+      },
+    );
+    vi.stubGlobal("CSS", {
+      highlights: {
+        set: (name: string, highlight: { ranges: Range[] }) => {
+          if (name.endsWith("-current")) {
+            currentCell = highlight.ranges[0]?.startContainer.textContent ?? null;
+          }
+        },
+        delete: () => {},
+      },
+    });
+    try {
+      // The viewer's find request opens find in the table.
+      const options = { viewMode: "preview", searchOpen: true } as const;
+      const view = renderViewer("name\nalpha\nbeta\nalpha two\n", true, "sales.csv", options);
+      fireEvent.change(screen.getByPlaceholderText("Find…"), { target: { value: "alpha" } });
+      expect(screen.getByText("1 / 2")).toBeDefined();
+      expect(currentCell).toBe("alpha");
+
+      const filter = screen.getByRole("textbox", { name: "Filter name" });
+      fireEvent.change(filter, { target: { value: "beta" } });
+      expect(screen.getByText("No results")).toBeDefined();
+      fireEvent.change(filter, { target: { value: "" } });
+      expect(screen.getByText("1 / 2")).toBeDefined();
+
+      // Sorted descending, "alpha two" comes before "alpha", and find follows.
+      const sort = screen.getByRole("button", { name: "Sort by name" });
+      fireEvent.click(sort);
+      fireEvent.click(sort);
+      expect(screen.getByText("1 / 2")).toBeDefined();
+      expect(currentCell).toBe("alpha two");
+
+      // The file is emptied on disk and refreshed at the same path.
+      view.rerender(viewerElement("", true, "sales.csv", options));
+      expect(screen.getByText(/This file has no rows/)).toBeDefined();
+      expect(screen.getByText("No results")).toBeDefined();
+    } finally {
+      vi.unstubAllGlobals();
+      for (const [target, name, original] of [
+        [Range.prototype, "getBoundingClientRect", rangeRect],
+        [Element.prototype, "scrollBy", scrollBy],
+      ] as const) {
+        if (original) Object.defineProperty(target, name, original);
+        else Reflect.deleteProperty(target, name);
+      }
+    }
+  });
+
+  it("shows the shared truncation banner for a partial file", () => {
+    renderViewer(CITIES, true, "sales.csv", { viewMode: "preview", truncated: true });
+    expect(screen.getByText(/too large to load fully/)).toBeDefined();
+    expect(screen.getByTestId("data-table-summary").textContent).toContain("At least 1 row ");
   });
 });
 
