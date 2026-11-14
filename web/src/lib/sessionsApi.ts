@@ -579,6 +579,7 @@ function postEventResponseFromWire(wire: {
  *   tests", or a child's, e.g. "ui:claude-native-ui:1".
  * @param options.hostId - Connected host to run on, e.g. "host_1".
  * @param options.workspace - Absolute directory on that host.
+ * @param options.projectId - File the session in this project, keeping the chosen placement.
  * @param options.sandbox - Run in a new sandbox instead: the provider (null
  *   for the server's first), an optional profile, the repository workspaces
  *   to clone (empty for an empty workspace), and the new host's id when the
@@ -597,6 +598,7 @@ export async function createSession(
     parentSessionId?: string;
     subAgentName?: string | null;
     title?: string;
+    projectId?: string;
     hostId?: string;
     workspace?: string;
     sandbox?: {
@@ -619,8 +621,10 @@ export async function createSession(
     parent_session_id?: string;
     sub_agent_name?: string | null;
     title?: string;
+    project_id?: string;
     host_id?: string;
-    workspace?: string;
+    workspace?: string | null;
+    git?: null;
     host_type?: "managed";
     sandbox_provider?: string;
     sandbox_profile_id?: string;
@@ -632,6 +636,12 @@ export async function createSession(
     model_override?: string;
     reasoning_effort?: string;
   } = { agent_id: agentId, initial_items: initialItems };
+  if (options.projectId !== undefined) {
+    body.project_id = options.projectId;
+    // Project launch hints must not replace the dialog's chosen placement.
+    body.workspace = options.workspace ?? null;
+    body.git = null;
+  }
   const { sandbox } = options;
   if (sandbox !== undefined) {
     body.host_type = "managed";
