@@ -104,6 +104,7 @@ from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     ConversationAlreadyExistsError,
+    ConversationAncestry,
     ConversationNotFoundError,
     ConversationStore,
     ConversationUpdateResult,
@@ -1431,6 +1432,38 @@ class SqlAlchemyConversationStore(ConversationStore):
                 live_status = None
             activity[row.id] = SessionActivity(updated_at=row.updated_at, live_status=live_status)
         return activity
+
+    def get_conversation_ancestry(
+        self, conversation_ids: list[str]
+    ) -> dict[str, ConversationAncestry]:
+        """Read ancestry by workspace and primary key without hydrating conversations."""
+        # Subclasses may add authorization or ID translation to conversation reads.
+        # Require their explicit implementation before using this projection.
+        if type(self) is not SqlAlchemyConversationStore:
+            raise NotImplementedError
+        if not conversation_ids:
+            return {}
+        with self._conv_session("get_conversation_ancestry") as session:
+            rows = session.execute(
+                select(
+                    SqlConversation.id,
+                    SqlConversation.parent_conversation_id,
+                    SqlConversation.root_conversation_id,
+                    SqlConversation.archived,
+                ).where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id.in_(list(set(conversation_ids))),
+                )
+            ).all()
+        return {
+            row.id: ConversationAncestry(
+                id=row.id,
+                parent_conversation_id=row.parent_conversation_id,
+                root_conversation_id=row.root_conversation_id,
+                archived=row.archived,
+            )
+            for row in rows
+        }
 
     def get_conversations(self, conversation_ids: list[str]) -> dict[str, Conversation]:
         """

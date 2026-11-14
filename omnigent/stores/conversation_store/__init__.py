@@ -318,6 +318,16 @@ class SessionConnectivity:
 
 
 @dataclass(frozen=True)
+class ConversationAncestry:
+    """Identity and visibility fields needed to trace a conversation's parents."""
+
+    id: str
+    parent_conversation_id: str | None
+    root_conversation_id: str | None
+    archived: bool
+
+
+@dataclass(frozen=True)
 class SessionActivity:
     """
     When a session last changed and what it is doing now.
@@ -707,6 +717,17 @@ class ConversationStore(ABC):
         :returns: Mapping ``conversation_id -> SessionActivity``.
         """
         ...
+
+    def get_conversation_ancestry(
+        self, conversation_ids: list[str]
+    ) -> dict[str, ConversationAncestry]:
+        """Read at most one ancestry row per ID, without labels or operational metadata.
+
+        Preserve external IDs and read authorization; omit missing or unreadable
+        IDs. Empty input returns an empty map without querying. Stores without
+        this bounded projection raise NotImplementedError so callers can fall back.
+        """
+        raise NotImplementedError
 
     @abstractmethod
     def get_conversations(self, conversation_ids: list[str]) -> dict[str, Conversation]:

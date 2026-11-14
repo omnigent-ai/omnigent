@@ -320,6 +320,7 @@ from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     ARCHIVED_AT_LABEL_KEY,
     PINNED_LABEL_KEY,
+    ConversationAncestry,
     ConversationNotFoundError,
     NameAlreadyExistsError,
 )
@@ -1633,18 +1634,17 @@ def _pending_elicitation_ancestor_ids(
     pending_session_ids: set[str],
 ) -> set[str]:
     """Find branches from indexed pending sessions back to the selected session."""
-    conversations: dict[str, Conversation | None] = {conv.id: conv}
+    conversations: dict[str, ConversationAncestry | None] = {conv.id: None}
     frontier = pending_session_ids
     while frontier:
-        rows: dict[str, Conversation] = {}
+        rows: dict[str, ConversationAncestry] = {}
         for batch in batched(sorted(frontier), 100):
-            rows.update(conv_store.get_conversations(list(batch)))
+            rows.update(conv_store.get_conversation_ancestry(list(batch)))
         conversations.update({session_id: rows.get(session_id) for session_id in frontier})
         frontier = {
             row.parent_conversation_id
             for row in rows.values()
             if not row.archived
-            and row.kind == "sub_agent"
             and (
                 not row.root_conversation_id
                 or not conv.root_conversation_id
@@ -1664,7 +1664,7 @@ def _pending_elicitation_ancestor_ids(
                 current is None
                 or current.id in path
                 or current.archived
-                or current.kind != "sub_agent"
+                or current.parent_conversation_id is None
             ):
                 break
             path.add(current.id)
@@ -1747,6 +1747,8 @@ def _pending_elicitation_snapshot_for_session(
         return events
     try:
         ancestor_ids = _pending_elicitation_ancestor_ids(conv_store, conv, pending_session_ids)
+    except NotImplementedError:
+        ancestor_ids = None
     except (TypeError, ValueError):
         _logger.warning(
             "Pending approval ancestry hydration failed; walking the selected tree", exc_info=True

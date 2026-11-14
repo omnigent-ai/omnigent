@@ -11,10 +11,13 @@ from sqlalchemy import delete, update
 
 from omnigent.db.db_models import SqlConversation, SqlConversationMetadata, current_workspace_id
 from omnigent.db.utils import get_or_create_engine
-from omnigent.entities import Conversation
 from omnigent.runtime import pending_elicitations, session_stream
 from omnigent.server.routes._sessions import helpers
-from omnigent.stores.conversation_store import sqlalchemy_store
+from omnigent.stores.conversation_store import (
+    ConversationAncestry,
+    ConversationStore,
+    sqlalchemy_store,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
 
@@ -42,10 +45,10 @@ def _spy_reads(
     store: SqlAlchemyConversationStore, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[Mock, Mock, Mock]:
     listing = Mock(wraps=store.list_conversations)
-    batch = Mock(wraps=store.get_conversations)
+    batch = Mock(wraps=store.get_conversation_ancestry)
     single = Mock(wraps=store.get_conversation)
     monkeypatch.setattr(store, "list_conversations", listing)
-    monkeypatch.setattr(store, "get_conversations", batch)
+    monkeypatch.setattr(store, "get_conversation_ancestry", batch)
     monkeypatch.setattr(store, "get_conversation", single)
     return listing, batch, single
 
@@ -60,7 +63,9 @@ def test_snapshot_skips_tree_without_pending_descendants(
     idle = store.create_conversation(parent_conversation_id=parent.id)
     store.create_conversation(parent_conversation_id=idle.id)
     other = store.create_conversation()
-    unrelated = store.create_conversation(parent_conversation_id=other.id)
+    unrelated = other
+    for _ in range(12):
+        unrelated = store.create_conversation(parent_conversation_id=unrelated.id)
     expected = []
     if pending_scope == "own":
         expected = [_record_pending(parent.id, "own")]
@@ -90,11 +95,11 @@ def test_snapshot_bounds_pending_ancestry_reads(
     pending_ids.add(unrelated.id)
     for session_id in pending_ids:
         _record_pending(session_id, session_id)
-    read_batch = store.get_conversations
+    read_batch = store.get_conversation_ancestry
     listing, batch, single = _spy_reads(store, monkeypatch)
 
-    def bounded_read(ids: list[str]) -> dict[str, Conversation]:
-        if len(ids) > 5000:
+    def bounded_read(ids: list[str]) -> dict[str, ConversationAncestry]:
+        if len(ids) > 100:
             raise RuntimeError("Bulk Fetch request limit exceeded")
         return read_batch(ids)
 
@@ -105,7 +110,7 @@ def test_snapshot_bounds_pending_ancestry_reads(
     requested = [session_id for call in batch.call_args_list for session_id in call.args[0]]
     assert set(requested) == pending_ids
     assert len(requested) == len(pending_ids)
-    assert all(len(call.args[0]) <= 5000 for call in batch.call_args_list)
+    assert all(len(call.args[0]) <= 100 for call in batch.call_args_list)
     listing.assert_not_called()
     single.assert_not_called()
 
@@ -241,11 +246,11 @@ def test_snapshot_excludes_broken_paths_and_unrelated_siblings(
                     SqlConversation.id == affected.id,
                 )
             )
-    read_batch = store.get_conversations
+    read_batch = store.get_conversation_ancestry
     listing, batch, single = _spy_reads(store, monkeypatch)
     if excluded == "unreadable":
 
-        def omit_unreadable(ids: list[str]) -> dict[str, Conversation]:
+        def omit_unreadable(ids: list[str]) -> dict[str, ConversationAncestry]:
             rows = read_batch(ids)
             rows.pop(blocked.id, None)
             return rows
@@ -394,39 +399,18 @@ def test_snapshot_includes_completed_mirror_after_pending_ids_capture(
     assert events == [mirrored]
 
 
-def test_snapshot_stops_hydration_at_unrelated_pending_chain_leaf(
-    store: SqlAlchemyConversationStore, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    parent = store.create_conversation()
-    unrelated_root = store.create_conversation()
-    leaf = unrelated_root
-    for _ in range(12):
-        leaf = store.create_conversation(parent_conversation_id=leaf.id)
-    assert leaf.root_conversation_id == unrelated_root.id
-    assert parent.root_conversation_id == parent.id
-    own = _record_pending(parent.id, "own")
-    _record_pending(leaf.id, "unrelated")
-    listing, batch, single = _spy_reads(store, monkeypatch)
-
-    events = helpers._pending_elicitation_snapshot_for_session(store, parent)
-
-    assert events == [own]
-    requested = [session_id for call in batch.call_args_list for session_id in call.args[0]]
-    assert requested == [leaf.id]
-    assert batch.call_count == 1
-    listing.assert_not_called()
-    single.assert_not_called()
-
-
 @pytest.mark.parametrize(
     ("invalid_metadata", "error_type"),
-    [({"live_status": 999}, ValueError), ({"session_state": "[]"}, TypeError)],
+    [
+        ({"live_status": 999}, ValueError),
+        ({"session_state": "[]"}, TypeError),
+        ({"session_overrides": "[]"}, AttributeError),
+    ],
 )
 def test_snapshot_preserves_own_prompt_when_unrelated_metadata_is_invalid(
     store: SqlAlchemyConversationStore,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
     invalid_metadata: dict[str, Any],
     error_type: type[Exception],
 ) -> None:
@@ -434,27 +418,51 @@ def test_snapshot_preserves_own_prompt_when_unrelated_metadata_is_invalid(
     unrelated = store.create_conversation()
     own = _record_pending(parent.id, "own")
     _record_pending(unrelated.id, "unrelated")
+    table = SqlConversation if "session_overrides" in invalid_metadata else SqlConversationMetadata
     with get_or_create_engine(db_uri).begin() as connection:
         connection.execute(
-            update(SqlConversationMetadata)
-            .where(
-                SqlConversationMetadata.workspace_id == current_workspace_id(),
-                SqlConversationMetadata.id == unrelated.id,
-            )
+            update(table)
+            .where(table.workspace_id == current_workspace_id(), table.id == unrelated.id)
             .values(**invalid_metadata)
         )
-    with pytest.raises(error_type, match=r"live_status|session_state"):
+    with pytest.raises(error_type, match=r"live_status|session_state|get"):
         store.get_conversations([unrelated.id])
     listing, batch, single = _spy_reads(store, monkeypatch)
 
     events = helpers._pending_elicitation_snapshot_for_session(store, parent)
 
     assert events == [own]
-    assert [call.kwargs["parent_conversation_id"] for call in listing.call_args_list] == [
-        parent.id
-    ]
-    assert batch.call_count == 1
+    listing.assert_not_called()
+    batch.assert_called_once_with([unrelated.id])
     single.assert_not_called()
-    assert any(
-        record.exc_info and isinstance(record.exc_info[1], error_type) for record in caplog.records
-    )
+
+
+@pytest.mark.parametrize("fallback", ["base-default", "sql-subclass"])
+def test_snapshot_falls_back_for_stores_without_ancestry_projection(
+    store: SqlAlchemyConversationStore,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    fallback: str,
+) -> None:
+    parent = store.create_conversation()
+    branch = store.create_conversation(parent_conversation_id=parent.id)
+    child = store.create_conversation(parent_conversation_id=branch.id)
+    _record_pending(child.id, "child")
+    _record_pending("1828054094416521", "managed-id")
+    if fallback == "sql-subclass":
+
+        class CustomStore(SqlAlchemyConversationStore):
+            pass
+
+        store = CustomStore(db_uri)
+    else:
+        monkeypatch.setattr(
+            store,
+            "get_conversation_ancestry",
+            lambda ids: ConversationStore.get_conversation_ancestry(store, ids),
+        )
+
+    events = helpers._pending_elicitation_snapshot_for_session(store, parent)
+
+    assert [event["elicitation_id"] for event in events] == ["child"]
+    assert events[0]["params"]["target_session_id"] == child.id

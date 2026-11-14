@@ -16,6 +16,7 @@ from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
+from omnigent.db.db_models import workspace_scope
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import (
     CompactionData,
@@ -35,7 +36,7 @@ from omnigent.session_import import (
     IMPORT_SOURCE_LABEL_KEY,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
-from omnigent.stores.conversation_store import ConversationUpdateResult
+from omnigent.stores.conversation_store import ConversationAncestry, ConversationUpdateResult
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -283,6 +284,57 @@ def test_rename_conversation_if_title_matches_is_atomic(
     assert renamed.title == "Debug request timeout"
     assert stale is None
     assert conversation_store.get_conversation(conv.id).title == "Debug request timeout"  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("label_count", [0, 257])
+def test_get_conversation_ancestry_bounds_rows_without_labels(
+    conversation_store: SqlAlchemyConversationStore, label_count: int
+) -> None:
+    root = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(parent_conversation_id=root.id)
+    conversation_store.update_conversation(child.id, archived=True)
+    conversation_store.set_labels(
+        child.id, {f"label-{index}": "value" for index in range(label_count)}
+    )
+    with workspace_scope(42):
+        foreign = conversation_store.create_conversation()
+    selects = []
+
+    def capture(connection, clauseelement, multiparams, params, execution_options):
+        if clauseelement.is_select:
+            selects.append(clauseelement)
+
+    event.listen(conversation_store._conv_engine, "before_execute", capture)
+    try:
+        assert conversation_store.get_conversation_ancestry([]) == {}
+        assert selects == []
+        result = conversation_store.get_conversation_ancestry(
+            [root.id, child.id, child.id, foreign.id, "5eca720dc2bc6cdc3a99028d7bd0f917"]
+        )
+    finally:
+        event.remove(conversation_store._conv_engine, "before_execute", capture)
+
+    assert result == {
+        root.id: ConversationAncestry(root.id, None, root.id, False),
+        child.id: ConversationAncestry(child.id, root.id, root.id, True),
+    }
+    assert len(selects) == 1
+    assert [table.name for table in selects[0].get_final_froms()] == ["conversations"]
+    assert set(selects[0].selected_columns.keys()) == {
+        "id",
+        "parent_conversation_id",
+        "root_conversation_id",
+        "archived",
+    }
+
+
+def test_sql_subclasses_must_opt_in_to_ancestry_reads(db_uri: str) -> None:
+    class CustomStore(SqlAlchemyConversationStore):
+        pass
+
+    store = CustomStore(db_uri)
+    with pytest.raises(NotImplementedError):
+        store.get_conversation_ancestry(["5eca720dc2bc6cdc3a99028d7bd0f917"])
 
 
 def test_get_conversations_bulk(

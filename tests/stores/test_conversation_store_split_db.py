@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from omnigent.stores.conversation_store import ConversationAncestry
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -133,6 +134,22 @@ def test_get_conversation_merges_both_dbs(store: SqlAlchemyConversationStore) ->
     assert fetched.title == "merge-test"
     assert fetched.workspace == "/x"
     assert fetched.kind == "default"
+
+
+def test_get_conversation_ancestry_needs_only_conversation_db(
+    store: SqlAlchemyConversationStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = store.create_conversation()
+    child = store.create_conversation(parent_conversation_id=root.id)
+
+    def reject_metadata_read(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("ancestry must not read the metadata database")
+
+    monkeypatch.setattr(store, "_session", reject_metadata_read)
+
+    assert store.get_conversation_ancestry([child.id]) == {
+        child.id: ConversationAncestry(child.id, root.id, root.id, False)
+    }
 
 
 def test_get_conversations_bulk(store: SqlAlchemyConversationStore) -> None:
