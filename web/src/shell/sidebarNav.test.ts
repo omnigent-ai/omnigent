@@ -493,7 +493,7 @@ describe("getConversationAgentType", () => {
 });
 
 describe("getConversationIconKind", () => {
-  it("maps native wrapper labels and nessie agent names to row icon kinds", () => {
+  it("maps native wrapper labels to row icon kinds and falls back for generic agents", () => {
     expect(
       getConversationIconKind(
         conversation("conv_claude", null, new Date(2026, 4, 14, 9), {
@@ -538,10 +538,10 @@ describe("getConversationIconKind", () => {
     ).toBe("antigravity");
     expect(
       getConversationIconKind({
-        ...conversation("conv_nessie", null, new Date(2026, 4, 14, 9)),
-        agent_name: "nessie",
+        ...conversation("conv_custom_agent", null, new Date(2026, 4, 14, 9)),
+        agent_name: "custom_agent",
       }),
-    ).toBe("nessie");
+    ).toBeNull();
     expect(
       getConversationIconKind(conversation("conv_other", null, new Date(2026, 4, 14, 9))),
     ).toBeNull();
