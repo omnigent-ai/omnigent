@@ -645,6 +645,22 @@ export interface PendingUserMessage {
    * it. Unset on snapshot-replayed entries.
    */
   sentMidTurn?: boolean;
+  /** A mid-turn steer's attachments, which Stop hands back with its text. */
+  steerFiles?: File[];
+}
+
+/**
+ * Part of a draft Stop handed back: an interrupted native steer, retracted once a
+ * receipt shows the agent read it, or (no `tempId`) a draft it was merged into.
+ */
+interface ReturnedPart {
+  tempId?: string;
+  /** The pending-input id a receipt names; known once the steer's POST answers. */
+  pendingId?: string;
+  text: string;
+  files: File[];
+  /** The waiting draft the steers joined, restored as it was once they are all read. */
+  draft?: NonNullable<ConversationState["failedSendDraft"]>;
 }
 
 /**
@@ -963,6 +979,8 @@ export interface ConversationState {
      * is left, so the composer adds it after newer input instead of dropping it.
      */
     recovered?: boolean;
+    /** What Stop handed back, when this draft holds unread native steers. */
+    returnedParts?: ReturnedPart[];
   } | null;
   /**
    * Stable id set by the failedSendDraft restore path so the next send()
@@ -978,7 +996,9 @@ export interface ConversationState {
    */
   restoredSendDraft: {
     conversationId: string;
-    stableId: string;
+    /** Unset for interrupted steers: a read flips `delivered` and the composer drops its part. */
+    stableId?: string;
+    returnedParts?: ReturnedPart[];
     text: string;
     files: File[];
     replyDraft?: StoredReplyDraft;
@@ -1811,6 +1831,16 @@ const sendChains = new Map<string | symbol, SendChain>();
  * lost and an earlier refused attempt's item already sits in the transcript.
  */
 const inFlightSends = new Map<string, boolean>();
+
+/**
+ * Sends Stop handed back to the composer before their POST settled, by bubble
+ * temp id, with the pending-input ids receipts cleared since: a receipt can beat
+ * the POST's answer, which is what names the send's own id.
+ */
+const stopReturnedSends = new Map<string, Set<string>>();
+
+/** The stable id of each open send kept for a reload (`rememberUnsentSend`), by bubble temp id. */
+const unsentSendIds = new Map<string, string>();
 
 // Sends with no conversation id yet (brand-new chat) serialize together: the
 // session is created inside the chained work, so they can't key by id. A
@@ -2922,6 +2952,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
                 createdAtS: Math.floor(Date.now() / 1000),
                 ...(selfAuthor !== null ? { author: selfAuthor } : {}),
                 ...(sentMidTurn ? { sentMidTurn } : {}),
+                ...(sentMidTurn && files && files.length > 0 ? { steerFiles: files } : {}),
               },
             ],
         // A new turn does NOT supersede the background-shell tally: shells
@@ -2974,14 +3005,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // it, so keep its text where a reload can find it (see `unsentSendToRestore`).
       // Only once identity names the sender: unlike `getCurrentAuthorId`, this id
       // tells the single-user `local` viewer apart from one not yet resolved.
+      // A send Stop already returned is carried by the composer's draft instead.
       const senderId = getCurrentUserId();
-      if (!compacts && sentOnScreen && senderId !== null && text.trim()) {
+      if (
+        !compacts &&
+        sentOnScreen &&
+        senderId !== null &&
+        text.trim() &&
+        !stopReturnedSends.has(tempId)
+      ) {
         rememberUnsentSend(sessionId, {
           stableId,
           text,
           authorId: senderId,
           ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
         });
+        unsentSendIds.set(tempId, stableId);
       }
       if (initialDraft && !(await waitForInitialDispatch(sessionId, tempId))) return;
 
@@ -3077,7 +3116,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // what releases this conversation's entry for eviction, since the
         // server can now replay it. The bubble keeps rendering until its
         // consumed event pops it.
+        const acceptedPendingId = postResult.pendingId;
+        const readBeforeAnswer =
+          acceptedPendingId !== undefined &&
+          stopReturnedSends.get(tempId)?.has(acceptedPendingId) === true;
         setterFor(sessionId)((s) => ({
+          ...(acceptedPendingId
+            ? updateReturnedParts(s, (parts) =>
+                parts.some((part) => part.tempId === tempId)
+                  ? parts.flatMap((part) => {
+                      if (part.tempId !== tempId) return [part];
+                      if (readBeforeAnswer) return [];
+                      return [{ ...part, pendingId: acceptedPendingId }];
+                    })
+                  : null,
+              )
+            : {}),
           pendingUserMessages: s.pendingUserMessages.map((p) =>
             p.tempId === tempId
               ? {
@@ -3122,8 +3176,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // The host is offline and the server recorded nothing: queue the message
       // ahead of this conversation's others and send it once the host is back.
       const holdTarget = postedSessionId ?? submitConversationId;
+      // Stop already gave this send back to the composer, which owns it now.
+      const returnedByStop = stopReturnedSends.has(tempId);
       const heldForHost =
-        err instanceof ApiError && err.code === HOST_OFFLINE_CODE && holdTarget !== null;
+        !returnedByStop &&
+        err instanceof ApiError &&
+        err.code === HOST_OFFLINE_CODE &&
+        holdTarget !== null;
       if (heldForHost) {
         holdSendForHost(holdTarget, message, {
           text,
@@ -3134,8 +3193,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ...(sentOnScreen ? {} : { offScreen: true }),
         });
       }
-      const callerHandlesError = heldForHost || opts?.onError !== undefined;
-      if (!heldForHost) opts?.onError?.(message);
+      // A queued send's callback would requeue a copy of what the composer now holds.
+      const callerHandlesError = heldForHost || (!returnedByStop && opts?.onError !== undefined);
+      if (!heldForHost && !returnedByStop) opts?.onError?.(message);
       // Hand the failed message back to the composer so the user can retry it —
       // a failed send has no server-side record, so nothing else would restore
       // it. Keyed by the session it was meant for, so it lands in the right
@@ -3177,10 +3237,20 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         else if (verdict === "delivered") deliveredDespiteFailure = true;
         else unsettled = true;
       }
+      // The agent read it before the POST failed, so the composer must not keep it.
+      if (returnedByStop && deliveredDespiteFailure && draftSessionId !== null) {
+        setterFor(draftSessionId)((s) =>
+          updateReturnedParts(s, (parts) => {
+            const unread = parts.filter((part) => part.tempId !== tempId);
+            return unread.length < parts.length ? unread : null;
+          }),
+        );
+      }
       if (
         !callerHandlesError &&
         !deliveredDespiteFailure &&
         draftSessionId !== null &&
+        !returnedByStop &&
         (text.trim() !== "" || (files?.length ?? 0) > 0)
       ) {
         setterFor(draftSessionId)({
@@ -3255,6 +3325,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
     } finally {
       inFlightSends.delete(stableId);
+      stopReturnedSends.delete(tempId);
+      unsentSendIds.delete(tempId);
       if (postedSessionId !== null) forgetUnsentSend(postedSessionId, stableId);
       // Release the next queued send regardless of success/failure so one
       // failed POST can't stall the chain forever.
@@ -3404,9 +3476,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const state = get();
     const sessionId = state.conversationId;
     if (!sessionId) return;
+    const steers = state.pendingUserMessages.filter(isUnreadSteer);
     const initialDraft = state.pendingUserMessages.find((p) => p.initialDraft)?.initialDraft;
+    const newerDraft = initialDraft && getSessionDraft(sessionId);
     if (initialDraft) {
-      const draft = getSessionDraft(sessionId) ?? initialDraft;
+      const draft = newerDraft ?? initialDraft;
       setSessionDraft(sessionId, draft);
       setActive({
         pendingUserMessages: [],
@@ -3416,15 +3490,35 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       });
       // What was queued behind it must not go first; it waits for an explicit retry.
       suspendQueuedMessages(sessionId);
-      // A local follow-up must not prevent Interrupt from stopping earlier work.
-      if (
-        state.activeResponse?.state !== "streaming" &&
-        state.sessionStatus !== "running" &&
-        state.sessionStatus !== "waiting" &&
-        state.backgroundTaskCount === 0
-      )
-        return;
     }
+    if (steers.length > 0) {
+      setActive((s) => {
+        if (s.conversationId !== sessionId) return {};
+        // The composer keeps newer input as it is; the steers go after it.
+        const waiting = s.failedSendDraft;
+        const kept =
+          newerDraft || (waiting && committedItemProvesDelivery(s.blocks, waiting))
+            ? null
+            : waiting;
+        return { failedSendDraft: withReturnedSteers(kept, sessionId, steers) };
+      });
+      for (const steer of steers) {
+        if (steer.posted === true) continue;
+        stopReturnedSends.set(steer.tempId, new Set());
+        // The composer's draft now carries it across a reload.
+        const unsentId = unsentSendIds.get(steer.tempId);
+        if (unsentId !== undefined) forgetUnsentSend(sessionId, unsentId);
+      }
+    }
+    // A local follow-up must not prevent Interrupt from stopping earlier work.
+    if (
+      initialDraft &&
+      state.activeResponse?.state !== "streaming" &&
+      state.sessionStatus !== "running" &&
+      state.sessionStatus !== "waiting" &&
+      state.backgroundTaskCount === 0
+    )
+      return;
     if (isTempConvId(sessionId)) return;
     // Fire-and-forget interrupt; the server emits session.interrupted
     // + response.incomplete on the open stream, which the pump
@@ -8092,7 +8186,7 @@ export function committedItemProvesDelivery(
  */
 export function restoredSendDraftUnchanged(
   restored: ConversationState["restoredSendDraft"],
-  stableId: string,
+  stableId: string | undefined,
   text: string,
   files: File[] | undefined,
   replyDraft: StoredReplyDraft | undefined,
@@ -8127,18 +8221,26 @@ export function takeFailedSendDraft(
   const patch: Partial<ConversationState> = { failedSendDraft: null };
   if (!delivered) patch.pendingRetryStableId = tracked ? (failed.stableId ?? null) : null;
   // A discarded failure must not untrack an earlier draft still in the composer.
-  if (tracked && failed.stableId)
-    patch.restoredSendDraft = {
-      conversationId,
-      stableId: failed.stableId,
-      text: failed.text,
-      files: failed.files,
-      replyDraft: failed.replyDraft,
-      serverRefused: failed.serverRefused,
-      delivered: false,
-    };
+  if (tracked && (failed.stableId || failed.returnedParts))
+    patch.restoredSendDraft = restoredDraftTracker(failed);
   setterFor(conversationId)(patch);
   return restore ? failed : null;
+}
+
+/** What the composer tracks while it holds `draft` as restored. */
+export function restoredDraftTracker(
+  draft: NonNullable<ConversationState["failedSendDraft"]>,
+): NonNullable<ConversationState["restoredSendDraft"]> {
+  return {
+    conversationId: draft.conversationId,
+    stableId: draft.stableId,
+    returnedParts: draft.returnedParts,
+    text: draft.text,
+    files: draft.files,
+    replyDraft: draft.replyDraft,
+    serverRefused: draft.serverRefused,
+    delivered: false,
+  };
 }
 
 /**
@@ -8185,6 +8287,14 @@ function retractDeliveredSendDraft(
   ) {
     patch.restoredSendDraft = { ...s.restoredSendDraft, delivered: true };
   }
+  // A send that Stop merged steers into keeps its own id; delivery drops its part.
+  Object.assign(
+    patch,
+    updateReturnedParts({ ...s, ...patch }, (parts) => {
+      const left = parts.filter((part) => !delivered(part.draft ?? null));
+      return left.length < parts.length ? left : null;
+    }),
+  );
   // The retry id belongs to the restored draft it came from, so a refused
   // send keeps it: an untouched resend must still dedupe against the item.
   const retryId = s.pendingRetryStableId;
@@ -8192,6 +8302,125 @@ function retractDeliveredSendDraft(
     const owner =
       s.restoredSendDraft?.stableId === retryId ? s.restoredSendDraft : { stableId: retryId };
     if (delivered(owner)) patch.pendingRetryStableId = null;
+  }
+  return patch;
+}
+
+/** A steer bubble's text, exactly as sent. */
+function steerText(p: PendingUserMessage): string {
+  return p.content.map((b) => (b.type === "input_text" ? b.text : "")).join("");
+}
+
+/**
+ * Whether Stop hands this bubble back: a native steer the agent has not read.
+ *
+ * The server stops replaying an interrupted input, and an agent may drop one it
+ * has not read (Codex discards a pending `turn/steer`), so the bubble is the last
+ * copy. A steer still posting may land on either side of the interrupt, so it
+ * returns too. A held first message comes back through its own draft.
+ */
+function isUnreadSteer(p: PendingUserMessage): boolean {
+  return (
+    p.sentMidTurn === true &&
+    p.initialDraft === undefined &&
+    (steerText(p).trim() !== "" || (p.steerFiles?.length ?? 0) > 0)
+  );
+}
+
+/** The composer draft of the parts Stop handed back, in order, reply cards included. */
+export function joinReturnedParts(parts: readonly ReturnedPart[]): {
+  text: string;
+  files: File[];
+  replyDraft: StoredReplyDraft | undefined;
+} {
+  // Joined as drafts, so the waiting draft's reply cards still frame only its own text.
+  const joined = parts
+    .filter((part) => part.text.trim() !== "")
+    .map((part) => restoreReplyDraft(part.text, part.draft?.replyDraft))
+    .reduce(appendReplyDraft, { quotes: [], text: "" });
+  return {
+    text: serializeReplyDraft(joined),
+    files: parts.flatMap((part) => part.files),
+    replyDraft: snapshotReplyDraft(joined),
+  };
+}
+
+/** The draft waiting for the composer that Stop added steers to, if any. */
+export function keptDraft(parts: readonly ReturnedPart[]) {
+  return parts.find((part) => part.tempId === undefined)?.draft;
+}
+
+/**
+ * The draft Stop hands back for interrupted steers, after any draft still
+ * waiting for the composer. It has no stable id: the server would dedupe a
+ * resend against the original send, and the agent may still read some steers.
+ * The waiting draft keeps its own id and reply context on its part.
+ *
+ * @param kept - The draft to keep ahead of the steers, if any.
+ * @param conversationId - The session being stopped.
+ * @param steers - Its unread steers' bubbles, in order.
+ * @returns The draft to restore.
+ */
+function withReturnedSteers(
+  kept: ConversationState["failedSendDraft"],
+  conversationId: string,
+  steers: readonly PendingUserMessage[],
+): NonNullable<ConversationState["failedSendDraft"]> {
+  const parts: ReturnedPart[] = [
+    ...(kept ? (kept.returnedParts ?? [{ text: kept.text, files: kept.files, draft: kept }]) : []),
+    ...steers.map((p) => ({
+      tempId: p.tempId,
+      ...(p.pendingId ? { pendingId: p.pendingId } : {}),
+      text: steerText(p),
+      files: p.steerFiles ?? [],
+    })),
+  ];
+  return {
+    conversationId,
+    ...joinReturnedParts(parts),
+    returnedParts: parts,
+    serverRefused: false,
+    recovered: true,
+  };
+}
+
+/**
+ * Update the parts Stop handed back, in the draft awaiting the composer and in
+ * the composer's restore tracker. Only a read removes a steer: the waiting draft
+ * drops its text, and the tracker flips `delivered` so the composer drops it too
+ * while unedited (e.g. Claude Code resubmits queued input after an interrupt).
+ *
+ * @param s - The conversation's state.
+ * @param update - Returns the new parts, or `null` when it changes nothing.
+ * @returns The state patch.
+ */
+function updateReturnedParts(
+  s: ConversationState,
+  update: (parts: ReturnedPart[]) => ReturnedPart[] | null,
+): Partial<ConversationState> {
+  const patch: Partial<ConversationState> = {};
+  const failed = s.failedSendDraft;
+  const failedParts = failed?.returnedParts && update(failed.returnedParts);
+  if (failed && failedParts) {
+    const unread = failedParts.some((part) => part.tempId !== undefined);
+    patch.failedSendDraft = unread
+      ? {
+          ...failed,
+          ...joinReturnedParts(failedParts),
+          returnedParts: failedParts,
+        }
+      : (keptDraft(failedParts) ?? null);
+  }
+  const restored = s.restoredSendDraft;
+  const shown = restored?.returnedParts;
+  const restoredParts = shown && update(shown);
+  if (restored && shown && restoredParts) {
+    const read = restoredParts.length < shown.length;
+    patch.restoredSendDraft = {
+      ...restored,
+      returnedParts: restoredParts,
+      ...(read ? { delivered: true } : {}),
+    };
   }
   return patch;
 }
@@ -9309,6 +9538,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // before it (re)populates the composer with an already-sent prompt,
       // and drop the send's failure card.
       if (inFlightSends.has(event.itemId)) inFlightSends.set(event.itemId, true);
+      const readId = event.clearedPendingId;
+      if (readId) for (const readIds of stopReturnedSends.values()) readIds.add(readId);
       applyToConversation((s) => {
         const committedIds = new Set([event.itemId]);
         // A late copy of an item already shown is not a new message.
@@ -9320,8 +9551,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           committedIds,
           content === null ? [] : [messageContentText(content)],
         );
+        const retracted = retractDeliveredSendDraft(s, committedIds, "consumed");
         return {
-          ...retractDeliveredSendDraft(s, committedIds, "consumed"),
+          ...retracted,
+          ...updateReturnedParts({ ...s, ...retracted }, (parts) => {
+            const unread = parts.filter((part) => part.pendingId !== readId);
+            return readId && unread.length < parts.length ? unread : null;
+          }),
           ...(blocks === s.blocks ? {} : { blocks }),
         };
       });

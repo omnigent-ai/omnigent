@@ -7496,6 +7496,8 @@ describe("chatStore — delivered-but-unacked send", () => {
 });
 
 describe("chatStore — stop", () => {
+  afterEach(clearSessionDrafts);
+
   it("posts {type: 'interrupt'} to the events endpoint without aborting the local stream", async () => {
     const controller = new AbortController();
     useChatStore.setState({
@@ -7574,6 +7576,292 @@ describe("chatStore — stop", () => {
       error: null,
     });
     expect(readConversationRows()[0]?.status).toBe("idle");
+  });
+
+  const readSteer = (clearedPendingId: string, text: string, itemId = `item_${clearedPendingId}`) =>
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId,
+      itemType: "message",
+      clearedPendingId,
+      data: { role: "user", content: [{ type: "input_text", text }] },
+    });
+  const steer = (tempId: string, text: string, extra: Partial<PendingUserMessage> = {}) => ({
+    tempId,
+    content: text ? [{ type: "input_text" as const, text }] : [],
+    sentMidTurn: true,
+    ...extra,
+  });
+
+  it("returns unread native steers to the composer until the agent reads them", () => {
+    const notes = new File(["notes"], "notes.txt");
+    const photo = new File(["photo"], "photo.png", { type: "image/png" });
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      pendingUserMessages: [
+        { tempId: "pend_0", content: [{ type: "input_text", text: "first" }], posted: true },
+        steer("pend_1", "steer one", { posted: true, pendingId: "pi_1" }),
+        steer("pend_2", "still posting"),
+        steer("pend_3", "steer two", { posted: true, pendingId: "pi_3", steerFiles: [notes] }),
+        steer("pend_4", "", { posted: true, pendingId: "pi_4", steerFiles: [photo] }),
+      ],
+      status: "streaming",
+      sessionStatus: "running",
+    });
+
+    useChatStore.getState().stop();
+
+    expect(useChatStore.getState().failedSendDraft).toEqual({
+      conversationId: "conv_abc",
+      text: "steer one\n\nstill posting\n\nsteer two",
+      files: [notes, photo],
+      returnedParts: [
+        { tempId: "pend_1", pendingId: "pi_1", text: "steer one", files: [] },
+        { tempId: "pend_2", text: "still posting", files: [] },
+        { tempId: "pend_3", pendingId: "pi_3", text: "steer two", files: [notes] },
+        { tempId: "pend_4", pendingId: "pi_4", text: "", files: [photo] },
+      ],
+      serverRefused: false,
+      recovered: true,
+    });
+    readSteer("pi_1", "steer one");
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      text: "still posting\n\nsteer two",
+      files: [notes, photo],
+    });
+    expect(takeFailedSendDraft("conv_abc", false)?.text).toBe("still posting\n\nsteer two");
+    // A resend must not reuse the original's stable id, which the server dedupes.
+    expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+    readSteer("pi_3", "steer two");
+    expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+      returnedParts: [
+        { tempId: "pend_2", text: "still posting" },
+        { tempId: "pend_4", files: [photo] },
+      ],
+      delivered: true,
+    });
+  });
+
+  const failedEarlier = {
+    conversationId: "conv_abc",
+    text: "> a quote\n\nfailed earlier",
+    files: [],
+    stableId: "c".repeat(32),
+    replyDraft: {
+      version: 1 as const,
+      quotes: [{ before: "", text: "a quote" }],
+      text: "failed earlier",
+    },
+    serverRefused: true,
+  };
+  const heldBubble = {
+    tempId: "pend_held",
+    content: [{ type: "input_text" as const, text: "held" }],
+    initialDraft: { text: "held", files: [] },
+    sentMidTurn: true,
+  };
+  it.each([
+    { held: "a failed send", failed: failedEarlier, pending: [], running: true },
+    { held: "a message held for the model", failed: null, pending: [heldBubble], running: true },
+    { held: "a message held while idle", failed: null, pending: [heldBubble], running: false },
+  ])(
+    "returns steers after $held, which stays as it was once they are read",
+    ({ failed, pending, running }) => {
+      useChatStore.setState({
+        conversationId: "conv_abc",
+        pendingUserMessages: [
+          steer("pend_1", "steer", { posted: true, pendingId: "pi_1" }),
+          ...pending,
+        ],
+        failedSendDraft: failed,
+        status: running ? "streaming" : "idle",
+        sessionStatus: running ? "running" : "idle",
+      });
+      const kept = failed ?? { text: "held", files: [], conversationId: "conv_abc" };
+
+      useChatStore.getState().stop();
+
+      expect(useChatStore.getState().failedSendDraft).toMatchObject({
+        text: `${kept.text}\n\nsteer`,
+        replyDraft: failed ? { ...failed.replyDraft, text: "failed earlier\n\nsteer" } : undefined,
+        recovered: true,
+      });
+      readSteer("pi_1", "steer");
+      expect(useChatStore.getState().failedSendDraft).toEqual(kept);
+    },
+  );
+
+  it.each([{ when: "before Stop" }, { when: "after Stop" }])(
+    "drops a send that Stop added steers to when it proves delivered $when",
+    ({ when }) => {
+      const delivered: AnyBlock = {
+        type: "user_message",
+        ctx: {
+          agent: null,
+          depth: 0,
+          turn: 0,
+          timestamp: 0,
+          responseId: "resp_1",
+          itemId: failedEarlier.stableId,
+        },
+        content: [{ type: "input_text", text: "failed earlier" }],
+      };
+      useChatStore.setState({
+        conversationId: "conv_abc",
+        blocks: when === "before Stop" ? [delivered] : [],
+        pendingUserMessages: [steer("pend_1", "steer", { posted: true, pendingId: "pi_1" })],
+        failedSendDraft: { ...failedEarlier, serverRefused: false },
+        status: "streaming",
+        sessionStatus: "running",
+      });
+
+      useChatStore.getState().stop();
+      if (when === "after Stop")
+        handleSessionEvent({
+          type: "session_input_consumed",
+          itemId: failedEarlier.stableId,
+          itemType: "message",
+          data: { role: "user", content: [{ type: "input_text", text: "failed earlier" }] },
+        });
+
+      expect(useChatStore.getState().failedSendDraft).toMatchObject({
+        text: "steer",
+        replyDraft: undefined,
+        returnedParts: [{ tempId: "pend_1", pendingId: "pi_1" }],
+      });
+    },
+  );
+
+  it.each([
+    { outcome: "read after its POST answers", readEarly: false, answer: "accepted" },
+    { outcome: "read before its POST answers", readEarly: true, answer: "accepted" },
+    { outcome: "kept when its POST fails", readEarly: false, answer: "failed" },
+    {
+      outcome: "kept when an unmatched read precedes its failed POST",
+      readEarly: true,
+      answer: "failed",
+    },
+    {
+      outcome: "dropped when its own receipt precedes its failed POST",
+      readEarly: true,
+      readOwn: true,
+      answer: "failed",
+    },
+    {
+      outcome: "kept, not requeued, when the host is offline",
+      readEarly: false,
+      answer: "offline",
+    },
+    { outcome: "kept, not requeued, when its queued Steer fails", answer: "failed", queued: true },
+    {
+      outcome: "kept, not requeued, when its queued Steer finds the host offline",
+      answer: "offline",
+      queued: true,
+    },
+  ])("returns a steer still posting at Stop, $outcome", async (testCase) => {
+    const { readEarly, readOwn, answer, queued } = testCase;
+    let answerPost: ((response: Response) => void) | null = null;
+    let steerStableId: string | undefined;
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/conv_existing/resources/files"))
+        return mockResponse({
+          id: "file_1",
+          name: "notes.txt",
+          metadata: { filename: "notes.txt" },
+        });
+      const event = url.endsWith("/conv_existing/events") ? JSON.parse(String(init?.body)) : null;
+      if (event?.type === "message") {
+        steerStableId = event.data.stable_id;
+        return new Promise<Response>((resolve) => {
+          answerPost = resolve;
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const notes = new File(["notes"], "notes.txt");
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      boundAgentId: "agent_xyz",
+      abortController: new AbortController(),
+      isNativeTerminalSession: true,
+      sessionStatus: "running",
+      status: "streaming",
+      pendingUserMessages: [],
+      queuedMessages: queued
+        ? [
+            {
+              queueId: "q_late",
+              text: "late steer",
+              files: [notes],
+              conversationId: "conv_existing",
+            },
+          ]
+        : [],
+    });
+
+    if (queued) useChatStore.getState().steerMessage("q_late");
+    const sending = queued
+      ? null
+      : useChatStore.getState().send("late steer", "agent_xyz", [notes]);
+    useChatStore.getState().stop();
+    const returned = useChatStore.getState().failedSendDraft;
+    expect(returned).toMatchObject({
+      text: "late steer",
+      files: [notes],
+      returnedParts: [{ text: "late steer", files: [notes] }],
+      recovered: true,
+    });
+    await vi.waitFor(() => expect(answerPost).not.toBeNull());
+    if (readEarly) readSteer("pi_late", "late steer", readOwn ? steerStableId : undefined);
+    const responses = {
+      accepted: () => mockResponse({ queued: true, pending_id: "pi_late" }),
+      offline: () => mockResponse({ error: { code: "host_offline" } }, { ok: false, status: 503 }),
+      failed: () => mockResponse({ error: "boom" }, { ok: false, status: 500 }),
+    };
+    answerPost!(responses[answer as keyof typeof responses]());
+    await (sending ??
+      vi.waitFor(() => expect(useChatStore.getState().blocks.at(-1)?.type).toBe("error")));
+
+    if (answer === "accepted" && !readEarly) {
+      expect(useChatStore.getState().failedSendDraft?.returnedParts).toEqual([
+        { ...returned!.returnedParts![0], pendingId: "pi_late" },
+      ]);
+      readSteer("pi_late", "late steer");
+    }
+    expect(useChatStore.getState().failedSendDraft).toEqual(
+      answer === "accepted" || readOwn ? null : returned,
+    );
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
+  it("does not recover a returned steer again when its POST fails after a resend", async () => {
+    let failPost: (() => void) | null = null;
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/conv_existing/events") && failPost === null)
+        return new Promise<Response>((resolve) => {
+          failPost = () => resolve(mockResponse({ error: "boom" }, { ok: false, status: 500 }));
+        });
+      return defaultFetchHandler(input, init);
+    });
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      isNativeTerminalSession: true,
+      sessionStatus: "running",
+      status: "streaming",
+      pendingUserMessages: [],
+    });
+
+    const sending = useChatStore.getState().send("late steer", "agent_xyz");
+    await vi.waitFor(() => expect(failPost).not.toBeNull());
+    useChatStore.getState().stop();
+    expect(takeFailedSendDraft("conv_existing", false, true)?.text).toBe("late steer");
+    const resending = useChatStore.getState().send("late steer", "agent_xyz");
+    failPost!();
+    await Promise.all([sending, resending]);
+
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
   });
 
   it("no-op when no session is bound", () => {
@@ -23265,6 +23553,81 @@ describe("a send cut off by a reload", () => {
       abort!();
       await sending;
       expect(peekUnsentSend("conv_existing")?.text).toBe("rerun the failing test");
+    } finally {
+      window.dispatchEvent(new Event("pageshow"));
+    }
+  });
+
+  it("leaves a steer Stop hands to the composer to the composer's draft on reload", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      isNativeTerminalSession: true,
+      sessionStatus: "running",
+      status: "streaming",
+    });
+    let abort: (() => void) | undefined;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events") && abort === undefined) {
+        return new Promise<Response>((_, reject) => {
+          abort = () => reject(new TypeError("Failed to fetch"));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const sending = useChatStore.getState().send("change of plan", "agent_xyz");
+    await vi.waitFor(() => expect(abort).toBeDefined());
+    expect(peekUnsentSend("conv_existing")?.text).toBe("change of plan");
+    useChatStore.getState().stop();
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({ text: "change of plan" });
+    window.dispatchEvent(new Event("pagehide"));
+    try {
+      abort!();
+      await sending;
+      expect(peekUnsentSend("conv_existing")).toBeNull();
+    } finally {
+      window.dispatchEvent(new Event("pageshow"));
+    }
+  });
+
+  it("keeps no reload record for a steer Stop returns before its POST starts", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      isNativeTerminalSession: true,
+      sessionStatus: "running",
+      status: "streaming",
+    });
+    const aborts: (() => void)[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const event = url.endsWith("/conv_existing/events") ? JSON.parse(String(init?.body)) : null;
+      if (event?.type === "message") {
+        return new Promise<Response>((_, reject) => {
+          aborts.push(() => reject(new TypeError("Failed to fetch")));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const earlier = useChatStore.getState().send("change of plan", "agent_xyz");
+    await vi.waitFor(() => expect(aborts).toHaveLength(1));
+    // Waits behind the earlier send, so it has no reload record when Stop runs.
+    const waiting = useChatStore.getState().send("and this", "agent_xyz");
+    useChatStore.getState().stop();
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      text: "change of plan\n\nand this",
+    });
+    window.dispatchEvent(new Event("pagehide"));
+    try {
+      aborts[0]!();
+      await earlier;
+      await vi.waitFor(() => expect(aborts).toHaveLength(2));
+      expect(peekUnsentSend("conv_existing")).toBeNull();
+      aborts[1]!();
+      await waiting;
+      expect(peekUnsentSend("conv_existing")).toBeNull();
     } finally {
       window.dispatchEvent(new Event("pageshow"));
     }

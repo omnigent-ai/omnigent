@@ -116,6 +116,9 @@ import {
   holdsInitialDraft,
   isStaleTempConvId,
   isTempConvId,
+  joinReturnedParts,
+  keptDraft,
+  restoredDraftTracker,
   retryConversationLoad,
   type ChatState,
   type PendingInitialPrompt,
@@ -2613,7 +2616,7 @@ function ComposerImpl(
   // `delivered` when the send turns out to have reached the server, so the
   // retraction effect below can empty the composer.
   const restoredSendDraft = useChatStore((s) => s.restoredSendDraft);
-  const pendingFailedSendRestore = useRef<{ stableId: string; draft: typeof draft } | null>(null);
+  const pendingFailedSendRestore = useRef<{ stableId?: string; draft: typeof draft } | null>(null);
   const hasPendingInitialMessage = useChatStore((s) =>
     s.pendingUserMessages.some((message) => message.initialDraft !== undefined),
   );
@@ -3446,12 +3449,13 @@ function ComposerImpl(
       const joined = appendReplyDraft(draft, restoreReplyDraft(merged.text, merged.replyDraft));
       replaceText(serializeReplyDraft(joined), snapshotReplyDraft(joined));
       restoreTaggedMentionsRef.current(merged.mentions);
+      if (failed.files.length > 0)
+        attachmentsRef.current.replaceFiles([...filesRef.current, ...failed.files]);
       dirtyRef.current = true;
       return;
     }
-    pendingFailedSendRestore.current = failed.stableId
-      ? { stableId: failed.stableId, draft }
-      : null;
+    pendingFailedSendRestore.current =
+      failed.stableId || failed.returnedParts ? { stableId: failed.stableId, draft } : null;
     replaceText(recalled.text, recalled.replyDraft);
     restoreTaggedMentionsRef.current({ files: [], sessions: recalled.sessions });
     textareaRef.current = tailTextareaRef.current;
@@ -3470,7 +3474,8 @@ function ComposerImpl(
     // Delivery can interrupt the queued text restore with a store render.
     // Wait for the local draft update before deciding whether the user edited it.
     const pending = pendingFailedSendRestore.current;
-    if (pending?.stableId === restoredSendDraft.stableId && pending.draft === draft) return;
+    if (pending && pending.stableId === restoredSendDraft.stableId && pending.draft === draft)
+      return;
     pendingFailedSendRestore.current = null;
     useChatStore.setState({ restoredSendDraft: null });
     // Compare with what the restore put in the composer, tokens included.
@@ -3482,6 +3487,35 @@ function ComposerImpl(
       filesRef.current.length === restoredSendDraft.files.length &&
       filesRef.current.every((f) => restoredSendDraft.files.includes(f));
     if (valueRef.current !== expected || !filesUnedited) return;
+    // Of what Stop handed back, keep what the agent has not read.
+    const parts = restoredSendDraft.returnedParts ?? [];
+    const unread = joinReturnedParts(parts);
+    if (unread.text !== "" || unread.files.length > 0) {
+      const kept = keptDraft(parts);
+      if (parts.some((part) => part.tempId !== undefined)) {
+        pendingFailedSendRestore.current = { draft };
+        useChatStore.setState({
+          restoredSendDraft: {
+            ...restoredSendDraft,
+            ...unread,
+            delivered: false,
+          },
+        });
+      } else if (kept?.stableId) {
+        // Only the send the steers joined is left, so a retry reuses its id again.
+        pendingFailedSendRestore.current = { stableId: kept.stableId, draft };
+        useChatStore.setState({
+          restoredSendDraft: restoredDraftTracker(kept),
+          pendingRetryStableId: kept.stableId,
+        });
+      }
+      const recalled = recallComposerDraft(unread.text, unread.replyDraft);
+      replaceText(recalled.text, recalled.replyDraft);
+      restoreTaggedMentionsRef.current({ files: [], sessions: recalled.sessions });
+      attachmentsRef.current.replaceFiles(unread.files);
+      dirtyRef.current = true;
+      return;
+    }
     replaceText("");
     attachmentsRef.current.replaceFiles([]);
     dirtyRef.current = false;

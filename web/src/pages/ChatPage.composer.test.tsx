@@ -6307,38 +6307,138 @@ describe("Composer reply quotes", () => {
     expect(getSessionDraft("conv_test")).toBeUndefined();
   });
 
-  it("retracts delivery that arrives while the failed draft restore is rendering", () => {
-    const stableId = "8".repeat(32);
-    render(<Composer {...composerProps()} />);
-    const unsubscribe = useChatStore.subscribe((state) => {
-      if (state.restoredSendDraft?.stableId !== stableId || state.restoredSendDraft.delivered)
-        return;
-      handleSessionEvent({
-        type: "session_input_consumed",
-        itemId: stableId,
-        itemType: "message",
-        data: { role: "user", content: [{ type: "input_text", text: "resend me" }] },
-      });
-    });
-    try {
+  it.each([
+    { ahead: "nothing", kept: undefined },
+    {
+      ahead: "a failed send",
+      kept: { conversationId: "conv_test", text: "failed", files: [], stableId: "9".repeat(32) },
+    },
+    {
+      ahead: "a failed reply",
+      kept: {
+        conversationId: "conv_test",
+        text: "> the failing test\n\nfailed",
+        files: [],
+        stableId: "9".repeat(32),
+        replyDraft: {
+          version: 1 as const,
+          quotes: [{ before: "", text: "the failing test" }],
+          text: "failed",
+        },
+      },
+    },
+  ])(
+    "drops each steer returned by Stop from the composer once the agent reads it, after $ahead",
+    ({ kept }) => {
+      const read = (itemId: string, text: string, clearedPendingId?: string) =>
+        act(() =>
+          handleSessionEvent({
+            type: "session_input_consumed",
+            itemId,
+            itemType: "message",
+            clearedPendingId,
+            data: { role: "user", content: [{ type: "input_text", text }] },
+          }),
+        );
+      // A reply's quote cards stay above the textarea, before every returned steer.
+      const keptText = kept?.replyDraft?.text ?? kept?.text;
+      const lead = keptText ? `${keptText}\n\n` : "";
+      const quotes = kept?.replyDraft?.quotes ?? [];
+      const joined = { quotes, text: `${lead}change of plan\n\nand this` };
+      const quoteCards = () => screen.queryAllByTestId("composer-reply-quote");
+      render(<Composer {...composerProps()} />);
       act(() =>
         useChatStore.setState({
           failedSendDraft: {
             conversationId: "conv_test",
-            text: "resend me",
+            text: serializeReplyDraft(joined),
             files: [],
-            stableId,
+            ...(quotes.length > 0 ? { replyDraft: { version: 1, ...joined } } : {}),
+            returnedParts: [
+              ...(kept ? [{ text: kept.text, files: [], draft: kept }] : []),
+              { tempId: "pend_1", pendingId: "pending_1", text: "change of plan", files: [] },
+              { tempId: "pend_2", pendingId: "pending_2", text: "and this", files: [] },
+            ],
+            recovered: true,
           },
         }),
       );
+      expect(textarea()).toHaveValue(`${lead}change of plan\n\nand this`);
+      expect(quoteCards()).toHaveLength(kept?.replyDraft ? 1 : 0);
+
+      read("item_1", "change of plan", "pending_1");
+      expect(textarea()).toHaveValue(`${lead}and this`);
+      expect(quoteCards()).toHaveLength(kept?.replyDraft ? 1 : 0);
+      expect(useChatStore.getState().restoredSendDraft).toMatchObject({ delivered: false });
+
+      read("item_2", "and this", "pending_2");
+      if (kept) {
+        // Only the failed send is left; an untouched retry reuses its id.
+        expect(textarea()).toHaveValue(keptText);
+        expect(quoteCards()).toHaveLength(kept.replyDraft ? 1 : 0);
+        expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+          stableId: kept.stableId,
+          delivered: false,
+        });
+        expect(useChatStore.getState().pendingRetryStableId).toBe(kept.stableId);
+        read(kept.stableId, kept.text);
+      }
       expect(textarea()).toHaveValue("");
       expect(useChatStore.getState().restoredSendDraft).toBeNull();
-      expect(useChatStore.getState().pendingRetryStableId).toBeNull();
       expect(getSessionDraft("conv_test")).toBeUndefined();
-    } finally {
-      unsubscribe();
-    }
-  });
+    },
+  );
+
+  it.each([
+    { identity: "its stable id", stableId: "8".repeat(32), clearedPendingId: undefined },
+    { identity: "a steer returned by Stop", stableId: undefined, clearedPendingId: "pending_1" },
+  ])(
+    "retracts delivery that arrives while the failed draft restore is rendering, by $identity",
+    ({ stableId, clearedPendingId }) => {
+      render(<Composer {...composerProps()} />);
+      const unsubscribe = useChatStore.subscribe((state) => {
+        if (!state.restoredSendDraft || state.restoredSendDraft.delivered) return;
+        handleSessionEvent({
+          type: "session_input_consumed",
+          itemId: stableId ?? "item_1",
+          itemType: "message",
+          clearedPendingId,
+          data: { role: "user", content: [{ type: "input_text", text: "resend me" }] },
+        });
+      });
+      try {
+        act(() =>
+          useChatStore.setState({
+            failedSendDraft: {
+              conversationId: "conv_test",
+              text: "resend me",
+              files: [],
+              stableId,
+              ...(clearedPendingId
+                ? {
+                    returnedParts: [
+                      {
+                        tempId: "pend_1",
+                        pendingId: clearedPendingId,
+                        text: "resend me",
+                        files: [],
+                      },
+                    ],
+                    recovered: true,
+                  }
+                : {}),
+            },
+          }),
+        );
+        expect(textarea()).toHaveValue("");
+        expect(useChatStore.getState().restoredSendDraft).toBeNull();
+        expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+        expect(getSessionDraft("conv_test")).toBeUndefined();
+      } finally {
+        unsubscribe();
+      }
+    },
+  );
 
   it("keeps the user's edits when the delivered retraction lands", () => {
     const stableId = "d".repeat(32);
@@ -7286,6 +7386,35 @@ describe("Composer failed-send attachment restore", () => {
     expect(screen.getByText("mine.txt")).toBeTruthy();
     expect(screen.queryByText("notes.txt")).toBeNull();
     expect(textarea()).toHaveValue("");
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+  });
+
+  it("adds steers returned by Stop, attachments included, after the composer's input", () => {
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "newer" } });
+    fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files: [new File(["mine"], "mine.txt", { type: "text/plain" })] },
+    });
+    const notes = new File(["notes"], "notes.txt", { type: "text/plain" });
+
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: {
+          conversationId: "conv_test",
+          text: "change of plan",
+          files: [notes],
+          returnedParts: [
+            { tempId: "pend_1", pendingId: "pending_1", text: "change of plan", files: [] },
+            { tempId: "pend_2", pendingId: "pending_2", text: "", files: [notes] },
+          ],
+          recovered: true,
+        },
+      }),
+    );
+
+    expect(textarea()).toHaveValue("newer\n\nchange of plan");
+    expect(screen.getByText("mine.txt")).toBeTruthy();
+    expect(screen.getByText("notes.txt")).toBeTruthy();
     expect(useChatStore.getState().failedSendDraft).toBeNull();
   });
 
