@@ -25,6 +25,7 @@ def _clear_model_options_caches() -> None:
     orch._model_options_stale.clear()
     orch._model_options_inflight.clear()
     orch._pushed_model_options_cache.clear()
+    orch._acp_dynamic_options_probed.clear()
 
 
 def _conv(**overrides: object) -> Conversation:
@@ -420,3 +421,331 @@ def test_load_agent_spec_for_session_reuses_only_the_bound_agent(
     assert spec is cache.load.return_value.spec
     assert store.get.call_count == store_reads
     assert cache.load.call_args.args[:2] == ("agent_1", "b://acp")
+
+
+@pytest.mark.asyncio
+async def test_fetch_model_options_probes_runner_for_uncurated_acp_and_caches_empty() -> None:
+    """Uncurated ACP sessions probe ``/v1/sessions/{id}/model-options`` once and cache."""
+    import asyncio
+
+    runner_calls: list[str] = []
+
+    async def fake_get(path: str, **_kwargs):
+        runner_calls.append(f"GET {path}")
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "models": [
+                {
+                    "id": "ag-pro",
+                    "displayName": "AG Pro",
+                    "isDefault": True,
+                    "supportedReasoningEfforts": [
+                        {"reasoningEffort": "low"},
+                        {"reasoningEffort": "high"},
+                    ],
+                    "defaultReasoningEffort": "low",
+                }
+            ]
+        }
+        return resp
+
+    runner_client = MagicMock()
+    runner_client.get = fake_get
+
+    with (
+        patch.object(orch, "_load_acp_model_options", return_value=[]),
+        patch.object(orch, "_publish_model_options"),
+    ):
+        # First call triggers background probe task and returns [] until task finishes.
+        opts1 = await orch._fetch_model_options(
+            runner_client, "conv_dyn", _conv(id="conv_dyn"), MagicMock(), harness="acp"
+        )
+        assert opts1 == []
+        task = orch._model_options_inflight.get("conv_dyn")
+        if task is not None:
+            await asyncio.gather(task)
+
+        # Second call returns the probed options without spawning another runner call.
+        opts2 = await orch._fetch_model_options(
+            runner_client, "conv_dyn", _conv(id="conv_dyn"), MagicMock(), harness="acp"
+        )
+        assert [o["id"] for o in opts2] == ["ag-pro"]
+        assert opts2[0]["supportedReasoningEfforts"] == [
+            {"reasoningEffort": "low"},
+            {"reasoningEffort": "high"},
+        ]
+        assert runner_calls == ["GET /v1/sessions/conv_dyn/model-options"]
+
+        # Marking stale triggers a re-probe; empty response is authoritative for ACP.
+        orch._invalidate_runner_backed_snapshot_state(
+            "conv_dyn", cancel_inflight=False, drop_model_options=False
+        )
+
+        async def empty_get(path: str, **_kwargs):
+            runner_calls.append(f"GET {path}")
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {"models": []}
+            return resp
+
+        runner_client.get = empty_get
+        await orch._fetch_model_options(
+            runner_client, "conv_dyn", _conv(id="conv_dyn"), MagicMock(), harness="acp"
+        )
+        task2 = orch._model_options_inflight.get("conv_dyn")
+        if task2 is not None:
+            await asyncio.gather(task2)
+        assert orch._model_options_cache["conv_dyn"] == []
+        assert "conv_dyn" in orch._acp_dynamic_options_probed
+        assert "conv_dyn" not in orch._model_options_stale
+
+
+@pytest.mark.asyncio
+async def test_persist_relay_reported_model_reads_reported_model_fallback() -> None:
+    """When terminal response omits usage.model, top-level reported_model is persisted."""
+    store = MagicMock()
+    conv = _conv(id="conv_rep")
+    conv.reported_model = None
+    store.get_conversation.return_value = conv
+
+    with patch.object(orch.session_stream, "publish") as pub_mock:
+        await orch._persist_relay_reported_model(
+            {"id": "resp_1", "status": "completed", "reported_model": "gemini-3-pro"},
+            "conv_rep",
+            store,
+        )
+
+    store.update_conversation.assert_called_once_with("conv_rep", reported_model="gemini-3-pro")
+    pub_mock.assert_called_once()
+    assert pub_mock.call_args.args[1]["model"] == "gemini-3-pro"
+
+
+@pytest.mark.asyncio
+async def test_load_model_options_acp_uses_extended_timeout_and_retries_transient_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fix 2: ACP probe uses 20s timeout and retries on TimeoutException / ConnectError."""
+    import httpx
+
+    from omnigent.server.routes import sessions as sessions_facade
+    from omnigent.server.routes._sessions import helpers
+
+    monkeypatch.setattr(sessions_facade, "_MODEL_OPTIONS_RETRY_DELAYS_S", (0.0,))
+
+    calls: list[float] = []
+
+    async def fake_get(_path: str, *, timeout: float, **_kwargs: object) -> MagicMock:
+        calls.append(timeout)
+        if len(calls) == 1:
+            raise httpx.ReadTimeout("cold acp boot")
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "models": [{"id": "ag-pro", "displayName": "AG Pro", "isDefault": True}]
+        }
+        return resp
+
+    runner_client = MagicMock()
+    runner_client.get = fake_get
+
+    with patch.object(helpers, "_publish_model_options") as pub_mock:
+        await helpers._load_model_options(
+            runner_client,
+            "conv_retry",
+            "/v1/sessions/conv_retry/model-options",
+            empty_is_authoritative=True,
+            timeout_s=20.0,
+        )
+
+    assert calls == [20.0, 20.0]
+    assert orch._model_options_cache["conv_retry"] == [
+        {"id": "ag-pro", "displayName": "AG Pro", "isDefault": True}
+    ]
+    assert "conv_retry" in orch._acp_dynamic_options_probed
+    pub_mock.assert_called_once_with("conv_retry")
+
+
+@pytest.mark.asyncio
+async def test_load_model_options_acp_probe_failure_does_not_mark_probed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fix 2: Exhausted transient probe failures must leave _acp_dynamic_options_probed unset."""
+    import httpx
+
+    from omnigent.server.routes import sessions as sessions_facade
+    from omnigent.server.routes._sessions import helpers
+
+    monkeypatch.setattr(sessions_facade, "_MODEL_OPTIONS_RETRY_DELAYS_S", (0.0,))
+
+    attempts = 0
+
+    async def failing_get(_path: str, **_kwargs: object) -> MagicMock:
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ConnectError("runner starting")
+
+    runner_client = MagicMock()
+    runner_client.get = failing_get
+
+    await helpers._load_model_options(
+        runner_client,
+        "conv_fail",
+        "/v1/sessions/conv_fail/model-options",
+        empty_is_authoritative=True,
+        timeout_s=20.0,
+    )
+
+    assert attempts == 2
+    assert "conv_fail" not in orch._acp_dynamic_options_probed
+    assert "conv_fail" not in orch._model_options_cache
+
+
+@pytest.mark.asyncio
+async def test_prefetch_session_acp_model_options_refreshes_stale_host_preview() -> None:
+    """Fix 1: Runner connect prefetches live ACP options even over a stale host preview."""
+    import asyncio
+
+    from omnigent.server.routes._sessions import helpers
+
+    conv = _conv(id="conv_prefetch", harness_override="acp:antigravity")
+    orch._model_options_cache["conv_prefetch"] = [
+        {"id": "host-preview", "displayName": "Host Preview", "isDefault": True}
+    ]
+    orch._model_options_stale.add("conv_prefetch")
+
+    timeouts: list[float] = []
+
+    async def fake_get(path: str, *, timeout: float, **_kwargs: object) -> MagicMock:
+        assert path == "/v1/sessions/conv_prefetch/model-options"
+        timeouts.append(timeout)
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "models": [
+                {
+                    "id": "live-ag",
+                    "displayName": "Live AG",
+                    "isDefault": True,
+                    "supportedReasoningEfforts": [{"reasoningEffort": "high"}],
+                    "defaultReasoningEffort": "high",
+                }
+            ]
+        }
+        return resp
+
+    runner_client = MagicMock()
+    runner_client.get = fake_get
+
+    with patch.object(helpers, "_publish_model_options") as pub_mock:
+        helpers.prefetch_session_acp_model_options(
+            "conv_prefetch", conv, runner_client, agent_store=MagicMock()
+        )
+        task = orch._model_options_inflight.get("conv_prefetch")
+        assert task is not None
+        await asyncio.gather(task)
+
+    assert timeouts == [20.0]
+    assert [m["id"] for m in orch._model_options_cache["conv_prefetch"]] == ["live-ag"]
+    assert "conv_prefetch" not in orch._model_options_stale
+    assert "conv_prefetch" in orch._acp_dynamic_options_probed
+    pub_mock.assert_called_once_with("conv_prefetch")
+
+
+@pytest.mark.asyncio
+async def test_sleeping_acp_session_falls_back_to_host_probe_with_raw_slug() -> None:
+    """Fix 3: Sleeping ACP sessions probe the host preserving ``acp:<slug>``."""
+    import asyncio
+
+    from omnigent.server.routes._sessions import helpers
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="antigravity",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={
+                "harness": "acp:antigravity",
+                "acp_agent": {"name": "Antigravity", "command": "agy acp"},
+            },
+        ),
+    )
+    store = MagicMock()
+    store.get.return_value = _agent_row("agent_1")
+    cache = MagicMock()
+    cache.load_spec.return_value = spec
+    cache.load.return_value.spec = spec
+    conv = _conv(id="conv_sleep", host_id="host_1")
+
+    host_calls: list[tuple[str, str, str]] = []
+
+    async def fake_host_load(
+        session_id: str, host_id: str, harness: str = "claude-native"
+    ) -> None:
+        host_calls.append((session_id, host_id, harness))
+
+    with (
+        patch.object(helpers, "get_agent_cache", return_value=cache),
+        patch.object(orch, "_load_acp_model_options", return_value=[]),
+        patch.object(orch, "_load_model_options_from_host", side_effect=fake_host_load),
+    ):
+        options = await orch._fetch_model_options(
+            None, "conv_sleep", conv, store, harness="acp", agent_cache=cache
+        )
+        assert options == []
+        task = orch._model_options_inflight.get("conv_sleep")
+        assert task is not None
+        await asyncio.gather(task)
+
+    assert host_calls == [("conv_sleep", "host_1", "acp:antigravity")]
+
+
+@pytest.mark.asyncio
+async def test_host_model_options_route_preserves_acp_slug() -> None:
+    """Fix 3: ``/hosts/{host_id}/harnesses/{harness}/model-options`` keeps ``acp:<slug>``."""
+    from types import SimpleNamespace
+
+    import httpx
+    from fastapi import FastAPI
+
+    from omnigent.server.routes.hosts import create_hosts_router
+
+    proxied: list[str] = []
+
+    async def fake_proxy(
+        *, host_registry: object, host_conn: object, harness: str
+    ) -> dict[str, object]:
+        proxied.append(harness)
+        return {
+            "status": "ok",
+            "models": [{"id": "ag-pro", "displayName": "AG Pro"}],
+            "routable_models": ["ag-pro"],
+        }
+
+    host_id = "host_0123456789abcdef0123456789abcdef"
+    host_store = MagicMock()
+    host_store.get_host.return_value = SimpleNamespace(host_id=host_id, user_id=None)
+    host_registry = MagicMock()
+    host_registry.get.return_value = SimpleNamespace(
+        hello=SimpleNamespace(version="0.99.0"),
+        capabilities=["harness-setup"],
+    )
+
+    app = FastAPI()
+    app.include_router(
+        create_hosts_router(
+            host_store=host_store,
+            host_registry=host_registry,
+            conversation_store=MagicMock(),
+        ),
+        prefix="/v1",
+    )
+
+    with patch("omnigent.server.routes.hosts._proxy_model_options", side_effect=fake_proxy):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get(f"/v1/hosts/{host_id}/harnesses/acp:antigravity/model-options")
+
+    assert resp.status_code == 200, resp.text
+    assert proxied == ["acp:antigravity"]
+    assert resp.json()["models"] == [{"id": "ag-pro", "displayName": "AG Pro"}]

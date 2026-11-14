@@ -62,9 +62,10 @@ from omnigent.errors import (
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_accounts import HarnessAccount, HarnessAccounts
 from omnigent.harness_aliases import (
-    canonicalize_harness,
     harness_account_key,
+    is_acp_harness,
     is_claude_sdk_harness_name,
+    resolve_acp_probe_harness,
 )
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
 from omnigent.host import HOST_FATAL_EXIT_CODE
@@ -1481,6 +1482,11 @@ class HostProcess:
         # lifetime. A tunnel reconnect retains successful or in-flight work;
         # a completed failed attempt may be retried.
         self._model_options_prewarm_task: asyncio.Task[bool] | None = None
+        # Short-lived in-memory cache + single-flight deduplication for live
+        # ACP pre-launch probes (avoids respawning external ACP binaries on UI
+        # polling/retries).
+        self._acp_model_options_cache: dict[str, tuple[float, list[dict[str, object]]]] = {}
+        self._acp_model_options_inflight: dict[str, asyncio.Task[ModelOptionsResult | None]] = {}
         # Discovery belongs to the daemon so connection retries share one
         # in-flight probe and registration waits for bounded discovery.
         self._capability_init_task: asyncio.Task[None] | None = None
@@ -4247,6 +4253,67 @@ class HostProcess:
         routable = list(config.routable_models) if config is not None else []
         return ModelOptionsResult(models=rows, routable_models=routable)
 
+    async def _probe_acp_model_options_once(self, harness: str) -> ModelOptionsResult | None:
+        """Spawn the configured ACP agent briefly to capture its live model catalog."""
+        from omnigent.inner.acp_executor import AcpExecutor
+        from omnigent.inner.acp_harness import acp_agent_config_from_entry
+        from omnigent.onboarding.acp_auth import resolve_acp_harness_entry
+
+        entry = await asyncio.to_thread(resolve_acp_harness_entry, harness)
+        if entry is None:
+            _logger.warning("ACP agent %r is not configured on this host", harness)
+            return None
+
+        config = acp_agent_config_from_entry(entry, omnigent_mcp=False)
+        executor = AcpExecutor(config, cwd=str(Path.home()), os_env=None)
+        try:
+            payload = await asyncio.wait_for(executor.live_model_options(), timeout=12.0)
+        except Exception:
+            _logger.warning("ACP model catalog probe failed for %s", harness, exc_info=True)
+            return None
+        finally:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(executor.close(), timeout=3.0)
+
+        raw_models = payload.get("models") if isinstance(payload, dict) else None
+        rows = (
+            [dict(row) for row in raw_models if isinstance(row, dict)]
+            if isinstance(raw_models, list)
+            else []
+        )
+        routable = [row["id"] for row in rows if isinstance(row.get("id"), str) and row["id"]]
+        if rows:
+            self._acp_model_options_cache[harness] = (time.monotonic(), rows)
+        return ModelOptionsResult(models=rows, routable_models=routable)
+
+    async def _probed_acp_model_options(self, harness: str) -> ModelOptionsResult | None:
+        """Return TTL-cached + single-flight live ACP model options for *harness*."""
+        cache_ttl_s = 300.0
+        cached = self._acp_model_options_cache.get(harness)
+        if cached is not None:
+            cached_at, rows = cached
+            if (time.monotonic() - cached_at) < cache_ttl_s:
+                routable = [
+                    row["id"] for row in rows if isinstance(row.get("id"), str) and row["id"]
+                ]
+                return ModelOptionsResult(
+                    models=[dict(row) for row in rows],
+                    routable_models=routable,
+                )
+            self._acp_model_options_cache.pop(harness, None)
+
+        inflight = self._acp_model_options_inflight.get(harness)
+        if inflight is None:
+            inflight = asyncio.create_task(
+                self._probe_acp_model_options_once(harness),
+                name=f"host-acp-model-options-{harness}",
+            )
+            self._acp_model_options_inflight[harness] = inflight
+            inflight.add_done_callback(
+                lambda _t, key=harness: self._acp_model_options_inflight.pop(key, None)
+            )
+        return await asyncio.shield(inflight)
+
     async def _handle_model_options(
         self,
         frame: HostModelOptionsFrame,
@@ -4259,7 +4326,7 @@ class HostProcess:
         resolves its own catalog at launch, and the in-session picker
         re-reads that authoritative snapshot after bind.
         """
-        harness = canonicalize_harness(frame.harness) or frame.harness
+        harness = resolve_acp_probe_harness(frame.harness)
         with_source = functools.partial(_with_model_configuration_source, harness=harness)
         if harness == "codex-native":
             # Harness-truth lane: every launch shape is answered from the
@@ -4329,6 +4396,21 @@ class HostProcess:
                 request_id=frame.request_id,
                 status="ok",
                 models=with_source(devin_models),
+            )
+
+        if is_acp_harness(harness):
+            probed = await self._probed_acp_model_options(harness)
+            if probed is not None:
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="ok",
+                    models=with_source(probed.models),
+                    routable_models=probed.routable_models,
+                )
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"the {harness} model probe failed — see the host log",
             )
 
         if is_claude_sdk_harness_name(harness):
@@ -5293,6 +5375,9 @@ class HostProcess:
             model_options_prewarm_task = self._model_options_prewarm_task
             if model_options_prewarm_task is not None:
                 model_options_prewarm_task.cancel()
+            acp_probe_tasks = list(self._acp_model_options_inflight.values())
+            for task in acp_probe_tasks:
+                task.cancel()
             # Stop accepting lifecycle work before draining teardown tasks.
             # Cancelling an in-flight launch retains its shielded spawn in
             # _runner_stop_tasks, so quiescing frame handlers first closes the
@@ -5308,6 +5393,10 @@ class HostProcess:
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await model_options_prewarm_task
                 self._model_options_prewarm_task = None
+                for task in acp_probe_tasks:
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
+                self._acp_model_options_inflight.clear()
                 from omnigent.models.model_catalog_store import shutdown_catalog_probes
 
                 await shutdown_catalog_probes()

@@ -4892,6 +4892,7 @@ def create_app(
             _ensure_runner_relay,
             _publish_runner_recovered_status,
             _publish_sandbox_status,
+            prefetch_session_acp_model_options,
             prefetch_session_routing_catalogs,
         )
 
@@ -5023,6 +5024,9 @@ def create_app(
                             roots.append((conv, routed.client))
                         else:
                             prefetch_session_routing_catalogs(conv.id, conv, routed.client)
+                            prefetch_session_acp_model_options(
+                                conv.id, conv, routed.client, agent_store=agent_store
+                            )
                         # A crash can leave a persisted count absent from the live index.
                         session_live_state.persist_pending_count(
                             conv.id, pending_elicitations.count_for(conv.id)
@@ -5155,6 +5159,9 @@ def create_app(
                             return
                         response.raise_for_status()
                     prefetch_session_routing_catalogs(conv.id, conv, client)
+                    prefetch_session_acp_model_options(
+                        conv.id, conv, client, agent_store=agent_store
+                    )
                     # Clear only a root's disconnect failure, after successful init.
                     # Children retain interruption evidence until continuation runs.
                     async with store_slots:
