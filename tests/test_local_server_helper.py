@@ -162,3 +162,32 @@ print('stdout-after-logger-marker', flush=True)
     assert handles[0].proc.poll() is not None
     if exit_early:
         assert handles[0].proc.returncode == 23
+
+
+def test_routable_host_waits_for_its_own_tunnel_and_names_the_failure() -> None:
+    """An online row isn't ready until a request through that host's tunnel succeeds."""
+    import httpx
+
+    from tests._helpers.host import routable_host, wait_for_routable_host
+
+    mine, other = "a" * 32, "b" * 32
+    probes: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/hosts":
+            hosts = [{"host_id": h, "status": "online"} for h in (other, mine)]
+            return httpx.Response(200, json={"hosts": hosts})
+        host_id = request.url.path.split("/")[3]
+        probes.append(host_id)
+        # The other host's tunnel answers; this one registers on its second probe.
+        ready = host_id == other or probes.count(mine) > 1
+        return httpx.Response(200 if ready else 400, json={"entries": []})
+
+    with httpx.Client(base_url="http://test", transport=httpx.MockTransport(respond)) as client:
+        assert routable_host(client, host_id=mine) is None
+        assert routable_host(client, host_id=mine)["host_id"] == mine
+        probes.clear()
+        expected = f"host {mine} online but its tunnel probe returned 400"
+        with pytest.raises(AssertionError, match=expected):
+            wait_for_routable_host(client, host_id=mine, timeout=0.01, poll_interval=0.05)
+    assert other not in probes

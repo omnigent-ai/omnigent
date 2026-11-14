@@ -20,6 +20,12 @@ from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_ex
 from tests._helpers.live_server import isolated_process_env, terminate_process
 
 
+def _tunnel_probe_status(client: httpx.Client | ModuleType, host_id: str, base_url: str) -> int:
+    """The status of a one-entry filesystem listing routed through *host_id*'s tunnel."""
+    url = f"{base_url}/v1/hosts/{host_id}/filesystem"
+    return client.get(url, params={"limit": 1}, timeout=10).status_code
+
+
 def host_tunnel_registered(
     client: httpx.Client | ModuleType, host_id: str, *, base_url: str = ""
 ) -> bool:
@@ -29,9 +35,33 @@ def host_tunnel_registered(
     session on the host in that window fails with ``wrong_replica``. Pass
     *base_url* when *client* has none (e.g. the ``httpx`` module).
     """
-    url = f"{base_url}/v1/hosts/{host_id}/filesystem"
-    response = client.get(url, params={"limit": 1}, timeout=10)
-    return response.status_code == 200
+    return _tunnel_probe_status(client, host_id, base_url) == 200
+
+
+def _find_routable_host(
+    client: httpx.Client | ModuleType,
+    *,
+    base_url: str,
+    host_id: str | None,
+    name: str | None,
+    owner: str | None,
+) -> tuple[dict[str, Any] | None, str]:
+    """The first matching online host whose tunnel answers, else ``None`` and why not."""
+    response = client.get(f"{base_url}/v1/hosts", timeout=10)
+    if response.status_code != 200:
+        return None, f"GET /v1/hosts returned {response.status_code}"
+    wanted = {"host_id": host_id, "name": name, "owner": owner}
+    reason = "no matching host online"
+    for row in response.json().get("hosts", []):
+        if row.get("status") != "online":
+            continue
+        if any(value is not None and row.get(key) != value for key, value in wanted.items()):
+            continue
+        status = _tunnel_probe_status(client, str(row["host_id"]), base_url)
+        if status == 200:
+            return row, ""
+        reason = f"host {row['host_id']} online but its tunnel probe returned {status}"
+    return None, reason
 
 
 def routable_host(
@@ -47,18 +77,10 @@ def routable_host(
     Rows are filtered by whichever of *host_id*, *name* and *owner* are given.
     Returns ``None`` while no match is online and registered; HTTP errors propagate.
     """
-    response = client.get(f"{base_url}/v1/hosts", timeout=10)
-    if response.status_code != 200:
-        return None
-    for row in response.json().get("hosts", []):
-        if row.get("status") != "online":
-            continue
-        wanted = {"host_id": host_id, "name": name, "owner": owner}
-        if any(value is not None and row.get(key) != value for key, value in wanted.items()):
-            continue
-        if host_tunnel_registered(client, str(row["host_id"]), base_url=base_url):
-            return row
-    return None
+    row, _ = _find_routable_host(
+        client, base_url=base_url, host_id=host_id, name=name, owner=owner
+    )
+    return row
 
 
 def wait_for_routable_host(
@@ -76,10 +98,11 @@ def wait_for_routable_host(
     last = "not polled"
     while time.monotonic() < deadline:
         try:
-            row = routable_host(client, base_url=base_url, host_id=host_id, name=name, owner=owner)
+            row, last = _find_routable_host(
+                client, base_url=base_url, host_id=host_id, name=name, owner=owner
+            )
             if row is not None:
                 return row
-            last = "no matching host online with a registered tunnel"
         except httpx.TransportError as exc:
             last = f"{type(exc).__name__}: {exc}"
         time.sleep(poll_interval)
