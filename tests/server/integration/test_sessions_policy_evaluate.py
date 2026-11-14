@@ -802,10 +802,17 @@ def _patch_default_policies(monkeypatch: pytest.MonkeyPatch, fn_path: str) -> No
 
 
 @pytest.mark.parametrize(
-    "tool_name",
-    ["sys_scheduled_task_create", "sys_scheduled_task_update", "sys_scheduled_task_delete"],
+    ("tool_name", "legacy"),
+    [
+        ("sys_scheduled_task_create", False),
+        ("sys_scheduled_task_create", True),
+        ("sys_scheduled_task_update", False),
+        ("sys_scheduled_task_update", True),
+        # A delete carries only the task id, so it has no legacy form.
+        ("sys_scheduled_task_delete", False),
+    ],
+    ids=["create", "create-legacy", "update", "update-legacy", "delete"],
 )
-@pytest.mark.parametrize("legacy", [False, True], ids=["complete-review", "legacy"])
 async def test_scheduled_changes_require_explicit_approval_without_custom_policies(
     client: httpx.AsyncClient,
     tool_name: str,

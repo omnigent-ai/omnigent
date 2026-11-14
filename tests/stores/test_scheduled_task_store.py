@@ -256,8 +256,11 @@ def test_a_reminder_only_delete_changes_nothing_for_another_task(
         else _reminder_fields(rrule="FREQ=MINUTELY", kind="automation")
     )
     task_id = store.create(scheduled_task_id=_uid("st_keep"), **fields).id
+    # The automation continues the same session, so only its kind refuses it: a
+    # session can't remove its own recurring automation without approval.
+    session = _uid("conv_other") if case == "another_session" else _uid("conv")
     with pytest.raises(ScheduledTaskNotSessionReminderError):
-        store.delete(task_id, reminder_session_id=_uid("conv_other"))
+        store.delete(task_id, reminder_session_id=session)
     kept = store.get(task_id)
     assert kept is not None and kept.state == "active"
 
