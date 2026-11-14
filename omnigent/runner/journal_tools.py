@@ -27,6 +27,7 @@ import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
+from weakref import WeakKeyDictionary
 
 import httpx
 
@@ -51,21 +52,28 @@ from omnigent.tools.builtins.journal import (
 )
 
 JOURNAL_TOOL_NAMES: frozenset[str] = frozenset(tool.name() for tool in JOURNAL_TOOLS)
+_server_workflow_flags: WeakKeyDictionary[httpx.AsyncClient, bool] = WeakKeyDictionary()
 
 
-async def server_workflows_enabled(server_client: httpx.AsyncClient | None) -> bool:
-    """Read the server's rollout flag; a host's environment cannot enable it."""
+async def server_workflows_enabled(
+    server_client: httpx.AsyncClient | None, *, refresh: bool = False
+) -> bool:
+    """Cache the server's startup flag; reconnects refresh without discarding known state."""
     if server_client is None:
         return False
+    if not refresh and server_client in _server_workflow_flags:
+        return _server_workflow_flags[server_client]
     try:
         response = await server_client.get("/v1/info")
         if response.status_code != 200:
-            return False
+            return _server_workflow_flags.get(server_client, False)
         info = response.json()
     except (httpx.HTTPError, ValueError):
-        return False
+        return _server_workflow_flags.get(server_client, False)
     features = info.get("features") if isinstance(info, dict) else None
-    return isinstance(features, dict) and features.get("workflows") is True
+    enabled = isinstance(features, dict) and features.get("workflows") is True
+    _server_workflow_flags[server_client] = enabled
+    return enabled
 
 
 # A read returns the newest entries whose lines fit this budget.

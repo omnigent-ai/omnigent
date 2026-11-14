@@ -8845,6 +8845,8 @@ def _codex_ensure_response_with_policy_notice(
 def _ensure_orchestrator_skills_in_bundle(
     bundle_dir: Path,
     agent_spec: object,
+    *,
+    workflows_enabled: bool = False,
 ) -> None:
     """
     Link Omnigent's own skills into a bundle's ``skills/`` dir.
@@ -8853,13 +8855,14 @@ def _ensure_orchestrator_skills_in_bundle(
     ``CODEX_HOME/skills/`` (codex) picks the skills up. ``build-omnigent``
     is linked for every agent — every ``omnigent claude`` / ``omnigent
     codex`` user should be able to author new agents — and each framework
-    skill, such as ``workflow``, for agents with its tool group. A skill the
-    bundle already has is left alone. Best-effort: a failure to link is
+    skill, such as ``workflow``, when its server flag and tool group allow it.
+    Existing user skills are left alone. Best-effort: a failure to link is
     logged but does not abort the terminal launch.
 
     :param bundle_dir: Materialized agent-bundle root, e.g.
         ``/tmp/omnigent-ap-chat-xyz/bundle``.
     :param agent_spec: The session's AgentSpec; decides the framework skills.
+    :param workflows_enabled: Whether the server advertises workflow tools.
     """
     # Anchored on the package root, not a ``.parent`` count off this file:
     # moving this module deeper must not silently break the source path.
@@ -8874,21 +8877,25 @@ def _ensure_orchestrator_skills_in_bundle(
             sources[name] = FRAMEWORK_SKILLS_DIR / name
     for name, source in sources.items():
         target_dir = bundle_dir / "skills" / name
-        if target_dir.exists():
-            continue
-        if not source.is_dir():
-            _logger.debug(
-                "Orchestrator skill source %s is not a directory; skipping injection",
-                source,
-                extra={"session_id": runner_primary_session_id()},
-            )
-            continue
         try:
+            if name in {"workflow", "save-workflow"} and not workflows_enabled:
+                if target_dir.is_symlink() and target_dir.resolve() == source.resolve():
+                    target_dir.unlink()
+                continue
+            if target_dir.exists():
+                continue
+            if not source.is_dir():
+                _logger.debug(
+                    "Orchestrator skill source %s is not a directory; skipping injection",
+                    source,
+                    extra={"session_id": runner_primary_session_id()},
+                )
+                continue
             target_dir.parent.mkdir(parents=True, exist_ok=True)
             target_dir.symlink_to(source)
         except OSError:
             _logger.debug(
-                "Could not link the %s skill into the agent bundle",
+                "Could not update the %s skill in the agent bundle",
                 name,
                 exc_info=True,
                 extra={"session_id": runner_primary_session_id()},
@@ -9903,10 +9910,16 @@ async def _auto_create_claude_terminal(
         router_started=subagent_router_dir is not None,
     )
     if bundle_dir is None:
+        from omnigent.runner.journal_tools import server_workflows_enabled
+
         # Reuse the bridge's owned directory across retries and terminal transfers.
         # Its dead-owner cleanup also reclaims these generated skill links.
         bundle_dir = bridge_dir / "skill-bundle"
-        _ensure_orchestrator_skills_in_bundle(bundle_dir, agent_spec)
+        _ensure_orchestrator_skills_in_bundle(
+            bundle_dir,
+            agent_spec,
+            workflows_enabled=await server_workflows_enabled(server_client),
+        )
     claude_args = augment_claude_args(
         base_claude_args,
         active_harnesses=runner_mcp_disabled_servers_active_harnesses(),

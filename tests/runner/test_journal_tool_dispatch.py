@@ -96,10 +96,18 @@ async def test_workflow_tool_advertisement_follows_the_server_not_the_host(
     schemas = (
         build_native_relay_tool_schemas(spec) if native else ToolManager(spec).get_tool_schemas()
     )
-    async with _client(lambda request: httpx.Response(200, json=info)) as client:
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=info)
+
+    async with _client(respond) as client:
         visible = filter_workflow_tool_schemas(
             schemas, enabled=await server_workflows_enabled(client)
         )
+        assert await server_workflows_enabled(client) is enabled
+        assert len(requests) == 1
     names = {schema["name"] if native else schema["function"]["name"] for schema in visible}
     assert names & JOURNAL_TOOL_NAMES == (JOURNAL_TOOL_NAMES if enabled else set())
     assert "sys_scheduled_task_create" in names
@@ -107,8 +115,14 @@ async def test_workflow_tool_advertisement_follows_the_server_not_the_host(
 
 
 @pytest.mark.parametrize("failure", ["unavailable", "invalid_json", "offline"])
-async def test_unavailable_server_does_not_enable_workflow_tools(failure: str) -> None:
+async def test_failed_workflow_flag_probes_retry_and_preserve_last_success(failure: str) -> None:
+    unavailable, enabled = True, True
+    requests: list[httpx.Request] = []
+
     def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if not unavailable:
+            return httpx.Response(200, json={"features": {"workflows": enabled}})
         if failure == "offline":
             raise httpx.ConnectError("offline", request=request)
         if failure == "invalid_json":
@@ -117,6 +131,18 @@ async def test_unavailable_server_does_not_enable_workflow_tools(failure: str) -
 
     async with _client(respond) as client:
         assert await server_workflows_enabled(client) is False
+        unavailable = False
+        assert await server_workflows_enabled(client) is True
+        assert len(requests) == 2
+        unavailable = True
+        assert await server_workflows_enabled(client) is True
+        assert len(requests) == 2
+        assert await server_workflows_enabled(client, refresh=True) is True
+        assert len(requests) == 3
+        unavailable, enabled = False, False
+        assert await server_workflows_enabled(client, refresh=True) is False
+        assert await server_workflows_enabled(client) is False
+        assert len(requests) == 4
 
 
 async def _run(client: httpx.AsyncClient, tool: str, args: dict[str, object], **kwargs) -> dict:

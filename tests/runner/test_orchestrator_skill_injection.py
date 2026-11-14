@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 import omnigent
 from omnigent.inner.codex_executor import codex_skill_sources, select_codex_skill_dirs
 from omnigent.runner.native.orchestration import (
@@ -62,19 +64,33 @@ def test_codex_resolves_the_injected_skill(tmp_path: Path) -> None:
     assert SKILL_NAME in select_codex_skill_dirs("all", sources)
 
 
-def test_agents_with_the_journal_tools_also_get_the_workflow_skills(tmp_path: Path) -> None:
-    """Native harnesses run ``/workflow`` and ``/save-workflow`` themselves; both are bundled."""
+@pytest.mark.parametrize("workflows_enabled", [False, True])
+def test_native_workflow_skills_require_server_flag_and_journal_tools(
+    tmp_path: Path, workflows_enabled: bool
+) -> None:
+    """Native workflow instructions must agree with the tools advertised by the server."""
     from omnigent.spec.types import AgentSpec, ToolGroupsConfig
 
     with_journal, without = tmp_path / "with", tmp_path / "without"
-    _ensure_orchestrator_skills_in_bundle(with_journal, AgentSpec(spec_version=1))
+    spec = AgentSpec(spec_version=1)
+    _ensure_orchestrator_skills_in_bundle(with_journal, spec, workflows_enabled=workflows_enabled)
     _ensure_orchestrator_skills_in_bundle(
-        without, AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(journal=False))
+        without,
+        AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(journal=False)),
+        workflows_enabled=workflows_enabled,
     )
 
-    assert (with_journal / "skills" / "workflow" / "SKILL.md").is_file()
-    assert (with_journal / "skills" / "save-workflow" / "SKILL.md").is_file()
+    assert (with_journal / "skills" / "workflow" / "SKILL.md").is_file() is workflows_enabled
+    assert (with_journal / "skills" / "save-workflow" / "SKILL.md").is_file() is workflows_enabled
     assert sorted(p.name for p in (with_journal / "skills").iterdir()) == sorted(
-        [SKILL_NAME, "save-workflow", "workflow"]
+        [SKILL_NAME, *(["save-workflow", "workflow"] if workflows_enabled else [])]
     )
     assert [p.name for p in (without / "skills").iterdir()] == [SKILL_NAME]
+
+    _ensure_orchestrator_skills_in_bundle(with_journal, spec, workflows_enabled=False)
+    assert [p.name for p in (with_journal / "skills").iterdir()] == [SKILL_NAME]
+    user_skill = with_journal / "skills" / "workflow" / "SKILL.md"
+    user_skill.parent.mkdir()
+    user_skill.write_text("User-authored workflow instructions")
+    _ensure_orchestrator_skills_in_bundle(with_journal, spec, workflows_enabled=False)
+    assert user_skill.read_text() == "User-authored workflow instructions"

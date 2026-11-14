@@ -108,6 +108,7 @@ from omnigent.runner.background_titles import (
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMPT_CHARS
 from omnigent.runner.background_work_reports import BackgroundWorkReporter
 from omnigent.runner.codex.goal import CodexGoalRunner
+from omnigent.runner.journal_tools import server_workflows_enabled
 from omnigent.runner.launch_failure import (
     TERMINAL_CLOSED_OUTSIDE_OMNIGENT,
     FailureDiagnosis,
@@ -3449,7 +3450,11 @@ def create_runner_app(
                         extra={"session_id": session_id},
                     )
                     if bundle_dir is not None:
-                        _ensure_orchestrator_skills_in_bundle(bundle_dir, spec)
+                        _ensure_orchestrator_skills_in_bundle(
+                            bundle_dir,
+                            spec,
+                            workflows_enabled=await server_workflows_enabled(server_client),
+                        )
                     return dataclasses.replace(
                         ctx,
                         bundle_dir=bundle_dir,
@@ -3510,7 +3515,11 @@ def create_runner_app(
                         bundle_dir = _resolved_spec_workdir(entry) if entry is not None else None
                         skills_filter = getattr(spec, "skills_filter", "all")
                     if bundle_dir is not None and spec is not None:
-                        _ensure_orchestrator_skills_in_bundle(bundle_dir, spec)
+                        _ensure_orchestrator_skills_in_bundle(
+                            bundle_dir,
+                            spec,
+                            workflows_enabled=await server_workflows_enabled(server_client),
+                        )
                     # Preserve the inline arm's use of the outer spec_entry (not the
                     # locally-resolved spec) as agent_spec.
                     return dataclasses.replace(
@@ -5675,7 +5684,6 @@ def create_runner_app(
             post_tools_changed,
             start_tool_relay,
         )
-        from omnigent.runner.journal_tools import server_workflows_enabled
 
         workflows_enabled = await server_workflows_enabled(server_client)
 
@@ -6388,7 +6396,6 @@ def create_runner_app(
                         extra={"session_id": conv},
                     )
 
-        from omnigent.runner.journal_tools import server_workflows_enabled
         from omnigent.runner.tool_dispatch import filter_workflow_tool_schemas
 
         _spec_tools = filter_workflow_tool_schemas(
@@ -9111,6 +9118,7 @@ def create_runner_app(
 
     async def _catch_up_scan() -> None:
         global _server_accepts_inferred_status, _server_accepts_input_only_failures
+        await server_workflows_enabled(server_client, refresh=True)
         # The new connection may reach an older server; it must accept inferred status
         # and input-only failures anew.
         _server_accepts_inferred_status = False

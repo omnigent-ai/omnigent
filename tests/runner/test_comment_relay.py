@@ -1695,7 +1695,7 @@ async def test_native_revision_refreshes_relay_before_turn_without_reset(
 
 
 @pytest.mark.asyncio
-async def test_native_relay_updates_workflow_tools_when_server_flag_changes(
+async def test_native_relay_updates_workflow_tools_after_server_reconnect(
     tmp_path: Path,
 ) -> None:
     from omnigent.runner.journal_tools import JOURNAL_TOOL_NAMES
@@ -1714,6 +1714,7 @@ async def test_native_relay_updates_workflow_tools_when_server_flag_changes(
             try:
                 for enabled in (False, True, False):
                     server_client.workflows_enabled = enabled
+                    await app.state.catch_up_scan()
                     await _launch_bridged(client, session_id)
                     names = _relay_tool_names(relay_file)
                     assert names & JOURNAL_TOOL_NAMES == (JOURNAL_TOOL_NAMES if enabled else set())
