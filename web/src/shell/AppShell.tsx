@@ -1131,7 +1131,11 @@ function AppShellImpl() {
         github: showFilesPanel,
         // Tasks tab: on servers that keep journals; elsewhere once the agent
         // makes a to-do list, so the chat's task preview can always open it.
-        tasks: (serverInfo !== "loading" && serverInfo.session_journal === true) || hasNativeTasks,
+        tasks:
+          (isFeatureEnabled(serverInfo, "workflows") &&
+            serverInfo !== "loading" &&
+            serverInfo.session_journal === true) ||
+          hasNativeTasks,
         // Browser soft tabs: available only when the shell hosts the embedded
         // WebContentsView. Plain web and older desktop builds hide the "+"
         // option entirely so they never surface a dead tab whose calls no-op.

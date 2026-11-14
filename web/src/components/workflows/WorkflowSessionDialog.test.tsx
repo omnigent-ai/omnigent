@@ -16,11 +16,20 @@ import { nativeWrapperLabelsForAgent } from "@/lib/nativeCodingAgents";
 import type * as RoutingModule from "@/lib/routing";
 import { createSession } from "@/lib/sessionsApi";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
-import { REVIEW_PLAN_FIRST, createWorkflowPrompt, runSavedWorkflowPrompt } from "@/lib/workflow";
+import {
+  REVIEW_PLAN_FIRST,
+  createWorkflowPrompt,
+  editWorkflowPlanPrompt,
+  runSavedWorkflowPrompt,
+} from "@/lib/workflow";
 import { consumePendingInitialPrompt } from "@/store/chatStore";
 import { testAgent } from "@/test/agentFixtures";
 
-import { type WorkflowSessionRequest, WorkflowSessionDialog } from "./WorkflowSessionDialog";
+import {
+  type WorkflowSessionRequest,
+  WorkflowSessionDialog,
+  WorkflowSessionForm,
+} from "./WorkflowSessionDialog";
 
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn(), useHostModelOptions: vi.fn() }));
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
@@ -73,7 +82,14 @@ const CREATE: WorkflowSessionRequest = {
   description: "Bump one package and fix what breaks",
 };
 
-function renderDialog(info: Partial<ServerInfo> = {}, request: WorkflowSessionRequest = RUN) {
+function renderDialog(
+  info: Partial<ServerInfo> = {},
+  request: WorkflowSessionRequest = RUN,
+  onStarted?: (
+    session: Awaited<ReturnType<typeof createSession>>,
+    prompt: string | null,
+  ) => Promise<void>,
+) {
   const onOpenChange = vi.fn();
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
@@ -81,7 +97,15 @@ function renderDialog(info: Partial<ServerInfo> = {}, request: WorkflowSessionRe
       <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, ...info }}>
         <TooltipProvider>
           <MemoryRouter>
-            <WorkflowSessionDialog request={request} open onOpenChange={onOpenChange} />
+            {onStarted ? (
+              <WorkflowSessionForm
+                request={request}
+                onClose={() => onOpenChange(false)}
+                onStarted={onStarted}
+              />
+            ) : (
+              <WorkflowSessionDialog request={request} open onOpenChange={onOpenChange} />
+            )}
           </MemoryRouter>
         </TooltipProvider>
       </CapabilitiesProvider>
@@ -132,6 +156,46 @@ describe("WorkflowSessionDialog", () => {
   });
   afterEach(cleanup);
 
+  it("embeds a planning session and retries a failed link without launching twice", async () => {
+    setHosts([{ host_id: "host_1" }]);
+    localStorage.setItem("omnigent:recent-workspaces", JSON.stringify({ host_1: ["/srv/app"] }));
+    startedSession();
+    const attached = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Couldn’t attach chat"))
+      .mockResolvedValueOnce(undefined);
+    renderDialog({}, { kind: "plan", workflow: WORKFLOW }, attached);
+    expect(screen.queryByTestId("workflow-session-instructions")).toBeNull();
+    expect(submit()).toHaveTextContent("Start planning");
+    fireEvent.click(submit());
+    expect(await screen.findByRole("alert")).toHaveTextContent("Couldn’t attach chat");
+    fireEvent.click(submit());
+    await waitFor(() => expect(attached).toHaveBeenCalledTimes(2));
+    expect(createSession).toHaveBeenCalledOnce();
+    expect(attached).toHaveBeenLastCalledWith({ id: "conv_run" }, editWorkflowPlanPrompt(WORKFLOW));
+    expect(navigate).not.toHaveBeenCalled();
+    expect(consumePendingInitialPrompt("conv_run")).toBeNull();
+  });
+
+  it("leaves a sandbox's durable planning prompt to the server", async () => {
+    setHosts([]);
+    localStorage.setItem("omnigent:last-host-choice", "sandbox");
+    startedSession();
+    const attached = vi.fn().mockResolvedValue(undefined);
+    renderDialog(
+      { ...SANDBOXES, durable_initial_input: true },
+      { kind: "plan", workflow: WORKFLOW },
+      attached,
+    );
+    fireEvent.click(submit());
+    await waitFor(() => expect(attached).toHaveBeenCalledWith({ id: "conv_run" }, null));
+    expect(vi.mocked(createSession).mock.calls[0]![2]?.initialInput).toMatchObject({
+      type: "message",
+      data: { content: [{ type: "input_text", text: editWorkflowPlanPrompt(WORKFLOW) }] },
+    });
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
   it("starts a session where the new-session page last ran, with the run request first", async () => {
     setHosts([
       { host_id: "host_1", name: "desk" },
@@ -151,8 +215,14 @@ describe("WorkflowSessionDialog", () => {
     expect(screen.getByTestId("workflow-session-host")).toHaveTextContent("laptop");
     expect(screen.getByPlaceholderText("Type a path or browse…")).toHaveValue("/home/you/app");
     expect(screen.getByTestId("workflow-session-agent")).toHaveTextContent("Codex");
-    const instructions = screen.getByTestId("workflow-session-instructions");
-    expect(instructions).toHaveValue(runSavedWorkflowPrompt(WORKFLOW));
+    // The run request stays out of the field, which only adds to it.
+    const instructions = screen.getByLabelText("Additional instructions");
+    expect(instructions).toHaveValue("");
+    expect(instructions).toHaveAttribute(
+      "placeholder",
+      "Optional. Instructions to customize the workflow.",
+    );
+    expect(submit()).toBeEnabled();
 
     fireEvent.change(instructions, { target: { value: "Run it on the flaky suite only." } });
     fireEvent.click(submit());
@@ -171,7 +241,7 @@ describe("WorkflowSessionDialog", () => {
       reasoningEffort: undefined,
     });
     expect(consumePendingInitialPrompt("conv_run")).toEqual({
-      text: "Run it on the flaky suite only.",
+      text: runSavedWorkflowPrompt(WORKFLOW, "Run it on the flaky suite only."),
       skill: null,
       files: [],
     });
@@ -422,13 +492,17 @@ describe("WorkflowSessionDialog", () => {
     await waitFor(() => expect(navigate).toHaveBeenCalled());
     expect(consumePendingInitialPrompt("conv_run")?.text).toBe(runSavedWorkflowPrompt(WORKFLOW));
 
+    // The review request comes last, after the run's additional instructions.
     cleanup();
     renderDialog();
+    fireEvent.change(screen.getByLabelText("Additional instructions"), {
+      target: { value: "Only the upload tests." },
+    });
     fireEvent.click(screen.getByTestId("workflow-session-review-plan"));
     fireEvent.click(submit());
     await waitFor(() => expect(navigate).toHaveBeenCalledTimes(2));
     expect(consumePendingInitialPrompt("conv_run")?.text).toBe(
-      `${runSavedWorkflowPrompt(WORKFLOW)}\n\n${REVIEW_PLAN_FIRST}`,
+      `${runSavedWorkflowPrompt(WORKFLOW, "Only the upload tests.")}\n\n${REVIEW_PLAN_FIRST}`,
     );
   });
 
@@ -439,7 +513,7 @@ describe("WorkflowSessionDialog", () => {
     renderDialog({}, CREATE);
 
     expect(screen.getByRole("dialog", { name: "New workflow" })).toBeInTheDocument();
-    expect(screen.getByTestId("workflow-session-instructions")).toHaveValue(
+    expect(screen.getByLabelText("Instructions")).toHaveValue(
       createWorkflowPrompt("Upgrade a dependency", "Bump one package and fix what breaks"),
     );
     // Drafting has no plan to review.

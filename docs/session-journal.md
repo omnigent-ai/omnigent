@@ -1,5 +1,10 @@
 # Session journal
 
+Workflows and journals are off by default. Add `workflows` to the server's
+`OMNIGENT_FEATURES` and restart the server to enable their APIs, UI and agent
+tools. The server's flag also controls tool discovery on separate hosts.
+Disabling it leaves saved workflows and journal entries intact.
+
 Every Omnigent session has a **journal**: an append-only record of the plan its
 agent follows, where each step stands, and the notes the agent keeps. The agent
 reads it to pick up where it left off, after a restart, a context compaction or
@@ -51,7 +56,7 @@ stored entry is at most 16,383 bytes after compression.
 
 ## Agent tools
 
-The eight tools make up the `journal` tool group, which every agent has. An agent
+With workflows enabled, the eight tools make up the `journal` tool group, which every agent has. An agent
 spec can drop it with `tool_groups.journal: false` (see
 [Tool groups](AGENT_YAML_SPEC.md#tool-groups)).
 
@@ -71,6 +76,10 @@ validation), `invalid_input` (a question or its task failed validation; a
 question needs a current plan that has its task), `entry_too_large` (with
 the size and the limit),
 `session_not_found` and `session_out_of_tree` (for reads of another session).
+`unattended_input_not_allowed` refuses a `needs_input` status or an input
+request from an automation or one of its workers, before writing an entry or
+raising a question. The agent must decide within the user's authorization or
+mark the step `failed` with the blocker, then continue independent work.
 A write's retry, for example while the runner's connection to the server
 reconnects, returns the entry the first attempt wrote instead of adding another.
 
@@ -140,11 +149,20 @@ the agent answers its own questions with the option it would recommend, and
 says so in the task's status. A task that needs you, such as a sign-in, fails
 saying what it needs, and the agent goes on with the rest.
 
+The journal API enforces this using the session's existing server-owned
+`omnigent.scheduled_task_origin` and `omnigent.scheduled_task_run` labels.
+It follows sub-agent parent links and `omnigent.created_by_session_id` links
+for independent workers, including nested workers. No new unattended flag is
+needed, and the restriction applies while that automation provenance remains.
+An automation's saved source session alone does not identify an unattended run.
+
 Click a workflow on the **Workflows** page to open it: its steps as a graph,
 and its runs, newest first. Each run links to its session and shows how many
 of its tasks are done, or that it's waiting for you. A run is listed once the
 agent writes the saved workflow's steps as its plan, so runs from before this
-release don't appear.
+release don't appear. Hover a step in the graph to see all of it. In a run's
+graph, the card says where the task stands, as the strip's does, and a step's
+**⋯** menu has its task's action.
 
 ## Automations
 
@@ -182,7 +200,13 @@ nothing is. A ready task's **⋯** menu has **Run**, and a stopped task's has
 **Continue**: each sends the agent a message asking it to do that, then go on
 with the rest of the plan. A task waiting for you has **Continue** too, which
 tells the agent it's fine to go ahead with that task, marking it started (or
-done, if its work is already done), then the rest of the plan. While the agent works, a running task's menu has
+done, if its work is already done), then the rest of the plan. A failed task's
+menu has **Retry**, which asks the agent to run it again, then go on with the
+rest of the plan. A task that waits on a failed task, directly or through tasks
+that haven't started, says **Can't start** and names the failed task until it
+runs again, here and in a run's graph; when only those tasks are left, the chat
+preview names the failure
+("Failed: Run the tests"). While the agent works, a running task's menu has
 **Stop**, which stops the agent as the composer's Stop does. It waits for you while a question or permission prompt in the chat
 waits for your answer. A task's history marks a restart after the task was done
 or failed. Tasks waiting for you are pink, and an idle list
@@ -190,9 +214,11 @@ with tasks the agent could still run says "Stopped" ("Run ended" after an
 automation run), so it never looks about to run. Then a play button at the top,
 beside "Updated …", asks the agent to continue the plan from where it left off,
 and while the agent works a stop button there stops it. A run's row on a
-workflow's or an automation's page has the same buttons. A summary line and a strip
+workflow's or an automation's page has the same buttons, and its strip and its
+graph the same task menus, which message the run's session. A summary line and a strip
 count the tasks in each state, and stay at the top as you scroll: hover a
-segment of the strip for that task's status, or click it to jump to the task. In
+segment of the strip for a card with that task's status and its **⋯** menu, or
+click it to jump to the task. In
 a plan, the strip links two neighboring tasks when one waits on the other, so a
 gap between them means they can run at the same time; hovering a task's segment
 arcs it to the tasks it waits on and the tasks that wait on it. When the agent replans, the new
@@ -281,6 +307,101 @@ it ran.
 Workflows live in `workflows`, keyed by workspace and ID, with the steps as
 compressed JSON of at most 16,383 bytes stored. `GET /v1/info` reports
 `workflows: true` on servers that store them.
+
+## Usage telemetry
+
+Workflow events use the same server-side structured debug-log sink as automation
+events (`omnigent.server.scheduled.telemetry`). Configure that sink as for the
+rest of the server; there is no separate analytics client or database migration.
+UI, API and agent tools all reach these server write boundaries. Delivery is
+best effort and logging failures never fail an accepted write.
+
+| Event | Emitted after | Counting key |
+| --- | --- | --- |
+| `workflow_created` | A workflow is persisted, including an empty draft. | Workspace + `workflow_id` |
+| `workflow_saved` | A nonempty plan is saved by POST or PATCH. Edits and retries can emit another save. | Workspace + `workflow_id`; use the first observed save for adoption. |
+| `workflow_plan_written` | A new plan version is appended to a session journal. | Workspace + `session_id` + `journal_entry_id` |
+| `workflow_step_status_written` | A status for a step in the current plan is appended. | Workspace + `session_id` + `journal_entry_id` |
+
+The log envelope carries `user_id`, `session_id`, `workspace_id`, `client_time`
+and the request ID. Creation and save events carry `step_count`, `has_plan`,
+`workflow_created_at` and `creation_source` (`agent` for an agent's write,
+otherwise `api`, including the web UI). Metadata edits and planning-session
+attachments do not emit saves. Rejected writes emit no successful-write event;
+their HTTP audit events retain the failure status and error classification.
+
+Journal events carry these dimensions:
+
+| Attribute | Meaning |
+| --- | --- |
+| `execution_source` | `automation`, `interactive`, or `unknown`. Both spawning parents and independent workers' creators are followed. Missing ancestry, cycles or failed metadata reads are unknown unless an automation ancestor was found. |
+| `workflow_kind` | `saved` when the plan names a workflow; otherwise `ad_hoc`. This is the association at the time of the event. |
+| `workflow_id` | The saved workflow ID, absent for ad hoc plans. |
+| `plan_id`, `plan_version`, `plan_created_at` | The persisted plan version the entry belongs to. A plan ID is the same ID returned on the saved workflow's runs page. |
+| `journal_entry_id`, `journal_position`, `entry_created_at` | Persisted identity and order; timestamps are epoch seconds. Retried appends emit no second event. |
+| `step_count` | Number of steps in that plan version. |
+| `root_session_id`, `parent_session_id`, `created_by_session_id` | Links to session metadata and usage events, including subagents and independent workers. |
+| `automation_session_id`, `task_id` | The observed automation ancestor and task, when available. |
+| `scheduled_task_run_id` | The occurrence recorded on this journal entry. Join it to automation events' `run_id`. It is deliberately absent when only an ancestor's current occurrence is known. |
+
+Plan events additionally carry `previous_plan_id`, `plan_change` and `step_keys`
+(a JSON array of opaque keys). `plan_change` is `made`, `replaced`, `updated`,
+`renamed`, `association_changed`, or `unchanged`. Status events carry `step_key`,
+the zero-based `step_index`, `status` (`started`, `done`, `failed`, `needs_input`),
+and `plan_elapsed_seconds`. Step keys are hashes scoped to the session, stable
+across plan revisions. Names, step IDs, goals, descriptions, prompts, notes and
+status text are not included.
+
+### Dashboard definitions
+
+Build daily, rolling-seven-day and whole-window results from deduplicated
+events. Recompute distinct users and sessions over the entire period, rather
+than adding daily distinct counts. Use UTC windows and mark the current day
+partial when it is included.
+
+| Metric | Evidence |
+| --- | --- |
+| Workflows created / creators | Distinct workflow IDs / users from `workflow_created`; split drafts with `has_plan`. |
+| Saved workflows / savers | First `workflow_saved` per workflow. Keep the first-save history outside the reporting window so edits do not count as new adoption. |
+| Workflow users / sessions | Distinct users / sessions with step-status events, grouped by `execution_source` and `workflow_kind`. |
+| Plans with execution activity | Distinct `plan_id` values with step-status events. Keep plan publication and plan-only editor proposals separate. |
+| Step outcomes / failures / waiting | Latest status per session and step key at the cutoff, ordered by journal position. `failed` and `needs_input` are distinct outcomes. |
+| Time to first step | First `started` event for a plan minus its `plan_created_at`; report sample count with percentiles. |
+| Plan progress | Join a plan's `step_keys` to those steps' latest statuses at the cutoff. As in the Tasks tab, surviving step keys retain progress across replans. All current steps must be `done` to infer completion. Missing statuses are pending/unknown. |
+| Automation delivery, startup errors and latency | Existing `scheduled_run_*` events, joined by occurrence ID. Startup success is prompt delivery, not workflow completion. |
+
+A plan version is not necessarily a new logical invocation: agents can replan,
+and saving an ad hoc plan writes another version with the saved workflow's ID.
+Use `previous_plan_id` and `plan_change` to inspect those revisions; do not call
+every plan write a new execution. Session adoption counts avoid that ambiguity.
+Saving afterward does not reclassify earlier ad hoc status events. A session can
+participate in multiple cohorts, so their distinct-session totals are not additive.
+
+Automation provenance describes the session's origin, including later human
+follow-ups to an automated session. Workflow classification starts with journal
+evidence: a trigger that fails before a plan is written has unknown workflow
+kind. Retain those failures and an attribution-coverage count in scheduler
+reports; dropping them would bias the success rate. Deleted ancestors and events
+outside log retention also remain unknown. There is no historical backfill.
+
+### Tokens and cost
+
+Join workflow session IDs to existing `session_created` / `session_metadata`
+lineage and usage events. Follow both parent and creator links to include work
+delegated by the workflow. Preserve unknown ancestry and missing usage as
+coverage gaps.
+
+- `response.completed` usage has `usage_kind=delta`, `usage_scope=response`;
+  deduplicate by response identity before summing within a time window.
+- `session.usage` has `usage_kind=cumulative`, `usage_scope=session_subtree`.
+  Use the latest snapshot at the cutoff, and only one root per spawn tree.
+  Do not add repeated snapshots or both a parent and its children's totals.
+  Independent workers have separate spawn trees and must be included separately.
+- A session can do work before, between and after workflows. Whole-session
+  totals measure workflow-associated session spend, not exact per-workflow
+  spend. For a bounded interval, use response deltas or complete before/after
+  snapshots and report missing baselines. Never substitute zero for missing
+  token or cost evidence, or sum overlapping cohorts as though disjoint.
 
 ## Storage
 

@@ -9,6 +9,8 @@ import {
   type TaskActivity,
 } from "@/lib/taskActivity";
 import { cn } from "@/lib/utils";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { useChatStore } from "@/store/chatStore";
 import { openTasksTab } from "@/store/sessionTasksActions";
 import { SubagentActivityMessage } from "./SubagentActivityMessage";
@@ -41,8 +43,10 @@ export function ActivityNotice({ data }: { data: Record<string, unknown> }) {
  */
 export function TaskActivityMessage({ activity }: { activity: TaskActivity }) {
   const markers = useContext(TaskMarkersContext);
+  const workflowsEnabled = isFeatureEnabled(useServerInfo(), "workflows");
   const id = taskMarkerId(activity);
   const flashing = useChatStore((state) => state.flashItemId === id);
+  if (!workflowsEnabled && (activity.kind === "plan" || !activity.native)) return null;
   let content;
   if (activity.kind === "plan") {
     const text = planChangeText(activity);

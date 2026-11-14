@@ -94,7 +94,10 @@ function setSession(state: Partial<ConversationState>) {
 
 beforeEach(() => {
   vi.mocked(useChildSessions).mockReturnValue({ children: [] } as never);
-  vi.mocked(useServerInfo).mockReturnValue({ session_journal: true } as never);
+  vi.mocked(useServerInfo).mockReturnValue({
+    session_journal: true,
+    features: { workflows: true },
+  } as never);
   vi.mocked(useSavedWorkflows).mockReturnValue({
     workflows: [],
     isLoading: false,
@@ -271,22 +274,10 @@ describe("TasksPanel", () => {
     renderPanel();
     const chip = screen.getByTestId("tasks-plan-workflow");
     expect(chip).toHaveTextContent("Workflow");
-    expect(chip.tagName).toBe("SPAN");
+    expect(chip).toHaveAttribute("href", `/workflows/${workflowId}`);
     fireEvent.focus(chip);
     expect(await screen.findByRole("tooltip")).toHaveTextContent(
       "Saved workflow “Triage flaky tests”",
-    );
-    cleanup();
-
-    // With the Workflows page on, the chip opens the workflow's own page.
-    vi.mocked(useServerInfo).mockReturnValue({
-      session_journal: true,
-      features: { workflows_page: true },
-    } as never);
-    renderPanel();
-    expect(screen.getByTestId("tasks-plan-workflow")).toHaveAttribute(
-      "href",
-      `/workflows/${workflowId}`,
     );
     cleanup();
 
@@ -316,13 +307,72 @@ describe("TasksPanel", () => {
     renderPanel();
     const segments = screen.getAllByTestId("tasks-progress-segment");
     fireEvent.focus(segments[1]);
-    const ready = await screen.findByRole("tooltip");
+    const ready = await screen.findByTestId("tasks-progress-card");
     expect(ready).toHaveTextContent("Task 2 of 3");
     expect(ready).toHaveTextContent("cache");
     expect(ready).toHaveTextContent("Ready to start");
     fireEvent.blur(segments[1]);
     fireEvent.focus(segments[2]);
-    await waitFor(() => expect(screen.getByRole("tooltip")).toHaveTextContent("Waiting on cache"));
+    await waitFor(() =>
+      expect(screen.getByTestId("tasks-progress-card")).toHaveTextContent("Waiting on cache"),
+    );
+  });
+
+  it("says a task can't start when a task it waits on failed, on its row and its card", async () => {
+    showJournal([
+      journalPlan(0, ["fix"], ["suite", ["fix"]], ["pr", ["suite"]]),
+      status(1, "fix", "failed", "Couldn't reproduce the race"),
+    ]);
+    renderPanel();
+    const steps = screen.getAllByTestId("tasks-row");
+    expect(steps.map((step) => step.dataset.state)).toEqual(["failed", "waiting", "waiting"]);
+    // pr waits on fix through suite, and names fix too.
+    expect(steps[1]).toHaveTextContent("Can't start · fix failed");
+    expect(steps[2]).toHaveTextContent("Can't start · fix failed");
+    const segments = screen.getAllByTestId("tasks-progress-segment");
+    expect(segments[2].getAttribute("aria-label")).toBe("Task 3, pr: Can't start");
+    fireEvent.focus(segments[2]);
+    expect(await screen.findByTestId("tasks-progress-card")).toHaveTextContent(
+      "Can't start · fix failed",
+    );
+  });
+
+  it("offers a task's ⋯ menu on its segment's card, and keeps the card up while it's open", async () => {
+    showJournal([
+      journalPlan(0, ["build"], ["deploy", ["build"]]),
+      status(1, "build", "done"),
+      status(2, "deploy", "failed", "The tests failed"),
+    ]);
+    const taskAction = vi.fn();
+    const withdraw = registerTaskAction("conv", taskAction);
+    try {
+      renderPanel();
+      const [built, failed] = screen.getAllByTestId("tasks-progress-segment");
+      // A done task has nothing to offer.
+      fireEvent.focus(built!);
+      expect(await screen.findByTestId("tasks-progress-card")).toHaveTextContent("build");
+      expect(screen.queryByTestId("tasks-progress-menu")).toBeNull();
+      fireEvent.blur(built!);
+      fireEvent.focus(failed!);
+      await waitFor(() =>
+        expect(screen.getByTestId("tasks-progress-card")).toHaveTextContent("The tests failed"),
+      );
+      fireEvent.pointerDown(screen.getByTestId("tasks-progress-menu"), { button: 0 });
+      fireEvent.pointerUp(document);
+      // Leaving the segment would close the card, but not while its menu is open.
+      fireEvent.blur(failed!);
+      await new Promise((resolve) => {
+        setTimeout(resolve, 200);
+      });
+      expect(screen.getByTestId("tasks-progress-card")).toBeInTheDocument();
+      expect(screen.getByTestId("tasks-progress-retry")).toHaveTextContent("Retry");
+      fireEvent.click(screen.getByTestId("tasks-progress-retry"));
+      expect(taskAction).toHaveBeenLastCalledWith("retry", "deploy");
+      // Picking the action puts the card away.
+      await waitFor(() => expect(screen.queryByTestId("tasks-progress-card")).toBeNull());
+    } finally {
+      act(withdraw);
+    }
   });
 
   it("jumps to a task when its progress segment is clicked", () => {
@@ -402,11 +452,12 @@ describe("TasksPanel", () => {
     }
   });
 
-  it("offers Run on a ready task, and Continue on a stopped one or one waiting for you", () => {
+  it("offers Run on a ready task, Continue on a stopped one or one waiting for you, and Retry on a failed one", () => {
     showJournal([
-      journalPlan(0, ["baseline"], ["ship"], ["docs", ["ship"]], ["approve"]),
+      journalPlan(0, ["baseline"], ["ship"], ["docs", ["ship"]], ["approve"], ["deploy"]),
       status(1, "baseline", "started"),
       status(2, "approve", "needs_input", "Deploy to prod now?"),
+      status(3, "deploy", "failed", "The tests failed"),
     ]);
     renderPanel();
     expect(screen.queryByTestId("tasks-row-menu")).toBeNull();
@@ -416,7 +467,7 @@ describe("TasksPanel", () => {
     const withdraw = registerTaskAction("conv", taskAction);
     try {
       renderPanel();
-      const [stopped, ready, waiting, needsYou] = screen.getAllByTestId("tasks-row");
+      const [stopped, ready, waiting, needsYou, failed] = screen.getAllByTestId("tasks-row");
       fireEvent.pointerDown(within(stopped!).getByTestId("tasks-row-menu"), { button: 0 });
       fireEvent.click(screen.getByTestId("tasks-row-continue"));
       expect(taskAction).toHaveBeenLastCalledWith("continue", "baseline");
@@ -430,6 +481,10 @@ describe("TasksPanel", () => {
       expect(screen.getByTestId("tasks-row-proceed")).toHaveTextContent("Continue");
       fireEvent.click(screen.getByTestId("tasks-row-proceed"));
       expect(taskAction).toHaveBeenLastCalledWith("proceed", "approve");
+      fireEvent.pointerDown(within(failed!).getByTestId("tasks-row-menu"), { button: 0 });
+      expect(screen.getByTestId("tasks-row-retry")).toHaveTextContent("Retry");
+      fireEvent.click(screen.getByTestId("tasks-row-retry"));
+      expect(taskAction).toHaveBeenLastCalledWith("retry", "deploy");
 
       // Once the agent works on the started task again, it has nothing to continue.
       setSession({ sessionStatus: "running" });
@@ -679,7 +734,9 @@ describe("TasksPanel", () => {
     expect(within(deploy).getByText(ended(failed))).toBeTruthy();
     expect(within(docs).getByText(ended(doneWithoutStart))).toBeTruthy();
     fireEvent.focus(screen.getAllByTestId("tasks-progress-segment")[0]);
-    expect(await screen.findByRole("tooltip")).toHaveTextContent(`Done · ${ended(done)}`);
+    expect(await screen.findByTestId("tasks-progress-card")).toHaveTextContent(
+      `Done · ${ended(done)}`,
+    );
   });
 
   it("leaves out the agent's notes, under a task, in its history and on their own", () => {

@@ -5,7 +5,7 @@ Routes, under ``/v1``, each scoped to the caller:
 * ``GET /workflows`` lists the caller's workflows by name, one page at a time.
 * ``POST /workflows`` saves one.
 * ``GET /workflows/{workflow_id}`` returns one, with its steps.
-* ``PATCH /workflows/{workflow_id}`` changes its name, description or steps.
+* ``PATCH /workflows/{workflow_id}`` changes its metadata, steps or planning session.
 * ``DELETE /workflows/{workflow_id}`` deletes it.
 * ``GET /workflows/{workflow_id}/runs`` lists the sessions that ran it, newest
   first, with where each run's steps stand.
@@ -23,13 +23,15 @@ from collections import Counter
 from collections.abc import Sequence
 from typing import Any
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Depends, Query, Request
 
 from omnigent.entities import Conversation
 from omnigent.entities.session_journal import JournalEntry
 from omnigent.entities.workflow import InvalidWorkflowError, Workflow
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import LEVEL_READ, AuthProvider
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._sessions.helpers import _session_status_from_cache
@@ -45,7 +47,11 @@ from omnigent.server.schemas import (
     WorkflowStep,
     WorkflowSummary,
 )
-from omnigent.server.session_orchestration import require_named_source_private
+from omnigent.server.session_orchestration import (
+    require_named_source_private,
+    require_owned_session,
+)
+from omnigent.server.workflow_telemetry import log_workflow_saved
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.session_journal_store import SessionJournalStore
@@ -54,6 +60,7 @@ from omnigent.stores.workflow_store import (
     WorkflowNameTakenError,
     WorkflowStore,
 )
+from omnigent.util.uuid import normalize_uuid
 
 _logger = logging.getLogger(__name__)
 
@@ -95,13 +102,15 @@ def _summary(workflow: Workflow) -> WorkflowSummary:
         description=workflow.description,
         created_at=workflow.created_at,
         updated_at=workflow.updated_at,
+        is_draft=not workflow.steps,
     )
 
 
 def _object(workflow: Workflow) -> WorkflowObject:
     return WorkflowObject(
         **_summary(workflow).model_dump(),
-        steps=[WorkflowStep(**step) for step in workflow.steps or []],
+        steps=[WorkflowStep(**step) for step in workflow.steps],
+        planning_session_id=workflow.planning_session_id,
     )
 
 
@@ -129,6 +138,13 @@ def _progress(plan: JournalEntry, statuses: dict[str, JournalEntry]) -> Workflow
     )
 
 
+def require_workflows(request: Request) -> None:
+    """Reject workflow and journal requests unless the server enables workflows."""
+    flags = getattr(request.app.state, "feature_flags", FeatureFlags())
+    if not flags.enabled(Feature.WORKFLOWS):
+        raise OmnigentError("Workflows are disabled on this server", code=ErrorCode.NOT_FOUND)
+
+
 def create_workflows_router(
     conversation_store: ConversationStore,
     *,
@@ -144,7 +160,7 @@ def create_workflows_router(
     :param permission_store: Checks whether that calling session is shared
         with edit access; ``None`` disables the check.
     """
-    router = APIRouter()
+    router = APIRouter(dependencies=[Depends(require_workflows)])
 
     def _store() -> WorkflowStore:
         store = open_store(conversation_store)
@@ -218,6 +234,12 @@ def create_workflows_router(
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
         except WorkflowNameTakenError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.ALREADY_EXISTS) from exc
+        log_workflow_saved(
+            workflow,
+            created=True,
+            plan_saved=True,
+            source_session_id=request.headers.get(ORCHESTRATION_SOURCE_HEADER),
+        )
         return _object(workflow)
 
     @router.get("/workflows/{workflow_id}", response_model=WorkflowObject)
@@ -245,6 +267,29 @@ def create_workflows_router(
         """
         user_id = await _writer(request)
         store = _store()
+        planning_session_id = body.planning_session_id
+        if planning_session_id is not None:
+            if await asyncio.to_thread(store.get, workflow_id, user_id=user_id) is None:
+                raise _not_found()
+            planning_session_id = normalize_uuid(planning_session_id)
+            if planning_session_id is None:
+                raise OmnigentError("Invalid planning session ID", code=ErrorCode.INVALID_INPUT)
+            if user_id not in (None, RESERVED_USER_LOCAL) and permission_store is not None:
+                assert user_id is not None
+                await asyncio.to_thread(
+                    require_owned_session,
+                    planning_session_id,
+                    user_id,
+                    conversation_store,
+                    permission_store,
+                    private=True,
+                )
+            else:
+                session = await asyncio.to_thread(
+                    conversation_store.get_conversation, planning_session_id
+                )
+                if session is None or session.archived:
+                    raise OmnigentError("Planning session not found", code=ErrorCode.NOT_FOUND)
         try:
             workflow = await asyncio.to_thread(
                 store.update,
@@ -253,6 +298,7 @@ def create_workflows_router(
                 name=body.name,
                 description=body.description,
                 steps=_steps(body.steps),
+                planning_session_id=planning_session_id,
             )
         except InvalidWorkflowError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
@@ -260,6 +306,12 @@ def create_workflows_router(
             raise OmnigentError(str(exc), code=ErrorCode.ALREADY_EXISTS) from exc
         if workflow is None:
             raise _not_found()
+        log_workflow_saved(
+            workflow,
+            created=False,
+            plan_saved=body.steps is not None,
+            source_session_id=request.headers.get(ORCHESTRATION_SOURCE_HEADER),
+        )
         return _object(workflow)
 
     @router.delete("/workflows/{workflow_id}", response_model=WorkflowDeleted)

@@ -802,7 +802,7 @@ function SidebarImpl({
   const branding = useBranding();
   const serverInfo = useServerInfo();
   const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
-  const workflowsPageEnabled = isFeatureEnabled(serverInfo, "workflows_page");
+  const workflowsPageEnabled = isFeatureEnabled(serverInfo, "workflows");
   const canvasEnabled = isFeatureEnabled(serverInfo, "canvas");
   const [searchParams] = useSearchParams();
   const canvasDestination = canvasLocation(searchParams.get(CANVAS_QUERY_PARAM) ?? MAIN_CANVAS_ID);

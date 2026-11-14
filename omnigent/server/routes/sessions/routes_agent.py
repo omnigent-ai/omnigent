@@ -39,6 +39,7 @@ from omnigent.server.auth import (
     AuthProvider,
 )
 from omnigent.server.bundles import bundle_location, redacted_agent_bundle, validate_agent_bundle
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
@@ -587,6 +588,17 @@ def register_agent_routes(
 
         if method == "tools/call":
             from omnigent.server.mcp_identity import mcp_policy_actor
+            from omnigent.tools.builtins.journal import JOURNAL_TOOLS
+
+            tool_name = params.get("name")
+            if (
+                isinstance(tool_name, str)
+                and tool_name in {tool.name() for tool in JOURNAL_TOOLS}
+                and not getattr(request.app.state, "feature_flags", FeatureFlags()).enabled(
+                    Feature.WORKFLOWS
+                )
+            ):
+                return _mcp_error_response(rpc_id, -32601, "Workflows are disabled on this server")
 
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             actor = mcp_policy_actor(request, conv, user_id) if conv else _build_actor(user_id)

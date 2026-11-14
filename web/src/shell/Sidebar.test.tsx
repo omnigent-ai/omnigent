@@ -1273,7 +1273,7 @@ describe("Sidebar session list", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar(true, "/workflows", undefined, {
       ...FALLBACK_SERVER_INFO,
-      features: { workflows_page: true },
+      features: { workflows: true },
     });
 
     const workflows = screen.getByTestId("workflows-nav");
@@ -1472,7 +1472,7 @@ describe("Sidebar session list", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar(true, "/workflows/1e7bf4052f44451895933c8413947d27", undefined, {
       ...FALLBACK_SERVER_INFO,
-      features: { workflows_page: true },
+      features: { workflows: true },
     });
 
     expect(screen.getByTestId("workflows-nav")).toHaveClass("bg-[var(--sidebar-active)]");

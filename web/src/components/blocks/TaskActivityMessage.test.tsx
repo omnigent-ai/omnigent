@@ -1,6 +1,8 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it } from "vitest";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { useSessionTasksActions } from "@/store/sessionTasksActions";
 import { ActivityNotice, TaskMarkersProvider } from "./TaskActivityMessage";
 
@@ -36,17 +38,25 @@ const PLAN_LINE = {
   },
 };
 
-function renderMarker(data: Record<string, unknown>, taskIds: string[] | null = ["deploy"]) {
+function renderMarker(
+  data: Record<string, unknown>,
+  taskIds: string[] | null = ["deploy"],
+  workflowsEnabled = true,
+) {
   const notice = <ActivityNotice data={data} />;
   return render(
     <MemoryRouter>
-      {taskIds ? (
-        <TaskMarkersProvider value={{ conversationId: "conv", taskIds: new Set(taskIds) }}>
-          {notice}
-        </TaskMarkersProvider>
-      ) : (
-        notice
-      )}
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: workflowsEnabled } }}
+      >
+        {taskIds ? (
+          <TaskMarkersProvider value={{ conversationId: "conv", taskIds: new Set(taskIds) }}>
+            {notice}
+          </TaskMarkersProvider>
+        ) : (
+          notice
+        )}
+      </CapabilitiesProvider>
     </MemoryRouter>,
   );
 }
@@ -57,6 +67,19 @@ afterEach(() => {
 });
 
 describe("TaskActivityMessage", () => {
+  it.each([taskMarker("done"), PLAN_LINE])(
+    "hides persisted workflow markers when disabled",
+    (data) => {
+      renderMarker(data, ["deploy"], false);
+      expect(screen.queryByTestId("task-activity")).toBeNull();
+    },
+  );
+
+  it("keeps native task markers when workflows are disabled", () => {
+    renderMarker(taskMarker("done", { native: true, entry_id: null }), ["deploy"], false);
+    expect(screen.getByTestId("task-activity")).toHaveTextContent("Completed Deploy the swap");
+  });
+
   it("names what happened to the task and opens the Tasks tab at it", () => {
     renderMarker(taskMarker("done"));
     const marker = screen.getByTestId("task-activity");

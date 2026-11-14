@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { NewWorkflowDialog, type NewWorkflowDialogProps } from "./NewWorkflowDialog";
@@ -16,7 +16,7 @@ const next = () => screen.getByTestId("new-workflow-next");
 describe("NewWorkflowDialog", () => {
   afterEach(cleanup);
 
-  it("asks for a name and what the workflow should do", () => {
+  it("asks for a name and what the workflow should do", async () => {
     const { onCreate, onOpenChange } = renderDialog();
 
     expect(screen.getByRole("dialog", { name: "New workflow" })).toBeInTheDocument();
@@ -30,7 +30,7 @@ describe("NewWorkflowDialog", () => {
       name: "Fix flaky tests",
       description: "Rerun the suite and file issues",
     });
-    expect(onOpenChange).toHaveBeenCalledWith(false);
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
   });
 
   it("moves on from Cmd+Enter in the description", () => {
@@ -73,5 +73,22 @@ describe("NewWorkflowDialog", () => {
 
     expect(name()).toHaveValue("");
     expect(description()).toHaveValue("");
+  });
+
+  it("keeps the user's text when saving the draft fails", async () => {
+    const onCreate = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Name already exists"))
+      .mockResolvedValueOnce(undefined);
+    const { onOpenChange } = renderDialog({ onCreate });
+    fireEvent.change(name(), { target: { value: "Release" } });
+    fireEvent.change(description(), { target: { value: "Prepare a release" } });
+    fireEvent.click(next());
+    expect(await screen.findByRole("alert")).toHaveTextContent("Name already exists");
+    expect(onOpenChange).not.toHaveBeenCalled();
+    expect(name()).toHaveValue("Release");
+    expect(description()).toHaveValue("Prepare a release");
+    fireEvent.click(next());
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
   });
 });

@@ -326,7 +326,7 @@ import {
 } from "@/lib/composerModelLabel";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { RewindPicker } from "@/components/RewindPicker";
-import type { ServerInfo } from "@/lib/capabilities";
+import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
 import { MainTerminalView } from "@/shell/MainTerminalView";
 import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
@@ -367,6 +367,7 @@ import { WorkflowDialog, type WorkflowRequest } from "@/components/composer/Work
 import { type SavedWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import {
   continuePlanMessage,
+  filterWorkflowSkills,
   offersSaveWorkflow,
   offersWorkflow,
   savedWorkflowMessage,
@@ -3118,7 +3119,7 @@ function ComposerImpl(
   const terminalPending = useChatStore((s) => s.terminalPending);
   const hostOnline = useSessionHostOnline(composerSessionId ?? undefined);
   const {
-    skills,
+    skills: discoveredSkills,
     skillsWarnings,
     skillsStatus,
     refetch: refreshSkills,
@@ -3157,6 +3158,11 @@ function ComposerImpl(
   // trigger native compaction. Other SDK harnesses don't support it yet.
   const showCompact = isNativeWrapper || sessionHarness === "claude-sdk";
   const composerServerInfo = useServerInfo();
+  const workflowsEnabled = isFeatureEnabled(composerServerInfo, "workflows");
+  const skills = useMemo(
+    () => filterWorkflowSkills(discoveredSkills, workflowsEnabled),
+    [discoveredSkills, workflowsEnabled],
+  );
   const showClear = composerOffersClear(sessionHarness, composerServerInfo);
   const showRewind = composerOffersRewind(sessionHarness, composerServerInfo);
   const [rewindPickerOpen, setRewindPickerOpen] = useState(false);
@@ -3202,7 +3208,7 @@ function ComposerImpl(
     if (!canSaveWorkflow || composerSessionId === null) return;
     return registerSaveWorkflow(composerSessionId, setSaveWorkflowName);
   }, [canSaveWorkflow, composerSessionId]);
-  // A task's ⋯ menu in the Tasks tab asks the agent to run a ready task or continue a stopped one.
+  // A task's ⋯ menu in the Tasks tab asks the agent to run, continue or retry a task.
   const taskActionRef = useRef<(action: TaskAction, taskName: string) => void>(() => undefined);
   useEffect(() => {
     if (isReadOnly || composerSessionId === null) return;
@@ -4342,7 +4348,7 @@ function ComposerImpl(
             (disabled ? "This session can't take messages right now." : null));
   const workflowBlockedReason = blockedReasonFor("run a workflow");
   taskActionRef.current = (action, taskName) => {
-    const reason = blockedReasonFor(`${action === "run" ? "run" : "continue"} the task`);
+    const reason = blockedReasonFor(`${action === "proceed" ? "continue" : action} the task`);
     if (reason) toast.error(reason);
     else sendWorkflowMessage(taskActionMessage(action, taskName));
   };

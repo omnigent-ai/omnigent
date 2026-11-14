@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import uuid
+from collections import Counter
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -13,10 +15,16 @@ from fastapi import FastAPI
 
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
-from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    CREATED_BY_SESSION_LABEL_KEY,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    SCHEDULED_TASK_RUN_LABEL_KEY,
+    SCHEDULED_TASK_SOURCE_LABEL_KEY,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+from tests.debug_log_helpers import capture_debug_rows
 from tests.server.conftest import ControllableMockClient
 from tests.server.integration.test_scheduled_tasks_routes import (
     _build_app,
@@ -34,7 +42,7 @@ CAROL = "carol@example.com"
 
 @pytest.fixture()
 def app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
-    app = _build_app(db_uri, tmp_path)
+    app = _build_app(db_uri, tmp_path, workflows=True)
     for user in (ALICE, BOB, CAROL):
         _make_user(db_uri, user)
     return app
@@ -54,10 +62,13 @@ def _session(
     labels: dict[str, str] | None = None,
     title: str | None = None,
     owner: str = ALICE,
+    parent_conversation_id: str | None = None,
 ) -> str:
     """A session *owner* owns, alice by default."""
     conversations = SqlAlchemyConversationStore(db_uri)
-    session = conversations.create_conversation(title=title)
+    session = conversations.create_conversation(
+        title=title, parent_conversation_id=parent_conversation_id
+    )
     SqlAlchemyPermissionStore(db_uri).grant(owner, session.id, 4)
     if labels:
         conversations.set_labels(session.id, labels)
@@ -71,6 +82,178 @@ def _runner(session_id: str, user: str = ALICE) -> dict[str, str]:
 
 def _write(kind: str, payload: dict[str, object], key: str, **fields: object) -> dict[str, object]:
     return {"kind": kind, "payload": payload, "idempotency_key": key, **fields}
+
+
+async def test_telemetry_reconstructs_workflow_usage_cohorts_without_retry_or_planning_counts(
+    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [100]
+    monkeypatch.setattr("omnigent.stores.session_journal_store.now_epoch", lambda: clock[0])
+    steps = [{"id": "private-step", "name": "Private task", "goal": "Private instructions"}]
+    saved = await client.post(
+        "/v1/workflows",
+        json={"name": "Private workflow", "description": "Private description", "steps": steps},
+        headers=_headers(),
+    )
+    assert saved.status_code == 200, saved.text
+    workflow_id = saved.json()["id"]
+    task_id, run_id = uuid.uuid4().hex, uuid.uuid4().hex
+    automation = _session(
+        db_uri,
+        labels={SCHEDULED_TASK_ORIGIN_LABEL_KEY: task_id, SCHEDULED_TASK_RUN_LABEL_KEY: run_id},
+    )
+    worker = _session(db_uri, labels={CREATED_BY_SESSION_LABEL_KEY: automation})
+    child = _session(db_uri, parent_conversation_id=worker)
+    sessions = [
+        (_session(db_uri), "interactive", "saved"),
+        (_session(db_uri), "interactive", "ad_hoc"),
+        (automation, "automation", "saved"),
+        (worker, "automation", "ad_hoc"),
+        (child, "automation", "saved"),
+    ]
+    proposal = _session(db_uri)
+    plans = {}
+    with capture_debug_rows("server") as rows:
+        for session_id, _, kind in sessions:
+            url = f"/v1/sessions/{session_id}/journal"
+            body = _write("plan", {"name": "Private plan", "steps": steps}, "plan")
+            if kind == "saved":
+                body["workflow_id"] = workflow_id
+            clock[0] = 100
+            for _ in range(2):
+                response = await client.post(url, json=body, headers=_runner(session_id))
+                assert response.status_code == 200, response.text
+            plans[session_id] = response.json()["id"]
+            for status, elapsed in (("started", 5), ("done", 11)):
+                clock[0] = 100 + elapsed
+                body = _write("status", {"status": status, "text": "Private result"}, status)
+                for _ in range(2):
+                    response = await client.post(url, json=body, headers=_runner(session_id))
+                    assert response.status_code == 200, response.text
+
+        proposed = await client.post(
+            f"/v1/sessions/{proposal}/journal",
+            json=_write("plan", {"name": "Private proposal", "steps": steps}, "proposal"),
+            headers=_runner(proposal),
+        )
+        assert proposed.status_code == 200, proposed.text
+        # Saving an already-executed ad hoc plan only associates a new plan version.
+        adhoc = sessions[1][0]
+        associated = await client.post(
+            f"/v1/sessions/{adhoc}/journal",
+            json=_write(
+                "plan", {"name": "Private plan", "steps": steps}, "save", workflow_id=workflow_id
+            ),
+            headers=_runner(adhoc),
+        )
+        assert associated.status_code == 200, associated.text
+
+    events = [row for row in rows if row["event_name"].startswith("workflow_")]
+    plan_events = [row for row in events if row["event_name"] == "workflow_plan_written"]
+    status_events = [row for row in events if row["event_name"] == "workflow_step_status_written"]
+    assert len(plan_events) == 7 and len(status_events) == 10
+    assert len({row["attributes"]["journal_entry_id"] for row in events}) == len(events)
+    assert "Private" not in str(events) and "private-step" not in str(events)
+
+    # A dashboard gets only serialized rows, not access to the live stores.
+    observed = {
+        (
+            row["session_id"],
+            row["attributes"]["execution_source"],
+            row["attributes"]["workflow_kind"],
+        )
+        for row in status_events
+    }
+    assert observed == set(sessions)
+    assert Counter((source, kind) for _, source, kind in observed) == {
+        ("interactive", "saved"): 1,
+        ("interactive", "ad_hoc"): 1,
+        ("automation", "saved"): 2,
+        ("automation", "ad_hoc"): 1,
+    }
+    assert {row["user_id"] for row in status_events} == {ALICE}
+    plan_keys = {
+        row["attributes"]["plan_id"]: json.loads(row["attributes"]["step_keys"])
+        for row in plan_events
+    }
+    for row in status_events:
+        attrs = row["attributes"]
+        assert attrs["plan_id"] == plans[row["session_id"]]
+        assert attrs["step_key"] in plan_keys[attrs["plan_id"]]
+        assert attrs["plan_elapsed_seconds"] == ("5" if attrs["status"] == "started" else "11")
+        if attrs["execution_source"] == "automation":
+            assert attrs["automation_session_id"] == automation and attrs["task_id"] == task_id
+        if row["session_id"] == automation:
+            assert attrs["scheduled_task_run_id"] == run_id
+        else:
+            # A worker must not be attributed to an ancestor's newer continued run.
+            assert "scheduled_task_run_id" not in attrs
+    association = plan_events[-1]["attributes"]
+    assert association["plan_change"] == "association_changed"
+    assert association["previous_plan_id"] == plans[adhoc]
+
+
+async def test_telemetry_records_failed_and_waiting_steps_but_not_rejected_writes(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session_id = _session(db_uri)
+    url = f"/v1/sessions/{session_id}/journal"
+    with capture_debug_rows("server") as rows:
+        response = await client.post(
+            url,
+            json=_write(
+                "plan", {"name": "Plan", "steps": [{"id": "check", "name": "Check"}]}, "p"
+            ),
+            headers=_runner(session_id),
+        )
+        assert response.status_code == 200, response.text
+        for status in ("failed", "needs_input"):
+            response = await client.post(
+                url,
+                json=_write("status", {"status": status, "text": "Private blocker"}, status),
+                headers=_runner(session_id),
+            )
+            assert response.status_code == 200, response.text
+        refused = await client.post(
+            url,
+            json=_write("status", {"status": "done", "text": "Finished"}, "foreign"),
+            headers=_runner(session_id, BOB),
+        )
+        assert refused.status_code == 404
+        invalid = await client.post(
+            url, json=_write("status", {"status": "nope"}, "invalid"), headers=_runner(session_id)
+        )
+        assert invalid.status_code == 400
+    statuses = [row for row in rows if row["event_name"] == "workflow_step_status_written"]
+    assert [row["attributes"]["status"] for row in statuses] == ["failed", "needs_input"]
+
+
+async def test_a_logging_failure_does_not_fail_a_committed_workflow_write(
+    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server import workflow_telemetry
+
+    def unavailable(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("Logging sink unavailable")
+
+    # Exercise a failed logging dependency while keeping the route and persistence real.
+    monkeypatch.setattr(workflow_telemetry._logger, "info", unavailable)
+    created = await client.post(
+        "/v1/workflows",
+        json={"name": "Workflow", "description": "Check the result"},
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    session_id = _session(db_uri)
+    url = f"/v1/sessions/{session_id}/journal"
+    response = await client.post(
+        url,
+        json=_write("plan", {"name": "Plan", "steps": [{"id": "check", "name": "Check"}]}, "p"),
+        headers=_runner(session_id),
+    )
+    assert response.status_code == 200, response.text
+    page = await client.get(url, headers=_headers())
+    assert [entry["id"] for entry in page.json()["data"]] == [response.json()["id"]]
 
 
 async def test_plans_and_statuses_mark_the_chat_once_each(
@@ -442,8 +625,9 @@ _ONE_TASK_PLAN = {
 }
 
 
+@pytest.mark.parametrize("origin", ["interactive", "automation_source", "interactive_worker"])
 async def test_a_workflow_question_marks_its_task_and_returns_the_answer(
-    client: httpx.AsyncClient, db_uri: str
+    client: httpx.AsyncClient, db_uri: str, origin: str
 ) -> None:
     """``sys_workflow_request_input`` through the real route, up to the user's answer."""
     import asyncio
@@ -453,7 +637,12 @@ async def test_a_workflow_question_marks_its_task_and_returns_the_answer(
     from omnigent.runner.journal_tools import execute_journal_tool
     from omnigent.runtime import pending_elicitations
 
-    session_id = _session(db_uri)
+    labels = {}
+    if origin == "automation_source":
+        labels[SCHEDULED_TASK_SOURCE_LABEL_KEY] = uuid.uuid4().hex
+    elif origin == "interactive_worker":
+        labels[CREATED_BY_SESSION_LABEL_KEY] = _session(db_uri)
+    session_id = _session(db_uri, labels=labels)
     client.headers.update(_headers())
     published: list[dict[str, object]] = []
 
@@ -504,6 +693,80 @@ async def test_a_workflow_question_marks_its_task_and_returns_the_answer(
         "answered": True,
         "answers": [{"question": "Approve the deploy to prod?", "answer": "Approve"}],
     }
+
+
+@pytest.mark.parametrize(
+    "automation_label", [SCHEDULED_TASK_ORIGIN_LABEL_KEY, SCHEDULED_TASK_RUN_LABEL_KEY]
+)
+@pytest.mark.parametrize(
+    "lineage",
+    [(), ("parent",), ("creator",), ("creator", "creator"), ("parent", "creator", "parent")],
+    ids=["automation", "subagent", "worker", "nested-worker", "mixed-descendant"],
+)
+async def test_automation_workflows_cannot_wait_for_user_input(
+    client: httpx.AsyncClient, db_uri: str, automation_label: str, lineage: tuple[str, ...]
+) -> None:
+    """Both tools fail before writing a waiting status or putting a question in the Inbox."""
+    import asyncio
+    import json
+
+    from omnigent.runner.journal_tools import execute_journal_tool
+    from omnigent.runtime import pending_elicitations
+
+    session_id = _session(db_uri, labels={automation_label: uuid.uuid4().hex})
+    for edge in lineage:
+        session_id = _session(
+            db_uri,
+            parent_conversation_id=session_id if edge == "parent" else None,
+            labels={CREATED_BY_SESSION_LABEL_KEY: session_id} if edge == "creator" else None,
+        )
+    client.headers.update(_headers())
+
+    async def run(tool: str, args: dict[str, object]) -> dict:
+        output = await asyncio.wait_for(
+            execute_journal_tool(
+                tool, json.dumps(args), server_client=client, conversation_id=session_id
+            ),
+            timeout=5,
+        )
+        return json.loads(output)
+
+    plan = {
+        **_ONE_TASK_PLAN,
+        "steps": [
+            *_ONE_TASK_PLAN["steps"],
+            {"id": "report", "name": "Report the outcome", "depends_on": []},
+        ],
+    }
+    assert (await run("sys_journal_write_plan", plan))["version"] == 1
+    for tool, args in (
+        (
+            "sys_journal_write_status",
+            {"step": "deploy", "status": "needs_input", "text": "Approve the deploy?"},
+        ),
+        ("sys_workflow_request_input", {"step": "deploy", "questions": [_DEPLOY_QUESTION]}),
+    ):
+        result = await run(tool, args)
+        assert result["error"].startswith("unattended_input_not_allowed:"), result
+        assert "failed" in result["error"] and "authorization" in result["error"]
+        assert pending_elicitations.snapshot_for(session_id) == []
+    journal = f"/v1/sessions/{session_id}/journal"
+    entries = (await client.get(journal)).json()["data"]
+    assert [entry["kind"] for entry in entries] == ["plan"]
+
+    # The agent can record the blocker and finish independent work after the rejection.
+    for step, status, text in (
+        ("deploy", "failed", "Sign-in requires a person"),
+        ("report", "done", "Reported the blocker"),
+    ):
+        assert "error" not in await run(
+            "sys_journal_write_status", {"step": step, "status": status, "text": text}
+        )
+    entries = (await client.get(journal, params={"kind": "status"})).json()["data"]
+    assert [(entry["step"], entry["payload"]["status"]) for entry in entries] == [
+        ("deploy", "failed"),
+        ("report", "done"),
+    ]
 
 
 async def test_a_retried_workflow_question_reuses_its_status_and_question(

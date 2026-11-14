@@ -1,14 +1,16 @@
-import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
 import { authenticatedFetch } from "@/lib/identity";
 import type { JournalEntry, JournalPlanStep } from "@/lib/sessionJournal";
 import type { WorkflowRun } from "@/lib/workflowRuns";
 import type { WorkflowStep } from "@/lib/workflowGraphLayout";
+import { apiErrorFromResponse } from "@/lib/sessionsApi";
 
 /** A saved workflow with its steps, as `GET /v1/workflows/{id}` returns it. */
 export interface WorkflowDetail extends SavedWorkflow {
   steps: WorkflowStep[];
+  planning_session_id?: string | null;
 }
 
 /** The workflow doesn't exist, or isn't the user's. */
@@ -38,12 +40,60 @@ export function useWorkflow(workflowId: string) {
       const res = await authenticatedFetch(workflowPath(workflowId), { signal });
       if (res.status === 404) throw new WorkflowNotFoundError();
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      const { id, name, description, steps } = (await res.json()) as WorkflowDetail;
-      return { id, name, description, steps: steps ?? [] };
+      const workflow = (await res.json()) as WorkflowDetail;
+      return { ...workflow, steps: workflow.steps ?? [] };
     },
     enabled: workflowId !== "",
     // A missing workflow stays missing.
     retry: (failures, error) => !(error instanceof WorkflowNotFoundError) && failures < 2,
+  });
+}
+
+async function writeWorkflow(path: string, method: string, body: object): Promise<WorkflowDetail> {
+  const res = await authenticatedFetch(path, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return res.json() as Promise<WorkflowDetail>;
+}
+
+function useWorkflowSaved() {
+  const queryClient = useQueryClient();
+  return (workflow: WorkflowDetail) => {
+    queryClient.setQueryData(["workflow", workflow.id], workflow);
+    void queryClient.invalidateQueries({ queryKey: ["saved-workflows"] });
+  };
+}
+
+/** Save a draft before launching its planning chat. */
+export function useCreateWorkflowDraft() {
+  const onSuccess = useWorkflowSaved();
+  return useMutation({
+    mutationFn: (draft: { name: string; description: string }) =>
+      writeWorkflow("/v1/workflows", "POST", { ...draft, steps: [] }),
+    onSuccess,
+  });
+}
+
+/** Apply the reviewed proposal to the existing workflow. */
+export function useSaveWorkflowPlan(workflowId: string) {
+  const onSuccess = useWorkflowSaved();
+  return useMutation({
+    mutationFn: (steps: WorkflowStep[]) =>
+      writeWorkflow(workflowPath(workflowId), "PATCH", { steps }),
+    onSuccess,
+  });
+}
+
+/** Persist the planning chat so reopening the workflow restores it on any device. */
+export function useSetWorkflowPlanningSession(workflowId: string) {
+  const onSuccess = useWorkflowSaved();
+  return useMutation({
+    mutationFn: (planningSessionId: string) =>
+      writeWorkflow(workflowPath(workflowId), "PATCH", { planning_session_id: planningSessionId }),
+    onSuccess,
   });
 }
 

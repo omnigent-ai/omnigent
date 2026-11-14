@@ -31,9 +31,9 @@ export function WorkflowPicker({
 }) {
   const [search, setSearch] = useState("");
   const trimmed = search.trim();
-  const filtered = trimmed
-    ? workflows.filter((workflow) => workflow.name.toLowerCase().includes(trimmed.toLowerCase()))
-    : workflows;
+  const filtered = workflows.filter(
+    (workflow) => !workflow.is_draft && workflow.name.toLowerCase().includes(trimmed.toLowerCase()),
+  );
 
   return (
     <div className="flex flex-col gap-0.5" data-testid="composer-workflow-picker">

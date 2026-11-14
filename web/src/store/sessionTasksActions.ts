@@ -11,7 +11,7 @@ interface SessionTasksActionsState {
   continuePlan: Readonly<Partial<Record<string, (planName: string | null) => void>>>;
   /** Per session: how its composer stops the agent, offered only while it works. */
   stopWork: Readonly<Partial<Record<string, () => void>>>;
-  /** Per session: how its composer asks the agent to run or continue a task, given its name. */
+  /** Per session: how its composer asks the agent to run, continue or retry a task, given its name. */
   taskAction: Readonly<Partial<Record<string, (action: TaskAction, taskName: string) => void>>>;
   /** A session whose Tasks tab should open; the shell clears it once open. */
   tasksTabToOpen: string | null;

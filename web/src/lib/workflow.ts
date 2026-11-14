@@ -36,6 +36,16 @@ export function workflowMessage(
 /** The framework skill that saves a session's plan as a reusable workflow. */
 export const SAVE_WORKFLOW_SKILL = "save-workflow";
 
+/** Hide workflow commands when the server has disabled their tools and APIs. */
+export function filterWorkflowSkills<T extends { name: string }>(
+  skills: readonly T[],
+  enabled: boolean,
+): readonly T[] {
+  return enabled
+    ? skills
+    : skills.filter(({ name }) => name !== WORKFLOW_SKILL && name !== SAVE_WORKFLOW_SKILL);
+}
+
 /** Whether a skill list offers the save-workflow skill, so the Tasks tab can offer Save as workflow. */
 export function offersSaveWorkflow(skills: readonly { name: string }[]): boolean {
   return skills.some((skill) => skill.name === SAVE_WORKFLOW_SKILL);
@@ -63,14 +73,20 @@ export function savedWorkflowMessage(
 }
 
 /**
- * What a task's ⋯ menu in the Tasks tab asks of the agent: run a ready task,
- * continue a stopped one, or go ahead with one waiting for you (`proceed`).
+ * What a task's ⋯ menu asks of the agent: run a ready task, continue a stopped
+ * one, go ahead with one waiting for you (`proceed`), or retry a failed one.
  */
-export type TaskAction = "run" | "continue" | "proceed";
+export type TaskAction = "run" | "continue" | "proceed" | "retry";
+
+const TASK_ACTION_VERBS: Record<Exclude<TaskAction, "proceed">, string> = {
+  run: "Run",
+  continue: "Continue",
+  retry: "Retry",
+};
 
 /**
- * The message that asks the agent to run, continue or go ahead with a task,
- * then go on with the rest of the plan rather than stop after that task.
+ * The message that asks the agent to run, continue, go ahead with or retry a
+ * task, then go on with the rest of the plan rather than stop after that task.
  *
  * @param taskName The task's name, e.g. `"Review #6109"`.
  * @returns e.g. `Run the task "Share the review files", then go on with the rest of the plan.`
@@ -79,8 +95,7 @@ export function taskActionMessage(action: TaskAction, taskName: string): string 
   if (action === "proceed") {
     return `It's fine to continue the task "${taskName}". Mark it started and go ahead with it (or mark it done if its work is already done), then go on with the rest of the plan.`;
   }
-  const verb = action === "run" ? "Run" : "Continue";
-  return `${verb} the task "${taskName}", then go on with the rest of the plan.`;
+  return `${TASK_ACTION_VERBS[action]} the task "${taskName}", then go on with the rest of the plan.`;
 }
 
 /**
@@ -117,14 +132,35 @@ export function createWorkflowPrompt(name: string, description: string): string 
   return `Use the ${SAVE_WORKFLOW_SKILL} skill to create a workflow named "${name.trim()}" from this description, without doing the work:\n\n${description.trim()}`;
 }
 
+/** The planning chat proposes a graph; Save plan in the editor applies it. */
+export function editWorkflowPlanPrompt(workflow: {
+  id: string;
+  name: string;
+  description: string;
+}): string {
+  return [
+    `Help me design the reusable workflow "${workflow.name}" (ID ${workflow.id}).`,
+    workflow.description,
+    "This is a planning conversation. Load the existing workflow with sys_workflow_load. Explore context if useful, but do not execute the workflow or make changes to the project.",
+    "Use sys_journal_write_plan to publish the proposed steps, and write a new plan whenever I ask for revisions. Keep step IDs stable. Do not set workflow_id on this journal plan: this conversation is for planning, not an execution run.",
+    "The workflow already exists. Do not call sys_workflow_save or create another workflow. I will use Save plan on the workflow page to apply the proposal. Draft a useful first proposal now, explain assumptions briefly, and iterate with me here.",
+  ].join("\n\n");
+}
+
 /**
  * The first message of a session that runs one of the user's saved workflows.
  * Like {@link createWorkflowPrompt}, it names the skill rather than invoking it.
  *
  * @param workflow The saved workflow, e.g. `{ id: "0123…", name: "Triage flaky tests" }`.
+ * @param details The user's additional instructions for this run, e.g.
+ *   `"Only the tickets in PROJ-12"`, added as their own paragraph; may be empty.
  */
-export function runSavedWorkflowPrompt(workflow: { id: string; name: string }): string {
-  return `Use the ${WORKFLOW_SKILL} skill to run the saved workflow "${workflow.name}" (ID ${workflow.id}).`;
+export function runSavedWorkflowPrompt(
+  workflow: { id: string; name: string },
+  details = "",
+): string {
+  const request = `Use the ${WORKFLOW_SKILL} skill to run the saved workflow "${workflow.name}" (ID ${workflow.id}).`;
+  return details.trim() ? `${request}\n\n${details.trim()}` : request;
 }
 
 // A savedWorkflowMessage without the plan review, as New automation stores it.

@@ -23,6 +23,8 @@ export interface StepNodeData extends Record<string, unknown> {
   number: number;
   /** Where the step stands in a run; absent for the workflow itself. */
   state?: StepState;
+  /** In a run, the failed steps it waits on, by name, when that's why it can't start. */
+  failedNames?: readonly string[];
 }
 
 export const STEP_NODE_WIDTH = 220;
@@ -77,6 +79,7 @@ export function stepRows(steps: readonly WorkflowStep[]): Map<string, number> {
 export function layoutWorkflowSteps(
   steps: readonly WorkflowStep[],
   states?: ReadonlyMap<string, StepState>,
+  failedNames?: ReadonlyMap<string, readonly string[]>,
 ): {
   nodes: Node<StepNodeData>[];
   edges: Edge[];
@@ -92,7 +95,8 @@ export function layoutWorkflowSteps(
   let nextTop = 0;
   for (const row of [...byRow.keys()].sort((first, second) => first - second)) {
     rowTops.set(row, nextTop);
-    const hasGoal = byRow.get(row)!.some((step) => step.goal);
+    // A step that can't start shows why where its goal goes, so it takes the same room.
+    const hasGoal = byRow.get(row)!.some((step) => step.goal || failedNames?.has(step.id));
     nextTop += (hasGoal ? STEP_NODE_HEIGHT : STEP_NAME_ONLY_HEIGHT) + ROW_GAP;
   }
   const widest = Math.max(0, ...[...byRow.values()].map((row) => row.length));
@@ -113,6 +117,7 @@ export function layoutWorkflowSteps(
           goal: step.goal,
           number: numbers.get(step.id) ?? 0,
           ...(states?.has(step.id) ? { state: states.get(step.id) } : {}),
+          ...(failedNames?.has(step.id) ? { failedNames: failedNames.get(step.id) } : {}),
         },
       });
     });

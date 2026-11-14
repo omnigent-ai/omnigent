@@ -239,7 +239,9 @@ class SysJournalWriteStatusTool(Tool):
             "started. Writing started on a done step reopens it. started and done need "
             "every step this one depends on to be done first; otherwise the write fails "
             "with step_not_ready, naming them. A user stopping you isn't a failure: leave "
-            "the step started."
+            "the step started. In an unattended automation or its workers, needs_input is "
+            "refused: decide within the user's authorization, or write failed with the "
+            "blocker and continue independent work."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -324,8 +326,9 @@ class SysWorkflowRequestInputTool(Tool):
             "options as buttons (they can also write their own answer), and returns the "
             "answers. Then write the task's next status: started to resume it, done for an "
             "approval given, failed for one refused. Ask everything you need in one call. "
-            "In a run no one is watching, such as an automation's, don't call it: write "
-            "needs_input with the options and your recommendation instead."
+            "In an unattended automation or its workers, this tool and needs_input are "
+            "refused. Decide within the user's authorization and record the choice, or "
+            "write failed with the blocker and continue independent work."
         )
 
     def get_schema(self) -> dict[str, Any]:

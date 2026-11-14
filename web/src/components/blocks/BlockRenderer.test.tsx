@@ -11,6 +11,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RenderItem } from "@/lib/renderItems";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
@@ -1570,17 +1572,21 @@ describe("BlockRenderer dispatch", () => {
       it("keeps a settled turn's task markers in view instead of folding its work", () => {
         render(
           <MemoryRouter>
-            <BlockRenderer
-              items={[
-                tool(1, "Agent"),
-                marker("e1", "started", "Say hello"),
-                tool(2, "Agent"),
-                marker("e2", "done", "Say hello"),
-                { kind: "text", itemId: "m1", text: "Said hello.", final: true },
-              ]}
-              sessionStatus="idle"
-              workedForS={9}
-            />
+            <CapabilitiesProvider
+              info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: true } }}
+            >
+              <BlockRenderer
+                items={[
+                  tool(1, "Agent"),
+                  marker("e1", "started", "Say hello"),
+                  tool(2, "Agent"),
+                  marker("e2", "done", "Say hello"),
+                  { kind: "text", itemId: "m1", text: "Said hello.", final: true },
+                ]}
+                sessionStatus="idle"
+                workedForS={9}
+              />
+            </CapabilitiesProvider>
           </MemoryRouter>,
         );
         expect(screen.queryByRole("button", { name: "Worked for 9s" })).toBeNull();

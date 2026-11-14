@@ -5377,6 +5377,9 @@ def create_runner_app(
             post_tools_changed,
             start_tool_relay,
         )
+        from omnigent.runner.journal_tools import server_workflows_enabled
+
+        workflows_enabled = await server_workflows_enabled(server_client)
 
         try:
             spec_entry = await _resolve_session_spec_entry(session_id)
@@ -5387,9 +5390,10 @@ def create_runner_app(
             # surface would withdraw spec-gated tools the agent does grant.
             # Keep it: once resolution recovers, the resolved spec differs
             # from the stored one and the relay rebuilds then.
-            if session_id in _session_comment_relays:
+            binding = _session_comment_relays.get(session_id)
+            if binding is not None and binding.workflows_enabled == workflows_enabled:
                 return
-            spec_entry = None
+            spec_entry = binding.spec_entry if binding is not None else None
 
         # The bridge dir, when the caller pinned it down or handed over the
         # labels it comes from. Deriving it any other way costs a server
@@ -5412,7 +5416,12 @@ def create_runner_app(
         # can reassign it independently — the terminal-launch and per-harness
         # startup paths — all pass a bridge hint and take the branch below.
         current = _session_comment_relays.get(session_id)
-        if current is not None and current.spec_entry is spec_entry and known_bridge_dir is None:
+        if (
+            current is not None
+            and current.spec_entry is spec_entry
+            and current.workflows_enabled == workflows_enabled
+            and known_bridge_dir is None
+        ):
             return
 
         bridge_dir = known_bridge_dir
@@ -5432,14 +5441,21 @@ def create_runner_app(
         if (
             current is not None
             and current.spec_entry is spec_entry
+            and current.workflows_enabled == workflows_enabled
             and current.bridge_dir == bridge_dir
         ):
             return
 
-        from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
+        from omnigent.runner.tool_dispatch import (
+            build_native_relay_tool_schemas,
+            filter_workflow_tool_schemas,
+        )
 
         relay_spec = _unwrap_spec_entry(spec_entry)
-        relay_schemas: list[_JsonObject] = build_native_relay_tool_schemas(relay_spec)
+        relay_schemas = filter_workflow_tool_schemas(
+            build_native_relay_tool_schemas(relay_spec),
+            enabled=workflows_enabled,
+        )
         if relay_spec is not None and relay_spec.mcp_servers:
             # Native terminals consume the persistent relay, not per-turn schemas.
             mcp = await ProxyMcpManager(session_id, server_client).schemas_for(relay_spec)
@@ -5455,6 +5471,7 @@ def create_runner_app(
             if (
                 current is not None
                 and current.spec_entry is spec_entry
+                and current.workflows_enabled == workflows_enabled
                 and current.bridge_dir == bridge_dir
             ):
                 return
@@ -5598,6 +5615,7 @@ def create_runner_app(
             relay=relay,
             spec_entry=spec_entry,
             bridge_dir=bridge_dir,
+            workflows_enabled=workflows_enabled,
         )
         # Close last: the new advertisement is already written, and
         # ClaudeNativeToolRelay.close only unlinks a tool_relay.json that
@@ -6070,7 +6088,13 @@ def create_runner_app(
                         extra={"session_id": conv},
                     )
 
-        _spec_tools = _session_tool_schemas.get(conv) or []
+        from omnigent.runner.journal_tools import server_workflows_enabled
+        from omnigent.runner.tool_dispatch import filter_workflow_tool_schemas
+
+        _spec_tools = filter_workflow_tool_schemas(
+            _session_tool_schemas.get(conv) or [],
+            enabled=await server_workflows_enabled(server_client),
+        )
         # Request-driven harnesses should not advertise browser tools when no
         # renderer is subscribed. Native harnesses ignore this per-turn list
         # and keep their session-scoped relay surface; their calls still use

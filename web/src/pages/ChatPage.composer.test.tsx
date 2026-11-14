@@ -6733,6 +6733,30 @@ describe("Composer side-chat entry points", () => {
 describe("Composer workflow entry point", () => {
   afterEach(cleanup);
 
+  function renderWithWorkflows(ui: ReactElement, enabled = true) {
+    return renderWithTooltips(
+      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, features: { workflows: enabled } }}>
+        {ui}
+      </CapabilitiesProvider>,
+    );
+  }
+
+  it("hides workflow actions and commands when the server disables workflows", () => {
+    setComposerState({
+      conversationId: "conv_test",
+      sessionHarness: "openai-agents",
+      skills: [
+        { name: "workflow", description: "Run a workflow" },
+        { name: "save-workflow", description: "Save a workflow" },
+      ],
+    });
+    renderWithWorkflows(<Composer {...composerProps()} />, false);
+    fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
+    expect(screen.queryByTestId("composer-workflow-action")).toBeNull();
+    expect(useSessionTasksActions.getState().startWorkflow.conv_test).toBeUndefined();
+    expect(useSessionTasksActions.getState().saveWorkflow.conv_test).toBeUndefined();
+  });
+
   const workflowSkills = [{ name: "workflow", description: "Plan and run a multi-step workflow" }];
 
   async function runWorkflowFromMenu(description: string, { reviewPlanFirst = true } = {}) {
@@ -6752,7 +6776,7 @@ describe("Composer workflow entry point", () => {
       skills: workflowSkills,
     });
     const handlers = { onSend: vi.fn(), onSendSlashCommand: vi.fn(), onStop: vi.fn() };
-    renderWithTooltips(<Composer {...composerProps(handlers)} />);
+    renderWithWorkflows(<Composer {...composerProps(handlers)} />);
     fireEvent.change(textarea(), { target: { value: "an unrelated draft" } });
 
     await runWorkflowFromMenu("Add retries");
@@ -6773,7 +6797,7 @@ describe("Composer workflow entry point", () => {
       skills: workflowSkills,
     });
     const onSend = vi.fn();
-    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    renderWithWorkflows(<Composer {...composerProps({ onSend })} />);
 
     await runWorkflowFromMenu("Add retries", { reviewPlanFirst: false });
 
@@ -6787,7 +6811,7 @@ describe("Composer workflow entry point", () => {
       skills: workflowSkills,
     });
     const onSendSlashCommand = vi.fn();
-    renderWithTooltips(<Composer {...composerProps({ onSendSlashCommand, unreachable: true })} />);
+    renderWithWorkflows(<Composer {...composerProps({ onSendSlashCommand, unreachable: true })} />);
 
     await runWorkflowFromMenu("Add retries");
 
@@ -6802,7 +6826,7 @@ describe("Composer workflow entry point", () => {
     setComposerState({ conversationId: "conv_test", sessionHarness: "openai-agents", skills: [] });
     const onSend = vi.fn();
     const error = vi.spyOn(toast, "error");
-    const { rerender } = renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    const { rerender } = renderWithWorkflows(<Composer {...composerProps({ onSend })} />);
 
     const taskAction = (action: "run" | "continue" | "proceed", name: string) =>
       act(() => useSessionTasksActions.getState().taskAction.conv_test?.(action, name));
@@ -6838,7 +6862,7 @@ describe("Composer workflow entry point", () => {
     setComposerState({ conversationId: "conv_test", sessionHarness: "openai-agents", skills: [] });
     const onSend = vi.fn();
     const error = vi.spyOn(toast, "error");
-    const { rerender } = renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    const { rerender } = renderWithWorkflows(<Composer {...composerProps({ onSend })} />);
 
     const continuePlan = (planName: string | null) =>
       act(() => useSessionTasksActions.getState().continuePlan.conv_test?.(planName));
@@ -6863,7 +6887,7 @@ describe("Composer workflow entry point", () => {
   it("lets the Tasks tab stop the agent only while it works", () => {
     setComposerState({ conversationId: "conv_test", sessionHarness: "openai-agents", skills: [] });
     const onStop = vi.fn();
-    const { rerender } = renderWithTooltips(
+    const { rerender } = renderWithWorkflows(
       <Composer {...composerProps({ onStop, isWorking: true })} />,
     );
     act(() => useSessionTasksActions.getState().stopWork.conv_test?.());
@@ -6883,7 +6907,7 @@ describe("Composer workflow entry point", () => {
       sessionHarness: "openai-agents",
       skills: workflowSkills,
     });
-    renderWithTooltips(<Composer {...composerProps()} />);
+    renderWithWorkflows(<Composer {...composerProps()} />);
 
     act(() => useSessionTasksActions.getState().startWorkflow.conv_test?.());
 
@@ -6892,7 +6916,7 @@ describe("Composer workflow entry point", () => {
 
   it("is absent when the session has no workflow skill", () => {
     setComposerState({ conversationId: "conv_test", sessionHarness: "openai-agents", skills: [] });
-    renderWithTooltips(<Composer {...composerProps()} />);
+    renderWithWorkflows(<Composer {...composerProps()} />);
     fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
     expect(screen.queryByTestId("composer-workflow-action")).toBeNull();
   });

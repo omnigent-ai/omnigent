@@ -6061,13 +6061,29 @@ describe("CreateScheduledTaskDialog workflow", () => {
     savedWorkflowsList.current = [];
   });
 
+  function renderWithWorkflows(ui: Parameters<typeof render>[0]) {
+    return render(ui, { info: { features: { automations_v2: true, workflows: true } } });
+  }
+
+  it("hides the workflow field while preserving an existing automation prompt when disabled", () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ prompt: run("The upload tests") })}
+      />,
+    );
+    expect(screen.queryByTestId("task-workflow-trigger")).toBeNull();
+    expect(screen.getByTestId("task-prompt-input")).toHaveValue(run("The upload tests"));
+  });
+
   function chooseWorkflow() {
     fireEvent.pointerDown(screen.getByTestId("task-workflow-trigger"), { button: 0 });
     fireEvent.click(screen.getByTestId("composer-saved-workflow"));
   }
 
   it("runs a saved workflow, with the instructions as each run's details", async () => {
-    renderDialog();
+    renderWithWorkflows(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
     expect(screen.getByTestId("task-workflow-trigger")).toHaveTextContent("No workflow");
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
     chooseWorkflow();
@@ -6091,7 +6107,7 @@ describe("CreateScheduledTaskDialog workflow", () => {
   });
 
   it("keeps the workflow it was opened from: the field has no menu, and runs follow it", async () => {
-    render(
+    renderWithWorkflows(
       <CreateScheduledTaskDialog
         open
         onOpenChange={vi.fn()}
@@ -6119,7 +6135,7 @@ describe("CreateScheduledTaskDialog workflow", () => {
   });
 
   it("opens a workflow automation with its workflow chosen and its details", () => {
-    render(
+    renderWithWorkflows(
       <CreateScheduledTaskDialog
         open
         onOpenChange={vi.fn()}
@@ -6131,14 +6147,14 @@ describe("CreateScheduledTaskDialog workflow", () => {
   });
 
   it("hands each trigger session the saved workflow", async () => {
-    render(
+    renderWithWorkflows(
       <CapabilitiesProvider
         info={{
           ...SERVER_INFO_OFFLINE_FALLBACK,
           scheduled_task_session_modes: true,
           scheduled_task_subhour: true,
           automation_trigger_poll_minutes: 30,
-          features: { automations_v2: true, session_orchestration: true },
+          features: { automations_v2: true, session_orchestration: true, workflows: true },
         }}
       >
         <CreateScheduledTaskDialog

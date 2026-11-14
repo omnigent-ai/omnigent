@@ -2323,7 +2323,7 @@
             "type": "string"
           },
           "steps": {
-            "description": "The graph: unique step IDs, dependencies inside it, no cycles, at most 100 steps.",
+            "description": "Empty or omitted to create a draft. Otherwise a graph with unique step IDs, dependencies inside it, no cycles, and at most 100 steps.",
             "items": {
               "$ref": "#/components/schemas/WorkflowStep"
             },
@@ -2333,8 +2333,7 @@
         },
         "required": [
           "name",
-          "description",
-          "steps"
+          "description"
         ],
         "title": "CreateWorkflowRequest",
         "type": "object"
@@ -13945,6 +13944,18 @@
             "description": "A new name.",
             "title": "Name"
           },
+          "planning_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The private owned session for iterating on the plan.",
+            "title": "Planning Session Id"
+          },
           "steps": {
             "anyOf": [
               {
@@ -14342,6 +14353,11 @@
             "title": "Id",
             "type": "string"
           },
+          "is_draft": {
+            "default": false,
+            "title": "Is Draft",
+            "type": "boolean"
+          },
           "name": {
             "title": "Name",
             "type": "string"
@@ -14351,6 +14367,18 @@
             "default": "workflow",
             "title": "Object",
             "type": "string"
+          },
+          "planning_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The conversation for proposing revisions, separate from runs.",
+            "title": "Planning Session Id"
           },
           "steps": {
             "description": "The workflow's graph.",
@@ -14587,6 +14615,12 @@
             "description": "Workflow ID, a bare 32-character hex UUID.",
             "title": "Id",
             "type": "string"
+          },
+          "is_draft": {
+            "default": false,
+            "description": "Derived from whether the saved plan has no steps.",
+            "title": "Is Draft",
+            "type": "boolean"
           },
           "name": {
             "description": "One line, unique among the owner's workflows.",

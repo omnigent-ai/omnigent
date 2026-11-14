@@ -12,6 +12,7 @@ from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import HostSkillsFrame, HostSkillsResultFrame, encode_host_frame
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_EDIT, AuthProvider
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_access_and_level, require_user
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
@@ -178,6 +179,10 @@ def create_skills_router(
                 for skill in framework_skills(spec)
                 if skill.name not in listed
             ]
+        if not getattr(request.app.state, "feature_flags", FeatureFlags()).enabled(
+            Feature.WORKFLOWS
+        ):
+            skills = [skill for skill in skills if skill.name not in {"workflow", "save-workflow"}]
         return SkillsResponse(skills=skills, warnings=result.warnings)
 
     return router

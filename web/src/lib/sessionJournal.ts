@@ -262,6 +262,34 @@ export function linkedToPrevious(steps: readonly JournalPlanStep[]): boolean[] {
   });
 }
 
+/**
+ * The tasks that can't start because a task they wait on failed, directly or
+ * through tasks that haven't started either: each one's failed tasks by ID,
+ * nearest first. A failed task that runs again clears them.
+ */
+export function failedUpstream(
+  progress: readonly StepProgress[],
+): ReadonlyMap<string, readonly string[]> {
+  const byId = new Map(progress.map((item) => [item.step.id, item]));
+  const blocked = new Map<string, string[]>();
+  for (const item of progress) {
+    if (item.state !== "waiting") continue;
+    const failed: string[] = [];
+    const seen = new Set<string>();
+    const pending = [...item.step.depends_on];
+    for (let id = pending.shift(); id !== undefined; id = pending.shift()) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const upstream = byId.get(id);
+      if (upstream?.state === "failed") failed.push(id);
+      // A task that hasn't started passes on whatever keeps it from starting.
+      else if (upstream?.state === "waiting") pending.push(...upstream.step.depends_on);
+    }
+    if (failed.length > 0) blocked.set(item.step.id, failed);
+  }
+  return blocked;
+}
+
 /** How many steps are in each state. */
 export function planTally(progress: readonly StepProgress[]): Record<StepState, number> {
   const tally: Record<StepState, number> = {
@@ -395,6 +423,12 @@ export function taskPreviewText(
     if (state === "needs_input") return `${WAITING_FOR_YOU}: ${item.step.name}`;
     if (state === "running") return item.activeForm ?? item.step.name;
     if (state === "stopped") return `Stopped: ${item.step.name}`;
+    if (state === "waiting") {
+      // Nothing else can run, so name the failure that holds the rest up.
+      const failedId = failedUpstream(progress).get(item.step.id)?.[0];
+      const failed = progress.find((candidate) => candidate.step.id === failedId);
+      if (failed) return `Failed: ${failed.step.name}`;
+    }
     return paused ? `${paused} · Next: ${item.step.name}` : `Next: ${item.step.name}`;
   }
   const failed = progress.filter((item) => item.state === "failed").length;

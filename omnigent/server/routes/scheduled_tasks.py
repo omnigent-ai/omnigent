@@ -67,6 +67,7 @@ from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.scheduled.telemetry import log_task_created
 from omnigent.server.session_mcp_selection import MAX_SESSION_MCP_SERVICES, session_mcp_selection
 from omnigent.server.session_orchestration import require_owned_session
+from omnigent.server.workflows import require_workflows
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.project_store import ProjectStore
@@ -1213,7 +1214,10 @@ def create_scheduled_tasks_router(
             "next_cursor": next_cursor,
         }
 
-    @router.get("/scheduled-tasks/{scheduled_task_id}/run-steps")
+    @router.get(
+        "/scheduled-tasks/{scheduled_task_id}/run-steps",
+        dependencies=[Depends(require_workflows)],
+    )
     async def list_scheduled_task_run_steps(
         request: Request,
         scheduled_task_id: str,

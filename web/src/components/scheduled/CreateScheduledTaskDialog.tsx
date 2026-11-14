@@ -264,6 +264,7 @@ export function CreateScheduledTaskDialog({
   const { data: hosts, isPending: hostsPending } = useHosts({ enabled: open });
   const info = useServerInfo();
   const anchoredScheduling = isFeatureEnabled(info, "automations_v2");
+  const workflowsEnabled = isFeatureEnabled(info, "workflows");
   const subhourSupported = info !== "loading" && info.scheduled_task_subhour === true;
   const triggerPollMinutes = info !== "loading" ? (info.automation_trigger_poll_minutes ?? 10) : 10;
   // Gates the "new sandbox each run" option: only servers that can actually
@@ -570,9 +571,12 @@ export function CreateScheduledTaskDialog({
       setSystemPromptOpen(false);
       setEditingSystemPrompt(false);
       const parts = splitTriggerPrompt(editingTask?.prompt ?? initialPrompt ?? "");
-      const savedRun = parseSavedWorkflowMessage(parts.userPrompt);
+      const savedRun = workflowsEnabled ? parseSavedWorkflowMessage(parts.userPrompt) : null;
       setWorkflowChoice(
-        lockedWorkflow ?? (savedRun && { id: savedRun.id, name: savedRun.name, description: "" }),
+        workflowsEnabled
+          ? (lockedWorkflow ??
+              (savedRun && { id: savedRun.id, name: savedRun.name, description: "" }))
+          : null,
       );
       setPrompt(savedRun ? savedRun.details : parts.userPrompt);
       setSystemPrompt(parts.systemPrompt);
@@ -637,6 +641,7 @@ export function CreateScheduledTaskDialog({
     savedWorkspace,
     sourceSession,
     lockedWorkflow,
+    workflowsEnabled,
   ]);
 
   // A new task starts on a server sandbox when one is offered, so it doesn't
@@ -948,7 +953,7 @@ export function CreateScheduledTaskDialog({
     (workflowChoice && parseSavedWorkflowMessage(text)?.details) ?? text;
   // Offered once the user has a saved workflow, or when the prompt already runs one.
   const workflowField =
-    savedWorkflows.workflows.length > 0 || workflowChoice ? (
+    workflowsEnabled && (savedWorkflows.workflows.length > 0 || workflowChoice) ? (
       <WorkflowField
         workflows={savedWorkflows.workflows}
         value={workflowShown}

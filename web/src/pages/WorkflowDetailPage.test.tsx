@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -14,8 +14,13 @@ import {
   WorkflowNotFoundError,
 } from "@/hooks/useWorkflow";
 import type * as WorkflowHooks from "@/hooks/useWorkflow";
+import { useSessionJournal } from "@/hooks/useSessionJournal";
+import { authenticatedFetch } from "@/lib/identity";
+import type * as IdentityModule from "@/lib/identity";
 import type * as RoutingModule from "@/lib/routing";
 import type { JournalEntry, StepProgress } from "@/lib/sessionJournal";
+import { sendUserMessage } from "@/lib/sessionsApi";
+import type * as SessionsApi from "@/lib/sessionsApi";
 import { openTasksTab } from "@/store/sessionTasksActions";
 import type * as TasksActions from "@/store/sessionTasksActions";
 import type { WorkflowStep } from "@/lib/workflowGraphLayout";
@@ -27,6 +32,27 @@ vi.mock("@/hooks/useWorkflow", async (importOriginal) => {
   const actual = await importOriginal<typeof WorkflowHooks>();
   return { ...actual, useWorkflow: vi.fn(), useWorkflowRuns: vi.fn() };
 });
+vi.mock("@/hooks/useSessionJournal", () => ({ useSessionJournal: vi.fn() }));
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof IdentityModule>()),
+  authenticatedFetch: vi.fn(),
+}));
+// The real chat has its own stream/composer tests; this page owns its placement and session link.
+vi.mock("@/components/workflows/WorkflowPlanningChat", () => ({
+  WorkflowPlanningChat: ({
+    workflow,
+    onClose,
+  }: {
+    workflow: WorkflowDetail;
+    onClose: () => void;
+  }) => (
+    <div data-testid="planning-chat" data-session={workflow.planning_session_id}>
+      <button type="button" onClick={onClose}>
+        Close planning chat
+      </button>
+    </div>
+  ),
+}));
 vi.mock("@/hooks/useSavedWorkflows", () => ({
   useDeleteWorkflow: vi.fn(),
   useSavedWorkflows: vi.fn(),
@@ -34,6 +60,10 @@ vi.mock("@/hooks/useSavedWorkflows", () => ({
 vi.mock("@/store/sessionTasksActions", async (importOriginal) => {
   const actual = await importOriginal<typeof TasksActions>();
   return { ...actual, openTasksTab: vi.fn() };
+});
+vi.mock("@/lib/sessionsApi", async (importOriginal) => {
+  const actual = await importOriginal<typeof SessionsApi>();
+  return { ...actual, interrupt: vi.fn(), sendUserMessage: vi.fn() };
 });
 vi.mock("@/hooks/useNow", () => ({ useNow: () => new Date("2026-11-12T18:00:00Z") }));
 vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: () => "loading" }));
@@ -165,12 +195,91 @@ describe("WorkflowDetailPage", () => {
     deleteWorkflow.mockClear();
     vi.mocked(openTasksTab).mockClear();
     vi.mocked(showToast).mockClear();
+    vi.mocked(useSessionJournal).mockReturnValue({
+      entries: [],
+      isLoading: false,
+      error: null,
+      hasOlder: false,
+      loadingOlder: false,
+      loadOlder: vi.fn(),
+    });
     vi.mocked(useDeleteWorkflow).mockReturnValue({
       mutate: deleteWorkflow,
       isPending: false,
     } as unknown as ReturnType<typeof useDeleteWorkflow>);
   });
   afterEach(cleanup);
+
+  it("keeps a draft unrunnable until its proposed plan saves, then reopens the same chat", async () => {
+    const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+    vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+    mockRuns([]);
+    const planner = "a".repeat(32);
+    let stored: WorkflowDetail = {
+      ...WORKFLOW,
+      steps: [],
+      is_draft: true,
+      planning_session_id: planner,
+    };
+    let rejectSave = true;
+    vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
+      if (options?.method === "PATCH") {
+        if (rejectSave)
+          return new Response(
+            JSON.stringify({ error: { message: "Try again", type: "server_error" } }),
+            { status: 500 },
+          );
+        const body = JSON.parse(String(options.body));
+        stored = { ...stored, steps: body.steps, is_draft: false };
+      }
+      return new Response(JSON.stringify(stored));
+    });
+    const proposal: JournalEntry = {
+      id: "proposal",
+      position: 1,
+      created_at: 1,
+      scheduled_task_run_id: null,
+      step: null,
+      author: { type: "agent" },
+      kind: "plan",
+      payload: { steps: WORKFLOW.steps },
+    };
+    vi.mocked(useSessionJournal).mockReturnValue({
+      entries: [proposal],
+      isLoading: false,
+      error: null,
+      hasOlder: false,
+      loadingOlder: false,
+      loadOlder: vi.fn(),
+    });
+    renderPage();
+
+    expect(await screen.findByText("Draft")).toBeInTheDocument();
+    expect(screen.getByTestId("workflow-steps-graph")).toHaveTextContent(
+      "Explore the failures, Fix the test",
+    );
+    expect(screen.getByTestId("planning-chat")).toHaveAttribute("data-session", planner);
+    expect(screen.getByTestId("workflow-detail-run")).toBeDisabled();
+    expect(screen.getByTestId("workflow-detail-create-automation")).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Couldn’t save the plan");
+    expect(screen.getByTestId("workflow-detail-run")).toBeDisabled();
+
+    rejectSave = false;
+    fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+    await waitFor(() => expect(screen.getByTestId("workflow-detail-run")).toBeEnabled());
+    expect(stored.steps).toEqual(WORKFLOW.steps);
+    expect(screen.getByTestId("planning-chat")).toBeInTheDocument();
+    expect(screen.queryByText("Draft")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+
+    cleanup();
+    renderPage();
+    await screen.findByTestId("workflow-detail-title");
+    fireEvent.click(screen.getByRole("button", { name: "Plan with agent" }));
+    expect(screen.getByTestId("planning-chat")).toHaveAttribute("data-session", planner);
+    expect(screen.getByTestId("workflow-detail-run")).toBeEnabled();
+  });
 
   it("shows the workflow, its steps, and the sessions that ran it", () => {
     mockWorkflow({});
@@ -257,6 +366,42 @@ describe("WorkflowDetailPage", () => {
     expect(within(running!).getByRole("button", { name: "Stop" })).toBeInTheDocument();
     expect(within(finished!).queryByTestId("plan-continue")).toBeNull();
     expect(within(finished!).queryByTestId("plan-stop")).toBeNull();
+  });
+
+  it("sends a task's ⋯ action on a run's timeline card to the run's session", async () => {
+    vi.mocked(sendUserMessage).mockResolvedValue({ queued: true });
+    mockWorkflow({});
+    const session = "a".repeat(32);
+    mockRuns([
+      run(session, "Fix the upload test", { done: 1, failed: 1 }, [
+        status("explore", "done"),
+        status("fix", "failed"),
+      ]),
+      {
+        ...run("b".repeat(32), "Archived run", { failed: 1 }, [status("explore", "failed")]),
+        archived: true,
+      },
+    ]);
+    renderPage();
+
+    const [live, archived] = screen.getAllByTestId("workflow-run");
+    fireEvent.focus(within(live!).getAllByTestId("tasks-progress-segment")[1]!);
+    fireEvent.pointerDown(await screen.findByTestId("tasks-progress-menu"), { button: 0 });
+    fireEvent.click(screen.getByTestId("tasks-progress-retry"));
+    await waitFor(() =>
+      expect(sendUserMessage).toHaveBeenCalledWith(
+        session,
+        'Retry the task "Fix the test", then go on with the rest of the plan.',
+      ),
+    );
+    await waitFor(() => expect(screen.queryByTestId("tasks-progress-card")).toBeNull());
+
+    // An archived run's cards offer nothing.
+    fireEvent.focus(within(archived!).getAllByTestId("tasks-progress-segment")[0]!);
+    expect(await screen.findByTestId("tasks-progress-card")).toHaveTextContent(
+      "Explore the failures",
+    );
+    expect(screen.queryByTestId("tasks-progress-menu")).toBeNull();
   });
 
   it("shows a run on the workflow's graph, where each task stands", () => {

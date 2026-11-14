@@ -10,6 +10,7 @@ import {
   Loader2Icon,
   MessageCircleQuestionMarkIcon,
   PlayIcon,
+  RotateCcwIcon,
   SquareIcon,
   WorkflowIcon,
   XIcon,
@@ -22,6 +23,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useNow } from "@/hooks/useNow";
 import { useSavedWorkflows } from "@/hooks/useSavedWorkflows";
@@ -35,6 +37,7 @@ import {
   relativeTime,
 } from "@/lib/relativeTime";
 import {
+  failedUpstream,
   finishedTaskCount,
   isRestart,
   linkedToPrevious,
@@ -71,6 +74,9 @@ export const STATE_LABELS: Record<StepState, string> = {
   done: "Done",
   failed: "Failed",
 };
+
+/** What a task that hasn't started says when a task it waits on failed. */
+const CANT_START = "Can't start";
 
 export const SEGMENT_COLORS: Record<StepState, string> = {
   waiting: "bg-foreground/10",
@@ -173,11 +179,23 @@ export function StepGlyph({ state, number }: { state: StepState; number?: number
   }
 }
 
-function stepDetail(item: StepProgress): ReactNode {
+/** "Can't start · Run the tests failed", for a task held up by the failed tasks named. */
+export function CantStart({ failedNames }: { failedNames: readonly string[] }) {
+  return (
+    <>
+      <span className="font-medium">{CANT_START}</span>
+      {` · ${listNames(failedNames)} failed`}
+    </>
+  );
+}
+
+/** @param failedNames - The failed tasks it waits on, by name, when that's why it can't start. */
+function stepDetail(item: StepProgress, failedNames: readonly string[] = []): ReactNode {
   const text = item.status ? textOf(item.status) : null;
   switch (item.state) {
     case "waiting":
-      return item.step.goal;
+      if (failedNames.length === 0) return item.step.goal;
+      return <CantStart failedNames={failedNames} />;
     case "ready":
       return (
         <>
@@ -339,12 +357,13 @@ function StepHistory({
 }
 
 // What a task's ⋯ menu offers: Run while it's ready, Continue once it's stopped or
-// while it waits for you, Stop while it runs.
-type RowAction = TaskAction | "stop";
-const ROW_ACTION_LABELS: Record<RowAction, string> = {
+// while it waits for you, Retry once it failed, Stop while it runs.
+type MenuAction = TaskAction | "stop";
+const MENU_ACTION_LABELS: Record<MenuAction, string> = {
   run: "Run",
   continue: "Continue",
   proceed: "Continue",
+  retry: "Retry",
   stop: "Stop",
 };
 
@@ -352,23 +371,90 @@ const TASK_ACTION_FOR_STATE: Partial<Record<StepState, TaskAction>> = {
   ready: "run",
   stopped: "continue",
   needs_input: "proceed",
+  failed: "retry",
 };
 
-interface RowMenuAction {
-  action: RowAction;
+export interface TaskMenuAction {
+  action: MenuAction;
   onSelect: () => void;
 }
 
-/** A task's menu action for its state, when this viewer's composer offers it. */
-function rowMenuAction(
+/**
+ * A task's menu action for its state, when the viewer can take it.
+ *
+ * @param onTaskAction Asks the agent to run, continue or retry the task; absent when the viewer can't send.
+ * @param onStop Stops the agent; absent unless it works.
+ */
+export function taskMenuAction(
   item: StepProgress,
   onTaskAction: ((action: TaskAction, taskName: string) => void) | undefined,
   onStop: (() => void) | undefined,
-): RowMenuAction | undefined {
+): TaskMenuAction | undefined {
   if (item.state === "running") return onStop && { action: "stop", onSelect: onStop };
   const action = TASK_ACTION_FOR_STATE[item.state];
   if (action === undefined || !onTaskAction) return undefined;
   return { action, onSelect: () => onTaskAction(action, item.step.name) };
+}
+
+/** A task's ⋯ menu, on its row, its timeline card and its graph node: the action its state offers. */
+export function TaskMenu({
+  taskName,
+  menuAction,
+  testIdPrefix,
+  className,
+  onOpenChange,
+}: {
+  taskName: string;
+  menuAction: TaskMenuAction;
+  /** Prefixes the button's and the item's test IDs, e.g. `tasks-row`. */
+  testIdPrefix: string;
+  className: string;
+  /** Also told the menu closed when it goes while open, e.g. once its task has no action. */
+  onOpenChange?: (open: boolean) => void;
+}) {
+  const openRef = useRef(false);
+  const onOpenChangeRef = useRef(onOpenChange);
+  onOpenChangeRef.current = onOpenChange;
+  useEffect(
+    () => () => {
+      if (openRef.current) onOpenChangeRef.current?.(false);
+    },
+    [],
+  );
+  return (
+    <DropdownMenu
+      onOpenChange={(open) => {
+        openRef.current = open;
+        onOpenChange?.(open);
+      }}
+    >
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          aria-label={`Actions for ${taskName}`}
+          className={className}
+          data-testid={`${testIdPrefix}-menu`}
+        >
+          <EllipsisIcon aria-hidden className="size-4" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        <DropdownMenuItem
+          data-testid={`${testIdPrefix}-${menuAction.action}`}
+          onSelect={() => menuAction.onSelect()}
+        >
+          {menuAction.action === "stop" ? (
+            <SquareIcon className="size-3.5 fill-current" />
+          ) : menuAction.action === "retry" ? (
+            <RotateCcwIcon className="size-4" />
+          ) : (
+            <PlayIcon className="size-4" />
+          )}
+          {MENU_ACTION_LABELS[menuAction.action]}
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
 }
 
 // A task row's small icon buttons: its ⋯ menu and the chevron that opens its history.
@@ -384,6 +470,7 @@ function StepRow({
   flash,
   onShowInChat,
   menuAction,
+  failedNames,
 }: {
   item: StepProgress;
   number: number;
@@ -394,11 +481,13 @@ function StepRow({
   flash: boolean;
   /** Scroll the chat to a marker, e.g. ``journal-<entry id>``. */
   onShowInChat: (markerId: string) => void;
-  /** What its ⋯ menu offers: Run, Continue or Stop; absent for none. */
-  menuAction?: RowMenuAction;
+  /** What its ⋯ menu offers: Run, Continue, Retry or Stop; absent for none. */
+  menuAction?: TaskMenuAction;
+  /** The failed tasks it waits on, by name, when that's why it can't start. */
+  failedNames?: readonly string[];
 }) {
   const [open, setOpen] = useState(false);
-  const detail = stepDetail(item);
+  const detail = stepDetail(item, failedNames);
   const waiting = item.state === "waiting";
   const emphasized =
     item.state === "running" || item.state === "needs_input" || item.state === "failed";
@@ -473,31 +562,12 @@ function StepRow({
           <div className={rowClassName}>{content}</div>
         )}
         {menuAction && (
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <button
-                type="button"
-                aria-label={`Actions for ${item.step.name}`}
-                className={cn(ROW_ICON_BUTTON, !hasHistory && "mr-1")}
-                data-testid="tasks-row-menu"
-              >
-                <EllipsisIcon aria-hidden className="size-4" />
-              </button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              <DropdownMenuItem
-                data-testid={`tasks-row-${menuAction.action}`}
-                onSelect={() => menuAction.onSelect()}
-              >
-                {menuAction.action === "stop" ? (
-                  <SquareIcon className="size-3.5 fill-current" />
-                ) : (
-                  <PlayIcon className="size-4" />
-                )}
-                {ROW_ACTION_LABELS[menuAction.action]}
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
+          <TaskMenu
+            taskName={item.step.name}
+            menuAction={menuAction}
+            testIdPrefix="tasks-row"
+            className={cn(ROW_ICON_BUTTON, !hasHistory && "mr-1")}
+          />
         )}
         {hasHistory && (
           <button
@@ -535,12 +605,20 @@ const STATUS_LINE_COLORS: Partial<Record<StepState, string>> = {
   failed: "text-destructive",
 };
 
-/** Where a task stands in a few words, e.g. "Done · 8:56 PM" or "Waiting on Run the tests". */
-function statusLine(item: StepProgress, pending: readonly string[]): ReactNode {
+/**
+ * Where a task stands in a few words, e.g. "Done · 8:56 PM", "Waiting on Run the
+ * tests" or "Can't start · Run the tests failed".
+ */
+function statusLine(
+  item: StepProgress,
+  pending: readonly string[],
+  failedNames: readonly string[] = [],
+): ReactNode {
   const { startedAt, status } = item;
   const ended = status ? formatMessageTimestamp(status.created_at) : null;
   switch (item.state) {
     case "waiting":
+      if (failedNames.length > 0) return `${CANT_START} · ${listNames(failedNames)} failed`;
       return pending.length > 0 ? `Waiting on ${listNames(pending)}` : "Not started";
     case "ready":
       return "Ready to start";
@@ -565,31 +643,95 @@ function statusLine(item: StepProgress, pending: readonly string[]): ReactNode {
   }
 }
 
+/**
+ * What a task's hover card says: which task it is, where it stands, and its
+ * newest result or its goal.
+ *
+ * @param pending - The tasks it waits on that aren't done, by name.
+ * @param failedNames - The failed tasks it waits on, by name, when that's why it can't start.
+ * @param full - Also show the goal beside a result, uncut, for a graph node whose box cuts both short.
+ * @param menu - Its ⋯ menu, in the top corner.
+ */
+export function TaskCardDetails({
+  item,
+  number,
+  total,
+  pending,
+  failedNames,
+  full = false,
+  menu,
+}: {
+  item: StepProgress;
+  number: number;
+  total: number;
+  pending: readonly string[];
+  failedNames: readonly string[];
+  full?: boolean;
+  menu?: ReactNode;
+}) {
+  const text = item.status ? textOf(item.status) : null;
+  const detail =
+    item.state === "waiting" || item.state === "ready" ? item.step.goal : (text ?? item.step.goal);
+  const goal = full && detail !== item.step.goal ? item.step.goal : null;
+  return (
+    <>
+      <span className="flex w-full items-center justify-between gap-3">
+        <span className="text-muted-foreground">
+          Task {number} of {total}
+        </span>
+        {menu}
+      </span>
+      <span className="break-words font-medium">{item.step.name}</span>
+      <span className="flex items-center gap-1.5">
+        <StepGlyph state={item.state} number={number} />
+        <span className={STATUS_LINE_COLORS[item.state]}>
+          {statusLine(item, pending, failedNames)}
+        </span>
+      </span>
+      {detail && (
+        <span className={cn("break-words text-muted-foreground", !full && "line-clamp-3")}>
+          {detail}
+        </span>
+      )}
+      {goal && <span className="break-words text-muted-foreground">Goal: {goal}</span>}
+    </>
+  );
+}
+
 /** Past this many tasks, the strip has no room for links between its segments. */
 const MAX_LINKED_TASKS = 40;
 /** How high a hover arc rises above the strip at most, in pixels. */
 const ARC_HEIGHT = 14;
 
+// The ⋯ button in the corner of a segment's card.
+const CARD_MENU_BUTTON =
+  "-my-1 -mr-1.5 shrink-0 cursor-pointer rounded-md p-1 text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50";
+
 /**
- * One segment per task; hovering one says which task it is and where it stands.
- * A plan links neighboring segments when one task waits on the other, so a gap
- * means the two can run at the same time, and hovering one of its segments
- * draws arcs to the tasks it waits on and the tasks that wait on it.
+ * One segment per task; hovering one shows a card with which task it is, where
+ * it stands and, given `menuActionFor`, its ⋯ menu. A plan links neighboring
+ * segments when one task waits on the other, so a gap means the two can run at
+ * the same time, and hovering one of its segments draws arcs to the tasks it
+ * waits on and the tasks that wait on it.
  */
 export function ProgressStrip({
   progress,
   fromPlan,
   onSelect,
+  menuActionFor,
 }: {
   progress: readonly StepProgress[];
   /** Whether the tasks are a plan's steps, the only tasks that say what they wait on. */
   fromPlan: boolean;
   onSelect: (stepId: string) => void;
+  /** What a task's card offers in its ⋯ menu, as its row's menu does; none when absent. */
+  menuActionFor?: (item: StepProgress) => TaskMenuAction | undefined;
 }) {
   const names = new Map(progress.map((item) => [item.step.id, item.step.name]));
   const done = new Set(
     progress.filter((item) => item.state === "done").map((item) => item.step.id),
   );
+  const blocked = failedUpstream(progress);
   const links =
     fromPlan && progress.length <= MAX_LINKED_TASKS
       ? linkedToPrevious(progress.map((item) => item.step))
@@ -614,113 +756,133 @@ export function ProgressStrip({
   const lit = (index: number) => focusIndex === null || index === focusIndex || related.has(index);
   // A segment's width, as CSS: the strip's width less its gaps, shared out.
   const unit = `((100% - ${(progress.length - 1) * gap}px) / ${progress.length})`;
+  // The task whose card shows, one at a time, and the task whose card's ⋯ menu
+  // is open, which keeps that card up while the pointer is in the menu.
+  const [cardStep, setCardStep] = useState<string | null>(null);
+  const [menuStep, setMenuStep] = useState<string | null>(null);
   return (
-    <TooltipProvider delayDuration={100} skipDelayDuration={400} disableHoverableContent>
-      <div
-        className={cn(
-          "relative flex h-4 items-center",
-          // A plan's strip keeps room above it for the hover arcs.
-          links ? "mt-px -mb-[5px]" : "-my-[5px]",
-          !links && (progress.length > 16 ? "gap-px" : "gap-[3px]"),
-        )}
-        // In pixels, so the arcs' calc() lands on each segment's center.
-        style={links ? { columnGap: gap } : undefined}
-        data-testid="tasks-progress"
-        data-links={links ? "true" : undefined}
-        onPointerLeave={() => setHovered(null)}
-      >
-        {focusIndex !== null && (
-          <div
-            aria-hidden
-            className="pointer-events-none absolute inset-x-0 bottom-[11px]"
-            style={{ height: ARC_HEIGHT }}
+    <div
+      className={cn(
+        "relative flex h-4 items-center",
+        // A plan's strip keeps room above it for the hover arcs.
+        links ? "mt-px -mb-[5px]" : "-my-[5px]",
+        !links && (progress.length > 16 ? "gap-px" : "gap-[3px]"),
+      )}
+      // In pixels, so the arcs' calc() lands on each segment's center.
+      style={links ? { columnGap: gap } : undefined}
+      data-testid="tasks-progress"
+      data-links={links ? "true" : undefined}
+      onPointerLeave={() => setHovered(null)}
+    >
+      {focusIndex !== null && (
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-x-0 bottom-[11px]"
+          style={{ height: ARC_HEIGHT }}
+        >
+          {[...related].map((index) => {
+            const from = Math.min(index, focusIndex);
+            const span = Math.abs(index - focusIndex);
+            return (
+              <span
+                key={index}
+                className="absolute bottom-0 border-x-[1.5px] border-t-[1.5px] border-muted-foreground"
+                style={{
+                  left: `calc(${from + 0.5} * ${unit} + ${from * gap}px)`,
+                  width: `calc(${span} * (${unit} + ${gap}px))`,
+                  height: Math.min(4 + span * 2, ARC_HEIGHT),
+                  borderTopLeftRadius: "50% 100%",
+                  borderTopRightRadius: "50% 100%",
+                }}
+                data-testid="tasks-progress-arc"
+              />
+            );
+          })}
+        </div>
+      )}
+      {progress.map((item, index) => {
+        const pending = item.step.depends_on
+          .filter((id) => !done.has(id))
+          .map((id) => names.get(id) ?? id);
+        const failedNames = (blocked.get(item.step.id) ?? []).map((id) => names.get(id) ?? id);
+        const menuAction = menuActionFor?.(item);
+        const stepId = item.step.id;
+        return (
+          <HoverCard
+            key={stepId}
+            open={cardStep === stepId || menuStep === stepId}
+            onOpenChange={(open) =>
+              setCardStep((current) => (open ? stepId : current === stepId ? null : current))
+            }
+            // Once one card shows, moving along the strip shows the next at once.
+            openDelay={cardStep === null ? 100 : 0}
+            closeDelay={100}
           >
-            {[...related].map((index) => {
-              const from = Math.min(index, focusIndex);
-              const span = Math.abs(index - focusIndex);
-              return (
-                <span
-                  key={index}
-                  className="absolute bottom-0 border-x-[1.5px] border-t-[1.5px] border-muted-foreground"
-                  style={{
-                    left: `calc(${from + 0.5} * ${unit} + ${from * gap}px)`,
-                    width: `calc(${span} * (${unit} + ${gap}px))`,
-                    height: Math.min(4 + span * 2, ARC_HEIGHT),
-                    borderTopLeftRadius: "50% 100%",
-                    borderTopRightRadius: "50% 100%",
-                  }}
-                  data-testid="tasks-progress-arc"
-                />
-              );
-            })}
-          </div>
-        )}
-        {progress.map((item, index) => {
-          const pending = item.step.depends_on
-            .filter((id) => !done.has(id))
-            .map((id) => names.get(id) ?? id);
-          const text = item.status ? textOf(item.status) : null;
-          const detail =
-            item.state === "waiting" || item.state === "ready"
-              ? item.step.goal
-              : (text ?? item.step.goal);
-          return (
-            <Tooltip key={item.step.id}>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  aria-label={`Task ${index + 1}, ${item.step.name}: ${STATE_LABELS[item.state]}`}
-                  onClick={() => onSelect(item.step.id)}
-                  onPointerEnter={() => setHovered(index)}
-                  onFocus={() => setHovered(index)}
-                  onBlur={() => setHovered(null)}
-                  className="group relative flex h-full min-w-0 flex-1 cursor-pointer items-center focus-visible:outline-none"
-                  data-testid="tasks-progress-segment"
-                  data-linked={links?.[index] || undefined}
-                  data-dimmed={!lit(index) || undefined}
-                >
-                  {links?.[index] && (
-                    <span
-                      aria-hidden
-                      className={cn(
-                        "absolute top-1/2 right-full h-0.5 -translate-y-1/2 bg-border-strong transition-opacity duration-150",
-                        !(lit(index) && lit(index - 1)) && "opacity-30",
-                      )}
-                      style={{ width: gap }}
-                    />
-                  )}
-                  <span
-                    className={cn(
-                      "h-1.5 w-full rounded-full transition-[height,opacity] duration-150 group-hover:h-2 group-focus-visible:h-2 group-focus-visible:ring-2 group-focus-visible:ring-ring/50",
-                      SEGMENT_COLORS[item.state],
-                      !lit(index) && "animate-none opacity-30",
-                    )}
-                  />
-                </button>
-              </TooltipTrigger>
-              <TooltipContent
-                side="bottom"
-                className="max-w-72 flex-col items-start gap-1 px-3 py-2"
+            <HoverCardTrigger asChild>
+              <button
+                type="button"
+                aria-label={`Task ${index + 1}, ${item.step.name}: ${failedNames.length > 0 ? CANT_START : STATE_LABELS[item.state]}`}
+                onClick={() => onSelect(item.step.id)}
+                onPointerEnter={() => setHovered(index)}
+                onFocus={() => setHovered(index)}
+                onBlur={() => setHovered(null)}
+                className="group relative flex h-full min-w-0 flex-1 cursor-pointer items-center focus-visible:outline-none"
+                data-testid="tasks-progress-segment"
+                data-linked={links?.[index] || undefined}
+                data-dimmed={!lit(index) || undefined}
               >
-                <span className="text-muted-foreground">
-                  Task {index + 1} of {progress.length}
-                </span>
-                <span className="break-words font-medium">{item.step.name}</span>
-                <span className="flex items-center gap-1.5">
-                  <StepGlyph state={item.state} number={index + 1} />
-                  <span className={STATUS_LINE_COLORS[item.state]}>
-                    {statusLine(item, pending)}
-                  </span>
-                </span>
-                {detail && (
-                  <span className="line-clamp-3 break-words text-muted-foreground">{detail}</span>
+                {links?.[index] && (
+                  <span
+                    aria-hidden
+                    className={cn(
+                      "absolute top-1/2 right-full h-0.5 -translate-y-1/2 bg-border-strong transition-opacity duration-150",
+                      !(lit(index) && lit(index - 1)) && "opacity-30",
+                    )}
+                    style={{ width: gap }}
+                  />
                 )}
-              </TooltipContent>
-            </Tooltip>
-          );
-        })}
-      </div>
-    </TooltipProvider>
+                <span
+                  className={cn(
+                    "h-1.5 w-full rounded-full transition-[height,opacity] duration-150 group-hover:h-2 group-focus-visible:h-2 group-focus-visible:ring-2 group-focus-visible:ring-ring/50",
+                    SEGMENT_COLORS[item.state],
+                    !lit(index) && "animate-none opacity-30",
+                  )}
+                />
+              </button>
+            </HoverCardTrigger>
+            <HoverCardContent
+              side="bottom"
+              sideOffset={8}
+              className="flex w-fit max-w-72 flex-col items-start gap-1 px-3 py-2 text-sm"
+              data-testid="tasks-progress-card"
+            >
+              <TaskCardDetails
+                item={item}
+                number={index + 1}
+                total={progress.length}
+                pending={pending}
+                failedNames={failedNames}
+                menu={
+                  menuAction && (
+                    <TaskMenu
+                      taskName={item.step.name}
+                      menuAction={menuAction}
+                      testIdPrefix="tasks-progress"
+                      className={CARD_MENU_BUTTON}
+                      onOpenChange={(open) => {
+                        setMenuStep(open ? stepId : null);
+                        // Picking an action, or closing the menu, puts the card away too.
+                        if (!open) setCardStep(null);
+                      }}
+                    />
+                  )
+                }
+              />
+            </HoverCardContent>
+          </HoverCard>
+        );
+      })}
+    </div>
   );
 }
 
@@ -732,7 +894,7 @@ export function ProgressStrip({
 function WorkflowChip({ workflowId }: { workflowId: string }) {
   const { workflows } = useSavedWorkflows();
   const name = workflows.find((workflow) => workflow.id === workflowId)?.name;
-  const linked = isFeatureEnabled(useServerInfo(), "workflows_page");
+  const linked = isFeatureEnabled(useServerInfo(), "workflows");
   const className = "h-5 gap-1 px-1.5 text-xs font-normal text-muted-foreground";
   const label = (
     <>
@@ -786,6 +948,7 @@ function TasksHeader({
   onSelect,
   onSaveWorkflow,
   onContinuePlan,
+  onTaskAction,
   onStop,
 }: {
   plan: JournalEntry | null;
@@ -799,6 +962,8 @@ function TasksHeader({
   onSaveWorkflow?: () => void;
   /** Asks the agent to continue the plan; absent when this viewer can't send. */
   onContinuePlan?: () => void;
+  /** The composer's Run, Continue or Retry for a task's card; absent when this viewer can't send. */
+  onTaskAction?: (action: TaskAction, taskName: string) => void;
   /** Stops the agent; offered only while it works. */
   onStop?: () => void;
 }) {
@@ -926,7 +1091,12 @@ function TasksHeader({
           )}
         </p>
       </div>
-      <ProgressStrip progress={progress} fromPlan={plan !== null} onSelect={onSelect} />
+      <ProgressStrip
+        progress={progress}
+        fromPlan={plan !== null}
+        onSelect={onSelect}
+        menuActionFor={(item) => taskMenuAction(item, onTaskAction, onStop)}
+      />
     </header>
   );
 }
@@ -945,11 +1115,12 @@ function TaskList({
   names: ReadonlyMap<string, string>;
   flashStep: string | null;
   onShowInChat: (markerId: string) => void;
-  /** The composer's Run or Continue, given a task's name; absent when this viewer can't send. */
+  /** The composer's Run, Continue or Retry, given a task's name; absent when this viewer can't send. */
   onTaskAction?: (action: TaskAction, taskName: string) => void;
   /** The composer's Stop; present only while the agent works. */
   onStop?: () => void;
 }) {
+  const blocked = failedUpstream(progress);
   return (
     <section aria-label="Tasks">
       <ol className="flex flex-col">
@@ -963,7 +1134,8 @@ function TaskList({
             names={names}
             flash={flashStep === item.step.id}
             onShowInChat={onShowInChat}
-            menuAction={rowMenuAction(item, onTaskAction, onStop)}
+            menuAction={taskMenuAction(item, onTaskAction, onStop)}
+            failedNames={blocked.get(item.step.id)?.map((id) => names.get(id) ?? id)}
           />
         ))}
       </ol>
@@ -1101,6 +1273,7 @@ export function TasksPanel({
                 saveWorkflow && plan ? () => saveWorkflow(planName(plan) ?? "") : undefined
               }
               onContinuePlan={continuePlan && (() => continuePlan(planName(plan)))}
+              onTaskAction={taskAction}
               onStop={stopWork}
             />
             <TaskList

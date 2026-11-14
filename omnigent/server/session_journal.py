@@ -29,12 +29,13 @@ import logging
 import threading
 from typing import Any, Literal
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Depends, Query, Request
 
 from omnigent.entities import Conversation
 from omnigent.entities.session_journal import (
     JOURNAL_PAGE_MAX,
     InvalidJournalEntryError,
+    JournalAppend,
     JournalEntry,
     JournalEntryTooLargeError,
     StepNotReadyError,
@@ -64,7 +65,10 @@ from omnigent.server.schemas import (
     SessionJournalInputRequested,
     SessionJournalPage,
 )
+from omnigent.server.session_provenance import session_provenance
+from omnigent.server.workflow_telemetry import log_journal_entry
 from omnigent.server.workflows import open_store as open_workflow_store
+from omnigent.server.workflows import require_workflows
 from omnigent.stores import ConversationStore
 from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
 from omnigent.stores.permission_store import PermissionStore
@@ -109,6 +113,19 @@ def _same_session(left: str, right: str) -> bool:
         return False
 
 
+def _require_attended_session(conversations: ConversationStore, session: Conversation) -> None:
+    """Follow automation provenance through sub-agents and independently created workers."""
+    if session_provenance(conversations, session).automation_session is not None:
+        raise OmnigentError(
+            "unattended_input_not_allowed: This session is part of an automation. "
+            "No one can answer questions or approve requests. Do not ask for input or "
+            "write needs_input. Choose an option within the user's authorization and "
+            "record the decision, or mark the step failed with the blocker. Continue "
+            "independent work.",
+            code=ErrorCode.CONFLICT,
+        )
+
+
 def entry_to_response(entry: JournalEntry) -> SessionJournalEntry:
     """Serialize an entry; its author is derived from its kind and a plan's source."""
     omnigent = entry.kind in _OMNIGENT_KINDS or (
@@ -140,7 +157,7 @@ def create_session_journal_router(
     :param auth_provider: Identifies the caller; ``None`` in single-user mode.
     :param permission_store: Session grants; ``None`` disables enforcement.
     """
-    router = APIRouter()
+    router = APIRouter(dependencies=[Depends(require_workflows)])
 
     def _store() -> SessionJournalStore:
         store = open_store(conversation_store)
@@ -228,9 +245,12 @@ def create_session_journal_router(
         *,
         idempotency_key: str,
         step: str | None,
+        user_id: str | None,
         workflow_id: str | None = None,
     ) -> JournalEntry:
         store = _store()
+        if kind == "status" and payload.get("status") == "needs_input":
+            await asyncio.to_thread(_require_attended_session, conversation_store, session)
         try:
             appended = await asyncio.to_thread(
                 lambda: store.append(
@@ -251,7 +271,7 @@ def create_session_journal_router(
             raise OmnigentError(f"step_not_ready: {exc}", code=ErrorCode.CONFLICT) from exc
         except InvalidJournalEntryError as exc:
             raise OmnigentError(f"invalid_entry: {exc}", code=ErrorCode.INVALID_INPUT) from exc
-        await _mark_in_chat(store, session.id, appended.entry)
+        await _observe_entry(store, session, appended, user_id=user_id)
         return appended.entry
 
     @router.post("/sessions/{session_id}/journal", response_model=SessionJournalEntry)
@@ -274,6 +294,7 @@ def create_session_journal_router(
             body.payload,
             idempotency_key=body.idempotency_key,
             step=body.step,
+            user_id=get_user_id(request, auth_provider),
             workflow_id=body.workflow_id,
         )
         return entry_to_response(entry)
@@ -299,6 +320,11 @@ def create_session_journal_router(
         if workflow is None:
             raise OmnigentError(
                 f"workflow_not_found: no saved workflow {workflow_id!r}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if not workflow.steps:
+            raise OmnigentError(
+                "workflow_is_draft: save a plan before running this workflow",
                 code=ErrorCode.INVALID_INPUT,
             )
 
@@ -339,6 +365,7 @@ def create_session_journal_router(
             normalize_status("needs_input", text=status_text(questions)),
             idempotency_key=body.idempotency_key,
             step=step,
+            user_id=get_user_id(request, auth_provider),
         )
         key = f"{session.id}:{body.idempotency_key}".encode()
         elicitation_id = f"elicit_journal_{hashlib.sha256(key).hexdigest()[:32]}"
@@ -366,9 +393,14 @@ def create_session_journal_router(
             entry=entry_to_response(entry), elicitation_id=elicitation_id
         )
 
-    async def _mark_in_chat(
-        store: SessionJournalStore, session_id: str, entry: JournalEntry
+    async def _observe_entry(
+        store: SessionJournalStore,
+        session: Conversation,
+        appended: JournalAppend,
+        *,
+        user_id: str | None,
     ) -> None:
+        session_id, entry = session.id, appended.entry
         # Every attempt writes its marker: a retry after a failed first marker
         # adds it, and the marker's stable ID keeps it to one.
         if entry.kind not in ("status", "plan"):
@@ -378,6 +410,15 @@ def create_session_journal_router(
                 store.list_entries, session_id, kind="plan", order="desc", after=entry.id, limit=1
             )
             earlier_plan = page.entries[0] if page.entries else None
+            if appended.created:
+                await asyncio.to_thread(
+                    log_journal_entry,
+                    conversation_store,
+                    session,
+                    entry,
+                    earlier_plan,
+                    user_id=user_id,
+                )
             if entry.kind == "status":
                 await record_status_marker(conversation_store, session_id, entry, earlier_plan)
             else:

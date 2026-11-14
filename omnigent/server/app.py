@@ -3825,8 +3825,10 @@ def create_app(
                 "session_rewind": True,
                 "session_pull_requests": session_pull_requests.open_store(conversation_store)
                 is not None,
-                "session_journal": session_journal.open_store(conversation_store) is not None,
-                "workflows": workflows.open_store(conversation_store) is not None,
+                "session_journal": frontend_features[Feature.WORKFLOWS.value]
+                and session_journal.open_store(conversation_store) is not None,
+                "workflows": frontend_features[Feature.WORKFLOWS.value]
+                and workflows.open_store(conversation_store) is not None,
                 "session_title_instructions": user_settings_store is not None,
                 "admin_view": admin_view_supported,
                 "filesystem_attachments": {

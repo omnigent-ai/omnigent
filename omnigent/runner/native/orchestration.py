@@ -2922,10 +2922,17 @@ async def _auto_create_pi_terminal(
     # failure must not block the terminal launch, so fall back to no tools.
     pi_tools: list[_JsonObject] = []
     try:
-        from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
+        from omnigent.runner.journal_tools import server_workflows_enabled
+        from omnigent.runner.tool_dispatch import (
+            build_native_relay_tool_schemas,
+            filter_workflow_tool_schemas,
+        )
 
         spec_for_tools = _unwrap_resolved_spec(agent_spec)
-        pi_tools = build_native_relay_tool_schemas(spec_for_tools)
+        pi_tools = filter_workflow_tool_schemas(
+            build_native_relay_tool_schemas(spec_for_tools),
+            enabled=await server_workflows_enabled(server_client),
+        )
     except Exception:  # tool registration is additive
         _logger.warning(
             "Failed to build pi-native tool schemas for session %s; "

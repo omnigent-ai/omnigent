@@ -73,6 +73,20 @@ describe("layoutWorkflowSteps", () => {
     expect(layoutWorkflowSteps([]).height).toBe(0);
   });
 
+  it("gives a step that can't start its failed steps' names and room for them", () => {
+    const failedNames = new Map([["pr", ["fix"]]]);
+    const { nodes, height } = layoutWorkflowSteps(
+      [step("fix"), step("pr", "fix")],
+      undefined,
+      failedNames,
+    );
+
+    expect(nodes.find((node) => node.id === "pr")?.data.failedNames).toEqual(["fix"]);
+    expect(nodes.find((node) => node.id === "fix")?.data.failedNames).toBeUndefined();
+    // pr has no goal, but its row is as tall as one with a goal.
+    expect(height).toBe(STEP_NAME_ONLY_HEIGHT + 28 + STEP_NODE_HEIGHT);
+  });
+
   it("gives each node its run state, and moves the edges into a running step", () => {
     const states = new Map([
       ["explore", "done" as const],

@@ -52,6 +52,22 @@ from omnigent.tools.builtins.journal import (
 
 JOURNAL_TOOL_NAMES: frozenset[str] = frozenset(tool.name() for tool in JOURNAL_TOOLS)
 
+
+async def server_workflows_enabled(server_client: httpx.AsyncClient | None) -> bool:
+    """Read the server's rollout flag; a host's environment cannot enable it."""
+    if server_client is None:
+        return False
+    try:
+        response = await server_client.get("/v1/info")
+        if response.status_code != 200:
+            return False
+        info = response.json()
+    except (httpx.HTTPError, ValueError):
+        return False
+    features = info.get("features") if isinstance(info, dict) else None
+    return isinstance(features, dict) and features.get("workflows") is True
+
+
 # A read returns the newest entries whose lines fit this budget.
 _READ_OUTPUT_MAX_BYTES = 32 * 1024
 # Retries while the runner's tunnel reconnects; the idempotency key makes them safe.

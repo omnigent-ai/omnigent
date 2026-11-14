@@ -42,6 +42,7 @@ import {
   RunPlanButton,
   RunTimeline,
   RunWorkflowButton,
+  useRunTaskMenus,
 } from "@/components/workflows/RunTasks";
 import { planRunControl } from "@/shell/PlanRunButton";
 import { WorkflowGraphOverlay } from "@/components/workflows/WorkflowStepsGraph";
@@ -97,6 +98,7 @@ export function TaskDetailPage() {
 
 function TaskDetail({ taskId }: { taskId: string }) {
   const navigate = useNavigate();
+  const info = useServerInfo();
   const now = useNow();
   // Switching a trigger's source renders a new template whose workers post this share link.
   const rebasePath = useRebasePath();
@@ -122,9 +124,10 @@ function TaskDetail({ taskId }: { taskId: string }) {
     isFetchedAfterMount: runsFetchedAfterMount,
   } = useScheduledTaskRuns(taskId, taskId !== "", awaitingRunRow);
   // An automation that runs a saved workflow shows each run's tasks.
-  const savedWorkflow = task
-    ? parseSavedWorkflowMessage(splitTriggerPrompt(task.prompt).userPrompt)
-    : null;
+  const savedWorkflow =
+    task && isFeatureEnabled(info, "workflows")
+      ? parseSavedWorkflowMessage(splitTriggerPrompt(task.prompt).userPrompt)
+      : null;
   const runSteps = useScheduledTaskRunSteps(taskId, runs, savedWorkflow !== null);
 
   const updateMutation = useUpdateScheduledTask();
@@ -240,7 +243,6 @@ function TaskDetail({ taskId }: { taskId: string }) {
     pinnedAgentIds: task != null ? [task.agentId] : [],
   });
   const { data: hosts } = useHosts();
-  const info = useServerInfo();
   const { data: projects } = useProjects({ enabled: task?.projectId != null });
   const sandboxLabel = sandboxOptionLabel(info !== "loading" ? info.sandbox_provider : null);
   const agent = agents?.find((candidate) => candidate.id === task?.agentId);
@@ -605,7 +607,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
               run={run}
               now={now}
               highlighted={run.id === highlightedRunId}
-              steps={runSteps.get(run.id)}
+              steps={savedWorkflow ? runSteps.get(run.id) : undefined}
               workflowName={savedWorkflow?.name}
             />
           ))}
@@ -730,12 +732,19 @@ function RunRow({
   const showTasks = progress.length > 0 && sessionId != null;
   const [graphOpen, setGraphOpen] = useState(false);
   // The saved workflow the run's plan follows, when the Workflows page can open it.
-  const workflowId = isFeatureEnabled(useServerInfo(), "workflows_page")
+  const workflowId = isFeatureEnabled(useServerInfo(), "workflows")
     ? (steps?.workflowId ?? null)
     : null;
   // Stop while the run's session works; play once it stopped with tasks left.
   const control =
     showTasks && steps ? planRunControl(progress, steps.statuses, sessionWorking) : null;
+  // What the run's buttons and task menus refresh once its session takes them.
+  const refreshKeys = [
+    scheduledTaskRunsKey(run.scheduledTaskId),
+    ["scheduled-task-run-steps", run.scheduledTaskId],
+  ];
+  // Its tasks' ⋯ menus, on the timeline's cards and the graph's nodes.
+  const taskMenus = useRunTaskMenus(sessionId, refreshKeys);
   // Room on the row's link for the buttons over its right end.
   const buttonPadding = ["", "pr-11", "pr-18", "pr-25"][
     1 + (workflowId ? 1 : 0) + (control ? 1 : 0)
@@ -840,17 +849,19 @@ function RunRow({
       )}
       {showTasks && (
         <>
-          <RunTimeline sessionId={sessionId} progress={progress} className="pr-3 pb-2.5 pl-10" />
+          <RunTimeline
+            sessionId={sessionId}
+            progress={progress}
+            menuActionFor={taskMenus}
+            className="pr-3 pb-2.5 pl-10"
+          />
           <div className="absolute top-1.5 right-2 z-10 flex items-center gap-0.5">
             {control && (
               <RunPlanButton
                 sessionId={sessionId}
                 planName={workflowName ?? null}
                 control={control}
-                refreshKeys={[
-                  scheduledTaskRunsKey(run.scheduledTaskId),
-                  ["scheduled-task-run-steps", run.scheduledTaskId],
-                ]}
+                refreshKeys={refreshKeys}
               />
             )}
             {workflowId && <RunWorkflowButton workflowId={workflowId} />}
@@ -875,6 +886,7 @@ function RunRow({
           }
           steps={steps.steps}
           progress={progress}
+          menuActionFor={taskMenus}
           onClose={() => setGraphOpen(false)}
         />
       )}

@@ -230,7 +230,7 @@ function AppRoutes({ basename }: AppProps) {
           <Route
             path={`${prefix}/workflows`}
             element={
-              <FeatureGatedPage feature="workflows_page">
+              <FeatureGatedPage feature="workflows">
                 <WorkflowsPage />
               </FeatureGatedPage>
             }
@@ -238,7 +238,7 @@ function AppRoutes({ basename }: AppProps) {
           <Route
             path={`${prefix}/workflows/:workflowId`}
             element={
-              <FeatureGatedPage feature="workflows_page">
+              <FeatureGatedPage feature="workflows">
                 <WorkflowDetailPage />
               </FeatureGatedPage>
             }
