@@ -28,6 +28,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+from rich.markup import escape
+
 from omnigent.onboarding.ambient import DetectedProvider
 from omnigent.onboarding.databricks_config import databricks_sdk_installed
 from omnigent.onboarding.interactive import ACCENT, console, encodable
@@ -97,6 +99,9 @@ _KIND_STYLE: dict[str, str] = {
     DATABRICKS_KIND: "red",
     CLI_CONFIG_KIND: "blue",
 }
+
+# Binding keys that read the Pi surface (they have no single model family).
+_PI_BOUND_HARNESSES = frozenset({"pi", "pi-native"})
 
 # Human label per harness surface, for the "(default · Claude)" /
 # "(default · Codex)" / "(default · Pi)" markers. Anthropic powers the
@@ -664,12 +669,17 @@ def render_provider_listing_by_harness(
     if not providers:
         console.print("  [dim]none configured yet[/dim]")
         return
+    bound_by_surface, unsurfaced, problems = _bound_harnesses(config)
+    for problem in problems:
+        console.print(f"  [red]inference.harnesses: {escape(problem)}[/red]")
     for family in (ANTHROPIC_FAMILY, OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE):
         console.print(f"  [bold]{_FAMILY_LABEL[family]}[/]")
+        bound = bound_by_surface.get(family, [])
+        bound_names = {row.provider for row in bound}
         serving = [
             (name, entry)
             for name, entry in providers.items()
-            if family in provider_families(entry)
+            if family in provider_families(entry) or name in bound_names
         ]
         if not serving:
             console.print("    [dim](none configured)[/dim]")
@@ -681,9 +691,76 @@ def render_provider_listing_by_harness(
             line = (
                 f"    {glyph} [{kind_style}]{entry.kind}[/] [bold]{name}[/] [dim]{summary}[/dim]"
             )
+            pinned = [row for row in bound if row.provider == name]
+            if pinned:
+                line += f" [green]{default_marker()} in use[/green] {_pinned_summary(pinned)}"
             if family in _provider_default_families(entry, config):
-                line += f" [green]{default_marker()} default[/green]"
+                scope = "default for harnesses without a binding" if bound else "default"
+                line += f" [green]{default_marker()} {scope}[/green]"
             console.print(line)
+    for row in unsurfaced:
+        console.print(f"  [bold]{escape(row.harness)}[/] {row.provider} {_pinned_summary([row])}")
+
+
+@dataclass(frozen=True)
+class _BoundHarness:
+    """One valid ``inference.harnesses`` binding, resolved as the runtime resolves it."""
+
+    harness: str
+    provider: str
+    model: str | None
+
+
+def _bound_harnesses(
+    config: dict[str, object],
+) -> tuple[dict[str, list[_BoundHarness]], list[_BoundHarness], list[str]]:
+    """Resolve every ``inference.harnesses`` binding through the runtime helpers.
+
+    A bound harness uses its bound provider and default model, not the legacy
+    per-surface default, so the listing reads the same helpers the runtime does
+    (:func:`parse_inference_config`, :func:`resolve_bound_provider`,
+    :func:`resolve_bound_model`).
+
+    :param config: The parsed config mapping (``providers:`` and ``inference:``).
+    :returns: ``(by_surface, unsurfaced, problems)``: bindings grouped under the
+        surface whose listing they belong to, bindings with no surface (ACP),
+        and one message per binding the runtime would reject.
+    """
+    from omnigent.errors import OmnigentError
+    from omnigent.inference_config import (
+        bound_harness_family,
+        parse_inference_config,
+        resolve_bound_model,
+        resolve_bound_provider,
+    )
+
+    by_surface: dict[str, list[_BoundHarness]] = {}
+    unsurfaced: list[_BoundHarness] = []
+    problems: list[str] = []
+    try:
+        bindings = parse_inference_config(config)
+    except ValueError as exc:
+        return by_surface, unsurfaced, [str(exc)]
+    for key, binding in bindings.items():
+        try:
+            resolve_bound_provider(config, key)
+            model = resolve_bound_model(config, key, None)
+        except OmnigentError as exc:
+            problems.append(f"{key}: {exc}")
+            continue
+        row = _BoundHarness(harness=key, provider=binding.provider, model=model)
+        surface = bound_harness_family(key) or (PI_SURFACE if key in _PI_BOUND_HARNESSES else None)
+        if surface is None:
+            unsurfaced.append(row)
+        else:
+            by_surface.setdefault(surface, []).append(row)
+    return by_surface, unsurfaced, problems
+
+
+def _pinned_summary(rows: list[_BoundHarness]) -> str:
+    """Describe which harnesses a provider is pinned for, and their default models."""
+    parts = [f"{row.harness} (model {row.model})" if row.model else row.harness for row in rows]
+    return f"[dim]{escape('; '.join(parts))}, pinned by inference.harnesses[/dim]"
 
 
 def _provider_default_families(entry: ProviderEntry, config: dict[str, object]) -> list[str]:
