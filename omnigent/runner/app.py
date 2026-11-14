@@ -222,6 +222,7 @@ from omnigent.server.schemas import (
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.spec.skill_sources import resolve_session_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
+from omnigent.superfast import maybe_shadow_gate
 from omnigent.util.dedicated_executor import DedicatedExecutor
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -8012,6 +8013,12 @@ def create_runner_app(
                 )
 
                 _publish_turn_status(conversation_id, "running")
+
+                # Superfast Decision Gate (shadow mode, off by default). Fire a
+                # background classification of the pending user turn and log the
+                # recommended route. Fire-and-forget so the real turn carries no
+                # gate latency; it never changes dispatch and fails open.
+                maybe_shadow_gate(message_body.get("content"), conversation_id)
 
                 if stream:
                     response = await _stream_message_to_harness(message_body, conversation_id)
