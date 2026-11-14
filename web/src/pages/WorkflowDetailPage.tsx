@@ -341,7 +341,9 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
               aria-describedby={undefined}
               className="flex h-[90dvh] flex-col gap-0 overflow-hidden p-0"
             >
-              <DialogTitle className="sr-only">Create plan</DialogTitle>
+              <DialogTitle className="sr-only">
+                {workflow.steps.length > 0 ? "Edit plan" : "Create plan"}
+              </DialogTitle>
               <WorkflowPlanningChat workflow={workflow} onClose={() => setPlannerOpen(false)} />
             </DialogContent>
           </Dialog>

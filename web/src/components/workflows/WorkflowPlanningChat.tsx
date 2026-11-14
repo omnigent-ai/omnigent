@@ -27,7 +27,9 @@ export function WorkflowPlanningChat({
     <div className="flex h-full min-h-0 flex-col" data-testid="workflow-planning-chat">
       <div className="flex shrink-0 items-center gap-2 border-b border-border px-4 py-3">
         <MessageSquareIcon className="size-4 text-muted-foreground" aria-hidden="true" />
-        <h2 className="min-w-0 flex-1 text-sm font-semibold">Create plan</h2>
+        <h2 className="min-w-0 flex-1 text-sm font-semibold">
+          {workflow.steps.length > 0 ? "Edit plan" : "Create plan"}
+        </h2>
         {sessionId && !needsSession && (
           <Button variant="ghost" size="icon-sm" asChild>
             <Link to={`/c/${sessionId}`} aria-label="Open planning session in full">
