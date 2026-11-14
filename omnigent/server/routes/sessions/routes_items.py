@@ -514,7 +514,7 @@ def register_items_routes(
             def visible_window() -> list[Conversation]:
                 # Hide foreign branches so summaries cannot disclose their parent ids.
                 visible = {parent.id}
-                for child in ordered:
+                for child in ordered[: start + limit]:
                     if parent_ids[child.id] in visible and confinement.allows_session(child.id):
                         visible.add(child.id)
                 return [child for child in window if child.id in visible]

@@ -1566,6 +1566,14 @@ def test_runner_child_pagination_keeps_hidden_positions_private(
     for child_id in hidden:
         conversations.replace_runner_id(child_id, token_bound_runner_id("other-binding"))
 
+    scope_reads = []
+    get_scope = conversations.get_runner_scope
+
+    def counted_scope(conversation_id, **kwargs):
+        scope_reads.append(conversation_id)
+        return get_scope(conversation_id, **kwargs)
+
+    monkeypatch.setattr(conversations, "get_runner_scope", counted_scope)
     url = f"/v1/sessions/{parent}/child_sessions"
     cursor = None
     visible = []
@@ -1574,11 +1582,15 @@ def test_runner_child_pagination_keeps_hidden_positions_private(
         params = {"limit": 1, "order": order, "descendants": descendants}
         if cursor is not None:
             params["after"] = cursor
+        scope_reads.clear()
         response = runner.get(url, params=params)
         assert response.status_code == 200, response.text
         assert all(child_id not in response.text for child_id in hidden)
         page = response.json()
         pages.append(page)
+        if len(pages) == 1:
+            first_child = children[0] if order == "asc" else children[-1]
+            assert set(scope_reads) & set(children) == {first_child}
         visible.extend(child["id"] for child in page["data"])
         assert page["first_id"] and page["last_id"]
         cursor = page["last_id"]
