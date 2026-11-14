@@ -6,6 +6,7 @@ import { conversation as conv, conversationPage } from "@/test/sidebarMockHelper
 import { act, cleanup, fireEvent, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 
 vi.mock("@/hooks/useConversations", async () => {
   const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
@@ -439,5 +440,147 @@ describe("mobile sidebar drawer keyboard dismissal", () => {
     setOpen(true);
 
     expect(composer).toHaveFocus();
+  });
+});
+
+// On a phone the primary nav folds into one strip of icon-over-label cells, so
+// the session list keeps the height four stacked rows would take.
+describe("mobile sidebar drawer primary nav strip", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const STRIP_FEATURES = { canvas: true, usage_page: true };
+
+  function cells(): HTMLElement[] {
+    return within(screen.getByTestId("sidebar-primary-nav")).getAllByRole("link");
+  }
+
+  function primaryNavLink(name: string | RegExp): HTMLElement {
+    return within(screen.getByTestId("sidebar-primary-nav")).getByRole("link", { name });
+  }
+
+  it("puts the always-on destinations in one strip of equal-width cells at least 44px tall", () => {
+    stubMobileLayout(true);
+    renderSidebar({ features: STRIP_FEATURES });
+
+    const strip = screen.getByTestId("sidebar-primary-nav-strip");
+    expect(strip).toHaveClass("flex", "rounded-2xl", "max-md:backdrop-blur-xl");
+    expect(strip).not.toHaveClass("flex-col", "overflow-x-auto");
+    const stripCells = within(strip).getAllByRole("link");
+    expect(stripCells.map((cell) => cell.dataset.testid)).toEqual([
+      "new-chat-button",
+      "scheduled-tasks-nav",
+      "inbox-button",
+    ]);
+    for (const cell of stripCells) {
+      expect(cell).toHaveClass("flex-1", "basis-0", "min-w-0", "flex-col", "min-h-11");
+      expect(cell).toHaveClass("mobile-touch-target");
+      expect(cell).not.toHaveClass("sidebar-row", "w-full");
+    }
+  });
+
+  it("keeps two cells when automations are off for the caller", () => {
+    stubMobileLayout(true);
+    renderSidebar({ info: { ...FALLBACK_SERVER_INFO, automations_enabled: false } });
+
+    const strip = screen.getByTestId("sidebar-primary-nav-strip");
+    expect(
+      within(strip)
+        .getAllByRole("link")
+        .map((cell) => cell.dataset.testid),
+    ).toEqual(["new-chat-button", "inbox-button"]);
+  });
+
+  it("renders flag-gated pages as full-width rows below the strip", () => {
+    stubMobileLayout(true);
+    renderSidebar({ route: "/canvas", features: STRIP_FEATURES });
+
+    const strip = screen.getByTestId("sidebar-primary-nav-strip");
+    const canvas = screen.getByTestId("canvas-nav");
+    const usage = screen.getByTestId("usage-nav");
+    for (const row of [canvas, usage]) {
+      expect(strip).not.toContainElement(row);
+      expect(screen.getByTestId("sidebar-primary-nav")).toContainElement(row);
+      expect(row).toHaveClass("sidebar-row", "w-full", "justify-start", "mobile-touch-target");
+      expect(row).not.toHaveClass("flex-1", "flex-col");
+    }
+    expect(strip.compareDocumentPosition(canvas) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(canvas.compareDocumentPosition(usage) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(canvas).toHaveTextContent(/^Canvas$/);
+    expect(canvas).toHaveAttribute("aria-current", "page");
+    expect(canvas).toHaveClass("bg-[var(--sidebar-active)]");
+    expect(usage).not.toHaveAttribute("aria-current");
+  });
+
+  it("labels New as New session and drops the hover-only shortcut hint", () => {
+    stubMobileLayout(true);
+    renderSidebar();
+
+    const newSession = primaryNavLink("New session");
+    expect(newSession).toHaveAttribute("data-testid", "new-chat-button");
+    expect(newSession).toHaveAttribute("href", "/");
+    expect(newSession).toHaveTextContent(/^New$/);
+    // The label follows the Appearance interface font size rather than a fixed px.
+    expect(within(newSession).getByText("New")).toHaveClass("text-[calc(var(--text-ui)-4px)]");
+    expect(newSession).toHaveAttribute("aria-keyshortcuts");
+    expect(newSession).toHaveAttribute("aria-current", "page");
+    expect(newSession.querySelector('[data-slot="shortcut-keys"]')).toBeNull();
+  });
+
+  it("highlights the active cell and pins the Inbox count to its corner", () => {
+    stubMobileLayout(true);
+    mockConversations([conv("conv_a", { pending_elicitations_count: 2 })]);
+    renderSidebar({ route: "/inbox" });
+
+    const inbox = screen.getByTestId("inbox-button");
+    expect(inbox).toHaveClass(
+      "bg-[var(--sidebar-active)]",
+      "text-[var(--sidebar-active-foreground)]",
+    );
+    expect(inbox).toHaveAttribute("aria-current", "page");
+    expect(screen.getByTestId("new-chat-button")).not.toHaveAttribute("aria-current");
+    const badge = within(inbox).getByLabelText("2 inbox items waiting");
+    expect(badge).toHaveClass("absolute", "top-1", "right-1", "bg-transparent");
+    expect(badge).not.toHaveClass("ml-auto");
+  });
+
+  it("closes the drawer on a plain tap but not on a modifier click", () => {
+    stubMobileLayout(true);
+    const onClose = vi.fn();
+    renderSidebar({ onClose, features: STRIP_FEATURES });
+
+    fireEvent.click(screen.getByTestId("canvas-nav"), { metaKey: true });
+    expect(onClose).not.toHaveBeenCalled();
+
+    for (const testId of ["new-chat-button", "inbox-button", "usage-nav"]) {
+      fireEvent.click(screen.getByTestId(testId));
+    }
+    expect(onClose).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([
+    ["desktop", false],
+    ["side-by-side", true],
+  ])("keeps full-width rows on the %s layout", (_layout, sideBySide) => {
+    if (sideBySide) {
+      // A wide phone matches both the mobile and the docked side-by-side queries.
+      vi.stubGlobal("matchMedia", (query: string) => ({
+        matches: query.includes("max-width"),
+        media: query,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      }));
+    } else stubMobileLayout(false);
+    renderSidebar({ features: STRIP_FEATURES });
+
+    expect(screen.queryByTestId("sidebar-primary-nav-strip")).toBeNull();
+    for (const cell of cells()) {
+      expect(cell).toHaveClass("sidebar-row", "w-full", "justify-start");
+      expect(cell).not.toHaveClass("flex-1");
+    }
+    const newSession = primaryNavLink(/^New session/);
+    expect(newSession).not.toHaveAttribute("aria-label");
+    expect(newSession.querySelector('[data-slot="shortcut-keys"]')).not.toBeNull();
   });
 });

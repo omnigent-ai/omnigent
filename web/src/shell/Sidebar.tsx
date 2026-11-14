@@ -272,7 +272,7 @@ import {
   type SidebarViewPreferences,
 } from "@/lib/sidebarViewPreferences";
 import { ExtensionPrimaryNavigation } from "@/extensions/ExtensionPrimaryNavigation";
-import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
+import { PrimaryNavLink, PrimaryNavStrip, type PrimaryNavLayout } from "@/shell/PrimaryNavLink";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useExtensions } from "@/extensions/ExtensionProvider";
 import { extensionPathParts, resolveExtensionPageFromPath } from "@/extensions/catalog";
@@ -1049,6 +1049,8 @@ function SidebarImpl({
   // A wide phone (unfolded foldable, landscape) docks the open sidebar beside
   // the chat instead of over it. Settings keeps its full-bleed drawer.
   const sideBySide = useIsSideBySideSidebarViewport() && !inSettings;
+  // The phone drawer folds the primary nav into one strip; docked and desktop keep rows.
+  const navLayout: PrimaryNavLayout = mobileLayout && !sideBySide ? "cell" : "row";
   const closeSwipeEnabled = open && mobileLayout && !inSettings && dragProgress == null;
   const openSwipeEnabled = !open && !peek && mobileLayout && !inSettings && dragProgress == null;
   useSidebarSwipeToOpen({
@@ -1390,121 +1392,82 @@ function SidebarImpl({
               />
             </div>
 
-            <div className="flex flex-col gap-px px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
-              {/* "New session" routes to the home composer ("/"), which now owns
-            session creation end-to-end (host/workspace/worktree chips +
-            send). Rendered as a Link so cmd/middle-click opens it in a new
-            tab; onNavClick still closes the sidebar on a plain mobile tap. */}
-              <Button
-                asChild
-                className={cn(
-                  // px-2 + gap-2 puts the icon on the sidebar's left (red) column
-                  // and the label on the label (blue) column — matching section
-                  // headers and project folders. border-0 drops the Button base's
-                  // transparent 1px border so the icon lands exactly on that
-                  // column, flush with the Inbox row and folder rows.
-                  SIDEBAR_ROW,
-                  "group/new-session w-full justify-start border-0 font-normal mobile-touch-target",
-                  SIDEBAR_HOVER_HIGHLIGHT,
-                  isNewChatPage && SIDEBAR_ACTIVE_HIGHLIGHT,
-                )}
-                variant="ghost"
-                data-testid="new-chat-button"
-              >
-                {/* New session always creates a session the viewer owns, which
-              lands under "My sessions" — so snap the tab back there on click
-              (the button stays visible on both tabs). */}
-                <Link
+            <div
+              data-testid="sidebar-primary-nav"
+              className={cn(
+                "flex flex-col gap-px px-2",
+                navLayout === "row" ? "pt-2 pb-0" : "pb-2",
+              )}
+            >
+              {/* Phone drawer: the always-on destinations share one strip of cells;
+            flag-gated and extension pages stay rows below it. */}
+              <PrimaryNavStrip layout={navLayout}>
+                {/* "New session" links to the home composer ("/"), so cmd/middle-click
+            opens a new tab. The new session is the viewer's own, so a click
+            also snaps the list back to "My sessions". */}
+                <PrimaryNavLink
                   to="/"
-                  componentId="sidebar.new_chat"
-                  aria-keyshortcuts={newSessionAriaShortcut()}
+                  label="New session"
+                  shortLabel="New"
+                  icon={MessageCirclePlusIcon}
+                  active={isNewChatPage}
+                  layout={navLayout}
                   onClick={(e) => {
                     switchTab("mine");
                     onNavClick(e);
                   }}
-                >
-                  <MessageCirclePlusIcon
-                    className={cn(
-                      "ui-icon",
-                      isNewChatPage
-                        ? "text-[var(--sidebar-active-foreground)]"
-                        : "text-muted-foreground",
-                    )}
+                  componentId="sidebar.new_chat"
+                  testId="new-chat-button"
+                  ariaKeyShortcuts={newSessionAriaShortcut()}
+                  className="group/new-session"
+                  trailing={navLayout === "row" && <NewSessionShortcutHint />}
+                />
+                {automationsEnabled && (
+                  <PrimaryNavLink
+                    to="/tasks"
+                    label="Automations"
+                    icon={ClockIcon}
+                    active={isTasksPage}
+                    layout={navLayout}
+                    onClick={onNavClick}
+                    componentId="sidebar.tasks"
+                    testId="scheduled-tasks-nav"
                   />
-                  New session
-                  <NewSessionShortcutHint />
-                </Link>
-              </Button>
-              {/* Keep Scheduled in the primary nav group with the same row treatment as New session. */}
-              {automationsEnabled && (
-                <Button
-                  asChild
-                  className={cn(
-                    // Same shared nav-row construct as "New session" / "Inbox" so
-                    // the active-pill, hover, insets, icon column, and text weight
-                    // all match post-refactor.
-                    SIDEBAR_ROW,
-                    "w-full justify-start border-0 font-normal mobile-touch-target",
-                    SIDEBAR_HOVER_HIGHLIGHT,
-                    isTasksPage && SIDEBAR_ACTIVE_HIGHLIGHT,
-                  )}
-                  variant="ghost"
-                  data-testid="scheduled-tasks-nav"
-                >
-                  <Link to="/tasks" onClick={onNavClick} componentId="sidebar.tasks">
-                    <ClockIcon
-                      className={cn(
-                        "ui-icon",
-                        isTasksPage
-                          ? "text-[var(--sidebar-active-foreground)]"
-                          : "text-muted-foreground",
-                      )}
-                    />
-                    Automations
-                  </Link>
-                </Button>
-              )}
-              <Button
-                asChild
-                variant="ghost"
-                className={cn(
-                  SIDEBAR_ROW,
-                  "w-full justify-start border-0 font-normal mobile-touch-target",
-                  SIDEBAR_HOVER_HIGHLIGHT,
-                  isInboxPage && SIDEBAR_ACTIVE_HIGHLIGHT,
                 )}
-                data-testid="inbox-button"
-              >
-                <Link to="/inbox" onClick={onNavClick} componentId="sidebar.inbox">
-                  <InboxIcon
-                    className={cn(
-                      "ui-icon",
-                      isInboxPage
-                        ? "text-[var(--sidebar-active-foreground)]"
-                        : "text-muted-foreground",
-                    )}
-                  />
-                  Inbox
-                  {(inboxCount > 0 || inboxCountIncomplete) && (
-                    <span
-                      title={
-                        inboxCountIncomplete ? "Open Inbox to check older automations." : undefined
-                      }
-                      aria-label={inboxBadgeLabel(inboxCount, inboxCountIncomplete)}
-                      className={cn(
-                        "ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-10 font-medium text-[var(--sidebar-active-foreground)] tabular-nums",
-                        // The active Inbox row already paints the translucent
-                        // --sidebar-active wash; repainting it on the nested
-                        // badge would double-composite to a darker fill.
-                        isInboxPage ? "bg-transparent" : "bg-[var(--sidebar-active)]",
-                      )}
-                    >
-                      {inboxCount > 0 ? inboxCount : ""}
-                      {inboxCountIncomplete ? "+" : ""}
-                    </span>
-                  )}
-                </Link>
-              </Button>
+                <PrimaryNavLink
+                  to="/inbox"
+                  label="Inbox"
+                  icon={InboxIcon}
+                  active={isInboxPage}
+                  layout={navLayout}
+                  onClick={onNavClick}
+                  componentId="sidebar.inbox"
+                  testId="inbox-button"
+                  trailing={
+                    (inboxCount > 0 || inboxCountIncomplete) && (
+                      <span
+                        title={
+                          inboxCountIncomplete
+                            ? "Open Inbox to check older automations."
+                            : undefined
+                        }
+                        aria-label={inboxBadgeLabel(inboxCount, inboxCountIncomplete)}
+                        className={cn(
+                          navLayout === "cell" ? "absolute top-1 right-1" : "ml-auto",
+                          "inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-10 font-medium text-[var(--sidebar-active-foreground)] tabular-nums",
+                          // The active Inbox row already paints the translucent
+                          // --sidebar-active wash; repainting it on the nested
+                          // badge would double-composite to a darker fill.
+                          isInboxPage ? "bg-transparent" : "bg-[var(--sidebar-active)]",
+                        )}
+                      >
+                        {inboxCount > 0 ? inboxCount : ""}
+                        {inboxCountIncomplete ? "+" : ""}
+                      </span>
+                    )
+                  }
+                />
+              </PrimaryNavStrip>
               {canvasEnabled && (
                 <PrimaryNavLink
                   to={canvasDestination.pathname + canvasDestination.search}
@@ -1521,29 +1484,15 @@ function SidebarImpl({
                 onNavigate={onNavClick}
               />
               {usagePageEnabled && (
-                <Button
-                  asChild
-                  variant="ghost"
-                  className={cn(
-                    SIDEBAR_ROW,
-                    "w-full justify-start border-0 font-normal mobile-touch-target",
-                    SIDEBAR_HOVER_HIGHLIGHT,
-                    isUsagePage && SIDEBAR_ACTIVE_HIGHLIGHT,
-                  )}
-                  data-testid="usage-nav"
-                >
-                  <Link to="/usage" onClick={onNavClick} componentId="sidebar.usage">
-                    <WalletIcon
-                      className={cn(
-                        "ui-icon",
-                        isUsagePage
-                          ? "text-[var(--sidebar-active-foreground)]"
-                          : "text-muted-foreground",
-                      )}
-                    />
-                    Usage
-                  </Link>
-                </Button>
+                <PrimaryNavLink
+                  to="/usage"
+                  label="Usage"
+                  icon={WalletIcon}
+                  active={isUsagePage}
+                  onClick={onNavClick}
+                  componentId="sidebar.usage"
+                  testId="usage-nav"
+                />
               )}
             </div>
 
