@@ -5793,9 +5793,10 @@ def inject_slash_command(
         ):
             # Not cancelled: Enters queued in a stalled pane can still submit it.
             raise RuntimeError(
-                f"Claude Code did not accept the slash command within "
-                f"{_SUBMIT_VERIFY_TIMEOUT_S}s (the command is still in the "
-                "input box). The command was not delivered."
+                f"Claude Code could not confirm submission of the slash command within "
+                f"{_SUBMIT_VERIFY_TIMEOUT_S}s (the command is still in the input box). "
+                "Queued Enter presses may still submit it. Check the terminal state before "
+                "explicitly retrying the command."
             )
     if dialog_hint is not None:
         _confirm_tui_dialog(socket_path, tmux_target, hint=dialog_hint, bridge_dir=bridge_dir)

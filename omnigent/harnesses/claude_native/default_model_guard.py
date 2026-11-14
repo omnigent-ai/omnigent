@@ -1,18 +1,25 @@
 """
-Keep Omnigent's ``/model`` switches out of the user's default Claude model.
+Attempt to restore Claude's saved default after automated ``/model`` switches.
 
-In an interactive session, Claude Code saves every ``/model <name>`` as the
-user's default in their ``settings.json``, and the inline command has no
-session-only form. Omnigent types ``/model`` for Smart Routing, the routed
-first message and the web model picker, so each switch used to change the
-model of every later Claude Code session.
+Claude Code saves interactive ``/model <name>`` selections in ``settings.json``;
+the command has no session-only form. Omnigent uses it for Smart Routing, the
+routed first message and the web model picker.
 
-One record per settings file, shared by every runner of the OS user, holds the
-user's own default and the models Omnigent typed whose save has not been seen
-yet. A save of a pending model is put back to that default, touching only the
-``model`` key; any other change to the key is the user's and becomes the new
-default. The live session keeps the switched model, which Claude holds in
-memory.
+A shared record per canonical settings file stores a remembered default and
+pending model values. A save matching a live pending value is treated as
+automated and restored to that default; a different observed value becomes the
+new baseline. Matching is a heuristic: a user's manual selection of the same
+pending model can also be reverted. Entries expire after 30 minutes.
+
+A registration with pending entries starts or reuses a daemon watcher. It stops
+with its runner or after repeated failures. Records survive runner exit, but
+startup and bridge attach do not resume watching. If no watcher survives, a
+delayed save can remain as the default. A later registration can resume protection
+for unexpired entries.
+
+Restoration rewrites the settings file with only its model value changed.
+Other writers do not share the guard's lock, so a concurrent edit can be lost
+between the final comparison and replacement.
 """
 
 from __future__ import annotations

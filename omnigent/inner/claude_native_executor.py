@@ -43,6 +43,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_transcript_path,
     terminal_dialog_pending,
 )
+from omnigent.harnesses.claude_native.default_model_guard import ModelSwitchProtectionError
 from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.inner.executor import (
     EnqueuedContent,
@@ -547,6 +548,15 @@ class ClaudeNativeExecutor(Executor):
                 extra={"session_id": self._request_session_id},
             )
             yield ExecutorError(message=describe_exception(exc), undelivered=True)
+            return
+        except ModelSwitchProtectionError as exc:
+            _logger.warning(
+                "claude-native: model-switch protection refused delivery; message not delivered",
+                extra={"session_id": self._request_session_id},
+            )
+            yield ExecutorError(
+                message=describe_exception(exc), undelivered=True, preserve_session=True
+            )
             return
         except RuntimeError as exc:
             _logger.exception(
