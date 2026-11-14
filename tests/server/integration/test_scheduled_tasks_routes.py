@@ -98,6 +98,7 @@ def _build_app(
     projects: bool = True,
     automations: bool | Callable[[], bool] | None = None,
     session_mcp_selection: object | None = None,
+    workflows: bool = False,
 ) -> FastAPI:
     from omnigent.server.auth import UnifiedAuthProvider
     from omnigent.stores.host_store import HostStore
@@ -119,7 +120,10 @@ def _build_app(
         automations=automations,
         auth_provider=UnifiedAuthProvider(source="header", local_single_user=local_single_user),
         feature_flags=resolve_feature_flags(
-            {"OMNIGENT_FEATURES": "automations_v2" if persistent else "-automations_v2"}
+            {
+                "OMNIGENT_FEATURES": ("automations_v2" if persistent else "-automations_v2")
+                + (",workflows" if workflows else "")
+            }
         ),
         server_config={"scheduled_task_scheduler": {"startup_retry_seconds": 0.01}},
         scheduled_task_dispatch=(

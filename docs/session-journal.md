@@ -1,5 +1,10 @@
 # Session journal
 
+Workflows and journals are off by default. Add `workflows` to the server's
+`OMNIGENT_FEATURES` and restart the server to enable their APIs, UI and agent
+tools. The server's flag also controls tool discovery on separate hosts.
+Disabling it leaves saved workflows and journal entries intact.
+
 Every Omnigent session has a **journal**: an append-only record of the plan its
 agent follows, where each step stands, and the notes the agent keeps. The agent
 reads it to pick up where it left off, after a restart, a context compaction or
@@ -51,7 +56,7 @@ stored entry is at most 16,383 bytes after compression.
 
 ## Agent tools
 
-The eight tools make up the `journal` tool group, which every agent has. An agent
+With workflows enabled, the eight tools make up the `journal` tool group, which every agent has. An agent
 spec can drop it with `tool_groups.journal: false` (see
 [Tool groups](AGENT_YAML_SPEC.md#tool-groups)).
 

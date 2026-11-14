@@ -98,6 +98,7 @@ export function TaskDetailPage() {
 
 function TaskDetail({ taskId }: { taskId: string }) {
   const navigate = useNavigate();
+  const info = useServerInfo();
   const now = useNow();
   // Switching a trigger's source renders a new template whose workers post this share link.
   const rebasePath = useRebasePath();
@@ -123,9 +124,10 @@ function TaskDetail({ taskId }: { taskId: string }) {
     isFetchedAfterMount: runsFetchedAfterMount,
   } = useScheduledTaskRuns(taskId, taskId !== "", awaitingRunRow);
   // An automation that runs a saved workflow shows each run's tasks.
-  const savedWorkflow = task
-    ? parseSavedWorkflowMessage(splitTriggerPrompt(task.prompt).userPrompt)
-    : null;
+  const savedWorkflow =
+    task && isFeatureEnabled(info, "workflows")
+      ? parseSavedWorkflowMessage(splitTriggerPrompt(task.prompt).userPrompt)
+      : null;
   const runSteps = useScheduledTaskRunSteps(taskId, runs, savedWorkflow !== null);
 
   const updateMutation = useUpdateScheduledTask();
@@ -241,7 +243,6 @@ function TaskDetail({ taskId }: { taskId: string }) {
     pinnedAgentIds: task != null ? [task.agentId] : [],
   });
   const { data: hosts } = useHosts();
-  const info = useServerInfo();
   const { data: projects } = useProjects({ enabled: task?.projectId != null });
   const sandboxLabel = sandboxOptionLabel(info !== "loading" ? info.sandbox_provider : null);
   const agent = agents?.find((candidate) => candidate.id === task?.agentId);
@@ -606,7 +607,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
               run={run}
               now={now}
               highlighted={run.id === highlightedRunId}
-              steps={runSteps.get(run.id)}
+              steps={savedWorkflow ? runSteps.get(run.id) : undefined}
               workflowName={savedWorkflow?.name}
             />
           ))}
@@ -731,7 +732,7 @@ function RunRow({
   const showTasks = progress.length > 0 && sessionId != null;
   const [graphOpen, setGraphOpen] = useState(false);
   // The saved workflow the run's plan follows, when the Workflows page can open it.
-  const workflowId = isFeatureEnabled(useServerInfo(), "workflows_page")
+  const workflowId = isFeatureEnabled(useServerInfo(), "workflows")
     ? (steps?.workflowId ?? null)
     : null;
   // Stop while the run's session works; play once it stopped with tasks left.

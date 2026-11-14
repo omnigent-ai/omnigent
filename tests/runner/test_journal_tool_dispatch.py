@@ -15,8 +15,17 @@ import pytest
 
 from omnigent.runner import pending_approvals
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
-from omnigent.runner.journal_tools import JOURNAL_TOOL_NAMES, execute_journal_tool
-from omnigent.runner.tool_dispatch import _ALL_LOCAL_TOOLS, _NATIVE_RELAY_BUILTIN_TOOLS
+from omnigent.runner.journal_tools import (
+    JOURNAL_TOOL_NAMES,
+    execute_journal_tool,
+    server_workflows_enabled,
+)
+from omnigent.runner.tool_dispatch import (
+    _ALL_LOCAL_TOOLS,
+    _NATIVE_RELAY_BUILTIN_TOOLS,
+    build_native_relay_tool_schemas,
+    filter_workflow_tool_schemas,
+)
 from omnigent.spec.parser import parse_tool_groups
 from omnigent.spec.types import AgentSpec
 from omnigent.tools import ToolManager
@@ -66,6 +75,48 @@ def test_tool_schemas_are_valid_json_schema(tool: type) -> None:
 
 def _client(handler) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://server.test")
+
+
+@pytest.mark.parametrize(
+    ("info", "enabled"),
+    [
+        ({}, False),
+        ({"workflows": True}, False),
+        ({"features": {"workflows": False}}, False),
+        ({"features": {"workflows": "true"}}, False),
+        ({"features": {"workflows": True}}, True),
+    ],
+)
+@pytest.mark.parametrize("native", [False, True])
+async def test_workflow_tool_advertisement_follows_the_server_not_the_host(
+    monkeypatch: pytest.MonkeyPatch, info: dict, enabled: bool, native: bool
+) -> None:
+    monkeypatch.setenv("OMNIGENT_FEATURES", "workflows" if not enabled else "-workflows")
+    spec = AgentSpec(spec_version=1)
+    schemas = (
+        build_native_relay_tool_schemas(spec) if native else ToolManager(spec).get_tool_schemas()
+    )
+    async with _client(lambda request: httpx.Response(200, json=info)) as client:
+        visible = filter_workflow_tool_schemas(
+            schemas, enabled=await server_workflows_enabled(client)
+        )
+    names = {schema["name"] if native else schema["function"]["name"] for schema in visible}
+    assert names & JOURNAL_TOOL_NAMES == (JOURNAL_TOOL_NAMES if enabled else set())
+    assert "sys_scheduled_task_create" in names
+    assert "sys_session_list" in names
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "invalid_json", "offline"])
+async def test_unavailable_server_does_not_enable_workflow_tools(failure: str) -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        if failure == "offline":
+            raise httpx.ConnectError("offline", request=request)
+        if failure == "invalid_json":
+            return httpx.Response(200, text="not json")
+        return httpx.Response(503)
+
+    async with _client(respond) as client:
+        assert await server_workflows_enabled(client) is False
 
 
 async def _run(client: httpx.AsyncClient, tool: str, args: dict[str, object], **kwargs) -> dict:

@@ -70,7 +70,7 @@ export type FeatureKey =
   | "splittable_terminal_view_ui"
   | "sidebar_windowed_rows"
   | "session_orchestration"
-  | "workflows_page";
+  | "workflows";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;

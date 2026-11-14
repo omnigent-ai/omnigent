@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 from unittest.mock import Mock
 
+import httpx
 import pytest
 
 from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
@@ -16,7 +17,6 @@ from omnigent.runner.app import ResolvedSpec
 from omnigent.spec.types import AgentSpec, LocalToolInfo, ToolRuntime
 from omnigent.tools import ToolManager
 from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient, _sse
-from tests.runner.helpers import NullServerClient
 
 
 @pytest.mark.posix_only
@@ -105,8 +105,9 @@ def test_metadata_probe_errors_still_fail_closed(harness: str) -> None:
     assert "collides with an already-registered tool" in reason
 
 
+@pytest.mark.parametrize("workflows_enabled", [False, True])
 async def test_cold_turn_schemas_preserve_local_tools_without_os_environment(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, workflows_enabled: bool
 ) -> None:
     """The first web turn keeps its full request schema surface without creating an env."""
     (tmp_path / "local_probe.py").write_text(
@@ -130,13 +131,25 @@ async def test_cold_turn_schemas_preserve_local_tools_without_os_environment(
     harness = _ScriptedHarnessClient(
         [_sse({"type": "response.completed", "response": {"id": "resp_metadata"}})]
     )
+
+    def server_response(request: httpx.Request) -> httpx.Response:
+        body = (
+            {"features": {"workflows": workflows_enabled}}
+            if request.url.path == "/v1/info"
+            else {}
+        )
+        return httpx.Response(200, json=body)
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(server_response), base_url="http://server"
+    )
     app = create_runner_app(
         process_manager=_FakeProcessManager(harness),  # type: ignore[arg-type]
         spec_resolver=resolve,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
+        server_client=server_client,
         runner_workspace=tmp_path,
     )
-    async with _runner_client(app) as client:
+    async with server_client, _runner_client(app) as client:
         response = await client.post(
             "/v1/sessions/conv_metadata/events",
             json={
@@ -154,4 +167,7 @@ async def test_cold_turn_schemas_preserve_local_tools_without_os_environment(
     assert len(harness.posted_bodies) == 1
     names = {schema["function"]["name"] for schema in harness.posted_bodies[0]["tools"]}
     assert names >= tool_dispatch._OS_ENV_TOOLS | {"local_probe", "sys_timer_set"}
+    assert names & tool_dispatch._JOURNAL_TOOLS == (
+        tool_dispatch._JOURNAL_TOOLS if workflows_enabled else set()
+    )
     create_env.assert_not_called()

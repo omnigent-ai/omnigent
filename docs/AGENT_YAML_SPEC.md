@@ -1076,7 +1076,9 @@ tool_groups:
 
 Every group defaults to `true`, so omitting the block changes nothing. Values
 must be booleans and group names must match exactly; a typo fails the load
-rather than silently leaving the group registered. Disabling `browser` also
+rather than silently leaving the group registered. The `journal` group also
+requires the server's `workflows` feature flag, which defaults off; enable it
+with `OMNIGENT_FEATURES=workflows` on the server. Disabling `browser` also
 drops the embedded-browser guidance from the composed system prompt, and
 disabling `journal` also drops the `/workflow` and `/save-workflow` skills (see
 [Session journal](session-journal.md)). The block is read the same way from a

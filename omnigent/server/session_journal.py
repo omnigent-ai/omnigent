@@ -29,7 +29,7 @@ import logging
 import threading
 from typing import Any, Literal
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Depends, Query, Request
 
 from omnigent.entities import Conversation
 from omnigent.entities.session_journal import (
@@ -65,6 +65,7 @@ from omnigent.server.schemas import (
     SessionJournalPage,
 )
 from omnigent.server.workflows import open_store as open_workflow_store
+from omnigent.server.workflows import require_workflows
 from omnigent.stores import ConversationStore
 from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
@@ -174,7 +175,7 @@ def create_session_journal_router(
     :param auth_provider: Identifies the caller; ``None`` in single-user mode.
     :param permission_store: Session grants; ``None`` disables enforcement.
     """
-    router = APIRouter()
+    router = APIRouter(dependencies=[Depends(require_workflows)])
 
     def _store() -> SessionJournalStore:
         store = open_store(conversation_store)

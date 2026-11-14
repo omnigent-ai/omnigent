@@ -25,6 +25,7 @@ from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.host.skills import HostSkillDiscovery
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ
+from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions.routes_agent import register_agent_routes
 from omnigent.server.routes.skills import create_skills_router
@@ -204,10 +205,18 @@ async def test_session_target_cannot_be_overridden(skills_app, overrides: dict[s
 
 
 @pytest.mark.parametrize("skill_filter", ["all", "none", ["allowed"]])
+@pytest.mark.parametrize("workflows_enabled", [False, True])
 async def test_presession_catalog_matches_filtered_invocations(
-    presession_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, skill_filter: str | list[str]
+    presession_app,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    skill_filter: str | list[str],
+    workflows_enabled: bool,
 ) -> None:
     app, _, conn, _, agent, _ = presession_app
+    app.state.feature_flags = resolve_feature_flags(
+        {"OMNIGENT_FEATURES": "workflows" if workflows_enabled else ""}
+    )
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
     for name in ("bundled", "hidden", "allowed", "denied"):
         directory = tmp_path / ".claude" / "skills" / name
@@ -274,6 +283,8 @@ async def test_presession_catalog_matches_filtered_invocations(
         response = await task
     assert response.status_code == 200
     expected = resolve_session_skills(spec, (tmp_path,), None)
+    if not workflows_enabled:
+        expected = [s for s in expected if s.name not in {"workflow", "save-workflow"}]
     assert response.json()["skills"] == [
         {"name": s.name, "description": s.description, "display_name": s.display_name}
         for s in expected

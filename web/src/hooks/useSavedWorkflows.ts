@@ -2,6 +2,7 @@ import { useCallback } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
 
 /** One of the user's saved workflows, as `GET /v1/workflows` lists it. */
@@ -37,7 +38,10 @@ export function useSavedWorkflows({ enabled = true }: { enabled?: boolean } = {}
   refresh: () => void;
 } {
   const serverInfo = useServerInfo();
-  const supported = serverInfo !== "loading" && serverInfo.workflows === true;
+  const supported =
+    isFeatureEnabled(serverInfo, "workflows") &&
+    serverInfo !== "loading" &&
+    serverInfo.workflows === true;
   const query = useQuery<SavedWorkflow[]>({
     queryKey: SAVED_WORKFLOWS_KEY,
     queryFn: async ({ signal }) => {
@@ -62,7 +66,7 @@ export function useSavedWorkflows({ enabled = true }: { enabled?: boolean } = {}
     if (enabled && supported) void refetch();
   }, [enabled, supported, refetch]);
   return {
-    workflows: query.data ?? NO_WORKFLOWS,
+    workflows: supported ? (query.data ?? NO_WORKFLOWS) : NO_WORKFLOWS,
     isLoading: query.isLoading,
     isError: query.isError,
     refresh,

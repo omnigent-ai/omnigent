@@ -1257,6 +1257,7 @@ class _SwitchableServerClient:
         """
         self.agent_id = agent_id
         self.bridge_id = bridge_id
+        self.workflows_enabled = False
 
     class _Response:
         """Stub 200 response carrying a caller-supplied JSON body."""
@@ -1287,6 +1288,8 @@ class _SwitchableServerClient:
         :returns: Stub 200 response.
         """
         del kwargs
+        if url == "/v1/info":
+            return self._Response({"features": {"workflows": self.workflows_enabled}})
         if url.endswith("/labels"):
             labels = {BRIDGE_ID_LABEL_KEY: self.bridge_id} if self.bridge_id else {}
             return self._Response({"labels": labels})
@@ -1674,6 +1677,36 @@ async def test_native_revision_refreshes_relay_before_turn_without_reset(
                     assert current_relay["url"] == initial_relay["url"]
                     assert current_relay["token"] == initial_relay["token"]
                 assert manager.released == []
+            finally:
+                await client.delete(f"/v1/sessions/{session_id}")
+    finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_native_relay_updates_workflow_tools_when_server_flag_changes(
+    tmp_path: Path,
+) -> None:
+    from omnigent.runner.journal_tools import JOURNAL_TOOL_NAMES
+
+    agent_id = "ag_workflows"
+    server_client = _SwitchableServerClient(agent_id)
+    app = _switch_app(tmp_path, server_client, {agent_id: _spec_without_terminals()})
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    relay_file = bridge_dir / _TOOL_RELAY_FILE
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            try:
+                for enabled in (False, True, False):
+                    server_client.workflows_enabled = enabled
+                    await _launch_bridged(client, session_id)
+                    names = _relay_tool_names(relay_file)
+                    assert names & JOURNAL_TOOL_NAMES == (JOURNAL_TOOL_NAMES if enabled else set())
+                    assert "list_comments" in names
             finally:
                 await client.delete(f"/v1/sessions/{session_id}")
     finally:

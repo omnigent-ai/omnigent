@@ -11,6 +11,8 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.server.feature_flags import resolve_feature_flags
+from omnigent.tools.builtins.journal import JOURNAL_TOOLS
 from tests.server.conftest import ControllableMockClient
 from tests.server.integration.test_scheduled_tasks_routes import (
     _build_app,
@@ -29,7 +31,7 @@ STEPS = [{"id": "build", "name": "Build"}, {"id": "test", "name": "Test", "depen
 
 @pytest.fixture()
 def app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
-    app = _build_app(db_uri, tmp_path)
+    app = _build_app(db_uri, tmp_path, workflows=True)
     for user in (ALICE, BOB):
         _make_user(db_uri, user)
     return app
@@ -41,6 +43,68 @@ async def client(
 ) -> AsyncIterator[httpx.AsyncClient]:
     async with _serve(app, mock_llm, tmp_path) as client:
         yield client
+
+
+@pytest.mark.parametrize("features", ["", "workflows,-workflows"])
+async def test_disabling_workflows_blocks_api_and_tools_without_changing_saved_data(
+    client: httpx.AsyncClient, app: FastAPI, db_uri: str, features: str
+) -> None:
+    created = await client.post(
+        "/v1/workflows",
+        json={"name": "Release", "description": "Build and test.", "steps": STEPS},
+        headers=_headers(ALICE),
+    )
+    assert created.status_code == 200, created.text
+    workflow = created.json()
+    path = f"/v1/workflows/{workflow['id']}"
+    session_id = _session(db_uri)
+    journal = f"/v1/sessions/{session_id}/journal"
+
+    app.state.feature_flags = resolve_feature_flags({"OMNIGENT_FEATURES": features})
+    info = (await client.get("/v1/info")).json()
+    assert info["features"]["workflows"] is False
+    assert info["workflows"] is False and info["session_journal"] is False
+    for method, url, body in (
+        ("GET", "/v1/workflows", None),
+        ("POST", "/v1/workflows", {"name": "Hidden", "description": "", "steps": STEPS}),
+        ("GET", path, None),
+        ("PATCH", path, {"name": "Changed"}),
+        ("DELETE", path, None),
+        ("GET", path + "/runs", None),
+        ("GET", journal, None),
+        ("POST", journal, _write("plan", {"steps": STEPS}, "disabled")),
+        (
+            "POST",
+            journal + "/input-requests",
+            {"step": "build", "questions": [{"question": "Continue?"}]},
+        ),
+        ("GET", f"/v1/scheduled-tasks/{uuid4().hex}/run-steps", None),
+    ):
+        response = await client.request(method, url, json=body, headers=_runner(session_id))
+        assert response.status_code == 404, (method, url, response.text)
+        assert response.json()["error"]["message"] == "Workflows are disabled on this server"
+
+    for tool in JOURNAL_TOOLS:
+        response = await client.post(
+            f"/v1/sessions/{session_id}/mcp",
+            headers=_headers(ALICE),
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": tool.name(), "arguments": {}},
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["error"]["message"] == "Workflows are disabled on this server"
+
+    app.state.feature_flags = resolve_feature_flags({"OMNIGENT_FEATURES": "workflows"})
+    info = (await client.get("/v1/info")).json()
+    assert info["features"]["workflows"] is True
+    assert info["workflows"] is True and info["session_journal"] is True
+    assert (await client.get(path, headers=_headers(ALICE))).json() == workflow
+    assert (await client.get(journal, headers=_headers(ALICE))).json()["data"] == []
+    assert len((await client.get("/v1/workflows", headers=_headers(ALICE))).json()["data"]) == 1
 
 
 async def test_a_workflow_round_trips_and_stays_private(client: httpx.AsyncClient) -> None:

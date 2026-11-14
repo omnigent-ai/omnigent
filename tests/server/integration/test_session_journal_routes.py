@@ -39,7 +39,7 @@ CAROL = "carol@example.com"
 
 @pytest.fixture()
 def app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
-    app = _build_app(db_uri, tmp_path)
+    app = _build_app(db_uri, tmp_path, workflows=True)
     for user in (ALICE, BOB, CAROL):
         _make_user(db_uri, user)
     return app

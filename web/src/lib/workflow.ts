@@ -36,6 +36,16 @@ export function workflowMessage(
 /** The framework skill that saves a session's plan as a reusable workflow. */
 export const SAVE_WORKFLOW_SKILL = "save-workflow";
 
+/** Hide workflow commands when the server has disabled their tools and APIs. */
+export function filterWorkflowSkills<T extends { name: string }>(
+  skills: readonly T[],
+  enabled: boolean,
+): readonly T[] {
+  return enabled
+    ? skills
+    : skills.filter(({ name }) => name !== WORKFLOW_SKILL && name !== SAVE_WORKFLOW_SKILL);
+}
+
 /** Whether a skill list offers the save-workflow skill, so the Tasks tab can offer Save as workflow. */
 export function offersSaveWorkflow(skills: readonly { name: string }[]): boolean {
   return skills.some((skill) => skill.name === SAVE_WORKFLOW_SKILL);

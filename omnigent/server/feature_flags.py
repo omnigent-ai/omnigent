@@ -45,7 +45,7 @@ class Feature(StrEnum):
     AUTOMATIONS_V2 = "automations_v2"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
     SIDEBAR_WINDOWED_ROWS = "sidebar_windowed_rows"
-    WORKFLOWS_PAGE = "workflows_page"
+    WORKFLOWS = "workflows"
 
 
 @dataclass(frozen=True)
@@ -217,9 +217,9 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         review_by_release="0.24.0",
     ),
     FeatureDefinition(
-        feature=Feature.WORKFLOWS_PAGE,
-        description="Web Workflows page that lists saved workflows and creates new ones",
-        owner="web",
+        feature=Feature.WORKFLOWS,
+        description="Workflows and session journals across the API, UI and agent tools",
+        owner="server",
         review_by_release="0.24.0",
     ),
 )

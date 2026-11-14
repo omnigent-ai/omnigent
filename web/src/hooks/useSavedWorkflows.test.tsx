@@ -1,14 +1,25 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO, type FeatureValues } from "@/lib/capabilities";
 
 import { useDeleteWorkflow, useSavedWorkflows } from "./useSavedWorkflows";
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
-vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: () => ({ workflows: true }) }));
+vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: vi.fn() }));
+
+beforeEach(() => {
+  vi.mocked(authenticatedFetch).mockReset();
+  vi.mocked(useServerInfo).mockReturnValue({
+    ...FALLBACK_SERVER_INFO,
+    workflows: true,
+    features: { workflows: true },
+  });
+});
 
 function renderWithClient<T>(hook: () => T, client = new QueryClient()) {
   const wrapper = ({ children }: { children: ReactNode }) => (
@@ -19,6 +30,26 @@ function renderWithClient<T>(hook: () => T, client = new QueryClient()) {
 
 describe("useSavedWorkflows", () => {
   afterEach(cleanup);
+
+  const disabledFeatures: FeatureValues[] = [{}, { workflows: false }];
+  it.each(disabledFeatures)(
+    "hides cached workflows and makes no request when the flag is absent or off: %j",
+    (features) => {
+      vi.mocked(useServerInfo).mockReturnValue({
+        ...FALLBACK_SERVER_INFO,
+        workflows: true,
+        features,
+      });
+      const client = new QueryClient();
+      client.setQueryData(["saved-workflows"], [{ id: "saved", name: "Release", description: "" }]);
+      const { result } = renderWithClient(() => useSavedWorkflows(), client);
+
+      act(() => result.current.refresh());
+
+      expect(result.current.workflows).toEqual([]);
+      expect(authenticatedFetch).not.toHaveBeenCalled();
+    },
+  );
 
   it("reports a failed load", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValue(

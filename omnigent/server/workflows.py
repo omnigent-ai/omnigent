@@ -23,13 +23,14 @@ from collections import Counter
 from collections.abc import Sequence
 from typing import Any
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Depends, Query, Request
 
 from omnigent.entities import Conversation
 from omnigent.entities.session_journal import JournalEntry
 from omnigent.entities.workflow import InvalidWorkflowError, Workflow
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._sessions.helpers import _session_status_from_cache
@@ -135,6 +136,13 @@ def _progress(plan: JournalEntry, statuses: dict[str, JournalEntry]) -> Workflow
     )
 
 
+def require_workflows(request: Request) -> None:
+    """Reject workflow and journal requests unless the server enables workflows."""
+    flags = getattr(request.app.state, "feature_flags", FeatureFlags())
+    if not flags.enabled(Feature.WORKFLOWS):
+        raise OmnigentError("Workflows are disabled on this server", code=ErrorCode.NOT_FOUND)
+
+
 def create_workflows_router(
     conversation_store: ConversationStore,
     *,
@@ -150,7 +158,7 @@ def create_workflows_router(
     :param permission_store: Checks whether that calling session is shared
         with edit access; ``None`` disables the check.
     """
-    router = APIRouter()
+    router = APIRouter(dependencies=[Depends(require_workflows)])
 
     def _store() -> WorkflowStore:
         store = open_store(conversation_store)

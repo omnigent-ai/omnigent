@@ -5,6 +5,7 @@ import { useChildSessions } from "@/hooks/useChildSessions";
 import { useConversationEntryValue } from "@/hooks/useConversationEntryState";
 import { useSessionJournal, type SessionJournalView } from "@/hooks/useSessionJournal";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { parentIdFromLabels } from "@/lib/sessionHost";
 import {
   pausedLabel,
@@ -46,7 +47,10 @@ export function useSessionTasks(
   enabled: boolean,
 ): SessionTasksView {
   const serverInfo = useServerInfo();
-  const journalSupported = serverInfo !== "loading" && serverInfo.session_journal === true;
+  const journalSupported =
+    isFeatureEnabled(serverInfo, "workflows") &&
+    serverInfo !== "loading" &&
+    serverInfo.session_journal === true;
   const journal = useSessionJournal(conversationId, enabled && journalSupported);
   const nativeTasks = useConversationEntryValue(conversationId ?? null, (state) => state.todos);
   const sessionStatus = useConversationEntryValue(

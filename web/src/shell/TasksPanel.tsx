@@ -894,7 +894,7 @@ export function ProgressStrip({
 function WorkflowChip({ workflowId }: { workflowId: string }) {
   const { workflows } = useSavedWorkflows();
   const name = workflows.find((workflow) => workflow.id === workflowId)?.name;
-  const linked = isFeatureEnabled(useServerInfo(), "workflows_page");
+  const linked = isFeatureEnabled(useServerInfo(), "workflows");
   const className = "h-5 gap-1 px-1.5 text-xs font-normal text-muted-foreground";
   const label = (
     <>

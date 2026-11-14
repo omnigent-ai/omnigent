@@ -40,7 +40,12 @@ import {
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { WorkflowDialog } from "@/components/composer/WorkflowDialog";
 import { type SavedWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
-import { offersWorkflow, savedWorkflowMessage, workflowMessage } from "@/lib/workflow";
+import {
+  filterWorkflowSkills,
+  offersWorkflow,
+  savedWorkflowMessage,
+  workflowMessage,
+} from "@/lib/workflow";
 import {
   COMPOSER_HARNESS_MENU_SIZE,
   HarnessMenuNavigationLabel,
@@ -5209,9 +5214,14 @@ function NewChatLandingContent({
     enabled: canDiscoverHostSkills,
     starting: (!sandboxSelected || arcletSkills) && (hostsLoading || agentsLoading),
   });
+  const workflowsEnabled = isFeatureEnabled(info, "workflows");
   const availableSkills = useMemo(
-    () => (skillsStatus === "ready" ? hostSkills : (selectedAgent?.skills ?? [])),
-    [skillsStatus, hostSkills, selectedAgent?.skills],
+    () =>
+      filterWorkflowSkills(
+        skillsStatus === "ready" ? hostSkills : (selectedAgent?.skills ?? []),
+        workflowsEnabled,
+      ),
+    [skillsStatus, hostSkills, selectedAgent?.skills, workflowsEnabled],
   );
 
   // Pre-session suggestions contain skills; built-ins such as /model need a live session.

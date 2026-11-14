@@ -10,6 +10,7 @@ import {
 import { createPortal } from "react-dom";
 import { useDraggable, useDroppable } from "@dnd-kit/core";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { cn } from "@/lib/utils";
 import { Maximize2Icon, XIcon } from "lucide-react";
 import { SideChatPane } from "@/components/chat/SideChatPane";
@@ -517,7 +518,9 @@ export function GridSessionPane({
                 showFilesPanel={showFiles}
                 showGithubTab={showFiles}
                 showTasksTab={
-                  (serverInfo !== "loading" && serverInfo.session_journal === true) ||
+                  (isFeatureEnabled(serverInfo, "workflows") &&
+                    serverInfo !== "loading" &&
+                    serverInfo.session_journal === true) ||
                   (state.todos?.length ?? 0) > 0
                 }
                 showBrowserTab={supportsBrowser()}

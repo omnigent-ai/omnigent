@@ -29,6 +29,10 @@ vi.mock("@/pages/ChatPage", () => ({
 vi.mock("@/pages/NotFoundPage", () => ({ NotFoundPage: () => <div>not found</div> }));
 vi.mock("@/pages/UsagePage", () => ({ UsagePage: () => <div>usage page</div> }));
 vi.mock("@/pages/TaskDetailPage", () => ({ TaskDetailPage: () => <div>task detail page</div> }));
+vi.mock("@/pages/WorkflowsPage", () => ({ WorkflowsPage: () => <div>workflows page</div> }));
+vi.mock("@/pages/WorkflowDetailPage", () => ({
+  WorkflowDetailPage: () => <div>workflow detail page</div>,
+}));
 vi.mock("@/pages/SettingsPage", async () => {
   const { useLocation, useNavigationType } = await import("react-router-dom");
   return {
@@ -256,6 +260,21 @@ function renderRoute(
     </CapabilitiesProvider>,
   );
 }
+
+describe("Workflow routes", () => {
+  it.each([
+    ["/workflows", "workflows page"],
+    ["/workflows/saved", "workflow detail page"],
+  ])("gates %s with the server workflows flag", async (path, page) => {
+    renderRoute(path);
+    expect(await screen.findByText("not found")).toBeInTheDocument();
+    expect(screen.queryByText(page)).toBeNull();
+    cleanup();
+
+    renderRoute(path, { workflows: true });
+    expect(await screen.findByText(page)).toBeInTheDocument();
+  });
+});
 
 describe("Canvas route", () => {
   it("preserves healthy chat state across pathname changes", () => {

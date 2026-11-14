@@ -1407,7 +1407,13 @@ describe("runs of a saved workflow", () => {
     setTask(task({ prompt: WORKFLOW_PROMPT }));
     setRuns([run({ id: "run_1", status: "succeeded", conversationId: "c_9" })]);
     vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(new Map([["run_1", STEPS]]));
-    renderPage();
+    render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: true } }}
+      >
+        {pageTree()}
+      </CapabilitiesProvider>,
+    );
 
     expect(screen.getByRole("heading", { name: "Runs" })).toBeInTheDocument();
     expect(hooks.useScheduledTaskRunSteps).toHaveBeenLastCalledWith(
@@ -1441,7 +1447,7 @@ describe("runs of a saved workflow", () => {
       vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(new Map([["run_1", steps]]));
       return render(
         <CapabilitiesProvider
-          info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows_page: workflowsPage } }}
+          info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: workflowsPage } }}
         >
           {pageTree()}
         </CapabilitiesProvider>,
@@ -1457,8 +1463,14 @@ describe("runs of a saved workflow", () => {
 
     // Not without the Workflows page, nor for a run whose plan names no workflow.
     renderRun(STEPS, false);
-    expect(screen.getByTestId("run-graph-button")).toBeInTheDocument();
+    expect(screen.queryByTestId("run-graph-button")).toBeNull();
     expect(screen.queryByTestId("run-workflow-button")).toBeNull();
+    expect(screen.queryByTestId("tasks-progress-segment")).toBeNull();
+    expect(hooks.useScheduledTaskRunSteps).toHaveBeenLastCalledWith(
+      "st_1",
+      expect.any(Array),
+      false,
+    );
     cleanup();
     renderRun({ ...STEPS, workflowId: null }, true);
     expect(screen.getByTestId("run-graph-button")).toBeInTheDocument();

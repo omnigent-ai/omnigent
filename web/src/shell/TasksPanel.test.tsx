@@ -94,7 +94,10 @@ function setSession(state: Partial<ConversationState>) {
 
 beforeEach(() => {
   vi.mocked(useChildSessions).mockReturnValue({ children: [] } as never);
-  vi.mocked(useServerInfo).mockReturnValue({ session_journal: true } as never);
+  vi.mocked(useServerInfo).mockReturnValue({
+    session_journal: true,
+    features: { workflows: true },
+  } as never);
   vi.mocked(useSavedWorkflows).mockReturnValue({
     workflows: [],
     isLoading: false,
@@ -271,22 +274,10 @@ describe("TasksPanel", () => {
     renderPanel();
     const chip = screen.getByTestId("tasks-plan-workflow");
     expect(chip).toHaveTextContent("Workflow");
-    expect(chip.tagName).toBe("SPAN");
+    expect(chip).toHaveAttribute("href", `/workflows/${workflowId}`);
     fireEvent.focus(chip);
     expect(await screen.findByRole("tooltip")).toHaveTextContent(
       "Saved workflow “Triage flaky tests”",
-    );
-    cleanup();
-
-    // With the Workflows page on, the chip opens the workflow's own page.
-    vi.mocked(useServerInfo).mockReturnValue({
-      session_journal: true,
-      features: { workflows_page: true },
-    } as never);
-    renderPanel();
-    expect(screen.getByTestId("tasks-plan-workflow")).toHaveAttribute(
-      "href",
-      `/workflows/${workflowId}`,
     );
     cleanup();
 
