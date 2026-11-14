@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from prompt_toolkit.layout.controls import FormattedTextControl
     from prompt_toolkit.styles import Style
 
+    from omnigent.harnesses.claude_native.settings_generation import ClaudeSettingsRequest
     from omnigent.onboarding.provider_config import ProviderEntry
     from omnigent.spec.types import AgentSpec
 
@@ -6826,27 +6827,52 @@ async def _launch_claude_terminal(
     :returns: Terminal resource id.
     :raises click.ClickException: If terminal launch fails.
     """
-    body = _claude_terminal_request(
-        claude_args,
-        command=command,
-        bridge_dir=bridge_dir,
-        ap_server_url=str(client.base_url),
-        ap_auth_headers=dict(client.headers),
-        claude_config=claude_config,
-        append_system_prompt=append_system_prompt,
-        allowed_tools=allowed_tools,
+    from omnigent.harnesses.claude_native.settings_generation import ClaudeSettingsRequest
+
+    settings_request = (
+        ClaudeSettingsRequest.create(bridge_dir)
+        if await _supports_claude_settings_requests(client, session_id)
+        else None
     )
     try:
+        body = _claude_terminal_request(
+            claude_args,
+            command=command,
+            bridge_dir=bridge_dir,
+            ap_server_url=str(client.base_url),
+            ap_auth_headers=dict(client.headers),
+            claude_config=claude_config,
+            append_system_prompt=append_system_prompt,
+            allowed_tools=allowed_tools,
+            settings_request=settings_request,
+        )
+        if settings_request is not None:
+            settings_request.mark_dispatched()
         resp = await client.post(
             f"/v1/sessions/{url_component(session_id)}/resources/terminals",
             json=body,
             timeout=30.0,
         )
+        acknowledged = False
+        if settings_request is not None:
+            try:
+                response_body = resp.json()
+            except ValueError:
+                response_body = None
+            if isinstance(response_body, dict):
+                acknowledged = settings_request.acknowledge(
+                    response_body.get("claude_settings_request_ack")
+                )
         if resp.status_code >= 400:
             raise click.ClickException(
                 f"Claude terminal launch failed ({resp.status_code}): {error_text(resp)}"
             )
         payload = resp.json()
+        if settings_request is not None and not acknowledged:
+            raise click.ClickException(
+                "Claude terminal launch did not acknowledge its settings request. "
+                "Restart the host and try again."
+            )
         terminal_id = payload.get("id")
         if not isinstance(terminal_id, str) or not terminal_id:
             raise click.ClickException(
@@ -6865,6 +6891,32 @@ async def _launch_claude_terminal(
         with contextlib.suppress(Exception):
             await asyncio.to_thread(ClaudeDebugLogFollower(bridge_dir).close, session_id)
         raise
+    finally:
+        if settings_request is not None:
+            settings_request.close()
+
+
+async def _supports_claude_settings_requests(client: httpx.AsyncClient, session_id: str) -> bool:
+    """Negotiate ownership before sending a generation to an older runner."""
+    from omnigent.harnesses.claude_native.settings_generation import (
+        CLAUDE_SETTINGS_REQUEST_PROTOCOL,
+    )
+
+    try:
+        response = await client.get(
+            f"/v1/sessions/{url_component(session_id)}/resources/terminals", timeout=10.0
+        )
+        payload = response.json()
+    except (httpx.HTTPError, ValueError):
+        return False
+    return (
+        response.status_code == 200
+        and isinstance(payload, dict)
+        and (
+            type(payload.get("claude_settings_request_protocol")) is int
+            and payload["claude_settings_request_protocol"] == CLAUDE_SETTINGS_REQUEST_PROTOCOL
+        )
+    )
 
 
 async def _find_running_claude_terminal(
@@ -6982,6 +7034,7 @@ def _claude_terminal_request(
     claude_config: ClaudeNativeUcodeConfig | None = None,
     append_system_prompt: str | None = None,
     allowed_tools: tuple[str, ...] = (),
+    settings_request: ClaudeSettingsRequest | None = None,
 ) -> _JsonObject:
     """
     Build the terminal resource creation body for Claude Code.
@@ -7001,6 +7054,7 @@ def _claude_terminal_request(
         framework guidance to append to Claude Code's system prompt.
     :param allowed_tools: Optional narrowly scoped Claude tools preapproved
         for this native session.
+    :param settings_request: Negotiated request owner, held through admission acknowledgement.
     :returns: JSON body for ``POST /resources/terminals``.
     """
     claude_args = _merge_default_model_arg(
@@ -7019,6 +7073,7 @@ def _claude_terminal_request(
         model_overrides=claude_config.model_overrides if claude_config is not None else None,
         append_system_prompt=append_system_prompt,
         allowed_tools=allowed_tools,
+        settings_request=settings_request,
     )
     # Let a registered launcher plugin (e.g. a wrapper such as isaac) rewrite the
     # command/args to wrap the same fully-augmented Claude launch. Identity by
@@ -7080,11 +7135,16 @@ def _claude_terminal_request(
         # Boolean opt-in; the runner derives the bridge dir from session_id.
         "bridge_inject_dir": True,
     }
+    if settings_request is not None:
+        request["claude_settings_request"] = settings_request.generation
     # Opaque launcher payloads retain their original argv; do not parse shell
     # text or claim a deferred-settings boundary we cannot establish.
     if claude_args_start is not None:
         request["claude_settings_generation"] = record_claude_settings_boundary(
-            bridge_dir, args, claude_args_start=claude_args_start
+            bridge_dir,
+            args,
+            claude_args_start=claude_args_start,
+            settings_request=settings_request,
         )
     return request
 

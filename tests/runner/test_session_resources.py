@@ -546,6 +546,7 @@ async def test_list_terminals_returns_only_terminal_resources(
 
     assert resp.status_code == 200
     body = resp.json()
+    assert body["claude_settings_request_protocol"] == 1
     types = {r["type"] for r in body["data"]}
     assert types == {"terminal"}
     ids = [r["id"] for r in body["data"]]

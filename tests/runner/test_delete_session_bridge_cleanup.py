@@ -28,6 +28,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -106,11 +107,26 @@ async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
         yield c
 
 
+@pytest.mark.parametrize("endpoint", ["", "/resources"])
+@pytest.mark.parametrize("owner", ["none", "pending", "failed-close", "timed-out-close"])
 async def test_delete_session_removes_native_bridge_dir(
     client: httpx.AsyncClient,
+    app: FastAPI,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    endpoint: str,
+    owner: str,
 ) -> None:
-    """``DELETE`` must remove the token-bearing claude-native bridge dir."""
+    """Delete retains settings until pending requests and terminals release them."""
+    from omnigent.harnesses.claude_native.bridge import augment_claude_args
+    from omnigent.harnesses.claude_native.settings_generation import (
+        ClaudeSettingsRequest,
+        acquire_claude_settings_request,
+        settings_generation_path,
+    )
+    from omnigent.inner.terminal import TerminalInstance
+    from omnigent.terminals import TerminalRegistry
+
     session_id = f"conv_{uuid.uuid4().hex}"
     bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
     assert bridge_dir == bridge_dir_for_bridge_id(session_id)
@@ -126,11 +142,72 @@ async def test_delete_session_removes_native_bridge_dir(
     )
     assert cached is not None
 
-    resp = await client.delete(f"/v1/sessions/{session_id}")
-    assert resp.status_code == 200
+    request = None
+    instance = None
+    revoked = []
+    if owner != "none":
+        request = ClaudeSettingsRequest.create(bridge_dir)
+        augment_claude_args(
+            (), bridge_dir=bridge_dir, defer_caller_settings=True, settings_request=request
+        )
+        baseline = settings_generation_path(bridge_dir, request.generation)
+        baseline_bytes = baseline.read_bytes()
+        if owner != "pending":
+            private_dir = tmp_path / "terminal"
+            private_dir.mkdir()
+            output = private_dir / "retained-settings.json"
+            output.write_text("{}")
+            instance = TerminalInstance(
+                name="claude",
+                session_key="main",
+                private_dir=private_dir,
+                socket_path=private_dir / "tmux.sock",
+                running=True,
+            )
+            with acquire_claude_settings_request(bridge_dir, request.generation) as lease:
+                lease.attach(instance)
+            request.close()
 
-    assert not bridge_dir.exists(), "bridge dir (with token) must be deleted"
-    assert not cached.exists()
+            async def stop_tmux(*_args: str) -> None:
+                if owner == "failed-close":
+                    raise RuntimeError("termination unconfirmed")
+                await asyncio.Event().wait()
+
+            monkeypatch.setattr(instance, "_tmux", stop_tmux)
+            monkeypatch.setattr(instance, "_stop_network_brokers", lambda: revoked.append(True))
+            monkeypatch.setattr("omnigent.terminals.registry._CLOSE_TIMEOUT_S", 0.02)
+            terminals = TerminalRegistry()
+            terminals._by_conversation[session_id] = {("claude", "main"): instance}
+            monkeypatch.setattr(
+                app.state.session_resource_registry, "_terminal_registry", terminals
+            )
+
+    url = f"/v1/sessions/{session_id}{endpoint}"
+    try:
+        resp = await client.delete(url)
+        assert resp.status_code == 200
+        assert not cached.exists()
+        if request is not None:
+            assert baseline.read_bytes() == baseline_bytes
+            if instance is not None:
+                assert instance._resource_cleanup_task is not None
+                await asyncio.wait_for(instance._resource_cleanup_task, timeout=5)
+                assert revoked == [True]
+                assert output.exists()
+                monkeypatch.setattr(instance, "_tmux", AsyncMock())
+                await instance.close()
+                assert not output.exists()
+            request.close()
+            resp = await client.delete(url)
+            assert resp.status_code == 200
+        assert not bridge_dir.exists(), "released bridge dir (with token) must be deleted"
+    finally:
+        if instance is not None:
+            monkeypatch.setattr(instance, "_tmux", AsyncMock())
+            await instance.close()
+        if request is not None:
+            request.close()
+        await client.delete(url)
 
 
 @pytest.mark.parametrize("family", sorted(BRIDGE_DIR_RESOLVERS))

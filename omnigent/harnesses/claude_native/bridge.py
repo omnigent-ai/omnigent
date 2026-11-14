@@ -78,6 +78,7 @@ from omnigent.harnesses.claude_native import (
 )
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
+from omnigent.harnesses.claude_native.settings_generation import settings_generation_path
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
 from omnigent.harnesses.claude_native.submit_verification import (
     SubmitBoundary,
@@ -103,6 +104,7 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 if TYPE_CHECKING:
     import httpx
 
+    from omnigent.harnesses.claude_native.settings_generation import ClaudeSettingsRequest
     from omnigent.inner.datamodel import OSEnvSandboxSpec
     from omnigent.inner.os_env import OSEnvironment
     from omnigent.inner.terminal import TerminalInstance
@@ -597,7 +599,6 @@ _TERMINAL_FAILURE_TAIL_LINES = 12
 _TERMINAL_FAILURE_TAIL_CHARS = 800
 _TERMINAL_FAILURE_TAIL_PREFIX = " Last terminal output:\n"
 _INVOCATION_SETTINGS_FILE = "claude-settings.json"
-_SETTINGS_GENERATION = re.compile(r"[0-9a-f]{32}")
 _GENERATED_SETTINGS_FILE = re.compile(r"claude-settings-([0-9a-f]{32})(?:-[0-9a-f]{32})?\.json")
 _CALLER_SETTINGS_MAX_BYTES = 1024 * 1024
 
@@ -2009,7 +2010,17 @@ def prune_orphaned_bridge_dirs() -> int:
 
     :returns: The number of orphaned bridge dirs removed.
     """
-    return native_bridge_common.prune_orphaned_dirs(_BRIDGE_ROOT)
+    from omnigent.harnesses.claude_native.settings_generation import (
+        has_live_claude_settings_owners,
+    )
+
+    return native_bridge_common.prune_orphaned_dirs(
+        _BRIDGE_ROOT,
+        should_prune=lambda path: (
+            (path / native_bridge_common.OWNER_PID_FILENAME).is_file()
+            and not has_live_claude_settings_owners(path)
+        ),
+    )
 
 
 def claude_global_config_path(
@@ -3160,6 +3171,7 @@ def augment_claude_args(
     active_harnesses: Collection[str] | None = None,
     defer_caller_settings: bool = False,
     legacy_bridge_identity: bool = False,
+    settings_request: ClaudeSettingsRequest | None = None,
 ) -> list[str]:
     """
     Return Claude CLI args with Omnigent MCP/hook/skill injection.
@@ -3217,8 +3229,11 @@ def augment_claude_args(
         read their files under the terminal's resolved sandbox.
     :param legacy_bridge_identity: Include the canonical settings operand so older
         runners can discover a CLI launch's bridge. The generated settings win.
+    :param settings_request: Explicit owner for a deferred launch generation.
     :returns: Augmented argument list for the terminal resource.
     """
+    if settings_request is not None and not defer_caller_settings:
+        raise ValueError("Claude settings requests require deferred caller settings")
     hook_settings = build_hook_settings(
         bridge_dir,
         python_executable=python_executable,
@@ -3240,13 +3255,18 @@ def augment_claude_args(
         if caller_settings:
             hook_settings = _merge_caller_settings(hook_settings, caller_settings, bridge_dir)
     settings_path = (
-        _generation_settings_path(bridge_dir, secrets.token_hex(16))
+        (
+            settings_request.settings_path(bridge_dir)
+            if settings_request is not None
+            else _generation_settings_path(bridge_dir, secrets.token_hex(16))
+        )
         if defer_caller_settings
         else bridge_dir / _INVOCATION_SETTINGS_FILE
     )
     _write_json_file(
         settings_path,
         _effective_invocation_settings(hook_settings, active_harnesses=active_harnesses),
+        exclusive=settings_request is not None,
     )
     from omnigent.onboarding.ambient import claude_code_managed_mcp_present
 
@@ -3551,13 +3571,15 @@ def _pop_caller_settings(
 
 def _generation_settings_path(bridge_dir: Path, generation: str) -> Path:
     """Constrain launch metadata to generated names in the trusted bridge directory."""
-    if not isinstance(generation, str) or not _SETTINGS_GENERATION.fullmatch(generation):
-        raise ValueError("Claude settings launch generation is invalid")
-    return bridge_dir / f"claude-settings-{generation}.json"
+    return settings_generation_path(bridge_dir, generation)
 
 
 def record_claude_settings_boundary(
-    bridge_dir: Path, args: list[str], *, claude_args_start: int
+    bridge_dir: Path,
+    args: list[str],
+    *,
+    claude_args_start: int,
+    settings_request: ClaudeSettingsRequest | None = None,
 ) -> str:
     """Record the framework-resolved Claude boundary without persisting argument values."""
     generation = None
@@ -3570,12 +3592,17 @@ def record_claude_settings_boundary(
     if generation is None:
         raise ValueError("Claude settings launch baseline is missing")
     settings_path = _generation_settings_path(bridge_dir, generation)
+    if settings_request is not None and settings_path != settings_request.settings_path(
+        bridge_dir
+    ):
+        raise ValueError("Claude settings request and boundary do not match")
     _write_json_file(
         settings_path.with_suffix(".boundary.json"),
         {
             "start": claude_args_start,
             "digest": hashlib.sha256(json.dumps(args).encode()).hexdigest(),
         },
+        exclusive=settings_request is not None,
     )
     return generation
 
@@ -3614,7 +3641,9 @@ def _effective_invocation_settings(
     )
 
 
-def _replace_framework_settings(args: list[str], baseline: Path, output: Path) -> None:
+def _replace_framework_settings(
+    args: list[str], baseline: Path, output: Path, *, retain_baseline: bool = False
+) -> None:
     """Rewrite framework flag operands while leaving settings-shaped prompt values literal."""
     index = 0
     while index < len(args):
@@ -3625,7 +3654,11 @@ def _replace_framework_settings(args: list[str], baseline: Path, output: Path) -
             index += 2
         elif arg == "--settings" and index + 1 < len(args):
             if args[index + 1] == str(baseline):
-                args[index + 1] = str(output)
+                if retain_baseline:
+                    args[index + 1 : index + 2] = [str(baseline), "--settings", str(output)]
+                    index += 2
+                else:
+                    args[index + 1] = str(output)
             index += 2
         else:
             index += 1
@@ -3637,6 +3670,7 @@ async def finalize_claude_caller_settings(
     bridge_dir: Path,
     generation: str | None = None,
     active_harnesses: Collection[str] | None = None,
+    private_output: bool = False,
 ) -> None:
     """Merge deferred settings using the new terminal's actual filesystem view.
 
@@ -3741,9 +3775,18 @@ async def finalize_claude_caller_settings(
         from omnigent.harnesses.claude_native.settings_validation import validate_caller_settings
 
         await validate_caller_settings(instance, settings, wrapper_prefix=prefix)
-        output_path = bridge_dir / f"claude-settings-{generation}-{secrets.token_hex(16)}.json"
-        _write_json_file(output_path, settings)
-        _replace_framework_settings(kept, settings_path, output_path)
+        output_path = (
+            instance.private_dir / f"claude-finalized-settings-{generation}.json"
+            if private_output
+            else bridge_dir / f"claude-settings-{generation}-{secrets.token_hex(16)}.json"
+        )
+        if private_output:
+            _atomic_write_user_json(output_path, settings)
+        else:
+            _write_json_file(output_path, settings)
+        _replace_framework_settings(
+            kept, settings_path, output_path, retain_baseline=private_output
+        )
     instance.args = [*prefix, *kept]
 
 
@@ -12462,7 +12505,7 @@ def _read_json_file(path: Path) -> _JsonObject:
     return payload if isinstance(payload, dict) else {}
 
 
-def _write_json_file(path: Path, payload: _JsonObject) -> None:
+def _write_json_file(path: Path, payload: _JsonObject, *, exclusive: bool = False) -> None:
     """
     Atomically write a JSON object file with owner-only permissions.
 
@@ -12470,10 +12513,10 @@ def _write_json_file(path: Path, payload: _JsonObject) -> None:
     :param payload: JSON-compatible object.
     :returns: None.
     """
-    _write_private_file(path, json.dumps(payload, separators=(",", ":")))
+    _write_private_file(path, json.dumps(payload, separators=(",", ":")), exclusive=exclusive)
 
 
-def _write_private_file(path: Path, text: str) -> None:
+def _write_private_file(path: Path, text: str, *, exclusive: bool = False) -> None:
     """Atomically write *text* to *path* with owner-only permissions."""
     _ensure_secure_dir(path.parent)
     tmp_path: Path | None = None
@@ -12491,7 +12534,10 @@ def _write_private_file(path: Path, text: str) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(tmp_path, 0o600)
-        os.replace(tmp_path, path)
+        if exclusive:
+            os.link(tmp_path, path)
+        else:
+            os.replace(tmp_path, path)
     finally:
         if tmp_path is not None:
             with contextlib.suppress(FileNotFoundError):

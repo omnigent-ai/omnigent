@@ -34,6 +34,7 @@ from omnigent.entities.session_resources import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import native_terminal_name
+from omnigent.harnesses.claude_native.settings_generation import ClaudeSettingsRequestExpired
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_terminal_name,
@@ -210,6 +211,9 @@ def register_resource_routes(
         order: str = "desc",
     ) -> JSONResponse:
         from omnigent.entities.pagination import paginate_in_memory
+        from omnigent.harnesses.claude_native.settings_generation import (
+            CLAUDE_SETTINGS_REQUEST_PROTOCOL,
+        )
 
         filtered = resource_registry.list_resources(
             session_id,
@@ -232,6 +236,11 @@ def register_resource_routes(
                 "first_id": page.first_id,
                 "last_id": page.last_id,
                 "has_more": page.has_more,
+                **(
+                    {"claude_settings_request_protocol": CLAUDE_SETTINGS_REQUEST_PROTOCOL}
+                    if resource_type == "terminal"
+                    else {}
+                ),
             },
         )
 
@@ -605,17 +614,33 @@ def register_resource_routes(
                 launched_relay = relay_after.relay
 
         prepare_claude: Callable[[TerminalInstance], Awaitable[None]] | None = None
+        settings_lease = None
+        settings_request_ack: dict[str, str] = {}
         try:
             if bridge_inject:
                 from omnigent.harnesses.claude_native.bridge import (
                     bridge_dir_for_bridge_id,
                     finalize_claude_caller_settings,
                 )
+                from omnigent.harnesses.claude_native.settings_generation import (
+                    acquire_claude_settings_request,
+                )
                 from omnigent.runner.identity import (
                     runner_mcp_disabled_servers_active_harnesses,
                 )
 
                 generation = body.get("claude_settings_generation")
+                request_generation = body.get("claude_settings_request")
+                if request_generation is not None:
+                    settings_lease = acquire_claude_settings_request(
+                        bridge_dir_for_bridge_id(bridge_id), request_generation
+                    )
+                    settings_request_ack = {
+                        "claude_settings_request_ack": settings_lease.generation
+                    }
+                    if generation is not None and generation != settings_lease.generation:
+                        raise ValueError("Claude settings request and boundary do not match")
+                replaced_invocation = False
                 if declared_terminal is not None and (
                     env_spec.command != spec.get("command", "bash")
                     or env_spec.args != spec.get("args", [])
@@ -623,13 +648,17 @@ def register_resource_routes(
                     # A declaration replaces the client's invocation, so its
                     # settings generation does not describe this terminal.
                     generation = None
+                    replaced_invocation = True
 
                 async def prepare_claude(instance: TerminalInstance) -> None:
+                    if settings_lease is not None and not replaced_invocation:
+                        settings_lease.attach(instance)
                     await finalize_claude_caller_settings(
                         instance,
                         bridge_dir=bridge_dir_for_bridge_id(bridge_id),
                         generation=generation,
                         active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
+                        private_output=settings_lease is not None,
                     )
 
             launch_method = (
@@ -648,6 +677,16 @@ def register_resource_routes(
                 resource_role=(CLAUDE_NATIVE_TERMINAL_ROLE if bridge_inject else None),
                 **({"prepare_terminal": prepare_claude} if bridge_inject else {}),
             )
+        except ClaudeSettingsRequestExpired as exc:
+            if launched_relay is not None:
+                _discard_comment_relay(session_id, launched_relay)
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": {"code": ErrorCode.CONFLICT, "message": str(exc)},
+                    **settings_request_ack,
+                },
+            )
         except (OSError, RuntimeError, ValueError) as exc:
             if launched_relay is not None:
                 _discard_comment_relay(session_id, launched_relay)
@@ -657,7 +696,8 @@ def register_resource_routes(
                     "error": {
                         "code": "terminal_launch_failed",
                         "message": _client_safe_error_detail(exc, context="terminal launch"),
-                    }
+                    },
+                    **settings_request_ack,
                 },
             )
 
@@ -665,6 +705,9 @@ def register_resource_routes(
             if launched_relay is not None:
                 _discard_comment_relay(session_id, launched_relay)
             raise
+        finally:
+            if settings_lease is not None:
+                settings_lease.close()
 
         if bridge_inject:
             _publish_tmux_target_for_bridge(
@@ -677,7 +720,10 @@ def register_resource_routes(
 
         return JSONResponse(
             status_code=200,
-            content=session_resource_view_to_dict(resource_view),
+            content={
+                **session_resource_view_to_dict(resource_view),
+                **settings_request_ack,
+            },
         )
 
     async def _readvertise_live_claude_pane(

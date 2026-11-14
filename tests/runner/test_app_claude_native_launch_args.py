@@ -1521,7 +1521,7 @@ async def test_auto_create_claude_settings_preserve_configured_argument_boundary
             wrapper_settings = (command == "claude-wrapper" and "--" not in prefix) or opaque_env
             if "--settings" in prefix and not wrapper_settings:
                 assert settings["env"]["CONFIG_ONLY"] == "yes"
-            assert created.instance.args.count("--settings") == (2 if wrapper_settings else 1)
+            assert created.instance.args.count("--settings") == (3 if wrapper_settings else 2)
         finally:
             await created.instance.close()
         raise RuntimeError("stop after prepared settings")
@@ -1756,6 +1756,7 @@ async def test_auto_create_claude_terminal_cleans_routers_when_preparation_fails
         expected.append(("turn", turn_router))
     assert shutdowns == expected
     assert registry.launch_required_terminal.call_count == (failure != "trust")
+    assert not list(bridge_dir.glob("claude-settings-*"))
 
 
 @pytest.mark.parametrize(

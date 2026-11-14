@@ -915,7 +915,20 @@ async def test_async_idle_watcher_treats_confirmation_start_failure_as_unknown(
 
 
 @pytest.mark.asyncio
-async def test_close_kills_tmux_when_socket_exists_after_running_cleared(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "success",
+        "target-gone",
+        "error",
+        "cancelled-before-kill",
+        "cancelled-kill",
+        "interrupted-spawn",
+    ],
+)
+async def test_close_kills_tmux_when_socket_exists_after_running_cleared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
     """Cleanup kills a surviving tmux server even after a watcher marked it dead."""
     private_dir = tmp_path / "terminal"
     private_dir.mkdir()
@@ -929,15 +942,61 @@ async def test_close_kills_tmux_when_socket_exists_after_running_cleared(tmp_pat
         running=False,
     )
     commands: list[tuple[str, ...]] = []
+    retired = []
+    revoked = []
+    output = private_dir / "retained-settings.json"
+    output.write_text("{}")
+    instance.add_resource_cleanup(lambda: retired.append(True))
+    monkeypatch.setattr(instance, "_stop_network_brokers", lambda: revoked.append(True))
+    if outcome == "cancelled-before-kill":
+        monkeypatch.setattr(
+            instance, "_stop_idle_watcher", AsyncMock(side_effect=asyncio.CancelledError)
+        )
+    if outcome == "interrupted-spawn":
+        with monkeypatch.context() as launch_patch:
+            launch_patch.setattr(
+                terminal_mod,
+                "asyncio",
+                SimpleNamespace(
+                    **{
+                        **vars(asyncio),
+                        "create_subprocess_exec": AsyncMock(side_effect=asyncio.CancelledError),
+                    }
+                ),
+            )
+            with pytest.raises(asyncio.CancelledError):
+                await instance.launch()
 
     async def _tmux(*args: str) -> None:
         commands.append(args)
+        if outcome == "target-gone":
+            raise terminal_mod._tmux_command_failed_error(
+                ["tmux", *args], 1, b"no server running on example socket"
+            )
+        if outcome == "error":
+            raise RuntimeError("termination unconfirmed")
+        if outcome == "cancelled-kill":
+            raise asyncio.CancelledError
 
     instance._tmux = _tmux  # type: ignore[method-assign]
 
-    await instance.close()
+    if outcome.startswith("cancelled"):
+        with pytest.raises(asyncio.CancelledError):
+            await instance.close()
+    else:
+        await instance.close()
 
-    assert commands == [("kill-server",)]
+    assert commands == ([] if outcome == "cancelled-before-kill" else [("kill-server",)])
+    assert revoked == [True] * (2 if outcome == "interrupted-spawn" else 1)
+    if outcome not in {"success", "target-gone"}:
+        assert output.exists()
+        assert retired == []
+        if outcome == "interrupted-spawn":
+            return
+        monkeypatch.setattr(instance, "_tmux", AsyncMock())
+        monkeypatch.setattr(instance, "_stop_idle_watcher", AsyncMock())
+        await instance.close()
+    assert retired == [True]
     assert not private_dir.exists()
 
 

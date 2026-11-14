@@ -370,6 +370,7 @@ async def test_preparation_uses_new_instance_once_before_spawn(
 ) -> None:
     created = _capture_instances(monkeypatch)
     calls = []
+    released = []
 
     async def launch(instance, *, cwd=None):
         assert calls == [instance]
@@ -381,6 +382,7 @@ async def test_preparation_uses_new_instance_once_before_spawn(
         assert instance.os_env.cwd == tmp_path
         assert not instance.running
         calls.append(instance)
+        instance.add_resource_cleanup(lambda: released.append(instance))
         if outcome == "error":
             raise ValueError("settings rejected")
         if outcome == "cancelled":
@@ -399,6 +401,9 @@ async def test_preparation_uses_new_instance_once_before_spawn(
             )
             assert first is second
             assert calls == [first]
+            assert released == []
+            assert terminal_registry.transfer("settings", "moved", "shell", "main")
+            assert released == []
         else:
             error = ValueError if outcome == "error" else asyncio.CancelledError
             with pytest.raises(error):
@@ -408,8 +413,10 @@ async def test_preparation_uses_new_instance_once_before_spawn(
             assert len(calls) == 1
             assert not created[0].private_dir.exists()
             assert terminal_registry.list_for_conversation("settings") == []
+            assert released == calls
     finally:
         await terminal_registry.shutdown()
+    assert released == calls
 
 
 @requires_tmux
@@ -421,10 +428,12 @@ async def test_overlapping_preparations_close_loser_and_keep_winner_owned(
     first_spawning = asyncio.Event()
     release_first = asyncio.Event()
     prepared = []
+    released = []
 
     async def prepare(instance):
         assert not instance.running
         prepared.append(instance)
+        instance.add_resource_cleanup(lambda: released.append(instance))
 
     async def launch(instance, *, cwd=None):
         instance.running = True
@@ -448,6 +457,7 @@ async def test_overlapping_preparations_close_loser_and_keep_winner_owned(
         assert winner is created[1]
         assert prepared == created
         assert not created[0].private_dir.exists()
+        assert released == [created[0]]
         assert winner.private_dir.exists()
         assert terminal_registry.get("settings", "claude", "main") is winner
     finally:
@@ -458,3 +468,4 @@ async def test_overlapping_preparations_close_loser_and_keep_winner_owned(
             await first
         await terminal_registry.shutdown()
     assert all(not instance.private_dir.exists() for instance in created)
+    assert released == created

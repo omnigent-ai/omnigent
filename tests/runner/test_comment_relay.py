@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import shlex
 import shutil
 import subprocess
 import threading
@@ -2051,4 +2052,144 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
                     assert finalized[0][:2] == ["claude", "--"]
             await client.delete(f"/v1/sessions/{session_id}")
     finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode", ["prepared", "opaque", "abandoned", "expired", "failure", "declared-replacement"]
+)
+async def test_cli_settings_request_ownership_survives_admission_and_terminal_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, terminal_registry_singleton
+) -> None:
+    from omnigent.harnesses.claude_native import settings_validation
+    from omnigent.harnesses.claude_native.main import _claude_terminal_request
+    from omnigent.harnesses.claude_native.settings_generation import (
+        ClaudeSettingsRequest,
+        settings_generation_path,
+    )
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.terminal import TerminalInstance
+    from omnigent.terminals import TerminalRegistry
+
+    monkeypatch.setattr(settings_validation, "validate_caller_settings", AsyncMock())
+    monkeypatch.chdir(tmp_path)
+    if mode == "opaque":
+        monkeypatch.setattr(
+            "omnigent.harnesses.claude_native.main.resolve_claude_launch",
+            lambda command, args: ("sh", ["-c", shlex.join([command, *args])]),
+        )
+    spec = _spec_without_terminals()
+    spec.os_env = OSEnvSpec(cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    app = _switch_app(
+        tmp_path, _SwitchableServerClient("settings-agent"), {"settings-agent": spec}
+    )
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    request = ClaudeSettingsRequest.create(bridge_dir)
+    caller = {"disableAllHooks": True} if mode == "failure" else {"env": {"EXAMPLE": "caller"}}
+    body = _claude_terminal_request(
+        ("--settings", json.dumps(caller)),
+        command="claude",
+        bridge_dir=bridge_dir,
+        settings_request=request,
+    )
+    baseline = settings_generation_path(bridge_dir, request.generation)
+    baseline_bytes = baseline.read_bytes()
+    if mode != "expired":
+        request.mark_dispatched()
+    if mode == "declared-replacement":
+        spec.terminals = {body["terminal"]: TerminalEnvSpec(command="bash", args=["-l"])}
+    launched = []
+
+    async def spawn(instance, *, cwd=None):
+        launched.append(instance)
+        instance.running = True
+
+    monkeypatch.setattr(TerminalInstance, "launch", spawn)
+    monkeypatch.setattr(TerminalInstance, "is_alive", AsyncMock(return_value=True))
+    monkeypatch.setattr(TerminalInstance, "_tmux", AsyncMock(return_value=""))
+    terminals = TerminalRegistry()
+    original_launch = _StubResourceRegistry.launch_required_terminal
+
+    async def launch(self, **kwargs):
+        if mode == "abandoned" and kwargs["spec"].args == body["spec"]["args"]:
+            request.close()
+        await terminals.launch(
+            session_id,
+            kwargs["terminal_name"],
+            kwargs["session_key"],
+            kwargs["spec"],
+            parent_os_env=kwargs["parent_os_env"],
+            prepare_terminal=kwargs["prepare_terminal"],
+        )
+        return await original_launch(self, **kwargs)
+
+    monkeypatch.setattr(_StubResourceRegistry, "launch_required_terminal", launch)
+    if mode == "expired":
+        request.close()
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            url = f"/v1/sessions/{session_id}/resources/terminals"
+            response = await client.post(url, json=body)
+            if mode in {"expired", "failure"}:
+                assert response.status_code == (409 if mode == "expired" else 500), response.text
+                if mode == "failure":
+                    assert response.json()["claude_settings_request_ack"] == request.generation
+                assert launched == []
+                request.close()
+                assert not list(bridge_dir.glob(f"claude-settings-{request.generation}*"))
+                return
+            assert response.status_code == 200, response.text
+            assert response.json()["claude_settings_request_ack"] == request.generation
+            assert not baseline.with_suffix(".dispatch.owner").exists()
+            assert len(launched) == 1
+            instance = launched[0]
+            request.close()
+            if mode == "declared-replacement":
+                assert instance.args == ["-l"]
+                assert not baseline.exists()
+            else:
+                assert baseline.read_bytes() == baseline_bytes
+                assert instance.private_dir.exists()
+                if mode == "opaque":
+                    assert str(baseline) in instance.args[-1]
+                else:
+                    settings_index = max(
+                        i for i, arg in enumerate(instance.args) if arg == "--settings"
+                    )
+                    output = Path(instance.args[settings_index + 1])
+                    assert output.parent == instance.private_dir
+                    assert json.loads(output.read_text())["env"]["EXAMPLE"] == "caller"
+            replay = await client.post(url, json=body)
+            assert replay.status_code == 409, replay.text
+            assert replay.json()["error"]["code"] == "conflict"
+            assert "expired" in replay.json()["error"]["message"]
+            assert len(launched) == 1
+            with ClaudeSettingsRequest.create(bridge_dir) as unused:
+                unused_body = _claude_terminal_request(
+                    (), command="claude", bridge_dir=bridge_dir, settings_request=unused
+                )
+                unused.mark_dispatched()
+                reused = await client.post(url, json=unused_body)
+                assert reused.status_code == 200, reused.text
+                assert len(launched) == 1
+            assert not list(bridge_dir.glob(f"claude-settings-{unused.generation}*"))
+            assert terminals.transfer(session_id, "moved", "claude", "main")
+            await terminals.cleanup_conversation(session_id)
+            assert instance.private_dir.exists()
+            if mode != "declared-replacement":
+                assert baseline.read_bytes() == baseline_bytes
+            await terminals.cleanup_conversation("moved")
+            assert not instance.private_dir.exists()
+            assert not list(bridge_dir.glob(f"claude-settings-{request.generation}*"))
+    finally:
+        request.close()
+        await terminals.shutdown()
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            await client.delete(f"/v1/sessions/{session_id}")
         shutil.rmtree(bridge_dir, ignore_errors=True)

@@ -1135,6 +1135,12 @@ class TerminalInstance:
     _tcp_egress_broker: TcpEgressBroker | None = field(default=None, repr=False)
     _tcp_egress_tmpdir: Path | None = field(default=None, repr=False)
     _resource_cleanup_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
+    _resource_cleanup_stack: contextlib.ExitStack = field(
+        default_factory=contextlib.ExitStack, init=False, repr=False
+    )
+    _has_retained_resources: bool = field(default=False, init=False, repr=False)
+    _launch_started: bool = field(default=False, init=False, repr=False)
+    _launch_incomplete: bool = field(default=False, init=False, repr=False)
     _clipboard_bridge: TerminalClipboardBridge | None = field(default=None, init=False, repr=False)
     _idle_task: asyncio.Task[None] | None = field(default=None, repr=False)
     # Threaded idle-watcher state. Mirrors :attr:`_idle_task` but for
@@ -1780,13 +1786,20 @@ class TerminalInstance:
         try:
             if self._clipboard_bridge is not None:
                 self._clipboard_bridge.start()
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-            )
+            self._launch_started = True
+            self._launch_incomplete = True
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                )
+            except OSError:
+                self._launch_incomplete = False
+                raise
             _, stderr = await proc.communicate()
+            self._launch_incomplete = False
             if proc.returncode != 0:
                 raise RuntimeError(
                     f"tmux launch failed (rc={proc.returncode}): {stderr.decode().strip()}"
@@ -2019,8 +2032,14 @@ class TerminalInstance:
         self._stop_git_ssh()
         self._stop_tcp_egress()
 
+    def add_resource_cleanup(self, callback: Callable[[], object]) -> None:
+        """Retire a resource only after this terminal's termination is confirmed."""
+        self._has_retained_resources = True
+        self._resource_cleanup_stack.callback(callback)
+
     async def close(self) -> None:
         """Kill the tmux session and clean up."""
+        terminal_stopped = False
         try:
             if self.lifecycle_trace.note_cleanup():
                 logger.info(
@@ -2037,6 +2056,11 @@ class TerminalInstance:
         except Exception as exc:  # noqa: BLE001 - diagnostics cannot prevent cleanup.
             logger.debug("Terminal cleanup telemetry failed (%s)", type(exc).__name__)
         try:
+            terminal_stopped = not (
+                self.running
+                or self.socket_path.exists()
+                or (self._has_retained_resources and self._launch_started)
+            )
             # Cancel both idle-watcher variants first so they don't race
             # the socket teardown. Order doesn't matter — they're
             # independent.
@@ -2047,9 +2071,15 @@ class TerminalInstance:
             # observe a failure. A private socket can still belong to a live tmux
             # server (or a remain-on-exit pane), so cleanup must not trust that
             # advisory flag before issuing kill-server.
-            if self.running or self.socket_path.exists():
-                with contextlib.suppress(RuntimeError):
+            if not terminal_stopped:
+                try:
                     await self._tmux("kill-server")
+                except _TmuxTargetGoneError:
+                    terminal_stopped = not self._launch_incomplete
+                except RuntimeError:
+                    pass
+                else:
+                    terminal_stopped = not self._launch_incomplete
             self.running = False
 
             if self._clipboard_bridge is not None:
@@ -2058,11 +2088,11 @@ class TerminalInstance:
         finally:
             if self._resource_cleanup_task is None or self._resource_cleanup_task.done():
                 self._resource_cleanup_task = asyncio.create_task(
-                    asyncio.to_thread(self._close_resources)
+                    asyncio.to_thread(self._close_resources, terminal_stopped=terminal_stopped)
                 )
             await asyncio.shield(self._resource_cleanup_task)
 
-    def _close_resources(self) -> None:
+    def _close_resources(self, *, terminal_stopped: bool) -> None:
         """Finish revocation and file cleanup even if the async owner times out."""
         try:
             self._stop_network_brokers()
@@ -2071,8 +2101,13 @@ class TerminalInstance:
                 if self.os_env is not None:
                     self.os_env.close()
             finally:
-                if self.private_dir.exists():
-                    shutil.rmtree(self.private_dir, ignore_errors=True)
+                # Interrupted launches or kills can leave consumers of these files alive.
+                if terminal_stopped or not self._has_retained_resources:
+                    try:
+                        self._resource_cleanup_stack.close()
+                    finally:
+                        if self.private_dir.exists():
+                            shutil.rmtree(self.private_dir, ignore_errors=True)
 
     def start_idle_watcher(
         self,

@@ -9895,6 +9895,12 @@ async def _auto_create_claude_terminal(
         auto_harness=launch_metadata.auto_harness,
     )
     _claude_turn_router = None
+    from omnigent.harnesses.claude_native.settings_generation import (
+        ClaudeSettingsRequest,
+        acquire_claude_settings_request,
+    )
+
+    settings_request: ClaudeSettingsRequest | None = None
 
     async def cleanup_owned_routers(error: BaseException) -> None:
         # No forwarder owns the routers yet, so release the ones this launch started.
@@ -9941,9 +9947,11 @@ async def _auto_create_claude_terminal(
             # Its dead-owner cleanup also reclaims these generated skill links.
             bundle_dir = bridge_dir / "skill-bundle"
             _ensure_orchestrator_skills_in_bundle(bundle_dir, agent_spec)
+        settings_request = ClaudeSettingsRequest.create(bridge_dir)
         claude_args = augment_claude_args(
             base_claude_args,
             defer_caller_settings=True,
+            settings_request=settings_request,
             active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
             bridge_dir=bridge_dir,
             workspace=Path(workspace),
@@ -10021,15 +10029,19 @@ async def _auto_create_claude_terminal(
             bridge_dir,
             launch_args,
             claude_args_start=_claude_terminal_args_start(env_spec, len(configured_prefix)),
+            settings_request=settings_request,
         )
 
         async def prepare_claude(instance: TerminalInstance) -> None:
-            await finalize_claude_caller_settings(
-                instance,
-                bridge_dir=bridge_dir,
-                generation=settings_generation,
-                active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
-            )
+            with acquire_claude_settings_request(bridge_dir, settings_generation) as lease:
+                lease.attach(instance)
+                await finalize_claude_caller_settings(
+                    instance,
+                    bridge_dir=bridge_dir,
+                    generation=settings_generation,
+                    active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
+                    private_output=True,
+                )
 
         # Seed trust and onboarding in the config selected by the terminal's launch environment.
         ensure_claude_workspace_trusted(
@@ -10037,6 +10049,8 @@ async def _auto_create_claude_terminal(
             env=_claude_terminal_launch_env(env_spec),
         )
     except BaseException as prepare_error:
+        if settings_request is not None:
+            settings_request.close()
         await cleanup_owned_routers(prepare_error)
         raise
     _logger.info(
@@ -10080,6 +10094,9 @@ async def _auto_create_claude_terminal(
         finally:
             await cleanup_owned_routers(launch_error)
         raise
+    finally:
+        if settings_request is not None:
+            settings_request.close()
     timings.mark("tmux_launch")
     if reset_pick_after_launch:
         await _clear_session_model_override(session_id, server_client)
@@ -10352,6 +10369,8 @@ async def _delete_native_bridge_dirs(
     Antigravity/claude/codex/opencode bridge ids can be rotated via a session
     label, so resolve those too (falling back to *session_id*, the un-rotated key);
     the remaining families key purely on *session_id*.
+    Claude settings owners defer removal until their request and terminal consumers
+    release; unacknowledged crash claims remain conservative.
 
     :param server_client: Omnigent server client used to resolve rotated bridge
         id labels. ``None`` skips label resolution (session_id keys only).
@@ -10368,6 +10387,9 @@ async def _delete_native_bridge_dirs(
     )
     from omnigent.harnesses.claude_native.bridge import (
         bridge_dir_for_bridge_id as claude_bridge_dir,
+    )
+    from omnigent.harnesses.claude_native.settings_generation import (
+        has_live_claude_settings_owners,
     )
     from omnigent.harnesses.codex_native.bridge import (
         CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -10403,6 +10425,7 @@ async def _delete_native_bridge_dirs(
         bridge_dir_for_session_id as qwen_bridge_dir,
     )
     from omnigent.inner.native_attachments import attachment_cache_dir
+    from omnigent.native.native_bridge_common import bridge_dir_preparation_lock
 
     labels: dict[str, str] = {}
     if server_client is not None:
@@ -10411,11 +10434,14 @@ async def _delete_native_bridge_dirs(
             session_id=session_id,
         )
 
+    claude_targets = {
+        claude_bridge_dir(labels.get(BRIDGE_ID_LABEL_KEY) or session_id),
+        claude_bridge_dir(session_id),
+    }
     targets = {
         antigravity_bridge_dir(labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
         antigravity_bridge_dir(session_id),
-        claude_bridge_dir(labels.get(BRIDGE_ID_LABEL_KEY) or session_id),
-        claude_bridge_dir(session_id),
+        *claude_targets,
         codex_bridge_dir(labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
         codex_bridge_dir(session_id),
         cursor_bridge_dir(session_id),
@@ -10432,7 +10458,14 @@ async def _delete_native_bridge_dirs(
     targets.update(attachment_cache_dir(target) for target in tuple(targets))
     for target in targets:
         try:
-            shutil.rmtree(target, ignore_errors=False)
+            with (
+                bridge_dir_preparation_lock(target)
+                if target in claude_targets
+                else contextlib.nullcontext()
+            ):
+                if target in claude_targets and has_live_claude_settings_owners(target):
+                    continue
+                shutil.rmtree(target, ignore_errors=False)
         except FileNotFoundError:
             pass
         except OSError as exc:

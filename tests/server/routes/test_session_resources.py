@@ -1745,6 +1745,18 @@ async def test_create_terminal_bootstrap_markers_do_not_bypass_gate_for_other_sh
             ErrorCode.RUNNER_UNAVAILABLE,
             "tunnel closed before request completed",
         ),
+        (
+            409,
+            {
+                "error": {
+                    "code": ErrorCode.CONFLICT,
+                    "message": "Claude settings request has expired; rebuild the terminal request",
+                }
+            },
+            409,
+            ErrorCode.CONFLICT,
+            "Claude settings request has expired; rebuild the terminal request",
+        ),
         # Runner returns an error with no body — fall back to
         # INTERNAL_ERROR (→500) and a message carrying the raw status.
         (
