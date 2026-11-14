@@ -2834,6 +2834,7 @@ function AccountSection() {
   const [pwBusy, setPwBusy] = useState(false);
   const [pwError, setPwError] = useState<string | null>(null);
   const [pwDone, setPwDone] = useState(false);
+  const [signOutError, setSignOutError] = useState<string | null>(null);
 
   useEffect(() => {
     if (capabilitiesLoading) return;
@@ -2843,7 +2844,14 @@ function AccountSection() {
     })();
   }, [capabilitiesLoading]);
 
-  const onSignOut = useCallback(() => signOutOfBrowserSession(accountsEnabled), [accountsEnabled]);
+  const onSignOut = useCallback(async () => {
+    setSignOutError(null);
+    try {
+      await signOutOfBrowserSession(accountsEnabled);
+    } catch (err) {
+      setSignOutError(err instanceof Error ? err.message : "Sign-out failed. Try again.");
+    }
+  }, [accountsEnabled]);
 
   const resetPwForm = useCallback(() => {
     setOldPw("");
@@ -2923,6 +2931,14 @@ function AccountSection() {
           >
             <LogOutIcon className="size-4" /> Sign out
           </Button>
+          {signOutError !== null && (
+            <div
+              role="alert"
+              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
+            >
+              {signOutError}
+            </div>
+          )}
         </div>
       </div>
 

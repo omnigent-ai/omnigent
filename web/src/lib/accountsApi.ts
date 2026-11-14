@@ -16,12 +16,13 @@
  * without try/catch every call site.
  */
 
+import { withActivityAge } from "./activity";
 import { withBasePath } from "./basePath";
 import { withRoutingKey } from "./host";
 
-// Standalone accounts endpoints skip the embed transport, so they add the routing key here.
+/** Standalone `/auth/*` fetch carrying both routing and browser activity context. */
 function accountsFetch(path: string, init?: RequestInit): Promise<Response> {
-  return fetch(withBasePath(path), withRoutingKey(init, { hostless: true }));
+  return fetch(withBasePath(path), withActivityAge(withRoutingKey(init, { hostless: true })));
 }
 
 /** Body of POST /auth/login. */
@@ -107,19 +108,33 @@ export async function login(body: LoginRequest): Promise<LoginResult> {
 }
 
 /**
- * POST /auth/logout — clear the session cookie.
+ * POST /auth/logout — end the session and clear the session cookie.
  *
- * Always succeeds from the caller's POV (204 even when no cookie
- * was set), so this returns ``void``. After it resolves, navigate
- * to ``/login`` to land the user on a clean form.
+ * Resolves once the server has signed the session out (204, also when no
+ * cookie was set); navigate to ``/login`` afterwards. Throws when sign-out
+ * did not happen — the server could not record it (503, cookie kept) or
+ * could not be reached — so the user is still signed in and can retry.
  */
 export async function logout(): Promise<void> {
+  let res: Response;
   try {
-    await accountsFetch("/auth/logout", { method: "POST" });
+    res = await accountsFetch("/auth/logout", { method: "POST" });
   } catch {
-    // Network error — the cookie is still in the browser, but the
-    // next authenticated request will 401 and bounce to login.
+    throw new Error("Could not reach the server, so you are still signed in. Try again.");
   }
+  if (res.ok) {
+    return;
+  }
+  let message = "Sign-out failed, so you are still signed in. Try again.";
+  try {
+    const data = (await res.json()) as { error?: string };
+    if (data.error) {
+      message = data.error;
+    }
+  } catch {
+    // Body wasn't JSON; keep the generic message.
+  }
+  throw new Error(message);
 }
 
 /**

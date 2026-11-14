@@ -1,5 +1,6 @@
 import type { ComponentType, ReactNode, Ref } from "react";
 
+import { withActivityAge } from "./activity.ts";
 import { getBasePath, withBasePath } from "./basePath.ts";
 import { updatesRoutingKey } from "./sessionHost.ts";
 import { clientRoutingKey, SLICE_KEY_HEADER, SLICE_KEY_PARAM } from "./routingKey.ts";
@@ -389,7 +390,9 @@ export function hostFetch(
     // the path is passed through untouched — `withBasePath` is standalone-only.
     return hostConfig.fetcher(path, routedInit);
   }
-  return fetch(withBasePath(path), routedInit);
+  // Standalone requests ride the session cookie, which renews only up to the
+  // last user interaction; the embed host owns its own auth.
+  return fetch(withBasePath(path), withActivityAge(routedInit));
 }
 
 export function resolveWebSocketUrl(path: string, options?: RoutingOptions): string {

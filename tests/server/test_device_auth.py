@@ -433,6 +433,74 @@ def test_consent_page_requires_login(app: TestClient) -> None:
     assert "/login" in r.headers["location"]
 
 
+def test_consent_reauth_gate_uses_login_time_not_renewed_iat(app: TestClient) -> None:
+    """A session renewed after the grant began still counts as a stale login.
+
+    Sliding renewal gives the cookie a fresh ``iat`` but keeps the original
+    ``auth_time``; consent must key on the login, so it bounces with
+    ``reauth=1`` instead of approving without a fresh password.
+    """
+    import os
+    import time
+
+    _login_admin(app)
+    secret = bytes.fromhex(os.environ["OMNIGENT_ACCOUNTS_COOKIE_SECRET"])
+    claims = jwt.decode(app.cookies["ap_session"], secret, algorithms=["HS256"])
+    r = app.post("/oauth/device/authorize", json={"client_id": "slack"})
+    assert r.status_code == 200, r.text
+    user_code = r.json()["user_code"]
+    now = int(time.time())
+    renewed = jwt.encode(
+        {**claims, "iat": now, "exp": now + 3600, "auth_time": now - 3600},
+        secret,
+        algorithm="HS256",
+    )
+
+    r = app.get(
+        f"/oauth/device?user_code={user_code}",
+        headers={"Cookie": f"ap_session={renewed}"},
+        follow_redirects=False,
+    )
+
+    assert r.status_code == 302, r.text
+    assert "reauth=1" in r.headers["location"]
+
+
+def test_renewed_session_drops_cli_login_ticket(app: TestClient) -> None:
+    """Renewal cannot preserve the proof used by the OIDC CLI consent gate."""
+    import os
+    import time
+
+    _login_admin(app)
+    secret = bytes.fromhex(os.environ["OMNIGENT_ACCOUNTS_COOKIE_SECRET"])
+    claims = jwt.decode(app.cookies["ap_session"], secret, algorithms=["HS256"])
+    now = int(time.time())
+    aged = jwt.encode(
+        {
+            **claims,
+            "iat": now - 8 * 3600 + 600,
+            "exp": now + 600,
+            "auth_time": now - 3600,
+            "cli_login_ticket": "ticket-from-login",
+        },
+        secret,
+        algorithm="HS256",
+    )
+
+    response = app.get(
+        "/auth/me",
+        headers={
+            "Cookie": f"ap_session={aged}",
+            "X-Omnigent-Activity-Age": "0",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    renewed = jwt.decode(response.cookies["ap_session"], secret, algorithms=["HS256"])
+    assert renewed["sid"] == claims["sid"]
+    assert "cli_login_ticket" not in renewed
+
+
 def test_consent_page_login_bounce_carries_base_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

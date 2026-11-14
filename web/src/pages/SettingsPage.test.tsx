@@ -22,6 +22,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
+import * as accountsApi from "@/lib/accountsApi";
 import { OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY } from "@/lib/subagentPanelPreferences";
 import {
   useProjectFolderCollapse,
@@ -104,7 +105,7 @@ vi.mock("@/shell/ImportSessionsPanel", () => ({
   ImportSessionsPanel: mocks.importSessionsPanel,
 }));
 vi.mock("@/lib/accountsApi", () => ({
-  logout: vi.fn(),
+  signOutOfBrowserSession: vi.fn(),
   changePassword: vi.fn(),
 }));
 vi.mock("@/lib/identity", () => ({
@@ -1651,6 +1652,57 @@ describe("SettingsPage", () => {
   it("hides the Updates section outside the Electron shell", () => {
     renderPage("/settings/updates");
     expect(screen.queryByRole("heading", { name: "Updates" })).toBeNull();
+  });
+
+  describe("accounts sign out", () => {
+    let hrefWrites: string[];
+    let originalLocation: Location;
+
+    beforeEach(() => {
+      hrefWrites = [];
+      originalLocation = window.location;
+      Object.defineProperty(window, "location", {
+        configurable: true,
+        value: {
+          ...originalLocation,
+          set href(value: string) {
+            hrefWrites.push(value);
+          },
+          get href() {
+            return hrefWrites[hrefWrites.length - 1] ?? "http://localhost/settings/account";
+          },
+        },
+      });
+    });
+
+    afterEach(() => {
+      Object.defineProperty(window, "location", { configurable: true, value: originalLocation });
+    });
+
+    it("navigates to the login page once sign-out succeeds", async () => {
+      vi.mocked(accountsApi.signOutOfBrowserSession).mockImplementationOnce(async () => {
+        window.location.href = "/login";
+      });
+      renderPage("/settings/account");
+
+      fireEvent.click(await screen.findByRole("button", { name: /Sign out/ }));
+
+      await waitFor(() => expect(hrefWrites).toEqual(["/login"]));
+      expect(screen.queryByRole("alert")).toBeNull();
+    });
+
+    it("stays signed in and shows the error when sign-out fails", async () => {
+      vi.mocked(accountsApi.signOutOfBrowserSession).mockRejectedValueOnce(
+        new Error("Sign-out failed: the server could not record it, so you are still signed in."),
+      );
+      renderPage("/settings/account");
+
+      fireEvent.click(await screen.findByRole("button", { name: /Sign out/ }));
+
+      expect(await screen.findByRole("alert")).toHaveTextContent(/you are still signed in/);
+      expect(hrefWrites).toEqual([]);
+      expect(screen.getByText("alice")).toBeInTheDocument();
+    });
   });
 
   it("renders the Account section under OIDC (accounts off, login_url set)", async () => {
