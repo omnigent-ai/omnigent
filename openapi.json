@@ -1562,6 +1562,32 @@
         "title": "CodexGoalObject",
         "type": "object"
       },
+      "CodexGoalReadResponse": {
+        "description": "Goal read with explicit availability from the native backend.",
+        "properties": {
+          "available": {
+            "description": "Whether the backend confirmed the goal, including its absence. An unavailable read must not replace the caller's snapshot.",
+            "title": "Available",
+            "type": "boolean"
+          },
+          "goal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CodexGoalObject"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "goal",
+          "available"
+        ],
+        "title": "CodexGoalReadResponse",
+        "type": "object"
+      },
       "CodexGoalResponse": {
         "description": "Response body for reading or setting a Codex-native session goal.",
         "properties": {
@@ -20231,7 +20257,7 @@
         ]
       },
       "get": {
-        "description": "Read the current Codex app-server goal for a Codex-native session.\n\n**Returns:** Current Codex goal state, or `goal=None` when no goal is set.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 for non-Codex sessions, 404 for missing sessions, or 503 when no live Codex runner can read the goal.",
+        "description": "Read the current Codex app-server goal for a Codex-native session.\n\n**Returns:** Current Codex goal state and availability. Legacy runner replies leave availability unspecified. `X-Omnigent-Codex-Goal-Read: strict` opts into unavailable-read errors. Background reads report `available=False` for absent or idle runners. Strict reads return 503 when no live runner is available and 502 for malformed runner replies; structured runner errors preserve their status.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 for non-Codex sessions or 404 for missing sessions.",
         "operationId": "get_codex_goal_v1_sessions__session_id__codex_goal_get",
         "parameters": [
           {
@@ -20250,7 +20276,15 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CodexGoalResponse"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/CodexGoalReadResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CodexGoalResponse"
+                    }
+                  ],
+                  "title": "Response Get Codex Goal V1 Sessions  Session Id  Codex Goal Get"
                 }
               }
             },

@@ -2332,6 +2332,16 @@ export function buildSlashCommandMap(
   return m;
 }
 
+/** Build the same skill descriptions for leading and inline completion. */
+function buildSkillCommandMap(
+  skills: readonly SkillSummary[],
+  prefix: "/" | "$",
+): Record<string, string> {
+  return Object.fromEntries(
+    skills.map((skill) => [`${prefix}${skill.name}`, skillMenuDescription(skill)]),
+  );
+}
+
 /**
  * Whether the composer offers ``/clear`` for a session on *harness*.
  *
@@ -2944,10 +2954,12 @@ function ComposerImpl(
     return true;
   };
   useEffect(() => setGoalDialogOpen(false), [conversationId]);
-  const { goal, setGoal: setGoalState } = useGoalState(
-    composerSessionId,
-    showGoalControl && runnerOnline === true,
-  );
+  const {
+    goal,
+    goalRevision,
+    setGoal: setGoalState,
+    refreshGoal,
+  } = useGoalState(composerSessionId, showGoalControl, runnerOnline === true);
   // "@"-file-mention is scoped to harnesses whose agent opens an on-disk file
   // from the attachment marker (``harnessSupportsFileMentions``); others get no
   // menu, so the workspace listing is never fetched for them. Codex's marker
@@ -3155,11 +3167,6 @@ function ComposerImpl(
   const showGoal =
     composerSessionId !== null &&
     (showGoalControl || showClaudeGoalControl || showPollyCodexGoalControl);
-  const menuSkills = useMemo(
-    () =>
-      showGoal && skillPrefix === "/" ? skills.filter((skill) => skill.name !== "goal") : skills,
-    [skills, showGoal, skillPrefix],
-  );
   // The built-ins this session offers; a gated-off one leaves a same-named
   // custom command to run as a skill.
   const offeredBuiltinCommands = useMemo(
@@ -3194,16 +3201,24 @@ function ComposerImpl(
       showGoal,
     ],
   );
-  const skillCommands = useMemo(
+  const goalBuiltinNames = useMemo(() => new Set(showGoal ? ["/goal"] : []), [showGoal]);
+  const commandSkills = useMemo(
     () =>
-      Object.fromEntries(
-        menuSkills.map((skill) => [`${skillPrefix}${skill.name}`, skillMenuDescription(skill)]),
-      ),
-    [menuSkills, skillPrefix],
+      showGoal && skillPrefix === "/"
+        ? skills.filter((skill) => skill.name.toLowerCase() !== "goal")
+        : skills,
+    [skills, showGoal, skillPrefix],
+  );
+  const skillCommands = useMemo(
+    () => buildSkillCommandMap(skills, skillPrefix),
+    [skills, skillPrefix],
   );
   const slashCommands = useMemo(
-    () => ({ ...offeredBuiltinCommands, ...skillCommands }),
-    [offeredBuiltinCommands, skillCommands],
+    () => ({
+      ...offeredBuiltinCommands,
+      ...buildSkillCommandMap(commandSkills, skillPrefix),
+    }),
+    [offeredBuiltinCommands, commandSkills, skillPrefix],
   );
   const slashCommandNames = useMemo(() => Object.keys(slashCommands), [slashCommands]);
   // Skills always need an optional argument fill-in so the user can
@@ -3212,14 +3227,14 @@ function ComposerImpl(
   const slashCommandsWithArgs = useMemo(
     () =>
       buildSlashCommandWithArgsSet(
-        menuSkills,
+        commandSkills,
         showEffort,
         showModel,
         showBtw,
         showSide,
         skillPrefix,
       ),
-    [menuSkills, showEffort, showModel, showBtw, showSide, skillPrefix],
+    [commandSkills, showEffort, showModel, showBtw, showSide, skillPrefix],
   );
 
   // Suggest names until a space starts the arguments; exclude file paths.
@@ -3762,10 +3777,7 @@ function ComposerImpl(
     }
   };
 
-  const skillLabels = useMemo(
-    () => skillDisplayNames(menuSkills, skillPrefix),
-    [menuSkills, skillPrefix],
-  );
+  const skillLabels = useMemo(() => skillDisplayNames(skills, skillPrefix), [skills, skillPrefix]);
   const selectedAgent = agents?.find((agent) => agent.id === boundAgentId);
   const registryEnabled =
     composerServerInfo !== "loading" && !!composerServerInfo.enabled_connections?.includes("mcp");
@@ -3896,6 +3908,7 @@ function ComposerImpl(
     text: value,
     commands: slashCompletionCommands,
     skills: skillCommands,
+    builtinNames: goalBuiltinNames,
     labels: skillLabels,
     textareaRef,
     prefix: skillPrefix,
@@ -4134,6 +4147,7 @@ function ComposerImpl(
     const skill = onSendSlashCommand
       ? matchSlashCommandInvocation(trimmed, slashCommandNames)
       : null;
+    let goalMessage: string | null = null;
     if (
       draft.quotes.length === 0 &&
       (skill !== null || isSlashCommandText(trimmed)) &&
@@ -4162,6 +4176,9 @@ function ComposerImpl(
       if (skill !== null && skill.command !== parts[0]) {
         runCommand(() => sendSkill(skill));
         return;
+      }
+      if (cmd === "/goal" && showGoal && arg) {
+        goalMessage = `/goal ${trimmed.slice(parts[0].length).trim()}`;
       }
       // Bare "/model" when the session has a switchable model (claude-native):
       // sent as plaintext it would open Claude's interactive selector inside the
@@ -4250,7 +4267,7 @@ function ComposerImpl(
       outgoing.text = withSessionMentionHint(outgoing.text, tagsSessions);
       onSend(serializeReplyDraft(outgoing), sendFiles, snapshotReplyDraft(outgoing));
     } else {
-      const message = isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd();
+      const message = goalMessage ?? (isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd());
       onSend(
         withSessionMentionHint(
           [expand(message), reviewContext].filter(Boolean).join("\n\n"),
@@ -4968,7 +4985,9 @@ function ComposerImpl(
           conversationId={composerSessionId}
           readOnly={isReadOnly}
           goal={goal}
+          goalRevision={goalRevision}
           onGoalChange={setGoalState}
+          refreshGoal={refreshGoal}
         />
       ) : (
         (showClaudeGoalControl || showPollyCodexGoalControl) && (

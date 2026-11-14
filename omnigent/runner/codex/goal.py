@@ -141,6 +141,7 @@ class CodexGoalRunner:
         action: str,
         method: str,
         params: dict[str, object],
+        require_live: bool = False,
     ) -> dict[str, object] | JSONResponse:
         """Execute one Codex app-server goal JSON-RPC request."""
         from omnigent.harnesses.codex_native.app_server import client_for_transport
@@ -158,12 +159,12 @@ class CodexGoalRunner:
             except (ConnectionRefusedError, FileNotFoundError):
                 if (
                     method == "thread/goal/get"
+                    and not require_live
                     and self._bridge_is_inactive is not None
                     and self._bridge_is_inactive(conv_id, state)
                 ):
-                    # Idle reaping leaves its old bridge file behind. Match the
-                    # disconnected-runner read without waking an autonomous goal.
-                    return {"goal": None}
+                    # An idle bridge cannot confirm whether the goal still exists.
+                    return {"goal": None, "available": False}
                 raise
             return self._goal_result(
                 await codex_client.request(method, {"threadId": state.thread_id, **params}),
@@ -192,24 +193,36 @@ class CodexGoalRunner:
             with contextlib.suppress(Exception):
                 await codex_client.close()
 
-    async def get(self, conv_id: str) -> Response:
+    async def get(self, conv_id: str, *, require_live: bool = False) -> Response:
         """Read the current Codex app-server goal for a loaded thread."""
         result = await self._request(
             conv_id,
             action="read",
             method="thread/goal/get",
             params={},
+            require_live=require_live,
         )
         if isinstance(result, JSONResponse):
             return result
         goal = result.get("goal")
-        if goal is not None and not isinstance(goal, dict):
+        available = result.get("available", True)
+        if type(available) is not bool or (not available and goal is not None):
+            return self._malformed_response("read", "invalid availability")
+        if not available and require_live:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_goal_failed",
+                    "detail": "Codex-native goal read requires a live Codex bridge.",
+                },
+            )
+        if "goal" not in result or (goal is not None and not isinstance(goal, dict)):
             return self._malformed_response("read", "invalid goal object")
         try:
             api_goal = None if goal is None else self._goal_to_api(goal)
         except ValueError as exc:
             return self._malformed_response("read", str(exc))
-        return JSONResponse({"goal": api_goal})
+        return JSONResponse({"goal": api_goal, "available": available})
 
     async def set(
         self,
@@ -310,7 +323,9 @@ class CodexGoalRunner:
             )
 
         if body_type == "goal_get":
-            return await self.get(conv_id)
+            return await self.get(
+                conv_id, require_live=isinstance(body, dict) and body.get("require_live") is True
+            )
 
         if body_type == "goal_clear":
             return await self.clear(conv_id)

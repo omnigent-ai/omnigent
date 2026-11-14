@@ -10,6 +10,7 @@ app with the forward step staged.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 from typing import Any, cast
@@ -22,7 +23,9 @@ from starlette.datastructures import State
 from omnigent._wrapper_labels import CODEX_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server import schemas
 from omnigent.server.host_registry import RunnerExitReports
+from omnigent.server.routes import sessions as session_routes
 from omnigent.server.routes._sessions.helpers import _HostLaunchAttempt
 from omnigent.server.routes.codex import sessions as codex
 from omnigent.server.routes.sessions import _RunnerForwardResult
@@ -406,13 +409,20 @@ async def test_forward_uses_the_live_runner_when_present(monkeypatch: pytest.Mon
     )
 
 
-async def test_forward_never_wakes_a_runner_just_to_read(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("require_live", [False, True])
+async def test_forward_never_wakes_a_runner_just_to_read(
+    monkeypatch: pytest.MonkeyPatch, require_live: bool
+) -> None:
     async def _never(**kwargs: Any) -> None:
         raise AssertionError("goal_get must not relaunch")
 
     monkeypatch.setattr(codex, "_launch_runner_for_codex_goal", _never)
     assert (
-        await _forward(monkeypatch, {"type": "goal_get"}, _forward_session_change_to_runner=None)
+        await _forward(
+            monkeypatch,
+            {"type": "goal_get", **({"require_live": True} if require_live else {})},
+            _forward_session_change_to_runner=None,
+        )
         is None
     )
 
@@ -449,6 +459,79 @@ async def test_forward_wakes_the_runner_then_retries_on_it(
     )
 
 
+@pytest.mark.parametrize(
+    ("event_type", "phase"),
+    [
+        ("goal_get", "forward"),
+        ("goal_set", "forward"),
+        ("goal_set", "recovery"),
+        ("goal_set", "retry"),
+        ("goal_status", "retry"),
+        ("goal_clear", "retry"),
+    ],
+)
+async def test_forward_deadline_covers_live_recovery_and_retry_without_restarting(
+    monkeypatch: pytest.MonkeyPatch, event_type: str, phase: str
+) -> None:
+    calls: list[str] = []
+    cancelled: list[str] = []
+
+    async def stage(name: str, result: Any) -> Any:
+        calls.append(name)
+        if name == phase:
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled.append(name)
+                raise
+        return result
+
+    async def forward(*args: Any) -> Any:
+        return await stage("forward", None)
+
+    async def recover(**kwargs: Any) -> Any:
+        return await stage("recovery", object())
+
+    async def retry(*args: Any) -> Any:
+        return await stage("retry", _result(200, {"goal": None}))
+
+    monkeypatch.setattr(codex, "_CODEX_GOAL_READ_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(codex, "_CODEX_GOAL_MUTATION_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(codex, "_forward_session_change_to_runner", forward)
+    monkeypatch.setattr(codex, "_launch_runner_for_codex_goal", recover)
+    monkeypatch.setattr(codex, "_post_codex_goal_event_to_runner", retry)
+
+    result = await _forward(monkeypatch, {"type": event_type})
+
+    status, body = _status_and_body(_payload_or_response(result))
+    assert status == 504
+    assert body["error"] == "codex_goal_request_timeout"
+    assert ("uncertain" in body["detail"]) is (event_type != "goal_get")
+    assert cancelled == [phase]
+    phases = ["forward", "recovery", "retry"]
+    assert calls == phases[: phases.index(phase) + 1]
+
+
+@pytest.mark.parametrize("failure", ["timeout", "cancellation"])
+async def test_forward_does_not_reclassify_other_timeouts_or_cancellation(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    error = TimeoutError("upstream timeout") if failure == "timeout" else asyncio.CancelledError()
+
+    async def forward(*args: Any) -> None:
+        raise error
+
+    async def never(**kwargs: Any) -> None:
+        raise AssertionError("an interrupted forward must not relaunch")
+
+    monkeypatch.setattr(codex, "_forward_session_change_to_runner", forward)
+    monkeypatch.setattr(codex, "_launch_runner_for_codex_goal", never)
+
+    with pytest.raises(type(error)) as caught:
+        await _forward(monkeypatch, {"type": "goal_set"})
+    assert caught.value is error
+
+
 # ── _require_codex_native_goal_session ─────────────────────────────────────
 
 
@@ -478,6 +561,31 @@ async def codex_session(client: httpx.AsyncClient, db_uri: str) -> str:
     return session_id
 
 
+@pytest.mark.parametrize("strict", [False, True])
+async def test_goal_read_timeout_is_an_error_instead_of_an_absent_snapshot(
+    client: httpx.AsyncClient,
+    codex_session: str,
+    monkeypatch: pytest.MonkeyPatch,
+    strict: bool,
+) -> None:
+    async def stalled(*args: Any) -> None:
+        await asyncio.Future()
+
+    monkeypatch.setattr(codex, "_CODEX_GOAL_READ_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(codex, "_forward_session_change_to_runner", stalled)
+
+    response = await client.get(
+        f"/v1/sessions/{codex_session}/codex_goal",
+        headers={"X-Omnigent-Codex-Goal-Read": "strict"} if strict else {},
+    )
+
+    assert response.status_code == 504
+    assert response.json() == {
+        "error": "codex_goal_request_timeout",
+        "detail": "Goal read timed out. Try again.",
+    }
+
+
 class _StagedForward:
     """Replace ``_forward_codex_goal_event`` with a canned result; record events."""
 
@@ -492,42 +600,197 @@ class _StagedForward:
         monkeypatch.setattr(codex, "_forward_codex_goal_event", _forward)
 
 
-async def test_get_goal_without_a_runner_reads_as_no_goal(
-    client: httpx.AsyncClient, codex_session: str, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("read_mode", [None, "unknown", "strict"])
+async def test_get_goal_without_a_runner_preserves_legacy_or_strict_semantics(
+    client: httpx.AsyncClient,
+    codex_session: str,
+    monkeypatch: pytest.MonkeyPatch,
+    read_mode: str | None,
 ) -> None:
     staged = _StagedForward(monkeypatch, None)
-    resp = await client.get(f"/v1/sessions/{codex_session}/codex_goal")
-    assert resp.status_code == 200, resp.text
-    assert resp.json() == {"goal": None}
-    assert staged.events == [{"type": "goal_get"}]
+    headers = {"X-Omnigent-Codex-Goal-Read": read_mode} if read_mode else {}
+    resp = await client.get(f"/v1/sessions/{codex_session}/codex_goal", headers=headers)
+    if read_mode == "strict":
+        assert resp.status_code == 503, resp.text
+        assert "Could not read Codex goal" in resp.json()["error"]["message"]
+        assert staged.events == [{"type": "goal_get", "require_live": True}]
+    else:
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"goal": None, "available": False}
+        assert staged.events == [{"type": "goal_get"}]
 
 
+@pytest.mark.parametrize("available", [True, False])
+def test_read_response_requires_a_strict_boolean(available: bool) -> None:
+    response = schemas.CodexGoalReadResponse.model_validate({"goal": None, "available": available})
+
+    assert response.available is available
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{"goal": None}]
+    + [{"goal": None, "available": value} for value in (None, 0, 1, "true", "false", [], {})]
+    + [{"goal": _goal(), "available": False}],
+)
+def test_read_response_rejects_missing_or_invalid_availability(payload: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        schemas.CodexGoalReadResponse.model_validate(payload)
+
+
+@pytest.mark.parametrize("strict", [False, True])
+async def test_get_goal_preserves_unavailable_runner_payloads(
+    client: httpx.AsyncClient,
+    codex_session: str,
+    monkeypatch: pytest.MonkeyPatch,
+    strict: bool,
+) -> None:
+    staged = _StagedForward(monkeypatch, _result(200, {"goal": None, "available": False}))
+
+    response = await client.get(
+        f"/v1/sessions/{codex_session}/codex_goal",
+        headers={"X-Omnigent-Codex-Goal-Read": "strict"} if strict else {},
+    )
+
+    if strict:
+        assert response.status_code == 503, response.text
+    else:
+        assert response.status_code == 200, response.text
+        assert response.json() == {"goal": None, "available": False}
+    assert staged.events == [{"type": "goal_get", **({"require_live": True} if strict else {})}]
+
+
+@pytest.mark.parametrize("goal", [None, _goal()])
+@pytest.mark.parametrize("strict", [False, True])
+async def test_get_goal_preserves_confirmed_runner_availability(
+    client: httpx.AsyncClient,
+    codex_session: str,
+    monkeypatch: pytest.MonkeyPatch,
+    goal: dict[str, Any] | None,
+    strict: bool,
+) -> None:
+    _StagedForward(monkeypatch, _result(200, {"goal": goal, "available": True}))
+
+    response = await client.get(
+        f"/v1/sessions/{codex_session}/codex_goal",
+        headers={"X-Omnigent-Codex-Goal-Read": "strict"} if strict else {},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["available"] is True
+    assert (response.json()["goal"] is None) is (goal is None)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{"goal": None, "available": "false"}, {"goal": _goal(), "available": False}],
+)
+async def test_get_goal_rejects_invalid_availability_before_legacy_fallback(
+    client: httpx.AsyncClient,
+    codex_session: str,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict[str, Any],
+) -> None:
+    _StagedForward(monkeypatch, _result(200, payload))
+
+    response = await client.get(f"/v1/sessions/{codex_session}/codex_goal")
+
+    assert response.status_code == 502, response.text
+    assert "malformed response" in response.json()["error"]["message"]
+
+
+async def test_get_goal_strict_transport_failure_is_unavailable(
+    client: httpx.AsyncClient,
+    codex_session: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _handler(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content) == {"type": "goal_get", "require_live": True}
+        raise httpx.ConnectError("runner unavailable")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://runner"
+    ) as runner_client:
+
+        async def _get_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+            return runner_client
+
+        monkeypatch.setattr(session_routes, "_get_runner_client", _get_client)
+        resp = await client.get(
+            f"/v1/sessions/{codex_session}/codex_goal",
+            headers={"X-Omnigent-Codex-Goal-Read": "strict"},
+        )
+
+    assert resp.status_code == 503, resp.text
+    assert "Could not read Codex goal" in resp.json()["error"]["message"]
+
+
+@pytest.mark.parametrize("strict", [False, True])
+async def test_get_goal_preserves_legacy_null_only_for_background_reads(
+    client: httpx.AsyncClient,
+    codex_session: str,
+    monkeypatch: pytest.MonkeyPatch,
+    strict: bool,
+) -> None:
+    _StagedForward(monkeypatch, _result(200, {"goal": None}))
+    resp = await client.get(
+        f"/v1/sessions/{codex_session}/codex_goal",
+        headers={"X-Omnigent-Codex-Goal-Read": "strict"} if strict else {},
+    )
+    if strict:
+        assert resp.status_code == 503, resp.text
+        assert resp.json()["error"]["code"] == "codex_native_goal_failed"
+    else:
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"goal": None}
+
+
+@pytest.mark.parametrize("strict", [False, True])
 async def test_get_goal_returns_the_runner_goal(
-    client: httpx.AsyncClient, codex_session: str, monkeypatch: pytest.MonkeyPatch
+    client: httpx.AsyncClient,
+    codex_session: str,
+    monkeypatch: pytest.MonkeyPatch,
+    strict: bool,
 ) -> None:
     _StagedForward(monkeypatch, _result(200, {"goal": _goal(token_budget=5000)}))
-    resp = await client.get(f"/v1/sessions/{codex_session}/codex_goal")
+    resp = await client.get(
+        f"/v1/sessions/{codex_session}/codex_goal",
+        headers={"X-Omnigent-Codex-Goal-Read": "strict"} if strict else {},
+    )
     assert resp.status_code == 200, resp.text
     assert resp.json()["goal"]["objective"] == "keep tests green"
     assert resp.json()["goal"]["token_budget"] == 5000
 
 
+@pytest.mark.parametrize("payload", [{"goal": {"objective": "no thread id"}}, {}])
 async def test_get_goal_rejects_a_goal_the_model_cannot_validate(
-    client: httpx.AsyncClient, codex_session: str, monkeypatch: pytest.MonkeyPatch
+    payload: dict[str, Any],
+    client: httpx.AsyncClient,
+    codex_session: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _StagedForward(monkeypatch, _result(200, {"goal": {"objective": "no thread id"}}))
+    _StagedForward(monkeypatch, _result(200, payload))
     resp = await client.get(f"/v1/sessions/{codex_session}/codex_goal")
     assert resp.status_code == 502
     assert "malformed response" in resp.json()["error"]["message"]
 
 
+@pytest.mark.parametrize("status", [400, 409], ids=["unsupported-event", "busy"])
 async def test_get_goal_passes_structured_runner_errors_through(
-    client: httpx.AsyncClient, codex_session: str, monkeypatch: pytest.MonkeyPatch
+    status: int,
+    client: httpx.AsyncClient,
+    codex_session: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _StagedForward(monkeypatch, _result(409, {"error": "goal_busy", "detail": "turn running"}))
+    error = (
+        {"error": "invalid_input", "detail": "Unknown event type: goal_get"}
+        if status == 400
+        else {"error": "goal_busy", "detail": "turn running"}
+    )
+    _StagedForward(monkeypatch, _result(status, error))
     resp = await client.get(f"/v1/sessions/{codex_session}/codex_goal")
-    assert resp.status_code == 409
-    assert resp.json() == {"error": "goal_busy", "detail": "turn running"}
+    assert resp.status_code == status
+    assert resp.json() == error
 
 
 async def test_set_goal_forwards_only_the_fields_the_caller_sent(
@@ -538,6 +801,7 @@ async def test_set_goal_forwards_only_the_fields_the_caller_sent(
         f"/v1/sessions/{codex_session}/codex_goal", json={"objective": "  keep tests green  "}
     )
     assert resp.status_code == 200, resp.text
+    assert "available" not in resp.json()
     assert staged.events == [{"type": "goal_set", "objective": "keep tests green"}]
 
     resp = await client.put(
@@ -588,6 +852,7 @@ async def test_update_status_forwards_the_status_event(
         f"/v1/sessions/{codex_session}/codex_goal/status", json={"status": "paused"}
     )
     assert resp.status_code == 200, resp.text
+    assert "available" not in resp.json()
     assert resp.json()["goal"]["status"] == "paused"
     assert staged.events == [{"type": "goal_status", "status": "paused"}]
 

@@ -37,6 +37,7 @@ from omnigent.server.routes.sessions import (
 )
 from omnigent.server.schemas import (
     ClearCodexGoalResponse,
+    CodexGoalReadResponse,
     CodexGoalResponse,
     SetCodexGoalRequest,
     UpdateCodexGoalStatusRequest,
@@ -48,6 +49,10 @@ _logger = logging.getLogger(__name__)
 
 
 _CODEX_NATIVE_GOAL_ERROR = "codex_native_goal_failed"
+_CODEX_GOAL_READ_HEADER = "X-Omnigent-Codex-Goal-Read"
+# Include runner recovery and RPC time, including transports that ignore HTTPX timeouts.
+_CODEX_GOAL_READ_TIMEOUT_SECONDS = 50.0
+_CODEX_GOAL_MUTATION_TIMEOUT_SECONDS = 180.0
 
 
 def _codex_goal_error(status_code: int, *, detail: str) -> JSONResponse:
@@ -407,28 +412,51 @@ async def _forward_codex_goal_event(
     :returns: Runner forward result, or ``None`` if no runner could be
         reached.
     """
-    runner_result = await _forward_session_change_to_runner(
-        session_id,
-        runner_router,
-        event,
+    is_read = event.get("type") == "goal_get"
+    deadline = asyncio.timeout(
+        _CODEX_GOAL_READ_TIMEOUT_SECONDS if is_read else _CODEX_GOAL_MUTATION_TIMEOUT_SECONDS
     )
-    if runner_result is not None:
-        return runner_result
-    if event.get("type") == "goal_get":
-        return None
-    runner_client = await _launch_runner_for_codex_goal(
-        session_id=session_id,
-        conv=conv,
-        request=request,
-        user_id=user_id,
-        runner_router=runner_router,
-        conversation_store=conversation_store,
-        permission_store=permission_store,
-        runner_exit_reports=runner_exit_reports,
-    )
-    if runner_client is None:
-        return None
-    return await _post_codex_goal_event_to_runner(session_id, runner_client, event)
+    try:
+        async with deadline:
+            runner_result = await _forward_session_change_to_runner(
+                session_id,
+                runner_router,
+                event,
+            )
+            if runner_result is not None:
+                return runner_result
+            if is_read:
+                return None
+            runner_client = await _launch_runner_for_codex_goal(
+                session_id=session_id,
+                conv=conv,
+                request=request,
+                user_id=user_id,
+                runner_router=runner_router,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
+                runner_exit_reports=runner_exit_reports,
+            )
+            if runner_client is None:
+                return None
+            return await _post_codex_goal_event_to_runner(session_id, runner_client, event)
+    except TimeoutError:
+        if not deadline.expired():
+            raise
+        return _RunnerForwardResult(
+            status_code=504,
+            body=json.dumps(
+                {
+                    "error": "codex_goal_request_timeout",
+                    "detail": (
+                        "Goal read timed out. Try again."
+                        if is_read
+                        else "Goal request timed out. The outcome is uncertain. "
+                        "Refresh the goal before retrying."
+                    ),
+                }
+            ),
+        )
 
 
 async def _require_codex_native_goal_session(
@@ -475,22 +503,26 @@ def register_codex_session_routes(
 
     @router.get(
         "/sessions/{session_id}/codex_goal",
-        response_model=CodexGoalResponse,
+        response_model=CodexGoalReadResponse | CodexGoalResponse,
     )
     async def get_codex_goal(
         request: Request,
         session_id: str,
-    ) -> CodexGoalResponse | Response:
+    ) -> CodexGoalReadResponse | CodexGoalResponse | Response:
         """
         Read the current Codex app-server goal for a Codex-native session.
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session/conversation identifier, e.g.
             ``"conv_abc123"``.
-        :returns: Current Codex goal state, or ``goal=None`` when no goal is
-            set.
-        :raises OmnigentError: 400 for non-Codex sessions, 404 for missing
-            sessions, or 503 when no live Codex runner can read the goal.
+        :returns: Current Codex goal state and availability. Legacy runner
+            replies leave availability unspecified.
+        ``X-Omnigent-Codex-Goal-Read: strict`` opts into unavailable-read errors.
+        Background reads report ``available=False`` for absent or idle runners.
+        Strict reads return 503 when no live runner is available and 502 for
+        malformed runner replies; structured runner errors preserve their status.
+
+        :raises OmnigentError: 400 for non-Codex sessions or 404 for missing sessions.
         """
         user_id = _get_user_id(request, auth_provider)
         await _require_access(
@@ -501,10 +533,11 @@ def register_codex_session_routes(
             conversation_store,
         )
         conv = await _require_codex_native_goal_session(session_id, conversation_store)
+        require_live = request.headers.get(_CODEX_GOAL_READ_HEADER) == "strict"
         runner_result = await _forward_codex_goal_event(
             session_id=session_id,
             conv=conv,
-            event={"type": "goal_get"},
+            event={"type": "goal_get", **({"require_live": True} if require_live else {})},
             request=request,
             user_id=user_id,
             runner_router=runner_router,
@@ -512,8 +545,8 @@ def register_codex_session_routes(
             permission_store=permission_store,
             runner_exit_reports=runner_exit_reports,
         )
-        if runner_result is None:
-            return CodexGoalResponse(goal=None)
+        if runner_result is None and not require_live:
+            return CodexGoalReadResponse(goal=None, available=False)
         runner_payload = _require_codex_goal_runner_payload(
             session_id,
             action="read",
@@ -522,13 +555,29 @@ def register_codex_session_routes(
         if isinstance(runner_payload, JSONResponse):
             return runner_payload
         try:
-            return CodexGoalResponse.model_validate(runner_payload)
+            # A present availability field must validate before legacy parsing.
+            goal_response = (
+                CodexGoalReadResponse.model_validate(runner_payload)
+                if "available" in runner_payload
+                else CodexGoalResponse.model_validate(runner_payload)
+            )
         except ValueError as exc:
             del exc
             return _codex_goal_error(
                 502,
                 detail="Could not read Codex goal: runner returned a malformed response.",
             )
+        if require_live and (
+            (isinstance(goal_response, CodexGoalReadResponse) and not goal_response.available)
+            or (
+                not isinstance(goal_response, CodexGoalReadResponse) and goal_response.goal is None
+            )
+        ):
+            return _codex_goal_error(
+                503,
+                detail="Could not read Codex goal: no live native goal response is available.",
+            )
+        return goal_response
 
     @router.put(
         "/sessions/{session_id}/codex_goal",

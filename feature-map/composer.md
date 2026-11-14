@@ -153,6 +153,46 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   row opens the same dialog as **+ → Goal**. `/goal <objective>` keeps its
   existing message path. Sessions without the control keep sending the text
   or invoking a same-named skill. States: no goal, existing goal, read-only.
+  Drafts with attachments are sent as ordinary messages and do not set a goal.
+  Leading `/goal` takes precedence over a same-named slash skill; inline goal
+  skills and Codex native `$goal` skills remain available. For plain-text drafts
+  without quotes, mentions or review comments, mixed-case and newline-separated
+  goal commands use the same canonical message path. Drafts carrying that
+  context retain their existing handling.
+  In Codex native Chat, the goal indicator follows commands and native goal
+  changes without reopening the dialog. Refreshes preserve edited dialog fields
+  while untouched fields follow current goal state. Reopening or switching
+  sessions discards old drafts, including when the opening read fails.
+  Pending reads and updates from an earlier dialog or session cannot replace
+  the current goal fields. Failed or unavailable background reads keep the last
+  goal and back off up to sixty seconds; returning to the tab retries immediately.
+  Automatic refresh runs while the runner is online and Chat is visible;
+  polling and focus reads retain the last snapshot, drafts and read error when
+  the native goal is unavailable, without waking an idle-reaped thread. A
+  confirmed native response with no goal still clears the accepted goal. Legacy
+  background replies without availability cannot confirm an absent goal.
+  Explicit dialog and reconciliation reads require a live response with current
+  servers and runners, and surface runner errors. A newer server rejects an
+  older runner's ambiguous null even when the native goal is empty. A native
+  terminal clear can then leave the indicator stale. Inspect the native goal;
+  update and reconnect the session's owning runner on its existing host/workspace
+  binding, then refresh to restore automatic absence detection. Repeating the
+  same legacy response cannot resolve the ambiguity. Goal creation and editing
+  remain available. An older server may ignore the strict header; its unmarked
+  strict null remains accepted for compatibility and can clear the indicator
+  without confirming native availability. Dialog reads and updates remain
+  available while runner status is offline or unknown. A new runner connection invalidates
+  earlier callbacks while retaining this session's accepted goal; a failed
+  reconnect read leaves that goal visible. Reconnect
+  preserves edited fields and visible errors in the same open dialog. A pending
+  Save, Clear, Pause or Resume stays busy after closing and reopening the same
+  session, including when its dialog remounts, until the request and its fresh-read
+  attempt finish. Browser reads have a sixty-second deadline and updates have
+  190 seconds, including response parsing. Server forwarding allows fifty
+  seconds for reads and 180 seconds for updates, including runner recovery.
+  A timed-out update leaves the outcome uncertain; refresh the goal before
+  retrying. Other sessions remain independently editable. A fresh accepted
+  snapshot releases opening-read loading even if the original read is pending.
 - `slash-rewind`: in claude-sdk and Claude Code native sessions, `/rewind` opens
   a searchable list of the session's prompts, newest first. Choosing one
   continues the conversation in a new session holding only the history before
@@ -789,6 +829,19 @@ Other connection providers alone do not enable the managed MCP picker.
   also checks Polly's command-backed dialog, full objective forwarding, and
   same-named skills when Goal is unavailable. New-session and side-chat
   composers do not expose this session Goal dialog.
+  `web/src/components/goal/useGoalState.test.tsx` covers external goal changes,
+  session switches, and polling races; `GoalDialog.test.tsx` in that directory
+  covers preserving drafts during background updates. Manually, in a started
+  Codex native Chat, send `/goal <objective>` while idle and during work. The
+  goal indicator should appear within a few seconds without reopening controls.
+  Open Goal, change the objective, budget, and mode, and wait ten seconds:
+  the unsaved edits should remain. Pause or resume the goal and confirm the
+  indicator follows its status; then delete the test goal. During a temporary
+  goal-read failure, the indicator should remain. Restore connectivity and
+  return to the tab to confirm it refreshes without reopening Goal.
+  If goal setup times out or loses its reply, the goal may already have been
+  saved even though the objective message was not delivered. Inspect Goal
+  before resending: another `/goal <objective>` sets that objective again.
 - **`session-mcp-status`, in-session composer:** component coverage lives in
   `web/src/pages/ChatPage.composer.test.tsx`. Manually open a started session,
   select `/mcp`, and expect the effective MCP names and descriptions under

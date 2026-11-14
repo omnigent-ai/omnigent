@@ -110,6 +110,7 @@ _BRIDGE_STATE_FAST_POLL_WINDOW_SECONDS = 2.0
 _BRIDGE_STATE_SLOW_POLL_SECONDS = 0.25
 _COMPACTION_WAIT_TIMEOUT_SECONDS = 60.0
 _DELIVERY_RPC_TIMEOUT_SECONDS = 30.0
+_GOAL_RPC_TIMEOUT_SECONDS = 30.0
 _DELIVERY_RECEIPT_TIMEOUT_SECONDS = 2.0
 _MAX_CODEX_TEXT_INPUT_CHARS = 1 << 20
 _CODEX_COMPACTING_FAILURE = CodexStartupFailure(
@@ -173,7 +174,7 @@ def _input_too_large_failure(actual_chars: int, max_chars: int) -> CodexStartupF
 
 
 class _CodexNativeInputUndelivered(RuntimeError):
-    """Delivery stopped after a proven refusal and before any resubmission."""
+    """Delivery stopped before native input was submitted or resubmitted."""
 
     def __init__(self, failure: CodexStartupFailure, *, preserve_session: bool = False) -> None:
         self.failure = failure
@@ -790,6 +791,31 @@ async def _wait_for_shell_completion(
         await asyncio.sleep(min(_SHELL_TURN_POLL_SECONDS, max(0, remaining)))
 
 
+async def _set_codex_goal(client: CodexAppServerClient, *, thread_id: str, objective: str) -> None:
+    """Distinguish uncertain goal setup from undelivered objective input."""
+    try:
+        async with asyncio.timeout(_GOAL_RPC_TIMEOUT_SECONDS):
+            await client.request(
+                "thread/goal/set", {"threadId": thread_id, "objective": objective}
+            )
+    except Exception as exc:
+        if isinstance(exc, CodexAppServerResponseError):
+            if is_server_draining_error(exc):
+                raise
+            failure = CodexStartupFailure(message=f"Codex goal request failed: {exc}")
+        else:
+            detail = "request timed out" if isinstance(exc, TimeoutError) else str(exc)
+            failure = CodexStartupFailure(
+                message=f"Codex goal setup may have succeeded: {detail}. "
+                "The objective input was not delivered.",
+                remediation="Open Goal to inspect the current goal before resending this message.",
+            )
+        raise _CodexNativeInputUndelivered(
+            failure,
+            preserve_session=True,
+        ) from exc
+
+
 async def _inject_codex_turn(
     client: CodexAppServerClient,
     *,
@@ -984,6 +1010,9 @@ class CodexNativeExecutor(Executor):
         :returns: ``True`` when Codex accepted the steering message.
         """
         del session_key
+        if goal_objective_from_content(content) is not None:
+            # Keep goal setup in run_turn so a refused live message cannot replay it.
+            return False
         input_items = _content_to_input_items(content, self._bridge_dir)
         if not input_items:
             return False
@@ -1001,6 +1030,7 @@ class CodexNativeExecutor(Executor):
             if client is None:
                 return False
             try:
+                _require_codex_binding(self._bridge_dir, state)
                 shell_command = _shell_command_from_content(content)
                 if shell_command is not None:
                     await _run_codex_shell_command(
@@ -1165,7 +1195,7 @@ class CodexNativeExecutor(Executor):
             # JSON-RPC -32600 error never reaches the user.
             length_error = goal_objective_length_error(goal_objective)
             if length_error is not None:
-                yield ExecutorError(message=length_error)
+                yield ExecutorError(message=length_error, undelivered=True, preserve_session=True)
                 return
         input_items: list[dict[str, object]] = (
             [{"type": "text", "text": goal_objective}]
@@ -1307,12 +1337,8 @@ class CodexNativeExecutor(Executor):
                             side_chat.request_side_chat(self._bridge_dir, side_question)
                         else:
                             if goal_objective is not None:
-                                await client.request(
-                                    "thread/goal/set",
-                                    {
-                                        "threadId": state.thread_id,
-                                        "objective": goal_objective,
-                                    },
+                                await _set_codex_goal(
+                                    client, thread_id=state.thread_id, objective=goal_objective
                                 )
                             await _inject_codex_turn(
                                 client,

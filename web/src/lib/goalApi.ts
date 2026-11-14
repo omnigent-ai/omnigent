@@ -15,6 +15,8 @@ export interface GoalResponse {
   goal: Goal | null;
 }
 
+export type GoalReadResponse = (GoalResponse & { available?: true }) | { available: false };
+
 export interface SetGoalInput {
   objective: string;
   tokenBudget?: number | null;
@@ -23,14 +25,22 @@ export interface SetGoalInput {
 
 export type GoalStatusUpdate = "active" | "paused";
 
+export interface GoalReadOptions {
+  /** Require a live runner response. Defaults to true. */
+  strict?: boolean;
+}
+
 /**
  * Goal API facade used by the provider-neutral composer UI.
  *
  * Codex remains the only supported backend in this refactor. The generic
  * session endpoint can replace this delegation without changing UI callers.
  */
-export async function getGoal(sessionId: string): Promise<GoalResponse> {
-  return getCodexGoal(sessionId);
+export async function getGoal(
+  sessionId: string,
+  options?: GoalReadOptions,
+): Promise<GoalReadResponse> {
+  return getCodexGoal(sessionId, options);
 }
 
 export async function setGoal(sessionId: string, goal: SetGoalInput): Promise<GoalResponse> {

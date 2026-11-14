@@ -1,6 +1,12 @@
 import { authenticatedFetch } from "./identity";
 import { ApiError } from "./sessionsApi";
 
+const CODEX_GOAL_READ_HEADER = "X-Omnigent-Codex-Goal-Read";
+const CODEX_GOAL_READ_STRICT = "strict";
+// Allow delivery time after AP's 50s read / 180s mutation forwarding budgets.
+const CODEX_GOAL_REQUEST_TIMEOUT_MS = 60_000;
+const CODEX_GOAL_MUTATION_TIMEOUT_MS = 190_000;
+
 /**
  * Raw Codex app-server goal object forwarded by the AP route.
  * The route preserves Codex's snake_case field names and open-ended
@@ -32,6 +38,11 @@ interface CodexGoalWire {
 interface CodexGoalResponseWire {
   /** Current goal, or `null` when Codex has no goal for the thread. */
   goal: CodexGoalWire | null;
+}
+
+interface CodexGoalReadResponseWire extends CodexGoalResponseWire {
+  /** Omitted by older servers and runners that do not report availability. */
+  available?: boolean;
 }
 
 /**
@@ -66,6 +77,10 @@ export interface CodexGoalResponse {
   goal: CodexGoal | null;
 }
 
+/** Unavailable reads carry no snapshot for callers to publish. */
+export type CodexGoalReadResponse =
+  (CodexGoalResponse & { available?: true }) | { available: false };
+
 /** Payload accepted by `PUT /v1/sessions/{id}/codex_goal`. */
 export interface SetCodexGoalInput {
   /** New goal objective. The server rejects blank objectives. */
@@ -84,6 +99,11 @@ export interface SetCodexGoalInput {
  * limiter states are read-only and stay represented by `CodexGoal.status`.
  */
 export type CodexGoalStatusUpdate = "active" | "paused";
+
+export interface CodexGoalReadOptions {
+  /** Require a live runner response. Defaults to true. */
+  strict?: boolean;
+}
 
 export async function codexGoalApiErrorFromResponse(res: Response): Promise<ApiError> {
   let message = `${res.status} ${res.statusText}`;
@@ -111,6 +131,38 @@ async function readJsonOrThrow<T>(res: Response): Promise<T> {
   return (await res.json()) as T;
 }
 
+async function requestCodexGoal<T>(url: string, init: RequestInit = {}): Promise<T> {
+  const isRead = (init.method ?? "GET").toUpperCase() === "GET";
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () => {
+        reject(
+          new ApiError(
+            isRead
+              ? "Goal read timed out. Try again."
+              : "Goal request timed out. The outcome is uncertain. Refresh the goal before retrying.",
+            504,
+            "codex_goal_request_timeout",
+          ),
+        );
+        controller.abort();
+      },
+      isRead ? CODEX_GOAL_REQUEST_TIMEOUT_MS : CODEX_GOAL_MUTATION_TIMEOUT_MS,
+    );
+  });
+  try {
+    const request = authenticatedFetch(url, { ...init, signal: controller.signal }).then(
+      readJsonOrThrow<T>,
+    );
+    // Custom fetchers and response bodies can ignore abort, so bound the entire request.
+    return await Promise.race([request, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Convert one Codex-goal wire object to the camelCase UI type.
  *
@@ -130,15 +182,44 @@ function codexGoalFromWire(wire: CodexGoalWire): CodexGoal {
   };
 }
 
+function isCodexGoalResponseWire(wire: unknown): wire is CodexGoalResponseWire {
+  if (!wire || typeof wire !== "object" || !("goal" in wire)) return false;
+  const goal = wire.goal as Partial<CodexGoalWire> | null;
+  return (
+    goal === null ||
+    (typeof goal === "object" &&
+      !Array.isArray(goal) &&
+      typeof goal.thread_id === "string" &&
+      typeof goal.objective === "string" &&
+      typeof goal.status === "string" &&
+      [goal.tokens_used, goal.time_used_seconds].every(
+        (value) => typeof value === "number" && Number.isFinite(value),
+      ) &&
+      [goal.token_budget, goal.created_at, goal.updated_at].every(
+        (value) =>
+          value === undefined ||
+          value === null ||
+          (typeof value === "number" && Number.isFinite(value)),
+      ))
+  );
+}
+
 /**
  * Convert a Codex-goal response body to the UI type.
  *
  * @param wire - Snake-case AP response body.
  * @returns CamelCase goal response.
  */
-function codexGoalResponseFromWire(wire: CodexGoalResponseWire): CodexGoalResponse {
+function codexGoalResponseFromWire(wire: unknown): CodexGoalResponse {
+  if (!isCodexGoalResponseWire(wire)) {
+    throw new ApiError(
+      "Codex goal request failed: server returned a malformed response.",
+      502,
+      "codex_native_goal_failed",
+    );
+  }
   return {
-    goal: wire.goal == null ? null : codexGoalFromWire(wire.goal),
+    goal: wire.goal === null ? null : codexGoalFromWire(wire.goal),
   };
 }
 
@@ -146,11 +227,47 @@ function codexGoalResponseFromWire(wire: CodexGoalResponseWire): CodexGoalRespon
  * Read the current Codex-native thread goal for a session.
  *
  * @param sessionId - Session identifier, e.g. ``"conv_abc123"``.
- * @returns The current goal, or ``goal: null`` when Codex has none.
+ * @param options - Background reads may report an unavailable idle runner.
+ * @returns A confirmed snapshot, or ``available: false`` for an unavailable background read.
+ * @throws ApiError when the runner is unavailable or the server rejects the request.
  */
-export async function getCodexGoal(sessionId: string): Promise<CodexGoalResponse> {
-  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`);
-  return codexGoalResponseFromWire(await readJsonOrThrow<CodexGoalResponseWire>(res));
+export async function getCodexGoal(
+  sessionId: string,
+  options: CodexGoalReadOptions = {},
+): Promise<CodexGoalReadResponse> {
+  const strict = options.strict !== false;
+  const wire = await requestCodexGoal<CodexGoalReadResponseWire>(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`,
+    {
+      headers: strict ? { [CODEX_GOAL_READ_HEADER]: CODEX_GOAL_READ_STRICT } : undefined,
+    },
+  );
+  if (
+    !isCodexGoalResponseWire(wire) ||
+    ("available" in wire && typeof wire.available !== "boolean") ||
+    (wire.available === false && wire.goal !== null)
+  ) {
+    throw new ApiError(
+      "Could not read Codex goal: server returned a malformed response.",
+      502,
+      "codex_native_goal_failed",
+    );
+  }
+  if (wire.available === false) {
+    if (strict) {
+      throw new ApiError(
+        "Could not read Codex goal: no live native goal response is available.",
+        503,
+        "codex_native_goal_failed",
+      );
+    }
+    return { available: false };
+  }
+  // An unmarked legacy background null cannot distinguish idle from deletion.
+  if (!strict && wire.available === undefined && wire.goal === null) {
+    return { available: false };
+  }
+  return codexGoalResponseFromWire(wire);
 }
 
 /**
@@ -175,12 +292,15 @@ export async function setCodexGoal(
   if (goal.status !== undefined) {
     body.status = goal.status;
   }
-  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  return codexGoalResponseFromWire(await readJsonOrThrow<CodexGoalResponseWire>(res));
+  const wire = await requestCodexGoal<CodexGoalResponseWire>(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+  return codexGoalResponseFromWire(wire);
 }
 
 /**
@@ -195,7 +315,7 @@ export async function updateCodexGoalStatus(
   sessionId: string,
   status: CodexGoalStatusUpdate,
 ): Promise<CodexGoalResponse> {
-  const res = await authenticatedFetch(
+  const wire = await requestCodexGoal<CodexGoalResponseWire>(
     `/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal/status`,
     {
       method: "PATCH",
@@ -203,7 +323,7 @@ export async function updateCodexGoalStatus(
       body: JSON.stringify({ status }),
     },
   );
-  return codexGoalResponseFromWire(await readJsonOrThrow<CodexGoalResponseWire>(res));
+  return codexGoalResponseFromWire(wire);
 }
 
 /**
@@ -213,8 +333,16 @@ export async function updateCodexGoalStatus(
  * @returns Whether Codex removed an existing goal.
  */
 export async function clearCodexGoal(sessionId: string): Promise<{ cleared: boolean }> {
-  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`, {
-    method: "DELETE",
-  });
-  return readJsonOrThrow<{ cleared: boolean }>(res);
+  const wire = await requestCodexGoal<{ cleared: boolean }>(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`,
+    { method: "DELETE" },
+  );
+  if (!wire || typeof wire !== "object" || typeof wire.cleared !== "boolean") {
+    throw new ApiError(
+      "Codex goal request failed: server returned a malformed response.",
+      502,
+      "codex_native_goal_failed",
+    );
+  }
+  return wire;
 }

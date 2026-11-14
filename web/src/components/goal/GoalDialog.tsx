@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { CheckIcon, Loader2Icon, PauseCircleIcon, PlayCircleIcon, TargetIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -12,12 +19,13 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
   clearGoal,
-  getGoal,
   setGoal,
   updateGoalStatus,
   type Goal,
   type GoalStatusUpdate,
 } from "@/lib/goalApi";
+import { getBasePath } from "@/lib/basePath";
+import { getOmnigentServerIdentity } from "@/lib/host";
 import { cn } from "@/lib/utils";
 import {
   canPauseGoal,
@@ -29,13 +37,92 @@ import {
   type GoalModeDraft,
 } from "./goalUtils";
 
+type GoalApiScope = string | object;
+type GoalMutationAction = "save" | "clear" | GoalStatusUpdate;
+
+interface GoalMutation {
+  token: object;
+  action: GoalMutationAction;
+  settled: boolean;
+}
+
+interface GoalMutationListener {
+  scope: GoalApiScope;
+  key: string;
+  notify: () => void;
+}
+
+// A request keeps its session ownership across dialog lifetimes.
+const goalMutations = new Map<GoalApiScope, Map<string, GoalMutation>>();
+const goalMutationListeners = new Set<GoalMutationListener>();
+const anonymousGoalApiScope = {};
+
+function getGoalMutation(scope: GoalApiScope, key: string): GoalMutation | null {
+  return goalMutations.get(scope)?.get(key) ?? null;
+}
+
+function hasGoalMutationOwner(scope: GoalApiScope, key: string): boolean {
+  return [...goalMutationListeners].some((owner) => owner.scope === scope && owner.key === key);
+}
+
+function publishGoalMutation(scope: GoalApiScope, key: string, mutation: GoalMutation | null) {
+  if (mutation) {
+    const sessions = goalMutations.get(scope) ?? new Map<string, GoalMutation>();
+    sessions.set(key, mutation);
+    goalMutations.set(scope, sessions);
+  } else {
+    const sessions = goalMutations.get(scope);
+    sessions?.delete(key);
+    if (sessions?.size === 0) goalMutations.delete(scope);
+  }
+  for (const owner of [...goalMutationListeners]) {
+    if (owner.scope === scope && owner.key === key) owner.notify();
+  }
+}
+
+function subscribeGoalMutation(scope: GoalApiScope, key: string, notify: () => void) {
+  const owner = { scope, key, notify };
+  goalMutationListeners.add(owner);
+  return () => {
+    goalMutationListeners.delete(owner);
+    const mutation = getGoalMutation(scope, key);
+    if (mutation?.settled && !hasGoalMutationOwner(scope, key)) {
+      publishGoalMutation(scope, key, null);
+    }
+  };
+}
+
+function startGoalMutation(scope: GoalApiScope, key: string, action: GoalMutationAction) {
+  if (getGoalMutation(scope, key)) return null;
+  const mutation = { token: {}, action, settled: false };
+  publishGoalMutation(scope, key, mutation);
+  return mutation;
+}
+
+function finishGoalMutation(
+  scope: GoalApiScope,
+  key: string,
+  mutation: GoalMutation,
+  reconcile = false,
+) {
+  if (getGoalMutation(scope, key)?.token !== mutation.token) return;
+  publishGoalMutation(
+    scope,
+    key,
+    reconcile && hasGoalMutationOwner(scope, key) ? { ...mutation, settled: true } : null,
+  );
+}
+
 export interface GoalDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   conversationId: string | null;
   readOnly: boolean;
   goal: Goal | null;
+  goalRevision: number;
   onGoalChange: (goal: Goal | null) => void;
+  /** Stable for this session connection; a new identity invalidates pending dialog reads. */
+  refreshGoal: () => Promise<void>;
 }
 
 interface GoalSummaryProps {
@@ -47,7 +134,7 @@ interface GoalSummaryProps {
  * Render the current goal state inside the dialog.
  *
  * @param props - Current loading and goal state.
- * @param props.loading - ``true`` while the goal GET request is in flight.
+ * @param props.loading - ``true`` until the opening read settles or current state arrives.
  * @param props.goal - Current goal, or ``null`` when no goal is set.
  * @returns Current-goal summary element.
  */
@@ -375,124 +462,250 @@ function useGoalDialogState({
   open,
   conversationId,
   goal,
+  goalRevision,
   onGoalChange,
-}: Pick<GoalDialogProps, "open" | "conversationId" | "goal" | "onGoalChange">): GoalDialogState {
+  refreshGoal,
+}: Pick<
+  GoalDialogProps,
+  "open" | "conversationId" | "goal" | "goalRevision" | "onGoalChange" | "refreshGoal"
+>): GoalDialogState {
+  // Anonymous embeds keep their owner when a transport callback is recreated.
+  const apiScope = getOmnigentServerIdentity() ?? anonymousGoalApiScope;
+  const mutationKey = JSON.stringify(["codex_goal", getBasePath(), conversationId]);
+  const subscribe = useCallback(
+    (notify: () => void) =>
+      open && conversationId ? subscribeGoalMutation(apiScope, mutationKey, notify) : () => {},
+    [apiScope, conversationId, mutationKey, open],
+  );
+  const activeMutation = useSyncExternalStore(
+    subscribe,
+    () => getGoalMutation(apiScope, mutationKey),
+    () => null,
+  );
+  const saving = activeMutation?.action === "save";
+  const clearing = activeMutation?.action === "clear";
+  const statusUpdating =
+    activeMutation?.action === "active" || activeMutation?.action === "paused"
+      ? activeMutation.action
+      : null;
   const [objective, setObjective] = useState(goal?.objective ?? "");
   const [tokenBudget, setTokenBudget] = useState(goal?.tokenBudget?.toString() ?? "");
   const [modeDraft, setModeDraftState] = useState<GoalModeDraft>(goalModeDraftForGoal(goal));
   const [loading, setLoading] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [clearing, setClearing] = useState(false);
-  const [statusUpdating, setStatusUpdating] = useState<GoalStatusUpdate | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [readError, setReadError] = useState<string | null>(null);
+  const [operationError, setOperationError] = useState<string | null>(null);
+  const draftOwner = useRef<{ apiScope: GoalApiScope; mutationKey: string } | undefined>(undefined);
+  const dirtyFields = useRef(new Set<"objective" | "tokenBudget" | "mode">());
+  const dialogBinding = useRef<object | null>(null);
+  const currentGoalOwner = useRef({ apiScope, mutationKey, refreshGoal });
 
-  const refreshGoal = useCallback(async () => {
-    if (!conversationId) return;
-    setLoading(true);
-    setError(null);
-    try {
-      const response = await getGoal(conversationId);
-      onGoalChange(response.goal);
-      setObjective(response.goal?.objective ?? "");
-      setTokenBudget(response.goal?.tokenBudget?.toString() ?? "");
-      setModeDraftState(goalModeDraftForGoal(response.goal));
-    } catch (err) {
-      setError(goalError("Could not read goal", err));
-    } finally {
-      setLoading(false);
+  useLayoutEffect(() => {
+    currentGoalOwner.current = { apiScope, mutationKey, refreshGoal };
+  }, [apiScope, mutationKey, refreshGoal]);
+
+  useLayoutEffect(() => {
+    // New dialog or goal-owner bindings invalidate async responses.
+    dialogBinding.current = open && conversationId ? {} : null;
+    setLoading(false);
+    setReadError(null);
+    return () => {
+      dialogBinding.current = null;
+    };
+  }, [apiScope, conversationId, mutationKey, open, refreshGoal]);
+
+  useLayoutEffect(() => {
+    setOperationError(null);
+  }, [apiScope, conversationId, mutationKey, open]);
+
+  useEffect(() => {
+    setReadError(null);
+    setLoading(false);
+  }, [goalRevision]);
+
+  useEffect(() => {
+    if (!open) {
+      draftOwner.current = undefined;
+      return;
     }
-  }, [conversationId, onGoalChange]);
+    if (
+      draftOwner.current?.apiScope !== apiScope ||
+      draftOwner.current?.mutationKey !== mutationKey
+    ) {
+      draftOwner.current = { apiScope, mutationKey };
+      dirtyFields.current.clear();
+    }
+    if (!dirtyFields.current.has("objective")) setObjective(goal?.objective ?? "");
+    if (!dirtyFields.current.has("tokenBudget")) {
+      setTokenBudget(goal?.tokenBudget?.toString() ?? "");
+    }
+    if (!dirtyFields.current.has("mode")) setModeDraftState(goalModeDraftForGoal(goal));
+  }, [apiScope, goal, mutationKey, open]);
 
   useEffect(() => {
-    if (!open) return;
-    void refreshGoal();
-  }, [open, refreshGoal]);
+    const binding = dialogBinding.current;
+    if (!binding || !conversationId) return;
+    let cancelled = false;
+    const refresh = async () => {
+      setLoading(true);
+      setReadError(null);
+      try {
+        await refreshGoal();
+      } catch (err) {
+        if (!cancelled && dialogBinding.current === binding) {
+          setReadError(goalError("Could not read goal", err));
+        }
+      } finally {
+        if (!cancelled && dialogBinding.current === binding) setLoading(false);
+      }
+    };
+    void refresh();
+    return () => {
+      cancelled = true;
+    };
+  }, [apiScope, conversationId, mutationKey, refreshGoal, open]);
 
   useEffect(() => {
-    if (!open) return;
-    setObjective(goal?.objective ?? "");
-    setTokenBudget(goal?.tokenBudget?.toString() ?? "");
-    setModeDraftState(goalModeDraftForGoal(goal));
-  }, [goal, open]);
+    const binding = dialogBinding.current;
+    if (!binding || !activeMutation?.settled) return;
+    let cancelled = false;
+    const reconcile = async () => {
+      setLoading(true);
+      setReadError(null);
+      try {
+        await refreshGoal();
+      } catch (err) {
+        if (!cancelled && dialogBinding.current === binding) {
+          setReadError(goalError("Could not read goal", err));
+        }
+      } finally {
+        if (!cancelled && dialogBinding.current === binding) {
+          setLoading(false);
+          finishGoalMutation(apiScope, mutationKey, activeMutation);
+        }
+      }
+    };
+    void reconcile();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeMutation, apiScope, mutationKey, conversationId, open, refreshGoal]);
+
+  const canApplyMutationResult = (binding: object) => {
+    if (dialogBinding.current === binding) return true;
+    const current = currentGoalOwner.current;
+    // Keep a closed dialog's matching snapshot owner current.
+    if (
+      current.apiScope === apiScope &&
+      current.mutationKey === mutationKey &&
+      !hasGoalMutationOwner(apiScope, mutationKey)
+    ) {
+      void current.refreshGoal().catch(() => {});
+    }
+    return false;
+  };
 
   const setObjectiveDraft = (value: string) => {
+    dirtyFields.current.add("objective");
     setObjective(value);
-    if (error !== null) setError(null);
+    setReadError(null);
+    setOperationError(null);
   };
   const setTokenBudgetDraft = (value: string) => {
+    dirtyFields.current.add("tokenBudget");
     setTokenBudget(value);
-    if (error !== null) setError(null);
+    setReadError(null);
+    setOperationError(null);
   };
   const setModeDraft = (value: GoalModeDraft) => {
+    dirtyFields.current.add("mode");
     setModeDraftState(value);
-    if (error !== null) setError(null);
+    setReadError(null);
+    setOperationError(null);
   };
 
   const saveGoal = async () => {
-    if (!conversationId) return;
+    const binding = dialogBinding.current;
+    if (!conversationId || !binding || getGoalMutation(apiScope, mutationKey)) return;
     const trimmedObjective = objective.trim();
     if (!trimmedObjective) {
-      setError("Goal objective cannot be empty.");
+      setOperationError("Goal objective cannot be empty.");
       return;
     }
     let parsedBudget: number | null;
     try {
       parsedBudget = parseGoalBudget(tokenBudget);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setOperationError(err instanceof Error ? err.message : String(err));
       return;
     }
-    setSaving(true);
-    setError(null);
+    const mutation = startGoalMutation(apiScope, mutationKey, "save");
+    if (!mutation) return;
+    setReadError(null);
+    setOperationError(null);
     try {
       const response = await setGoal(conversationId, {
         objective: trimmedObjective,
         tokenBudget: parsedBudget,
         status: modeDraft === "keep" ? undefined : modeDraft,
       });
+      if (!canApplyMutationResult(binding)) return;
+      dirtyFields.current.clear();
       onGoalChange(response.goal);
       setObjective(response.goal?.objective ?? trimmedObjective);
       setTokenBudget(response.goal?.tokenBudget?.toString() ?? tokenBudget.trim());
       setModeDraftState(goalModeDraftForGoal(response.goal));
     } catch (err) {
-      setError(goalError("Could not set goal", err));
+      if (dialogBinding.current === binding)
+        setOperationError(goalError("Could not set goal", err));
     } finally {
-      setSaving(false);
+      finishGoalMutation(apiScope, mutationKey, mutation, dialogBinding.current !== binding);
     }
   };
 
   const clearCurrentGoal = async () => {
-    if (!conversationId) return;
-    setClearing(true);
-    setError(null);
+    const binding = dialogBinding.current;
+    if (!conversationId || !binding || getGoalMutation(apiScope, mutationKey)) return;
+    const mutation = startGoalMutation(apiScope, mutationKey, "clear");
+    if (!mutation) return;
+    setReadError(null);
+    setOperationError(null);
     try {
       await clearGoal(conversationId);
+      if (!canApplyMutationResult(binding)) return;
+      dirtyFields.current.clear();
       onGoalChange(null);
       setObjective("");
       setTokenBudget("");
       setModeDraftState("active");
     } catch (err) {
-      setError(goalError("Could not clear goal", err));
+      if (dialogBinding.current === binding)
+        setOperationError(goalError("Could not clear goal", err));
     } finally {
-      setClearing(false);
+      finishGoalMutation(apiScope, mutationKey, mutation, dialogBinding.current !== binding);
     }
   };
 
   const updateStatus = async (status: GoalStatusUpdate) => {
-    if (!conversationId) return;
-    setStatusUpdating(status);
-    setError(null);
+    const binding = dialogBinding.current;
+    if (!conversationId || !binding || getGoalMutation(apiScope, mutationKey)) return;
+    const mutation = startGoalMutation(apiScope, mutationKey, status);
+    if (!mutation) return;
+    setReadError(null);
+    setOperationError(null);
     try {
       const response = await updateGoalStatus(conversationId, status);
+      if (!canApplyMutationResult(binding)) return;
+      dirtyFields.current.clear();
       onGoalChange(response.goal);
       setObjective(response.goal?.objective ?? "");
       setTokenBudget(response.goal?.tokenBudget?.toString() ?? "");
       setModeDraftState(goalModeDraftForGoal(response.goal));
     } catch (err) {
       const action = status === "paused" ? "pause" : "resume";
-      setError(goalError(`Could not ${action} goal`, err));
+      if (dialogBinding.current === binding)
+        setOperationError(goalError(`Could not ${action} goal`, err));
     } finally {
-      setStatusUpdating(null);
+      finishGoalMutation(apiScope, mutationKey, mutation, dialogBinding.current !== binding);
     }
   };
 
@@ -504,7 +717,7 @@ function useGoalDialogState({
     saving,
     clearing,
     statusUpdating,
-    error,
+    error: operationError ?? readError,
     setObjectiveDraft,
     setTokenBudgetDraft,
     setModeDraft,
@@ -524,7 +737,9 @@ function useGoalDialogState({
  * @param props.conversationId - Active session id, e.g. ``"conv_abc123"``.
  * @param props.readOnly - ``true`` when write actions must be disabled.
  * @param props.goal - Current goal state, or ``null`` when none is set.
- * @param props.onGoalChange - Called after successful read, set, or clear.
+ * @param props.goalRevision - Local revision of the latest accepted goal snapshot.
+ * @param props.onGoalChange - Called after successful set, clear, or status updates.
+ * @param props.refreshGoal - Refresh through the owner of the current goal snapshot.
  * @returns Goal dialog.
  */
 export function GoalDialog({
@@ -533,13 +748,17 @@ export function GoalDialog({
   conversationId,
   readOnly,
   goal,
+  goalRevision,
   onGoalChange,
+  refreshGoal,
 }: GoalDialogProps) {
   const state = useGoalDialogState({
     open,
     conversationId,
     goal,
+    goalRevision,
     onGoalChange,
+    refreshGoal,
   });
   const { loading, saving, clearing, statusUpdating } = state;
   const busy = loading || saving || clearing || statusUpdating !== null;
@@ -557,7 +776,6 @@ export function GoalDialog({
           </DialogTitle>
         </DialogHeader>
 
-        {/* Leave room for focus rings inside the scrollable region. */}
         <div className="-m-1 min-h-0 space-y-3 overflow-y-auto p-1">
           <GoalSummary loading={loading} goal={goal} />
           <GoalEditor
