@@ -188,13 +188,17 @@ export async function readParquet(
   // Past the limit (or on a footer count that isn't a number) the nested columns
   // aren't read: they show a note, and the flat columns still show.
   const skipNested = !(values <= maxValues);
-  const rows = await parquetReadObjects({
-    file,
-    rowEnd: DATA_TABLE_MAX_ROWS,
-    columns: columns
-      .map((column) => column.name)
-      .filter((name) => !(skipNested && nested.has(name))),
-  });
+  const readColumns = columns
+    .map((column) => column.name)
+    .filter((name) => !(skipNested && nested.has(name)));
+  // With every kept column skipped there is nothing to read, but the rows still show.
+  const rows =
+    readColumns.length > 0
+      ? await parquetReadObjects({ file, rowEnd: DATA_TABLE_MAX_ROWS, columns: readColumns })
+      : Array.from(
+          { length: Math.min(Number(metadata.num_rows), DATA_TABLE_MAX_ROWS) },
+          (): Record<string, unknown> => ({}),
+        );
   const isDate = columns.map(
     (column) => column.converted_type === "DATE" || column.logical_type?.type === "DATE",
   );

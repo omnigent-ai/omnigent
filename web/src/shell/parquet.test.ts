@@ -73,6 +73,14 @@ describe("readParquet", () => {
     expect(table?.totalRows).toBe(20_000);
   });
 
+  it("shows placeholder rows when every column is nested and skipped", async () => {
+    // One list column holding 2,000,000 values in its first 1,000 rows.
+    const table = await readParquet(fixture("repeated-list.parquet"), 1_000_000);
+    expect(table?.rows).toHaveLength(DATA_TABLE_MAX_ROWS);
+    expect(new Set(table?.rows.map((row) => row.join()))).toEqual(new Set([SKIPPED_NESTED_VALUE]));
+    expect(table?.totalRows).toBe(1000);
+  });
+
   it("skips nested columns packing more values than the preview decodes", async () => {
     // An id column and a list column of 2,000 values a row, over 1,000 rows.
     const table = await readParquet(fixture("list-and-id.parquet"), 1_000_000);

@@ -9,6 +9,7 @@ import {
   isElapsedFormatCode,
   isTimeFormatCode,
   readWorkbook,
+  resolvePartPath,
   WorkbookError,
 } from "./xlsx";
 
@@ -160,6 +161,54 @@ describe("readWorkbook time formats and limits", () => {
       ["Again", [["pens"]], undefined],
     ]);
     expect(sheets[2].table).toBe(sheets[0].table);
+  });
+
+  it("counts every part read against the workbook limit, not just the largest", async () => {
+    // Big (20,140 bytes) fits the 20,500-byte limit alone, but not after the
+    // package's other parts (about 1,300 bytes) were read.
+    const sheets = await readWorkbook(fixture("budget.xlsx"), 20_500);
+    expect(sheets.map((sheet) => [sheet.name, sheet.message])).toEqual([
+      ["Small", undefined],
+      ["Big", "This sheet is too large to preview. Download the workbook to open it."],
+      ["Again", undefined],
+    ]);
+  });
+});
+
+describe("workbook relationships", () => {
+  // Hand-built: the same sheet (shared-string header and row, a date-styled
+  // serial) with one part moved where only its relationship says.
+  it.each(["renamed-strings.xlsx", "renamed-styles.xlsx", "parent-relative-sheet.xlsx"])(
+    "resolves workbook relationship targets for %s",
+    async (name) => {
+      const [sheet] = await readWorkbook(fixture(name));
+      expect(sheet.name).toBe("Orders");
+      expect(sheet.message).toBeUndefined();
+      expect(sheet.table?.header).toEqual(["item", "when"]);
+      expect(sheet.table?.rows).toEqual([["pens", "2026-03-01"]]);
+      expect(sheet.table?.totalRows).toBe(1);
+    },
+  );
+
+  it("finds a relocated workbook through the package and skips an external sheet", async () => {
+    // The workbook is book/main.xml; its sheet part's name is percent-encoded
+    // in the relationship; a second sheet points outside the package.
+    const sheets = await readWorkbook(fixture("relocated-workbook.xlsx"));
+    expect(sheets.map((sheet) => [sheet.name, sheet.table?.rows])).toEqual([
+      ["Orders", [["pens", "2026-03-01"]]],
+      ["Linked", undefined],
+    ]);
+  });
+
+  it.each([
+    ["xl/workbook.xml", "worksheets/sheet1.xml", "xl/worksheets/sheet1.xml"],
+    ["xl/workbook.xml", "../xl/worksheets/./sheet1.xml", "xl/worksheets/sheet1.xml"],
+    ["xl/workbook.xml", "/xl/styles.xml", "xl/styles.xml"],
+    ["", "xl/workbook.xml", "xl/workbook.xml"],
+    ["xl/workbook.xml", "sheet%201.xml", "xl/sheet%201.xml"],
+    ["xl/workbook.xml", "../../outside.xml", null],
+  ])("resolves %s → %s as %s", (source, target, expected) => {
+    expect(resolvePartPath(source, target)).toBe(expected);
   });
 });
 
