@@ -7,7 +7,7 @@ import json
 import httpx
 import pytest
 
-from tests._helpers.native_session import create_native_session
+from tests._helpers.native_session import _redacted_response_text, create_native_session
 from tests.e2e import conftest as helpers
 
 
@@ -159,7 +159,6 @@ def test_pending_tool_poll_waits_for_this_turn(monkeypatch, previous_call) -> No
 @pytest.mark.parametrize(
     ("sensitive_fields", "credential_tails"),
     [
-        pytest.param({}, (), id="long-api-key"),
         pytest.param(
             {"password": '"synthetic-password-tail'},
             ("synthetic-password-tail",),
@@ -215,17 +214,6 @@ def test_pending_tool_poll_waits_for_this_turn(monkeypatch, previous_call) -> No
             {"password/synthetic-key-tail": "synthetic-key-value-tail"},
             ("synthetic-key-tail", "synthetic-key-value-tail"),
             id="non-assignment-password-key",
-        ),
-        pytest.param(
-            None,
-            (
-                "synthetic-passphrase-tail",
-                "synthetic-cookie-tail",
-                "synthetic-private-key-tail",
-                "synthetic-object-tail",
-                "synthetic-list-tail",
-            ),
-            id="metadata-validation",
         ),
         pytest.param(
             {
@@ -289,14 +277,43 @@ def test_pending_tool_poll_waits_for_this_turn(monkeypatch, previous_call) -> No
         ],
     ],
 )
-def test_native_create_failure_keeps_bounded_redacted_response(
-    sensitive_fields: dict | None, credential_tails: tuple[str, ...]
+def test_redacted_response_text_omits_credentials(
+    sensitive_fields: dict, credential_tails: tuple[str, ...]
 ) -> None:
     message = "host did not respond to workspace stat"
-    if sensitive_fields is None:
+    payload = {"error": {"code": "invalid_input", "message": message, **sensitive_fields}}
+    response = httpx.Response(400, json=payload)
+    original_content = response.content
+
+    diagnostic = _redacted_response_text(response)
+
+    assert "invalid_input" in diagnostic
+    assert message in diagnostic
+    assert "[REDACTED]" in diagnostic
+    assert all(tail not in diagnostic for tail in credential_tails)
+    assert response.content == original_content
+    assert response.json() == payload
+
+
+@pytest.mark.parametrize(
+    "invalid_metadata", [False, True], ids=["long-api-key", "metadata-validation"]
+)
+def test_native_create_failure_keeps_bounded_redacted_response(
+    invalid_metadata: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    message = "host did not respond to workspace stat"
+    credential_tails = ()
+    if invalid_metadata:
         from omnigent.errors import OmnigentError
         from omnigent.server.routes._sessions.helpers import _parse_session_create_metadata
 
+        credential_tails = (
+            "synthetic-passphrase-tail",
+            "synthetic-cookie-tail",
+            "synthetic-private-key-tail",
+            "synthetic-object-tail",
+            "synthetic-list-tail",
+        )
         with pytest.raises(OmnigentError) as validation:
             _parse_session_create_metadata(
                 json.dumps(
@@ -318,18 +335,30 @@ def test_native_create_failure_keeps_bounded_redacted_response(
             "code": "invalid_input",
             "message": message,
             "api_key": credential,
-            **(sensitive_fields or {}),
             "detail": "diagnostic-after-redaction",
             "context": "x" * 3000 + "outside-diagnostic-limit",
         }
     }
     response = httpx.Response(400, json=payload)
     original_content = response.content
+    original_raise_for_status = response.raise_for_status
+    original_errors = []
+
+    def raise_for_status():
+        try:
+            original_raise_for_status()
+        except httpx.HTTPStatusError as error:
+            original_errors.append(error)
+            raise
+
+    monkeypatch.setattr(response, "raise_for_status", raise_for_status)
     with httpx.Client(transport=httpx.MockTransport(lambda _: response)) as client:
         with pytest.raises(httpx.HTTPStatusError) as raised:
             create_native_session(client, "http://server.example.test", harness="codex")
 
     error = raised.value
+    assert len(original_errors) == 1
+    assert error is original_errors[0]
     assert error.response is response
     assert error.request is response.request
     assert error.response.status_code == 400
@@ -337,7 +366,7 @@ def test_native_create_failure_keeps_bounded_redacted_response(
     assert error.response.json() == payload
     note = "\n".join(error.__notes__)
     assert "invalid_input" in note
-    if sensitive_fields is not None:
+    if not invalid_metadata:
         assert message in note
     assert "diagnostic-after-redaction" in note
     assert "[REDACTED]" in note
@@ -359,7 +388,18 @@ def test_native_create_failure_keeps_bounded_redacted_response(
         ),
     ],
 )
-def test_native_create_failure_keeps_http_error_when_diagnostic_body_is_omitted(body: str) -> None:
+def test_redacted_response_text_omits_unsafe_bodies(body: str) -> None:
+    response = httpx.Response(502, content=body)
+
+    diagnostic = _redacted_response_text(response)
+
+    assert "Response body omitted" in diagnostic
+    assert "synthetic-omitted-tail" not in diagnostic
+    assert response.text == body
+
+
+def test_native_create_failure_keeps_http_error_when_diagnostic_body_is_omitted() -> None:
+    body = 'upstream password="synthetic-omitted-tail'
     response = httpx.Response(502, content=body)
     with httpx.Client(transport=httpx.MockTransport(lambda _: response)) as client:
         with pytest.raises(httpx.HTTPStatusError) as raised:

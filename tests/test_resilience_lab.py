@@ -11,7 +11,7 @@ import httpx
 import pytest
 
 from tests._helpers.server_runner import ServerRunner
-from tests.e2e.resilience.lab.lab import Lab, LabConfig
+from tests.e2e.resilience.lab.lab import Lab
 
 
 @pytest.mark.parametrize(
@@ -26,6 +26,8 @@ from tests.e2e.resilience.lab.lab import Lab, LabConfig
         pytest.param("lab", "late-success", id="lab-rpc-late-success"),
         pytest.param("server-runner", "remaining-budget", id="server-runner-rpc-remaining-budget"),
         pytest.param("server-runner", "late-success", id="server-runner-rpc-late-success"),
+        pytest.param("lab", "host-exit", id="lab-host-exit"),
+        pytest.param("server-runner", "host-exit", id="server-runner-host-exit"),
     ],
 )
 def test_host_startup_waits_for_rpc_when_online_row_precedes_tunnel(
@@ -38,6 +40,7 @@ def test_host_startup_waits_for_rpc_when_online_row_precedes_tunnel(
     spawned_env = {}
     request_timeouts = []
     rpc_timeouts = []
+    sleep = Mock()
 
     def respond(request: httpx.Request) -> httpx.Response:
         nonlocal rpc_attempted, rpc_ready
@@ -78,21 +81,28 @@ def test_host_startup_waits_for_rpc_when_online_row_precedes_tunnel(
             httpx.Client(transport=httpx.MockTransport(respond), base_url="http://test")
         )
         if helper == "lab":
-            lab = Lab(LabConfig(root=tmp_path / "lab"))
-            resources.callback(lab.stop)
-            host_id = lab.host_id
-            monkeypatch.setattr(lab, "_proxies", Mock(host=Mock(url="http://test")))
+            # Readiness needs no constructor sockets, TLS material, or process cleanup.
+            lab = Lab.__new__(Lab)
+            lab.host_id = host_id
+            lab._proxies = Mock(host=Mock(url="http://test"))
             monkeypatch.setattr(lab, "_host_side_env", dict)
-            monkeypatch.setattr(lab, "_spawn", lambda *_: Mock(running=True))
+            monkeypatch.setattr(
+                lab,
+                "_spawn",
+                lambda *_: Mock(
+                    running=scenario != "host-exit", log_tail=lambda: "host-startup-marker"
+                ),
+            )
             lab.observer = observer
+            monkeypatch.setattr(
+                "tests.e2e.resilience.lab.lab.time",
+                SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep),
+            )
             if scenario in {"remaining-budget", "late-success"}:
                 monkeypatch.setattr("tests.e2e.resilience.lab.lab._STARTUP_TIMEOUT_S", 1.0)
-                monkeypatch.setattr(
-                    "tests.e2e.resilience.lab.lab.time",
-                    SimpleNamespace(monotonic=lambda: clock.now, sleep=lambda _: None),
-                )
             start_host = lab._start_host
         else:
+            monkeypatch.setattr("tests._helpers.server_runner.find_free_port", lambda: 1)
             stack = ServerRunner(
                 tmp_path / "stack",
                 resources,
@@ -111,16 +121,28 @@ def test_host_startup_waits_for_rpc_when_online_row_precedes_tunnel(
 
             def spawn(*args, **kwargs):
                 spawned_env.update(args[3])
-                return Mock(poll=lambda: None)
+                return Mock(
+                    poll=lambda: 23 if scenario == "host-exit" else None,
+                    returncode=23 if scenario == "host-exit" else None,
+                )
 
             monkeypatch.setattr(stack, "_client", observer)
             monkeypatch.setattr(stack, "_spawn", spawn)
+            if scenario == "host-exit":
+                stack.log_path("host").write_text("host-startup-marker")
             monkeypatch.setattr(
                 "tests._helpers.server_runner.time",
-                SimpleNamespace(monotonic=lambda: clock.now, sleep=lambda _: None),
+                SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep),
             )
             start_host = stack.start_host
-        if scenario in {"deadline", "late-success"}:
+        if scenario == "host-exit":
+            error = RuntimeError if helper == "lab" else AssertionError
+            with pytest.raises(error, match="exited") as raised:
+                start_host()
+            assert "host-startup-marker" in str(raised.value)
+            assert not request_timeouts, "An exited host must fail before any readiness request"
+            sleep.assert_not_called()
+        elif scenario in {"deadline", "late-success"}:
             error = TimeoutError if helper == "lab" else AssertionError
             with pytest.raises(error, match=r"host daemon|never became ready"):
                 start_host()
