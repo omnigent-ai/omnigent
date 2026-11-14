@@ -37,6 +37,13 @@ allowed_domains:
 # artifact_location: /data/artifacts
 # database_uri: postgresql+psycopg://user:pw@host:5432/omnigent
 
+# Remote, durable artifact store (env: OMNIGENT_ARTIFACT_URI). When set,
+# artifacts go here and artifact_location only holds local state. Accepted:
+#   s3://bucket[/prefix]                                  S3 / R2 / MinIO (`s3` extra)
+#   dbfs:/Volumes/<catalog>/<schema>/<volume>[/<prefix>]  Unity Catalog Volumes
+#     (`databricks` extra, plus DATABRICKS_HOST and credentials in the env)
+# artifact_store_uri: s3://my-bucket/artifacts
+
 # Extra Python modules scanned for POLICY_REGISTRY lists at startup.
 # policy_modules:
 #   - myorg.policies.safety
