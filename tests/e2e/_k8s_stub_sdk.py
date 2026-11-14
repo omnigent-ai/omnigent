@@ -18,6 +18,10 @@ from __future__ import annotations
 # Env var naming the JSON file the stub SDK appends captured API calls to.
 CAPTURE_ENV_VAR = "OMNIGENT_TEST_K8S_CAPTURE_FILE"
 
+# Captured ``call`` names for the launch Job and its launch-token Secret.
+JOB_CALL = "create_namespaced_job"
+LAUNCH_TOKEN_CALL = "create_namespaced_secret"
+
 # Relative path -> source for each stub module written under the PYTHONPATH root.
 STUB_FILES: dict[str, str] = {
     "kubernetes/__init__.py": (

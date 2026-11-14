@@ -29,7 +29,7 @@ from omnigent.host.claude_credential import CLAUDE_OAUTH_TOKEN_ENV_VAR
 from omnigent.host.identity import HOST_ID_ENV_VAR
 from tests._helpers.live_server import find_free_port, isolated_process_env, terminate_process
 from tests._helpers.polling import poll_until
-from tests.e2e._k8s_stub_sdk import CAPTURE_ENV_VAR, STUB_FILES
+from tests.e2e._k8s_stub_sdk import CAPTURE_ENV_VAR, JOB_CALL, LAUNCH_TOKEN_CALL, STUB_FILES
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _KMS_KEY_ARN = "arn:aws:kms:us-east-1:111122223333:key/00000000-0000-0000-0000-000000000000"
@@ -236,13 +236,13 @@ def test_connected_subscription_is_exported_by_the_owners_sandbox_host(tmp_path:
             assert created.status_code == 201, created.text
             poll_until(
                 lambda: (
-                    _captured(capture_path, "create_namespaced_job")
-                    and _captured(capture_path, "create_namespaced_secret")
+                    _captured(capture_path, JOB_CALL)
+                    and _captured(capture_path, LAUNCH_TOKEN_CALL)
                 ),
                 timeout_s=120.0,
             )
-            job = _captured(capture_path, "create_namespaced_job")["manifest"]
-            secret = _captured(capture_path, "create_namespaced_secret")["manifest"]
+            job = _captured(capture_path, JOB_CALL)["manifest"]
+            secret = _captured(capture_path, LAUNCH_TOKEN_CALL)["manifest"]
             host_env = _host_container_env(job, secret)
 
             # The sandbox host starts with the image's shared default and its own launch env.
