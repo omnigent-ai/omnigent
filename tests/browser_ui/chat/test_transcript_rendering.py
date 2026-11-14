@@ -1399,7 +1399,7 @@ def test_long_session_message_sender_truncates_inside_its_message(
                 "short-report",
                 "user",
                 f"[Message from session {short_sender}]\n"
-                "Gold-source index covers 47 of 50 questions; three still need a source.",
+                "Gold-source index covers 47 of 50 questions so far.",
                 response_id="short-report",
             ),
             message_item(
