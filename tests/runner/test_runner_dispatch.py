@@ -103,6 +103,7 @@ from omnigent.runtime.prompt import (
 from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
 from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy, ToolsConfig
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
+from tests._helpers.polling import poll_until_async
 from tests._helpers.providers import isolate_provider_resolution
 from tests.runner.conftest import (
     _FakeProcessManager as _RecoveryFakeProcessManager,
@@ -3737,6 +3738,102 @@ async def test_runner_read_inbox_formats_valid_terminal_idle_item() -> None:
 
     assert inbox_output == "[System: inbox item terminal_idle — terminal bash:main is idle]"
     assert session_inbox.empty()
+
+
+def _start_waiting_inbox_read(
+    session_inbox: asyncio.Queue[dict[str, Any]], session_id: str
+) -> asyncio.Task[str]:
+    """Start a ``sys_read_inbox`` call that waits up to 30s on an empty inbox."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    return asyncio.create_task(
+        execute_tool(
+            tool_name="sys_read_inbox",
+            arguments='{"wait_s": 30}',
+            session_inbox=session_inbox,
+            conversation_id=session_id,
+        )
+    )
+
+
+def _shell_result(handle_id: str) -> dict[str, Any]:
+    return {
+        "handle_id": handle_id,
+        "tool_name": "sys_os_shell",
+        "status": "completed",
+        "output": f"output of {handle_id}",
+    }
+
+
+@pytest.mark.asyncio
+async def test_runner_read_inbox_wait_reports_results_without_collecting_them() -> None:
+    """
+    ``wait_s`` holds an empty-inbox read until results land, then only reports them.
+
+    They stay queued in arrival order, so a wait whose harness dropped the call
+    consumes nothing; a waited read of a non-empty inbox reports at once.
+    """
+    from omnigent.runner.tool_dispatch import _inbox_wait_releases, execute_tool
+
+    session_id = "conv_inbox_wait"
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    read = _start_waiting_inbox_read(session_inbox, session_id)
+    await poll_until_async(lambda: session_id in _inbox_wait_releases, timeout_s=5.0)
+    assert not read.done()
+
+    session_inbox.put_nowait(_shell_result("handle_first"))
+    session_inbox.put_nowait(_shell_result("handle_second"))
+    report = "2 results waiting in inbox; call sys_read_inbox without wait_s to collect."
+    assert await asyncio.wait_for(read, timeout=5.0) == report
+    rewait = _start_waiting_inbox_read(session_inbox, session_id)
+    assert await asyncio.wait_for(rewait, timeout=5.0) == report
+
+    output = await execute_tool(
+        tool_name="sys_read_inbox", arguments="{}", session_inbox=session_inbox
+    )
+    assert output.index("output of handle_first") < output.index("output of handle_second")
+    assert session_inbox.empty()
+    assert session_id not in _inbox_wait_releases
+
+
+@pytest.mark.asyncio
+async def test_runner_read_inbox_wait_cancelled_as_result_lands_keeps_it() -> None:
+    """A waiting read cancelled in the tick its result lands leaves it in the inbox."""
+    from omnigent.runner.tool_dispatch import _inbox_wait_releases
+
+    session_id = "conv_inbox_wait_cancel"
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    read = _start_waiting_inbox_read(session_inbox, session_id)
+    await poll_until_async(lambda: session_id in _inbox_wait_releases, timeout_s=5.0)
+
+    session_inbox.put_nowait(_shell_result("handle_kept"))
+    read.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await read
+
+    assert session_inbox.qsize() == 1
+    assert session_inbox.get_nowait()["handle_id"] == "handle_kept"
+
+
+@pytest.mark.parametrize(
+    ("wait_s", "expected"),
+    [
+        (None, 0.0),
+        (12, 12.0),
+        (-3, 0.0),
+        (10_000, 45.0),
+        (float("nan"), 0.0),
+        (float("inf"), 45.0),
+        ("30", 0.0),
+        (True, 0.0),
+    ],
+)
+def test_inbox_wait_seconds_is_clamped(wait_s: object, expected: float) -> None:
+    """Only a real number waits, and never past the cap native bridges tolerate."""
+    from omnigent.runner.tool_dispatch import _inbox_wait_seconds
+
+    args = {} if wait_s is None else {"wait_s": wait_s}
+    assert _inbox_wait_seconds(args) == expected
 
 
 @pytest.mark.asyncio

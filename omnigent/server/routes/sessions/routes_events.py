@@ -1255,7 +1255,8 @@ def register_events_routes(
         - ``"external_session_interrupted"`` publishes a
           ``session.interrupted`` event observed outside the Omnigent task
           runtime, without persisting an item or starting / steering a
-          task.
+          task, and forwards it so the runner releases the turn's
+          ``sys_read_inbox`` waits.
         - ``"external_elicitation_resolved"`` marks a native
           harness-originated elicitation as resolved elsewhere so
           subscribed clients clear the pending approval card.
@@ -2518,6 +2519,10 @@ def register_events_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             _publish_interrupted(session_id, response_id=response_id)
+            # Let the runner release waits the interrupted turn abandoned.
+            await _forward_session_change_to_runner(
+                session_id, runner_router, {"type": _EXTERNAL_SESSION_INTERRUPTED_TYPE}
+            )
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_SUPERSEDED_TYPE:
             target_conversation_id = body.data.get("target_conversation_id")

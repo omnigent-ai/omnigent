@@ -6931,11 +6931,19 @@ async def test_post_external_session_interrupted_publishes_session_interrupted(
     Codex-native uses this when app-server reports a terminal
     ``turn/completed`` status of ``interrupted``. The event must decorate
     the active web turn as cancelled, but must not persist a transcript item
-    or start / steer an Omnigent task.
+    or start / steer an Omnigent task. It is forwarded to the runner, which
+    releases ``sys_read_inbox`` waits the interrupted turn abandoned.
     """
     published: list[tuple[str, dict[str, Any]]] = []
+    forwarded: list[dict[str, Any]] = []
+
+    async def _record_forward(_session_id: str, _router: Any, event: dict[str, Any]) -> None:
+        forwarded.append(event)
 
     _capture_published(monkeypatch, published)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner", _record_forward
+    )
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
 
@@ -6955,6 +6963,7 @@ async def test_post_external_session_interrupted_publishes_session_interrupted(
     assert event["type"] == "session.interrupted"
     assert isinstance(event["data"]["requested_at"], int)
     assert event["data"]["response_id"] == "codex_turn_123"
+    assert forwarded == [{"type": "external_session_interrupted"}]
 
     snap = await client.get(f"/v1/sessions/{session['id']}")
     assert snap.status_code == 200, snap.text

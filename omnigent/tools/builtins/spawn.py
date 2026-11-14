@@ -62,6 +62,18 @@ _HISTORY_MAX_TOTAL_CHARS = _HISTORY_MAX_TAIL * _ACTIVITY_MAX_CHARS
 _CLOSED_TITLE_INFIX = CLOSED_TITLE_INFIX
 
 
+# Shared by both ``sys_session_send`` description variants.
+_CHILD_RESULT_DELIVERY = (
+    "Returns a launch handle immediately, not the child's output. When a "
+    "dispatched child finishes, the Omnigent runtime posts "
+    f"`{SUBAGENT_WAKE_NOTICE_SHAPE}` into this session as a new message, "
+    "starting a turn for you if you are idle. That notice comes from the "
+    "runtime, not from a person; respond by calling sys_read_inbox to collect "
+    "the result. Don't sleep or poll for the child: end your turn or keep "
+    "doing independent work until the notice arrives."
+)
+
+
 class SysSessionSendTool(Tool):
     """
     Send a message to a named sub-agent — auto-create-or-continue.
@@ -135,8 +147,7 @@ class SysSessionSendTool(Tool):
             "session you created (e.g. via sys_session_create) — this "
             "is confined to your direct children. Provide exactly one "
             "of (agent + title) or session_id, always with args. "
-            "Returns the child's output when its turn completes. To run "
-            "multiple sessions in parallel, emit multiple "
+            "To run multiple sessions in parallel, emit multiple "
             "sys_session_send tool_calls in the same response with a "
             "distinct task-based title for each independent session — "
             "they dispatch concurrently. Reusing a title continues the "
@@ -152,11 +163,7 @@ class SysSessionSendTool(Tool):
             "pass their file ids via the object args form's 'file_ids' "
             "list on the first named (agent, title) send only; file_ids "
             "cannot be used with session_id or when continuing an existing "
-            "named session. When a dispatched child finishes, the Omnigent "
-            f"runtime posts `{SUBAGENT_WAKE_NOTICE_SHAPE}` into this session "
-            "as a new message, starting a turn for you if you are idle. That "
-            "notice comes from the runtime, not from a person; respond by "
-            "calling sys_read_inbox to collect the result."
+            f"named session. {_CHILD_RESULT_DELIVERY}"
         )
 
     def __init__(self, sub_specs: dict[str, AgentSpec]) -> None:
@@ -268,10 +275,10 @@ def _build_sys_session_send_schema(
             "conversation, visible in the session tree) — not your "
             "harness's built-in subagent/Task tool, which remains the "
             "right choice for quick in-context delegation. "
-            "Confined to your direct children. Returns the child's "
-            "output when its turn completes. To run multiple sessions "
+            "Confined to your direct children. To run multiple sessions "
             "in parallel, emit multiple sys_session_send tool_calls in "
-            "the same response — they dispatch concurrently."
+            "the same response — they dispatch concurrently. "
+            f"{_CHILD_RESULT_DELIVERY}"
         )
     )
     # ``args.harness`` is allowlist-gated (design D.4): advertise it only when
@@ -920,10 +927,12 @@ class SysSessionCreateTool(Tool):
     an optional ``title`` labels the session.
 
     Returns a handle ``{conversation_id, agent_id, title, status}``, plus
-    ``project_id`` and ``project_name`` for an independent session. The session runs
-    asynchronously — use ``sys_session_get_history`` /
-    ``sys_session_get_info`` to monitor it. Use ``sys_session_send`` for
-    further child work and ``sys_session_message`` for independent sessions.
+    ``project_id`` and ``project_name`` for an independent session. The
+    session runs asynchronously: a child wakes the caller when its turn
+    finishes, while independent sessions must be monitored with
+    ``sys_session_get_info`` / ``sys_session_get_history``. Use
+    ``sys_session_send`` for further child work and ``sys_session_message``
+    for independent sessions.
     """
 
     @classmethod
@@ -974,9 +983,13 @@ class SysSessionCreateTool(Tool):
             "read their status/history, and use sys_session_message for subsequent work. "
             "Returns {conversation_id, agent_id, title, status}, plus project_id "
             "and project_name for an independent session; the "
-            "session runs asynchronously — monitor it with "
-            "sys_session_get_history / sys_session_get_info or drive it "
-            "with sys_session_send for children or sys_session_message for independent sessions."
+            "session runs asynchronously. A child (default placement) posts "
+            f"`{SUBAGENT_WAKE_NOTICE_SHAPE}` into this session when its turn "
+            "finishes, so don't sleep or poll it: end your turn or keep working, "
+            "then call sys_read_inbox; drive it further with sys_session_send. "
+            "Independent sessions post no notice: monitor them with "
+            "sys_session_get_info / sys_session_get_history and drive them with "
+            "sys_session_message."
         )
 
     def get_schema(self) -> dict[str, Any]:

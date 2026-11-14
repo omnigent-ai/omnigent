@@ -24,6 +24,7 @@ import base64
 import dataclasses
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -74,6 +75,7 @@ from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
 from omnigent.tools.builtins.async_inbox import (
+    INBOX_WAIT_MAX_S,
     SysCallAsyncTool,
     SysCancelAsyncTool,
     SysCancelTaskTool,
@@ -8954,6 +8956,8 @@ async def _execute_async_inbox_tool(
     """
     del harness_client
     if tool_name == SysReadInboxTool.name():
+        if wait_s := _inbox_wait_seconds(args):
+            return await _wait_for_inbox_results(session_inbox, wait_s, conversation_id)
         return await _drain_inbox(
             session_inbox,
             server_client=server_client,
@@ -9356,6 +9360,81 @@ async def _cleanup_drained_subagent_work(
         await _record_subagent_receipt(server_client, child_id, work_id)
 
 
+_EMPTY_INBOX_OUTPUT = "Inbox is empty — no completed tasks."
+# Release events of in-flight ``sys_read_inbox`` waits, keyed by session id.
+_inbox_wait_releases: dict[str | None, set[asyncio.Event]] = {}
+
+
+def release_inbox_waits(session_id: str) -> None:
+    """
+    End a session's in-flight ``sys_read_inbox`` waits now.
+
+    Called on an Omnigent or harness-reported interrupt, so a wait never holds
+    an interrupted turn open.
+
+    :param session_id: Session whose waits to release, e.g. ``"conv_abc123"``.
+    """
+    for release in _inbox_wait_releases.get(session_id, ()):
+        release.set()
+
+
+def _inbox_wait_seconds(args: _JsonObject) -> float:
+    """:returns: ``args["wait_s"]`` clamped to ``[0, INBOX_WAIT_MAX_S]``; 0 if invalid."""
+    wait_s = args.get("wait_s")
+    if isinstance(wait_s, bool) or not isinstance(wait_s, int | float) or math.isnan(wait_s):
+        return 0.0
+    return min(max(float(wait_s), 0.0), INBOX_WAIT_MAX_S)
+
+
+async def _until_inbox_item(inbox: asyncio.Queue[_JsonObject]) -> None:
+    """Return once ``inbox`` holds an item, leaving every item queued in order."""
+    head = await inbox.get()
+    # No await since get(), so no other task ever sees the queue without it.
+    later = [inbox.get_nowait() for _ in range(inbox.qsize())]
+    for item in (head, *later):
+        inbox.put_nowait(item)
+
+
+async def _wait_for_inbox_results(
+    inbox: asyncio.Queue[_JsonObject] | None, wait_s: float, session_id: str | None
+) -> str:
+    """
+    Wait up to ``wait_s`` for inbox results without collecting them.
+
+    A wait whose harness dropped the call thus consumes nothing: results stay
+    queued for a plain read, and their wake notices still post.
+
+    :param inbox: The session's queue, or ``None`` if none exists yet.
+    :param wait_s: Seconds to wait while the inbox is empty, e.g. ``30.0``.
+    :param session_id: Session id that keys the wait's release, e.g. ``"conv_abc123"``.
+    :returns: How many results are waiting, or the empty-inbox output.
+    """
+    if inbox is None:
+        return _EMPTY_INBOX_OUTPUT
+    if inbox.empty():
+        release = asyncio.Event()
+        releases = _inbox_wait_releases.setdefault(session_id, set())
+        releases.add(release)
+        arrival = asyncio.ensure_future(_until_inbox_item(inbox))
+        released = asyncio.ensure_future(release.wait())
+        try:
+            await asyncio.wait(
+                {arrival, released}, timeout=wait_s, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            # A pending get() is cancelled without taking its item.
+            arrival.cancel()
+            released.cancel()
+            releases.discard(release)
+            if not releases:
+                _inbox_wait_releases.pop(session_id, None)
+    waiting = inbox.qsize()
+    if not waiting:
+        return _EMPTY_INBOX_OUTPUT
+    noun = "result" if waiting == 1 else "results"
+    return f"{waiting} {noun} waiting in inbox; call sys_read_inbox without wait_s to collect."
+
+
 async def _drain_inbox(
     inbox: asyncio.Queue[_JsonObject] | None,
     *,
@@ -9375,7 +9454,7 @@ async def _drain_inbox(
     :returns: Formatted string of completed tasks.
     """
     if inbox is None or inbox.empty():
-        return "Inbox is empty — no completed tasks."
+        return _EMPTY_INBOX_OUTPUT
     items: list[str] = []
     retry_payloads: list[_JsonObject] = []
     while not inbox.empty():
@@ -9407,7 +9486,7 @@ async def _drain_inbox(
             await _cleanup_drained_subagent_work(evaluation.payload, server_client=server_client)
     for payload in retry_payloads:
         inbox.put_nowait(payload)
-    return "\n\n".join(items) if items else "Inbox is empty — no completed tasks."
+    return "\n\n".join(items) if items else _EMPTY_INBOX_OUTPUT
 
 
 async def _evaluate_async_tool_call_policy(
