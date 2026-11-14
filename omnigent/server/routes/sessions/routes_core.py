@@ -106,6 +106,7 @@ from omnigent.server.bundles import agent_needs_own_copy, copy_agent_bundle, val
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.feature_flags import Feature
 from omnigent.server.host_registry import HostLaunchResult, HostRegistry, RunnerExitReports
+from omnigent.server.openapi_request_bodies import SESSION_CREATE_OPENAPI_EXTRA
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import SessionAccess
 from omnigent.server.routes._auth_helpers import (
@@ -1433,6 +1434,7 @@ def register_core_routes(
             Depends(require_json_or_multipart_content_type),
             Depends(require_trusted_origin),
         ],
+        openapi_extra=SESSION_CREATE_OPENAPI_EXTRA,
     )
     async def create_session(
         request: Request,

@@ -1,0 +1,218 @@
+"""Mocked readiness checks for native host startup helpers."""
+
+from __future__ import annotations
+
+from contextlib import ExitStack
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import httpx
+import pytest
+
+from tests._helpers.server_runner import ServerRunner
+from tests.e2e.resilience.lab.lab import Lab
+
+
+@pytest.mark.parametrize(
+    "helper,scenario",
+    [
+        pytest.param("lab", "rpc-delay", id="lab"),
+        pytest.param("lab", "rpc-timeout", id="lab-rpc-timeout-once"),
+        pytest.param("server-runner", "rpc-delay", id="server-runner"),
+        pytest.param("server-runner", "rpc-timeout", id="server-runner-rpc-timeout-once"),
+        pytest.param("server-runner", "unrelated-host", id="server-runner-unrelated-host"),
+        pytest.param("server-runner", "deadline", id="server-runner-deadline"),
+        pytest.param("lab", "remaining-budget", id="lab-rpc-remaining-budget"),
+        pytest.param("lab", "late-success", id="lab-rpc-late-success"),
+        pytest.param("lab", "final-sleep-budget", id="lab-final-sleep-budget"),
+        pytest.param("server-runner", "remaining-budget", id="server-runner-rpc-remaining-budget"),
+        pytest.param("server-runner", "late-success", id="server-runner-rpc-late-success"),
+        pytest.param("lab", "host-exit", id="lab-host-exit"),
+        pytest.param("server-runner", "host-exit", id="server-runner-host-exit"),
+    ],
+)
+def test_host_startup_waits_for_rpc_when_online_row_precedes_tunnel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, helper: str, scenario: str
+) -> None:
+    host_id = "a" * 32
+    rpc_attempted = False
+    rpc_ready = False
+    clock = SimpleNamespace(now=0.0)
+    spawned_env = {}
+    request_timeouts = []
+    rpc_timeouts = []
+
+    def advance_clock(seconds: float) -> None:
+        clock.now += seconds if scenario == "final-sleep-budget" else max(seconds, 0.1)
+
+    sleep = Mock(side_effect=advance_clock)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal rpc_attempted, rpc_ready
+        assert request.method == "GET"
+        request_timeouts.append(request.extensions["timeout"])
+        if request.url.path == "/v1/hosts":
+            if scenario == "deadline":
+                clock.now = 1.0
+            # The database commit can be visible before the tunnel is registered.
+            rows = [{"host_id": host_id, "status": "online"}]
+            if scenario == "unrelated-host":
+                rows.insert(0, {"host_id": "unrelated-host", "status": "online"})
+            return httpx.Response(200, json={"hosts": rows})
+        if request.url.path == "/v1/hosts/unrelated-host/filesystem":
+            return httpx.Response(200, json={"data": []})
+        assert request.url.path == f"/v1/hosts/{host_id}/filesystem"
+        assert request.url.params["limit"] == "1"
+        rpc_timeouts.append(request.extensions["timeout"])
+        if scenario == "deadline":
+            rpc_ready = True
+            return httpx.Response(200, json={"data": []})
+        if not rpc_attempted:
+            rpc_attempted = True
+            if scenario == "rpc-timeout":
+                raise httpx.ReadTimeout("host tunnel is not ready", request=request)
+            if scenario in {"remaining-budget", "late-success"}:
+                clock.now = 0.75
+            if scenario == "final-sleep-budget":
+                clock.now = 0.99
+            return httpx.Response(
+                409, json={"error": {"code": "conflict", "message": "host is offline"}}
+            )
+        rpc_ready = True
+        if scenario == "late-success":
+            clock.now = 1.1
+        return httpx.Response(200, json={"object": "list", "data": [], "has_more": False})
+
+    with ExitStack() as resources:
+        observer = resources.enter_context(
+            httpx.Client(transport=httpx.MockTransport(respond), base_url="http://test")
+        )
+        if helper == "lab":
+            # Readiness needs no constructor sockets, TLS material, or process cleanup.
+            lab = Lab.__new__(Lab)
+            lab.host_id = host_id
+            lab._proxies = Mock(host=Mock(url="http://test"))
+            monkeypatch.setattr(lab, "_host_side_env", dict)
+            monkeypatch.setattr(
+                lab,
+                "_spawn",
+                lambda *_: Mock(
+                    running=scenario != "host-exit", log_tail=lambda: "host-startup-marker"
+                ),
+            )
+            lab.observer = observer
+            monkeypatch.setattr(
+                "tests.e2e.resilience.lab.lab.time",
+                SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep),
+            )
+            monkeypatch.setattr(
+                "tests.e2e.resilience.lab.lab._POLL_S",
+                0.25 if scenario == "final-sleep-budget" else 0,
+            )
+            if scenario in {"remaining-budget", "late-success", "final-sleep-budget"}:
+                monkeypatch.setattr("tests.e2e.resilience.lab.lab._STARTUP_TIMEOUT_S", 1.0)
+            start_host = lab._start_host
+        else:
+            monkeypatch.setattr("tests._helpers.server_runner.find_free_port", lambda: 1)
+            stack = ServerRunner(
+                tmp_path / "stack",
+                resources,
+                server_bootstrap=None,
+                server_env={},
+                base_env={},
+                server_cwd=None,
+                workspace=None,
+                database_uri=None,
+                artifact_location=None,
+                binding_token="example-token",
+                health_timeout=1,
+                poll_interval=0,
+            )
+            stack.host_id = host_id
+
+            def spawn(*args, **kwargs):
+                spawned_env.update(args[3])
+                return Mock(
+                    poll=lambda: 23 if scenario == "host-exit" else None,
+                    returncode=23 if scenario == "host-exit" else None,
+                )
+
+            monkeypatch.setattr(stack, "_client", observer)
+            monkeypatch.setattr(stack, "_spawn", spawn)
+            if scenario == "host-exit":
+                stack.log_path("host").write_text("host-startup-marker")
+            monkeypatch.setattr(
+                "tests._helpers.server_runner.time",
+                SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep),
+            )
+            start_host = stack.start_host
+        if scenario == "host-exit":
+            error = RuntimeError if helper == "lab" else AssertionError
+            with pytest.raises(error, match="exited") as raised:
+                start_host()
+            assert "host-startup-marker" in str(raised.value)
+            assert not request_timeouts, "An exited host must fail before any readiness request"
+            sleep.assert_not_called()
+        elif scenario in {"deadline", "late-success", "final-sleep-budget"}:
+            error = TimeoutError if helper == "lab" else AssertionError
+            with pytest.raises(error, match=r"host daemon|never became ready"):
+                start_host()
+            if scenario == "deadline":
+                assert not rpc_ready, "No host RPC may start after the readiness deadline"
+                assert request_timeouts[0]["read"] <= 1.0
+            elif scenario == "final-sleep-budget":
+                assert not rpc_ready
+                assert len(request_timeouts) == len(rpc_timeouts) == 1
+                sleep.assert_called_once_with(pytest.approx(0.01))
+                assert clock.now == pytest.approx(1.0)
+            else:
+                assert rpc_ready, "The deadline must reject the late successful RPC"
+        else:
+            start_host()
+            assert rpc_ready, "Host startup returned before the host could answer an RPC"
+        if scenario == "rpc-timeout":
+            assert len(rpc_timeouts) == 2
+        if scenario in {"remaining-budget", "late-success"}:
+            assert len(rpc_timeouts) == 2
+            assert 0 < rpc_timeouts[0]["read"] <= 1.0
+            assert 0 < rpc_timeouts[1]["read"] <= 0.25
+        if helper == "server-runner":
+            assert spawned_env["OMNIGENT_HOST_ID"] == host_id
+            assert spawned_env["OMNIGENT_HOST_NAME"]
+
+
+def test_runner_readiness_stops_after_health_exhausts_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = SimpleNamespace(now=0.0)
+    requests = []
+    sleep = Mock()
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append((request.url.path, request.extensions["timeout"]))
+        assert request.url.path == "/health", "Runner status started after the health deadline"
+        clock.now = 1.0
+        return httpx.Response(200, json={"status": "ok"})
+
+    stack = ServerRunner.__new__(ServerRunner)
+    stack.base_url = "http://test"
+    stack.runner_id = "example-runner"
+    stack.server = stack.runner = stack.host = None
+    stack._health_timeout = 1.0
+    stack._poll_interval = 0.0
+    monkeypatch.setattr(stack, "log_tail", lambda: "runner-readiness-marker")
+    monkeypatch.setattr(
+        "tests._helpers.server_runner.time",
+        SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep),
+    )
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        stack._client = client
+        with pytest.raises(AssertionError, match="never became ready") as raised:
+            stack._wait_ready(runner=True)
+
+    assert "runner-readiness-marker" in str(raised.value)
+    assert [path for path, _ in requests] == ["/health"]
+    assert requests[0][1]["read"] == 1.0
+    assert clock.now == 1.0
+    sleep.assert_not_called()

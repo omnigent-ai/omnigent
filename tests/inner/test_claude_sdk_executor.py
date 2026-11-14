@@ -2045,35 +2045,38 @@ class TestGatewayModelVocabulary(unittest.TestCase):
             ),
             note="",
         )
-        with patch(
-            "omnigent.models.model_catalog.listing_for_provider", return_value=listing
-        ) as lister:
-            vocabulary = _gateway_model_vocabulary(
-                "https://gw.example.com/anthropic", "printf tok"
-            )
-        self.assertEqual(
-            vocabulary.alias_pins,
-            {
-                "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8",
-                "ANTHROPIC_DEFAULT_FABLE_MODEL": "databricks-claude-fable-5",
-            },
-        )
-        # Same listing, second half of the vocabulary: the canonical spelling
-        # Claude Code names itself, rewritten to what this gateway serves. The
-        # non-Claude id contributes to neither half.
-        self.assertEqual(
-            vocabulary.model_overrides,
-            {
-                "claude-opus-4-8": "databricks-claude-opus-4-8",
-                "claude-fable-5": "databricks-claude-fable-5",
-            },
-        )
-        # The listing is fetched as a gateway transport: the base URL and the
-        # auth command the CLI itself uses, not a Databricks profile.
-        provider = lister.call_args.args[0]
-        self.assertEqual(provider.base_url, "https://gw.example.com/anthropic")
-        self.assertEqual(provider.auth_command, "printf tok")
-        self.assertIsNone(provider.profile)
+        for api_key in (None, "dummy-listing-key"):
+            with self.subTest(api_key=api_key):
+                with patch(
+                    "omnigent.models.model_catalog.listing_for_provider", return_value=listing
+                ) as lister:
+                    vocabulary = _gateway_model_vocabulary(
+                        "https://gw.example.com/anthropic", "printf tok", api_key
+                    )
+                self.assertEqual(
+                    vocabulary.alias_pins,
+                    {
+                        "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8",
+                        "ANTHROPIC_DEFAULT_FABLE_MODEL": "databricks-claude-fable-5",
+                    },
+                )
+                # Same listing, second half of the vocabulary: the canonical spelling
+                # Claude Code names itself, rewritten to what this gateway serves. The
+                # non-Claude id contributes to neither half.
+                self.assertEqual(
+                    vocabulary.model_overrides,
+                    {
+                        "claude-opus-4-8": "databricks-claude-opus-4-8",
+                        "claude-fable-5": "databricks-claude-fable-5",
+                    },
+                )
+                # The listing is fetched as a gateway transport: the base URL and the
+                # static key or dynamic command, not a Databricks profile.
+                provider = lister.call_args.args[0]
+                self.assertEqual(provider.base_url, "https://gw.example.com/anthropic")
+                self.assertEqual(provider.auth_command, None if api_key else "printf tok")
+                self.assertEqual(provider.api_key, api_key)
+                self.assertIsNone(provider.profile)
 
     def test_nothing_when_the_listing_has_no_claude_models(self):
         from omnigent.inner.claude_sdk_executor import (
@@ -2203,9 +2206,31 @@ class TestEmptyPrompt(unittest.TestCase):
 
 class TestSystemMessages(unittest.TestCase):
     def test_databricks_auth_uses_api_key_helper_settings(self):
-        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+        for windows_static in (False, True):
+            with self.subTest(windows_static=windows_static):
+                self._assert_api_key_helper_settings(windows_static)
 
+    def _assert_api_key_helper_settings(self, windows_static):
+        import shlex
+
+        from omnigent.inner import claude_sdk_executor as ex
+        from omnigent.models.model_catalog import ModelListing
+
+        ClaudeSDKExecutor = ex.ClaudeSDKExecutor
+        token = "dummy-static-'quoted-key"
+        command = (
+            f"printf %s {shlex.quote(token)}"
+            if windows_static
+            else "databricks auth token --host https://host"
+        )
+        listing = ModelListing(source="openai-compatible", verified=True, models=(), note="")
+        discovered = []
         captured_options = []
+        transport_env = {
+            "HARNESS_CLAUDE_SDK_API_KEY_HELPER": command,
+            "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND": command,
+        }
+        connect_env = {}
 
         class _ResultMessage:
             def __init__(self, session_id, result):
@@ -2217,7 +2242,14 @@ class TestSystemMessages(unittest.TestCase):
 
             class ClaudeSDKClient(_SDKClient):
                 def __init__(self, options):
+                    super().__init__(options)
                     captured_options.append(options)
+
+                async def connect(self):
+                    child_env = {**os.environ, **self.options.env}
+                    connect_env.update(
+                        (name, child_env[name]) for name in transport_env if name in child_env
+                    )
 
                 async def receive_response(self):
                     yield _ResultMessage("default", "ok")
@@ -2232,7 +2264,7 @@ class TestSystemMessages(unittest.TestCase):
         ):
             return {
                 "ANTHROPIC_BASE_URL": base_url_override or "https://host/ai-gateway/anthropic",
-                "OMNIGENT_CLAUDE_API_KEY_HELPER": "databricks auth token --host https://host",
+                "OMNIGENT_CLAUDE_API_KEY_HELPER": command,
                 "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "900000",
                 "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
             }
@@ -2241,11 +2273,19 @@ class TestSystemMessages(unittest.TestCase):
 
         async def _t():
             with (
+                patch.dict(os.environ, transport_env),
                 patch(
                     "omnigent.inner.claude_sdk_executor._resolve_gateway_env",
                     _resolve_gateway_env,
                 ),
                 patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK),
+                patch.object(ex, "IS_WINDOWS", windows_static),
+                patch.object(
+                    ex.model_catalog, "listing_for_provider", return_value=listing
+                ) as lister,
+                patch.object(
+                    ex, "PrivateStaticKeyFile", wraps=ex.PrivateStaticKeyFile
+                ) as create_key,
             ):
                 executor = ClaudeSDKExecutor(
                     gateway=True,
@@ -2253,31 +2293,60 @@ class TestSystemMessages(unittest.TestCase):
                     base_url_override="https://host/ai-gateway/anthropic",
                     gateway_auth_command="printf token",
                 )
-                events = [
-                    e
-                    async for e in executor.run_turn(
-                        [{"role": "user", "content": "hello"}],
-                        [],
-                        "",
-                    )
-                ]
-            self.assertEqual(len(events), 1)
-            # The gateway path routes the CLI through the local shim
-            # (which restores thinking.display); record its target and
-            # shut it down inside the loop that started it.
-            self.assertIsNotNone(executor._gateway_shim)
-            shim_upstream["base_url"] = executor._gateway_shim.base_url
-            shim_upstream["upstream"] = executor._gateway_shim._upstream_base_url
-            await executor._gateway_shim.aclose()
+                credential_file = None
+                try:
+                    for _turn in range(2):
+                        events = [
+                            e
+                            async for e in executor.run_turn(
+                                [{"role": "user", "content": "hello"}],
+                                [],
+                                "",
+                            )
+                        ]
+                        self.assertEqual(len(events), 1)
+                        state = executor._clients["default"]
+                        if windows_static:
+                            helper = json.loads(captured_options[0].settings)["apiKeyHelper"]
+                            operand = helper.rsplit(" ", 1)[1]
+                            path = Path(base64.b64decode(operand, validate=True).decode("utf-8"))
+                            self.assertEqual(path.read_bytes(), token.encode("utf-8"))
+                            self.assertEqual(state.static_key_file.path, path)
+                            if credential_file is not None:
+                                self.assertEqual(path, credential_file)
+                            credential_file = path
+                        else:
+                            self.assertIsNone(state.static_key_file)
+                    self.assertEqual(create_key.call_count, int(windows_static))
+                    lister.assert_called_once()
+                    discovered.append(lister.call_args.args[0])
+                    self.assertIsNotNone(executor._gateway_shim)
+                    shim_upstream["base_url"] = executor._gateway_shim.base_url
+                    shim_upstream["upstream"] = executor._gateway_shim._upstream_base_url
+                finally:
+                    await executor.close()
+                if credential_file is not None:
+                    self.assertFalse(credential_file.parent.exists())
 
         _run(_t())
 
         self.assertEqual(len(captured_options), 1)
         settings = json.loads(captured_options[0].settings)
-        self.assertEqual(
-            settings["apiKeyHelper"],
-            "databricks auth token --host https://host",
-        )
+        if windows_static:
+            self.assertNotIn(token, captured_options[0].settings)
+            self.assertNotIn(
+                base64.b64encode(token.encode()).decode(), captured_options[0].settings
+            )
+            self.assertNotIn(token, captured_options[0].env.values())
+            self.assertEqual(connect_env, {})
+            self.assertNotIn("dummy-static", captured_options[0].settings)
+            self.assertEqual(discovered[0].api_key, token)
+            self.assertIsNone(discovered[0].auth_command)
+        else:
+            self.assertEqual(settings["apiKeyHelper"], command)
+            self.assertEqual(connect_env, transport_env)
+            self.assertEqual(discovered[0].auth_command, command)
+            self.assertIsNone(discovered[0].api_key)
         # The CLI talks to the loopback shim; the shim forwards to the
         # real gateway. A direct gateway URL here would mean the shim was
         # bypassed and opus thinking.display stays stripped.
@@ -3419,22 +3488,53 @@ class TestStreamEventStreaming(unittest.TestCase):
 
     def test_close_disconnects_all_live_clients(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
+        from omnigent.inner.claude_sdk_key_file import PrivateStaticKeyFile
 
-        disconnect_a = AsyncMock()
-        disconnect_b = AsyncMock()
-        client_a = type("Client", (), {"disconnect": disconnect_a})()
-        client_b = type("Client", (), {"disconnect": disconnect_b})()
-
-        async def _t():
+        async def _t(cleanup_failure):
+            disconnect_a = AsyncMock()
+            disconnect_b = AsyncMock()
+            client_a = type("Client", (), {"disconnect": disconnect_a})()
+            client_b = type("Client", (), {"disconnect": disconnect_b})()
+            key_file = PrivateStaticKeyFile("dummy-shutdown-key")
+            relay = SimpleNamespace(close=Mock())
+            shim = SimpleNamespace(aclose=AsyncMock())
             executor = ClaudeSDKExecutor()
-            executor._clients["session-a"] = _ClaudeClientState(client=client_a, model=None)
+            executor._gateway_shim = shim
+            executor._clients["session-a"] = _ClaudeClientState(
+                client=client_a, model=None, static_key_file=key_file, mcp_relay=relay
+            )
             executor._clients["session-b"] = _ClaudeClientState(client=client_b, model=None)
-            await executor.close()
-            disconnect_a.assert_awaited_once_with()
-            disconnect_b.assert_awaited_once_with()
-            self.assertEqual(executor._clients, {})
+            operation = cleanup_failure or "unlink"
+            remove = getattr(Path, operation)
 
-        _run(_t())
+            def refuse(path, *args, **kwargs):
+                target = key_file.path if operation == "unlink" else key_file.directory
+                if cleanup_failure and path == target:
+                    raise PermissionError("locked dummy-shutdown-key")
+                return remove(path, *args, **kwargs)
+
+            try:
+                with (
+                    patch.object(Path, operation, autospec=True, side_effect=refuse),
+                    patch("omnigent.inner.claude_sdk_key_file.logger.warning") as warning,
+                ):
+                    await executor.close()
+                    disconnect_a.assert_awaited_once_with()
+                    disconnect_b.assert_awaited_once_with()
+                    relay.close.assert_called_once_with()
+                    shim.aclose.assert_awaited_once_with()
+                    self.assertIsNone(executor._gateway_shim)
+                    self.assertEqual(executor._clients, {})
+                    self.assertEqual(warning.call_count, int(cleanup_failure is not None))
+                    self.assertNotIn("dummy-shutdown-key", repr(warning.call_args_list))
+                    self.assertEqual(key_file.directory.exists(), cleanup_failure is not None)
+            finally:
+                key_file.close()
+            self.assertFalse(key_file.directory.exists())
+
+        for cleanup_failure in (None, "unlink", "rmdir"):
+            with self.subTest(cleanup_failure=cleanup_failure):
+                _run(_t(cleanup_failure))
 
     def test_close_session_force_closes_on_loop_mismatch(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
@@ -3902,19 +4002,26 @@ def test_non_databricks_model_without_routing_does_not_raise() -> None:
 
 
 @pytest.mark.asyncio
-async def test_anthropic_api_key_stripped_during_connect(monkeypatch):
-    """``_get_or_create_client`` must strip ``ANTHROPIC_API_KEY`` from
-    ``os.environ`` during the ``connect()`` window so the Claude CLI
-    uses subscription auth instead of a developer API key.
+@pytest.mark.parametrize(
+    "helper_command,is_windows,strip_transport",
+    [
+        pytest.param(None, False, False, id="subscription"),
+        pytest.param("printf %s dummy-connect-key", True, True, id="windows-static"),
+        pytest.param("dummy-auth print-token", True, False, id="windows-dynamic"),
+        pytest.param("printf %s dummy-connect-key", False, False, id="posix-static"),
+    ],
+)
+async def test_anthropic_api_key_stripped_during_connect(
+    monkeypatch, helper_command, is_windows, strip_transport
+):
+    """Strip connection credentials while preserving parent and other helper paths."""
+    from omnigent.inner import claude_sdk_executor as ex
 
-    This test drives ``_get_or_create_client`` with a stub SDK and
-    captures ``os.environ`` at the moment ``connect()`` is invoked,
-    ensuring both ``CLAUDECODE`` and ``ANTHROPIC_API_KEY`` are absent.
-    """
-    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
-
-    # Env snapshot captured inside connect() -- proves the real code
-    # path strips the keys, not just a standalone _unset_env_var call.
+    _, static_api_key = ex._platform_safe_api_key_helper(helper_command, is_windows=is_windows)
+    transport_env = {
+        "HARNESS_CLAUDE_SDK_API_KEY_HELPER": helper_command or "dummy-unused-helper",
+        "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND": "printf %s dummy-parent-gateway-key",
+    }
     connect_env: dict[str, str] = {}
 
     class _StubClient:
@@ -3930,8 +4037,16 @@ async def test_anthropic_api_key_stripped_during_connect(monkeypatch):
             self._transport = None
 
         async def connect(self) -> None:
-            """Record env state at the moment the real code calls connect."""
-            connect_env.update(os.environ)
+            """Capture the credential fields from the SDK's merged child environment."""
+            child_env = {**os.environ, **self.options.env}
+            for name in (
+                *transport_env,
+                "ANTHROPIC_API_KEY",
+                "CLAUDECODE",
+                "HARNESS_CLAUDE_SDK_CWD",
+            ):
+                if name in child_env:
+                    connect_env[name] = child_env[name]
 
         async def disconnect(self) -> None:
             """No-op disconnect."""
@@ -3943,15 +4058,22 @@ async def test_anthropic_api_key_stripped_during_connect(monkeypatch):
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-secret")
     monkeypatch.setenv("CLAUDECODE", "parent-value")
+    monkeypatch.setenv("HARNESS_CLAUDE_SDK_CWD", "dummy-parent-workspace")
+    for name, value in transport_env.items():
+        monkeypatch.setenv(name, value)
 
-    executor = ClaudeSDKExecutor()
-    options = SimpleNamespace()
-    await executor._get_or_create_client(
-        _StubSDK,  # type: ignore[arg-type]
-        session_key="test-session",
-        options=options,
-        model=None,
-    )
+    executor = ex.ClaudeSDKExecutor()
+    options = SimpleNamespace(env={})
+    try:
+        await executor._get_or_create_client(
+            _StubSDK,  # type: ignore[arg-type]
+            session_key="test-session",
+            options=options,
+            model=None,
+            static_api_key=static_api_key,
+        )
+    finally:
+        await executor.close()
 
     # Both keys must be absent at the moment connect() ran.
     assert "ANTHROPIC_API_KEY" not in connect_env, (
@@ -3963,6 +4085,13 @@ async def test_anthropic_api_key_stripped_during_connect(monkeypatch):
     # Both are restored after _get_or_create_client returns.
     assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-test-secret"
     assert os.environ["CLAUDECODE"] == "parent-value"
+    assert connect_env["HARNESS_CLAUDE_SDK_CWD"] == "dummy-parent-workspace"
+    for name, value in transport_env.items():
+        if strip_transport:
+            assert name not in connect_env, f"{name} leaked into the Windows static-key child"
+        else:
+            assert connect_env[name] == value
+        assert os.environ[name] == value
 
 
 @pytest.mark.asyncio
