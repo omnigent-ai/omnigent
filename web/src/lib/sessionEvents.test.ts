@@ -1123,6 +1123,18 @@ describe("session.usage (FLAT envelope)", () => {
     expect(ev.contextWindow).toBe(1000000);
   });
 
+  it("lifts a cost-only cost_hidden broadcast", () => {
+    const out = parse("session.usage", {
+      type: "session.usage",
+      conversation_id: "conv_abc",
+      cost_hidden: true,
+    });
+    expect(out).toHaveLength(1);
+    const ev = out[0] as SessionUsageEvent;
+    expect(ev.costHidden).toBe(true);
+    expect(ev.totalCostUsd).toBeUndefined();
+  });
+
   it("rejects payloads with neither field", () => {
     const out = parse("session.usage", {
       type: "session.usage",

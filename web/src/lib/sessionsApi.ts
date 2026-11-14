@@ -204,6 +204,8 @@ interface SessionResponseWire {
   last_total_tokens?: number | null;
   usage_included?: boolean;
   total_cost_usd?: number | null;
+  /** `true` when the operator hides USD cost; clients clear any cached cost. */
+  cost_hidden?: boolean | null;
   /**
    * Per-model breakdown of the same subtree usage, keyed by the raw harness
    * model id. Each value is a `ModelUsage` (the five token buckets + optional
@@ -400,6 +402,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     lastTotalTokens: wire.last_total_tokens,
     usageIncluded: wire.usage_included ?? true,
     totalCostUsd: wire.total_cost_usd,
+    costHidden: wire.cost_hidden === true,
     usageByModel: usageByModelFromWire(wire.usage_by_model),
     lastTaskError: wire.last_task_error,
     pendingElicitations: wire.pending_elicitations ?? [],
@@ -1552,6 +1555,7 @@ export async function getSessionSignInLink(
 export interface SessionUsageSnapshot {
   id: string;
   totalCostUsd: number | null;
+  costHidden: boolean;
   usageByModel: Record<string, ModelUsage> | null;
 }
 
@@ -1571,12 +1575,13 @@ export async function getSessionUsage(
     { signal: options.signal },
   );
   const wire =
-    await readJsonOrThrow<Pick<SessionResponseWire, "id" | "total_cost_usd" | "usage_by_model">>(
-      res,
-    );
+    await readJsonOrThrow<
+      Pick<SessionResponseWire, "id" | "total_cost_usd" | "cost_hidden" | "usage_by_model">
+    >(res);
   return {
     id: wire.id,
     totalCostUsd: wire.total_cost_usd ?? null,
+    costHidden: wire.cost_hidden === true,
     usageByModel: usageByModelFromWire(wire.usage_by_model),
   };
 }

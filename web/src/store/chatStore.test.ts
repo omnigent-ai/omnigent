@@ -1026,6 +1026,86 @@ describe("chatStore — lazy subtree usage", () => {
     expect(useChatStore.getState().sessionCostUsd).toBe(8);
   });
 
+  it("clears a cached cost once the server hides it, keeping token usage", async () => {
+    const readUsage = vi.fn(() => usage("conv_usage", 3.5));
+    routeUsage("conv_usage", readUsage);
+    await useChatStore.getState().switchTo("conv_usage");
+    await tick();
+    expect(useChatStore.getState().sessionCostUsd).toBe(3.5);
+
+    await useChatStore.getState().switchTo("conv_other");
+    readUsage.mockImplementation(() =>
+      mockResponse({
+        id: "conv_usage",
+        cost_hidden: true,
+        usage_by_model: { "model-a": { input_tokens: 200 } },
+      }),
+    );
+    await useChatStore.getState().switchTo("conv_usage");
+    await tick();
+
+    expect(useChatStore.getState().sessionCostUsd).toBeNull();
+    expect(useChatStore.getState().sessionUsageByModel?.["model-a"]?.inputTokens).toBe(200);
+
+    handleSessionEvent({ type: "session_usage", conversationId: "conv_usage", totalCostUsd: 8 });
+    expect(useChatStore.getState().sessionCostUsd).toBe(8);
+    handleSessionEvent({
+      type: "session_usage",
+      conversationId: "conv_usage",
+      costHidden: true,
+      usageByModel: {
+        "model-a": {
+          inputTokens: 300,
+          outputTokens: null,
+          totalTokens: null,
+          cacheReadInputTokens: null,
+          cacheCreationInputTokens: null,
+          totalCostUsd: null,
+        },
+      },
+    });
+
+    expect(useChatStore.getState().sessionCostUsd).toBeNull();
+    expect(useChatStore.getState().sessionUsageByModel?.["model-a"]?.inputTokens).toBe(300);
+  });
+
+  it("clears cached per-model costs from hidden metadata when the usage read fails", async () => {
+    routeUsage("conv_usage", () => usage("conv_usage", 3.5));
+    await useChatStore.getState().switchTo("conv_usage");
+    await tick();
+    expect(useChatStore.getState().sessionUsageByModel?.["model-a"]?.totalCostUsd).toBe(3.5);
+
+    await useChatStore.getState().switchTo("conv_other");
+    routeUsage(
+      "conv_usage",
+      () => Promise.reject(new Error("usage unavailable")),
+      snapshot("conv_usage", { cost_hidden: true }),
+    );
+    await useChatStore.getState().switchTo("conv_usage");
+    await tick();
+
+    expect(useChatStore.getState().sessionCostUsd).toBeNull();
+    expect(useChatStore.getState().sessionUsageByModel?.["model-a"]).toMatchObject({
+      inputTokens: 100,
+      totalCostUsd: null,
+    });
+  });
+
+  it("clears cached per-model costs on a hiding-only usage event", async () => {
+    routeUsage("conv_usage", () => usage("conv_usage", 3.5));
+    await useChatStore.getState().switchTo("conv_usage");
+    await tick();
+    expect(useChatStore.getState().sessionUsageByModel?.["model-a"]?.totalCostUsd).toBe(3.5);
+
+    handleSessionEvent({ type: "session_usage", conversationId: "conv_usage", costHidden: true });
+
+    expect(useChatStore.getState().sessionCostUsd).toBeNull();
+    expect(useChatStore.getState().sessionUsageByModel?.["model-a"]).toMatchObject({
+      inputTokens: 100,
+      totalCostUsd: null,
+    });
+  });
+
   describe("periodic usage reconciliation", () => {
     beforeEach(() => {
       vi.useFakeTimers();

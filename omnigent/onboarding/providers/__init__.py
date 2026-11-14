@@ -659,9 +659,72 @@ _FIREWORKS_MODEL_PREFIX = "accounts/fireworks/"
 _FIREWORKS_PROVIDER_ALIAS = "fireworks"
 
 
+ANTHROPIC_1M_CONTEXT_MARKER = "[1m]"
+
+# A short numeric hyphen segment ("4", "5", "2.5") names a model version; a
+# date stamp ("20250929", "2024-08-06", "05-06") or a word ("preview") names a
+# variant of one.
+_VERSION_SEGMENT_PATTERN = re.compile(r"^\d{1,2}(?:\.\d+)*$")
+_MONTH_SEGMENT_PATTERN = re.compile(r"^(?:0[1-9]|1[0-2])$")
+_DAY_SEGMENT_PATTERN = re.compile(r"^(?:0[1-9]|[12]\d|3[01])$")
+
+
+def split_anthropic_1m_context_marker(model: str) -> tuple[str, bool]:
+    """Strip Claude Code's trailing ``[1m]`` long-context marker from a Claude id.
+
+    The marker selects the 1M-context beta of the same model, e.g.
+    ``"claude-sonnet-4-5[1m]"`` → ``("claude-sonnet-4-5", True)``. Non-Claude ids
+    are returned unchanged, e.g. ``"gpt-5.4[1m]"`` → ``("gpt-5.4[1m]", False)``.
+
+    :param model: Model id as reported by a harness or gateway.
+    :returns: The id without the marker, and whether the marker was present.
+    """
+    stripped = model.strip()
+    if not stripped.lower().endswith(ANTHROPIC_1M_CONTEXT_MARKER):
+        return stripped, False
+    base = stripped[: -len(ANTHROPIC_1M_CONTEXT_MARKER)].rstrip()
+    bare_name = base.rsplit("/", 1)[-1].split(":", 1)[0].lower()
+    if "claude" not in bare_name:
+        return stripped, False
+    return base, True
+
+
+def _date_segment_indices(segments: list[str]) -> set[int]:
+    """Indices of zero-padded ``MM-DD`` segment pairs, e.g. in ``gpt-4o-2024-08-06``."""
+    indices: set[int] = set()
+    for index in range(len(segments) - 1):
+        if _MONTH_SEGMENT_PATTERN.match(segments[index]) and _DAY_SEGMENT_PATTERN.match(
+            segments[index + 1]
+        ):
+            indices.update((index, index + 1))
+    return indices
+
+
+def _is_version_segment_at(segments: list[str], index: int) -> bool:
+    """Whether ``segments[index]`` of a hyphen-split id names a model version."""
+    return _VERSION_SEGMENT_PATTERN.match(
+        segments[index]
+    ) is not None and index not in _date_segment_indices(segments)
+
+
+def _is_same_version_family_member(candidate_name: str, family_prefix: str) -> bool:
+    """Whether *candidate_name* extends *family_prefix* without a different version.
+
+    ``claude-sonnet-4`` covers ``claude-sonnet-4-20250514`` but neither
+    ``claude-sonnet-4-5`` nor ``claude-sonnet-4.5``, which are different models.
+    """
+    if candidate_name == family_prefix:
+        return True
+    if not candidate_name.startswith(f"{family_prefix}-"):
+        return False
+    segments = candidate_name.split("-")
+    return not _is_version_segment_at(segments, family_prefix.count("-") + 1)
+
+
 def _catalog_lookup_targets(model: str) -> list[tuple[str, str]]:
     """Return bounded provider/id pairs for a model catalog lookup."""
-    normalized = model.split(":", 1)[0].strip()
+    unmarked, _ = split_anthropic_1m_context_marker(model)
+    normalized = unmarked.split(":", 1)[0].strip()
     known_providers = set(get_all_providers())
     targets: list[tuple[str, str]] = []
 
@@ -722,7 +785,12 @@ def find_catalog_models(model: str) -> list[ModelInfo]:
     query OpenRouter, while bare ids use stable family-to-provider routing with
     OpenRouter as a bounded fallback. Exact matches win; otherwise all entries
     sharing the id without its final hyphen segment are returned so callers can
-    accept a field only when every candidate reports the same value.
+    accept a field only when every candidate reports the same value. The family
+    fallback never crosses a version segment: ``claude-opus-4-9`` does not fall
+    back to ``claude-opus-4-*``, and ``claude-sonnet-4-<date>`` matches neither
+    ``claude-sonnet-4-5`` nor ``claude-sonnet-4.5``. Dated variants such as
+    ``gpt-4o-2024-08-07`` still fall back within their own version. A trailing
+    Claude ``[1m]`` marker is ignored.
 
     :param model: Provider-local, provider-qualified, or vendor-namespaced id.
     :returns: One exact match, compatible family-prefix matches, or an empty list.
@@ -739,6 +807,9 @@ def find_catalog_models(model: str) -> list[ModelInfo]:
                 return [candidate]
         if "-" not in lookup_id:
             continue
+        lookup_segments = lookup_lower.split("-")
+        if _is_version_segment_at(lookup_segments, len(lookup_segments) - 1):
+            continue
         prefixes = {lookup_lower.rsplit("-", 1)[0]}
         if provider == "openrouter":
             prefixes.add(lookup_lower.rsplit("/", 1)[-1].rsplit("-", 1)[0])
@@ -746,7 +817,7 @@ def find_catalog_models(model: str) -> list[ModelInfo]:
             candidate
             for candidate in models
             if any(
-                candidate_name.startswith(prefix)
+                _is_same_version_family_member(candidate_name, prefix)
                 for prefix in prefixes
                 for candidate_name in (
                     candidate.name.lower(),

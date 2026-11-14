@@ -352,6 +352,7 @@ def test_encoded_context_window_resolves_anthropic_1m_beta_suffix() -> None:
     assert _encoded_context_window("CLAUDE-OPUS-4-8[1M]") == 1_000_000
     # Databricks-hosted Claude (contains "claude") also resolves.
     assert _encoded_context_window("databricks-claude-opus-4-8[1m]") == 1_000_000
+    assert _encoded_context_window("us.anthropic.claude-opus-4-8-v1:0[1m]") == 1_000_000
     # Without the suffix the encoded path defers to catalog metadata.
     assert _encoded_context_window("claude-opus-4-8") is None
     # The rule is Claude-scoped: a non-Claude id ending in [1m] is NOT forced to
