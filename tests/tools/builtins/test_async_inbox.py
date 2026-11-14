@@ -28,7 +28,7 @@ from typing import Any
 import pytest
 
 from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
-from omnigent.spec import AgentSpec
+from omnigent.spec import AgentSpec, BuiltinToolConfig, ExecutorSpec, ToolsConfig
 from omnigent.tools.builtins.async_inbox import (
     SysCallAsyncTool,
     SysCancelAsyncTool,
@@ -309,6 +309,86 @@ def test_async_enabled_false_does_not_register() -> None:
     assert SysCallAsyncTool.name() not in names
     assert SysReadInboxTool.name() not in names
     assert SysCancelAsyncTool.name() not in names
+
+
+@pytest.mark.parametrize(
+    "spec_kwargs",
+    [
+        {"tools": ToolsConfig(agents=["researcher"])},
+        {
+            "tools": ToolsConfig(builtins=[BuiltinToolConfig(name="web_fetch")]),
+            # web_fetch builds its researcher from the parent's harness.
+            "executor": ExecutorSpec(config={"harness": "pi"}),
+        },
+        {"spawn": True},
+    ],
+    ids=["declared-agents", "web-fetch", "spawn"],
+)
+def test_async_enabled_false_with_dispatch_still_registers_inbox(
+    spec_kwargs: dict[str, Any],
+) -> None:
+    """
+    ``async: false`` keeps ``sys_read_inbox`` for a dispatching spec.
+
+    A spec that can dispatch sub-agents receives their results through
+    its inbox, so suppressing the one drain would strand them. The rest
+    of the async namespace stays under the kill-switch.
+    """
+    spec = AgentSpec(spec_version=1, async_enabled=False, **spec_kwargs)
+    manager = ToolManager(spec=spec)
+    names = manager.get_tool_names()
+    assert SysReadInboxTool.name() in names
+    assert SysCallAsyncTool.name() not in names
+    assert SysCancelAsyncTool.name() not in names
+
+
+@pytest.mark.asyncio
+async def test_dispatching_spec_inbox_drains_runner_queue() -> None:
+    import asyncio
+
+    import httpx
+
+    from omnigent.runner.tool_dispatch import execute_tool
+    from omnigent.tools.base import ToolContext
+
+    spec = AgentSpec(
+        spec_version=1,
+        async_enabled=False,
+        tools=ToolsConfig(agents=["researcher"]),
+    )
+    manager = ToolManager(spec=spec)
+    tool = manager.get_tool(SysReadInboxTool.name())
+    assert tool is not None
+    ctx = ToolContext(
+        task_id="task_parent", agent_id="agent_parent", conversation_id="conv_parent"
+    )
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    inbox.put_nowait(
+        {
+            "type": "sub_agent",
+            "handle_id": "task_1",
+            "agent": "researcher",
+            "title": "topic",
+            "status": "completed",
+            "output": "research result",
+        }
+    )
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW"})
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as client:
+        result = await execute_tool(
+            tool_name=tool.name(),
+            arguments="{}",
+            agent_spec=spec,
+            server_client=client,
+            task_id=ctx.task_id,
+            agent_id=ctx.agent_id,
+            conversation_id=ctx.conversation_id,
+            session_inbox=inbox,
+        )
+    assert "research result" in result
+    assert inbox.empty()
 
 
 def test_async_enabled_true_registers() -> None:
