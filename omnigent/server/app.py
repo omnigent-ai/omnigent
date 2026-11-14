@@ -111,6 +111,10 @@ from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
 from omnigent.server.mcp_gateway import McpGatewayBackend
 from omnigent.server.mcp_pool import ServerMcpPool
+from omnigent.server.openapi_request_bodies import (
+    SESSION_CREATE_BODY_MODELS,
+    register_component_models,
+)
 from omnigent.server.openapi_stream_events import install_stream_event_schemas
 from omnigent.server.performance_metrics import (
     ServerMetricsOtelPublisher,
@@ -5672,6 +5676,7 @@ def create_app(
         app.add_middleware(BasePathMiddleware, base_path=resolved_base_path)
 
     install_stream_event_schemas(app)
+    register_component_models(app, SESSION_CREATE_BODY_MODELS)
     return app
 
 
