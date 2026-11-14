@@ -198,8 +198,6 @@ async def test_delete_session_removes_native_bridge_dir(
                 await instance.close()
                 assert not output.exists()
             request.close()
-            resp = await client.delete(url)
-            assert resp.status_code == 200
         assert not bridge_dir.exists(), "released bridge dir (with token) must be deleted"
     finally:
         if instance is not None:

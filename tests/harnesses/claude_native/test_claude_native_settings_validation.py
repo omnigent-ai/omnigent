@@ -17,6 +17,7 @@ import psutil
 import pytest
 
 from omnigent.harnesses.claude_native import settings_validation as validation
+from omnigent.inner import terminal as terminal_module
 from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.inner.terminal import TerminalInstance
 from tests._helpers.polling import poll_until_async
@@ -165,24 +166,45 @@ async def test_validator_requires_complete_controls_and_keeps_the_full_document(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("sandboxed", [False, True])
+@pytest.mark.parametrize(
+    ("sandboxed", "env_wrapped"),
+    [
+        pytest.param(False, True, id="False"),
+        pytest.param(True, True, id="True"),
+        pytest.param(True, False, id="different-paths"),
+    ],
+)
 async def test_validator_preserves_selected_environment_wrapper_and_policy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sandboxed: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sandboxed: bool, env_wrapped: bool
 ) -> None:
     instance = _instance(tmp_path)
-    instance.command = "env"
-    selected_command = "selected-wrapper" if sandboxed else "claude"
-    selected_prefix = ["claude", "--"] if sandboxed else []
-    prefix = [
-        *([] if sandboxed else ["-i"]),
-        "-C",
-        "subdir",
-        "PATH=/selected/bin",
-        "PRIVATE_KEY=wrapper-value",
-        "CLAUDE_CONFIG_DIR=/caller-config",
-        selected_command,
-        *selected_prefix,
-    ]
+    instance.command = "env" if env_wrapped else "claude"
+    selected_command = "selected-wrapper" if sandboxed and env_wrapped else "claude"
+    selected_prefix = ["claude", "--"] if sandboxed and env_wrapped else []
+    prefix = (
+        [
+            *([] if sandboxed else ["-i"]),
+            "-C",
+            "subdir",
+            "PATH=/selected/bin",
+            "PRIVATE_KEY=wrapper-value",
+            "CLAUDE_CONFIG_DIR=/caller-config",
+            selected_command,
+            *selected_prefix,
+        ]
+        if env_wrapped
+        else []
+    )
+    selected_path = "/selected/bin"
+    if not env_wrapped:
+        runner_tools, terminal_tools = tmp_path / "runner-bin", tmp_path / "terminal-bin"
+        for tools in (runner_tools, terminal_tools):
+            tools.mkdir()
+            (tools / "claude").touch(mode=0o700)
+        monkeypatch.setenv("PATH", str(runner_tools))
+        selected_path = str(terminal_tools)
+        instance.env["PATH"] = selected_path
+    selected_cwd = instance.os_env.cwd / "subdir" if env_wrapped else instance.os_env.cwd
     policy = SandboxPolicy(
         backend_type="linux_bwrap",
         active=True,
@@ -199,19 +221,36 @@ async def test_validator_preserves_selected_environment_wrapper_and_policy(
     )
     if sandboxed:
         instance.sandbox_policy = policy
+    if not env_wrapped:
+        startup_targets = []
+
+        def stop_before_spawn(command, _policy, *, cwd):
+            startup_targets.append(command)
+            assert cwd == str(instance.private_dir)
+            raise RuntimeError("stop before spawning")
+
+        with monkeypatch.context() as startup_patch:
+            startup_patch.setattr(terminal_module, "create_exec_launcher", stop_before_spawn)
+            with pytest.raises(RuntimeError, match="stop before spawning"):
+                await instance._launch_impl()
+        assert startup_targets == [str(runner_tools / "claude")]
+        selected_command = startup_targets[0]
     launches = []
 
     def launcher(command, cloned, *, cwd):
-        launches.append(cloned)
-        assert command == selected_command
-        assert cwd == str(instance.os_env.cwd / "subdir")
+        launches.append((command, cloned))
+        assert cwd == str(selected_cwd)
         return str(tmp_path / "launcher")
 
     async def doctor(command, args, *, cwd, env):
         assert command == (str(tmp_path / "launcher") if sandboxed else selected_command)
         assert args[: len(selected_prefix)] == selected_prefix
-        assert cwd == (Path("/") if sandboxed else instance.os_env.cwd / "subdir")
-        assert env["PATH"] == "/selected/bin" and env["PRIVATE_KEY"] == "wrapper-value"
+        assert cwd == (Path("/") if sandboxed else selected_cwd)
+        assert env["PATH"] == selected_path
+        if env_wrapped:
+            assert env["PRIVATE_KEY"] == "wrapper-value"
+        else:
+            assert "PRIVATE_KEY" not in env
         assert "EXCLUDED" not in env and env["CLAUDE_CONFIG_DIR"] != "/caller-config"
         if "--help" in args:
             return _HELP, ""
@@ -227,7 +266,8 @@ async def test_validator_preserves_selected_environment_wrapper_and_policy(
         instance, {"attribution": False}, wrapper_prefix=prefix
     )
     assert len(launches) == (4 if sandboxed else 0)
-    for cloned in launches:
+    assert [command for command, _ in launches] == ([selected_command] * 4 if sandboxed else [])
+    for _, cloned in launches:
         assert not cloned.allow_network
         assert len(cloned.write_roots) == 1 and not cloned.write_files
         assert cloned.mask_paths == [instance.os_env.cwd / "secret", instance.private_dir]
@@ -236,7 +276,7 @@ async def test_validator_preserves_selected_environment_wrapper_and_policy(
         assert cloned.copy_on_write_namespace == policy.copy_on_write_namespace
         assert cloned.copy_on_write_roots == policy.copy_on_write_roots
         assert "EXCLUDED" not in cloned.spawn_env_allowlist
-        assert "PRIVATE_KEY" in cloned.spawn_env_allowlist
+        assert ("PRIVATE_KEY" in cloned.spawn_env_allowlist) == env_wrapped
     assert policy.allow_network and instance.socket_path in policy.deny_unix_socket_paths
     assert policy.spawn_env_allowlist == ["PATH"]
     assert not instance.socket_path.exists()

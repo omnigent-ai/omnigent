@@ -252,6 +252,8 @@ async def validate_caller_settings(
     if sandbox is not None and sandbox.active and sandbox.spawn_env_allowlist is not None:
         env = {name: value for name, value in env.items() if name in sandbox.spawn_env_allowlist}
     command, prefix, cwd = instance.command, list(wrapper_prefix), instance.os_env.cwd
+    if sandbox is not None and sandbox.active and Path(command).name != "env":
+        command = shutil.which(command) or command
     if Path(command).name == "env":
         wrapper = env_wrapper_launch(command, prefix, env)
         if wrapper is None:

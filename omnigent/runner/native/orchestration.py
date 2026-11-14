@@ -10395,7 +10395,7 @@ async def _delete_native_bridge_dirs(
         bridge_dir_for_bridge_id as claude_bridge_dir,
     )
     from omnigent.harnesses.claude_native.settings_generation import (
-        has_live_claude_settings_owners,
+        request_claude_bridge_deletion,
     )
     from omnigent.harnesses.codex_native.bridge import (
         CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -10431,7 +10431,6 @@ async def _delete_native_bridge_dirs(
         bridge_dir_for_session_id as qwen_bridge_dir,
     )
     from omnigent.inner.native_attachments import attachment_cache_dir
-    from omnigent.native.native_bridge_common import bridge_dir_preparation_lock
 
     labels: dict[str, str] = {}
     if server_client is not None:
@@ -10464,13 +10463,9 @@ async def _delete_native_bridge_dirs(
     targets.update(attachment_cache_dir(target) for target in tuple(targets))
     for target in targets:
         try:
-            with (
-                bridge_dir_preparation_lock(target)
-                if target in claude_targets
-                else contextlib.nullcontext()
-            ):
-                if target in claude_targets and has_live_claude_settings_owners(target):
-                    continue
+            if target in claude_targets:
+                request_claude_bridge_deletion(target, session_id)
+            else:
                 shutil.rmtree(target, ignore_errors=False)
         except FileNotFoundError:
             pass
