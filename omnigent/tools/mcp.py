@@ -57,6 +57,11 @@ from mcp.types import Tool as McpToolDef
 from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.spec.types import MCPServerConfig, RetryPolicy
+from omnigent.tools.mcp_oauth import (
+    OmnigentOAuthClientProvider,
+    build_oauth_client_provider,
+    find_oauth_error,
+)
 
 _T = TypeVar("_T")
 
@@ -419,7 +424,9 @@ def _cache_key(config: MCPServerConfig, cwd: Path | None = None) -> str:
     # static ``headers`` map doesn't show it. A profile name is not
     # a secret; keyed verbatim.
     profile_part = config.databricks_profile or ""
-    return f"http:{config.name}:{config.url}:{profile_part}:{headers_part}"
+    # OAuth likewise changes who the server sees as the caller.
+    oauth_part = "oauth" if config.oauth else ""
+    return f"http:{config.name}:{config.url}:{profile_part}:{oauth_part}:{headers_part}"
 
 
 def clear_discovery_cache() -> None:
@@ -898,7 +905,8 @@ class McpServerConnection:
         # future never resolved and connect() would hang forever.
         except Exception as exc:
             if not ready.done():
-                ready.set_exception(exc)
+                # Surface a sign-in problem's own message, not its task-group wrapper.
+                ready.set_exception(find_oauth_error(exc) or exc)
                 return
             _logger.exception(
                 "MCP server %r lifecycle task failed during steady state",
@@ -1184,6 +1192,7 @@ class McpServerConnection:
             )
         timeout = self.config.timeout
         headers = self._resolve_http_headers()
+        auth = self._resolve_http_auth()
         if self.http_transport == "sse" or (
             self.http_transport == "auto" and _is_sse_endpoint(self.config.url)
         ):
@@ -1199,18 +1208,18 @@ class McpServerConnection:
             # is the intended trade-off: it matches the /sse convention
             # and avoiding the teardown hang takes priority over covering
             # a misnamed-endpoint case that is not known to occur.
-            return await self._open_sse_transport(stack, timeout, headers)
+            return await self._open_sse_transport(stack, timeout, headers, auth)
         if self.http_transport == "streamable-http":
-            return await self._open_streamable_http_transport(stack, timeout, headers)
+            return await self._open_streamable_http_transport(stack, timeout, headers, auth)
         try:
-            return await self._open_streamable_http_transport(stack, timeout, headers)
+            return await self._open_streamable_http_transport(stack, timeout, headers, auth)
         except Exception as exc:
             _logger.debug(
                 "Streamable HTTP failed for %s (%s), falling back to SSE",
                 self.config.name,
                 exc,
             )
-            return await self._open_sse_transport(stack, timeout, headers)
+            return await self._open_sse_transport(stack, timeout, headers, auth)
 
     def _resolve_http_headers(self) -> dict[str, str] | None:
         """
@@ -1231,11 +1240,29 @@ class McpServerConnection:
             merged.setdefault("Authorization", f"Bearer {token}")
         return merged or None
 
+    def _resolve_http_auth(self) -> OmnigentOAuthClientProvider | None:
+        """
+        Build the ``httpx.Auth`` for the MCP connection, when configured.
+
+        Returns a fresh OAuth provider when ``config.oauth`` is set, or
+        ``None`` otherwise (the common case — most servers use a static
+        header or no auth at all). A new instance per connect/reconnect
+        is safe: it restores the stored tokens, their expiry and the
+        discovered token endpoint on first use, so an expired token is
+        refreshed without a browser sign-in (see
+        :class:`~omnigent.tools.mcp_oauth.OmnigentOAuthClientProvider`).
+
+        :returns: An OAuth provider, or ``None`` when
+            ``config.oauth`` is not set.
+        """
+        return build_oauth_client_provider(self.config)
+
     async def _open_streamable_http_transport(
         self,
         stack: AsyncExitStack,
         timeout: int | None,
         headers: dict[str, str] | None,
+        auth: OmnigentOAuthClientProvider | None = None,
     ) -> tuple[_ReadStream, _WriteStream]:
         """
         Open a Streamable HTTP MCP transport.
@@ -1249,6 +1276,8 @@ class McpServerConnection:
             for SDK defaults.
         :param headers: Resolved HTTP headers (may include a
             Databricks bearer token), or ``None``.
+        :param auth: An OAuth client provider when ``config.oauth``
+            is set, or ``None``.
         :returns: A ``(read_stream, write_stream)`` tuple.
         """
         assert self.config.url is not None
@@ -1256,6 +1285,7 @@ class McpServerConnection:
             streamablehttp_client(
                 url=self.config.url,
                 headers=headers,
+                auth=auth,
                 timeout=float(timeout) if timeout is not None else 30,
                 sse_read_timeout=float(timeout) if timeout is not None else 300,
                 # Record response-stream network failures the SDK
@@ -1270,6 +1300,7 @@ class McpServerConnection:
         stack: AsyncExitStack,
         timeout: int | None,
         headers: dict[str, str] | None,
+        auth: OmnigentOAuthClientProvider | None = None,
     ) -> tuple[_ReadStream, _WriteStream]:
         """
         Open a legacy SSE MCP transport.
@@ -1282,6 +1313,8 @@ class McpServerConnection:
             for SDK defaults.
         :param headers: Resolved HTTP headers (may include a
             Databricks bearer token), or ``None``.
+        :param auth: An OAuth client provider when ``config.oauth``
+            is set, or ``None``.
         :returns: A ``(read_stream, write_stream)`` tuple.
         """
         assert self.config.url is not None
@@ -1289,6 +1322,7 @@ class McpServerConnection:
             sse_client(
                 url=self.config.url,
                 headers=headers,
+                auth=auth,
                 # MCP SDK default: 5s for initial HTTP connection handshake.
                 timeout=float(timeout) if timeout is not None else 5,
                 # MCP SDK default: 300s (5 min) for SSE event read.
