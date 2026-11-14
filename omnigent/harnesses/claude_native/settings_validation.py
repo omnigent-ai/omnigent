@@ -303,7 +303,11 @@ async def validate_caller_settings(
                             executable = shutil.which(command, path=env.get("PATH", os.defpath))
                             if executable is not None:
                                 for path in (Path(executable), Path(executable).resolve()):
-                                    roots.extend([path.parent, path.parent.parent])
+                                    roots.extend(
+                                        parent
+                                        for parent in (path.parent, path.parent.parent)
+                                        if str(parent) != parent.anchor
+                                    )
                             if any(private_dir.is_relative_to(path) for path in roots) or any(
                                 path.is_relative_to(private_dir)
                                 and not path.is_relative_to(workspace)

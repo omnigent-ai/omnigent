@@ -502,6 +502,16 @@ class ClaudeSettingsLease:
             return
         try:
             with bridge_dir_preparation_lock(self.bridge_dir):
+                if self._terminal_claim is not None:
+                    if (
+                        self._bridge_fd is None
+                        or _fd_identity(self._bridge_fd) != _directory_identity(self.bridge_dir)
+                        or self._claim_fd is None
+                        or not _file_matches_fd(self._terminal_claim, self._claim_fd)
+                    ):
+                        return
+                    self._terminal_claim.unlink(missing_ok=True)
+                    self._terminal_claim = None
                 lifecycle = _read_lifecycle(self.bridge_dir)
                 if lifecycle is None or lifecycle.incarnation != self._incarnation:
                     return
@@ -512,9 +522,6 @@ class ClaudeSettingsLease:
                     lifecycle.session_id is None or lifecycle.bridge_identity is None
                 ):
                     return
-                if self._terminal_claim is not None:
-                    self._terminal_claim.unlink(missing_ok=True)
-                    self._terminal_claim = None
                 _release(fd)
                 fd = None
                 # Expired admissions may release claims without retiring their operand generation.

@@ -167,20 +167,49 @@ async def test_validator_requires_complete_controls_and_keeps_the_full_document(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("sandboxed", "env_wrapped"),
+    ("sandboxed", "env_wrapped", "fork_executable"),
     [
-        pytest.param(False, True, id="False"),
-        pytest.param(True, True, id="True"),
-        pytest.param(True, False, id="different-paths"),
+        pytest.param(False, True, None, id="False"),
+        pytest.param(True, True, None, id="True"),
+        pytest.param(True, False, None, id="different-paths"),
+        pytest.param(True, True, "bin", id="fork-bin"),
+        pytest.param(True, True, "opt", id="fork-opt"),
+        pytest.param(True, True, "shallow-symlink", id="fork-shallow-symlink"),
+        pytest.param(True, True, "private-parent", id="fork-private-parent"),
+        pytest.param(True, True, "private-symlink", id="fork-private-symlink"),
+        pytest.param(True, True, "policy-root", id="fork-policy-root"),
+        pytest.param(True, True, "private-read", id="fork-private-read"),
     ],
 )
 async def test_validator_preserves_selected_environment_wrapper_and_policy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sandboxed: bool, env_wrapped: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sandboxed: bool,
+    env_wrapped: bool,
+    fork_executable: str | None,
 ) -> None:
     instance = _instance(tmp_path)
     instance.command = "env" if env_wrapped else "claude"
     selected_command = "selected-wrapper" if sandboxed and env_wrapped else "claude"
     selected_prefix = ["claude", "--"] if sandboxed and env_wrapped else []
+    if fork_executable is not None:
+        instance.os_env.cwd = instance.private_dir / "workspace"
+        instance.os_env.cwd.mkdir()
+        executable = Path("/bin/claude" if fork_executable == "bin" else "/opt/claude")
+        if fork_executable == "private-parent":
+            executable = instance.private_dir / "bin" / "claude"
+        elif fork_executable in {"shallow-symlink", "private-symlink"}:
+            target = (
+                instance.private_dir / "bin" / "claude"
+                if fork_executable == "private-symlink"
+                else executable
+            )
+            executable = tmp_path / "tools" / "bin" / "claude"
+            executable.parent.mkdir(parents=True)
+            executable.symlink_to(target)
+        selected_command = str(executable)
+        which = Mock(return_value=selected_command)
+        monkeypatch.setattr(validation.shutil, "which", which)
     prefix = (
         [
             *([] if sandboxed else ["-i"]),
@@ -208,7 +237,13 @@ async def test_validator_preserves_selected_environment_wrapper_and_policy(
     policy = SandboxPolicy(
         backend_type="linux_bwrap",
         active=True,
-        read_roots=[],
+        read_roots=(
+            [Path("/")]
+            if fork_executable == "policy-root"
+            else [instance.private_dir / "control"]
+            if fork_executable == "private-read"
+            else []
+        ),
         write_roots=[instance.os_env.cwd, instance.private_dir],
         write_files=[instance.os_env.cwd / "write-file"],
         allow_network=True,
@@ -261,17 +296,44 @@ async def test_validator_preserves_selected_environment_wrapper_and_policy(
         return _HEADER + issue + _COMPLETION, ""
 
     monkeypatch.setattr(validation, "create_exec_launcher", launcher)
-    monkeypatch.setattr(validation, "_run_doctor", doctor)
-    await validation.validate_caller_settings(
-        instance, {"attribution": False}, wrapper_prefix=prefix
+    doctor_mock = AsyncMock(side_effect=doctor)
+    monkeypatch.setattr(validation, "_run_doctor", doctor_mock)
+    rejected = fork_executable in {
+        "private-parent",
+        "private-symlink",
+        "policy-root",
+        "private-read",
+    }
+    if rejected:
+        with pytest.raises(validation.CallerSettingsError, match="Cannot validate"):
+            await validation.validate_caller_settings(
+                instance, {"attribution": False}, wrapper_prefix=prefix
+            )
+        doctor_mock.assert_not_awaited()
+    else:
+        await validation.validate_caller_settings(
+            instance, {"attribution": False}, wrapper_prefix=prefix
+        )
+        assert doctor_mock.await_count == 4
+    if fork_executable is not None:
+        which.assert_called_once_with(selected_command, path=selected_path)
+    assert len(launches) == (4 if sandboxed and not rejected else 0)
+    assert [command for command, _ in launches] == (
+        [selected_command] * 4 if sandboxed and not rejected else []
     )
-    assert len(launches) == (4 if sandboxed else 0)
-    assert [command for command, _ in launches] == ([selected_command] * 4 if sandboxed else [])
     for _, cloned in launches:
         assert not cloned.allow_network
         assert len(cloned.write_roots) == 1 and not cloned.write_files
-        assert cloned.mask_paths == [instance.os_env.cwd / "secret", instance.private_dir]
-        assert cloned.deny_unix_socket_paths == [instance.os_env.cwd / "other.sock"]
+        assert cloned.mask_paths == (
+            policy.mask_paths
+            if fork_executable is not None
+            else [instance.os_env.cwd / "secret", instance.private_dir]
+        )
+        assert cloned.deny_unix_socket_paths == (
+            policy.deny_unix_socket_paths
+            if fork_executable is not None
+            else [instance.os_env.cwd / "other.sock"]
+        )
         assert cloned.credential_source_paths == policy.credential_source_paths
         assert cloned.copy_on_write_namespace == policy.copy_on_write_namespace
         assert cloned.copy_on_write_roots == policy.copy_on_write_roots

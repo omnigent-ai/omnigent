@@ -6179,6 +6179,9 @@ def test_claude_bridge_deletion_preserves_standalone_settings_owners(
         "changed-bridge-identity",
         "legacy-reactivated",
         "unknown-session-reactivated",
+        "new-session-reactivated",
+        "new-session-claim-replaced",
+        "new-session-claim-symlink",
     ],
 )
 async def test_claude_settings_close_preserves_uncertain_bridge_state(
@@ -6214,6 +6217,8 @@ async def test_claude_settings_close_preserves_uncertain_bridge_state(
     assert saved_fd is not None
     saved_fds = [saved_fd, retained._bridge_fd, retained._claim_fd]
     assert all(fd is not None for fd in saved_fds)
+    claim = retained._terminal_claim
+    assert claim is not None
     request.close()
     request_claude_bridge_deletion(bridge_dir, "conv_state")
     lifecycle_path = bridge_dir / ".claude-settings-lifecycle.json"
@@ -6230,7 +6235,13 @@ async def test_claude_settings_close_preserves_uncertain_bridge_state(
         config["active_session_id"] = "conv_other"
         config["conversation_id"] = "conv_other"
         config_path.write_text(json.dumps(config))
-    elif state in {"legacy-reactivated", "unknown-session-reactivated"}:
+    elif state in {
+        "legacy-reactivated",
+        "unknown-session-reactivated",
+        "new-session-reactivated",
+        "new-session-claim-replaced",
+        "new-session-claim-symlink",
+    }:
         if state == "legacy-reactivated":
             lifecycle_path.write_text(
                 json.dumps(
@@ -6241,12 +6252,18 @@ async def test_claude_settings_close_preserves_uncertain_bridge_state(
                     }
                 )
             )
-        else:
+        elif state == "unknown-session-reactivated":
             (bridge_dir / "bridge.json").unlink()
-        prepare_bridge_dir("conv_state", workspace=tmp_path)
+        assert (
+            prepare_bridge_dir(
+                "conv_other" if state.startswith("new-session-") else "conv_state",
+                bridge_id="conv_state",
+                workspace=tmp_path,
+            )
+            == bridge_dir
+        )
+        assert json.loads(lifecycle_path.read_text())["incarnation"] != lifecycle["incarnation"]
     elif state in {"claim-replaced", "claim-symlink"}:
-        claim = retained._terminal_claim
-        assert claim is not None
         claim.rename(tmp_path / "original-claim")
         if state == "claim-replaced":
             claim.write_text("replacement-owned")
@@ -6281,11 +6298,25 @@ async def test_claude_settings_close_preserves_uncertain_bridge_state(
         else:
             lifecycle["unknown"] = True
         lifecycle_path.write_text(json.dumps(lifecycle))
+    if state in {"new-session-claim-replaced", "new-session-claim-symlink"}:
+        claim.rename(tmp_path / "original-claim")
+        if state == "new-session-claim-replaced":
+            claim.write_text("replacement-owned")
+        else:
+            claim.symlink_to(tmp_path / "original-claim")
     snapshot = (
         {path.name: path.read_bytes() for path in bridge_dir.iterdir()}
         if bridge_dir.exists()
         else None
     )
+    if snapshot is not None and state not in {
+        "claim-unlink-failure",
+        "claim-replaced",
+        "claim-symlink",
+        "new-session-claim-replaced",
+        "new-session-claim-symlink",
+    }:
+        del snapshot[claim.name]
     try:
         if state != "claim-unlink-failure":
             with pytest.raises(ValueError):
@@ -6301,6 +6332,9 @@ async def test_claude_settings_close_preserves_uncertain_bridge_state(
             assert not bridge_dir.exists()
         else:
             assert {path.name: path.read_bytes() for path in bridge_dir.iterdir()} == snapshot
+        if state == "new-session-reactivated":
+            request_claude_bridge_deletion(bridge_dir, "conv_other")
+            assert not bridge_dir.exists()
     finally:
         request.close()
         await instance.close()
@@ -17884,6 +17918,9 @@ def test_active_session_switch_closes_allow_window(
         request_claude_bridge_deletion(bridge_dir, "conv_new")
         assert lifecycle_path.read_bytes() == returned
         snapshot = {path.name: path.read_bytes() for path in bridge_dir.iterdir()}
+        claim = retained._terminal_claim
+        assert claim is not None
+        del snapshot[claim.name]
         retained.close()
         with pytest.raises(OSError) as closed:
             os.fstat(retained_fd)
