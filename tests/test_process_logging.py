@@ -1402,3 +1402,19 @@ def test_stdio_hardening_tolerates_reconfigure_failure(
     monkeypatch.setattr(sys, "stderr", _FakeStream("cp1252", raises=True))
 
     ensure_stdio_survives_unencodable_output()  # must not raise
+
+
+def test_configure_process_logging_records_process_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The destination becomes the process source that runner-id attribution reads."""
+    from omnigent import debug_logging
+
+    monkeypatch.setattr(debug_logging, "_process_source", None)
+    configure_process_logging(
+        "harness",
+        log_path=tmp_path / "harness.log",
+        logger_names=("omnigent.test_process_source",),
+        root=False,
+    )
+    assert debug_logging._process_source == "harness"

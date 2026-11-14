@@ -73,6 +73,7 @@ from omnigent.models.codex_model_vocabulary import (
 from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
+from omnigent.runtime.telemetry import set_resource_attribute
 from omnigent.spec.repo_scope import repo_scope_dirs
 from omnigent.spec.types import RetryPolicy
 from omnigent.telemetry.surface import harness_client_surface
@@ -763,12 +764,7 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
         deny_exact=_CODEX_ENV_DENY_EXACT,
         extra_allowed=extra_allow,
     )
-    resource_attributes = [
-        attribute
-        for attribute in env.get("OTEL_RESOURCE_ATTRIBUTES", "").split(",")
-        if attribute.strip() and attribute.partition("=")[0].strip() != "launch_mode"
-    ]
-    env["OTEL_RESOURCE_ATTRIBUTES"] = ",".join([*resource_attributes, "launch_mode=omni"])
+    set_resource_attribute(env, "launch_mode", "omni")
     return env
 
 
