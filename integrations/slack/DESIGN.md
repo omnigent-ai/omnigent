@@ -31,6 +31,7 @@ is the Python analogue).
 | `elicitation.py` | `ElicitationController` — in-turn approval/question orchestration (post card, spawn resolver, finalize on `elicitation_resolved`). |
 | `approvals.py` | Elicitation vocabulary: `ElicitationCoordinator` (click↔resolver bridge), Block Kit card builders, `ElicitationOutcome`, click routing/parsing. |
 | `notifications.py` | `SlackNotifier` — all outbound Slack messages (acks, replies, ephemerals, todo plan, deflection notices) + the text formatters. |
+| `agent_sessions.py` | `AgentSessions` — the thread's status in Slack's agent UI (`agents.sessions.setStatus`). Best-effort, and makes no calls unless `OMNIGENT_SLACK_AGENT_SESSIONS` is on. |
 | `service.py` | `SlackOmnigentService` — event acceptance, turn routing, turn lifecycle. Delegates streaming to `streaming.py`, elicitation to `elicitation.py`, messages to `notifications.py`. |
 | `setup.py` / `oauth.py` / `auth_manager.py` / `tokens.py` | Per-user setup modal, device/OIDC login flows, token storage (encrypted at rest). |
 | `store.py` | SQLite: thread→session mapping and per-user config. |
@@ -228,6 +229,9 @@ Slack channels are multi-user, so the bot enforces a **per-thread owner** model
   in their control value. A click from anyone but the owner is rejected **before**
   any verdict is delivered — the card is visible channel-wide but only the owner
   can act.
+- Slack's agent-session stop button (`agent_session_stopped`) carries whoever
+  clicked it. Only the owner's click cancels the turn and interrupts the server;
+  anyone else gets a private note.
 
 ## Turn-progress signals
 

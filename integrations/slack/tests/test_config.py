@@ -36,6 +36,7 @@ def _set_env(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> None:
         "OMNIGENT_SLACK_DATABRICKS_APP_URL",
         "OMNIGENT_SLACK_DEFAULT_AGENT_ID",
         "OMNIGENT_SLACK_DEFAULT_HOST_TYPE",
+        "OMNIGENT_SLACK_AGENT_SESSIONS",
         "DATABRICKS_HOST",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -360,3 +361,14 @@ def test_unknown_default_host_type_fails_startup(monkeypatch: pytest.MonkeyPatch
     assert "Invalid configuration" in msg
     assert "OMNIGENT_SLACK_DEFAULT_HOST_TYPE" in msg
     assert "managed" in msg
+
+
+def test_agent_sessions_are_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    # They need an app declared an agent, so a plain bot must not make the calls.
+    _set_env(monkeypatch)
+    assert _load().agent_sessions is False
+
+
+def test_agent_sessions_read_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_env(monkeypatch, OMNIGENT_SLACK_AGENT_SESSIONS="true")
+    assert _load().agent_sessions is True

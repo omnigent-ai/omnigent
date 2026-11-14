@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from omnigent_slack.agent_sessions import AgentSessions, session_title
 from omnigent_slack.approvals import (
     ClickTarget,
     ElicitationCoordinator,
@@ -94,6 +95,15 @@ _RESTART_ABANDONED_TEXT = (
     "I won't be replying here. Please send your message again."
 )
 
+# Posted in place of the ack when the thread's owner stops the turn with Slack's
+# agent-session stop button.
+_STOPPED_TEXT = ":octagonal_sign: Stopped."
+
+# Told privately to anyone but the owner who clicks that stop button.
+_STOP_NOT_OWNER_TEXT = (
+    "This thread's Omnigent session belongs to whoever started it, so only they can stop it."
+)
+
 # How long a cancelled turn may spend replacing its ack with the notice above.
 # Shutdown's gather waits on every cancelled turn, so this bounds the restart.
 _SHUTDOWN_NOTICE_GRACE_SECONDS = 5.0
@@ -152,6 +162,16 @@ class _StreamState:
     elicitations: ElicitationTurnState = field(default_factory=ElicitationTurnState)
 
 
+@dataclass
+class _RunningTurn:
+    """A spawned turn's task, so Slack's stop button can find and cancel it."""
+
+    turn: SlackTurn
+    task: asyncio.Task[None]
+    # Set when the owner stopped the turn, so its cancellation isn't a restart.
+    stopped: bool = False
+
+
 def _classify_turn_error(
     exc: BaseException, server_url: str, *, host_type: HostType
 ) -> str | None:
@@ -201,6 +221,7 @@ class SlackOmnigentService:
         server_url: str,
         bot_user_id: str | None = None,
         elicitations: ElicitationCoordinator | None = None,
+        agent_sessions: bool = False,
     ) -> None:
         self._store = store
         self._pool = pool
@@ -226,6 +247,8 @@ class SlackOmnigentService:
             post_reply=self._notifier.post_reply,
             logger=self._logger,
         )
+        # The thread's status in Slack's agent UI; no Slack calls unless enabled.
+        self._agent_sessions = AgentSessions(enabled=agent_sessions, logger=self._logger)
         # Threads with a turn actively streaming IN THIS PROCESS. Each turn opens
         # its own SSE stream; two at once would render the same events into Slack
         # twice. This is a LOCAL concurrency guard (reserved synchronously, before
@@ -239,6 +262,8 @@ class SlackOmnigentService:
         self._active_threads: set[ThreadKey] = set()
         # In-flight turn tasks, tracked so shutdown can cancel them.
         self._turn_tasks: set[asyncio.Task[None]] = set()
+        # The same turns by thread, so Slack's stop button can cancel one.
+        self._running_turns: dict[ThreadKey, _RunningTurn] = {}
 
     @property
     def elicitations(self) -> ElicitationCoordinator:
@@ -372,6 +397,71 @@ class SlackOmnigentService:
         except Exception:
             await self._unclaim_event(body, event)
             raise
+
+    async def handle_agent_session_stopped(
+        self,
+        *,
+        body: dict[str, Any],
+        event: dict[str, Any],
+        client: SlackClientProtocol,
+    ) -> None:
+        """Stop a thread's turn when its owner clicks Slack's stop button.
+
+        Slack stops the streaming reply itself and leaves the session status to
+        the app. Only the thread's owner may stop the turn: it is cancelled
+        without the restart notice, its reply is not reopened, and the server is
+        asked to interrupt the session. Anyone else gets a private note, and the
+        turn carries on in a fresh reply.
+        """
+        if not await self._claim_event(body, event):
+            return
+        team_id = body.get("team_id") or event.get("team")
+        channel_id = event.get("channel")
+        thread_ts = event.get("thread_ts")
+        user_id = event.get("user")
+        if not (team_id and channel_id and thread_ts and user_id):
+            self._logger.info("Ignoring agent_session_stopped without a thread or user")
+            return
+        key = ThreadKey(team_id=str(team_id), channel_id=str(channel_id), thread_ts=str(thread_ts))
+        record = await self._store.get_session(key)
+        running = self._running_turns.get(key)
+        owner_user_id = None
+        if running is not None:
+            owner_user_id = running.turn.owner_user_id
+        elif record is not None:
+            owner_user_id = record.owner_user_id
+        if owner_user_id is None:
+            self._logger.info("No Omnigent session to stop thread=%s", key.display())
+            return
+        if str(user_id) != owner_user_id:
+            self._logger.info(
+                "Ignoring stop from non-owner thread=%s owner=%s user=%s",
+                key.display(),
+                owner_user_id,
+                user_id,
+            )
+            await self._notifier.post_ephemeral(client, key, str(user_id), _STOP_NOT_OWNER_TEXT)
+            return
+
+        self._logger.info("Owner stopped the turn thread=%s", key.display())
+        if running is not None:
+            running.stopped = True
+            running.task.cancel()
+        else:
+            # No turn of this process is running (it ended, or a restart dropped
+            # it); the session must still leave ``processing``.
+            await self._agent_sessions.set_status(client, key, "active")
+        if record is None:
+            return
+        try:
+            omnigent = await self._pool.get(
+                self._server_url, pack_user_key(key.team_id, owner_user_id)
+            )
+            await omnigent.interrupt(record.session_id)
+        except Exception:
+            self._logger.warning(
+                "Failed to interrupt session_id=%s thread=%s", record.session_id, key.display()
+            )
 
     async def _route_turn(
         self,
@@ -592,16 +682,30 @@ class SlackOmnigentService:
         task = asyncio.create_task(self._run_turn_tracked(turn))
         self._turn_tasks.add(task)
         task.add_done_callback(self._turn_tasks.discard)
+        self._running_turns[turn.key] = _RunningTurn(turn=turn, task=task)
 
     async def _run_turn_tracked(self, turn: SlackTurn) -> None:
         try:
+            await self._agent_sessions.set_status(
+                turn.slack_client,
+                turn.key,
+                "processing",
+                title=session_title(turn.text),
+                initiator_user_id=turn.owner_user_id,
+            )
             await self._run_turn(turn)
         except asyncio.CancelledError:
             raise
         except Exception:
             self._logger.exception("Slack turn failed for %s", turn.key.display())
         finally:
-            self._active_threads.discard(turn.key)
+            # Every ending leaves the session ``active``, before the thread is
+            # released so the next turn's ``processing`` can't land first.
+            try:
+                await self._agent_sessions.set_status(turn.slack_client, turn.key, "active")
+            finally:
+                self._running_turns.pop(turn.key, None)
+                self._active_threads.discard(turn.key)
 
     async def _run_turn(self, turn: SlackTurn) -> None:
         self._logger.info("Starting turn thread=%s chars=%s", turn.key.display(), len(turn.text))
@@ -615,6 +719,7 @@ class SlackOmnigentService:
             recipient_user_id=turn.owner_user_id,
             ack_ts=None,
             logger=self._logger,
+            seal_session_status=self._agent_sessions.stream_seal_status,
         )
 
         try:
@@ -681,12 +786,12 @@ class SlackOmnigentService:
                 # already logged in _stream_turn; never echo it to the channel.
                 await self._notifier.post_failure_reply(turn.slack_client, turn.key)
         except asyncio.CancelledError:
-            # Bot shutdown (deploy/restart) cancelled the turn mid-flight: swap
-            # the stranded "Working on it…" ack for an honest notice. The
-            # inflight marker stays set so a follow-up isn't deflected with a
-            # "still working" promise nobody will keep.
+            # Bot shutdown (deploy/restart) or the owner's stop cancelled the
+            # turn mid-flight: swap the stranded "Working on it…" ack for an
+            # honest notice. The inflight marker stays set so a follow-up isn't
+            # deflected with a "still working" promise nobody will keep.
             cancelled = True
-            await self._deliver_restart_notice(turn, reply)
+            await self._deliver_cancel_notice(turn, reply)
             raise
         finally:
             if not cancelled:
@@ -711,25 +816,29 @@ class SlackOmnigentService:
                 "Failed to persist turn-inflight=%s thread=%s", inflight, key.display()
             )
 
-    async def _deliver_restart_notice(self, turn: SlackTurn, reply: _AnswerReply) -> None:
+    async def _deliver_cancel_notice(self, turn: SlackTurn, reply: _AnswerReply) -> None:
         """Replace the stranded ack with an honest notice for a cancelled turn.
 
-        Best-effort and time-bounded: shutdown's gather waits on the cancelled
-        turn, so a slow or failing Slack call must not stall the restart, and
-        the caller re-raises the cancellation either way.
+        A turn its owner stopped says so and closes its reply; any other
+        cancellation is a restart. Best-effort and time-bounded: shutdown's
+        gather waits on the cancelled turn, so a slow or failing Slack call must
+        not stall the restart, and the caller re-raises the cancellation either way.
         """
+        running = self._running_turns.get(turn.key)
+        if running is not None and running.stopped:
+            notice = reply.halt(_STOPPED_TEXT)
+        else:
+            notice = reply.stop_with(_RESTART_ABANDONED_TEXT)
         try:
-            await asyncio.wait_for(
-                reply.stop_with(_RESTART_ABANDONED_TEXT), _SHUTDOWN_NOTICE_GRACE_SECONDS
-            )
+            await asyncio.wait_for(notice, _SHUTDOWN_NOTICE_GRACE_SECONDS)
         except asyncio.CancelledError:
             # A second cancel arrived during the grace window: give up quietly
             # (the caller re-raises the original cancellation).
             self._logger.warning(
-                "Restart notice cancelled mid-delivery thread=%s", turn.key.display()
+                "Cancel notice cancelled mid-delivery thread=%s", turn.key.display()
             )
         except Exception:
-            self._logger.warning("Failed to deliver restart notice thread=%s", turn.key.display())
+            self._logger.warning("Failed to deliver cancel notice thread=%s", turn.key.display())
 
     async def _notify_auth_expired(self, turn: SlackTurn, reply: _AnswerReply) -> None:
         """Deliver the expired-login re-login prompt as a DM with a setup button.
@@ -1021,6 +1130,7 @@ class SlackOmnigentService:
             # events (the web UI's model), so no polling is needed.
             await reply.seal_for_interruption()
             await self._elicitation.start(omnigent, turn, elicitation, state.elicitations)
+            await self._agent_sessions.set_status(client, turn.key, "suspended")
             return
 
         resolved_eid = extract_elicitation_resolved(event)
@@ -1029,6 +1139,8 @@ class SlackOmnigentService:
             # answer elsewhere). Wake the resolver so it stops waiting, and
             # finalize the card in place. Idempotent via the `finalized` guard.
             await self._elicitation.on_resolved(turn, resolved_eid, state.elicitations)
+            if not state.elicitations.has_open_card:
+                await self._agent_sessions.set_status(client, turn.key, "processing")
             return
 
         denied_reason = extract_policy_denied(event)
