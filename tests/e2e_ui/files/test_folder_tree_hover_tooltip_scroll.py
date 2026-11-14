@@ -65,7 +65,7 @@ def _open_tree_scrolled_to_bottom(
 
     # Park the pointer over the chat column so no row is hovered at rest.
     page.mouse.move(200, 300)
-    section = rail.locator("section")
+    section = rail.locator("section").filter(has=any_row.first)
     section.evaluate("el => { el.scrollTop = el.scrollHeight; }")
     bottom_row = rail.get_by_role("button", name=_HOVER_FILE, exact=True)
     expect(bottom_row).to_be_visible(timeout=15_000)

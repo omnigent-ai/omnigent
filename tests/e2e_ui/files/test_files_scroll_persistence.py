@@ -72,7 +72,7 @@ def test_files_panel_scroll_survives_session_switch(
     # Both sessions must be in the sidebar for the SPA switch.
     expect(page.locator(f'a[href="/c/{session_b}"]')).to_be_visible(timeout=30_000)
 
-    section = rail.locator("section")
+    section = rail.locator("section").filter(has=any_file.first)
     # Scroll partway down; a real scroll event fires and the panel saves it.
     section.evaluate("el => { el.scrollTop = 300; }")
     expect(section).to_have_js_property("scrollTop", 300)
