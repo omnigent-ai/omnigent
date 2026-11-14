@@ -269,11 +269,13 @@ function DataTableView({
           {table.encoding !== "utf-8" ? ` · ${table.encoding}` : ""}
         </span>
         {filtered && <span>{visibleRows.length.toLocaleString()} matching</span>}
-        {selected && (
+        {selected && selectedIndex >= 0 && (
+          // The selection is only an outline on screen, so the buttons name what they copy.
           <span className="ml-auto flex gap-1">
             <Button
               variant="ghost"
               size="xs"
+              aria-label={`Copy cell (${table.header[selected.column] || `column ${selected.column + 1}`}, row ${(selectedIndex + 1).toLocaleString()})`}
               onClick={() => copyWithToast(selected.row[selected.column], "cell")}
             >
               <CopyIcon /> Copy cell
@@ -281,6 +283,7 @@ function DataTableView({
             <Button
               variant="ghost"
               size="xs"
+              aria-label={`Copy row ${(selectedIndex + 1).toLocaleString()}`}
               onClick={() => copyWithToast(rowAsTsv(selected.row), "row")}
             >
               <CopyIcon /> Copy row

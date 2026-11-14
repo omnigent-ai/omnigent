@@ -76,6 +76,16 @@ describe("DataTablePreview", () => {
     expect(screen.getAllByRole("columnheader")[1]).toHaveAttribute("aria-sort", "none");
   });
 
+  it("offers no Copy while a filter hides the selected row", () => {
+    renderTable(SALES);
+    fireEvent.click(screen.getByRole("cell", { name: "North" }));
+    expect(screen.getByRole("button", { name: /Copy cell/ })).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter region" }), {
+      target: { value: "East" },
+    });
+    expect(screen.queryByRole("button", { name: /Copy cell/ })).toBeNull();
+  });
+
   it("filters a column by the text it contains, ignoring case, across columns at once", () => {
     renderTable(SALES);
     fireEvent.change(screen.getByRole("textbox", { name: "Filter region" }), {
@@ -98,6 +108,9 @@ describe("DataTablePreview", () => {
     expect(screen.queryByRole("button", { name: /Copy cell/ })).toBeNull();
 
     fireEvent.click(screen.getByRole("cell", { name: "East" }));
+    // The buttons name the cell and row they copy, which is only an outline on screen.
+    expect(screen.getByRole("button", { name: "Copy cell (region, row 2)" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy row 2" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Copy cell/ }));
     fireEvent.click(screen.getByRole("button", { name: /Copy row/ }));
 
