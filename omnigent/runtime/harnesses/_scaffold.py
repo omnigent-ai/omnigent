@@ -57,6 +57,7 @@ from omnigent.inner.executor import (
     LiveMcpReconnectRefused,
     LiveMcpServerStatus,
     LiveMcpServerUnknown,
+    LiveSettingsRejectedError,
 )
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.policies.types import FAIL_CLOSED_PHASES
@@ -501,6 +502,9 @@ class TurnContext:
         # to populate the usage field on the response.completed SSE.
         # ``None`` when the inner executor does not report usage.
         self.provider_usage: dict[str, Any] | None = None
+        # Optional live model identifier reported by the harness even when
+        # provider_usage is absent (for example ACP turns without usage tokens).
+        self.reported_model: str | None = None
         # Idle-watchdog reset hook. ``_guarded_run_turn`` sets this to
         # push the per-turn idle deadline forward on each real progress
         # event so a long-but-active turn isn't killed mid-turn.
@@ -886,7 +890,7 @@ def _live_mcp_detail(exc: BaseException) -> str:
     return str(exc).strip()[:_LIVE_MCP_DETAIL_MAX_CHARS]
 
 
-def _live_mcp_failure(status_code: int, error: str) -> JSONResponse:
+def _error_response(status_code: int, error: str) -> JSONResponse:
     return JSONResponse({"error": error}, status_code=status_code)
 
 
@@ -986,6 +990,25 @@ class HarnessApp:
         :raises LiveMcpServerUnknown: The harness reports no server named *name*.
         :raises LiveMcpReconnectRefused: The harness tried and gave its reason.
         """
+        raise NotImplementedError
+
+    def supports_live_model_options(self) -> bool:
+        """Whether this harness supports dynamic model/effort discovery and live updates."""
+        return False
+
+    async def live_model_options(self) -> dict[str, Any] | None:
+        """Return discovered model/effort options for the session."""
+        raise NotImplementedError
+
+    async def apply_live_settings(
+        self,
+        *,
+        model: str | None = None,
+        effort: str | None = None,
+        apply_model: bool = False,
+        apply_effort: bool = False,
+    ) -> dict[str, Any]:
+        """Apply model and/or effort changes on the active session."""
         raise NotImplementedError
 
     async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
@@ -1226,7 +1249,89 @@ class HarnessApp:
             methods=["POST"],
             response_model=None,
         )
+        router.add_api_route(
+            "/sessions/{conversation_id}/model-options",
+            self._get_live_model_options,
+            methods=["GET"],
+            response_model=None,
+        )
+        router.add_api_route(
+            "/sessions/{conversation_id}/session-settings",
+            self._post_live_session_settings,
+            methods=["POST"],
+            response_model=None,
+        )
         return router
+
+    def _live_model_options_error(self, request: Request, conversation_id: str) -> Response | None:
+        """Authorize a live model-options/settings request; refuse if unsupported."""
+        denied = self._check_auth(request)
+        if denied is not None:
+            return denied
+        self._check_conversation_id(request, conversation_id)
+        if not self.supports_live_model_options():
+            return JSONResponse(
+                {
+                    "error": "unsupported",
+                    "detail": "This harness does not expose live model options.",
+                },
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+        return None
+
+    async def _get_live_model_options(self, conversation_id: str, request: Request) -> Response:
+        """Handle ``GET /v1/sessions/{conversation_id}/model-options``."""
+        refused = self._live_model_options_error(request, conversation_id)
+        if refused is not None:
+            return refused
+        try:
+            payload = await self.live_model_options()
+        except TimeoutError:
+            return _error_response(status.HTTP_504_GATEWAY_TIMEOUT, "model_options_timeout")
+        except Exception:
+            _logger.warning("Reading live model options failed", exc_info=True)
+            return _error_response(status.HTTP_502_BAD_GATEWAY, "model_options_failed")
+        return JSONResponse(payload if isinstance(payload, dict) else {"models": []})
+
+    async def _post_live_session_settings(
+        self, conversation_id: str, request: Request
+    ) -> Response:
+        """Handle ``POST /v1/sessions/{conversation_id}/session-settings``."""
+        refused = self._live_model_options_error(request, conversation_id)
+        if refused is not None:
+            return refused
+        try:
+            raw = await request.json()
+        except Exception:
+            return _error_response(status.HTTP_400_BAD_REQUEST, "invalid_request")
+        if not isinstance(raw, dict):
+            return _error_response(status.HTTP_400_BAD_REQUEST, "invalid_request")
+        apply_model = "model" in raw
+        apply_effort = "reasoning_effort" in raw
+        model_val = raw.get("model")
+        effort_val = raw.get("reasoning_effort")
+        if (model_val is not None and not isinstance(model_val, str)) or (
+            effort_val is not None and not isinstance(effort_val, str)
+        ):
+            return _error_response(status.HTTP_400_BAD_REQUEST, "invalid_request")
+        try:
+            result = await self.apply_live_settings(
+                model=model_val,
+                effort=effort_val,
+                apply_model=apply_model,
+                apply_effort=apply_effort,
+            )
+        except TimeoutError:
+            return _error_response(status.HTTP_504_GATEWAY_TIMEOUT, "session_settings_timeout")
+        except LiveSettingsRejectedError as exc:
+            return JSONResponse(
+                {"error": "session_settings_rejected", "detail": str(exc)},
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        except Exception:
+            _logger.warning("Applying live session settings failed", exc_info=True)
+            return _error_response(status.HTTP_502_BAD_GATEWAY, "session_settings_failed")
+        return JSONResponse(result if isinstance(result, dict) else {})
 
     def _live_mcp_request_error(self, request: Request, conversation_id: str) -> Response | None:
         """Authorize a live-MCP request; refuse one this harness cannot answer."""
@@ -1249,10 +1354,10 @@ class HarnessApp:
         try:
             statuses = await self.live_mcp_statuses()
         except TimeoutError:
-            return _live_mcp_failure(status.HTTP_504_GATEWAY_TIMEOUT, "mcp_status_timeout")
+            return _error_response(status.HTTP_504_GATEWAY_TIMEOUT, "mcp_status_timeout")
         except Exception:
             _logger.warning("Reading live MCP status failed", exc_info=True)
-            return _live_mcp_failure(status.HTTP_502_BAD_GATEWAY, "mcp_status_failed")
+            return _error_response(status.HTTP_502_BAD_GATEWAY, "mcp_status_failed")
         return JSONResponse(_live_mcp_body(statuses))
 
     async def _post_live_mcp_reconnect(self, conversation_id: str, request: Request) -> Response:
@@ -1265,23 +1370,23 @@ class HarnessApp:
             return refused
         server_name = await _live_mcp_server_name(request)
         if server_name is None:
-            return _live_mcp_failure(status.HTTP_400_BAD_REQUEST, "invalid_request")
+            return _error_response(status.HTTP_400_BAD_REQUEST, "invalid_request")
         reconnect_error: str | None = None
         try:
             await self.reconnect_live_mcp_server(server_name)
         except LiveMcpHarnessNotRunning:
-            return _live_mcp_failure(status.HTTP_409_CONFLICT, "harness_not_running")
+            return _error_response(status.HTTP_409_CONFLICT, "harness_not_running")
         except LiveMcpServerUnknown:
-            return _live_mcp_failure(status.HTTP_404_NOT_FOUND, "mcp_server_unknown")
+            return _error_response(status.HTTP_404_NOT_FOUND, "mcp_server_unknown")
         except TimeoutError:
-            return _live_mcp_failure(status.HTTP_504_GATEWAY_TIMEOUT, "mcp_reconnect_timeout")
+            return _error_response(status.HTTP_504_GATEWAY_TIMEOUT, "mcp_reconnect_timeout")
         except LiveMcpReconnectRefused as exc:
             _logger.info("The harness refused to reconnect MCP server %r: %s", server_name, exc)
             reconnect_error = _live_mcp_detail(exc) or "Reconnect failed."
         except Exception:
             # Other failures can carry internal detail, so only the log gets it.
             _logger.warning("Reconnecting MCP server %r failed", server_name, exc_info=True)
-            return _live_mcp_failure(status.HTTP_502_BAD_GATEWAY, "mcp_reconnect_failed")
+            return _error_response(status.HTTP_502_BAD_GATEWAY, "mcp_reconnect_failed")
         body: dict[str, Any]
         try:
             body = _live_mcp_body(await self.live_mcp_statuses())
@@ -2111,6 +2216,7 @@ class HarnessApp:
             status=status_value,
             model=model,
             created_at=int(time.time()),
+            reported_model=ctx.reported_model,
             error=None if exception is None else self._build_error_detail(exception),
             usage=usage,
         )

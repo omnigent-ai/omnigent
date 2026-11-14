@@ -19,6 +19,7 @@ import math
 import os
 import re
 import time
+import urllib.parse
 import uuid
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -61,6 +62,7 @@ from omnigent.errors import (
 )
 from omnigent.harness_aliases import (
     canonicalize_harness,
+    is_acp_harness,
     is_native_harness,
 )
 from omnigent.harness_availability import CODEX_CANONICAL_HARNESSES
@@ -8268,10 +8270,31 @@ def create_runner_app(
                     conversation_id,
                     effort,
                 )
+            if is_acp_harness(harness):
+                return await _handle_acp_session_settings_change(
+                    conversation_id,
+                    effort=effort,
+                    apply_effort=True,
+                )
             return Response(status_code=204)
 
         if body_type == "model_change":
             harness = _session_harness_name(conversation_id)
+            if is_acp_harness(harness):
+                model = body.get("model") if isinstance(body, dict) else None
+                if model is not None and not isinstance(model, str):
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "error": "invalid_input",
+                            "detail": "Body 'model' must be a string or null",
+                        },
+                    )
+                return await _handle_acp_session_settings_change(
+                    conversation_id,
+                    model=model,
+                    apply_model=True,
+                )
             if harness in (
                 "claude-native",
                 "codex-native",
@@ -8802,6 +8825,132 @@ def create_runner_app(
     _opencode_native_model_options = _native_controls.opencode_native_model_options
     _teardown_session_terminals = _native_controls.teardown_session_terminals
 
+    async def _handle_acp_session_settings_change(
+        conversation_id: str,
+        *,
+        model: str | None = None,
+        effort: str | None = None,
+        apply_model: bool = False,
+        apply_effort: bool = False,
+    ) -> Response:
+        if process_manager is None:
+            return Response(status_code=204)
+        try:
+            client = await process_manager.get_client(conversation_id, "any")
+        except (NoLiveHarnessError, RuntimeError):
+            return Response(status_code=204)
+        payload: dict[str, object] = {}
+        if apply_model:
+            payload["model"] = model
+        if apply_effort:
+            payload["reasoning_effort"] = effort
+        try:
+            resp = await client.post(
+                f"/v1/sessions/{urllib.parse.quote(conversation_id, safe='')}/session-settings",
+                json=payload,
+                timeout=15.0,
+            )
+        except (httpx.HTTPError, RuntimeError):
+            _logger.warning(
+                "ACP live settings forward failed for session=%s",
+                conversation_id,
+                exc_info=True,
+                extra={"session_id": conversation_id},
+            )
+            return JSONResponse(status_code=502, content={"error": "acp_session_settings_failed"})
+        if resp.status_code == 404:
+            return Response(status_code=204)
+        if resp.status_code >= 400:
+            _logger.warning(
+                "ACP live settings forward returned HTTP %s for session=%s",
+                resp.status_code,
+                conversation_id,
+                extra={"session_id": conversation_id},
+            )
+            err_payload: dict[str, object] = {"error": "acp_session_settings_failed"}
+            if resp.status_code == 400:
+                try:
+                    raw_err = resp.json()
+                except ValueError:
+                    raw_err = None
+                if isinstance(raw_err, dict) and isinstance(raw_err.get("error"), str):
+                    err_payload = raw_err
+            return JSONResponse(
+                status_code=resp.status_code if resp.status_code in (400, 502, 504) else 502,
+                content=err_payload,
+            )
+        try:
+            resp_json = resp.json()
+        except ValueError:
+            resp_json = None
+        active_model = resp_json.get("active_model") if isinstance(resp_json, dict) else None
+        if apply_model and model is not None and isinstance(active_model, str) and active_model:
+            try:
+                await server_client.post(
+                    f"/v1/sessions/{urllib.parse.quote(conversation_id, safe='')}/events",
+                    json={"type": "external_model_change", "data": {"model": active_model}},
+                    timeout=5.0,
+                )
+            except Exception:
+                _logger.debug(
+                    "Could not mirror ACP active model for session=%s",
+                    conversation_id,
+                    exc_info=True,
+                    extra={"session_id": conversation_id},
+                )
+        return Response(status_code=204)
+
+    async def _acp_model_options(session_id: str) -> list[_JsonObject]:
+        if process_manager is None:
+            return []
+        client: httpx.AsyncClient | None = None
+        try:
+            client = await process_manager.get_client(session_id, "any")
+        except (NoLiveHarnessError, RuntimeError):
+            client = None
+        if client is None:
+            entry = await _resolve_session_spec_entry(session_id)
+            spec = _unwrap_resolved_spec(entry) if entry is not None else None
+            if spec is None:
+                return []
+            spec_workdir = _resolved_spec_workdir(entry)
+            spec = _spec_with_workdir_paths(spec, spec_workdir)
+            if spec is None:
+                return []
+            raw_harness = (
+                _session_harness_overrides.get(session_id)
+                or spec.executor.config.get("harness")
+                or spec.executor.type
+            )
+            if not is_acp_harness(raw_harness):
+                return []
+            spawn_env = _build_spawn_env_from_spec(
+                spec,
+                cast(str, raw_harness),
+                workdir=spec_workdir,
+                cwd=await _session_runtime_cwd(session_id),
+                model_override=await _fetch_session_model_override(session_id),
+                session_id=session_id,
+                resource_registry=resource_registry,
+            )
+            client = await process_manager.get_client(
+                session_id,
+                canonicalize_harness(raw_harness) or cast(str, raw_harness),
+                spawn_env,
+            )
+        resp = await client.get(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/model-options",
+            timeout=15.0,
+        )
+        if resp.status_code == 404:
+            return []
+        resp.raise_for_status()
+        payload = resp.json()
+        raw_models = payload.get("models") if isinstance(payload, dict) else None
+        if not isinstance(raw_models, list):
+            return []
+        return [dict(item) for item in raw_models if isinstance(item, dict)]
+
     register_live_mcp_routes(app, process_manager=process_manager)
     register_model_option_routes(
         app,
@@ -8815,6 +8964,7 @@ def create_runner_app(
         _session_harness_name=_session_harness_name,
         _session_spec_cache=_session_spec_cache,
         server_client=server_client,
+        _acp_model_options=_acp_model_options,
     )
 
     @app.post("/v1/sessions/{session_id}/resources/environments/{environment_id}/shell")
