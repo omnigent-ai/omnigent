@@ -1158,6 +1158,8 @@ describe("Composer native goal state", () => {
   it.each(["goal submission", "native activity"])(
     "reconciles %s after idle backoff even when the first read precedes setup",
     async (activity) => {
+      const previousState = useChatStore.getState();
+      onTestFinished(() => useChatStore.setState(previousState, true));
       vi.useFakeTimers();
       const mockGetGoal = vi.mocked(getGoal).mockResolvedValue({ available: false });
       const onSend = vi.fn();

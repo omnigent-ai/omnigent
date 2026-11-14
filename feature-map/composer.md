@@ -171,7 +171,7 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   goal state. Reopening or switching sessions discards old drafts, including when
   the opening read fails. Earlier reads and updates cannot replace another
   session's goal fields. Reconnecting retains this session's last goal, edited
-  fields and visible errors in the same open dialog. A fresh goal response
+  fields and operation errors in the same open dialog. A fresh goal response
   releases opening-read loading even if an earlier read is still pending.
   A pending Save, Clear, Pause or Resume stays busy after closing and reopening
   the same session until the request and its refresh attempt finish. An
