@@ -172,13 +172,24 @@ function codexGoalFromWire(wire: CodexGoalWire): CodexGoal {
   };
 }
 
+function isCodexGoalResponseWire(wire: unknown): wire is CodexGoalResponseWire {
+  return !!wire && typeof wire === "object" && "goal" in wire;
+}
+
 /**
  * Convert a Codex-goal response body to the UI type.
  *
  * @param wire - Snake-case AP response body.
  * @returns CamelCase goal response.
  */
-function codexGoalResponseFromWire(wire: CodexGoalResponseWire): CodexGoalResponse {
+function codexGoalResponseFromWire(wire: unknown): CodexGoalResponse {
+  if (!isCodexGoalResponseWire(wire)) {
+    throw new ApiError(
+      "Codex goal request failed: server returned a malformed response.",
+      502,
+      "codex_native_goal_failed",
+    );
+  }
   return {
     goal: wire.goal === null || wire.goal === undefined ? null : codexGoalFromWire(wire.goal),
   };
@@ -204,9 +215,7 @@ export async function getCodexGoal(
     },
   );
   if (
-    !wire ||
-    typeof wire !== "object" ||
-    !("goal" in wire) ||
+    !isCodexGoalResponseWire(wire) ||
     ("available" in wire && typeof wire.available !== "boolean") ||
     (wire.available === false && wire.goal !== null)
   ) {
@@ -296,8 +305,16 @@ export async function updateCodexGoalStatus(
  * @returns Whether Codex removed an existing goal.
  */
 export async function clearCodexGoal(sessionId: string): Promise<{ cleared: boolean }> {
-  return requestCodexGoal<{ cleared: boolean }>(
+  const wire = await requestCodexGoal<{ cleared: boolean }>(
     `/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`,
     { method: "DELETE" },
   );
+  if (!wire || typeof wire !== "object" || typeof wire.cleared !== "boolean") {
+    throw new ApiError(
+      "Codex goal request failed: server returned a malformed response.",
+      502,
+      "codex_native_goal_failed",
+    );
+  }
+  return wire;
 }

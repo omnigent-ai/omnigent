@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearCodexGoal, getCodexGoal, setCodexGoal, updateCodexGoalStatus } from "./codexGoalApi";
 import { authenticatedFetch } from "./identity";
+import { ApiError } from "./sessionsApi";
 
 vi.mock("./identity", () => ({
   authenticatedFetch: vi.fn(),
@@ -157,7 +158,11 @@ describe("codex goal API", () => {
       mockJsonResponse({ goal: null, available: false }),
     );
 
-    await expect(getCodexGoal("conv", { strict })).rejects.toMatchObject({ status: 503 });
+    await expect(getCodexGoal("conv", { strict })).rejects.toMatchObject({
+      status: 503,
+      code: "codex_native_goal_failed",
+      message: "Could not read Codex goal: no live native goal response is available.",
+    });
   });
 
   it.each([null, 0, 1, "true", "false", [], {}])(
@@ -185,9 +190,31 @@ describe("codex goal API", () => {
       await expect(getCodexGoal("conv", { strict: false })).rejects.toMatchObject({
         status: 502,
         code: "codex_native_goal_failed",
+        message: "Could not read Codex goal: server returned a malformed response.",
       });
     },
   );
+
+  it.each(
+    goalRequests
+      .filter(({ name }) => ["save", "pause", "clear"].includes(name))
+      .flatMap((operation) =>
+        [null, true, {}, ...(operation.name === "clear" ? [{ cleared: "false" }] : [])].map(
+          (body) => ({ ...operation, body }),
+        ),
+      ),
+  )("rejects a malformed mutation response for $name: $body", async ({ request, body }) => {
+    mockAuthenticatedFetch.mockResolvedValueOnce(mockJsonResponse(body));
+
+    const response = request();
+
+    await expect(response).rejects.toBeInstanceOf(ApiError);
+    await expect(response).rejects.toMatchObject({
+      status: 502,
+      code: "codex_native_goal_failed",
+      message: "Codex goal request failed: server returned a malformed response.",
+    });
+  });
 
   it("keeps read availability out of mutation conversion", async () => {
     mockAuthenticatedFetch.mockResolvedValue(
@@ -203,35 +230,47 @@ describe("codex goal API", () => {
     }
   });
 
-  it("sets, updates, and clears goals with the expected wire payloads", async () => {
-    mockAuthenticatedFetch
-      .mockResolvedValueOnce(mockJsonResponse({ goal: WIRE_GOAL }))
-      .mockResolvedValueOnce(mockJsonResponse({ goal: { ...WIRE_GOAL, status: "paused" } }))
-      .mockResolvedValueOnce(mockJsonResponse({ cleared: true }));
+  it.each([WIRE_GOAL, null])(
+    "sets, updates, and clears goals with the expected wire payloads for %j",
+    async (goal) => {
+      const cleared = goal !== null;
+      mockAuthenticatedFetch
+        .mockResolvedValueOnce(mockJsonResponse({ goal }))
+        .mockResolvedValueOnce(
+          mockJsonResponse({ goal: goal === null ? null : { ...goal, status: "paused" } }),
+        )
+        .mockResolvedValueOnce(mockJsonResponse({ cleared }));
 
-    await setCodexGoal("conv", { objective: "Do it", tokenBudget: null, status: "active" });
-    await updateCodexGoalStatus("conv", "paused");
-    await expect(clearCodexGoal("conv")).resolves.toEqual({ cleared: true });
+      await expect(
+        setCodexGoal("conv", { objective: "Do it", tokenBudget: null, status: "active" }),
+      ).resolves.toMatchObject({
+        goal: goal === null ? null : { objective: goal.objective },
+      });
+      await expect(updateCodexGoalStatus("conv", "paused")).resolves.toMatchObject({
+        goal: goal === null ? null : { status: "paused" },
+      });
+      await expect(clearCodexGoal("conv")).resolves.toEqual({ cleared });
 
-    expect(mockAuthenticatedFetch).toHaveBeenNthCalledWith(
-      1,
-      "/v1/sessions/conv/codex_goal",
-      expect.objectContaining({
-        method: "PUT",
-        body: JSON.stringify({ objective: "Do it", token_budget: null, status: "active" }),
-      }),
-    );
-    expect(mockAuthenticatedFetch).toHaveBeenNthCalledWith(
-      2,
-      "/v1/sessions/conv/codex_goal/status",
-      expect.objectContaining({ method: "PATCH", body: JSON.stringify({ status: "paused" }) }),
-    );
-    expect(mockAuthenticatedFetch).toHaveBeenNthCalledWith(
-      3,
-      "/v1/sessions/conv/codex_goal",
-      expect.objectContaining({ method: "DELETE" }),
-    );
-  });
+      expect(mockAuthenticatedFetch).toHaveBeenNthCalledWith(
+        1,
+        "/v1/sessions/conv/codex_goal",
+        expect.objectContaining({
+          method: "PUT",
+          body: JSON.stringify({ objective: "Do it", token_budget: null, status: "active" }),
+        }),
+      );
+      expect(mockAuthenticatedFetch).toHaveBeenNthCalledWith(
+        2,
+        "/v1/sessions/conv/codex_goal/status",
+        expect.objectContaining({ method: "PATCH", body: JSON.stringify({ status: "paused" }) }),
+      );
+      expect(mockAuthenticatedFetch).toHaveBeenNthCalledWith(
+        3,
+        "/v1/sessions/conv/codex_goal",
+        expect.objectContaining({ method: "DELETE" }),
+      );
+    },
+  );
 
   it.each([502, 503])("rejects a strict goal read with nested status %s", async (status) => {
     mockAuthenticatedFetch.mockResolvedValueOnce(
