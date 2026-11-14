@@ -19,10 +19,10 @@ data class ManagedConfig(
     val serverUrls: List<String>,
 ) {
     /** True when [url] shares an origin with a preset, so it needn't be listed twice. */
-    fun includes(url: String): Boolean {
-        val origin = originOf(url) ?: return false
-        return serverUrls.any { originOf(it) == origin }
-    }
+    fun includes(url: String): Boolean = originOf(url)?.let(::serverFor) != null
+
+    /** The preset on [origin], keeping its mount path. */
+    fun serverFor(origin: String): String? = serverUrls.firstOrNull { originOf(it) == origin }
 
     companion object {
         /**

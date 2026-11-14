@@ -1,6 +1,7 @@
 package ai.omnigent.android
 
 import android.content.Context
+import android.content.Intent
 import android.content.RestrictionsManager
 import android.content.res.Configuration
 import android.net.Uri
@@ -19,6 +20,7 @@ import androidx.test.core.app.ApplicationProvider
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
@@ -29,6 +31,7 @@ import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
+import org.robolectric.android.controller.ActivityController
 import org.robolectric.annotation.Config
 import org.robolectric.shadow.api.Shadow
 import org.robolectric.shadows.ShadowPopupMenu
@@ -333,6 +336,92 @@ class MainActivityTest {
     }
 
     @Test
+    fun `a conversation link to the current server opens in place`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        val shell = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = shell.get()
+        activity.invoke("onPageReady", arrayOf(String::class.java), "https://example.com/")
+
+        shell.openLink("omnigent://example.com/c/abc")
+
+        assertEquals("https://example.com", shadowOf(activity.webView()).lastLoadedUrl)
+        assertEquals(activation("/c/abc"), shadowOf(activity.webView()).lastEvaluatedJavascript)
+    }
+
+    @Test
+    fun `a conversation link to another known server opens once that server is ready`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        ServerStore(context).connect("https://second.example.test")
+        ServerStore(context).connect("https://example.com")
+        val shell = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = shell.get()
+
+        shell.openLink("omnigent://second.example.test/c/abc")
+
+        assertEquals("https://second.example.test", shadowOf(activity.webView()).lastLoadedUrl)
+        assertEquals("/c/abc", activity.declared<String?>("pendingNavigatePath"))
+        assertNotEquals(activation("/c/abc"), shadowOf(activity.webView()).lastEvaluatedJavascript)
+
+        // Keeps the insets script, which follows the activation, from overwriting it.
+        activity.assign("lastInsets", null)
+        activity.invoke("onPageReady", arrayOf(String::class.java), "https://second.example.test/")
+
+        assertEquals(activation("/c/abc"), shadowOf(activity.webView()).lastEvaluatedJavascript)
+        assertNull(activity.declared<String?>("pendingNavigatePath"))
+        assertNull(activity.intent.getStringExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH))
+    }
+
+    @Test
+    fun `a server opened from a link is remembered once its page loads`() {
+        val store = ServerStore(ApplicationProvider.getApplicationContext())
+        store.select("https://example.com")
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+
+        activity.invoke("onPageReady", arrayOf(String::class.java), "chrome-error://chromewebdata/")
+        assertEquals(emptyList<String>(), store.recentServers())
+        activity.invoke("onPageReady", arrayOf(String::class.java), "https://example.com/")
+        assertEquals(listOf("https://example.com"), store.recentServers())
+    }
+
+    @Test
+    fun `a page from the server being left does not remember the next one`() {
+        val store = ServerStore(ApplicationProvider.getApplicationContext())
+        store.connect("https://example.com")
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+
+        store.select("https://new.example.test")
+        activity.invoke("onPageReady", arrayOf(String::class.java), "https://example.com/")
+
+        assertEquals(listOf("https://example.com"), store.recentServers())
+    }
+
+    @Test
+    fun `switching servers drops a path held for the server being left`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        ServerStore(context).connect("https://second.example.test")
+        ServerStore(context).connect("https://example.com")
+        val shell = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = shell.get()
+        shell.openLink("omnigent://second.example.test/c/abc")
+
+        activity.invoke(
+            "onSwitchServerRequested",
+            arrayOf(String::class.java),
+            "https://example.com",
+        )
+
+        assertEquals("https://example.com", shadowOf(activity.webView()).lastLoadedUrl)
+        assertNull(activity.declared<String?>("pendingNavigatePath"))
+        // A relaunch, e.g. after a font-size change, rebuilds the shell from its retained intent.
+        val relaunched =
+            Robolectric
+                .buildActivity(MainActivity::class.java, activity.intent)
+                .setup()
+                .get()
+        assertNull(relaunched.declared<String?>("pendingNavigatePath"))
+    }
+
+    @Test
     fun `server pill tracks the container width and truncates in the middle`() {
         val activity = launch()
         val pill = activity.switchButton() as TextView
@@ -541,6 +630,18 @@ class MainActivityTest {
             .apply { isAccessible = true }
             .get(this) as WebView
 
+    // Hands the running shell what DeepLinkActivity forwards for [link].
+    private fun ActivityController<MainActivity>.openLink(link: String) {
+        val receiver =
+            Robolectric
+                .buildActivity(
+                    DeepLinkActivity::class.java,
+                    Intent(Intent.ACTION_VIEW, Uri.parse(link)),
+                ).setup()
+                .get()
+        newIntent(shadowOf(receiver).nextStartedActivity)
+    }
+
     private fun launch(): MainActivity {
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
         return Robolectric.buildActivity(MainActivity::class.java).setup().get()
@@ -553,6 +654,21 @@ class MainActivityTest {
             .getDeclaredField(name)
             .apply { isAccessible = true }
             .get(this) as T
+
+    private fun MainActivity.assign(
+        name: String,
+        value: Any?,
+    ) {
+        MainActivity::class
+            .java
+            .getDeclaredField(name)
+            .apply { isAccessible = true }
+            .set(this, value)
+    }
+
+    private fun activation(path: String): String =
+        "window.__omnigentNativeEmitNotificationActivated && " +
+            "window.__omnigentNativeEmitNotificationActivated(\"$path\");"
 
     private fun MainActivity.switchButton(): View =
         MainActivity::class
