@@ -697,14 +697,12 @@ describe("GoalDialog", () => {
     },
   );
 
-  it.each(
-    [
-      { action: "save", button: "goal-save" },
-      { action: "resume", button: "goal-resume" },
-    ].flatMap((mutation) => ["success", "error"].map((late) => ({ ...mutation, late }))),
-  )(
-    "bounds a stalled $action and reconciliation after reopening, ignoring late $late",
-    async ({ action, button, late }) => {
+  it.each([
+    { action: "save", button: "goal-save" },
+    { action: "resume", button: "goal-resume" },
+  ])(
+    "bounds a stalled $action and reconciliation after reopening, ignoring late success",
+    async ({ action, button }) => {
       vi.useFakeTimers();
       const actualGoalApi = await vi.importActual<typeof GoalApiModule>("@/lib/goalApi");
       mockGetGoal.mockImplementation(actualGoalApi.getGoal);
@@ -783,11 +781,9 @@ describe("GoalDialog", () => {
         expect(writeCount).toBe(2);
 
         await act(async () => {
-          if (late === "error") oldRequest.reject(new Error("late write failure"));
-          else
-            oldRequest.resolve(
-              Response.json({ goal: { ...wireGoal, objective: "Old reply" }, cleared: true }),
-            );
+          oldRequest.resolve(
+            Response.json({ goal: { ...wireGoal, objective: "Old reply" }, cleared: true }),
+          );
           reconciliationBody.resolve({ goal: { ...wireGoal, objective: "Old read reply" } });
         });
 

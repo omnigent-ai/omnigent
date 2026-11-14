@@ -254,7 +254,8 @@ async def test_real_codex_goal_set_get_clear_round_trip(
         assert clear_result.get("cleared") is True
 
         get_after_clear = await _codex_goal_request(app_session, "thread/goal/get")
-        assert get_after_clear.get("goal") is None
+        assert "goal" in get_after_clear
+        assert get_after_clear["goal"] is None
 
         clear_again = await _codex_goal_request(app_session, "thread/goal/clear")
         assert clear_again.get("cleared") is False
