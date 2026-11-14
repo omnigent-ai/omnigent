@@ -118,6 +118,7 @@ describe("PreviewSearchBar", () => {
     function renderWideRow(
       cellStyle: CSSProperties,
       match = { top: 100, bottom: 120, left: 900, right: 950 },
+      stickyHeader = false,
     ) {
       const scrollBy = vi.fn();
       Element.prototype.scrollBy = scrollBy;
@@ -136,6 +137,7 @@ describe("PreviewSearchBar", () => {
       render(
         <div>
           <div ref={containerRef}>
+            {stickyHeader && <div data-preview-sticky data-testid="sticky" />}
             <span data-testid="cell" style={cellStyle}>
               the fox
             </span>
@@ -166,6 +168,31 @@ describe("PreviewSearchBar", () => {
         type("fox");
       });
       expect(scrollBy).toHaveBeenCalledWith({ top: 360, left: 0, behavior: "smooth" });
+    });
+
+    it("scrolls a match out from under a sticky header", async () => {
+      // The scroller spans 0–300px; its header covers 0–80px, over the match at 20–36px.
+      const scrollBy = renderWideRow({}, { top: 20, bottom: 36, left: 100, right: 150 }, true);
+      screen.getByTestId("sticky").getBoundingClientRect = () =>
+        ({ top: 0, bottom: 80, left: 0, right: 400, width: 400, height: 80 }) as DOMRect;
+      await act(async () => {
+        type("fox");
+      });
+      // Centered in the band below the header: 20 - 80 - 220 / 2 + 16 / 2.
+      expect(scrollBy).toHaveBeenCalledWith({ top: -162, left: 0, behavior: "smooth" });
+    });
+
+    it("leaves a match in the sticky header itself where it is", async () => {
+      const scrollBy = renderWideRow({}, { top: 20, bottom: 36, left: 100, right: 150 }, true);
+      const sticky = screen.getByTestId("sticky");
+      sticky.getBoundingClientRect = () =>
+        ({ top: 0, bottom: 80, left: 0, right: 400, width: 400, height: 80 }) as DOMRect;
+      // The matched text is a column name, inside the header.
+      sticky.append(screen.getByTestId("cell"));
+      await act(async () => {
+        type("fox");
+      });
+      expect(scrollBy).not.toHaveBeenCalled();
     });
 
     it("reveals a clipped cell, not the hidden tail of its text", async () => {

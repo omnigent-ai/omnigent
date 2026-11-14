@@ -149,9 +149,9 @@ describe("detectDelimiter", () => {
     expect(detectDelimiter(`${head}\n${tail}`, "x.csv")).toBe(";");
   });
 
-  it("detects the delimiter of a file whose first line is a huge row of commas", () => {
-    // A row this wide is read under the column cap.
-    expect(detectDelimiter(`${",".repeat(1_000_000)}\n`, "x.csv")).toBe(",");
+  it("detects the delimiter of a file whose first line is a huge row of semicolons", () => {
+    // A row far wider than the column cap is still read; semicolon isn't the fallback.
+    expect(detectDelimiter(`${";".repeat(1_000_000)}\n`, "x.csv")).toBe(";");
   });
 
   it("ignores a delimiter inside quotes", () => {

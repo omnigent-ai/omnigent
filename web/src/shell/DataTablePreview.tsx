@@ -303,7 +303,7 @@ function DataTableView({
         className="min-h-0 flex-1 overflow-auto"
       >
         <table aria-label={path} className="border-separate border-spacing-0 font-mono text-sm">
-          <thead className="sticky top-0 z-10 bg-background">
+          <thead data-preview-sticky className="sticky top-0 z-10 bg-background">
             <tr>
               {table.header.map((name, column) => {
                 const sorted = sort?.column === column ? sort.direction : undefined;

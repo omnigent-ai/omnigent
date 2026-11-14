@@ -1940,6 +1940,31 @@ describe("FileViewer markdown preview/edit/source modes", () => {
     expect(viewModeOf()).toBe("preview");
   });
 
+  it("switches a CSV opened on its table to source when a comment is picked", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+    renderViewer({ open: true, path: "results.csv" });
+    expect(viewModeOf()).toBe("preview");
+
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: "comment c1" }));
+    expect(viewModeOf()).toBe("source");
+    // The toggle still returns to the table.
+    fireEvent.click(screen.getByRole("button", { name: "View preview" }));
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it("ends a picked comment's pull toward source when another file opens", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+    const view = renderViewer({ open: true, path: "results.csv" });
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: "comment c1" }));
+    expect(viewModeOf()).toBe("source");
+
+    view.rerender(viewerTree({ open: true, path: "other.csv" }));
+    view.rerender(viewerTree({ open: true, path: "results.csv" }));
+    expect(viewModeOf()).toBe("preview");
+  });
+
   it("guards unsaved edits when leaving the markdown editor, switching only after Discard", () => {
     renderViewer({ open: true, path: "notes.md" });
     selectMode("Edit");
