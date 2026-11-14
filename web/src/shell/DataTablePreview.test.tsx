@@ -190,7 +190,9 @@ describe("DataTablePreview", () => {
     const handle = screen.getByRole("separator", { name: "Resize units" });
     const header = screen.getAllByRole("columnheader")[1];
     expect(header.style.width).toBe("");
-    expect(handle).not.toHaveAttribute("aria-valuenow");
+    // Before a resize the handle reports the rendered width (no layout in jsdom: the minimum).
+    fireEvent.focus(handle);
+    expect(handle).toHaveAttribute("aria-valuenow", "64");
     expect(handle).toHaveAttribute("aria-valuetext", "Fits its content");
 
     // jsdom has no layout, so the first step starts from zero and clamps to the minimum.

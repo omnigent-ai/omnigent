@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   DATA_TABLE_MAX_CELLS,
   DATA_TABLE_MAX_CHARS,
@@ -88,10 +88,21 @@ describe("parseDataTable", () => {
   // The kept rows stay a prefix of the file: once a row doesn't fit, later
   // rows aren't kept either, though their rows and columns still count.
   it.each([
-    ["a row that fills the budget", "x".repeat(DATA_TABLE_MAX_CHARS)],
-    ["one cell bigger than the whole budget", "x".repeat(DATA_TABLE_MAX_CHARS * 2)],
-  ])("stops keeping rows at %s", (_label, wide) => {
-    const table = parseDataTable(`col\nshort\n${wide},y,z\nlater\n`, "wide.csv");
+    ["a row that fills the budget", "x".repeat(DATA_TABLE_MAX_CHARS), "wide.csv", ","],
+    [
+      "one cell bigger than the whole budget",
+      "x".repeat(DATA_TABLE_MAX_CHARS * 2),
+      "wide.csv",
+      ",",
+    ],
+    [
+      "one tab-separated cell bigger than the budget",
+      "x".repeat(DATA_TABLE_MAX_CHARS * 2),
+      "wide.tsv",
+      "\t",
+    ],
+  ])("stops keeping rows at %s", (_label, wide, path, delimiter) => {
+    const table = parseDataTable(`col\nshort\n${[wide, "y", "z"].join(delimiter)}\nlater\n`, path);
     expect(table?.rows).toEqual([["short"]]);
     expect(table?.totalRows).toBe(3);
     expect(table?.totalColumns).toBe(3);
@@ -215,8 +226,7 @@ describe("inferColumnType and compareCells", () => {
   });
 
   it("orders a date before a time later that day, whatever the viewer's time zone", () => {
-    const zone = process.env.TZ;
-    process.env.TZ = "Asia/Tokyo";
+    vi.stubEnv("TZ", "Asia/Tokyo");
     try {
       expect(
         ["2024-01-01 05:00", "2024-01-01", "2024-01-01T04:00:00+09:00"].sort((a, b) =>
@@ -224,7 +234,13 @@ describe("inferColumnType and compareCells", () => {
         ),
       ).toEqual(["2024-01-01T04:00:00+09:00", "2024-01-01", "2024-01-01 05:00"]);
     } finally {
-      process.env.TZ = zone;
+      vi.unstubAllEnvs();
     }
+  });
+
+  it("treats two numbers too large to represent as equal", () => {
+    expect(compareCells("1e999", "1e999", "number")).toBe(0);
+    expect(compareCells("1e999", "-1e999", "number")).toBeGreaterThan(0);
+    expect(compareCells("5", "1e999", "number")).toBeLessThan(0);
   });
 });

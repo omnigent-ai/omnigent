@@ -279,12 +279,17 @@ export function inferColumnType(values: string[]): DataColumnType {
  *
  * @returns Negative, zero or positive, as for ``Array.prototype.sort``.
  */
+// Ordered by comparison rather than subtraction, which gives NaN for two infinities.
+function compareValues(a: number, b: number): number {
+  return a === b ? 0 : a < b ? -1 : 1;
+}
+
 export function compareCells(a: string, b: string, type: DataColumnType): number {
   const aEmpty = a.trim() === "";
   const bEmpty = b.trim() === "";
   if (aEmpty || bEmpty) return Number(aEmpty) - Number(bEmpty);
-  if (type === "number") return cellNumber(a) - cellNumber(b);
-  if (type === "date") return cellDate(a) - cellDate(b);
+  if (type === "number") return compareValues(cellNumber(a), cellNumber(b));
+  if (type === "date") return compareValues(cellDate(a), cellDate(b));
   return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
 }
 
