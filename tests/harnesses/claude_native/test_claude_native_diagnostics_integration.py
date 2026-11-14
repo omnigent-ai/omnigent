@@ -165,6 +165,76 @@ async def test_diagnostics_continue_before_transcript_discovery_and_follow_sessi
     follower.close.assert_called_once_with("cleared-session")
 
 
+@pytest.mark.parametrize("operation", ["context", "transcript", "diagnostics"])
+@pytest.mark.parametrize("cancel_during_read", [False, True])
+async def test_transcript_poll_metadata_leaves_loop_responsive_and_drains(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    no_network: None,
+    operation: str,
+    cancel_during_read: bool,
+) -> None:
+    from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
+
+    (tmp_path / CONTEXT_RAW_FILE).write_text(
+        json.dumps({"context_window": {"context_window_size": 1000}}), encoding="utf-8"
+    )
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    started = asyncio.Event()
+    completed = asyncio.Event()
+    next_poll = asyncio.Event()
+    release = threading.Event()
+    loop_progressed: list[bool] = []
+    worker_threads: list[int] = []
+    operation_name = {
+        "context": "sync_raw_status_context",
+        "transcript": "read_transcript_path",
+        "diagnostics": "_observe_transcript_discovery",
+    }[operation]
+    original = getattr(forwarder, operation_name)
+
+    def blocked_operation(*args: object, **kwargs: object) -> object:
+        if not worker_threads:
+            worker_threads.append(threading.get_ident())
+            loop.call_soon_threadsafe(started.set)
+            loop_progressed.append(release.wait(timeout=1.0))
+            try:
+                return original(*args, **kwargs)
+            finally:
+                loop.call_soon_threadsafe(completed.set)
+        loop.call_soon_threadsafe(next_poll.set)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(forwarder, operation_name, blocked_operation)
+    task = asyncio.create_task(_forward(tmp_path))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        assert not completed.is_set(), "metadata I/O blocked the runner loop"
+        if cancel_during_read:
+            for _ in range(2):
+                task.cancel()
+                await asyncio.sleep(0)
+                assert not task.done(), "metadata writer lost ownership during cancellation"
+                assert not completed.is_set()
+        release.set()
+        await asyncio.wait_for(completed.wait(), timeout=2)
+        if not cancel_during_read:
+            await asyncio.wait_for(next_poll.wait(), timeout=2)
+            task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.wait_for(completed.wait(), timeout=2)
+
+    assert loop_progressed == [True]
+    assert worker_threads[0] != loop_thread
+    assert json.loads((tmp_path / "context.json").read_text()) == {"context_window_size": 1000}
+
+
 async def test_disabled_diagnostics_do_not_start_a_follower(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

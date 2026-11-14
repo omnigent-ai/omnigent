@@ -55,6 +55,7 @@ from omnigent.harnesses.claude_native.bridge import (
 from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import sync_raw_status_context
+from omnigent.inner._subprocess_lifecycle import await_cleanup_task
 from omnigent.inner.hook_scripts.subagent_router import AGENT_TOOL_NAMES
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native._native_post_delivery import (
@@ -1282,6 +1283,35 @@ async def _forward_claude_diagnostics(
                 raise
 
 
+async def _refresh_transcript_poll_metadata(
+    bridge_dir: Path,
+    status_raw_sig: tuple[int, int] | None,
+    session_id: str,
+    diagnostics: _TranscriptDiscoveryDiagnostics,
+) -> tuple[tuple[int, int] | None, Path | None]:
+    """Refresh context and transcript metadata off-loop, retaining writes on cancellation."""
+
+    def refresh() -> tuple[tuple[int, int] | None, Path | None]:
+        signature = sync_raw_status_context(bridge_dir, status_raw_sig)
+        transcript_path = read_transcript_path(bridge_dir)
+        _observe_transcript_discovery(
+            bridge_dir=bridge_dir,
+            session_id=session_id,
+            transcript_path=transcript_path,
+            diagnostics=diagnostics,
+        )
+        return signature, transcript_path
+
+    worker = asyncio.create_task(asyncio.to_thread(refresh))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        # A stopped poll must not leave a context writer racing the next forwarder.
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await await_cleanup_task(worker)
+        raise
+
+
 async def forward_claude_transcript_to_session(
     *,
     base_url: str,
@@ -1536,13 +1566,11 @@ async def forward_claude_transcript_to_session(
                         )
                     # Normalize the statusLine shim's raw capture into
                     # context.json (one stat when nothing changed).
-                    status_raw_sig = sync_raw_status_context(bridge_dir, status_raw_sig)
-                    transcript_path = read_transcript_path(bridge_dir)
-                    _observe_transcript_discovery(
-                        bridge_dir=bridge_dir,
-                        session_id=current_session_id,
-                        transcript_path=transcript_path,
-                        diagnostics=transcript_diagnostics,
+                    status_raw_sig, transcript_path = await _refresh_transcript_poll_metadata(
+                        bridge_dir,
+                        status_raw_sig,
+                        current_session_id,
+                        transcript_diagnostics,
                     )
                     if transcript_path is not None:
                         state = await _ensure_state_for_transcript(
