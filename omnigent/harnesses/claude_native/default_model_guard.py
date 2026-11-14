@@ -12,10 +12,13 @@ new baseline. Matching is a heuristic: a user's manual selection of the same
 pending model can also be reverted. Entries expire after 30 minutes.
 
 A registration with pending entries starts or reuses a daemon watcher. It stops
-with its runner or after repeated failures. Records survive runner exit, but
-startup and bridge attach do not resume watching. If no watcher survives, a
-delayed save can remain as the default. A later registration can resume protection
-for unexpired entries.
+with its runner or after repeated exceptions escape settlement. Caught settings
+restoration errors keep the switch pending and retry at the normal polling
+interval until success or expiry; they do not count toward watcher backoff.
+
+Records survive runner exit, but startup and bridge attach do not resume watching.
+If no watcher survives, a delayed save can remain as the default. A later
+registration can resume protection for unexpired entries.
 
 Restoration rewrites the settings file with only its model value changed.
 Other writers do not share the guard's lock, so a concurrent edit can be lost

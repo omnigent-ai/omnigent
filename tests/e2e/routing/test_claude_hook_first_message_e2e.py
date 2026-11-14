@@ -20,7 +20,7 @@ What is scored:
   pane must report the switch before the replay runs. Claude Code answers that
   form by also rewriting the ``model`` key in the developer's own
   settings file. The guard restores its model key asynchronously; this check
-  verifies that unrelated settings remain unchanged.
+  waits for the full settings snapshot, including the saved default, to match.
 * **One decision, one turn.** A leaked replay shows up as two user messages for
   one thing typed.
 * **The second prompt fast-skips.** Turn 2 must issue **zero** routing calls —
@@ -115,7 +115,7 @@ def test_claude_routes_the_first_typed_message_exactly_once(
     routing_arms("claude-native")  # type: ignore[operator]
     workspace = trusted_workspace(tmp_path, "claude_hook_ws")
     settings_path = claude_user_settings_path(workspace, routing_claude_settings_env)
-    settings_before = claude_settings_apart_from_the_model(settings_path)
+    settings_before = claude_settings_apart_from_the_model(settings_path, include_model=True)
 
     # A BARE routed create: Smart Routing on, no prompt, so nothing is routed
     # yet and the pick is left to the in-harness hook.
@@ -193,6 +193,13 @@ def test_claude_routes_the_first_typed_message_exactly_once(
         "turn 2's prompt reached the router; the fast skip must be free"
     )
 
-    assert claude_settings_apart_from_the_model(settings_path) == settings_before, (
-        f"{settings_path} changed beyond its `model` key"
+    wait_for(
+        lambda: (
+            True
+            if claude_settings_apart_from_the_model(settings_path, include_model=True)
+            == settings_before
+            else None
+        ),
+        timeout=10,
+        what=f"{settings_path}, including the saved default, to match its initial state",
     )

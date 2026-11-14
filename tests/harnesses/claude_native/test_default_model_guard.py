@@ -56,6 +56,75 @@ def test_undoes_the_save_of_a_switch_omnigent_typed(
     assert not list(state.glob("*.json"))
 
 
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "settings unreadable",
+        "pending settings unreadable",
+        "record unreadable",
+        "record corrupt",
+        "record invalid default",
+        "record invalid pending",
+    ],
+)
+def test_failed_registration_preserves_settings_and_pending_recovery(
+    paths: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    settings, state = paths
+    _write(settings, {"model": "opus"})
+    record_path: Path | None = None
+    record_before: bytes | None = None
+    valid_record: bytes | None = None
+    if outcome.startswith("record ") or outcome == "pending settings unreadable":
+        default_model_guard.begin_model_switch(settings, "sonnet", state_dir=state)
+        record_path = next(state.glob("*.json"))
+        valid_record = record_path.read_bytes()
+        _write(settings, {"model": "sonnet"})
+        if outcome == "record corrupt":
+            record_path.write_text("{incomplete", encoding="utf-8")
+        elif outcome.startswith("record invalid "):
+            record = json.loads(valid_record)
+            record[outcome.removeprefix("record invalid ")] = {}
+            _write(record_path, record)
+        record_before = record_path.read_bytes()
+    if outcome.endswith("settings unreadable"):
+        settings.write_text("{incomplete", encoding="utf-8")
+    settings_before = settings.read_bytes()
+    real_read_text = Path.read_text
+
+    def read_record_with_failure(path: Path, *args: object, **kwargs: object) -> str:
+        if path == record_path and outcome == "record unreadable":
+            raise PermissionError("record temporarily unavailable")
+        return real_read_text(path, *args, **kwargs)
+
+    with monkeypatch.context() as read_fault:
+        read_fault.setattr(Path, "read_text", read_record_with_failure)
+        with pytest.raises(default_model_guard.ModelSwitchProtectionError) as error:
+            default_model_guard.begin_model_switch(settings, "sonnet", state_dir=state)
+        if outcome.startswith("record "):
+            assert "Check permissions, free space, and coordination records" in str(error.value)
+            assert str(state) in str(error.value)
+        assert settings.read_bytes() == settings_before
+        if record_path is not None:
+            assert record_path.read_bytes() == record_before
+            if outcome.startswith("record "):
+                failure = PermissionError if outcome == "record unreadable" else ValueError
+                with pytest.raises(failure):
+                    default_model_guard.settle_default_model(settings, state_dir=state)
+                assert record_path.read_bytes() == record_before
+                assert settings.read_bytes() == settings_before
+        else:
+            assert not list(state.glob("*.json"))
+
+    if record_path is not None:
+        assert valid_record is not None
+        record_path.write_bytes(valid_record)
+        _write(settings, {"model": "sonnet"})
+        assert not default_model_guard.settle_default_model(settings, state_dir=state)
+        assert _read(settings) == {"model": "opus"}
+        assert not list(state.glob("*.json"))
+
+
 def test_a_failed_restore_stays_pending_and_is_retried(
     paths: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:

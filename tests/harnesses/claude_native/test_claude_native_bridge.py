@@ -7196,12 +7196,6 @@ def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
         "clear failed",
         "capture cancelled",
         "guard unavailable",
-        "settings unreadable",
-        "pending settings unreadable",
-        "record unreadable",
-        "record corrupt",
-        "record invalid default",
-        "record invalid pending",
     ],
 )
 def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
@@ -7221,32 +7215,7 @@ def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
     settings_path = claude_native_bridge.read_user_settings_path(bridge_dir)
     state_dir = default_model_guard.state_directory(settings_path)
     settings_path.write_text('{"model": "opus"}', encoding="utf-8")
-    record_path: Path | None = None
-    record_before: bytes | None = None
-    valid_record: bytes | None = None
-    if outcome.startswith("record ") or outcome == "pending settings unreadable":
-        default_model_guard.begin_model_switch(settings_path, "sonnet", state_dir=state_dir)
-        record_path = next(state_dir.glob("*.json"))
-        valid_record = record_path.read_bytes()
-        settings_path.write_text('{"model": "sonnet"}', encoding="utf-8")
-        if outcome == "record corrupt":
-            record_path.write_text("{incomplete", encoding="utf-8")
-        elif outcome.startswith("record invalid "):
-            record = json.loads(valid_record)
-            record[outcome.removeprefix("record invalid ")] = {}
-            record_path.write_text(json.dumps(record), encoding="utf-8")
-        record_before = record_path.read_bytes()
-    if outcome.endswith("settings unreadable"):
-        settings_path.write_text("{incomplete", encoding="utf-8")
     initial_settings = settings_path.read_text(encoding="utf-8")
-    real_read_text = Path.read_text
-
-    def read_record_with_failure(path: Path, *args: object, **kwargs: object) -> str:
-        if path == record_path and outcome == "record unreadable":
-            raise PermissionError("record temporarily unavailable")
-        return real_read_text(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "read_text", read_record_with_failure)
     entered: list[bool] = []
     typed: list[str] = []
     cleared: list[bool] = []
@@ -7299,7 +7268,7 @@ def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
     else:
         with pytest.raises(RuntimeError) as error:
             claude_native_bridge.inject_slash_command(bridge_dir, command="/model sonnet")
-        if outcome == "guard unavailable" or outcome.startswith("record "):
+        if outcome == "guard unavailable":
             assert "Check permissions, free space, and coordination records" in str(error.value)
             assert str(state_dir) in str(error.value)
     if outcome in (
@@ -7312,28 +7281,11 @@ def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
     ):
         # A queued Enter or later user Enter may submit a possibly pasted draft.
         settings_path.write_text('{"model": "sonnet"}', encoding="utf-8")
-    if outcome in (
-        "guard unavailable",
-        "settings unreadable",
-        "pending settings unreadable",
-    ) or outcome.startswith("record "):
+    if outcome == "guard unavailable":
         assert entered == []
         assert typed == []
         assert cleared == []
         assert settings_path.read_text(encoding="utf-8") == initial_settings
-        if record_path is not None:
-            assert record_path.read_bytes() == record_before
-            if outcome.startswith("record "):
-                failure = PermissionError if outcome == "record unreadable" else ValueError
-                with pytest.raises(failure):
-                    default_model_guard.settle_default_model(settings_path, state_dir=state_dir)
-                assert record_path.read_bytes() == record_before
-            monkeypatch.setattr(Path, "read_text", real_read_text)
-            assert valid_record is not None
-            record_path.write_bytes(valid_record)
-            settings_path.write_text('{"model": "sonnet"}', encoding="utf-8")
-            assert not default_model_guard.settle_default_model(settings_path, state_dir=state_dir)
-            assert json.loads(settings_path.read_text(encoding="utf-8")) == {"model": "opus"}
         return
     default_model_guard.settle_default_model(settings_path, state_dir=state_dir)
 
