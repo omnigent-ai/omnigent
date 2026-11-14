@@ -975,6 +975,34 @@ async def test_the_reminder_tools_request_continues_its_session(
 
 
 @pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
+async def test_reminder_names_skip_date_placeholder_validation(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    from omnigent.tools.builtins.scheduled_tasks import reminder_name
+
+    session_id = _owned_session(db_uri)
+    rule, fire_at = _one_time_rule_in(hours=2)
+    name = reminder_name("Check the {{env}} rollout")
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json={
+            "name": name,
+            "prompt": "check the rollout",
+            "rrule": rule,
+            "timezone": "UTC",
+            "agent_id": builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
+            "session_mode": "continue",
+            "session_id": session_id,
+            "kind": "reminder",
+            "first_run_at": fire_at,
+        },
+        headers=_headers(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["name"] == name
+
+
+@pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
 async def test_the_list_leaves_reminders_out_until_an_edit_makes_one_an_automation(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
