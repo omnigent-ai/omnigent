@@ -666,10 +666,23 @@ access, so those providers cannot run under that policy.
 
 **Migration:** Claude SDK agents that declare worker `egress_rules`,
 `credential_proxy`, or `tcp_egress` now fail startup. Those configurations did
-not confine the Claude process. Use `sys_os_shell` or sandboxed terminals for
-brokered tool operations, and choose a supported worker policy that meets the
-agent's isolation and model-connectivity requirements. Worker `tcp_egress` is
-unsupported across harnesses.
+not confine the Claude process. `sys_os_shell` shares the agent's primary
+`os_env`, so moving a call there does not make these Claude SDK policies valid.
+
+- For HTTP egress on the primary worker policy, change to Codex's supported
+  egress configuration. Credentialed `sys_os_shell` operations also require
+  the [brokered Codex gateway configuration](#secretless-credential-proxy)
+  below, including `broker_gateway: true` and its required gateway binding.
+  Nonbrokered or signer-backed Codex is not a substitute for that configuration.
+- For terminal-only HTTP or TCP egress without credentials, put `egress_rules`
+  or `tcp_egress` in the terminal's own `os_env`. Terminal launches ignore
+  `credential_proxy` and do not inject its credentials. Keep the primary
+  worker's required confinement; terminal-local rules do not replace a worker
+  egress boundary.
+
+Inner workers cannot enforce `tcp_egress`. If that restriction must cover the
+worker itself, there is no supported inner-harness migration yet. Retain the
+restriction and treat the configuration as unsupported.
 
 Check inherited `web_fetch` policies during migration too: its researcher can
 now refuse to start when the inherited harness cannot enforce confinement.
