@@ -62,7 +62,7 @@ describe("useGoalState", () => {
     expect(result.current.goal?.status).toBe("paused");
 
     rerender({ pollingEnabled: false });
-    expect(result.current.goal).toBeNull();
+    expect(result.current.goal).toEqual({ ...GOAL, status: "paused" });
     await act(async () => {
       window.dispatchEvent(new Event("focus"));
       document.dispatchEvent(new Event("visibilitychange"));
@@ -500,7 +500,7 @@ describe("useGoalState", () => {
   });
 
   it.each(["capability", "runner"])(
-    "does not resurrect an old goal when the %s reconnect read fails",
+    "retains only a runner reconnect's last snapshot when the %s read fails",
     async (boundary) => {
       mockGetGoal.mockResolvedValueOnce({ goal: GOAL }).mockRejectedValueOnce(new Error("offline"));
       const { result, rerender } = renderHook(
@@ -518,7 +518,7 @@ describe("useGoalState", () => {
       rerender({ connected: true });
       await waitFor(() => expect(mockGetGoal).toHaveBeenCalledTimes(2));
 
-      expect(result.current.goal).toBeNull();
+      expect(result.current.goal).toEqual(boundary === "runner" ? GOAL : null);
     },
   );
 

@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GoalDialog, parseGoalBudget, type GoalDialogProps } from "./GoalDialog";
 import { useGoalState } from "./useGoalState";
 import type { Goal } from "@/lib/goalApi";
+import * as host from "@/lib/host";
 import { clearGoal, getGoal, setGoal, updateGoalStatus } from "@/lib/goalApi";
 
 vi.mock("@/lib/goalApi", async (importOriginal) => {
@@ -134,6 +135,7 @@ describe("GoalDialog", () => {
 
   afterEach(() => {
     cleanup();
+    vi.restoreAllMocks();
     vi.resetAllMocks();
   });
 
@@ -479,11 +481,12 @@ describe("GoalDialog", () => {
   it.each(
     mutations.flatMap((mutation) => goalReadResults.map((read) => ({ ...mutation, ...read }))),
   )(
-    "preserves a $action error and dirty draft when a poll accepts $result",
+    "preserves a $action error, draft, and untouched fields through reconnect and a poll accepting $result",
     async ({ action, button, errorPrefix, goal: nextGoal }) => {
       const pending = deferred<GoalMutationResponse>();
       queueGoalMutations(action, pending.promise);
-      render(<ManagedDialog />);
+      const reconnectRead = deferred<{ goal: Goal | null }>();
+      const { rerender } = render(<ManagedDialog />);
       await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
       fireEvent.change(screen.getByTestId("goal-objective"), {
         target: { value: "Unsaved objective" },
@@ -491,7 +494,20 @@ describe("GoalDialog", () => {
       fireEvent.click(screen.getByTestId(button));
       await act(async () => pending.reject(new Error("mutation unavailable")));
       expect(screen.getByText(`${errorPrefix}: mutation unavailable`)).toBeInTheDocument();
-      mockGetGoal.mockResolvedValueOnce({ goal: nextGoal });
+      mockGetGoal.mockReturnValueOnce(reconnectRead.promise);
+      rerender(<ManagedDialog pollingEnabled={false} />);
+      expect(screen.getByText(`${errorPrefix}: mutation unavailable`)).toBeInTheDocument();
+      expect(screen.getByTestId("owner-goal")).toHaveTextContent(ACTIVE_GOAL.objective);
+      expect(screen.getByTestId("goal-objective")).toHaveValue("Unsaved objective");
+      expect(screen.getByTestId("goal-token-budget")).toHaveValue(ACTIVE_GOAL.tokenBudget);
+      expect(screen.getByTestId("goal-mode-active")).toHaveAttribute("aria-checked", "true");
+      expect(screen.getByTestId("goal-save")).toBeDisabled();
+      await act(async () => reconnectRead.reject(new Error("reconnect unavailable")));
+      expect(screen.getByText(`${errorPrefix}: mutation unavailable`)).toBeInTheDocument();
+      expect(screen.getByTestId("owner-goal")).toHaveTextContent(ACTIVE_GOAL.objective);
+      expect(screen.getByTestId("goal-token-budget")).toHaveValue(ACTIVE_GOAL.tokenBudget);
+      mockGetGoal.mockResolvedValue({ goal: nextGoal });
+      rerender(<ManagedDialog />);
 
       await act(async () => window.dispatchEvent(new Event("focus")));
 
@@ -503,74 +519,100 @@ describe("GoalDialog", () => {
 
   it.each(
     mutations.flatMap((mutation) =>
-      [false, true].map((refreshFirst) => ({ ...mutation, refreshFirst })),
+      ["reopen", "remount"].flatMap((boundary) =>
+        ["success", "error", "read error"].map((outcome) => ({ ...mutation, boundary, outcome })),
+      ),
     ),
   )(
-    "refreshes current state after a stale closed-dialog $action success (refreshFirst=$refreshFirst)",
-    async ({ action, button, refreshFirst }) => {
+    "blocks another $action across $boundary until settlement and reconciliation ($outcome)",
+    async ({ action, button, boundary, outcome }) => {
       const oldRequest = deferred<GoalMutationResponse>();
-      const newerRequest = deferred<GoalMutationResponse>();
-      const newestRequest = deferred<GoalMutationResponse>();
+      const nextRequest = deferred<GoalMutationResponse>();
       const refreshRead = deferred<{ goal: Goal | null }>();
-      queueGoalMutations(action, oldRequest.promise);
-      queueGoalMutations("save", newerRequest.promise, newestRequest.promise);
-      const { rerender } = render(<ManagedDialog />);
-      await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
-      fireEvent.click(screen.getByTestId(button));
-      rerender(<ManagedDialog open={false} />);
-      rerender(<ManagedDialog />);
-      await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
+      try {
+        queueGoalMutations(action, oldRequest.promise);
+        queueGoalMutations("save", nextRequest.promise);
+        const { rerender } = render(<ManagedDialog />);
+        await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
+        fireEvent.click(screen.getByTestId(button));
+        if (boundary === "reopen") {
+          rerender(<ManagedDialog open={false} />);
+          rerender(<ManagedDialog />);
+        } else {
+          rerender(<ManagedDialog key="replacement" />);
+        }
+        await waitFor(() => expect(screen.queryByText("Loading goal")).not.toBeInTheDocument());
 
-      const newerGoal = { ...ACTIVE_GOAL, objective: "Newer accepted goal" };
-      fireEvent.change(screen.getByTestId("goal-objective"), {
-        target: { value: newerGoal.objective },
-      });
-      fireEvent.click(screen.getByTestId("goal-save"));
-      await act(async () => newerRequest.resolve({ goal: newerGoal, cleared: true }));
-      expect(screen.getByTestId("owner-goal")).toHaveTextContent(newerGoal.objective);
+        // Exercise the write actions after the new mount's opening read has settled.
+        for (const { button: mutationButton } of mutations) {
+          fireEvent.click(screen.getByTestId(mutationButton));
+        }
+        expect(mockSetGoal).toHaveBeenCalledTimes(action === "save" ? 1 : 0);
+        expect(mockClearGoal).toHaveBeenCalledTimes(action === "clear" ? 1 : 0);
+        expect(mockUpdateGoalStatus).toHaveBeenCalledTimes(action === "pause" ? 1 : 0);
+        expect(screen.getByTestId("goal-save")).toBeDisabled();
+        expect(screen.getByTestId("goal-objective")).toHaveValue(ACTIVE_GOAL.objective);
+        expect(screen.getByTestId("goal-token-budget")).toHaveValue(ACTIVE_GOAL.tokenBudget);
+        expect(screen.getByTestId("goal-mode-active")).toHaveAttribute("aria-checked", "true");
 
-      const newestGoal = {
-        ...ACTIVE_GOAL,
-        objective: "Newest accepted goal",
-        tokenBudget: 999,
-        status: "paused",
-      };
-      fireEvent.change(screen.getByTestId("goal-objective"), {
-        target: { value: newestGoal.objective },
-      });
-      fireEvent.change(screen.getByTestId("goal-token-budget"), { target: { value: "999" } });
-      fireEvent.click(screen.getByTestId("goal-mode-paused"));
-      fireEvent.click(screen.getByTestId("goal-save"));
-      const readCount = mockGetGoal.mock.calls.length;
-      mockGetGoal.mockReturnValueOnce(refreshRead.promise);
-      await act(async () => oldRequest.resolve({ goal: ACTIVE_GOAL, cleared: true }));
+        const readCount = mockGetGoal.mock.calls.length;
+        mockGetGoal.mockReturnValueOnce(refreshRead.promise);
+        await act(async () => {
+          if (outcome === "error") oldRequest.reject(new Error("old operation failed"));
+          else
+            oldRequest.resolve({
+              goal: { ...ACTIVE_GOAL, objective: "Old response" },
+              cleared: true,
+            });
+        });
+        expect(mockGetGoal).toHaveBeenCalledTimes(readCount + 1);
+        fireEvent.click(screen.getByTestId("goal-save"));
+        expect(mockSetGoal).toHaveBeenCalledTimes(action === "save" ? 1 : 0);
+        expect(screen.getByTestId("goal-save")).toBeDisabled();
+        expect(screen.getByTestId("owner-goal")).toHaveTextContent(ACTIVE_GOAL.objective);
+        expect(screen.getByTestId("goal-objective")).toHaveValue(ACTIVE_GOAL.objective);
+        expect(screen.queryByText(/old operation failed/)).not.toBeInTheDocument();
 
-      expect(mockGetGoal).toHaveBeenCalledTimes(readCount + 1);
-      expect(screen.getByTestId("owner-goal")).toHaveTextContent(newerGoal.objective);
-      expect(screen.getByTestId("goal-objective")).toHaveValue(newestGoal.objective);
-      expect(screen.getByTestId("goal-token-budget")).toHaveValue(999);
-      expect(screen.getByTestId("goal-mode-paused")).toHaveAttribute("aria-checked", "true");
-      expect(screen.getByTestId("goal-save")).toBeDisabled();
-
-      const serverGoal = { ...ACTIVE_GOAL, objective: "Current server goal" };
-      if (refreshFirst) {
-        await act(async () => refreshRead.resolve({ goal: serverGoal }));
-        expect(screen.getByTestId("owner-goal")).toHaveTextContent(serverGoal.objective);
-        expect(screen.getByTestId("goal-objective")).toHaveValue(newestGoal.objective);
+        const serverGoal = { ...ACTIVE_GOAL, objective: "Current server goal" };
+        await act(async () => {
+          if (outcome === "read error") refreshRead.reject(new Error("reconciliation unavailable"));
+          else refreshRead.resolve({ goal: serverGoal });
+        });
+        expect(screen.getByTestId("goal-save")).toBeEnabled();
+        if (outcome === "read error") {
+          expect(
+            screen.getByText("Could not read goal: reconciliation unavailable"),
+          ).toBeInTheDocument();
+          expect(screen.getByTestId("goal-objective")).toHaveValue(ACTIVE_GOAL.objective);
+          expect(screen.getByTestId("goal-token-budget")).toHaveValue(ACTIVE_GOAL.tokenBudget);
+        } else {
+          expect(screen.getByTestId("owner-goal")).toHaveTextContent(serverGoal.objective);
+          expect(screen.getByTestId("goal-objective")).toHaveValue(serverGoal.objective);
+        }
+        fireEvent.change(screen.getByTestId("goal-objective"), {
+          target: { value: "Next local draft" },
+        });
+        fireEvent.change(screen.getByTestId("goal-token-budget"), { target: { value: "999" } });
+        fireEvent.click(screen.getByTestId("goal-mode-paused"));
+        fireEvent.click(screen.getByTestId("goal-save"));
+        expect(mockSetGoal).toHaveBeenLastCalledWith("conv_codex", {
+          objective: "Next local draft",
+          tokenBudget: 999,
+          status: "paused",
+        });
+        expect(screen.getByTestId("goal-save")).toBeDisabled();
+        expect(screen.getByTestId("goal-objective")).toHaveValue("Next local draft");
         expect(screen.getByTestId("goal-token-budget")).toHaveValue(999);
         expect(screen.getByTestId("goal-mode-paused")).toHaveAttribute("aria-checked", "true");
-        expect(screen.getByTestId("goal-save")).toBeDisabled();
-        await act(async () => newestRequest.resolve({ goal: newestGoal, cleared: true }));
-      } else {
-        await act(async () => newestRequest.resolve({ goal: newestGoal, cleared: true }));
-        await act(async () => refreshRead.resolve({ goal: serverGoal }));
+        await act(async () => nextRequest.resolve({ goal: serverGoal, cleared: true }));
+        expect(screen.getByTestId("goal-save")).toBeEnabled();
+      } finally {
+        await act(async () => {
+          oldRequest.resolve({ goal: ACTIVE_GOAL, cleared: true });
+          nextRequest.resolve({ goal: ACTIVE_GOAL, cleared: true });
+          refreshRead.resolve({ goal: ACTIVE_GOAL });
+        });
       }
-
-      expect(screen.getByTestId("owner-goal")).toHaveTextContent(newestGoal.objective);
-      expect(screen.getByTestId("goal-objective")).toHaveValue(newestGoal.objective);
-      expect(screen.getByTestId("goal-token-budget")).toHaveValue(999);
-      expect(screen.getByTestId("goal-mode-paused")).toHaveAttribute("aria-checked", "true");
-      expect(screen.getByTestId("goal-save")).toBeEnabled();
     },
   );
 
@@ -580,140 +622,173 @@ describe("GoalDialog", () => {
       async ({ action, button }) => {
         const oldRequest = deferred<{ goal: Goal | null; cleared: boolean }>();
         const newRequest = deferred<{ goal: Goal | null; cleared: boolean }>();
-        const mutationMock = queueGoalMutations(action, oldRequest.promise, newRequest.promise);
-        const { rerender } = render(<ManagedDialog />);
-        await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
-        const newGoal = {
-          ...ACTIVE_GOAL,
-          objective: "Draft before reconnect",
-          tokenBudget: 999,
-          status: "paused",
-        };
-        fireEvent.change(screen.getByTestId("goal-objective"), {
-          target: { value: newGoal.objective },
-        });
-        fireEvent.change(screen.getByTestId("goal-token-budget"), { target: { value: "999" } });
-        fireEvent.click(screen.getByTestId("goal-mode-paused"));
-        fireEvent.click(screen.getByTestId(button));
+        try {
+          const mutationMock = queueGoalMutations(action, oldRequest.promise, newRequest.promise);
+          const { rerender } = render(<ManagedDialog />);
+          await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
+          const newGoal = {
+            ...ACTIVE_GOAL,
+            objective: "Draft before reconnect",
+            tokenBudget: 999,
+            status: "paused",
+          };
+          fireEvent.change(screen.getByTestId("goal-objective"), {
+            target: { value: newGoal.objective },
+          });
+          fireEvent.change(screen.getByTestId("goal-token-budget"), { target: { value: "999" } });
+          fireEvent.click(screen.getByTestId("goal-mode-paused"));
+          fireEvent.click(screen.getByTestId(button));
 
-        const readsBeforeReconnect = mockGetGoal.mock.calls.length;
-        rerender(<ManagedDialog pollingEnabled={false} />);
-        await waitFor(() => expect(mockGetGoal).toHaveBeenCalledTimes(readsBeforeReconnect + 1));
-        rerender(<ManagedDialog />);
-        await waitFor(() => expect(mockGetGoal).toHaveBeenCalledTimes(readsBeforeReconnect + 3));
-        await waitFor(() => expect(screen.queryByText("Loading goal")).not.toBeInTheDocument());
+          const readsBeforeReconnect = mockGetGoal.mock.calls.length;
+          rerender(<ManagedDialog pollingEnabled={false} />);
+          await waitFor(() => expect(mockGetGoal).toHaveBeenCalledTimes(readsBeforeReconnect + 1));
+          rerender(<ManagedDialog />);
+          await waitFor(() => expect(mockGetGoal).toHaveBeenCalledTimes(readsBeforeReconnect + 3));
+          await waitFor(() => expect(screen.queryByText("Loading goal")).not.toBeInTheDocument());
 
-        expect(screen.getByTestId("goal-objective")).toHaveValue(newGoal.objective);
-        expect(screen.getByTestId("goal-token-budget")).toHaveValue(999);
-        expect(screen.getByTestId("goal-mode-paused")).toHaveAttribute("aria-checked", "true");
-        for (const { button: mutationButton } of mutations) {
-          expect(screen.getByTestId(mutationButton)).toBeDisabled();
-          fireEvent.click(screen.getByTestId(mutationButton));
+          expect(screen.getByTestId("goal-objective")).toHaveValue(newGoal.objective);
+          expect(screen.getByTestId("goal-token-budget")).toHaveValue(999);
+          expect(screen.getByTestId("goal-mode-paused")).toHaveAttribute("aria-checked", "true");
+          for (const { button: mutationButton } of mutations) {
+            expect(screen.getByTestId(mutationButton)).toBeDisabled();
+            fireEvent.click(screen.getByTestId(mutationButton));
+          }
+          expect(mockSetGoal).toHaveBeenCalledTimes(action === "save" ? 1 : 0);
+          expect(mockClearGoal).toHaveBeenCalledTimes(action === "clear" ? 1 : 0);
+          expect(mockUpdateGoalStatus).toHaveBeenCalledTimes(action === "pause" ? 1 : 0);
+
+          const backgroundGoal = {
+            ...ACTIVE_GOAL,
+            objective: "Current background goal",
+            tokenBudget: 888,
+          };
+          const readsBeforeOldResponse = mockGetGoal.mock.calls.length;
+          mockGetGoal.mockResolvedValueOnce({ goal: backgroundGoal });
+          await act(async () => {
+            if (outcome === "success") oldRequest.resolve({ goal: ACTIVE_GOAL, cleared: true });
+            else oldRequest.reject(new Error("old mutation failed"));
+          });
+          expect(mockGetGoal).toHaveBeenCalledTimes(readsBeforeOldResponse + 1);
+          expect(screen.getByTestId("goal-current")).toHaveTextContent(backgroundGoal.objective);
+          expect(screen.getByTestId("goal-objective")).toHaveValue(newGoal.objective);
+          expect(screen.getByTestId("goal-token-budget")).toHaveValue(999);
+          expect(screen.getByTestId("goal-mode-paused")).toHaveAttribute("aria-checked", "true");
+          expect(screen.getByTestId("goal-save")).toBeEnabled();
+          expect(screen.queryByText(/old mutation failed/)).not.toBeInTheDocument();
+
+          fireEvent.click(screen.getByTestId(button));
+          expect(mutationMock).toHaveBeenCalledTimes(2);
+          expect(screen.getByTestId("goal-save")).toBeDisabled();
+          await act(async () => newRequest.resolve({ goal: newGoal, cleared: true }));
+          expect(screen.getByTestId("goal-save")).toBeEnabled();
+          if (action === "clear") expect(screen.getByTestId("goal-empty")).toBeInTheDocument();
+          else expect(screen.getByTestId("goal-current")).toHaveTextContent(newGoal.objective);
+        } finally {
+          await act(async () => {
+            oldRequest.resolve({ goal: ACTIVE_GOAL, cleared: true });
+            newRequest.resolve({ goal: ACTIVE_GOAL, cleared: true });
+          });
         }
-        expect(mockSetGoal).toHaveBeenCalledTimes(action === "save" ? 1 : 0);
-        expect(mockClearGoal).toHaveBeenCalledTimes(action === "clear" ? 1 : 0);
-        expect(mockUpdateGoalStatus).toHaveBeenCalledTimes(action === "pause" ? 1 : 0);
-
-        const backgroundGoal = {
-          ...ACTIVE_GOAL,
-          objective: "Current background goal",
-          tokenBudget: 888,
-        };
-        const readsBeforeOldResponse = mockGetGoal.mock.calls.length;
-        mockGetGoal.mockResolvedValueOnce({ goal: backgroundGoal });
-        await act(async () => {
-          if (outcome === "success") oldRequest.resolve({ goal: ACTIVE_GOAL, cleared: true });
-          else oldRequest.reject(new Error("old mutation failed"));
-        });
-        if (outcome === "error") {
-          await act(async () => window.dispatchEvent(new Event("focus")));
-        }
-
-        expect(mockGetGoal).toHaveBeenCalledTimes(readsBeforeOldResponse + 1);
-        expect(screen.getByTestId("goal-current")).toHaveTextContent(backgroundGoal.objective);
-        expect(screen.getByTestId("goal-objective")).toHaveValue(newGoal.objective);
-        expect(screen.getByTestId("goal-token-budget")).toHaveValue(999);
-        expect(screen.getByTestId("goal-mode-paused")).toHaveAttribute("aria-checked", "true");
-        expect(screen.getByTestId("goal-save")).toBeEnabled();
-        expect(screen.queryByText(/old mutation failed/)).not.toBeInTheDocument();
-
-        fireEvent.click(screen.getByTestId(button));
-        expect(mutationMock).toHaveBeenCalledTimes(2);
-        expect(screen.getByTestId("goal-save")).toBeDisabled();
-        await act(async () => newRequest.resolve({ goal: newGoal, cleared: true }));
-        expect(screen.getByTestId("goal-save")).toBeEnabled();
-        if (action === "clear") expect(screen.getByTestId("goal-empty")).toBeInTheDocument();
-        else expect(screen.getByTestId("goal-current")).toHaveTextContent(newGoal.objective);
       },
     );
   });
 
-  describe("pending successful operations across a session switch", () => {
-    it.each(mutations)(
-      "ignores an old $action response without erasing current drafts",
-      async ({ action, button }) => {
-        const pending = deferred<{ goal: Goal | null; cleared: boolean }>();
-        const currentRequest = deferred<GoalMutationResponse>();
-        queueGoalMutations(action, pending.promise, currentRequest.promise);
-        const { props, rerender } = renderDialog();
-        await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
-        fireEvent.click(screen.getByTestId(button));
-        expect(screen.getByTestId("goal-save")).toBeDisabled();
-
-        const nextGoal = { ...ACTIVE_GOAL, objective: "Current goal", tokenBudget: 777 };
-        const nextProps = {
-          ...props,
-          conversationId: "conv_other",
-          goal: nextGoal,
-        };
-        mockRefreshGoal.mockResolvedValueOnce(undefined);
-        rerender(<GoalDialog {...nextProps} />);
-        await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
-        fireEvent.change(screen.getByTestId("goal-objective"), {
-          target: { value: "Current unsaved objective" },
-        });
-        fireEvent.change(screen.getByTestId("goal-token-budget"), { target: { value: "999" } });
-        fireEvent.click(screen.getByTestId("goal-mode-paused"));
-        fireEvent.click(screen.getByTestId(button));
-        await act(async () =>
-          pending.resolve({ goal: { ...ACTIVE_GOAL, status: "paused" }, cleared: true }),
-        );
-
-        rerender(
-          <GoalDialog
-            {...nextProps}
-            goal={{ ...nextGoal, objective: "Background update", tokenBudget: 888 }}
-          />,
-        );
-
-        expect(screen.getByTestId("goal-save")).toBeDisabled();
-        expect(screen.getByTestId("goal-objective")).toHaveValue("Current unsaved objective");
-        expect(screen.getByTestId("goal-token-budget")).toHaveValue(999);
-        expect(screen.getByTestId("goal-mode-paused")).toHaveAttribute("aria-checked", "true");
-        expect(props.onGoalChange).not.toHaveBeenCalled();
-        await act(async () => currentRequest.resolve({ goal: nextGoal, cleared: true }));
-        expect(screen.getByTestId("goal-save")).toBeEnabled();
-      },
-    );
-  });
-
-  describe.each(["session switch", "reopen"] as const)(
-    "pending operations across %s",
+  describe.each(["session", "server", "anonymous embed"] as const)(
+    "pending successful operations across a %s switch",
     (boundary) => {
       it.each(mutations)(
-        "ignores an old $action error and leaves a newer operation busy",
+        "ignores an old $action response without erasing current drafts",
         async ({ action, button }) => {
-          const oldRequest = deferred<{ goal: Goal | null; cleared: boolean }>();
-          const newRequest = deferred<{ goal: Goal | null; cleared: boolean }>();
+          const server = vi.spyOn(host, "getOmnigentServerIdentity").mockReturnValue("server-a");
+          const firstFetcher = vi.fn<() => Promise<Response>>();
+          const secondFetcher = vi.fn<() => Promise<Response>>();
+          const config = vi
+            .spyOn(host, "getOmnigentHostConfig")
+            .mockReturnValue({ fetcher: firstFetcher });
+          if (boundary === "anonymous embed") server.mockReturnValue(null);
+          const pending = deferred<{ goal: Goal | null; cleared: boolean }>();
+          const currentRequest = deferred<GoalMutationResponse>();
+          try {
+            queueGoalMutations(action, pending.promise, currentRequest.promise);
+            const { props, rerender } = renderDialog();
+            await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
+            fireEvent.click(screen.getByTestId(button));
+            expect(screen.getByTestId("goal-save")).toBeDisabled();
+
+            const nextGoal = { ...ACTIVE_GOAL, objective: "Current goal", tokenBudget: 777 };
+            const nextProps = {
+              ...props,
+              conversationId: boundary === "session" ? "conv_other" : props.conversationId,
+              goal: nextGoal,
+            };
+            if (boundary === "server") server.mockReturnValue("server-b");
+            if (boundary === "anonymous embed") config.mockReturnValue({ fetcher: secondFetcher });
+            mockRefreshGoal.mockResolvedValueOnce(undefined);
+            rerender(<GoalDialog {...nextProps} />);
+            await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
+            if (boundary === "server") server.mockReturnValue("server-a");
+            if (boundary === "anonymous embed") config.mockReturnValue({ fetcher: firstFetcher });
+            rerender(<GoalDialog {...props} />);
+            await waitFor(() => expect(screen.queryByText("Loading goal")).not.toBeInTheDocument());
+            fireEvent.click(screen.getByTestId(button));
+            const mutationMock = {
+              save: mockSetGoal,
+              clear: mockClearGoal,
+              pause: mockUpdateGoalStatus,
+            }[action];
+            expect(mutationMock).toHaveBeenCalledTimes(1);
+            expect(screen.getByTestId("goal-save")).toBeDisabled();
+            if (boundary === "server") server.mockReturnValue("server-b");
+            if (boundary === "anonymous embed") config.mockReturnValue({ fetcher: secondFetcher });
+            rerender(<GoalDialog {...nextProps} />);
+            await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
+            fireEvent.change(screen.getByTestId("goal-objective"), {
+              target: { value: "Current unsaved objective" },
+            });
+            fireEvent.change(screen.getByTestId("goal-token-budget"), { target: { value: "999" } });
+            fireEvent.click(screen.getByTestId("goal-mode-paused"));
+            fireEvent.click(screen.getByTestId(button));
+            await act(async () =>
+              pending.resolve({ goal: { ...ACTIVE_GOAL, status: "paused" }, cleared: true }),
+            );
+
+            rerender(
+              <GoalDialog
+                {...nextProps}
+                goal={{ ...nextGoal, objective: "Background update", tokenBudget: 888 }}
+              />,
+            );
+
+            expect(screen.getByTestId("goal-save")).toBeDisabled();
+            expect(screen.getByTestId("goal-objective")).toHaveValue("Current unsaved objective");
+            expect(screen.getByTestId("goal-token-budget")).toHaveValue(999);
+            expect(screen.getByTestId("goal-mode-paused")).toHaveAttribute("aria-checked", "true");
+            expect(props.onGoalChange).not.toHaveBeenCalled();
+            await act(async () => currentRequest.resolve({ goal: nextGoal, cleared: true }));
+            expect(screen.getByTestId("goal-save")).toBeEnabled();
+          } finally {
+            await act(async () => {
+              pending.resolve({ goal: ACTIVE_GOAL, cleared: true });
+              currentRequest.resolve({ goal: ACTIVE_GOAL, cleared: true });
+            });
+          }
+        },
+      );
+    },
+  );
+
+  describe("pending operations across a session switch", () => {
+    it.each(mutations)(
+      "ignores an old $action error and leaves a newer operation busy",
+      async ({ action, button }) => {
+        const oldRequest = deferred<GoalMutationResponse>();
+        const newRequest = deferred<GoalMutationResponse>();
+        try {
           queueGoalMutations(action, oldRequest.promise, newRequest.promise);
           const { props, rerender } = renderDialog();
           await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
           fireEvent.click(screen.getByTestId(button));
-          if (boundary === "reopen") rerender(<GoalDialog {...props} open={false} />);
-          const nextProps = {
-            ...props,
-            conversationId: boundary === "reopen" ? props.conversationId : "conv_other",
-          };
+          const nextProps = { ...props, conversationId: "conv_other" };
           rerender(<GoalDialog {...nextProps} />);
           await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
           fireEvent.change(screen.getByTestId("goal-objective"), {
@@ -728,10 +803,15 @@ describe("GoalDialog", () => {
           expect(screen.getByTestId("goal-objective")).toHaveValue("New session draft");
           await act(async () => newRequest.resolve({ goal: ACTIVE_GOAL, cleared: true }));
           expect(screen.getByTestId("goal-save")).toBeEnabled();
-        },
-      );
-    },
-  );
+        } finally {
+          await act(async () => {
+            oldRequest.resolve({ goal: ACTIVE_GOAL, cleared: true });
+            newRequest.resolve({ goal: ACTIVE_GOAL, cleared: true });
+          });
+        }
+      },
+    );
+  });
 
   it("clears the loading state when the session disappears during the opening read", async () => {
     const pending = deferred<void>();

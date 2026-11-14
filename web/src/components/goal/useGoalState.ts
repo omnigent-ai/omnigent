@@ -11,8 +11,12 @@ interface UseGoalStateResult {
   refreshGoal: () => Promise<void>;
 }
 
-interface GoalBinding {
+interface GoalOwner {
   conversationId: string;
+}
+
+interface GoalBinding extends GoalOwner {
+  owner: GoalOwner;
   pollingEnabled: boolean;
 }
 
@@ -30,10 +34,14 @@ export function useGoalState(
   const updateVersion = useRef(0);
   const lastSuccessfulVersion = useRef(0);
   const activeBinding = useRef<GoalBinding | null>(null);
-  // Runner liveness changes invalidate reads and callbacks from the previous connection.
+  const owner = useMemo(
+    () => (enabled && conversationId ? { conversationId } : null),
+    [conversationId, enabled],
+  );
+  // Keep accepted state for this session while fencing the previous connection's callbacks.
   const binding = useMemo(
-    () => (enabled && conversationId ? { conversationId, pollingEnabled } : null),
-    [conversationId, enabled, pollingEnabled],
+    () => (owner ? { ...owner, owner, pollingEnabled } : null),
+    [owner, pollingEnabled],
   );
   useLayoutEffect(() => {
     activeBinding.current = binding;
@@ -121,7 +129,7 @@ export function useGoalState(
     };
   }, [conversationId, enabled, pollingEnabled, refreshGoal]);
 
-  const currentSnapshot = binding !== null && snapshot?.binding === binding ? snapshot : null;
+  const currentSnapshot = owner !== null && snapshot?.binding.owner === owner ? snapshot : null;
   return {
     goal: currentSnapshot?.goal ?? null,
     goalRevision: currentSnapshot?.revision ?? 0,
