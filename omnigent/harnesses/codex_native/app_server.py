@@ -114,6 +114,7 @@ from omnigent.inner.codex_executor import (
     read_codex_model_catalog,
     write_codex_hooks_file,
 )
+from omnigent.inner.codex_rpc_errors import CodexAppServerResponseError
 from omnigent.inner.databricks_executor import (
     _databricks_gateway_host,
     _read_databrickscfg_host,
@@ -1026,22 +1027,6 @@ def _inject_mcp_server_config(
     )
     rendered = f"{updated}\n\n{section}" if updated else section
     _write_private_config(config_path, rendered)
-
-
-class CodexAppServerResponseError(RuntimeError):
-    """Structured JSON-RPC error returned by the Codex app-server."""
-
-    def __init__(self, error: object) -> None:
-        """Preserve the JSON-RPC code and message while remaining a RuntimeError."""
-        self.error = error
-        self.code: int | None = None
-        self.message: str | None = None
-        if isinstance(error, dict):
-            code = error.get("code")
-            message = error.get("message")
-            self.code = code if isinstance(code, int) else None
-            self.message = message if isinstance(message, str) else None
-        super().__init__(str(error))
 
 
 #: Codex ``-32600`` messages for a thread with no active turn at all. The
