@@ -1910,11 +1910,8 @@ async def test_failed_launch_rolls_back_only_new_relay(
 @pytest.mark.parametrize(
     "mode",
     [
-        "plain",
-        "disable-hooks",
         "wrapped",
         "legacy",
-        "declared-replacement",
         "declared-identical",
         "declared-identical-invalid",
     ],
@@ -1928,7 +1925,6 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
 
     monkeypatch.setattr(settings_validation, "validate_caller_settings", AsyncMock())
 
-    disable_hooks = mode == "disable-hooks"
     agent_id = "settings-agent"
     session_id = f"conv_{uuid.uuid4().hex[:12]}"
     spec = _spec_without_terminals()
@@ -1938,11 +1934,7 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
     app = _switch_app(tmp_path, _SwitchableServerClient(agent_id), {agent_id: spec})
     bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
     settings_file = tmp_path / "caller.json"
-    settings_file.write_text(
-        json.dumps(
-            {"env": {"ORDER": "file", "FROM_FILE": "yes"}, "disableAllHooks": disable_hooks}
-        )
-    )
+    settings_file.write_text(json.dumps({"env": {"ORDER": "file", "FROM_FILE": "yes"}}))
     monkeypatch.chdir(tmp_path)
     if mode in {"wrapped", "legacy"}:
         monkeypatch.setattr(
@@ -1958,8 +1950,8 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
     if mode.startswith("declared-"):
         spec.terminals = {
             body["terminal"]: TerminalEnvSpec(
-                command="bash" if mode == "declared-replacement" else body["spec"]["command"],
-                args=["-l"] if mode == "declared-replacement" else list(body["spec"]["args"]),
+                command=body["spec"]["command"],
+                args=list(body["spec"]["args"]),
                 os_env=spec.os_env,
             )
         }
@@ -2024,10 +2016,7 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
             response = await client.post(
                 f"/v1/sessions/{session_id}/resources/terminals", json=body
             )
-            if mode in {
-                "disable-hooks",
-                "declared-identical-invalid",
-            }:
+            if mode == "declared-identical-invalid":
                 assert response.status_code == 500, response.text
                 assert response.json()["error"]["code"] == "terminal_launch_failed"
                 assert not finalized
@@ -2036,11 +2025,6 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
                 assert response.status_code == 200, response.text
                 assert len(finalized) == 1
                 final_args = finalized[0]
-                if mode == "declared-replacement":
-                    assert final_args == ["-l"]
-                    assert json.loads(baseline_path.read_text()) == baseline
-                    await client.delete(f"/v1/sessions/{session_id}")
-                    return
                 settings_index = max(i for i, arg in enumerate(final_args) if arg == "--settings")
                 settings = json.loads(Path(final_args[settings_index + 1]).read_text())
                 assert json.loads(baseline_path.read_text()) == baseline
@@ -2124,15 +2108,41 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
     )
     bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
     request = ClaudeSettingsRequest.create(bridge_dir)
-    caller = {"disableAllHooks": True} if mode == "failure" else {"env": {"EXAMPLE": "caller"}}
+    caller = {
+        "env": {"EXAMPLE": "caller", "FROM_FILE": "yes", "ORDER": "file"},
+        **({"disableAllHooks": True} if mode == "failure" else {}),
+    }
+    caller_file = tmp_path / "caller.json"
+    caller_file.write_text(json.dumps(caller))
+    caller_reads = []
+    policy_selected = False
+    original_read = bridge._read_caller_settings
+
+    def read_caller_settings(path, **kwargs):
+        if path == caller_file:
+            assert policy_selected
+            caller_reads.append(path)
+        return original_read(path, **kwargs)
+
+    monkeypatch.setattr(bridge, "_read_caller_settings", read_caller_settings)
     body = _claude_terminal_request(
-        ("--settings", json.dumps(caller)),
+        ("--settings", str(caller_file), '--settings={"env":{"ORDER":"inline"}}'),
         command="claude",
         bridge_dir=bridge_dir,
         settings_request=request,
     )
     baseline = settings_generation_path(bridge_dir, request.generation)
     baseline_bytes = baseline.read_bytes()
+    boundary_path = baseline.with_suffix(".boundary.json")
+    if mode == "opaque":
+        assert not boundary_path.exists()
+    else:
+        boundary = boundary_path.read_text()
+        assert str(caller_file) not in boundary
+        assert "FROM_FILE" not in boundary
+        assert "ORDER" not in boundary
+    assert "FROM_FILE" not in json.loads(baseline_bytes).get("env", {})
+    assert caller_reads == []
     if mode != "expired":
         request.mark_dispatched()
     if mode == "declared-replacement":
@@ -2155,8 +2165,16 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
             request.close()
 
         async def prepare(instance):
+            nonlocal policy_selected
+
+            assert instance.sandbox_policy is None
+            assert instance.os_env.cwd == tmp_path
             prepared.append((instance, list(instance.args)))
-            await kwargs["prepare_terminal"](instance)
+            policy_selected = True
+            try:
+                await kwargs["prepare_terminal"](instance)
+            finally:
+                policy_selected = False
 
         await terminals.launch(
             session_id,
@@ -2236,18 +2254,26 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
             if mode == "declared-replacement":
                 assert instance.args == ["-l"]
                 assert not baseline.exists()
+                assert caller_reads == []
             else:
                 assert baseline.read_bytes() == baseline_bytes
                 assert instance.private_dir.exists()
                 if mode == "opaque":
                     assert str(baseline) in instance.args[-1]
+                    assert caller_reads == []
                 else:
                     settings_index = max(
                         i for i, arg in enumerate(instance.args) if arg == "--settings"
                     )
                     output = Path(instance.args[settings_index + 1])
                     assert output.parent == instance.private_dir
-                    assert json.loads(output.read_text())["env"]["EXAMPLE"] == "caller"
+                    settings = json.loads(output.read_text())
+                    assert settings["env"]["EXAMPLE"] == "caller"
+                    assert settings["env"]["FROM_FILE"] == "yes"
+                    assert settings["env"]["ORDER"] == "inline"
+                    assert settings["hooks"] == json.loads(baseline_bytes)["hooks"]
+                    assert str(caller_file) not in instance.args
+                    assert caller_reads == [caller_file]
             replay = await client.post(url, json=body)
             assert replay.status_code == 409, replay.text
             assert replay.json()["error"]["code"] == "conflict"

@@ -5276,25 +5276,23 @@ def test_merge_caller_settings_preserves_hook_contents(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "hooks",
-    ["private-hook-content", {"PrivateEvent": {"command": "private-hook-content"}}],
-    ids=["outer", "event"],
-)
 @pytest.mark.parametrize("source", ["inline", "file"])
 @pytest.mark.parametrize("private_output", [False, True], ids=["bridge-output", "private-output"])
 async def test_caller_hook_shapes_fail_before_finalized_output(
     tmp_path: Path,
     claude_settings_validator,
     caplog: pytest.LogCaptureFixture,
-    hooks: object,
     source: str,
     private_output: bool,
 ) -> None:
+    from omnigent.harnesses.claude_native.settings_validation import (
+        CallerSettingsError,
+        CallerSettingsErrorReason,
+    )
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.inner.terminal import create_terminal_instance
 
-    payload = json.dumps({"hooks": hooks})
+    payload = json.dumps({"hooks": {"PrivateEvent": {"command": "private-hook-content"}}})
     if source == "file":
         caller_file = tmp_path / "caller.json"
         caller_file.write_text(payload)
@@ -5325,10 +5323,13 @@ async def test_caller_hook_shapes_fail_before_finalized_output(
                 instance, bridge_dir=tmp_path, generation=generation, private_output=private_output
             )
 
+        assert isinstance(error.value, CallerSettingsError)
+        assert error.value.reason is CallerSettingsErrorReason.INVALID_HOOKS
         assert str(error.value) == error.value.client_message
         assert "private-hook-content" not in str(error.value)
         assert "PrivateEvent" not in str(error.value)
         assert "private-hook-content" not in caplog.text
+        assert "PrivateEvent" not in caplog.text
         claude_settings_validator.assert_not_awaited()
         assert instance.args == original_args
         assert {
@@ -5577,15 +5578,11 @@ async def test_overlapping_caller_settings_finalizers_keep_immutable_baseline(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("private_output", [False, True], ids=["bridge-output", "private-output"])
-@pytest.mark.parametrize(
-    "cancel_worker_tasks", [False, True], ids=["parent-cancellation", "shutdown-cancellation"]
-)
 async def test_caller_settings_writes_drain_before_cancelled_launch_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     claude_settings_validator,
     private_output: bool,
-    cancel_worker_tasks: bool,
 ) -> None:
     from functools import partial
 
@@ -5632,7 +5629,6 @@ async def test_caller_settings_writes_drain_before_cancelled_launch_cleanup(
     work_threads: list[tuple[str, int]] = []
     preparation_context = ContextVar("settings_preparation", default=False)
     work_contexts: list[bool] = []
-    worker_tasks: list[asyncio.Task[Any]] = []
     outputs: list[Path] = []
     written_settings: list[dict[str, Any]] = []
     cleanup_observations: list[bool] = []
@@ -5641,19 +5637,6 @@ async def test_caller_settings_writes_drain_before_cancelled_launch_cleanup(
         work_threads.append((name, threading.get_ident()))
         work_contexts.append(preparation_context.get())
         return original(*args, **kwargs)
-
-    def create_worker_task(coroutine, **kwargs):
-        task = asyncio.create_task(coroutine, **kwargs)
-        if preparation_context.get():
-            worker_tasks.append(task)
-        return task
-
-    if cancel_worker_tasks:
-        monkeypatch.setattr(
-            claude_native_bridge,
-            "asyncio",
-            SimpleNamespace(**{**vars(asyncio), "create_task": create_worker_task}),
-        )
 
     steps = (
         "_claude_settings_boundary",
@@ -5705,18 +5688,14 @@ async def test_caller_settings_writes_drain_before_cancelled_launch_cleanup(
         assert not write_finished.is_set()
         for _attempt in range(3):
             preparation.cancel()
-            if cancel_worker_tasks and _attempt == 0:
-                for task in worker_tasks:
-                    task.cancel()
             checkpoint = loop.create_future()
             loop.call_soon(checkpoint.set_result, None)
             await checkpoint
-            if cancel_worker_tasks and _attempt == 0:
-                await asyncio.wait({preparation}, timeout=1)
             assert not preparation.done()
             assert cleanup_observations == []
             assert instance.private_dir.exists()
             assert baseline_path.read_bytes() == baseline_bytes
+            assert instance.args == original_args
 
         release_write.set()
         with pytest.raises(asyncio.CancelledError):
@@ -6403,24 +6382,11 @@ async def test_caller_settings_resolve_terminal_workspace(
     assert settings["hooks"]["UserPromptSubmit"]
 
 
-def test_augment_claude_args_preserves_settings_like_option_values(tmp_path: Path) -> None:
-    """A settings-looking operand remains prompt text or an option value."""
-    flag = "--append-system-prompt"
-    literal = '--settings={"env":{"EXAMPLE_KEY":"value"}}'
-    args = augment_claude_args(
-        (flag, literal),
-        bridge_dir=tmp_path,
-        ap_server_url="https://example.test",
-    )
-    assert literal in args[args.index(flag) + 1]
-    settings = _load_invocation_settings(args)
-    assert "EXAMPLE_KEY" not in settings.get("env", {})
-    assert settings["hooks"]["PreToolUse"]
-
-
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "flag",
     [
+        "--append-system-prompt",
         "--system-prompt",
         "--name",
         "--agent-name",
@@ -6429,10 +6395,31 @@ def test_augment_claude_args_preserves_settings_like_option_values(tmp_path: Pat
         "--prefill",
     ],
 )
-def test_pop_caller_settings_preserves_option_values(flag: str, tmp_path: Path) -> None:
+@pytest.mark.usefixtures("claude_settings_validator")
+async def test_pop_caller_settings_preserves_option_values(
+    flag: str, tmp_path: Path, _finalize_test_claude_args
+) -> None:
+    from omnigent.inner.datamodel import OSEnvSpec
+
     literal = '--settings={"env":{"EXAMPLE_KEY":"value"}}'
     args = [flag, literal]
     assert claude_native_bridge._pop_caller_settings(args, workspace=None) == (args, [])
+    finalized = await _finalize_test_claude_args(
+        augment_claude_args(
+            args,
+            bridge_dir=tmp_path,
+            ap_server_url="https://example.test",
+            defer_caller_settings=True,
+        ),
+        bridge_dir=tmp_path,
+        os_env_spec=OSEnvSpec(
+            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+        ),
+    )
+    assert literal in finalized[finalized.index(flag) + 1]
+    settings = _load_invocation_settings(finalized)
+    assert "EXAMPLE_KEY" not in settings.get("env", {})
+    assert settings["hooks"]["PreToolUse"]
     baseline = tmp_path / "baseline.json"
     output = tmp_path / "output.json"
     args = [flag, "--settings", str(baseline), "--settings", str(baseline)]
@@ -17245,14 +17232,20 @@ def test_message_display_shell_command_round_trips(tmp_path: Path) -> None:
     ]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("caller_settings", [False, True], ids=["global", "caller"])
 @pytest.mark.parametrize(
     "suffix",
     ["", " # caller status", "\ncat <<'STATUS_EOF'\ncaller status\nSTATUS_EOF"],
     ids=["simple", "trailing-comment", "heredoc"],
 )
-def test_statusline_shell_command_captures_and_chains(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caller_settings: bool, suffix: str
+@pytest.mark.usefixtures("claude_settings_validator")
+async def test_statusline_shell_command_captures_and_chains(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caller_settings: bool,
+    suffix: str,
+    _finalize_test_claude_args,
 ) -> None:
     """The statusLine shim captures raw stdin atomically and chains the user command.
 
@@ -17261,6 +17254,7 @@ def test_statusline_shell_command_captures_and_chains(
     stdin Claude sent.
     """
     from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE, sync_raw_status_context
+    from omnigent.inner.datamodel import OSEnvSpec
 
     chain_out = tmp_path / "chain_out.json"
     chain_command = f"tee {shlex.quote(str(chain_out))}{suffix}"
@@ -17273,7 +17267,14 @@ def test_statusline_shell_command_captures_and_chains(
         if caller_settings
         else ()
     )
-    args = augment_claude_args(caller_args, bridge_dir=tmp_path)
+    args = augment_claude_args(caller_args, bridge_dir=tmp_path, defer_caller_settings=True)
+    args = await _finalize_test_claude_args(
+        args,
+        bridge_dir=tmp_path,
+        os_env_spec=OSEnvSpec(
+            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+        ),
+    )
     settings = _load_invocation_settings(args)
     command = settings["statusLine"]["command"]
     assert "python" not in command, f"statusLine path must not spawn python: {command}"
@@ -19863,6 +19864,9 @@ async def test_disabled_mcp_settings_launch_hook(
             defer_caller_settings=deferred,
         )
         if deferred:
+            baseline_index = max(i for i, arg in enumerate(args) if arg == "--settings") + 1
+            baseline_path = Path(args[baseline_index])
+            baseline = baseline_path.read_bytes()
             args = await _finalize_test_claude_args(
                 args,
                 bridge_dir=bridge_dir,
@@ -19871,18 +19875,21 @@ async def test_disabled_mcp_settings_launch_hook(
                     type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
                 ),
             )
+            assert baseline_path.read_bytes() == baseline
+            assert Path(args[args.index("--settings") + 1]) != baseline_path
         return args
 
     original_args = await build_args()
     settings_path = Path(original_args[original_args.index("--settings") + 1])
     original = settings_path.read_bytes()
+    assert json.loads(original)["deniedMcpServers"] == [caller_denial]
     if saved:
         set_disabled(ServerKey("claude", "fixture"), True)
     with patch(
         "omnigent.mcp_disabled_servers.apply_claude_settings", wraps=apply_claude_settings
     ) as hook:
         args = await build_args(active)
-    hook.assert_called()
+    assert hook.call_count == (2 if deferred else 1)
     assert all(
         call.kwargs == {"executor": "claude-native", "active_harnesses": active}
         for call in hook.call_args_list

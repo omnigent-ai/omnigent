@@ -576,11 +576,12 @@ async def test_cancelled_launch_reaps_real_tmux(
             await instance.close()
 
 
-@requires_tmux
 @pytest.mark.parametrize("outcome", ["success", "error", "cancelled"])
 async def test_preparation_uses_new_instance_once_before_spawn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
 ) -> None:
+    monkeypatch.setattr("omnigent.inner.terminal._require_supported_tmux", lambda: None)
+    monkeypatch.setattr(TerminalInstance, "_tmux", AsyncMock(return_value=""))
     created = _capture_instances(monkeypatch)
     calls = []
     released = []
@@ -632,10 +633,11 @@ async def test_preparation_uses_new_instance_once_before_spawn(
     assert released == calls
 
 
-@requires_tmux
 async def test_overlapping_preparations_close_loser_and_keep_winner_owned(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr("omnigent.inner.terminal._require_supported_tmux", lambda: None)
+    monkeypatch.setattr(TerminalInstance, "_tmux", AsyncMock(return_value=""))
     spec = _spec(tmp_path)
     created = _capture_instances(monkeypatch)
     first_spawning = asyncio.Event()

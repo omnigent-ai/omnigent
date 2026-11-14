@@ -3831,20 +3831,15 @@ def _merge_caller_settings(
     settings: dict[str, Any], callers: list[dict[str, Any]], bridge_dir: Path
 ) -> dict[str, Any]:
     """
-    Merge caller ``--settings`` objects into Omnigent's invocation settings.
+    Compose callers in flag order, then apply bridge precedence.
 
-    Caller hook entries precede Omnigent's for the same event, ``env`` merges,
-    ``permissions`` lists merge, a caller ``statusLine`` command is chained after
-    Omnigent's context capture (in place of the user's global one), and any other
-    key Omnigent does not set is taken from the caller. Later caller values win
-    before Omnigent's own values take precedence. Effective ``disableAllHooks``
-    and ``allowManagedHooksOnly`` values of ``true`` are rejected. Other CLI
-    hook controls, including environment modes and plugin-only customization,
-    are passed through. These local guards enforce bridge merge requirements;
-    the finalizer validates the complete document with the selected CLI.
-    Hook containers must be objects of event lists; entries remain intact.
-    Caller MCP-denial lists use the last caller value; saved denials append later.
-    Other maps merge direct members only; a later nested map replaces the earlier one.
+    Hooks require an object of event lists; caller entries precede bridge entries.
+    Env and other maps merge direct members, replacing nested values; permission
+    lists merge. The last caller MCP-denial list wins; saved denials append later.
+    Chain a caller statusLine command after bridge context capture, replacing
+    the global command. Local hook guards reject effective disableAllHooks=true
+    or allowManagedHooksOnly=true; other CLI controls pass through. The finalizer
+    validates the complete document with the selected CLI.
 
     :param settings: Omnigent's invocation settings.
     :param callers: Parsed caller settings, in flag order.
