@@ -14,6 +14,7 @@ from omnigent.entities.session_journal import (
     PLAN_NAME_MAX_CHARS,
     InvalidJournalEntryError,
     _line,
+    _text,
     normalize_plan,
 )
 
@@ -74,11 +75,11 @@ def normalize_workflow(
             if steps == []
             else normalize_plan(steps, name=workflow_name, source="workflow")["steps"]
         )
+        text = _text("description", description).strip()
     except InvalidJournalEntryError as exc:
         raise InvalidWorkflowError(str(exc)) from exc
-    if not isinstance(description, str) or not description.strip():
+    if not text:
         raise InvalidWorkflowError("description must not be empty")
-    text = description.strip()
     if len(text) > WORKFLOW_DESCRIPTION_MAX_CHARS:
         raise InvalidWorkflowError(
             f"description must be at most {WORKFLOW_DESCRIPTION_MAX_CHARS} characters"

@@ -101,6 +101,9 @@ def test_an_update_keeps_what_it_leaves_out_and_checks_the_result(store: Workflo
     ]
     with pytest.raises(InvalidWorkflowError, match="cycle"):
         store.update(saved.id, user_id=ALICE, steps=cycle)
+    with pytest.raises(InvalidWorkflowError, match="description must be valid Unicode text"):
+        store.update(saved.id, user_id=ALICE, description="\ud800")
+    assert store.get(saved.id, user_id=ALICE) == stored
     assert store.update(saved.id, user_id=BOB, name="mine") is None
 
 
@@ -109,6 +112,8 @@ def test_invalid_or_oversized_workflows_are_refused(store: WorkflowStore) -> Non
         store.create(user_id=ALICE, name="x", description=" ", steps=STEPS)
     with pytest.raises(InvalidWorkflowError, match="at most 2000"):
         store.create(user_id=ALICE, name="x", description="d" * 2001, steps=STEPS)
+    with pytest.raises(InvalidWorkflowError, match="description must be valid Unicode text"):
+        store.create(user_id=ALICE, name="x", description="\ud800", steps=STEPS)
     with pytest.raises(InvalidWorkflowError, match="unknown fields: agent"):
         store.create(
             user_id=ALICE,
