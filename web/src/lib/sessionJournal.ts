@@ -16,6 +16,9 @@ const STEP_STATUSES: readonly string[] = ["started", "done", "needs_input", "fai
 /** What a task waiting for the user says, in pink: the sidebar's Needs response color. */
 export const WAITING_FOR_YOU = "Waiting for you";
 
+/** The phase of a workflow question's prompt, which already marks its own task waiting. */
+export const WORKFLOW_QUESTION_PHASE = "workflow_request_input";
+
 /** One plan step, as a plan entry's payload lists it. */
 export interface JournalPlanStep {
   id: string;
