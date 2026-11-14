@@ -396,6 +396,11 @@ function useGoalDialogState({
   const draftSession = useRef<string | null | undefined>(undefined);
   const dirtyFields = useRef(new Set<"objective" | "tokenBudget" | "mode">());
   const dialogBinding = useRef<object | null>(null);
+  const currentRefreshGoal = useRef(refreshGoal);
+
+  useLayoutEffect(() => {
+    currentRefreshGoal.current = refreshGoal;
+  }, [refreshGoal]);
 
   useLayoutEffect(() => {
     // New dialog or goal-owner bindings invalidate pending operations.
@@ -457,7 +462,7 @@ function useGoalDialogState({
   const canApplyMutationResult = (binding: object) => {
     if (dialogBinding.current === binding) return true;
     // Re-read current state instead of applying a closed dialog's response.
-    void refreshGoal().catch(() => {});
+    void currentRefreshGoal.current().catch(() => {});
     return false;
   };
 

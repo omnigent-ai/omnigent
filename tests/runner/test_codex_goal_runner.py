@@ -248,17 +248,17 @@ async def test_request_maps_generic_exception_to_safe_detail(
 
 
 @pytest.mark.parametrize(
-    ("method", "stage", "error", "empty"),
+    ("method", "stage", "error", "status_code"),
     [
-        ("thread/goal/get", "connect", ConnectionRefusedError(), True),
-        ("thread/goal/get", "connect", FileNotFoundError(), True),
-        ("thread/goal/get", "connect", RuntimeError("handshake failed"), False),
-        ("thread/goal/get", "request", ConnectionRefusedError(), False),
-        ("thread/goal/set", "connect", ConnectionRefusedError(), False),
+        ("thread/goal/get", "connect", ConnectionRefusedError(), 502),
+        ("thread/goal/get", "connect", FileNotFoundError(), 502),
+        ("thread/goal/get", "connect", RuntimeError("handshake failed"), 503),
+        ("thread/goal/get", "request", ConnectionRefusedError(), 503),
+        ("thread/goal/set", "connect", ConnectionRefusedError(), 503),
     ],
 )
 async def test_inactive_bridge_only_changes_read_connection_refusal(
-    monkeypatch: pytest.MonkeyPatch, method: str, stage: str, error: Exception, empty: bool
+    monkeypatch: pytest.MonkeyPatch, method: str, stage: str, error: Exception, status_code: int
 ) -> None:
     fake_client = _FakeCodexClient(
         connect_exc=error if stage == "connect" else None,
@@ -273,11 +273,9 @@ async def test_inactive_bridge_only_changes_read_connection_refusal(
 
     result = await runner._request("conv_1", action="read", method=method, params={})
 
-    if empty:
-        assert result == {"goal": None}
-    else:
-        assert isinstance(result, JSONResponse)
-        assert result.status_code == 503
+    assert isinstance(result, JSONResponse)
+    assert result.status_code == status_code
+    assert _json_response(result)["error"] == "codex_native_goal_failed"
     assert len(fake_client.request_calls) == (1 if stage == "request" else 0)
     assert fake_client.closed
 

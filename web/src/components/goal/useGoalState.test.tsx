@@ -242,26 +242,25 @@ describe("useGoalState", () => {
     expect(result.current.goal).toEqual(GOAL);
   });
 
-  it.each([
-    { elapsed: 14_999, reads: 2 },
-    { elapsed: 34_999, reads: 3 },
-    { elapsed: 74_999, reads: 4 },
-    { elapsed: 134_999, reads: 5 },
-    { elapsed: 194_999, reads: 6 },
-  ])(
-    "backs off repeated failures with $reads reads before $elapsed ms",
-    async ({ elapsed, reads }) => {
-      vi.useFakeTimers();
-      mockGetGoal.mockResolvedValueOnce({ goal: GOAL }).mockRejectedValue(new Error("offline"));
-      const { result } = renderHook(() => useGoalState("conv", true));
-      await act(async () => {});
-      await act(() => vi.advanceTimersByTimeAsync(elapsed));
-      expect(mockGetGoal).toHaveBeenCalledTimes(reads);
-      await act(() => vi.advanceTimersByTimeAsync(1));
-      expect(mockGetGoal).toHaveBeenCalledTimes(reads + 1);
+  it("backs off repeated failures through a repeated sixty-second cap", async () => {
+    vi.useFakeTimers();
+    mockGetGoal.mockResolvedValueOnce({ goal: GOAL }).mockRejectedValue(new Error("offline"));
+    const { result } = renderHook(() => useGoalState("conv", true));
+    await act(async () => {});
+    expect(mockGetGoal).toHaveBeenCalledTimes(1);
+
+    // Each timer boundary must settle before the next clock advance.
+    /* oxlint-disable no-await-in-loop */
+    for (const [index, delay] of [5_000, 10_000, 20_000, 40_000, 60_000, 60_000].entries()) {
+      await act(() => vi.advanceTimersByTimeAsync(delay - 1));
+      expect(mockGetGoal).toHaveBeenCalledTimes(index + 1);
       expect(result.current.goal).toEqual(GOAL);
-    },
-  );
+      await act(() => vi.advanceTimersByTimeAsync(1));
+      expect(mockGetGoal).toHaveBeenCalledTimes(index + 2);
+      expect(result.current.goal).toEqual(GOAL);
+    }
+    /* oxlint-enable no-await-in-loop */
+  });
 
   it("resets polling to five seconds after recovering from the maximum backoff", async () => {
     vi.useFakeTimers();

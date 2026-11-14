@@ -161,9 +161,9 @@ class CodexGoalRunner:
                     and self._bridge_is_inactive is not None
                     and self._bridge_is_inactive(conv_id, state)
                 ):
-                    # Idle reaping leaves its old bridge file behind. Match the
-                    # disconnected-runner read without waking an autonomous goal.
-                    return {"goal": None}
+                    # An idle bridge cannot confirm absence. Do not wake the
+                    # autonomous goal or discard the browser's last snapshot.
+                    return self._bridge_error(action)
                 raise
             return self._goal_result(
                 await codex_client.request(method, {"threadId": state.thread_id, **params}),

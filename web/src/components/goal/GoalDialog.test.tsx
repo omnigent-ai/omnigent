@@ -215,8 +215,8 @@ describe("GoalDialog", () => {
           editedFields === "all fields" ? "My unsaved objective" : goal.objective,
         );
         expect(screen.getByTestId("goal-token-budget")).toHaveValue(12345);
-        const mode =
-          editedFields === "all fields" ? "paused" : goal.status === "active" ? "active" : "keep";
+        const untouchedMode = goal.status === "active" ? "active" : "keep";
+        const mode = editedFields === "all fields" ? "paused" : untouchedMode;
         expect(screen.getByTestId(`goal-mode-${mode}`)).toHaveAttribute("aria-checked", "true");
       }
       expect(screen.getByTestId("goal-current")).toHaveTextContent("complete");
@@ -567,18 +567,22 @@ describe("GoalDialog", () => {
         fireEvent.click(screen.getByTestId("goal-mode-paused"));
         fireEvent.click(screen.getByTestId(button));
 
-        await act(async () => {
-          if (outcome === "success") oldRequest.resolve({ goal: ACTIVE_GOAL, cleared: true });
-          else oldRequest.reject(new Error("old mutation failed"));
-        });
         const backgroundGoal = {
           ...ACTIVE_GOAL,
           objective: "Current background goal",
           tokenBudget: 888,
         };
+        const readsBeforeOldResponse = mockGetGoal.mock.calls.length;
         mockGetGoal.mockResolvedValueOnce({ goal: backgroundGoal });
-        await act(async () => window.dispatchEvent(new Event("focus")));
+        await act(async () => {
+          if (outcome === "success") oldRequest.resolve({ goal: ACTIVE_GOAL, cleared: true });
+          else oldRequest.reject(new Error("old mutation failed"));
+        });
+        if (outcome === "error") {
+          await act(async () => window.dispatchEvent(new Event("focus")));
+        }
 
+        expect(mockGetGoal).toHaveBeenCalledTimes(readsBeforeOldResponse + 1);
         expect(screen.getByTestId("goal-current")).toHaveTextContent(backgroundGoal.objective);
         expect(screen.getByTestId("goal-objective")).toHaveValue(newGoal.objective);
         expect(screen.getByTestId("goal-token-budget")).toHaveValue(999);
