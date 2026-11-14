@@ -164,7 +164,7 @@ def _cache_cost_model_label(model: object) -> str | None:
     match = re.fullmatch(
         r"(?:system\.ai\.|databricks-)?claude-(opus|sonnet|haiku|fable)-"
         r"([0-9]+)(?:-([0-9]+))?(?:\[1m\])?",
-        model,
+        model.lower(),
     )
     if match is None:
         return None
@@ -215,9 +215,18 @@ def _draft(pane: str) -> str | None:
 def _known_claude_id(model: str) -> str | None:
     from omnigent.models.claude_model_vocabulary import canonical_claude_id
 
-    if model.startswith(("claude-", "system.ai.claude-", "databricks-claude-")):
+    if model.lower().startswith(("claude-", "system.ai.claude-", "databricks-claude-")):
         return canonical_claude_id(model)
     return None
+
+
+def _normalized_public_model(model: str) -> str:
+    from omnigent.models.claude_model_vocabulary import CLAUDE_MODEL_ALIASES
+
+    folded = model.lower()
+    if folded.removesuffix("[1m]") in CLAUDE_MODEL_ALIASES or _known_claude_id(model):
+        return folded
+    return model
 
 
 def _target(
@@ -226,13 +235,13 @@ def _target(
     values: Sequence[str],
     env: Mapping[str, str],
 ) -> _Target:
-    from omnigent.models.claude_model_vocabulary import alias_pins
+    from omnigent.models.claude_model_vocabulary import CLAUDE_MODEL_ALIASES, alias_pins
 
-    requested = model.strip()
+    requested = _normalized_public_model(model.strip())
     pins = alias_pins(env)
     base = requested.removesuffix("[1m]")
     pinned = pins.get(base)
-    resolved = pinned or requested
+    resolved = _normalized_public_model(pinned or requested)
     if requested.endswith("[1m]") and not resolved.endswith("[1m]"):
         resolved += "[1m]"
     candidates = [
@@ -240,8 +249,18 @@ def _target(
         for option in options or ()
         if option.get("enabled") is True and option.get("value") != "default"
     ]
-    exact = [option for option in candidates if option.get("value") == requested]
-    matched = exact or [option for option in candidates if option.get("model") == resolved]
+    exact = [
+        option
+        for option in candidates
+        if isinstance(option.get("value"), str)
+        and _normalized_public_model(str(option["value"])) == requested
+    ]
+    matched = exact or [
+        option
+        for option in candidates
+        if isinstance(option.get("model"), str)
+        and _normalized_public_model(str(option["model"])) == resolved
+    ]
     canonical = _known_claude_id(resolved)
     if not matched and canonical:
         matched = [
@@ -255,15 +274,53 @@ def _target(
                 option
                 for option in candidates
                 if isinstance(option.get("model"), str)
-                and _known_claude_id(str(option["model"]).removesuffix("[1m]")) == canonical
+                and _known_claude_id(
+                    _normalized_public_model(str(option["model"])).removesuffix("[1m]")
+                )
+                == canonical
             ]
+    if len(matched) > 1:
+        concrete_models = {
+            _normalized_public_model(str(option["model"]))
+            for option in matched
+            if isinstance(option.get("model"), str) and option["model"]
+        }
+        if len(concrete_models) == 1:
+            concrete_model = next(iter(concrete_models))
+            ordinary = [
+                option
+                for option in matched
+                if isinstance(option.get("value"), str)
+                and (
+                    _normalized_public_model(str(option["value"])) == concrete_model
+                    or _normalized_public_model(str(option["value"])).removesuffix("[1m]")
+                    in CLAUDE_MODEL_ALIASES
+                    or _known_claude_id(str(option["value"])) is not None
+                )
+            ]
+            preferred = exact or ordinary
+            matched = sorted(
+                preferred,
+                key=lambda option: (
+                    _normalized_public_model(str(option["value"])) != concrete_model,
+                    option.get("provenance") != "structured",
+                    str(option["value"]),
+                    str(option.get("display_name", "")),
+                ),
+            )[:1]
+    if not exact and any(
+        str(option.get("value", "")).lower().removesuffix("[1m]") == "opusplan"
+        for option in matched
+    ):
+        matched = []
     if len(matched) == 1:
         option = matched[0]
         value, concrete = option.get("value"), option.get("model")
         if isinstance(value, str) and value and isinstance(concrete, str) and concrete:
-            if (requested.endswith("[1m]") and not concrete.endswith("[1m]")) or (
-                pinned and concrete != resolved
-            ):
+            if (
+                requested.endswith("[1m]")
+                and not _normalized_public_model(concrete).endswith("[1m]")
+            ) or (pinned and _normalized_public_model(concrete) != resolved):
                 matched = []
             else:
                 label = option.get("display_name")
@@ -276,14 +333,17 @@ def _target(
                     if isinstance(label, str) and label and unique_label
                     else None
                 )
-                if (
-                    confirmation_label
-                    and sum(
+                if confirmation_label and any(
+                    (
                         item.get("display_name") == confirmation_label
                         or _cache_cost_model_label(item.get("model")) == confirmation_label
-                        for item in candidates
                     )
-                    != 1
+                    and (
+                        not isinstance(item.get("model"), str)
+                        or _normalized_public_model(str(item["model"]))
+                        != _normalized_public_model(concrete)
+                    )
+                    for item in candidates
                 ):
                     confirmation_label = None
                 return _Target(
