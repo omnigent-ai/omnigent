@@ -11,15 +11,15 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from omnigent_client import OmnigentError, RegisteredAgent, SessionsNamespace
+from omnigent_client import OmnigentError, RegisteredAgent
 from omnigent_client._sessions import Session
 from omnigent_ui_sdk import TerminalHost
 
 import omnigent.host.identity as identity
 from omnigent import session_host
-from omnigent.cli_auth import databricks_request_headers
+from omnigent.chat import _server_headers
+from omnigent.cli_auth import open_sdk_client
 from omnigent.repl._repl import _SessionsChatReplAdapter
-from omnigent.session_host import SessionRoutingTransport
 
 FIRST_SESSION = "a1" * 16
 NEXT_SESSION = "b2" * 16
@@ -94,13 +94,12 @@ async def _remote_adapter(
     async def _stream() -> None:
         return
 
-    # The CLI's auth adds the default routing headers; the transport keys session requests.
-    async with httpx.AsyncClient(
-        headers=databricks_request_headers("http://srv"),
-        transport=SessionRoutingTransport(transport=httpx.MockTransport(handler)),
-    ) as http:
+    # The REPL's own client factory with its static headers and no auth.
+    async with open_sdk_client(
+        "http://srv", headers=_server_headers(), transport=httpx.MockTransport(handler)
+    ) as client:
         adapter = _SessionsChatReplAdapter(
-            SimpleNamespace(sessions=SessionsNamespace(http, "http://srv")),  # type: ignore[arg-type]
+            client,
             agent_name,
             session_id=session_id,
             registered_agent=RegisteredAgent(id="ag_selected", harness="claude"),

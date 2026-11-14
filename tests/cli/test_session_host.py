@@ -132,7 +132,8 @@ async def test_sdk_client_keys_each_session_by_its_own_host(
         assert await client.sessions.list_registered_agents() == []
         assert await client.sessions.list_launch_hosts() == []
         assert await client.sessions.resolve_online_runner() is None
-        assert OMNIGENT_SLICE_KEY_HEADER not in client._http.headers
+        # Per-session routing never leaks into the shared headers, which keep the default.
+        assert client._http.headers[OMNIGENT_SLICE_KEY_HEADER] == "host_fallback"
 
 
 @pytest.mark.parametrize(
@@ -207,6 +208,38 @@ async def test_sdk_upload_follows_a_refusal_with_the_whole_file(
 
     assert uploaded.id == "file_1"
     assert sends == [("client_key", True), ("host_owner", True)]
+
+
+@pytest.mark.asyncio
+async def test_sdk_client_without_auth_keeps_the_default_key_and_selectors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An uncached session read and a hostless create carry the default key and selectors."""
+    from omnigent.chat import _server_headers
+
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
+    monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", "host_fallback")
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_EXTRA_HEADERS", '{"x-route-selector": "instance-7"}')
+    mount = "http://127.0.0.1/api/2.0/omnigent"
+    seen: list[tuple[str, str, str | None, str | None]] = []
+    session = {"id": NEW_SESSION, "agent_id": "ag", "status": "idle", "created_at": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        route = request.url.path.removeprefix("/api/2.0/omnigent")
+        key = request.headers.get(OMNIGENT_SLICE_KEY_HEADER)
+        seen.append((request.method, route, key, request.headers.get("x-route-selector")))
+        return httpx.Response(201 if request.method == "POST" else 200, json=session)
+
+    async with open_sdk_client(
+        mount, headers=_server_headers(), transport=httpx.MockTransport(handler)
+    ) as client:
+        await client.sessions.get(NEW_SESSION)
+        await client.sessions.create_from_agent_id("ag")
+
+    assert seen == [
+        ("GET", f"/v1/sessions/{NEW_SESSION}", "host_fallback", "instance-7"),
+        ("POST", "/v1/sessions", "host_fallback", "instance-7"),
+    ]
 
 
 def test_session_host_cache_shares_one_entry_across_id_spellings() -> None:
