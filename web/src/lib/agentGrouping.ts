@@ -31,7 +31,7 @@ export const BUILTIN_AGENTS = new Set([
 // doesn't report `capabilities.integration_mode`. NOT the source of truth — a
 // new builtin ACP row needs no entry here, because `useAvailableAgents` stamps
 // `acpHarness` from the server catalog (see {@link isAcpHarnessAgent}).
-const LEGACY_ACP_CLI_HARNESS_IDS = new Set<string>(["devin", "grok"]);
+const LEGACY_ACP_CLI_HARNESS_IDS = new Set<string>(["devin", "grok", "jcode"]);
 
 /**
  * Whether an agent is backed by the generic ACP harness — a user-configured
@@ -54,6 +54,23 @@ export function isAcpHarnessAgent(
   const harness = agent.harness;
   if (harness == null) return false;
   return harness.startsWith("acp:") || LEGACY_ACP_CLI_HARNESS_IDS.has(harness);
+}
+
+/**
+ * Whether a bare harness id refers to the generic ACP harness (``acp``,
+ * ``acp:<slug>``, or a builtin ACP CLI harness id).
+ */
+export function isGenericAcpHarness(
+  harness: string | null | undefined,
+  acpHarnessIds?: ReadonlySet<string>,
+): boolean {
+  if (!harness) return false;
+  return (
+    harness === "acp" ||
+    harness.startsWith("acp:") ||
+    LEGACY_ACP_CLI_HARNESS_IDS.has(harness) ||
+    acpHarnessIds?.has(harness) === true
+  );
 }
 
 // Preferred display order for the built-in group. The server returns

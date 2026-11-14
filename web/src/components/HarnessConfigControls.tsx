@@ -10,8 +10,10 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { isGenericAcpHarness } from "@/lib/agentGrouping";
 import { SMART_ROUTING_LABEL } from "@/lib/agentLabels";
 import { codexEffortLevelsForModel } from "@/lib/codexNativeModels";
+import { acpEffortLevelsForModel } from "@/lib/composerCapabilities";
 import { normalizeEffortLabel } from "@/lib/composerModelLabel";
 import { MODEL_CATALOG_BROWSE_MIN, groupByModelCreator } from "@/lib/modelCreators";
 import type { NativeModelOption } from "@/lib/types";
@@ -173,19 +175,27 @@ export const PI_NATIVE_EFFORTS: { value: string; label: string }[] = [
 ];
 
 /**
- * Create-time effort ladder for a native harness (`null` = none). Codex and Devin use
- * `model` or the catalog default to resolve their model-specific efforts.
+ * Create-time effort ladder for a native or generic-ACP harness (`null` = none).
+ * Codex, Devin, and ACP catalogs use `model` (or default/sole model) for per-model ladders.
  */
 export function nativeEffortOptions(
   harness: string | null | undefined,
   modelOptions: readonly NativeModelOption[],
   model: string | null | undefined,
+  options?: { isAcp?: boolean; acpHarnessIds?: ReadonlySet<string> },
 ): { value: string; label: string }[] | null {
   if (harness === "claude-native") return CLAUDE_NATIVE_EFFORTS;
   if (harness === "pi-native") return PI_NATIVE_EFFORTS;
-  if (harness !== "codex-native" && harness !== "devin-native") return null;
-  const effortModel = model || modelOptions.find((option) => option.isDefault)?.id;
-  return codexEffortLevelsForModel(modelOptions, effortModel).map((value) => ({
+  const isCodexLike = harness === "codex-native" || harness === "devin-native";
+  const isAcp = options?.isAcp ?? isGenericAcpHarness(harness, options?.acpHarnessIds);
+  if (!isCodexLike && !isAcp) return null;
+  const levels = isAcp
+    ? acpEffortLevelsForModel(modelOptions, model)
+    : codexEffortLevelsForModel(
+        modelOptions,
+        model || modelOptions.find((option) => option.isDefault)?.id,
+      );
+  return levels.map((value) => ({
     value,
     label: normalizeEffortLabel(value),
   }));

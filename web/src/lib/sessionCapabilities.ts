@@ -1,5 +1,7 @@
 /** UI-only session capability gates, derived from the live session snapshot. */
 
+import { isGenericAcpHarness } from "./agentGrouping";
+
 export const SANDBOX_SWITCH_HOST_UNSUPPORTED =
   "Switching hosts is not supported for this sandbox session yet.";
 export const SESSION_ACTIONS_LOADING = "Checking session capabilities…";
@@ -92,7 +94,10 @@ export function supportsEffortControl(
     // Devin has no --effort flag: effort is a model-variant suffix the executor
     // recombines and re-applies via /model, so the in-chat effort dial is live.
     wrapper === DEVIN_NATIVE_WRAPPER ||
-    (wrapper == null && session?.harness === "codex-native")
+    (wrapper == null && session?.harness === "codex-native") ||
+    (wrapper == null &&
+      session?.parentSessionId == null &&
+      (isGenericAcpHarness(session?.harness) || effortFamily === "acp"))
   ) {
     return true;
   }

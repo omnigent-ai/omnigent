@@ -19,15 +19,17 @@ import {
 } from "@/lib/composerModelLabel";
 import { currentFusionCombo, fusionOption, isFusionModelUid } from "@/lib/devinFusion";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
+import { useSessionAgent } from "@/hooks/useAgents";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useSession } from "@/hooks/useSession";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useHostModelOptions } from "@/hooks/useHosts";
-import { useHarnessEffortFamilies } from "@/lib/agentLabels";
+import { useAcpHarnessIds, useHarnessEffortFamilies } from "@/lib/agentLabels";
 import {
   effortAfterModelChange,
   effortLevelsForConv,
+  resolveHostProbeTarget,
   sdkEffortFamilyForHarness,
   selectedModelForPicker,
   modelPickerKindForConv,
@@ -105,8 +107,19 @@ export function SideChatSettings({
     : session;
   const sessionOptions = catalogs.find((catalog) => catalog?.length) ?? [];
   const kind = modelPickerKindForConv(capabilities, sessionOptions);
-  const probeHarness =
-    kind === "codex" || kind === "claude" || kind === "devin" ? `${kind}-native` : null;
+  const { data: boundAgent } = useSessionAgent(
+    settingsSupported && kind === null && !session.inferenceConfigured ? session.id : null,
+  );
+  const acpHarnessIds = useAcpHarnessIds(
+    settingsSupported && !session.inferenceConfigured && kind === null && !session.agentId,
+  );
+  const { probeHarness, isAcp: probeIsAcp } = resolveHostProbeTarget({
+    pickerKind: kind,
+    boundAgent,
+    agentId: session.agentId,
+    harness: session.harness,
+    acpHarnessIds,
+  });
   const { data: hostOptions } = useHostModelOptions(
     session.hostId ?? parent?.hostId ?? null,
     probeHarness ?? "",
@@ -114,24 +127,26 @@ export function SideChatSettings({
       !session.inferenceConfigured &&
       probeHarness !== null &&
       sessionOptions.length === 0,
+    probeIsAcp ? { poll: false } : undefined,
   );
   // Share the main composer's host catalog while the session has no model list.
   const options =
     !session.inferenceConfigured && sessionOptions.length === 0
       ? (hostOptions ?? sessionOptions)
       : sessionOptions;
+  const resolvedKind = modelPickerKindForConv(capabilities, options);
   const family = sdkEffortFamilyForHarness(session.harness, families);
   const reportedModel = state.llmModel ?? session.llmModel ?? null;
   const model =
     draft?.settings?.modelOverride ??
-    selectedModelForPicker(kind, options, session.modelOverride ?? null, reportedModel) ??
+    selectedModelForPicker(resolvedKind, options, session.modelOverride ?? null, reportedModel) ??
     reportedModel;
   const fusionModel =
-    kind === "devin" && isFusionModelUid(model) ? fusionOption(options) : undefined;
+    resolvedKind === "devin" && isFusionModelUid(model) ? fusionOption(options) : undefined;
   const selectedModel = fusionModel ?? findModelLabelOption(options, model);
   const nativeAgent =
     nativeCodingAgentForHarness(session.harness) ??
-    (kind ? nativeCodingAgentForHarness(`${kind}-native`) : undefined);
+    (resolvedKind ? nativeCodingAgentForHarness(`${resolvedKind}-native`) : undefined);
   const harnessLabel = nativeAgent?.displayName ?? session.agentName ?? "Session";
   const modelLabel = formatStatusModelLabel(model, options) ?? defaultModelLabel(options);
   const effort =
@@ -140,7 +155,7 @@ export function SideChatSettings({
       : (session.reasoningEffort ?? null);
   const supportsEffort = shouldShowEffortPicker(capabilities, family);
   const efforts = supportsEffort ? effortLevelsForConv(capabilities, options, model, family) : [];
-  const showModels = kind !== null && options.length > 0;
+  const showModels = resolvedKind !== null && options.length > 0;
   if (
     !settingsSupported ||
     (nativeSession && (!nativeSide || draft)) ||

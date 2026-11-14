@@ -19,7 +19,8 @@ import {
   nativePermissionOptions,
 } from "@/lib/nativeHarnessModes";
 import { nativeEffortOptions } from "@/components/HarnessConfigControls";
-import { harnessUnconfiguredOnHost } from "@/lib/harnessSetup";
+import { isAcpHarnessAgent } from "@/lib/agentGrouping";
+import { hostModelsBlockedOnHost } from "@/lib/harnessSetup";
 import type { NativeModelOption } from "@/lib/types";
 
 const EMPTY_MODELS: NativeModelOption[] = [];
@@ -40,14 +41,17 @@ export function useScheduledHarnessSettings(
   const info = useServerInfo();
   const harness = nativeCodingAgentForAvailableAgent(agent)?.harness ?? agent?.harness ?? null;
   const nativeModelSettings = nativeAgentHasModelSettings(agent);
+  const isAcp = !nativeModelSettings && isAcpHarnessAgent(agent) && harness !== null;
+  const acpPollOpts: [] | [{ poll?: boolean }] = isAcp ? [{ poll: false }] : [];
   const hostModels = useHostModelOptions(
     sandbox ? null : (host?.host_id ?? null),
     harness ?? "",
     enabled &&
-      nativeModelSettings &&
       !sandbox &&
       host?.status === "online" &&
-      !harnessUnconfiguredOnHost(harness, host),
+      (nativeModelSettings || isAcp) &&
+      !hostModelsBlockedOnHost(harness, host),
+    ...acpPollOpts,
   );
   const provider = info === "loading" ? null : info.sandbox_provider;
   const capabilities =
@@ -102,7 +106,7 @@ export function useScheduledHarnessSettings(
     capabilities?.default_models === true &&
     capabilities.inference_models !== true &&
     !(sandboxAuthoritative && sandboxData.status === "unconfigured");
-  const supportsModel = nativeModelSettings || sandboxDefaultModels || configured;
+  const supportsModel = nativeModelSettings || isAcp || sandboxDefaultModels || configured;
   const catalog: readonly NativeModelOption[] | undefined = liveCatalog ?? cached?.models;
   const unsupported = sandbox && sandboxCatalogOffered && previewIsUnsupported(sandboxModels);
   const blockedReason = unsupported
@@ -119,7 +123,9 @@ export function useScheduledHarnessSettings(
   // Like New Chat, provider default catalogs own effort choices even for Claude/Pi.
   const effortHarness = sandboxDefaultModels ? "codex-native" : harness;
   const effortsForModel = (picked: string) =>
-    nativeEffortOptions(effortHarness, models, picked) ?? [];
+    nativeEffortOptions(effortHarness, models, picked, {
+      isAcp: !sandboxDefaultModels && isAcp,
+    }) ?? [];
   const efforts = effortsForModel(model);
   const supportsHarnessPermissions =
     harness === "claude-native" ||
