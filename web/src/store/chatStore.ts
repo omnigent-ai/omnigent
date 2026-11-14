@@ -5500,7 +5500,9 @@ async function bindStream(
         sessionUsageByModel:
           state.sessionUsageByModel !== stateBeforeFetch.sessionUsageByModel
             ? state.sessionUsageByModel
-            : (session.usageByModel ?? state.sessionUsageByModel),
+            : session.costHidden
+              ? withoutModelCosts(session.usageByModel ?? state.sessionUsageByModel)
+              : (session.usageByModel ?? state.sessionUsageByModel),
         todos: (session.todos ?? []) as {
           content: string;
           status: "pending" | "in_progress" | "completed";
@@ -5517,6 +5519,16 @@ async function bindStream(
       conversationLoadError: err instanceof Error ? err : new Error(String(err)),
     });
   }
+}
+
+/** Drop per-model USD while keeping token counts, once the server hides cost. */
+function withoutModelCosts(
+  usageByModel: Record<string, ModelUsage> | null,
+): Record<string, ModelUsage> | null {
+  if (usageByModel === null) return null;
+  return Object.fromEntries(
+    Object.entries(usageByModel).map(([model, usage]) => [model, { ...usage, totalCostUsd: null }]),
+  );
 }
 
 /** Hydrate display-only subtree totals without delaying session reconciliation. */
@@ -5557,7 +5569,11 @@ async function hydrateSessionUsage(id: string): Promise<void> {
         : {}),
       ...(revisions.models === revisionsBeforeFetch.models &&
       state.sessionUsageByModel === before.sessionUsageByModel
-        ? { sessionUsageByModel: usage.usageByModel ?? state.sessionUsageByModel }
+        ? {
+            sessionUsageByModel: usage.costHidden
+              ? withoutModelCosts(usage.usageByModel ?? state.sessionUsageByModel)
+              : (usage.usageByModel ?? state.sessionUsageByModel),
+          }
         : {}),
     }));
   } catch {
@@ -5745,9 +5761,13 @@ function reconnectStatusPatch(
   patch.backgroundTasks = session.backgroundTasks ?? [];
   if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
-  if (session.costHidden) patch.sessionCostUsd = null;
-  else if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
-  if (session.usageByModel != null) patch.sessionUsageByModel = session.usageByModel;
+  if (session.costHidden) {
+    patch.sessionCostUsd = null;
+    patch.sessionUsageByModel = withoutModelCosts(session.usageByModel ?? s.sessionUsageByModel);
+  } else {
+    if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
+    if (session.usageByModel != null) patch.sessionUsageByModel = session.usageByModel;
+  }
   if (!settleTurn) return patch;
   patch.sessionStatus = session.status;
   // `waiting` is a TURN-END snapshot (the turn finished; only background work
@@ -8689,7 +8709,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         patch.sessionUsageByModel = event.usageByModel;
       }
       const costChanged = event.totalCostUsd !== undefined || event.costHidden === true;
-      if (costChanged || event.usageByModel !== undefined) {
+      const modelsChanged = event.usageByModel !== undefined || event.costHidden === true;
+      if (costChanged || modelsChanged) {
         const entry =
           sourceConversationId === null
             ? undefined
@@ -8699,11 +8720,16 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           const revisions = sessionUsageRevisions.get(entry);
           sessionUsageRevisions.set(entry, {
             cost: (revisions?.cost ?? 0) + (costChanged ? 1 : 0),
-            models: (revisions?.models ?? 0) + (event.usageByModel !== undefined ? 1 : 0),
+            models: (revisions?.models ?? 0) + (modelsChanged ? 1 : 0),
           });
         }
       }
-      if (Object.keys(patch).length > 0) {
+      if (event.costHidden) {
+        applyToConversation((s) => ({
+          ...patch,
+          sessionUsageByModel: withoutModelCosts(event.usageByModel ?? s.sessionUsageByModel),
+        }));
+      } else if (Object.keys(patch).length > 0) {
         applyToConversation(patch);
       }
       return;
