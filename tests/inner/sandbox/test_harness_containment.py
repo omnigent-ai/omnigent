@@ -367,8 +367,9 @@ def test_harness_rejects_policy_features_it_cannot_honor(
     if message == "tcp_egress":
         assert failure.value.reason == "tcp_egress"
         assert failure.value.client_message == (
-            "The selected harness does not support os_env.sandbox.tcp_egress. "
-            "Use sys_os_shell or a sandboxed terminal."
+            "Inner harnesses cannot enforce worker-wide os_env.sandbox.tcp_egress. "
+            "sys_os_shell shares the worker policy. Terminal-local tcp_egress applies only "
+            "to terminal traffic; keep the required worker confinement."
         )
     resolve.assert_not_called()
     launcher.assert_not_called()
