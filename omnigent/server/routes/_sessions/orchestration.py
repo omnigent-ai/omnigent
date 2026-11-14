@@ -86,6 +86,7 @@ from omnigent.native.failure_telemetry import (
 from omnigent.native.input_diagnostics import (
     input_attributes,
     log_input_event,
+    native_input_identity,
     with_input_attributes,
 )
 from omnigent.native.native_coding_agents import (
@@ -3422,7 +3423,28 @@ async def _persist_external_conversation_item_unlocked(
     skipped_pending: list[pending_inputs.DrainedInput] = []
     uncertain_pending: list[pending_inputs.DrainedInput] = []
     held_older: list[pending_inputs.DrainedInput] = []
-    if drains_pending_inputs and item.type == "message" and isinstance(item.data, MessageData):
+    native_input_id = body.data.get("native_input_id")
+    native_agent = _native_coding_agent_for_session(conv)
+    has_native_input_identity = (
+        native_agent is not None
+        and native_agent.harness == "codex-native"
+        and bool(native_input_identity(native_input_id))
+    )
+    if drains_pending_inputs and has_native_input_identity:
+        # A named receipt can arrive out of order or after its queue entry expired.
+        # Neither case establishes that another queued message was lost.
+        drained = pending_inputs.resolve_native_client_id(
+            session_id, str(native_input_id), hold=True
+        )
+        match_method = "native_client_id"
+        if drained is not None:
+            cleared_pending_id = drained.pending_id
+            item = _merge_pending_file_blocks(item, drained.content)
+            if drained.created_by is not None and item.created_by is None:
+                item = item.model_copy(update={"created_by": drained.created_by})
+            if drained.stable_id is not None and item.stable_id is None:
+                item = item.model_copy(update={"stable_id": drained.stable_id})
+    elif drains_pending_inputs and item.type == "message" and isinstance(item.data, MessageData):
         # Match the mirror to its entry by text: a pasted message the TUI never
         # recorded leaves a stale head entry, and draining by position would
         # hand it to THIS message (see ``omnigent.runtime.pending_inputs``).
@@ -3430,7 +3452,6 @@ async def _persist_external_conversation_item_unlocked(
         # to the oldest entry, except for Kiro, whose prompt text is exact.
         text = _message_text(item.data.content) or ""
         agent_message_candidate = body.data.get("agent_message_candidate") is True
-        native_agent = _native_coding_agent_for_session(conv)
         matched = pending_inputs.resolve_matching_text(
             session_id,
             text,

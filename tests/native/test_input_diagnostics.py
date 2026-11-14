@@ -10,7 +10,31 @@ from omnigent.native.input_diagnostics import (
     input_attributes,
     input_delivery_scope,
     log_input_event,
+    native_input_client_id,
+    native_input_identity,
 )
+
+
+@pytest.mark.parametrize("stable_id", [None, "a" * 32])
+def test_native_client_identity_round_trip(stable_id: str | None) -> None:
+    attrs: dict[str, object] = {"delivery_attempt_id": "b" * 32, "content": "private"}
+    if stable_id is not None:
+        attrs["input_stable_id"] = stable_id
+    encoded = native_input_client_id(attrs)
+    assert native_input_identity(encoded) == (
+        {"input_stable_id": stable_id}
+        if stable_id is not None
+        else {"delivery_attempt_id": "b" * 32}
+    )
+    assert "private" not in str(encoded)
+    assert native_input_client_id({"input_stable_id": "a" * 32}) is None
+
+
+@pytest.mark.parametrize(
+    "client_id", [None, {}, "a" * 32, "omnigent:stable:private", "omnigent:attempt:" + "a" * 33]
+)
+def test_native_client_identity_ignores_foreign_or_malformed_values(client_id: object) -> None:
+    assert native_input_identity(client_id) == {}
 
 
 def test_input_attributes_reject_content_and_malformed_identifiers() -> None:
