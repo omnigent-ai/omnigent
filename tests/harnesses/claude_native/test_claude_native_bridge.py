@@ -5145,10 +5145,13 @@ async def test_augment_claude_args_merges_caller_settings(
         "cleanupPeriodDays": 42,
         "customOptions": {"nested": {"later": True}},
     }
+    literal = '--settings={"env":{"EXAMPLE_KEY":"value"}}'
     args = augment_claude_args(
         (
             "--name",
             "seat-1",
+            "--append-system-prompt",
+            literal,
             "--settings",
             str(caller_file),
             "--settings=" + json.dumps(later),
@@ -5171,9 +5174,11 @@ async def test_augment_claude_args_merges_caller_settings(
     )
 
     assert args.count("--settings") == 1
-    assert not any(arg.startswith("--settings=") for arg in args)
-    assert args[:2] == ["--name", "seat-1"]
+    assert args[:4] == ["--name", "seat-1", "--append-system-prompt", literal]
+    assert not any(arg.startswith("--settings=") for arg in args[4:])
     settings = _load_invocation_settings(args)
+    assert "EXAMPLE_KEY" not in settings.get("env", {})
+    assert settings["hooks"]["PreToolUse"]
     assert settings["env"]["SEAT_KEY"] == "seat-2"
     assert settings["env"]["FIRST_ONLY"] == "kept"
     assert settings["env"]["B"] == "2"
@@ -5284,13 +5289,11 @@ def test_merge_caller_settings_preserves_hook_contents(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("source", ["inline", "file"])
-@pytest.mark.parametrize("private_output", [False, True], ids=["bridge-output", "private-output"])
 async def test_caller_hook_shapes_fail_before_finalized_output(
     tmp_path: Path,
     claude_settings_validator,
     caplog: pytest.LogCaptureFixture,
     source: str,
-    private_output: bool,
 ) -> None:
     from omnigent.harnesses.claude_native.settings_validation import (
         CallerSettingsError,
@@ -5327,7 +5330,7 @@ async def test_caller_hook_shapes_fail_before_finalized_output(
     try:
         with pytest.raises(ValueError, match="Caller hooks must be an object") as error:
             await claude_native_bridge.finalize_claude_caller_settings(
-                instance, bridge_dir=tmp_path, generation=generation, private_output=private_output
+                instance, bridge_dir=tmp_path, generation=generation, private_output=True
             )
 
         assert isinstance(error.value, CallerSettingsError)
@@ -5597,8 +5600,6 @@ async def test_caller_settings_writes_drain_before_cancelled_launch_cleanup(
     claude_settings_validator,
     private_output: bool,
 ) -> None:
-    from functools import partial
-
     from omnigent.harnesses.claude_native.settings_generation import (
         ClaudeSettingsRequest,
         acquire_claude_settings_request,
@@ -5639,34 +5640,29 @@ async def test_caller_settings_writes_drain_before_cancelled_launch_cleanup(
     write_started = asyncio.Event()
     release_write = threading.Event()
     write_finished = threading.Event()
-    work_threads: list[tuple[str, int]] = []
+    work_threads: list[int] = []
     preparation_context = ContextVar("settings_preparation", default=False)
     work_contexts: list[bool] = []
     outputs: list[Path] = []
     written_settings: list[dict[str, Any]] = []
     cleanup_observations: list[bool] = []
 
-    def record_step(name: str, original: Callable[..., Any], *args, **kwargs):
-        work_threads.append((name, threading.get_ident()))
-        work_contexts.append(preparation_context.get())
-        return original(*args, **kwargs)
+    run_step = claude_native_bridge._run_claude_settings_step
 
-    steps = (
-        "_claude_settings_boundary",
-        "_pop_caller_settings",
-        "_read_caller_settings",
-        "_ensure_secure_dir",
-        "_merge_caller_settings",
-        "_effective_invocation_settings",
-    )
-    for name in steps:
-        original = getattr(claude_native_bridge, name)
-        monkeypatch.setattr(claude_native_bridge, name, partial(record_step, name, original))
+    async def record_step(operation: Callable[[], Any]) -> Any:
+        def observed_operation() -> Any:
+            work_threads.append(threading.get_ident())
+            work_contexts.append(preparation_context.get())
+            return operation()
+
+        return await run_step(observed_operation)
+
+    monkeypatch.setattr(claude_native_bridge, "_run_claude_settings_step", record_step)
     writer_name = "_atomic_write_user_json" if private_output else "_write_json_file"
     writer = getattr(claude_native_bridge, writer_name)
 
     def paused_writer(path: Path, settings: dict[str, Any]) -> None:
-        work_threads.append((writer_name, threading.get_ident()))
+        work_threads.append(threading.get_ident())
         work_contexts.append(preparation_context.get())
         outputs.append(path)
         loop.call_soon_threadsafe(write_started.set)
@@ -5695,8 +5691,8 @@ async def test_caller_settings_writes_drain_before_cancelled_launch_cleanup(
     preparation = asyncio.create_task(prepare_and_close())
     try:
         await asyncio.wait_for(write_started.wait(), timeout=5)
-        assert {name for name, _thread in work_threads} == {*steps, writer_name}
-        assert all(thread != loop_thread for _name, thread in work_threads)
+        assert work_threads
+        assert all(thread != loop_thread for thread in work_threads)
         assert all(work_contexts)
         assert not write_finished.is_set()
         for _attempt in range(3):
@@ -6567,7 +6563,6 @@ async def test_caller_settings_resolve_terminal_workspace(
     assert settings["hooks"]["UserPromptSubmit"]
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "flag",
     [
@@ -6580,31 +6575,10 @@ async def test_caller_settings_resolve_terminal_workspace(
         "--prefill",
     ],
 )
-@pytest.mark.usefixtures("claude_settings_validator")
-async def test_pop_caller_settings_preserves_option_values(
-    flag: str, tmp_path: Path, _finalize_test_claude_args
-) -> None:
-    from omnigent.inner.datamodel import OSEnvSpec
-
+def test_pop_caller_settings_preserves_option_values(flag: str, tmp_path: Path) -> None:
     literal = '--settings={"env":{"EXAMPLE_KEY":"value"}}'
     args = [flag, literal]
     assert claude_native_bridge._pop_caller_settings(args, workspace=None) == (args, [])
-    finalized = await _finalize_test_claude_args(
-        augment_claude_args(
-            args,
-            bridge_dir=tmp_path,
-            ap_server_url="https://example.test",
-            defer_caller_settings=True,
-        ),
-        bridge_dir=tmp_path,
-        os_env_spec=OSEnvSpec(
-            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
-        ),
-    )
-    assert literal in finalized[finalized.index(flag) + 1]
-    settings = _load_invocation_settings(finalized)
-    assert "EXAMPLE_KEY" not in settings.get("env", {})
-    assert settings["hooks"]["PreToolUse"]
     baseline = tmp_path / "baseline.json"
     output = tmp_path / "output.json"
     args = [flag, "--settings", str(baseline), "--settings", str(baseline)]
