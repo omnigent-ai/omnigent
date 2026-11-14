@@ -5,6 +5,8 @@
 // that holds a draft (a send intent, not a verdict).
 
 import { fireEvent, render, renderHook, screen } from "@testing-library/react";
+import type { ReactNode } from "react";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const submitApproval = vi.fn();
@@ -17,6 +19,11 @@ vi.mock("@/lib/embedded", () => ({ useIsEmbedded: () => embedded }));
 // The drawer's own tree stands in as one folder button.
 vi.mock("@/shell/FilesPanel", () => ({
   FilesPanel: () => <button type="button">src</button>,
+}));
+vi.mock("@/shell/WorkspaceUploads", () => ({
+  WorkspaceUploadProvider: ({ children }: { children: ReactNode }) => children,
+  WorkspaceUploadDropRoot: ({ children }: { children: ReactNode }) => children,
+  UploadsTray: () => null,
 }));
 
 import { setEmbedRoot } from "@/lib/host";
@@ -354,16 +361,26 @@ describe("useApproveHotkey Esc", () => {
           <div data-composer-card="">
             <textarea aria-label="composer" />
           </div>
-          <FilesPanelDrawer
-            open
-            onClose={onClose}
-            onFileSelect={vi.fn()}
-            flatView={false}
-            showHidden={false}
-            onShowHiddenChange={vi.fn()}
-            sort="recent"
-            onSortChange={vi.fn()}
-          />
+          {/* The drawer mounts its tree inside the session's upload provider. */}
+          <MemoryRouter initialEntries={["/c/s"]}>
+            <Routes>
+              <Route
+                path="/c/:conversationId"
+                element={
+                  <FilesPanelDrawer
+                    open
+                    onClose={onClose}
+                    onFileSelect={vi.fn()}
+                    flatView={false}
+                    showHidden={false}
+                    onShowHiddenChange={vi.fn()}
+                    sort="recent"
+                    onSortChange={vi.fn()}
+                  />
+                }
+              />
+            </Routes>
+          </MemoryRouter>
         </>,
       );
       const target =

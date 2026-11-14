@@ -688,3 +688,24 @@ describe("FolderTree truncated search", () => {
     ).toBeInTheDocument();
   });
 });
+
+describe("FolderTree upload destinations", () => {
+  it("exposes folder destinations and file parents on mounted rows", () => {
+    renderTree({
+      conversationId: "upload-row-metadata",
+      files: [file("src/assets/existing.txt"), file("root.txt")],
+    });
+    expect(screen.getByText("assets/").closest("[data-drop-dir]")).toHaveAttribute(
+      "data-drop-dir",
+      "src/assets",
+    );
+    expect(screen.getByText("existing.txt").closest("[data-drop-dir]")).toHaveAttribute(
+      "data-drop-dir",
+      "src/assets",
+    );
+    expect(screen.getByText("root.txt").closest("[data-drop-dir]")).toHaveAttribute(
+      "data-drop-dir",
+      "",
+    );
+  });
+});
