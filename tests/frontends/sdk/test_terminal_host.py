@@ -8,16 +8,19 @@ by the pty-driver tests in this directory).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import sys
 from collections.abc import Iterable
+from typing import Any
 
 import pytest
 from omnigent_client import child_summary_busy
 from omnigent_ui_sdk.terminal._formatter import StreamingText
 from omnigent_ui_sdk.terminal._host import TerminalHost
 from prompt_toolkit.output import DummyOutput
+from prompt_toolkit.utils import get_cwidth
 from rich.text import Text
 
 
@@ -1755,3 +1758,387 @@ def test_subagent_finished_node_kept_visible_in_selector() -> None:
     node = host._subagents["conv_c1"]
     assert host._subagent_visible(node, host._monotonic()) is True
     assert host._subagent_status_label(node) == "Done"
+
+
+# ── Inline question selector ──────────────────────────────────
+
+
+def _env_question(**overrides: Any) -> Any:
+    from omnigent_ui_sdk.terminal import QuestionSpec
+
+    fields: dict[str, Any] = {
+        "key": "Env?",
+        "question": "Which environment?",
+        "options": (("dev", ""), ("staging", ""), ("prod", "")),
+    }
+    fields.update(overrides)
+    return QuestionSpec(**fields)
+
+
+def _picker_text(picker: Any, width: int = 100) -> str:
+    return "".join(text for _, text in picker.render(width))
+
+
+@pytest.mark.asyncio
+async def test_question_picker_answers_follow_the_web_form() -> None:
+    from omnigent_ui_sdk.terminal._questions import QuestionPicker
+
+    single = QuestionPicker([_env_question()])
+    single.move(-1)  # wraps to the "Type something" row
+    assert single.on_custom_row()
+    assert single.answer("") is False, "an empty custom answer must not count"
+    assert single.answer("  qa  ") is True
+    assert await single.future == {"Env?": "qa"}
+
+    multi = QuestionPicker([_env_question(multi_select=True)])
+    multi.move(1)
+    assert multi.answer("") is True, "Enter with nothing checked takes the highlight"
+    assert await multi.future == {"Env?": ["staging"]}
+
+    typed = QuestionPicker([_env_question(multi_select=True)])
+    typed.toggle()
+    assert typed.answer("eu-1") is True
+    assert await typed.future == {"Env?": ["dev", "eu-1"]}
+
+    closed = QuestionPicker([_env_question(allow_custom=False)])
+    closed.note_typing("x")
+    assert closed.row_count() == 3 and not closed.on_custom_row()
+    assert "Type something" not in _picker_text(closed)
+    # Typed text is never turned into the highlighted option ("No" must not
+    # submit a highlighted "Yes").
+    assert closed.answer("No, stay in Plan mode") is False
+    assert closed.answer("") is True
+    assert await closed.future == {"Env?": "dev"}
+
+    free_multi = QuestionPicker([_env_question(options=(), multi_select=True)])
+    assert free_multi.answer("eu-west") is True
+    assert await free_multi.future == {"Env?": ["eu-west"]}
+
+    fixed = QuestionPicker([_env_question(options=(), allow_custom=False, text_default="fixed")])
+    assert fixed.answer("fixed CHANGED") is True, "a fixed default answers as it is"
+    assert await fixed.future == {"Env?": "fixed"}
+
+    editor = QuestionPicker([_env_question(options=(), text_default="draft")])
+    assert editor.answer("") is True, "an editor answer may be empty"
+    assert await editor.future == {"Env?": ""}
+
+
+@pytest.mark.asyncio
+async def test_question_picker_walks_several_questions() -> None:
+    from omnigent_ui_sdk.terminal._questions import QuestionPicker
+
+    picker = QuestionPicker([_env_question(), _env_question(key="Region?", question="Region?")])
+    assert "question 1 of 2" in _picker_text(picker)
+    picker.move(2)
+    assert picker.answer("") is True
+    assert not picker.future.done()
+    assert "question 2 of 2" in _picker_text(picker)
+    assert picker.row == 0, "each question starts on its first option"
+    assert picker.answer("") is True
+    assert await picker.future == {"Env?": "prod", "Region?": "dev"}
+
+
+@pytest.mark.asyncio
+async def test_question_picker_scrolls_long_lists_and_truncates_wide_lines() -> None:
+    from omnigent_ui_sdk.terminal._questions import QuestionPicker
+
+    many = QuestionPicker(
+        [_env_question(options=tuple((f"opt{i}", "") for i in range(12)), allow_custom=False)]
+    )
+    many.move(-1)  # wraps to the last option, which scrolls into view
+    shown = _picker_text(many)
+    assert "▸ 12. opt11" in shown and "1. opt0" not in shown
+    wide = QuestionPicker([_env_question(options=(("界" * 80, ""),))])
+    assert all(get_cwidth(text.rstrip("\n")) <= 40 for _, text in wide.render(40))
+    # Question text wraps by terminal cells without dropping a character...
+    from omnigent_ui_sdk.terminal._questions import _wrap
+
+    cjk = "你好世界" * 20
+    half = "你好世界" * 10  # 40 characters, but 80 cells
+    for question_text in (cjk, f"Deploy {cjk} now?", f"{half} {half}"):
+        wrapped = _wrap(question_text, 76)
+        assert all(get_cwidth(line) <= 76 for line in wrapped)
+        assert "".join(wrapped).replace(" ", "") == question_text.replace(" ", "")
+    # ...and the selector shows up to three rows of it, ending in "…" when cut
+    # (the host prints a longer question in full above the selector).
+    fits = QuestionPicker([_env_question(question=cjk)])
+    assert not fits.question_overflows(80)
+    assert "".join(t.strip() for s, t in fits.render(80) if s == "") == cjk
+    long_question = QuestionPicker([_env_question(question=f"Deploy {cjk} now?")])
+    assert long_question.question_overflows(80)
+    shown = [t.rstrip("\n") for s, t in long_question.render(80) if s == ""]
+    assert len(shown) == 3 and shown[-1].endswith("…")
+    assert all(get_cwidth(line) <= 80 for line in shown)
+
+
+@pytest.mark.asyncio
+async def test_question_picker_fits_the_rows_it_is_given() -> None:
+    from omnigent_ui_sdk.terminal._questions import QuestionPicker
+
+    picker = QuestionPicker(
+        [
+            _env_question(
+                question="Pick one " * 40,
+                options=tuple((f"opt{i}", "") for i in range(12)),
+            )
+        ]
+    )
+    for max_rows in (4, 6, 10):
+        for _ in range(12):  # every highlight position, scrolling as it goes
+            rendered = picker.render(80, max_rows)
+            assert len(rendered) <= max_rows
+            assert any(text.startswith(" ▸ ") for _, text in rendered), "highlight scrolled away"
+            picker.move(1)
+    # A taller window shows a full page of options again, whatever the scroll.
+    option_rows = [t for _, t in picker.render(80, 30) if re.match(r" [▸ ] \d+\. opt", t)]
+    assert len(option_rows) == 8
+
+
+async def _press(host: TerminalHost, raw: str = "", *presses: Any) -> None:
+    """Feed *raw* terminal input, then *presses*, through the prompt's merged bindings."""
+    from prompt_toolkit.application.current import create_app_session
+    from prompt_toolkit.input.vt100_parser import Vt100Parser
+
+    app = host._prompt.app
+    app.timeoutlen = None  # no prefix-key flush task: every sequence here is complete
+    parsed: list[Any] = []
+    parser = Vt100Parser(parsed.append)
+    parser.feed(raw)
+    parser.flush()
+    with create_app_session() as session:
+        session.app = app
+        for press in [*parsed, *presses]:
+            app.key_processor.feed(press)
+        app.key_processor.process_keys()
+    await asyncio.sleep(0)
+
+
+async def _open(host: TerminalHost, *questions: Any) -> asyncio.Task[Any]:
+    asking = asyncio.create_task(host.ask_questions(list(questions)))
+    await asyncio.sleep(0)
+    return asking
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dismissed", [False, True], ids=["answered", "dismissed"])
+async def test_answers_never_reach_the_chat_line_or_its_undo(dismissed: bool) -> None:
+    host = TerminalHost(model_name="test")
+    chat = host._prompt.default_buffer
+    await _press(host, "draft")
+
+    asking = await _open(host, _env_question())
+    assert host._prompt.app.layout.current_buffer is host._answer_buffer
+    await _press(host, "synthetic")
+    assert chat.text == "draft", "typing reached the chat line"
+    if dismissed:
+        host.dismiss_questions()  # what Esc does
+    else:
+        await _press(host, "\r")
+
+    assert await asking == (None if dismissed else {"Env?": "synthetic"})
+    assert host._prompt.app.layout.current_buffer is chat
+    assert chat.text == "draft"
+    await _press(host, "\x1f")  # Ctrl+_ undoes the draft's own typing
+    assert chat.text and "draft".startswith(chat.text), chat.text
+    assert host._answer_buffer.text == ""
+
+
+@pytest.mark.asyncio
+async def test_answer_pastes_and_clears_leave_the_chat_pastes_alone() -> None:
+    # Placeholders belong to the chat draft's registry; an answer takes the
+    # pasted text itself, and Ctrl+C on an answer clears only the answer.
+    from prompt_toolkit.key_binding.key_processor import KeyPress
+    from prompt_toolkit.keys import Keys
+
+    host = TerminalHost(model_name="test")
+    draft_paste = host._register_pasted_block("draft paste " * 30)
+    host._prompt.default_buffer.text = f"see {draft_paste.placeholder}"
+
+    asking = await _open(host, _env_question())
+    await _press(host, "typo\x03")  # Ctrl+C
+    assert host._answer_buffer.text == ""
+    assert host._pasted_blocks == [draft_paste]
+    await _press(host, "", KeyPress(Keys.BracketedPaste, "answer paste " * 30))
+    await _press(host, "\r")
+
+    assert await asking == {"Env?": ("answer paste " * 30).strip()}
+    assert host._pasted_blocks == [draft_paste]
+    assert host._prompt.default_buffer.text == f"see {draft_paste.placeholder}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("question", "shown", "expected"),
+    [
+        (_env_question(allow_custom=False), "", {"Env?": "dev"}),
+        # A fixed default (``isOther: false``) is shown but can't be edited.
+        (
+            _env_question(options=(), allow_custom=False, text_default="fixed"),
+            "fixed",
+            {"Env?": "fixed"},
+        ),
+    ],
+    ids=["options-only", "fixed-default"],
+)
+async def test_a_question_that_takes_no_typed_answer_rejects_typing(
+    question: Any, shown: str, expected: Any
+) -> None:
+    host = TerminalHost(model_name="test")
+    asking = await _open(host, question)
+    await _press(host, "CHANGED")
+    assert host._answer_buffer.text == shown and host._prompt.default_buffer.text == ""
+    await _press(host, "\r")
+    assert await asking == expected
+
+
+@pytest.mark.asyncio
+async def test_replacing_an_open_selector_starts_a_fresh_answer_line() -> None:
+    host = TerminalHost(model_name="test")
+    first = await _open(host, _env_question())
+    await _press(host, "typed into the first selector")
+    second = await _open(host, _env_question(key="Region?"))
+    assert await first is None
+    assert host._answer_buffer.text == ""
+    await _press(host, "\x1f")  # nothing of the first answer to undo back into
+    assert host._answer_buffer.text == ""
+    await _press(host, "\r")
+    assert await second == {"Region?": "dev"}
+
+
+@pytest.mark.asyncio
+async def test_selector_owns_the_arrow_keys_while_open() -> None:
+    # Down on an empty line would otherwise open the sub-agents menu.
+    host = TerminalHost(model_name="test")
+    host.has_any_subagents = lambda: True  # type: ignore[method-assign]
+    asking = await _open(host, _env_question())
+    await _press(host, "\x1b[B")  # Down
+    assert host._question_picker is not None and host._question_picker.row == 1
+    assert not host._subagent_menu_open
+    await _press(host, "\x1b[A")  # Up
+    assert host._question_picker.row == 0
+    host.dismiss_questions()
+    await asking
+
+
+@pytest.mark.asyncio
+async def test_editor_question_leaves_the_arrows_to_its_text(tmp_path: Any) -> None:
+    # No rows to move through: Up moves the cursor in a multi-line prefill,
+    # and never swaps the answer for an old chat message from history.
+    host = TerminalHost(model_name="test", history_file=str(tmp_path / "history"))
+    host._prompt.default_buffer.history.append_string("an old chat message")
+    asking = await _open(host, _env_question(options=(), text_default="line one\nline two"))
+    await _press(host, "\x1b[A\x1b[A")
+    assert host._answer_buffer.text == "line one\nline two"
+    assert host._answer_buffer.document.cursor_position_row == 0
+    await _press(host, "\r")
+    assert await asking == {"Env?": "line one\nline two"}
+
+
+@pytest.mark.asyncio
+async def test_the_answer_line_shows_only_while_its_text_is_the_answer() -> None:
+    # Single-select: the typed text belongs to "Type something", so moving onto
+    # an option hides it and Enter sends the option shown, not hidden text.
+    host = TerminalHost(model_name="test")
+    single = await _open(host, _env_question())
+    assert not host._answer_line_shown()
+    await _press(host, "teal")
+    assert host._question_picker is not None and host._question_picker.on_custom_row()
+    assert host._answer_line_shown()
+    await _press(host, "\x1b[A")  # Up onto "prod"
+    assert not host._answer_line_shown()
+    await _press(host, "\r")
+    assert await single == {"Env?": "prod"}
+
+    # Multi-select sends the typed text with the checked options, so it stays.
+    multi = await _open(host, _env_question(multi_select=True))
+    await _press(host, "eu-1\x1b[A ")  # type, Up onto "prod", Space checks it
+    assert host._answer_line_shown()
+    await _press(host, "\r")
+    assert await multi == {"Env?": ["prod", "eu-1"]}
+
+
+@pytest.mark.asyncio
+async def test_alt_hash_neither_edits_nor_accepts_an_answer() -> None:
+    # Insert-comment would prefix the answer with "#" and accept it.
+    host = TerminalHost(model_name="test")
+    asking = await _open(host, _env_question())
+    picker = host._question_picker
+    assert picker is not None
+    await _press(host, "teal\x1b#")
+    assert not picker.future.done(), "Alt+# accepted the answer"
+    assert host._answer_buffer.text == "teal"
+    await _press(host, "\r")
+    assert await asking == {"Env?": "teal"}
+
+
+@pytest.mark.asyncio
+async def test_a_long_question_is_printed_in_full_and_the_selector_fits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    printed: list[str] = []
+    monkeypatch.setattr(sys.stdout, "write", lambda data: printed.append(data) or len(data))
+    monkeypatch.setattr(sys.stdout, "flush", lambda: None)
+    host = TerminalHost(model_name="test")
+    words = [f"step{i}" for i in range(400)]
+    asking = await _open(host, _env_question(question=" ".join(words)))
+
+    shown = re.sub(r"\x1b\[[0-9;]*m", "", "".join(printed)).split()
+    assert [word for word in shown if word.startswith("step")] == words
+    assert host._question_picker_line_count() <= host._picker_rows()
+    host.dismiss_questions()
+    await asking
+
+
+@pytest.mark.asyncio
+async def test_the_chat_draft_shrinks_to_one_row_while_a_question_is_open() -> None:
+    # A tall draft would otherwise push the selector off the screen.
+    from prompt_toolkit.layout.controls import BufferControl
+
+    host = TerminalHost(model_name="test")
+    chat = host._prompt.default_buffer
+    chat.text = "\n".join(f"line {i}" for i in range(30))
+    chat_window = next(
+        window
+        for window in host._prompt.app.layout.find_all_windows()
+        if isinstance(window.content, BufferControl) and window.content.buffer is chat
+    )
+    assert chat_window.height().preferred > 1
+    asking = await _open(host, _env_question())
+    assert chat_window.height().preferred == 1
+    host.dismiss_questions()
+    await asking
+    assert chat_window.height().preferred > 1
+
+
+@pytest.mark.parametrize(
+    ("question", "typed", "after_ctrl_c"),
+    [
+        (_env_question(), "teal", ""),
+        (_env_question(options=(), text_default="draft"), " edits", "draft"),
+        # Ctrl+C never wipes a fixed default that Enter would still send.
+        (_env_question(options=(), allow_custom=False, text_default="fixed"), "x", "fixed"),
+    ],
+    ids=["typed", "editor", "fixed-default"],
+)
+@pytest.mark.asyncio
+async def test_ctrl_c_returns_an_answer_to_its_question_text(
+    question: Any, typed: str, after_ctrl_c: str
+) -> None:
+    host = TerminalHost(model_name="test")
+    asking = await _open(host, question)
+    await _press(host, typed + "\x03")
+    assert host._answer_buffer.text == after_ctrl_c
+    assert host._question_picker is not None, "Ctrl+C closed the question"
+    host.dismiss_questions()
+    await asking
+
+
+@pytest.mark.asyncio
+async def test_question_with_options_ignores_a_prefill() -> None:
+    # A prefill would read as typing and move the highlight to "Type
+    # something"; only option-less (editor) questions start prefilled.
+    host = TerminalHost(model_name="test")
+    asking = await _open(host, _env_question(text_default="draft"))
+    assert host._answer_buffer.text == ""
+    await _press(host, "\r")
+    assert await asking == {"Env?": "dev"}

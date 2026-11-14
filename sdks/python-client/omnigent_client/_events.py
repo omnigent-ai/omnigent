@@ -196,6 +196,11 @@ class ElicitationRequest:
         consumer can route the verdict back to the child that parked on
         it. ``None`` means resolve against the session the event arrived
         on.
+    :param ask_user_question: Producer-supplied extra for question prompts:
+        ``{"questions": [...]}`` in the shape the web question form renders
+        (each with ``question``, ``options``, ``multiSelect``, optional
+        ``id``/``header``/``isOther``/``textInput``). ``None`` for plain
+        approvals.
     """
 
     elicitation_id: str
@@ -207,6 +212,7 @@ class ElicitationRequest:
     content_preview: str
     url: str | None = None
     target_session_id: str | None = None
+    ask_user_question: dict[str, object] | None = None
 
 
 @dataclass
