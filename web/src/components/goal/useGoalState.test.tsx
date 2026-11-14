@@ -1,5 +1,6 @@
 import type * as GoalApiModule from "@/lib/goalApi";
 
+import { useEffect } from "react";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getGoal, type Goal } from "@/lib/goalApi";
@@ -48,6 +49,7 @@ describe("useGoalState", () => {
     const { result } = renderHook(() => useGoalState("conv", true));
     await act(async () => {});
     expect(mockGetGoal).toHaveBeenNthCalledWith(1, "conv", { strict: false });
+    expect(result.current.goal).toEqual(GOAL);
 
     await act(() => vi.advanceTimersByTimeAsync(5_000));
     expect(mockGetGoal).toHaveBeenNthCalledWith(2, "conv", { strict: false });
@@ -61,6 +63,58 @@ describe("useGoalState", () => {
     expect(mockGetGoal).toHaveBeenNthCalledWith(5, "conv", { strict: true });
     expect(result.current.goal).toEqual(GOAL);
   });
+
+  it.each([GOAL, null])(
+    "deduplicates equal background snapshots without losing confirmation or ordering (%j)",
+    async (goal) => {
+      vi.useFakeTimers();
+      const olderRead = deferredGoalRead();
+      const committed = vi.fn();
+      mockGetGoal.mockImplementation(async () => ({ goal: goal ? { ...goal } : null }));
+      const { result } = renderHook(() => {
+        const state = useGoalState("conv", true);
+        useEffect(committed);
+        return state;
+      });
+      await act(async () => {});
+      const initialGoal = result.current.goal;
+      const initialRevision = result.current.goalRevision;
+      const initialCommits = committed.mock.calls.length;
+
+      await act(() => vi.advanceTimersByTimeAsync(5_000));
+      await act(async () => window.dispatchEvent(new Event("focus")));
+
+      expect(result.current.goal).toBe(initialGoal);
+      expect(result.current.goalRevision).toBe(initialRevision);
+      expect(committed).toHaveBeenCalledTimes(initialCommits);
+      mockGetGoal.mockReturnValueOnce(olderRead.promise);
+      const refresh = result.current.refreshGoal();
+
+      await act(async () => window.dispatchEvent(new Event("focus")));
+      const confirmedRevision = result.current.goalRevision;
+      const confirmedCommits = committed.mock.calls.length;
+      expect(confirmedRevision).toBeGreaterThan(initialRevision);
+      await act(async () => window.dispatchEvent(new Event("focus")));
+      await act(async () => {
+        olderRead.resolve({ goal: goal ? null : GOAL });
+        await refresh;
+      });
+
+      expect(result.current.goal).toEqual(goal);
+      expect(result.current.goalRevision).toBe(confirmedRevision);
+      expect(committed).toHaveBeenCalledTimes(confirmedCommits);
+      const changedGoal = goal ? { ...goal, tokensUsed: goal.tokensUsed + 1 } : GOAL;
+      mockGetGoal.mockResolvedValue({ goal: changedGoal });
+      await act(async () => window.dispatchEvent(new Event("focus")));
+      expect(result.current.goal).toEqual(changedGoal);
+      expect(result.current.goalRevision).toBeGreaterThan(confirmedRevision);
+      const changedRevision = result.current.goalRevision;
+
+      await act(() => result.current.refreshGoal());
+
+      expect(result.current.goalRevision).toBeGreaterThan(changedRevision);
+    },
+  );
 
   it("accepts an idle background null but reports an unavailable explicit read through the real API", async () => {
     vi.useFakeTimers();
@@ -585,15 +639,6 @@ describe("useGoalState", () => {
     } finally {
       visibility.mockRestore();
     }
-  });
-
-  it("loads the goal when enabled for a conversation", async () => {
-    mockGetGoal.mockResolvedValueOnce({ goal: GOAL });
-
-    const { result } = renderHook(() => useGoalState("conv", true));
-
-    await waitFor(() => expect(result.current.goal).toEqual(GOAL));
-    expect(mockGetGoal).toHaveBeenCalledWith("conv", { strict: false });
   });
 
   it("starts empty on read errors and clears state when disabled", async () => {

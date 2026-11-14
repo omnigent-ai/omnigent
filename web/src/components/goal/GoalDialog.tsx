@@ -25,7 +25,7 @@ import {
   type GoalStatusUpdate,
 } from "@/lib/goalApi";
 import { getBasePath } from "@/lib/basePath";
-import { getOmnigentHostConfig, getOmnigentServerIdentity } from "@/lib/host";
+import { getOmnigentServerIdentity } from "@/lib/host";
 import { cn } from "@/lib/utils";
 import {
   canPauseGoal,
@@ -55,7 +55,7 @@ interface GoalMutationListener {
 // A request keeps its session ownership across dialog lifetimes.
 const goalMutations = new Map<GoalApiScope, Map<string, GoalMutation>>();
 const goalMutationListeners = new Set<GoalMutationListener>();
-const standaloneGoalApiScope = {};
+const anonymousGoalApiScope = {};
 
 function getGoalMutation(scope: GoalApiScope, key: string): GoalMutation | null {
   return goalMutations.get(scope)?.get(key) ?? null;
@@ -469,8 +469,8 @@ function useGoalDialogState({
   GoalDialogProps,
   "open" | "conversationId" | "goal" | "goalRevision" | "onGoalChange" | "refreshGoal"
 >): GoalDialogState {
-  const apiScope =
-    getOmnigentServerIdentity() ?? getOmnigentHostConfig().fetcher ?? standaloneGoalApiScope;
+  // Anonymous embeds keep their owner when a transport callback is recreated.
+  const apiScope = getOmnigentServerIdentity() ?? anonymousGoalApiScope;
   const mutationKey = JSON.stringify(["codex_goal", getBasePath(), conversationId]);
   const subscribe = useCallback(
     (notify: () => void) =>

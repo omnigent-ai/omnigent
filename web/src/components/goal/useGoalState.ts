@@ -4,6 +4,21 @@ import { getGoal, type Goal } from "@/lib/goalApi";
 const GOAL_POLL_INTERVAL_MS = 5_000;
 const GOAL_POLL_MAX_DELAY_MS = 60_000;
 
+function goalsEqual(previous: Goal | null, next: Goal | null): boolean {
+  return (
+    previous === next ||
+    (previous !== null &&
+      next !== null &&
+      previous.objective === next.objective &&
+      previous.status === next.status &&
+      previous.tokenBudget === next.tokenBudget &&
+      previous.tokensUsed === next.tokensUsed &&
+      previous.timeUsedSeconds === next.timeUsedSeconds &&
+      previous.createdAt === next.createdAt &&
+      previous.updatedAt === next.updatedAt)
+  );
+}
+
 interface UseGoalStateResult {
   goal: Goal | null;
   goalRevision: number;
@@ -33,6 +48,7 @@ export function useGoalState(
   } | null>(null);
   const updateVersion = useRef(0);
   const lastSuccessfulVersion = useRef(0);
+  const lastExplicitReadVersion = useRef(0);
   const activeBinding = useRef<GoalBinding | null>(null);
   const owner = useMemo(
     () => (enabled && conversationId ? { conversationId } : null),
@@ -69,6 +85,7 @@ export function useGoalState(
         throw new Error("Goal is unavailable for this session.");
       }
       const version = ++updateVersion.current;
+      if (strict) lastExplicitReadVersion.current = version;
       const isCurrent = () =>
         activeBinding.current === binding && version > lastSuccessfulVersion.current;
       try {
@@ -76,11 +93,19 @@ export function useGoalState(
         if (response.available === false) return;
         if (isCurrent()) {
           lastSuccessfulVersion.current = version;
-          setSnapshot((current) =>
-            activeBinding.current === binding
-              ? { binding, goal: response.goal, revision: version }
-              : current,
-          );
+          setSnapshot((current) => {
+            if (activeBinding.current !== binding) return current;
+            // An equal response still confirms recovery after an explicit read attempt.
+            if (
+              !strict &&
+              current?.binding === binding &&
+              current.revision >= lastExplicitReadVersion.current &&
+              goalsEqual(current.goal, response.goal)
+            ) {
+              return current;
+            }
+            return { binding, goal: response.goal, revision: version };
+          });
         }
       } catch (error) {
         if (activeBinding.current === binding && lastSuccessfulVersion.current < version)
