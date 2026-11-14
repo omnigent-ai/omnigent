@@ -29,10 +29,12 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
 from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
+from sqlalchemy.dialects.postgresql import VARCHAR as PGVarchar
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from omnigent.db.bounded_binary import BoundedBinary
 from omnigent.db.compression import CompressedText
+from omnigent.db.envelope import EnvelopedText
 from omnigent.entities.comment import COMMENT_ANCHOR_MAX_STORED_BYTES
 from omnigent.util.uuid import InvalidUuidError as InvalidUuidError
 from omnigent.util.uuid import normalize_uuid as normalize_uuid
@@ -652,6 +654,91 @@ def _on_sqlite_family(
     """
     del ddl, target, bind, tables, state, compiler, checkfirst
     return dialect.name in ("sqlite", "cloudflare_d1")
+
+
+# Largest stored ``memories.content`` and ``memories.description`` envelopes,
+# framing included. Content stays under the 16 KB per-value limit for new columns;
+# a description is 512 characters of up to four bytes each, plus framing.
+MEMORY_CONTENT_MAX_STORED_BYTES = 16_383
+MEMORY_DESCRIPTION_MAX_STORED_BYTES = 2_100
+# A user id of up to 128 characters, plus an owner-kind prefix such as ``user:``.
+MEMORY_ACTOR_ID_MAX_LENGTH = 160
+# Exact comparison on MySQL, whose default collation ignores case and accents and
+# would let two owners share one memory.
+_MEMORY_ACTOR_ID = String(MEMORY_ACTOR_ID_MAX_LENGTH).with_variant(
+    MySQLVarchar(MEMORY_ACTOR_ID_MAX_LENGTH, charset="utf8mb4", collation="utf8mb4_0900_bin"),
+    "mysql",
+)
+# Byte-order comparison without trailing-space padding on every engine (SQLite and
+# CockroachDB compare bytes by default), so each distinct path is its own key and
+# the paths under a prefix form one contiguous primary-key range.
+_MEMORY_PATH = (
+    String(512)
+    .with_variant(MySQLVarchar(512, charset="utf8mb4", collation="utf8mb4_0900_bin"), "mysql")
+    .with_variant(PGVarchar(512, collation="C"), "postgresql")
+)
+
+
+class SqlMemory(OmnigentBase):
+    """
+    Long-term memory entries, one row per ``(workspace, actor, path)``.
+
+    :param workspace_id: Tenant scope; stamped from :func:`current_workspace_id`.
+    :param actor_id: Whose memory this is, e.g. ``"user:alice"``.
+    :param path: Absolute entry path, e.g. ``"/projects/api/gotchas"``, compared
+        byte for byte.
+    :param content: Entry body, in an opaque storage envelope.
+    :param description: One-line summary returned with listings, in an opaque
+        storage envelope.
+    :param created_at: Unix epoch seconds of the first write.
+    :param updated_at: Unix epoch seconds of the last write.
+    """
+
+    __tablename__ = "memories"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, nullable=False, default=current_workspace_id
+    )
+    actor_id: Mapped[str] = mapped_column(_MEMORY_ACTOR_ID, primary_key=True)
+    path: Mapped[str] = mapped_column(_MEMORY_PATH, primary_key=True)
+    content: Mapped[str] = mapped_column(
+        EnvelopedText(MEMORY_CONTENT_MAX_STORED_BYTES), nullable=False
+    )
+    description: Mapped[str | None] = mapped_column(
+        EnvelopedText(MEMORY_DESCRIPTION_MAX_STORED_BYTES), nullable=True
+    )
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        # SQLite ignores declared lengths and types, so bound every column there:
+        # strings at up to four bytes per character, envelopes at their stored size.
+        CheckConstraint(
+            "typeof(workspace_id) = 'integer'", name="ck_memories_workspace_id_integer"
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            f"length(CAST(actor_id AS BLOB)) <= {4 * MEMORY_ACTOR_ID_MAX_LENGTH}",
+            name="ck_memories_actor_id_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "length(CAST(path AS BLOB)) <= 2048", name="ck_memories_path_bytes"
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            f"length(CAST(content AS BLOB)) <= {MEMORY_CONTENT_MAX_STORED_BYTES}",
+            name="ck_memories_content_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "description IS NULL OR "
+            f"length(CAST(description AS BLOB)) <= {MEMORY_DESCRIPTION_MAX_STORED_BYTES}",
+            name="ck_memories_description_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "typeof(created_at) = 'integer'", name="ck_memories_created_at_integer"
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "typeof(updated_at) = 'integer'", name="ck_memories_updated_at_integer"
+        ).ddl_if(callable_=_on_sqlite_family),
+    )
 
 
 class SqlConversationMetadata(OmnigentBase):
