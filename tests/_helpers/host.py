@@ -57,7 +57,13 @@ def _find_routable_host(
             continue
         if any(value is not None and row.get(key) != value for key, value in wanted.items()):
             continue
-        status = _tunnel_probe_status(client, str(row["host_id"]), base_url)
+        try:
+            status = _tunnel_probe_status(client, str(row["host_id"]), base_url)
+        except httpx.TransportError as exc:
+            # One host's dead tunnel mustn't stop a later matching host from counting.
+            failure = type(exc).__name__
+            reason = f"host {row['host_id']} online but its tunnel probe raised {failure}"
+            continue
         if status == 200:
             return row, ""
         reason = f"host {row['host_id']} online but its tunnel probe returned {status}"
@@ -75,7 +81,8 @@ def routable_host(
     """Return the first online host row matching the filters whose tunnel answers.
 
     Rows are filtered by whichever of *host_id*, *name* and *owner* are given.
-    Returns ``None`` while no match is online and registered; HTTP errors propagate.
+    Returns ``None`` while no match is online and registered, including when a
+    request answers non-200; a transport error on the hosts list propagates.
     """
     row, _ = _find_routable_host(
         client, base_url=base_url, host_id=host_id, name=name, owner=owner
@@ -95,8 +102,7 @@ def wait_for_routable_host(
 ) -> dict[str, Any]:
     """Poll :func:`routable_host` until it returns a row, retrying transport errors."""
     deadline = time.monotonic() + timeout
-    last = "not polled"
-    while time.monotonic() < deadline:
+    while True:  # Always poll once, so a timeout names a real failure.
         try:
             row, last = _find_routable_host(
                 client, base_url=base_url, host_id=host_id, name=name, owner=owner
@@ -105,6 +111,8 @@ def wait_for_routable_host(
                 return row
         except httpx.TransportError as exc:
             last = f"{type(exc).__name__}: {exc}"
+        if time.monotonic() >= deadline:
+            break
         time.sleep(poll_interval)
     wanted = {"host_id": host_id, "name": name, "owner": owner}
     filters = ", ".join(f"{key}={value!r}" for key, value in wanted.items() if value is not None)
