@@ -140,6 +140,12 @@ When the user asks to review the plan before the work starts:
   while one waits on something slow, such as CI or another session.
 - Write `done` when the step achieved its goal. Only `done` lets later steps
   start.
+- Don't write `done` while a later step still needs something that's on its
+  way, such as a PR another session will open, CI on your push or a deploy
+  you started, even if the step's own goal is met. Keep the step `started`,
+  say what it waits for in its status ("Sync started; waiting for its PR"),
+  and check on it with a background timer, as for a session you start (see
+  "Running another workflow as a step"). Write `done` once it arrives.
 - Keep going while any step is ready or started. Don't end your turn until
   everything left is done, failed, waiting for the user, running in another
   session, or waits on one of those, unless the user or your instructions say
@@ -169,8 +175,9 @@ When the user asks to review the plan before the work starts:
 - If the user stops you, leave the step you were on `started`; the Tasks tab
   shows it as stopped while you're idle. A stop isn't the step failing, so
   don't write `failed` for it. Write a note if it helps to say what's left.
-- When you resume, check your `needs_input` steps and the steps running in
-  other sessions first, and write a new status for any that can go ahead.
+- When you resume, check your `needs_input` steps, the steps running in other
+  sessions and the steps waiting for something on its way first, and write a
+  new status for any that can go ahead.
 - Replan with `sys_journal_write_plan` whenever the goal grows or changes. Keep
   step IDs stable across replans, so finished steps keep their status; give a
   step a new ID only when its work changes. Keep the plan's name while the

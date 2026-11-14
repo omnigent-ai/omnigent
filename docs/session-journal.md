@@ -35,7 +35,10 @@ The newest status for a step is its current one:
 
 - `started`: the agent has begun the step itself. It shows as Running while the
   session is working, and as "Started 3h ago" once it's idle.
-- `done`: the step achieved its goal. Only `done` lets later steps start.
+- `done`: the step achieved its goal. Only `done` lets later steps start, so a
+  step stays `started` while something a later step needs is still on its way,
+  such as a PR another session will open. The agent says what it waits for and
+  checks on it until it arrives.
 - `needs_input`: the step waits for the session's user: an approval, a
   decision, a go-ahead, or how to get past something the agent can't clear
   itself, such as CI being down, with the ways forward it sees. The agent asks
