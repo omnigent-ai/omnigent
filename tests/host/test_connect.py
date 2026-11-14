@@ -9503,7 +9503,7 @@ async def test_slow_frame_does_not_head_of_line_block(
     assert any('"req_slow"' in frame for frame in ws.sent)
 
 
-@pytest.mark.parametrize("stage", ["queued", "preflight", "spawn"])
+@pytest.mark.parametrize("stage", ["queued", "preflight", "workspace", "spawn"])
 async def test_runner_status_waits_for_pending_launch(
     stage: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -9528,6 +9528,13 @@ async def test_runner_status_waits_for_pending_launch(
             _pause()
         return True
 
+    original_is_dir = Path.is_dir
+
+    def workspace_is_dir(path: Path) -> bool:
+        if stage == "workspace" and path == tmp_path:
+            _pause()
+        return original_is_dir(path)
+
     def _spawn(*_args: object) -> tuple[subprocess.Popen[bytes], Path]:
         if stage == "spawn":
             _pause()
@@ -9540,6 +9547,7 @@ async def test_runner_status_waits_for_pending_launch(
         return await real_status(frame)
 
     monkeypatch.setattr("omnigent.host.connect.harness_is_configured", _preflight)
+    monkeypatch.setattr(Path, "is_dir", workspace_is_dir)
     monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
     monkeypatch.setattr(host, "_spawn_runner_proc", _spawn)
     monkeypatch.setattr(host, "_watch_runner", AsyncMock())

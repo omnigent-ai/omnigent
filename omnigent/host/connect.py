@@ -2153,7 +2153,7 @@ class HostProcess:
 
         workspace = Path(frame.workspace).expanduser()
         workspace_recreated = False
-        if not workspace.is_dir():
+        if not await asyncio.to_thread(workspace.is_dir):
             # Recreate a vanished leaf (pruned worktree, an agent's rm -rf) so the
             # session keeps working; a missing *parent* signals a stale path or an
             # unmounted volume, so refuse rather than build on the wrong filesystem.
