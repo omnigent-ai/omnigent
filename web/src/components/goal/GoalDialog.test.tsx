@@ -367,6 +367,30 @@ describe("GoalDialog", () => {
     expect(screen.getByTestId("goal-objective")).toHaveValue("");
   });
 
+  it.each([ACTIVE_GOAL, null])(
+    "hides an obsolete opening-read error after a newer poll succeeds (%j)",
+    async (nextGoal) => {
+      const openingRead = deferred<{ goal: Goal | null }>();
+      const pollRead = deferred<{ goal: Goal | null }>();
+      mockGetGoal.mockReturnValueOnce(openingRead.promise).mockReturnValueOnce(pollRead.promise);
+      render(<ManagedDialog />);
+      expect(mockGetGoal).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        pollRead.resolve({ goal: nextGoal });
+        openingRead.reject(new Error("obsolete read unavailable"));
+      });
+
+      expect(screen.queryByText(/Could not read goal/)).not.toBeInTheDocument();
+      expect(screen.getByTestId("goal-objective")).toHaveValue(nextGoal?.objective ?? "");
+      expect(screen.getByTestId("goal-token-budget")).toHaveValue(nextGoal?.tokenBudget ?? null);
+      expect(screen.getByTestId("goal-save")).toBeEnabled();
+      if (nextGoal)
+        expect(screen.getByTestId("goal-current")).toHaveTextContent(nextGoal.objective);
+      else expect(screen.getByTestId("goal-empty")).toBeInTheDocument();
+    },
+  );
+
   describe.each(["success", "error"] as const)("old %s after runner reconnect", (outcome) => {
     it.each(mutations)(
       "preserves the new draft and busy $action operation",

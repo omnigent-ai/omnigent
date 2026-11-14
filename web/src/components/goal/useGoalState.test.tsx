@@ -182,6 +182,34 @@ describe("useGoalState", () => {
     },
   );
 
+  it.each(["dialog refresh", "poll", "dialog update"])(
+    "ignores an old explicit read error after a newer %s succeeds",
+    async (newest) => {
+      const older = deferredGoalRead();
+      mockGetGoal
+        .mockResolvedValueOnce({ goal: GOAL })
+        .mockReturnValueOnce(older.promise)
+        .mockResolvedValueOnce({ goal: null });
+      const { result } = renderHook(() => useGoalState("conv", true));
+      await act(async () => {});
+      const olderRefresh = result.current.refreshGoal();
+
+      await act(async () => {
+        if (newest === "poll") window.dispatchEvent(new Event("focus"));
+        else if (newest === "dialog update") result.current.setGoal(null);
+        else await result.current.refreshGoal();
+      });
+      expect(result.current.goal).toBeNull();
+
+      await act(async () => {
+        older.reject(new Error("obsolete read failed"));
+        await expect(olderRefresh).resolves.toBeUndefined();
+      });
+
+      expect(result.current.goal).toBeNull();
+    },
+  );
+
   it("reports an unavailable session when explicitly refreshed while disconnected", async () => {
     const { result } = renderHook(() => useGoalState("conv", false));
 

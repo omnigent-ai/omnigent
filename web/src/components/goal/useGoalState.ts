@@ -19,6 +19,7 @@ export function useGoalState(conversationId: string | null, enabled: boolean): U
     null,
   );
   const updateVersion = useRef(0);
+  const lastSuccessfulVersion = useRef(0);
   const activeBinding = useRef<GoalBinding | null>(null);
   const binding = useMemo(
     () => (enabled && conversationId ? { conversationId } : null),
@@ -37,6 +38,7 @@ export function useGoalState(conversationId: string | null, enabled: boolean): U
     (goal: Goal | null) => {
       if (!binding || activeBinding.current !== binding) return;
       updateVersion.current += 1;
+      lastSuccessfulVersion.current = updateVersion.current;
       setSnapshot((current) => (activeBinding.current === binding ? { binding, goal } : current));
     },
     [binding],
@@ -50,10 +52,11 @@ export function useGoalState(conversationId: string | null, enabled: boolean): U
     try {
       const response = await getGoal(binding.conversationId);
       if (isCurrent()) {
+        lastSuccessfulVersion.current = version;
         setSnapshot((current) => (isCurrent() ? { binding, goal: response.goal } : current));
       }
     } catch (error) {
-      if (activeBinding.current === binding) throw error;
+      if (activeBinding.current === binding && lastSuccessfulVersion.current < version) throw error;
     }
   }, [binding]);
 
