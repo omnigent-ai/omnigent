@@ -39,9 +39,7 @@ class Workflow:
         as the goal.
     :param created_at: Unix epoch seconds when it was saved.
     :param updated_at: Unix epoch seconds of the last write.
-    :param steps: The steps in the journal plan's format, or ``None`` when read
-        without them, as a list page reads it.
-    :param is_draft: Whether no plan has been saved yet.
+    :param steps: The saved steps in the journal plan's format; empty for a draft.
     :param planning_session_id: The owner's conversation for iterating on the plan.
     """
 
@@ -51,8 +49,7 @@ class Workflow:
     description: str
     created_at: int
     updated_at: int
-    steps: list[dict[str, Any]] | None = None
-    is_draft: bool = False
+    steps: list[dict[str, Any]]
     planning_session_id: str | None = None
 
 

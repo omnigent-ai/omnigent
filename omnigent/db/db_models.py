@@ -1972,15 +1972,12 @@ class SqlWorkflow(OmnigentBase):
     name: Mapped[str] = mapped_column(String(80), nullable=False)
     # A few paragraphs: at most 8,000 bytes in UTF-8.
     description: Mapped[str] = mapped_column(String(2000), nullable=False)
-    # Deferred so whole-row reads skip it; list pages never need it.
+    # Deferred so callers load the compressed plan explicitly.
     plan: Mapped[str] = mapped_column(
         CompressedText(max_stored_bytes=MAX_STORED_VALUE_BYTES), nullable=False, deferred=True
     )
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    is_draft: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default=false()
-    )
     planning_session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
 
     __table_args__ = (

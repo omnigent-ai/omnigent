@@ -14618,7 +14618,7 @@
           },
           "is_draft": {
             "default": false,
-            "description": "Whether a plan must be saved before the workflow can run.",
+            "description": "Derived from whether the saved plan has no steps.",
             "title": "Is Draft",
             "type": "boolean"
           },

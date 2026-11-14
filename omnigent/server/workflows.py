@@ -99,14 +99,14 @@ def _summary(workflow: Workflow) -> WorkflowSummary:
         description=workflow.description,
         created_at=workflow.created_at,
         updated_at=workflow.updated_at,
-        is_draft=workflow.is_draft,
+        is_draft=not workflow.steps,
     )
 
 
 def _object(workflow: Workflow) -> WorkflowObject:
     return WorkflowObject(
         **_summary(workflow).model_dump(),
-        steps=[WorkflowStep(**step) for step in workflow.steps or []],
+        steps=[WorkflowStep(**step) for step in workflow.steps],
         planning_session_id=workflow.planning_session_id,
     )
 

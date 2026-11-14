@@ -161,9 +161,8 @@ async def test_draft_planning_is_persistent_private_and_separate_from_runs(
     assert saved.status_code == 200 and saved.json()["is_draft"] is False
     assert saved.json()["planning_session_id"] == planner
     assert (await client.get(path + "/runs", headers=_headers(ALICE))).json()["data"] == []
-    assert (await client.get("/v1/workflows", headers=_headers(ALICE))).json()["data"][0][
-        "id"
-    ] == draft["id"]
+    listed = (await client.get("/v1/workflows", headers=_headers(ALICE))).json()["data"][0]
+    assert listed["id"] == draft["id"] and listed["is_draft"] is False
     replacement = _session(db_uri)
     replaced = await client.patch(
         path,
@@ -174,3 +173,10 @@ async def test_draft_planning_is_persistent_private_and_separate_from_runs(
     assert (await client.get(path, headers=_headers(ALICE))).json()[
         "planning_session_id"
     ] == replacement
+
+    cleared = await client.patch(path, json={"steps": []}, headers=_headers(ALICE))
+    assert cleared.status_code == 200 and cleared.json()["is_draft"] is True
+    assert (await client.get(path, headers=_headers(ALICE))).json()["steps"] == []
+    assert (await client.get("/v1/workflows", headers=_headers(ALICE))).json()["data"][0][
+        "is_draft"
+    ] is True

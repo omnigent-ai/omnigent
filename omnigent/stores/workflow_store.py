@@ -31,18 +31,6 @@ from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
 WORKFLOW_PAGE_MAX = 200
 
-# What a list page reads: everything but the plan.
-_SUMMARY_COLUMNS = (
-    SqlWorkflow.id,
-    SqlWorkflow.user_id,
-    SqlWorkflow.name,
-    SqlWorkflow.description,
-    SqlWorkflow.created_at,
-    SqlWorkflow.updated_at,
-    SqlWorkflow.is_draft,
-    SqlWorkflow.planning_session_id,
-)
-
 
 class WorkflowNameTakenError(Exception):
     """The owner already has a workflow with this name."""
@@ -68,7 +56,7 @@ def _plan_text(steps: list[dict[str, Any]]) -> str:
     return text
 
 
-def _to_workflow(row: Any, *, with_steps: bool) -> Workflow:
+def _to_workflow(row: SqlWorkflow) -> Workflow:
     return Workflow(
         id=row.id,
         user_id=row.user_id,
@@ -76,8 +64,7 @@ def _to_workflow(row: Any, *, with_steps: bool) -> Workflow:
         description=row.description,
         created_at=row.created_at,
         updated_at=row.updated_at,
-        steps=json.loads(row.plan)["steps"] if with_steps else None,
-        is_draft=row.is_draft,
+        steps=json.loads(row.plan)["steps"],
         planning_session_id=row.planning_session_id,
     )
 
@@ -138,7 +125,6 @@ class WorkflowStore:
             created_at=now,
             updated_at=now,
             steps=workflow_steps,
-            is_draft=not workflow_steps,
         )
 
         def write(session: Session) -> Workflow:
@@ -155,7 +141,6 @@ class WorkflowStore:
                     plan=plan,
                     created_at=now,
                     updated_at=now,
-                    is_draft=workflow.is_draft,
                 )
             )
             return workflow
@@ -166,9 +151,11 @@ class WorkflowStore:
         """Return one of the owner's workflows with its steps, or ``None``."""
         with self._session("get_workflow") as session:
             row = session.execute(
-                select(*_SUMMARY_COLUMNS, SqlWorkflow.plan).where(*_owned(workflow_id, user_id))
-            ).first()
-        return None if row is None else _to_workflow(row, with_steps=True)
+                select(SqlWorkflow)
+                .where(*_owned(workflow_id, user_id))
+                .options(undefer(SqlWorkflow.plan))
+            ).scalar_one_or_none()
+            return None if row is None else _to_workflow(row)
 
     def list_page(
         self,
@@ -178,7 +165,7 @@ class WorkflowStore:
         after: str | None = None,
         name: str | None = None,
     ) -> tuple[list[Workflow], bool]:
-        """Return one page of the owner's workflows by name, without their steps.
+        """Return one page of the owner's workflows by name, including their saved plans.
 
         :param user_id: The owner, or ``None`` in single-user mode.
         :param limit: Page size, 1 to :data:`WORKFLOW_PAGE_MAX`.
@@ -190,9 +177,13 @@ class WorkflowStore:
         if not 1 <= limit <= WORKFLOW_PAGE_MAX:
             raise InvalidWorkflowError(f"limit must be 1 to {WORKFLOW_PAGE_MAX}")
         with self._session("list_workflows") as session:
-            stmt = select(*_SUMMARY_COLUMNS).where(
-                SqlWorkflow.workspace_id == current_workspace_id(),
-                SqlWorkflow.user_id == user_id,
+            stmt = (
+                select(SqlWorkflow)
+                .where(
+                    SqlWorkflow.workspace_id == current_workspace_id(),
+                    SqlWorkflow.user_id == user_id,
+                )
+                .options(undefer(SqlWorkflow.plan))
             )
             if name is not None:
                 stmt = stmt.where(SqlWorkflow.name == name)
@@ -207,10 +198,10 @@ class WorkflowStore:
                 if after_name is None:
                     raise InvalidWorkflowError("after must be the ID of one of your workflows")
                 stmt = stmt.where(tuple_(SqlWorkflow.name, SqlWorkflow.id) > (after_name, after))
-            rows = session.execute(
+            rows = session.scalars(
                 stmt.order_by(SqlWorkflow.name, SqlWorkflow.id).limit(limit + 1)
             ).all()
-        return [_to_workflow(row, with_steps=False) for row in rows[:limit]], len(rows) > limit
+            return [_to_workflow(row) for row in rows[:limit]], len(rows) > limit
 
     def update(
         self,
@@ -257,11 +248,10 @@ class WorkflowStore:
             row.description = text
             if steps is not None:
                 row.plan = _plan_text(workflow_steps)
-                row.is_draft = not workflow_steps
             if planning_session_id is not None:
                 row.planning_session_id = planning_session_id
             row.updated_at = now_epoch()
-            return _to_workflow(row, with_steps=True)
+            return _to_workflow(row)
 
         return run_write_transaction(self._session_immediate, "update_workflow", write)
 

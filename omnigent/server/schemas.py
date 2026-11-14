@@ -3411,7 +3411,7 @@ class WorkflowSummary(BaseModel):
     :param description: What the workflow is for.
     :param created_at: Unix epoch seconds when it was saved.
     :param updated_at: Unix epoch seconds of the last write.
-    :param is_draft: Whether a plan must be saved before the workflow can run.
+    :param is_draft: Derived from whether the saved plan has no steps.
     """
 
     id: str

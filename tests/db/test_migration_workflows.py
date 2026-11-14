@@ -33,10 +33,7 @@ def test_upgrade_matches_the_model_and_downgrade_drops_the_table(tmp_path: Path)
     assert list(columns) == [column.name for column in table.columns]
     for column in table.columns:
         assert columns[column.name]["nullable"] is column.nullable, column.name
-        if column.name == "is_draft":
-            assert columns[column.name]["default"] == "0"
-        else:
-            assert columns[column.name]["default"] is None, column.name
+        assert columns[column.name]["default"] is None, column.name
     assert inspector.get_pk_constraint(_TABLE)["constrained_columns"] == ["workspace_id", "id"]
     indexes = inspector.get_indexes(_TABLE)
     assert {index["name"]: index["column_names"] for index in indexes} == {

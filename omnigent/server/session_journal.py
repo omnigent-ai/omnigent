@@ -337,7 +337,7 @@ def create_session_journal_router(
                 f"workflow_not_found: no saved workflow {workflow_id!r}",
                 code=ErrorCode.INVALID_INPUT,
             )
-        if workflow.is_draft:
+        if not workflow.steps:
             raise OmnigentError(
                 "workflow_is_draft: save a plan before running this workflow",
                 code=ErrorCode.INVALID_INPUT,
