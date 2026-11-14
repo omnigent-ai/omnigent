@@ -367,6 +367,59 @@ describe("side-chat working indicator", () => {
     expect(useChatStore.getState().sideChatSelectionTarget?.childId).toBe("pending:side");
     expect(screen.getByRole("button", { name: "Send side question" })).toBeEnabled();
   });
+
+  it("starts a typed /side question's fork once under StrictMode and once per retry, with its quotes", async () => {
+    let rejectStart: ((error: Error) => void) | undefined;
+    const onStart = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectStart = reject;
+        }),
+    );
+    const quotes = [{ id: "quote", before: "", text: "selected line" }];
+    useChatStore.setState({
+      sideChatComposers: {
+        "pending:slash": { text: "why?", files: [], quotes, autoStart: true },
+      },
+    });
+
+    renderPane(
+      <StrictMode>
+        <SideChatPane childId="pending:slash" onStart={onStart} />
+      </StrictMode>,
+    );
+
+    expect(onStart).toHaveBeenCalledExactlyOnceWith("> selected line\n\nwhy?");
+    expect(useChatStore.getState().sideChatComposers["pending:slash"]).toMatchObject({
+      autoStart: false,
+      starting: true,
+    });
+    expect(screen.getByTestId("working-indicator")).toHaveTextContent("Working…");
+    expect(screen.getByTestId("side-chat-input")).toBeDisabled();
+    expect(screen.getByTestId("side-chat-input")).toHaveValue("why?");
+
+    await act(async () => rejectStart?.(new Error("Fork creation failed")));
+    expect(useChatStore.getState().sideChatComposers["pending:slash"]).toMatchObject({
+      text: "why?",
+      quotes,
+      autoStart: false,
+      starting: false,
+    });
+    expect(screen.queryByTestId("working-indicator")).toBeNull();
+    expect(screen.getByTestId("side-chat-input")).toBeEnabled();
+
+    act(() =>
+      useChatStore
+        .getState()
+        .updateSideChatComposer("pending:slash", (current) => ({ ...current, autoStart: true })),
+    );
+    expect(onStart).toHaveBeenCalledTimes(2);
+    expect(onStart).toHaveBeenLastCalledWith("> selected line\n\nwhy?");
+    expect(useChatStore.getState().sideChatComposers["pending:slash"]).toMatchObject({
+      autoStart: false,
+      starting: true,
+    });
+  });
 });
 
 it.each(["confirmed", "rejected"])(

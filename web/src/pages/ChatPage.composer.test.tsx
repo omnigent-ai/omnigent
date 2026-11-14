@@ -6807,6 +6807,46 @@ describe("Composer side-chat entry points", () => {
     }
   });
 
+  it("hands a typed /side question to a pending tab that a repeat reuses until it forks", () => {
+    const authenticatedFetch = vi.spyOn(identity, "authenticatedFetch");
+    composerSessionSnapshot.sideChatAllowed = true;
+    renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} />);
+    const submitSide = (command: string) => {
+      fireEvent.change(textarea(), { target: { value: command } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      return useChatStore.getState().sideChatToOpen!.childId;
+    };
+    const composerFor = (id: string) => useChatStore.getState().sideChatComposers[id];
+
+    const pendingId = submitSide("/side why?");
+    expect(pendingId).toMatch(/^pending:/);
+    expect(useChatStore.getState().sideChatToOpen?.parentId).toBe("conv_test");
+    expect(composerFor(pendingId)).toEqual({ text: "why?", files: [], autoStart: true });
+    expect(useChatStore.getState().sideChatDrafts[pendingId]).toBeUndefined();
+    expect(textarea()).toHaveValue("");
+
+    const markComposer = (patch: { autoStart: boolean; starting: boolean }) =>
+      useChatStore.getState().updateSideChatComposer(pendingId, (current) => ({
+        ...current,
+        ...patch,
+      }));
+    markComposer({ autoStart: false, starting: true });
+    const otherId = submitSide("/side how?");
+    expect(otherId).not.toBe(pendingId);
+    expect(submitSide("/side why?")).toBe(pendingId);
+    expect(composerFor(pendingId)?.autoStart).toBe(false);
+    markComposer({ autoStart: false, starting: false });
+    expect(submitSide("/side how?")).toBe(otherId);
+    expect(submitSide("/side why?")).toBe(pendingId);
+    expect(composerFor(pendingId)?.autoStart).toBe(true);
+
+    useChatStore.getState().clearSideChatComposer(pendingId);
+    expect(submitSide("/side why?")).not.toBe(pendingId);
+    const bareId = submitSide("/side ");
+    expect(composerFor(bareId)).toEqual({ text: "", files: [], autoFocus: true });
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+  });
+
   it("focuses the native side-chat question after the add menu closes", async () => {
     const user = userEvent.setup();
     useChatStore.setState({ sessionHarness: "codex-native" });
