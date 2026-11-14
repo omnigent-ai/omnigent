@@ -354,6 +354,7 @@ from omnigent.server.routes._sessions.helpers import (
     _query_host_runner_status,
     _read_state_entry,
     _record_daily_cost,
+    _reject_malformed_label_keys,
     _reject_reserved_cost_control_label_seed,
     _reject_server_reserved_label_seed,
     _relay_persist,
@@ -12468,6 +12469,11 @@ async def _create_session_from_existing_agent(
         server_sandbox_providers,
     )
 
+    # Checked before the project merge: a null (a default left off this
+    # session) for a reserved key is rejected like a set would be.
+    _reject_malformed_label_keys(body.labels)
+    _reject_reserved_cost_control_label_seed(body.labels)
+    _reject_server_reserved_label_seed(body.labels)
     project_resolution = await resolve_project_session_create(
         body=body,
         user_id=user_id,
@@ -12496,9 +12502,6 @@ async def _create_session_from_existing_agent(
         created_by_session_id=created_by_session_id,
     )
     assert body.agent_id is not None
-
-    _reject_reserved_cost_control_label_seed(body.labels)
-    _reject_server_reserved_label_seed(body.labels)
 
     agent = await validate_session_agent(
         user_id=user_id,
