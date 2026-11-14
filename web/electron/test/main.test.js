@@ -2222,6 +2222,7 @@ describe("Databricks auth mode wiring", () => {
 
     it("keeps the workspace URL for sign-in, and shows the pick", async (t) => {
       const h = await joinThroughAccount(t);
+      assert.deepEqual(h.calls.loadURL, [[workspace]]);
       assert.equal(saved(h).server_url, workspace);
       assert.deepEqual(saved(h).recent_servers, [workspace]);
       assert.deepEqual(saved(h).server_labels, { [workspaceOrigin]: picked });
@@ -4028,43 +4029,59 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     assert.deepEqual(h.calls.loadFile, []);
   });
 
-  it("reopens the mounted page after a Cancel, then Connect while offline", async (t) => {
-    let online = false;
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = async () => {
-      if (!online) throw new TypeError("fetch failed");
-      return { headers: new Headers({ server: "databricks" }) };
-    };
-    t.after(() => {
-      globalThis.fetch = originalFetch;
-    });
-    const h = browserHarness(t, [], {
-      normalizeServer: urlHelpers.normalizeUrl,
-      expandWorkspace: urlHelpers.expandDatabricksWorkspaceUrl,
-      ensureSession: async (_ses, sessionOrigin) => {
+  // [the failed page's server, managed servers, Connect's URL (null: the setup page's
+  //  pre-filled server), whether Connect reaches the workspace]
+  for (const [server, managedServers, connectTo, connectsOnline] of [
+    [workspace, [], null, false],
+    [`${workspace}/`, [`${workspace}/`], origin, false],
+    [`${workspace}/`, [`${workspace}/`], origin, true],
+  ]) {
+    const how = connectsOnline ? "online" : "while offline";
+    it(`reopens the failed page on ${server} after a Cancel, then Connect ${how}`, async (t) => {
+      let online = false;
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async () => {
         if (!online) throw new TypeError("fetch failed");
-        return sessionOrigin;
-      },
+        return { headers: new Headers({ server: "databricks" }) };
+      };
+      t.after(() => {
+        globalThis.fetch = originalFetch;
+      });
+      const h = browserHarness(t, [], {
+        serverUrl: server,
+        managedServers,
+        normalizeServer: urlHelpers.normalizeUrl,
+        expandWorkspace: urlHelpers.expandDatabricksWorkspaceUrl,
+        ensureSession: async (_ses, sessionOrigin) => {
+          if (!online) throw new TypeError("fetch failed");
+          return sessionOrigin;
+        },
+      });
+      h.api.registerIpc();
+      failLoad(h);
+      await wait(1);
+      h.overlay.cancel();
+      await until(() => h.calls.loadFile.length === 1, "the setup page");
+      // The setup form keeps the mounted URL for the next Connect.
+      assert.equal(h.overlay.hint, null);
+      assert.equal(setupParams(h).url, server);
+      h.api.setReconnectDelaysMs([20]);
+      online = connectsOnline;
+      const result = await h.ipc.get("omnigent:set-server-url")(
+        setupEvent(h),
+        connectTo ?? setupParams(h).url,
+        { requestId: "connect" },
+      );
+      if (!connectsOnline) {
+        assert.equal(result.reconnecting, true);
+        assert.equal(h.overlay.hint, "Check your network connection.");
+        online = true;
+      }
+      await until(() => h.calls.loadURL.length === 1, "the failed page");
+      assert.deepEqual(h.calls.loadURL, [[page]]);
+      assert.equal(h.overlay.hint, null);
     });
-    h.api.registerIpc();
-    failLoad(h);
-    await wait(1);
-    h.overlay.cancel();
-    await until(() => h.calls.loadFile.length === 1, "the setup page");
-    // The setup form keeps the mounted URL for the next Connect.
-    assert.equal(h.overlay.hint, null);
-    assert.equal(setupParams(h).url, workspace);
-    h.api.setReconnectDelaysMs([20]);
-    const result = await h.ipc.get("omnigent:set-server-url")(setupEvent(h), setupParams(h).url, {
-      requestId: "connect",
-    });
-    assert.equal(result.reconnecting, true);
-    assert.equal(h.overlay.hint, "Check your network connection.");
-    online = true;
-    await until(() => h.calls.loadURL.length === 1, "the reconnect");
-    assert.deepEqual(h.calls.loadURL, [[workspace]]);
-    assert.equal(h.overlay.hint, null);
-  });
+  }
 
   it("waits while offline without using up retries", async (t) => {
     const h = browserHarness(t, [20], {
@@ -4237,21 +4254,25 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     });
   }
 
-  it("does not retry credential failures", async (t) => {
+  it("does not retry credential failures, and Connect returns to the failed page", async (t) => {
     const h = browserHarness(t, [25], {
-      ensureSession: async () => {
+      ensureSession: async (_ses, sessionOrigin, { interactive }) => {
+        if (interactive) return sessionOrigin;
         throw Object.assign(new Error("expired with no refresh token"), {
           errorCode: "NO_REFRESH_TOKEN",
         });
       },
     });
-    await assert.rejects(h.api.loadServerUrl(h.win, workspace));
+    h.api.registerIpc();
+    await assert.rejects(h.api.loadServerUrl(h.win, workspace, "/c/conv_1"));
     await wait(50);
     assert.equal(h.calls.auth.length, 1);
     assert.deepEqual(setupParams(h), {
       error: "Session expired. Connect to sign in again.",
       url: workspace,
     });
+    await h.ipc.get("omnigent:set-server-url")(setupEvent(h), workspace);
+    assert.deepEqual(h.calls.loadURL, [[`${workspace}/c/conv_1`]]);
   });
 
   it("goes straight to setup for other windows and non-network errors", async (t) => {
@@ -4432,7 +4453,8 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
 
     network.verdict = "allow";
     await until(() => h.calls.loadURL.length === 2, "the reconnect");
-    assert.deepEqual(h.calls.loadURL.at(-1), [workspace]);
+    // Back on the page the user was on before Cancel.
+    assert.deepEqual(h.calls.loadURL.at(-1), [`${workspace}/c/123`]);
     assert.equal(h.api.windows.get(h.win).origin, origin);
     assert.equal(h.overlay.hint, null);
     await wait(80);
@@ -4499,6 +4521,98 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
     assert.equal(h.overlay.hint, null);
     assert.equal(network.browserSignIns, 0);
   });
+
+  // [Connect target, its URL (null: the setup page's pre-filled server), page loaded,
+  //  window server, browser sign-ins, which probes find the account host's mount]
+  for (const [label, connectTo, landing, windowServer, signIns, mountProbes = "all"] of [
+    ["the linked account host", null, `${workspace}/c/conv_1`, workspace, 1],
+    [
+      "the linked account host without mount discovery",
+      null,
+      `${workspace}/c/conv_1`,
+      workspace,
+      1,
+      "none",
+    ],
+    [
+      "the linked account host once Connect finds its mount",
+      null,
+      `${workspace}/c/conv_1`,
+      workspace,
+      1,
+      "Connect",
+    ],
+    [
+      "a workspace on the account host",
+      "https://accounts.cloud.databricks.com/omnigent?o=123",
+      workspace,
+      workspace,
+      1,
+    ],
+    [
+      "another server",
+      "https://server.example/",
+      "https://server.example/",
+      "https://server.example/",
+      0,
+    ],
+  ]) {
+    it(`opens Connect to ${label} after an account-host deep link needs sign-in`, async (t) => {
+      const accountOrigin = "https://accounts.cloud.databricks.com";
+      const network = createWorkspaceNetwork(origin, {
+        oauth: {
+          // Tokens are stored per workspace, never under the account origin.
+          getValidStoredToken: async () => {
+            throw Object.assign(new Error("no stored token"), { errorCode: "NO_STORED_TOKEN" });
+          },
+          runInteractiveLogin: async () => {
+            network.browserSignIns++;
+            return { tokens: { access_token: "token" }, issuerOrigin: accountOrigin };
+          },
+        },
+        account: {
+          parseAccountFromToken: () => ({ accountOrigin, accountId: "account" }),
+          listRunningWorkspaces: async () => [
+            { workspaceId: "123", fqdn: new URL(origin).hostname },
+          ],
+        },
+      });
+      let probes = 0;
+      const h = loadNavigationHarness({
+        serverUrl: workspace,
+        databricksMode: "browser",
+        network,
+        deepLinks: require("../src/deepLink"),
+        normalizeServer: urlHelpers.normalizeUrl,
+        expandWorkspace: async (url) => {
+          probes++;
+          const found = mountProbes === "all" || (mountProbes === "Connect" && probes > 1);
+          return found && new URL(url).origin === accountOrigin
+            ? `${accountOrigin}/omnigent${new URL(url).search}`
+            : url;
+        },
+      });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      h.electron.dialog.showMessageBox = async () => ({ response: 1 }); // Open
+      await h.api.handleDeepLink("omnigent://accounts.cloud.databricks.com/c/conv_1");
+      await until(() => h.calls.loadFile.length === 1, "the sign-in fallback");
+      const { url } = shown(h);
+      assert.equal(url, mountProbes === "all" ? `${accountOrigin}/omnigent` : accountOrigin);
+      const connecting = h.ipc.get("omnigent:set-server-url")(
+        { sender: h.webContents, senderFrame: { url: `file://${h.api.SETUP_PAGE}` } },
+        connectTo ?? url,
+      );
+      if (!connectTo) {
+        await until(() => h.pickers.length === 1, "the workspace picker");
+        h.ipc.get("workspacePicker:choose")({ sender: h.pickers[0].webContents }, "123");
+      }
+      await connecting;
+      assert.deepEqual(h.calls.loadURL, [[landing]]);
+      assert.equal(h.api.windows.get(h.win).serverUrl, windowServer);
+      assert.equal(network.browserSignIns, signIns);
+    });
+  }
 
   it("does not retry an account URL whose workspace listing failed", async (t) => {
     const accountUrl = "https://spog.cloud.databricks.com/";

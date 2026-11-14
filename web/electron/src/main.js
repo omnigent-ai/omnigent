@@ -984,12 +984,19 @@ function cancelReconnect(win) {
   reconnectOverlay.hide(win);
 }
 
-/** Return to setup with a pre-filled server and an optional error message. */
-function showConnectFailure(win, url, message) {
+/**
+ * Return to setup with a pre-filled server and an optional error message.
+ * Connecting to that server again resumes `returnUrl`, such as a deep link.
+ */
+function showConnectFailure(win, url, message, returnUrl) {
   const params = new URLSearchParams({ url });
   if (message) params.set("error", message);
   else params.set("step", "server");
-  if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
+  const windowState = windows.get(win);
+  if (windowState?.ephemeral) params.set("ephemeral", "1");
+  if (windowState) {
+    windowState.setupReturn = returnUrl && returnUrl !== url ? { serverUrl: url, returnUrl } : null;
+  }
   pinWindow(win, null); // back on the setup page → no trusted origin
   void loadSetupPage(win, params.toString());
 }
@@ -1004,7 +1011,7 @@ function stopReconnect(win) {
   });
   // An in-flight attempt may have re-pinned the window; hold it for setup again.
   databricksAuth?.rejectConnection(win);
-  showConnectFailure(win, state.serverUrl, state.finalMessage);
+  showConnectFailure(win, state.serverUrl, state.finalMessage, state.returnUrl);
 }
 
 /**
@@ -1182,7 +1189,7 @@ function showDatabricksAuthRequired(
       blocked,
       interactive,
     });
-  if (!retrying) showConnectFailure(win, serverUrl, message);
+  if (!retrying) showConnectFailure(win, serverUrl, message, returnUrl);
 }
 
 function getDatabricksAuth() {
@@ -1382,6 +1389,8 @@ function applyDockIcon() {
  * @property {import("./desktopCommands").DesktopCommandState | null} [desktopCommands]
  *   Menu commands this window's SPA last reported it can act on (see
  *   desktopCommands.js); absent until a supporting web bundle reports.
+ * @property {{ serverUrl: string, returnUrl: string } | null} [setupReturn] The page
+ *   a failed load was opening, until this window loads a server (see showConnectFailure).
  *
  * @type {Map<BrowserWindow, WindowState>}
  */
@@ -2276,6 +2285,46 @@ function resolveServerPath(serverUrl, routePath) {
 }
 
 /**
+ * The in-app route `url` opens under `serverUrl` (the inverse of
+ * resolveServerPath), or null when `url` is the server root or outside it.
+ *
+ * @param {string} serverUrl
+ * @param {string} url
+ * @returns {string | null}
+ */
+function serverRoutePath(serverUrl, url) {
+  const base = serverUrl.replace(/\/+$/, "");
+  return url.startsWith(`${base}/`) ? url.slice(base.length) : null;
+}
+
+/**
+ * The server and page a Connect to `discovered` opens: the failed page saved in
+ * `setupReturn` when Connect names its server (see showConnectFailure).
+ *
+ * @param {string} discovered
+ * @param {{ serverUrl: string, returnUrl: string } | null | undefined} setupReturn
+ * @returns {{ serverUrl: string, loadUrl?: string }}
+ */
+function connectResumeTarget(discovered, setupReturn) {
+  // A bare workspace root and its UI mount are one server, with or without a trailing slash.
+  const identity = (url) => {
+    const server = new URL(databricksWorkspaceUiUrl(url) ?? url);
+    server.pathname = server.pathname.replace(/\/+$/, "");
+    return server.toString();
+  };
+  if (!setupReturn || identity(setupReturn.serverUrl) !== identity(discovered)) {
+    return { serverUrl: discovered };
+  }
+  // A bare workspace root means discovery failed (e.g. offline): keep the failed page's server.
+  const serverUrl = databricksWorkspaceUiUrl(discovered) ? setupReturn.serverUrl : discovered;
+  const route = serverRoutePath(setupReturn.serverUrl, setupReturn.returnUrl);
+  return {
+    serverUrl,
+    loadUrl: route ? resolveServerPath(serverUrl, route) : setupReturn.returnUrl,
+  };
+}
+
+/**
  * Pin an existing window to a server origin and load a (optionally
  * path-suffixed) URL. Shared by the deep-link reuse/reload paths so the
  * pin + identity + load sequence isn't duplicated. ``serverUrl`` is stored as
@@ -2367,8 +2416,9 @@ async function loadServerUrl(
         }
         assertCurrent();
         if (resolvedOrigin !== entered.origin) {
+          const route = serverRoutePath(serverUrl, target);
           serverUrl = databricksWorkspaceUiUrl(resolvedOrigin);
-          target = serverUrl;
+          target = route ? resolveServerPath(serverUrl, route) : serverUrl;
           pinWindow(win, resolvedOrigin, attempt);
           setWindowServerUrl(win, serverUrl);
           const settings = loadSettings();
@@ -2451,6 +2501,7 @@ async function loadServerUrl(
     diagnostics.record("connection_result", { origin: originOf(serverUrl), outcome: "loaded" });
     // Loaded: any reconnect this window was waiting on is over.
     cancelReconnect(win);
+    if (windowState) windowState.setupReturn = null;
     // Only a manifest that was actually read can say the name went away.
     if (manifest?.manifestVersion >= 1 && !windowState?.ephemeral) {
       rememberServerName(serverUrl, manifest.serverName);
@@ -4499,8 +4550,12 @@ function registerIpc() {
       // A managed choice is already validated and may name a workspace mount;
       // preserve it exactly. The shared expansion is a no-op for paths, while a
       // managed workspace root still gets the normal mount discovery.
-      const target = await resolveConnectTarget(url, { signal }); // throws → setup page shows error
+      const discovered = await resolveConnectTarget(url, { signal }); // throws → setup page shows error
       signal.throwIfAborted();
+      const { serverUrl: target, loadUrl } = connectResumeTarget(
+        discovered,
+        windows.get(win)?.setupReturn,
+      );
 
       // Multi-server windows connect without touching the saved server —
       // the connection lives and dies with the window.
@@ -4515,6 +4570,7 @@ function registerIpc() {
       const resolvedServerUrl = await loadServerUrl(win, target, undefined, {
         interactive: true,
         attempt,
+        loadUrl,
       });
       // Only a server that actually responded earns a recents slot. Sign-in that
       // moved to another host keeps the pick's name for display.
