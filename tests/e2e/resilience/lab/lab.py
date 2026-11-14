@@ -42,6 +42,7 @@ import httpx
 import psutil
 import yaml
 
+from tests._helpers.host import host_tunnel_registered
 from tests._helpers.live_server import reserve_port
 from tests.e2e.resilience.lab.events import EventLog
 from tests.e2e.resilience.lab.model import MockModel
@@ -757,7 +758,7 @@ class Lab:
                 return None
             for row in response.json().get("hosts", []):
                 if row.get("host_id") == self.host_id and row.get("status") == "online":
-                    return True
+                    return True if host_tunnel_registered(observer, self.host_id) else None
             return None
 
         wait_for(_online, timeout=_STARTUP_TIMEOUT_S, what="the host daemon to register")

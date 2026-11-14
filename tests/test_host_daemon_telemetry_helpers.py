@@ -27,11 +27,16 @@ def test_waits_for_own_host_while_another_host_is_online(initial_status: str) ->
     expected_host_id = "a" * 32
     unrelated = {"host_id": "b" * 32, "status": "online"}
     own_host_polls = 0
+    tunnel_probes = 0
 
     def respond(request: httpx.Request) -> httpx.Response:
-        nonlocal own_host_polls
+        nonlocal own_host_polls, tunnel_probes
         if request.url.path == "/v1/hosts":
             return httpx.Response(200, json={"hosts": [unrelated]})
+        if request.url.path == f"/v1/hosts/{expected_host_id}/filesystem":
+            # The row reads online before the tunnel registers: the first probe fails.
+            tunnel_probes += 1
+            return httpx.Response(200 if tunnel_probes > 1 else 400, json={"entries": []})
         assert request.url.path == f"/v1/hosts/{expected_host_id}"
         own_host_polls += 1
         if own_host_polls == 1 and initial_status == "missing":
@@ -48,4 +53,4 @@ def test_waits_for_own_host_while_another_host_is_online(initial_status: str) ->
         selected = _online_host_id(client, host_id=expected_host_id, timeout=2)
 
     assert selected == expected_host_id
-    assert own_host_polls == 2
+    assert (own_host_polls, tunnel_probes) == (3, 2)

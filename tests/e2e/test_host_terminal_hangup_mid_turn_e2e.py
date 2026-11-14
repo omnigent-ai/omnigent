@@ -28,6 +28,7 @@ import yaml
 from omnigent.inner import _proc
 from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
+from tests._helpers.host import routable_host
 from tests._helpers.live_server import isolated_local_server, isolated_process_env
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests.e2e.conftest import (
@@ -208,13 +209,9 @@ def test_terminal_hangup_lets_in_flight_turn_finish(
 
             def _host_online() -> bool:
                 try:
-                    rows = client.get("/v1/hosts").json().get("hosts", [])
+                    return routable_host(client, host_id=terminal.host_id) is not None
                 except (httpx.HTTPError, ValueError):
                     return False  # server still warming up; let _wait_until retry
-                return any(
-                    r.get("host_id") == terminal.host_id and r.get("status") == "online"
-                    for r in rows
-                )
 
             assert _wait_until(_host_online, _HOST_ONLINE_TIMEOUT_S), (
                 f"host never came online\n{terminal.log_path.read_text(errors='replace')[-4000:]}"

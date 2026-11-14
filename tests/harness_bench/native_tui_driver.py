@@ -30,6 +30,7 @@ from omnigent.host.daemon_launch import (
 from omnigent.native.native_terminal import bind_session_runner
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
+from tests._helpers.host import routable_host
 from tests._helpers.live_server import find_free_port
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.harness_bench.driver import (
@@ -429,11 +430,9 @@ class NativeTuiDriver:
         assert self._client is not None
         deadline = time.monotonic() + _HOST_ONLINE_TIMEOUT_S
         while time.monotonic() < deadline:
-            resp = self._client.get("/v1/hosts")
-            if resp.status_code == 200:
-                online = [h for h in resp.json().get("hosts", []) if h.get("status") == "online"]
-                if online:
-                    return str(online[0]["host_id"])
+            row = routable_host(self._client)
+            if row is not None:
+                return str(row["host_id"])
             time.sleep(_POLL_INTERVAL_S)
         raise ProvisioningError(f"no host came online within {_HOST_ONLINE_TIMEOUT_S}s")
 

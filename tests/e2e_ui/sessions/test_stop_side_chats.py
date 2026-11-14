@@ -13,6 +13,7 @@ import yaml
 from playwright.sync_api import Page, expect
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from tests._helpers.host import routable_host
 from tests._helpers.server_runner import server_runner
 from tests._helpers.session import bundle_files, post_session_bundle
 from tests.e2e_ui.chat.test_side_chat_entrypoints import _items, _send_parent, _start_side_chat
@@ -100,10 +101,7 @@ def test_stop_session_stops_hosted_side_chats(
             response.raise_for_status()
             return response.json()
 
-        host = _wait(
-            lambda: next((h for h in get("/v1/hosts")["hosts"] if h["status"] == "online"), None),
-            "isolated host registration",
-        )
+        host = _wait(lambda: routable_host(client), "isolated host registration")
 
         def create(title: str) -> str:
             response = post_session_bundle(

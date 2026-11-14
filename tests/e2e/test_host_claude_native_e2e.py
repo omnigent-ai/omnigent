@@ -85,6 +85,7 @@ from omnigent.harnesses.claude_native.bridge import (
 )
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
+from tests._helpers.host import wait_for_routable_host
 from tests.e2e.helpers import POLL_INTERVAL_S
 
 # Opt-in only. claude-native needs a real *interactive* Claude login
@@ -244,15 +245,8 @@ def _online_host_id(client: httpx.Client, timeout: float = 30.0) -> str:
     :returns: The online host's ``host_id``.
     :raises AssertionError: If no host comes online within *timeout*.
     """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        resp = client.get("/v1/hosts")
-        if resp.status_code == 200:
-            online = [h for h in resp.json().get("hosts", []) if h["status"] == "online"]
-            if online:
-                return str(online[0]["host_id"])
-        time.sleep(POLL_INTERVAL_S)
-    raise AssertionError(f"No host came online within {timeout}s")
+    row = wait_for_routable_host(client, timeout=timeout, poll_interval=POLL_INTERVAL_S)
+    return str(row["host_id"])
 
 
 def _claude_native_agent_id(client: httpx.Client) -> str:

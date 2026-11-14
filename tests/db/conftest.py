@@ -12,21 +12,19 @@ a hard failure — a different migration test each run.
 Serialize the DDL-heavy tests behind a cross-process lock so only one worker
 mutates the shared schema catalog at a time. Scoped to CockroachDB (other
 dialects keep per-database isolation) and to the migration modules (the small
-non-DDL ``tests/db`` unit tests stay fully parallel).
+non-DDL ``tests/db`` unit tests stay fully parallel). Each worker's database
+setup and teardown in ``tests/conftest.py`` takes the same lock.
 """
 
 from __future__ import annotations
 
-import tempfile
 from collections.abc import Callable, Iterator
-from pathlib import Path
 from typing import Any
 
 import pytest
 from sqlalchemy import Engine
 
-# One lock file per runner; all workers on the host contend on it.
-_CRDB_SCHEMA_LOCK = Path(tempfile.gettempdir()) / "omnigent-crdb-schema-ddl.lock"
+from tests._helpers.crdb_schema_lock import crdb_schema_ddl_lock
 
 
 def _runs_schema_ddl(node: pytest.Item) -> bool:
@@ -42,9 +40,7 @@ def _serialize_crdb_schema_ddl(
     if "cockroachdb" not in _worker_db_uri or not _runs_schema_ddl(request.node):
         yield
         return
-    from filelock import FileLock
-
-    with FileLock(str(_CRDB_SCHEMA_LOCK)):
+    with crdb_schema_ddl_lock("cockroachdb"):
         yield
 
 
