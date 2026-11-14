@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from omnigent.harnesses.opencode_native.forwarder import OpenCodeNativeForwarder
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.inner.terminal import TerminalInstance
+    from omnigent.runner.launch_failure import FailureDiagnosis
     from omnigent.runner.subagent_routing import SubagentRouter
     from omnigent.runner.turn_routing import TurnRouter
     from omnigent.spec.types import MCPServerConfig
@@ -8544,8 +8545,31 @@ def _native_terminal_configuration_message(exc: BaseException) -> str | None:
     return None
 
 
+def _classify_launch_exit(
+    instance: TerminalInstance,
+) -> tuple[str | None, FailureDiagnosis | None]:
+    """Return a launch exit's permitted output and the known failure it shows, if any."""
+    output: str | None = None
+    diagnosis = None
+    # A failed diagnostic read must not hide the known terminal-exit cause.
+    with contextlib.suppress(Exception):
+        from omnigent.runner.launch_failure import classify_terminal_failure
+
+        output = _startup_terminal_output(instance)
+        diagnosis = classify_terminal_failure(
+            command=instance.command,
+            exit_status=instance.last_exit_status(),
+            output=output,
+        )
+    return output, diagnosis
+
+
 def _native_terminal_start_error_payload(
-    exc: BaseException, runtime_name: str, *, session_id: str
+    exc: BaseException,
+    runtime_name: str,
+    *,
+    session_id: str,
+    fallback_diagnosis: FailureDiagnosis | None = None,
 ) -> dict[str, str]:
     """
     Build the structured error payload for a native terminal start failure.
@@ -8554,6 +8578,8 @@ def _native_terminal_start_error_payload(
         e.g. ``ImportError("Native Codex requires the 'codex' CLI on PATH.")``.
     :param runtime_name: Human-readable runtime name, e.g. ``"Codex"``.
     :param session_id: Session whose terminal failed, which may be a runner's child.
+    :param fallback_diagnosis: Cause for a launch exit whose output matches no
+        known failure, from :func:`_launch_exit_fallback_diagnosis`.
     :returns: ``{"code": ..., "message": ...}`` payload for SSE and
         JSON error responses. Known actionable configuration errors surface
         their safe message directly; other causes point to the runner log.
@@ -8651,20 +8677,10 @@ def _native_terminal_start_error_payload(
     from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
     if isinstance(exc, TerminalExitedDuringLaunch):
-        # The exit status and captured output ride on the exception for every
-        # runtime. A failed diagnostic read must not hide the known
-        # terminal-exit cause.
-        output: str | None = None
-        diagnosis = None
-        with contextlib.suppress(Exception):
-            from omnigent.runner.launch_failure import classify_terminal_failure
-
-            output = _startup_terminal_output(exc.instance)
-            diagnosis = classify_terminal_failure(
-                command=exc.instance.command,
-                exit_status=exc.instance.last_exit_status(),
-                output=output,
-            )
+        # The exit status and captured output ride on the exception for every runtime.
+        output, diagnosis = _classify_launch_exit(exc.instance)
+        if diagnosis is None:
+            diagnosis = fallback_diagnosis
         if diagnosis is not None:
             message = f"{diagnosis.title}: {diagnosis.cause}"
             if diagnosis.remediation:
@@ -8731,11 +8747,27 @@ def _native_terminal_start_failure_context(exc: BaseException, error_id: str) ->
     )
 
 
+async def _launch_exit_fallback_diagnosis(exc: BaseException) -> FailureDiagnosis | None:
+    """Probe an unclassified launch exit for a lost macOS login session off the event loop."""
+    from omnigent.runner.launch_failure import diagnose_lost_login_session
+    from omnigent.terminals.registry import TerminalExitedDuringLaunch
+
+    if not isinstance(exc, TerminalExitedDuringLaunch):
+        return None
+    if _classify_launch_exit(exc.instance)[1] is not None:
+        return None
+    with contextlib.suppress(Exception):
+        return await asyncio.to_thread(diagnose_lost_login_session)
+    return None
+
+
 def _publish_native_terminal_start_error(
     publish_event: Callable[[str, _JsonObject], None],
     session_id: str,
     runtime_name: str,
     exc: BaseException,
+    *,
+    fallback_diagnosis: FailureDiagnosis | None = None,
 ) -> dict[str, str]:
     """
     Publish live failure events for a native terminal start failure.
@@ -8754,10 +8786,13 @@ def _publish_native_terminal_start_error(
         e.g. ``"conv_abc123"``.
     :param runtime_name: Human-readable runtime name, e.g. ``"Claude"``.
     :param exc: The startup exception whose text should be surfaced.
+    :param fallback_diagnosis: Cause for an otherwise unclassified launch exit.
     :returns: The structured error payload that was published on the
         status event.
     """
-    error = _native_terminal_start_error_payload(exc, runtime_name, session_id=session_id)
+    error = _native_terminal_start_error_payload(
+        exc, runtime_name, session_id=session_id, fallback_diagnosis=fallback_diagnosis
+    )
     publish_event(
         session_id,
         {
@@ -8771,7 +8806,11 @@ def _publish_native_terminal_start_error(
 
 
 def _native_terminal_start_error_response(
-    exc: BaseException, runtime_name: str, *, session_id: str
+    exc: BaseException,
+    runtime_name: str,
+    *,
+    session_id: str,
+    fallback_diagnosis: FailureDiagnosis | None = None,
 ) -> JSONResponse:
     """
     Return a structured JSON error for native terminal ensure failures.
@@ -8779,6 +8818,7 @@ def _native_terminal_start_error_response(
     :param exc: Exception raised by terminal auto-create.
     :param runtime_name: Human-readable runtime name, e.g. ``"Codex"``.
     :param session_id: Session whose terminal ensure failed.
+    :param fallback_diagnosis: Cause for an otherwise unclassified launch exit.
     :returns: HTTP 412 for configuration errors, the lifecycle status for a removed
         agent or workspace, else 500,
         with an ``error`` object carrying the real failure message.
@@ -8788,7 +8828,9 @@ def _native_terminal_start_error_response(
         status_code = 412
     elif isinstance(exc, OmnigentError) and exc.code in _NATIVE_TERMINAL_LIFECYCLE_ERROR_CODES:
         status_code = exc.http_status
-    error = _native_terminal_start_error_payload(exc, runtime_name, session_id=session_id)
+    error = _native_terminal_start_error_payload(
+        exc, runtime_name, session_id=session_id, fallback_diagnosis=fallback_diagnosis
+    )
     return JSONResponse(
         status_code=status_code,
         content={
@@ -10947,6 +10989,7 @@ async def _launch_native_terminal(
                 ctx.session_id,
                 agent.display_name,
                 exc,
+                fallback_diagnosis=await _launch_exit_fallback_diagnosis(exc),
             )
             return False
         finally:
@@ -11102,10 +11145,15 @@ async def _ensure_native_terminal(
                         error_impact=ErrorImpact.BLOCKING.value,
                     ),
                 )
-            return _native_terminal_start_error_response(
-                exc, agent.display_name, session_id=ctx.session_id
-            )
-        return respond(view)
+            launch_error = exc
+        else:
+            return respond(view)
+    return _native_terminal_start_error_response(
+        launch_error,
+        agent.display_name,
+        session_id=ctx.session_id,
+        fallback_diagnosis=await _launch_exit_fallback_diagnosis(launch_error),
+    )
 
 
 async def _claude_native_session_wants_rebuild(

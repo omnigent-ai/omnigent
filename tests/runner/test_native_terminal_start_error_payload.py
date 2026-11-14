@@ -10,11 +10,14 @@ startup-defect code. These are fast, layer-local guards for that split.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+import threading
 from pathlib import Path
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -26,9 +29,13 @@ from omnigent.harnesses.codex_native.app_server import CodexModelProviderMissing
 from omnigent.harnesses.codex_native.launch_args import CodexTransportArgsError
 from omnigent.inference_config import ModelNotAllowedError, inference_config_scope
 from omnigent.inner.terminal import TerminalInstance, TmuxUnavailableError
+from omnigent.runner import launch_failure
 from omnigent.runner.native import orchestration
 from omnigent.runner.native.orchestration import (
     _NATIVE_TERMINAL_START_FAILED_CODE,
+    NativeLaunchContext,
+    _ensure_native_terminal,
+    _launch_native_terminal,
     _native_terminal_start_error_payload,
     _native_terminal_start_error_response,
     _publish_native_terminal_start_error,
@@ -339,11 +346,15 @@ def test_claude_early_exit_surfaces_classified_diagnosis(
     monkeypatch.setattr(instance, "last_exit_text", lambda: "Not logged in · Please run /login")
 
     payload = _native_terminal_start_error_payload(
-        TerminalExitedDuringLaunch(instance), "Claude", session_id="conv_1"
+        TerminalExitedDuringLaunch(instance),
+        "Claude",
+        session_id="conv_1",
+        fallback_diagnosis=launch_failure._LOGIN_SESSION_LOST,
     )
 
     message = payload["message"]
     assert "Agent isn't signed in" in message
+    assert "login session" not in message
     assert "no valid credentials" in message
     assert "/login" in message
     assert "Native Claude terminal failed to start" not in message
@@ -378,11 +389,7 @@ def test_pi_early_exit_without_match_falls_back_to_exit_summary(
     assert "Native Pi terminal failed to start" not in message
 
 
-def test_claude_early_exit_output_gated_when_capture_disabled(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """With stderr capture disabled, a non-Codex exit reads no pane output."""
-    monkeypatch.delenv("OMNIGENT_HARNESS_STDERR_ENABLED", raising=False)
+def _claude_exited_during_launch(tmp_path: Path) -> TerminalExitedDuringLaunch:
     instance = TerminalInstance(
         name="claude",
         session_key="main",
@@ -391,17 +398,103 @@ def test_claude_early_exit_output_gated_when_capture_disabled(
         command="claude",
     )
     instance._remember_exit_status("1 1")
+    return TerminalExitedDuringLaunch(instance)
+
+
+@pytest.mark.parametrize(
+    ("fallback_diagnosis", "expected"),
+    [
+        (None, "Claude terminal exited with status 1 before becoming available."),
+        (launch_failure._LOGIN_SESSION_LOST, "The host lost its macOS login session: "),
+    ],
+    ids=["no-fallback", "lost-login-session"],
+)
+def test_claude_early_exit_output_gated_when_capture_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fallback_diagnosis: launch_failure.FailureDiagnosis | None,
+    expected: str,
+) -> None:
+    """With stderr capture disabled, a non-Codex exit reads no pane output."""
+    monkeypatch.delenv("OMNIGENT_HARNESS_STDERR_ENABLED", raising=False)
+    exc = _claude_exited_during_launch(tmp_path)
     read_output = Mock(side_effect=AssertionError("capture is disabled"))
-    monkeypatch.setattr(instance, "last_exit_text", read_output)
+    monkeypatch.setattr(exc.instance, "last_exit_text", read_output)
 
     payload = _native_terminal_start_error_payload(
-        TerminalExitedDuringLaunch(instance), "Claude", session_id="conv_1"
+        exc, "Claude", session_id="conv_1", fallback_diagnosis=fallback_diagnosis
     )
 
     message = payload["message"]
-    assert "Claude terminal exited with status 1 before becoming available." in message
+    assert message.startswith(expected), message
     assert "startup terminal output:" not in message
     read_output.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ensure", [False, True], ids=["startup", "reattach"])
+@pytest.mark.parametrize(
+    ("pane_text", "expected", "probe_calls"),
+    [
+        (None, "The host lost its macOS login session: ", 1),
+        ("Not logged in · Please run /login", "Agent isn't signed in: ", 0),
+    ],
+    ids=["withheld-output", "classified-output"],
+)
+async def test_launch_exit_probes_for_a_lost_login_session_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    ensure: bool,
+    pane_text: str | None,
+    expected: str,
+    probe_calls: int,
+) -> None:
+    """Only unclassified launch exits are probed, off the event loop and outside ensure's lock."""
+    ensure_locks: dict[str, asyncio.Lock] = {}
+    probes: list[tuple[int, bool]] = []
+
+    def _probe() -> launch_failure.FailureDiagnosis:
+        probes.append((threading.get_ident(), ensure_locks["conv_1"].locked()))
+        return launch_failure._LOGIN_SESSION_LOST
+
+    exc = _claude_exited_during_launch(tmp_path)
+
+    async def _exit_during_launch(*_args: object, **_kwargs: object) -> None:
+        raise exc
+
+    if pane_text is None:
+        monkeypatch.delenv("OMNIGENT_HARNESS_STDERR_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_HARNESS_STDERR_ENABLED", "1")
+        monkeypatch.setattr(exc.instance, "last_exit_text", lambda: pane_text)
+    monkeypatch.setattr(launch_failure, "diagnose_lost_login_session", _probe)
+    monkeypatch.setattr(orchestration, "_auto_create_claude_terminal", _exit_during_launch)
+    events: list[dict] = []
+    registry = SimpleNamespace(
+        terminal_registry=None, get_terminal_resource=AsyncMock(return_value=None)
+    )
+    ctx = NativeLaunchContext(
+        "conv_1",
+        registry,
+        lambda _session_id, event: events.append(event),
+        server_client=Mock(spec=httpx.AsyncClient),
+    )
+
+    if ensure:
+        response = await _ensure_native_terminal("claude", ctx, ensure_locks=ensure_locks)
+        assert response is not None
+        error = json.loads(response.body)["error"]
+    else:
+        launched = await _launch_native_terminal("claude-native", ctx, ensure_locks=ensure_locks)
+        assert launched is False
+        error = next(event["error"] for event in events if event.get("status") == "failed")
+
+    assert error["message"].startswith(expected), error["message"]
+    assert len(probes) == probe_calls
+    for probe_thread, lock_held in probes:
+        assert probe_thread != threading.get_ident()
+        if ensure:
+            assert not lock_held
 
 
 def test_unrelated_omnigent_error_is_not_treated_as_missing_agent() -> None:
