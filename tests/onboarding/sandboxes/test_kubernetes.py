@@ -1288,11 +1288,19 @@ def test_pod_ready_timeout_env_var_rejects_non_numeric(monkeypatch: pytest.Monke
 class _FakeApiException(Exception):
     """Stands in for ``kubernetes.client.rest.ApiException``."""
 
-    def __init__(self, *, status: int | None = None, reason: str = "", body: str = "") -> None:
+    def __init__(
+        self,
+        *,
+        status: int | None = None,
+        reason: str = "",
+        body: str = "",
+        headers: dict[str, str] | None = None,
+    ) -> None:
         super().__init__(reason or body or str(status))
         self.status = status
         self.reason = reason
         self.body = body
+        self.headers = headers
 
 
 class _FakeConfigException(Exception):
@@ -1375,12 +1383,29 @@ class _FakeBatch:
         self.last_delete_body: object = None
         self.create_job_error: Exception | None = None
         self.delete_job_errors: list[Exception | None] = []
+        self.read_job_queue: list[object] = [_FakeApiException(status=404, reason="Not Found")]
+        self.read_job_timeouts: list[float] = []
+        self.job_exists = False
 
     def create_namespaced_job(self, namespace, body, _request_timeout=None):
         self.calls.append("create_job")
         if self.create_job_error is not None:
             raise self.create_job_error
+        if self.job_exists:
+            raise _FakeApiException(status=409, reason="AlreadyExists")
         self.created_jobs.append(body)
+
+    def read_namespaced_job(self, name, namespace, _request_timeout=None):
+        self.calls.append("read_job")
+        self.read_job_timeouts.append(_request_timeout)
+        response = self.read_job_queue[0]
+        if len(self.read_job_queue) > 1:
+            self.read_job_queue.pop(0)
+        if isinstance(response, Exception):
+            if isinstance(response, _FakeApiException) and response.status == 404:
+                self.job_exists = False
+            raise response
+        return response
 
     def delete_namespaced_job(self, name, namespace, body=None, _request_timeout=None):
         self.calls.append("delete_job")
@@ -1841,22 +1866,153 @@ def test_terminate_deletes_job_and_secret(
     assert core.deleted_secrets == ["omnigent-job-6-token"]
 
 
-def test_resume_recycles_job_and_token_secret(
+def test_resume_waits_before_recreating_the_job(
     fake_clients: tuple[_FakeCore, _FakeBatch],
+    resume_clock: SimpleNamespace,
 ) -> None:
-    """Resume clears stale launch resources so start_host can recreate the same id."""
+    """Foreground DELETE leaves the name occupied until GET observes absence."""
     core, batch = fake_clients
+    batch.job_exists = True
+    batch.read_job_queue = [SimpleNamespace(), _FakeApiException(status=404)]
+    _setup_pod_discovery(core)
     launcher = _launcher()
 
     assert launcher.can_resume is True
     assert launcher.capabilities.resume_stopped is True
-
     launcher.resume("omnigent-job-resume")
+    launcher.start_host(
+        "omnigent-job-resume",
+        token="replacement-token",
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+    )
 
-    assert batch.deleted_jobs == ["omnigent-job-resume"]
+    assert batch.calls == ["delete_job", "read_job", "read_job", "create_job"]
     assert batch.last_delete_body.propagation_policy == "Foreground"
-    assert core.deleted_pods == ["omnigent-job-resume"]
+    assert batch.deleted_jobs == core.deleted_pods == ["omnigent-job-resume"]
     assert core.deleted_secrets == ["omnigent-job-resume-token"]
+    assert len(core.created_secrets) == len(batch.created_jobs) == 1
+
+
+@pytest.fixture
+def resume_clock(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    clock = SimpleNamespace(now=0.0, sleeps=[])
+    monkeypatch.setattr(k8s.time, "monotonic", lambda: clock.now)
+
+    def sleep(seconds: float) -> None:
+        clock.sleeps.append(seconds)
+        clock.now += seconds or 0.001
+
+    monkeypatch.setattr(k8s.time, "sleep", sleep)
+    return clock
+
+
+@pytest.mark.parametrize(
+    "recovered, observation", [(False, "connection reset"), (True, "Job still present")]
+)
+def test_resume_timeout_bounds_reads_and_sleeps_and_reports_last_observation(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+    monkeypatch: pytest.MonkeyPatch,
+    resume_clock: SimpleNamespace,
+    recovered: bool,
+    observation: str,
+) -> None:
+    from urllib3.exceptions import HTTPError
+
+    _, batch = fake_clients
+    monkeypatch.setattr(k8s, "_RESUME_DELETE_TIMEOUT_S", 0.25)
+    monkeypatch.setattr(k8s, "_RESUME_DELETE_POLL_S", 0.1)
+    batch.read_job_queue = [HTTPError("connection reset")]
+    if recovered:
+        batch.read_job_queue.append(SimpleNamespace())
+    original_read = batch.read_namespaced_job
+
+    def read(*args, **kwargs):
+        resume_clock.now += 0.01
+        return original_read(*args, **kwargs)
+
+    monkeypatch.setattr(batch, "read_namespaced_job", read)
+    launcher = _launcher()
+    with pytest.raises(click.ClickException, match=f"Timed out.*{observation}"):
+        launcher.resume("omnigent-job-resume")
+
+    assert batch.read_job_timeouts == pytest.approx([0.25, 0.14, 0.03])
+    assert resume_clock.sleeps == pytest.approx([0.1, 0.1, 0.02])
+    assert launcher._api_client is None
+
+
+@pytest.mark.parametrize(
+    "status, retry_after, expected_delay",
+    [(429, "3", 3.0), (503, "0", 1.0), (429, "invalid", 1.0)],
+)
+def test_resume_retries_temporary_api_errors_with_retry_after(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+    resume_clock: SimpleNamespace,
+    status: int,
+    retry_after: str,
+    expected_delay: float,
+) -> None:
+    _, batch = fake_clients
+    batch.read_job_queue = [
+        _FakeApiException(status=status, headers={"Retry-After": retry_after}),
+        _FakeApiException(status=404),
+    ]
+
+    _launcher().resume("omnigent-job-resume")
+
+    assert resume_clock.sleeps == [expected_delay]
+    assert batch.read_job_timeouts == [k8s._POD_READY_REQUEST_TIMEOUT_S] * 2
+
+
+def test_resume_does_not_read_with_zero_budget(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+    monkeypatch: pytest.MonkeyPatch,
+    resume_clock: SimpleNamespace,
+) -> None:
+    _, batch = fake_clients
+    monkeypatch.setattr(k8s, "_RESUME_DELETE_TIMEOUT_S", 0)
+    launcher = _launcher()
+    with pytest.raises(click.ClickException, match="no Job read completed"):
+        launcher.resume("omnigent-job-resume")
+
+    assert not batch.read_job_timeouts
+    assert launcher._api_client is None
+
+
+def test_resume_accepts_a_definitive_404_from_an_in_flight_request(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+    monkeypatch: pytest.MonkeyPatch,
+    resume_clock: SimpleNamespace,
+) -> None:
+    _, batch = fake_clients
+    monkeypatch.setattr(k8s, "_RESUME_DELETE_TIMEOUT_S", 1.0)
+    original_read = batch.read_namespaced_job
+
+    def read(*args, **kwargs):
+        resume_clock.now = 1.5
+        return original_read(*args, **kwargs)
+
+    monkeypatch.setattr(batch, "read_namespaced_job", read)
+    _launcher().resume("omnigent-job-resume")
+    assert batch.read_job_timeouts == [1.0]
+
+
+@pytest.mark.parametrize("status", [403, 500])
+def test_resume_surfaces_api_errors_without_retry(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+    resume_clock: SimpleNamespace,
+    status: int,
+) -> None:
+    _, batch = fake_clients
+    batch.read_job_queue = [_FakeApiException(status=status, reason=f"API {status}")]
+    launcher = _launcher()
+    with pytest.raises(click.ClickException, match=f"API {status}"):
+        launcher.resume("omnigent-job-resume")
+
+    assert batch.calls.count("read_job") == 1
+    assert not resume_clock.sleeps
+    assert launcher._api_client is None
 
 
 def test_terminate_is_idempotent_on_404(
