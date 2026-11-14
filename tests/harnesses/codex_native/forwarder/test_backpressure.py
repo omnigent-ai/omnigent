@@ -543,3 +543,115 @@ async def test_child_lane_drain_timeout_stops_a_stuck_worker() -> None:
     finally:
         await state.close_child_streams()
         await client.aclose()
+
+
+_FORKED_CHILD_COUNT = 4
+_PARENT_HISTORY_TURNS = 3
+_PARENT_HISTORY_ITEMS_PER_TURN = 50
+
+
+def _history_turn(thread_id: str, turn_id: str, item_count: int) -> dict[str, Any]:
+    items = [
+        {"type": "agentMessage", "id": f"{turn_id}-msg-{index}", "text": f"{thread_id} {index}"}
+        for index in range(item_count)
+    ]
+    return {"id": turn_id, "status": "completed", "items": items}
+
+
+class _ForkingCodexClient(_StreamingCodexClient):
+    """Fake app-server whose sub-agent threads are forks of a long parent history."""
+
+    def __init__(self, children: list[str]) -> None:
+        super().__init__()
+        parent_history = [
+            _history_turn(
+                _PARENT_THREAD, f"turn_parent_old_{index}", _PARENT_HISTORY_ITEMS_PER_TURN
+            )
+            for index in range(_PARENT_HISTORY_TURNS)
+        ]
+        self.turns = {_PARENT_THREAD: parent_history}
+        self.sources: dict[str, dict[str, str]] = {}
+        for child in children:
+            self.turns[child] = [*parent_history, _history_turn(child, f"turn_{child}", 1)]
+            self.sources[child] = {"forkedFromId": _PARENT_THREAD}
+
+    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        thread_id = params.get("threadId", _PARENT_THREAD)
+        turns = self.turns.get(thread_id, [])
+        if method == "thread/turns/list":
+            data = [{"id": turn["id"], "items": []} for turn in turns]
+            return {"result": {"data": data, "nextCursor": None, "backwardsCursor": None}}
+        if method in {"thread/resume", "thread/read"}:
+            # The forwarder never sees the parent's history (as after an idle
+            # reconnect), so skipping a fork's copy cannot rely on having seen it.
+            listed = thread_id != _PARENT_THREAD and not params.get("excludeTurns")
+            thread = {
+                "id": thread_id,
+                "turns": turns if listed else [],
+                **self.sources.get(thread_id, {}),
+            }
+            return {"result": {"thread": thread}}
+        return await super().request(method, params)
+
+
+async def test_parent_turn_completion_is_not_delayed_by_forked_subagent_backfill(
+    tmp_path: Path,
+) -> None:
+    """Spawning forks of a long parent keeps the parent's events on time.
+
+    Each fork starts with the parent's history; replaying it into every
+    sub-agent session ran inline and held the parent's completion behind it.
+    """
+    _write_parent_bridge(tmp_path)
+    children = [_child_thread(index) for index in range(_FORKED_CHILD_COUNT)]
+    codex = _ForkingCodexClient(children)
+    posts: list[tuple[str, dict[str, Any]]] = []
+    parent_idle_received = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(_POST_LATENCY_SECONDS)
+        body = json.loads(request.content) if request.content else {}
+        posts.append((request.url.path, body))
+        if _is_parent_idle_status(request.url.path, body):
+            parent_idle_received.set()
+        if body.get("type") == "external_codex_subagent_start":
+            return _register_child_response(body, request)
+        return httpx.Response(200, json={}, request=request)
+
+    forwarder = _start_forwarder(tmp_path, codex, handler)
+    try:
+        _spawn_children(codex, children)
+        codex.emit(
+            _event(
+                "turn/completed",
+                _PARENT_THREAD,
+                _PARENT_TURN,
+                turn={"id": _PARENT_TURN, "status": "completed", "items": []},
+            ),
+            marker="parent_turn_completed",
+        )
+        async with asyncio.timeout(60):
+            await parent_idle_received.wait()
+        idle_received_at = asyncio.get_running_loop().time()
+    finally:
+        codex.queue.put_nowait(None)
+    async with asyncio.timeout(30):
+        await forwarder
+
+    lag = idle_received_at - codex.emitted_at["parent_turn_completed"]
+    child_texts = {
+        child: [
+            part["text"]
+            for path, body in posts
+            if path == f"/v1/sessions/session_{child}/events"
+            and body.get("type") == "external_conversation_item"
+            for part in body["data"]["item_data"].get("content", [])
+        ]
+        for child in children
+    }
+    assert lag < _MAX_PARENT_COMPLETION_LAG_SECONDS, (
+        f"the server received the parent's idle status {lag:.2f}s after Codex emitted "
+        "turn/completed"
+    )
+    # Each sub-agent session holds only its own reply, not the forked parent history.
+    assert child_texts == {child: [f"{child} 0"] for child in children}

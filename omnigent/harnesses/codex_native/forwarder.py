@@ -117,6 +117,8 @@ _EMPTY_ROLLOUT_FRAGMENT = "is empty"
 # been loaded through its parent. Codex's own hint is ``thread/read`` with
 # ``includeTurns: true``, which returns the same ``{"thread": Thread}`` shape.
 _UNLOADED_SUBAGENT_FRAGMENT = "cannot resume an unloaded multi-agent v2 sub-agent"
+# Page size for listing a fork source's turn ids (items are not loaded).
+_TURN_ID_PAGE_SIZE = 200
 _POST_MAX_ATTEMPTS = 3
 _POST_RETRY_DELAY_SECONDS = 0.1
 _POST_RETRY_MAX_DELAY_SECONDS = 30.0
@@ -3647,6 +3649,7 @@ async def _replay_resume_response(
     elicitation_tracker: _CodexElicitationTaskTracker,
     forwarder_state: _CodexForwarderState | None = None,
     replay_from_turn_id: str | None = None,
+    skip_turn_ids: frozenset[str] = frozenset(),
 ) -> None:
     """
     Mirror message items returned by ``thread/resume``.
@@ -3666,6 +3669,8 @@ async def _replay_resume_response(
         sub-agent registration.
     :param replay_from_turn_id: Optional first turn to replay after an
         interrupted forwarder. Earlier acknowledged turns are skipped.
+    :param skip_turn_ids: Turns to leave out, e.g. the history a forked
+        sub-agent copied from its source thread.
     :returns: None.
     """
     result = response.get("result")
@@ -3679,6 +3684,8 @@ async def _replay_resume_response(
         return
     thread_id = thread.get("id")
     thread_id = thread_id if isinstance(thread_id, str) and thread_id else None
+    if skip_turn_ids:
+        turns = [turn for turn in turns if _turn_id_from_payload(turn) not in skip_turn_ids]
     replay_turns = _resume_turns_from(turns, replay_from_turn_id)
     async with _conversation_item_delivery_scope(session_id):
         for turn in replay_turns:
@@ -7808,6 +7815,98 @@ async def _backfill_child_thread(
         child_thread_id=child_thread_id,
         response=response,
         forwarder_state=forwarder_state,
+        inherited_turn_ids=await _inherited_turn_ids(codex_client, response),
+    )
+
+
+async def _inherited_turn_ids(
+    codex_client: CodexAppServerClient,
+    response: CodexMessage,
+) -> frozenset[str]:
+    """
+    Return the turn ids a forked thread copied from the thread it forked from.
+
+    A Codex fork starts with its source thread's turns under the source's turn
+    ids. Codex names the source (``forkedFromId``, or ``parentThreadId`` for a
+    sub-agent) but not which turns were copied, so list the source's turns.
+
+    :param codex_client: Connected Codex app-server client.
+    :param response: The forked thread's ``thread/resume`` or ``thread/read``
+        response envelope.
+    :returns: The source thread's turn ids, or an empty set when the thread
+        has no source or its turns cannot be listed.
+    """
+    result = response.get("result")
+    thread = result.get("thread") if isinstance(result, dict) else None
+    if not isinstance(thread, dict):
+        return frozenset()
+    source_thread_id = thread.get("forkedFromId") or thread.get("parentThreadId")
+    if not isinstance(source_thread_id, str) or not source_thread_id:
+        return frozenset()
+    try:
+        return await _list_thread_turn_ids(codex_client, source_thread_id)
+    except RuntimeError as exc:
+        _logger.info(
+            "Codex thread/turns/list failed for %s; reading the thread instead: %s",
+            source_thread_id,
+            exc,
+        )
+    try:
+        read = await codex_client.request(
+            "thread/read", {"threadId": source_thread_id, "includeTurns": True}
+        )
+    except RuntimeError as exc:
+        _logger.warning(
+            "Codex forwarder could not list the turns of fork source %s: %s",
+            source_thread_id,
+            exc,
+        )
+        return frozenset()
+    read_result = read.get("result")
+    read_thread = read_result.get("thread") if isinstance(read_result, dict) else None
+    turns = read_thread.get("turns") if isinstance(read_thread, dict) else None
+    return _turn_ids(turns if isinstance(turns, list) else [])
+
+
+async def _list_thread_turn_ids(
+    codex_client: CodexAppServerClient, thread_id: str
+) -> frozenset[str]:
+    """
+    Page through ``thread/turns/list`` for a thread's turn ids, without items.
+
+    :param codex_client: Connected Codex app-server client.
+    :param thread_id: Codex thread id, e.g. ``"thread_parent"``.
+    :returns: Every turn id of the thread.
+    :raises RuntimeError: When Codex rejects the request.
+    """
+    turn_ids: set[str] = set()
+    cursor: str | None = None
+    seen_cursors: set[str] = set()
+    while True:
+        params: _JsonObject = {
+            "threadId": thread_id,
+            "itemsView": "notLoaded",
+            "limit": _TURN_ID_PAGE_SIZE,
+        }
+        if cursor is not None:
+            params["cursor"] = cursor
+        response = await codex_client.request("thread/turns/list", params)
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError(f"thread/turns/list returned no result for {thread_id}")
+        data = result.get("data")
+        turn_ids |= _turn_ids(data if isinstance(data, list) else [])
+        next_cursor = result.get("nextCursor")
+        if not isinstance(next_cursor, str) or not next_cursor or next_cursor in seen_cursors:
+            return frozenset(turn_ids)
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+
+
+def _turn_ids(turns: list[object]) -> frozenset[str]:
+    """Return the ids of Codex turn objects."""
+    return frozenset(
+        turn_id for turn in turns if (turn_id := _turn_id_from_payload(turn)) is not None
     )
 
 
@@ -7892,6 +7991,7 @@ async def _apply_child_resume(
     child_thread_id: str,
     response: CodexMessage,
     forwarder_state: _CodexForwarderState,
+    inherited_turn_ids: frozenset[str] = frozenset(),
 ) -> None:
     """
     Upsert child name labels and replay its backlogged transcript.
@@ -7902,6 +8002,8 @@ async def _apply_child_resume(
     :param child_thread_id: Codex child thread id, e.g. ``"thread_child"``.
     :param response: Validated ``thread/resume`` response envelope.
     :param forwarder_state: Mutable state for sub-agent mappings.
+    :param inherited_turn_ids: Turns the child copied from the thread it
+        forked from, left out of the replay.
     :returns: None.
     """
     await _upsert_child_name_from_resume(
@@ -7925,6 +8027,7 @@ async def _apply_child_resume(
             usage_coalescer=usage_coalescer,
             elicitation_tracker=child_elicitation_tracker,
             forwarder_state=forwarder_state,
+            skip_turn_ids=inherited_turn_ids,
         )
     finally:
         await child_elicitation_tracker.close()
