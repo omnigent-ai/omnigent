@@ -1337,10 +1337,12 @@ def _populate_codex_home_config(
                 if key in source_config:
                     minimal_document[key] = source_config[key]
             dest_path.write_text(tomlkit.dumps(minimal_document))
+            _normalize_copied_codex_catalog_paths(dest_path, source_dir)
             continue
         shutil.copy2(source_file, dest_path)
         if filename == "config.toml":
             _normalize_copied_codex_effort(dest_path, supported_efforts=supported_efforts)
+            _normalize_copied_codex_catalog_paths(dest_path, source_dir)
             if extend_model_catalog:
                 # Routed turns and spawns can land on an arm codex's bundled
                 # catalog has no entry for, which it then refuses client-side.
@@ -2179,6 +2181,31 @@ def write_codex_model_catalog(
     return path
 
 
+def _write_codex_config(config_path: Path, text: str) -> bool:
+    """Publish a complete private config, retaining the prior file on failure."""
+    temporary_path: Path | None = None
+    try:
+        config_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=f"{config_path.name}.",
+            dir=config_path.parent,
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(text)
+        os.replace(temporary_path, config_path)
+    except OSError as exc:
+        logger.warning("could not write %s (%s)", config_path, exc)
+        return False
+    finally:
+        if temporary_path is not None:
+            with suppress(FileNotFoundError):
+                temporary_path.unlink()
+    return True
+
+
 def set_codex_model_catalog_path(config_path: Path, catalog_path: Path) -> bool:
     """
     Point the session's private ``config.toml`` at *catalog_path*.
@@ -2200,21 +2227,7 @@ def set_codex_model_catalog_path(config_path: Path, catalog_path: Path) -> bool:
     if "model_catalog_json" in document:
         return False
     document["model_catalog_json"] = str(catalog_path)
-    config_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(config_path.parent))
-    try:
-        os.chmod(tmp_name, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(tomlkit.dumps(document))
-        os.replace(tmp_name, config_path)
-        os.chmod(config_path, 0o600)
-    except OSError as exc:
-        logger.warning("could not write %s (%s)", config_path, exc)
-        return False
-    finally:
-        with suppress(FileNotFoundError):
-            os.unlink(tmp_name)
-    return True
+    return _write_codex_config(config_path, tomlkit.dumps(document))
 
 
 def write_required_brokered_model_catalog(
@@ -2332,6 +2345,32 @@ def verify_brokered_codex_native_tools_disabled(codex_path: str, codex_home: Pat
 # the first table header so keys inside ``[profiles.*]`` etc. are never
 # rewritten (they may target other providers with different ladders).
 _EFFORT_KEY_RE = re.compile(r'^(\s*model_reasoning_effort\s*=\s*")([^"]*)("\s*(?:#.*)?)$')
+
+
+def _normalize_copied_codex_catalog_paths(config_path: Path, source_home: Path) -> None:
+    """Keep configured catalogs relative to the source home when copying config."""
+    import tomlkit
+
+    from omnigent.harnesses.codex_native.launch_args import absolute_codex_path
+
+    try:
+        document = tomlkit.parse(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    layers: list[dict[str, Any]] = [document]
+    profiles = document.get("profiles")
+    if isinstance(profiles, dict):
+        layers.extend(profile for profile in profiles.values() if isinstance(profile, dict))
+    changed = False
+    for layer in layers:
+        catalog = layer.get("model_catalog_json")
+        if isinstance(catalog, str) and catalog:
+            resolved = absolute_codex_path(catalog, source_home)
+            if catalog != resolved:
+                layer["model_catalog_json"] = resolved
+                changed = True
+    if changed:
+        _write_codex_config(config_path, tomlkit.dumps(document))
 
 
 def _normalize_copied_codex_effort(
