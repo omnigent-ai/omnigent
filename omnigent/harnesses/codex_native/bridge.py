@@ -1829,6 +1829,7 @@ def mark_shell_command_pending(
             or current.session_id != state.session_id
             or current.thread_id != state.thread_id
             or current.socket_path != state.socket_path
+            or current.codex_home != state.codex_home
             or current.pending_shell_command_id is not None
         ):
             return False
@@ -1866,6 +1867,7 @@ def reconcile_shell_command_state(
             or state.session_id != observed.session_id
             or state.thread_id != observed.thread_id
             or state.socket_path != observed.socket_path
+            or state.codex_home != observed.codex_home
         ):
             return
         updated = state
