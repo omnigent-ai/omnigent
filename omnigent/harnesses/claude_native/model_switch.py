@@ -98,6 +98,7 @@ _PICKER_FOOTER = re.compile(
 _PICKER_ROW = re.compile(r"^\s*(❯)?\s*[↑↓]?\s*(\d+)\.\s+(.+)$")
 _STATUS_TABS = re.compile(r"(?m)^\s*Settings\s+Status\s+Config\s+Usage\s+Stats\s*$")
 _STATUS_ESCAPE = re.compile(r"(?m)^\s*(?:Press )?Esc to cancel\s*$")
+_CACHE_COST_TITLE = re.compile(r"(?m)^[ \t]*Switch model\?[ \t]*$")
 _MIN_PICKER_VERSION = (2, 1, 323)
 _IMMEDIATE_PICKER_TIMEOUT_S = 2.0
 
@@ -149,6 +150,22 @@ def _status(pane: str) -> dict[str, str] | None:
                 return None
             fields[match[1]] = match[2]
     return fields if fields.keys() >= {"Version", "Session ID", "Model"} else None
+
+
+def _row_label(row: _PickerRow) -> str:
+    return re.split(r"\s{2,}", row.text, maxsplit=1)[0].replace("✔", "").strip()
+
+
+def _cache_cost_confirmation(pane: str, label: str) -> bool:
+    titles = list(_CACHE_COST_TITLE.finditer(pane))
+    if len(titles) != 1:
+        return False
+    return " ".join(pane[titles[0].end() :].split()) == (
+        "Your next response will be slower and use more tokens "
+        "This conversation is cached for the current model. "
+        f"Switching to {label} means the full history gets re-read. "
+        f"❯ 1. Yes, switch to {label} 2. No, go back"
+    )
 
 
 def _draft(pane: str) -> str | None:
@@ -246,7 +263,7 @@ def _target(
 
 
 class SessionOnlyModelSwitch:
-    """Own one picker and one fresh status overlay under the bridge's locks."""
+    """Own model selection and a fresh status overlay under the bridge's locks."""
 
     def __init__(
         self,
@@ -269,6 +286,7 @@ class SessionOnlyModelSwitch:
         self.submitted = False
         self.control_attempted = False
         self.commit_attempted = False
+        self.confirmation_attempted = False
         self.info: dict[str, str] = {}
         self.active_session: str | None = None
         self.session = ""
@@ -328,10 +346,16 @@ class SessionOnlyModelSwitch:
             if accept(pane):
                 return pane
             if self.deadline.clock() >= until:
+                action = {
+                    "preflight": "Claude did not become ready for session-only model selection.",
+                    "picker": "Claude did not show the expected session-only model picker.",
+                    "commit": "Claude did not return to an empty input box after model selection.",
+                    "confirmation": "Claude did not finish the cache-cost model confirmation.",
+                    "status": "Claude did not finish the fresh local model status check.",
+                }[self.phase]
                 raise self.refuse(
-                    "Claude did not show the expected immediate session-only model control. "
-                    "The command may be queued or a dialog may be open. Check the terminal "
-                    "before retrying; the dependent prompt was not sent."
+                    f"{action} Check the terminal before retrying; "
+                    "the dependent prompt was not sent."
                 )
             self.bridge.time.sleep(min(0.05, max(0.0, until - self.deadline.clock())))
 
@@ -442,6 +466,37 @@ class SessionOnlyModelSwitch:
         self.status_close_attempted = False
         return fields["Model"]
 
+    def finish_commit(self) -> None:
+        def settled(pane: str) -> bool:
+            if _draft(pane) == "" and _picker(pane) is None:
+                return True
+            label = self.choice.label
+            if (
+                not self.confirmation_attempted
+                and self.choice.structured
+                and label
+                and self.owned_picker
+                and _row_label(self.owned_picker.selected) == label
+                and _cache_cost_confirmation(pane, label)
+            ):
+                self.phase = "confirmation"
+                latest = self.pane()
+                raw = self.bridge._read_json_file(self.bridge_dir / self.bridge.CONTEXT_RAW_FILE)
+                if (
+                    not _cache_cost_confirmation(latest, label)
+                    or not raw
+                    or raw.get("session_id") != self.session
+                    or raw.get("version") != self.version
+                ):
+                    raise self.refuse(
+                        "Claude's model confirmation or session changed. Retry explicitly."
+                    )
+                self.confirmation_attempted = True
+                self.send("Enter")
+            return False
+
+        self.wait(settled, seconds=2.0)
+
     def row_matches(self, row: _PickerRow) -> bool:
         if re.match(r"Default(?:\s|\()", row.text):
             return False
@@ -451,7 +506,7 @@ class SessionOnlyModelSwitch:
             return True
         if "Managed by your organization" in row.text:
             return False
-        label = re.split(r"\s{2,}", row.text, maxsplit=1)[0].replace("✔", "").strip()
+        label = _row_label(row)
         if label in {self.choice.value, self.choice.model}:
             return True
         return bool(self.choice.structured and self.choice.label and label == self.choice.label)
@@ -584,7 +639,7 @@ class SessionOnlyModelSwitch:
                 ),
                 seconds=1.0,
             )
-        self.wait(lambda text: _draft(text) == "" and _picker(text) is None, seconds=2.0)
+        self.finish_commit()
         current = self.local_status()
         if not self.status_matches(current, exact_context=False):
             raise self.refuse(

@@ -13482,11 +13482,27 @@ def test_composer_box_reads_every_row_of_the_input_box(
         assert claude_native_bridge._composer_row(pane) == box.rows[0]
 
 
+def _cache_cost_confirmation_pane(label: str) -> str:
+    return (
+        "   Switch model?\n"
+        "   Your next response will be slower and use more tokens\n\n"
+        "   This conversation is cached for the current model. "
+        f"Switching to {label} means the full history gets re-read.\n\n"
+        f"   ❯ 1. Yes, switch to {label}\n"
+        "     2. No, go back\n"
+    )
+
+
 class _SessionModelComposer(_EditableComposer):
     """Editable composer with the recorded local model and status overlays."""
 
     def __init__(
-        self, *, draft: str = "", busy: bool = False, prompt_separator: str = " "
+        self,
+        *,
+        draft: str = "",
+        busy: bool = False,
+        prompt_separator: str = " ",
+        cache_cost_label: str | None = None,
     ) -> None:
         super().__init__(draft, cursor=len(draft))
         self.options = ["claude-sonnet-5-5", "private-glm[1m]"]
@@ -13499,6 +13515,8 @@ class _SessionModelComposer(_EditableComposer):
         self.status_queries = 0
         self.session = "native-session"
         self.version = "2.1.323"
+        self.cache_cost_label = cache_cost_label
+        self.confirmations = 0
 
     def _run_tmux(self, socket_path: str, *args: str) -> None:
         claude_native_bridge._check_injection_cancelled()
@@ -13510,12 +13528,21 @@ class _SessionModelComposer(_EditableComposer):
             elif key == "Up":
                 self.highlight = (self.highlight - 1) % len(self.options)
             elif key == "s" and "-l" in args:
-                self.model = self.options[self.highlight]
-                self.overlay = None
+                if self.cache_cost_label:
+                    self.overlay = "cache-cost"
+                else:
+                    self.model = self.options[self.highlight]
+                    self.overlay = None
             elif key == "Escape":
                 self.overlay = None
             else:
                 pytest.fail(f"Unexpected key in model picker: {args}")
+            return
+        if self.overlay == "cache-cost":
+            assert key == "Enter", args
+            self.confirmations += 1
+            self.model = self.options[self.highlight]
+            self.overlay = None
             return
         if self.overlay == "status":
             assert key == "Escape", args
@@ -13530,6 +13557,9 @@ class _SessionModelComposer(_EditableComposer):
             self.overlay = "status"
 
     def _capture_pane(self, socket_path: str, tmux_target: str) -> str:
+        if self.overlay == "cache-cost":
+            assert self.cache_cost_label is not None
+            return _cache_cost_confirmation_pane(self.cache_cost_label)
         if self.overlay == "picker":
             rows = "\n".join(
                 f"   {'❯' if index == self.highlight else ' '} {index + 1}.  Choice {index}  "
@@ -13655,14 +13685,20 @@ def test_model_draft_does_not_consume_other_prompt_whitespace(prefix: str) -> No
 )
 @pytest.mark.parametrize("busy", [False, True], ids=["idle", "busy"])
 @pytest.mark.parametrize("delivery", ["direct", "routed-pending"])
+@pytest.mark.parametrize("cache_cost", [False, True], ids=["immediate", "cache-cost"])
 async def test_model_command_selects_session_only_then_reads_fresh_status(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     busy: bool,
     delivery: str,
     prompt_separator: str,
+    cache_cost: bool,
 ) -> None:
-    composer = _SessionModelComposer(busy=busy, prompt_separator=prompt_separator)
+    composer = _SessionModelComposer(
+        busy=busy,
+        prompt_separator=prompt_separator,
+        cache_cost_label="Choice 1" if cache_cost else None,
+    )
     bridge_dir = _session_model_bridge(tmp_path, composer)
     composer.install(monkeypatch)
 
@@ -13728,11 +13764,13 @@ async def test_model_command_selects_session_only_then_reads_fresh_status(
     assert result.session_id == composer.session
     assert composer.submitted == ["/model", "/status"]
     assert composer.status_queries == 1
+    assert composer.confirmations == int(cache_cost)
     assert [args[-1] for args in composer.sends] == [
         "/model",
         "Enter",
         "Down",
         "s",
+        *(["Enter"] if cache_cost else []),
         "/status",
         "Enter",
         "Escape",
@@ -13824,7 +13862,9 @@ def test_model_command_refuses_unsupported_or_unowned_input_before_keys(
 
     expected = type(refusal) if holdable else claude_native_bridge.ClaudeModelSwitchRefused
     with pytest.raises(expected) as caught:
-        claude_native_bridge.inject_model_command(bridge_dir, model=target, timeout_s=0.4)
+        claude_native_bridge.inject_model_command(
+            bridge_dir, model=target, timeout_s=0.4, ready_timeout_s=0.1
+        )
 
     if refusal is not None:
         assert (caught.value if holdable else caught.value.__cause__) is refusal
@@ -13833,6 +13873,10 @@ def test_model_command_refuses_unsupported_or_unowned_input_before_keys(
     assert composer.model == "claude-sonnet-5-5"
     if unsupported == "draft":
         assert composer.text == "a person's draft"
+    if unsupported == "missing-version":
+        assert "did not become ready" in str(caught.value)
+        assert "queued" not in str(caught.value)
+        assert not caught.value.command_submitted
 
 
 @pytest.mark.parametrize("prompt", ["blocked prompt", "blocked\n\nprompt", "blocked prompt "])
@@ -14029,9 +14073,11 @@ def test_model_command_explicitly_selects_context_when_status_omits_the_marker(
     assert [args[-1] for args in composer.sends].count("s") == 1
 
 
-@pytest.mark.parametrize("refuse", [False, True], ids=["success", "unsupported"])
+@pytest.mark.parametrize(
+    "outcome", ["success", "unsupported", "cache-cost-success", "cache-cost-refused"]
+)
 def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouched(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refuse: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
 ) -> None:
     config_dir = tmp_path / "config"
     config_dir.mkdir()
@@ -14048,7 +14094,15 @@ def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouch
         ]
 
     baseline = snapshots()
-    composer = _SessionModelComposer()
+    composer = _SessionModelComposer(
+        cache_cost_label=(
+            "Choice 1"
+            if outcome == "cache-cost-success"
+            else "Unselected model"
+            if outcome == "cache-cost-refused"
+            else None
+        )
+    )
     bridge_dir = _session_model_bridge(tmp_path, composer)
     metadata = json.loads((bridge_dir / "bridge.json").read_text())
     metadata["user_settings_path"] = str(legacy)
@@ -14061,12 +14115,18 @@ def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouch
         assert snapshots() == baseline
 
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", send)
-    if refuse:
+    if outcome in {"unsupported", "cache-cost-refused"}:
         with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused):
-            claude_native_bridge.inject_model_command(bridge_dir, model="absent-model")
-        assert composer.sends == []
+            claude_native_bridge.inject_model_command(
+                bridge_dir,
+                model="absent-model" if outcome == "unsupported" else "private-glm[1m]",
+            )
+        assert composer.confirmations == composer.status_queries == 0
+        if outcome == "unsupported":
+            assert composer.sends == []
     else:
         claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+        assert composer.confirmations == int(outcome == "cache-cost-success")
     assert snapshots() == baseline
 
 
@@ -14323,6 +14383,8 @@ def test_model_command_cancels_only_its_recognized_unselectable_picker(
         "highlight",
         "observed-picker",
         "commit",
+        "observed-confirmation",
+        "confirmation",
         "status-draft",
         "status",
         "observed-status",
@@ -14331,12 +14393,14 @@ def test_model_command_cancels_only_its_recognized_unselectable_picker(
 def test_model_command_stops_selection_at_cancellation_or_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop: str, phase: str
 ) -> None:
-    composer = _SessionModelComposer()
+    composer = _SessionModelComposer(
+        cache_cost_label="Choice 1" if "confirmation" in phase else None
+    )
     bridge_dir = _session_model_bridge(tmp_path, composer)
     composer.install(monkeypatch)
     cancelled = threading.Event()
     stopped_after: list[tuple[str, ...]] = []
-    picker_reads = status_reads = 0
+    picker_reads = status_reads = confirmation_reads = 0
 
     def stop_here() -> None:
         stopped_after.extend(composer.sends)
@@ -14353,6 +14417,7 @@ def test_model_command_stops_selection_at_cancellation_or_deadline(
             or (phase == "picker" and key == "Enter" and composer.overlay == "picker")
             or (phase == "highlight" and key == "Down")
             or (phase == "commit" and key == "s")
+            or (phase == "confirmation" and key == "Enter" and composer.confirmations == 1)
             or (phase == "status-draft" and key == "/status")
             or (phase == "status" and key == "Enter" and composer.overlay == "status")
         )
@@ -14360,7 +14425,7 @@ def test_model_command_stops_selection_at_cancellation_or_deadline(
             stop_here()
 
     def capture(socket_path: str, target: str) -> str:
-        nonlocal picker_reads, status_reads
+        nonlocal picker_reads, status_reads, confirmation_reads
         pane = composer._capture_pane(socket_path, target)
         if composer.overlay == "picker" and composer.highlight == 1:
             picker_reads += 1
@@ -14369,6 +14434,10 @@ def test_model_command_stops_selection_at_cancellation_or_deadline(
         if composer.overlay == "status":
             status_reads += 1
             if phase == "observed-status" and status_reads == 2:
+                stop_here()
+        if composer.overlay == "cache-cost":
+            confirmation_reads += 1
+            if phase == "observed-confirmation" and confirmation_reads == 2:
                 stop_here()
         return pane
 
@@ -14390,12 +14459,27 @@ def test_model_command_stops_selection_at_cancellation_or_deadline(
     else:
         assert cleanup == []
     assert caught.value.model_may_have_changed is (
-        phase in {"commit", "status-draft", "status", "observed-status"}
+        phase
+        in {
+            "commit",
+            "observed-confirmation",
+            "confirmation",
+            "status-draft",
+            "status",
+            "observed-status",
+        }
     )
     assert [args[-1] for args in composer.sends].count("s") <= 1
     assert composer.overlay == (
-        "picker" if phase in {"picker", "highlight"} else "status" if phase == "status" else None
+        "picker"
+        if phase in {"picker", "highlight"}
+        else "status"
+        if phase == "status"
+        else "cache-cost"
+        if phase == "observed-confirmation"
+        else None
     )
+    assert composer.confirmations == int(phase == "confirmation")
 
 
 def test_cancelled_model_switch_cleanup_is_bounded_without_retrying_keys(
@@ -14599,6 +14683,124 @@ def test_model_command_never_repeats_an_ambiguous_session_only_commit(
     assert [args[-1] for args in composer.sends] == ["/model", "Enter", "Down", "s"]
 
 
+@pytest.mark.parametrize("failure", ["persistent", "lost-acknowledgement"])
+def test_model_command_confirms_cache_cost_at_most_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    composer = _SessionModelComposer(cache_cost_label="Choice 1")
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+
+    def send(socket_path: str, *args: str) -> None:
+        confirming = composer.overlay == "cache-cost"
+        composer._run_tmux(socket_path, *args)
+        if confirming:
+            if failure == "lost-acknowledgement":
+                raise OSError("confirmation acknowledgement was lost")
+            composer.overlay = "cache-cost"
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", send)
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
+        claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+
+    assert caught.value.phase == "confirmation" and caught.value.model_may_have_changed
+    assert composer.confirmations == 1
+    assert composer.submitted == ["/model"]
+    assert composer.status_queries == 0
+    assert [args[-1] for args in composer.sends] == ["/model", "Enter", "Down", "s", "Enter"]
+
+
+@pytest.mark.parametrize("metadata", ["legacy", "duplicate-label", "unselected-label"])
+def test_model_command_does_not_confirm_an_unproven_cache_cost_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, metadata: str
+) -> None:
+    label = "Catalog name" if metadata == "unselected-label" else "Choice 1"
+    composer = _SessionModelComposer(cache_cost_label=label)
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    config_path = bridge_dir / "bridge.json"
+    config = json.loads(config_path.read_text())
+    options = config["model_picker_options"]
+    if metadata == "legacy":
+        options[1]["provenance"] = "legacy"
+    elif metadata == "duplicate-label":
+        options[0]["display_name"] = label
+    else:
+        options[1]["display_name"] = label
+    config_path.write_text(json.dumps(config))
+    composer.install(monkeypatch)
+
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
+        claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+
+    assert caught.value.phase == "commit" and caught.value.model_may_have_changed
+    assert composer.confirmations == composer.status_queries == 0
+    assert composer.submitted == ["/model"]
+    assert [args[-1] for args in composer.sends] == ["/model", "Enter", "Down", "s"]
+
+
+@pytest.mark.parametrize("changed", ["dialog", "session_id", "version"])
+def test_model_command_rechecks_cache_cost_confirmation_before_enter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed: str
+) -> None:
+    composer = _SessionModelComposer(cache_cost_label="Choice 1")
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+    confirmation_reads = 0
+
+    def capture(socket_path: str, target: str) -> str:
+        nonlocal confirmation_reads
+        pane = composer._capture_pane(socket_path, target)
+        if composer.overlay == "cache-cost":
+            confirmation_reads += 1
+            if confirmation_reads == 2:
+                if changed == "dialog":
+                    return _cache_cost_confirmation_pane("Choice 0")
+                raw_path = bridge_dir / claude_native_bridge.CONTEXT_RAW_FILE
+                raw = json.loads(raw_path.read_text())
+                raw[changed] = "replacement-session" if changed == "session_id" else "2.1.324"
+                raw_path.write_text(json.dumps(raw))
+        return pane
+
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
+        claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+
+    assert caught.value.phase == "confirmation" and caught.value.model_may_have_changed
+    assert composer.confirmations == composer.status_queries == 0
+    assert composer.submitted == ["/model"]
+    assert [args[-1] for args in composer.sends] == ["/model", "Enter", "Down", "s"]
+
+
+@pytest.mark.parametrize("changed", ["model", "session", "version", "clipped-status"])
+def test_model_command_requires_fresh_status_after_cache_cost_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed: str
+) -> None:
+    composer = _SessionModelComposer(cache_cost_label="Choice 1")
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+
+    def capture(socket_path: str, target: str) -> str:
+        pane = composer._capture_pane(socket_path, target)
+        if composer.overlay == "status":
+            original, replacement = {
+                "model": ("Model: private-glm[1m]", "Model: claude-sonnet-5-5"),
+                "session": ("Session ID: native-session", "Session ID: replacement-session"),
+                "version": ("Version: 2.1.323", "Version: 2.1.324"),
+                "clipped-status": ("   Esc to cancel\n", ""),
+            }[changed]
+            return pane.replace(original, replacement)
+        return pane
+
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
+        claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+
+    assert caught.value.phase == "status" and caught.value.model_may_have_changed
+    assert composer.confirmations == composer.status_queries == 1
+    assert composer.submitted == ["/model", "/status"]
+    assert [args[-1] for args in composer.sends].count("s") == 1
+
+
 @pytest.mark.parametrize(
     "blocked_at",
     [
@@ -14608,6 +14810,8 @@ def test_model_command_never_repeats_an_ambiguous_session_only_commit(
         "picker",
         "highlight",
         "commit",
+        "confirmation",
+        "confirmed",
         "status-draft",
         "status",
     ],
@@ -14615,14 +14819,19 @@ def test_model_command_never_repeats_an_ambiguous_session_only_commit(
 def test_model_command_does_not_dismiss_a_replacement_permission_prompt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, blocked_at: str
 ) -> None:
-    composer = _SessionModelComposer(draft="blocked prompt" if blocked_at == "owned-clear" else "")
+    composer = _SessionModelComposer(
+        draft="blocked prompt" if blocked_at == "owned-clear" else "",
+        cache_cost_label="Choice 1" if blocked_at in {"confirmation", "confirmed"} else None,
+    )
     bridge_dir = _session_model_bridge(tmp_path, composer)
     composer.install(monkeypatch)
-    status_reads = 0
+    status_reads = confirmation_reads = 0
 
     def capture(socket_path: str, target: str) -> str:
-        nonlocal status_reads
+        nonlocal status_reads, confirmation_reads
         sent = [args[-1] for args in composer.sends]
+        if composer.overlay == "cache-cost":
+            confirmation_reads += 1
         if (
             blocked_at == "preflight"
             or (blocked_at == "owned-clear" and _CLEAR_ONE_ROW_COMPOSER in sent)
@@ -14630,6 +14839,8 @@ def test_model_command_does_not_dismiss_a_replacement_permission_prompt(
             or (blocked_at == "picker" and composer.overlay == "picker")
             or (blocked_at == "highlight" and "Down" in sent)
             or (blocked_at == "commit" and "s" in sent)
+            or (blocked_at == "confirmation" and confirmation_reads >= 2)
+            or (blocked_at == "confirmed" and composer.confirmations == 1)
             or (blocked_at == "status-draft" and "/status" in sent)
         ):
             return _PERMISSION_PROMPT_PANE
@@ -14660,6 +14871,8 @@ def test_model_command_does_not_dismiss_a_replacement_permission_prompt(
         "picker": ["/model", "Enter"],
         "highlight": ["/model", "Enter", "Down"],
         "commit": ["/model", "Enter", "Down", "s"],
+        "confirmation": ["/model", "Enter", "Down", "s"],
+        "confirmed": ["/model", "Enter", "Down", "s", "Enter"],
         "status-draft": ["/model", "Enter", "Down", "s", "/status"],
         "status": ["/model", "Enter", "Down", "s", "/status", "Enter"],
     }
@@ -14812,39 +15025,58 @@ def test_model_command_can_use_an_exact_live_canonical_row_on_an_older_bridge(
     assert composer.submitted == ["/model", "/status"]
 
 
-@pytest.mark.parametrize("phase", ["picker", "commit", "status"])
+@pytest.mark.parametrize(
+    "phase", ["picker", "commit", "observed-confirmation", "confirmation", "status"]
+)
 @pytest.mark.parametrize("identity", ["owning-session", "native-session", "tmux-target"])
 def test_model_command_does_not_continue_into_a_replacement_session_or_pane(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, identity: str
 ) -> None:
-    composer = _SessionModelComposer()
+    composer = _SessionModelComposer(
+        cache_cost_label="Choice 1" if "confirmation" in phase else None
+    )
     bridge_dir = _session_model_bridge(tmp_path, composer)
     composer.install(monkeypatch)
     sends_before_rotation: list[tuple[str, ...]] = []
+    confirmation_reads = 0
+
+    def rotate(socket_path: str) -> None:
+        sends_before_rotation.extend(composer.sends)
+        if identity == "owning-session":
+            config = json.loads((bridge_dir / "bridge.json").read_text())
+            config["active_session_id"] = "replacement-session"
+            (bridge_dir / "bridge.json").write_text(json.dumps(config))
+        elif identity == "native-session":
+            (bridge_dir / "state.json").write_text(
+                json.dumps({"claude_session_id": "replacement-native-session"})
+            )
+        else:
+            write_tmux_target(
+                bridge_dir, socket_path=Path(socket_path), tmux_target="replacement:0.0"
+            )
 
     def send(socket_path: str, *args: str) -> None:
         composer._run_tmux(socket_path, *args)
         reached = (
             (phase == "picker" and args[-1] == "Enter" and composer.overlay == "picker")
             or (phase == "commit" and args[-1] == "s")
+            or (phase == "confirmation" and composer.confirmations == 1)
             or (phase == "status" and args[-1] == "Enter" and composer.overlay == "status")
         )
         if reached:
-            sends_before_rotation.extend(composer.sends)
-            if identity == "owning-session":
-                config = json.loads((bridge_dir / "bridge.json").read_text())
-                config["active_session_id"] = "replacement-session"
-                (bridge_dir / "bridge.json").write_text(json.dumps(config))
-            elif identity == "native-session":
-                (bridge_dir / "state.json").write_text(
-                    json.dumps({"claude_session_id": "replacement-native-session"})
-                )
-            else:
-                write_tmux_target(
-                    bridge_dir, socket_path=Path(socket_path), tmux_target="replacement:0.0"
-                )
+            rotate(socket_path)
+
+    def capture(socket_path: str, target: str) -> str:
+        nonlocal confirmation_reads
+        pane = composer._capture_pane(socket_path, target)
+        if composer.overlay == "cache-cost":
+            confirmation_reads += 1
+            if phase == "observed-confirmation" and confirmation_reads == 2:
+                rotate(socket_path)
+        return pane
 
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", send)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
     with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused):
         claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
 
@@ -14874,6 +15106,51 @@ def test_model_control_parsers_refuse_partial_duplicate_and_closed_overlays(
     else:
         pane = pane.replace("   Model:", "   Model: other-model\n   Model:")
     assert parse(pane) is None
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_model_control_parser_recognizes_the_captured_cache_cost_confirmation(
+    wrapped: bool,
+) -> None:
+    pane = _cache_cost_confirmation_pane("Sonnet 5.5")
+    if wrapped:
+        pane = pane.replace("Switching to Sonnet", "Switching to\n   Sonnet").replace(
+            "full history gets re-read.", "full history\n   gets re-read."
+        )
+
+    assert claude_model_switch._cache_cost_confirmation(pane, "Sonnet 5.5")
+    assert not claude_model_switch._cache_cost_confirmation(pane, "Choice 1")
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        pytest.param("Switch model?", "Switch mode", id="clipped-title"),
+        pytest.param("slower and use more tokens", "faster", id="unknown-warning"),
+        pytest.param("Switching to Sonnet 5.5", "Switching to Opus 5.5", id="cache-target"),
+        pytest.param("Yes, switch to Sonnet 5.5", "Yes, switch to Opus 5.5", id="yes-target"),
+        pytest.param("❯ 1.", "  1.", id="unselected-yes"),
+        pytest.param("     2.", "   ❯ 2.", id="second-selected-row"),
+        pytest.param("     2. No, go back\n", "", id="clipped-options"),
+        pytest.param("Switch model?", "Switch model?\nSwitch model?", id="duplicate-title"),
+        pytest.param(
+            "     2. No, go back\n",
+            "     2. No, go back\n" + _PERMISSION_PROMPT_PANE,
+            id="permission-prompt",
+        ),
+        pytest.param(
+            "     2. No, go back\n",
+            "     2. No, go back\n" + _CAPTURED_EMPTY_NBSP_COMPOSER,
+            id="replacement-composer",
+        ),
+    ],
+)
+def test_model_control_parser_refuses_unowned_or_incomplete_cache_cost_confirmations(
+    old: str, new: str
+) -> None:
+    pane = _cache_cost_confirmation_pane("Sonnet 5.5").replace(old, new)
+
+    assert not claude_model_switch._cache_cost_confirmation(pane, "Sonnet 5.5")
 
 
 @pytest.mark.parametrize("operation", ["send", "capture"])
