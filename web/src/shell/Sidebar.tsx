@@ -353,6 +353,7 @@ import {
 } from "@/lib/automationFromSession";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
+import { RunnerStatsSection, hasRunnerStats } from "./RunnerStatsSection";
 import {
   SIDEBAR_ROW,
   SIDEBAR_HOVER_HIGHLIGHT,
@@ -5528,6 +5529,10 @@ function SessionTooltipContent({
       />
     );
   }
+  // Runner stats section replaces the location line when available.
+  const host = conversation.host_id ? hostsById.get(conversation.host_id) : undefined;
+  const showRunnerStats = hasRunnerStats(host) && isFeatureEnabled(serverInfo, "host_stats");
+
   return (
     <TooltipContent
       side="right"
@@ -5545,14 +5550,22 @@ function SessionTooltipContent({
         <span className="shrink-0">{relativeTime(conversation.updated_at * 1000)}</span>
         <span aria-hidden>·</span>
         <SessionHarnessIcon conversation={conversation} testId="session-tooltip-harness" />
-        <span data-testid="session-tooltip-location" className="flex min-w-0 items-center gap-1.5">
-          <LaptopIcon aria-hidden className="size-3.5 shrink-0" />
-          <span className="truncate">{sessionLocationLabel(conversation, hostsById)}</span>
-        </span>
+        {!showRunnerStats && (
+          <span
+            data-testid="session-tooltip-location"
+            className="flex min-w-0 items-center gap-1.5"
+          >
+            <LaptopIcon aria-hidden className="size-3.5 shrink-0" />
+            <span className="truncate">{sessionLocationLabel(conversation, hostsById)}</span>
+          </span>
+        )}
       </p>
       <SessionTooltipDetails conversation={conversation} />
       {shared && <SessionSharedHint />}
       {hasError && <SessionErrorHint />}
+      {host && showRunnerStats && (
+        <RunnerStatsSection host={host} label={sessionLocationLabel(conversation, hostsById)} />
+      )}
     </TooltipContent>
   );
 }

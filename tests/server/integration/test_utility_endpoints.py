@@ -105,6 +105,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "session_orchestration": True,
         "sibling_sessions": True,
         "codex_plan_at_launch": True,
+        "host_stats": False,
     }
     assert data["sibling_sessions"] is True
     # Compatibility field for frontend builds predating the nested map.

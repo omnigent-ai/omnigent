@@ -5298,6 +5298,7 @@ def create_app(
                 on_host_update=_on_hosts_changed,
                 harness_install=app.state.harness_install,
                 sandbox_config=sandbox_config,
+                feature_flags=resolved_feature_flags,
             ),
             prefix="/v1",
             tags=["hosts"],

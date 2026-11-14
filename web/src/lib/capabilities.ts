@@ -70,7 +70,8 @@ export type FeatureKey =
   | "sidebar_windowed_rows"
   | "session_overview"
   | "project_repository_creation"
-  | "session_orchestration";
+  | "session_orchestration"
+  | "host_stats";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
