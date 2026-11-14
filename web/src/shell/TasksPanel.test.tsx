@@ -685,6 +685,29 @@ describe("TasksPanel", () => {
     expect(row().dataset.state).toBe("running");
   });
 
+  it("leaves the other running tasks running while a workflow question waits", () => {
+    showJournal([
+      journalPlan(0, ["tests"], ["docs"]),
+      status(1, "tests", "started"),
+      status(2, "docs", "needs_input", "Which docs site?"),
+    ]);
+    const question = {
+      type: "elicitation",
+      elicitationId: "e1",
+      status: "pending",
+      phase: "workflow_request_input",
+    };
+    setSession({
+      sessionStatus: "running",
+      blocks: [question] as unknown as ConversationState["blocks"],
+    });
+    renderPanel();
+    const [tests, docs] = screen.getAllByTestId("tasks-row");
+    expect(tests.dataset.state).toBe("running");
+    expect(docs.dataset.state).toBe("needs_input");
+    expect(screen.getByText("1 waiting for you")).toBeTruthy();
+  });
+
   it("says an idle list stopped while a task could run, or that an automation's run ended", () => {
     showJournal([journalPlan(0, ["a"], ["b", ["a"]]), status(1, "a", "done", "ok")]);
     const { unmount } = renderPanel();

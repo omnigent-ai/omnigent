@@ -10,6 +10,7 @@ import { parentIdFromLabels } from "@/lib/sessionHost";
 import {
   pausedLabel,
   sessionTaskList,
+  WORKFLOW_QUESTION_PHASE,
   type JournalEntry,
   type PausedLabel,
   type SessionTaskList,
@@ -71,9 +72,15 @@ export function useSessionTasks(
     sessionStatus === "waiting" ||
     (backgroundTasks ?? 0) > 0 ||
     workersRunning;
-  // A question or permission prompt in the chat waiting for the user's answer.
+  // A question or permission prompt in the chat waiting for the user's answer. A
+  // workflow question marks only its own task, which the journal already shows.
   const awaitingUser = useConversationEntryValue(conversationId ?? null, (state) =>
-    state.blocks.some((block) => block.type === "elicitation" && block.status === "pending"),
+    state.blocks.some(
+      (block) =>
+        block.type === "elicitation" &&
+        block.status === "pending" &&
+        block.phase !== WORKFLOW_QUESTION_PHASE,
+    ),
   );
   const entries = journalSupported ? journal.entries : NO_ENTRIES;
   const tasks = sessionTaskList(entries, nativeTasks, sessionWorking, awaitingUser);

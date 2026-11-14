@@ -132,9 +132,10 @@ When the user asks to review the plan before the work starts:
   list would only disagree with it.
 - Write `started` with `sys_journal_write_status` when you begin a step yourself.
 - Start a step only once the steps it depends on are done: the journal refuses
-  `started` or `done` otherwise (`step_not_ready`). If another step's work
-  covered one, write `done` on it and say which step covered it. If one turned
-  out unnecessary, replan without it.
+  any status on it otherwise, even a question with `sys_workflow_request_input`
+  (`step_not_ready`). If another step's work covered one, write `done` on it
+  and say which step covered it. If one turned out unnecessary, replan without
+  it.
 - Run ready steps that don't depend on each other at the same time when you
   can, such as on sub-agents if you have them, and work on other ready steps
   while one waits on something slow, such as CI or another session.

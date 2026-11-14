@@ -44,7 +44,6 @@ from omnigent.entities.session_journal import (
     IDEMPOTENCY_KEY_MAX_CHARS,
     JOURNAL_KINDS,
     JOURNAL_PAGE_MAX,
-    STATUSES_NEEDING_DEPENDENCIES,
     InvalidJournalEntryError,
     JournalAppend,
     JournalEntry,
@@ -321,8 +320,8 @@ class SessionJournalStore:
         :returns: The entry, and whether this call appended it.
         :raises InvalidJournalEntryError: If a field is invalid.
         :raises JournalEntryTooLargeError: If the stored payload is too large.
-        :raises StepNotReadyError: If a ``started`` or ``done`` status names a step
-            whose dependencies in the current plan aren't all done.
+        :raises StepNotReadyError: If a status names a step whose dependencies in
+            the current plan aren't all done.
         :raises JournalSessionNotFoundError: If the session doesn't exist.
         """
         fields = normalize_payload(kind, payload)
@@ -386,12 +385,11 @@ class SessionJournalStore:
                 steps = self._entries([plan])[0].payload["steps"] if plan is not None else None
                 if entry_step is None:
                     entry_step = self._default_step(steps)
-                if fields["status"] in STATUSES_NEEDING_DEPENDENCIES:
-                    waiting = self._unfinished_dependencies(
-                        session, conversation_id, steps, entry_step
-                    )
-                    if waiting:
-                        raise StepNotReadyError(entry_step, waiting)
+                waiting = self._unfinished_dependencies(
+                    session, conversation_id, steps, entry_step
+                )
+                if waiting:
+                    raise StepNotReadyError(entry_step, waiting)
             row = SqlSessionJournalEntry(
                 workspace_id=current_workspace_id(),
                 conversation_id=conversation_id,

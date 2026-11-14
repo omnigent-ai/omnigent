@@ -67,6 +67,7 @@ import { isNativePolicyName, nativeCodingAgentForPolicyName } from "@/lib/native
 import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
 import { Link, useLocation } from "@/lib/routing";
+import { WORKFLOW_QUESTION_PHASE } from "@/lib/sessionJournal";
 import { sessionNavigationSearch } from "@/lib/sessionNavigation";
 import { type FileEditDiff, getFileEditDiff } from "@/lib/toolEditDiff";
 import type { AgyPermission, CodexPersistMode, FileEditRequest, RememberScope } from "@/lib/types";
@@ -103,8 +104,6 @@ const QUESTION_TITLES = [
 
 // A workflow question comes from whichever harness runs the workflow; its
 // message names the task waiting on it.
-const WORKFLOW_QUESTION_PHASE = "workflow_request_input";
-
 function questionPromptTitle(policyName: string, phase: string, message: string): string {
   if (phase === WORKFLOW_QUESTION_PHASE && message) return message;
   const match = QUESTION_TITLES.find(
