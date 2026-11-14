@@ -1135,6 +1135,7 @@ class TerminalInstance:
     _tcp_egress_broker: TcpEgressBroker | None = field(default=None, repr=False)
     _tcp_egress_tmpdir: Path | None = field(default=None, repr=False)
     _resource_cleanup_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
+    _resource_cleanup_terminal_stopped: bool = field(default=False, init=False, repr=False)
     _resource_cleanup_stack: contextlib.ExitStack = field(
         default_factory=contextlib.ExitStack, init=False, repr=False
     )
@@ -2090,11 +2091,27 @@ class TerminalInstance:
                 await asyncio.to_thread(self._clipboard_bridge.close)
 
         finally:
-            if self._resource_cleanup_task is None or self._resource_cleanup_task.done():
-                self._resource_cleanup_task = asyncio.create_task(
-                    asyncio.to_thread(self._close_resources, terminal_stopped=terminal_stopped)
-                )
-            await asyncio.shield(self._resource_cleanup_task)
+            pending = self._resource_cleanup_task
+            if (
+                pending is None
+                or pending.done()
+                or (terminal_stopped and not self._resource_cleanup_terminal_stopped)
+            ):
+                previous = pending if pending is not None and not pending.done() else None
+
+                async def close_resources() -> None:
+                    try:
+                        if previous is not None:
+                            await asyncio.shield(previous)
+                    finally:
+                        await asyncio.to_thread(
+                            self._close_resources, terminal_stopped=terminal_stopped
+                        )
+
+                pending = asyncio.create_task(close_resources())
+                self._resource_cleanup_task = pending
+                self._resource_cleanup_terminal_stopped = terminal_stopped
+            await asyncio.shield(pending)
 
     def _close_resources(self, *, terminal_stopped: bool) -> None:
         """Finish revocation and file cleanup even if the async owner times out."""

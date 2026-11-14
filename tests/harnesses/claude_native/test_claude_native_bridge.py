@@ -22,7 +22,7 @@ import time
 import unicodedata
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, suppress
+from contextlib import AsyncExitStack, contextmanager, suppress
 from contextvars import ContextVar
 from http.client import BadStatusLine, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -5020,36 +5020,43 @@ def test_augment_claude_args_merges_user_disallowed_tools(tmp_path: Path) -> Non
     assert disallowed == ["Bash", "Edit"]
 
 
-async def _finalize_test_claude_args(
-    args, *, bridge_dir, os_env_spec, active_harnesses=None, generation=None
-):
+@pytest.fixture
+async def _finalize_test_claude_args():
     from omnigent.inner.datamodel import TerminalEnvSpec
     from omnigent.inner.terminal import create_terminal_instance
 
-    created = create_terminal_instance(
-        "claude", "settings", TerminalEnvSpec(args=args, os_env=os_env_spec)
-    )
-    try:
-        await claude_native_bridge.finalize_claude_caller_settings(
-            created.instance,
-            bridge_dir=bridge_dir,
-            generation=(
-                generation
-                if generation is not None
-                else claude_native_bridge.record_claude_settings_boundary(
-                    bridge_dir, args, claude_args_start=0
-                )
-            ),
-            active_harnesses=active_harnesses,
-        )
-        return created.instance.args
-    finally:
-        await created.instance.close()
+    async with AsyncExitStack() as cleanup:
+
+        async def finalize(
+            args, *, bridge_dir, os_env_spec, active_harnesses=None, generation=None
+        ):
+            created = create_terminal_instance(
+                "claude", "settings", TerminalEnvSpec(args=args, os_env=os_env_spec)
+            )
+            cleanup.push_async_callback(created.instance.close)
+            await claude_native_bridge.finalize_claude_caller_settings(
+                created.instance,
+                bridge_dir=bridge_dir,
+                generation=(
+                    generation
+                    if generation is not None
+                    else claude_native_bridge.record_claude_settings_boundary(
+                        bridge_dir, args, claude_args_start=0
+                    )
+                ),
+                active_harnesses=active_harnesses,
+            )
+            return created.instance.args
+
+        yield finalize
 
 
 @pytest.mark.asyncio
 async def test_augment_claude_args_merges_caller_settings(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, claude_settings_validator
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claude_settings_validator,
+    _finalize_test_claude_args,
 ) -> None:
     """
     A caller ``--settings`` is merged into the invocation settings, not dropped.
@@ -5302,7 +5309,11 @@ async def test_caller_hook_shapes_fail_before_finalized_output(
     ids=["retention", "vendor-rejection"],
 )
 async def test_caller_settings_validation_preserves_baseline_and_arguments(
-    tmp_path: Path, claude_settings_validator, caller: dict, error: str
+    tmp_path: Path,
+    claude_settings_validator,
+    caller: dict,
+    error: str,
+    _finalize_test_claude_args,
 ) -> None:
     from omnigent.inner.datamodel import OSEnvSpec
 
@@ -5339,7 +5350,7 @@ async def test_caller_settings_validation_preserves_baseline_and_arguments(
     ["no-caller", "delimiter", "unreadable", "mismatch", "invalid-generation", "missing-boundary"],
 )
 async def test_caller_settings_finalize_parsing_and_generation(
-    tmp_path: Path, mode: str, claude_settings_validator
+    tmp_path: Path, mode: str, claude_settings_validator, _finalize_test_claude_args
 ) -> None:
     from omnigent.inner.datamodel import OSEnvSpec
 
@@ -5503,13 +5514,16 @@ async def test_overlapping_caller_settings_finalizers_keep_immutable_baseline(
         if owned_request:
             for lease in leases:
                 lease.close()
-            await instances[0].close()
-            assert not outputs[0].exists()
-            assert outputs[1].exists()
-            assert baseline_path.read_bytes() == baseline_bytes
-            await instances[1].close()
-            assert not outputs[1].exists()
+        await instances[0].close()
+        assert not outputs[0].exists()
+        assert outputs[1].exists()
+        assert baseline_path.read_bytes() == baseline_bytes
+        await instances[1].close()
+        assert not outputs[1].exists()
+        if owned_request:
             assert not list(tmp_path.glob(f"claude-settings-{generation}*"))
+        else:
+            assert baseline_path.read_bytes() == baseline_bytes
     finally:
         release.set()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -5811,7 +5825,7 @@ sys.stdin.read()
 @pytest.mark.asyncio
 @pytest.mark.parametrize("filesystem_mode", ["none", "default", "fork"])
 async def test_caller_settings_resolve_terminal_workspace(
-    tmp_path: Path, filesystem_mode: str, claude_settings_validator
+    tmp_path: Path, filesystem_mode: str, claude_settings_validator, _finalize_test_claude_args
 ) -> None:
     from omnigent.inner.datamodel import OSEnvSpec
 
@@ -6115,7 +6129,10 @@ async def test_caller_settings_reuses_existing_terminal_filesystem_view(
     sys.platform != "linux" or shutil.which("bwrap") is None, reason="requires Linux and bwrap"
 )
 async def test_caller_settings_follow_terminal_filesystem_policy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, claude_settings_validator
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claude_settings_validator,
+    _finalize_test_claude_args,
 ) -> None:
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
@@ -19236,7 +19253,9 @@ def test_read_tmux_target_rejects_invalid_payloads(tmp_path: Path) -> None:
 @pytest.mark.parametrize("saved", [False, True])
 @pytest.mark.parametrize("active", [None, [], ["claude"]])
 @pytest.mark.usefixtures("claude_settings_validator")
-async def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved, deferred):
+async def test_disabled_mcp_settings_launch_hook(
+    tmp_path, monkeypatch, active, saved, deferred, _finalize_test_claude_args
+):
     from omnigent.inner.datamodel import OSEnvSpec
     from tests._helpers.mcp_disabled_servers import launch_activation
 

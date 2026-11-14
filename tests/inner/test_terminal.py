@@ -923,6 +923,9 @@ async def test_async_idle_watcher_treats_confirmation_start_failure_as_unknown(
         "error",
         "cancelled-before-kill",
         "cancelled-kill",
+        "cancelled-kill-overlap",
+        "cancelled-kill-overlap-cancelled-retry",
+        "cancelled-kill-overlap-cleanup-error",
         "interrupted-spawn",
         "interrupted-spawn-retry",
     ],
@@ -945,10 +948,24 @@ async def test_close_kills_tmux_when_socket_exists_after_running_cleared(
     commands: list[tuple[str, ...]] = []
     retired = []
     revoked = []
+    overlap = "-overlap" in outcome
+    cleanup_started = threading.Event()
+    release_cleanup = threading.Event()
+    cleanup_error = RuntimeError("first resource cleanup failed")
     output = private_dir / "retained-settings.json"
     output.write_text("{}")
     instance.add_resource_cleanup(lambda: retired.append(True))
-    monkeypatch.setattr(instance, "_stop_network_brokers", lambda: revoked.append(True))
+
+    def revoke_brokers() -> None:
+        revoked.append(True)
+        if overlap and len(revoked) == 1:
+            cleanup_started.set()
+            if not release_cleanup.wait(timeout=5):
+                raise TimeoutError("resource cleanup was not released")
+            if outcome.endswith("cleanup-error"):
+                raise cleanup_error
+
+    monkeypatch.setattr(instance, "_stop_network_brokers", revoke_brokers)
     if outcome == "cancelled-before-kill":
         monkeypatch.setattr(
             instance, "_stop_idle_watcher", AsyncMock(side_effect=asyncio.CancelledError)
@@ -981,10 +998,67 @@ async def test_close_kills_tmux_when_socket_exists_after_running_cleared(
             )
         if outcome == "error":
             raise RuntimeError("termination unconfirmed")
-        if outcome == "cancelled-kill":
+        if outcome.startswith("cancelled-kill"):
             raise asyncio.CancelledError
 
     instance._tmux = _tmux  # type: ignore[method-assign]
+
+    if overlap:
+        first_close = asyncio.create_task(instance.close())
+        retry = None
+        termination_confirmed = asyncio.Event()
+
+        async def kill_on_retry(*args: str) -> None:
+            commands.append(args)
+            termination_confirmed.set()
+
+        try:
+            assert await asyncio.to_thread(cleanup_started.wait, 2)
+            assert output.exists()
+            assert retired == []
+            monkeypatch.setattr(instance, "_tmux", kill_on_retry)
+            retry = asyncio.create_task(instance.close())
+            await asyncio.wait_for(termination_confirmed.wait(), timeout=1)
+            await asyncio.sleep(0)
+            assert not retry.done()
+            assert output.exists()
+            assert retired == []
+            if outcome.endswith("cancelled-retry"):
+                for _ in range(3):
+                    retry.cancel()
+            release_cleanup.set()
+            first_result, retry_result = await asyncio.gather(
+                first_close, retry, return_exceptions=True
+            )
+            cleanup_task = instance._resource_cleanup_task
+            assert cleanup_task is not None
+            (cleanup_result,) = await asyncio.gather(cleanup_task, return_exceptions=True)
+        finally:
+            release_cleanup.set()
+            await asyncio.gather(
+                first_close, *([retry] if retry is not None else []), return_exceptions=True
+            )
+            if instance._resource_cleanup_task is not None:
+                await asyncio.gather(instance._resource_cleanup_task, return_exceptions=True)
+
+        assert commands == [("kill-server",), ("kill-server",)]
+        if outcome.endswith("cleanup-error"):
+            assert first_result is cleanup_error
+            assert retry_result is cleanup_error
+            assert cleanup_result is cleanup_error
+        else:
+            assert isinstance(first_result, asyncio.CancelledError)
+            assert (
+                isinstance(retry_result, asyncio.CancelledError)
+                if outcome.endswith("cancelled-retry")
+                else retry_result is None
+            )
+            assert cleanup_result is None
+        assert retired == [True]
+        assert not private_dir.exists()
+        await instance.close()
+        assert retired == [True]
+        return
 
     if outcome.startswith("cancelled"):
         with pytest.raises(asyncio.CancelledError):

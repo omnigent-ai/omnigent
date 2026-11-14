@@ -3816,6 +3816,8 @@ async def finalize_claude_caller_settings(
         _replace_framework_settings(
             kept, settings_path, output_path, retain_baseline=private_output
         )
+        if not private_output:
+            instance.add_resource_cleanup(functools.partial(output_path.unlink, missing_ok=True))
     instance.args = [*prefix, *kept]
 
 
