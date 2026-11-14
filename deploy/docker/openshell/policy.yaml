@@ -1,0 +1,93 @@
+version: 1
+
+# --- Sandbox setup configuration (queried once at startup) ---
+
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /usr
+    - /lib
+    - /lib64
+    - /proc
+    - /dev/urandom
+    - /etc
+    - /var/log
+  read_write:
+    - /sandbox
+    - /tmp
+    - /dev/null
+    - /dev/pts
+
+landlock:
+  compatibility: best_effort
+
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+# --- Network policies (queried per-CONNECT request) ---
+
+network_policies:
+  claude_code:
+    name: claude-code
+    endpoints:
+      - { host: api.anthropic.com, port: 443, protocol: rest, enforcement: enforce, access: full }
+      - { host: statsig.anthropic.com, port: 443 }
+      - { host: sentry.io, port: 443 }
+      - { host: platform.claude.com, port: 443 }
+    binaries:
+      - { path: /usr/local/bin/claude }
+      - { path: /usr/local/bin/node }
+      - { path: /usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe }
+
+  opencode:
+    name: opencode
+    endpoints:
+      - { host: registry.npmjs.org, port: 443, protocol: rest, access: read-only, allow_encoded_slash: true }
+      - { host: opencode.ai, port: 443 }
+      - { host: models.opencode.ai, port: 443 }
+    binaries:
+      - { path: /usr/local/lib/node_modules/opencode-ai/bin/.opencode }
+      - { path: /usr/local/lib/node_modules/opencode-ai/bin/opencode.exe }
+      - { path: /usr/local/bin/node }
+      - { path: /usr/local/bin/opencode }
+      - { path: /usr/bin/curl }
+
+  codex:
+    name: codex
+    endpoints:
+    - { host: raw.githubusercontent.com, port: 443}
+    binaries:
+      - { path: /usr/local/bin/codex }
+      - { path: /usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex }
+
+  omnigent_server:
+    name: omnigent-server
+    endpoints:
+      - { host: "omnigent.omnigent.svc.cluster.local", port: 80 }
+    binaries:
+      - { path: /sandbox/.venv/bin/python }
+      - { path: /sandbox/.venv/bin/python3 }
+      - { path: /sandbox/.venv/bin/omnigent }
+      # Resolved interpreter behind the venv symlinks: /usr/bin/python3.12 on
+      # the UBI image, /usr/local/bin/python3.12 on the Debian host image.
+      - { path: /usr/bin/python3.12 }
+      - { path: /usr/local/bin/python3.12 }
+      - { path: /usr/local/bin/python3 }
+      - { path: /usr/local/bin/python }
+      - { path: /usr/bin/curl }
+
+  pypi:
+    name: pypi
+    endpoints:
+      - { host: pypi.org, port: 443 }
+      - { host: files.pythonhosted.org, port: 443 }
+      - { host: objects.githubusercontent.com, port: 443 }
+      - { host: downloads.python.org, port: 443 }
+    binaries:
+      - { path: /sandbox/.venv/bin/python }
+      - { path: /sandbox/.venv/bin/python3 }
+      - { path: /sandbox/.venv/bin/pip }
+      - { path: /usr/local/bin/python3.12 }
+      - { path: /usr/local/bin/python3 }
+      - { path: /usr/local/bin/python }
