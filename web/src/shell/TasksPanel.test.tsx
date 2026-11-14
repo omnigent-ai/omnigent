@@ -530,6 +530,42 @@ describe("TasksPanel", () => {
     }
   });
 
+  it("takes Continue to the question a waiting task's agent waits on, rather than messaging it", () => {
+    showJournal([
+      journalPlan(0, ["approve"], ["docs"]),
+      status(1, "approve", "needs_input", "Deploy to prod now?"),
+      status(2, "docs", "needs_input", "Paused at your request"),
+    ]);
+    const question = {
+      type: "elicitation",
+      elicitationId: "elicit_approve",
+      status: "pending",
+      phase: "workflow_request_input",
+      journalStep: "approve",
+    };
+    setSession({ blocks: [question] as unknown as ConversationState["blocks"] });
+    const taskAction = vi.fn();
+    const onShowInChat = vi.fn();
+    const withdraw = registerTaskAction("conv", taskAction);
+    try {
+      renderPanel(undefined, onShowInChat);
+      const [approve, docs] = screen.getAllByTestId("tasks-row");
+      fireEvent.pointerDown(within(approve!).getByTestId("tasks-row-menu"), { button: 0 });
+      fireEvent.click(screen.getByTestId("tasks-row-proceed"));
+      expect(taskAction).not.toHaveBeenCalled();
+      expect(onShowInChat).toHaveBeenCalledOnce();
+      const search = new URLSearchParams(screen.getByTestId("search").textContent ?? "");
+      expect(search.get("message")).toBe("elicit_approve");
+
+      // A task with no question waiting still asks the agent to go ahead.
+      fireEvent.pointerDown(within(docs!).getByTestId("tasks-row-menu"), { button: 0 });
+      fireEvent.click(screen.getByTestId("tasks-row-proceed"));
+      expect(taskAction).toHaveBeenCalledWith("proceed", "docs");
+    } finally {
+      act(withdraw);
+    }
+  });
+
   it("offers Stop on a running task while the composer can stop the agent", () => {
     showJournal([journalPlan(0, ["baseline"]), status(1, "baseline", "started")]);
     setSession({ sessionStatus: "running" });

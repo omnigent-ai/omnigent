@@ -204,7 +204,10 @@ nothing is. A ready task's **⋯** menu has **Run**, and a stopped task's has
 **Continue**: each sends the agent a message asking it to do that, then go on
 with the rest of the plan. A task waiting for you has **Continue** too, which
 tells the agent it's fine to go ahead with that task, marking it started (or
-done, if its work is already done), then the rest of the plan. A failed task's
+done, if its work is already done), then the rest of the plan. While the agent
+waits on a question it asked about that task, it can't read a message, so
+Continue takes you to the question in the chat instead; on a workflow's or an
+automation's page, it opens the run's session at the question. A failed task's
 menu has **Retry**, which asks the agent to run it again, then go on with the
 rest of the plan. A task that waits on a failed task, directly or through tasks
 that haven't started, says **Can't start** and names the failed task until it

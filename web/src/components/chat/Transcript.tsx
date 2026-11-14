@@ -496,6 +496,7 @@ function TranscriptImpl({
                     from="assistant"
                     className="max-w-full"
                     data-testid="bottom-elicitation"
+                    data-message-id={item.elicitationId}
                   >
                     <MessageContent className="w-full">
                       <ElicitationCard

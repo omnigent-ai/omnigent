@@ -938,6 +938,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         status: "pending",
         response: null,
         askUserQuestion: event.askUserQuestion,
+        ...(event.journalStep ? { journalStep: event.journalStep } : {}),
         exitPlanMode: event.exitPlanMode,
         fileEdit: event.fileEdit,
         codexCommand: event.codexCommand,

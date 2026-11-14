@@ -1167,6 +1167,9 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         !Array.isArray(askUserQuestionRaw)
           ? (askUserQuestionRaw as Record<string, unknown>)
           : null,
+      ...(typeof p.journal_step === "string" && p.journal_step
+        ? { journalStep: p.journal_step }
+        : {}),
       exitPlanMode:
         exitPlanModeRaw && typeof exitPlanModeRaw === "object" && !Array.isArray(exitPlanModeRaw)
           ? (exitPlanModeRaw as Record<string, unknown>)
