@@ -58,6 +58,7 @@ from fastapi.responses import StreamingResponse as _StreamingResponse
 
 import omnigent.runtime.harnesses._executor_adapter as _adapter_mod_recovery
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE
+from omnigent.inner._proc import process_alive
 from omnigent.inner.executor import (
     Executor as _RecoveryExecutor,
 )
@@ -2810,34 +2811,37 @@ async def _os_env_helper_pid(
         await lease.release(reusable=True)
 
 
-def _process_exists(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    return True
-
-
 async def _wait_until_dead(pid: int, timeout: float = 5.0) -> None:
     """Wait until *pid* has exited (a zombie counts), so the next call sees it dead."""
-    import subprocess
-
-    def stopped() -> bool:
-        state = subprocess.run(
-            ["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, check=False
-        ).stdout.strip()
-        return not state or state.startswith("Z")
-
-    await poll_until_async(stopped, timeout_s=timeout, interval_s=0.02)
+    await poll_until_async(lambda: not process_alive(pid), timeout_s=timeout, interval_s=0.02)
 
 
 @pytest.mark.asyncio
-async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+@pytest.mark.parametrize("credential_proxy", [False, True], ids=["reusable", "credential-proxy"])
+async def test_runner_os_env_tools_use_agent_spec_cwd(
+    monkeypatch: pytest.MonkeyPatch, credential_proxy: bool
+) -> None:
+    from subprocess import Popen
+    from unittest.mock import AsyncMock
+
+    from omnigent.inner.datamodel import CredentialProxySpec, OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.os_env import _HelperProcessClient
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
+    from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
     from omnigent.spec.types import AgentSpec
 
     registry = SessionResourceRegistry()
+    lease_environment = AsyncMock(wraps=registry.lease_tool_environment)
+    monkeypatch.setattr(registry, "lease_tool_environment", lease_environment)
+    processes: list[Popen[str]] = []
+    start_helper = _HelperProcessClient._start_locked
+
+    def record_start(helper: _HelperProcessClient) -> None:
+        start_helper(helper)
+        assert helper._proc is not None
+        processes.append(helper._proc)
+
+    monkeypatch.setattr(_HelperProcessClient, "_start_locked", record_start)
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         spec = AgentSpec(
@@ -2845,7 +2849,10 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
             os_env=OSEnvSpec(
                 type="caller_process",
                 cwd=str(root),
-                sandbox=OSEnvSandboxSpec(type="none"),
+                sandbox=OSEnvSandboxSpec(
+                    type="none",
+                    credential_proxy=CredentialProxySpec(entries=[]) if credential_proxy else None,
+                ),
             ),
         )
         try:
@@ -2858,15 +2865,27 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
             )
             assert json.loads(write)["created"] is True
             assert root.joinpath("created.txt").read_text() == "Привет 世界\nplanet\n"
+            assert len(processes) == 1
 
+            filesystem_registry = AgentEditFilesystemRegistry(watch_path=root)
+            original_text = root.joinpath("created.txt").read_bytes().decode("utf-8")
             edit = await _execute_os_env_tool(
                 "sys_os_edit",
                 {"path": "created.txt", "oldText": "planet", "newText": "world"},
                 agent_spec=spec,
                 conversation_id="conv_runner_os_env_test",
                 resource_registry=registry,
+                filesystem_registry=filesystem_registry,
             )
             assert json.loads(edit)["replacements"] == 1
+            assert filesystem_registry.get_baseline("created.txt") == original_text
+            assert [
+                entry["status"]
+                for entry in filesystem_registry.list_changed_files(
+                    "conv_runner_os_env_test", limit=10
+                )
+            ] == ["modified"]
+            assert len(processes) == (2 if credential_proxy else 1)
 
             read = await _execute_os_env_tool(
                 "sys_os_read",
@@ -2877,8 +2896,14 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
             )
             assert "Привет 世界" in read
             assert json.loads(read)["content"] == "Привет 世界\nworld\n"
+            assert len(processes) == (3 if credential_proxy else 1)
+            if credential_proxy:
+                lease_environment.assert_not_awaited()
+            else:
+                assert lease_environment.await_count == 3
         finally:
             await registry.cleanup_session("conv_runner_os_env_test")
+        assert all(process.poll() is not None for process in processes)
 
 
 @pytest.mark.asyncio
@@ -2907,7 +2932,7 @@ async def test_runner_os_env_helper_retires_after_returned_error_and_shell(
             resource_registry=registry,
         )
         assert json.loads(error)["error"].startswith("Could not find oldText")
-        assert not _process_exists(helper_pid)
+        assert not process_alive(helper_pid)
         assert (tmp_path / "note.txt").read_text() == "ready\n"
         replacement = await _os_env_helper_pid(registry, spec, "conv_retire")
         assert replacement != helper_pid
@@ -2924,12 +2949,12 @@ async def test_runner_os_env_helper_retires_after_returned_error_and_shell(
         cwd, pid = shell_result["stdout"].split()
         assert Path(cwd).resolve() == tmp_path.resolve()
         assert int(pid) == replacement
-        assert not _process_exists(replacement)
+        assert not process_alive(replacement)
         after_shell = await _os_env_helper_pid(registry, spec, "conv_retire")
         assert after_shell != replacement
     finally:
         await registry.cleanup_session("conv_retire")
-    assert not _process_exists(after_shell)
+    assert not process_alive(after_shell)
 
 
 @pytest.mark.asyncio
@@ -2966,7 +2991,7 @@ async def test_runner_os_env_helper_restarts_replaces_workspace_and_times_out(
 
         moved = await _os_env_helper_pid(registry, agent(tmp_path / "b"), "conv_a")
         assert moved != restarted
-        assert not _process_exists(restarted)
+        assert not process_alive(restarted)
 
         # A timed-out command's descendants may outlive it, so its helper is retired.
         timed_out = await _execute_os_env_tool(
@@ -2977,12 +3002,12 @@ async def test_runner_os_env_helper_restarts_replaces_workspace_and_times_out(
             resource_registry=registry,
         )
         assert json.loads(timed_out)["timed_out"] is True
-        assert not _process_exists(moved)
+        assert not process_alive(moved)
         moved = await _os_env_helper_pid(registry, agent(tmp_path / "b"), "conv_a")
 
     finally:
         await registry.cleanup_session("conv_a")
-    assert not _process_exists(moved)
+    assert not process_alive(moved)
 
 
 @pytest.mark.asyncio
@@ -3064,7 +3089,7 @@ async def test_runner_os_env_busy_helper_serves_concurrent_calls_and_cancellatio
         gate_fd = None
         with pytest.raises(asyncio.CancelledError):
             await blocked
-        assert not _process_exists(session_helper)
+        assert not process_alive(session_helper)
         replacement = await _os_env_helper_pid(registry, spec, "conv_busy")
         assert replacement != session_helper
     finally:
@@ -3074,7 +3099,7 @@ async def test_runner_os_env_busy_helper_serves_concurrent_calls_and_cancellatio
             blocked.cancel()
             await asyncio.gather(blocked, return_exceptions=True)
         await registry.cleanup_session("conv_busy")
-    assert not _process_exists(replacement)
+    assert not process_alive(replacement)
 
 
 _REVERT_NATIVE_TEXT = f"one{os.linesep}two{os.linesep}"

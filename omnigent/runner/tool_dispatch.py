@@ -8323,6 +8323,10 @@ async def _execute_os_env_tool(
                 resource_registry is not None
                 and conversation_id is not None
                 and not effective_spec.fork
+                and (
+                    effective_spec.sandbox is None
+                    or effective_spec.sandbox.credential_proxy is None
+                )
             ):
                 # Reuse the session's warm helper; a busy one leaves this call its own.
                 tool_lease = await resource_registry.lease_tool_environment(
