@@ -926,8 +926,8 @@ async def test_a_reminder_only_delete_removes_that_sessions_reminder(
     session_id = _owned_session(db_uri)
     task_id = await _create_reminder(auth_client, session_id)
     deleted = await auth_client.delete(
-        f"/v1/scheduled-tasks/{task_id}",
-        params={"reminder_session_id": session_id},
+        f"/v1/scheduled-tasks/{task_id}/reminder",
+        params={"session_id": session_id},
         headers=_headers(),
     )
     assert deleted.status_code == 200, deleted.text
@@ -963,8 +963,8 @@ async def test_a_reminder_only_delete_keeps_a_reminder_moved_to_another_session(
 
         monkeypatch.setattr(SqlAlchemyScheduledTaskStore, "delete", move_then_delete)
     refused = await auth_client.delete(
-        f"/v1/scheduled-tasks/{task_id}",
-        params={"reminder_session_id": first},
+        f"/v1/scheduled-tasks/{task_id}/reminder",
+        params={"session_id": first},
         headers=_headers(),
     )
     assert refused.status_code == 409, refused.text
@@ -998,8 +998,8 @@ async def test_a_reminder_only_delete_keeps_an_automation(
     # A refusal must change nothing, not rely on undoing a change afterwards.
     monkeypatch.setattr(SqlAlchemyConversationStore, "delete_label", record_delete_label)
     refused = await auth_client.delete(
-        f"/v1/scheduled-tasks/{task_id}",
-        params={"reminder_session_id": _owned_session(db_uri)},
+        f"/v1/scheduled-tasks/{task_id}/reminder",
+        params={"session_id": _owned_session(db_uri)},
         headers=_headers(),
     )
     assert refused.status_code == 409, refused.text

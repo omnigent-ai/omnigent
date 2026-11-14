@@ -321,8 +321,7 @@ class ServerInfoResponse(BaseModel):
     # Scheduled-task runs drop a trigger prompt's ``<!-- omnigent-trigger ... -->`` header
     # before dispatch; older servers would send it to the model.
     scheduled_task_trigger_headers: bool = True
-    # DELETE honors ``reminder_session_id``, deleting only that session's reminder.
-    # Older servers ignore the parameter and would delete any task.
+    # ``DELETE /v1/scheduled-tasks/{id}/reminder`` deletes only a given session's reminder.
     scheduled_task_reminder_cancel: bool = True
     automation_trigger_poll_minutes: int = 10
     # Scheduled permissions use the selected native harness's vocabulary.

@@ -1576,11 +1576,8 @@ def create_scheduled_tasks_router(
             next_run_at=_next_run_at(updated, request),
         )
 
-    @router.delete("/scheduled-tasks/{scheduled_task_id}")
-    async def delete_scheduled_task(
-        request: Request,
-        scheduled_task_id: str,
-        reminder_session_id: str | None = Query(default=None, min_length=1),
+    async def _delete_task(
+        request: Request, scheduled_task_id: str, *, reminder_session_id: str | None
     ) -> dict[str, Any]:
         """Check ownership, then delete the task and history in a worker thread.
 
@@ -1636,5 +1633,23 @@ def create_scheduled_tasks_router(
         ):
             scheduler.remove(scheduled_task_id)
         return {"deleted": True, "id": scheduled_task_id}
+
+    @router.delete("/scheduled-tasks/{scheduled_task_id}")
+    async def delete_scheduled_task(request: Request, scheduled_task_id: str) -> dict[str, Any]:
+        """Delete an owned task and its history."""
+        return await _delete_task(request, scheduled_task_id, reminder_session_id=None)
+
+    @router.delete("/scheduled-tasks/{scheduled_task_id}/reminder")
+    async def delete_session_reminder(
+        request: Request,
+        scheduled_task_id: str,
+        session_id: str = Query(min_length=1),
+    ) -> dict[str, Any]:
+        """Delete the task only if it is *session_id*'s reminder; anything else is a 409.
+
+        A route of its own, so a server without it answers 404 instead of treating
+        the request as a plain delete of any task.
+        """
+        return await _delete_task(request, scheduled_task_id, reminder_session_id=session_id)
 
     return router

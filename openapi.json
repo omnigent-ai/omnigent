@@ -17517,7 +17517,7 @@
     },
     "/v1/scheduled-tasks/{scheduled_task_id}": {
       "delete": {
-        "description": "Check ownership, then delete the task and history in a worker thread.\n\nThe ownership lookup remains synchronous; remove the timer after deletion.\nWith *reminder_session_id*, only that session's reminder is deleted, checked\nin the same write as the delete; any other task is a 409 and stays.",
+        "description": "Delete an owned task and its history.",
         "operationId": "delete_scheduled_task_v1_scheduled_tasks__scheduled_task_id__delete",
         "parameters": [
           {
@@ -17527,23 +17527,6 @@
             "schema": {
               "title": "Scheduled Task Id",
               "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "reminder_session_id",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "minLength": 1,
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Reminder Session Id"
             }
           }
         ],
@@ -17668,6 +17651,61 @@
           }
         },
         "summary": "Update Scheduled Task",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
+    "/v1/scheduled-tasks/{scheduled_task_id}/reminder": {
+      "delete": {
+        "description": "Delete the task only if it is *session_id*'s reminder; anything else is a 409.\n\nA route of its own, so a server without it answers 404 instead of treating\nthe request as a plain delete of any task.",
+        "operationId": "delete_session_reminder_v1_scheduled_tasks__scheduled_task_id__reminder_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Session Reminder V1 Scheduled Tasks  Scheduled Task Id  Reminder Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Session Reminder",
         "tags": [
           "scheduled_tasks"
         ]

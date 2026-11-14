@@ -1079,10 +1079,10 @@ async def test_reminder_cancel_deletes_only_with_the_servers_session_check() -> 
     assert out == {"status": "cancelled", "scheduled_task_id": _TASK_ID}
     assert client.calls == [
         ("GET", "/v1/info", None),
-        ("DELETE", f"/v1/scheduled-tasks/{_TASK_ID}", None),
+        ("DELETE", f"/v1/scheduled-tasks/{_TASK_ID}/reminder", None),
     ]
     # The server checks the session in the same write as the delete.
-    assert client.delete_params == [{"reminder_session_id": "conv_1"}]
+    assert client.delete_params == [{"session_id": "conv_1"}]
 
 
 @pytest.mark.asyncio
@@ -1098,7 +1098,7 @@ async def test_reminder_cancel_reports_the_servers_refusal_of_another_task() -> 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("info", [_Resp(body={}), _Resp(status_code=404, body={})])
 async def test_reminder_cancel_refuses_servers_that_cannot_limit_the_delete(info: _Resp) -> None:
-    # An older server ignores reminder_session_id and would delete any task.
+    # The capability lets the tool explain an older server before calling it.
     client = _CancelClient()
     client._info = info
     out = await _cancel(client)
@@ -1108,12 +1108,29 @@ async def test_reminder_cancel_refuses_servers_that_cannot_limit_the_delete(info
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [404, 500])
-async def test_reminder_cancel_reports_a_failed_delete(status: int) -> None:
-    client = _CancelClient(_Resp(status_code=status, body={"error": "nope"}))
+async def test_reminder_cancel_reports_a_failed_delete() -> None:
+    client = _CancelClient(_Resp(status_code=500, body={"error": "nope"}))
     out = await _cancel(client)
-    assert out["error"] == f"server returned {status}"
+    assert out["error"] == "server returned 500"
     assert "status" not in out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [404, 405])
+async def test_reminder_cancel_never_falls_back_to_a_plain_delete(status: int) -> None:
+    """Discovery reached a new server, the delete an older one without the route.
+
+    The older server answers 404 or 405 for the reminder route, and the tool stops
+    there, so it never sends the plain delete that would remove any task.
+    """
+    client = _CancelClient(_Resp(status_code=status, body={"detail": "Not Found"}))
+    out = await _cancel(client)
+    assert f"server returned {status}; nothing was deleted" in out["error"]
+    assert "sys_scheduled_task_delete" in out["error"]
+    assert "status" not in out
+    assert [call for call in client.calls if call[0] == "DELETE"] == [
+        ("DELETE", f"/v1/scheduled-tasks/{_TASK_ID}/reminder", None)
+    ]
 
 
 @pytest.mark.asyncio

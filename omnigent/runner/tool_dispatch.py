@@ -5383,11 +5383,12 @@ async def _execute_reminder_cancel(
     """
     Delete a reminder the calling session set, without the approval other deletes need.
 
-    The server checks, in the same write as the delete, that the task is a
-    reminder continuing this session (``reminder_session_id``), so a concurrent
-    edit can't turn this into deleting another task. Older servers ignore that
-    parameter and would delete any task, so the call is refused unless the
-    server advertises ``scheduled_task_reminder_cancel``.
+    It calls ``DELETE /v1/scheduled-tasks/{id}/reminder``, where the server checks,
+    in the same write as the delete, that the task is a reminder continuing this
+    session, so a concurrent edit can't turn this into deleting another task. A
+    server without that route answers 404 rather than deleting anything, and the
+    tool never falls back to the plain delete. ``scheduled_task_reminder_cancel``
+    in ``/v1/info`` only lets it explain an older server up front.
 
     :param args: Parsed arguments with ``scheduled_task_id``.
     :param server_client: HTTP client pointed at the Omnigent server.
@@ -5417,7 +5418,7 @@ async def _execute_reminder_cancel(
                 }
             )
         resp = await server_client.delete(
-            task_url, params={"reminder_session_id": conversation_id}, timeout=30.0
+            f"{task_url}/reminder", params={"session_id": conversation_id}, timeout=30.0
         )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"{tool_name} failed: {exc}"})
@@ -5427,6 +5428,17 @@ async def _execute_reminder_cancel(
                 "error": f"{tool_name} only cancels reminders this session set; "
                 "delete other tasks with sys_scheduled_task_delete, which asks the "
                 "user first"
+            }
+        )
+    if resp.status_code in (404, 405):
+        # The task is gone, or the request reached a server without this route.
+        return json.dumps(
+            {
+                "error": f"server returned {resp.status_code}; nothing was deleted. The "
+                "reminder may already be gone, or this server can't cancel reminders: "
+                "check sys_scheduled_task_list, and delete it with "
+                "sys_scheduled_task_delete if it is still there",
+                "details": resp.text[:1000],
             }
         )
     if resp.status_code >= 400:
