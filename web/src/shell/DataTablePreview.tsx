@@ -4,6 +4,7 @@ import {
   useEffect,
   useMemo,
   useState,
+  type FocusEvent,
   type KeyboardEvent,
   type PointerEvent,
   type RefObject,
@@ -130,6 +131,8 @@ function DataTableView({
   const [sort, setSort] = useState<{ column: number; direction: SortDirection } | null>(null);
   const [filters, setFilters] = useState<string[]>([]);
   const [widths, setWidths] = useState<Record<number, number>>({});
+  // Rendered widths of auto-sized columns, read when their resize handle takes focus.
+  const [fittedWidths, setFittedWidths] = useState<Record<number, number>>({});
   // Tied to the rows it was picked from, so a refreshed file drops a stale selection.
   const [picked, setPicked] = useState<{
     rows: string[][];
@@ -195,6 +198,13 @@ function DataTableView({
     handle.addEventListener("pointermove", move);
     handle.addEventListener("pointerup", stop);
     handle.addEventListener("pointercancel", stop);
+  };
+  const measureFitted = (column: number, event: FocusEvent<HTMLDivElement>) => {
+    const rendered = event.currentTarget.parentElement?.getBoundingClientRect().width ?? 0;
+    const width = Math.min(MAX_COLUMN_WIDTH, Math.max(MIN_COLUMN_WIDTH, Math.round(rendered)));
+    setFittedWidths((current) =>
+      current[column] === width ? current : { ...current, [column]: width },
+    );
   };
   const resizeByKey = (column: number, event: KeyboardEvent<HTMLDivElement>) => {
     const step =
@@ -346,11 +356,12 @@ function DataTableView({
                       aria-label={`Resize ${name}`}
                       aria-valuemin={MIN_COLUMN_WIDTH}
                       aria-valuemax={MAX_COLUMN_WIDTH}
-                      aria-valuenow={width === undefined ? undefined : Math.round(width)}
+                      aria-valuenow={Math.round(width ?? fittedWidths[column] ?? MIN_COLUMN_WIDTH)}
                       aria-valuetext={
                         width === undefined ? "Fits its content" : `${Math.round(width)} pixels`
                       }
                       tabIndex={0}
+                      onFocus={(event) => measureFitted(column, event)}
                       onPointerDown={(event) => startResize(column, event)}
                       onKeyDown={(event) => resizeByKey(column, event)}
                       className="absolute inset-y-0 right-0 w-1.5 cursor-col-resize touch-none hover:bg-ring/40 focus-visible:bg-ring/60 focus-visible:outline-none"
