@@ -236,11 +236,12 @@ function parseRecords(
 const NUMBER_PATTERN = /^[-+]?(\d{1,3}(,\d{3})+|\d+)?(\.\d+)?([eE][-+]?\d+)?%?$/;
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/;
 
-/** The number a cell holds, or ``NaN`` when it holds none. */
+/** The number a cell holds, ``"25%"`` as 0.25, or ``NaN`` when it holds none. */
 export function cellNumber(value: string): number {
   const trimmed = value.trim();
   if (!trimmed || !/\d/.test(trimmed) || !NUMBER_PATTERN.test(trimmed)) return Number.NaN;
-  return Number.parseFloat(trimmed.replace(/,/g, "").replace(/%$/, ""));
+  const number = Number.parseFloat(trimmed.replace(/,/g, "").replace(/%$/, ""));
+  return trimmed.endsWith("%") ? number / 100 : number;
 }
 
 /**

@@ -196,6 +196,13 @@ describe("inferColumnType and compareCells", () => {
       "1,000",
       "",
     ]);
+    // A percentage is a fraction: 25% is less than a half.
+    expect(["1", "25%", "0.5", "150%"].sort((a, b) => compareCells(a, b, "number"))).toEqual([
+      "25%",
+      "0.5",
+      "1",
+      "150%",
+    ]);
     expect(["item10", "item2"].sort((a, b) => compareCells(a, b, "text"))).toEqual([
       "item2",
       "item10",
