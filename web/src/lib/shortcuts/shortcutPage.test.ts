@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import {
   type ShortcutPageContext,
@@ -31,36 +31,6 @@ function everyContext(): ShortcutPageContext[] {
     Object.fromEntries(CONTEXT_FLAGS.map((flag, index) => [flag, (bits & (1 << index)) !== 0])),
   ) as unknown as ShortcutPageContext[];
 }
-
-// The catalog's glyphs are fixed when it loads, so each platform loads it afresh.
-async function loadCatalog(mac: boolean) {
-  vi.resetModules();
-  vi.stubGlobal("navigator", { platform: mac ? "MacIntel" : "Win32", userAgent: "" });
-  return import("@/lib/shortcutCatalog");
-}
-
-afterEach(() => {
-  vi.unstubAllGlobals();
-  vi.resetModules();
-});
-
-describe("shortcutPageGroups against the shortcut catalog", () => {
-  it.each([
-    { platform: "macOS", mac: true },
-    { platform: "other platforms", mac: false },
-  ])("lists exactly the shortcut catalog's rows in every context on $platform", async ({ mac }) => {
-    const { shortcutGroupsFor } = await loadCatalog(mac);
-    const contexts = everyContext();
-    expect(contexts).toHaveLength(1024);
-    // The catalog loaded with this platform's glyphs.
-    expect(shortcutGroupsFor(contexts[0]!)[0]!.items[0]!.keys[0]).toBe(mac ? "⌘" : "Ctrl");
-    for (const context of contexts) {
-      expect(shortcutPageGroups(context, mac), JSON.stringify(context)).toStrictEqual(
-        shortcutGroupsFor(context),
-      );
-    }
-  });
-});
 
 /** The recorded groups for `context`, assembled as the page would list them. */
 function goldenGroupsFor(context: ShortcutPageContext, mac: boolean): ShortcutPageGroup[] {
@@ -97,7 +67,9 @@ describe("shortcutPageGroups against the recorded rows", () => {
     { platform: "macOS", mac: true },
     { platform: "other platforms", mac: false },
   ])("lists exactly the recorded rows in every context on $platform", ({ mac }) => {
-    for (const context of everyContext()) {
+    const contexts = everyContext();
+    expect(contexts).toHaveLength(1024);
+    for (const context of contexts) {
       expect(shortcutPageGroups(context, mac), JSON.stringify(context)).toStrictEqual(
         goldenGroupsFor(context, mac),
       );
