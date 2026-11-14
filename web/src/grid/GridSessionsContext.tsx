@@ -18,6 +18,7 @@ import { useNavigate, useParams } from "@/lib/routing";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { isTempConvId } from "@/lib/tempConversationId";
 import {
+  gridLayoutForSessions,
   gridSessionIds,
   parseSessionGrids,
   removeGridSession,
@@ -42,6 +43,8 @@ interface GridSessionsContextValue {
   deleteGrid: (id: string) => void;
   renameGrid: (id: string, name: string) => void;
   swapPanes: (firstId: string, secondId: string, edge?: SplitEdge) => void;
+  /** Save a new grid of two to four sessions and open it; false when none was made. */
+  openGrid: (sessionIds: readonly string[], name?: string) => boolean;
 }
 
 const GridSessionsContext = createContext<GridSessionsContextValue | null>(null);
@@ -153,6 +156,19 @@ function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
         const layout = swapGridSessions(activeGrid.layout, firstId, secondId, edge);
         if (layout !== activeGrid.layout)
           save(grids.map((grid) => (grid.id === activeGrid.id ? { ...grid, layout } : grid)));
+      },
+      openGrid: (sessionIds, name) => {
+        const layout = gridLayoutForSessions(sessionIds);
+        if (storageKey === null || layout === null) return false;
+        const trimmed = name?.trim().slice(0, USER_SESSION_TITLE_MAX_CHARS);
+        const grid: SessionGrid = {
+          id: randomUUID(),
+          ...(trimmed ? { name: trimmed } : {}),
+          layout,
+        };
+        save([...grids, grid]);
+        navigate(`/grid/${grid.id}`);
+        return true;
       },
       renameGrid: (id, name) => {
         const trimmed = name.trim().slice(0, USER_SESSION_TITLE_MAX_CHARS);
