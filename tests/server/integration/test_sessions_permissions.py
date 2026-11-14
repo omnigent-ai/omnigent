@@ -2330,7 +2330,7 @@ async def test_model_override_reset_requires_edit_access(
 async def test_get_session_items_with_read_access(
     auth_client: httpx.AsyncClient,
 ) -> None:
-    """A user with read access can GET session items; a user with no access gets 404."""
+    """A user with read access can GET session items and export them; a stranger gets 404."""
     agent = await create_test_agent(auth_client, user="bryan")
     s1 = await _create_session_as(auth_client, agent["id"], "bryan")
     session_id = s1["id"]
@@ -2355,6 +2355,20 @@ async def test_get_session_items_with_read_access(
     assert resp.status_code == 200, (
         f"Corey with read grant should GET /items -> 200, got {resp.status_code}."
     )
+
+    # Read access is sufficient for the notebook export too.
+    resp = await auth_client.get(
+        f"/v1/sessions/{session_id}/export",
+        params={"format": "ipynb"},
+        headers={"X-Forwarded-Email": "corey"},
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await auth_client.get(
+        f"/v1/sessions/{session_id}/export",
+        params={"format": "ipynb"},
+        headers={"X-Forwarded-Email": "stranger"},
+    )
+    assert resp.status_code == 404, resp.text
 
     # Stranger has no access -> 404.
     resp = await auth_client.get(

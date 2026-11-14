@@ -95,7 +95,15 @@ the header menu), and each place is a separate entry point.
   you own it. A shared session opened by direct link gets no row unless you
   have owner-level access, because the session response carries no owner.
 - `delete`: confirmed, then removed from the list and the server.
-- `export`: Export in the header menu saves the transcript as a local file.
+- `export`: Export in the header menu saves the transcript as a local file
+  (`.jsonl`, the format `omnigent session import` reads back). Export as notebook
+  (`.ipynb`) saves a Jupyter notebook instead: a header naming the agent and
+  model with a link back to the session, messages as Markdown cells, the
+  commands the agent ran as `%%bash`, Python or `%%sql` code cells with their
+  outputs, other tool calls, reasoning and router picks as short notes, and a
+  closing cell listing the tools a rerun may need. The CLI equivalent is
+  `omnigent session export --format ipynb [--no-outputs]`, and the API is
+  `GET /v1/sessions/{id}/export?format=ipynb`.
 - `unread`: Mark as unread flags a session to revisit and survives a reload,
   including for the session being viewed. Its dot appears once the turn is
   idle; approval and error indicators can take precedence. A row showing the
@@ -846,10 +854,12 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_sidebar_delete.py::test_delete_session_removes_row_and_from_store`,
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_delete_removes_sessions`
 - **`export`, header menu (own environment):**
-  `tests/e2e_ui/sessions/test_export_chat_menu.py::test_header_session_menu_offers_export`,
   `tests/e2e_ui/sessions/test_export_chat_menu.py::test_header_export_downloads_transcript`
-  seed the transcript into the spawned server's database; run them with plain
-  `uv run pytest`, outside `verify-env run`.
+  (transcript and notebook) seeds the transcript into the spawned server's
+  database; run them with plain `uv run pytest`, outside `verify-env run`. The
+  notebook's cell mapping is covered by `tests/test_session_notebook.py`, the
+  endpoint by `tests/server/integration/test_sessions_notebook_export.py` and the
+  CLI by `tests/host/test_cli_session_export.py`.
 - **`unread`, sidebar row menu:**
   `tests/e2e_ui/sessions/test_sidebar_mark_unread.py::test_mark_unread_lights_the_dot_and_persists_across_reload`,
   `tests/e2e_ui/sessions/test_sidebar_mark_unread.py::test_unread_dot_survives_reload_from_localStorage_when_server_seed_is_empty`.

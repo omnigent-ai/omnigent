@@ -12,6 +12,7 @@ import {
   ChevronLeftIcon,
   ClockPlusIcon,
   DownloadIcon,
+  NotebookIcon,
   EllipsisIcon,
   FolderInputIcon,
   GitBranchIcon,
@@ -57,7 +58,7 @@ import { useIsMutating, useQueryClient } from "@tanstack/react-query";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isIndentedSibling, isSessionPinned } from "@/lib/sessionFamilies";
 import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
-import { exportSessionTranscript } from "@/lib/sessionsApi";
+import { exportSessionNotebook, exportSessionTranscript } from "@/lib/sessionsApi";
 import { triggerBrowserDownload } from "@/hooks/useFileContent";
 import {
   type Conversation,
@@ -84,7 +85,8 @@ import { supportsDesktopCommands } from "@/lib/nativeBridge";
 import { useIsEmbedded } from "@/lib/embedded";
 import { getEmbedRoot } from "@/lib/host";
 import { hasCommandModifier, isFocusInDialogOrMenu } from "@/lib/hotkeys";
-import { useNavigate } from "@/lib/routing";
+import { useNavigate, useRebasePath } from "@/lib/routing";
+import { getShareableSessionLink } from "@/lib/shareLink";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { unpinWithUndo } from "./unpinUndoToast";
@@ -135,6 +137,7 @@ export function HeaderConversationMenu({
   workspaceItems = null,
 }: HeaderConversationMenuProps) {
   const navigate = useNavigate();
+  const rebasePath = useRebasePath();
   const info = useServerInfo();
   const queryClient = useQueryClient();
   const isMobile = useIsMobileViewport();
@@ -170,6 +173,7 @@ export function HeaderConversationMenu({
   const canPin = !isIndentedSibling(conversation);
   const isArchived = conversation.archived === true;
   const canAddAgent = !isArchived && info !== "loading" && info.sibling_sessions;
+  const canExportNotebook = info !== "loading" && info.session_notebook_export === true;
   const addAgentPath = `/?sibling=${encodeURIComponent(conversation.id)}`;
   const label = conversationDisplayLabel(conversation);
   // Mobile taps need a bigger target than the dense desktop row.
@@ -270,6 +274,20 @@ export function HeaderConversationMenu({
       );
     } catch {
       toast.error("Export failed");
+    }
+  };
+
+  const exportNotebook = async () => {
+    try {
+      triggerBrowserDownload(
+        await exportSessionNotebook(
+          conversation.id,
+          getShareableSessionLink(conversation.id, rebasePath),
+        ),
+        `${conversation.id}.ipynb`,
+      );
+    } catch {
+      toast.error("Notebook export failed");
     }
   };
 
@@ -387,6 +405,16 @@ export function HeaderConversationMenu({
         <DownloadIcon className="size-3.5" />
         Export
       </DropdownMenuItem>
+      {canExportNotebook && (
+        <DropdownMenuItem
+          data-testid="header-export-notebook"
+          className={itemClass}
+          onSelect={() => void exportNotebook()}
+        >
+          <NotebookIcon className="size-3.5" />
+          Export as notebook (.ipynb)
+        </DropdownMenuItem>
+      )}
       {hasAgentInfo && onAgentInfo && (
         <DropdownMenuItem
           data-testid="header-agent-info"

@@ -16,6 +16,7 @@ import {
   createBundledSession,
   createSession,
   createSideChat,
+  exportSessionNotebook,
   exportSessionTranscript,
   fetchRewindPrompts,
   fetchSessionItemsPage,
@@ -1725,6 +1726,46 @@ describe("fetchRewindPrompts", () => {
     expect(fetchMock.mock.calls[5]![0]).toBe(
       "/v1/sessions/sess_1/items?limit=200&order=desc&type=message&after=msg_p5",
     );
+  });
+});
+
+describe("exportSessionNotebook", () => {
+  it("downloads the server's notebook for the session", async () => {
+    fetchMock.mockResolvedValueOnce(new Response('{"nbformat":4}', { status: 200 }));
+
+    const blob = await exportSessionNotebook("sess 1", "https://omnigent.example/c/sess%201?o=7");
+
+    const url = new URL(String(fetchMock.mock.calls[0]![0]), "http://localhost");
+    expect(url.pathname).toMatch(/\/v1\/sessions\/sess%201\/export$/);
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      format: "ipynb",
+      link: "https://omnigent.example/c/sess%201?o=7",
+    });
+    expect(blob.type).toBe("application/x-ipynb+json");
+    expect(await blob.text()).toBe('{"nbformat":4}');
+  });
+
+  it.each([
+    ["a non-web link", "omnigent://c/sess_1"],
+    ["an overlong link", `https://omnigent.example/c/sess_1?pad=${"x".repeat(2048)}`],
+  ])("leaves out %s instead of failing the export", async (_label, link) => {
+    fetchMock.mockResolvedValueOnce(new Response("{}", { status: 200 }));
+
+    await exportSessionNotebook("sess_1", link);
+
+    const url = new URL(String(fetchMock.mock.calls[0]![0]), "http://localhost");
+    expect(Object.fromEntries(url.searchParams)).toEqual({ format: "ipynb" });
+  });
+
+  it("throws the server's error when the export fails", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse(
+        { error: { code: "not_found", message: "Session not found" } },
+        { ok: false, status: 404, statusText: "Not Found" },
+      ),
+    );
+
+    await expect(exportSessionNotebook("sess_1")).rejects.toMatchObject({ code: "not_found" });
   });
 });
 

@@ -1622,6 +1622,30 @@ export async function fetchSessionItemsPage(
   return { items: [...page.data].reverse(), hasMore: page.has_more };
 }
 
+const NOTEBOOK_LINK_MAX_CHARS = 2048;
+
+function isNotebookLink(link: string): boolean {
+  return link.length <= NOTEBOOK_LINK_MAX_CHARS && /^https?:\/\/\S+$/.test(link);
+}
+
+/**
+ * Download a session as a Jupyter notebook, which the server builds: messages
+ * as Markdown cells and the commands the agent ran as code cells.
+ *
+ * @param link - The session's shareable URL, shown in the notebook's header.
+ *   A link the server wouldn't accept (not http(s), or too long) is left out
+ *   rather than failing the export.
+ */
+export async function exportSessionNotebook(sessionId: string, link?: string): Promise<Blob> {
+  const params = new URLSearchParams({ format: "ipynb" });
+  if (link && isNotebookLink(link)) params.set("link", link);
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/export?${params}`,
+  );
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return new Blob([await res.text()], { type: "application/x-ipynb+json" });
+}
+
 /**
  * Build a portable JSONL export of a session's transcript.
  *
