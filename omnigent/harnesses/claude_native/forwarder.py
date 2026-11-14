@@ -47,6 +47,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_transcript_items_from_offset,
     read_transcript_items_since_with_position,
     read_transcript_path,
+    refresh_launch_files,
     transcript_has_forked_from_marker,
     transcript_has_recent_local_command,
     url_component,
@@ -178,6 +179,9 @@ _MAX_SEEN_BTW_KEYS = 64
 # task, so elapsed time here means the latency-sensitive lane stopped making
 # progress rather than that a healthy backlog drain simply took a long time.
 _FORWARD_LOOP_STALL_DEADLINE_S = 300.0
+# How often a running forwarder refreshes its pane's launch-time files so a
+# temp-dir cleaner never ages them out (see ``refresh_launch_files``).
+_LAUNCH_FILE_REFRESH_INTERVAL_S = 6 * 60 * 60.0
 _POST_TIMEOUT_S = 10.0
 # A child-history POST carries up to 100 items and can outlast the live lane's
 # budget; that lane runs off the latency-sensitive path, so it gets more room.
@@ -1227,6 +1231,43 @@ async def _forward_progress_timeout(
 
 
 @contextlib.asynccontextmanager
+async def _keep_launch_files_fresh(
+    bridge_dir: Path,
+    session_id: str,
+    *,
+    interval_s: float = _LAUNCH_FILE_REFRESH_INTERVAL_S,
+) -> AsyncIterator[None]:
+    """Refresh the pane's launch-time files for as long as the forwarder runs.
+
+    A pane that outlives the temp-dir cleaner's window would otherwise lose
+    ``tmux.json`` and its siblings while it is still running. Refresh failures
+    are logged and retried on the next interval; they never stop forwarding.
+    """
+    stop = asyncio.Event()
+
+    async def refresh_until_stopped() -> None:
+        while not stop.is_set():
+            try:
+                await asyncio.to_thread(refresh_launch_files, bridge_dir)
+            except Exception:  # best-effort upkeep must not stop forwarding
+                _logger.debug(
+                    "Claude launch-file refresh failed; session=%s",
+                    session_id,
+                    exc_info=True,
+                )
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), timeout=interval_s)
+
+    task = asyncio.create_task(refresh_until_stopped(), name=f"claude-launch-files-{session_id}")
+    try:
+        yield
+    finally:
+        stop.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@contextlib.asynccontextmanager
 async def _forward_claude_diagnostics(
     bridge_dir: Path,
     session_id: str,
@@ -1395,6 +1436,8 @@ async def forward_claude_transcript_to_session(
             timeout=subagent_timeout,
             event_dispatcher=event_dispatcher,
         ) as subagent_client,
+        # Last, so a client that fails to open never starts (or awaits) the upkeep.
+        _keep_launch_files_fresh(bridge_dir, session_id),
     ):
         loop_failures = 0
         loop_failure_logged_at = 0.0
