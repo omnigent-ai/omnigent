@@ -1451,14 +1451,15 @@ html[data-electron-mac] .breadcrumb-folder {
 
 /* The iOS WKWebView runs full-screen under the keyboard at every responsive
  * width. useIOSViewportLock publishes the area above the docked keyboard so
- * flow content stays visible without shrinking for floating iPad controls. */
+ * flow content stays visible without shrinking for floating iPad controls.
+ * An embedding host's header above the shell is subtracted. */
 [data-ios-native].app-shell {
   height: 100lvh;
-  height: var(--omnigent-viewport-height, 100lvh);
+  height: calc(var(--omnigent-viewport-height, 100lvh) - var(--omnigent-shell-top, 0px));
   min-height: 100lvh;
-  min-height: var(--omnigent-viewport-height, 100lvh);
+  min-height: calc(var(--omnigent-viewport-height, 100lvh) - var(--omnigent-shell-top, 0px));
   max-height: 100lvh;
-  max-height: var(--omnigent-viewport-height, 100lvh);
+  max-height: calc(var(--omnigent-viewport-height, 100lvh) - var(--omnigent-shell-top, 0px));
   overflow: hidden;
 }
 

@@ -66,6 +66,24 @@ describe("iOS keyboard layout", () => {
     expect(setDocumentScrollEnabled).toHaveBeenLastCalledWith(true);
   });
 
+  it("publishes the shell's offset below an embedding host's header", () => {
+    const shell = document.createElement("div");
+    shell.className = "app-shell";
+    shell.dataset.iosNative = "true";
+    shell.getBoundingClientRect = () => ({ top: 56 }) as DOMRect;
+    document.body.append(shell);
+    try {
+      const { unmount } = renderHook(useKeyboardLayout);
+      changeKeyboard(464, 464);
+      expect(shellHeight()).toBe("464px");
+      expect(document.documentElement.style.getPropertyValue("--omnigent-shell-top")).toBe("56px");
+      unmount();
+      expect(document.documentElement.style.getPropertyValue("--omnigent-shell-top")).toBe("");
+    } finally {
+      shell.remove();
+    }
+  });
+
   it("keeps the shell and overlays full-height for floating hardware-keyboard controls", () => {
     const { result } = renderHook(useKeyboardLayout);
     changeKeyboard(685, 834);
