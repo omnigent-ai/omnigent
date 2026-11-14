@@ -15,6 +15,7 @@ import {
   WorkflowIcon,
   XIcon,
 } from "lucide-react";
+import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -1052,15 +1053,20 @@ function TasksHeader({
                       requestAnimationFrame(() => onSaveWorkflow());
                     }}
                   >
-                    <DropdownMenuItem
+                    <SessionActionMenuItem
                       data-testid="tasks-save-workflow"
+                      disabledReason={
+                        workflowId
+                          ? "Already saved as a workflow. Open the workflow to edit it."
+                          : undefined
+                      }
                       onSelect={() => {
                         saveAfterCloseRef.current = true;
                       }}
                     >
                       <WorkflowIcon className="size-3.5" />
                       Save as workflow…
-                    </DropdownMenuItem>
+                    </SessionActionMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>
               )}
