@@ -470,6 +470,10 @@ class SandboxBackend(ABC):
         """Resolve host-local policy immediately before launcher construction."""
         return policy
 
+    def prepare_launcher_filesystem(self, policy: SandboxPolicy, cwd: Path) -> None:
+        """Materialize approved bind sources before capturing launch identities."""
+        del policy, cwd
+
     def launch_fingerprint(
         self,
         argv: list[str],

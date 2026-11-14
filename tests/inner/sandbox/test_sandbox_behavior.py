@@ -575,15 +575,19 @@ def test_sandbox_hides_user_dotfiles_in_cwd(
 
 
 @pytest.mark.parametrize("declares_stability", [False, True])
+@pytest.mark.parametrize("missing_write_root", [False, True])
 def test_sandbox_helper_survives_sequential_requests(
     tmp_path: Path,
     active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],
     sandbox_pythonpath_env: None,
     monkeypatch: pytest.MonkeyPatch,
     declares_stability: bool,
+    missing_write_root: bool,
 ) -> None:
     """Requests run on short-lived threads; the helper must outlive the one that spawned it."""
-    sandbox_spec = active_sandbox_spec_factory()
+    sandbox_spec = active_sandbox_spec_factory(
+        write_paths=[str(tmp_path / "docs" / "specs")] if missing_write_root else None
+    )
     if not declares_stability:
         monkeypatch.setattr(
             type(get_backend(sandbox_spec.type)),
@@ -597,7 +601,7 @@ def test_sandbox_helper_survives_sequential_requests(
     # Each launch gets a fresh private scratch dir; PIDs are namespace-local under bwrap.
     try:
         scratch_dirs = {
-            run_async(os_env.shell("echo $TMPDIR"))["stdout"].strip() for _ in range(5)
+            run_async(os_env.shell('echo "$XDG_RUNTIME_DIR"'))["stdout"].strip() for _ in range(5)
         }
     finally:
         os_env.close()

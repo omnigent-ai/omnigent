@@ -726,6 +726,7 @@ class _HelperProcessClient:
             backend = get_backend(sandbox.backend_type)
             chdir = helper_cwd if helper_cwd != self.cwd else None
             if self._relaunch_when_stale:
+                backend.prepare_launcher_filesystem(sandbox, self.cwd)
                 fingerprint = functools.partial(
                     backend.launch_fingerprint, helper_argv, sandbox, self.cwd, chdir=chdir
                 )
