@@ -4,6 +4,7 @@ import {
   REVIEW_PLAN_FIRST,
   continuePlanMessage,
   createWorkflowPrompt,
+  editWorkflowPlanPrompt,
   runSavedWorkflowPrompt,
   offersSaveWorkflow,
   offersWorkflow,
@@ -96,6 +97,34 @@ describe("createWorkflowPrompt", () => {
     expect(createWorkflowPrompt("  Triage flaky tests ", " Rerun the suite ")).toBe(
       'Use the save-workflow skill to create a workflow named "Triage flaky tests" from this description, without doing the work:\n\nRerun the suite',
     );
+  });
+});
+
+describe("editWorkflowPlanPrompt", () => {
+  const workflow = {
+    id: "0123456789abcdef0123456789abcdef",
+    name: "Triage flaky tests",
+    description: "Rerun the suite and file issues",
+    steps: [{ id: "rerun", name: "Rerun the suite", goal: null, depends_on: [] }],
+  };
+
+  it("asks to load a saved plan and wait for requested edits before proposing changes", () => {
+    const prompt = editWorkflowPlanPrompt(workflow);
+    expect(prompt).toContain(`Help me edit the reusable workflow "${workflow.name}"`);
+    expect(prompt).toContain(`(ID ${workflow.id})`);
+    expect(prompt).toContain("Load the existing workflow with sys_workflow_load");
+    expect(prompt).toContain("Read the saved plan and use it as the starting point");
+    expect(prompt).toContain("wait for my answer before proposing or publishing changes");
+    expect(prompt).toContain("Preserve steps I haven't asked to change");
+    expect(prompt).not.toContain("Draft a useful first proposal now");
+  });
+
+  it("drafts a first proposal only when the workflow has no saved steps", () => {
+    const prompt = editWorkflowPlanPrompt({ ...workflow, steps: [] });
+    expect(prompt).toContain(`Help me design the reusable workflow "${workflow.name}"`);
+    expect(prompt).toContain(`Workflow description: ${workflow.description}`);
+    expect(prompt).toContain("Draft a useful first proposal now");
+    expect(prompt).toContain("I will use Save plan on the workflow page to apply the proposal");
   });
 });
 

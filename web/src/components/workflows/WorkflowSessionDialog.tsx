@@ -32,6 +32,7 @@ import { readRecentWorkspaces, useRecentWorkspaces } from "@/hooks/useRecentWork
 import { markSandboxLaunch } from "@/hooks/useSandboxLaunchSelectionCheck";
 import { previewIsUnsupported, useSandboxModelOptions } from "@/hooks/useSandboxModelOptions";
 import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
+import type { WorkflowDetail } from "@/hooks/useWorkflow";
 import { partitionPickerEntries, selectableSessionAgents } from "@/lib/agentGrouping";
 import { readLastAgentId } from "@/lib/agentPreferences";
 import { pickerCuration, sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
@@ -78,10 +79,10 @@ import { WorkspacePathField } from "@/shell/WorkspacePathField";
 import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 
-/** What the dialog starts a session for: running a saved workflow, or drafting a new one. */
+/** What the session is for: running a workflow, planning one, or editing its plan. */
 export type WorkflowSessionRequest =
   | { kind: "run"; workflow: SavedWorkflow }
-  | { kind: "plan"; workflow: SavedWorkflow }
+  | { kind: "plan"; workflow: WorkflowDetail }
   | { kind: "create"; name: string; description: string };
 
 export interface WorkflowSessionDialogProps {

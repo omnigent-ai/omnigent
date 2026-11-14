@@ -163,7 +163,7 @@ def test_an_append_to_a_missing_session_writes_nothing(
     assert _count(db_uri, "session_journal_entries", MISSING) == 0
 
 
-def test_the_stored_payload_limit_counts_compressed_bytes(
+def test_the_stored_content_limit_counts_compressed_bytes(
     journal: SessionJournalStore,
 ) -> None:
     # Random text barely compresses: within the raw limit, but not the stored one.

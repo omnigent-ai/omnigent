@@ -242,30 +242,6 @@ export function stepsWithoutPlan(entries: readonly JournalEntry[]): JournalPlanS
 }
 
 /**
- * For each step, whether it and the step listed before it can't run at the same
- * time, because one waits on the other, directly or through other steps.
- */
-export function linkedToPrevious(steps: readonly JournalPlanStep[]): boolean[] {
-  const dependsOn = new Map(steps.map((step) => [step.id, step.depends_on]));
-  const waitsOn = (from: string, target: string): boolean => {
-    const seen = new Set<string>();
-    const pending = [...(dependsOn.get(from) ?? [])];
-    for (let id = pending.pop(); id !== undefined; id = pending.pop()) {
-      if (id === target) return true;
-      if (seen.has(id)) continue;
-      seen.add(id);
-      pending.push(...(dependsOn.get(id) ?? []));
-    }
-    return false;
-  };
-  return steps.map((step, index) => {
-    if (index === 0) return false;
-    const previous = steps[index - 1].id;
-    return waitsOn(step.id, previous) || waitsOn(previous, step.id);
-  });
-}
-
-/**
  * The tasks that can't start because a task they wait on failed, directly or
  * through tasks that haven't started either: each one's failed tasks by ID,
  * nearest first. A failed task that runs again clears them.

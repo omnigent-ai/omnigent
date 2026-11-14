@@ -1,6 +1,8 @@
 // The message that runs Omnigent's `workflow` skill from the "Run a workflow"
 // dialog, in the session composer and on the new-session page.
 
+import type { WorkflowStep } from "@/lib/workflowGraphLayout";
+
 /** The framework skill that plans and runs a workflow (`/workflow <description>`). */
 export const WORKFLOW_SKILL = "workflow";
 
@@ -137,13 +139,18 @@ export function editWorkflowPlanPrompt(workflow: {
   id: string;
   name: string;
   description: string;
+  steps: readonly WorkflowStep[];
 }): string {
+  const hasSavedPlan = workflow.steps.length > 0;
   return [
-    `Help me design the reusable workflow "${workflow.name}" (ID ${workflow.id}).`,
+    `Help me ${hasSavedPlan ? "edit" : "design"} the reusable workflow "${workflow.name}" (ID ${workflow.id}).`,
     `Workflow description: ${workflow.description}`,
     "This is a planning conversation. Load the existing workflow with sys_workflow_load. Explore context if useful, but do not execute the workflow or make changes to the project.",
     "Use sys_journal_write_plan to publish the proposed steps, and write a new plan whenever I ask for revisions. Keep step IDs stable. Do not set workflow_id on this journal plan: this conversation is for planning, not an execution run.",
-    "The workflow already exists. Do not call sys_workflow_save or create another workflow. I will use Save plan on the workflow page to apply the proposal. Draft a useful first proposal now, explain assumptions briefly, and iterate with me here.",
+    "The workflow already exists. Do not call sys_workflow_save or create another workflow. I will use Save plan on the workflow page to apply the proposal.",
+    hasSavedPlan
+      ? "Read the saved plan and use it as the starting point. Ask what edits I want and wait for my answer before proposing or publishing changes. Preserve steps I haven't asked to change, and iterate with me on my requested edits."
+      : "Draft a useful first proposal now, explain assumptions briefly, and iterate with me here.",
   ].join("\n\n");
 }
 

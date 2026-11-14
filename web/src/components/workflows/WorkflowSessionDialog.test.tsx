@@ -9,7 +9,7 @@ import { type HostDirectoryListing, useHostFilesystem } from "@/hooks/useHostFil
 import { type Host, useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { useSandboxModelOptions } from "@/hooks/useSandboxModelOptions";
 import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
-import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
+import type { WorkflowDetail } from "@/hooks/useWorkflow";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { nativeWrapperLabelsForAgent } from "@/lib/nativeCodingAgents";
@@ -48,10 +48,11 @@ vi.mock("@/lib/routing", async (importOriginal) => {
   return { ...actual, useNavigate: () => navigate };
 });
 
-const WORKFLOW: SavedWorkflow = {
+const WORKFLOW: WorkflowDetail = {
   id: "6f1c2b9a4d8e4f30a1b2c3d4e5f60718",
   name: "Fix flaky tests",
   description: "Reruns the suite and files an issue for each flaky test.",
+  steps: [],
 };
 const CLAUDE_CODE = testAgent("ag_claude_native", "claude-native-ui", {
   display_name: "Claude Code",
@@ -206,6 +207,31 @@ describe("WorkflowSessionDialog", () => {
       data: { content: [{ type: "input_text", text: editWorkflowPlanPrompt(WORKFLOW) }] },
     });
     expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("starts a new chat for a saved plan with an edit request", async () => {
+    setHosts([{ host_id: "host_1" }]);
+    localStorage.setItem("omnigent:recent-workspaces", JSON.stringify({ host_1: ["/srv/app"] }));
+    startedSession();
+    const attached = vi.fn().mockResolvedValue(undefined);
+    renderDialog(
+      {},
+      {
+        kind: "plan",
+        workflow: {
+          ...WORKFLOW,
+          steps: [{ id: "rerun", name: "Rerun the suite", goal: null, depends_on: [] }],
+        },
+      },
+      attached,
+    );
+    fireEvent.click(submit());
+    await waitFor(() =>
+      expect(attached).toHaveBeenCalledWith(
+        { id: "conv_run" },
+        expect.stringContaining(`Help me edit the reusable workflow "${WORKFLOW.name}"`),
+      ),
+    );
   });
 
   it("starts a session where the new-session page last ran, with the run request first", async () => {

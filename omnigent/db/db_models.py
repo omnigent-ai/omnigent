@@ -1816,7 +1816,7 @@ class SqlSessionJournalEntry(OmnigentBase):
         for entries about no step, such as plans.
     :param idempotency_key: Names the write that appended the entry, e.g.
         ``"tool:toolu_01…"``, so a retried append returns the existing entry.
-    :param payload: The kind's fields as compressed JSON, at most
+    :param content: The kind's fields as compressed JSON, at most
         :data:`MAX_STORED_VALUE_BYTES` bytes stored.
     """
 
@@ -1838,7 +1838,7 @@ class SqlSessionJournalEntry(OmnigentBase):
     workflow_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     step: Mapped[str | None] = mapped_column(String(64), nullable=True)
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
-    payload: Mapped[str] = mapped_column(
+    content: Mapped[str] = mapped_column(
         CompressedText(max_stored_bytes=MAX_STORED_VALUE_BYTES), nullable=False
     )
 

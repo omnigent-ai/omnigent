@@ -7,7 +7,7 @@ other sessions' appends and the session's metadata updates don't wait. An
 append carries an idempotency key, so a retried append returns the entry its
 first attempt wrote instead of writing it twice.
 
-Payloads are the kind's compressed JSON, at most
+An entry's content is the kind's compressed JSON, at most
 :data:`~omnigent.db.db_models.MAX_STORED_VALUE_BYTES` bytes stored. The store
 checks the size before writing, so an agent gets ``entry_too_large``.
 """
@@ -96,8 +96,8 @@ class JournalSessionNotFoundError(Exception):
     """The session doesn't exist, or was deleted while the append ran."""
 
 
-def _stored_payload(payload: Mapping[str, Any]) -> str:
-    """The payload's JSON, refused when it doesn't fit the column compressed."""
+def _stored_content(payload: Mapping[str, Any]) -> str:
+    """The payload's JSON for the ``content`` column, refused when it doesn't fit compressed."""
     text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     if len(text.encode()) + _FRAMING_BYTES <= MAX_STORED_VALUE_BYTES:
         return text
@@ -167,7 +167,7 @@ class SessionJournalStore:
                 kind=decode_journal_entry_kind(row.kind),
                 step=row.step,
                 scheduled_task_run_id=row.scheduled_task_run_id,
-                payload=json.loads(row.payload),
+                payload=json.loads(row.content),
                 workflow_id=row.workflow_id,
             )
             for row in rows
@@ -319,7 +319,7 @@ class SessionJournalStore:
             current plan's.
         :returns: The entry, and whether this call appended it.
         :raises InvalidJournalEntryError: If a field is invalid.
-        :raises JournalEntryTooLargeError: If the stored payload is too large.
+        :raises JournalEntryTooLargeError: If the stored content is too large.
         :raises StepNotReadyError: If a status names a step whose dependencies in
             the current plan aren't all done.
         :raises JournalSessionNotFoundError: If the session doesn't exist.
@@ -340,7 +340,7 @@ class SessionJournalStore:
                 raise InvalidJournalEntryError("only a plan names a workflow")
             workflow_id = _workflow_id(workflow_id)
         # A plan's version is known only under the lock, so its size is checked there.
-        stored = None if kind == "plan" else _stored_payload(fields)
+        stored = None if kind == "plan" else _stored_content(fields)
         code = encode_journal_entry_kind(kind)
 
         def write(session: Session) -> tuple[SqlSessionJournalEntry, bool, dict[str, Any] | None]:
@@ -373,7 +373,7 @@ class SessionJournalStore:
                     1 if previous is None else self._entries([previous])[0].payload["version"] + 1
                 )
                 entry_payload = {"version": version, **fields}
-                entry_text = _stored_payload(entry_payload)
+                entry_text = _stored_content(entry_payload)
             entry_step = step
             entry_workflow_id = workflow_id
             if kind == "note":
@@ -401,7 +401,7 @@ class SessionJournalStore:
                 workflow_id=entry_workflow_id,
                 step=entry_step,
                 idempotency_key=idempotency_key,
-                payload=entry_text,
+                content=entry_text,
             )
             session.add(row)
             session.execute(
@@ -675,7 +675,7 @@ def copy_journal_for_fork(
             workflow_id=None,
             step=row.step,
             idempotency_key=row.idempotency_key,
-            payload=row.payload,
+            content=row.content,
         )
         for position, row in enumerate(
             row

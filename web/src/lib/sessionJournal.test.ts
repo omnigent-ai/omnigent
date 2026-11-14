@@ -5,7 +5,6 @@ import {
   failedUpstream,
   finishedTaskCount,
   isRestart,
-  linkedToPrevious,
   mergeJournalEntries,
   nativeTaskProgress,
   pausedLabel,
@@ -206,26 +205,6 @@ describe("stepProgress", () => {
     });
     // Once fix runs again, the tasks after it are only waiting.
     expect(blockedBy([...fixFailed, status(3, "fix", "started")])).toEqual({});
-  });
-
-  it("links a step to the one before it when one waits on the other", () => {
-    const linked = (...planned: [string, string[]?][]) =>
-      linkedToPrevious(planSteps(plan(0, ...planned)));
-    // batch and pool both wait on profile, so they can run at the same time.
-    expect(
-      linked(
-        ["profile"],
-        ["batch", ["profile"]],
-        ["pool", ["profile"]],
-        ["ship", ["batch", "pool"]],
-      ),
-    ).toEqual([false, true, false, true]);
-    // Listed out of order: check waits on build through test, and on test directly.
-    expect(linked(["build"], ["check", ["test"]], ["test", ["build"]])).toEqual([
-      false,
-      true,
-      true,
-    ]);
   });
 
   it("lists the steps the agent named in statuses when there is no plan", () => {
