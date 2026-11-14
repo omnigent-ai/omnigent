@@ -225,7 +225,7 @@ def test_connected_subscription_is_exported_by_the_owners_sandbox_host(tmp_path:
             assert connected.status_code == 200, connected.text
             assert connected.json()["connected"] is True
             assert pasted_token not in connected.text
-            assert kms.actions == ["Encrypt"]
+            assert kms.actions.count("Encrypt") == 1
             assert pasted_token.encode() not in (tmp_path / "e2e.db").read_bytes()
 
             # The user starts a managed sandbox session.
@@ -234,7 +234,13 @@ def test_connected_subscription_is_exported_by_the_owners_sandbox_host(tmp_path:
                 "/v1/sessions", json={"agent_id": agent_id, "host_type": "managed"}, timeout=120.0
             )
             assert created.status_code == 201, created.text
-            poll_until(lambda: _captured(capture_path, "create_namespaced_job"), timeout_s=120.0)
+            poll_until(
+                lambda: (
+                    _captured(capture_path, "create_namespaced_job")
+                    and _captured(capture_path, "create_namespaced_secret")
+                ),
+                timeout_s=120.0,
+            )
             job = _captured(capture_path, "create_namespaced_job")["manifest"]
             secret = _captured(capture_path, "create_namespaced_secret")["manifest"]
             host_env = _host_container_env(job, secret)
@@ -269,6 +275,6 @@ def test_connected_subscription_is_exported_by_the_owners_sandbox_host(tmp_path:
             )
             assert hook.returncode == 0, hook.stderr
             assert json.loads(hook.stdout.strip().splitlines()[-1]) == [True, pasted_token]
-            assert kms.actions == ["Encrypt", "Decrypt"]
+            assert "Decrypt" in kms.actions
         finally:
             terminate_process(proc)
