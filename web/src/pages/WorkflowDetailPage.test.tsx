@@ -17,6 +17,8 @@ import type * as WorkflowHooks from "@/hooks/useWorkflow";
 import { useSession } from "@/hooks/useSession";
 import { useSessionJournal } from "@/hooks/useSessionJournal";
 import type * as SessionJournalHooks from "@/hooks/useSessionJournal";
+import { useOptionalLoadedConversations } from "@/hooks/useSidebarData";
+import type * as SidebarDataModule from "@/hooks/useSidebarData";
 import { authenticatedFetch } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
@@ -31,6 +33,7 @@ import type { WorkflowStep } from "@/lib/workflowGraphLayout";
 import type { WorkflowRun } from "@/lib/workflowRuns";
 import type { Session } from "@/lib/types";
 import { journalPage } from "@/test/journalFixtures";
+import { conversation, conversationPage } from "@/test/sidebarMockHelpers";
 
 import { WorkflowDetailPage } from "./WorkflowDetailPage";
 
@@ -40,6 +43,10 @@ vi.mock("@/hooks/useWorkflow", async (importOriginal) => {
 });
 vi.mock("@/hooks/useSessionJournal", () => ({ useSessionJournal: vi.fn() }));
 vi.mock("@/hooks/useSession", () => ({ useSession: vi.fn() }));
+vi.mock("@/hooks/useSidebarData", async (importOriginal) => ({
+  ...(await importOriginal<typeof SidebarDataModule>()),
+  useOptionalLoadedConversations: vi.fn(),
+}));
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof IdentityModule>()),
   authenticatedFetch: vi.fn(),
@@ -187,18 +194,19 @@ const deleteWorkflow = vi.fn();
 
 function renderPage(client = new QueryClient()) {
   // A run's play and stop buttons refresh the runs through the query client.
-  return render(
-    <QueryClientProvider client={client}>
-      <MemoryRouter>
-        <WorkflowDetailPage />
-      </MemoryRouter>
-    </QueryClientProvider>,
-  );
+  return render(<WorkflowDetailPage />, {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={client}>
+        <MemoryRouter>{children}</MemoryRouter>
+      </QueryClientProvider>
+    ),
+  });
 }
 
 describe("WorkflowDetailPage", () => {
   beforeEach(() => {
     vi.mocked(useServerInfo).mockReturnValue("loading");
+    vi.mocked(useOptionalLoadedConversations).mockReturnValue(undefined);
     navigate.mockClear();
     deleteWorkflow.mockClear();
     vi.mocked(openTasksTab).mockClear();
@@ -415,6 +423,10 @@ describe("WorkflowDetailPage", () => {
         ...run("b".repeat(32), "Running run", { started: 1 }, [status("explore", "started")]),
         sessionStatus: "running",
       },
+      {
+        ...run("d".repeat(32), "Background run", { started: 1 }, [status("explore", "started")]),
+        backgroundWorkRunning: true,
+      },
       run("c".repeat(32), "Finished run", { done: 2 }, [
         status("explore", "done"),
         status("fix", "done"),
@@ -422,11 +434,50 @@ describe("WorkflowDetailPage", () => {
     ]);
     renderPage();
 
-    const [stopped, running, finished] = screen.getAllByTestId("workflow-run");
+    const [stopped, running, background, finished] = screen.getAllByTestId("workflow-run");
     expect(within(stopped!).getByRole("button", { name: "Continue the plan" })).toBeInTheDocument();
     expect(within(running!).getByRole("button", { name: "Stop" })).toBeInTheDocument();
+    expect(background).toHaveAttribute("data-run-state", "running");
+    expect(within(background!).getByRole("button", { name: "Stop" })).toBeInTheDocument();
     expect(within(finished!).queryByTestId("plan-continue")).toBeNull();
     expect(within(finished!).queryByTestId("plan-stop")).toBeNull();
+  });
+
+  it.each([
+    { source: "background work", activity: { background_work_running: true } },
+    { source: "child activity", activity: { status: "running" as const } },
+  ])("keeps the run, tasks and graph in sync with sidebar $source", ({ activity }) => {
+    mockWorkflow({});
+    const session = "a".repeat(32);
+    const activeRun = run(session, "Fix the upload test", { started: 1 }, [
+      status("explore", "started"),
+    ]);
+    mockRuns([activeRun]);
+    vi.mocked(useOptionalLoadedConversations).mockReturnValue({
+      ...conversationPage([conversation(session, activity)]).data!,
+      pageParams: [undefined],
+    });
+    const { rerender } = renderPage();
+    const row = screen.getByTestId("workflow-run");
+    expect(row).toHaveAttribute("data-run-state", "running");
+    expect(within(row).getByRole("button", { name: "Stop" })).toBeInTheDocument();
+    expect(within(row).getAllByTestId("tasks-progress-segment")[0]).toHaveAttribute(
+      "aria-label",
+      "Task 1, Explore the failures: Running",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "View Fix the upload test on the graph" }));
+    expect(screen.getByTestId("workflow-graph-overlay")).toHaveTextContent("explore:running");
+
+    // The live sidebar settles before the next run-list refresh.
+    mockRuns([{ ...activeRun, sessionStatus: "running" }]);
+    vi.mocked(useOptionalLoadedConversations).mockReturnValue({
+      ...conversationPage([conversation(session)]).data!,
+      pageParams: [undefined],
+    });
+    rerender(<WorkflowDetailPage />);
+    expect(row).toHaveAttribute("data-run-state", "stopped");
+    expect(within(row).getByRole("button", { name: "Continue the plan" })).toBeInTheDocument();
+    expect(screen.getByTestId("workflow-graph-overlay")).toHaveTextContent("explore:stopped");
   });
 
   it("sends a task's ⋯ action on a run's timeline card to the run's session", async () => {

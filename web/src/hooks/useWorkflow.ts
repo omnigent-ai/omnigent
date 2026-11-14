@@ -108,6 +108,7 @@ interface RawRun {
   title: string;
   started_at: number;
   session_status: WorkflowRun["sessionStatus"];
+  background_work_running?: boolean;
   archived: boolean;
   progress: {
     total: number;
@@ -144,6 +145,7 @@ export function useWorkflowRuns(workflowId: string) {
           title: run.title,
           startedAt: run.started_at,
           sessionStatus: run.session_status,
+          backgroundWorkRunning: run.background_work_running ?? false,
           archived: run.archived,
           progress: {
             total: run.progress.total,

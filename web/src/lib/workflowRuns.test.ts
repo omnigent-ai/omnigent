@@ -38,6 +38,18 @@ describe("describeWorkflowRun", () => {
     });
   });
 
+  it("counts background work while keeping completed and input states", () => {
+    const active = { ...run({ started: 1 }), backgroundWorkRunning: true };
+    expect(describeWorkflowRun(active).kind).toBe("running");
+    expect(describeWorkflowRun({ ...active, progress: { ...active.progress, done: 5 } }).kind).toBe(
+      "done",
+    );
+    expect(
+      describeWorkflowRun({ ...active, progress: { ...active.progress, needsInput: 1 } }).kind,
+    ).toBe("waiting");
+    expect(describeWorkflowRun(active, false).kind).toBe("stopped");
+  });
+
   it("says a stopped run failed, or how far it got", () => {
     expect(describeWorkflowRun(run({ done: 2, failed: 1 }))).toEqual({
       kind: "failed",

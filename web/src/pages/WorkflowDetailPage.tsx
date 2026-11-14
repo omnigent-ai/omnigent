@@ -45,6 +45,7 @@ import {
   WorkflowNotFoundError,
 } from "@/hooks/useWorkflow";
 import { useSessionJournal } from "@/hooks/useSessionJournal";
+import { useSessionWorking } from "@/hooks/useSessionWorking";
 import { useSession } from "@/hooks/useSession";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { WorkflowPlanningChat } from "@/components/workflows/WorkflowPlanningChat";
@@ -56,6 +57,7 @@ import { cn } from "@/lib/utils";
 import { currentPlan, planSteps, type StepState } from "@/lib/sessionJournal";
 import {
   describeWorkflowRun,
+  isWorkflowRunWorking,
   runStepProgress,
   type WorkflowRun,
   type WorkflowRunState,
@@ -454,12 +456,11 @@ function WorkflowRunRow({
   workflowId: string;
   workflowName: string;
 }) {
-  const state = describeWorkflowRun(run);
-  const progress = useMemo(() => runStepProgress(run), [run]);
+  const sessionWorking = useSessionWorking(run.sessionId, isWorkflowRunWorking(run));
+  const state = describeWorkflowRun(run, sessionWorking);
+  const progress = useMemo(() => runStepProgress(run, sessionWorking), [run, sessionWorking]);
   // Stop while the run's session works; play once it stopped with tasks left.
-  const control = run.archived
-    ? null
-    : planRunControl(progress, run.statuses, run.sessionStatus === "running");
+  const control = run.archived ? null : planRunControl(progress, run.statuses, sessionWorking);
   const refreshKeys = [["workflow-runs", workflowId]];
   // Its tasks' ⋯ menus, on the timeline's cards and the graph's nodes; an archived run has none.
   const taskMenus = useRunTaskMenus(run.archived ? null : run.sessionId, refreshKeys);
