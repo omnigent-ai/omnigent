@@ -1,7 +1,7 @@
 """Index conversation labels by key so the pinned-sessions list stays fast.
 
 Revision ID: b4e1c7d2a9f3
-Revises: a7d4c2e9f610
+Revises: 27d16059fab9
 
 The primary key leads with ``conversation_id``, so a lookup by key alone (the
 sidebar's ``pinned=true`` list) scanned every label in the workspace.
@@ -15,7 +15,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "b4e1c7d2a9f3"
-down_revision = "a7d4c2e9f610"
+down_revision = "27d16059fab9"
 branch_labels = None
 depends_on = None
 
