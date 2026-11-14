@@ -10,6 +10,8 @@ implements them separately, so a fix for one harness does not reach the others.
 ## Sub-features
 
 - `launch-web`: pick the harness in the new-session composer and start a session.
+  Claude composes configured caller settings before launch and refuses invalid
+  settings or unavailable validation with actionable guidance.
 - `picker-curation`: server config `restrict_to_agent_names` limits and orders
   what New Chat offers, and `default_agent_name` pre-selects one for a user
   with no remembered pick. Curated, the menu is one flat list with no Harnesses
@@ -43,7 +45,8 @@ implements them separately, so a fix for one harness does not reach the others.
   an Omnigent session behind it. With `OMNIGENT_SESSION_ENV_PASSTHROUGH=NAME,...`
   the named shell variables reach only the new runner that command launches; a
   reused live runner keeps its launch values, and a later server-driven restart
-  starts without them.
+  starts without them. Claude composes repeated `--settings` values in order
+  with Omnigent's required settings and refuses startup if validation fails.
 - `gateway-attribution`: Unity Gateway requests name the coding agent and the
   interface that created its session: desktop app, web UI, mobile, or CLI.
 - `gemini-gateways`: configure native Gemini URL/key or Databricks profile routing,
@@ -213,6 +216,15 @@ implements them separately, so a fix for one harness does not reach the others.
 **Web:** start a new session, choose the harness in the harness picker, open its
 configuration for model and effort, and send. Approval cards and the Terminal
 view appear in the session.
+
+**Caller settings (Claude, CLI and web):** run
+`omnigent claude --settings ./settings.json`, or add `--settings` operands to
+the host's `harness.claude-native.args` configuration and start Claude from New
+Chat. Relative files resolve in the selected terminal workspace. Repeated files
+and inline JSON compose in order while preserving Omnigent's hooks. Invalid
+settings or a CLI/wrapper that cannot perform the read-only validation check
+refuse startup with guidance; the launch inputs remain intact. Opaque serialized
+shell invocations keep their existing behavior.
 
 **Gateway attribution:** start a fresh Claude Code or Codex session from the
 desktop app, browser, iOS/Android app, and CLI. The session keeps that creating
@@ -490,6 +502,27 @@ Each composer/TUI prompt must appear exactly once in persisted user history.
 Run with a real Pi CLI on PATH and retries disabled. Composer API evidence
 does not cover browser clicks; scripted routing does not establish live judge
 quality. Broader Smart Routing journeys remain outside this Pi-specific recipe.
+
+**Claude caller settings (`launch-cli`, `launch-web`; mocked component checks):**
+run the relevant node IDs below with `uv run --no-sync pytest --reruns 0`:
+
+- `tests/harnesses/claude_native/test_claude_native_bridge.py::test_augment_claude_args_merges_caller_settings`
+  checks ordered file/inline composition with required hooks, and
+  `tests/harnesses/claude_native/test_claude_native_bridge.py::test_caller_settings_validation_preserves_baseline_and_arguments`
+  checks rejection before arguments or baseline settings change.
+- `tests/harnesses/claude_native/test_claude_native.py::test_cli_settings_probe_falls_back_without_creating_owned_request`
+  checks legacy fallback for failed or unsupported ownership probes.
+- `tests/runner/test_comment_relay.py::test_cli_settings_request_ownership_survives_admission_and_terminal_lifecycle`
+  checks the explicit CLI launch route, composition after filesystem selection,
+  typed startup refusals and ownership release without spawning a vendor CLI.
+- `tests/runner/test_app_claude_native_launch_args.py::test_auto_create_claude_settings_preserve_configured_argument_boundary`
+  checks configured web-launch settings through preparation, and
+  `tests/runner/test_app_sessions_native_terminals_autocreate.py::test_native_terminal_start_error_guidance_and_redaction`
+  checks automatic startup guidance, log references and error IDs without
+  exposing settings values or private paths.
+
+These component checks leave real CLI and browser composition/refusal journeys
+unverified. Follow the launch preconditions above for those separate drives.
 
 **Claude subscription authentication (`launch-cli`, `launch-web`):** with a
 valid Claude login and an explicit subscription provider, start `omnigent claude`
@@ -1457,6 +1490,10 @@ creating the automation. Record the client configuration with the evidence.
 - For user/project defaults and startup-argument precedence, use
   [Preferences and config defaults](./preferences.md). The read-only Startup
   configuration and plugin inventory do not expose shared-preference controls.
+- Claude settings left by legacy launches or uncertain ownership need host
+  operator investigation. A deleted session, old file, dead runner or free lock
+  does not prove that a detached terminal stopped using its settings. See
+  caller-settings recovery ownership and limitations in the [README](../README.md).
 - A change to shared native-harness behavior (cleanup, idle handling,
   approvals, sign-in state, resume) must be checked on every harness it claims
   to cover. List the harnesses you actually drove; "all harnesses" means all

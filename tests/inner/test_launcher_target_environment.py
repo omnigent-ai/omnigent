@@ -211,7 +211,19 @@ def test_launcher_source_contains_only_payload_path(
 
 @pytest.mark.parametrize(
     "fault",
-    ["missing", "malformed", "shape", "inherit", "unset", "variables", "overrides", "oversize"],
+    [
+        "missing",
+        "malformed",
+        "shape",
+        "inherit",
+        "unset",
+        "unset-member",
+        "variables",
+        "variables-value",
+        "overrides",
+        "overrides-value",
+        "oversize",
+    ],
 )
 def test_invalid_target_payload_never_starts_target(
     tmp_path: Path, inert_launcher, fault: str, caplog: pytest.LogCaptureFixture
@@ -227,7 +239,12 @@ def test_invalid_target_payload_never_starts_target(
         path.write_bytes(b" " * (1024 * 1024 + 1))
     else:
         data = json.loads(path.read_text())
-        data[fault] = "wrong-type-" + _SENTINEL
+        if fault == "unset-member":
+            data["unset"].append(1)
+        elif fault in {"variables-value", "overrides-value"}:
+            data[fault.removesuffix("-value")]["EXAMPLE_INVALID"] = [_SENTINEL]
+        else:
+            data[fault] = "wrong-type-" + _SENTINEL
         path.write_text(json.dumps(data))
     with patch.dict(inert_launcher.environment, _bootstrap(), clear=True):
         with pytest.raises((ValueError, FileNotFoundError)) as error:
@@ -235,6 +252,7 @@ def test_invalid_target_payload_never_starts_target(
                 _encoded(_policy(False)), _TARGET, ["doctor"], target_environment_path=str(path)
             )
     inert_launcher.run.assert_not_called()
+    inert_launcher.execute.assert_not_called()
     inert_launcher.cleanup.assert_called_once_with(None)
     assert _SENTINEL not in str(error.value)
     assert _SENTINEL not in caplog.text

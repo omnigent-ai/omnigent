@@ -252,26 +252,12 @@ async def test_validator_keeps_wrapper_values_out_of_bootstrap(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     context = _context(tmp_path, sandboxed=sandboxed, form=form)
-    _install_doubles(context, monkeypatch)
-    await validation.validate_caller_settings(
-        context.instance, {"attribution": False}, wrapper_prefix=context.prefix
-    )
-    _check_result(context)
-    assert _SENTINEL not in caplog.text
-
-
-@pytest.mark.parametrize(
-    ("sandboxed", "form"), [(True, "inherit"), (True, "nested-reset"), (False, "reset")]
-)
-async def test_validator_payload_reaches_mocked_final_target(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sandboxed: bool, form: str
-) -> None:
-    context = _context(tmp_path, sandboxed=sandboxed, form=form)
     _install_doubles(context, monkeypatch, handoff=True)
     await validation.validate_caller_settings(
         context.instance, {"attribution": False}, wrapper_prefix=context.prefix
     )
     _check_result(context)
+    assert _SENTINEL not in caplog.text
     assert len(context.finals) == 4
     for final, bootstrap in zip(context.finals, context.bootstrap, strict=True):
         assert final["EXAMPLE_TARGET_ONLY"] == _SENTINEL

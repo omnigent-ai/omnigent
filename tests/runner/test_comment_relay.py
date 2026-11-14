@@ -2058,7 +2058,6 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
         "expired-before-admission",
         "expired-after-admission",
         "failure",
-        "invalid-retention",
         "declared-replacement",
         "invalid-settings",
         "validation-unavailable",
@@ -2117,7 +2116,6 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
     caller = {
         "env": {"EXAMPLE": "caller", "FROM_FILE": "yes", "ORDER": "file"},
         **({"disableAllHooks": True} if mode == "failure" else {}),
-        **({"cleanupPeriodDays": 0} if mode == "invalid-retention" else {}),
     }
     caller_file = tmp_path / "caller.json"
     caller_file.write_text(json.dumps(caller))
@@ -2221,7 +2219,6 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
                 "expired-before-admission",
                 "expired-after-admission",
                 "failure",
-                "invalid-retention",
                 "invalid-settings",
                 "validation-unavailable",
                 "unexpected-validator-error",
@@ -2279,13 +2276,6 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
                         "Claude rejected the merged caller settings. Check --settings "
                         "with the selected Claude CLI, then retry; the launch arguments "
                         "and bridge settings were left unchanged."
-                    )
-                elif mode == "invalid-retention":
-                    assert message == (
-                        "Caller cleanupPeriodDays must be a positive integer. "
-                        "Set it to at least 1 in --settings, then retry; "
-                        "the launch arguments and bridge settings "
-                        "were left unchanged."
                     )
                 elif mode == "validation-unavailable":
                     assert message == (

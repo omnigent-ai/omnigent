@@ -6851,7 +6851,11 @@ async def _launch_claude_terminal(
             settings_request=settings_request,
         )
         if settings_request is not None:
-            await _run_claude_settings_step(settings_request.mark_dispatched)
+            withdraw_undelivered_dispatch = settings_request.cancel_undelivered_dispatch
+            await _run_claude_settings_step(
+                settings_request.mark_dispatched,
+                dispose=lambda _result: withdraw_undelivered_dispatch(),
+            )
         try:
             # Production uses HTTPX's default transport. Disable auth and redirect
             # replays so ConnectError proves this fresh generation was not delivered.

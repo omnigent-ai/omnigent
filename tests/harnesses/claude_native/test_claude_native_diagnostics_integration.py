@@ -561,6 +561,8 @@ async def test_cli_settings_ownership_drains_workers_after_repeated_cancellation
                 await checkpoint
                 assert not task.done()
                 assert requests[0]._request_fd is not None
+                if phase == "dispatch":
+                    assert baseline.read_bytes() == baseline_bytes
             release.set()
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(task, timeout=5)
@@ -574,18 +576,12 @@ async def test_cli_settings_ownership_drains_workers_after_repeated_cancellation
                 with pytest.raises(OSError):
                     os.fstat(fd)
             assert bool(posted) is (phase not in {"create", "dispatch"})
-            if phase == "dispatch":
-                assert baseline.read_bytes() == baseline_bytes
-                assert baseline.with_suffix(".dispatch.owner").is_file()
-            else:
-                assert not list(tmp_path.glob("claude-settings-*"))
+            assert not list(tmp_path.glob("claude-settings-*"))
         finally:
             release.set()
             await asyncio.gather(task, return_exceptions=True)
             for request in requests:
                 close(request)
-                baseline = tmp_path / f"claude-settings-{request.generation}.json"
-                baseline.with_suffix(".dispatch.owner").unlink(missing_ok=True)
             prune_unused_claude_settings(tmp_path)
 
 

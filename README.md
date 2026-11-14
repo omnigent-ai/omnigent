@@ -340,6 +340,29 @@ Launches whose arguments are hidden inside serialized shell commands retain
 their existing behavior; this merge and validation apply to inspectable
 invocations.
 
+Request and terminal owners on the host release their own settings generations
+during normal cleanup. Legacy launches without the ownership capability create
+generations without request locks, which per-generation pruning skips. A crash
+can also leave dispatch or terminal claims that retain settings indefinitely.
+Investigating those leftovers is the host operator's responsibility; there is
+no automatic reconciliation of these claims.
+
+Before reclaiming a legacy generation or crash-left claim, the operator must
+identify its bridge, session, generation and peer versions, and establish that
+every possible consumer has finished: the sender, any in-flight launch or
+admitted receiver, and detached terminals, including older clients. Prefer each
+known owner's normal release path, and establish that queued launches or resumes
+cannot reuse its settings operands. Retain identity and completion evidence
+without copying credential-bearing settings. File age, runner-PID death and free
+locks do not establish reclaimability. If consumer completion cannot be proved,
+retain the files and escalate to the host maintainer.
+
+Unknown claims and malformed, unknown-version or future lifecycle metadata
+remain unresolved recovery cases; do not unlink claims or reset metadata to
+bypass them. Disk lifecycle schema 2 is distinct from the advertised ownership
+wire protocol 1. Wire-v2 reconciliation, rollout and mixed-version recovery
+remain open work rather than guarantees of this cleanup protocol.
+
 </details>
 
 <details>
