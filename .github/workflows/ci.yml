@@ -274,8 +274,8 @@ jobs:
           path: artifacts/
           retention-days: 14
 
-  # One lane on the minimum supported CockroachDB, mirroring the single-version
-  # postgres/mysql lanes. The full version matrix runs locally via `just crdb-test`.
+  # Cover the minimum supported version and the recommended v25.2 release.
+  # The full version matrix runs locally via `just crdb-test`.
   stores-cockroachdb:
     name: Pytest (stores-crdb-${{ matrix.crdb_version }})
     needs: scope
@@ -289,6 +289,9 @@ jobs:
           - crdb_version: "23.2.28"
             crdb_service: crdb-23-2-28
             crdb_port: 26323
+          - crdb_version: "25.2.10"
+            crdb_service: crdb-25-2-10
+            crdb_port: 26325
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
@@ -311,13 +314,14 @@ jobs:
       - name: Run store + DB tests against CockroachDB
         env:
           OMNIGENT_TEST_DB_URI: cockroachdb+psycopg://root@localhost:${{ matrix.crdb_port }}/defaultdb?sslmode=disable
+          OMNIGENT_TEST_CRDB_VERSION: ${{ matrix.crdb_version }}
         run: |
           uv run pytest tests/stores tests/db \
             -m "not databricks" \
             -n 4 \
             --dist=loadfile \
             --timeout=300 \
-            --junitxml=artifacts/pytest-stores-crdb.xml
+            --junitxml=artifacts/pytest-stores-crdb-${{ matrix.crdb_version }}.xml
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
