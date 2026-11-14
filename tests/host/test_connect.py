@@ -10397,6 +10397,91 @@ async def test_launch_harness_probe_runs_off_the_event_loop(
     )
 
 
+@pytest.mark.parametrize("config_fails", [False, True])
+@pytest.mark.parametrize("cancel_launch", [False, True])
+async def test_launch_provider_config_read_keeps_host_responsive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    config_fails: bool,
+    cancel_launch: bool,
+) -> None:
+    """Slow provider settings cannot stall control requests or spawn after cancellation."""
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "bootstrap-token"
+    host._auth_token_factory_resolved = True
+    loop = asyncio.get_running_loop()
+    config_started = asyncio.Event()
+    config_released = threading.Event()
+    config_finished = threading.Event()
+    spawned_envs: list[dict[str, str]] = []
+    monkeypatch.setenv("KPI3_TEST_GATEWAY_TOKEN", "provider-secret")
+    monkeypatch.setenv("KPI3_TEST_UNRELATED_SECRET", "unrelated-secret")
+
+    def read_config() -> dict[str, object]:
+        loop.call_soon_threadsafe(config_started.set)
+        try:
+            assert config_released.wait(5), "provider config read blocked the event loop"
+            if config_fails:
+                raise OSError("provider settings temporarily unreadable")
+            return {
+                "providers": {
+                    "gateway": {
+                        "kind": "gateway",
+                        "anthropic": {
+                            "base_url": "https://gateway.example.test",
+                            "api_key_ref": "env:KPI3_TEST_GATEWAY_TOKEN",
+                        },
+                    }
+                }
+            }
+        finally:
+            config_finished.set()
+
+    def spawn(env: dict[str, str], *_args: object) -> None:
+        spawned_envs.append(env)
+        raise OSError("stop before creating a runner")
+
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", read_config)
+    monkeypatch.setattr(host, "_spawn_runner_proc", spawn)
+    launching = asyncio.create_task(
+        host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="launch-config", binding_token="config-token", workspace=str(tmp_path)
+            )
+        )
+    )
+    try:
+        await asyncio.wait_for(config_started.wait(), timeout=5)
+        assert not launching.done(), "launch stalled the loop until the config read failed"
+        reply = await asyncio.wait_for(
+            host._handle_runner_status(HostRunnerStatusFrame("status", "unrelated-runner")),
+            timeout=1,
+        )
+        assert reply == HostRunnerStatusResultFrame("status", "unknown")
+        assert not config_finished.is_set()
+        assert spawned_envs == []
+        if cancel_launch:
+            launching.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await launching
+    finally:
+        config_released.set()
+        await asyncio.gather(launching, return_exceptions=True)
+        assert await asyncio.to_thread(config_finished.wait, 5)
+
+    if cancel_launch:
+        assert spawned_envs == []
+    else:
+        result = launching.result()
+        assert result.status == "failed"
+        assert "stop before creating a runner" in (result.error or "")
+        [env] = spawned_envs
+        assert env[RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR] == "bootstrap-token"
+        assert env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] == "config-token"
+        assert (env.get("KPI3_TEST_GATEWAY_TOKEN") == "provider-secret") is not config_fails
+        assert "KPI3_TEST_UNRELATED_SECRET" not in env
+
+
 async def test_fatal_upgrade_error_surfaces_server_refusal_body() -> None:
     """A refusal that carries a body (what ``_refuse_upgrade`` sends, e.g. the
     server's malformed-host-id 400) is surfaced verbatim — the client passes the

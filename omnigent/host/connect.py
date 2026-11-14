@@ -2202,8 +2202,10 @@ class HostProcess:
             if frame.session_id
             else {}
         )
-        env = _build_runner_env(
-            os.environ,
+        # Provider configuration may live on a slow home-directory filesystem.
+        env = await asyncio.to_thread(
+            _build_runner_env,
+            dict(os.environ),
             server_url=self._server_url,
             runner_id=runner_id,
             binding_token=frame.binding_token,
