@@ -52,7 +52,9 @@ const sessionMock = vi.mocked(useSession);
 const chatStoreMock = vi.mocked(useChatStore);
 const fetchMock = vi.fn();
 
-function stubSession(opts: { hostId?: string | null; createdAtSecondsAgo?: number } | null) {
+function stubSession(
+  opts: { hostId?: string | null; createdAtSecondsAgo?: number; runnerId?: string | null } | null,
+) {
   if (opts === null) {
     sessionMock.mockReturnValue({ session: null, isLoading: false, error: null });
     return;
@@ -61,6 +63,7 @@ function stubSession(opts: { hostId?: string | null; createdAtSecondsAgo?: numbe
   sessionMock.mockReturnValue({
     session: {
       hostId: opts.hostId ?? "host_1",
+      runnerId: opts.runnerId,
       permissionLevel: null,
       createdAt,
     } as Session,
@@ -695,6 +698,144 @@ describe("useWorkspaceEnvironment gating", () => {
     await flushMicrotasks();
 
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("useWorkspaceEnvironment runner bind", () => {
+  const environmentUrl = "/v1/sessions/conv_new/resources/environments/default";
+  const notBound = () => jsonResponse({ error: { code: "conflict" } }, 409);
+
+  function renderShared(probe: () => ReactNode) {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = () => <QueryClientProvider client={qc}>{probe()}</QueryClientProvider>;
+    const view = render(tree());
+    const environmentStatus = () => qc.getQueryState(["workspace-environment", "conv_new"])?.status;
+    return { rerender: () => view.rerender(tree()), environmentStatus };
+  }
+
+  it("refetches a pre-bind 409 once the snapshot reports the bound runner", async () => {
+    onlineMock.mockReturnValue(true);
+    stubSession({ runnerId: null });
+    fetchMock
+      .mockResolvedValueOnce(notBound())
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValue(changedFilesResponse());
+
+    const { rerender } = renderShared(() => (
+      <>
+        <ChangedFilesProbe id="conv_new" />
+        <EnvironmentProbe id="conv_new" />
+      </>
+    ));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    stubSession({ runnerId: null });
+    rerender();
+    await flushMicrotasks();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    stubSession({ runnerId: "runner_1" });
+    rerender();
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    await flushMicrotasks();
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      environmentUrl,
+      environmentUrl,
+      `${environmentUrl}/changes`,
+    ]);
+  });
+
+  it("refetches a 409 when the first loaded snapshot already reports a runner", async () => {
+    onlineMock.mockReturnValue(true);
+    sessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
+    fetchMock.mockResolvedValueOnce(notBound()).mockResolvedValue(environmentResponse());
+
+    const { rerender, environmentStatus } = renderShared(() => <EnvironmentProbe id="conv_new" />);
+    await waitFor(() => expect(environmentStatus()).toBe("error"));
+    stubSession({ runnerId: "runner_1" });
+    rerender();
+
+    await waitFor(() => expect(environmentStatus()).toBe("success"));
+    rerender();
+    await flushMicrotasks();
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([environmentUrl, environmentUrl]);
+  });
+
+  it.each([
+    ["unbound", () => stubSession({ runnerId: null })],
+    ["unknown", () => sessionMock.mockReturnValue({ session: null, isLoading: true, error: null })],
+  ])(
+    "refetches a 409 that settles after a %s snapshot reports the runner",
+    async (_initial, stubInitialSession) => {
+      onlineMock.mockReturnValue(true);
+      stubInitialSession();
+      let releaseNotBound: (value: Response) => void = () => {};
+      fetchMock
+        .mockReturnValueOnce(
+          new Promise<Response>((resolve) => {
+            releaseNotBound = resolve;
+          }),
+        )
+        .mockResolvedValue(environmentResponse());
+
+      const { rerender, environmentStatus } = renderShared(() => (
+        <EnvironmentProbe id="conv_new" />
+      ));
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+      stubSession({ runnerId: "runner_1" });
+      rerender();
+      await flushMicrotasks();
+      releaseNotBound(notBound());
+
+      await waitFor(() => expect(environmentStatus()).toBe("success"));
+      await flushMicrotasks();
+      expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([environmentUrl, environmentUrl]);
+    },
+  );
+
+  it("refetches a 409 only once per bound runner", async () => {
+    onlineMock.mockReturnValue(true);
+    stubSession({ runnerId: "runner_1" });
+    // A delayed response lets each refetch render as in flight before it fails.
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          setTimeout(() => resolve(notBound()), 5);
+        }),
+    );
+
+    const settle = () =>
+      new Promise((resolve) => {
+        setTimeout(resolve, 50);
+      });
+
+    const { rerender, environmentStatus } = renderShared(() => <EnvironmentProbe id="conv_new" />);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(environmentStatus()).toBe("error"));
+    await settle();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    stubSession({ runnerId: "runner_2" });
+    rerender();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(environmentStatus()).toBe("error"));
+    await settle();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not refetch a loaded environment when the first snapshot arrives", async () => {
+    onlineMock.mockReturnValue(true);
+    sessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
+    fetchMock.mockResolvedValue(environmentResponse());
+
+    const { rerender, environmentStatus } = renderShared(() => <EnvironmentProbe id="conv_new" />);
+    await waitFor(() => expect(environmentStatus()).toBe("success"));
+    stubSession({ runnerId: "runner_1" });
+    rerender();
+    rerender();
+    await flushMicrotasks();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 
