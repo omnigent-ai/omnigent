@@ -10,13 +10,31 @@ in-process store.
 * ``sys_scheduled_task_list`` — list the caller's tasks.
 * ``sys_scheduled_task_update`` — update a task's mutable fields.
 * ``sys_scheduled_task_delete`` — delete a task.
+* ``sys_reminder_set`` — send a message into the calling session once, at a
+  given time. It is a scheduled task with a one-time ``COUNT=1`` rule that
+  continues the session, so it survives runner exits, unlike ``sys_timer_set``.
 """
 
 from __future__ import annotations
 
+import math
+import re
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from omnigent.tools.base import Tool
+
+# Shorter waits belong to sys_timer_set. Rounding up to the minute can add up to
+# another minute.
+MIN_REMINDER_DELAY = timedelta(minutes=15)
+# The end of an ISO-8601 time with "Z" or a whole-minute offset such as "-08:00".
+_WHOLE_MINUTE_OFFSET = re.compile(r"(?:[Zz]|[+-]\d{2}(?::?\d{2})?)$")
+# Well under a year, so the rule's month, day and time occur only once after creation.
+MAX_REMINDER_DELAY = timedelta(days=90)
+REMINDER_NAME_CHARS = 60
+_TOO_SOON = (
+    f"A reminder must be at least {MIN_REMINDER_DELAY.seconds // 60} minutes in the future."
+)
 
 _RRULE_DESC = (
     "RFC 5545 recurrence rule, e.g. 'FREQ=DAILY;BYHOUR=9;BYMINUTE=0' (daily at "
@@ -416,6 +434,172 @@ class SysScheduledTaskDeleteTool(Tool):
                         },
                     },
                     "required": ["scheduled_task_id"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+
+def resolve_reminder_time(args: dict[str, Any], now: datetime) -> datetime | str:
+    """Resolve a ``sys_reminder_set`` call's fire time, rounded up to the minute.
+
+    :param args: Parsed tool arguments with exactly one of ``at`` (ISO-8601 with
+        an offset, e.g. ``"2026-11-12T15:00:00-08:00"``) or ``delay_seconds``.
+    :param now: The current time, timezone-aware.
+    :returns: The fire time in UTC on a whole minute, or an error message.
+    """
+    has_at = args.get("at") is not None
+    has_delay = args.get("delay_seconds") is not None
+    if has_at == has_delay:
+        return "Set exactly one of 'at' or 'delay_seconds'."
+    if has_at:
+        raw = args["at"]
+        if not isinstance(raw, str):
+            return "'at' must be an ISO-8601 string, e.g. '2026-11-12T15:00:00-08:00'."
+        try:
+            when = datetime.fromisoformat(raw.strip())
+        except ValueError:
+            return f"'at' is not an ISO-8601 time: {raw!r}."
+        if when.tzinfo is None or when.utcoffset() is None:
+            return "'at' needs a UTC offset or 'Z', e.g. '2026-11-12T15:00:00-08:00'."
+        if _WHOLE_MINUTE_OFFSET.search(raw.strip()) is None:
+            # fromisoformat also takes offsets with seconds and fractions, which it
+            # can truncate; with only whole minutes, any fraction is the clock's.
+            return "'at' needs a UTC offset in whole minutes, such as 'Z' or '-08:00'."
+        fraction = re.search(r"[.,](\d+)", raw)
+        # fromisoformat drops digits past microseconds; count them so the time
+        # can't round down to a minute before the one asked for.
+        sub_microsecond = fraction is not None and bool(fraction.group(1)[6:].strip("0"))
+    else:
+        delay = args["delay_seconds"]
+        # bool is an int subclass; reject it like sys_timer_set does.
+        if not isinstance(delay, (int, float)) or isinstance(delay, bool):
+            return "'delay_seconds' must be a number."
+        # Bound the value before any conversion: a huge int overflows float(), and
+        # timedelta() overflows well inside the finite float range.
+        if isinstance(delay, float) and not math.isfinite(delay):
+            return "'delay_seconds' must be a finite number."
+        if delay > MAX_REMINDER_DELAY.total_seconds():
+            return f"A reminder can be at most {MAX_REMINDER_DELAY.days} days away."
+        if delay < 0:
+            return _TOO_SOON
+        when = now + timedelta(seconds=delay)
+        sub_microsecond = False
+    try:
+        if sub_microsecond:
+            when += timedelta(microseconds=1)
+        when = when.astimezone(UTC)
+        # The upper limit applies before rounding, so the largest delay is accepted;
+        # the extra seconds still leave the time well under a year away.
+        if when > now + MAX_REMINDER_DELAY:
+            return f"A reminder can be at most {MAX_REMINDER_DELAY.days} days away."
+        if when.second or when.microsecond:
+            when = when.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    except OverflowError:
+        # Only an 'at' near the ends of the datetime range gets here.
+        return "'at' is outside the supported date range."
+    if when < now + MIN_REMINDER_DELAY:
+        return _TOO_SOON
+    return when
+
+
+def reminder_rrule(when: datetime) -> str:
+    """The one-time rule that fires at *when* (UTC, whole minute).
+
+    The server counts ``COUNT`` from the task's creation, and *when* is less than a
+    year away, so the first match of this month, day and time is *when* itself.
+
+    :param when: The fire time, e.g. ``datetime(2026, 11, 12, 23, 0, tzinfo=UTC)``.
+    :returns: The rule, e.g. for 23:00 UTC on November 12:
+        ``"FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=12;BYHOUR=23;BYMINUTE=0;BYSECOND=0;COUNT=1"``.
+    """
+    when = when.astimezone(UTC)
+    return (
+        f"FREQ=YEARLY;BYMONTH={when.month};BYMONTHDAY={when.day};"
+        f"BYHOUR={when.hour};BYMINUTE={when.minute};BYSECOND=0;COUNT=1"
+    )
+
+
+def reminder_prompt(message: str, when: datetime) -> str:
+    """The text the reminder sends into the session when it fires."""
+    return f"[Reminder set for {when.astimezone(UTC):%Y-%m-%d %H:%M} UTC]\n{message}"
+
+
+def reminder_name(message: str) -> str:
+    """The automation name a reminder is listed under."""
+    first_line = " ".join(message.split())
+    if len(first_line) > REMINDER_NAME_CHARS:
+        first_line = first_line[: REMINDER_NAME_CHARS - 3] + "..."
+    return f"Reminder: {first_line}"
+
+
+class SysReminderSetTool(Tool):
+    """Remind the calling session once. Runner-dispatched to ``POST /v1/scheduled-tasks``."""
+
+    @classmethod
+    def name(cls) -> str:
+        """:returns: ``"sys_reminder_set"``."""
+        return "sys_reminder_set"
+
+    @classmethod
+    def description(cls) -> str:
+        """:returns: Human-readable description of the tool."""
+        return (
+            "Set a one-time reminder: at the given time, the message is sent into "
+            "this session as a new turn, even if the session has gone idle, the "
+            "runner has stopped, or the server restarted in between. If the "
+            "session's runner can't be reached or woken then (its host is "
+            "offline, say), or the session was deleted, the run fails and the "
+            "reminder is not retried. Give either "
+            "'at' (an ISO-8601 time with a UTC offset) or 'delay_seconds'. The "
+            f"requested time may be at most {MAX_REMINDER_DELAY.days} days away, and "
+            "is rounded up to the next minute, which can add less than a minute; the "
+            f"result must be at least {MIN_REMINDER_DELAY.seconds // 60} minutes away. "
+            "Write the message for your future self: "
+            "say what to check or do. The Automations page doesn't list "
+            "reminders; sys_scheduled_task_list does. Cancel one with "
+            "sys_scheduled_task_delete and the returned "
+            "scheduled_task_id. Works in top-level sessions you own on a "
+            "connected host, not in sub-agent sessions, side chats, managed sandboxes, or "
+            "sessions running in a permission mode that skips approval. For "
+            "a shorter wait inside an active turn, use sys_timer_set (when enabled)."
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        """:returns: The OpenAI-format tool schema."""
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name(),
+                "description": self.description(),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "message": {
+                            "type": "string",
+                            "description": (
+                                "What the reminder says when it fires, e.g. "
+                                "'Check whether CI on PR #123 passed and report back.'"
+                            ),
+                        },
+                        "at": {
+                            "type": "string",
+                            "description": (
+                                "When to fire, as ISO-8601 with a UTC offset or 'Z', "
+                                "e.g. '2026-11-12T15:00:00-08:00'. Do not set "
+                                "delay_seconds with it."
+                            ),
+                        },
+                        "delay_seconds": {
+                            "type": "number",
+                            "description": (
+                                "When to fire, as seconds from when the call runs (after "
+                                "its approval), e.g. 2700 for 45 minutes. Do not set at "
+                                "with it."
+                            ),
+                        },
+                    },
+                    "required": ["message"],
                     "additionalProperties": False,
                 },
             },
