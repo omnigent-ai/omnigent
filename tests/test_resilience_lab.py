@@ -169,3 +169,39 @@ def test_host_startup_waits_for_rpc_when_online_row_precedes_tunnel(
         if helper == "server-runner":
             assert spawned_env["OMNIGENT_HOST_ID"] == host_id
             assert spawned_env["OMNIGENT_HOST_NAME"]
+
+
+def test_runner_readiness_stops_after_health_exhausts_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = SimpleNamespace(now=0.0)
+    requests = []
+    sleep = Mock()
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append((request.url.path, request.extensions["timeout"]))
+        assert request.url.path == "/health", "Runner status started after the health deadline"
+        clock.now = 1.0
+        return httpx.Response(200, json={"status": "ok"})
+
+    stack = ServerRunner.__new__(ServerRunner)
+    stack.base_url = "http://test"
+    stack.runner_id = "example-runner"
+    stack.server = stack.runner = stack.host = None
+    stack._health_timeout = 1.0
+    stack._poll_interval = 0.0
+    monkeypatch.setattr(stack, "log_tail", lambda: "runner-readiness-marker")
+    monkeypatch.setattr(
+        "tests._helpers.server_runner.time",
+        SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep),
+    )
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        stack._client = client
+        with pytest.raises(AssertionError, match="never became ready") as raised:
+            stack._wait_ready(runner=True)
+
+    assert "runner-readiness-marker" in str(raised.value)
+    assert [path for path, _ in requests] == ["/health"]
+    assert requests[0][1]["read"] == 1.0
+    assert clock.now == 1.0
+    sleep.assert_not_called()

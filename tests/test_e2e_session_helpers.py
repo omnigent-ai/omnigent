@@ -376,26 +376,61 @@ def test_native_create_failure_keeps_bounded_redacted_response(
     assert len(note) < 2200
 
 
+def _sized_json_response_body(size_bytes: int, character: str) -> str:
+    envelope_bytes = len(json.dumps({"message": ""}, ensure_ascii=False).encode("utf-8"))
+    count, remainder = divmod(size_bytes - envelope_bytes, len(character.encode("utf-8")))
+    return json.dumps({"message": character * count + "x" * remainder}, ensure_ascii=False)
+
+
 @pytest.mark.parametrize(
-    "body",
+    ("body", "expected_bytes", "omitted"),
     [
-        pytest.param('upstream password="synthetic-omitted-tail', id="plain-text"),
-        pytest.param('{"password":"\\"synthetic-omitted-tail"} trailing', id="invalid-json"),
-        pytest.param("[" * 1100 + '"synthetic-omitted-tail"' + "]" * 1100, id="deep-json"),
+        pytest.param('upstream password="synthetic-omitted-tail', None, True, id="plain-text"),
+        pytest.param(
+            '{"password":"\\"synthetic-omitted-tail"} trailing', None, True, id="invalid-json"
+        ),
+        pytest.param(
+            "[" * 1100 + '"synthetic-omitted-tail"' + "]" * 1100, None, True, id="deep-json"
+        ),
         pytest.param(
             json.dumps({"message": "password" * 4096 + "synthetic-omitted-tail"}),
+            None,
+            True,
             id="repeated-sensitive-label",
         ),
+        *[
+            pytest.param(
+                _sized_json_response_body(size_bytes, character),
+                size_bytes,
+                size_bytes > 16_384,
+                id=f"{label}-{size_bytes}-bytes",
+            )
+            for label, character in (("ascii", "x"), ("multibyte", "é"))
+            for size_bytes in (16_384, 16_385)
+        ],
     ],
 )
-def test_redacted_response_text_omits_unsafe_bodies(body: str) -> None:
-    response = httpx.Response(502, content=body)
+def test_redacted_response_text_omits_unsafe_bodies(
+    body: str, expected_bytes: int | None, omitted: bool
+) -> None:
+    response = httpx.Response(502, content=body.encode("utf-8"))
+    original_content = response.content
+    original_payload = None
+    if expected_bytes is not None:
+        assert len(original_content) == expected_bytes
+        original_payload = response.json()
 
     diagnostic = _redacted_response_text(response)
 
-    assert "Response body omitted" in diagnostic
-    assert "synthetic-omitted-tail" not in diagnostic
+    if omitted:
+        assert "Response body omitted" in diagnostic
+        assert "synthetic-omitted-tail" not in diagnostic
+    else:
+        assert json.loads(diagnostic) == original_payload
+    assert response.content == original_content
     assert response.text == body
+    if expected_bytes is not None:
+        assert response.json() == original_payload
 
 
 def test_native_create_failure_keeps_http_error_when_diagnostic_body_is_omitted() -> None:
