@@ -4946,6 +4946,7 @@ function ComposerImpl(
                 }
                 onWorkflow={canStartWorkflow ? openWorkflowDialog : undefined}
                 savedWorkflows={savedWorkflows.workflows}
+                workflowPagination={savedWorkflows.pagination}
                 onRunSavedWorkflow={
                   canStartWorkflow ? (workflow) => openWorkflowDialog("", workflow) : undefined
                 }

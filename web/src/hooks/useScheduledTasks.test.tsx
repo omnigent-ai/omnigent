@@ -18,6 +18,7 @@ import {
   useRunScheduledTaskNow,
   useScheduledTask,
   useScheduledTaskRuns,
+  useScheduledTaskRunSteps,
   useScheduledTasks,
   useUpdateScheduledTask,
 } from "./useScheduledTasks";
@@ -26,6 +27,7 @@ vi.mock("@/lib/scheduledTasksApi", () => ({
   listScheduledTasks: vi.fn(),
   getScheduledTask: vi.fn(),
   listScheduledTaskRuns: vi.fn(),
+  listScheduledTaskRunSteps: vi.fn(),
   createScheduledTask: vi.fn(),
   updateScheduledTask: vi.fn(),
   deleteScheduledTask: vi.fn(),
@@ -287,6 +289,33 @@ describe("hasUnsettledRun (the refetchInterval stop condition)", () => {
 });
 
 describe("useScheduledTaskRuns live refresh", () => {
+  it("loads steps when a new settled run replaces one on a full history page", async () => {
+    const { wrapper } = makeWrapper();
+    const previous = Array.from({ length: 20 }, (_, index) => ({
+      ...SUCCEEDED_RUN,
+      id: `run-old-${index}`,
+    }));
+    const current = [{ ...SUCCEEDED_RUN, id: "run-new" }, ...previous.slice(0, 19)];
+    const stepsFor = (runs: api.ScheduledTaskRun[]) =>
+      runs.map((run) => ({
+        runId: run.id,
+        workflowId: null,
+        steps: [],
+        statuses: [],
+      }));
+    vi.mocked(api.listScheduledTaskRunSteps)
+      .mockResolvedValueOnce(stepsFor(previous))
+      .mockResolvedValueOnce(stepsFor(current));
+    const { result, rerender } = renderHook(
+      ({ runs }) => useScheduledTaskRunSteps("st_1", runs, true),
+      { wrapper, initialProps: { runs: previous } },
+    );
+    await waitFor(() => expect(result.current.has("run-old-0")).toBe(true));
+    rerender({ runs: current });
+    await waitFor(() => expect(result.current.has("run-new")).toBe(true));
+    expect(api.listScheduledTaskRunSteps).toHaveBeenCalledTimes(2);
+  });
+
   it("keeps refetching a >20s run until it settles, WITHOUT a remount", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: false });
     try {

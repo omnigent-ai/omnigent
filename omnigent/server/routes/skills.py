@@ -172,17 +172,16 @@ def create_skills_router(
                 for skill in spec.skills
                 if skill.user_invocable
             ] + [skill for skill in skills if skill.name not in reserved]
-            # Framework skills come last, as in resolve_session_skills.
-            listed = reserved | {skill.name for skill in skills}
-            skills += [
-                SkillSummary(name=skill.name, description=skill.description)
-                for skill in framework_skills(spec)
-                if skill.name not in listed
-            ]
-        if not getattr(request.app.state, "feature_flags", FeatureFlags()).enabled(
-            Feature.WORKFLOWS
-        ):
-            skills = [skill for skill in skills if skill.name not in {"workflow", "save-workflow"}]
+            if getattr(request.app.state, "feature_flags", FeatureFlags()).enabled(
+                Feature.WORKFLOWS
+            ):
+                # Framework skills come last, as in resolve_session_skills.
+                listed = reserved | {skill.name for skill in skills}
+                skills += [
+                    SkillSummary(name=skill.name, description=skill.description)
+                    for skill in framework_skills(spec)
+                    if skill.name not in listed
+                ]
         return SkillsResponse(skills=skills, warnings=result.warnings)
 
     return router

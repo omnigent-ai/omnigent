@@ -43,8 +43,10 @@ beforeEach(() => {
   byKind = {};
   vi.mocked(authenticatedFetch).mockReset();
   vi.mocked(authenticatedFetch).mockImplementation(async (url) => {
-    const kind = new URL(String(url), "http://test").searchParams.get("kind");
-    const page = kind ? byKind[kind] : queued.shift();
+    const params = new URL(String(url), "http://test").searchParams;
+    const kind = params.get("kind");
+    const step = params.get("step");
+    const page = kind ? byKind[step ? `${kind}:${step}` : kind] : queued.shift();
     return new Response(JSON.stringify(page ?? journalPage([])));
   });
 });
@@ -67,26 +69,35 @@ describe("useSessionJournal", () => {
   });
 
   it("reads the newest plan and statuses when older pages exist", async () => {
-    const plan = journalPlan(0, ["a"]);
-    const started = journalEntry(1, { kind: "status", step: "a", content: { status: "started" } });
-    byKind = { plan: journalPage([plan]), status: journalPage([started]) };
-    respond(journalPage([journalEntry(3), journalEntry(2)], { has_more: true }));
+    const plan = journalPlan(0, ["a"], ["b"]);
+    const done = journalEntry(1, { kind: "status", step: "a", content: { status: "done" } });
+    const busy = Array.from({ length: 1001 }, (_, index) =>
+      journalEntry(index + 2, { kind: "status", step: "b", content: { status: "started" } }),
+    ).reverse();
+    byKind = {
+      plan: journalPage([plan]),
+      status: journalPage(busy.slice(0, 1000), { has_more: true }),
+      "status:a": journalPage([done]),
+      "status:b": journalPage([busy[0]]),
+    };
+    respond(journalPage([busy[0]], { has_more: true }));
     const { result } = renderHook(() => useSessionJournal(SESSION, true), { wrapper });
     await waitFor(() =>
-      expect(result.current.entries.map((entry) => entry.position)).toEqual([0, 1, 2, 3]),
+      expect(result.current.entries.map((entry) => entry.position)).toEqual([0, 1, 1002]),
     );
     expect(result.current.hasOlder).toBe(true);
     expect(requestedQueries().map((query) => Object.fromEntries(query))).toEqual([
       { order: "desc", limit: "100" },
       { kind: "plan", order: "desc", limit: "1" },
-      { kind: "status", order: "desc", limit: "1000" },
+      { kind: "status", step: "a", order: "desc", limit: "1" },
+      { kind: "status", step: "b", order: "desc", limit: "1" },
     ]);
 
-    respond(journalPage([started, plan]));
+    respond(journalPage(busy.slice(1, 101), { has_more: true }));
     act(() => result.current.loadOlder());
-    await waitFor(() => expect(result.current.hasOlder).toBe(false));
-    expect(requestedQueries()[3].get("after")).toBe("e2");
-    expect(result.current.entries.map((entry) => entry.position)).toEqual([0, 1, 2, 3]);
+    await waitFor(() => expect(result.current.entries).toHaveLength(103));
+    expect(requestedQueries()[4].get("after")).toBe("e1002");
+    expect(result.current.entries).toContainEqual(done);
   });
 
   it("adds live entries once, including entries written during an automation run", async () => {

@@ -52,18 +52,19 @@ export function scrollToMessage(
   messageId: string,
   flash?: (id: string) => void,
   ensureVisible?: (id: string) => boolean,
+  root: ParentNode = document,
 ): void {
   // The row may be windowed out of the DOM (virtualized transcript). Ask the
   // transcript to scroll it into the mounted range first; its node then mounts
   // on the next frame, so retry the DOM lookup + centering scroll there.
   const scrolledIntoWindow = ensureVisible?.(messageId) ?? false;
   const el =
-    findMessageElement(messageId) ??
-    document.querySelector(`[data-user-message-id="${CSS.escape(messageId)}"]`);
+    findMessageElement(messageId, root) ??
+    root.querySelector(`[data-user-message-id="${CSS.escape(messageId)}"]`);
   if (!el) {
     if (scrolledIntoWindow) {
       // Row is being mounted by the virtualizer — center on it next frame.
-      requestAnimationFrame(() => scrollToMessage(messageId, flash));
+      requestAnimationFrame(() => scrollToMessage(messageId, flash, undefined, root));
       return;
     }
     // Fail loud: id exists in the list but DOM anchor is missing.
@@ -145,8 +146,9 @@ export function scrollToUserMessage(
   itemId: string,
   flash?: (id: string) => void,
   ensureVisible?: (id: string) => boolean,
+  root: ParentNode = document,
 ): void {
-  scrollToMessage(itemId, flash, ensureVisible);
+  scrollToMessage(itemId, flash, ensureVisible, root);
 }
 
 export function useUserMessageNav(
@@ -154,6 +156,7 @@ export function useUserMessageNav(
   // From the virtualized transcript: pulls a windowed-out target into the DOM
   // before the centering scroll. Omitted in tests / non-virtualized callers.
   ensureItemVisible?: (id: string) => boolean,
+  root: ParentNode = document,
 ): UserMessageNav {
   const flashUserMessage = useChatStore((s) => s.flashUserMessage);
   const [anchorId, setAnchorId] = useState<string | null>(null);
@@ -172,16 +175,16 @@ export function useUserMessageNav(
       ? userMessageIds[userMessageIds.length - 1]
       : userMessageIds[currentIndex - 1];
     setAnchorId(target);
-    scrollToUserMessage(target, flashUserMessage, ensureItemVisible);
-  }, [userMessageIds, currentIndex, outside, flashUserMessage, ensureItemVisible]);
+    scrollToUserMessage(target, flashUserMessage, ensureItemVisible, root);
+  }, [userMessageIds, currentIndex, outside, flashUserMessage, ensureItemVisible, root]);
 
   const goNext = useCallback(() => {
     if (outside) return;
     if (currentIndex >= userMessageIds.length - 1) return;
     const target = userMessageIds[currentIndex + 1];
     setAnchorId(target);
-    scrollToUserMessage(target, flashUserMessage, ensureItemVisible);
-  }, [userMessageIds, currentIndex, outside, flashUserMessage, ensureItemVisible]);
+    scrollToUserMessage(target, flashUserMessage, ensureItemVisible, root);
+  }, [userMessageIds, currentIndex, outside, flashUserMessage, ensureItemVisible, root]);
 
   // Stable identity so consumers can put the return value in an
   // effect dep array without re-registering on every render.

@@ -69,6 +69,7 @@ function mockWorkflows(state: Partial<ReturnType<typeof useSavedWorkflows>>) {
     isLoading: false,
     isError: false,
     refresh,
+    pagination: { hasMore: false, loadingMore: false, loadMore: vi.fn() },
     ...state,
   });
   return refresh;
@@ -96,7 +97,11 @@ describe("WorkflowsPage", () => {
   afterEach(cleanup);
 
   it("lists workflows with their descriptions", () => {
-    mockWorkflows({ workflows: WORKFLOWS });
+    const loadMore = vi.fn();
+    mockWorkflows({
+      workflows: WORKFLOWS,
+      pagination: { hasMore: true, loadingMore: false, loadMore },
+    });
     render(<WorkflowsPage />);
 
     expect(screen.getByRole("heading", { name: "Workflows" })).toBeInTheDocument();
@@ -106,6 +111,8 @@ describe("WorkflowsPage", () => {
     expect(
       first.getByText("Reruns the suite and files an issue for each flaky test."),
     ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Load more workflows" }));
+    expect(loadMore).toHaveBeenCalledOnce();
   });
 
   it("confirms deleting a workflow from its menu, and says when that fails", () => {

@@ -29,7 +29,7 @@ import { useNavigate } from "@/lib/routing";
 import { useCreateWorkflowDraft } from "@/hooks/useWorkflow";
 
 export function WorkflowsPage() {
-  const { workflows, isLoading, isError, refresh } = useSavedWorkflows();
+  const { workflows, isLoading, isError, refresh, pagination } = useSavedWorkflows();
   const createDraft = useCreateWorkflowDraft();
   const navigate = useNavigate();
   const info = useServerInfo();
@@ -126,6 +126,18 @@ export function WorkflowsPage() {
             />
           ))}
         </div>
+      )}
+
+      {pagination?.hasMore && (
+        <Button
+          variant="outline"
+          className="mt-4"
+          disabled={pagination.loadingMore}
+          onClick={pagination.loadMore}
+          componentId="workflows.load-more"
+        >
+          {pagination.loadingMore ? "Loading…" : "Load more workflows"}
+        </Button>
       )}
 
       {deleteTarget && (

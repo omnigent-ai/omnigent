@@ -353,8 +353,9 @@ function TranscriptImpl({
     () => display.bubbles.filter(isUserTurnBubble).map((b) => b.itemId),
     [display.bubbles, isUserTurnBubble],
   );
-  const nav = useUserMessageNav(userMessageIds, ensureItemVisible);
+  const nav = useUserMessageNav(userMessageIds, ensureItemVisible, scroller?.el);
   useMessageDeepLink(conversationId ?? null, {
+    root: scroller?.el,
     ensureMessageVisible: ensureItemVisible,
     ready: display.conversationId === conversationId && !!scroller?.el && !!scrollToItemRef.current,
     rangeNonce: spacerMeasureNonce,

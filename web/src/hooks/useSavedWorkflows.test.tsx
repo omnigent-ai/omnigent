@@ -41,7 +41,10 @@ describe("useSavedWorkflows", () => {
         features,
       });
       const client = new QueryClient();
-      client.setQueryData(["saved-workflows"], [{ id: "saved", name: "Release", description: "" }]);
+      client.setQueryData(["saved-workflows"], {
+        pages: [{ data: [{ id: "saved", name: "Release", description: "" }], has_more: false }],
+        pageParams: [null],
+      });
       const { result } = renderWithClient(() => useSavedWorkflows(), client);
 
       act(() => result.current.refresh());
@@ -61,6 +64,46 @@ describe("useSavedWorkflows", () => {
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect(result.current.isLoading).toBe(false);
     expect(result.current.workflows).toEqual([]);
+  });
+
+  it("loads another bounded page only on request", async () => {
+    const first = Array.from({ length: 200 }, (_, index) => ({
+      id: `workflow-${index}`,
+      name: `Workflow ${index}`,
+      description: "",
+    }));
+    const last = { id: "workflow-200", name: "Last workflow", description: "" };
+    vi.mocked(authenticatedFetch)
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            data: first,
+            has_more: true,
+            last_id: "workflow-199",
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            data: [last],
+            has_more: false,
+            last_id: last.id,
+          }),
+        ),
+      );
+    const { result } = renderWithClient(() => useSavedWorkflows());
+    await waitFor(() => expect(result.current.workflows).toHaveLength(200));
+    expect(authenticatedFetch).toHaveBeenCalledTimes(1);
+    expect(result.current.pagination.hasMore).toBe(true);
+    act(() => result.current.pagination.loadMore());
+    await waitFor(() => expect(result.current.workflows).toHaveLength(201));
+    expect(result.current.workflows.at(-1)).toEqual(last);
+    expect(result.current.pagination.hasMore).toBe(false);
+    expect(authenticatedFetch).toHaveBeenLastCalledWith(
+      "/v1/workflows?limit=200&after=workflow-199",
+      expect.anything(),
+    );
   });
 });
 

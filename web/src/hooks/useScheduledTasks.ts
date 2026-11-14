@@ -201,7 +201,7 @@ export function useScheduledTaskRunSteps(
       // Each page starts after the previous page's last run, as the run list pages.
       const after = index === 0 ? undefined : pages[index - 1]!.at(-1)!.id;
       return {
-        queryKey: ["scheduled-task-run-steps", id, after ?? null, page.length],
+        queryKey: ["scheduled-task-run-steps", id, after ?? null, page.map((run) => run.id)],
         queryFn: () => listScheduledTaskRunSteps(id, { limit: RUN_STEPS_PAGE, after }),
         enabled,
         staleTime: 30_000,

@@ -1139,10 +1139,12 @@ function AppShellImpl() {
         // Pull Requests tab: shares the Files/workspace gate. Non-git workspaces and
         // other unavailable reasons are shown as empty states in the panel.
         github: showFilesPanel,
-        // Tasks need workflows enabled, with a journal or a native to-do list.
+        // Existing native tasks remain available without workflow capabilities.
         tasks:
-          isFeatureEnabled(serverInfo, "workflows") &&
-          ((serverInfo !== "loading" && serverInfo.session_journal === true) || hasNativeTasks),
+          hasNativeTasks ||
+          (isFeatureEnabled(serverInfo, "workflows") &&
+            serverInfo !== "loading" &&
+            serverInfo.session_journal === true),
         // Browser soft tabs: available only when the shell hosts the embedded
         // WebContentsView. Plain web and older desktop builds hide the "+"
         // option entirely so they never surface a dead tab whose calls no-op.

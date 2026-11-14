@@ -2,7 +2,7 @@ import { useState } from "react";
 import { CheckIcon, PlusIcon, SearchIcon, WorkflowIcon, XIcon } from "lucide-react";
 
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
-import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
+import type { SavedWorkflow, WorkflowPagination } from "@/hooks/useSavedWorkflows";
 
 /**
  * Searchable list of the user's saved workflows, laid out like `ProjectPicker`'s
@@ -14,6 +14,7 @@ import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
  */
 export function WorkflowPicker({
   workflows,
+  pagination,
   onSelect,
   onDescribe,
   onClear,
@@ -21,6 +22,7 @@ export function WorkflowPicker({
   heading = "Run a workflow",
 }: {
   workflows: readonly SavedWorkflow[];
+  pagination?: WorkflowPagination;
   onSelect: (workflow: SavedWorkflow) => void;
   onDescribe?: (description: string) => void;
   onClear?: () => void;
@@ -77,6 +79,17 @@ export function WorkflowPicker({
         ))}
         {filtered.length === 0 && (
           <p className="px-2 py-1.5 text-sm text-muted-foreground">No matching workflows</p>
+        )}
+        {pagination?.hasMore && (
+          <DropdownMenuItem
+            disabled={pagination.loadingMore}
+            onSelect={(event) => {
+              event.preventDefault();
+              pagination.loadMore();
+            }}
+          >
+            {pagination.loadingMore ? "Loading…" : "Load more workflows"}
+          </DropdownMenuItem>
         )}
       </div>
       {(onDescribe || onClear) && (

@@ -7665,6 +7665,7 @@ function NewChatLandingContent({
                         }}
                         onWorkflow={canStartWorkflow ? openWorkflowDialog : undefined}
                         savedWorkflows={savedWorkflows.workflows}
+                        workflowPagination={savedWorkflows.pagination}
                         onRunSavedWorkflow={
                           canStartWorkflow
                             ? (workflow) => openWorkflowDialog(undefined, workflow)

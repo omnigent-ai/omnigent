@@ -71,12 +71,7 @@ export function useSessionTasks(
     ),
   );
   const entries = journalSupported ? journal.entries : NO_ENTRIES;
-  const tasks = sessionTaskList(
-    entries,
-    workflowsEnabled ? nativeTasks : [],
-    sessionWorking,
-    awaitingUser,
-  );
+  const tasks = sessionTaskList(entries, nativeTasks, sessionWorking, awaitingUser);
   return {
     ...tasks,
     journal,

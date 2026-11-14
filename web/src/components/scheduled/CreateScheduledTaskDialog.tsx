@@ -1050,6 +1050,7 @@ export function CreateScheduledTaskDialog({
     workflowsEnabled && (savedWorkflows.workflows.length > 0 || workflowChoice) ? (
       <WorkflowField
         workflows={savedWorkflows.workflows}
+        pagination={savedWorkflows.pagination}
         value={workflowShown}
         onChange={setWorkflowChoice}
         onOpenChange={handleSelectOpenChange}

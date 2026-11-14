@@ -16,7 +16,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { WorkflowPicker } from "@/components/composer/WorkflowPicker";
-import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
+import type { SavedWorkflow, WorkflowPagination } from "@/hooks/useSavedWorkflows";
 
 const EMPTY_PROJECTS: readonly { name: string }[] = [];
 const EMPTY_WORKFLOWS: readonly SavedWorkflow[] = [];
@@ -51,6 +51,7 @@ export function ComposerAddMenu({
   onSideChat,
   onWorkflow,
   savedWorkflows = EMPTY_WORKFLOWS,
+  workflowPagination,
   onRunSavedWorkflow,
   onOpen,
   projects = EMPTY_PROJECTS,
@@ -79,6 +80,7 @@ export function ComposerAddMenu({
   onWorkflow?: (description?: string) => void;
   /** The user's saved workflows; when there are some, Run a workflow lists them. */
   savedWorkflows?: readonly SavedWorkflow[];
+  workflowPagination?: WorkflowPagination;
   /** Open the dialog that runs a saved workflow, once the menu has closed. */
   onRunSavedWorkflow?: (workflow: SavedWorkflow) => void;
   /** Called as the menu opens, e.g. to refresh the saved workflows. */
@@ -197,6 +199,7 @@ export function ComposerAddMenu({
         ) : showWorkflows ? (
           <WorkflowPicker
             workflows={savedWorkflows}
+            pagination={workflowPagination}
             onSelect={(workflow) => {
               pendingActionRef.current = () => onRunSavedWorkflow?.(workflow);
             }}

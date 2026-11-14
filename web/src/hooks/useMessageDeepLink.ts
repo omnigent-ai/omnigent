@@ -37,6 +37,7 @@ export function useMessageDeepLinkChatView(conversationId: string | null): void 
 }
 
 interface MessageDeepLinkOptions {
+  root?: ParentNode;
   /** Mount a loaded message that is outside the virtualized window. */
   ensureMessageVisible?: (messageId: string) => boolean;
   ready?: boolean;
@@ -46,7 +47,12 @@ interface MessageDeepLinkOptions {
 /** Resolve a message after its transcript and virtualizer are ready. */
 export function useMessageDeepLink(
   conversationId: string | null,
-  { ensureMessageVisible, ready = true, rangeNonce = 0 }: MessageDeepLinkOptions = {},
+  {
+    ensureMessageVisible,
+    ready = true,
+    rangeNonce = 0,
+    root = document,
+  }: MessageDeepLinkOptions = {},
 ): void {
   const [searchParams] = useSearchParams();
   const messageId = searchParams.get(MESSAGE_QUERY_PARAM);
@@ -69,9 +75,9 @@ export function useMessageDeepLink(
     if (appliedKeyRef.current === key) return;
     if (!ready || showTerminal || loadingConversation || loadingMoreHistory) return;
 
-    if (findMessageElement(messageId)) {
+    if (findMessageElement(messageId, root)) {
       appliedKeyRef.current = key;
-      scrollToMessage(messageId, flashUserMessage);
+      scrollToMessage(messageId, flashUserMessage, undefined, root);
       return;
     }
     // Geometry publishes a new range after this scroll mounts the target.
@@ -94,5 +100,6 @@ export function useMessageDeepLink(
     flashUserMessage,
     ensureMessageVisible,
     rangeNonce,
+    root,
   ]);
 }

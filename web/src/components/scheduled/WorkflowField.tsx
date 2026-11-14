@@ -9,7 +9,7 @@ import {
   DropdownMenuContent,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
+import type { SavedWorkflow, WorkflowPagination } from "@/hooks/useSavedWorkflows";
 import { cn } from "@/lib/utils";
 import { pickerTriggerClass } from "./pickerStyles";
 
@@ -21,12 +21,14 @@ import { pickerTriggerClass } from "./pickerStyles";
  */
 export function WorkflowField({
   workflows,
+  pagination,
   value,
   onChange,
   onOpenChange,
   locked = false,
 }: {
   workflows: readonly SavedWorkflow[];
+  pagination?: WorkflowPagination;
   value: SavedWorkflow | null;
   onChange: (workflow: SavedWorkflow | null) => void;
   /** Reports the menu opening and closing, as the dialog's other pickers do. */
@@ -82,6 +84,7 @@ export function WorkflowField({
         <DropdownMenuContent align="start" className="w-[var(--radix-dropdown-menu-trigger-width)]">
           <WorkflowPicker
             workflows={workflows}
+            pagination={pagination}
             heading={null}
             selectedId={value?.id}
             onSelect={onChange}

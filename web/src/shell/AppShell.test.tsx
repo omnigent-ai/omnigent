@@ -3178,7 +3178,7 @@ describe("Session overview", () => {
 
 describe("Right workspace card visibility", () => {
   it.each([true, false, undefined])(
-    "gates a pinned Tasks tab with native to-dos on workflows=%s",
+    "preserves a pinned Tasks tab with native to-dos on workflows=%s",
     (workflows) => {
       mockConversations([{ id: "conv_tasks", permission_level: null }]);
       useChatStore.setState({
@@ -3196,12 +3196,7 @@ describe("Right workspace card visibility", () => {
         }),
       );
 
-      if (workflows) {
-        expect(screen.getByRole("tab", { name: "Tasks" })).toHaveAttribute("aria-selected", "true");
-      } else {
-        expect(screen.queryByRole("tab", { name: "Tasks" })).toBeNull();
-        expect(screen.getByRole("tab", { name: "Files" })).toHaveAttribute("aria-selected", "true");
-      }
+      expect(screen.getByRole("tab", { name: "Tasks" })).toHaveAttribute("aria-selected", "true");
     },
   );
 

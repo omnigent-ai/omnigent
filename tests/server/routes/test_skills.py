@@ -218,7 +218,7 @@ async def test_presession_catalog_matches_filtered_invocations(
         {"OMNIGENT_FEATURES": "workflows" if workflows_enabled else ""}
     )
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
-    for name in ("bundled", "hidden", "allowed", "denied"):
+    for name in ("bundled", "hidden", "allowed", "denied", "save-workflow"):
         directory = tmp_path / ".claude" / "skills" / name
         directory.mkdir(parents=True)
         (directory / "SKILL.md").write_text(
@@ -230,6 +230,7 @@ async def test_presession_catalog_matches_filtered_invocations(
         skills_filter=skill_filter,
         skills=[
             SkillSpec(name="bundled", description="Bundled precedence", content="Instructions"),
+            SkillSpec(name="workflow", description="Custom workflow", content="Instructions"),
             SkillSpec(
                 name="hidden", description="Hidden", content="Instructions", user_invocable=False
             ),
@@ -243,8 +244,8 @@ async def test_presession_catalog_matches_filtered_invocations(
 
     builtin = builtin_agent_object(agent, app.state.agent_cache)
     session = session_agent_object(agent, app.state.agent_cache, mcp_servers_editable=True)
-    assert [s.name for s in builtin.skills] == ["bundled"]
-    assert [s.name for s in session.skills] == ["bundled"]
+    assert [s.name for s in builtin.skills] == ["bundled", "workflow"]
+    assert [s.name for s in session.skills] == ["bundled", "workflow"]
     # `skills: none` runs claude-sdk with no setting sources, so /mcp hides user servers.
     assert builtin.loads_user_settings is session.loads_user_settings is (skill_filter != "none")
     discovery = HostSkillDiscovery(
@@ -284,7 +285,9 @@ async def test_presession_catalog_matches_filtered_invocations(
     assert response.status_code == 200
     expected = resolve_session_skills(spec, (tmp_path,), None)
     if not workflows_enabled:
-        expected = [s for s in expected if s.name not in {"workflow", "save-workflow"}]
+        from omnigent.spec.skill_sources import FRAMEWORK_SKILLS_DIR
+
+        expected = [s for s in expected if s.skill_dir != FRAMEWORK_SKILLS_DIR / s.name]
     assert response.json()["skills"] == [
         {"name": s.name, "description": s.description, "display_name": s.display_name}
         for s in expected

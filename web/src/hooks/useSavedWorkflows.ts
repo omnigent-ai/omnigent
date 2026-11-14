@@ -1,5 +1,5 @@
-import { useCallback } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useMemo } from "react";
+import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
@@ -17,7 +17,18 @@ export interface SavedWorkflow {
   is_draft?: boolean;
 }
 
-// The menu lists the user's workflows by name; more than this many need a search page.
+export interface WorkflowPagination {
+  hasMore: boolean;
+  loadingMore: boolean;
+  loadMore: () => void;
+}
+
+interface WorkflowPage {
+  data: SavedWorkflow[];
+  has_more: boolean;
+  last_id: string | null;
+}
+
 const SAVED_WORKFLOWS_PAGE = 200;
 const NO_WORKFLOWS: readonly SavedWorkflow[] = [];
 const SAVED_WORKFLOWS_KEY = ["saved-workflows"];
@@ -36,27 +47,26 @@ export function useSavedWorkflows({ enabled = true }: { enabled?: boolean } = {}
   isLoading: boolean;
   isError: boolean;
   refresh: () => void;
+  pagination: WorkflowPagination;
 } {
   const serverInfo = useServerInfo();
   const supported =
     isFeatureEnabled(serverInfo, "workflows") &&
     serverInfo !== "loading" &&
     serverInfo.workflows === true;
-  const query = useQuery<SavedWorkflow[]>({
+  const query = useInfiniteQuery({
     queryKey: SAVED_WORKFLOWS_KEY,
-    queryFn: async ({ signal }) => {
-      const res = await authenticatedFetch(`/v1/workflows?limit=${SAVED_WORKFLOWS_PAGE}`, {
+    queryFn: async ({ signal, pageParam }): Promise<WorkflowPage> => {
+      const params = new URLSearchParams({ limit: String(SAVED_WORKFLOWS_PAGE) });
+      if (pageParam) params.set("after", pageParam);
+      const res = await authenticatedFetch(`/v1/workflows?${params}`, {
         signal,
       });
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      const body = (await res.json()) as { data?: SavedWorkflow[] };
-      return (body.data ?? []).map(({ id, name, description, is_draft }) => ({
-        id,
-        name,
-        description,
-        is_draft,
-      }));
+      return (await res.json()) as WorkflowPage;
     },
+    initialPageParam: null as string | null,
+    getNextPageParam: (last) => (last.has_more && last.last_id ? last.last_id : undefined),
     staleTime: 30_000,
     enabled: enabled && supported,
   });
@@ -65,11 +75,24 @@ export function useSavedWorkflows({ enabled = true }: { enabled?: boolean } = {}
   const refresh = useCallback(() => {
     if (enabled && supported) void refetch();
   }, [enabled, supported, refetch]);
+  const workflows = useMemo(
+    () => query.data?.pages.flatMap((page) => page.data) ?? NO_WORKFLOWS,
+    [query.data],
+  );
   return {
-    workflows: supported ? (query.data ?? NO_WORKFLOWS) : NO_WORKFLOWS,
+    workflows: supported ? workflows : NO_WORKFLOWS,
     isLoading: query.isLoading,
     isError: query.isError,
     refresh,
+    pagination: {
+      hasMore: supported && query.hasNextPage,
+      loadingMore: query.isFetchingNextPage,
+      loadMore: () => {
+        if (enabled && supported && query.hasNextPage && !query.isFetchingNextPage) {
+          void query.fetchNextPage();
+        }
+      },
+    },
   };
 }
 

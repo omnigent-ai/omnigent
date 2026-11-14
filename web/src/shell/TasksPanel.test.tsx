@@ -117,6 +117,7 @@ beforeEach(() => {
     isLoading: false,
     isError: false,
     refresh: vi.fn(),
+    pagination: { hasMore: false, loadingMore: false, loadMore: vi.fn() },
   });
   conversationRegistry
     .acquire("conv")
@@ -194,7 +195,7 @@ describe("TasksPanel", () => {
   });
 
   it.each([true, false, undefined])(
-    "gates the agent's own list without a journal on workflows=%s",
+    "preserves the agent's own list without a journal on workflows=%s",
     (workflows) => {
       vi.mocked(useServerInfo).mockReturnValue({
         session_journal: false,
@@ -203,11 +204,7 @@ describe("TasksPanel", () => {
       showJournal([journalPlan(0, ["profile"])]);
       setSession({ todos: [{ content: "Only item", status: "pending", activeForm: "" }] });
       renderPanel();
-      if (workflows) {
-        expect(screen.getByTestId("tasks-row")).toHaveTextContent("Only item");
-      } else {
-        expect(screen.queryByTestId("tasks-row")).toBeNull();
-      }
+      expect(screen.getByTestId("tasks-row")).toHaveTextContent("Only item");
       expect(vi.mocked(useSessionJournal)).toHaveBeenLastCalledWith("conv", false);
     },
   );
@@ -286,6 +283,7 @@ describe("TasksPanel", () => {
       isLoading: false,
       isError: false,
       refresh: vi.fn(),
+      pagination: { hasMore: false, loadingMore: false, loadMore: vi.fn() },
     });
     showJournal([{ ...journalPlan(0, ["explore"]), workflow_id: workflowId }]);
     renderPanel();

@@ -46,7 +46,9 @@ describe("ComposerAddMenu's Run a workflow", () => {
   });
 
   it("lists the saved workflows to search and run", async () => {
+    const loadMore = vi.fn();
     const { onRunSavedWorkflow, onWorkflow } = renderMenu({
+      workflowPagination: { hasMore: true, loadingMore: false, loadMore },
       savedWorkflows: [
         ...savedWorkflows,
         {
@@ -64,6 +66,10 @@ describe("ComposerAddMenu's Run a workflow", () => {
       "Triage flaky testsFinds and fixes flaky tests.",
       "Release notesDrafts the release notes.",
     ]);
+    fireEvent.click(screen.getByText("Load more workflows"));
+    expect(loadMore).toHaveBeenCalledOnce();
+    expect(screen.getByLabelText("Search workflows")).toBeVisible();
+    expect(onRunSavedWorkflow).not.toHaveBeenCalled();
 
     fireEvent.change(screen.getByLabelText("Search workflows"), { target: { value: "TRIAGE" } });
     expect(names()).toEqual(["Triage flaky testsFinds and fixes flaky tests."]);

@@ -15,6 +15,7 @@ import { useEffect, useMemo, useSyncExternalStore } from "react";
 import {
   fetchJournalPage,
   mergeJournalEntries,
+  planSteps,
   sessionJournalKey,
   type JournalEntry,
   type JournalPage,
@@ -23,8 +24,6 @@ import { isSessionStreamOpen, subscribeSessionStreams } from "@/lib/sessionStrea
 import { isTempConvId } from "@/lib/tempConversationId";
 
 const PAGE_SIZE = "100";
-// Enough statuses to cover every step of a plan, which has at most 100.
-const STATUS_PAGE_SIZE = "1000";
 /** How often the tab catches up while the session's stream is down. */
 export const JOURNAL_FALLBACK_REFETCH_MS = 30_000;
 // A catch-up reads at most this many pages; past that the tab refetches instead.
@@ -167,15 +166,25 @@ export function useSessionJournal(
   const olderExist = query.hasNextPage;
   const planAndStatuses = useQuery({
     queryKey: [...sessionJournalKey(conversationId), "plan-and-statuses"],
-    queryFn: () =>
-      Promise.all([
-        fetchJournalPage(conversationId!, { kind: "plan", order: "desc", limit: "1" }),
-        fetchJournalPage(conversationId!, {
-          kind: "status",
-          order: "desc",
-          limit: STATUS_PAGE_SIZE,
-        }),
-      ]),
+    queryFn: async () => {
+      const plan = await fetchJournalPage(conversationId!, {
+        kind: "plan",
+        order: "desc",
+        limit: "1",
+      });
+      // A busy step must not crowd another step's last status out of a global page.
+      const statuses = await Promise.all(
+        (plan.data[0] ? planSteps(plan.data[0]) : []).map(({ id }) =>
+          fetchJournalPage(conversationId!, {
+            kind: "status",
+            step: id,
+            order: "desc",
+            limit: "1",
+          }),
+        ),
+      );
+      return [plan, ...statuses];
+    },
     enabled: active && olderExist,
     staleTime: Number.POSITIVE_INFINITY,
     refetchOnWindowFocus: false,
