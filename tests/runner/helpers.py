@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,32 @@ class NullServerClient:
         """
         del url, kwargs
         return self._Response()
+
+
+def history_items_page(
+    items: Sequence[Mapping[str, Any]], params: Mapping[str, str]
+) -> dict[str, Any]:
+    """Return one page of conversation items, ordered and paged as the items endpoint does.
+
+    :param items: Items in ascending (chronological) order, each with an ``"id"``.
+    :param params: Items query params. ``order`` (``"asc"`` by default, ``"desc"``
+        reverses), ``after`` (an item id; the page starts after it in sort order)
+        and ``limit`` (default ``"100"``) are honored.
+    :returns: Response body with ``data``, ``first_id``, ``last_id`` and ``has_more``.
+    """
+    ordered = list(reversed(items)) if params.get("order") == "desc" else list(items)
+    start = 0
+    if after := params.get("after"):
+        start = [item["id"] for item in ordered].index(after) + 1
+    limit = int(params.get("limit", "100"))
+    page = ordered[start : start + limit]
+    return {
+        "object": "list",
+        "data": page,
+        "first_id": page[0]["id"] if page else None,
+        "last_id": page[-1]["id"] if page else None,
+        "has_more": start + limit < len(ordered),
+    }
 
 
 class RunningFlagTerminalInstance(TerminalInstance):
