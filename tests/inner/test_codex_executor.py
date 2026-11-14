@@ -656,6 +656,29 @@ class TestCodexExecutor(unittest.TestCase):
         self.assertIn("assistant: two", prompt)
         self.assertIn("user: three", prompt)
 
+    def test_initial_prompt_does_not_expand_unicode_history_past_rpc_limit(self):
+        for character in ("界", "🧪", "é"):
+            for offset in (-1, 0, 1):
+                with self.subTest(character=character, offset=offset):
+                    messages = [
+                        {"role": "user", "content": "first"},
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": '\n"\\\0'}],
+                        },
+                        {"role": "user", "content": "continue"},
+                    ]
+                    overhead = len(_build_initial_prompt(messages))
+                    original = character * (1_048_576 - overhead + offset) + '\n"\\\0'
+                    messages[1]["content"][0]["text"] = original
+
+                    prompt = _prompt_for_turn(messages, is_new_thread=True)
+
+                    self.assertEqual(len(prompt), 1_048_576 + offset)
+                    serialized = prompt.split("assistant: ", 1)[1].split("\nuser: ", 1)[0]
+                    self.assertEqual(json.loads(serialized), messages[1]["content"])
+                    self.assertEqual(messages[1]["content"][0]["text"], original)
+
     def test_dynamic_tool_result_payload_uses_content_items(self):
         payload = _dynamic_tool_result_payload({"answer": 5})
         self.assertEqual(payload["success"], True)
@@ -6986,6 +7009,58 @@ def _session_with_scripted_turn() -> _CodexAppServerSession:
         ]
     )
     return session
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+async def test_fresh_sdk_turn_respects_decoded_replay_character_boundary(offset: int) -> None:
+    session = _session_with_scripted_turn()
+    requests: list[dict] = []
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": [{"type": "output_text", "text": ""}]},
+        {"role": "user", "content": "continue"},
+    ]
+    overhead = len(_build_initial_prompt(messages))
+    messages[1]["content"][0]["text"] = "🧪" * (1_048_576 - overhead + offset)
+
+    async def request(method: str, params: dict) -> dict:
+        if method == "thread/start":
+            return {"result": {"thread": {"id": "thread-1"}}}
+        assert method == "turn/start"
+        requests.append(json.loads(json.dumps(params)))
+        actual_chars = sum(len(item.get("text", "")) for item in params["input"])
+        if actual_chars > 1_048_576:
+            raise RuntimeError("input_too_large")
+        session._events.put_nowait(_completed_turn_event())
+        return {"result": {"turn": {"id": "turn-1"}}}
+
+    session._request = request
+
+    async def collect() -> list:
+        return [
+            event
+            async for event in session.run_turn(
+                messages=messages,
+                tools=[],
+                system_prompt="retain system instructions",
+                model="test-model",
+                cwd="/tmp",
+                sandbox="read-only",
+            )
+        ]
+
+    async with asyncio.timeout(5):
+        if offset > 0:
+            with pytest.raises(RuntimeError, match="input_too_large"):
+                await collect()
+        else:
+            events = await collect()
+            assert isinstance(events[-1], TurnComplete)
+    assert len(requests) == 1
+    assert requests[0]["input"][0]["text"].endswith(
+        "Respond to the latest user message, using the conversation above as context."
+    )
 
 
 async def _run_turn_with_events(session: _CodexAppServerSession, events: list[dict]) -> list:
