@@ -324,7 +324,7 @@ async def test_plans_and_statuses_mark_the_chat_once_each(
         _write("plan", {"name": "Ship the demo", "steps": steps}, "tool:1"),
         _write("status", {"status": "started"}, "tool:2", step="deploy"),
         _write("status", {"status": "done", "text": "Pod 1/1"}, "tool:3", step="deploy"),
-        _write("note", {"body": "Notes get no marker"}, "tool:4"),
+        _write("note", {"body": "Notes get no visible marker"}, "tool:4"),
         # A retried status, the same plan again, then a replan that adds a task.
         _write("status", {"status": "done", "text": "Pod 1/1"}, "tool:3", step="deploy"),
         _write("plan", {"name": "Ship the demo", "steps": steps}, "tool:5"),
@@ -333,7 +333,17 @@ async def test_plans_and_statuses_mark_the_chat_once_each(
         resp = await client.post(url, json=body, headers=_runner(session_id))
         assert resp.status_code == 200, resp.text
     items = SqlAlchemyConversationStore(db_uri).list_items(session_id, limit=50).data
-    markers = [item.data.resource for item in items if item.type == "resource_event"]
+    markers = [
+        item.data.resource
+        for item in items
+        if item.type == "resource_event" and item.data.event_type != "session.journal.checkpoint"
+    ]
+    checkpoints = [
+        item
+        for item in items
+        if item.type == "resource_event" and item.data.event_type == "session.journal.checkpoint"
+    ]
+    assert len(checkpoints) == 2
     assert [(m.get("change") or m["status"], m["name"]) for m in markers] == [
         ("made", "Ship the demo"),
         ("started", "Deploy the swap"),

@@ -12,15 +12,20 @@ import sqlalchemy as sa
 
 from omnigent.db import current_query_name
 from omnigent.db.db_models import MAX_STORED_VALUE_BYTES
+from omnigent.entities import MessageData, NewConversationItem
 from omnigent.entities.session_journal import InvalidJournalEntryError, StepNotReadyError
 from omnigent.errors import StaleCursorError
+from omnigent.server.journal_markers import (
+    record_journal_checkpoint,
+    record_plan_marker,
+    record_status_marker,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.session_journal_store import (
     JOURNAL_DELETE_BATCH,
     JournalEntryTooLargeError,
     JournalSessionNotFoundError,
     SessionJournalStore,
-    copy_journal_for_fork,
 )
 
 SESSION = "4e92b5a0c0ee6db3f874f9c4a3f855a5"
@@ -404,24 +409,74 @@ def test_a_fork_that_leaves_the_journal_keeps_its_history_and_starts_one(
     assert [e.kind for e in journal.list_entries(SESSION).entries] == ["plan"]
 
 
-def test_a_truncated_fork_copies_only_what_its_history_wrote(
+@pytest.mark.asyncio
+async def test_a_truncated_fork_copies_only_what_its_history_wrote(
     monkeypatch: pytest.MonkeyPatch,
     conversations: SqlAlchemyConversationStore,
     journal: SessionJournalStore,
 ) -> None:
-    times = iter((100, 200, 300))
-    monkeypatch.setattr("omnigent.stores.session_journal_store.now_epoch", lambda: next(times))
-    for index in range(3):
-        _note(journal, f"k{index}")
-    fork = conversations.fork_conversation(SESSION, copy_items=False)
-    copied = copy_journal_for_fork(
-        journal._session_immediate,
-        SESSION,
-        fork.id,
-        created_through=200,
+    monkeypatch.setattr("omnigent.stores.session_journal_store.now_epoch", lambda: 100)
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store.now_epoch", lambda: 100
     )
-    assert copied == 2
-    assert [e.created_at for e in journal.list_entries(fork.id).entries] == [100, 200]
+
+    def reply(response_id: str) -> None:
+        conversations.append(
+            SESSION,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=response_id,
+                    data=MessageData(
+                        role="assistant",
+                        agent="agent",
+                        content=[{"type": "text", "text": "Ready"}],
+                    ),
+                )
+            ],
+        )
+
+    reply("before-plan")
+    first = journal.append(SESSION, "plan", _plan("a"), idempotency_key="plan").entry
+    await record_plan_marker(conversations, SESSION, first, None)
+    note = _note(journal, "note").entry
+    await record_journal_checkpoint(conversations, SESSION, note)
+    reply("copied")
+    later = journal.append(SESSION, "plan", _plan("a", "b"), idempotency_key="later").entry
+    await record_plan_marker(conversations, SESSION, later, first)
+    done = journal.append(
+        SESSION,
+        "status",
+        {"status": "done", "text": "After the cutoff"},
+        idempotency_key="done",
+        step="a",
+    ).entry
+    await record_status_marker(conversations, SESSION, done, later)
+    reply("left-behind")
+
+    empty = conversations.fork_conversation(SESSION, up_to_response_id="before-plan")
+    assert journal.list_entries(empty.id).entries == []
+    fork = conversations.fork_conversation(SESSION, up_to_response_id="copied")
+    nested = conversations.fork_conversation(fork.id, up_to_response_id="copied")
+    for session_id in (fork.id, nested.id):
+        copied = journal.list_entries(session_id).entries
+        assert [(entry.kind, entry.content) for entry in copied] == [
+            (first.kind, first.content),
+            (note.kind, note.content),
+        ]
+        assert {entry.created_at for entry in copied} == {100}
+        markers = [
+            item.data.resource["entry_id"]
+            for item in conversations.list_items(session_id).data
+            if item.type == "resource_event"
+        ]
+        assert markers == [entry.id for entry in copied]
+    assert len(journal.list_entries(SESSION).entries) == 4
+    full = conversations.fork_conversation(SESSION)
+    assert journal.current_plan(full.id).content == later.content
+    assert journal.plan_step_statuses([journal.current_plan(full.id)])[0]["a"].content == (
+        done.content
+    )
 
 
 WORKFLOW = "9a3c1e5b7d2f4a6c8e0b1d3f5a7c9e2b"

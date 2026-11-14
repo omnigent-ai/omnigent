@@ -21,6 +21,9 @@ does a run of an automation that starts from a session.
 
 Forking copies a fixed journal prefix in batches before publishing the new
 session. A failed copy removes its staged entries and leaves no partial fork.
+For a truncated fork, journal references in the copied transcript select that
+prefix, including entries written in the same second. Notes and unchanged plans
+write hidden checkpoints; copied references point to the fork's own entries.
 
 | Kind     | Written by | Fields                                                                       |
 | -------- | ---------- | ---------------------------------------------------------------------------- |

@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Mapping, Sequence
+from itertools import batched
 from typing import Any, TypeVar
 
 from sqlalchemy import Select, and_, delete, or_, select, update
@@ -696,12 +697,17 @@ class SessionJournalStore:
 # ── Deletion with the session ─────────────────────────
 
 
+def fork_journal_entry_id(fork_id: str, entry_id: str) -> str:
+    """Give a copied entry and its transcript references the same new ID."""
+    return uuid.uuid5(uuid.UUID(fork_id), entry_id).hex
+
+
 def copy_journal_for_fork(
     sessions: NamedManagedSessionMaker,
     source_id: str,
     fork_id: str,
     *,
-    created_through: int | None = None,
+    through_entry_ids: Sequence[str] | None = None,
 ) -> int:
     """Stage a fixed journal prefix in bounded transactions before publishing the fork.
 
@@ -712,8 +718,8 @@ def copy_journal_for_fork(
 
     :param source_id: The session being forked.
     :param fork_id: The new fork, which has no journal yet.
-    :param created_through: Copy only entries written at or before this epoch
-        second, the time of the fork's last copied item; ``None`` copies them all.
+    :param through_entry_ids: Journal checkpoints in the copied transcript.
+        Copy through their newest entry; ``None`` copies the whole journal.
     :returns: How many entries the fork starts with, including run boundaries.
     """
     scope = (
@@ -738,6 +744,24 @@ def copy_journal_for_fork(
         if source is None:
             raise JournalSessionNotFoundError(source_id)
 
+    if through_entry_ids is not None:
+        boundary = None
+        for batch in batched(through_entry_ids, JOURNAL_COPY_BATCH):
+            with sessions("read_fork_journal_boundary") as session:
+                positions = session.scalars(
+                    _using(
+                        select(SqlSessionJournalEntry.position)
+                        .where(*scope, SqlSessionJournalEntry.id.in_(batch))
+                        .limit(len(batch)),
+                        "ix_session_journal_entries_id",
+                    )
+                ).all()
+            if positions:
+                boundary = max(boundary if boundary is not None else -1, *positions)
+        if boundary is None:
+            return 0
+        last_position = min(last_position, boundary)
+
     after = -1
     copied = 0
 
@@ -759,9 +783,6 @@ def copy_journal_for_fork(
         for row in rows:
             if row.position != cursor + 1:
                 raise JournalSessionNotFoundError(source_id)
-            # Journal times are allocated with positions under the head lock.
-            if created_through is not None and row.created_at > created_through:
-                return cursor, position, True
             cursor = row.position
             if row.kind in _KINDS_A_FORK_LEAVES:
                 continue
@@ -771,7 +792,7 @@ def copy_journal_for_fork(
                     conversation_id=fork_id,
                     position=position,
                     created_at=row.created_at,
-                    id=uuid.uuid4().hex,
+                    id=fork_journal_entry_id(fork_id, row.id),
                     kind=row.kind,
                     scheduled_task_run_id=None,
                     workflow_id=None,

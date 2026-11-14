@@ -3,8 +3,8 @@
 The journal route and the to-do path write them into the session's transcript as
 ``resource_event`` items, the way sub-agent markers are written, so they're
 saved, stream live and keep their place in the chat. Each has a stable ID, so a
-retried write adds one marker. They're display metadata: a failure to write one
-is logged and never fails the write that caused it.
+retried write adds one marker. They also anchor journal snapshots in truncated
+forks. A failed marker is logged; a truncated fork leaves unanchored entries out.
 """
 
 from __future__ import annotations
@@ -133,6 +133,7 @@ async def record_plan_marker(
     """
     change = plan_change(previous.content if previous else None, entry.content)
     if change is None:
+        await record_journal_checkpoint(store, session_id, entry)
         return
     await _append(
         store,
@@ -143,6 +144,23 @@ async def record_plan_marker(
             resource_id=entry.id,
             resource_type=RESOURCE_TYPE,
             resource={**change, "entry_id": entry.id},
+        ),
+    )
+
+
+async def record_journal_checkpoint(
+    store: ConversationStore, session_id: str, entry: JournalEntry
+) -> None:
+    """Anchor entries with no visible marker to an exact transcript cutoff."""
+    await _append(
+        store,
+        session_id,
+        f"journal:{entry.id}",
+        ResourceEventData(
+            event_type="session.journal.checkpoint",
+            resource_id=entry.id,
+            resource_type=RESOURCE_TYPE,
+            resource={"entry_id": entry.id},
         ),
     )
 

@@ -157,6 +157,7 @@ from omnigent.stores.session_journal_store import (
     delete_journal_entries_batch,
     delete_journal_heads,
     discard_fork_journal,
+    fork_journal_entry_id,
 )
 from omnigent.util.session_lifecycle import title_without_closed_marker
 
@@ -6479,11 +6480,52 @@ class SqlAlchemyConversationStore(ConversationStore):
             # is about the session, not a continuation, so it starts with none, as
             # does a fork whose caller leaves the journal behind.
             copy_journal = copy_journal and copy_items and side_chat_parent_id is None
-            journal_through: int | None = None
-            if copy_journal and cutoff_position is not None:
-                if source_items:
-                    journal_through = source_items[-1].created_at
-                else:
+            journal_through: list[str] | None = [] if cutoff_position is not None else None
+            remapped_journal_data: dict[int, str] = {}
+            if copy_journal:
+                marker_positions = [
+                    pos
+                    for pos, item in enumerate(source_items)
+                    if decode_item_type(item.type) == "resource_event"
+                    and item.response_id.startswith("journal_")
+                ]
+                decoded_markers = (
+                    self._decode_item_data_batch(
+                        [source_items[pos].data for pos in marker_positions]
+                    )
+                    if marker_positions
+                    else []
+                )
+                changed_positions: list[int] = []
+                changed_markers: list[str] = []
+                for pos, payload in zip(marker_positions, decoded_markers, strict=True):
+                    data = json.loads(payload)
+                    resource = data.get("resource")
+                    if data.get("resource_type") != "journal" or not isinstance(resource, dict):
+                        continue
+                    entry_id = resource.get("entry_id")
+                    if not isinstance(entry_id, str):
+                        continue
+                    try:
+                        entry_id = uuid_to_bytes(entry_id).hex()
+                    except ValueError:
+                        continue
+                    if journal_through is not None:
+                        journal_through.append(entry_id)
+                    resource["entry_id"] = fork_journal_entry_id(new_conv_id, entry_id)
+                    if data.get("resource_id") == entry_id:
+                        data["resource_id"] = resource["entry_id"]
+                    changed_positions.append(pos)
+                    changed_markers.append(json.dumps(data))
+                if changed_markers:
+                    remapped_journal_data = dict(
+                        zip(
+                            changed_positions,
+                            self._encode_item_data_batch(changed_markers),
+                            strict=True,
+                        )
+                    )
+                if journal_through == []:
                     copy_journal = False
 
             # Compaction cursors refer to item IDs. Since every copied item gets
@@ -6633,7 +6675,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                         "data": remapped_compaction_data.get(
                             pos,
                             remapped_file_data.get(
-                                pos, remapped_error_data.get(pos, src_item.data)
+                                pos,
+                                remapped_journal_data.get(
+                                    pos, remapped_error_data.get(pos, src_item.data)
+                                ),
                             ),
                         ),
                         "search_text": search_text,
@@ -6800,7 +6845,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 self._session_immediate,
                 source_conversation_id,
                 new_conv_id,
-                created_through=journal_through,
+                through_entry_ids=journal_through,
             )
         try:
             new_conv = run_write_transaction(

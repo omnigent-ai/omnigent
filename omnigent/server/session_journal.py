@@ -55,7 +55,11 @@ from omnigent.runner.identity import (
 )
 from omnigent.runtime import session_stream
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
-from omnigent.server.journal_markers import record_plan_marker, record_status_marker
+from omnigent.server.journal_markers import (
+    record_journal_checkpoint,
+    record_plan_marker,
+    record_status_marker,
+)
 from omnigent.server.routes._auth_helpers import get_user_id, require_access_and_level
 from omnigent.server.routes._errors import session_not_found
 from omnigent.server.schemas import (
@@ -426,6 +430,7 @@ def create_session_journal_router(
         # Every attempt writes its marker: a retry after a failed first marker
         # adds it, and the marker's stable ID keeps it to one.
         if entry.kind not in ("status", "plan"):
+            await record_journal_checkpoint(conversation_store, session_id, entry)
             return
         try:
             page = await asyncio.to_thread(
