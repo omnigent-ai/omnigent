@@ -824,10 +824,101 @@ def _cancel_runner_relays(session_ids: list[str]) -> None:
             handle.task.cancel()
 
 
-# Strong references to detached archive stops so the tasks can't be
-# garbage-collected mid-stop (asyncio only holds weak refs to tasks).
+async def _host_runner_bindings(
+    conversation_store: ConversationStore,
+    conv: Any,
+    descendant_ids: list[str],
+) -> set[tuple[str, str]]:
+    """Return the ``(host_id, runner_id)`` pairs a session tree is bound to.
+
+    Read before a delete removes the rows, so the runners can be stopped after.
+    """
+    rows = [conv]
+    if descendant_ids:
+        try:
+            descendants = await asyncio.to_thread(
+                conversation_store.get_conversations, descendant_ids
+            )
+            rows.extend(descendants.values())
+        except Exception:  # noqa: BLE001
+            _logger.warning(
+                "Cannot read the runner bindings of %s's sub-agents",
+                conv.id,
+                exc_info=True,
+                extra={"session_id": conv.id},
+            )
+    return {(row.host_id, row.runner_id) for row in rows if row.host_id and row.runner_id}
+
+
+async def _stop_released_host_runners(
+    session_id: str,
+    bindings: set[tuple[str, str]],
+    conversation_store: ConversationStore,
+    host_registry: Any,
+) -> None:
+    """Stop the host-launched runners a delete left with no bound session.
+
+    A sub-agent rides its parent's runner, so deleting only the sub-agent
+    keeps that runner; deleting the parent's whole tree releases it.
+    """
+    from omnigent.server.routes import sessions as _facade
+
+    for host_id, runner_id in sorted(bindings):
+        try:
+            still_bound = await asyncio.to_thread(
+                conversation_store.list_runner_session_statuses, runner_id, limit=1
+            )
+        except Exception:  # noqa: BLE001
+            _logger.warning(
+                "Cannot check whether runner %s still serves a session; leaving it running",
+                runner_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+            continue
+        if still_bound:
+            continue
+        try:
+            # The runner may already have exited (idle timeout), so an
+            # unknown-runner reply is expected rather than a warning.
+            await _facade._stop_session_host_runner(
+                session_id, host_id, runner_id, host_registry, expect_already_stopped=True
+            )
+        except Exception:  # noqa: BLE001
+            _logger.warning(
+                "Stopping runner %s after deleting %s failed",
+                runner_id,
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+
+
+# Strong references to detached archive and delete stops so the tasks can't
+# be garbage-collected mid-stop (asyncio only holds weak refs to tasks).
 # custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _detached_stop_tasks: set[asyncio.Task[None]] = set()
+
+
+def _spawn_released_host_runner_stop(
+    session_id: str,
+    bindings: set[tuple[str, str]],
+    conversation_store: ConversationStore,
+    host_registry: Any,
+) -> None:
+    """Run :func:`_stop_released_host_runners` as a retained background task.
+
+    The delete is already committed, so it must not wait out a slow or
+    silent host's stop acknowledgement.
+    """
+    if not bindings:
+        return
+    task = asyncio.create_task(
+        _stop_released_host_runners(session_id, bindings, conversation_store, host_registry)
+    )
+    _detached_stop_tasks.add(task)
+    task.add_done_callback(_detached_stop_tasks.discard)
+
 
 # Deferred archive stops still inside the undo grace, keyed by session id.
 # Scheduling a stop cancels the session's prior pending one, and an unarchive
@@ -15148,6 +15239,7 @@ __all__ = [
     "_handle_mcp_tools_call",
     "_heal_subagent_runner_binding_via_parent",
     "_hold_native_ask_gate",
+    "_host_runner_bindings",
     "_is_native_terminal_session",
     "_kick_managed_relaunch",
     "_kick_managed_wake",
@@ -15184,7 +15276,9 @@ __all__ = [
     "_spawn_gateway_backed",
     "_spawn_native_approval_popup_forward",
     "_spawn_native_blocked_notice_forward",
+    "_spawn_released_host_runner_stop",
     "_stop_host_runner_intentionally",
+    "_stop_released_host_runners",
     "_wait_for_host_bound_runner_client",
     "_wait_for_host_reconnect",
     "_wake_parent_for_blocked_child",
