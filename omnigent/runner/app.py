@@ -1600,9 +1600,6 @@ def create_runner_app(
     app.state.sdk_compact_inprogress = _sdk_compact_inprogress
     _native_pane_status: dict[str, str] = {}
     app.state.native_pane_status = _native_pane_status
-    # Detached watchers answering a /model confirm dialog that pops after
-    # the active turn settles (a mid-turn switch queues in the composer).
-    _model_dialog_watchers: set[asyncio.Task[None]] = set()
     _session_message_buffers: dict[str, list[dict[str, Any]]] = {}
     app.state.session_message_buffers = _session_message_buffers
     _claude_prompt_waiters: dict[str, asyncio.Task[None]] = {}
@@ -8727,7 +8724,6 @@ def create_runner_app(
         _ingest_next_seq=_ingest_next_seq,
         _ingest_now_serving=_ingest_now_serving,
         _load_history_as_input=_load_history_as_input,
-        _model_dialog_watchers=_model_dialog_watchers,
         _native_cost_popup_config_file=_native_cost_popup_config_file,
         _native_pane_status=_native_pane_status,
         _opencode_terminal_ensure_locks=_opencode_terminal_ensure_locks,

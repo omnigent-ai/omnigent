@@ -342,7 +342,10 @@ def register_model_option_routes(
                 bridge_dir_for_bridge_id,
                 record_model_vocabulary,
             )
-            from omnigent.models.claude_model_vocabulary import picker_command_values
+            from omnigent.models.claude_model_vocabulary import (
+                picker_command_values,
+                picker_model_options,
+            )
 
             bridge_id = await _claude_native_bridge_id_for_session(
                 server_client=server_client,
@@ -354,6 +357,7 @@ def register_model_option_routes(
                 launch_env=None,
                 launch_model=None,
                 picker_values=picker_command_values(rows),
+                picker_options=picker_model_options(rows),
             )
         except Exception:  # vocabulary refresh is advisory
             _logger.debug(

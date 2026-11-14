@@ -35,6 +35,7 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
+from tests._helpers.providers import isolate_provider_resolution
 from tests.budgets import budget
 from tests.runner.conftest import (
     _build_app_for_spec,
@@ -2028,6 +2029,7 @@ async def test_claude_native_model_options_use_session_launch_catalog(
 @pytest.mark.parametrize("empty", [False, True])
 async def test_claude_native_model_options_refresh_the_bridge_vocabulary(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     empty: bool,
 ) -> None:
     """Serving the session listing rewrites the bridge's picker vocabulary.
@@ -2042,6 +2044,7 @@ async def test_claude_native_model_options_refresh_the_bridge_vocabulary(
     from omnigent.harnesses.claude_native.main import ClaudeModelProbe, ClaudeNativeUcodeConfig
     from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG
 
+    isolate_provider_resolution(monkeypatch, tmp_path / "config")
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
     )
@@ -2059,14 +2062,40 @@ async def test_claude_native_model_options_refresh_the_bridge_vocabulary(
             return ClaudeModelProbe(alias_rows=[], disabled_models=frozenset())
         return ClaudeModelProbe(
             alias_rows=[
-                {"id": "opus", "model": "claude-opus-4-10", "displayName": "Opus 4.10"},
-                {"id": "system.ai.glm-5-3", "model": "system.ai.glm-5-3", "displayName": "GLM"},
+                {
+                    "id": "opus",
+                    "model": "claude-opus-4-10",
+                    "displayName": "Opus 4.10",
+                    "_claude_picker_options": [
+                        {
+                            "value": "opus",
+                            "model": "claude-opus-4-10",
+                            "display_name": "Opus",
+                            "enabled": True,
+                            "provenance": "structured",
+                        }
+                    ],
+                },
+                {
+                    "id": "system.ai.glm-5-3",
+                    "model": "system.ai.glm-5-3",
+                    "displayName": "GLM",
+                    "_claude_picker_options": [
+                        {
+                            "value": "system.ai.glm-5-3",
+                            "model": "system.ai.glm-5-3",
+                            "display_name": "GLM",
+                            "enabled": True,
+                            "provenance": "structured",
+                        }
+                    ],
+                },
             ],
             disabled_models=frozenset(),
         )
 
     monkeypatch.setattr("omnigent.harnesses.claude_native.main.probe_claude_model_options", _probe)
-    recorded: list[tuple[Any, Any, Any, list[str]]] = []
+    recorded: list[tuple[Any, Any, Any, list[str], list[dict[str, object]]]] = []
 
     def _record(
         bridge_dir: Any,
@@ -2074,8 +2103,17 @@ async def test_claude_native_model_options_refresh_the_bridge_vocabulary(
         launch_env: Any,
         launch_model: Any,
         picker_values: Any = None,
+        picker_options: Any = None,
     ) -> None:
-        recorded.append((bridge_dir, launch_env, launch_model, list(picker_values or [])))
+        recorded.append(
+            (
+                bridge_dir,
+                launch_env,
+                launch_model,
+                list(picker_values or []),
+                list(picker_options or []),
+            )
+        )
 
     monkeypatch.setattr(claude_bridge, "record_model_vocabulary", _record)
 
@@ -2097,6 +2135,13 @@ async def test_claude_native_model_options_refresh_the_bridge_vocabulary(
     monkeypatch.setattr(
         "omnigent.runner.native.orchestration._auto_create_claude_terminal", _fake_auto_create
     )
+    monkeypatch.setattr("omnigent.runner.native._auto_create_claude_terminal", _fake_auto_create)
+
+    async def launch_stub(ctx: Any) -> SessionResourceView:
+        return await _fake_auto_create(ctx.session_id, ctx.resource_registry, ctx.publish_event)
+
+    monkeypatch.setattr("omnigent.runner.native.orchestration._launch_claude", launch_stub)
+    monkeypatch.setattr("omnigent.runner.native._launch_claude", launch_stub)
     app, _ = await _build_app_for_spec(claude_spec)
 
     async with _runner_client(app) as client:
@@ -2109,11 +2154,31 @@ async def test_claude_native_model_options_refresh_the_bridge_vocabulary(
 
     assert listing.status_code == 200, listing.text
     assert recorded, "the listing must refresh the bridge vocabulary"
-    bridge_dir, launch_env, launch_model, picker_values = recorded[-1]
+    bridge_dir, launch_env, launch_model, picker_values, picker_options = recorded[-1]
     assert bridge_dir == claude_bridge.bridge_dir_for_bridge_id(conv_id)
     assert launch_env is None
     assert launch_model is None
     assert picker_values == ([] if empty else ["opus", "system.ai.glm-5-3"])
+    assert picker_options == (
+        []
+        if empty
+        else [
+            {
+                "value": "opus",
+                "model": "claude-opus-4-10",
+                "display_name": "Opus",
+                "enabled": True,
+                "provenance": "structured",
+            },
+            {
+                "value": "system.ai.glm-5-3",
+                "model": "system.ai.glm-5-3",
+                "display_name": "GLM",
+                "enabled": True,
+                "provenance": "structured",
+            },
+        ]
+    )
 
 
 @pytest.mark.asyncio

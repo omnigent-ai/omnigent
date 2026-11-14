@@ -22,8 +22,3 @@ def _ignore_ambient_claude_config_dir(monkeypatch: pytest.MonkeyPatch) -> None:
     :returns: None.
     """
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-
-
-@pytest.fixture(autouse=True)
-def _guard_default_model_settings(_isolate_claude_default_model_guard: object) -> None:
-    """Use isolated settings and explicit watcher opt-in for Claude adapter tests."""

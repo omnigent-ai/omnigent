@@ -35,7 +35,6 @@ import httpx
 import pytest
 
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
-from omnigent.harnesses.claude_native import default_model_guard
 from omnigent.harnesses.claude_native import hook as claude_native_hook
 from omnigent.harnesses.claude_native.bridge import (
     _BACKGROUND_TASK_FIELD_MAX_CHARS,
@@ -7184,115 +7183,6 @@ def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
     ]
 
 
-@pytest.mark.parametrize(
-    "outcome",
-    [
-        "submitted",
-        "unconfirmed",
-        "enter timed out",
-        "enter failed",
-        "paste failed",
-        "paste timed out",
-        "clear failed",
-        "capture cancelled",
-        "guard unavailable",
-    ],
-)
-def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
-) -> None:
-    """
-    A typed ``/model`` save is put back, even one that lands after submit
-    verification gave up; a possibly pasted draft stays protected for a later Enter.
-
-    The fake pane writes the save the way Claude Code does in an interactive
-    session, so the settle afterwards sees exactly what a real pane leaves.
-    """
-    bridge_dir = tmp_path / "bridge"
-    write_tmux_target(
-        bridge_dir, socket_path=Path("/tmp/example/tmux.sock"), tmux_target="claude:0.0"
-    )
-    settings_path = claude_native_bridge.read_user_settings_path(bridge_dir)
-    state_dir = default_model_guard.state_directory(settings_path)
-    settings_path.write_text('{"model": "opus"}', encoding="utf-8")
-    initial_settings = settings_path.read_text(encoding="utf-8")
-    entered: list[bool] = []
-    typed: list[str] = []
-    cleared: list[bool] = []
-    real_clear = claude_native_bridge._clear_composer
-
-    def clear_composer(*args: object, **kwargs: object) -> None:
-        cleared.append(True)
-        if outcome == "clear failed":
-            raise RuntimeError("composer unavailable")
-        real_clear(*args, **kwargs)
-
-    monkeypatch.setattr(claude_native_bridge, "_clear_composer", clear_composer)
-    if outcome == "guard unavailable":
-        state_dir.write_text("not a directory", encoding="utf-8")
-
-    class _FakeCompleted:
-        returncode = 0
-        stdout = ""
-        stderr = ""
-
-    def _fake_run(cmd: list[str], **kwargs: object) -> _FakeCompleted:
-        del kwargs
-        result = _FakeCompleted()
-        if "capture-pane" in cmd:
-            if typed and outcome == "capture cancelled":
-                raise RuntimeError("injection cancelled during capture")
-            # A stalled pane keeps showing the typed command after Enter.
-            result.stdout = _composer_pane("/model sonnet" if outcome == "unconfirmed" else "")
-        elif "-l" in cmd and cmd[-1] == "/model sonnet":
-            typed.append(cmd[-1])
-            if outcome == "paste failed":
-                result.returncode = 1
-            if outcome == "paste timed out":
-                raise subprocess.TimeoutExpired(cmd, 1)
-        elif cmd[-1] == "Enter":
-            entered.append(True)
-            if outcome == "enter timed out":
-                raise subprocess.TimeoutExpired(cmd, 1)
-            if outcome == "enter failed":
-                result.returncode = 1
-            elif outcome == "submitted":
-                settings_path.write_text('{"model": "sonnet"}', encoding="utf-8")
-        return result
-
-    monkeypatch.setattr("subprocess.run", _fake_run)
-    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
-
-    if outcome == "submitted":
-        claude_native_bridge.inject_slash_command(bridge_dir, command="/model sonnet")
-    else:
-        with pytest.raises(RuntimeError) as error:
-            claude_native_bridge.inject_slash_command(bridge_dir, command="/model sonnet")
-        if outcome == "guard unavailable":
-            assert "Check permissions, free space, and coordination records" in str(error.value)
-            assert str(state_dir) in str(error.value)
-    if outcome in (
-        "unconfirmed",
-        "enter timed out",
-        "enter failed",
-        "paste failed",
-        "paste timed out",
-        "capture cancelled",
-    ):
-        # A queued Enter or later user Enter may submit a possibly pasted draft.
-        settings_path.write_text('{"model": "sonnet"}', encoding="utf-8")
-    if outcome == "guard unavailable":
-        assert entered == []
-        assert typed == []
-        assert cleared == []
-        assert settings_path.read_text(encoding="utf-8") == initial_settings
-        return
-    default_model_guard.settle_default_model(settings_path, state_dir=state_dir)
-
-    assert json.loads(settings_path.read_text(encoding="utf-8")) == {"model": "opus"}
-    assert not list(state_dir.glob("*.json"))
-
-
 def test_tmux_injections_are_serialized_per_bridge(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -9778,39 +9668,59 @@ def test_picker_values_round_trip_from_either_launch_path(
     against these rows.
     """
     from omnigent.harnesses.claude_native.bridge import (
+        read_model_picker_options,
         read_model_picker_values,
         record_model_vocabulary,
     )
 
     root = tmp_path / "root"
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
+    picker_options = [
+        {
+            "value": "system.ai.glm-5-3",
+            "model": "system.ai.glm-5-3",
+            "display_name": "GLM",
+            "enabled": True,
+            "provenance": "structured",
+        }
+    ]
 
     bridge_dir = prepare_bridge_dir(
         "conv_abc",
         workspace=tmp_path,
         picker_values=["system.ai.claude-opus-4-8[1m]", "system.ai.glm-5-3"],
+        picker_options=picker_options,
     )
     assert read_model_picker_values(bridge_dir) == [
         "system.ai.claude-opus-4-8[1m]",
         "system.ai.glm-5-3",
     ]
+    assert read_model_picker_options(bridge_dir) == picker_options
 
     # The runner path records the same values after preparing the bridge.
     bridge_dir = prepare_bridge_dir("conv_def", workspace=tmp_path)
     assert read_model_picker_values(bridge_dir) == []
+    assert read_model_picker_options(bridge_dir) is None
     record_model_vocabulary(
         bridge_dir,
         launch_env=None,
         launch_model=None,
         picker_values=["system.ai.glm-5-3"],
+        picker_options=picker_options,
     )
     assert read_model_picker_values(bridge_dir) == ["system.ai.glm-5-3"]
+    assert read_model_picker_options(bridge_dir) == picker_options
     # A launch that learned no catalog leaves the recorded picker alone.
     record_model_vocabulary(bridge_dir, launch_env=None, launch_model=None)
     assert read_model_picker_values(bridge_dir) == ["system.ai.glm-5-3"]
-    record_model_vocabulary(bridge_dir, launch_env=None, launch_model=None, picker_values=[])
+    assert read_model_picker_options(bridge_dir) == picker_options
+    record_model_vocabulary(
+        bridge_dir, launch_env=None, launch_model=None, picker_values=[], picker_options=[]
+    )
     assert read_model_picker_values(bridge_dir) == []
+    assert read_model_picker_options(bridge_dir) == []
     assert read_model_picker_values(tmp_path / "nonexistent") == []
+    assert read_model_picker_options(tmp_path / "nonexistent") is None
 
 
 def test_model_env_is_empty_without_a_ucode_launch(
@@ -11881,11 +11791,16 @@ def test_wait_for_claude_prompt_ready_tail_is_observed_not_recaptured(
         return observed if calls["n"] == 1 else late_ready
 
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._capture_pane", fake_capture)
-    with pytest.raises(RuntimeError) as excinfo:
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(True),
+    )
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout) as excinfo:
         claude_native_bridge._wait_for_claude_prompt_ready(
             "/tmp/example/tmux.sock",
             "claude:0.0",
             timeout_s=0.0,
+            extend_for_slow_boot=False,
         )
     message = str(excinfo.value)
     # The tail reflects what the loop observed, and the late box-present
@@ -13566,56 +13481,913 @@ def test_composer_box_reads_every_row_of_the_input_box(
         assert claude_native_bridge._composer_row(pane) == box.rows[0]
 
 
-def test_a_model_switch_types_the_argument_form_and_confirms(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    A model switch is ``/model <id>`` plus the confirm Enter.
+class _SessionModelComposer(_EditableComposer):
+    """Editable composer with the recorded local model and status overlays."""
 
-    Accepted trade-off: the argument form also saves the pick as the person's
-    global default for new sessions. The interactive picker avoided that write
-    but needed ~35s of screen-scraping automation to drive.
-    """
+    def __init__(self, *, draft: str = "", busy: bool = False) -> None:
+        super().__init__(draft, cursor=len(draft))
+        self.options = ["claude-sonnet-5-5", "private-glm[1m]"]
+        self.model = self.options[0]
+        self.highlight = 0
+        self.overlay: str | None = None
+        self.busy = busy
+        self.sends: list[tuple[str, ...]] = []
+        self.status_queries = 0
+        self.session = "native-session"
+        self.version = "2.1.323"
+
+    def _run_tmux(self, socket_path: str, *args: str) -> None:
+        claude_native_bridge._check_injection_cancelled()
+        self.sends.append(args)
+        key = args[-1]
+        if self.overlay == "picker":
+            if key == "Down":
+                self.highlight = (self.highlight + 1) % len(self.options)
+            elif key == "Up":
+                self.highlight = (self.highlight - 1) % len(self.options)
+            elif key == "s" and "-l" in args:
+                self.model = self.options[self.highlight]
+                self.overlay = None
+            elif key == "Escape":
+                self.overlay = None
+            else:
+                pytest.fail(f"Unexpected key in model picker: {args}")
+            return
+        if self.overlay == "status":
+            assert key == "Escape", args
+            self.overlay = None
+            return
+        command = self.text
+        super()._run_tmux(socket_path, *args)
+        if key == "Enter" and command == "/model":
+            self.overlay = "picker"
+        elif key == "Enter" and command == "/status":
+            self.status_queries += 1
+            self.overlay = "status"
+
+    def _capture_pane(self, socket_path: str, tmux_target: str) -> str:
+        if self.overlay == "picker":
+            rows = "\n".join(
+                f"   {'❯' if index == self.highlight else ' '} {index + 1}.  Choice {index}  "
+                f"Managed by your organization ({model})"
+                for index, model in enumerate(self.options)
+            )
+            return (
+                "   Select model\n" + rows + "\n"
+                "   Enter to set as default · s to use this session only · Esc to cancel\n"
+            )
+        if self.overlay == "status":
+            return (
+                "   Settings  Status  Config  Usage  Stats\n"
+                f"   Version: {self.version}\n"
+                f"   Session ID: {self.session}\n"
+                f"   Model: {self.model}\n"
+                "   Esc to cancel\n"
+            )
+        return ("Working…\n" if self.busy else "") + super()._capture_pane(
+            socket_path, tmux_target
+        )
+
+
+def _session_model_bridge(tmp_path: Path, composer: _SessionModelComposer) -> Path:
     bridge_dir = _picker_bridge_dir(tmp_path)
-    dialog = "  Switch model?\n  This will invalidate the prompt cache.\n"
-    sends = _fake_tmux(
-        monkeypatch,
-        # Idle at the occupied-input check, then the typed command
-        # renders, the submit pops the dialog, the accept clears it —
-        # one capture per delivery stage.
-        [
-            _IDLE_PANE,
-            _composer_pane("/model databricks-claude-sonnet-5"),
-            dialog,
-            dialog,
-            _IDLE_PANE,
-        ],
+    (bridge_dir / "bridge.json").write_text(
+        json.dumps(
+            {
+                "active_session_id": "web-session",
+                "model_picker_values": composer.options,
+                "model_picker_options": [
+                    {
+                        "value": model,
+                        "model": model,
+                        "display_name": f"Choice {index}",
+                        "enabled": True,
+                        "provenance": "structured",
+                    }
+                    for index, model in enumerate(composer.options)
+                ],
+            }
+        )
     )
-
-    claude_native_bridge.inject_slash_command(
-        bridge_dir,
-        command="/model databricks-claude-sonnet-5",
-        auto_confirm=True,
-        confirm_hint=claude_native_bridge.SWITCH_MODEL_DIALOG_HINT,
+    (bridge_dir / "state.json").write_text(json.dumps({"claude_session_id": composer.session}))
+    (bridge_dir / claude_native_bridge.CONTEXT_RAW_FILE).write_text(
+        json.dumps(
+            {
+                "session_id": composer.session,
+                "version": composer.version,
+                "model": {"id": composer.model},
+            }
+        )
     )
+    return bridge_dir
 
-    assert [args[-1] for args in sends] == [
-        "Space",
-        _CLEAR_ONE_ROW_COMPOSER,
-        "/model databricks-claude-sonnet-5",
+
+@pytest.mark.parametrize("busy", [False, True], ids=["idle", "busy"])
+def test_model_command_selects_session_only_then_reads_fresh_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, busy: bool
+) -> None:
+    composer = _SessionModelComposer(busy=busy)
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+
+    result = claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+
+    assert result.resolved_model == result.status_model == composer.model == "private-glm[1m]"
+    assert result.session_id == composer.session
+    assert composer.submitted == ["/model", "/status"]
+    assert composer.status_queries == 1
+    assert [args[-1] for args in composer.sends] == [
+        "/model",
         "Enter",
-        # The "Switch model?" confirmation, once it actually rendered.
+        "Down",
+        "s",
+        "/status",
         "Enter",
+        "Escape",
     ]
-    # The id must go through literally, not as a tmux key name.
-    assert sends[2] == [
+    assert next(args for args in composer.sends if args[-1] == "s") == (
         "send-keys",
         "-l",
         "-t",
         "claude:0.0",
-        "/model databricks-claude-sonnet-5",
+        "s",
+    )
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    [
+        "version",
+        "missing-owner",
+        "missing-version",
+        "missing-session",
+        "target",
+        "draft",
+        "clipped",
+        "picker",
+    ],
+)
+def test_model_command_refuses_unsupported_or_unowned_input_before_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unsupported: str
+) -> None:
+    composer = _SessionModelComposer(draft="a person's draft" if unsupported == "draft" else "")
+    if unsupported == "version":
+        composer.version = "2.1.302"
+    if unsupported == "picker":
+        composer.overlay = "picker"
+    if unsupported == "clipped":
+        composer._visible_rows = 1
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    if unsupported == "missing-owner":
+        path = bridge_dir / "bridge.json"
+        metadata = json.loads(path.read_text())
+        metadata.pop("active_session_id")
+        path.write_text(json.dumps(metadata))
+    if unsupported in {"missing-version", "missing-session"}:
+        path = bridge_dir / claude_native_bridge.CONTEXT_RAW_FILE
+        metadata = json.loads(path.read_text())
+        metadata.pop("version" if unsupported == "missing-version" else "session_id")
+        path.write_text(json.dumps(metadata))
+    composer.install(monkeypatch)
+    target = "absent-model" if unsupported == "target" else "private-glm[1m]"
+
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused):
+        claude_native_bridge.inject_model_command(bridge_dir, model=target, timeout_s=0.4)
+
+    assert composer.sends == []
+    assert composer.model == "claude-sonnet-5-5"
+    if unsupported == "draft":
+        assert composer.text == "a person's draft"
+
+
+@pytest.mark.parametrize("prompt", ["blocked prompt", "blocked\n\nprompt", "blocked prompt "])
+def test_model_command_clears_only_the_exact_owned_blocked_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prompt: str
+) -> None:
+    composer = _SessionModelComposer(draft=prompt)
+    composer.cursor = len(prompt) // 2
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+
+    result = claude_native_bridge.inject_model_command(
+        bridge_dir, model="private-glm[1m]", owned_draft=prompt
+    )
+
+    assert result.resolved_model == "private-glm[1m]"
+    assert composer.submitted == ["/model", "/status"]
+    clear_bursts = [args for args in composer.sends if "\x1b[107;5u" in args[-1]]
+    assert len(clear_bursts) == 1
+    assert not any(args[-1] == "Space" for args in composer.sends)
+
+
+@pytest.mark.parametrize("owned", ["blocked prompt ", "blocked prompt\n", "different prompt"])
+def test_model_command_does_not_normalize_draft_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owned: str
+) -> None:
+    composer = _SessionModelComposer(draft="blocked prompt")
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused):
+        claude_native_bridge.inject_model_command(
+            bridge_dir, model="private-glm[1m]", owned_draft=owned
+        )
+
+    assert composer.sends == []
+    assert composer.text == "blocked prompt"
+
+
+def test_model_command_rechecks_an_owned_draft_before_clearing_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    composer = _SessionModelComposer(draft="blocked prompt")
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+    captures = 0
+
+    def capture(socket_path: str, target: str) -> str:
+        nonlocal captures
+        captures += 1
+        if captures == 3:
+            composer.text = "a person's replacement"
+        return composer._capture_pane(socket_path, target)
+
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused):
+        claude_native_bridge.inject_model_command(
+            bridge_dir, model="private-glm[1m]", owned_draft="blocked prompt"
+        )
+
+    assert composer.sends == []
+    assert composer.text == "a person's replacement"
+
+
+@pytest.mark.parametrize(
+    ("raw_target", "actual_target", "already_selected", "status_queries"),
+    [(True, True, True, 1), (True, False, False, 2), (False, True, False, 1)],
+    ids=["fresh-same-model", "stale-target-hint", "stale-other-hint"],
+)
+def test_model_command_uses_a_fresh_status_for_same_model_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raw_target: bool,
+    actual_target: bool,
+    already_selected: bool,
+    status_queries: int,
+) -> None:
+    composer = _SessionModelComposer()
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    target = composer.options[-1]
+    raw_path = bridge_dir / claude_native_bridge.CONTEXT_RAW_FILE
+    raw = json.loads(raw_path.read_text())
+    raw["model"] = {"id": target if raw_target else composer.options[0]}
+    raw_path.write_text(json.dumps(raw))
+    if actual_target:
+        composer.model = target
+    composer.install(monkeypatch)
+
+    result = claude_native_bridge.inject_model_command(bridge_dir, model=target)
+
+    assert result.already_selected is already_selected
+    assert composer.status_queries == status_queries
+    assert composer.model == target
+    assert composer.submitted[-1] == "/status"
+    assert [args[-1] for args in composer.sends].count("s") == (0 if already_selected else 1)
+
+
+def test_model_command_explicitly_selects_context_when_status_omits_the_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    composer = _SessionModelComposer()
+    composer.model = composer.options[-1]
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+
+    def capture(socket_path: str, target: str) -> str:
+        pane = composer._capture_pane(socket_path, target)
+        if composer.overlay == "status":
+            return pane.replace("Model: private-glm[1m]", "Model: private-glm")
+        return pane
+
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+
+    result = claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+
+    assert not result.already_selected
+    assert result.resolved_model == "private-glm[1m]"
+    assert result.status_model == "private-glm"
+    assert composer.submitted == ["/status", "/model", "/status"]
+    assert [args[-1] for args in composer.sends].count("s") == 1
+
+
+@pytest.mark.parametrize("refuse", [False, True], ids=["success", "unsupported"])
+def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refuse: bool
+) -> None:
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    settings = config_dir / "settings.json"
+    settings.write_text('{"model":"saved-opus","other":true}\n')
+    legacy = tmp_path / "legacy-settings.json"
+    legacy.write_text('{"model":"saved-sonnet"}\n')
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+
+    def snapshots() -> list[tuple[bytes, int, int]]:
+        return [
+            (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns)
+            for path in (settings, legacy)
+        ]
+
+    baseline = snapshots()
+    composer = _SessionModelComposer()
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    metadata = json.loads((bridge_dir / "bridge.json").read_text())
+    metadata["user_settings_path"] = str(legacy)
+    (bridge_dir / "bridge.json").write_text(json.dumps(metadata))
+    composer.install(monkeypatch)
+
+    def send(socket_path: str, *args: str) -> None:
+        assert snapshots() == baseline
+        composer._run_tmux(socket_path, *args)
+        assert snapshots() == baseline
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", send)
+    if refuse:
+        with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused):
+            claude_native_bridge.inject_model_command(bridge_dir, model="absent-model")
+        assert composer.sends == []
+    else:
+        claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+    assert snapshots() == baseline
+
+
+@pytest.mark.parametrize(
+    ("requested", "picker_value", "concrete", "pins", "reported", "confirmed"),
+    [
+        (
+            "opus",
+            "opus",
+            "system.ai.claude-opus-5-5[1m]",
+            {"ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-5-5[1m]"},
+            "claude-opus-5-5",
+            True,
+        ),
+        ("opus[1m]", "opus[1m]", "system.ai.claude-opus-5-5[1m]", {}, "claude-opus-5-5", True),
+        (
+            "claude-opus-5-5",
+            "opus",
+            "system.ai.claude-opus-5-5[1m]",
+            {"ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-5-5[1m]"},
+            "claude-opus-5-5",
+            True,
+        ),
+        (
+            "claude-opus-5-5[1m]",
+            "opus[1m]",
+            "system.ai.claude-opus-5-5[1m]",
+            {},
+            "claude-opus-5-5",
+            True,
+        ),
+        (
+            "private/model-B[large]",
+            "private/model-B[large]",
+            "private/model-B[large]",
+            {},
+            "private/model-B[large]",
+            True,
+        ),
+        (
+            "private-claude-opus[1m]",
+            "private-claude-opus[1m]",
+            "private-claude-opus[1m]",
+            {},
+            "claude-opus",
+            False,
+        ),
+        ("Private/Model-B", "Private/Model-B", "Private/Model-B", {}, "private/model-b", False),
+    ],
+    ids=[
+        "pinned-alias",
+        "context-alias",
+        "pinned-public-prefix",
+        "public-prefix-context",
+        "exact-private-id",
+        "private-prefix-is-not-public",
+        "private-case-is-exact",
+    ],
+)
+def test_model_command_verifies_alias_context_and_private_model_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requested: str,
+    picker_value: str,
+    concrete: str,
+    pins: dict[str, str],
+    reported: str,
+    confirmed: bool,
+) -> None:
+    composer = _SessionModelComposer()
+    composer.options[-1] = concrete
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    claude_native_bridge.record_model_vocabulary(
+        bridge_dir,
+        launch_env=pins,
+        launch_model=None,
+        picker_values=[picker_value],
+        picker_options=[
+            {
+                "value": picker_value,
+                "model": concrete,
+                "display_name": "Choice 1",
+                "enabled": True,
+                "provenance": "structured",
+            }
+        ],
+    )
+    composer.install(monkeypatch)
+
+    def capture(socket_path: str, target: str) -> str:
+        pane = composer._capture_pane(socket_path, target)
+        return (
+            pane.replace(f"Model: {concrete}", f"Model: {reported}")
+            if composer.overlay == "status"
+            else pane
+        )
+
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+    if confirmed:
+        result = claude_native_bridge.inject_model_command(bridge_dir, model=requested)
+        assert result.requested_model == requested
+        assert result.picker_value == picker_value
+        assert result.resolved_model == concrete
+        assert result.status_model == reported
+    else:
+        with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
+            claude_native_bridge.inject_model_command(bridge_dir, model=requested)
+        assert caught.value.phase == "status"
+        assert caught.value.model_may_have_changed
+    assert composer.submitted == ["/model", "/status"]
+    assert composer.model == concrete
+
+
+@pytest.mark.parametrize(
+    ("requested", "value", "concrete", "pins"),
+    [
+        ("opus[1m]", "opus", "claude-opus-5-5", {}),
+        ("opus", "opus", "claude-opus-4-8", {"ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5-5"}),
+        ("claude-opus-5-5", "private-claude-opus-5-5", "private-claude-opus-5-5", {}),
+        ("Private/model", "private/model", "private/model", {}),
+    ],
+    ids=["missing-context-variant", "stale-pin-resolution", "private-prefix", "private-case"],
+)
+def test_model_command_refuses_unproven_model_equivalence_before_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requested: str,
+    value: str,
+    concrete: str,
+    pins: dict[str, str],
+) -> None:
+    composer = _SessionModelComposer()
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    claude_native_bridge.record_model_vocabulary(
+        bridge_dir,
+        launch_env=pins,
+        launch_model=None,
+        picker_values=[value],
+        picker_options=[
+            {
+                "value": value,
+                "model": concrete,
+                "display_name": "Choice 1",
+                "enabled": True,
+                "provenance": "structured",
+            }
+        ],
+    )
+    composer.install(monkeypatch)
+
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
+        claude_native_bridge.inject_model_command(bridge_dir, model=requested)
+
+    assert caught.value.unsupported
+    assert composer.sends == []
+
+
+@pytest.mark.parametrize("surface", ["queued", "absent", "unsupported-footer", "clipped-picker"])
+def test_model_command_refuses_queued_or_unrecognized_pickers_without_selecting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
+) -> None:
+    composer = _SessionModelComposer(busy=True)
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+
+    def send(socket_path: str, *args: str) -> None:
+        composer._run_tmux(socket_path, *args)
+        if (
+            args[-1] == "Enter"
+            and composer.overlay == "picker"
+            and surface in {"queued", "absent"}
+        ):
+            composer.overlay = None
+            composer.text = "/model" if surface == "queued" else ""
+            composer.cursor = len(composer.text)
+
+    def capture(socket_path: str, target: str) -> str:
+        pane = composer._capture_pane(socket_path, target)
+        if composer.overlay == "picker":
+            if surface == "unsupported-footer":
+                return pane.replace("s to use this session only", "s is unavailable")
+            if surface == "clipped-picker":
+                return pane[: pane.index("Enter to set as default")]
+        return pane
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", send)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
+        claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]", timeout_s=4)
+
+    assert caught.value.phase == "picker" and caught.value.command_submitted
+    assert not caught.value.model_may_have_changed
+    assert composer.submitted == ["/model"]
+    assert composer.model == composer.options[0]
+    assert not any(args[-1] in {"Down", "Up", "s", "Escape", "/status"} for args in composer.sends)
+    assert composer.text == ""
+
+
+@pytest.mark.parametrize("live_rows", ["duplicate", "missing"])
+def test_model_command_cancels_only_its_recognized_unselectable_picker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live_rows: str
+) -> None:
+    composer = _SessionModelComposer()
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    if live_rows == "duplicate":
+        composer.options.append(composer.options[-1])
+    else:
+        composer.options[-1] = "different-private-model"
+    composer.install(monkeypatch)
+
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused):
+        claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+
+    assert composer.submitted == ["/model"]
+    assert [args[-1] for args in composer.sends].count("Escape") == 1
+    assert not any(args[-1] in {"s", "/status"} for args in composer.sends)
+    assert composer.overlay is None
+
+
+@pytest.mark.parametrize("stop", ["cancel", "deadline"])
+@pytest.mark.parametrize("phase", ["draft", "picker", "commit", "status"])
+def test_model_command_stops_all_keys_at_cancellation_or_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop: str, phase: str
+) -> None:
+    composer = _SessionModelComposer()
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+    cancelled = threading.Event()
+    stopped_after: list[tuple[str, ...]] = []
+
+    def send(socket_path: str, *args: str) -> None:
+        composer._run_tmux(socket_path, *args)
+        key = args[-1]
+        reached = (
+            (phase == "draft" and key == "/model")
+            or (phase == "picker" and key == "Enter" and composer.overlay == "picker")
+            or (phase == "commit" and key == "s")
+            or (phase == "status" and key == "Enter" and composer.overlay == "status")
+        )
+        if reached:
+            stopped_after.extend(composer.sends)
+            if stop == "cancel":
+                cancelled.set()
+            else:
+                claude_native_bridge.time.sleep(1)
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", send)
+    with claude_native_bridge.cancellable_injection(cancelled):
+        with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
+            claude_native_bridge.inject_model_command(
+                bridge_dir, model="private-glm[1m]", timeout_s=0.5
+            )
+
+    assert stopped_after and composer.sends == stopped_after
+    assert not any(args[-1] == "Escape" for args in composer.sends)
+    assert caught.value.model_may_have_changed is (phase in {"commit", "status"})
+    assert [args[-1] for args in composer.sends].count("s") <= 1
+
+
+@pytest.mark.parametrize("replacement", [False, True], ids=["own-draft", "replacement-draft"])
+def test_model_command_cleans_only_its_exact_unsubmitted_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replacement: bool
+) -> None:
+    composer = _SessionModelComposer()
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+
+    def send(socket_path: str, *args: str) -> None:
+        composer._run_tmux(socket_path, *args)
+        if args[-1] == "/model":
+            if replacement:
+                composer.text = "a person's replacement"
+            raise OSError("private runtime details")
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", send)
+
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
+        claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+
+    assert not caught.value.command_submitted and not caught.value.model_may_have_changed
+    assert "private runtime details" not in str(caught.value)
+    assert composer.text == ("a person's replacement" if replacement else "")
+    assert composer.submitted == []
+    assert not any(args[-1] in {"Enter", "Escape", "s"} for args in composer.sends)
+    assert len(composer.sends) == (1 if replacement else 2)
+
+
+def test_model_command_never_repeats_an_ambiguous_session_only_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    composer = _SessionModelComposer()
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+
+    def send(socket_path: str, *args: str) -> None:
+        composer._run_tmux(socket_path, *args)
+        if args[-1] == "s":
+            raise OSError("commit acknowledgement was lost")
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", send)
+
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
+        claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+
+    assert caught.value.phase == "commit" and caught.value.model_may_have_changed
+    assert composer.submitted == ["/model"]
+    assert composer.model == "private-glm[1m]"
+    assert [args[-1] for args in composer.sends] == ["/model", "Enter", "Down", "s"]
+
+
+def test_model_command_does_not_dismiss_a_replacement_permission_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    composer = _SessionModelComposer()
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+    status_reads = 0
+
+    def capture(socket_path: str, target: str) -> str:
+        nonlocal status_reads
+        if composer.overlay == "status":
+            status_reads += 1
+            if status_reads >= 2:
+                return _PERMISSION_PROMPT_PANE
+        return composer._capture_pane(socket_path, target)
+
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused):
+        claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+
+    assert composer.submitted == ["/model", "/status"]
+    assert [args[-1] for args in composer.sends] == [
+        "/model",
+        "Enter",
+        "Down",
+        "s",
+        "/status",
+        "Enter",
     ]
+
+
+def test_model_command_tracks_the_highlight_through_a_scrolling_picker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    composer = _SessionModelComposer()
+    composer.options = [f"private-model-{index}" for index in range(13)]
+    composer.model = composer.options[0]
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+
+    def capture(socket_path: str, target: str) -> str:
+        if composer.overlay != "picker":
+            return composer._capture_pane(socket_path, target)
+        start = max(0, composer.highlight - 1)
+        rows = []
+        for index in range(start, min(start + 3, len(composer.options))):
+            marker = (
+                "❯" if index == composer.highlight else "↑" if index == start and start else " "
+            )
+            rows.append(
+                f"   {marker} {index + 1}. Choice {index}  Managed by your organization "
+                f"({composer.options[index]})"
+            )
+        return (
+            "Select model\n"
+            + "\n".join(rows)
+            + "\nEnter to set as default · s to use this session only · Esc to cancel\n"
+        )
+
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+    result = claude_native_bridge.inject_model_command(bridge_dir, model="private-model-12")
+
+    assert result.resolved_model == composer.model == "private-model-12"
+    assert [args[-1] for args in composer.sends].count("Down") == 12
+    assert composer.submitted == ["/model", "/status"]
+
+
+@pytest.mark.parametrize("wrap", ["description", "model-id"])
+def test_model_command_accepts_wrapped_descriptions_but_refuses_partial_model_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wrap: str
+) -> None:
+    composer = _SessionModelComposer()
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+
+    def capture(socket_path: str, target: str) -> str:
+        pane = composer._capture_pane(socket_path, target)
+        if composer.overlay == "picker":
+            if wrap == "description":
+                return pane.replace(
+                    "Managed by your organization", "Managed by your\n      organization"
+                )
+            return pane.replace("(private-glm[1m])", "(private-\n      glm[1m])")
+        return pane
+
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+    if wrap == "description":
+        receipt = claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+        assert receipt.resolved_model == "private-glm[1m]"
+    else:
+        with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused):
+            claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+        assert not any(args[-1] == "s" for args in composer.sends)
+
+
+@pytest.mark.parametrize("metadata", ["structured", "legacy", "duplicate-label"])
+def test_model_command_requires_unique_structured_provenance_for_label_only_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, metadata: str
+) -> None:
+    composer = _SessionModelComposer()
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    names = (
+        ["Common name", "Common name"]
+        if metadata == "duplicate-label"
+        else ["Choice 0", "Choice 1"]
+    )
+    claude_native_bridge.record_model_vocabulary(
+        bridge_dir,
+        launch_env=None,
+        launch_model=None,
+        picker_options=[
+            {
+                "value": model,
+                "model": model,
+                "display_name": names[index],
+                "enabled": True,
+                "provenance": "legacy" if metadata == "legacy" else "structured",
+            }
+            for index, model in enumerate(composer.options)
+        ],
+    )
+    composer.install(monkeypatch)
+
+    def capture(socket_path: str, target: str) -> str:
+        pane = composer._capture_pane(socket_path, target)
+        if composer.overlay == "picker":
+            for index, model in enumerate(composer.options):
+                pane = pane.replace(
+                    f"Choice {index}  Managed by your organization ({model})",
+                    f"{names[index]}  Available model",
+                )
+        return pane
+
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+    if metadata == "structured":
+        result = claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+        assert result.resolved_model == "private-glm[1m]"
+    else:
+        with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused):
+            claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+        assert not any(args[-1] == "s" for args in composer.sends)
+
+
+def test_model_command_can_use_an_exact_live_canonical_row_on_an_older_bridge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    composer = _SessionModelComposer()
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    metadata = json.loads((bridge_dir / "bridge.json").read_text())
+    del metadata["model_picker_options"]
+    (bridge_dir / "bridge.json").write_text(json.dumps(metadata))
+    composer.install(monkeypatch)
+
+    receipt = claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+
+    assert receipt.resolved_model == "private-glm[1m]"
+    assert composer.submitted == ["/model", "/status"]
+
+
+@pytest.mark.parametrize("phase", ["picker", "commit", "status"])
+@pytest.mark.parametrize("identity", ["owning-session", "native-session", "tmux-target"])
+def test_model_command_does_not_continue_into_a_replacement_session_or_pane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, identity: str
+) -> None:
+    composer = _SessionModelComposer()
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+    sends_before_rotation: list[tuple[str, ...]] = []
+
+    def send(socket_path: str, *args: str) -> None:
+        composer._run_tmux(socket_path, *args)
+        reached = (
+            (phase == "picker" and args[-1] == "Enter" and composer.overlay == "picker")
+            or (phase == "commit" and args[-1] == "s")
+            or (phase == "status" and args[-1] == "Enter" and composer.overlay == "status")
+        )
+        if reached:
+            sends_before_rotation.extend(composer.sends)
+            if identity == "owning-session":
+                config = json.loads((bridge_dir / "bridge.json").read_text())
+                config["active_session_id"] = "replacement-session"
+                (bridge_dir / "bridge.json").write_text(json.dumps(config))
+            elif identity == "native-session":
+                (bridge_dir / "state.json").write_text(
+                    json.dumps({"claude_session_id": "replacement-native-session"})
+                )
+            else:
+                write_tmux_target(
+                    bridge_dir, socket_path=Path(socket_path), tmux_target="replacement:0.0"
+                )
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", send)
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused):
+        claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+
+    assert sends_before_rotation and composer.sends == sends_before_rotation
+    assert not any(args[-1] == "Escape" for args in composer.sends)
+
+
+@pytest.mark.parametrize("overlay", ["picker", "status"])
+@pytest.mark.parametrize("damage", ["missing-footer", "duplicate", "replacement-composer"])
+def test_model_control_parsers_refuse_partial_duplicate_and_closed_overlays(
+    overlay: str, damage: str
+) -> None:
+    from omnigent.harnesses.claude_native import model_switch
+
+    composer = _SessionModelComposer()
+    composer.overlay = overlay
+    pane = composer._capture_pane("ignored", "ignored")
+    parse = model_switch._picker if overlay == "picker" else model_switch._status
+    assert parse(pane) is not None
+    if damage == "missing-footer":
+        pane = pane[: pane.rfind("\n", 0, pane.rfind("Esc"))]
+    elif damage == "replacement-composer":
+        composer.overlay = None
+        pane += composer._capture_pane("ignored", "ignored")
+    elif overlay == "picker":
+        pane = pane.replace("     2.", "   ❯ 2.")
+    else:
+        pane = pane.replace("   Model:", "   Model: other-model\n   Model:")
+    assert parse(pane) is None
+
+
+@pytest.mark.parametrize("operation", ["send", "capture"])
+def test_model_switch_caps_each_tmux_subprocess_to_its_remaining_parent_deadline(
+    monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    from omnigent.harnesses.claude_native.model_switch import ModelSwitchDeadline
+
+    clock = _VirtualClock()
+    parent = ModelSwitchDeadline(0.4, None, clock.monotonic)
+    deadline = ModelSwitchDeadline(5, parent, clock.monotonic)
+    timeouts: list[float] = []
+
+    def run(command: list[str], **kwargs: Any) -> Any:
+        timeouts.append(kwargs["timeout"])
+        return SimpleNamespace(returncode=0, stdout="pane", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    def invoke() -> None:
+        if operation == "send":
+            claude_native_bridge._run_tmux(
+                "/tmp/example/tmux.sock", "send-keys", "-t", "main", "s"
+            )
+        else:
+            assert claude_native_bridge._capture_pane("/tmp/example/tmux.sock", "main") == "pane"
+
+    with claude_native_bridge.cancellable_injection(deadline):
+        invoke()
+        clock.sleep(0.3)
+        invoke()
+        clock.sleep(0.2)
+        with pytest.raises(claude_native_bridge.ClaudeInjectionCancelled):
+            invoke()
+
+    assert timeouts == pytest.approx([0.4, 0.1])
 
 
 def test_confirm_tui_dialog_polls_instead_of_sleeping_a_fixed_interval(
@@ -18223,3 +18995,27 @@ def test_a_sandboxed_helper_accepts_the_bridge_under_its_read_only_pinned_tmpdir
             bridge._trusted_parent_for_bridge_dir(pinned / "elsewhere")
     finally:
         pinned.chmod(0o700)
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({"HOME": "/home/user"}, "/home/user/.claude/settings.json"),
+        ({"HOME": "/home/user", "CLAUDE_CONFIG_DIR": "/srv/claude"}, "/srv/claude/settings.json"),
+        ({"HOME": "/home/user", "CLAUDE_CONFIG_DIR": "cfg/../conf"}, "/repo/conf/settings.json"),
+    ],
+    ids=["home", "config dir", "relative config dir"],
+)
+def test_settings_path_follows_claudes_config_dir(env: dict[str, str], expected: str) -> None:
+    assert claude_native_bridge.claude_user_settings_path(Path("/repo"), env) == Path(expected)
+
+
+@pytest.mark.parametrize("command", ["/model sonnet", "/model private-model[1m]"])
+def test_inline_automated_model_commands_are_refused_before_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(monkeypatch, [_IDLE_PANE])
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused):
+        claude_native_bridge.inject_slash_command(bridge_dir, command=command)
+    assert sends == []

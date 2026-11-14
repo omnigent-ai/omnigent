@@ -1,16 +1,4 @@
-"""Static guards on how a routed model reaches a live TUI.
-
-Every check here is a source-level invariant, not a behavior: the behavior is
-covered in ``tests/harnesses/claude_native/test_claude_native_bridge.py`` (the injector) and
-``tests/server/test_turn_routing.py`` (the hook path).
-
-A routed switch is typed as ``/model <id>``. Claude Code answers it with "Set
-model to X **and saved as your default for new sessions**" and rewrites the
-``model`` key in the person's own ``~/.claude/settings.json``. The dedicated
-default-model guard restores that key after an Omnigent switch; its behavior
-is covered in ``test_default_model_guard.py``. These static checks keep the
-switch path polling the TUI rather than guessing its latency.
-"""
+"""Keep the bounded session-only picker path polling observed UI transitions."""
 
 from __future__ import annotations
 
@@ -21,14 +9,10 @@ import pytest
 
 _OMNIGENT = Path(__file__).resolve().parent.parent / "omnigent"
 
-#: Functions on the claude model-switch path. A fixed sleep in any of them is
-#: the row-100 defect: the "Switch model?" dialog took 1.861 s to render on a
-#: session with history, so a 0.3 s sleep dropped the confirming Enter.
 _SWITCH_PATH_FUNCTIONS = (
-    "inject_slash_command",
-    "_confirm_tui_dialog",
-    # The confirm retry loop lives here, so it inherits the same rule.
-    "_confirm_and_verify_dialog_closed",
+    ("bridge.py", "inject_model_command"),
+    ("model_switch.py", "wait"),
+    ("model_switch.py", "command"),
 )
 
 
@@ -42,8 +26,10 @@ def _tree(relative: str) -> ast.Module:
     return ast.parse((_OMNIGENT / relative).read_text(encoding="utf-8"))
 
 
-@pytest.mark.parametrize("name", _SWITCH_PATH_FUNCTIONS)
-def test_the_model_switch_path_polls_and_never_sleeps_a_fixed_interval(name: str) -> None:
+@pytest.mark.parametrize(("module", "name"), _SWITCH_PATH_FUNCTIONS)
+def test_the_model_switch_path_polls_and_never_sleeps_a_fixed_interval(
+    module: str, name: str
+) -> None:
     """
     Guard #21: no ``time.sleep(<literal>)`` on the switch path.
 
@@ -53,7 +39,7 @@ def test_the_model_switch_path_polls_and_never_sleeps_a_fixed_interval(name: str
     """
     from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 
-    tree = _tree("harnesses/claude_native/bridge.py")
+    tree = _tree(f"harnesses/claude_native/{module}")
     functions = {
         node.name: node
         for node in ast.walk(tree)

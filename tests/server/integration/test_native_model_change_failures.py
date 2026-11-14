@@ -15,12 +15,13 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.claude_native import bridge as claude_bridge
 from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.harnesses.codex_native import app_server
 from omnigent.harnesses.codex_native import bridge as codex_bridge
 from omnigent.inner.databricks_executor import DatabricksAuthError
-from omnigent.runner import create_runner_app, native_controls
+from omnigent.runner import create_runner_app
 from omnigent.runner._entry import _RunnerDatabricksAuth
 from omnigent.runner.transports.ws_tunnel.frames import (
     Frame,
@@ -38,6 +39,7 @@ from omnigent.server.routes.sessions import routes_core
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
 from omnigent.terminals.registry import TerminalRegistry
+from tests._helpers.providers import isolate_provider_resolution
 from tests.runner.conftest import (
     _FakeProcessManager,
     _ScriptedHarnessClient,
@@ -142,11 +144,18 @@ class _ClaudePane:
     def report_model(self, model: str) -> None:
         (self.bridge_dir / "context.json").write_text(json.dumps({"model": model}))
 
-    def inject(self, bridge_dir: Path, *, command: str, **_kwargs: Any) -> None:
+    def select(
+        self, bridge_dir: Path, *, model: str, **_kwargs: Any
+    ) -> claude_bridge.ClaudeModelSwitchResult:
         assert bridge_dir == self.bridge_dir
-        self.commands.append(command)
-        if self.confirm:
-            self.report_model(command.removeprefix("/model "))
+        self.commands.append(model)
+        if not self.confirm:
+            raise claude_bridge.ClaudeModelSwitchRefused(
+                "Claude's fresh status did not confirm the session-only model selection.",
+                phase="status",
+            )
+        self.report_model(model)
+        return claude_bridge.ClaudeModelSwitchResult(model, model, model, model, "native-session")
 
 
 @dataclass
@@ -210,6 +219,7 @@ async def native_session(
     monkeypatch: pytest.MonkeyPatch,
     request: pytest.FixtureRequest,
 ) -> AsyncIterator[_NativeSession]:
+    isolate_provider_resolution(monkeypatch, tmp_path / "config")
     harness = getattr(request, "param", "claude-native")
     is_claude = harness == "claude-native"
     previous_model = "claude-opus-4-6" if is_claude else "gpt-5.4"
@@ -262,12 +272,23 @@ async def native_session(
         monkeypatch.setattr(claude_native, "resolve_native_claude_config", lambda **_kwargs: None)
         monkeypatch.setattr(claude_native, "stored_claude_catalog_rows", lambda _config: None)
         monkeypatch.setattr(claude_native, "claude_launch_catalog", AsyncMock(return_value=[]))
+
+        async def launch_stub(ctx: Any) -> SessionResourceView:
+            assert ctx.session_id == session_id
+            return SessionResourceView(
+                id="terminal_claude_main", type="terminal", session_id=session_id, name="claude"
+            )
+
+        async def refuse_auto_create(*args: Any, **kwargs: Any) -> None:
+            raise AssertionError("The public model-control test must not launch a native terminal")
+
+        for module in ("omnigent.runner.native", "omnigent.runner.native.orchestration"):
+            monkeypatch.setattr(f"{module}._launch_claude", launch_stub)
+            monkeypatch.setattr(f"{module}._auto_create_claude_terminal", refuse_auto_create)
         monkeypatch.setattr(claude_bridge, "confirm_dialog_if_open", lambda *_a, **_k: False)
         # No pane behind this bridge dir: the prompt wait ahead of the injection
         # would only time out, so it passes at once as in the runner suite.
         monkeypatch.setattr(claude_bridge, "wait_for_input_ready", lambda *_a, **_k: None)
-        monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_CONFIRM_TIMEOUT_S", 0.05)
-        monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_CONFIRM_POLL_S", 0.005)
     else:
         monkeypatch.setattr(codex_bridge, "_BRIDGE_ROOT", tmp_path / "codex")
         monkeypatch.setattr(app_server, "_effort_catalog_cache", {})
@@ -394,11 +415,11 @@ async def test_claude_model_confirmation_controls_public_patch_and_rollback(
     session = native_session
     assert session.claude is not None
     session.claude.confirm = confirmed
-    monkeypatch.setattr(claude_bridge, "inject_slash_command", session.claude.inject)
+    monkeypatch.setattr(claude_bridge, "inject_model_command", session.claude.select)
 
     response = await _pick_model(client, session)
 
-    assert session.claude.commands == [f"/model {session.requested_model}"]
+    assert session.claude.commands == [session.requested_model]
     assert session.tunnel.dispatch_errors == []
     if confirmed:
         assert response.status_code == 200, response.text
@@ -408,7 +429,7 @@ async def test_claude_model_confirmation_controls_public_patch_and_rollback(
     else:
         session.assert_refused(response)
         refused = session.runner_replies[0].json()
-        assert refused["error"] == "claude_native_model_unconfirmed"
+        assert refused["error"] == "claude_native_model_failed"
         assert "did not confirm" in refused["detail"]
         assert "did not confirm" in session.errors[0]["message"]
 
@@ -428,7 +449,7 @@ async def test_refused_model_change_preserves_newer_silent_selection(
     session = native_session
     assert session.claude is not None
     session.claude.confirm = False
-    monkeypatch.setattr(claude_bridge, "inject_slash_command", session.claude.inject)
+    monkeypatch.setattr(claude_bridge, "inject_model_command", session.claude.select)
     async with _held_model_reply(client, session) as (first, release_refusal):
         newer = await client.patch(
             f"/v1/sessions/{session.session_id}",
@@ -443,7 +464,7 @@ async def test_refused_model_change_preserves_newer_silent_selection(
 
     assert refused.status_code == 503, refused.text
     assert "Please check the current selection and try again" in refused.text
-    assert session.runner_replies[0].json()["error"] == "claude_native_model_unconfirmed"
+    assert session.runner_replies[0].json()["error"] == "claude_native_model_failed"
     assert session.errors[0]["code"] == "model_change_not_applied"
     saved = session.store.get_conversation(session.session_id)
     assert saved.model_override == newer_model
@@ -465,7 +486,7 @@ async def test_refused_model_change_preserves_concurrent_terminal_report(
     session = native_session
     assert session.claude is not None
     session.claude.confirm = False
-    monkeypatch.setattr(claude_bridge, "inject_slash_command", session.claude.inject)
+    monkeypatch.setattr(claude_bridge, "inject_model_command", session.claude.select)
     async with _held_model_reply(client, session) as (first, release_refusal):
         event = (
             {"type": "external_model_change", "data": {"model": "claude-sonnet-4-6"}}
@@ -504,14 +525,21 @@ async def test_refused_claude_model_change_keeps_effort_applied_by_the_same_patc
     def inject(_bridge_dir: Path, *, command: str, **_kwargs: Any) -> None:
         commands.append(command)
 
+    def refuse_model(_bridge_dir: Path, *, model: str, **_kwargs: Any) -> None:
+        commands.append(model)
+        raise claude_bridge.ClaudeModelSwitchRefused(
+            "Fresh status did not confirm model selection"
+        )
+
     monkeypatch.setattr(claude_bridge, "inject_slash_command", inject)
+    monkeypatch.setattr(claude_bridge, "inject_model_command", refuse_model)
     refused = await client.patch(
         f"/v1/sessions/{session.session_id}",
         json={"model_override": session.requested_model, "reasoning_effort": "low"},
     )
 
     assert refused.status_code == 503, refused.text
-    assert commands == ["/effort low", f"/model {session.requested_model}"]
+    assert commands == ["/effort low", session.requested_model]
     assert [reply.status_code for reply in session.runner_replies] == [204, 503]
     saved = session.store.get_conversation(session.session_id)
     assert saved.model_override == prior_model
@@ -534,7 +562,7 @@ async def test_refused_model_change_keeps_the_new_replicas_same_selection(
     session = native_session
     assert session.claude is not None
     session.claude.confirm = False
-    monkeypatch.setattr(claude_bridge, "inject_slash_command", session.claude.inject)
+    monkeypatch.setattr(claude_bridge, "inject_model_command", session.claude.select)
     monkeypatch.setattr(routes_events, "last_liveness_stamp", lambda _runner: None)
     async with _held_model_reply(client, session) as (first, release_refusal):
         session.store.touch_runner_liveness(["runner_connected"], int(time.time()))
@@ -586,7 +614,11 @@ async def test_claude_pending_prompt_blocks_model_pick_without_answering_it(
     ]
     session.assert_model(session.previous_model)
     assert any(
-        record.exc_info and isinstance(record.exc_info[1], claude_bridge.ClaudeUserPromptPending)
+        record.exc_info
+        and (
+            isinstance(record.exc_info[1], claude_bridge.ClaudeUserPromptPending)
+            or isinstance(record.exc_info[1].__cause__, claude_bridge.ClaudeUserPromptPending)
+        )
         for record in caplog.records
     )
     assert sent == []
@@ -634,13 +666,12 @@ async def test_claude_model_the_picker_cannot_spell_is_rejected_as_invalid_input
 ) -> None:
     session = native_session
     assert session.claude is not None
-    monkeypatch.setattr(claude_bridge, "inject_slash_command", session.claude.inject)
     session.requested_model = "gpt-6-sol"
 
     response = await _pick_model(client, session)
 
     assert response.status_code == 400, response.text
-    assert "cannot switch to gpt-6-sol" in response.json()["error"]["message"]
+    assert "gpt-6-sol" in response.json()["error"]["message"]
     assert session.runner_replies[0].json()["error"] == "claude_native_model_unsupported"
     assert session.claude.commands == []
     assert session.errors == []

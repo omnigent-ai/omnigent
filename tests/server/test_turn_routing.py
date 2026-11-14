@@ -1005,41 +1005,23 @@ def test_settle_probe_reads_the_pane_for_claude_and_the_turn_id_for_codex(
 
 
 async def test_replay_switches_the_claude_pane_before_delivering(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """
-    Claude's model switch happens in the replay, not in its hook.
+    from omnigent.harnesses.claude_native.bridge import ClaudeModelSwitchResult
 
-    The hook's own pane is frozen waiting on the hook subprocess, so
-    keystrokes sent from there would queue behind the block. Order is
-    load-bearing: the pane must already be on the routed model when the
-    prompt arrives, or the turn runs on the launch model.
-    """
-    monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
-    monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
     _mark(tmp_path)
-    switched: list[tuple[Path, str, bool]] = []
+    turn_routing.write_pending_replay(
+        tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id=None, model="private-model"
+    )
+    selections: list[tuple[str, str | None]] = []
     client = _FakeServerClient()
 
-    def _inject(
-        bridge_dir: Path,
-        *,
-        command: str,
-        auto_confirm: bool = False,
-        confirm_hint: str | None = None,
-    ) -> None:
-        assert not client.posts, "the pane must be switched before the prompt lands"
-        switched.append((bridge_dir, command, auto_confirm))
+    def select(_bridge: Path, *, model: str, owned_draft: str | None) -> ClaudeModelSwitchResult:
+        assert not client.posts
+        selections.append((model, owned_draft))
+        return ClaudeModelSwitchResult(model, model, model, model, "native-session")
 
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.inject_slash_command", _inject, raising=False
-    )
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.read_model_env",
-        lambda _dir: {"ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5"},
-    )
-
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge.inject_model_command", select)
     await schedule_replay(
         "conv_1",
         prompt="hello",
@@ -1047,44 +1029,29 @@ async def test_replay_switches_the_claude_pane_before_delivering(
         blocked_turn_id=None,
         server_client=client,
         harness="claude-native",
-        model="databricks-claude-sonnet-5",
-        idle=lambda _turn: True,
+        model="private-model",
+        idle=lambda _: True,
     )
 
-    # The vocabulary spelling, not the catalog id: ``/model`` rejects a bare
-    # gateway id and silently keeps the old model.
-    assert switched == [(tmp_path, "/model sonnet", True)]
+    assert selections == [("private-model", "hello")]
     assert len(client.posts) == 1
+    assert turn_routing.read_pending_replay(tmp_path) is None
 
 
-async def test_replay_still_delivers_when_the_claude_switch_fails(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("actuator_result", [False, None])
+async def test_replay_keeps_the_prompt_pending_when_the_model_actuator_is_not_true(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, actuator_result: bool | None
 ) -> None:
-    """A switch that does not take must not cost the user their prompt."""
-    monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
-    monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
     _mark(tmp_path)
+    turn_routing.write_pending_replay(
+        tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id=None, model="private-model"
+    )
     client = _FakeServerClient()
 
-    def _boom(
-        _bridge_dir: Path,
-        *,
-        command: str,
-        auto_confirm: bool = False,
-        confirm_hint: str | None = None,
-    ) -> None:
-        del command, auto_confirm, confirm_hint
-        raise RuntimeError("tmux target is not advertised")
+    async def refuse(*args: object, **kwargs: object) -> bool | None:
+        return actuator_result
 
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.inject_slash_command", _boom, raising=False
-    )
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.read_model_env",
-        lambda _dir: {"ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5"},
-    )
-
+    monkeypatch.setattr(turn_routing, "_apply_routed_model", refuse)
     await schedule_replay(
         "conv_1",
         prompt="hello",
@@ -1092,49 +1059,56 @@ async def test_replay_still_delivers_when_the_claude_switch_fails(
         blocked_turn_id=None,
         server_client=client,
         harness="claude-native",
-        model="databricks-claude-sonnet-5",
-        idle=lambda _turn: True,
+        model="private-model",
+        idle=lambda _: True,
     )
 
-    assert len(client.posts) == 1
+    assert client.posts == []
+    pending = turn_routing.read_pending_replay(tmp_path)
+    assert pending is not None and pending.prompt == "hello"
 
 
-async def test_replay_skips_the_switch_for_an_unspeakable_model(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+async def test_replay_refused_model_switch_can_be_explicitly_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """
-    A model this pane has no ``/model`` spelling for is left alone.
+    from omnigent.harnesses.claude_native.bridge import (
+        ClaudeModelSwitchRefused,
+        ClaudeModelSwitchResult,
+    )
 
-    Typing a value the CLI will not take leaves the pane on its old model
-    while the recorded decision claims the routed one.
-    """
-    monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
-    monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
     _mark(tmp_path)
+    turn_routing.write_pending_replay(
+        tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id=None, model="private-model"
+    )
     client = _FakeServerClient()
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.inject_slash_command",
-        lambda *a, **k: pytest.fail("must not touch the pane"),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.read_model_env",
-        lambda _dir: {"ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5"},
-    )
+    refusing = True
 
-    await schedule_replay(
-        "conv_1",
-        prompt="hello",
-        bridge_dir=tmp_path,
-        blocked_turn_id=None,
-        server_client=client,
-        harness="claude-native",
-        model="databricks-claude-opus-4-8",
-        idle=lambda _turn: True,
-    )
+    def select(_bridge: Path, *, model: str, owned_draft: str | None) -> ClaudeModelSwitchResult:
+        if refusing:
+            raise ClaudeModelSwitchRefused("No exact picker choice")
+        return ClaudeModelSwitchResult(model, model, model, model, "native-session")
 
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge.inject_model_command", select)
+
+    async def replay() -> None:
+        await schedule_replay(
+            "conv_1",
+            prompt="hello",
+            bridge_dir=tmp_path,
+            blocked_turn_id=None,
+            server_client=client,
+            harness="claude-native",
+            model="private-model",
+            idle=lambda _: True,
+        )
+
+    await replay()
+    assert client.posts == []
+    assert turn_routing.read_pending_replay(tmp_path) is not None
+    refusing = False
+    await replay()
     assert len(client.posts) == 1
+    assert turn_routing.read_pending_replay(tmp_path) is None
 
 
 async def test_replay_leaves_the_model_alone_for_codex(
@@ -1147,9 +1121,8 @@ async def test_replay_leaves_the_model_alone_for_codex(
     _mark(tmp_path)
     client = _FakeServerClient()
     monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.inject_slash_command",
+        "omnigent.harnesses.claude_native.bridge.inject_model_command",
         lambda *a, **k: pytest.fail("codex must not drive the claude pane"),
-        raising=False,
     )
 
     await schedule_replay(
@@ -1188,31 +1161,30 @@ async def test_server_relay_hands_the_routed_model_to_the_replay(
     assert armed[0]["harness"] == "claude-native"
 
 
-async def test_replay_skips_the_switch_when_the_pane_is_already_there(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("receipt_model", ["private-model", "another-model", None])
+async def test_replay_requires_a_fresh_same_model_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, receipt_model: str | None
 ) -> None:
-    """
-    A pane already on the routed model gets no ``/model`` echo.
+    from omnigent.harnesses.claude_native.bridge import ClaudeModelSwitchResult
 
-    Block-and-replay puts that echo ahead of the session's very first turn,
-    where weak models have been observed refusing the replayed prompt, so a
-    redundant switch is worth not typing.
-    """
-    monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
-    monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
     _mark(tmp_path)
+    turn_routing.write_pending_replay(
+        tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id=None, model="private-model"
+    )
     client = _FakeServerClient()
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.read_claude_status_model",
-        lambda _dir: "databricks-claude-sonnet-5",
-    )
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.inject_slash_command",
-        lambda *a, **k: pytest.fail("no switch when the pane is already on it"),
-        raising=False,
-    )
+    checked: list[str] = []
 
+    def select(_bridge: Path, *, model: str, **kwargs: object) -> ClaudeModelSwitchResult | None:
+        checked.append(model)
+        return (
+            None
+            if receipt_model is None
+            else ClaudeModelSwitchResult(
+                receipt_model, receipt_model, receipt_model, receipt_model, "native-session", True
+            )
+        )
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge.inject_model_command", select)
     await schedule_replay(
         "conv_1",
         prompt="hello",
@@ -1220,11 +1192,15 @@ async def test_replay_skips_the_switch_when_the_pane_is_already_there(
         blocked_turn_id=None,
         server_client=client,
         harness="claude-native",
-        model="databricks-claude-sonnet-5",
-        idle=lambda _turn: True,
+        model="private-model",
+        idle=lambda _: True,
     )
 
-    assert len(client.posts) == 1
+    assert checked == ["private-model"]
+    assert len(client.posts) == (1 if receipt_model == "private-model" else 0)
+    assert (turn_routing.read_pending_replay(tmp_path) is None) is (
+        receipt_model == "private-model"
+    )
 
 
 # ── Timeout ladder ──────────────────────────────────────────────────

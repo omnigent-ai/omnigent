@@ -73,11 +73,16 @@ from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
 from omnigent.harnesses.claude_native import (
     PEER_MESSAGE_WAKE_KIND,
     PEER_MESSAGE_WAKE_TEXT,
-    default_model_guard,
     delivery_diagnostics,
 )
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
+from omnigent.harnesses.claude_native.model_switch import (
+    ClaudeModelSwitchRefused,
+    ClaudeModelSwitchResult,
+    ModelSwitchDeadline,
+    SessionOnlyModelSwitch,
+)
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
 from omnigent.harnesses.claude_native.submit_verification import (
     SubmitBoundary,
@@ -1899,6 +1904,7 @@ def prepare_bridge_dir(
     launch_model: str | None = None,
     launch_env: Mapping[str, str] | None = None,
     picker_values: Sequence[str] | None = None,
+    picker_options: Sequence[Mapping[str, object]] | None = None,
     sandbox: OSEnvSandboxSpec | None = None,
 ) -> Path:
     """
@@ -1926,6 +1932,8 @@ def prepare_bridge_dir(
         offers, e.g. ``["system.ai.glm-5-3"]``. Persisted for the same
         translation: a gateway-managed picker names rows by served id, and
         no pin spells those.
+    :param picker_options: Actual picker descriptors with raw display labels
+        and provenance, excluding synthesized default catalog rows.
     :param sandbox: Resolved ``os_env.sandbox`` for this session (the
         agent spec's declared sandbox, already overridden by any
         ``enforce_sandbox``/``force_sandbox`` policy verdict). Persisted
@@ -1969,9 +1977,8 @@ def prepare_bridge_dir(
             payload["model_env"] = model_env
         if picker_values is not None:
             payload["model_picker_values"] = list(picker_values)
-        payload["user_settings_path"] = str(
-            claude_user_settings_path(workspace, {**os.environ, **(launch_env or {})})
-        )
+        if picker_options is not None:
+            payload["model_picker_options"] = [dict(option) for option in picker_options]
         if sandbox is not None:
             payload["sandbox"] = _bridge_sandbox_payload(sandbox)
         _write_json_file(bridge_dir / _CONFIG_FILE, payload)
@@ -2070,42 +2077,6 @@ def claude_user_settings_path(
     if config_dir is None:
         config_dir = os.path.join(env.get("HOME") or str(_account_home_dir()), ".claude")
     return _claude_joined_path(base, config_dir, "settings.json")
-
-
-def read_user_settings_path(bridge_dir: Path) -> Path:
-    """
-    Return the user ``settings.json`` this session's Claude saves to.
-
-    :param bridge_dir: Bridge directory path.
-    :returns: The path recorded at launch; for a session launched before the
-        record, the path for the runner's own environment.
-    """
-    config = _read_json_file(bridge_dir / _CONFIG_FILE)
-    recorded = config.get("user_settings_path") if isinstance(config, dict) else None
-    if isinstance(recorded, str) and recorded:
-        return Path(recorded)
-    return claude_user_settings_path()
-
-
-def write_user_settings_path(bridge_dir: Path, settings_path: Path) -> None:
-    """
-    Record the user ``settings.json`` this session's Claude saves to.
-
-    The runner calls this once the pane's final launch env and cwd are known;
-    :func:`prepare_bridge_dir` only sees the env it was handed.
-
-    :param bridge_dir: Bridge directory path.
-    :param settings_path: The pane's settings file, e.g.
-        ``Path("/srv/claude/settings.json")``.
-    :returns: None.
-    :raises RuntimeError: If the bridge config does not exist.
-    """
-    with _bridge_metadata_write_lock(bridge_dir):
-        config = _read_json_file(bridge_dir / _CONFIG_FILE)
-        if not config:
-            raise RuntimeError(f"bridge config missing: {bridge_dir / _CONFIG_FILE}")
-        config["user_settings_path"] = str(settings_path)
-        _write_json_file(bridge_dir / _CONFIG_FILE, config)
 
 
 def _claude_joined_path(cwd: Path, directory: str, name: str) -> Path:
@@ -2362,12 +2333,22 @@ def read_model_picker_values(bridge_dir: Path) -> list[str]:
     return [value for value in values if isinstance(value, str) and value]
 
 
+def read_model_picker_options(bridge_dir: Path) -> list[dict[str, object]] | None:
+    """Read actual picker descriptors; ``None`` means an older unknown catalog."""
+    config = _read_json_file(bridge_dir / _CONFIG_FILE)
+    options = config.get("model_picker_options") if isinstance(config, dict) else None
+    if not isinstance(options, list):
+        return None
+    return [option for option in options if isinstance(option, dict)]
+
+
 def record_model_vocabulary(
     bridge_dir: Path,
     *,
     launch_env: Mapping[str, str] | None,
     launch_model: str | None,
     picker_values: Sequence[str] | None = None,
+    picker_options: Sequence[Mapping[str, object]] | None = None,
 ) -> None:
     """
     Persist the launch's model vocabulary after the bridge dir exists.
@@ -2386,6 +2367,8 @@ def record_model_vocabulary(
         ``None``.
     :param picker_values: The ``/model`` spellings this session's picker
         offers, or ``None`` when the catalog is unknown. An empty list clears it.
+    :param picker_options: Actual picker descriptors, including raw labels and
+        provenance. An empty list clears previously recorded descriptors.
     :returns: None.
     """
     # Read-modify-write under the bridge dir's cross-process lock so a
@@ -2410,6 +2393,11 @@ def record_model_vocabulary(
             changed = True
         if picker_values is not None and config.get("model_picker_values") != list(picker_values):
             config["model_picker_values"] = list(picker_values)
+            changed = True
+        if picker_options is not None and config.get("model_picker_options") != list(
+            picker_options
+        ):
+            config["model_picker_options"] = [dict(option) for option in picker_options]
             changed = True
         if launch_model and config.get("launch_model") != launch_model:
             config["launch_model"] = launch_model
@@ -5668,6 +5656,45 @@ def wait_for_input_ready(
     )
 
 
+def inject_model_command(
+    bridge_dir: Path,
+    *,
+    model: str,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+    ready_timeout_s: float | None = None,
+    owned_draft: str | None = None,
+) -> ClaudeModelSwitchResult:
+    """Select a model for this session and require a fresh local status receipt.
+
+    ``owned_draft`` is only for the exact persisted prompt whose routing hook
+    proved it blocked. Unrelated drafts and dialogs receive no clearing keys.
+    The timeout covers lock waits and every step; no dependent prompt is sent.
+    """
+    deadline = ModelSwitchDeadline(timeout_s, _INJECTION_CANCEL_EVENT.get(), time.monotonic)
+    transaction = SessionOnlyModelSwitch(
+        bridge_dir,
+        model=model,
+        deadline=deadline,
+        ready_timeout_s=ready_timeout_s,
+        owned_draft=owned_draft,
+    )
+    try:
+        with cancellable_injection(deadline):
+            return _inject_model_command_locked(bridge_dir, transaction)
+    except ClaudeInjectionCancelled as exc:
+        raise transaction.refuse(
+            "Claude's model switch was cancelled; the prompt was not sent."
+        ) from exc
+
+
+@_serialize_bridge_injection
+def _inject_model_command_locked(
+    bridge_dir: Path, transaction: SessionOnlyModelSwitch
+) -> ClaudeModelSwitchResult:
+    del bridge_dir
+    return transaction.run()
+
+
 @_serialize_bridge_injection
 def inject_slash_command(
     bridge_dir: Path,
@@ -5726,6 +5753,10 @@ def inject_slash_command(
         raise ValueError(f"slash command must start with '/'; got {command!r}")
     if "\n" in command:
         raise ValueError("slash command must be a single line")
+    if re.match(r"^/model\s+\S", command):
+        raise ClaudeModelSwitchRefused(
+            "Automated model selections must use the session-only picker."
+        )
     dialog_hint: str | None = None
     if auto_confirm:
         if not confirm_hint:
@@ -5749,38 +5780,29 @@ def inject_slash_command(
             "Answer the pending Claude question or permission request before changing settings.",
             nothing_typed=True,
         )
-    switch = _begin_model_switch(bridge_dir, command)
-    paste_attempted = False
-    try:
-        # Clear the user's draft so the command is not appended to it.
-        # Unlike Escape, this leaves an in-flight generation running.
-        _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
-        # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
-        paste_attempted = True
-        _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
-        # A dropped Enter can leave the command drafted: wait for rendering, submit,
-        # and verify it left the box. An unidentifiable draft gets a blind submit.
-        needle = _submit_needle(command)
-        draft_seen = False
-        deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
-        while time.monotonic() < deadline:
-            pane = _capture_pane(socket_path, tmux_target)
-            _raise_if_user_prompt_pending(bridge_dir, pane)
-            if _draft_in_input_box(pane, needle):
-                draft_seen = True
-                break
-            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-        time.sleep(_PASTE_SETTLE_S)
-        if has_pending_user_prompt(bridge_dir):
-            raise ClaudeUserPromptPending(
-                "Claude is waiting for an explicit answer; settings command not sent."
-            )
-        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-    except BaseException:
-        # A pasted draft can still be submitted later, even if this injection failed.
-        if switch is not None and not paste_attempted:
-            switch.cancel()
-        raise
+    # Clear the user's draft so the command is not appended to it.
+    # Unlike Escape, this leaves an in-flight generation running.
+    _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
+    # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
+    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
+    # A dropped Enter can leave the command drafted: wait for rendering, submit,
+    # and verify it left the box. An unidentifiable draft gets a blind submit.
+    needle = _submit_needle(command)
+    draft_seen = False
+    deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+    while time.monotonic() < deadline:
+        pane = _capture_pane(socket_path, tmux_target)
+        _raise_if_user_prompt_pending(bridge_dir, pane)
+        if _draft_in_input_box(pane, needle):
+            draft_seen = True
+            break
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    time.sleep(_PASTE_SETTLE_S)
+    if has_pending_user_prompt(bridge_dir):
+        raise ClaudeUserPromptPending(
+            "Claude is waiting for an explicit answer; settings command not sent."
+        )
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     if draft_seen:
         # Retry only while the command remains drafted and no user decision
         # is pending. A dialog replacing the composer counts as submission.
@@ -5800,21 +5822,6 @@ def inject_slash_command(
             )
     if dialog_hint is not None:
         _confirm_tui_dialog(socket_path, tmux_target, hint=dialog_hint, bridge_dir=bridge_dir)
-
-
-def _begin_model_switch(
-    bridge_dir: Path, command: str
-) -> default_model_guard.PendingModelSwitch | None:
-    """Register a ``/model <arg>`` *command* with the default-model guard."""
-    if not command.startswith("/model "):
-        return None
-    model_arg = command.removeprefix("/model").strip()
-    if not model_arg:
-        return None
-    settings_path = read_user_settings_path(bridge_dir)
-    return default_model_guard.begin_model_switch(
-        settings_path, model_arg, state_dir=default_model_guard.state_directory(settings_path)
-    )
 
 
 def _confirm_tui_dialog(
@@ -6480,6 +6487,17 @@ class _UnixHTTPConnection(HTTPConnection):
         self.sock = sock
 
 
+def _tmux_injection_timeout_s() -> float:
+    deadline = _INJECTION_CANCEL_EVENT.get()
+    if isinstance(deadline, ModelSwitchDeadline):
+        _check_injection_cancelled()
+        remaining = deadline.remaining_s()
+        if remaining <= 0:
+            raise ClaudeInjectionCancelled("Claude's model-switch deadline expired.")
+        return min(_TMUX_SEND_TIMEOUT_S, remaining)
+    return _TMUX_SEND_TIMEOUT_S
+
+
 def _run_tmux(socket_path: str, *args: str, allow_missing_target: bool = False) -> None:
     """
     Invoke ``tmux -S <socket_path> <args...>`` and raise on failure.
@@ -6507,17 +6525,18 @@ def _run_tmux(socket_path: str, *args: str, allow_missing_target: bool = False) 
         target = args[args.index("-t") + 1]
         args = ("copy-mode", "-q", "-t", target, ";", *args)
     cmd = ["tmux", "-S", socket_path, *args]
+    timeout_s = _tmux_injection_timeout_s()
     try:
         proc = subprocess.run(
             cmd,
             check=False,
             capture_output=True,
             text=True,
-            timeout=_TMUX_SEND_TIMEOUT_S,
+            timeout=timeout_s,
         )
     except subprocess.TimeoutExpired as exc:
-        delivery_diagnostics.record_tmux_failure(operation, timeout_s=_TMUX_SEND_TIMEOUT_S)
-        raise RuntimeError(f"tmux command timed out after {_TMUX_SEND_TIMEOUT_S}s") from exc
+        delivery_diagnostics.record_tmux_failure(operation, timeout_s=timeout_s)
+        raise RuntimeError(f"tmux command timed out after {timeout_s}s") from exc
     except OSError as exc:
         delivery_diagnostics.record_tmux_failure(operation, os_errno=exc.errno)
         raise
@@ -6636,7 +6655,7 @@ def _capture_pane(socket_path: str, tmux_target: str, *, join_wrapped: bool = Fa
             check=False,
             capture_output=True,
             text=True,
-            timeout=_TMUX_SEND_TIMEOUT_S,
+            timeout=_tmux_injection_timeout_s(),
         )
     except (subprocess.SubprocessError, OSError):
         return ""

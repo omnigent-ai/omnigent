@@ -1391,15 +1391,12 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
 
     A launch-only ``CLAUDE_CONFIG_DIR`` (here from an ``env`` wrapper) must
     reach the seeder, and seeding must happen before the terminal launches.
-    The default-model guard records the settings file in that same config dir.
     """
     from unittest.mock import Mock
 
-    from omnigent.harnesses.claude_native import bridge as claude_native_bridge
     from omnigent.runner.resource_registry import SessionResourceRegistry
 
     seeded: list[tuple[Path, dict[str, str] | None]] = []
-    recorded_settings: list[Path] = []
     registry = Mock(spec=SessionResourceRegistry)
     registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
     registry.launch_required_terminal.side_effect = RuntimeError("stop after seeding")
@@ -1411,11 +1408,6 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/runner/claude")
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", record_seed
-    )
-    monkeypatch.setattr(
-        claude_native_bridge,
-        "write_user_settings_path",
-        lambda _bridge_dir, settings_path: recorded_settings.append(settings_path),
     )
     monkeypatch.setattr(
         "omnigent.harness_startup_config.resolve_harness_command", lambda *_a, **_k: "env"
@@ -1439,7 +1431,6 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
     assert workspace == Path(bridge_dir).resolve()
     assert env is not None
     assert env["CLAUDE_CONFIG_DIR"] == "/launch/claude"
-    assert recorded_settings == [Path("/launch/claude/settings.json")]
     registry.launch_required_terminal.assert_awaited_once()
 
 
@@ -1509,16 +1500,14 @@ async def test_auto_create_claude_terminal_logs_stage_timings(
     "subagent_started,turn_started",
     [(True, True), (True, False), (False, True), (False, False)],
 )
-@pytest.mark.parametrize("failure_stage", ["trust", "settings-metadata"])
 async def test_auto_create_claude_terminal_cleans_routers_when_trust_seeding_fails(
     bridge_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
     subagent_started: bool,
     turn_started: bool,
-    failure_stage: str,
 ) -> None:
     """
-    A trust or settings-metadata failure releases only this launch's routers.
+    A trust-seeding failure releases only this launch's routers.
 
     Seeding runs after the subagent and turn routers start but before the
     forwarder that normally shuts them down exists, so a malformed config must
@@ -1528,7 +1517,6 @@ async def test_auto_create_claude_terminal_cleans_routers_when_trust_seeding_fai
 
     :param subagent_started: Whether this launch started a subagent router.
     :param turn_started: Whether this launch started a turn router.
-    :param failure_stage: Which pre-launch settings operation fails.
     """
     from unittest.mock import Mock
 
@@ -1560,13 +1548,8 @@ async def test_auto_create_claude_terminal_cleans_routers_when_trust_seeding_fai
     monkeypatch.setattr(orchestration, "_shutdown_session_turn_router_async", record_turn_shutdown)
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted",
-        failing_settings_operation if failure_stage == "trust" else lambda *_a, **_k: None,
+        failing_settings_operation,
     )
-    if failure_stage == "settings-metadata":
-        monkeypatch.setattr(
-            "omnigent.harnesses.claude_native.bridge.write_user_settings_path",
-            failing_settings_operation,
-        )
     registry = Mock(spec=SessionResourceRegistry)
     registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
 

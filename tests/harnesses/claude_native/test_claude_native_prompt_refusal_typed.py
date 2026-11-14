@@ -213,11 +213,14 @@ def test_model_switch_acknowledged_without_a_pane_is_false(tmp_path: Path) -> No
 def test_the_settings_pre_check_refuses_before_typing(
     bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A routed ``/model`` refused up front can be retried as is once the prompt is answered."""
+    """An effort change refused before typing can be retried once the prompt is answered."""
     _show(monkeypatch, f"{_RULE}\n❯ \n{_RULE}\n  ? for shortcuts\n")
     monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", lambda _dir: True)
+    sent: list[tuple[str, ...]] = []
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda *args: sent.append(args))
 
     with pytest.raises(ClaudeUserPromptPending, match="before changing settings") as raised:
-        claude_native_bridge.inject_slash_command(bridge_dir, command="/model opus")
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
     assert raised.value.nothing_typed is True
+    assert sent == []

@@ -416,33 +416,6 @@ def _isolate_claude_native_state(
     monkeypatch.setenv("OMNIGENT_CLAUDE_NATIVE_STATE_DIR", str(state_dir))
 
 
-@pytest.fixture
-def _isolate_claude_default_model_guard(
-    tmp_path_factory: pytest.TempPathFactory,
-    monkeypatch: pytest.MonkeyPatch,
-) -> Callable[[Path, Path], None]:
-    """
-    Keep the ``/model`` default-model guard away from the real ``~/.claude``.
-
-    Any test that types ``/model`` through the real ``inject_slash_command``
-    would otherwise record and restore the developer's own Claude settings.
-
-    :param tmp_path_factory: Pytest's session-scoped temp factory.
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :returns: The real watcher starter, for the dedicated thread test to opt in.
-    """
-    from omnigent.harnesses.claude_native import bridge, default_model_guard
-
-    root = tmp_path_factory.mktemp("claude-default-model")
-    settings_path = root / "settings.json"
-    ensure_watcher = default_model_guard._ensure_watcher
-    monkeypatch.setattr(default_model_guard, "_ensure_watcher", lambda *_args: None)
-    monkeypatch.setattr(
-        bridge, "claude_user_settings_path", lambda *_args, **_kwargs: settings_path
-    )
-    return ensure_watcher
-
-
 @pytest.fixture(autouse=True)
 def _isolate_codex_native_state(
     tmp_path_factory: pytest.TempPathFactory,
