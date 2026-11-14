@@ -282,14 +282,22 @@ async def _drive(
                 await asyncio.wait_for(served[first_response].wait(), timeout=10)
                 await _paint_frames(page)
                 await _expect_pending(
-                    page, pending_label, effort=expected_effort, permission=expected_permission
+                    page,
+                    pending_label,
+                    effort=expected_effort,
+                    permission=expected_permission,
+                    workspace_pending=first_response != "hosts",
                 )
 
                 gates["hosts" if first_response == "agents" else "agents"].set()
                 await asyncio.wait_for(models_requested.wait(), timeout=10)
                 await _paint_frames(page)
                 await _expect_pending(
-                    page, pending_label, effort=expected_effort, permission=expected_permission
+                    page,
+                    pending_label,
+                    effort=expected_effort,
+                    permission=expected_permission,
+                    workspace_pending=False,
                 )
                 await page.get_by_test_id("new-chat-landing").screenshot(
                     path=output / f"{visit}-loading.png", animations="disabled"

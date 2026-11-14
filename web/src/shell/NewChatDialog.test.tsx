@@ -3103,8 +3103,9 @@ describe("NewChatLandingScreen cached picker preview", () => {
 
     mockAgents(DEFAULT_LANDING_AGENTS);
     mockHosts([host("online")]);
-    fireEvent.change(input, { target: { value: "Wait for directory metadata and model catalog" } });
-    expect(workspace).toBeDisabled();
+    fireEvent.change(input, { target: { value: "Directory ready; metadata and model pending" } });
+    expect(workspace).toBeEnabled();
+    expect(workspace).not.toHaveAttribute("aria-busy");
     expect(permission).toHaveTextContent("Plan");
     expect(permission).toBeEnabled();
 
@@ -4732,6 +4733,10 @@ describe("NewChatLandingScreen", () => {
         const worktree = await selectNewWorktree(autoSeeded);
         const requestedBranch = autoSeeded ? worktree.textContent : branchName;
         selectWorkspace(nextWorkspace);
+        const directory = screen.getByTestId("new-chat-landing-workspace-chip");
+        expect(directory).toBeEnabled();
+        expect(directory).not.toHaveAttribute("aria-busy");
+        expect(screen.queryByRole("status", { name: "Loading working directory" })).toBeNull();
         const input = screen.getByTestId("new-chat-landing-input");
         fireEvent.change(input, { target: { value: "continue on the drafted branch" } });
         const submit = screen.getByTestId("new-chat-landing-submit");
@@ -5764,7 +5769,7 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
-  it("keeps placeholder worktrees from relabeling the selected directory", async () => {
+  it("shows the selected directory while placeholder worktree metadata loads", async () => {
     let worktreeResult = {
       data: [
         { path: "/Users/corey/legacy", branch: "main", is_main: true, detached: false },
@@ -5780,8 +5785,12 @@ describe("NewChatLandingScreen", () => {
     useHostWorktreesMock.mockImplementation(() => worktreeResult);
     renderLanding();
 
-    expect(screen.getByRole("status", { name: "Loading working directory" })).toBeVisible();
-    expect(screen.queryByTestId("new-chat-landing-workspace-chip")).toBeNull();
+    const pendingWorkspace = screen.getByTestId("new-chat-landing-workspace-chip");
+    expect(screen.queryByRole("status", { name: "Loading working directory" })).toBeNull();
+    expect(pendingWorkspace).toBeEnabled();
+    expect(pendingWorkspace).not.toHaveAttribute("aria-busy");
+    expect(pendingWorkspace).toHaveAccessibleName("Working directory: /Users/corey/repo");
+    expect(screen.getByTestId("new-chat-landing-workspace-icon-folder")).toBeInTheDocument();
     expect(screen.queryByText("legacy")).toBeNull();
 
     worktreeResult = {
@@ -6246,7 +6255,7 @@ describe("NewChatLandingScreen", () => {
     expect(submit.disabled).toBe(false);
   });
 
-  it("starts the session while the host's worktree discovery is still pending", async () => {
+  it("shows the selected folder and starts while worktree discovery is still pending", async () => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
       json: async () => ({ id: "conv_new" }),
@@ -6256,8 +6265,11 @@ describe("NewChatLandingScreen", () => {
       data: undefined,
     } as ReturnType<typeof useHostWorktrees>);
     renderLanding();
-    // The directory control keeps reporting the pending discovery.
-    expect(await screen.findByRole("status", { name: "Loading working directory" })).toBeVisible();
+    const workspace = await screen.findByTestId("new-chat-landing-workspace-chip");
+    expect(workspace).toHaveAccessibleName("Working directory: /Users/corey/repo");
+    expect(workspace).toBeEnabled();
+    expect(workspace).not.toHaveAttribute("aria-busy");
+    expect(screen.queryByRole("status", { name: "Loading working directory" })).toBeNull();
     const submit = screen.getByTestId("new-chat-landing-submit");
     fireEvent.pointerMove(submit.parentElement!, { pointerType: "mouse" });
     expect(await screen.findByRole("tooltip")).toHaveTextContent("Enter a message to get started");
