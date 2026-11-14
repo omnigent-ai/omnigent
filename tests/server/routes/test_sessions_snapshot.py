@@ -325,6 +325,10 @@ async def test_session_snapshot_uses_child_spec_metadata(
 
     class _AgentCache:
         @staticmethod
+        def load_spec(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
+            return _AgentCache.load(agent_id, bundle_location, expand_env=expand_env).spec
+
+        @staticmethod
         def load(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
             assert (agent_id, bundle_location) == ("ag_advisor", "bundle")
             cache_loads.append(expand_env)
@@ -415,6 +419,10 @@ async def test_session_snapshot_does_not_claim_agent_model_for_own_auth_acp(
             )()
 
     class _AgentCache:
+        @staticmethod
+        def load_spec(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
+            return _AgentCache.load(agent_id, bundle_location, expand_env=expand_env).spec
+
         @staticmethod
         def load(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
             return type("LoadedAgent", (), {"spec": spec})()
@@ -508,6 +516,10 @@ async def test_session_snapshot_unresolvable_sub_agent_warns_and_reports_parent(
 
     class _AgentCache:
         @staticmethod
+        def load_spec(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
+            return _AgentCache.load(agent_id, bundle_location, expand_env=expand_env).spec
+
+        @staticmethod
         def load(agent_id: str, bundle_location: str, *, expand_env: bool = True) -> Any:
             assert (agent_id, bundle_location) == ("ag_advisor", "bundle")
             return type("LoadedAgent", (), {"spec": parent_spec})()
@@ -589,6 +601,10 @@ async def test_session_snapshot_native_sub_agent_reports_parent_without_warning(
             )()
 
     class _AgentCache:
+        @staticmethod
+        def load_spec(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
+            return _AgentCache.load(agent_id, bundle_location, expand_env=expand_env).spec
+
         @staticmethod
         def load(agent_id: str, bundle_location: str, *, expand_env: bool = True) -> Any:
             return type("LoadedAgent", (), {"spec": parent_spec})()
