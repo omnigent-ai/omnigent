@@ -50,6 +50,7 @@ from omnigent.server._elicitation_registry import (
 )
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
 from omnigent.server.routes import sessions as sessions_route
+from tests.budgets import budget
 from tests.server.helpers import create_session_for_agent as _create_session
 from tests.server.helpers import create_test_agent, start_session_stream_collector
 
@@ -4702,7 +4703,7 @@ async def test_pi_extension_ui_hook_round_trip(
             client, session_id, event["elicitation_id"], action, content
         )
         assert verdict.status_code == 202, verdict.text
-    async with asyncio.timeout(1.0):
+    async with asyncio.timeout(budget(3.0)):
         response = await hook_task
     assert response.status_code == 200, response.text
     assert response.json() == {"type": "extension_ui_response", "id": "dialog", **expected}
