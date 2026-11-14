@@ -5398,6 +5398,33 @@ describe("NewChatLandingScreen", () => {
     }
   });
 
+  it("keeps the agent label when an acp:<slug> probe returns no models", () => {
+    mockAgents([
+      {
+        id: "a_traex",
+        name: "traex",
+        display_name: "TraeX",
+        description: null,
+        harness: "acp:traex",
+        acpHarness: true,
+        skills: [],
+      },
+    ]);
+    mockHosts([{ ...host("online"), configured_harnesses: { acp: true, "acp:traex": true } }]);
+    useHostModelOptionsMock.mockImplementation(
+      (_hostId, harness) =>
+        (harness === "acp:traex"
+          ? { data: [], isLoading: false, error: null }
+          : CLAUDE_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
+    );
+
+    renderLanding();
+
+    const trigger = screen.getByTestId("new-chat-landing-agent-select");
+    expect(trigger).toHaveTextContent(/traex/i);
+    expect(trigger).not.toHaveTextContent("Models unavailable");
+  });
+
   it.each(catalogAgents)(
     "blocks $display_name's retained catalog while it needs setup",
     (agent) => {
