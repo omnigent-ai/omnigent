@@ -973,6 +973,15 @@ tools:
       - get_pull_request
 ```
 
+```yaml
+# NPM-packaged stdio server via npx
+tools:
+  deja:
+    type: mcp
+    command: npx
+    args: ["-y", "@vshulcz/deja-vu", "mcp"]
+```
+
 MCP tools can also point at a remote URL:
 
 ```yaml
