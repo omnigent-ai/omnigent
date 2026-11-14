@@ -1594,6 +1594,11 @@ def test_openai_chat_wire_api_resolves_to_completions(monkeypatch: pytest.Monkey
     assert provider.model == "zai-org/GLM-4.7"
     assert provider.api_key == "sk-test-deepinfra-key"  # Resolved from environment
     assert provider.auth_header is False
+    # Pi defaults ``supportsDeveloperRole`` to true for unrecognized base URLs and
+    # sends ``developer`` for reasoning models, which non-OpenAI servers behind a
+    # passthrough proxy reject with a 400; chat-wire gateways must render ``system``.
+    rendered = provider.to_models_config()["providers"][provider.provider_id]
+    assert rendered.get("compat", {}).get("supportsDeveloperRole") is False
 
 
 def test_openai_responses_wire_api_default() -> None:
