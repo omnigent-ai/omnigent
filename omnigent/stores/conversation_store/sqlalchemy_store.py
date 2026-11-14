@@ -154,6 +154,7 @@ from omnigent.stores.session_journal_store import (
     copy_journal_for_fork,
     delete_journal_entries_batch,
     delete_journal_heads,
+    discard_fork_journal,
 )
 from omnigent.util.session_lifecycle import title_without_closed_marker
 
@@ -6756,11 +6757,25 @@ class SqlAlchemyConversationStore(ConversationStore):
                 _upsert_labels(session, new_conv_id, fork_labels, now)
             return new_conv
 
-        new_conv = run_write_transaction(
-            self._conv_session_immediate,
-            "insert_fork_conversation",
-            insert_ap,
-        )
+        # Journal rows are invisible until the conversation is published. A failed
+        # batch must not expose a fork with only part of its plan history.
+        if copy_journal:
+            copy_journal_for_fork(
+                self._session_immediate,
+                source_conversation_id,
+                new_conv_id,
+                created_through=journal_through,
+            )
+        try:
+            new_conv = run_write_transaction(
+                self._conv_session_immediate,
+                "insert_fork_conversation",
+                insert_ap,
+            )
+        except BaseException:
+            if copy_journal:
+                discard_fork_journal(self._session_immediate, new_conv_id)
+            raise
 
         # Write fork metadata (and cloned agent if any) to the Omnigent DB.
         def insert_metadata(
@@ -6800,13 +6815,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                     if host is not None and host.deleted_at is None:
                         fork_meta.host_id = current.host_id
             meta_sess.add(fork_meta)
-            if copy_journal:
-                copy_journal_for_fork(
-                    meta_sess,
-                    source_conversation_id,
-                    new_conv_id,
-                    created_through=journal_through,
-                )
             if creating_clone and agent_id is not None:
                 assert cloned_agent_name is not None and cloned_agent_bundle_location is not None
                 meta_sess.add(

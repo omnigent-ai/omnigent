@@ -19,6 +19,9 @@ session. A fork carries the journal its history wrote: all of it, or up to where
 from an earlier message cuts the history. A side chat starts with none, and so
 does a run of an automation that starts from a session.
 
+Forking copies a fixed journal prefix in batches before publishing the new
+session. A failed copy removes its staged entries and leaves no partial fork.
+
 | Kind     | Written by | Fields                                                                       |
 | -------- | ---------- | ---------------------------------------------------------------------------- |
 | `plan`   | agent      | `name`, `steps` (the whole graph), `version` (set by Omnigent), `source`     |

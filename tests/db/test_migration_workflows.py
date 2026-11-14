@@ -18,7 +18,7 @@ _TABLE = "workflows"
 
 def _migrate(uri: str, engine: sa.Engine, revision: str, *, down: bool = False) -> None:
     config = _build_alembic_config(uri)
-    with engine.begin() as conn:
+    with engine.connect() as conn:
         config.attributes["connection"] = conn
         (command.downgrade if down else command.upgrade)(config, revision)
 
@@ -62,9 +62,28 @@ def test_drafts_downgrade_cleanly_and_existing_plans_upgrade_as_runnable(tmp_pat
         user_id=None, name="saved", description="Run it.", steps=[{"id": "a", "name": "A"}]
     )
     draft = store.create(user_id=None, name="draft", description="Plan it.", steps=[])
+    for index in range(251):
+        store.create(user_id=None, name=f"draft {index}", description="Plan it.", steps=[])
+    cleanup_reads = []
+
+    def inspect_cleanup(_conn, _cursor, statement, parameters, _context, _executemany):
+        query = getattr(_context.compiled, "statement", None)
+        if isinstance(query, sa.Select) and any(
+            getattr(table, "name", None) == "workflows" for table in query.get_final_froms()
+        ):
+            cleanup_reads.append(parameters)
+            assert "LIMIT" in statement
+        if isinstance(query, sa.Delete) and query.table.name == "workflows":
+            assert _conn.get_execution_options().get("isolation_level") == "AUTOCOMMIT"
+
+    sa.event.listen(engine, "before_cursor_execute", inspect_cleanup)
     _migrate(uri, engine, "3b9e4c71d2a8", down=True)
+    sa.event.remove(engine, "before_cursor_execute", inspect_cleanup)
+    assert len(cleanup_reads) >= 3
     _migrate(uri, engine, "head")
     assert store.get(saved.id, user_id=None) == saved
     assert store.get(draft.id, user_id=None) is None
+    with engine.connect() as connection:
+        assert connection.execute(sa.text("SELECT COUNT(*) FROM workflows")).scalar_one() == 1
     engine.dispose()
     clear_engine_cache()

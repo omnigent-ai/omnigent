@@ -10,8 +10,8 @@ import threading
 import pytest
 import sqlalchemy as sa
 
+from omnigent.db import current_query_name
 from omnigent.db.db_models import MAX_STORED_VALUE_BYTES
-from omnigent.db.utils import run_write_transaction
 from omnigent.entities.session_journal import InvalidJournalEntryError, StepNotReadyError
 from omnigent.errors import StaleCursorError
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -313,9 +313,15 @@ def test_deleting_a_session_deletes_its_journal_in_batches(
     assert _count(db_uri, "session_journal_heads", SESSION) == 0
 
 
+@pytest.mark.parametrize("fail_second_batch", [False, True])
 def test_a_fork_carries_the_journal_and_continues_it(
-    conversations: SqlAlchemyConversationStore, journal: SessionJournalStore
+    conversations: SqlAlchemyConversationStore,
+    journal: SessionJournalStore,
+    monkeypatch: pytest.MonkeyPatch,
+    fail_second_batch: bool,
+    db_uri: str,
 ) -> None:
+    monkeypatch.setattr("omnigent.stores.session_journal_store.JOURNAL_COPY_BATCH", 2)
     journal.append(SESSION, "plan", _plan("deploy", "video"), idempotency_key="k0")
     journal.append(
         SESSION,
@@ -328,7 +334,36 @@ def test_a_fork_carries_the_journal_and_continues_it(
     journal.append(SESSION, "note", {"body": "Swap is up"}, idempotency_key="k2", step="video")
     source = journal.list_entries(SESSION).entries
 
-    fork = conversations.fork_conversation(SESSION)
+    reads = 0
+
+    def inspect_batch(_conn, _cursor, statement, _parameters, _context, _executemany):
+        nonlocal reads
+        if (current_query_name() or "").endswith(
+            "copy_fork_journal_batch"
+        ) and statement.startswith("SELECT"):
+            reads += 1
+            assert "LIMIT" in statement
+            if reads == 2 and fail_second_batch:
+                raise RuntimeError("copy interrupted")
+
+    sa.event.listen(conversations._engine, "before_cursor_execute", inspect_batch)
+    try:
+        if fail_second_batch:
+            with pytest.raises(RuntimeError, match="copy interrupted"):
+                conversations.fork_conversation(SESSION)
+            assert {c.id for c in conversations.list_conversations().data} == {SESSION, OTHER}
+            with sa.create_engine(db_uri).connect() as connection:
+                assert (
+                    connection.execute(
+                        sa.text("SELECT COUNT(*) FROM session_journal_entries")
+                    ).scalar_one()
+                    == 3
+                )
+            return
+        fork = conversations.fork_conversation(SESSION)
+    finally:
+        sa.event.remove(conversations._engine, "before_cursor_execute", inspect_batch)
+    assert reads == 2
     copied = journal.list_entries(fork.id).entries
     assert [(e.position, e.kind, e.step, e.content) for e in copied] == [
         (e.position, e.kind, e.step, e.content) for e in source
@@ -379,10 +414,11 @@ def test_a_truncated_fork_copies_only_what_its_history_wrote(
     for index in range(3):
         _note(journal, f"k{index}")
     fork = conversations.fork_conversation(SESSION, copy_items=False)
-    copied = run_write_transaction(
+    copied = copy_journal_for_fork(
         journal._session_immediate,
-        "copy_journal_for_fork",
-        lambda session: copy_journal_for_fork(session, SESSION, fork.id, created_through=200),
+        SESSION,
+        fork.id,
+        created_through=200,
     )
     assert copied == 2
     assert [e.created_at for e in journal.list_entries(fork.id).entries] == [100, 200]

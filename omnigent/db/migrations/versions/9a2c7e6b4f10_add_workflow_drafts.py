@@ -4,7 +4,8 @@ Revision ID: 9a2c7e6b4f10
 Revises: 3b9e4c71d2a8
 
 Existing workflows remain runnable. Apply before upgrading the server.
-Downgrade removes drafts and session links; saved plans remain intact.
+Downgrade removes drafts and session links; saved plans remain intact. Stop
+writers first. Draft cleanup commits bounded batches and can be restarted.
 """
 
 from __future__ import annotations
@@ -22,6 +23,8 @@ down_revision: str | None = "3b9e4c71d2a8"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 
+_CLEANUP_BATCH = 250
+
 
 def upgrade() -> None:
     """Link a workflow to its planning conversation."""
@@ -38,13 +41,20 @@ def downgrade() -> None:
         sa.column("plan", CompressedText()),
     )
     connection = op.get_bind()
-    for row in connection.execute(sa.select(workflows)).all():
-        if not json.loads(row.plan)["steps"]:
-            connection.execute(
-                workflows.delete().where(
-                    workflows.c.workspace_id == row.workspace_id,
-                    workflows.c.id == row.id,
-                )
-            )
+    key = sa.tuple_(workflows.c.workspace_id, workflows.c.id)
+    query = sa.select(workflows).order_by(workflows.c.workspace_id, workflows.c.id)
+    page = connection.execute(query.limit(_CLEANUP_BATCH)).all()
+    if page:
+        # Each cleanup statement commits independently; the revision is advanced
+        # only after cleanup and DDL finish, so an interrupted downgrade is retryable.
+        with op.get_context().autocommit_block():
+            while page:
+                drafts = [
+                    (row.workspace_id, row.id) for row in page if not json.loads(row.plan)["steps"]
+                ]
+                if drafts:
+                    connection.execute(workflows.delete().where(key.in_(drafts)))
+                after = (page[-1].workspace_id, page[-1].id)
+                page = connection.execute(query.where(key > after).limit(_CLEANUP_BATCH)).all()
     with op.batch_alter_table("workflows") as batch:
         batch.drop_column("planning_session_id")

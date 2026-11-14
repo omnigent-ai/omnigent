@@ -35,6 +35,7 @@ from omnigent.db.db_models import (
 )
 from omnigent.db.enum_codecs import decode_journal_entry_kind, encode_journal_entry_kind
 from omnigent.db.utils import (
+    NamedManagedSessionMaker,
     get_or_create_engine,
     make_named_managed_session_maker,
     now_epoch,
@@ -68,6 +69,8 @@ _KINDS_A_FORK_LEAVES = frozenset(
 )
 # Session deletion removes at most this many entries per transaction.
 JOURNAL_DELETE_BATCH = 500
+# A saved plan can add one boundary marker, so a copy inserts at most 500 rows.
+JOURNAL_COPY_BATCH = 250
 
 _Statement = TypeVar("_Statement", bound=Select[Any])
 
@@ -693,9 +696,13 @@ class SessionJournalStore:
 
 
 def copy_journal_for_fork(
-    session: Session, source_id: str, fork_id: str, *, created_through: int | None = None
+    sessions: NamedManagedSessionMaker,
+    source_id: str,
+    fork_id: str,
+    *,
+    created_through: int | None = None,
 ) -> int:
-    """Copy a session's journal into its new fork, in order, in the fork's transaction.
+    """Stage a fixed journal prefix in bounded transactions before publishing the fork.
 
     The fork's entries get their own IDs and positions from 0, keep their times,
     steps and contents, and drop their automation run and workflow, so a run's or
@@ -712,59 +719,116 @@ def copy_journal_for_fork(
         SqlSessionJournalEntry.workspace_id == current_workspace_id(),
         SqlSessionJournalEntry.conversation_id == source_id,
     )
-    query = select(SqlSessionJournalEntry).where(*scope).order_by(SqlSessionJournalEntry.position)
-    if created_through is not None:
-        # An append takes its position and time under the session's lock, so the
-        # entries written by then are a prefix. Bounding it by position keeps the
-        # copy a plain primary-key range; a time filter made Postgres sort it.
-        last = session.execute(
+    with sessions("snapshot_fork_journal") as session:
+        source = session.get(
+            SqlConversationMetadata, (current_workspace_id(), source_id), with_for_update=True
+        )
+        last_position = session.execute(
             _using(
                 select(SqlSessionJournalEntry.position)
-                .where(*scope, SqlSessionJournalEntry.created_at <= created_through)
+                .where(*scope)
                 .order_by(SqlSessionJournalEntry.position.desc())
                 .limit(1),
                 "PRIMARY",
             )
         ).scalar()
-        if last is None:
+        if last_position is None:
             return 0
-        query = query.where(SqlSessionJournalEntry.position <= last)
-    copies = []
-    for row in session.execute(_using(query, "PRIMARY")).scalars():
-        if row.kind in _KINDS_A_FORK_LEAVES:
-            continue
-        records = [(row.kind, row.idempotency_key, row.content)]
-        if row.kind == _PLAN_KIND and row.workflow_id is not None:
-            records.insert(
-                0,
-                (_PLAN_STATUS_KIND, f"fork-run:{row.id}", _stored_content({"status": "started"})),
-            )
-        for kind, key, content in records:
-            copies.append(
-                SqlSessionJournalEntry(
-                    workspace_id=row.workspace_id,
-                    conversation_id=fork_id,
-                    position=len(copies),
-                    created_at=row.created_at,
-                    id=uuid.uuid4().hex,
-                    kind=kind,
-                    scheduled_task_run_id=None,
-                    workflow_id=None,
-                    step=row.step,
-                    idempotency_key=key,
-                    content=content,
+        if source is None:
+            raise JournalSessionNotFoundError(source_id)
+
+    after = -1
+    copied = 0
+
+    def copy_batch(session: Session) -> tuple[int, int, bool]:
+        rows = session.scalars(
+            _using(
+                select(SqlSessionJournalEntry)
+                .where(
+                    *scope,
+                    SqlSessionJournalEntry.position > after,
+                    SqlSessionJournalEntry.position <= last_position,
                 )
+                .order_by(SqlSessionJournalEntry.position)
+                .limit(JOURNAL_COPY_BATCH),
+                "PRIMARY",
             )
-    if copies:
-        session.add_all(copies)
-        session.add(
-            SqlSessionJournalHead(
-                workspace_id=current_workspace_id(),
-                conversation_id=fork_id,
-                next_position=len(copies),
+        ).all()
+        cursor, position = after, copied
+        for row in rows:
+            if row.position != cursor + 1:
+                raise JournalSessionNotFoundError(source_id)
+            # Journal times are allocated with positions under the head lock.
+            if created_through is not None and row.created_at > created_through:
+                return cursor, position, True
+            cursor = row.position
+            if row.kind in _KINDS_A_FORK_LEAVES:
+                continue
+            records = [(row.kind, row.idempotency_key, row.content)]
+            if row.kind == _PLAN_KIND and row.workflow_id is not None:
+                records.insert(
+                    0,
+                    (
+                        _PLAN_STATUS_KIND,
+                        f"fork-run:{row.id}",
+                        _stored_content({"status": "started"}),
+                    ),
+                )
+            for kind, key, content in records:
+                session.add(
+                    SqlSessionJournalEntry(
+                        workspace_id=row.workspace_id,
+                        conversation_id=fork_id,
+                        position=position,
+                        created_at=row.created_at,
+                        id=uuid.uuid4().hex,
+                        kind=kind,
+                        scheduled_task_run_id=None,
+                        workflow_id=None,
+                        step=row.step,
+                        idempotency_key=key,
+                        content=content,
+                    )
+                )
+                position += 1
+        if cursor == after:
+            raise JournalSessionNotFoundError(source_id)
+        return cursor, position, cursor == last_position
+
+    try:
+        done = False
+        while not done:
+            after, copied, done = run_write_transaction(
+                sessions, "copy_fork_journal_batch", copy_batch
             )
+        if copied:
+            with sessions("finish_fork_journal") as session:
+                session.add(
+                    SqlSessionJournalHead(
+                        workspace_id=current_workspace_id(),
+                        conversation_id=fork_id,
+                        next_position=copied,
+                    )
+                )
+    except BaseException:
+        discard_fork_journal(sessions, fork_id)
+        raise
+    return copied
+
+
+def discard_fork_journal(sessions: NamedManagedSessionMaker, fork_id: str) -> None:
+    """Remove an unpublished fork's staged journal after a failed copy or insert."""
+    with sessions("discard_fork_journal_head") as session:
+        delete_journal_heads(session, [fork_id])
+    while (
+        run_write_transaction(
+            sessions,
+            "discard_fork_journal_batch",
+            lambda session: delete_journal_entries_batch(session, [fork_id]),
         )
-    return len(copies)
+        == JOURNAL_DELETE_BATCH
+    ):
+        pass
 
 
 def delete_journal_heads(session: Session, conversation_ids: Sequence[str]) -> None:
