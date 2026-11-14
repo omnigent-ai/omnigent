@@ -1,6 +1,8 @@
 import { authenticatedFetch } from "./identity";
 import { ApiError } from "./sessionsApi";
 
+const CODEX_GOAL_READ_HEADER = "X-Omnigent-Codex-Goal-Read";
+
 /**
  * Raw Codex app-server goal object forwarded by the AP route.
  * The route preserves Codex's snake_case field names and open-ended
@@ -150,7 +152,16 @@ function codexGoalResponseFromWire(wire: CodexGoalResponseWire): CodexGoalRespon
  */
 export async function getCodexGoal(sessionId: string): Promise<CodexGoalResponse> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`);
-  return codexGoalResponseFromWire(await readJsonOrThrow<CodexGoalResponseWire>(res));
+  const wire = await readJsonOrThrow<CodexGoalResponseWire>(res);
+  // Older servers also return null when the runner cannot be reached.
+  if (wire.goal == null && res.headers.get(CODEX_GOAL_READ_HEADER) !== "confirmed") {
+    throw new ApiError(
+      "This server cannot confirm an empty Codex goal. Update the server or delete the goal explicitly.",
+      503,
+      "codex_goal_read_unconfirmed",
+    );
+  }
+  return codexGoalResponseFromWire(wire);
 }
 
 /**

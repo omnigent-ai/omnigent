@@ -162,7 +162,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   while untouched fields follow current goal state. Reopening or switching
   sessions discards old drafts, including when the opening read fails.
   Pending reads and updates from an earlier dialog or session cannot replace
-  the current goal fields.
+  the current goal fields. Failed background reads keep the last goal and slow
+  retries; returning to the tab retries immediately.
 - `slash-rewind`: in claude-sdk and Claude Code native sessions, `/rewind` opens
   a searchable list of the session's prompts, newest first. Choosing one
   continues the conversation in a new session holding only the history before
@@ -806,7 +807,9 @@ Other connection providers alone do not enable the managed MCP picker.
   goal indicator should appear within a few seconds without reopening controls.
   Open Goal, change the objective, budget, and mode, and wait ten seconds:
   the unsaved edits should remain. Pause or resume the goal and confirm the
-  indicator follows its status; then delete the test goal.
+  indicator follows its status; then delete the test goal. During a temporary
+  goal-read failure, the indicator should remain. Restore connectivity and
+  return to the tab to confirm it refreshes without reopening Goal.
 - **`session-mcp-status`, in-session composer:** component coverage lives in
   `web/src/pages/ChatPage.composer.test.tsx`. Manually open a started session,
   select `/mcp`, and expect the effective MCP names and descriptions under

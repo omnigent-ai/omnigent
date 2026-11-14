@@ -48,6 +48,7 @@ _logger = logging.getLogger(__name__)
 
 
 _CODEX_NATIVE_GOAL_ERROR = "codex_native_goal_failed"
+_CODEX_GOAL_READ_HEADER = "X-Omnigent-Codex-Goal-Read"
 
 
 def _codex_goal_error(status_code: int, *, detail: str) -> JSONResponse:
@@ -480,6 +481,7 @@ def register_codex_session_routes(
     async def get_codex_goal(
         request: Request,
         session_id: str,
+        response: Response,
     ) -> CodexGoalResponse | Response:
         """
         Read the current Codex app-server goal for a Codex-native session.
@@ -512,8 +514,6 @@ def register_codex_session_routes(
             permission_store=permission_store,
             runner_exit_reports=runner_exit_reports,
         )
-        if runner_result is None:
-            return CodexGoalResponse(goal=None)
         runner_payload = _require_codex_goal_runner_payload(
             session_id,
             action="read",
@@ -522,13 +522,15 @@ def register_codex_session_routes(
         if isinstance(runner_payload, JSONResponse):
             return runner_payload
         try:
-            return CodexGoalResponse.model_validate(runner_payload)
+            goal_response = CodexGoalResponse.model_validate(runner_payload)
         except ValueError as exc:
             del exc
             return _codex_goal_error(
                 502,
                 detail="Could not read Codex goal: runner returned a malformed response.",
             )
+        response.headers[_CODEX_GOAL_READ_HEADER] = "confirmed"
+        return goal_response
 
     @router.put(
         "/sessions/{session_id}/codex_goal",

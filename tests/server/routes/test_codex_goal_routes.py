@@ -23,6 +23,7 @@ from omnigent._wrapper_labels import CODEX_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_K
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.host_registry import RunnerExitReports
+from omnigent.server.routes import sessions as session_routes
 from omnigent.server.routes._sessions.helpers import _HostLaunchAttempt
 from omnigent.server.routes.codex import sessions as codex
 from omnigent.server.routes.sessions import _RunnerForwardResult
@@ -492,14 +493,51 @@ class _StagedForward:
         monkeypatch.setattr(codex, "_forward_codex_goal_event", _forward)
 
 
-async def test_get_goal_without_a_runner_reads_as_no_goal(
+async def test_get_goal_without_a_runner_is_unavailable(
     client: httpx.AsyncClient, codex_session: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     staged = _StagedForward(monkeypatch, None)
     resp = await client.get(f"/v1/sessions/{codex_session}/codex_goal")
+    assert resp.status_code == 503, resp.text
+    assert "Could not read Codex goal" in resp.json()["error"]["message"]
+    assert "X-Omnigent-Codex-Goal-Read" not in resp.headers
+    assert staged.events == [{"type": "goal_get"}]
+
+
+@pytest.mark.parametrize("failure", [httpx.ConnectError, httpx.ReadTimeout])
+async def test_get_goal_transport_failure_is_unavailable(
+    failure: type[httpx.HTTPError],
+    client: httpx.AsyncClient,
+    codex_session: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _handler(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content) == {"type": "goal_get"}
+        raise failure("runner unavailable")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://runner"
+    ) as runner_client:
+
+        async def _get_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+            return runner_client
+
+        monkeypatch.setattr(session_routes, "_get_runner_client", _get_client)
+        resp = await client.get(f"/v1/sessions/{codex_session}/codex_goal")
+
+    assert resp.status_code == 503, resp.text
+    assert "Could not read Codex goal" in resp.json()["error"]["message"]
+    assert "X-Omnigent-Codex-Goal-Read" not in resp.headers
+
+
+async def test_get_goal_returns_a_confirmed_absent_goal(
+    client: httpx.AsyncClient, codex_session: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _StagedForward(monkeypatch, _result(200, {"goal": None}))
+    resp = await client.get(f"/v1/sessions/{codex_session}/codex_goal")
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"goal": None}
-    assert staged.events == [{"type": "goal_get"}]
+    assert resp.headers["X-Omnigent-Codex-Goal-Read"] == "confirmed"
 
 
 async def test_get_goal_returns_the_runner_goal(
@@ -510,24 +548,40 @@ async def test_get_goal_returns_the_runner_goal(
     assert resp.status_code == 200, resp.text
     assert resp.json()["goal"]["objective"] == "keep tests green"
     assert resp.json()["goal"]["token_budget"] == 5000
+    assert resp.headers["X-Omnigent-Codex-Goal-Read"] == "confirmed"
 
 
+@pytest.mark.parametrize("payload", [{"goal": {"objective": "no thread id"}}, {}])
 async def test_get_goal_rejects_a_goal_the_model_cannot_validate(
-    client: httpx.AsyncClient, codex_session: str, monkeypatch: pytest.MonkeyPatch
+    payload: dict[str, Any],
+    client: httpx.AsyncClient,
+    codex_session: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _StagedForward(monkeypatch, _result(200, {"goal": {"objective": "no thread id"}}))
+    _StagedForward(monkeypatch, _result(200, payload))
     resp = await client.get(f"/v1/sessions/{codex_session}/codex_goal")
     assert resp.status_code == 502
     assert "malformed response" in resp.json()["error"]["message"]
+    assert "X-Omnigent-Codex-Goal-Read" not in resp.headers
 
 
+@pytest.mark.parametrize("status", [400, 409], ids=["unsupported-event", "busy"])
 async def test_get_goal_passes_structured_runner_errors_through(
-    client: httpx.AsyncClient, codex_session: str, monkeypatch: pytest.MonkeyPatch
+    status: int,
+    client: httpx.AsyncClient,
+    codex_session: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _StagedForward(monkeypatch, _result(409, {"error": "goal_busy", "detail": "turn running"}))
+    error = (
+        {"error": "invalid_input", "detail": "Unknown event type: goal_get"}
+        if status == 400
+        else {"error": "goal_busy", "detail": "turn running"}
+    )
+    _StagedForward(monkeypatch, _result(status, error))
     resp = await client.get(f"/v1/sessions/{codex_session}/codex_goal")
-    assert resp.status_code == 409
-    assert resp.json() == {"error": "goal_busy", "detail": "turn running"}
+    assert resp.status_code == status
+    assert resp.json() == error
+    assert "X-Omnigent-Codex-Goal-Read" not in resp.headers
 
 
 async def test_set_goal_forwards_only_the_fields_the_caller_sent(

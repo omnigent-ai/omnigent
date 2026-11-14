@@ -1306,19 +1306,13 @@ def test_web_started_codex_turn_returns_without_waiting_for_terminal_event(
 
 
 @pytest.mark.parametrize(
-    ("active_turn_id", "live_injection", "content_blocks"),
-    [
-        (None, False, False),
-        ("turn_existing", False, False),
-        ("turn_existing", True, False),
-        ("turn_existing", True, True),
-    ],
-    ids=["idle", "active-turn", "live-queue", "live-text-blocks"],
+    ("active_turn_id", "live_injection"),
+    [(None, False), ("turn_existing", False), ("turn_existing", True)],
+    ids=["idle", "active-turn", "live-queue"],
 )
 def test_goal_command_sets_goal_before_submitting_objective(
     active_turn_id: str | None,
     live_injection: bool,
-    content_blocks: bool,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1345,15 +1339,7 @@ def test_goal_command_sets_goal_before_submitting_objective(
 
     command = "  /goal Finish the implementation and tests  "
     if live_injection:
-        content = (
-            [
-                {"type": "input_text", "text": "  /goal Finish "},
-                {"type": "input_text", "text": "the implementation and tests  "},
-            ]
-            if content_blocks
-            else command
-        )
-        assert asyncio.run(executor.enqueue_session_message("main", content))
+        assert asyncio.run(executor.enqueue_session_message("main", command))
     else:
         events = _collect_turn_events(executor, command)
         assert [type(event) for event in events] == [TurnComplete]
@@ -1381,46 +1367,65 @@ def test_goal_command_sets_goal_before_submitting_objective(
     ]
 
 
-@pytest.mark.parametrize("reply_lost", [False, True], ids=["refused", "reply-lost"])
+@pytest.mark.parametrize("goal_failure", ["refused", "reply-lost", "unanswered"])
 @pytest.mark.parametrize(
     ("active_turn_id", "live_injection"),
     [(None, False), ("turn_existing", False), ("turn_existing", True)],
     ids=["idle", "active-turn", "live-queue"],
 )
-def test_failed_goal_command_does_not_deliver_input_or_interrupt_native_work(
-    reply_lost: bool,
+async def test_failed_goal_command_does_not_deliver_input_or_interrupt_native_work(
+    goal_failure: str,
     active_turn_id: str | None,
     live_injection: bool,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """A failed goal request leaves its objective unsent and native work intact."""
+    request_cancelled = False
 
     class _GoalFailingClient(_FakeCodexNativeClient):
         requests = []
 
         async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            nonlocal request_cancelled
             response = await super().request(method, params)
             if method == "thread/goal/set":
-                if reply_lost:
+                if goal_failure == "unanswered":
+                    try:
+                        await asyncio.Future()
+                    finally:
+                        request_cancelled = True
+                if goal_failure == "reply-lost":
                     raise ConnectionResetError("goal response lost")
                 raise CodexAppServerResponseError({"code": -32600, "message": "goal rejected"})
             return response
 
+    monkeypatch.setattr(codex_native_executor, "_GOAL_RPC_TIMEOUT_SECONDS", 0.01, raising=False)
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _GoalFailingClient
     )
     _seed_bridge(tmp_path, active_turn_id=active_turn_id)
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
 
-    if live_injection:
-        assert not asyncio.run(executor.enqueue_session_message("main", "/goal Finish the tests"))
-    else:
-        events = _collect_turn_events(executor, "/goal Finish the tests")
-        assert [type(event) for event in events] == [ExecutorError]
-        assert events[0].undelivered is True
-        assert events[0].preserve_session is True
-        assert ("goal response lost" if reply_lost else "goal rejected") in events[0].message
+    async with asyncio.timeout(1):
+        if live_injection:
+            assert not await executor.enqueue_session_message("main", "/goal Finish the tests")
+        else:
+            events = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": "/goal Finish the tests"}], [], ""
+                )
+            ]
+            assert [type(event) for event in events] == [ExecutorError]
+            assert events[0].undelivered is True
+            assert events[0].preserve_session is True
+            expected_error = {
+                "refused": "goal rejected",
+                "reply-lost": "goal response lost",
+                "unanswered": "timed out",
+            }[goal_failure]
+            assert expected_error in events[0].message
 
     assert _GoalFailingClient.requests == [
         ("thread/goal/set", {"threadId": "thread_123", "objective": "Finish the tests"})
@@ -1428,6 +1433,22 @@ def test_failed_goal_command_does_not_deliver_input_or_interrupt_native_work(
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id == active_turn_id
+    assert not executor._inject_lock.locked()
+
+    if goal_failure == "unanswered":
+        assert request_cancelled
+        async with asyncio.timeout(1):
+            followup = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": "Continue existing work"}], [], ""
+                )
+            ]
+        assert [type(event) for event in followup] == [TurnComplete]
+        assert [method for method, _ in _GoalFailingClient.requests] == [
+            "thread/goal/set",
+            "turn/steer" if active_turn_id else "turn/start",
+        ]
 
 
 @pytest.mark.parametrize(

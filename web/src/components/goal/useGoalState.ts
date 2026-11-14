@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { getGoal, type Goal } from "@/lib/goalApi";
 
 const GOAL_POLL_INTERVAL_MS = 5_000;
+const GOAL_POLL_MAX_DELAY_MS = 60_000;
 
 interface UseGoalStateResult {
   goal: Goal | null;
@@ -70,29 +71,41 @@ export function useGoalState(conversationId: string | null, enabled: boolean): U
   useEffect(() => {
     let cancelled = false;
     let inFlight = false;
+    let timer: number | undefined;
+    let pollDelay = GOAL_POLL_INTERVAL_MS;
     if (!enabled || !conversationId) {
       setSnapshot(null);
       return;
     }
+    const schedule = () => {
+      if (!cancelled) timer = window.setTimeout(() => void refresh(), pollDelay);
+    };
     const refresh = async () => {
-      if (cancelled || inFlight || document.visibilityState === "hidden") return;
+      if (cancelled || inFlight) return;
+      window.clearTimeout(timer);
+      if (document.visibilityState === "hidden") {
+        schedule();
+        return;
+      }
       inFlight = true;
       try {
         await refreshGoal();
+        pollDelay = GOAL_POLL_INTERVAL_MS;
       } catch {
         // Keep the last snapshot; opening the dialog surfaces read failures.
+        pollDelay = Math.min(pollDelay * 2, GOAL_POLL_MAX_DELAY_MS);
       } finally {
         inFlight = false;
+        schedule();
       }
     };
     void refresh();
-    const timer = window.setInterval(() => void refresh(), GOAL_POLL_INTERVAL_MS);
     const onFocus = () => void refresh();
     window.addEventListener("focus", onFocus);
     document.addEventListener("visibilitychange", onFocus);
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      window.clearTimeout(timer);
       window.removeEventListener("focus", onFocus);
       document.removeEventListener("visibilitychange", onFocus);
     };

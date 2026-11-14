@@ -16,12 +16,13 @@ const mockAuthenticatedFetch = vi.mocked(authenticatedFetch);
 
 function mockJsonResponse(
   body: unknown,
-  init: { ok?: boolean; status?: number; statusText?: string } = {},
+  init: { ok?: boolean; status?: number; statusText?: string; headers?: HeadersInit } = {},
 ): Response {
   return {
     ok: init.ok ?? true,
     status: init.status ?? 200,
     statusText: init.statusText ?? "OK",
+    headers: new Headers(init.headers),
     json: async () => body,
   } as unknown as Response;
 }
@@ -42,7 +43,7 @@ describe("codex goal API", () => {
     mockAuthenticatedFetch.mockReset();
   });
 
-  it("reads and converts a goal response", async () => {
+  it("reads and converts a populated goal response from an older server", async () => {
     mockAuthenticatedFetch.mockResolvedValueOnce(mockJsonResponse({ goal: WIRE_GOAL }));
 
     await expect(getCodexGoal("conv a/b")).resolves.toEqual({
@@ -59,6 +60,34 @@ describe("codex goal API", () => {
     });
     expect(mockAuthenticatedFetch).toHaveBeenCalledWith("/v1/sessions/conv%20a%2Fb/codex_goal");
   });
+
+  it("accepts a confirmed empty goal after an external deletion", async () => {
+    mockAuthenticatedFetch.mockResolvedValueOnce(
+      mockJsonResponse({ goal: null }, { headers: { "X-Omnigent-Codex-Goal-Read": "confirmed" } }),
+    );
+
+    await expect(getCodexGoal("conv")).resolves.toEqual({ goal: null });
+  });
+
+  it.each([undefined, "unavailable"])(
+    "rejects an ambiguous empty goal from an older server (confirmation=%s)",
+    async (confirmation) => {
+      mockAuthenticatedFetch.mockResolvedValueOnce(
+        mockJsonResponse(
+          { goal: null },
+          {
+            headers:
+              confirmation === undefined ? {} : { "X-Omnigent-Codex-Goal-Read": confirmation },
+          },
+        ),
+      );
+
+      await expect(getCodexGoal("conv")).rejects.toMatchObject({
+        code: "codex_goal_read_unconfirmed",
+        status: 503,
+      });
+    },
+  );
 
   it("sets, updates, and clears goals with the expected wire payloads", async () => {
     mockAuthenticatedFetch

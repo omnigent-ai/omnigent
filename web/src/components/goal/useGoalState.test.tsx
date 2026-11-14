@@ -57,20 +57,31 @@ describe("useGoalState", () => {
     expect(result.current.goal?.status).toBe("paused");
   });
 
-  it("keeps a dialog update when an older goal read finishes", async () => {
-    let resolveRead!: (response: { goal: Goal | null }) => void;
-    mockGetGoal.mockReturnValueOnce(
-      new Promise((resolve) => {
-        resolveRead = resolve;
-      }),
-    );
-    const { result } = renderHook(() => useGoalState("conv", true));
-    act(() => result.current.setGoal(GOAL));
+  it.each(["initial read", "dialog refresh"])(
+    "keeps an explicit update when an older %s finishes",
+    async (source) => {
+      const read = deferredGoalRead();
+      if (source === "dialog refresh") mockGetGoal.mockResolvedValueOnce({ goal: GOAL });
+      mockGetGoal.mockReturnValueOnce(read.promise);
+      const { result } = renderHook(() => useGoalState("conv", true));
+      let refresh: Promise<void> | undefined;
+      if (source === "dialog refresh") {
+        await act(async () => {});
+        act(() => {
+          refresh = result.current.refreshGoal();
+        });
+      }
+      const pausedGoal = { ...GOAL, status: "paused" as const };
+      act(() => result.current.setGoal(pausedGoal));
 
-    await act(async () => resolveRead({ goal: null }));
+      await act(async () => {
+        read.resolve({ goal: null });
+        await refresh;
+      });
 
-    expect(result.current.goal).toEqual(GOAL);
-  });
+      expect(result.current.goal).toEqual(pausedGoal);
+    },
+  );
 
   it.each([
     { newest: "dialog refresh", sameBatch: false },
@@ -124,26 +135,6 @@ describe("useGoalState", () => {
       expect(result.current.goal).toEqual(latestGoal);
     },
   );
-
-  it("invalidates a pending dialog refresh when a goal is explicitly updated", async () => {
-    const read = deferredGoalRead();
-    mockGetGoal.mockResolvedValueOnce({ goal: GOAL }).mockReturnValueOnce(read.promise);
-    const { result } = renderHook(() => useGoalState("conv", true));
-    await act(async () => {});
-    let refresh!: Promise<void>;
-    act(() => {
-      refresh = result.current.refreshGoal();
-    });
-    const pausedGoal = { ...GOAL, status: "paused" as const };
-    act(() => result.current.setGoal(pausedGoal));
-
-    await act(async () => {
-      read.resolve({ goal: null });
-      await refresh;
-    });
-
-    expect(result.current.goal).toEqual(pausedGoal);
-  });
 
   it.each(["dialog refresh", "poll"])(
     "propagates an explicit read error after a newer %s fails",
@@ -249,6 +240,80 @@ describe("useGoalState", () => {
     await act(() => vi.advanceTimersByTimeAsync(5_000));
 
     expect(result.current.goal).toEqual(GOAL);
+  });
+
+  it.each([
+    { elapsed: 14_999, reads: 2 },
+    { elapsed: 34_999, reads: 3 },
+    { elapsed: 74_999, reads: 4 },
+    { elapsed: 134_999, reads: 5 },
+    { elapsed: 194_999, reads: 6 },
+  ])(
+    "backs off repeated failures with $reads reads before $elapsed ms",
+    async ({ elapsed, reads }) => {
+      vi.useFakeTimers();
+      mockGetGoal.mockResolvedValueOnce({ goal: GOAL }).mockRejectedValue(new Error("offline"));
+      const { result } = renderHook(() => useGoalState("conv", true));
+      await act(async () => {});
+      await act(() => vi.advanceTimersByTimeAsync(elapsed));
+      expect(mockGetGoal).toHaveBeenCalledTimes(reads);
+      await act(() => vi.advanceTimersByTimeAsync(1));
+      expect(mockGetGoal).toHaveBeenCalledTimes(reads + 1);
+      expect(result.current.goal).toEqual(GOAL);
+    },
+  );
+
+  it("resets polling to five seconds after recovering from the maximum backoff", async () => {
+    vi.useFakeTimers();
+    mockGetGoal.mockResolvedValueOnce({ goal: GOAL }).mockRejectedValue(new Error("offline"));
+    const { result } = renderHook(() => useGoalState("conv", true));
+    await act(async () => {});
+    await act(() => vi.advanceTimersByTimeAsync(195_000));
+    expect(mockGetGoal).toHaveBeenCalledTimes(7);
+    const pausedGoal = { ...GOAL, status: "paused" as const };
+    mockGetGoal.mockResolvedValue({ goal: pausedGoal });
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    expect(result.current.goal).toEqual(pausedGoal);
+    expect(mockGetGoal).toHaveBeenCalledTimes(8);
+    await act(() => vi.advanceTimersByTimeAsync(4_999));
+    expect(mockGetGoal).toHaveBeenCalledTimes(8);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(mockGetGoal).toHaveBeenCalledTimes(9);
+  });
+
+  it("retries on focus and visibility during backoff without overlapping a pending read", async () => {
+    vi.useFakeTimers();
+    const recovery = deferredGoalRead();
+    mockGetGoal
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockRejectedValueOnce(new Error("still offline"))
+      .mockReturnValueOnce(recovery.promise)
+      .mockResolvedValue({ goal: GOAL });
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    try {
+      const { result } = renderHook(() => useGoalState("conv", true));
+      await act(async () => {});
+      await act(() => vi.advanceTimersByTimeAsync(1_000));
+      await act(async () => window.dispatchEvent(new Event("focus")));
+      expect(mockGetGoal).toHaveBeenCalledTimes(2);
+
+      visibility.mockReturnValue("hidden");
+      await act(async () => document.dispatchEvent(new Event("visibilitychange")));
+      await act(() => vi.advanceTimersByTimeAsync(20_000));
+      expect(mockGetGoal).toHaveBeenCalledTimes(2);
+      visibility.mockReturnValue("visible");
+      await act(async () => document.dispatchEvent(new Event("visibilitychange")));
+      await act(async () => window.dispatchEvent(new Event("focus")));
+      await act(() => vi.advanceTimersByTimeAsync(60_000));
+      expect(mockGetGoal).toHaveBeenCalledTimes(3);
+
+      await act(async () => recovery.resolve({ goal: GOAL }));
+      expect(result.current.goal).toEqual(GOAL);
+      await act(() => vi.advanceTimersByTimeAsync(5_000));
+      expect(mockGetGoal).toHaveBeenCalledTimes(4);
+    } finally {
+      visibility.mockRestore();
+    }
   });
 
   it("ignores a previous session's reads and dialog updates", async () => {

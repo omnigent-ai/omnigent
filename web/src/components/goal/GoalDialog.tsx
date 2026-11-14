@@ -36,6 +36,7 @@ export interface GoalDialogProps {
   goal: Goal | null;
   goalRevision: number;
   onGoalChange: (goal: Goal | null) => void;
+  /** Stable for this session connection; a new identity invalidates pending dialog reads. */
   refreshGoal: () => Promise<void>;
 }
 

@@ -110,6 +110,7 @@ _BRIDGE_STATE_FAST_POLL_WINDOW_SECONDS = 2.0
 _BRIDGE_STATE_SLOW_POLL_SECONDS = 0.25
 _COMPACTION_WAIT_TIMEOUT_SECONDS = 60.0
 _DELIVERY_RPC_TIMEOUT_SECONDS = 30.0
+_GOAL_RPC_TIMEOUT_SECONDS = 30.0
 _DELIVERY_RECEIPT_TIMEOUT_SECONDS = 2.0
 _MAX_CODEX_TEXT_INPUT_CHARS = 1 << 20
 _CODEX_COMPACTING_FAILURE = CodexStartupFailure(
@@ -793,12 +794,16 @@ async def _wait_for_shell_completion(
 async def _set_codex_goal(client: CodexAppServerClient, *, thread_id: str, objective: str) -> None:
     """Keep existing native work when a goal request fails before input delivery."""
     try:
-        await client.request("thread/goal/set", {"threadId": thread_id, "objective": objective})
+        async with asyncio.timeout(_GOAL_RPC_TIMEOUT_SECONDS):
+            await client.request(
+                "thread/goal/set", {"threadId": thread_id, "objective": objective}
+            )
     except Exception as exc:
         if isinstance(exc, CodexAppServerResponseError) and is_server_draining_error(exc):
             raise
+        detail = "request timed out" if isinstance(exc, TimeoutError) else str(exc)
         raise _CodexNativeInputUndelivered(
-            CodexStartupFailure(message=f"Codex goal request failed: {exc}"),
+            CodexStartupFailure(message=f"Codex goal request failed: {detail}"),
             preserve_session=True,
         ) from exc
 

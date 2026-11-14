@@ -2,7 +2,7 @@ import type * as GoalApiModule from "@/lib/goalApi";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { GoalDialog, parseGoalBudget } from "./GoalDialog";
+import { GoalDialog, parseGoalBudget, type GoalDialogProps } from "./GoalDialog";
 import { useGoalState } from "./useGoalState";
 import type { Goal } from "@/lib/goalApi";
 import { clearGoal, getGoal, setGoal, updateGoalStatus } from "@/lib/goalApi";
@@ -34,31 +34,24 @@ const ACTIVE_GOAL: Goal = {
   updatedAt: 2,
 };
 
-function renderDialog({
-  goal = ACTIVE_GOAL,
-  readOnly = false,
-  conversationId = "conv_codex",
-  onGoalChange = vi.fn(),
-}: {
-  goal?: Goal | null;
-  readOnly?: boolean;
-  conversationId?: string | null;
-  onGoalChange?: (goal: Goal | null) => void;
-} = {}) {
-  const onOpenChange = vi.fn();
-  render(
-    <GoalDialog
-      open
-      onOpenChange={onOpenChange}
-      conversationId={conversationId}
-      readOnly={readOnly}
-      refreshGoal={mockRefreshGoal}
-      goalRevision={0}
-      goal={goal}
-      onGoalChange={onGoalChange}
-    />,
-  );
-  return { onGoalChange, onOpenChange };
+function renderDialog(overrides: Partial<GoalDialogProps> = {}) {
+  const props = {
+    open: true,
+    conversationId: "conv_codex",
+    readOnly: false,
+    refreshGoal: mockRefreshGoal,
+    goalRevision: 0,
+    goal: ACTIVE_GOAL,
+    onGoalChange: vi.fn(),
+    onOpenChange: vi.fn(),
+    ...overrides,
+  };
+  return {
+    ...render(<GoalDialog {...props} />),
+    props,
+    onGoalChange: props.onGoalChange,
+    onOpenChange: props.onOpenChange,
+  };
 }
 
 function deferred<T>() {
@@ -193,41 +186,52 @@ describe("GoalDialog", () => {
     expect(onGoalChange).toHaveBeenLastCalledWith(updatedGoal);
   });
 
-  it("keeps unsaved edits when background goal snapshots change", async () => {
-    const onGoalChange = vi.fn();
-    const onOpenChange = vi.fn();
-    const props = {
-      open: true,
-      conversationId: "conv_codex",
-      readOnly: false,
-      refreshGoal: mockRefreshGoal,
-      goalRevision: 0,
-      goal: ACTIVE_GOAL,
-      onGoalChange,
-      onOpenChange,
-    };
-    const { rerender } = render(<GoalDialog {...props} />);
-    await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
-    fireEvent.change(screen.getByTestId("goal-objective"), {
-      target: { value: "My unsaved objective" },
-    });
-    fireEvent.change(screen.getByTestId("goal-token-budget"), {
-      target: { value: "12345" },
-    });
-    fireEvent.click(screen.getByTestId("goal-mode-paused"));
+  it.each(["all fields", "budget only"])(
+    "keeps unsaved %s edits when background goal snapshots change",
+    async (editedFields) => {
+      const { props, rerender } = renderDialog();
+      await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
+      if (editedFields === "all fields") {
+        fireEvent.change(screen.getByTestId("goal-objective"), {
+          target: { value: "My unsaved objective" },
+        });
+        fireEvent.click(screen.getByTestId("goal-mode-paused"));
+      }
+      fireEvent.change(screen.getByTestId("goal-token-budget"), {
+        target: { value: "12345" },
+      });
 
-    for (const goal of [
-      { ...ACTIVE_GOAL },
-      { ...ACTIVE_GOAL, status: "complete", tokensUsed: 2000 },
-    ]) {
-      rerender(<GoalDialog {...props} goal={goal} />);
-      expect(screen.getByTestId("goal-objective")).toHaveValue("My unsaved objective");
-      expect(screen.getByTestId("goal-token-budget")).toHaveValue(12345);
-      expect(screen.getByTestId("goal-mode-paused")).toHaveAttribute("aria-checked", "true");
-    }
-    expect(screen.getByTestId("goal-current")).toHaveTextContent("complete");
-    expect(screen.getByTestId("goal-current")).toHaveTextContent("2,000");
-  });
+      for (const goal of [
+        { ...ACTIVE_GOAL },
+        {
+          ...ACTIVE_GOAL,
+          objective: "Updated native objective",
+          status: "complete",
+          tokensUsed: 2000,
+        },
+      ]) {
+        rerender(<GoalDialog {...props} goal={goal} />);
+        expect(screen.getByTestId("goal-objective")).toHaveValue(
+          editedFields === "all fields" ? "My unsaved objective" : goal.objective,
+        );
+        expect(screen.getByTestId("goal-token-budget")).toHaveValue(12345);
+        const mode =
+          editedFields === "all fields" ? "paused" : goal.status === "active" ? "active" : "keep";
+        expect(screen.getByTestId(`goal-mode-${mode}`)).toHaveAttribute("aria-checked", "true");
+      }
+      expect(screen.getByTestId("goal-current")).toHaveTextContent("complete");
+      expect(screen.getByTestId("goal-current")).toHaveTextContent("2,000");
+      fireEvent.click(screen.getByTestId("goal-save"));
+      await waitFor(() =>
+        expect(mockSetGoal).toHaveBeenCalledWith("conv_codex", {
+          objective:
+            editedFields === "all fields" ? "My unsaved objective" : "Updated native objective",
+          tokenBudget: 12345,
+          status: editedFields === "all fields" ? "paused" : undefined,
+        }),
+      );
+    },
+  );
 
   it("preserves Codex-owned statuses when keep-current mode is selected", async () => {
     const blockedGoal = { ...ACTIVE_GOAL, status: "blocked" };
@@ -247,17 +251,7 @@ describe("GoalDialog", () => {
   it.each(["complete", "blocked", "usageLimited"])(
     "does not overwrite an untouched %s mode when saving an objective edit",
     async (status) => {
-      const props = {
-        open: true,
-        conversationId: "conv_codex",
-        readOnly: false,
-        refreshGoal: mockRefreshGoal,
-        goalRevision: 0,
-        goal: ACTIVE_GOAL,
-        onGoalChange: vi.fn(),
-        onOpenChange: vi.fn(),
-      };
-      const { rerender } = render(<GoalDialog {...props} />);
+      const { props, rerender } = renderDialog();
       await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
       fireEvent.change(screen.getByTestId("goal-objective"), {
         target: { value: "My edited objective" },
@@ -281,17 +275,7 @@ describe("GoalDialog", () => {
   it.each(["reopen", "session switch"])(
     "discards old drafts on %s even when the new read fails",
     async (boundary) => {
-      const props = {
-        open: true,
-        conversationId: "conv_codex",
-        readOnly: false,
-        refreshGoal: mockRefreshGoal,
-        goalRevision: 0,
-        goal: ACTIVE_GOAL,
-        onGoalChange: vi.fn(),
-        onOpenChange: vi.fn(),
-      };
-      const { rerender } = render(<GoalDialog {...props} />);
+      const { props, rerender } = renderDialog();
       await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
       fireEvent.change(screen.getByTestId("goal-objective"), {
         target: { value: "Cancelled objective" },
@@ -325,17 +309,7 @@ describe("GoalDialog", () => {
   );
 
   it("does not restore a deleted goal after reopening with a failed read", async () => {
-    const props = {
-      open: true,
-      conversationId: "conv_codex",
-      readOnly: false,
-      refreshGoal: mockRefreshGoal,
-      goalRevision: 0,
-      goal: ACTIVE_GOAL,
-      onGoalChange: vi.fn(),
-      onOpenChange: vi.fn(),
-    };
-    const { rerender } = render(<GoalDialog {...props} />);
+    const { props, rerender } = renderDialog();
     await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
     rerender(<GoalDialog {...props} open={false} />);
     mockRefreshGoal.mockRejectedValueOnce(new Error("runner unavailable"));
@@ -407,44 +381,32 @@ describe("GoalDialog", () => {
     expect(screen.getByTestId("goal-objective")).toHaveValue("");
   });
 
-  it.each([ACTIVE_GOAL, null])(
-    "hides an obsolete opening-read error after a newer poll succeeds (%j)",
-    async (nextGoal) => {
+  it.each(
+    goalReadResults.flatMap((read) =>
+      ["same batch", "error first"].map((ordering) => ({ ...read, ordering })),
+    ),
+  )(
+    "recovers $result after an opening-read failure ($ordering)",
+    async ({ goal: nextGoal, ordering }) => {
       const openingRead = deferred<{ goal: Goal | null }>();
       const pollRead = deferred<{ goal: Goal | null }>();
       mockGetGoal.mockReturnValueOnce(openingRead.promise).mockReturnValueOnce(pollRead.promise);
       render(<ManagedDialog />);
       expect(mockGetGoal).toHaveBeenCalledTimes(2);
 
-      await act(async () => {
-        pollRead.resolve({ goal: nextGoal });
-        openingRead.reject(new Error("obsolete read unavailable"));
-      });
-
-      expect(screen.queryByText(/Could not read goal/)).not.toBeInTheDocument();
-      expect(screen.getByTestId("goal-objective")).toHaveValue(nextGoal?.objective ?? "");
-      expect(screen.getByTestId("goal-token-budget")).toHaveValue(nextGoal?.tokenBudget ?? null);
-      expect(screen.getByTestId("goal-save")).toBeEnabled();
-      if (nextGoal)
-        expect(screen.getByTestId("goal-current")).toHaveTextContent(nextGoal.objective);
-      else expect(screen.getByTestId("goal-empty")).toBeInTheDocument();
-    },
-  );
-
-  it.each(goalReadResults)(
-    "clears a displayed opening-read error when a later poll accepts $result",
-    async ({ goal: nextGoal }) => {
-      const openingRead = deferred<{ goal: Goal | null }>();
-      const pollRead = deferred<{ goal: Goal | null }>();
-      mockGetGoal.mockReturnValueOnce(openingRead.promise).mockReturnValueOnce(pollRead.promise);
-      render(<ManagedDialog />);
-      expect(mockGetGoal).toHaveBeenCalledTimes(2);
-
-      await act(async () => openingRead.reject(new Error("opening read unavailable")));
-      expect(screen.getByText("Could not read goal: opening read unavailable")).toBeInTheDocument();
-      expect(screen.getByTestId("goal-save")).toBeEnabled();
-
-      await act(async () => pollRead.resolve({ goal: nextGoal }));
+      if (ordering === "error first") {
+        await act(async () => openingRead.reject(new Error("opening read unavailable")));
+        expect(
+          screen.getByText("Could not read goal: opening read unavailable"),
+        ).toBeInTheDocument();
+        expect(screen.getByTestId("goal-save")).toBeEnabled();
+        await act(async () => pollRead.resolve({ goal: nextGoal }));
+      } else {
+        await act(async () => {
+          pollRead.resolve({ goal: nextGoal });
+          openingRead.reject(new Error("obsolete read unavailable"));
+        });
+      }
 
       expect(screen.queryByText(/Could not read goal/)).not.toBeInTheDocument();
       expect(screen.getByTestId("goal-objective")).toHaveValue(nextGoal?.objective ?? "");
@@ -640,17 +602,7 @@ describe("GoalDialog", () => {
         async ({ action, button }) => {
           const pending = deferred<{ goal: Goal | null; cleared: boolean }>();
           queueGoalMutations(action, pending.promise);
-          const props = {
-            open: true,
-            conversationId: "conv_codex",
-            readOnly: false,
-            refreshGoal: mockRefreshGoal,
-            goalRevision: 0,
-            goal: ACTIVE_GOAL,
-            onGoalChange: vi.fn(),
-            onOpenChange: vi.fn(),
-          };
-          const { rerender } = render(<GoalDialog {...props} />);
+          const { props, rerender } = renderDialog();
           await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
           fireEvent.click(screen.getByTestId(button));
           expect(screen.getByTestId("goal-save")).toBeDisabled();
@@ -695,17 +647,7 @@ describe("GoalDialog", () => {
           const oldRequest = deferred<{ goal: Goal | null; cleared: boolean }>();
           const newRequest = deferred<{ goal: Goal | null; cleared: boolean }>();
           queueGoalMutations(action, oldRequest.promise, newRequest.promise);
-          const props = {
-            open: true,
-            conversationId: "conv_codex",
-            readOnly: false,
-            refreshGoal: mockRefreshGoal,
-            goalRevision: 0,
-            goal: ACTIVE_GOAL,
-            onGoalChange: vi.fn(),
-            onOpenChange: vi.fn(),
-          };
-          const { rerender } = render(<GoalDialog {...props} />);
+          const { props, rerender } = renderDialog();
           await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
           fireEvent.click(screen.getByTestId(button));
           if (boundary === "reopen") rerender(<GoalDialog {...props} open={false} />);
@@ -735,17 +677,7 @@ describe("GoalDialog", () => {
   it("clears the loading state when the session disappears during the opening read", async () => {
     const pending = deferred<void>();
     mockRefreshGoal.mockReturnValueOnce(pending.promise);
-    const props = {
-      open: true,
-      conversationId: "conv_codex",
-      readOnly: false,
-      refreshGoal: mockRefreshGoal,
-      goalRevision: 0,
-      goal: ACTIVE_GOAL,
-      onGoalChange: vi.fn(),
-      onOpenChange: vi.fn(),
-    };
-    const { rerender } = render(<GoalDialog {...props} />);
+    const { props, rerender } = renderDialog();
     expect(screen.getByText("Loading goal")).toBeInTheDocument();
 
     rerender(<GoalDialog {...props} conversationId={null} goal={null} />);
