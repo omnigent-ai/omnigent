@@ -510,6 +510,10 @@ function ctxFor(item: ConversationItem): BlockContext {
   // Preserve human authorship only when the server sent it.
   const createdBy =
     "created_by" in item && typeof item.created_by === "string" ? item.created_by : undefined;
+  const webStableId =
+    "web_stable_id" in item && typeof item.web_stable_id === "string"
+      ? item.web_stable_id
+      : undefined;
   return {
     agent,
     depth,
@@ -517,6 +521,7 @@ function ctxFor(item: ConversationItem): BlockContext {
     timestamp: 0,
     responseId: item.response_id,
     itemId: item.id,
+    ...(webStableId !== undefined ? { webStableId } : {}),
     ...(createdBy !== undefined ? { createdBy } : {}),
     ...(typeof item.created_at === "number" && item.created_at > 0
       ? { createdAtS: item.created_at }

@@ -411,6 +411,26 @@ describe("itemsToBlocks — flat shape", () => {
   });
 });
 
+describe("itemsToBlocks — native mirrors", () => {
+  it("carries the web send a mirrored message delivered on its block", () => {
+    const mirror = {
+      id: "msg_mirror",
+      response_id: "resp_mirror",
+      type: "message",
+      status: "completed",
+      role: "user",
+      content: [{ type: "input_text", text: "ship it" }],
+      web_stable_id: "a".repeat(32),
+    } satisfies ConversationItem;
+    const [named, plain] = itemsToBlocks([
+      mirror,
+      { ...mirror, id: "msg_typed", web_stable_id: undefined },
+    ]);
+    expect(named?.ctx).toMatchObject({ itemId: "msg_mirror", webStableId: "a".repeat(32) });
+    expect(plain?.ctx).not.toHaveProperty("webStableId");
+  });
+});
+
 describe("itemsToBlocks — historical error attribution", () => {
   function errorItem(responseId: string, code = "RuntimeError"): ErrorItem {
     return {
