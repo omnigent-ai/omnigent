@@ -81,21 +81,31 @@ vi.mock("./ContentSearchPanel", () => ({
     <input data-testid="content-search-stub" ref={inputRef} />
   ),
 }));
-vi.mock("@/components/BrowserPane/BrowserPane", () => ({
-  BrowserPane: ({
-    conversationId,
-    active,
-    focus,
-  }: {
-    conversationId: string;
-    active?: boolean;
-    focus?: string | null;
-  }) => (
-    <div data-testid="browser-pane-stub" data-active={String(active)} data-focus={focus ?? ""}>
-      {conversationId}
-    </div>
-  ),
-}));
+vi.mock("@/components/BrowserPane/BrowserPane", async () => {
+  const { useEffect, useRef } = await import("react");
+  return {
+    BrowserPane: function BrowserPaneStub({
+      conversationId,
+      active,
+      focus,
+    }: {
+      conversationId: string;
+      active?: boolean;
+      focus?: string | null;
+    }) {
+      const addressRef = useRef<HTMLInputElement>(null);
+      useEffect(() => {
+        if (focus === "address") addressRef.current?.focus();
+      }, [focus]);
+      return (
+        <div data-testid="browser-pane-stub" data-active={String(active)} data-focus={focus ?? ""}>
+          {conversationId}
+          <input aria-label="Address" ref={addressRef} />
+        </div>
+      );
+    },
+  };
+});
 // The rail terminal view mounts a real xterm/WebSocket; stub it to a marker
 // echoing the terminal id it was asked to attach so we can prove the right
 // shell tab surfaced.
@@ -123,33 +133,46 @@ vi.mock("@/hooks/useAgents", () => ({
   useSessionAgent: vi.fn(() => ({ data: undefined })),
 }));
 vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
-// A side chat's pane is covered by its own suite; the stub just names its child.
-vi.mock("@/components/chat/SideChatPane", () => ({
-  SideChatPane: ({
-    childId,
-    readOnly,
-    fullSession,
-    onStart,
-  }: {
-    childId: string;
-    readOnly?: boolean;
-    fullSession?: boolean;
-    onStart?: (text: string) => Promise<void>;
-  }) => (
-    <div
-      data-testid="side-chat-pane-stub"
-      data-read-only={readOnly === undefined ? undefined : String(readOnly)}
-      data-full-session={String(fullSession ?? false)}
-    >
-      {childId}
-      {childId.startsWith("pending:") && onStart && (
-        <button type="button" onClick={() => void onStart("question")}>
-          Start side chat
-        </button>
-      )}
-    </div>
-  ),
-}));
+// A side chat's pane is covered by its own suite; the stub names its child and,
+// like the real pane, focuses its composer as it mounts when asked to.
+vi.mock("@/components/chat/SideChatPane", async () => {
+  const { useEffect, useRef } = await import("react");
+  return {
+    SideChatPane: function SideChatPaneStub({
+      childId,
+      readOnly,
+      fullSession,
+      onStart,
+    }: {
+      childId: string;
+      readOnly?: boolean;
+      fullSession?: boolean;
+      onStart?: (text: string) => Promise<void>;
+    }) {
+      const composerRef = useRef<HTMLTextAreaElement>(null);
+      useEffect(() => {
+        if (useChatStore.getState().sideChatComposers[childId]?.autoFocus) {
+          composerRef.current?.focus();
+        }
+      }, [childId]);
+      return (
+        <div
+          data-testid="side-chat-pane-stub"
+          data-read-only={readOnly === undefined ? undefined : String(readOnly)}
+          data-full-session={String(fullSession ?? false)}
+        >
+          {childId}
+          <textarea aria-label="Side chat composer" ref={composerRef} />
+          {childId.startsWith("pending:") && onStart && (
+            <button type="button" onClick={() => void onStart("question")}>
+              Start side chat
+            </button>
+          )}
+        </div>
+      );
+    },
+  };
+});
 const canEditMock = vi.hoisted(() => vi.fn(() => true));
 vi.mock("@/hooks/usePermissions", async (importOriginal) => ({
   ...(await importOriginal<typeof UsePermissionsModule>()),
@@ -1059,30 +1082,27 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/App.tsx");
   });
 
-  it("renders exactly one '+' — after the nav tabs with no open tabs, trailing the tabs otherwise", () => {
-    // No open tabs → "+" follows the nav tabs, outside the right-pinned group.
+  it("keeps exactly one '+' leading the right-pinned group as tabs open and close", () => {
     declaresShell();
-    renderWorkspace({ openFiles: [] });
-    expect(screen.getAllByRole("button", { name: "Open new" })).toHaveLength(1);
-    const leadingPlus = screen.getByRole("button", { name: "Open new" });
-    expect(leadingPlus.closest(".ml-auto")).toBeNull();
-    expect(
-      screen.getByRole("tablist").compareDocumentPosition(leadingPlus) &
-        Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
-    cleanup();
-
-    // With open tabs "+" leads the right-pinned group, outside the scrolling
-    // tabs region so it stays put when the tabs overflow.
-    declaresShell();
-    renderWorkspace({ openFiles: ["src/App.tsx"] });
+    const { rerender } = renderWorkspace({ openFiles: ["src/App.tsx"] });
     expect(screen.getAllByRole("button", { name: "Open new" })).toHaveLength(1);
     const plus = screen.getByRole("button", { name: "Open new" });
     const trailing = plus.closest(".ml-auto")!;
     expect(trailing.firstElementChild).toContainElement(plus);
+    // Outside the scrolling tabs region, "+" stays put when the tabs overflow.
     const tabsRegion = trailing.previousElementSibling as HTMLElement;
     expect(tabsRegion).toContainElement(screen.getByRole("button", { name: "Close App.tsx" }));
     expect(tabsRegion).not.toContainElement(plus);
+
+    rerender({ openFiles: [] });
+    expect(screen.getAllByRole("button", { name: "Open new" })).toHaveLength(1);
+    // The same trigger, not a remounted copy, survives closing the last tab and reopening one.
+    expect(screen.getByRole("button", { name: "Open new" })).toBe(plus);
+    expect(trailing.firstElementChild).toContainElement(plus);
+
+    rerender({ openFiles: ["src/App.tsx"] });
+    expect(screen.getByRole("button", { name: "Open new" })).toBe(plus);
+    expect(trailing.firstElementChild).toContainElement(plus);
   });
 
   it.each([false, true])(
@@ -1161,11 +1181,14 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     expect(screen.getByRole("button", { name: "Open new" })).not.toHaveFocus();
   });
 
-  it("opens a Side chat tab from the menu with its composer asked to take focus", async () => {
+  it.each([
+    ["no other tabs", []],
+    ["a file tab", ["src/App.tsx"]],
+  ])("opens a Side chat tab from the menu and focuses its composer (%s)", async (_, openFiles) => {
     const previousHarness = useChatStore.getState().sessionHarness;
     useChatStore.setState({ sessionHarness: "openai-agents", sideChatComposers: {} });
     try {
-      const { onRightRailTabChange } = renderWorkspace({ rightRailTab: "sidechat" });
+      const { onRightRailTabChange } = renderWorkspace({ rightRailTab: "sidechat", openFiles });
 
       fireEvent.pointerDown(await screen.findByRole("button", { name: "Open new" }), { button: 0 });
       fireEvent.click(await screen.findByRole("menuitem", { name: "Side chat" }));
@@ -1176,6 +1199,8 @@ describe('WorkspacePanel "+" new-tab menu', () => {
       expect(useChatStore.getState().sideChatComposers).toEqual({
         [pendingId]: { text: "", files: [], autoFocus: true },
       });
+      // The closing menu's focus trap must not take focus back from the composer.
+      expect(screen.getByRole("textbox", { name: "Side chat composer" })).toHaveFocus();
     } finally {
       useChatStore.setState({ sessionHarness: previousHarness, sideChatComposers: {} });
     }
@@ -2417,6 +2442,7 @@ describe("WorkspacePanel desktop menu commands", () => {
       });
       fireEvent.click(await screen.findByRole("menuitem", { name: "Browser" }));
       await waitFor(() => expect(pane()).not.toHaveTextContent(viewOf("browser-1")));
+      expect(within(pane()).getByRole("textbox", { name: "Address" })).toHaveFocus();
 
       closeNewTab();
       await waitFor(() => expect(chatBox).toHaveFocus());

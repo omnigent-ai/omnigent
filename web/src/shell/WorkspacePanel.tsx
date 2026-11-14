@@ -198,7 +198,6 @@ function NewTabMenu({
   onCreateStart,
   onCreateError,
   liveness,
-  menuAlign,
 }: {
   conversationId: string;
   panels: readonly DefaultWorkspaceTab[];
@@ -221,14 +220,11 @@ function NewTabMenu({
   /** Open session's derived liveness — drives the "Shell" item's connect
    *  affordance. Absent is treated as ready. */
   liveness?: SessionLiveness;
-  /** Menu edge to line up with the trigger: "end" once "+" sits at the right edge. */
-  menuAlign: "start" | "end";
 }) {
   const { data: agent } = useSessionAgent(conversationId);
   const create = useCreateTerminal(conversationId);
   const connectState = shellConnectState(liveness);
-  // Remembered shell type, persisted across remounts/reloads. Seeded from
-  // localStorage so the "+" in either strip spot agrees on the current pick.
+  // Remembered shell type, persisted across remounts/reloads.
   const [preferred, setPreferred] = useState<string | null>(() => readPreferredShell());
   // Controlled so a launch can force the menu closed on select.
   const [menuOpen, setMenuOpen] = useState(false);
@@ -245,6 +241,13 @@ function NewTabMenu({
   // The remembered shell, or the first declared type. Used only when shell
   // access is available; the menu can also contain just built-in pages.
   const defaultShell = resolveDefaultShell(declaredTerminals, preferred) as string;
+
+  // Radix runs onSelect before closing; close first so the menu's focus trap
+  // doesn't pull focus back from a tab that takes it as it opens.
+  const closeThen = (action: () => void) => () => {
+    setMenuOpen(false);
+    action();
+  };
 
   const launchShell = (name: string) => {
     setMenuOpen(false);
@@ -319,7 +322,7 @@ function NewTabMenu({
           ("Reconnecting…" + spinner, and the sub-trigger's chevron) — the
           default min-w-32 tracks the 32px "+" trigger and clips it. */}
       <DropdownMenuContent
-        align={menuAlign}
+        align="end"
         className="min-w-56"
         // On close, Radix restores focus to the "+" trigger, which re-opens its
         // tooltip for a frame before blur dismisses it — a visible flash after a
@@ -335,7 +338,7 @@ function NewTabMenu({
           return (
             <DropdownMenuItem
               key={tab}
-              onSelect={() => onOpenPanel(tab)}
+              onSelect={closeThen(() => onOpenPanel(tab))}
               className="cursor-pointer"
             >
               <Icon className="size-4" />
@@ -347,7 +350,7 @@ function NewTabMenu({
           <DropdownMenuSeparator />
         )}
         {onOpenBrowser && (
-          <DropdownMenuItem onSelect={onOpenBrowser} className="cursor-pointer">
+          <DropdownMenuItem onSelect={closeThen(onOpenBrowser)} className="cursor-pointer">
             <GlobeIcon className="size-4" />
             Browser
             {/* ⌘T is the desktop menu's New Browser Tab; older shells have no chord. */}
@@ -357,7 +360,7 @@ function NewTabMenu({
           </DropdownMenuItem>
         )}
         {onOpenSideChat && (
-          <DropdownMenuItem onSelect={onOpenSideChat} className="cursor-pointer">
+          <DropdownMenuItem onSelect={closeThen(onOpenSideChat)} className="cursor-pointer">
             <MessagesSquareIcon className="size-4" />
             Side chat
           </DropdownMenuItem>
@@ -1421,21 +1424,6 @@ function WorkspacePanelImpl({
       openTerminals.length > 0 ||
       sideChats.tabs.length > 0 ||
       (showBrowserTab && browsers.tabs.length > 0));
-  const newTabMenu = (menuAlign: "start" | "end") => (
-    <NewTabMenu
-      conversationId={conversationId}
-      panels={unpinnedTabs}
-      onOpenPanel={selectPermanentTab}
-      onOpenBrowser={showBrowserTab ? addBrowserFromMenu : undefined}
-      onOpen={noteMenuOrigin}
-      onOpenSideChat={onNewSideChat}
-      onOpenTerminal={openTerminalTab}
-      onCreateStart={onShellCreateStart}
-      onCreateError={onShellCreateFailed}
-      liveness={liveness}
-      menuAlign={menuAlign}
-    />
-  );
   const effectiveHandleProps = pending
     ? {
         ...handleProps,
@@ -2033,12 +2021,23 @@ function WorkspacePanelImpl({
               </WorkspaceTabsScroller>
             </>
           )}
-          {/* With no open tabs, "+" sits right after the nav tabs. */}
-          {!pending && !showOpenTabs && newTabMenu("start")}
-          {/* The picker and fullscreen toggle form the trailing control group,
-            pinned right outside the scrolling viewport; "+" joins it once tabs exist. */}
+          {/* "+", the picker and the fullscreen toggle form the trailing control
+            group, pinned right outside the scrolling viewport. */}
           <div className="ml-auto flex shrink-0 items-center gap-1 pl-1">
-            {showOpenTabs && newTabMenu("end")}
+            {!pending && (
+              <NewTabMenu
+                conversationId={conversationId}
+                panels={unpinnedTabs}
+                onOpenPanel={selectPermanentTab}
+                onOpenBrowser={showBrowserTab ? addBrowserFromMenu : undefined}
+                onOpen={noteMenuOrigin}
+                onOpenSideChat={onNewSideChat}
+                onOpenTerminal={openTerminalTab}
+                onCreateStart={onShellCreateStart}
+                onCreateError={onShellCreateFailed}
+                liveness={liveness}
+              />
+            )}
             {panelOptions.length > 0 && (
               <DropdownMenu
                 onOpenChange={(isOpen) => {
