@@ -19,6 +19,7 @@ import sys
 import tempfile
 import threading
 import time
+import tracemalloc
 import unicodedata
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -106,6 +107,332 @@ def _trust_tmp_bridge_parent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
 
 # The clear sent to a one-row input box: two Ctrl+K, then two Ctrl+U (CSI-u).
 _CLEAR_ONE_ROW_COMPOSER = "\x1b[107;5u" * 2 + "\x1b[117;5u" * 2
+
+
+@pytest.mark.parametrize("reader", ["recent_command", "fork_marker"])
+def test_transcript_metadata_scan_bounds_memory(claude_transcript_dir: Path, reader: str) -> None:
+    transcript = claude_transcript_dir / "session.jsonl"
+    marker = {
+        "sessionId": "current",
+        "subtype": "local_command",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "content": "<command-name>/fork</command-name>",
+        "forkedFrom": {"sessionId": "parent"},
+    }
+    with transcript.open("w", encoding="utf-8") as handle:
+        for _ in range(8192):
+            handle.write(json.dumps({"type": "progress", "padding": "x" * 4096}) + "\n")
+        handle.write(json.dumps(marker) + "\n")
+
+    was_tracing = tracemalloc.is_tracing()
+    if not was_tracing:
+        tracemalloc.start()
+    baseline, _ = tracemalloc.get_traced_memory()
+    tracemalloc.reset_peak()
+    try:
+        if reader == "recent_command":
+            found = claude_native_bridge.transcript_has_recent_local_command(
+                transcript,
+                claude_session_id="current",
+                recorded_at=1767225600.0,
+                command_names=frozenset({"/fork"}),
+            )
+        else:
+            found = claude_native_bridge.transcript_has_forked_from_marker(
+                transcript, claude_session_id="current", source_claude_session_id="parent"
+            )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        if not was_tracing:
+            tracemalloc.stop()
+
+    assert found
+    assert tracemalloc.is_tracing() is was_tracing
+    assert peak - baseline < 4 * 1024 * 1024, f"metadata scan allocated {peak - baseline:,} bytes"
+
+
+@pytest.mark.parametrize("reader", ["recent_command", "fork_marker"])
+@pytest.mark.parametrize("position", [0, 199, 200, 399, 400, 599])
+def test_transcript_metadata_scan_preserves_record_windows(
+    claude_transcript_dir: Path, reader: str, position: int
+) -> None:
+    transcript = claude_transcript_dir / "session.jsonl"
+    marker = {
+        "sessionId": "current",
+        "subtype": "local_command",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "content": "<command-name>/fork</command-name>",
+        "forkedFrom": {"sessionId": "parent"},
+    }
+    records = ["{}"] * 600
+    records[position] = json.dumps(marker)
+    transcript.write_text("\n".join(records), encoding="utf-8")
+
+    if reader == "recent_command":
+        found = claude_native_bridge.transcript_has_recent_local_command(
+            transcript,
+            claude_session_id="current",
+            recorded_at=1767225600.0,
+            command_names=frozenset({"/fork"}),
+        )
+        assert found is (position >= 400)
+    else:
+        found = claude_native_bridge.transcript_has_forked_from_marker(
+            transcript, claude_session_id="current", source_claude_session_id="parent"
+        )
+        assert found is (position < 200 or position >= 400)
+
+
+@pytest.mark.parametrize("reader", ["recent_command", "fork_marker"])
+def test_transcript_metadata_scan_keeps_unicode_line_separators(
+    claude_transcript_dir: Path, reader: str
+) -> None:
+    transcript = claude_transcript_dir / "session.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "sessionId": "current",
+                "subtype": "local_command",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "content": "<command-name>/fork</command-name>\u2028note\u2029end",
+                "forkedFrom": {"sessionId": "parent"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    if reader == "recent_command":
+        assert claude_native_bridge.transcript_has_recent_local_command(
+            transcript,
+            claude_session_id="current",
+            recorded_at=1767225600.0,
+            command_names=frozenset({"/fork"}),
+        )
+    else:
+        assert claude_native_bridge.transcript_has_forked_from_marker(
+            transcript, claude_session_id="current", source_claude_session_id="parent"
+        )
+
+
+@pytest.mark.parametrize("reader", ["recent_command", "fork_marker"])
+def test_transcript_metadata_scan_stops_at_its_snapshot(
+    claude_transcript_dir: Path, monkeypatch: pytest.MonkeyPatch, reader: str
+) -> None:
+    transcript = claude_transcript_dir / "session.jsonl"
+    transcript.write_text("{}\n", encoding="utf-8")
+    original_fstat = os.fstat
+
+    def snapshot_then_append(descriptor: int) -> os.stat_result:
+        snapshot = original_fstat(descriptor)
+        with transcript.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "sessionId": "current",
+                        "subtype": "local_command",
+                        "timestamp": "2026-01-01T00:00:00Z",
+                        "content": "<command-name>/fork</command-name>",
+                        "forkedFrom": {"sessionId": "parent"},
+                    }
+                )
+                + "\n"
+            )
+        return snapshot
+
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "os",
+        SimpleNamespace(path=os.path, sep=os.sep, fstat=snapshot_then_append),
+    )
+    if reader == "recent_command":
+        assert not claude_native_bridge.transcript_has_recent_local_command(
+            transcript,
+            claude_session_id="current",
+            recorded_at=1767225600.0,
+            command_names=frozenset({"/fork"}),
+        )
+    else:
+        assert not claude_native_bridge.transcript_has_forked_from_marker(
+            transcript, claude_session_id="current", source_claude_session_id="parent"
+        )
+
+    monkeypatch.setattr(claude_native_bridge, "os", os)
+    if reader == "recent_command":
+        assert claude_native_bridge.transcript_has_recent_local_command(
+            transcript,
+            claude_session_id="current",
+            recorded_at=1767225600.0,
+            command_names=frozenset({"/fork"}),
+        )
+    else:
+        assert claude_native_bridge.transcript_has_forked_from_marker(
+            transcript, claude_session_id="current", source_claude_session_id="parent"
+        )
+
+
+@pytest.mark.parametrize(
+    ("record", "recent_command", "fork_marker"),
+    [
+        ({"sessionId": "other"}, False, False),
+        ({"subtype": "progress"}, False, True),
+        ({"timestamp": "2025-01-01T00:00:00Z"}, False, True),
+        ({"content": "<command-name>/help</command-name>"}, False, True),
+        ({"forkedFrom": {"sessionId": "other"}}, True, False),
+        ({"forkedFrom": {"sessionId": "current"}}, True, False),
+    ],
+)
+def test_transcript_metadata_scan_preserves_identity_and_command_filters(
+    claude_transcript_dir: Path, record: dict[str, Any], recent_command: bool, fork_marker: bool
+) -> None:
+    transcript = claude_transcript_dir / "session.jsonl"
+    marker = {
+        "sessionId": "current",
+        "subtype": "local_command",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "content": "<command-name>/fork</command-name>",
+        "forkedFrom": {"sessionId": "parent"},
+        **record,
+    }
+    transcript.write_text("null\n[1]\n{broken\n" + json.dumps(marker) + "\n", encoding="utf-8")
+
+    assert (
+        claude_native_bridge.transcript_has_recent_local_command(
+            transcript,
+            claude_session_id="current",
+            recorded_at=1767225600.0,
+            command_names=frozenset({"/fork"}),
+        )
+        is recent_command
+    )
+    assert (
+        claude_native_bridge.transcript_has_forked_from_marker(
+            transcript, claude_session_id="current", source_claude_session_id="parent"
+        )
+        is fork_marker
+    )
+
+
+@pytest.mark.parametrize("reader", ["recent_command", "fork_marker"])
+@pytest.mark.parametrize("path_kind", ["absolute", "parent", "sibling", "file_link", "dir_link"])
+def test_transcript_metadata_scan_rejects_paths_outside_claude_projects(
+    claude_transcript_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reader: str,
+    path_kind: str,
+) -> None:
+    outside = claude_transcript_dir.parent / "projects-other" / "session.jsonl"
+    outside.parent.mkdir()
+    outside.write_text(
+        json.dumps(
+            {
+                "sessionId": "current",
+                "subtype": "local_command",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "content": "<command-name>/fork</command-name>",
+                "forkedFrom": {"sessionId": "parent"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    if path_kind == "parent":
+        transcript = claude_transcript_dir / ".." / "projects-other" / outside.name
+    elif path_kind == "sibling":
+        transcript = outside
+    elif path_kind == "file_link":
+        transcript = claude_transcript_dir / "session.jsonl"
+        transcript.symlink_to(outside)
+    elif path_kind == "dir_link":
+        link = claude_transcript_dir / "linked-project"
+        link.symlink_to(outside.parent, target_is_directory=True)
+        transcript = link / outside.name
+    else:
+        transcript = tmp_path / "outside.jsonl"
+        outside.rename(transcript)
+        outside = transcript
+
+    original_open = Path.open
+    original_realpath = os.path.realpath
+
+    def refuse_outside_resolution(path: Any) -> str:
+        assert os.path.abspath(path) != str(outside), "an untrusted path reached the filesystem"
+        return original_realpath(path)
+
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "os",
+        SimpleNamespace(
+            path=SimpleNamespace(
+                abspath=os.path.abspath,
+                normcase=os.path.normcase,
+                realpath=refuse_outside_resolution,
+            ),
+            sep=os.sep,
+            fstat=os.fstat,
+        ),
+    )
+
+    def refuse_outside_read(path: Path, *args: Any, **kwargs: Any) -> Any:
+        assert path.resolve() != outside.resolve(), "an untrusted transcript was opened"
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", refuse_outside_read)
+    if reader == "recent_command":
+        assert not claude_native_bridge.transcript_has_recent_local_command(
+            transcript,
+            claude_session_id="current",
+            recorded_at=1767225600.0,
+            command_names=frozenset({"/fork"}),
+        )
+    else:
+        assert not claude_native_bridge.transcript_has_forked_from_marker(
+            transcript, claude_session_id="current", source_claude_session_id="parent"
+        )
+
+
+@pytest.mark.parametrize("reader", ["recent_command", "fork_marker"])
+@pytest.mark.parametrize("config_kind", ["default", "relative", "symlink"])
+def test_transcript_metadata_scan_uses_claude_config_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reader: str, config_kind: str
+) -> None:
+    if config_kind == "default":
+        monkeypatch.setenv("HOME", str(tmp_path))
+        config_dir = tmp_path / ".claude"
+    elif config_kind == "relative":
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "custom-config")
+        config_dir = tmp_path / "custom-config"
+    else:
+        config_dir = tmp_path / "actual-config"
+        config_dir.mkdir()
+        alias = tmp_path / "config-alias"
+        alias.symlink_to(config_dir, target_is_directory=True)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(alias))
+    transcript = config_dir / "projects" / "project" / "session.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        json.dumps(
+            {
+                "sessionId": "current",
+                "subtype": "local_command",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "content": "<command-name>/fork</command-name>",
+                "forkedFrom": {"sessionId": "parent"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    if reader == "recent_command":
+        assert claude_native_bridge.transcript_has_recent_local_command(
+            transcript,
+            claude_session_id="current",
+            recorded_at=1767225600.0,
+            command_names=frozenset({"/fork"}),
+        )
+    else:
+        assert claude_native_bridge.transcript_has_forked_from_marker(
+            transcript, claude_session_id="current", source_claude_session_id="parent"
+        )
 
 
 def _composer_pane(draft: str = "") -> str:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 
@@ -22,3 +24,13 @@ def _ignore_ambient_claude_config_dir(monkeypatch: pytest.MonkeyPatch) -> None:
     :returns: None.
     """
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+
+@pytest.fixture
+def claude_transcript_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Provide transcripts under the configured Claude project directory."""
+    config_dir = tmp_path / "claude-config"
+    projects = config_dir / "projects"
+    projects.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    return projects
