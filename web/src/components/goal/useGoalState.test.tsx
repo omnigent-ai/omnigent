@@ -47,8 +47,12 @@ describe("useGoalState", () => {
     mockGetGoal
       .mockResolvedValueOnce({ goal: null })
       .mockResolvedValueOnce({ goal: GOAL })
-      .mockResolvedValueOnce({ goal: { ...GOAL, status: "paused" } });
-    const { result } = renderHook(() => useGoalState("conv", true));
+      .mockResolvedValueOnce({ goal: { ...GOAL, status: "paused" } })
+      .mockResolvedValue({ goal: GOAL });
+    const { result, rerender } = renderHook(
+      ({ pollingEnabled }) => useGoalState("conv", true, pollingEnabled),
+      { initialProps: { pollingEnabled: true } },
+    );
     await act(async () => {});
     expect(result.current.goal).toBeNull();
 
@@ -56,6 +60,30 @@ describe("useGoalState", () => {
     expect(result.current.goal).toEqual(GOAL);
     await act(() => vi.advanceTimersByTimeAsync(5_000));
     expect(result.current.goal?.status).toBe("paused");
+
+    rerender({ pollingEnabled: false });
+    expect(result.current.goal).toBeNull();
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+      document.dispatchEvent(new Event("visibilitychange"));
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(mockGetGoal).toHaveBeenCalledTimes(3);
+
+    await act(() => result.current.refreshGoal());
+    expect(mockGetGoal).toHaveBeenCalledTimes(4);
+    expect(result.current.goal).toEqual(GOAL);
+    act(() => result.current.setGoal({ ...GOAL, status: "paused" }));
+    expect(result.current.goal?.status).toBe("paused");
+    act(() => result.current.setGoal(null));
+    expect(result.current.goal).toBeNull();
+
+    rerender({ pollingEnabled: true });
+    await act(async () => {});
+    expect(result.current.goal).toEqual(GOAL);
+    expect(mockGetGoal).toHaveBeenCalledTimes(5);
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(mockGetGoal).toHaveBeenCalledTimes(6);
   });
 
   it.each(["initial read", "dialog refresh"])(
@@ -477,38 +505,56 @@ describe("useGoalState", () => {
     expect(mockGetGoal).toHaveBeenCalledWith("conv");
   });
 
-  it("does not resurrect an old goal when the reconnect read fails", async () => {
-    mockGetGoal.mockResolvedValueOnce({ goal: GOAL }).mockRejectedValueOnce(new Error("offline"));
-    const { result, rerender } = renderHook(({ reachable }) => useGoalState("conv", reachable), {
-      initialProps: { reachable: true },
-    });
-    await waitFor(() => expect(result.current.goal).toEqual(GOAL));
+  it.each(["capability", "runner"])(
+    "does not resurrect an old goal when the %s reconnect read fails",
+    async (boundary) => {
+      mockGetGoal.mockResolvedValueOnce({ goal: GOAL }).mockRejectedValueOnce(new Error("offline"));
+      const { result, rerender } = renderHook(
+        ({ connected }) =>
+          useGoalState(
+            "conv",
+            boundary === "capability" ? connected : true,
+            boundary === "runner" ? connected : true,
+          ),
+        { initialProps: { connected: true } },
+      );
+      await waitFor(() => expect(result.current.goal).toEqual(GOAL));
 
-    rerender({ reachable: false });
-    rerender({ reachable: true });
-    await waitFor(() => expect(mockGetGoal).toHaveBeenCalledTimes(2));
+      rerender({ connected: false });
+      rerender({ connected: true });
+      await waitFor(() => expect(mockGetGoal).toHaveBeenCalledTimes(2));
 
-    expect(result.current.goal).toBeNull();
-  });
+      expect(result.current.goal).toBeNull();
+    },
+  );
 
-  it.each(["success", "failure"])(
-    "ignores a pending dialog read's %s after the same session reconnects",
-    async (outcome) => {
+  it.each(
+    ["capability", "runner"].flatMap((boundary) =>
+      ["success", "failure"].map((outcome) => ({ boundary, outcome })),
+    ),
+  )(
+    "ignores a pending dialog read's $outcome and old setter after the $boundary reconnects",
+    async ({ boundary, outcome }) => {
       const oldRead = deferredGoalRead();
       mockGetGoal
         .mockResolvedValueOnce({ goal: GOAL })
         .mockReturnValueOnce(oldRead.promise)
         .mockResolvedValueOnce({ goal: null });
-      const { result, rerender } = renderHook(({ enabled }) => useGoalState("conv", enabled), {
-        initialProps: { enabled: true },
-      });
+      const { result, rerender } = renderHook(
+        ({ connected }) =>
+          useGoalState(
+            "conv",
+            boundary === "capability" ? connected : true,
+            boundary === "runner" ? connected : true,
+          ),
+        { initialProps: { connected: true } },
+      );
       await act(async () => {});
       const oldSetter = result.current.setGoal;
       const oldRefresh = result.current.refreshGoal();
 
-      rerender({ enabled: false });
-      expect(result.current.goal).toBeNull();
-      rerender({ enabled: true });
+      rerender({ connected: false });
+      rerender({ connected: true });
       await act(async () => {});
       expect(mockGetGoal).toHaveBeenCalledTimes(3);
 

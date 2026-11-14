@@ -49,7 +49,7 @@ interface GoalSummaryProps {
  * Render the current goal state inside the dialog.
  *
  * @param props - Current loading and goal state.
- * @param props.loading - ``true`` while the goal GET request is in flight.
+ * @param props.loading - ``true`` until the opening read settles or current state arrives.
  * @param props.goal - Current goal, or ``null`` when no goal is set.
  * @returns Current-goal summary element.
  */
@@ -418,6 +418,7 @@ function useGoalDialogState({
 
   useEffect(() => {
     setReadError(null);
+    setLoading(false);
   }, [goalRevision]);
 
   useEffect(() => {

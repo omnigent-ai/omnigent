@@ -323,17 +323,28 @@ describe("GoalDialog", () => {
     expect(mockSetGoal).not.toHaveBeenCalled();
   });
 
-  it.each([ACTIVE_GOAL, null])(
-    "keeps the newer poll when opening-read responses finish in the same batch (%j)",
-    async (nextGoal) => {
+  it.each(
+    goalReadResults.flatMap((read) =>
+      ["same batch", "poll first"].map((ordering) => ({ ...read, ordering })),
+    ),
+  )(
+    "keeps the newer $result while the opening read settles ($ordering)",
+    async ({ goal: nextGoal, ordering }) => {
       const openingRead = deferred<{ goal: Goal | null }>();
       const pollRead = deferred<{ goal: Goal | null }>();
       mockGetGoal.mockReturnValueOnce(openingRead.promise).mockReturnValueOnce(pollRead.promise);
       render(<ManagedDialog />);
       expect(mockGetGoal).toHaveBeenCalledTimes(2);
 
+      if (ordering === "poll first") {
+        await act(async () => pollRead.resolve({ goal: nextGoal }));
+        expect(screen.queryByText("Loading goal")).not.toBeInTheDocument();
+        expect(screen.getByTestId("goal-objective")).toBeEnabled();
+        expect(screen.getByTestId("goal-save")).toBeEnabled();
+        expect(screen.getByTestId("goal-objective")).toHaveValue(nextGoal?.objective ?? "");
+      }
       await act(async () => {
-        pollRead.resolve({ goal: nextGoal });
+        if (ordering === "same batch") pollRead.resolve({ goal: nextGoal });
         openingRead.resolve({
           goal: {
             ...ACTIVE_GOAL,

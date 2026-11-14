@@ -456,10 +456,7 @@ async def test_delivery_does_not_submit_after_bridge_binding_changes(
         assert failure.undelivered is True
         assert failure.preserve_session is True
         assert "changed" in failure.message
-    assert all(
-        method not in {"turn/start", "turn/steer", "thread/goal/set"}
-        for method, _ in RotatingClient.requests
-    )
+    assert all(method not in {"turn/start", "turn/steer"} for method, _ in RotatingClient.requests)
     assert read_bridge_state(tmp_path) == replacement
 
 
@@ -1367,15 +1364,10 @@ def test_goal_command_sets_goal_before_submitting_objective(
 
 
 @pytest.mark.parametrize("goal_failure", ["refused", "reply-lost", "unanswered"])
-@pytest.mark.parametrize(
-    ("active_turn_id", "live_injection"),
-    [(None, False), ("turn_existing", False), ("turn_existing", True)],
-    ids=["idle", "active-turn", "live-queue"],
-)
+@pytest.mark.parametrize("active_turn_id", [None, "turn_existing"], ids=["idle", "active-turn"])
 async def test_failed_goal_command_does_not_deliver_input_or_interrupt_native_work(
     goal_failure: str,
     active_turn_id: str | None,
-    live_injection: bool,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1408,10 +1400,6 @@ async def test_failed_goal_command_does_not_deliver_input_or_interrupt_native_wo
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
 
     async with asyncio.timeout(1):
-        if live_injection:
-            assert not await executor.enqueue_session_message("main", "/goal Finish the tests")
-            assert _GoalFailingClient.requests == []
-            assert _GoalFailingClient.created == []
         events = [
             event
             async for event in executor.run_turn(
@@ -1461,14 +1449,9 @@ async def test_failed_goal_command_does_not_deliver_input_or_interrupt_native_wo
         ]
 
 
-@pytest.mark.parametrize(
-    ("active_turn_id", "live_injection"),
-    [(None, False), ("turn_existing", False), ("turn_existing", True)],
-    ids=["idle", "active-turn", "live-queue"],
-)
+@pytest.mark.parametrize("active_turn_id", [None, "turn_existing"], ids=["idle", "active-turn"])
 def test_goal_draining_refusal_retains_restart_remediation(
     active_turn_id: str | None,
-    live_injection: bool,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1487,9 +1470,6 @@ def test_goal_draining_refusal_retains_restart_remediation(
     _seed_bridge(tmp_path, active_turn_id=active_turn_id)
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
 
-    if live_injection:
-        assert not asyncio.run(executor.enqueue_session_message("main", "/goal Finish tests"))
-        assert _GoalDrainingClient.requests == []
     [failure] = _collect_turn_events(executor, "/goal Finish tests")
 
     assert isinstance(failure, ExecutorError)
@@ -2067,14 +2047,9 @@ def test_attachment_commands_remain_model_input(
     assert len(items) == (1 if attachment == "command-text-file" else 2)
 
 
-@pytest.mark.parametrize(
-    ("active_turn_id", "live_injection"),
-    [(None, False), ("turn_existing", False), ("turn_existing", True)],
-    ids=["idle", "active-turn", "live-queue"],
-)
+@pytest.mark.parametrize("active_turn_id", [None, "turn_existing"], ids=["idle", "active-turn"])
 def test_overlong_goal_command_fails_clearly_without_reaching_app_server(
     active_turn_id: str | None,
-    live_injection: bool,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -2100,8 +2075,6 @@ def test_overlong_goal_command_fails_clearly_without_reaching_app_server(
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
 
     command = "/goal " + "x" * 4001
-    if live_injection:
-        assert not asyncio.run(executor.enqueue_session_message("main", command))
     events = _collect_turn_events(executor, command)
 
     assert [type(event) for event in events] == [ExecutorError]

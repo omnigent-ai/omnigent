@@ -164,6 +164,13 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   Pending reads and updates from an earlier dialog or session cannot replace
   the current goal fields. Failed background reads keep the last goal and slow
   retries; returning to the tab retries immediately.
+  Automatic refresh runs while the runner is online and Chat is visible;
+  these requests count as runner activity. Explicit dialog reads and accepted
+  updates remain available while runner status is offline or unknown. A new
+  runner connection invalidates earlier callbacks and snapshots; a failed
+  reconnect read does not restore the previous connection's goal. Reconnect
+  preserves edited fields in the same open dialog. A fresh accepted snapshot
+  releases opening-read loading even if the original read is still pending.
 - `slash-rewind`: in claude-sdk and Claude Code native sessions, `/rewind` opens
   a searchable list of the session's prompts, newest first. Choosing one
   continues the conversation in a new session holding only the history before

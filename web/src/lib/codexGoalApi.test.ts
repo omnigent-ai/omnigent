@@ -36,7 +36,7 @@ describe("codex goal API", () => {
     mockAuthenticatedFetch.mockReset();
   });
 
-  it("reads and converts a populated goal response from an older server", async () => {
+  it("reads and converts a populated goal response", async () => {
     mockAuthenticatedFetch.mockResolvedValueOnce(mockJsonResponse({ goal: WIRE_GOAL }));
 
     await expect(getCodexGoal("conv a/b")).resolves.toEqual({

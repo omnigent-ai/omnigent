@@ -1140,13 +1140,15 @@ describe("Composer Codex goal control", () => {
 describe("Composer native goal state", () => {
   afterEach(() => {
     cleanup();
+    vi.mocked(getGoal).mockReset();
     vi.restoreAllMocks();
   });
 
-  it("loads the goal when a detached runner reconnects", async () => {
-    const mockGetGoal = vi.mocked(getGoal);
-    mockGetGoal.mockResolvedValueOnce({
-      goal: {
+  it.each([false, undefined])(
+    "keeps Goal usable with runnerOnline=%s and reconnects",
+    async (runnerOnline) => {
+      const mockGetGoal = vi.mocked(getGoal);
+      const goal: GoalApiModule.Goal = {
         objective: "Finish the implementation",
         status: "active",
         tokenBudget: null,
@@ -1154,23 +1156,68 @@ describe("Composer native goal state", () => {
         timeUsedSeconds: 0,
         createdAt: null,
         updatedAt: null,
-      },
-    });
-    useChatStore.setState({ conversationId: "conv_goal" });
+      };
+      mockGetGoal.mockResolvedValue({ goal });
+      const updatedGoal = { ...goal, objective: "Finish the implementation and tests" };
+      const mockSetGoal = vi
+        .spyOn(await import("@/lib/goalApi"), "setGoal")
+        .mockResolvedValueOnce({ goal: updatedGoal });
+      useChatStore.setState({ conversationId: "conv_goal" });
 
-    const { rerender } = renderWithTooltips(
-      <Composer {...composerProps({ showGoalControl: true, runnerOnline: false })} />,
-    );
-    expect(mockGetGoal).not.toHaveBeenCalled();
+      const { rerender } = renderWithTooltips(
+        <Composer {...composerProps({ showGoalControl: true, runnerOnline })} />,
+      );
+      expect(mockGetGoal).not.toHaveBeenCalled();
 
-    rerender(
-      <TooltipProvider>
-        <Composer {...composerProps({ showGoalControl: true, runnerOnline: true })} />
-      </TooltipProvider>,
-    );
+      fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
+      fireEvent.click(screen.getByTestId("composer-goal-action"));
+      await waitFor(() =>
+        expect(screen.getByTestId("goal-current")).toHaveTextContent(goal.objective),
+      );
+      expect(mockGetGoal).toHaveBeenCalledTimes(1);
+      expect(mockGetGoal).toHaveBeenCalledWith("conv_goal");
+      expect(screen.queryByText(/Could not read goal/)).toBeNull();
 
-    await waitFor(() => expect(mockGetGoal).toHaveBeenCalledWith("conv_goal"));
-  });
+      rerender(
+        <TooltipProvider>
+          <Composer
+            {...composerProps({
+              showGoalControl: true,
+              runnerOnline: runnerOnline === false ? undefined : false,
+            })}
+          />
+        </TooltipProvider>,
+      );
+      expect(mockGetGoal).toHaveBeenCalledTimes(1);
+      expect(screen.getByTestId("goal-current")).toHaveTextContent(goal.objective);
+
+      fireEvent.change(screen.getByTestId("goal-objective"), {
+        target: { value: updatedGoal.objective },
+      });
+      fireEvent.click(screen.getByTestId("goal-save"));
+      await waitFor(() =>
+        expect(screen.getByTestId("goal-current")).toHaveTextContent(updatedGoal.objective),
+      );
+      expect(mockSetGoal).toHaveBeenCalledWith("conv_goal", {
+        objective: updatedGoal.objective,
+        tokenBudget: null,
+        status: "active",
+      });
+      expect(screen.getByTestId("composer-goal-mode")).toHaveAccessibleName(
+        `Goal active: ${updatedGoal.objective}`,
+      );
+
+      mockGetGoal.mockResolvedValue({ goal: updatedGoal });
+      rerender(
+        <TooltipProvider>
+          <Composer {...composerProps({ showGoalControl: true, runnerOnline: true })} />
+        </TooltipProvider>,
+      );
+
+      await waitFor(() => expect(mockGetGoal).toHaveBeenCalledTimes(3));
+      expect(screen.getByTestId("goal-current")).toHaveTextContent(updatedGoal.objective);
+    },
+  );
 });
 
 describe("Composer slash-command menu", () => {

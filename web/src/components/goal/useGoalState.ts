@@ -13,10 +13,15 @@ interface UseGoalStateResult {
 
 interface GoalBinding {
   conversationId: string;
+  pollingEnabled: boolean;
 }
 
 /** Keep Chat's goal indicator current when commands or the native terminal change it. */
-export function useGoalState(conversationId: string | null, enabled: boolean): UseGoalStateResult {
+export function useGoalState(
+  conversationId: string | null,
+  enabled: boolean,
+  pollingEnabled = true,
+): UseGoalStateResult {
   const [snapshot, setSnapshot] = useState<{
     binding: GoalBinding;
     goal: Goal | null;
@@ -25,9 +30,10 @@ export function useGoalState(conversationId: string | null, enabled: boolean): U
   const updateVersion = useRef(0);
   const lastSuccessfulVersion = useRef(0);
   const activeBinding = useRef<GoalBinding | null>(null);
+  // Runner liveness changes invalidate reads and callbacks from the previous connection.
   const binding = useMemo(
-    () => (enabled && conversationId ? { conversationId } : null),
-    [conversationId, enabled],
+    () => (enabled && conversationId ? { conversationId, pollingEnabled } : null),
+    [conversationId, enabled, pollingEnabled],
   );
   useLayoutEffect(() => {
     activeBinding.current = binding;
@@ -80,6 +86,7 @@ export function useGoalState(conversationId: string | null, enabled: boolean): U
       setSnapshot(null);
       return;
     }
+    if (!pollingEnabled) return;
     const schedule = () => {
       if (!cancelled) timer = window.setTimeout(() => void refresh(), pollDelay);
     };
@@ -112,7 +119,7 @@ export function useGoalState(conversationId: string | null, enabled: boolean): U
       window.removeEventListener("focus", onFocus);
       document.removeEventListener("visibilitychange", onFocus);
     };
-  }, [conversationId, enabled, refreshGoal]);
+  }, [conversationId, enabled, pollingEnabled, refreshGoal]);
 
   const currentSnapshot = binding !== null && snapshot?.binding === binding ? snapshot : null;
   return {
