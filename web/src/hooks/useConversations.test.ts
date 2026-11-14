@@ -4355,9 +4355,15 @@ it("shows owned pins on a first load before the shared pins arrive", async () =>
     labels: { [PINNED_LABEL_KEY]: "1" },
   });
   let releaseShared: (response: Response) => void = () => {};
-  fetchMock
-    .mockResolvedValueOnce(mockResponse({ data: [row("mine")] }))
-    .mockReturnValueOnce(new Promise<Response>((resolve) => (releaseShared = resolve)));
+  const sharedResponse = new Promise<Response>((resolve) => {
+    releaseShared = resolve;
+  });
+  fetchMock.mockImplementation((url: string) => {
+    const visibility = new URL(String(url), "http://localhost").searchParams.get("visibility");
+    if (visibility === "mine") return Promise.resolve(mockResponse({ data: [row("mine")] }));
+    if (visibility === "shared") return sharedResponse;
+    return Promise.resolve(mockResponse({}));
+  });
   const queryClient = new QueryClient();
   const wrapper = ({ children }: { children: ReactNode }) =>
     createElement(QueryClientProvider, { client: queryClient }, children);
