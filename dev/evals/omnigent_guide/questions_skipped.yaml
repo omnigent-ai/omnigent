@@ -1,0 +1,136 @@
+# Drawn questions replaced by the next draw from their cluster, and why.
+# Reasons: bug-only (the only answer is a code fix or which release fixed it),
+# private, outside, duplicate. See README.md.
+skipped:
+- origin: issue#9412
+  cluster_id: 2
+  question: The Omnigent desktop app (0.17.0 `.deb`) crashes on launch or when I maximize the window on
+    Ubuntu Wayland with `GPU process isn't usable. Goodbye.`; how do I get it to start reliably?
+  reason: bug-only
+  note: Open Linux desktop crash on Wayland. The --no-sandbox and chrome-sandbox workaround is only in
+    the issue, not in Omnigent code or docs.
+- origin: issue#8304
+  cluster_id: 2
+  question: Why does the Omnigent desktop app crash with `SIGTRAP` when I maximize its window on Linux
+    under Wayland, and how can I work around it?
+  reason: bug-only
+  note: Open Wayland maximize crash with fix PRs still open. The --ozone-platform=x11 workaround is only
+    in the issue, not in Omnigent code or docs.
+- origin: issue#5939
+  cluster_id: 4
+  question: Why does my agent spec's output policy return DENY on the `claude-sdk` harness while the assistant's
+    reply still streams to the user and gets saved to the conversation?
+  reason: bug-only
+  note: 'Output-policy DENY on claude-sdk was a bug fixed in v0.13.0 (commit ae47c337a, PR #6055, DENY
+    enforced at the relay''s persist point); on 0.17+ the answer reduces to which release fixed it.'
+- origin: discussion#1133
+  cluster_id: 5
+  question: When I use my Claude subscription through Omnigent, does it run the real Claude Code CLI with
+    my login, or does it imitate Claude Code in a way that could break Anthropic's terms of service?
+  reason: duplicate
+  note: Same asker and same answer as p205 (Omnigent runs the real Claude Code CLI or Agent SDK with the
+    user's own login); the terms-of-service judgment is Anthropic's.
+- origin: issue#5636
+  cluster_id: 7
+  question: Why are skills that I group in subfolders like `skills/ops/deploy/SKILL.md` missing from the
+    slash-command picker and from `load_skill`, while `skills/flat/SKILL.md` shows up?
+  reason: bug-only
+  note: Namespace folders were ignored before 0.12.0 (#5638). Every tested build scans one namespace level
+    (omnigent/spec/parser.py:2401-2455), so `skills/ops/deploy/SKILL.md` is found and the answer reduces
+    to which release fixed it.
+- origin: issue#7386
+  cluster_id: 8
+  question: Why does my antigravity-native session hang in the Omnigent web UI whenever agy asks for tool
+    approval, with the permission prompt showing only in the attached terminal?
+  reason: bug-only
+  note: 'Fixed in 0.15.0 (#7200, #7578): Omnigent now passes agy''s CSRF token to its local RPC, and approvals
+    surface as web elicitations (omnigent/harnesses/antigravity_native/interactions.py). The answer reduces
+    to the fix release.'
+- origin: issue#8100
+  cluster_id: 8
+  question: Why do headless antigravity-native (agy) sub-agents launched by Omnigent still stop for approval
+    on file writes or out-of-workspace paths even though they run with `--dangerously-skip-permissions`?
+  reason: bug-only
+  note: Open, no maintainer answer. The extra prompts come from agy's own approval settings; Omnigent
+    code and docs say --dangerously-skip-permissions auto-approves everything, and the settings.json workaround
+    is only in the issue.
+- origin: issue#5938
+  cluster_id: 9
+  question: 'My `linux_bwrap` sandbox grants `write_paths: [docs/specs]` so the agent can create that
+    folder, but its first write fails with `[Errno 30] Read-only file system`; why, and how do I fix it?'
+  reason: bug-only
+  note: 'Fixed in 0.13.0 (#5971): linux_bwrap creates missing write_paths roots before spawn (omnigent/inner/bwrap_sandbox.py:513-551),
+    so the asker''s setup works in every tested build.'
+- origin: issue#2967
+  cluster_id: 10
+  question: My Polly (claude-sdk) session fails every turn with "Prompt is too long" and `/compact` refuses
+    to run — how do I recover the session without starting over?
+  reason: bug-only
+  note: Closed after context-overflow fixes landed (maintainer asked to retest on 0.11.0); the missing
+    auto-compaction and the refusing /compact were bugs, so the answer is the release that fixed them.
+- origin: issue#668
+  cluster_id: 10
+  question: Why does `omni claude` time out with `The runner did not create the Claude terminal ... within
+    60s` and `omni codex` fail with `Native Codex terminal failed to start` on my M4 Mac (iTerm2, native
+    Claude Code installer, Homebrew tmux), while `omni debby` works?
+  reason: bug-only
+  note: Closed after the asker upgraded Omnigent (0.2) and Claude Code; no documented setting explains
+    the 60 s terminal timeout on that machine.
+- origin: issue#9900
+  cluster_id: 10
+  question: On my macOS host, why does a claude-code session left idle over a weekend come back with "The
+    harness is not running" even though the runner and its tmux pane are still alive, and how do I stop
+    it happening?
+  reason: bug-only
+  note: Open, no maintainer answer; the only workaround is the asker's own TMPDIR override in the host
+    service, which no doc covers.
+- origin: issue#5563
+  cluster_id: 10
+  question: On my Mac, with the host installed through `omni host enable`, Claude sessions fail to start
+    or resume under load with "harness 'claude-native' for conversation '…' did not bind its endpoint
+    within 30s"; how do I fix this?
+  reason: bug-only
+  note: 'Fixed: the launchd plist no longer sets ProcessType=Background (omnigent/host/service.py:101);
+    the answer is the release with the fix.'
+- origin: issue#2331
+  cluster_id: 10
+  question: Why do my claude-native sessions ignore `ANTHROPIC_BASE_URL` and `ANTHROPIC_MODEL` and send
+    my LiteLLM gateway key to the real Anthropic API instead of the gateway?
+  reason: bug-only
+  note: 'Fixed by #2371 (ambient ANTHROPIC_API_KEY now honors ANTHROPIC_BASE_URL and ANTHROPIC_MODEL);
+    the answer is the release that fixed it.'
+- origin: issue#1023
+  cluster_id: 10
+  question: 'Why does the claude-sdk harness fail with `Claude SDK connect failed: Failed to start Claude
+    Code: [Errno 8] Exec format error` on my Apple Silicon Mac when `claude --version` works and Node
+    is arm64?'
+  reason: private
+  note: Maintainer traced the Exec format error to a broken Claude Code install on the asker's machine.
+- origin: session history
+  cluster_id: 11
+  question: In the Omnigent web app, why do sub-agent results appear in the chat as if I had sent them?
+  reason: bug-only
+  note: Known display bug (sub-agent results shown as user messages) fixed in a later release.
+- origin: issue#4382
+  cluster_id: 12
+  question: Why does `omni hermes` fail with `harness 'hermes-native' is not configured on host` even
+    though a current Hermes Agent (v0.20.0) is installed and on my PATH?
+  reason: bug-only
+  note: 'Hermes "not configured on host" despite Hermes v0.20.0 was a version-check bug fixed after 0.8.2
+    (maintainer: update). 0.17+ gate Hermes on semver >= 0.17.0 (omnigent/onboarding/harness_install.py:118-125),
+    so the answer reduces to which release fixed it.'
+- origin: issue#1694
+  cluster_id: 12
+  question: Why does Debby's GPT head on the codex harness fail with 'The <gpt model> model is not supported
+    when using Codex with a ChatGPT account' on my ChatGPT subscription, and how do I make it work?
+  reason: bug-only
+  note: A bare GPT model id sent to a ChatGPT-login Codex was a bug; 0.17+ default Codex-login sessions to
+    CODEX_DEFAULT_MODEL (omnigent/inner/codex_executor.py:4964-4979), so the answer reduces to upgrading.
+- origin: issue#1515
+  cluster_id: 12
+  question: Why does `omni opencode` ignore the custom providers and base URLs (such as an AI gateway)
+    that I configured in `~/.config/opencode/opencode.jsonc`?
+  reason: bug-only
+  note: The per-session XDG_CONFIG_HOME hid opencode.jsonc on 0.3.0; 0.17+ merge the user's provider block,
+    default model and plugins (omnigent/harnesses/opencode_native/provider.py:549), so the answer reduces
+    to which release fixed it.

@@ -1,0 +1,1553 @@
+# Real questions about Omnigent, with answer keys derived from the code.
+#
+# Positives were mined from GitHub issues and discussions and from one user's
+# Omnigent session history (paraphrased and scrubbed), embedded, clustered
+# with k-means, and drawn at random within clusters. A drawn question was
+# replaced by the next draw from its cluster only when it had no answer the
+# code or docs establish (bug-only, private, outside, duplicate); see
+# README.md. Near misses are real questions about other tools.
+#
+# The test split is frozen by questions.lock and scored once per arm.
+
+cases:
+- id: delete-worktree-session-runner-offline
+  split: test
+  origin: github issue#6110
+  cluster: workspaces-and-worktrees
+  should_trigger: true
+  prompt: How do I delete a worktree-backed session in the Omnigent web UI when its runner is offline
+    and the delete keeps failing with a 404?
+  criteria:
+  - id: c1
+    text: Tells the user to delete the session without worktree cleanup by leaving "Delete local branch"
+      unticked in the delete dialog (API `delete_branch=false`), which succeeds while the runner is offline.
+    source: omnigent/server/routes/_sessions/helpers.py:9673 (offline message says to delete the session
+      only with delete_branch=false or wait for the runner to reconnect); web/src/shell/Sidebar.tsx:5406
+  - id: c2
+    text: Explains that removing the worktree and branch needs the session's host to be reachable, so
+      a delete that includes branch cleanup is refused while the runner is offline (the alternative is
+      to wait for the runner to reconnect and retry).
+    source: omnigent/server/routes/sessions/routes_events.py:3185-3203; CHANGELOG.md:1255 (#6190)
+  - id: c3
+    text: Says the leftover worktree and branch can be removed by hand on the host with `git worktree
+      remove` and `git branch -D`.
+    check:
+      any_of:
+      - git worktree (remove|prune)
+    source: omnigent/host/git_worktree.py:615-621 (Omnigent's own cleanup runs git worktree remove --force,
+      then git branch -D)
+- id: default-session-start-folder
+  split: test
+  origin: github issue#9478
+  cluster: workspaces-and-worktrees
+  should_trigger: true
+  prompt: Is there a host or server setting that makes every new Omnigent session start in a fixed folder
+    such as `/workspaces`, without each user creating a project or typing the path?
+  criteria:
+  - id: c1
+    text: States that no host or server setting sets a default starting folder for new sessions; this
+      is not supported.
+    source: omnigent/server/routes/_session_create_validation.py:326 (workspace required when host_id
+      is set); web/src/shell/NewChatDialog.tsx:2914
+  - id: c2
+    text: Says the new-session dialog pre-fills the most recently used folder on the chosen host, or the
+      host's home directory when there is none.
+    source: web/src/shell/NewChatDialog.tsx:2964-2985 (seed logic) and :2914 (recent[0] ?? derivedHome)
+  - id: c3
+    text: Names a project's default working directory (set in the project's settings) as the closest option,
+      and notes that projects are private to their owner, so each user has to set one up.
+    source: web/src/lib/projectsApi.ts:21-27 (ProjectConfig.workspace); omnigent/server/routes/projects.py:3-12
+      (projects are owner-private)
+- id: upload-file-into-workspace
+  split: dev
+  origin: github issue#9859
+  cluster: workspaces-and-worktrees
+  should_trigger: true
+  prompt: How do I upload a file from my machine, such as an image, archive, or dataset, into the workspace
+    of an Omnigent session that runs on a remote host or a managed sandbox?
+  criteria:
+  - id: c1
+    text: States that Omnigent has no feature for uploading a file from the user's machine straight into
+      a session's workspace; this is not supported.
+    source: CHANGELOG.md:745 (#6339, attachments add nothing to the working checkout); omnigent/server/routes/sessions/routes_resources.py:2779-2800
+      (workspace file writes take a JSON text body)
+  - id: c2
+    text: Explains that attaching the file to a chat message does not put it in the workspace; native
+      coding agents such as Claude Code and Codex get a local copy outside the working directory, under
+      `~/.omnigent/attachments/` on the machine that runs the agent.
+    source: omnigent/inner/native_attachments.py:151-165 (attachment_cache_dir, materialize_attachment)
+- id: local-sandboxed-omnigent
+  split: test
+  origin: session history
+  cluster: servers-and-hosts
+  should_trigger: true
+  prompt: Can I run a sandboxed Omnigent on my own machine, for example in a Podman pod, when I run the
+    server locally instead of using a hosted version, and would that help?
+  criteria:
+  - id: c1
+    text: Says agents can be sandboxed on the user's own machine with a local server and no container,
+      using Omnigent's OS-level sandbox (OmniBox, set with `os_env.sandbox` in the agent config), which
+      uses bubblewrap on Linux and Seatbelt on macOS to limit file and network access.
+    check:
+      any_of:
+      - omnibox
+      - os_env
+      - bwrap
+      - bubblewrap
+      - seatbelt
+    source: docs/AGENT_YAML_SPEC.md:317 (Local OS access) and :462-476 (platform default sandbox); omnigent.ai/docs/omnibox
+  - id: c2
+    text: Names a documented way to run whole hosts isolated on the same machine as a local server, such
+      as the microsandbox or BoxLite (local mode) micro-VM providers, or OpenShell with a local Docker
+      or Podman compute driver, configured in the server's `sandbox:` section.
+    check:
+      any_of:
+      - microsandbox
+      - boxlite
+      - openshell
+    source: deploy/microsandbox/README.md:6-7; deploy/boxlite/README.md:17; omnigent/onboarding/sandboxes/openshell.py:11-14
+  - id: c3
+    text: Explains that the cloud sandbox host changes where the runner runs (remote compute that keeps
+      working after the laptop closes), while isolation comes from the sandbox, so running the server
+      locally does not give up sandboxing.
+    source: omnigent.ai/docs/omnibox (Related section, the Cloud Sandbox Host controls where the runner
+      executes); deploy/README.md:270-272
+- id: egress-proxy-corporate-upstream
+  split: test
+  origin: github issue#8913
+  cluster: servers-and-hosts
+  should_trigger: true
+  prompt: Does the Omnigent sandbox egress proxy honor `HTTP_PROXY`/`HTTPS_PROXY`, so that a sandboxed
+    agent with `os_env.sandbox.egress_rules` can reach allowed hosts on a network where all traffic must
+    go through a corporate proxy?
+  criteria:
+  - id: c1
+    text: 'States that sending the egress proxy''s traffic through an upstream corporate proxy is not
+      supported: the proxy connects to allowed destinations directly, ignores `HTTP_PROXY`/`HTTPS_PROXY`
+      for its own connections, and has no upstream-proxy setting.'
+    source: omnigent/inner/egress/proxy.py:217-226 (constructor options) and :834-841 (asyncio.open_connection
+      straight to the destination)
+  - id: c2
+    text: Explains that with `egress_rules` set, the sandbox's `HTTP_PROXY`/`HTTPS_PROXY` point at Omnigent's
+      local egress proxy, so the sandboxed agent cannot route through the corporate proxy either.
+    source: omnigent/inner/egress/controller.py:259-266 (apply_egress_env); omnigent/inner/os_env.py:813-822
+- id: host-tunnel-handshake-timeout-macos
+  split: dev
+  origin: github issue#1514
+  cluster: servers-and-hosts
+  should_trigger: true
+  prompt: 'Why does `omnigent host` on macOS never connect, looping on `Host tunnel disconnected: timed
+    out during opening handshake`, so that no host ever comes online?'
+  criteria:
+  - id: c1
+    text: Attributes the loop to websockets 15 or later in the Python environment Omnigent runs from;
+      that client hangs on macOS before it sends the opening handshake, which is why Omnigent pins `websockets<15`.
+    check:
+      any_of:
+      - websockets[^\n]{0,80}15
+      - 15[^\n]{0,40}websockets
+    source: pyproject.toml:44-46
+  - id: c2
+    text: Tells the user to check the installed websockets version and bring it below 15, for example
+      by reinstalling or upgrading Omnigent so its `websockets>=10.4,<15` requirement applies, or by installing
+      `websockets<15` into that environment.
+    source: pyproject.toml:46
+- id: upgrade-restart-host-service
+  split: test
+  origin: github issue#8868
+  cluster: servers-and-hosts
+  should_trigger: true
+  prompt: When I run `omnigent upgrade`, does the host service I installed with `omnigent host enable`
+    start running the new version too?
+  criteria:
+  - id: c1
+    text: States that `omnigent upgrade` does not restart the host service onto the new version; it only
+      drains and stops the local background server and the local host daemon, so the service keeps running
+      the old code until it is restarted.
+    source: omnigent/cli.py:5768-5770 (upgrade docstring), :5438-5452 (_drain_and_stop_local_server),
+      :4788-4813 (_stop_local_server_and_daemon)
+  - id: c2
+    text: Tells the user to restart the service after upgrading, for example `omnigent host disable` then
+      `omnigent host enable`, or a direct restart with `launchctl kickstart -k gui/$(id -u)/ai.omnigent.host`
+      on macOS or `systemctl --user restart omnigent-host.service` on Linux.
+    source: omnigent/host/service.py:20-21 (service labels) and :218-246 (enable re-bootstraps the launchd
+      job or starts the systemd unit); omnigent/cli.py:10313-10380 (host enable and host disable)
+- id: remove-offline-external-host
+  split: test
+  origin: github issue#2038
+  cluster: servers-and-hosts
+  should_trigger: true
+  prompt: How do I remove a decommissioned external host from my self-hosted Omnigent server so it no
+    longer shows up as offline in the session host picker?
+  criteria:
+  - id: c1
+    text: 'States that deleting or deregistering a host is not supported: there is no web UI action, API
+      route, or CLI command for it, and the host list shows every registered host, online or offline.'
+    source: omnigent/server/routes/hosts.py:673-731 (host routes are GET and POST only; list_hosts returns
+      online and offline hosts); web/src/shell/NewChatDialog.tsx:2678-2680
+  - id: c2
+    text: Says the remaining workaround is to delete that host's row from the server database's `hosts`
+      table by hand, because the host list is read from that table.
+    source: omnigent/db/db_models.py:1328 (hosts table); omnigent/server/routes/hosts.py:700-705
+- id: cli-401-after-token-expiry
+  split: dev
+  origin: github issue#9549
+  cluster: servers-and-hosts
+  should_trigger: true
+  prompt: Why do `omnigent host status`, `omnigent host stop` and other CLI commands fail with `401 Authentication
+    required` about an hour after I run `omnigent login`?
+  criteria:
+  - id: c1
+    text: Explains that the stored login token has expired and these CLI commands do not renew it from
+      the stored refresh grant (only the host/runner process refreshes it), so their requests carry no
+      valid credentials.
+    source: omnigent/chat.py:688-736 (_remote_headers uses load_token, which drops an expired token);
+      omnigent/runner/_entry.py:733 (the only refresh_stored_token caller)
+  - id: c2
+    text: Gives the workaround of running `omnigent login` again to get a fresh token.
+    check:
+      cli:
+      - login
+    source: omnigent/cli_auth.py:373-378 (expiry warning tells the user to run omnigent login)
+- id: pause-is-interrupt
+  split: test
+  origin: github issue#8374
+  cluster: sessions-and-desktop-app
+  should_trigger: true
+  prompt: What does Pause actually do to a running Omnigent session, and can I resume the interrupted
+    work afterwards on the Codex, Claude SDK, Pi, and Antigravity harnesses?
+  criteria:
+  - id: c1
+    text: States that Omnigent has no pause that freezes work; the action is an interrupt that cancels
+      the turn in progress, and running tool calls are recorded as cancelled.
+    source: omnigent/server/routes/sessions/routes_events.py:892-893; omnigent/runner/session_history.py:368
+  - id: c2
+    text: Says the interrupted request is not resumed automatically; Omnigent marks it as abandoned, so
+      the agent continues that work only if the user asks for it again in a new message.
+    source: omnigent/runner/session_history.py:369-375 (interrupted-marker text)
+  - id: c3
+    text: Says that on the Codex, Claude SDK, Pi, and Antigravity harnesses the harness session is closed
+      or rebuilt after the interrupt, and the next message starts a fresh harness session that replays
+      the full conversation history, so earlier context is kept.
+    source: omnigent/inner/codex_executor.py:4803-4829; omnigent/inner/claude_sdk_executor.py:2046-2066;
+      omnigent/inner/pi_executor.py:2081-2096; omnigent/inner/antigravity_executor.py:422-445
+- id: desktop-app-intel-mac
+  split: test
+  origin: github issue#842
+  cluster: sessions-and-desktop-app
+  should_trigger: true
+  prompt: Is there an Omnigent desktop app build for Intel Macs, or does the macOS desktop app only run
+    on Apple Silicon?
+  criteria:
+  - id: c1
+    text: States that the macOS desktop app is built for Intel (x64) as well as Apple Silicon (arm64).
+    source: web/electron/package.json:91-120 (mac dmg and zip targets for x64 and arm64); CHANGELOG.md:1835
+      (#4772)
+  - id: c2
+    text: Points to the separate Intel download, the "Download for Intel" link (`/download/mac-x64`) on
+      the desktop install page, rather than the Apple Silicon download.
+    source: omnigent.ai/docs/interact/desktop (macOS install links); web/electron/RELEASING.md:108
+- id: codex-terminal-scrollback
+  split: dev
+  origin: github issue#6113
+  cluster: sessions-and-desktop-app
+  should_trigger: true
+  prompt: How do I scroll back through earlier formatted output in a native `omnigent codex` terminal
+    session when the mouse wheel and Page Up do nothing?
+  criteria:
+  - id: c1
+    text: Says Page Up in Omnigent's managed terminal enters tmux copy mode scrolled up one page, where
+      earlier output can be read, and that copy mode ends when the view is scrolled back to the bottom.
+    check:
+      any_of:
+      - copy[- ]mode
+    source: omnigent/inner/terminal.py:222-249 (_tmux_scrollback_key_commands binds PPage to copy-mode
+      -eu)
+  - id: c2
+    text: Says the mouse wheel also scrolls back through the terminal history, because Omnigent turns
+      on tmux mouse mode for its managed terminals.
+    source: omnigent/inner/terminal.py:183-216 (mouse on); CHANGELOG.md:1294 (#6354)
+  - id: c3
+    text: Does not tell the user to enter copy mode with the tmux prefix (Ctrl-b then [), which Omnigent
+      disables in its managed terminals.
+    source: omnigent/inner/terminal.py:225-229 and :252-268 (prefix set to None, prefix table unbound)
+- id: databricks-deploy-e2e-test
+  split: test
+  origin: session history
+  cluster: databricks-and-login
+  should_trigger: true
+  prompt: What steps should I follow to test an Omnigent deployment on Databricks end to end?
+  criteria:
+  - id: c1
+    text: 'For a self-managed Databricks Apps deployment, checks the app''s `/health` endpoint: `deploy/databricks/deploy.py`
+      polls it until it returns 200, and it can be checked by hand with `curl` and a bearer token from
+      `databricks auth token`.'
+    check:
+      any_of:
+      - /health
+    source: deploy/databricks/README.md:137-141 (Deploy) and :187-198 (Smoke check)
+  - id: c2
+    text: Signs the CLI in to the deployed server with `omnigent login <server-url>`, which runs the Databricks
+      browser login for a Databricks-fronted server.
+    check:
+      cli:
+      - login
+    source: omnigent/cli.py:13091-13122 (login docstring, Databricks-fronted flow)
+  - id: c3
+    text: Registers a machine with the server using `omnigent host <server-url>` (or `--server`).
+    check:
+      cli:
+      - host
+    source: omnigent/cli.py:9164-9253 (host command; help examples use a databricksapps.com URL)
+  - id: c4
+    text: Starts a real session against the deployed server (in the web UI, or a CLI command with `--server`)
+      and confirms that an agent turn completes.
+    source: omnigent/cli.py:13110-13114 (later `omnigent run --server <url>` uses the stored login); feature-map/login-and-host-auth.md:3-6
+- id: azure-custom-url-login
+  split: test
+  origin: github issue#2781
+  cluster: databricks-and-login
+  should_trigger: true
+  prompt: Why does `omni login` not work with my Azure Databricks workspace's custom URL, and which URL
+    should I use for `omni login` and `omni host`?
+  criteria:
+  - id: c1
+    text: Explains that the custom (vanity) Azure URL redirects an unauthenticated request to its login
+      page instead of answering Omnigent's probe, so login cannot detect that the server is Databricks-fronted.
+    source: omnigent/cli.py:12482-12490 (_canonical_azure_databricks_url docstring)
+  - id: c2
+    text: Recommends the workspace's canonical URL, `https://adb-<workspace-id>.<n>.azuredatabricks.net`
+      (for example with `/omnigent`), or the custom URL with the `?o=<workspace-id>` selector so Omnigent
+      can derive that canonical host.
+    check:
+      any_of:
+      - adb-
+      - \?o=
+    source: omnigent/cli.py:12565-12652 (_resolve_server_url falls back to the canonical adb- host for
+      a vanity URL carrying ?o=); omnigent/cli.py:12520
+  - id: c3
+    text: Says to give `omnigent host` the same server URL (positionally or with `--server`); without
+      one, host uses the default server that `omnigent login` saved.
+    check:
+      cli:
+      - host
+    source: omnigent/cli.py:9248-9253 (host falls back to config `server` and resolves it with _resolve_server_url);
+      omnigent/cli.py:13065 (_remember_default_server)
+- id: copilot-extra-with-databricks
+  split: dev
+  origin: github issue#8646
+  cluster: databricks-and-login
+  should_trigger: true
+  prompt: Why does `omni copilot` fail with `CopilotExecutor requires the 'github-copilot-sdk' package`
+    after I installed `omnigent[databricks]`, and how do I add Copilot support without dropping the Databricks
+    extra?
+  criteria:
+  - id: c1
+    text: Explains that the Copilot harness needs the optional `copilot` extra (the `github-copilot-sdk`
+      package), which neither the default install nor the `databricks` extra includes.
+    source: pyproject.toml:237-241 (copilot extra); omnigent/onboarding/copilot_auth.py:100-106
+  - id: c2
+    text: Recommends one install command that keeps both extras, for example `uv tool install --force
+      "omnigent[databricks,copilot]"` (or the pipx/pip equivalent), or adding the Copilot SDK with `--with`
+      while `omnigent[databricks]` stays the main package.
+    check:
+      any_of:
+      - omnigent\\?\[[^\]]*databricks[^\]]*copilot
+      - omnigent\\?\[[^\]]*copilot[^\]]*databricks
+      - omnigent\\?\[databricks\\?\][\s\S]{0,80}--with[\s\S]{0,20}copilot
+      - --with[\s\S]{0,20}omnigent\\?\[copilot\\?\][\s\S]{0,80}omnigent\\?\[databricks
+      - --with[ =]+\S*github-copilot-sdk[\s\S]{0,80}omnigent\\?\[databricks
+    source: omnigent/onboarding/extra_install.py:62-86 (the error's suggested `uv tool install --with
+      "omnigent[copilot]" omnigent --force` reinstalls the base package); pyproject.toml:241, 295
+- id: claude-native-model-dropdown-slash
+  split: test
+  origin: github issue#4754
+  cluster: native-session-ui
+  should_trigger: true
+  prompt: Why does picking a model from the chat-mode model dropdown in a claude-native session put a
+    `/model opus` command into my prompt instead of switching the model?
+  criteria:
+  - id: c1
+    text: 'Explains that the `/model <name>` line is how Omnigent performs the switch: it types Claude
+      Code''s `/model` command into the session''s Claude Code terminal, and the model changes when Claude
+      Code runs it, so this is expected rather than a failed switch.'
+    source: omnigent/runner/native_controls.py:1163-1176; web/src/lib/renderItems.ts:1356-1362
+  - id: c2
+    text: 'Gives the reason: a claude-native session is the real Claude Code TUI running in a terminal,
+      and its `/model` command is the way to change a running session''s model, so Omnigent drives that
+      command instead of a separate API.'
+    source: omnigent/harnesses/claude_native/bridge.py:4566-4571 and :4606-4615 (inject_slash_command);
+      omnigent/inner/claude_native_executor.py:231-245
+- id: opencode-native-terminal-prompt
+  split: test
+  origin: github issue#8107
+  cluster: native-session-ui
+  should_trigger: true
+  prompt: Why does my `opencode-native` session look stalled in the Omnigent Chat view with a pending
+    tool and no approval card, and where do I answer the permission or question prompt?
+  criteria:
+  - id: c1
+    text: Tells the user to open the session's Terminal view (the Chat/Terminal switcher in the session
+      header) and answer OpenCode's prompt in its own terminal UI, after which the turn continues.
+    check:
+      any_of:
+      - terminal\s+(view|tab|pane)
+      - chat/terminal
+    source: feature-map/terminals.md:12-14, 35 (Chat/Terminal switcher); omnigent/harnesses/opencode_native/forwarder.py:1227-1233
+      (an answer given in the TUI is accepted)
+  - id: c2
+    text: Explains that OpenCode is blocked on its own permission or question prompt in its terminal UI,
+      which the Chat view did not mirror as an approval card, so the tool stays pending until the prompt
+      is answered.
+    source: omnigent/harnesses/opencode_native/forwarder.py:1041-1048 (the question tool blocks the turn
+      until answered) and :1088-1100 (only well-formed questions become a card)
+- id: cursor-native-first-turn-model
+  split: dev
+  origin: github issue#8379
+  cluster: native-session-ui
+  should_trigger: true
+  prompt: Why doesn't the Omnigent web UI offer a model picker for a Cursor (`cursor-native`) session
+    in New Chat before the first message, and how do I make the first turn use the model I want?
+  criteria:
+  - id: c1
+    text: Explains that New Chat offers no model setting for Cursor before the session exists (Cursor's
+      entry has only its mode setting; model settings are offered for harnesses such as Claude Code, Codex,
+      Pi, and Devin), so the first turn runs on Cursor's default model.
+    source: 'web/src/shell/NewChatDialog.tsx:1316-1323 (agentHasModelSettings) and :4025-4037; web/src/lib/nativeCodingAgents.ts:188-196
+      (cursor capabilities: cursorMode only)'
+  - id: c2
+    text: Recommends starting the session from the CLI with `omnigent cursor --model <model-id>` so the
+      first turn uses that model.
+    check:
+      cli:
+      - cursor
+      options:
+      - --model
+    source: omnigent cursor --help (--model "Cursor model id to use for the native TUI"); .eval/mining/cli_reference.txt
+- id: claude-native-running-permission-mode
+  split: test
+  origin: github issue#1454
+  cluster: native-session-ui
+  should_trigger: true
+  prompt: Can I change the permission mode (for example to `plan` or `acceptEdits`) of a claude-native
+    session that is already running, from the Omnigent web UI or the mobile app?
+  criteria:
+  - id: c1
+    text: States that yes, a running claude-native session has a "Permission mode" picker in the web chat
+      composer, and the mobile app has the same control because it loads the same web UI.
+    source: web/src/pages/ChatPage.tsx:3835-3847 and :4412-4417 (shouldShowPermissionModeControl); web/ios/README.md:3-5
+  - id: c2
+    text: Confirms that Plan and Accept edits are among the modes a running session can switch to (the
+      picker offers Manual, Accept edits, Plan, and Auto, the modes Claude Code reaches with shift+tab).
+    source: web/src/lib/claudePermissionMode.ts:52-56 (CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES)
+- id: codex-web-approval-mode
+  split: test
+  origin: github issue#272
+  cluster: claude-auth-and-setup
+  should_trigger: true
+  prompt: Can I choose an approval mode such as full-auto when I start a Codex session from the Omnigent
+    web UI, the way Claude Code sessions get a Permission mode selector?
+  criteria:
+  - id: c1
+    text: States that yes, when Codex is selected in the web UI's New Chat, a permission (approval) mode
+      picker is offered before the session starts.
+    source: web/src/lib/nativeCodingAgents.ts:125-134 (codex capability approvalMode); web/src/shell/NewChatDialog.tsx:3280
+      and :4025-4031
+  - id: c2
+    text: 'Names a no-prompt choice in that picker: Full access (Codex runs with `--sandbox danger-full-access
+      --ask-for-approval never`) or Bypass approvals & sandbox; the other choices are Default and Read
+      only.'
+    check:
+      any_of:
+      - full[ -]?access
+      - bypass approvals
+    source: web/src/lib/nativeHarnessModes.ts:171-219; web/src/lib/codexApprovalOptions.ts:1-33
+- id: claude-subscription-auth
+  split: test
+  origin: github discussion#1133
+  cluster: claude-auth-and-setup
+  should_trigger: true
+  prompt: How does Omnigent authenticate to Claude when I use a corporate Anthropic subscription instead
+    of an API key?
+  criteria:
+  - id: c1
+    text: 'Explains that Omnigent does not handle the subscription credential itself: it runs Claude Code
+      (the `claude` CLI for claude-native, or the Claude Agent SDK, which drives Claude Code, for claude-sdk),
+      and Claude Code signs in with its own subscription login, so no API key is needed.'
+    source: omnigent/onboarding/provider_config.py:115-116 (subscription = a logged-in CLI that carries
+      its own auth); omnigent/onboarding/harness_readiness.py:597-603
+  - id: c2
+    text: Says to sign Claude Code in with the subscription account, for example `claude auth login --claudeai`
+      or `/login` inside Claude Code; Omnigent then uses that login as the Claude subscription credential.
+    check:
+      any_of:
+      - claude\s+auth\s+login
+      - /login
+    source: omnigent/onboarding/harness_install.py:537; omnigent/onboarding/configure_models.py:487-491
+      ("Claude — subscription (Pro/Max)" via the claude CLI login)
+- id: claude-cli-install-eacces
+  split: dev
+  origin: github issue#890
+  cluster: claude-auth-and-setup
+  should_trigger: true
+  prompt: Why does `omnigent setup` fail with an npm `EACCES` permission error when it tries to install
+    the Claude CLI with `npm install -g`, and how do I get the Claude CLI installed without sudo?
+  criteria:
+  - id: c1
+    text: Recommends Anthropic's native installer, `curl -fsSL https://claude.ai/install.sh | bash`, which
+      installs Claude Code into the user-writable `~/.local/bin` without sudo.
+    check:
+      any_of:
+      - claude\.ai/install\.sh
+    source: omnigent/onboarding/harness_install.py:166-170 (_CLAUDE_INSTALL_HINT)
+  - id: c2
+    text: Explains that the EACCES comes from `npm install -g` writing to a root-owned global npm prefix,
+      and that current Omnigent setup installs Claude Code with the native installer instead of npm.
+    source: omnigent/onboarding/harness_install.py:166-170 and :178-195 (Claude spec has no npm package;
+      install_command runs the native installer)
+- id: claude-sdk-account-per-session
+  split: test
+  origin: github issue#503
+  cluster: claude-auth-and-setup
+  should_trigger: true
+  prompt: I have separate work and personal Claude seats; how can I tell which Claude account an Omnigent
+    claude-sdk session is using, and can I pick a different account for each session?
+  criteria:
+  - id: c1
+    text: 'Explains that a claude-sdk session drives Claude Code on the host that runs it, so it uses
+      that host''s Claude credential: by default Claude Code''s own login (`~/.claude`, or `$CLAUDE_CONFIG_DIR`
+      when the host was started with it), unless an API key or token is configured as the default.'
+    source: omnigent/onboarding/harness_readiness.py:597-603; omnigent/host/connect.py:540-542 (CLAUDE_CONFIG_DIR
+      forwarded to runners); omnigent/inner/claude_sdk_executor.py:770-779 (child env inherits os.environ)
+  - id: c2
+    text: 'Tells the user how to check: `omnigent config list` shows the Claude credential in use (a subscription
+      appears as "via claude CLI"), and Claude Code''s own status (for example `claude auth status`) on
+      that host shows the signed-in account.'
+    check:
+      any_of:
+      - config\s+list
+      - claude\s+auth\s+status
+      - /status
+    source: omnigent/cli.py:11322-11335 (config list); omnigent/onboarding/configure_models.py:700-720
+      ("via claude CLI"); omnigent/onboarding/harness_install.py:189 (status_args auth status)
+  - id: c3
+    text: 'States that choosing a different Claude account per session is not supported: the subscription
+      login comes from the host''s Claude Code configuration (separate accounts need, for example, separate
+      hosts with their own `CLAUDE_CONFIG_DIR`, or signing in again between sessions; naming a workaround
+      is not required).'
+    source: omnigent/onboarding/provider_config.py:115-116; omnigent/host/connect.py:540-542
+- id: claude-messagedisplay-hook-warning
+  split: test
+  origin: github issue#37
+  cluster: claude-auth-and-setup
+  should_trigger: true
+  prompt: Why does Claude Code's `/doctor` warn `Unknown hook event "MessageDisplay" was ignored` about
+    the settings file Omnigent generates for my sessions? I use Claude Code 2.1.141.
+  criteria:
+  - id: c1
+    text: Explains that Omnigent's claude-native integration registers a `MessageDisplay` hook (to stream
+      assistant text into Omnigent), and Claude Code 2.1.141 is too old to know that hook event, so it
+      ignores it and `/doctor` warns.
+    source: omnigent/harnesses/claude_native/bridge.py:2353-2358 and :2413-2416
+  - id: c2
+    text: Recommends upgrading Claude Code; current Omnigent supports Claude Code 2.1.161 or newer and
+      reports an older CLI as not ready (stating the exact version is not required).
+    source: omnigent/onboarding/harness_install.py:103-105, 127 (_CLAUDE_MIN_VERSION = "2.1.161") and
+      :822-827
+- id: gateway-model-custom-pricing
+  split: test
+  origin: github issue#5950
+  cluster: models-costs-and-routing
+  should_trigger: true
+  prompt: Can I set per-token prices for a model served by my own OpenAI-compatible gateway that is not
+    in the MLflow catalog, so the `cost_budget` policies can track its spend instead of asking me to approve
+    untracked spend?
+  criteria:
+  - id: c1
+    text: Says yes and shows a `pricing:` block with `input_per_million` and `output_per_million` (USD
+      per million tokens; `cache_read_per_million` and `cache_write_per_million` are optional).
+    check:
+      any_of:
+      - input_per_million
+      - output_per_million
+    source: omnigent/onboarding/provider_config.py:242-283 (ModelPricingConfig) and :757-792 (`pricing`
+      parse; input_per_million and output_per_million are required)
+  - id: c2
+    text: Places the `pricing:` block on the gateway provider's family entry (for example `providers.<name>.openai`)
+      in `~/.omnigent/config.yaml`, and says configured prices take precedence over the MLflow catalog.
+    source: omnigent/onboarding/provider_config.py:1056-1061 (families anthropic/openai/gemini under a
+      provider), :321-326 (FamilyConfig.pricing); omnigent/llms/context_window.py:311-413 (provider pricing
+      first, then the MLflow catalog)
+  - id: c3
+    text: Says that once the model is priced this way, session cost is recorded and the cost policies
+      enforce their limits instead of asking to approve untracked spend.
+    source: omnigent/server/routes/_sessions/orchestration.py:1598-1678 (cost priced with provider config;
+      total_cost_usd written only when priced); omnigent/policies/builtins/cost.py:96-133 (unpriced ASK
+      only when total_cost_usd is absent)
+- id: polly-subagent-model-selection
+  split: test
+  origin: github issue#1128
+  cluster: models-costs-and-routing
+  should_trigger: true
+  prompt: Why does my Polly (claude-sdk) session send traffic to the Opus endpoint on my model gateway
+    when the session footer shows a Sonnet model, and do the sub-agents Polly spawns use the model
+    I selected?
+  criteria:
+  - id: c1
+    text: Says a sub-agent inherits the parent session's selected model when Polly's dispatch does not
+      name a model.
+    source: 'omnigent/runner/tool_dispatch.py:1739-1830 (_inherited_parent_model) and :2841-2860 (no per-dispatch
+      model: inherit); CHANGELOG.md:1558 (#5871)'
+  - id: c2
+    text: Says inheritance is skipped, so the worker runs its own default model, when the worker's spec
+      pins `executor.model` or the worker's harness belongs to a different vendor or model family than
+      the parent (for example a Codex worker under a Claude brain).
+    source: omnigent/runner/tool_dispatch.py:1755-1767 (skip rules), :1778-1827 (pinned model, family
+      mismatch, foreign harness), :2314-2341 (_child_is_foreign_harness)
+  - id: c3
+    text: Says Polly can name a model for each dispatch (`args.model` on `sys_session_send`), which overrides
+      inheritance, so a sub-agent can run on a different model, such as Opus, than the one the session
+      shows.
+    source: examples/polly/config.yaml:103-110 (each dispatch may carry an explicit args.model); omnigent/runner/tool_dispatch.py:2816-2840
+      (explicit model persisted as the child's model_override)
+- id: new-session-host-skills-menu
+  split: test
+  origin: github issue#6280
+  cluster: skills-discovery
+  should_trigger: true
+  prompt: Why don't my host-discovered skills show up in the web composer's slash-command menu in a new
+    session until I send the first message?
+  criteria:
+  - id: c1
+    text: Says current builds discover host skills for the new-session composer before the session starts,
+      so the `/` menu does not depend on sending a first message.
+    source: 'web/src/shell/NewChatDialog.tsx:4692-4728 (pre-session useSkills against the selected host);
+      CHANGELOG.md:769 (v0.15.0, #7435: browse host skills with `/` before creating a session)'
+  - id: c2
+    text: Says that discovery runs only once the new-session dialog has an online host, a working directory
+      and a specific harness (not automatic routing); until then the menu lists only the agent's bundled
+      skills and shows a hint.
+    source: web/src/shell/NewChatDialog.tsx:4692-4706 (skillsUnavailableMessage conditions) and :4726-4728
+      (falls back to selectedAgent.skills)
+  - id: c3
+    text: Says that for a cloud sandbox session, host skills become available only after the sandbox starts.
+    source: web/src/shell/NewChatDialog.tsx:4695-4696 ("Host skills will be available after the sandbox
+      starts.")
+- id: agy-worker-user-mcp-servers
+  split: test
+  origin: github issue#8353
+  cluster: antigravity-and-mcp
+  should_trigger: true
+  prompt: Why don't the MCP servers I configured in `~/.gemini/config/mcp_config.json` show up in antigravity-native
+    (agy) worker sessions started by Omnigent, even though my normal agy sees them?
+  criteria:
+  - id: c1
+    text: Explains that Omnigent starts agy with a separate per-session Gemini directory (passed with
+      `--gemini_dir`) instead of the user's real `~/.gemini`.
+    source: omnigent/harnesses/antigravity_native/bridge.py:404-428 (agy_home_dir, agy_gemini_dir); omnigent/runner/native/orchestration.py:6510
+      (worker agy launched with --gemini_dir)
+  - id: c2
+    text: States that Omnigent writes that directory's `config/mcp_config.json` with only its own relay
+      server and does not copy the user's `~/.gemini/config/mcp_config.json`, so those servers are missing.
+    source: 'omnigent/harnesses/antigravity_native/bridge.py:429-475 (build_mcp_config: only the Omnigent
+      relay), :502-533 (write_mcp_config), :535-590 (seed_isolated_agy_home copies OAuth markers, settings.json,
+      onboarding state, plugins, skills and hooks, not mcp_config.json)'
+- id: per-session-policy-file-cli
+  split: test
+  origin: github issue#8147
+  cluster: antigravity-and-mcp
+  should_trigger: true
+  prompt: Can I pass a policy config (for example with `-c config.yaml`) to a single `omni <harness>`
+    session such as `omni pi` from the CLI, instead of setting the policies in the global config?
+  criteria:
+  - id: c1
+    text: States that passing a policy file to a single `omnigent pi` (or other harness launcher) session
+      is not supported; the command has no such option.
+    source: omnigent/cli_native.py:563-605 (`pi` options are --server and -r/--resume; other args go to
+      Pi; same in 0.17 `omnigent pi --help`); omnigent/cli.py:4434 and :4504 (only `omnigent server` reads
+      `policies`, from its --config file)
+  - id: c2
+    text: 'Offers a supported way to scope policies more narrowly than the whole server: add a policy
+      to the running session (from the web UI, or by asking the agent, which uses `sys_add_policy`), or
+      declare the policies in an agent''s YAML.'
+    source: docs/POLICIES.md "Who configures policies" (lines 11-23), "Adding policies to an agent spec"
+      (lines 104-141), "Adding policies to a running session" (lines 190-197)
+- id: agy-linux-keyring-not-ready
+  split: dev
+  origin: github issue#8405
+  cluster: antigravity-and-mcp
+  should_trigger: true
+  prompt: Why does Omnigent report the antigravity-native harness as not ready on Linux when I'm signed
+    in to agy with my Google account and `agy models` works?
+  criteria:
+  - id: c1
+    text: 'Explains that on Linux the antigravity-native readiness check is file-based: it looks for agy''s
+      token file (`~/.gemini/antigravity-cli/antigravity-oauth-token` or `~/.gemini/oauth_creds.json`)
+      and does not run `agy models`, which Omnigent uses as a fallback only on macOS.'
+    check:
+      any_of:
+      - antigravity-oauth-token
+      - oauth_creds\.json
+    source: omnigent/onboarding/gemini_auth.py:27-37 (file-first, macOS-only CLI fallback, Linux purely
+      file-based), :76-77 (token paths), :123-166 (gemini_auth_has_credential)
+  - id: c2
+    text: States that a Google login that agy keeps only in the OS keyring, with no token file, is therefore
+      not detected on Linux even though agy itself works.
+    source: omnigent/onboarding/gemini_auth.py:152-166 (no CLI probe when sys.platform != "darwin")
+  - id: c3
+    text: Gives setting a `GEMINI_API_KEY` as a way to get the harness reported ready on Linux.
+    check:
+      any_of:
+      - GEMINI_API_KEY
+    source: omnigent/onboarding/gemini_auth.py:152-154 (a non-empty GEMINI_API_KEY counts as a credential);
+      CHANGELOG.md:1403 (#5134)
+- id: opencode-gh-not-logged-in
+  split: test
+  origin: github issue#10017
+  cluster: sandboxes-and-shell-env
+  should_trigger: true
+  prompt: In an `omni opencode` session, why does `gh` in the agent's shell say "You are not logged into
+    any GitHub hosts" when I am logged in to gh on the host?
+  criteria:
+  - id: c1
+    text: Explains that Omnigent runs `opencode serve`, and so the agent's shell, with a per-session `XDG_CONFIG_HOME`,
+      so `gh` looks for its login there instead of the host's `~/.config/gh`.
+    check:
+      any_of:
+      - XDG_CONFIG_HOME
+    source: omnigent/harnesses/opencode_native/app_server.py:327-368 (filtered_server_env sets a per-session
+      XDG_CONFIG_HOME); omnigent/git_providers/github.py:45-56 (gh reads GH_CONFIG_DIR, then $XDG_CONFIG_HOME/gh,
+      then ~/.config/gh)
+  - id: c2
+    text: Recommends forwarding gh's credentials into the session by listing the variable in `OMNIGENT_RUNNER_ENV_PASSTHROUGH`
+      before the host starts, because `opencode serve` otherwise gets only a small environment allowlist.
+    check:
+      any_of:
+      - OMNIGENT_RUNNER_ENV_PASSTHROUGH
+    source: omnigent/harnesses/opencode_native/app_server.py:62-84 and :346-361 (passthrough keys plus
+      names in OMNIGENT_RUNNER_ENV_PASSTHROUGH); omnigent/host/connect.py:784-790 and :880-916 (host forwards
+      the listed names to runners); CHANGELOG.md:1143 (#5041)
+  - id: c3
+    text: Names a variable gh reads for this, such as `GH_TOKEN` (or `GITHUB_TOKEN`), or `GH_CONFIG_DIR`
+      pointing at the real gh config directory.
+    check:
+      any_of:
+      - GH_TOKEN
+      - GITHUB_TOKEN
+      - GH_CONFIG_DIR
+    source: omnigent/git_providers/github.py:45-56 (GH_CONFIG_DIR override); omnigent/runner/github_resource.py:21
+      (gh ranks GH_TOKEN/GITHUB_TOKEN above hosts.yml)
+- id: codex-native-bwrap-home-workspace
+  split: test
+  origin: github issue#8027
+  cluster: sandboxes-and-shell-env
+  should_trigger: true
+  prompt: Why does a `codex-native` session in the `linux_bwrap` sandbox exit within seconds with `CODEX_HOME
+    points to ... but that path does not exist` and then fail with `Codex app-server never started a thread
+    (startup timed out)` when my workspace is my home directory?
+  criteria:
+  - id: c1
+    text: Explains that `linux_bwrap` hides the top-level hidden (dot) directories of the working directory
+      behind an empty tmpfs, so with the home directory as the workspace `~/.omnigent` is masked inside
+      the sandbox.
+    source: omnigent/inner/bwrap_sandbox.py:24-30 (cwd dotdirs tmpfs-masked unless allowed) and :559-581
+      (masks are emitted after the binds, so they win)
+  - id: c2
+    text: States that codex-native keeps the session's `CODEX_HOME` under `~/.omnigent/codex-native/`,
+      so the mask makes Codex report that `CODEX_HOME` does not exist and the app-server never starts.
+    source: omnigent/harnesses/codex_native/bridge.py:92 (_BRIDGE_ROOT = ~/.omnigent/codex-native) and
+      :490-498 (codex_home_for_bridge_dir)
+  - id: c3
+    text: 'Recommends using a project directory instead of the home directory as the session''s workspace,
+      or running without the sandbox (`os_env.sandbox.type: none`).'
+    source: omnigent/inner/bwrap_sandbox.py:24-30 (masking applies to the working directory's dotdirs);
+      omnigent/inner/sandbox.py:1355-1356 (`os_env.sandbox.type='none'` is the opt-out)
+- id: ssh-agent-socket-in-sessions
+  split: dev
+  origin: github issue#3531
+  cluster: sandboxes-and-shell-env
+  should_trigger: true
+  prompt: Why do `git` over SSH and other ssh-agent tools fail inside Omnigent-launched terminals and
+    sub-agents because `SSH_AUTH_SOCK` is empty, and how do I pass my ssh-agent socket through?
+  criteria:
+  - id: c1
+    text: States that current builds forward `SSH_AUTH_SOCK` to runners and harness CLIs by default, so
+      it only has to be set in the environment the Omnigent host was started from (restart the host after
+      setting it).
+    source: 'omnigent/host/connect.py:663-668 (SSH_AUTH_SOCK in the runner env allowlist); omnigent/inner/agent_env.py:71
+      (harness CLI allowlist); CHANGELOG.md:1733 (v0.10.0, #4377)'
+  - id: c2
+    text: 'States that inside an active OS sandbox (`linux_bwrap` or `darwin_seatbelt`, the default when
+      a spec does not set `sandbox.type: none`) `SSH_AUTH_SOCK` is removed from the agent''s shell unless
+      the spec lists it in `os_env.sandbox.env_passthrough`.'
+    check:
+      config:
+      - os_env.sandbox.env_passthrough
+    source: omnigent/inner/os_env.py:104-110 (SSH_AUTH_SOCK excluded in an active sandbox; opt in per
+      spec and grant the socket path) and :180-205 (build_helper_env); omnigent/spec/parser.py:1273-1320
+      (_parse_env_passthrough)
+- id: cursor-sdk-auto-approve-tools
+  split: test
+  origin: github issue#2286
+  cluster: sandboxes-and-shell-env
+  should_trigger: true
+  prompt: 'Is there a setting that makes a `cursor` SDK harness agent auto-approve Cursor''s native tool
+    calls, like `permission_mode: bypassPermissions` for claude-native or `yolo: true` for codex-native,
+    so it can run unattended?'
+  criteria:
+  - id: c1
+    text: 'Says yes: set `permission_mode` in the agent spec''s `executor.config`; `auto` or `bypassPermissions`
+      skip the web approval card for Cursor''s native tool calls.'
+    check:
+      config:
+      - executor.config.permission_mode
+    source: omnigent/runtime/workflow.py:2280-2285 (executor.config.permission_mode becomes HARNESS_CURSOR_PERMISSION_MODE);
+      omnigent/inner/cursor_executor.py:620-623 and :709-716 (auto and bypassPermissions skip the elicitation)
+  - id: c2
+    text: States that `auto` is already the default when the spec sets no `permission_mode`, so Cursor's
+      native tools are not gated by approval cards unless an interactive mode is chosen.
+    source: omnigent/inner/cursor_harness.py:34-38 and :66 (_DEFAULT_PERMISSION_MODE = "auto"); omnigent/runtime/workflow.py:2280-2282
+- id: claude-native-picker-ambient-gateway
+  split: test
+  origin: github issue#8559
+  cluster: native-harness-failures
+  should_trigger: true
+  prompt: Why is the claude-native model picker empty ("Models unavailable") when I export `ANTHROPIC_BASE_URL`
+    to point Claude Code at a LiteLLM gateway, even though Claude Code's own `/model` lists the models?
+  criteria:
+  - id: c1
+    text: Explains that with only the exported `ANTHROPIC_BASE_URL` (no Omnigent provider entry), Omnigent
+      treats any host other than anthropic.com as a gateway that serves only its own model ids, so it
+      drops the canonical `claude-*` models that Claude Code reported and nothing is left in the picker.
+    source: omnigent/harnesses/claude_native/main.py:455 (_ambient_env_is_non_anthropic_gateway) and :1351
+      (claude_model_catalog keeps a claude-* row only when it is a declared routable model; the ambient
+      path declares none)
+  - id: c2
+    text: 'Recommends adding the gateway to Omnigent as a Gateway credential for Claude (with `omnigent
+      setup`, which writes a `kind: gateway` entry under `providers:` in `~/.omnigent/config.yaml` with
+      the base URL, key, and default model), so the picker lists the models that entry declares.'
+    check:
+      any_of:
+      - omni(gent)? setup
+      - 'providers:'
+      - kind:\s*gateway
+    source: 'README.md "3. Choose & switch models" (Gateway credential: LiteLLM base_url and key via omnigent
+      setup); omnigent/onboarding/configure_models.py:943 (build_gateway_provider_entry); omnigent/harnesses/claude_native/main.py:3018
+      (_provider_config_for_native_claude sets routable_models from the entry''s models)'
+- id: resume-after-container-replacement
+  split: test
+  origin: github issue#9281
+  cluster: native-harness-failures
+  should_trigger: true
+  prompt: After I replaced my Omnigent server container but kept its PostgreSQL database, resuming an
+    older Claude native session fails with a 500 error; why, and how do I keep sessions resumable across
+    container replacements?
+  criteria:
+  - id: c1
+    text: Explains that PostgreSQL keeps the session rows, but the agent bundles the sessions resume from
+      are kept in the server's artifact store, which by default is a local directory inside the container
+      (`/data/artifacts` in the Docker image), so replacing the container deletes them.
+    source: 'deploy/docker/entrypoint.py:62 (_DEFAULT_ARTIFACT_DIR = "/data/artifacts"), :248-266 (_select_artifact_store:
+      local filesystem store unless an s3:// URI is set); omnigent/stores/artifact_store/__init__.py:1
+      (blob storage for agent bundles)'
+  - id: c2
+    text: 'Recommends artifact storage that outlives the container: an S3-compatible bucket through `OMNIGENT_ARTIFACT_URI=s3://<bucket>[/prefix]`
+      (or `artifact_store_uri:` in the server config), or a persistent volume mounted at the artifact
+      directory.'
+    source: deploy/docker/entrypoint.py:148-167 (ARTIFACT_DIR / artifact_location, and artifact_store_uri
+      / OMNIGENT_ARTIFACT_URI must be s3://bucket[/prefix]); deploy/cloudflare/README.md:50
+- id: goose-prompt-timeout
+  split: dev
+  origin: github issue#6201
+  cluster: native-harness-failures
+  should_trigger: true
+  prompt: Can I raise the Goose harness's 300-second idle prompt timeout (and its 30-second init timeout)
+    in Omnigent without patching `goose_executor.py`, so slow thinking models stop failing with 'Timeout
+    waiting for goose response'?
+  criteria:
+  - id: c1
+    text: States that the 300-second idle prompt timeout of the `goose` harness cannot be raised by any
+      environment variable or config setting; it is a constant in `omnigent/inner/goose_executor.py`,
+      so changing it needs a code change.
+    source: omnigent/inner/goose_executor.py:135-136 (_PROMPT_TIMEOUT_SECONDS = 300.0, no env read) and
+      :1188-1194 (the "Timeout waiting for goose response" error)
+  - id: c2
+    text: States that the 30-second init timeout is also a fixed constant with no override.
+    source: omnigent/inner/goose_executor.py:137 (_INIT_TIMEOUT_SECONDS = 30.0)
+- id: windows-claude-native-not-configured
+  split: test
+  origin: github issue#9672
+  cluster: native-harness-failures
+  should_trigger: true
+  prompt: On native Windows 11, why does my host report `claude-native` as "not configured" even though
+    `claude.exe` is installed in `~/.local/bin` and runs from my shell?
+  criteria:
+  - id: c1
+    text: States that native terminal harnesses such as `claude-native` are not supported on native Windows
+      (they need tmux and a POSIX PTY), so the host reports them as unavailable whether or not `claude.exe`
+      is installed.
+    source: README.md "Windows (native)" (native omnigent claude/codex/cursor wrappers are not available
+      on Windows); omnigent/onboarding/harness_readiness.py:235-237; omnigent/runner/native/orchestration.py:7820-7826
+  - id: c2
+    text: Recommends an SDK harness such as `claude-sdk` on native Windows, or running the host under
+      WSL (or on Linux or macOS) to use `claude-native`.
+    check:
+      any_of:
+      - claude-sdk
+      - SDK(-based)? harness
+      - \bWSL\b
+    source: omnigent/runner/native/orchestration.py:7823-7825 ("Use an SDK-based harness (e.g. claude-sdk
+      ...) or run it on Linux/macOS"); omnigent/cli_common.py:28-43; README.md "Windows (native)" ("use
+      Linux/macOS, or WSL")
+- id: claude-native-default-model-unset
+  split: test
+  origin: session history
+  cluster: native-harness-failures
+  should_trigger: true
+  prompt: Which model does the Claude Code harness use by default when my agent spec does not set a model?
+  criteria:
+  - id: c1
+    text: States that for the Claude Code (`claude-native`) harness, when nothing selects a model, Omnigent
+      starts Claude Code without a `--model` flag, so Claude Code's own default model applies (its own
+      settings or `/model` choice, or the account's default).
+    source: 'omnigent/harnesses/claude_native/main.py:6494-6513 (_merge_default_model_arg adds --model
+      only when a model is configured); omnigent/inner/claude_sdk_executor.py:2581-2584 (no model: "lets
+      the SDK pick its own default")'
+  - id: c2
+    text: 'Says that a model chosen outside the spec takes precedence over Claude Code''s default: the
+      session''s pick (`--model`, the model picker, or `/model`) or a `models.default` set on the Claude
+      provider configured in Omnigent (for example through `omnigent setup`).'
+    source: omnigent/harnesses/claude_native/main.py:3018-3105 (provider entry supplies model=family.default_model)
+      and :6432-6435 (passed as --model unless the user already chose one)
+- id: promote-subagent-to-session
+  split: test
+  origin: github issue#4429
+  cluster: sessions-and-custom-agents
+  should_trigger: true
+  prompt: Can I turn a sub-agent session into a normal top-level session in the sidebar so I can keep
+    working in it after the parent session ends?
+  criteria:
+  - id: c1
+    text: Says to fork the sub-agent session (for example with Fork in the web or desktop app); the fork
+      is a new top-level session that appears in the sidebar.
+    source: 'omnigent/server/routes/sessions/routes_core.py:3251-3256 (fork docstring: a sub-agent source
+      is allowed, which is how a sub-agent is promoted to a session of its own)'
+  - id: c2
+    text: 'States that the fork keeps the sub-agent''s conversation and is independent of the parent:
+      it outlives the parent session, and the original sub-agent stays under its parent.'
+    source: omnigent/server/routes/sessions/routes_core.py:3251-3256 (fresh top-level conversation with
+      its own owner grant; outlives the parent; source untouched)
+- id: cli-fork-into-other-native-harness
+  split: test
+  origin: github issue#3150
+  cluster: sessions-and-custom-agents
+  should_trigger: true
+  prompt: From the Omnigent CLI, can I fork a session I started in one harness, for example `omni pi`,
+    and continue it with its full history in a different native harness such as `omni claude`?
+  criteria:
+  - id: c1
+    text: 'States that the CLI cannot do this: `omnigent run --fork <id>` opens the fork in the REPL on
+      the source session''s agent, and `omnigent run --harness` with a native harness rejects `--fork`
+      as a REPL-only option.'
+    source: omnigent/cli.py:7350 (_FORK_HELP), :7785 and :7798 (native harness dispatch rejects --fork);
+      omnigent/chat.py:1672 (sdk.sessions.fork(id) with no agent switch)
+  - id: c2
+    text: Says to fork from the web UI or desktop app instead and pick a different agent, such as Claude
+      Code, in the Fork dialog; the fork carries the conversation history into the new native harness.
+    source: omnigent/server/routes/sessions/routes_core.py:3225-3230 (fork with body.agent_id switches
+      harness) and :3518-3538 (history carried into a native target, rebuilt from the copied items across
+      families)
+- id: agent-inbox-notification
+  split: dev
+  origin: session history
+  cluster: sessions-and-custom-agents
+  should_trigger: true
+  prompt: How can an agent in my session send me a notification through the Omnigent inbox when something
+    needs my attention, like a failing pipeline it is watching?
+  criteria:
+  - id: c1
+    text: 'States that there is no tool for an agent to post a notification into the Inbox; the Inbox
+      is built from session state. An answer that offers `sys_read_inbox` for this fails: that tool reads
+      the agent''s own async-work results.'
+    source: web/src/pages/InboxPage.tsx:1-40 (Inbox assembled from pending approvals, unseen comments,
+      and session read state); omnigent/tools/builtins/__init__.py:26-71 (no notification tool); omnigent/tools/builtins/async_inbox.py:1-12
+  - id: c2
+    versions: '>=0.18.0'
+    text: Says the Inbox lists sessions waiting on the user's approval or answer and sessions with agent
+      replies the user has not read, so the agent flags the failure by reporting it in a message in its
+      session (the session then shows as Unread, and the desktop app or browser raises a notification).
+    source: web/src/pages/InboxPage.tsx:27-37 ("It also lists sessions with unseen agent output"; Unread
+      and Awaiting response tabs; added before v0.18.0); web/src/hooks/useIdleNotifications.ts:1-11
+  - id: c3
+    versions: <0.18.0
+    text: Says that in this version the Inbox lists only pending approval or question cards (and unseen
+      file comments); an agent reply marks the session unread in the sidebar and raises a desktop or browser
+      notification, but does not appear in the Inbox.
+    source: v0.17.0 web/src/pages/InboxPage.tsx:1-35 (approvals and unseen file comments only) and web/src/hooks/useIdleNotifications.ts:1-11
+- id: custom-agent-native-harness-picker
+  split: test
+  origin: github issue#1596
+  cluster: sessions-and-custom-agents
+  should_trigger: true
+  prompt: Can a named custom agent defined in my agent bundle's `config.yaml` use `claude-native` or `codex-native`
+    as its own brain and still appear in the web or desktop Agents picker, like Polly and Debby do?
+  criteria:
+  - id: c1
+    text: States that yes, a custom agent can run on `claude-native` or `codex-native`.
+    source: README.md "Write your own agent" (executor harness options include claude-native and codex-native);
+      docs/AGENT_YAML_SPEC.md "Executor"
+  - id: c2
+    text: 'Shows the harness setting in the agent config: `executor.harness`, or `executor.config.harness`
+      in a bundle `config.yaml`.'
+    check:
+      config:
+      - executor.harness
+      - executor.config.harness
+    source: examples/polly/config.yaml (executor.type omnigent, executor.config.harness); omnigent/spec/AGENTSPEC.md
+      "config.yaml"
+  - id: c3
+    versions: '>=0.18.0'
+    text: Says to install it with `omnigent agent add <dir>` so it stays in the new-session picker of
+      the web and desktop apps, listed under its own name.
+    check:
+      cli:
+      - agent add
+    source: 'omnigent/cli.py:11614 (agent group: "Install reusable agents so they stay in the new-session
+      picker"); web/src/hooks/useAvailableAgents.ts:169-198 (user agents shown by their own name, including
+      claude-native ones)'
+  - id: c4
+    versions: <0.18.0
+    text: Says this version has no command that installs an agent into the picker (no `omnigent agent
+      add`), so the agent is started with `omnigent run <dir>` or registered on the server with `omnigent
+      server --agent <dir>` or `OMNIGENT_BUILTIN_AGENT_DIRS`.
+    source: '.eval/venv/s0/bin/omnigent agent --help ("No such command ''agent''"); .eval/venv/s0/bin/omnigent
+      server --help (--agent: pre-register an agent); deploy/docker/README.md (OMNIGENT_BUILTIN_AGENT_DIRS)'
+- id: acp-omp-system-prompt-injection
+  split: test
+  origin: github issue#4917
+  cluster: sessions-and-custom-agents
+  should_trigger: true
+  prompt: 'When I run `omp` (Oh My Pi) as a generic ACP agent in Omnigent with `omnigent_mcp: false` so
+    `session/new` stops hanging, its replies contain malformed `</function></tool_call>` text; is there
+    a setting to stop Omnigent from describing its builtin tools in the system prompt?'
+  criteria:
+  - id: c1
+    text: 'Names the `inject_system_prompt: false` setting on that agent''s entry under `acp.agents` in
+      `~/.omnigent/config.yaml` (or in the spec''s embedded `executor.config.acp_agent`), which stops
+      Omnigent from adding its system prompt, with the builtin-tool descriptions, to the first prompt.'
+    check:
+      any_of:
+      - inject_system_prompt
+      - HARNESS_ACP_INJECT_SYSTEM_PROMPT
+    source: omnigent/onboarding/acp_auth.py:168-170 (per-agent inject_system_prompt, default true); omnigent/inner/acp_executor.py:221-230
+      (set False for Pi forks such as omp) and :1880 (system prompt folded into the first turn only when
+      true)
+  - id: c2
+    text: 'Says to keep `omnigent_mcp: false` as well; the two flags are independent: one turns off the
+      MCP relay, the other turns off the system-prompt injection.'
+    source: 'omnigent/onboarding/acp_auth.py:165-170; omnigent/inner/acp_executor.py:221-230; docs/AGENT_YAML_SPEC.md
+      "Custom ACP agents" (omnigent_mcp: false)'
+- id: shared-skill-all-harnesses
+  split: dev
+  origin: session history
+  cluster: sessions-and-custom-agents
+  should_trigger: true
+  prompt: Where should I put a skill so that every harness can use it in any session, without creating
+    a dedicated Omnigent agent for it?
+  criteria:
+  - id: c1
+    versions: '>=0.18.0'
+    text: Recommends the vendor-neutral `~/.agents/skills/<skill>/SKILL.md` directory (or `.agents/skills/`
+      in a repository), which Omnigent exposes to Claude Code, Codex, and its other harnesses.
+    check:
+      any_of:
+      - \.agents/skills
+    source: omnigent/spec/skill_sources.py:184-185 (Omnigent exposes .agents/skills to Claude); omnigent/inner/bundle_skills.py:145;
+      omnigent/inner/codex_executor.py:788 (~/.agents/skills linked for Codex); omnigent/spec/parser.py:2321
+      (generic host walk)
+  - id: c2
+    versions: <0.18.0
+    text: 'Says this version has no skill directory that every harness reads: Claude Code reads `.claude/skills`
+      (for example `~/.claude/skills`) and Codex reads `~/.codex/skills`, so the skill must be placed
+      in each harness''s own directory.'
+    source: v0.17.0 omnigent/spec/skill_sources.py:172-180 (claude-native reads .claude/skills, not .agents/skills);
+      v0.17.0 omnigent/inner/codex_executor.py:716-750 (bundle and ~/.codex/skills only)
+  - id: c3
+    text: States that skills in an agent bundle's `skills/` directory load only in that agent's sessions,
+      so a skill for every session belongs in a host-level skills directory instead.
+    source: 'omnigent/spec/AGENTSPEC.md "Skills — skills/<dir>/SKILL.md"; omnigent/spec/skill_sources.py:267-290
+      (resolve_session_skills: the session''s bundle skills plus the harness''s host skills)'
+- id: pi-gateway-env-key-ref
+  split: test
+  origin: github issue#3788
+  cluster: providers-and-gateways
+  should_trigger: true
+  prompt: 'Why does `omnigent run --harness pi` fail with `pi harness: provider ''my-gateway'' configures
+    no family whose credentials resolve` when my `kind: gateway` provider in `~/.omnigent/config.yaml`
+    uses `api_key_ref: env:MY_TOKEN` and I have exported MY_TOKEN in my shell?'
+  criteria:
+  - id: c1
+    text: 'Explains that the session does not run in the shell where MY_TOKEN was exported: Omnigent''s
+      background host daemon, which spawns the session runner, starts with an allowlisted environment
+      (known provider variables and `OMNIGENT_`-prefixed names), so a custom variable such as MY_TOKEN
+      is dropped and `env:MY_TOKEN` cannot resolve.'
+    source: 'omnigent/cli.py:3560-3622 (_build_host_daemon_env: local mode keeps only allowlisted names
+      and prefixes); omnigent/cli.py:728-736 (_LOCAL_DAEMON_ENV_PREFIXES includes OMNIGENT_); tests/cli/test_backend.py:304-330
+      (an unrelated GITHUB_TOKEN is stripped)'
+  - id: c2
+    text: 'Gives a fix that gets the key past that filtering: export it as `OMNIGENT_MY_TOKEN` (which
+      `env:MY_TOKEN` also resolves and the daemon keeps), or store the key in Omnigent''s secret store
+      with `omnigent setup` so the provider uses `api_key_ref: keychain:<name>`.'
+    source: 'omnigent/onboarding/provider_config.py:563-576 (env: refs fall back to OMNIGENT_<VAR>; the
+      error names both); omnigent/util/env_credentials.py:39-58; omnigent/cli_config.py:849-853 and :914
+      (setup stores a gateway key as keychain:<name>)'
+  - id: c3
+    text: If it recommends an environment-variable fix, says to restart Omnigent's background processes
+      (for example `omnigent stop`, then run again), because a daemon that is already running keeps the
+      environment it started with.
+    source: omnigent/cli.py:3505-3512 (an existing daemon is reused); omnigent/cli.py:4985-4991 (stop)
+- id: codex-subagent-openrouter-gateway
+  split: test
+  origin: github issue#59
+  cluster: providers-and-gateways
+  should_trigger: true
+  prompt: Why does my Polly `codex` sub-agent on the codex-native harness fail with `Codex native bridge
+    state is missing` when an OpenRouter gateway is the default openai-family provider in `~/.omnigent/config.yaml`,
+    even though `codex login status` says I'm logged in with ChatGPT? How do I get it working?
+  criteria:
+  - id: c1
+    text: Explains that Omnigent routes a Codex harness through the default provider for the `openai`
+      family in `~/.omnigent/config.yaml` (unless the agent names a provider), so the sub-agent goes through
+      the OpenRouter gateway instead of the ChatGPT login.
+    source: omnigent/onboarding/provider_config.py:164-175 (codex-native consumes the openai family) and
+      :1397-1424 (default_provider_for_harness); omnigent/harnesses/codex_native/app_server.py:4034
+  - id: c2
+    text: 'States that Codex can use only an OpenAI Responses API endpoint, so a gateway set up for Chat
+      Completions (`wire_api: chat`, as Omnigent configures OpenRouter) cannot serve it.'
+    source: omnigent/inner/codex_executor.py:2236-2256 (codex >= 0.137 rejects wire_api chat); omnigent/runtime/workflow.py:843-850;
+      omnigent/onboarding/configure_models.py:202-203 (OpenRouter preset uses the chat wire); omnigent/cli_config.py:884-887
+  - id: c3
+    text: 'Recommends making the ChatGPT (Codex) subscription the default for Codex/`openai` (for example
+      `omnigent setup` → Codex → the subscription → "Make default for Codex") and keeping the gateway
+      as the default only for Pi (`default: pi`).'
+    source: omnigent/cli_config.py:3068-3110 (Make default for <harness>) and :3237-3258; omnigent/onboarding/provider_config.py:1670-1720
+      (set_default_provider clears only that scope) and :829-891 (a provider may claim the pi scope alone)
+- id: missing-stored-provider-secret
+  split: dev
+  origin: github issue#1637
+  cluster: providers-and-gateways
+  should_trigger: true
+  prompt: 'How do I fix `OmnigentError: no stored secret named ''my-gateway''; run omnigent setup --no-internal-beta
+    to set it`, which appears when I switch to Polly in the web UI and ask a question?'
+  criteria:
+  - id: c1
+    text: 'Explains that a provider in `~/.omnigent/config.yaml` points at its key with `api_key_ref:
+      keychain:<name>`, and Omnigent''s secret store (the OS keychain, or `~/.omnigent/secrets.json` when
+      no keyring backend works) holds no secret under that name, so the provider Polly''s harness uses
+      has no key.'
+    source: omnigent/onboarding/provider_config.py:549-561 (resolve_secret keychain branch raises this
+      error); omnigent/onboarding/secrets.py:1-26 (backends) and :179-204 (load_secret)
+  - id: c2
+    text: Recommends running `omnigent setup` again and re-entering the API key for that provider, which
+      stores it under the name the config references.
+    check:
+      cli:
+      - setup
+    source: omnigent/cli_config.py:751-759 (a pasted key is stored with secret_store.store_secret and
+      referenced as keychain:<name>) and :849-853 (gateway key)
+- id: setup-gateway-option-location
+  split: test
+  origin: session history
+  cluster: providers-and-gateways
+  should_trigger: true
+  prompt: I ran `omnigent setup` but I can't find the Gateway option for a custom OpenAI-compatible endpoint.
+    Where is it?
+  criteria:
+  - id: c1
+    text: 'Explains that Gateway is not a top-level choice: in `omnigent setup` you first pick a harness
+      (Claude, Codex, or Pi) from the harness list, whose CLI must be installed (setup offers to install
+      it first), and the gateway is added from that harness''s credential menu.'
+    source: 'omnigent/cli_config.py:4207-4232 ("Configure harnesses" list); omnigent/cli_config.py:1463-1486
+      (_manage_harness_providers: install prompt before the credential menu)'
+  - id: c2
+    text: Says to choose `+ Add a credential` in that harness's menu and then `Gateway — custom base URL
+      + key`.
+    check:
+      any_of:
+      - add (a )?credential[\s\S]*gateway
+    source: omnigent/cli_config.py:1395 (+ Add a credential); omnigent/onboarding/configure_models.py:499-504
+      (Gateway — custom base URL + key)
+- id: pi-default-model-openrouter
+  split: test
+  origin: github issue#7735
+  cluster: providers-and-gateways
+  should_trigger: true
+  prompt: How do I set a default model for new Pi sessions in Omnigent when I use OpenRouter through an
+    API key?
+  criteria:
+  - id: c1
+    text: 'Says Pi sessions on that key start on the provider''s configured default model: the `models.default`
+      value under the OpenRouter entry''s `openai` family in `~/.omnigent/config.yaml`.'
+    check:
+      any_of:
+      - models\.default
+      - 'models:\s*\n\s*default\s*:'
+      - models:\s*\{\s*default
+    source: 'omnigent/onboarding/configure_models.py:819-851 (key entry writes models: {default: ...})
+      and :171 (OpenRouter serves openai); omnigent/harnesses/pi_native/credentials.py:1588-1594 (no session
+      model → family default); omnigent/runtime/workflow.py:995-1000'
+  - id: c2
+    text: 'Explains how to change it: edit that value in `~/.omnigent/config.yaml`, or add the OpenRouter
+      key again in `omnigent setup` and enter the new model at its "Default model" prompt; sessions started
+      afterwards use it.'
+    source: omnigent/cli_config.py:774 (Default model prompt) and :727-760 (a key from the same source
+      updates the entry in place)
+- id: pi-picker-custom-models-json
+  split: dev
+  origin: github issue#8760
+  cluster: providers-and-gateways
+  should_trigger: true
+  prompt: Why doesn't the Pi model picker in Omnigent list the custom providers (such as a local Ollama
+    server or other OpenAI-compatible endpoints) that I defined in `~/.pi/agent/models.json`, and how
+    can I pick those models?
+  criteria:
+  - id: c1
+    text: 'States that the picker does not read Pi''s `models.json`: with no Omnigent-managed provider
+      it lists only models from Pi''s `models-store.json` for providers logged in through `auth.json`
+      (and with a provider from `omnigent setup`, that provider''s models), so providers defined only
+      in `models.json` are missing.'
+    source: omnigent/harnesses/pi_native/credentials.py:447-483 (pi_own_login_model_options reads auth.json
+      and models-store.json) and :524-545 (pi_native_model_options)
+  - id: c2
+    text: 'Gives the workaround of naming the model at launch with `omnigent pi --model <provider>/<model>`:
+      Omnigent passes an explicit `--model` to Pi and does not inject its own provider, so Pi resolves
+      the model from its own `models.json`.'
+    check:
+      any_of:
+      - omni(gent)?\s+pi\b[^\n]*--model
+    source: 'omnigent/cli_native.py:610-616 (help example: omnigent pi --model <provider>/<model>);
+      omnigent/runner/native/orchestration.py:2257-2273 (_pi_args_have_provider) and :2616'
+- id: copilot-token-auth-failure
+  split: test
+  origin: session history
+  cluster: providers-and-gateways
+  should_trigger: true
+  prompt: Why does the Copilot harness in Omnigent keep failing to authenticate when GitHub shows that
+    my token is not expired?
+  criteria:
+  - id: c1
+    text: States that Copilot accepts only a fine-grained personal access token with the "Copilot Requests"
+      permission or an OAuth token (from the GitHub CLI or the Copilot CLI login), and rejects a classic
+      `ghp_` token even when it has not expired.
+    source: docs/AGENT_YAML_SPEC.md:189-205 (GitHub Copilot); omnigent/onboarding/copilot_auth.py:24-28
+      and :57-61
+  - id: c2
+    text: 'Explains which token Omnigent sends: the agent spec''s `auth.api_key`, else the token saved
+      with `omnigent setup` (the `copilot:` block in `~/.omnigent/config.yaml`), else `COPILOT_GITHUB_TOKEN`
+      / `GH_TOKEN` / `GITHUB_TOKEN`, else the GitHub CLI login, so a different token from the one checked
+      can be in use.'
+    source: omnigent/runtime/workflow.py:2486-2560 (_build_copilot_spawn_env precedence); docs/AGENT_YAML_SPEC.md:199-201
+  - id: c3
+    text: Recommends setting or replacing the token through `omnigent setup` → Copilot ("Set GitHub token"
+      / "Replace GitHub token"), which keeps it in Omnigent's secret store where the background host can
+      read it.
+    check:
+      cli:
+      - setup
+    source: omnigent/cli_config.py:2892-2960 (_manage_copilot_harness); omnigent/onboarding/copilot_auth.py:1-19;
+      shell GH_TOKEN/GITHUB_TOKEN are not in the daemon or runner allowlists (omnigent/cli.py:690-736,
+      omnigent/host/connect.py:762-783, tests/cli/test_backend.py:318-329)
+- id: uninstall-script-missing
+  split: test
+  origin: github issue#3095
+  cluster: install-upgrade-uninstall
+  should_trigger: true
+  prompt: 'How do I uninstall Omnigent when `omnigent uninstall --yes` fails with `Error: uninstall script
+    is missing from this installation`?'
+  criteria:
+  - id: c1
+    text: Explains that `omnigent uninstall` hands off to a bundled `uninstall_oss.sh` script and the
+      installed package does not contain it.
+    source: omnigent/cli.py:5038-5054 (_uninstall_script_path raises this error) and :5345-5366
+  - id: c2
+    text: 'Gives a way to uninstall without the bundled script: run the standalone `uninstall_oss.sh`
+      from the Omnigent repository (curl it from GitHub and pipe it to `sh`, adding `--yes` to apply),
+      or remove the package with the tool that installed it (for example `uv tool uninstall omnigent`).'
+    check:
+      any_of:
+      - uninstall_oss\.sh
+      - uv tool uninstall
+      - brew uninstall
+      - pip uninstall
+    source: 'README.md:224-257 (Uninstalling Omnigent: standalone script when the wheel is broken); scripts/uninstall_oss.sh:643-667
+      (uv tool uninstall omnigent)'
+- id: pi-self-installed-version
+  split: test
+  origin: session history
+  cluster: install-upgrade-uninstall
+  should_trigger: true
+  prompt: If I install a newer version of Pi myself, will Omnigent use it, and will that change which
+    Pi tools I can use?
+  criteria:
+  - id: c1
+    text: 'Says Omnigent does not ship its own Pi: it runs the `pi` CLI found on `PATH` (or the one named
+      by `OMNIGENT_PI_PATH` or `harness.pi-native.command`), so a newer Pi you install is the one it uses.'
+    source: omnigent/harnesses/pi_native/main.py:150-176 (resolve_pi_executable); omnigent/harness_startup_config.py:14-20
+      (command precedence); omnigent/onboarding/harness_install.py:211-218 (setup installs @earendil-works/pi-coding-agent
+      from npm)
+  - id: c2
+    text: States that Omnigent checks only a minimum Pi version and sets no upper limit, so a newer Pi
+      release is accepted.
+    source: omnigent/onboarding/harness_install.py:122 (_PI_MIN_VERSION = 0.84.2) and :211-218 (no max_version_exclusive
+      for Pi, unlike OpenCode at :226-232); omnigent/harnesses/pi_native/main.py:75-100
+  - id: c3
+    text: 'Explains the effect on tools: in `omnigent pi` (pi-native) Pi keeps its own built-in tools,
+      so a newer Pi''s built-ins come with it, plus Omnigent''s tools through its extension; the headless
+      `pi` harness used by agent specs starts Pi with `--no-tools` and re-enables only the agent''s tools,
+      so upgrading Pi does not change that set.'
+    source: omnigent/runner/native/orchestration.py:2276-2307 (_build_pi_native_args adds only --extension,
+      --approve and session flags); omnigent/inner/pi_executor.py:1915-1943 (--no-tools) and :2358-2381
+      (--tools allowlist)
+- id: windows-update-long-paths
+  split: dev
+  origin: github issue#8673
+  cluster: install-upgrade-uninstall
+  should_trigger: true
+  prompt: Why does `omni update` on native Windows fail with `Filename too long` errors for my Git-based
+    install, then leave my uv tool install broken with `No pyvenv.cfg file`? How do I recover?
+  criteria:
+  - id: c1
+    text: Explains that a Git-based install is updated by reinstalling Omnigent from the GitHub repository
+      (`uv tool install --reinstall` with the git URL), so the failure happens in the git checkout, which
+      hits Windows path-length limits unless long-path support is enabled in git, and the interrupted
+      reinstall leaves the uv tool environment broken.
+    source: omnigent/cli.py:5862-5870 (VCS installs re-pull their git ref via _upgrade_vcs_install); omnigent/update_check.py:1546-1552
+      (uv tool install --reinstall <git URL>)
+  - id: c2
+    text: 'Gives the recovery: remove the broken tool environment (`uv tool uninstall omnigent`) and reinstall
+      with uv, for example `uv tool install --python 3.12 omnigent` as documented for native Windows (or
+      reinstall from git after enabling long paths).'
+    check:
+      any_of:
+      - uv tool install
+    source: 'README.md:174-197 (Windows (native): uv tool install --python 3.12 omnigent)'
+- id: db-upgrade-unknown-revision
+  split: test
+  origin: github issue#6719
+  cluster: install-upgrade-uninstall
+  should_trigger: true
+  prompt: 'Why does `omnigent debug db-upgrade` on Omnigent 0.9.0 fail with `CommandError: Can''t locate
+    revision identified by ''za2b3c4d5e6f''`, and how do I upgrade my local database?'
+  criteria:
+  - id: c1
+    text: Explains that a newer Omnigent version already migrated the database, so its schema revision
+      is unknown to the installed 0.9.0 build, and `db-upgrade` (which only migrates forward to that build's
+      own latest revision) cannot handle it.
+    source: 'omnigent/db/utils.py:745-764 (_verify_db_revision_is_supported: an unknown revision means
+      the schema is newer; "Upgrade Omnigent before using this database"); omnigent/cli.py:11936-11963
+      (debug db-upgrade runs migrations to head)'
+  - id: c2
+    text: Recommends upgrading Omnigent to the newer version that last used the database (or the latest
+      release, for example with `omnigent upgrade`) instead of migrating with the old build; the newer
+      build migrates the database itself on startup.
+    source: omnigent/db/utils.py:768-832 (_initialize_or_verify_schema migrates a behind-head database
+      automatically); README.md:202-216 (Updating to a new release)
+- id: windows-uninstall-winerror-193
+  split: test
+  origin: github issue#8001
+  cluster: install-upgrade-uninstall
+  should_trigger: true
+  prompt: 'How do I uninstall Omnigent on Windows 11 when `omnigent uninstall` crashes with `OSError:
+    [WinError 193] %1 is not a valid Win32 application`?'
+  criteria:
+  - id: c1
+    text: Explains that `omnigent uninstall` runs the POSIX shell script `uninstall_oss.sh`, which native
+      Windows cannot execute, so the built-in uninstaller does not work there.
+    source: omnigent/cli.py:5345-5366 (uninstall runs the .sh script with subprocess.run); docs/UNINSTALL_DESIGN.md:17-24
+      (pure POSIX sh)
+  - id: c2
+    text: Says to stop Omnigent's background processes first (`omnigent stop`).
+    check:
+      cli:
+      - stop
+      - server stop
+    source: 'omnigent/cli.py:4985-4991 (stop: every host daemon and the background server)'
+  - id: c3
+    text: Says to remove the CLI with the tool that installed it, which for the documented native-Windows
+      install is `uv tool uninstall omnigent` (or `pip uninstall omnigent` for a pip install).
+    check:
+      any_of:
+      - uv tool uninstall
+      - pip uninstall
+    source: README.md:174-197 (native Windows installs with uv tool install --python 3.12 omnigent); scripts/uninstall_oss.sh:643-667
+- id: public-roadmap
+  split: dev
+  origin: github discussion#780
+  cluster: install-upgrade-uninstall
+  should_trigger: true
+  prompt: Is there a public roadmap for Omnigent, and where can I find it?
+  criteria:
+  - id: c1
+    text: States that Omnigent's docs and website have no roadmap page, so there is no official published
+      roadmap document to point to.
+    source: 'CONTRIBUTING.md:9-12 (Issue prioritization: "not a delivery promise or roadmap commitment");
+      .eval/site-routes.txt (no roadmap route on omnigent.ai)'
+  - id: c2
+    text: 'Points to where planned and shipped work is visible: the release notes (omnigent.ai/releases
+      or CHANGELOG.md) and the project''s GitHub issues and discussions.'
+    source: CHANGELOG.md:1-6 (curated highlights under /releases); .eval/site-routes.txt (/releases);
+      CONTRIBUTING.md:1-4 (issues on GitHub)
+- id: homebrew-old-version-setup-crash
+  split: test
+  origin: github issue#1881
+  cluster: install-upgrade-uninstall
+  should_trigger: true
+  prompt: 'Why does `omni setup` on Omnigent 0.2.0 from Homebrew crash with `ValueError: select() requires
+    at least one option`, and how do I get a newer version when `brew upgrade` stays on 0.2.0?'
+  criteria:
+  - id: c1
+    text: Says the crash is a defect in that old 0.2.0 build (setup tried to show a menu with no options),
+      so the fix is to move to a current release, not to change a setting.
+    source: omnigent/onboarding/interactive.py:463 (select() raises on an empty option list); omnigent/cli_config.py:4207-4232
+      (current setup menus always add a Quit row); CHANGELOG.md:8 and :2531 (v0.18.0 vs v0.2.0)
+  - id: c2
+    text: Says that when the Homebrew tap offers no newer version, install from PyPI instead, for example
+      `uv tool install omnigent` (after `brew uninstall omnigent`, so only one copy is on PATH), then
+      run `omnigent setup` again.
+    check:
+      any_of:
+      - uv tool install
+      - pip install
+    source: 'README.md:94-112 (manual install: uv tool install omnigent or pip install; the Homebrew tap
+      is a separate channel); omnigent/cli.py:5756-5797 (omni upgrade handles uv tool and pipx installs,
+      not Homebrew)'
+- id: near-miss-01
+  split: test
+  origin: session history
+  cluster: 'near-miss: Claude Code hooks'
+  should_trigger: false
+  prompt: Should a rule that must run on every pull request, like bumping the package version, be a Claude
+    Code hook instead of an instruction in CLAUDE.md, and can I add hooks that apply to only one repository?
+- id: near-miss-02
+  split: test
+  origin: session history
+  cluster: 'near-miss: Claude Code in containers'
+  should_trigger: false
+  prompt: How can I avoid logging Claude Code in separately inside every container I start, for example
+    by reusing one long-lived token?
+- id: near-miss-03
+  split: dev
+  origin: session history
+  cluster: 'near-miss: GitHub Actions'
+  should_trigger: false
+  prompt: How can I re-run a failed GitHub Actions check on my pull request when GitHub says I need admin
+    rights to the repository to re-run it?
+- id: near-miss-04
+  split: test
+  origin: session history
+  cluster: 'near-miss: Claude Code CLI'
+  should_trigger: false
+  prompt: What terminal command opens a Claude Code session so I can test a tool from an MCP server I
+    just added?
+- id: near-miss-05
+  split: test
+  origin: session history
+  cluster: 'near-miss: Claude artifacts'
+  should_trigger: false
+  prompt: If an artifact page I use gets republished, will the data I entered in it be reset, and how
+    does state work in an artifact?
+- id: near-miss-06
+  split: dev
+  origin: session history
+  cluster: 'near-miss: git worktrees'
+  should_trigger: false
+  prompt: Why would my app work when I run it from the main checkout but fail to load when I run it from
+    a git worktree of the same repository?
+- id: near-miss-07
+  split: test
+  origin: session history
+  cluster: 'near-miss: local dev proxy'
+  should_trigger: false
+  prompt: If a browser extension for adding request headers is blocked on my machine, how do I set up
+    a local reverse proxy that adds auth headers while I test my app?
+- id: near-miss-08
+  split: test
+  origin: session history
+  cluster: 'near-miss: Azure DevOps'
+  should_trigger: false
+  prompt: What is the best practice for stacking dependent pull requests in Azure DevOps?
+- id: near-miss-09
+  split: dev
+  origin: session history
+  cluster: 'near-miss: Databricks'
+  should_trigger: false
+  prompt: What are the pros and cons of using Databricks Lakebase as the database for a small web app?
+- id: near-miss-10
+  split: test
+  origin: session history
+  cluster: 'near-miss: GitHub privacy'
+  should_trigger: false
+  prompt: If I share links to my pull requests in a public chat, can people see the email address on my
+    commits?
+- id: near-miss-11
+  split: test
+  origin: session history
+  cluster: 'near-miss: GitHub CLI'
+  should_trigger: false
+  prompt: Is there a faster way to make several GitHub repositories private and archive them than changing
+    each one by hand?
+- id: near-miss-12
+  split: dev
+  origin: session history
+  cluster: 'near-miss: git config'
+  should_trigger: false
+  prompt: How can I make git use my personal email automatically in every repository whose remote points
+    at my personal GitHub account, while work repositories keep my work email?
+- id: near-miss-13
+  split: test
+  origin: session history
+  cluster: 'near-miss: git worktrees'
+  should_trigger: false
+  prompt: Can someone else easily run the code in my git worktree, or does it exist only on my machine
+    until I commit and push?
+- id: near-miss-14
+  split: test
+  origin: session history
+  cluster: 'near-miss: MCP in Claude Code'
+  should_trigger: false
+  prompt: How can I confirm that Claude Code is connected to an MCP server such as Datadog, and sign in
+    if the connector needs authentication?
+- id: near-miss-15
+  split: dev
+  origin: session history
+  cluster: 'near-miss: AWS IAM'
+  should_trigger: false
+  prompt: What does it mean when a rendered AWS IAM trust policy uses 1,657 of the 2,048 allowed characters?
+- id: near-miss-16
+  split: test
+  origin: session history
+  cluster: 'near-miss: AWS IAM'
+  should_trigger: false
+  prompt: In AWS IAM, what is the difference between granting access to the role a scheduler service runs
+    as and granting access to a role that it assumes?
+- id: near-miss-17
+  split: test
+  origin: session history
+  cluster: 'near-miss: Azure DevOps'
+  should_trigger: false
+  prompt: How does adding a custom agent or bot to Azure DevOps work, so that it checks every new pull
+    request and comments when a new component looks like an existing one?
+- id: near-miss-18
+  split: dev
+  origin: session history
+  cluster: 'near-miss: local dev servers'
+  should_trigger: false
+  prompt: How do I kill my running dev server sessions when Vite says its WebSocket port 24678 is already
+    in use?
+- id: near-miss-19
+  split: test
+  origin: session history
+  cluster: 'near-miss: Node tooling'
+  should_trigger: false
+  prompt: My eval script told me to run promptfoo view, but my shell says the promptfoo command cannot
+    be found; how do I run it?
