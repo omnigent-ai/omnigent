@@ -35,9 +35,10 @@ _SHELL_SCRIPT_FLAGS = {"-c", "-lc", "-ic"}
 # Codex's and other harnesses' shell tools beyond each harness's declared one.
 _EXTRA_SHELL_TOOLS = frozenset({"exec_command", "run_command"})
 # ``python3 - <<'EOF'`` … ``EOF``: Python fed on stdin. Only a quoted delimiter
-# (no shell expansion) with nothing else on its line runs the body as written.
+# (no shell expansion) with nothing else on its line runs the body as written,
+# and the shell ends the heredoc only at a line that is exactly the delimiter.
 _PYTHON_HEREDOC = re.compile(
-    r"\A\s*(?:python3?)\s+-\s*<<\s*(['\"])(\w+)\1[ \t]*\n(?P<body>.*?)\n\2\s*\Z",
+    r"\A\s*(?:python3?)\s+-\s*<<\s*(['\"])(\w+)\1[ \t]*\n(?P<body>.*?)\n\2\n*\Z",
     re.DOTALL,
 )
 # ``python3 -c '…'``: only a quoted program the shell passes through unchanged
@@ -48,6 +49,11 @@ _PYTHON_C = re.compile(
 # Argument names shell tools use for the directory a command runs in.
 _WORKING_DIRECTORY_KEYS = ("workdir", "cwd", "directory")
 _SQL_ARGUMENT_KEYS = ("sql", "query", "statement")
+# Tools whose result is the built-in shell envelope, and that envelope's fields.
+_SHELL_RESULT_TOOLS = frozenset({"sys_os_shell"})
+_SHELL_RESULT_KEYS = frozenset(
+    {"stdout", "stderr", "exit_code", "timed_out", "error", "shell", "cwd"}
+)
 _INLINE_IMAGE_TYPES = ("png", "jpeg", "gif", "webp")
 # URL characters kept as is in the header link; ``<>()[]`` and spaces are encoded.
 _URL_SAFE = ":/?#@!$&'*+,;=%~-._"
@@ -106,7 +112,7 @@ def _python_source(command: str) -> str | None:
     if heredoc:
         body = heredoc.group("body")
         # A delimiter line inside the body ends the heredoc early: more shell follows.
-        if any(line.strip() == heredoc.group(2) for line in body.splitlines()):
+        if any(line == heredoc.group(2) for line in body.splitlines()):
             return None
         return body
     inline = _PYTHON_C.match(command)
@@ -159,10 +165,14 @@ def _indented_code_spans(text: str, fences: list[tuple[int, int]]) -> Iterator[t
     offset = 0
     in_code = in_list = previous_blank = False
     can_start = True
+    # Fences are in text order, so one cursor walks them alongside the lines.
+    fence = 0
     for raw in text.split("\n"):
         end = offset + len(raw)
         line = raw.removesuffix("\r")
-        if any(start <= offset < stop for start, stop in fences):
+        while fence < len(fences) and fences[fence][1] <= offset:
+            fence += 1
+        if fence < len(fences) and fences[fence][0] <= offset:
             # The block after a fence may be indented code.
             in_code = in_list = False
             can_start = True
@@ -237,22 +247,42 @@ def _stream(name: str, text: str) -> dict[str, Any]:
     return {"output_type": "stream", "name": name, "text": _cut(text)}
 
 
-def _tool_outputs(output: str) -> list[dict[str, Any]]:
+def _shell_result(parsed: object) -> dict[str, Any] | None:
+    """The built-in shell tool's result, or ``None`` for anything shaped otherwise."""
+    if not isinstance(parsed, dict) or not parsed.keys() <= _SHELL_RESULT_KEYS:
+        return None
+    streams = {"stdout", "stderr"} <= parsed.keys() and all(
+        isinstance(parsed[name], str) for name in ("stdout", "stderr")
+    )
+    # A failure to run at all carries only the error, or only the timeout.
+    failed = not ({"stdout", "stderr"} & parsed.keys()) and bool(
+        parsed.get("error") or parsed.get("timed_out")
+    )
+    return parsed if streams or failed else None
+
+
+def _tool_outputs(output: str, tool: str) -> list[dict[str, Any]]:
     """A tool result as notebook outputs: stdout and stderr, text, or images."""
     try:
         parsed = json.loads(output)
     except (TypeError, ValueError):
         parsed = None
-    if isinstance(parsed, dict) and {"stdout", "stderr"} <= parsed.keys():
-        # The built-in shell tool's envelope.
+    # Another tool's output that happens to look like the envelope stays text.
+    shell = _shell_result(parsed) if tool in _SHELL_RESULT_TOOLS else None
+    if shell is not None:
         outputs = []
-        if parsed.get("stdout"):
-            outputs.append(_stream("stdout", str(parsed["stdout"])))
-        if parsed.get("stderr"):
-            outputs.append(_stream("stderr", str(parsed["stderr"])))
-        exit_code = parsed.get("exit_code")
-        if isinstance(exit_code, int) and exit_code != 0:
+        if shell.get("stdout"):
+            outputs.append(_stream("stdout", shell["stdout"]))
+        if shell.get("stderr"):
+            outputs.append(_stream("stderr", shell["stderr"]))
+        exit_code = shell.get("exit_code")
+        error = shell.get("error")
+        if shell.get("timed_out"):
+            outputs.append(_stream("stderr", f"[{error or 'Command timed out'}]\n"))
+        elif isinstance(exit_code, int) and exit_code != 0:
             outputs.append(_stream("stderr", f"[exit code: {exit_code}]\n"))
+        elif exit_code is None and error:
+            outputs.append(_stream("stderr", f"[{error}]\n"))
         return outputs
     # Only the exact image envelope; text that merely looks like one stays text.
     image_result = decode_mcp_image_result(parsed)
@@ -296,7 +326,8 @@ class _NotebookBuilder:
         self.include_outputs = include_outputs
         self.cells: list[dict[str, Any]] = []
         self._code_cells_by_call: dict[str, dict[str, Any]] = {}
-        self._calls_seen: set[str] = set()
+        # Each call's tool, by call id, so its output is read in that tool's shape.
+        self._calls_seen: dict[str, str] = {}
         self._pending_terminal: deque[dict[str, Any]] = deque()
         self._shell_tools = _shell_tool_names()
         self.tools_used: dict[str, int] = {}
@@ -332,7 +363,7 @@ class _NotebookBuilder:
         arguments = _arguments(item.get("arguments"))
         call_id = item.get("call_id")
         if call_id:
-            self._calls_seen.add(str(call_id))
+            self._calls_seen[str(call_id)] = name
         shell = _shell_command(arguments) if name in self._shell_tools else None
         if shell is not None:
             magic, command = shell
@@ -359,6 +390,7 @@ class _NotebookBuilder:
         query = _sql_query(name, arguments)
         if query is not None:
             self.code(f"%%sql\n{query}", call_id)
+            self.magics_used.add("%%sql")
             return
         summary = ", ".join(f"`{key}`" for key in arguments) or "no arguments"
         self.markdown(f"*Tool call: `{name}` ({summary}).*")
@@ -370,7 +402,8 @@ class _NotebookBuilder:
             return
         cell = self._code_cells_by_call.get(call_id)
         if cell is not None and self.include_outputs:
-            cell["outputs"].extend(_tool_outputs(str(item.get("output", ""))))
+            tool = self._calls_seen[call_id]
+            cell["outputs"].extend(_tool_outputs(str(item.get("output", "")), tool))
 
     def terminal_command(self, item: Mapping[str, Any]) -> None:
         if item.get("kind") == "input":
@@ -477,16 +510,24 @@ def session_notebook(
             f"- `{name}` ({count} call{'s' if count != 1 else ''})"
             for name, count in sorted(builder.tools_used.items())
         )
+        needs = [
+            note
+            for magic, note in (
+                ("%%script zsh", "zsh for the `%%script zsh` cells"),
+                (
+                    "%%sql",
+                    "the JupySQL extension (`%load_ext sql`) connected to the same database "
+                    "for the `%%sql` cells",
+                ),
+            )
+            if magic in builder.magics_used
+        ]
+        also = f" Some cells also need {' and '.join(needs)}." if needs else ""
         builder.markdown(
             "## Reproducing this notebook\n\n"
             "The code cells repeat what the agent ran. Running them again may need the "
-            "same workspace files, credentials and data sources"
-            + (
-                ", and zsh for the `%%script zsh` cells"
-                if "%%script zsh" in builder.magics_used
-                else ""
-            )
-            + f". The session used these tools:\n\n{tools}"
+            f"same workspace files, credentials and data sources.{also} The session used "
+            f"these tools:\n\n{tools}"
         )
 
     return {

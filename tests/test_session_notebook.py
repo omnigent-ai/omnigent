@@ -130,6 +130,8 @@ def test_messages_become_markdown_and_shell_runs_become_bash_cells_with_output()
             {"command": "python3 - <<EOF\nprint('$HOME')\nEOF"},
             "%%bash\npython3 - <<EOF\nprint('$HOME')\nEOF",
         ),
+        # Blank lines after the delimiter don't change what runs.
+        ("Bash", {"command": "python3 - <<'EOF'\nprint(1)\nEOF\n\n"}, "print(1)"),
         # A second heredoc after the Python one is more shell, not Python.
         (
             "Bash",
@@ -169,6 +171,19 @@ def test_messages_become_markdown_and_shell_runs_become_bash_cells_with_output()
             {"command": ["/bin/zsh", "-lc", "python3 - <<'PY'\nprint(1)\nPY"]},
             "print(1)",
         ),
+        # The shell ends a heredoc only at a line that is exactly the delimiter.
+        (
+            "Bash",
+            {"command": "python3 - <<'EOF'\nprint(42)\nEOF "},
+            "%%bash\npython3 - <<'EOF'\nprint(42)\nEOF ",
+        ),
+        (
+            "Bash",
+            {"command": "python3 - <<'EOF'\nprint(42)\nEOF\t"},
+            "%%bash\npython3 - <<'EOF'\nprint(42)\nEOF\t",
+        ),
+        # Codex's ``exec_command`` names its command ``cmd``.
+        ("exec_command", {"cmd": "make test"}, "%%bash\nmake test"),
     ],
     ids=[
         "python-heredoc",
@@ -179,6 +194,7 @@ def test_messages_become_markdown_and_shell_runs_become_bash_cells_with_output()
         "heredoc-with-redirect",
         "unquoted-heredoc",
         "heredoc-then-more-shell",
+        "heredoc-then-blank-lines",
         "python-c-with-redirect",
         "python-c-expanded",
         "working-directory",
@@ -187,6 +203,9 @@ def test_messages_become_markdown_and_shell_runs_become_bash_cells_with_output()
         "wrapper-with-expansion",
         "codex-argv-quoted-script",
         "codex-argv-python",
+        "heredoc-delimiter-trailing-space",
+        "heredoc-delimiter-trailing-tab",
+        "exec-command-cmd",
     ],
 )
 def test_each_harness_shell_command_becomes_the_cell_it_ran(
@@ -194,11 +213,6 @@ def test_each_harness_shell_command_becomes_the_cell_it_ran(
 ) -> None:
     notebook = _notebook([_call("c1", name, arguments)])
     assert _cells(notebook) == [("code", source)]
-
-
-def test_exec_command_takes_its_command_from_cmd() -> None:
-    notebook = _notebook([_call("c1", "exec_command", {"cmd": "make test"})])
-    assert _cells(notebook) == [("code", "%%bash\nmake test")]
 
 
 def test_an_sql_tool_becomes_an_sql_cell_and_other_tools_short_notes() -> None:
@@ -230,11 +244,25 @@ def test_outputs_carry_stderr_exit_codes_and_images_unless_left_out() -> None:
             ],
         }
     )
+    # The shell tool's result for a command it stopped at its timeout.
+    timed_out = json.dumps(
+        {
+            "stdout": "",
+            "stderr": "",
+            "exit_code": None,
+            "timed_out": True,
+            "error": "Command timed out after 30 seconds",
+            "shell": "/bin/bash",
+            "cwd": "/work",
+        }
+    )
     items = [
         _call("c1", "sys_os_shell", {"command": "python3 plot.py"}),
         _result("c1", json.dumps({"stdout": "", "stderr": "warning\n", "exit_code": 2})),
         _call("c2", "sys_os_shell", {"command": "open chart.png"}),
         _result("c2", image),
+        _call("c3", "sys_os_shell", {"command": "sleep 60"}),
+        _result("c3", timed_out),
     ]
 
     with_outputs = _notebook(items)
@@ -246,9 +274,38 @@ def test_outputs_carry_stderr_exit_codes_and_images_unless_left_out() -> None:
         {"output_type": "stream", "name": "stdout", "text": "chart saved"},
         {"output_type": "display_data", "data": {"image/png": _PNG}, "metadata": {}},
     ]
+    assert with_outputs["cells"][3]["outputs"] == [
+        {
+            "output_type": "stream",
+            "name": "stderr",
+            "text": "[Command timed out after 30 seconds]\n",
+        }
+    ]
 
     without = _notebook(items, include_outputs=False)
-    assert [cell.get("outputs") for cell in without["cells"][1:3]] == [[], []]
+    assert [cell.get("outputs") for cell in without["cells"][1:4]] == [[], [], []]
+
+
+@pytest.mark.parametrize(
+    ("name", "printed"),
+    [
+        # Claude Code's Bash returns what the command printed, JSON or not.
+        ("Bash", {"stdout": "a", "stderr": "", "exit_code": 0}),
+        # The shell tool's own result never carries other fields.
+        ("sys_os_shell", {"stdout": "a", "stderr": "", "rows": 3}),
+    ],
+    ids=["another-tools-output", "extra-fields"],
+)
+def test_output_that_only_looks_like_a_shell_result_stays_text(
+    name: str, printed: dict[str, Any]
+) -> None:
+    output = json.dumps(printed)
+    notebook = _notebook(
+        [_call("c1", name, {"command": "cat result.json"}), _result("c1", output)]
+    )
+    assert notebook["cells"][1]["outputs"] == [
+        {"output_type": "stream", "name": "stdout", "text": output}
+    ]
 
 
 def test_output_that_only_looks_like_an_image_result_stays_text() -> None:
@@ -376,6 +433,10 @@ def test_a_closing_cell_lists_the_tools_a_rerun_may_need() -> None:
     assert closing.startswith("## Reproducing this notebook")
     assert "- `execute_sql` (1 call)" in closing
     assert "- `sys_os_shell` (2 calls)" in closing
+    # A %%sql cell needs the SQL extension and a connection to rerun.
+    assert "the JupySQL extension (`%load_ext sql`) connected to the same database" in closing
+    shell_only = _notebook([_call("c1", "sys_os_shell", {"command": "ls"})])
+    assert "JupySQL" not in shell_only["cells"][-1]["source"]
 
 
 def test_the_header_link_cannot_break_out_of_its_markdown() -> None:
@@ -388,7 +449,7 @@ def test_dollar_signs_in_text_stay_text_but_code_and_links_keep_them() -> None:
     text = (
         "West made $538.9k (\\$2k fees); see `echo $HOME` and\n```\n$ ls\n```\n"
         "[chart](https://example.com/q?p=$5), <https://example.com/a$b> and "
-        "https://example.com/c$d; 见https://x.com价格$5\n\n    echo $HOME"
+        "https://example.com/c$d; 见https://example.org价格$5\n\n    echo $HOME"
     )
     notebook = _notebook([_message("assistant", text)])
     [(_, source)] = _cells(notebook)
@@ -397,14 +458,19 @@ def test_dollar_signs_in_text_stay_text_but_code_and_links_keep_them() -> None:
         f"**Assistant**\n\nWest made {dollar}538.9k ({dollar}2k fees); "
         "see `echo $HOME` and\n```\n$ ls\n```\n"
         "[chart](https://example.com/q?p=$5), <https://example.com/a$b> and "
-        f"https://example.com/c$d; 见https://x.com价格{dollar}5\n\n    echo $HOME"
+        f"https://example.com/c$d; 见https://example.org价格{dollar}5\n\n    echo $HOME"
     )
 
 
-def test_pathological_link_text_converts_quickly() -> None:
-    """Link-protection patterns can't rescan the text after every failed match."""
+@pytest.mark.parametrize(
+    "text",
+    ["](" * 50_000 + "<https://" * 20_000 + "$5", "```\nx\n```\n" * 20_000 + "$5"],
+    ids=["unclosed-links", "many-fences"],
+)
+def test_pathological_text_converts_quickly(text: str) -> None:
+    """Protecting links and code can't rescan the text after every match or line."""
     started = time.monotonic()
-    _notebook([_message("user", "](" * 50_000 + "<https://" * 20_000 + "$5")])
+    _notebook([_message("user", text)])
     assert time.monotonic() - started < 2
 
 
@@ -456,3 +522,39 @@ def test_the_closing_cell_says_zsh_cells_need_zsh(script: str, needs_zsh: bool) 
     notebook = _notebook([_call("c1", "shell", {"command": ["/bin/zsh", "-lc", script]})])
     closing = notebook["cells"][-1]["source"]
     assert ("zsh for the `%%script zsh` cells" in closing) is needs_zsh
+
+
+def test_a_shell_run_that_failed_to_start_shows_its_error() -> None:
+    notebook = _notebook(
+        [
+            _call("c1", "sys_os_shell", {"command": "ls"}),
+            _result("c1", json.dumps({"error": "Failed to run shell command: no shell"})),
+            _call("c2", "sys_os_shell", {"command": "pwd"}),
+            # The output of another tool with the same keys is still text.
+            _call("c3", "Bash", {"command": "cat err.json"}),
+            _result("c3", json.dumps({"error": "x"})),
+        ]
+    )
+    assert notebook["cells"][1]["outputs"] == [
+        {
+            "output_type": "stream",
+            "name": "stderr",
+            "text": "[Failed to run shell command: no shell]\n",
+        }
+    ]
+    assert notebook["cells"][3]["outputs"] == [
+        {"output_type": "stream", "name": "stdout", "text": json.dumps({"error": "x"})}
+    ]
+
+
+def test_the_closing_cell_lists_every_extra_a_rerun_needs_in_one_sentence() -> None:
+    notebook = _notebook(
+        [
+            _call("c1", "shell", {"command": ["/bin/zsh", "-lc", "print -r hi"]}),
+            _call("c2", "execute_sql", {"query": "SELECT 1"}),
+        ]
+    )
+    assert (
+        "Some cells also need zsh for the `%%script zsh` cells and the JupySQL extension "
+        "(`%load_ext sql`) connected to the same database for the `%%sql` cells."
+    ) in notebook["cells"][-1]["source"]
