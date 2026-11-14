@@ -1463,6 +1463,14 @@ describe("unsent composer state survives the pane moving", () => {
       expect(useChatStore.getState().sideChatComposers["other-pane"].text).toBe("keep me");
     },
   );
+
+  it("is one row tall only in a grid cell", () => {
+    const view = renderPane(<SideChatPane childId={childId} fullSession />);
+    expect(screen.getByTestId("side-chat-input")).not.toHaveAttribute("rows");
+    view.unmount();
+    renderPane(<SideChatPane childId={childId} fullSession gridComposer={{}} />);
+    expect(screen.getByTestId("side-chat-input")).toHaveAttribute("rows", "1");
+  });
 });
 
 describe("history a side chat copied from its parent", () => {

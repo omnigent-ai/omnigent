@@ -1,7 +1,14 @@
 import type * as TerminalsModule from "@/hooks/useTerminals";
 import type * as SessionsApi from "@/lib/sessionsApi";
 import type * as FilesPanelModule from "@/shell/FilesPanel";
-import { type ComponentProps, type ReactElement, useContext, useState } from "react";
+import type * as GridSessionsModule from "./GridSessionsContext";
+import {
+  type ComponentProps,
+  type ReactElement,
+  type ReactNode,
+  useContext,
+  useState,
+} from "react";
 import {
   act,
   cleanup,
@@ -22,7 +29,8 @@ import { RearrangeableGrid } from "./GridWorkspace";
 import { splitGrid } from "./gridLayout";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
-import { retrySession } from "@/lib/sessionsApi";
+import { retrySession, updateSession } from "@/lib/sessionsApi";
+import { toast } from "sonner";
 import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
 import { selectPullRequestInPanel } from "@/shell/PullRequestPanel";
 
@@ -44,6 +52,7 @@ const fixture = vi.hoisted(() => ({
   terminalPending: false,
   composerDisabled: false,
   hostOnline: undefined as boolean | undefined,
+  livenessKind: "online",
   failedChat: "",
   failedTerminal: "",
   renderError: new Error("Grid surface render failed"),
@@ -53,6 +62,15 @@ const fixture = vi.hoisted(() => ({
 vi.mock("@/lib/sessionsApi", async (original) => ({
   ...(await original<typeof SessionsApi>()),
   retrySession: vi.fn(async () => ({ recovered: true })),
+  updateSession: vi.fn(async () => ({ labels: {} })),
+}));
+vi.mock("@/components/HostBadge", () => ({
+  HostBadge: ({ sessionId, readOnly }: { sessionId: string; readOnly?: boolean }) => (
+    <span>
+      Host for {sessionId}
+      {readOnly && " (status only)"}
+    </span>
+  ),
 }));
 vi.mock("@/components/blocks/TerminalView", () => ({
   TerminalView: ({
@@ -83,17 +101,29 @@ vi.mock("@/hooks/useSidebarData", () => ({
 vi.mock("@/hooks/useSession", () => ({
   useSession: (id: string) => ({
     session: {
+      id,
       title: id,
+      llmModel: "snapshot-model",
       agentId: `agent-${id}`,
       labels: fixture.labels,
       permissionLevel: fixture.permissionLevel,
     },
   }),
   useRootSessionId: (id: string) => id,
+  sessionQueryOptions: (id: string) => ({
+    queryKey: ["session", id],
+    queryFn: async () => ({ id, title: id }),
+  }),
 }));
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: () => true }));
 vi.mock("@/hooks/useConversationEntryState", () => ({
-  useConversationEntryState: () => ({ terminalPending: fixture.terminalPending }),
+  useConversationEntryState: () => ({
+    terminalPending: fixture.terminalPending,
+    claudePermissionMode: "default",
+    codexModelOptions: [],
+    llmModel: "live-model",
+    sessionReasoningEffort: "high",
+  }),
 }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: () => {},
@@ -103,7 +133,7 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 vi.mock("@/hooks/useBrowserAgentRelay", () => ({ useBrowserAgentRelay: () => {} }));
 vi.mock("@/hooks/useSessionLiveness", () => ({
   livenessRowFromSession: () => null,
-  useSessionLiveness: () => ({ kind: "online" }),
+  useSessionLiveness: () => ({ kind: fixture.livenessKind }),
 }));
 vi.mock("@/hooks/useChildSessions", () => ({ useChildSessions: () => ({ children: [] }) }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
@@ -115,15 +145,21 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   useTerminals: () => ({ terminals: fixture.terminals }),
   useDeleteTerminal: () => ({}),
 }));
-vi.mock("./GridSessionsContext", () => ({
+vi.mock("./GridSessionsContext", async (original) => ({
+  ...(await original<typeof GridSessionsModule>()),
   useGridSessions: () => {
     const [selectedSessionId, selectSession] = useState("first");
     return { closePane: vi.fn(), selectedSessionId, selectSession };
   },
-  gridTitle: () => "Test grid",
 }));
 vi.mock("@/components/chat/SideChatPane", () => ({
-  SideChatPane: ({ childId }: { childId: string }) => {
+  SideChatPane: ({
+    childId,
+    gridComposer,
+  }: {
+    childId: string;
+    gridComposer?: { leading?: ReactNode; trailing?: ReactNode };
+  }) => {
     const context = useContext(FileViewerContext)!;
     const terminal = useTerminalFirst();
     if (childId === fixture.failedChat) throw fixture.renderError;
@@ -155,6 +191,8 @@ vi.mock("@/components/chat/SideChatPane", () => ({
         <button type="button" onClick={() => context.openGithubTab(LINKED_PR)}>
           Open PR
         </button>
+        {gridComposer?.leading}
+        {gridComposer?.trailing}
       </>
     );
   },
@@ -207,10 +245,65 @@ afterEach(() => {
   fixture.terminalPending = false;
   fixture.composerDisabled = false;
   fixture.hostOnline = undefined;
+  fixture.livenessKind = "online";
   fixture.failedChat = "";
   fixture.failedTerminal = "";
   fixture.discardEdits = null;
   vi.restoreAllMocks();
+});
+
+/** A two-cell grid of "first" and "second". */
+const twoCellGrid = () => (
+  <MemoryRouter>
+    <TooltipProvider>
+      <RearrangeableGrid
+        grid={{ id: "two-cells", layout: splitGrid("first", "first", "second", "right")! }}
+      />
+    </TooltipProvider>
+  </MemoryRouter>
+);
+
+it("shows each cell's session controls and targets that session's permission mode", async () => {
+  fixture.labels = { "omnigent.wrapper": "claude-code-native-ui" };
+  document.title = "Single session";
+  const view = render(twoCellGrid());
+  // Named from the cells' snapshots; neither session is on a loaded sidebar page.
+  await waitFor(() => expect(document.title).toBe("first + second"));
+  const second = within(screen.getByRole("region", { name: "second" }));
+  // An inactive cell keeps the toggle's slot, so activating it never shifts the titlebar.
+  expect(second.queryByRole("button", { name: /grid workspace$/ })).toBeNull();
+  expect(second.getByLabelText(/grid workspace$/)).toHaveStyle({ visibility: "hidden" });
+  // Host and model are read-only here (switch them full screen); live state beats the snapshot.
+  expect(second.getByText("Host for second (status only)")).toBeInTheDocument();
+  expect(second.getByTestId("grid-model-status")).toHaveAccessibleName(
+    "Session · live-model · High",
+  );
+  fireEvent.pointerDown(second.getByRole("button", { name: "Permission mode: Manual" }), {
+    button: 0,
+  });
+  fireEvent.click(screen.getByTestId("composer-permission-option-auto"));
+  await waitFor(() =>
+    expect(updateSession).toHaveBeenCalledWith("second", { claudePermissionMode: "auto" }),
+  );
+  // A rejected switch reports why and frees the chip for another try.
+  const toastError = vi.spyOn(toast, "error").mockReturnValue("error");
+  vi.mocked(updateSession).mockRejectedValueOnce(new Error("Runner unavailable"));
+  const chip = () => second.getByRole("button", { name: "Permission mode: Manual" });
+  fireEvent.pointerDown(chip(), { button: 0 });
+  fireEvent.click(screen.getByTestId("composer-permission-option-plan"));
+  await waitFor(() => expect(toastError).toHaveBeenCalledWith("Runner unavailable"));
+  await waitFor(() => expect(chip()).toBeEnabled());
+  // Only the owner can switch modes.
+  fixture.permissionLevel = 2;
+  view.rerender(twoCellGrid());
+  expect(chip()).toBeDisabled();
+  fixture.permissionLevel = null;
+  // Like the main composer, an unreachable session's chip can't switch modes.
+  fixture.livenessKind = "host_offline";
+  view.rerender(twoCellGrid());
+  expect(second.getByRole("button", { name: "Permission mode: Manual" })).toBeDisabled();
+  view.unmount();
+  expect(document.title).toBe("Single session");
 });
 
 it("opens agent-requested files only in the active workspace and respects navigation guards", () => {

@@ -10,9 +10,14 @@ import {
 import { createPortal } from "react-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { useDraggable, useDroppable } from "@dnd-kit/core";
+import { toast } from "sonner";
 import { cn } from "@/lib/utils";
-import { Maximize2Icon, XIcon } from "lucide-react";
+import { Maximize2Icon, PanelRightCloseIcon, PanelRightIcon, XIcon } from "lucide-react";
 import { SideChatPane } from "@/components/chat/SideChatPane";
+import { COMPOSER_COLLAPSED_LABEL_CLASS } from "@/components/composer/ChatComposer";
+import { ComposerPermissionPicker } from "@/components/composer/ComposerControls";
+import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
+import { HostBadge } from "@/components/HostBadge";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { Button } from "@/components/ui/button";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
@@ -31,8 +36,21 @@ import {
 import { terminalTabKey, useDeleteTerminal } from "@/hooks/useTerminals";
 import { useWorkspaceResources } from "@/shell/useWorkspaceResources";
 import { supportsBrowser } from "@/lib/nativeBridge";
-import { isNativeWrapper, nativeCodingAgentForSubagentWrapper } from "@/lib/nativeCodingAgents";
+import {
+  isNativeWrapper,
+  nativeCodingAgentForHarness,
+  nativeCodingAgentForSubagentWrapper,
+} from "@/lib/nativeCodingAgents";
+import {
+  compactModelTriggerLabel,
+  formatStatusEffortLabel,
+  formatStatusModelLabel,
+} from "@/lib/composerModelLabel";
+import { permissionChip, permissionChipKind } from "@/lib/permissionModeCycle";
 import { isOwnerLevel } from "@/lib/permissionsApi";
+import type { Session } from "@/lib/types";
+import { useChatStore } from "@/store/chatStore";
+import { SidebarOpenButton } from "@/shell/SidebarOpenButton";
 import { retrySession } from "@/lib/sessionsApi";
 import { readTranscriptViewDefault } from "@/lib/transcriptViewPreferences";
 import { MainTerminalView } from "@/shell/MainTerminalView";
@@ -78,6 +96,8 @@ export function GridSessionPane({
   workspaceTarget,
   workspacePanel,
   onOpenWorkspace,
+  onToggleWorkspace,
+  onOpenSidebar,
 }: {
   sessionId: string;
   area?: string;
@@ -88,6 +108,8 @@ export function GridSessionPane({
   workspaceTarget: HTMLDivElement | null;
   workspacePanel: GridWorkspacePanelProps;
   onOpenWorkspace: () => void;
+  onToggleWorkspace: () => void;
+  onOpenSidebar?: () => void;
 }) {
   const queryClient = useQueryClient();
   const { session, isLoading: sessionLoading } = useSession(sessionId);
@@ -398,6 +420,9 @@ export function GridSessionPane({
               selected && "bg-brand-accent/10",
             )}
           >
+            {onOpenSidebar && (
+              <SidebarOpenButton onOpenSidebar={onOpenSidebar} componentId="grid.open_sidebar" />
+            )}
             <button
               type="button"
               ref={setActivatorNodeRef}
@@ -413,6 +438,21 @@ export function GridSessionPane({
               {title}
             </button>
             <ViewModeToggle hotkeyEnabled={selected && !workspacePanel.maximized} alwaysVisible />
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              aria-label={`${workspacePanel.open ? "Collapse" : "Expand"} grid workspace`}
+              onClick={onToggleWorkspace}
+              // Hidden, not removed: activating a cell must not shift its titlebar mid-click.
+              // No transition, or visibility stays "visible" while it fades out.
+              style={selected ? undefined : { visibility: "hidden", transition: "none" }}
+            >
+              {workspacePanel.open ? (
+                <PanelRightCloseIcon className="size-3.5" />
+              ) : (
+                <PanelRightIcon className="size-3.5" />
+              )}
+            </Button>
             <Button asChild variant="ghost" size="icon-xs">
               <Link
                 draggable={false}
@@ -434,7 +474,27 @@ export function GridSessionPane({
           <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
             <div ref={setChatRef} className={cn("h-full", showTerminal && "hidden")}>
               <RenderErrorBoundary name="chat" resetKey={sessionId}>
-                <SideChatPane childId={sessionId} fullSession readOnly={!canEdit} />
+                <SideChatPane
+                  childId={sessionId}
+                  fullSession
+                  readOnly={!canEdit}
+                  gridComposer={{
+                    leading: session && (
+                      <>
+                        {/* Status only; switching hosts stays in the full-screen view. */}
+                        <HostBadge sessionId={sessionId} appearance="composer" readOnly />
+                        <GridPermissionPicker
+                          session={session}
+                          permissionLevel={permissionLevel}
+                          unreachable={
+                            liveness.kind === "host_offline" || liveness.kind === "local_stranded"
+                          }
+                        />
+                      </>
+                    ),
+                    trailing: session && <GridModelStatus session={session} />,
+                  }}
+                />
               </RenderErrorBoundary>
             </div>
             {terminalFirst && (agentTerminal !== null || showTerminal || terminalOpened) && (
@@ -559,5 +619,84 @@ export function GridSessionPane({
           )}
       </FileViewerContext.Provider>
     </TerminalFirstContextProvider>
+  );
+}
+
+/** The cell session's permission mode; its owner can switch it as in the main composer. */
+function GridPermissionPicker({
+  session,
+  permissionLevel,
+  unreachable,
+}: {
+  session: Session;
+  permissionLevel: number | null;
+  /** Its host is offline and a message can't wake it, as in the main composer. */
+  unreachable: boolean;
+}) {
+  const state = useConversationEntryState(session.id);
+  const [busy, setBusy] = useState(false);
+  const kind = permissionChipKind(session);
+  if (kind === null) return null;
+  const chip = permissionChip(kind, state.claudePermissionMode, state.codexApprovalMode);
+  const owner = isOwnerLevel(permissionLevel);
+  return (
+    <ComposerPermissionPicker
+      label="Permission mode"
+      value={chip.label || "Permission mode"}
+      harness={state.sessionHarness}
+      selectedValue={chip.value}
+      options={chip.options}
+      disabled={!owner || unreachable || busy}
+      disabledReason={owner ? undefined : "Only the session owner can change the permission mode"}
+      onSelect={(mode) => {
+        const store = useChatStore.getState();
+        setBusy(true);
+        (kind === "codex"
+          ? store.setCodexApprovalMode(mode, session.id)
+          : store.setClaudePermissionMode(mode, session.id)
+        )
+          .catch((error: unknown) =>
+            toast.error(error instanceof Error ? error.message : "Unable to change permissions"),
+          )
+          .finally(() => setBusy(false));
+      }}
+    />
+  );
+}
+
+/** The cell session's harness, model and effort, read-only; switch models full screen. */
+function GridModelStatus({ session }: { session: Session }) {
+  // Live state first: the snapshot misses picks made full screen or in the terminal.
+  const state = useConversationEntryState(session.id);
+  const harness = state.sessionHarness ?? session.harness ?? null;
+  const agent = nativeCodingAgentForHarness(harness);
+  const options = state.codexModelOptions.length
+    ? state.codexModelOptions
+    : (session.codexModelOptions ?? []);
+  const model =
+    state.llmModel ?? state.sessionModelOverride ?? session.llmModel ?? session.modelOverride;
+  const harnessLabel = agent?.displayName ?? session.agentName ?? "Session";
+  const modelLabel = formatStatusModelLabel(model ?? null, options);
+  const effortLabel = formatStatusEffortLabel(
+    state.sessionReasoningEffort ?? session.reasoningEffort ?? null,
+  );
+  const summary = [harnessLabel, modelLabel, effortLabel].filter(Boolean).join(" · ");
+  return (
+    <span
+      title={summary}
+      aria-label={summary}
+      data-testid="grid-model-status"
+      className="flex h-8 min-w-0 items-center gap-1 px-2 text-muted-foreground md:h-7"
+    >
+      <ComposerAgentIcon
+        agent={{
+          name: agent?.agentName ?? session.agentName ?? "",
+          harness: agent?.harness ?? harness,
+        }}
+      />
+      <span className={cn("min-w-0 truncate text-ui", COMPOSER_COLLAPSED_LABEL_CLASS)}>
+        {compactModelTriggerLabel(modelLabel ?? harnessLabel)}
+      </span>
+    </span>
   );
 }

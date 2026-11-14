@@ -1449,16 +1449,16 @@ export interface ChatActions {
    * Switch a running claude-native session's permission mode (e.g. to
    * ``"auto"``). Rejects when the live TUI could not reach the mode, so
    * callers surface the error rather than assuming the switch landed.
-   * No-ops when there is no active conversation.
+   * Targets *sessionId* when given, else the active conversation (no-op without one).
    */
-  setClaudePermissionMode: (mode: string) => Promise<void>;
+  setClaudePermissionMode: (mode: string, sessionId?: string) => Promise<void>;
   /**
    * Switch a running codex-native session's approval/sandbox mode (e.g. to
    * ``"full-access"``). Rejects when the live Codex thread could not accept the
    * update, so callers surface the error rather than assuming it landed.
-   * No-ops when there is no active conversation.
+   * Targets *sessionId* when given, else the active conversation (no-op without one).
    */
-  setCodexApprovalMode: (mode: string) => Promise<void>;
+  setCodexApprovalMode: (mode: string, sessionId?: string) => Promise<void>;
   /**
    * Fetch the next page of older messages and prepend them to `blocks`.
    *
@@ -3987,10 +3987,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  setClaudePermissionMode: async (mode) => {
-    const { conversationId } = get();
+  setClaudePermissionMode: async (mode, sessionId) => {
+    const conversationId = sessionId ?? get().conversationId;
     if (!conversationId) return;
-    const previous = get().claudePermissionMode;
+    const previous = (sessionId ? setterForState(sessionId) : get())?.claudePermissionMode ?? "";
     // Pinned for the same reason as `setCostControlMode` — see there.
     const patchSet = setterFor(conversationId);
     // Optimistic, then reconciled against the mode the server confirms the
@@ -4005,10 +4005,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  setCodexApprovalMode: async (mode) => {
-    const { conversationId } = get();
+  setCodexApprovalMode: async (mode, sessionId) => {
+    const conversationId = sessionId ?? get().conversationId;
     if (!conversationId) return;
-    const previous = get().codexApprovalMode;
+    const previous = (sessionId ? setterForState(sessionId) : get())?.codexApprovalMode ?? "";
     // Pinned for the same reason as `setCostControlMode` — see there.
     const patchSet = setterFor(conversationId);
     // Optimistic, then reconciled against the mode the server confirms the
