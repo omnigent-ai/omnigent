@@ -186,6 +186,11 @@ def test_routable_host_waits_for_its_own_tunnel_and_names_the_failure() -> None:
     with httpx.Client(base_url="http://test", transport=httpx.MockTransport(respond)) as client:
         assert routable_host(client, host_id=mine) is None
         assert routable_host(client, host_id=mine)["host_id"] == mine
+        # The waiter keeps polling past a failed probe until the tunnel answers.
+        probes.clear()
+        row = wait_for_routable_host(client, host_id=mine, timeout=5, poll_interval=0)
+        assert row["host_id"] == mine
+        assert probes == [mine, mine]
         probes.clear()
         # A zero timeout still polls once, so the message names the failed probe.
         expected = f"host {mine} online but its tunnel probe returned 400"
