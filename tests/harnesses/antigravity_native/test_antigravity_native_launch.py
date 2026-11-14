@@ -11,9 +11,11 @@ from pathlib import Path
 import pytest
 
 import omnigent.harnesses.antigravity_native.launch as _mod
+from omnigent.harnesses.antigravity_native.credentials import AntigravityCredentials
 from omnigent.harnesses.antigravity_native.launch import (
     NativeAntigravityLaunch,
     agy_binary_path,
+    agy_native_env_unset,
     build_agy_launch,
     resolve_native_antigravity_launch,
     should_skip_permissions,
@@ -413,3 +415,35 @@ class TestShouldSkipPermissions:
     def test_none_mode_headless_true(self) -> None:
         """``None`` mode + headless skips (headless wins regardless of mode)."""
         assert should_skip_permissions(permission_mode=None, headless=True) is True
+
+
+# ---------------------------------------------------------------------------
+# agy_native_env_unset
+# ---------------------------------------------------------------------------
+
+
+class TestAgyNativeEnvUnset:
+    """Tests for :func:`agy_native_env_unset` (ambient key vs OAuth, #13925)."""
+
+    _RESOLVE = "omnigent.harnesses.antigravity_native.credentials.resolve_antigravity_credentials"
+
+    def test_empty_without_ambient_key(self) -> None:
+        """No ambient key means nothing to strip."""
+        assert agy_native_env_unset({}) == ()
+
+    def test_strips_ambient_key_when_oauth_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Ambient key declined by the resolver gets stripped from the child env."""
+        monkeypatch.setattr(self._RESOLVE, lambda: None)
+        assert agy_native_env_unset({"GEMINI_API_KEY": "stray"}) == ("GEMINI_API_KEY",)
+
+    def test_strips_companion_base_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The ambient endpoint override leaves with its key."""
+        monkeypatch.setattr(self._RESOLVE, lambda: None)
+        environ = {"GEMINI_API_KEY": "stray", "GOOGLE_GEMINI_BASE_URL": "https://x.example/"}
+        assert agy_native_env_unset(environ) == ("GEMINI_API_KEY", "GOOGLE_GEMINI_BASE_URL")
+
+    def test_keeps_key_when_resolver_uses_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When the ambient (or configured) key drives auth, nothing is stripped."""
+        creds = AntigravityCredentials("key", "https://api.example/")
+        monkeypatch.setattr(self._RESOLVE, lambda: creds)
+        assert agy_native_env_unset({"GEMINI_API_KEY": "stray"}) == ()

@@ -169,6 +169,28 @@ def gemini_auth_has_credential(creds_path: Path | None = None) -> bool:
         return False
 
 
+def gemini_oauth_login_detected() -> bool:
+    """Return whether ``agy`` has a persisted Google OAuth login.
+
+    Unlike :func:`gemini_auth_has_credential` this ignores a non-empty ambient
+    ``GEMINI_API_KEY``: it answers "is the user signed in via OAuth", which is
+    the question that decides which identity an agy session should use when a
+    stray ambient key would otherwise preempt the subscription login.
+
+    :returns: ``True`` when a token file carries a usable credential or — on
+        macOS only, where agy 1.1.7+ stores OAuth in the Keychain — ``agy
+        models`` reports a signed-in CLI; ``False`` otherwise.
+    """
+    if any(_file_carries_token(path) for path in GEMINI_OAUTH_CRED_PATHS):
+        return True
+    if sys.platform != "darwin":
+        return False
+    try:
+        return harness_install.harness_cli_logged_in(GEMINI_FAMILY)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
 def gemini_login_detected() -> bool:
     """Return whether a usable ``agy`` credential is present on this machine.
 

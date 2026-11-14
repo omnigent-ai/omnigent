@@ -581,6 +581,7 @@ def register_resource_routes(
                 command=spec.get("command", "bash"),
                 args=spec.get("args", []),
                 env=spec.get("env", {}),
+                env_unset=list(spec.get("env_unset", [])),
                 scrollback=spec.get("scrollback", 10000),
                 tmux_allow_passthrough=bool(spec.get("tmux_allow_passthrough", False)),
                 tmux_start_on_attach=bool(spec.get("tmux_start_on_attach", False)),

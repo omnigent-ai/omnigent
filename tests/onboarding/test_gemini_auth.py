@@ -318,3 +318,23 @@ def test_cli_fallback_failure_reads_as_no_credential(
 
     monkeypatch.setattr(harness_install, "harness_cli_logged_in", _raise)
     assert ga.gemini_login_detected() is False
+
+
+def test_oauth_login_detected_ignores_ambient_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bare ``GEMINI_API_KEY`` is a credential, not an OAuth login."""
+    monkeypatch.setenv("GEMINI_API_KEY", "ambient-fake")
+    assert ga.gemini_oauth_login_detected() is False
+
+
+def test_oauth_login_detected_sees_token_file_despite_api_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """OAuth detection is orthogonal to a stray ambient key."""
+    monkeypatch.setenv("GEMINI_API_KEY", "ambient-fake")
+    _write(
+        tmp_path / "gemini-home" / "oauth_creds.json",
+        {"access_token": "ya29.abc", "token_type": "Bearer"},
+    )
+    assert ga.gemini_oauth_login_detected() is True

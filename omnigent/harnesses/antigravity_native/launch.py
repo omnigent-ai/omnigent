@@ -36,13 +36,16 @@ Key design points:
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 import shutil
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.onboarding.gemini_auth import gemini_auth_has_credential
+from omnigent.onboarding.gemini_gateway import GEMINI_BASE_URL_ENV
 
 _logger = logging.getLogger(__name__)
 
@@ -141,6 +144,36 @@ def resolve_native_antigravity_launch(
             "agy will prompt for login on first run."
         )
     return NativeAntigravityLaunch(auth_mode="subscription", model=model)
+
+
+def agy_native_env_unset(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """Env var names to strip from an agy child environment.
+
+    An ambient ``GEMINI_API_KEY`` exported for other tooling would preempt the
+    seeded OAuth login inside agy — pinning the session to that key's
+    project quota — so the launch env drops it (and its companion
+    ``GOOGLE_GEMINI_BASE_URL``) whenever the credential resolver declined the
+    ambient key in favor of OAuth. Explicitly configured credentials are never
+    stripped: the resolver returns them, and their env overrides carry the
+    configured values instead.
+
+    :param environ: Optional environment mapping; defaults to ``os.environ``.
+    :returns: ``("GEMINI_API_KEY",)`` — plus ``("GOOGLE_GEMINI_BASE_URL",)``
+        when ambient — or ``()``.
+    """
+    env = os.environ if environ is None else environ
+    if not (env.get("GEMINI_API_KEY") or "").strip():
+        return ()
+    from omnigent.harnesses.antigravity_native.credentials import (
+        resolve_antigravity_credentials,
+    )
+
+    if resolve_antigravity_credentials() is not None:
+        return ()
+    names = ["GEMINI_API_KEY"]
+    if (env.get(GEMINI_BASE_URL_ENV) or "").strip():
+        names.append(GEMINI_BASE_URL_ENV)
+    return tuple(names)
 
 
 def should_skip_permissions(

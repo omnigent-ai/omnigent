@@ -7053,7 +7053,10 @@ async def _auto_create_antigravity_terminal(
         write_mcp_config,
         write_tmux_target,
     )
-    from omnigent.harnesses.antigravity_native.launch import build_agy_launch
+    from omnigent.harnesses.antigravity_native.launch import (
+        agy_native_env_unset,
+        build_agy_launch,
+    )
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 
     if server_client is None:
@@ -7159,6 +7162,10 @@ async def _auto_create_antigravity_terminal(
             trusted_workspace=workspace,
         ),
     }
+    # An ambient ``GEMINI_API_KEY`` exported for other tooling would preempt
+    # agy's OAuth login inside the session; ``agy_native_env_unset`` strips it
+    # when the credential resolver left OAuth in charge.
+    agy_env_unset = list(agy_native_env_unset())
     # agy's periodic feedback survey shares its "esc to cancel" footer with the
     # running-turn marker, so a web turn injected while it is up is misread as an
     # active turn and lost (#1494). Disable it before launch. agy now runs under
@@ -7169,7 +7176,11 @@ async def _auto_create_antigravity_terminal(
     await asyncio.to_thread(
         ensure_agy_feedback_survey_disabled,
         agy_home_dir(bridge_dir),
-        launch_env={**os.environ, **env_overrides},
+        launch_env={
+            name: value
+            for name, value in {**os.environ, **env_overrides}.items()
+            if name not in agy_env_unset
+        },
     )
     argv = [argv[0], f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *argv[1:]]
     from omnigent.harnesses.antigravity_native.gateway import wrap_agy_gateway_launch
@@ -7252,6 +7263,7 @@ async def _auto_create_antigravity_terminal(
             command=argv[0],
             args=list(argv[1:]),
             env=env_overrides,
+            env_unset=agy_env_unset,
             # Match the local ``omnigent antigravity`` terminal scrollback.
             scrollback=100_000,
             # Let agy's full-screen TUI escape sequences reach the web xterm.
