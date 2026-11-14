@@ -49,6 +49,7 @@ from omnigent.runtime.policies.approval import (
     _is_explicit_decline,
     _parse_verdict,
     _truncate,
+    _verdict_reason,
 )
 from omnigent.runtime.policies.approval import (
     build_elicitation_params_json as _params_json,
@@ -200,6 +201,31 @@ def test_is_explicit_decline(raw: str | None, expected: bool) -> None:
     """Only exact ``action == "decline"`` is an explicit decline.
     cancel, accept, malformed, and None all return False."""
     assert _is_explicit_decline(raw) is expected
+
+
+# ── _verdict_reason ────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ('{"action": "decline", "reason": "use a narrower scope"}', "use a narrower scope"),
+        ('{"action": "cancel", "reason": "not like that"}', "not like that"),
+        ('{"action": "decline"}', None),  # absent → policy-reason fallback
+        ('{"action": "decline", "reason": ""}', None),  # empty → fallback
+        ('{"action": "decline", "reason": null}', None),  # explicit null → fallback
+        ('{"action": "decline", "reason": 42}', None),  # wrong type → fallback
+        ('{"action": "decline", "reason": ["a"]}', None),  # wrong type → fallback
+        ("not json", None),
+        ("{}", None),
+        (None, None),
+    ],
+)
+def test_verdict_reason(raw: str | None, expected: str | None) -> None:
+    """The resolver-rationale extractor is fail-closed: only a
+    non-empty string ``reason`` survives; anything else yields
+    ``None`` so callers fall back to the policy's reason (#7315)."""
+    assert _verdict_reason(raw) == expected
 
 
 # ── _parse_verdict ─────────────────────────────────────
@@ -450,11 +476,53 @@ async def test_decline_raises_elicitation_declined_error(
             park=_accepting_park('{"action": "decline"}'),
         )
     assert exc_info.value.policy_name == "gate"
+    # No resolver rationale in the verdict → the POLICY's reason is
+    # carried, preserving the pre-#7315 fallback.
+    assert exc_info.value.args[0] == "review needed"
     # No labels landed — §7.2 invariant preserved.
     assert engine.labels == {}
     conv = conversation_store.get_conversation(engine.conversation_id)
     assert conv is not None
     assert conv.labels == {}
+
+
+@pytest.mark.asyncio
+async def test_decline_carries_resolver_reason_over_policy_reason(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A decline verdict carrying ``reason`` raises with the
+    RESOLVER's rationale, not the policy's.
+
+    Regression guard for #7315: the harness must hear why the human
+    refused ("use a narrower scope"), not the question restated as
+    the answer ("review needed"). Without the fix the policy reason
+    wins and the refusal rationale is structurally unreachable.
+    """
+    policy = _ask_policy("gate", set_labels={"integrity": "0"})
+    engine = _engine_with_policies(conversation_store, [policy])
+    recorder = _Recorder()
+    result = _composed_ask(
+        deciding_policy="gate",
+        reason="review needed",
+        set_labels={"integrity": "0"},
+    )
+
+    with pytest.raises(ElicitationDeclinedError) as exc_info:
+        await _await_elicitation(
+            task_id="task_1",
+            root_task_id="task_1",
+            result=result,
+            phase=Phase.REQUEST,
+            content_preview="hello",
+            policy_engine=engine,
+            register=recorder.register,
+            emit=recorder.emit,
+            park=_accepting_park('{"action": "decline", "reason": "use a narrower scope"}'),
+        )
+    assert exc_info.value.args[0] == "use a narrower scope"
+    assert exc_info.value.policy_name == "gate"
+    # §7.2 invariant preserved — a reasoned refusal is still a refusal.
+    assert engine.labels == {}
 
 
 @pytest.mark.asyncio
