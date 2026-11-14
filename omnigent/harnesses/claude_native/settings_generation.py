@@ -472,8 +472,7 @@ class ClaudeSettingsLease:
             raise ClaudeSettingsRequestExpired()
         return lifecycle
 
-    def attach(self, instance: TerminalInstance) -> None:
-        """Retain inputs until confirmed terminal termination, including after transfer."""
+    def _retain_for_terminal(self) -> ClaudeSettingsLease:
         with bridge_dir_preparation_lock(self.bridge_dir):
             if self._fd is None:
                 raise ValueError("Claude settings request ownership has ended")
@@ -494,7 +493,7 @@ class ClaudeSettingsLease:
                 _release(bridge_fd)
                 _release(claim_fd)
                 raise
-        retained = ClaudeSettingsLease(
+        return ClaudeSettingsLease(
             self.bridge_dir,
             self.generation,
             fd,
@@ -505,10 +504,27 @@ class ClaudeSettingsLease:
             _claim_fd=claim_fd,
             _session_id=self._session_id,
         )
+
+    def attach(self, instance: TerminalInstance) -> None:
+        """Retain inputs until confirmed terminal termination, including after transfer."""
+        retained = self._retain_for_terminal()
         try:
             instance.add_resource_cleanup(retained.close)
         except BaseException:
             retained.close()
+            raise
+
+    async def attach_async(self, instance: TerminalInstance) -> None:
+        """Drain retention before registering cleanup on the terminal's event loop."""
+        from omnigent.harnesses.claude_native.bridge import _run_claude_settings_step
+
+        retained = await _run_claude_settings_step(
+            self._retain_for_terminal, dispose=ClaudeSettingsLease.close
+        )
+        try:
+            instance.add_resource_cleanup(retained.close)
+        except BaseException:
+            await _run_claude_settings_step(retained.close)
             raise
 
     def close(self) -> None:

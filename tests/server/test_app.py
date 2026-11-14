@@ -2524,7 +2524,9 @@ def test_session_id_from_request_parses_session_path() -> None:
 
 @pytest.mark.asyncio
 async def test_offline_runner_is_logged_as_state_while_real_faults_stay_errors(
-    app: FastAPI,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
@@ -2534,12 +2536,19 @@ async def test_offline_runner_is_logged_as_state_while_real_faults_stay_errors(
     downgrading every 5xx would hide genuine faults just as effectively
     as an offline session's polling buried them.
 
-    :param app: The real application, for its registered handlers.
+    :param db_uri: Temporary SQLite database URI.
+    :param tmp_path: Temporary artifact and cache directory.
+    :param monkeypatch: Overrides UI discovery and captures audit attributes.
     :param caplog: Pytest log capture fixture.
     :returns: None.
     """
-    from omnigent.errors import ErrorCode, OmnigentError
+    import json
 
+    from omnigent.errors import ErrorCode, OmnigentError, TerminalLaunchError
+
+    app = _build_api_only_app(db_uri, tmp_path, monkeypatch)
+    audit: list[dict[str, str]] = []
+    monkeypatch.setattr(server_app, "add_audit_attrs", lambda **attrs: audit.append(attrs))
     handler = app.exception_handlers[OmnigentError]
     request = Request(
         {
@@ -2561,20 +2570,36 @@ async def test_offline_runner_is_logged_as_state_while_real_faults_stay_errors(
             ),
         )
         fault = await handler(request, OmnigentError("boom", code=ErrorCode.INTERNAL_ERROR))
+        admitted_fault = await handler(
+            request,
+            TerminalLaunchError(
+                "terminal launch failed", claude_settings_request_ack="settings-generation"
+            ),
+        )
 
-    # The wire contract is untouched: only the log level moves.
     assert offline.status_code == 503
     assert fault.status_code == 500
+    assert fault.body == b'{"error":{"code":"internal_error","message":"boom"}}'
+    assert admitted_fault.status_code == 500
+    assert json.loads(admitted_fault.body) == {
+        "error": {"code": ErrorCode.INTERNAL_ERROR, "message": "terminal launch failed"},
+        "claude_settings_request_ack": "settings-generation",
+    }
+    assert len(audit) == 3
+    assert audit[2] == audit[1]
+    assert audit[2]["http_status"] == "500"
 
     records = [r for r in caplog.records if r.name == "omnigent.server.app"]
-    assert len(records) == 2, f"expected one record per error, got {records}"
-    unavailable, internal = records
+    assert len(records) == 3, f"expected one record per error, got {records}"
+    unavailable, internal, admitted_internal = records
     assert unavailable.levelno == logging.WARNING
     # Raised deliberately from a known site, so a stack adds no information.
     assert unavailable.exc_info is None
     assert "Internal error" not in unavailable.getMessage()
     assert internal.levelno == logging.ERROR
     assert internal.exc_info is not None
+    assert admitted_internal.levelno == logging.ERROR
+    assert admitted_internal.exc_info is not None
 
 
 @pytest.mark.asyncio

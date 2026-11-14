@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
 import json
 import logging
 import mimetypes
@@ -614,6 +615,8 @@ def register_resource_routes(
             ):
                 launched_relay = relay_after.relay
 
+        from omnigent.harnesses.claude_native.bridge import _run_claude_settings_step
+
         prepare_claude: Callable[[TerminalInstance], Awaitable[None]] | None = None
         settings_lease = None
         settings_request_ack: dict[str, str] = {}
@@ -624,6 +627,7 @@ def register_resource_routes(
                     finalize_claude_caller_settings,
                 )
                 from omnigent.harnesses.claude_native.settings_generation import (
+                    ClaudeSettingsLease,
                     acquire_claude_settings_request,
                 )
                 from omnigent.runner.identity import (
@@ -633,8 +637,13 @@ def register_resource_routes(
                 generation = body.get("claude_settings_generation")
                 request_generation = body.get("claude_settings_request")
                 if request_generation is not None:
-                    settings_lease = acquire_claude_settings_request(
-                        bridge_dir_for_bridge_id(bridge_id), request_generation
+                    settings_lease = await _run_claude_settings_step(
+                        functools.partial(
+                            acquire_claude_settings_request,
+                            bridge_dir_for_bridge_id(bridge_id),
+                            request_generation,
+                        ),
+                        dispose=ClaudeSettingsLease.close,
                     )
                     settings_request_ack = {
                         "claude_settings_request_ack": settings_lease.generation
@@ -654,7 +663,7 @@ def register_resource_routes(
                 async def prepare_claude(instance: TerminalInstance) -> None:
                     try:
                         if settings_lease is not None and not replaced_invocation:
-                            settings_lease.attach(instance)
+                            await settings_lease.attach_async(instance)
                         await finalize_claude_caller_settings(
                             instance,
                             bridge_dir=bridge_dir_for_bridge_id(bridge_id),
@@ -724,18 +733,19 @@ def register_resource_routes(
             if launched_relay is not None:
                 _discard_comment_relay(session_id, launched_relay)
             raise
+        else:
+            # Publish the registered terminal before admission release can be cancelled.
+            if bridge_inject:
+                _publish_tmux_target_for_bridge(
+                    resource_registry=resource_registry,
+                    session_id=session_id,
+                    bridge_id=bridge_id,
+                    terminal_name=terminal_name,
+                    session_key=session_key,
+                )
         finally:
             if settings_lease is not None:
-                settings_lease.close()
-
-        if bridge_inject:
-            _publish_tmux_target_for_bridge(
-                resource_registry=resource_registry,
-                session_id=session_id,
-                bridge_id=bridge_id,
-                terminal_name=terminal_name,
-                session_key=session_key,
-            )
+                await _run_claude_settings_step(settings_lease.close)
 
         return JSONResponse(
             status_code=200,

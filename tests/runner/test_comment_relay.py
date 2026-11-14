@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import shlex
 import shutil
 import subprocess
@@ -2356,3 +2357,265 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
         ) as client:
             await client.delete(f"/v1/sessions/{session_id}")
         shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["admission", "attachment"])
+async def test_cancelled_settings_route_disposes_late_owner_before_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    from omnigent.harnesses.claude_native import settings_generation
+    from omnigent.harnesses.claude_native.main import _claude_terminal_request
+    from omnigent.harnesses.claude_native.settings_generation import (
+        ClaudeSettingsLease,
+        ClaudeSettingsRequest,
+    )
+
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(bridge, "start_tool_relay", Mock())
+    finalize = AsyncMock()
+    monkeypatch.setattr(bridge, "finalize_claude_caller_settings", finalize)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.resolve_claude_launch",
+        lambda cmd, args: (cmd, args),
+    )
+    session_id = "conv_cancelled_settings"
+    registry = _StubResourceRegistry(tmp_path)
+    app = _switch_app(
+        tmp_path,
+        _SwitchableServerClient("settings-agent"),
+        {"settings-agent": _spec_without_terminals()},
+        resource_registry=registry,
+    )
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    request = ClaudeSettingsRequest.create(bridge_dir)
+    body = _claude_terminal_request(
+        (), command="claude", bridge_dir=bridge_dir, settings_request=request
+    )
+    baseline = request.settings_path(bridge_dir)
+    baseline_bytes = baseline.read_bytes()
+    request.mark_dispatched()
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    started = asyncio.Event()
+    disposing = asyncio.Event()
+    release_owner = threading.Event()
+    release_disposal = threading.Event()
+    late_owners: list[ClaudeSettingsLease] = []
+    worker_threads: list[int] = []
+    cleanup_order: list[str] = []
+    terminal = Mock()
+    acquire = settings_generation.acquire_claude_settings_request
+    retain = ClaudeSettingsLease._retain_for_terminal
+    close = ClaudeSettingsLease.close
+
+    def late_owner(owner: ClaudeSettingsLease) -> ClaudeSettingsLease:
+        late_owners.append(owner)
+        worker_threads.append(threading.get_ident())
+        loop.call_soon_threadsafe(started.set)
+        if threading.get_ident() != loop_thread and not release_owner.wait(timeout=5):
+            raise TimeoutError("settings owner was not released")
+        return owner
+
+    def acquire_owner(*args) -> ClaudeSettingsLease:
+        owner = acquire(*args)
+        return late_owner(owner) if phase == "admission" else owner
+
+    def retain_owner(self) -> ClaudeSettingsLease:
+        return late_owner(retain(self))
+
+    def close_owner(self) -> None:
+        worker_threads.append(threading.get_ident())
+        if late_owners and self is late_owners[0]:
+            loop.call_soon_threadsafe(disposing.set)
+            if threading.get_ident() != loop_thread and not release_disposal.wait(timeout=5):
+                raise TimeoutError("settings disposal was not released")
+            close(self)
+            cleanup_order.append("disposed")
+        else:
+            close(self)
+            cleanup_order.append("released")
+
+    async def prepare_before_launch(**kwargs):
+        try:
+            await kwargs["prepare_terminal"](terminal)
+        finally:
+            cleanup_order.append("rollback")
+
+    monkeypatch.setattr(settings_generation, "acquire_claude_settings_request", acquire_owner)
+    monkeypatch.setattr(ClaudeSettingsLease, "_retain_for_terminal", retain_owner)
+    monkeypatch.setattr(ClaudeSettingsLease, "close", close_owner)
+    monkeypatch.setattr(registry, "launch_required_terminal", prepare_before_launch)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        task = asyncio.create_task(
+            client.post(f"/v1/sessions/{session_id}/resources/terminals", json=body)
+        )
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            owner = late_owners[0]
+            descriptors = [owner._fd, owner._bridge_fd, owner._claim_fd]
+            for gate in (release_owner, release_disposal):
+                for _attempt in range(3):
+                    task.cancel()
+                    checkpoint = loop.create_future()
+                    loop.call_soon(checkpoint.set_result, None)
+                    await checkpoint
+                    assert not task.done()
+                    assert cleanup_order == []
+                    assert baseline.read_bytes() == baseline_bytes
+                    assert owner._fd is not None
+                    terminal.add_resource_cleanup.assert_not_called()
+                gate.set()
+                if gate is release_owner:
+                    await asyncio.wait_for(disposing.wait(), timeout=5)
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=5)
+            assert all(thread != loop_thread for thread in worker_threads)
+            assert cleanup_order == (
+                ["disposed"] if phase == "admission" else ["disposed", "rollback", "released"]
+            )
+            assert owner._fd is owner._bridge_fd is owner._claim_fd is None
+            for fd in descriptors:
+                if fd is not None:
+                    with pytest.raises(OSError):
+                        os.fstat(fd)
+            assert not list(bridge_dir.glob("*.terminal-*.owner"))
+            assert not baseline.with_suffix(".dispatch.owner").exists()
+            finalize.assert_not_awaited()
+            request.close()
+            assert not list(bridge_dir.glob("claude-settings-*"))
+        finally:
+            release_owner.set()
+            release_disposal.set()
+            await asyncio.gather(task, return_exceptions=True)
+            for owner in late_owners:
+                close(owner)
+            request.close()
+
+
+@pytest.mark.asyncio
+async def test_settings_route_publishes_before_cancelled_admission_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.claude_native import settings_generation
+    from omnigent.harnesses.claude_native.main import _claude_terminal_request
+    from omnigent.harnesses.claude_native.settings_generation import (
+        ClaudeSettingsLease,
+        ClaudeSettingsRequest,
+    )
+
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(bridge, "start_tool_relay", Mock())
+    monkeypatch.setattr(bridge, "finalize_claude_caller_settings", AsyncMock())
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.resolve_claude_launch",
+        lambda command, args: (command, args),
+    )
+    session_id = "conv_successful_settings_release"
+    registry = _StubResourceRegistry(tmp_path)
+    app = _switch_app(
+        tmp_path,
+        _SwitchableServerClient("settings-agent"),
+        {"settings-agent": _spec_without_terminals()},
+        resource_registry=registry,
+    )
+    terminal = Mock(running=True, socket_path=tmp_path / "terminal.sock", tmux_target="claude:0.0")
+    registry.terminal_registry = Mock()
+    registry.terminal_registry.get.return_value = terminal
+    callbacks: list[Callable[[], None]] = []
+    terminal.add_resource_cleanup.side_effect = callbacks.append
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    request = ClaudeSettingsRequest.create(bridge_dir)
+    body = _claude_terminal_request(
+        (), command="claude", bridge_dir=bridge_dir, settings_request=request
+    )
+    baseline = request.settings_path(bridge_dir)
+    baseline_bytes = baseline.read_bytes()
+    request.mark_dispatched()
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    closing = asyncio.Event()
+    release_close = threading.Event()
+    admitted: list[ClaudeSettingsLease] = []
+    retained: list[ClaudeSettingsLease] = []
+    close_threads: list[int] = []
+    acquire = settings_generation.acquire_claude_settings_request
+    retain = ClaudeSettingsLease._retain_for_terminal
+    close = ClaudeSettingsLease.close
+    launch = registry.launch_required_terminal
+
+    def acquire_owner(*args) -> ClaudeSettingsLease:
+        owner = acquire(*args)
+        admitted.append(owner)
+        return owner
+
+    def retain_owner(self) -> ClaudeSettingsLease:
+        owner = retain(self)
+        retained.append(owner)
+        return owner
+
+    def paused_close(self) -> None:
+        if admitted and self is admitted[0]:
+            close_threads.append(threading.get_ident())
+            loop.call_soon_threadsafe(closing.set)
+            if threading.get_ident() != loop_thread and not release_close.wait(timeout=5):
+                raise TimeoutError("admission release was not resumed")
+        close(self)
+
+    async def prepare_and_register(**kwargs):
+        await kwargs["prepare_terminal"](terminal)
+        return await launch(**kwargs)
+
+    monkeypatch.setattr(settings_generation, "acquire_claude_settings_request", acquire_owner)
+    monkeypatch.setattr(ClaudeSettingsLease, "_retain_for_terminal", retain_owner)
+    monkeypatch.setattr(ClaudeSettingsLease, "close", paused_close)
+    monkeypatch.setattr(registry, "launch_required_terminal", prepare_and_register)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        task = asyncio.create_task(
+            client.post(f"/v1/sessions/{session_id}/resources/terminals", json=body)
+        )
+        try:
+            await asyncio.wait_for(closing.wait(), timeout=5)
+            target = bridge.read_tmux_target(bridge_dir)
+            assert target == {
+                "socket_path": str(terminal.socket_path),
+                "tmux_target": "claude:0.0",
+            }
+            assert len(callbacks) == len(retained) == 1
+            for _attempt in range(3):
+                task.cancel()
+                checkpoint = loop.create_future()
+                loop.call_soon(checkpoint.set_result, None)
+                await checkpoint
+                assert not task.done()
+                assert admitted[0]._fd is not None
+                assert retained[0]._fd is not None
+                assert baseline.read_bytes() == baseline_bytes
+            release_close.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=5)
+            assert close_threads and all(thread != loop_thread for thread in close_threads)
+            assert admitted[0]._fd is admitted[0]._bridge_fd is None
+            assert retained[0]._fd is not None
+            assert bridge.read_tmux_target(bridge_dir) == target
+            await asyncio.to_thread(request.close)
+            assert baseline.read_bytes() == baseline_bytes
+            await asyncio.to_thread(callbacks[0])
+            assert retained[0]._fd is None
+            assert not list(bridge_dir.glob("claude-settings-*"))
+        finally:
+            release_close.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            for callback in callbacks:
+                await asyncio.to_thread(callback)
+            for owner in admitted:
+                await asyncio.to_thread(close, owner)
+            await asyncio.to_thread(request.close)

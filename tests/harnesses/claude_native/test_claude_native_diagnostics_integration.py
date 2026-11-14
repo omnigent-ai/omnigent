@@ -6,9 +6,11 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import threading
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -458,6 +460,133 @@ async def test_cli_settings_request_is_released_after_acknowledgement(
         assert not list(bridge_dir.glob("*.terminal-*.owner"))
         prune_unused_claude_settings(bridge_dir)
         assert not list(bridge_dir.glob("claude-settings-*"))
+
+
+@pytest.mark.parametrize("phase", ["create", "dispatch", "acknowledge", "undelivered", "close"])
+async def test_cli_settings_ownership_drains_workers_after_repeated_cancellation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, phase: str
+) -> None:
+    from omnigent.harnesses.claude_native.settings_generation import (
+        ClaudeSettingsRequest,
+        acquire_claude_settings_request,
+        prune_unused_claude_settings,
+    )
+
+    monkeypatch.setattr(claude_native, "resolve_claude_launch", lambda cmd, args: (cmd, args))
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.diagnostics.ClaudeDebugLogFollower", Mock()
+    )
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    started = asyncio.Event()
+    release = threading.Event()
+    launch_context = ContextVar("settings_launch", default=False)
+    worker_observations: list[tuple[int, bool]] = []
+    requests: list[ClaudeSettingsRequest] = []
+    descriptors: list[int] = []
+    posted: list[dict[str, object]] = []
+    create = ClaudeSettingsRequest.create
+    close = ClaudeSettingsRequest.close
+
+    def pause(name: str) -> None:
+        worker_observations.append((threading.get_ident(), launch_context.get()))
+        if name == phase:
+            loop.call_soon_threadsafe(started.set)
+            if threading.get_ident() != loop_thread and not release.wait(timeout=5):
+                raise TimeoutError("settings ownership worker was not released")
+
+    def create_request(cls, bridge_dir: Path) -> ClaudeSettingsRequest:
+        request = create(bridge_dir)
+        requests.append(request)
+        descriptors.extend(
+            fd
+            for fd in (request._request_fd, request._lease._fd, request._lease._bridge_fd)
+            if fd is not None
+        )
+        pause("create")
+        return request
+
+    monkeypatch.setattr(ClaudeSettingsRequest, "create", classmethod(create_request))
+    for name, method_name in (
+        ("dispatch", "mark_dispatched"),
+        ("acknowledge", "acknowledge"),
+        ("undelivered", "cancel_undelivered_dispatch"),
+        ("close", "close"),
+    ):
+        method = getattr(ClaudeSettingsRequest, method_name)
+
+        def observed(self, *args, name=name, method=method):
+            if name == "close":
+                pause(name)
+            result = method(self, *args)
+            if name != "close":
+                pause(name)
+            return result
+
+        monkeypatch.setattr(ClaudeSettingsRequest, method_name, observed)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"claude_settings_request_protocol": 1})
+        body = json.loads(request.content)
+        posted.append(body)
+        if phase == "undelivered":
+            raise httpx.ConnectError("request was not delivered", request=request)
+        generation = body["claude_settings_request"]
+        with acquire_claude_settings_request(tmp_path, generation):
+            return httpx.Response(
+                200,
+                json={"id": "terminal_claude_main", "claude_settings_request_ack": generation},
+            )
+
+    async def launch(client: httpx.AsyncClient) -> None:
+        launch_context.set(True)
+        await claude_native._launch_claude_terminal(
+            client, "cancelled-child", (), command="claude", bridge_dir=tmp_path
+        )
+
+    async with httpx.AsyncClient(
+        base_url="http://unused.invalid", transport=httpx.MockTransport(respond)
+    ) as client:
+        task = asyncio.create_task(launch(client))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            assert requests
+            baseline = tmp_path / f"claude-settings-{requests[0].generation}.json"
+            baseline_bytes = baseline.read_bytes() if baseline.exists() else None
+            for _attempt in range(3):
+                task.cancel()
+                checkpoint = loop.create_future()
+                loop.call_soon(checkpoint.set_result, None)
+                await checkpoint
+                assert not task.done()
+                assert requests[0]._request_fd is not None
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=5)
+            assert all(
+                thread != loop_thread and context for thread, context in worker_observations
+            )
+            assert requests[0]._request_fd is None
+            assert requests[0]._lease._fd is None
+            assert requests[0]._lease._bridge_fd is None
+            for fd in descriptors:
+                with pytest.raises(OSError):
+                    os.fstat(fd)
+            assert bool(posted) is (phase not in {"create", "dispatch"})
+            if phase == "dispatch":
+                assert baseline.read_bytes() == baseline_bytes
+                assert baseline.with_suffix(".dispatch.owner").is_file()
+            else:
+                assert not list(tmp_path.glob("claude-settings-*"))
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+            for request in requests:
+                close(request)
+                baseline = tmp_path / f"claude-settings-{request.generation}.json"
+                baseline.with_suffix(".dispatch.owner").unlink(missing_ok=True)
+            prune_unused_claude_settings(tmp_path)
 
 
 async def test_cli_logs_launch_error_before_cancellation_during_diagnostic_drain(

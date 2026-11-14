@@ -54,6 +54,7 @@ from omnigent.errors import (
     ErrorImpact,
     ErrorPhase,
     OmnigentError,
+    TerminalLaunchError,
     WrongReplicaError,
     is_cancelled_rpc_error,
     is_permission_denied_rpc_error,
@@ -3110,7 +3111,10 @@ def create_app(
             if isinstance(exc, WrongReplicaError)
             else {"code": exc.code, "message": exc.message}
         )
-        return JSONResponse(status_code=exc.http_status, content={"error": error})
+        content: dict[str, Any] = {"error": error}
+        if isinstance(exc, TerminalLaunchError):
+            content["claude_settings_request_ack"] = exc.claude_settings_request_ack
+        return JSONResponse(status_code=exc.http_status, content=content)
 
     @app.exception_handler(RequestValidationError)
     async def _handle_validation_error(

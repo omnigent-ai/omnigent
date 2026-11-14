@@ -37,7 +37,7 @@ from omnigent.entities import (
     StoredFile,
 )
 from omnigent.entities.session_resources import session_resource_view_to_dict
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, TerminalLaunchError
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_terminal_name,
@@ -1675,10 +1675,18 @@ def register_resources_routes(
         if status >= 400:
             error = payload.get("error", {})
             # OmnigentError derives http_status from code; pass the runner's code, not a status.
-            raise OmnigentError(
-                error.get("message", f"Terminal launch failed (runner returned HTTP {status})"),
-                code=error.get("code", ErrorCode.INTERNAL_ERROR),
+            message = error.get(
+                "message", f"Terminal launch failed (runner returned HTTP {status})"
             )
+            code = error.get("code", ErrorCode.INTERNAL_ERROR)
+            settings_request_ack = payload.get("claude_settings_request_ack")
+            if isinstance(settings_request_ack, str):
+                raise TerminalLaunchError(
+                    message,
+                    code=code,
+                    claude_settings_request_ack=settings_request_ack,
+                )
+            raise OmnigentError(message, code=code)
         _publish_and_persist_resource_event(
             session_id,
             "session.resource.created",

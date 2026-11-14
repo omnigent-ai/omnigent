@@ -22,7 +22,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, TerminalLaunchError
 from omnigent.host.frames import HOST_CAPABILITIES, HostHelloFrame
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runtime import (
@@ -530,9 +530,12 @@ def _sessions_app(conversation_store: _ConversationStore, **router_options: Any)
         exc: OmnigentError,
     ) -> JSONResponse:
         del request
+        content: dict[str, Any] = {"error": {"code": exc.code, "message": exc.message}}
+        if isinstance(exc, TerminalLaunchError):
+            content["claude_settings_request_ack"] = exc.claude_settings_request_ack
         return JSONResponse(
             status_code=exc.http_status,
-            content={"error": {"code": exc.code, "message": exc.message}},
+            content=content,
         )
 
     class _StubAgentStore:
@@ -1728,6 +1731,10 @@ async def test_create_terminal_bootstrap_markers_do_not_bypass_gate_for_other_sh
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "settings_request_ack,expected_ack",
+    [(None, None), ("settings-generation", "settings-generation"), (42, None)],
+)
+@pytest.mark.parametrize(
     "runner_status,runner_payload,expected_status,expected_code,expected_message",
     [
         # Runner returns its own error body (the common case: tunnel
@@ -1776,6 +1783,8 @@ async def test_create_terminal_surfaces_runner_error_without_crashing(
     expected_status: int,
     expected_code: str,
     expected_message: str,
+    settings_request_ack: str | int | None,
+    expected_ack: str | None,
 ) -> None:
     """A runner ``>=400`` on terminal launch yields a clean error, not a 500 crash.
 
@@ -1796,9 +1805,14 @@ async def test_create_terminal_surfaces_runner_error_without_crashing(
         surface, e.g. ``"runner_unavailable"``.
     :param expected_message: The human-readable message the route should
         surface.
+    :param settings_request_ack: The admitted request acknowledgement to preserve,
+        or a malformed value that must not enter the public envelope.
+    :param expected_ack: The acknowledgement expected in the public response, if any.
     :returns: None.
     """
     path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals"
+    if settings_request_ack is not None:
+        runner_payload = {**runner_payload, "claude_settings_request_ack": settings_request_ack}
     fake_runner = _FakeRunnerClient(responses={path: (runner_status, runner_payload)})
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
@@ -1817,6 +1831,10 @@ async def test_create_terminal_surfaces_runner_error_without_crashing(
     # error was surfaced, not swallowed or replaced by a generic 500.
     assert body["error"]["code"] == expected_code
     assert body["error"]["message"] == expected_message
+    if expected_ack is None:
+        assert "claude_settings_request_ack" not in body
+    else:
+        assert body["claude_settings_request_ack"] == expected_ack
     # The launch failed, so no resource-created event/resource is returned.
     assert "id" not in body
     # The proxy POST was actually attempted before the error was raised.

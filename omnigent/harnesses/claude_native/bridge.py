@@ -3670,17 +3670,25 @@ def _replace_framework_settings(
             index += 1
 
 
-async def _run_claude_settings_step[Result](operation: Callable[[], Result]) -> Result:
-    """Keep preparation work owned until its worker stops, even under cancellation."""
+async def _run_claude_settings_step[Result](
+    operation: Callable[[], Result], *, dispose: Callable[[Result], None] | None = None
+) -> Result:
+    """Drain cancelled work and dispose any result the caller could not adopt."""
     from omnigent.inner._subprocess_lifecycle import await_cleanup_task
 
     # Loop shutdown must not cancel the completion signal before the thread finishes.
-    worker = asyncio.get_running_loop().run_in_executor(None, copy_context().run, operation)
+    loop = asyncio.get_running_loop()
+    worker = loop.run_in_executor(None, copy_context().run, operation)
     try:
         return await asyncio.shield(worker)
     except asyncio.CancelledError:
         with contextlib.suppress(Exception, asyncio.CancelledError):
             await await_cleanup_task(worker)
+            if dispose is not None:
+                cleanup = loop.run_in_executor(
+                    None, copy_context().run, functools.partial(dispose, worker.result())
+                )
+                await await_cleanup_task(cleanup)
         raise
 
 

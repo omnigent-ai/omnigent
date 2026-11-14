@@ -217,7 +217,7 @@ def test_env_split_string_keeps_a_word_only_for_set_variables():
         # env applies only the last -C, relative to the starting directory.
         ["-C", "link", "-C", "sub", "/bin/pwd"],
         ["-C", "sub", "env", "-C", "nested", "/bin/pwd"],
-        ["-C", "link", "env", "-C", "..", "/bin/pwd"],
+        ["-C", "nested-link", "env", "-C", "..", "/bin/pwd"],
         ["-C", "sub", "env", "-C", "/", "/bin/pwd"],
     ],
 )
@@ -228,12 +228,27 @@ def test_env_wrapper_chdir_matches_real_env(tmp_path, args):
     (tmp_path / "sub").mkdir()
     (tmp_path / "sub" / "nested").mkdir()
     (tmp_path / "link").symlink_to(tmp_path / "sub")
+    (tmp_path / "nested-link").symlink_to(tmp_path / "sub" / "nested")
     chdir = startup.env_wrapper_chdir("/usr/bin/env", args)
     assert chdir is not None
     process = subprocess.run(
         ["/usr/bin/env", *args], cwd=tmp_path, env={}, capture_output=True, text=True, check=True
     )
     assert process.stdout.strip() == str((tmp_path / chdir).resolve())
+
+
+def test_nested_env_chdir_preserves_symlink_parent(tmp_path):
+    """Nested ``env`` resolves a symlink before applying the parent-directory change."""
+    sub = tmp_path / "sub"
+    (sub / "nested").mkdir(parents=True)
+    (tmp_path / "nested-link").symlink_to(sub / "nested")
+
+    chdir = startup.env_wrapper_chdir(
+        "/usr/bin/env", ["-C", "nested-link", "env", "-C", "..", "/bin/pwd"]
+    )
+
+    assert chdir is not None
+    assert (tmp_path / chdir).resolve() == sub
 
 
 @pytest.mark.parametrize(

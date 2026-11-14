@@ -96,6 +96,7 @@ from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     RESUME_COPY_MARKER_SUFFIX,
     ClaudeNativeHookInterpreterMismatchError,
+    _run_claude_settings_step,
     augment_claude_args,
     bridge_dir_for_bridge_id,
     claude_terminal_relay_env,
@@ -6830,7 +6831,10 @@ async def _launch_claude_terminal(
     from omnigent.harnesses.claude_native.settings_generation import ClaudeSettingsRequest
 
     settings_request = (
-        ClaudeSettingsRequest.create(bridge_dir)
+        await _run_claude_settings_step(
+            functools.partial(ClaudeSettingsRequest.create, bridge_dir),
+            dispose=ClaudeSettingsRequest.close,
+        )
         if await _supports_claude_settings_requests(client, session_id)
         else None
     )
@@ -6847,7 +6851,7 @@ async def _launch_claude_terminal(
             settings_request=settings_request,
         )
         if settings_request is not None:
-            settings_request.mark_dispatched()
+            await _run_claude_settings_step(settings_request.mark_dispatched)
         try:
             # Production uses HTTPX's default transport. Disable auth and redirect
             # replays so ConnectError proves this fresh generation was not delivered.
@@ -6861,7 +6865,7 @@ async def _launch_claude_terminal(
         except httpx.ConnectError:
             if settings_request is not None:
                 with contextlib.suppress(Exception):
-                    settings_request.cancel_undelivered_dispatch()
+                    await _run_claude_settings_step(settings_request.cancel_undelivered_dispatch)
             raise
         acknowledged = False
         if settings_request is not None:
@@ -6870,8 +6874,11 @@ async def _launch_claude_terminal(
             except ValueError:
                 response_body = None
             if isinstance(response_body, dict):
-                acknowledged = settings_request.acknowledge(
-                    response_body.get("claude_settings_request_ack")
+                acknowledged = await _run_claude_settings_step(
+                    functools.partial(
+                        settings_request.acknowledge,
+                        response_body.get("claude_settings_request_ack"),
+                    )
                 )
         if resp.status_code >= 400:
             raise click.ClickException(
@@ -6903,7 +6910,7 @@ async def _launch_claude_terminal(
         raise
     finally:
         if settings_request is not None:
-            settings_request.close()
+            await _run_claude_settings_step(settings_request.close)
 
 
 async def _supports_claude_settings_requests(client: httpx.AsyncClient, session_id: str) -> bool:

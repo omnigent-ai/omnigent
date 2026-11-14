@@ -5596,6 +5596,67 @@ async def test_overlapping_caller_settings_finalizers_keep_immutable_baseline(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "registration_fails", [False, True], ids=["adopted", "registration-failed"]
+)
+async def test_async_settings_attachment_registers_on_loop_and_releases_failed_retention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, registration_fails: bool
+) -> None:
+    from omnigent.harnesses.claude_native.settings_generation import (
+        ClaudeSettingsLease,
+        ClaudeSettingsRequest,
+        acquire_claude_settings_request,
+    )
+
+    request = ClaudeSettingsRequest.create(tmp_path)
+    augment_claude_args(
+        (), bridge_dir=tmp_path, defer_caller_settings=True, settings_request=request
+    )
+    lease = acquire_claude_settings_request(tmp_path, request.generation)
+    terminal = Mock()
+    callbacks: list[Callable[[], None]] = []
+    retained: list[ClaudeSettingsLease] = []
+    worker_threads: list[int] = []
+    loop_thread = threading.get_ident()
+    retain = ClaudeSettingsLease._retain_for_terminal
+
+    def retain_in_worker(self) -> ClaudeSettingsLease:
+        worker_threads.append(threading.get_ident())
+        owner = retain(self)
+        retained.append(owner)
+        return owner
+
+    def register(callback: Callable[[], None]) -> None:
+        assert threading.get_ident() == loop_thread
+        if registration_fails:
+            raise RuntimeError("terminal cleanup registration failed")
+        callbacks.append(callback)
+
+    monkeypatch.setattr(ClaudeSettingsLease, "_retain_for_terminal", retain_in_worker)
+    terminal.add_resource_cleanup.side_effect = register
+    try:
+        if registration_fails:
+            with pytest.raises(RuntimeError, match="terminal cleanup registration failed"):
+                await lease.attach_async(terminal)
+            assert retained[0]._fd is retained[0]._bridge_fd is retained[0]._claim_fd is None
+            assert not list(tmp_path.glob("*.terminal-*.owner"))
+        else:
+            await lease.attach_async(terminal)
+            assert retained[0]._fd is not None
+            assert len(callbacks) == 1
+            assert len(list(tmp_path.glob("*.terminal-*.owner"))) == 1
+        assert worker_threads and all(thread != loop_thread for thread in worker_threads)
+    finally:
+        lease.close()
+        request.close()
+        for callback in callbacks:
+            callback()
+        for owner in retained:
+            owner.close()
+    assert not list(tmp_path.glob("claude-settings-*"))
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("private_output", [False, True], ids=["bridge-output", "private-output"])
 async def test_caller_settings_writes_drain_before_cancelled_launch_cleanup(
     tmp_path: Path,

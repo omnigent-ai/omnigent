@@ -18,6 +18,7 @@ import logging
 import os
 import shlex
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -1649,6 +1650,156 @@ async def test_auto_create_claude_terminal_logs_stage_timings(
     assert record.attributes["total_ms"] >= sum(
         record.attributes[f"{stage}_ms"] for stage in stages
     ) - len(stages)
+    assert not list(bridge_dir.rglob("claude-settings-*"))
+
+
+async def test_auto_create_claude_terminal_hands_off_before_cancelled_sender_release(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from collections.abc import Callable
+    from unittest.mock import AsyncMock, Mock
+
+    from omnigent.entities.session_resources import SessionResourceView
+    from omnigent.harnesses.claude_native import bridge, forwarder
+    from omnigent.harnesses.claude_native.settings_generation import (
+        ClaudeSettingsLease,
+        ClaudeSettingsRequest,
+    )
+    from omnigent.runner.native import orchestration
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+
+    session_id = "conv_cancelled_successful_close"
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    closing = asyncio.Event()
+    release_close = threading.Event()
+    release_forwarder = asyncio.Event()
+    requests: list[ClaudeSettingsRequest] = []
+    retained: list[ClaudeSettingsLease] = []
+    callbacks: list[Callable[[], None]] = []
+    close_threads: list[int] = []
+    create = ClaudeSettingsRequest.create
+    retain = ClaudeSettingsLease._retain_for_terminal
+    close = ClaudeSettingsRequest.close
+    terminal = Mock(
+        running=True, socket_path=bridge_dir / "terminal.sock", tmux_target="claude:0.0"
+    )
+    terminal.add_resource_cleanup.side_effect = callbacks.append
+    registry = Mock(spec=SessionResourceRegistry)
+    registry.terminal_registry.get.return_value = terminal
+    subagent_router, turn_router = object(), object()
+    stop_subagent, stop_turn = AsyncMock(), AsyncMock()
+    tasks: dict[str, asyncio.Task[object]] = {}
+    events = Mock()
+
+    def create_request(cls, path: Path) -> ClaudeSettingsRequest:
+        request = create(path)
+        requests.append(request)
+        return request
+
+    def retain_owner(self) -> ClaudeSettingsLease:
+        owner = retain(self)
+        retained.append(owner)
+        return owner
+
+    def paused_close(self) -> None:
+        close_threads.append(threading.get_ident())
+        loop.call_soon_threadsafe(closing.set)
+        if threading.get_ident() != loop_thread and not release_close.wait(timeout=5):
+            raise TimeoutError("sender release was not resumed")
+        close(self)
+
+    async def prepare_and_register(**kwargs):
+        await kwargs["prepare_terminal"](terminal)
+        return SessionResourceView(
+            id="terminal_claude_main",
+            type="terminal",
+            session_id=session_id,
+            name="claude:main",
+            metadata={"running": True},
+        )
+
+    async def supervise(**kwargs) -> None:
+        await release_forwarder.wait()
+
+    monkeypatch.setattr(ClaudeSettingsRequest, "create", classmethod(create_request))
+    monkeypatch.setattr(ClaudeSettingsRequest, "close", paused_close)
+    monkeypatch.setattr(ClaudeSettingsLease, "_retain_for_terminal", retain_owner)
+    monkeypatch.setattr(bridge, "ensure_claude_workspace_trusted", lambda *_a, **_k: None)
+    monkeypatch.setattr(bridge, "finalize_claude_caller_settings", AsyncMock())
+    monkeypatch.setattr(forwarder, "supervise_forwarder", supervise)
+    monkeypatch.setattr(orchestration, "_AUTO_FORWARDER_TASKS", tasks)
+    monkeypatch.setattr(orchestration, "_schedule_terminal_interactive_observer", Mock())
+    monkeypatch.setattr(
+        orchestration,
+        "_start_subagent_router_for_native_session",
+        lambda *_a, **_k: (bridge_dir, subagent_router),
+    )
+    monkeypatch.setattr(
+        orchestration, "_start_turn_router_for_native_session", lambda *_a, **_k: turn_router
+    )
+    monkeypatch.setattr(orchestration, "_shutdown_session_router_async", stop_subagent)
+    monkeypatch.setattr(orchestration, "_shutdown_session_turn_router_async", stop_turn)
+    registry.launch_required_terminal.side_effect = prepare_and_register
+    task = asyncio.create_task(
+        _auto_create_claude_terminal_for_test(
+            monkeypatch,
+            session_id=session_id,
+            workspace=bridge_dir,
+            registry=registry,
+            publish_event=events,
+        )
+    )
+    try:
+        await asyncio.wait_for(closing.wait(), timeout=5)
+        request = requests[0]
+        baseline = request.settings_path(request.bridge_dir)
+        baseline_bytes = baseline.read_bytes()
+        target = bridge.read_tmux_target(request.bridge_dir)
+        assert target == {"socket_path": str(terminal.socket_path), "tmux_target": "claude:0.0"}
+        events.assert_called_once()
+        assert events.call_args.args[1]["type"] == "session.resource.created"
+        assert session_id in tasks and not tasks[session_id].done()
+        for _attempt in range(3):
+            task.cancel()
+            checkpoint = loop.create_future()
+            loop.call_soon(checkpoint.set_result, None)
+            await checkpoint
+            assert not task.done()
+            assert request._request_fd is not None
+            assert baseline.read_bytes() == baseline_bytes
+            assert retained[0]._fd is not None
+            stop_subagent.assert_not_awaited()
+            stop_turn.assert_not_awaited()
+        release_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+        assert close_threads and all(thread != loop_thread for thread in close_threads)
+        assert request._request_fd is request._lease._fd is request._lease._bridge_fd is None
+        assert baseline.read_bytes() == baseline_bytes
+        assert bridge.read_tmux_target(request.bridge_dir) == target
+        assert len(callbacks) == 1 and retained[0]._fd is not None
+        assert session_id in tasks and not tasks[session_id].done()
+        stop_subagent.assert_not_awaited()
+        stop_turn.assert_not_awaited()
+        release_forwarder.set()
+        await asyncio.wait_for(tasks[session_id], timeout=5)
+        stop_subagent.assert_awaited_once_with(session_id, subagent_router)
+        stop_turn.assert_awaited_once_with(session_id, turn_router)
+        await asyncio.to_thread(callbacks[0])
+        assert retained[0]._fd is None
+        assert not list(request.bridge_dir.glob("claude-settings-*"))
+        registry.launch_required_terminal.assert_awaited_once()
+    finally:
+        release_close.set()
+        release_forwarder.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, *list(tasks.values()), return_exceptions=True)
+        for callback in callbacks:
+            await asyncio.to_thread(callback)
+        for request in requests:
+            await asyncio.to_thread(close, request)
 
 
 @pytest.mark.parametrize(
@@ -1658,6 +1809,7 @@ async def test_auto_create_claude_terminal_logs_stage_timings(
         ("trust", True, False),
         ("trust", False, True),
         ("trust", False, False),
+        ("cancelled-close", True, True),
         ("disableAllHooks", True, True),
     ],
 )
@@ -1696,7 +1848,7 @@ async def test_auto_create_claude_terminal_cleans_routers_when_preparation_fails
         shutdowns.append(("turn", router))
 
     def failing_seed(_workspace: Path, env: dict[str, str] | None = None) -> None:
-        if failure == "trust":
+        if failure in {"trust", "cancelled-close"}:
             raise ValueError("config is not a JSON object")
 
     monkeypatch.setattr(
@@ -1715,7 +1867,7 @@ async def test_auto_create_claude_terminal_cleans_routers_when_preparation_fails
     registry = Mock(spec=SessionResourceRegistry)
     registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
 
-    if failure != "trust":
+    if failure not in {"trust", "cancelled-close"}:
         monkeypatch.setattr(
             orchestration,
             "_build_claude_native_base_args",
@@ -1740,8 +1892,8 @@ async def test_auto_create_claude_terminal_cleans_routers_when_preparation_fails
                 await created.instance.close()
 
         registry.launch_required_terminal.side_effect = prepare_before_launch
-    expected_error = "config is not a JSON object" if failure == "trust" else failure
-    with pytest.raises(ValueError, match=expected_error):
+
+    async def launch() -> None:
         await _auto_create_claude_terminal_for_test(
             monkeypatch,
             session_id="conv_seed_failure_routers",
@@ -1749,14 +1901,57 @@ async def test_auto_create_claude_terminal_cleans_routers_when_preparation_fails
             registry=registry,
         )
 
+    if failure == "cancelled-close":
+        from omnigent.harnesses.claude_native.settings_generation import ClaudeSettingsRequest
+
+        loop = asyncio.get_running_loop()
+        loop_thread = threading.get_ident()
+        closing = asyncio.Event()
+        release = threading.Event()
+        worker_threads: list[int] = []
+        close = ClaudeSettingsRequest.close
+
+        def paused_close(self) -> None:
+            worker_threads.append(threading.get_ident())
+            loop.call_soon_threadsafe(closing.set)
+            if threading.get_ident() != loop_thread and not release.wait(timeout=5):
+                raise TimeoutError("request close was not released")
+            close(self)
+
+        monkeypatch.setattr(ClaudeSettingsRequest, "close", paused_close)
+        task = asyncio.create_task(launch())
+        try:
+            await asyncio.wait_for(closing.wait(), timeout=5)
+            for _attempt in range(3):
+                task.cancel()
+                checkpoint = loop.create_future()
+                loop.call_soon(checkpoint.set_result, None)
+                await checkpoint
+                assert not task.done()
+                assert shutdowns == []
+                assert list(bridge_dir.rglob("claude-settings-*.request.lock"))
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=5)
+            assert all(thread != loop_thread for thread in worker_threads)
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+    else:
+        expected_error = "config is not a JSON object" if failure == "trust" else failure
+        with pytest.raises(ValueError, match=expected_error):
+            await launch()
+
     expected = []
     if subagent_started:
         expected.append(("subagent", subagent_router))
     if turn_started:
         expected.append(("turn", turn_router))
     assert shutdowns == expected
-    assert registry.launch_required_terminal.call_count == (failure != "trust")
-    assert not list(bridge_dir.glob("claude-settings-*"))
+    assert registry.launch_required_terminal.call_count == (
+        failure not in {"trust", "cancelled-close"}
+    )
+    assert not list(bridge_dir.rglob("claude-settings-*"))
 
 
 @pytest.mark.parametrize(
