@@ -20,6 +20,7 @@ from omnigent.server.routes._sessions import common, helpers, orchestration
 from omnigent.server.schemas import ErrorDetail
 from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from tests.budgets import budget
 
 _RUNNER = "runner-stopped"
 
@@ -60,6 +61,8 @@ def family(
             sessions._session_active_response_cache.pop(session_id, None)
             sessions._runner_relay_tasks.pop(session_id, None)
             session_stream.close(session_id)
+        # Failed tasks can keep loop-bound locks alive through their tracebacks.
+        common._intentional_runner_stop_locks.clear()
 
 
 @pytest.mark.parametrize("handoff", ["stopped", "rebound", "failed"])
@@ -1042,7 +1045,7 @@ async def test_overlapping_stop_failure_preserves_successful_stop(
     first = asyncio.create_task(
         orchestration._stop_host_runner_intentionally(ids["parent"], "host", _RUNNER, None, store)
     )
-    await asyncio.wait_for(first_entered.wait(), timeout=10)
+    await asyncio.wait_for(first_entered.wait(), timeout=budget(10))
     second_id = ids["parent"] if same_runner else ids["elsewhere"]
     second_runner = _RUNNER if same_runner else "runner-other"
     second = asyncio.create_task(
@@ -1051,10 +1054,20 @@ async def test_overlapping_stop_failure_preserves_successful_stop(
         )
     )
     try:
-        # Let an independent stop finish while the first delivery is held open.
-        await asyncio.wait({second}, timeout=1)
-        if not same_runner:
-            assert second.done(), "Stopping another runner must not wait for the first runner"
+        if same_runner:
+            stop_lock = common._intentional_runner_stop_locks[_RUNNER]
+            acquire_stop_lock = stop_lock.acquire
+            second_waiting = asyncio.Event()
+
+            async def acquire_after_first() -> bool:
+                second_waiting.set()
+                return await acquire_stop_lock()
+
+            monkeypatch.setattr(stop_lock, "acquire", acquire_after_first)
+            await asyncio.wait_for(second_waiting.wait(), timeout=budget(10))
+        else:
+            # An independent runner finishes before the first delivery is released.
+            assert await asyncio.wait_for(asyncio.shield(second), timeout=budget(10))
         if first_cancelled:
             first.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -1062,7 +1075,7 @@ async def test_overlapping_stop_failure_preserves_successful_stop(
         else:
             release_first.set()
             assert not await first
-        assert await asyncio.wait_for(second, timeout=10)
+        assert await asyncio.wait_for(second, timeout=budget(10))
         error = ErrorDetail(
             code="runner_disconnected", message="Runner disconnected unexpectedly."
         )
