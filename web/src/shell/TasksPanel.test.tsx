@@ -4,6 +4,7 @@ import type * as UseSessionJournalModule from "@/hooks/useSessionJournal";
 import type * as CapabilitiesModule from "@/lib/CapabilitiesContext";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
@@ -451,6 +452,47 @@ describe("TasksPanel", () => {
       act(withdraw);
     }
   });
+
+  it.each([false, true])(
+    "disables saving an existing workflow and explains where to edit it (replanned: %s)",
+    async (replanned) => {
+      const workflowId = "0123456789abcdef0123456789abcdef";
+      showJournal([
+        { ...journalPlan(0, ["explore"]), workflow_id: workflowId },
+        ...(replanned ? [journalPlan(1, ["explore"], ["fix", ["explore"]])] : []),
+      ]);
+      const save = vi.fn();
+      const withdraw = registerSaveWorkflow("conv", save);
+      const user = userEvent.setup();
+      try {
+        renderPanel();
+        await user.click(screen.getByRole("button", { name: "Plan actions" }));
+        const item = screen.getByRole("menuitem", { name: "Save as workflow…" });
+        expect(item).toHaveAttribute("aria-disabled", "true");
+        expect(item).toHaveAccessibleDescription(
+          "Already saved as a workflow. Open the workflow to edit it.",
+        );
+        await user.hover(item);
+        expect(await screen.findByRole("tooltip")).toHaveTextContent(
+          "Already saved as a workflow. Open the workflow to edit it.",
+        );
+
+        await user.click(item);
+        await user.keyboard("{Enter} ");
+        expect(screen.getByRole("menu")).toBeInTheDocument();
+        await user.keyboard("{Escape}");
+        await act(
+          () =>
+            new Promise<void>((resolve) => {
+              requestAnimationFrame(() => resolve());
+            }),
+        );
+        expect(save).not.toHaveBeenCalled();
+      } finally {
+        act(withdraw);
+      }
+    },
+  );
 
   it("offers Run on a ready task, Continue on a stopped one or one waiting for you, and Retry on a failed one", () => {
     showJournal([
