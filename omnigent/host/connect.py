@@ -6185,22 +6185,28 @@ class HostProcess:
             async for reply in serve_tunnel_call(self._workspace_reader, frame):
                 await self._send_text(ws, self._encode_frame(reply))
         elif isinstance(frame, HostFsRequestFrame):
-            # Git status and directory walks can block, so run the read
-            # off the event loop and reply when it completes.
-            fs_result = await asyncio.to_thread(self._handle_fs_request, frame)
+            # Git/PR commands must retain their exit status through cancellation.
+            fs_result = await self._run_host_subprocess_in_thread(
+                lambda: self._handle_fs_request(frame)
+            )
             await self._send_text(ws, self._encode_frame(fs_result))
         elif isinstance(frame, HostFsWriteFrame):
-            # gh/git writes can block; run off the event loop and reply back.
-            fs_write_result = await asyncio.to_thread(self._handle_fs_write, frame)
+            fs_write_result = await self._run_host_subprocess_in_thread(
+                lambda: self._handle_fs_write(frame)
+            )
             await self._send_text(ws, self._encode_frame(fs_write_result))
         elif isinstance(frame, HostSkillsFrame):
-            skills_result = await asyncio.to_thread(self._handle_skills, frame)
+            skills_result = await self._run_host_subprocess_in_thread(
+                lambda: self._handle_skills(frame)
+            )
             await self._send_text(ws, self._encode_frame(skills_result))
         elif isinstance(frame, HostPluginsFrame):
             plugins_result = await asyncio.to_thread(self._handle_plugins, frame)
             await self._send_text(ws, self._encode_frame(plugins_result))
         elif isinstance(frame, HostSkillContentFrame):
-            content_result = await asyncio.to_thread(self._handle_skill_content, frame)
+            content_result = await self._run_host_subprocess_in_thread(
+                lambda: self._handle_skill_content(frame)
+            )
             await self._send_text(ws, self._encode_frame(content_result))
         elif isinstance(frame, HostSetMcpServerEnabledFrame):
             enabled_result = await asyncio.to_thread(self._handle_set_mcp_server_enabled, frame)
