@@ -36,6 +36,8 @@ def _option(raw: object, where: str) -> dict[str, Any]:
         raise InvalidJournalEntryError(f"{where} has unknown fields: {', '.join(sorted(unknown))}")
     option: dict[str, Any] = {"label": _line(f"{where}.label", raw.get("label"))}
     description = raw.get("description")
+    if isinstance(description, str) and not description.strip():
+        description = None
     if description is not None:
         option["description"] = _line(f"{where}.description", description)
     return option

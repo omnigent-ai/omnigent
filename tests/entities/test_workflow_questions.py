@@ -25,8 +25,21 @@ def _question(**fields: object) -> dict[str, object]:
     }
 
 
-def test_questions_are_collapsed_and_keep_an_optional_recommendation() -> None:
-    [question] = normalize_questions([_question(recommended="Use prod")])
+@pytest.mark.parametrize("description", [None, "", " \n "])
+def test_questions_are_collapsed_and_keep_an_optional_recommendation(
+    description: str | None,
+) -> None:
+    [question] = normalize_questions(
+        [
+            _question(
+                recommended="Use prod",
+                options=[
+                    {"label": "Use staging", "description": "Probe staging first"},
+                    {"label": "Use prod", "description": description},
+                ],
+            )
+        ]
+    )
     assert question == {
         "question": "Which profiles should the release use?",
         "header": "Profiles",
