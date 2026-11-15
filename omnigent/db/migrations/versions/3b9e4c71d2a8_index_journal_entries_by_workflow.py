@@ -18,8 +18,9 @@ start on it: startup refuses a schema revision the build does not know.
 
 Rollback: stop the servers, downgrade with a build that includes this
 migration (``OMNIGENT_DB_URL=<uri> alembic -c omnigent/db/alembic.ini
-downgrade ce12af3da168``), then start the older build. Downgrade drops the
-index; no data is lost.
+downgrade 3b9e4c71d2a8@ce12af3da168``), then start the older build. This
+branch-qualified target preserves the automation branch. It drops the index
+and downgrades later workflow revisions; follow their rollback prerequisites.
 """
 
 from __future__ import annotations

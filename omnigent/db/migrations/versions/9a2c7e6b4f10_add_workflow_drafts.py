@@ -4,8 +4,12 @@ Revision ID: 9a2c7e6b4f10
 Revises: 3b9e4c71d2a8
 
 Existing workflows remain runnable. Apply before upgrading the server.
-Downgrade removes drafts and session links; saved plans remain intact. Stop
-writers first. Draft cleanup commits bounded batches and can be restarted.
+
+Rollback: stop writers, then use a build containing this migration to run
+``OMNIGENT_DB_URL=<uri> alembic -c omnigent/db/alembic.ini downgrade
+9a2c7e6b4f10@3b9e4c71d2a8`` before starting the older server. This preserves
+the automation branch, removes drafts and session links, and keeps saved plans.
+Draft cleanup commits bounded batches and can be restarted.
 Decrypt saved plans with the deployment's codec before downgrading; all plans
 are checked before the first draft is removed.
 """
