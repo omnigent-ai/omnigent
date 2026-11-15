@@ -1876,6 +1876,23 @@ describe("BlockStream — elicitation", () => {
     expect(blockFor({ is_blocking: true })).not.toHaveProperty("isBlocking");
   });
 
+  it("keeps the task a workflow question is about on its card", () => {
+    const card = (params: Record<string, unknown>) => {
+      const event = parseEvent("response.elicitation_request", {
+        elicitation_id: "elicit_journal_1",
+        params: { mode: "form", message: "Waiting for you on Deploy", ...params },
+      });
+      if (event === null) throw new Error("expected an elicitation request");
+      return reduce([event]).find((b): b is ElicitationBlock => b.type === "elicitation");
+    };
+
+    expect(card({ phase: "workflow_request_input", journal_step: "deploy" })).toMatchObject({
+      phase: "workflow_request_input",
+      journalStep: "deploy",
+    });
+    expect(card({ phase: "workflow_request_input" })).not.toHaveProperty("journalStep");
+  });
+
   it("flushes pending text before an elicitation prompt", () => {
     const blocks = reduce([
       { type: "response_created", response: makeResponse({ responseId: "resp_plan" }) },
