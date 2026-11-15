@@ -20,6 +20,7 @@ from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
 from omnigent.spec import AgentSpec
 from omnigent.stores import ConversationStore
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.tools.builtins.session_message import SESSION_MESSAGE_MAX_CHARS
 from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
@@ -969,7 +970,7 @@ class SysSessionCreateTool(Tool):
             "A project_name other than this session's project makes a standalone "
             "session there, not a nested agent. "
             "An independent worker's optional "
-            "first message must contain 1–8000 characters. "
+            f"first message must contain 1–{SESSION_MESSAGE_MAX_CHARS} characters. "
             "Independent sessions do not forward replies: "
             "read their status/history, and use sys_session_message for subsequent work. "
             "Returns {conversation_id, agent_id, title, status}, plus project_id "

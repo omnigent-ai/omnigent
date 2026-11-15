@@ -5,6 +5,9 @@ from typing import Any
 from omnigent.server.feature_flags import Feature, resolve_feature_flags
 from omnigent.tools.base import Tool
 
+# Sized so an automation's worker can receive long owner instructions plus the matched item.
+SESSION_MESSAGE_MAX_CHARS = 32_000
+
 
 def peer_session_messaging_enabled() -> bool:
     """Whether this process's ``OMNIGENT_FEATURES`` leaves peer messaging enabled."""
@@ -37,7 +40,11 @@ class SysSessionMessageTool(Tool):
                     "type": "object",
                     "properties": {
                         "session_id": {"type": "string", "description": "Destination session ID."},
-                        "message": {"type": "string", "minLength": 1, "maxLength": 8000},
+                        "message": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": SESSION_MESSAGE_MAX_CHARS,
+                        },
                     },
                     "required": ["session_id", "message"],
                     "additionalProperties": False,
