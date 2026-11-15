@@ -824,6 +824,121 @@ async def test_a_workflow_question_marks_its_task_and_returns_the_answer(
     }
 
 
+async def test_a_human_turn_after_a_continued_automation_restores_interactive_attribution(
+    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes._sessions.helpers import _publish_status
+    from tests.server.integration.test_sessions_harness_override import _stub_late_runner_bind
+
+    conversations = SqlAlchemyConversationStore(db_uri)
+    session_id = _session(db_uri)
+    tasks = SqlAlchemyScheduledTaskStore(db_uri)
+    task = tasks.create(
+        uuid.uuid4().hex,
+        "Reminder",
+        "Review the report",
+        "FREQ=HOURLY",
+        ALICE,
+        uuid.uuid4().hex,
+        "UTC",
+        session_mode="continue",
+        session_id=session_id,
+    )
+    run = tasks.create_run(
+        uuid.uuid4().hex,
+        task.id,
+        "succeeded",
+        1,
+        conversation_id=session_id,
+        fired_at=1,
+    )
+    conversations.update_scheduled_run_label(session_id, run.id, action="begin")
+    conversations.update_scheduled_run_label(session_id, run.id, action="commit")
+    journal = f"/v1/sessions/{session_id}/journal"
+    automated = await client.post(
+        journal,
+        json=_write("plan", _ONE_TASK_PLAN, "automated-plan"),
+        headers=_runner(session_id),
+    )
+    assert automated.json()["scheduled_task_run_id"] == run.id
+    question = {"step": "deploy", "questions": [_DEPLOY_QUESTION], "idempotency_key": "question"}
+    # Continued runs succeed on delivery, before their agent has finished working.
+    refused = await client.post(
+        f"{journal}/input-requests", json=question, headers=_runner(session_id)
+    )
+    assert refused.status_code == 409 and "unattended_input_not_allowed" in refused.text
+
+    workers = []
+    for ancestry in (
+        {"parent_conversation_id": session_id},
+        {"labels": {CREATED_BY_SESSION_LABEL_KEY: session_id}},
+    ):
+        worker = conversations.create_conversation(
+            **ancestry,
+            runner_id=token_bound_runner_id(_RUNNER_TOKEN),
+        )
+        SqlAlchemyPermissionStore(db_uri).grant(ALICE, worker.id, 4)
+        workers.append(worker.id)
+    finished = await client.post(
+        journal,
+        json=_write("status", {"status": "done", "text": "Reported"}, "done"),
+        headers=_runner(session_id),
+    )
+    assert finished.status_code == 200, finished.text
+    _publish_status(session_id, "idle")
+    _stub_late_runner_bind(monkeypatch)
+    sender = _session(db_uri)
+    peer = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "session_message", "data": {"message": "Background worker finished"}},
+        headers=_runner(sender),
+    )
+    assert peer.status_code == 202, peer.text
+    assert (
+        conversations.get_conversation(session_id).labels[SCHEDULED_TASK_RUN_LABEL_KEY] == run.id
+    )
+    human = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "text", "text": "Let's review the result"}],
+            },
+        },
+        headers=_headers(ALICE),
+    )
+    assert human.status_code == 202, human.text
+    followup = await client.post(
+        journal,
+        json=_write("plan", _ONE_TASK_PLAN, "interactive-plan"),
+        headers=_runner(session_id),
+    )
+    assert followup.json()["scheduled_task_run_id"] is None
+    asked = await client.post(
+        f"{journal}/input-requests", json=question, headers=_runner(session_id)
+    )
+    assert asked.status_code == 200, asked.text
+    assert asked.json()["entry"]["scheduled_task_run_id"] is None
+    note = await client.post(
+        journal,
+        json=_write("note", {"body": "Interactive follow-up"}, "human-note"),
+        headers=_runner(session_id),
+    )
+    assert note.json()["scheduled_task_run_id"] is None
+    history = (
+        await client.get(f"/v1/scheduled-tasks/{task.id}/run-steps", headers=_headers(ALICE))
+    ).json()
+    assert [entry["content"]["status"] for entry in history["runs"][0]["statuses"]] == ["done"]
+    for worker_id in workers:
+        waiting = await client.post(
+            f"/v1/sessions/{worker_id}/journal",
+            json=_write("status", {"status": "needs_input", "text": "Approve?"}, "worker-wait"),
+            headers=_runner(worker_id),
+        )
+        assert waiting.status_code == 409 and "unattended_input_not_allowed" in waiting.text
+
+
 @pytest.mark.parametrize(
     "automation_label", [SCHEDULED_TASK_ORIGIN_LABEL_KEY, SCHEDULED_TASK_RUN_LABEL_KEY]
 )

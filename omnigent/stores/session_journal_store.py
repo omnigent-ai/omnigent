@@ -447,11 +447,11 @@ class SessionJournalStore:
                 )
                 entry_content = {"version": version, **fields}
                 starts_run = workflow_id is not None and start_run
-                if scheduled_task_run_id is not None and not starts_run:
+                if not starts_run:
                     boundary = self._newest_kind_row(session, conversation_id, _PLAN_STATUS_KIND)
                     starts_run = (
-                        boundary is None or boundary.scheduled_task_run_id != scheduled_task_run_id
-                    )
+                        boundary.scheduled_task_run_id if boundary else None
+                    ) != scheduled_task_run_id
                 encoded = self._stored_contents(
                     [entry_content, *([{"status": "started"}] if starts_run else [])]
                 )

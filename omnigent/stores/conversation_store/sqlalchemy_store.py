@@ -102,6 +102,7 @@ from omnigent.stores.conversation_store import (
     _INSTANCE_SCOPED_LABEL_KEYS,
     _SANDBOX_REPO_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
+    CREATED_BY_SESSION_LABEL_KEY,
     FAMILY_PIN_LABEL_PREFIX,
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
@@ -1218,7 +1219,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             if parent_conversation_id is not None and not title:
                 title = f"untitled:{new_id}"
 
-            def insert_conversation(ap_sess: Session) -> SqlConversation:
+            def insert_conversation(ap_sess: Session) -> tuple[SqlConversation, dict[str, str]]:
                 # Application-level (parent, title) uniqueness — there is no DB
                 # unique constraint. Only children are scoped; top-level sessions
                 # (NULL parent) may reuse titles freely. The SELECT seeks this
@@ -1246,6 +1247,24 @@ class SqlAlchemyConversationStore(ConversationStore):
                             f"sub-agent name already exists under parent "
                             f"{parent_conversation_id!r}: title={title!r}"
                         )
+                creation_labels = dict(prepared_labels)
+                # Workers retain the automated work that launched them even if
+                # their parent later returns to an interactive turn.
+                for source_id in dict.fromkeys(
+                    (prepared_labels.get(CREATED_BY_SESSION_LABEL_KEY), parent_conversation_id)
+                ):
+                    if source_id is None:
+                        continue
+                    inherited = {}
+                    for key in (SCHEDULED_TASK_ORIGIN_LABEL_KEY, SCHEDULED_TASK_RUN_LABEL_KEY):
+                        label = ap_sess.get(
+                            SqlConversationLabel, (current_workspace_id(), source_id, key)
+                        )
+                        if label is not None:
+                            inherited[key] = label.value
+                    if inherited:
+                        creation_labels = {**inherited, **creation_labels}
+                        break
                 row = SqlConversation(
                     id=new_id,
                     created_at=now,
@@ -1257,11 +1276,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                     session_overrides=encoded_overrides,
                 )
                 ap_sess.add(row)
-                if prepared_labels:
-                    _upsert_prepared_labels(ap_sess, new_id, prepared_labels, now)
-                return row
+                if creation_labels:
+                    _upsert_prepared_labels(ap_sess, new_id, creation_labels, now)
+                return row, creation_labels
 
-            row = run_write_transaction(
+            row, creation_labels = run_write_transaction(
                 self._conv_session_immediate,
                 "insert_conversation",
                 insert_conversation,
@@ -1308,7 +1327,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             except OmnigentError:
                 self._discard_unbound_conversation(new_id)
                 raise
-            return _to_conversation(row, meta, prepared_labels)
+            return _to_conversation(row, meta, creation_labels)
         except IntegrityError as exc:
             # Translate a caller-supplied-id PK collision into a clean exception
             # type. Per-parent title uniqueness is enforced by the SELECT above,

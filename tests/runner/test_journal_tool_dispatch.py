@@ -483,6 +483,33 @@ async def test_a_save_posts_the_workflow_as_the_session_and_returns_its_id() -> 
     assert [step["id"] for step in body["steps"]] == ["explore", "fix"]
 
 
+@pytest.mark.parametrize(
+    "failure", ["invalid-json", "missing-content", "invalid-content", "disconnect"]
+)
+async def test_a_saved_workflow_still_succeeds_when_the_journal_followup_fails(
+    failure: str,
+) -> None:
+    saved = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/workflows":
+            saved.append(json.loads(request.content))
+            return httpx.Response(200, json=_WORKFLOW)
+        if failure == "disconnect":
+            raise httpx.ReadError("journal disconnected", request=request)
+        if failure == "invalid-json":
+            return httpx.Response(200, text="unreadable")
+        plan: dict[str, object] = {"workflow_id": None}
+        if failure == "invalid-content":
+            plan["content"] = []
+        return httpx.Response(200, json={"data": [plan]})
+
+    async with _client(handler) as client:
+        result = await _run(client, "sys_workflow_save", _SAVE_ARGS)
+    assert result == {"id": _WORKFLOW_ID, "name": "Triage flaky tests"}
+    assert len(saved) == 1
+
+
 @pytest.mark.parametrize("saved_steps", [_STEPS, list(reversed(_STEPS))])
 async def test_a_save_names_the_sessions_plan_after_the_new_workflow(
     saved_steps: list[dict[str, object]],

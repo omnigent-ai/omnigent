@@ -60,7 +60,11 @@ from omnigent.host.frames import (
 from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.mcp_selection import mcp_selection_revision, selected_mcp_spec
 from omnigent.native.input_diagnostics import input_attributes
-from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+from omnigent.runner.identity import (
+    ORCHESTRATION_SOURCE_HEADER,
+    RUNNER_TUNNEL_TOKEN_HEADER,
+    token_bound_runner_id,
+)
 from omnigent.runner.launch_failure import (
     CODEX_COMPACTION_MODEL_FAILED,
     CODEX_PROVIDER_AUTH_FAILED,
@@ -323,6 +327,9 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     RUNNER_LIVENESS_TTL_S,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX,
+    SCHEDULED_TASK_RUN_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     runner_seen_is_fresh,
 )
@@ -1366,6 +1373,19 @@ def register_events_routes(
             )
         start_fire_stage("input_validation", session_id=session_id)
         peer_message = body.type == "session_message"
+        interactive_run_id = (
+            conv.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY)
+            if isinstance(request, Request)
+            and not peer_message
+            and not request.headers.get(ORCHESTRATION_SOURCE_HEADER)
+            and not request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER)
+            and not conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY)
+            and (
+                (body.type == "message" and body.data.get("role", "user") == "user")
+                or body.type == _SLASH_COMMAND_TYPE
+            )
+            else None
+        )
         if peer_message:
             if not isinstance(request, Request):
                 raise OmnigentError(
@@ -3737,6 +3757,20 @@ def register_events_routes(
         if refreshed_conv is None:
             raise _session_not_found()
         conv = refreshed_conv
+        # A human's next turn ends attribution from an earlier continuation.
+        # Leave a newer fire or a prompt still being dispatched untouched.
+        if (
+            interactive_run_id
+            and SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX + interactive_run_id not in conv.labels
+            and await asyncio.to_thread(
+                conversation_store.replace_label_if,
+                session_id,
+                SCHEDULED_TASK_RUN_LABEL_KEY,
+                expected=interactive_run_id,
+                value=None,
+            )
+        ):
+            conv.labels.pop(SCHEDULED_TASK_RUN_LABEL_KEY, None)
         # Recheck the bound runtime: forks and host restarts can change it
         # after upload, while retained history still needs these files.
         if body.type in ("message", _SLASH_COMMAND_TYPE) and _is_native_terminal_session(conv):

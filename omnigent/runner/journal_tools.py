@@ -21,6 +21,7 @@ import difflib
 import hashlib
 import itertools
 import json
+import logging
 import random
 import re
 import uuid
@@ -57,6 +58,7 @@ from omnigent.tools.builtins.journal import (
 )
 
 JOURNAL_TOOL_NAMES: frozenset[str] = frozenset(tool.name() for tool in JOURNAL_TOOLS)
+_logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -601,14 +603,17 @@ async def _save_workflow(
     if response.status_code >= 400:
         return _error(_server_message(response))
     workflow = response.json()
-    await _name_plan_workflow(
-        workflow["id"],
-        steps=steps,
-        server_client=server_client,
-        conversation_id=conversation_id,
-        call_id=call_id,
-        publish_event=publish_event,
-    )
+    try:
+        await _name_plan_workflow(
+            workflow["id"],
+            steps=steps,
+            server_client=server_client,
+            conversation_id=conversation_id,
+            call_id=call_id,
+            publish_event=publish_event,
+        )
+    except Exception:
+        _logger.warning("Workflow saved but its journal plan could not be linked", exc_info=True)
     return json.dumps({"id": workflow["id"], "name": workflow["name"]}, ensure_ascii=False)
 
 
