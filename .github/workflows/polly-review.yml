@@ -156,11 +156,11 @@ jobs:
         github.event_name == 'workflow_dispatch'
       )
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Set review deadline
         # Reserve time for process cleanup and diagnostics before the job expires.
-        run: echo "POLLY_REVIEW_DEADLINE=$(( $(date +%s) + 27 * 60 ))" >> "$GITHUB_ENV"
+        run: echo "POLLY_REVIEW_DEADLINE=$(( $(date +%s) + 55 * 60 ))" >> "$GITHUB_ENV"
 
       - name: Acknowledge /review command
         if: github.event_name == 'issue_comment'
@@ -1032,6 +1032,12 @@ jobs:
               'polly-review.txt': pathlib.Path('/tmp/polly_review.txt'),
               'diff-summary.json': pathlib.Path('/tmp/pr_diff_summary.json'),
           }
+          # Preserve completed reviewer reports even when the coordinator times out.
+          temporary = pathlib.Path('/tmp')
+          for pattern in ('*review*.md', '*report*.md', 'rv/*.md', '.polly*/*.md'):
+              for source in temporary.glob(pattern):
+                  if source.is_file() and not source.is_symlink():
+                      sources['reviewer-reports/' + str(source.relative_to(temporary))] = source
           logs = pathlib.Path.home() / '.omnigent' / 'logs'
           for source in logs.rglob('*.log'):
               sources['process-logs/' + str(source.relative_to(logs))] = source
