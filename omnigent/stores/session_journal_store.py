@@ -24,7 +24,7 @@ from collections.abc import Mapping, Sequence
 from itertools import batched
 from typing import Any, TypeVar
 
-from sqlalchemy import Select, and_, delete, or_, select, update
+from sqlalchemy import Select, and_, delete, or_, select, tuple_, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -546,6 +546,7 @@ class SessionJournalStore:
                     SqlSessionJournalEntry.conversation_id == conversation_id,
                     SqlSessionJournalEntry.id == entry_id,
                 )
+                .order_by(SqlSessionJournalEntry.position)
                 .limit(1),
                 "ix_session_journal_entries_id",
             )
@@ -790,6 +791,7 @@ def reserve_fork_journal(sessions: NamedManagedSessionMaker, fork_id: str) -> No
                         SqlSessionJournalEntry.workspace_id == current_workspace_id(),
                         SqlSessionJournalEntry.conversation_id == fork_id,
                     )
+                    .order_by(SqlSessionJournalEntry.position)
                     .limit(1),
                     "PRIMARY",
                 )
@@ -857,6 +859,7 @@ def copy_journal_for_fork(
                     _using(
                         select(SqlSessionJournalEntry.position)
                         .where(*scope, SqlSessionJournalEntry.id.in_(batch))
+                        .order_by(SqlSessionJournalEntry.id)
                         .limit(len(batch)),
                         "ix_session_journal_entries_id",
                     )
@@ -954,33 +957,33 @@ def delete_journal_heads(session: Session, conversation_ids: Sequence[str]) -> N
 def delete_journal_entries_batch(session: Session, conversation_ids: Sequence[str]) -> int:
     """Delete up to :data:`JOURNAL_DELETE_BATCH` of the sessions' entries.
 
-    The batch is read in primary-key order, so each session's share is a
-    contiguous run of positions, deleted as one bounded range.
+    The batch's primary keys are read in key order and deleted by key, so the
+    delete touches only the rows it read.
 
     :returns: How many were deleted; fewer than a batch means none are left.
     """
+    entries = SqlSessionJournalEntry
     keys = session.execute(
         _using(
-            select(SqlSessionJournalEntry.conversation_id, SqlSessionJournalEntry.position)
+            select(entries.conversation_id, entries.position, entries.created_at)
             .where(
-                SqlSessionJournalEntry.workspace_id == current_workspace_id(),
-                SqlSessionJournalEntry.conversation_id.in_(conversation_ids),
+                entries.workspace_id == current_workspace_id(),
+                entries.conversation_id.in_(conversation_ids),
             )
-            .order_by(SqlSessionJournalEntry.conversation_id, SqlSessionJournalEntry.position)
+            .order_by(entries.conversation_id, entries.position)
             .limit(JOURNAL_DELETE_BATCH),
             "PRIMARY",
         )
     ).all()
-    ranges: dict[str, tuple[int, int]] = {}
-    for conversation_id, position in keys:
-        first, _ = ranges.get(conversation_id, (position, position))
-        ranges[conversation_id] = (first, position)
-    for conversation_id, (first, last) in ranges.items():
+    if keys:
         session.execute(
-            delete(SqlSessionJournalEntry).where(
-                SqlSessionJournalEntry.workspace_id == current_workspace_id(),
-                SqlSessionJournalEntry.conversation_id == conversation_id,
-                SqlSessionJournalEntry.position.between(first, last),
+            delete(entries)
+            .where(
+                entries.workspace_id == current_workspace_id(),
+                tuple_(entries.conversation_id, entries.position, entries.created_at).in_(
+                    [tuple(key) for key in keys]
+                ),
             )
+            .execution_options(synchronize_session=False)
         )
     return len(keys)
