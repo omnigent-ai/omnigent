@@ -13,6 +13,13 @@ import {
 const MAX_PART_BYTES = 64 * 1024 * 1024;
 /** Most bytes all of a workbook's parts may inflate to together, bounding the work. */
 const MAX_WORKBOOK_BYTES = 256 * 1024 * 1024;
+/**
+ * Most table cells (padding included) and characters all of a workbook's sheet
+ * tables may hold together. Each sheet has its own caps, but every sheet's
+ * table is kept, so a workbook of many sparse sheets needs a cap of its own.
+ */
+const MAX_WORKBOOK_CELLS = 1_000_000;
+const MAX_WORKBOOK_CHARS = 10_000_000;
 
 const END_OF_CENTRAL_DIRECTORY = 0x06054b50;
 const CENTRAL_DIRECTORY_ENTRY = 0x02014b50;
@@ -109,6 +116,23 @@ function rawInflater(): DecompressionStream {
 const TOO_LARGE = "This workbook is too large to preview. Download it to open it.";
 const TOO_LARGE_SHEET = "This sheet is too large to preview. Download the workbook to open it.";
 const PAST_LIMIT = Symbol("past the size limits");
+const PAST_WORKBOOK_LIMIT =
+  "This sheet is past what the preview holds for one workbook. Download the workbook to open it.";
+
+/** What a workbook's sheet tables may still hold, in cells and characters. */
+export interface WorkbookTableBudget {
+  cells: number;
+  chars: number;
+}
+
+/** The cells (padding included) and characters *table* holds. */
+function tableSize(table: DataTable): WorkbookTableBudget {
+  const chars = [table.header, ...table.rows].reduce(
+    (sum, row) => sum + row.reduce((rowSum, cell) => rowSum + cell.length, 0),
+    0,
+  );
+  return { cells: table.header.length * (table.rows.length + 1), chars };
+}
 
 /** Bytes the workbook's parts may still inflate to. */
 interface InflateBudget {
@@ -426,9 +450,10 @@ function relationshipId(sheet: Element): string | undefined {
 export async function readWorkbook(
   bytes: Uint8Array,
   maxBytes = MAX_WORKBOOK_BYTES,
+  tableBudget: WorkbookTableBudget = { cells: MAX_WORKBOOK_CELLS, chars: MAX_WORKBOOK_CHARS },
 ): Promise<WorkbookSheet[]> {
   try {
-    return await readSheets(bytes, maxBytes);
+    return await readSheets(bytes, maxBytes, { ...tableBudget });
   } catch (error) {
     if (error instanceof WorkbookError) throw error;
     // Offsets or sizes in a corrupt zip that point outside the file.
@@ -507,7 +532,11 @@ function partOfType(relationships: Relationship[], type: string): string | undef
   return relationships.find((relationship) => relationship.type.endsWith(`/${type}`))?.path;
 }
 
-async function readSheets(bytes: Uint8Array, maxBytes: number): Promise<WorkbookSheet[]> {
+async function readSheets(
+  bytes: Uint8Array,
+  maxBytes: number,
+  tableBudget: WorkbookTableBudget,
+): Promise<WorkbookSheet[]> {
   const entries = zipEntries(bytes);
   const budget: InflateBudget = { left: maxBytes };
   // Parts are found through the package's relationships, wherever the writer put them.
@@ -536,7 +565,7 @@ async function readSheets(bytes: Uint8Array, maxBytes: number): Promise<Workbook
   const sheets: WorkbookSheet[] = [];
   // Sheets pointing at the same part share its table instead of reading it again.
   // A part past the size limits is remembered too, so it is tried only once.
-  const tables = new Map<string, DataTable | null | typeof PAST_LIMIT>();
+  const tables = new Map<string, DataTable | null | typeof PAST_LIMIT | string>();
   // One sheet at a time, so only one inflated part is held at once.
   /* oxlint-disable no-await-in-loop */
   for (const sheet of descendants(workbook, "sheet")) {
@@ -544,19 +573,34 @@ async function readSheets(bytes: Uint8Array, maxBytes: number): Promise<Workbook
     const name = sheet.getAttribute("name") ?? `Sheet ${sheets.length + 1}`;
     const target = targets.get(relationshipId(sheet) ?? "");
     if (target !== undefined && !tables.has(target)) {
-      try {
-        const part = await readPart(bytes, entries, target, budget);
-        tables.set(target, part ? sheetTable(part, sharedStrings, dated, date1904) : null);
-      } catch (error) {
-        // A sheet past the size limits is marked, and the sheets that fit still show.
-        if (!(error instanceof WorkbookTooLargeError)) throw error;
-        tables.set(target, PAST_LIMIT);
+      if (tableBudget.cells <= 0 || tableBudget.chars <= 0) {
+        // The workbook's tables already hold all they may; nothing more is read.
+        tables.set(target, PAST_WORKBOOK_LIMIT);
+      } else {
+        try {
+          const part = await readPart(bytes, entries, target, budget);
+          const table = part ? sheetTable(part, sharedStrings, dated, date1904) : null;
+          const size = table ? tableSize(table) : { cells: 0, chars: 0 };
+          // A table that doesn't fit what's left isn't kept, and later sheets aren't read.
+          if (size.cells > tableBudget.cells || size.chars > tableBudget.chars) {
+            tables.set(target, PAST_WORKBOOK_LIMIT);
+            tableBudget.cells = 0;
+          } else {
+            tableBudget.cells -= size.cells;
+            tableBudget.chars -= size.chars;
+            tables.set(target, table);
+          }
+        } catch (error) {
+          // A sheet past the size limits is marked, and the sheets that fit still show.
+          if (!(error instanceof WorkbookTooLargeError)) throw error;
+          tables.set(target, PAST_LIMIT);
+        }
       }
     }
     const table = target === undefined ? null : (tables.get(target) ?? null);
-    sheets.push(
-      table === PAST_LIMIT ? { name, table: null, message: TOO_LARGE_SHEET } : { name, table },
-    );
+    if (table === PAST_LIMIT) sheets.push({ name, table: null, message: TOO_LARGE_SHEET });
+    else if (typeof table === "string") sheets.push({ name, table: null, message: table });
+    else sheets.push({ name, table });
   }
   /* oxlint-enable no-await-in-loop */
   return sheets;

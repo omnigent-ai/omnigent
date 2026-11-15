@@ -175,6 +175,28 @@ describe("readWorkbook time formats and limits", () => {
   });
 });
 
+describe("workbook-wide table budget", () => {
+  // Hand-built: four distinct sparse sheets, each a 10-column header (A1 and J1)
+  // over single-cell rows, so each table pads out to 100 cells.
+  it("stops keeping tables once distinct sparse sheets fill the workbook's budget", async () => {
+    const sheets = await readWorkbook(fixture("sparse-sheets.xlsx"), undefined, {
+      cells: 250,
+      chars: 1_000_000,
+    });
+    expect(sheets.map((sheet) => [sheet.name, sheet.table?.rows.length, sheet.message])).toEqual([
+      ["S1", 9, undefined],
+      ["S2", 9, undefined],
+      ["S3", undefined, expect.stringContaining("past what the preview holds for one workbook")],
+      ["S4", undefined, expect.stringContaining("past what the preview holds for one workbook")],
+    ]);
+  });
+
+  it("keeps every table within the default budget", async () => {
+    const sheets = await readWorkbook(fixture("sparse-sheets.xlsx"));
+    expect(sheets.every((sheet) => sheet.table?.header.length === 10)).toBe(true);
+  });
+});
+
 describe("formula results", () => {
   // Hand-built: a text formula whose saved result is blank, and an untyped
   // formula saved without computing (`<v/>`), beside a filled cell.
