@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 import sqlalchemy as sa
 from alembic import command
+from sqlalchemy.dialects.mysql import VARBINARY
 
 from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
 from omnigent.db.db_models import SqlWorkflow
@@ -99,7 +100,12 @@ def test_description_envelopes_preserve_legacy_text_and_downgrade(
             workflow_id, user_id=None, description=description * min(5, 2000 // len(description))
         )
         columns = {column["name"]: column for column in sa.inspect(engine).get_columns(_TABLE)}
-        assert isinstance(columns["description"]["type"], sa.LargeBinary)
+        description_type = columns["description"]["type"]
+        if engine.dialect.name == "mysql":
+            assert isinstance(description_type, VARBINARY)
+            assert description_type.length == 2000
+        else:
+            assert isinstance(description_type, sa.LargeBinary)
         assert not columns["description"]["nullable"]
         assert not any(name.startswith("_description_") for name in columns)
         with engine.connect() as connection:

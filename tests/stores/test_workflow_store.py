@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import random
 import string
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 
@@ -45,15 +47,48 @@ def test_a_saved_workflow_reads_back_only_for_its_owner(store: WorkflowStore) ->
     assert store.get(local.id, user_id=None) == local
 
 
-def test_names_are_unique_per_owner(store: WorkflowStore) -> None:
-    deploy = _save(store, "deploy")
+@pytest.mark.parametrize("user_id", [ALICE, None])
+def test_names_are_unique_per_owner(store: WorkflowStore, user_id: str | None) -> None:
+    deploy = _save(store, "deploy", user_id=user_id)
     with pytest.raises(WorkflowNameTakenError):
-        _save(store, "deploy")
+        _save(store, "deploy", user_id=user_id)
     _save(store, "deploy", user_id=BOB)
-    release = _save(store, "release")
+    release = _save(store, "release", user_id=user_id)
     with pytest.raises(WorkflowNameTakenError):
-        store.update(release.id, user_id=ALICE, name="deploy")
-    assert store.update(deploy.id, user_id=ALICE, name="deploy") is not None
+        store.update(release.id, user_id=user_id, name="deploy")
+    assert store.update(deploy.id, user_id=user_id, name="deploy") is not None
+
+
+@pytest.mark.parametrize("user_id", [ALICE, None])
+@pytest.mark.parametrize("operation", ["create", "rename", "mixed"])
+def test_competing_saves_cannot_claim_the_same_name(
+    store: WorkflowStore, db_uri: str, user_id: str | None, operation: str
+) -> None:
+    originals = [
+        _save(store, f"original {index}", user_id=user_id)
+        if operation == "rename" or (operation == "mixed" and index % 2)
+        else None
+        for index in range(4)
+    ]
+    ready = Barrier(len(originals))
+
+    def save(index: int) -> Workflow | None:
+        competing = WorkflowStore(db_uri)
+        ready.wait(timeout=10)
+        try:
+            original = originals[index]
+            if original is not None:
+                return competing.update(original.id, user_id=user_id, name="shared name")
+            return _save(competing, "shared name", user_id=user_id)
+        except WorkflowNameTakenError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=len(originals)) as pool:
+        results = list(pool.map(save, range(len(originals))))
+    winners = [result for result in results if result is not None]
+    assert len(winners) == 1
+    page, has_more = store.list_page(user_id=user_id, name="shared name", limit=2)
+    assert page == winners and not has_more
 
 
 def test_pages_go_by_name_and_filter_by_name(store: WorkflowStore) -> None:

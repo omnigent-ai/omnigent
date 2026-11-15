@@ -2,9 +2,9 @@
 
 Workflows are rows of ``workflows`` in the database that holds the session
 metadata. Every read and write is scoped to the caller: another owner's
-workflow reads as missing. Names are unique per owner through a check here
-rather than a unique key, so two concurrent saves of one name can both land,
-as with projects. Every query is served by the primary key or by
+workflow reads as missing. Creates and edits serialize on an owner's retained
+preference row before checking names, including owners without an account row.
+Every workflow query is served by the primary key or by
 ``ix_workflows_user_id_name``.
 """
 
@@ -25,6 +25,7 @@ from omnigent.db.db_models import (
     SqlWorkflow,
     current_workspace_id,
 )
+from omnigent.db.preference_rows import upsert_preference_row
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -48,6 +49,12 @@ def _owned(workflow_id: str, user_id: str | None) -> tuple[ColumnElement[bool], 
         SqlWorkflow.id == workflow_id,
         SqlWorkflow.user_id == user_id,
     )
+
+
+def _lock_owner(session: Session, user_id: str | None) -> None:
+    """The upsert holds one owner lock until commit, even when no workflow exists."""
+    # Retain the row when workflows are deleted so later saves use the same lock.
+    upsert_preference_row(session, user_id="__workflow_owners__", key=user_id or "", value="{}")
 
 
 def _check_stored_size(text: str, field: str, limit: int) -> None:
@@ -137,6 +144,7 @@ class WorkflowStore:
 
         def write(session: Session) -> Workflow:
             require_active_account(session, user_id)
+            _lock_owner(session, user_id)
             if self._name_taken(session, user_id=user_id, name=workflow_name, exclude_id=None):
                 raise WorkflowNameTakenError(f"a workflow named {workflow_name!r} already exists")
             session.add(
@@ -235,6 +243,8 @@ class WorkflowStore:
         """
 
         def write(session: Session) -> Workflow | None:
+            require_active_account(session, user_id)
+            _lock_owner(session, user_id)
             row = session.execute(
                 select(SqlWorkflow)
                 .where(*_owned(workflow_id, user_id))
@@ -248,7 +258,6 @@ class WorkflowStore:
                 steps=json.loads(row.plan)["steps"] if steps is None else steps,
             )
             _check_stored_size(text, "description", WORKFLOW_DESCRIPTION_MAX_STORED_BYTES)
-            require_active_account(session, user_id)
             if workflow_name != row.name and self._name_taken(
                 session, user_id=user_id, name=workflow_name, exclude_id=workflow_id
             ):
