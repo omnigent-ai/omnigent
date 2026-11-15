@@ -74,8 +74,10 @@ from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.scheduled.telemetry import log_task_created
 from omnigent.server.session_mcp_selection import MAX_SESSION_MCP_SERVICES, session_mcp_selection
 from omnigent.server.session_orchestration import require_owned_session
+from omnigent.server.workflows import require_workflows
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
+from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import (
     AutomationFailure,
@@ -1285,6 +1287,68 @@ def create_scheduled_tasks_router(
                 run_rows.append(_run_to_response(r))
         return {
             "runs": run_rows,
+            "next_cursor": next_cursor,
+        }
+
+    @router.get(
+        "/scheduled-tasks/{scheduled_task_id}/run-steps",
+        dependencies=[Depends(require_workflows)],
+    )
+    async def list_scheduled_task_run_steps(
+        request: Request,
+        scheduled_task_id: str,
+        limit: int = Query(default=20, ge=1, le=50),
+        after: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        """The plan steps of one page of a scheduled task's runs, for their timelines.
+
+        Pages like ``GET /scheduled-tasks/{id}/runs``, most recent first. Each
+        run that wrote a plan lists the steps of its first plan and each step's
+        newest status entry: one run-index lookup per run, then one
+        kind-and-step lookup per step. The response is ``{"runs": [{"run_id",
+        "workflow_id", "plan_name", "is_current", "steps", "statuses"}], "next_cursor"}``.
+        """
+        from omnigent.server.session_journal import entry_to_response, open_store
+
+        owner = _owner(request)
+        _require_owned(scheduled_task_id, None if owner == RESERVED_USER_LOCAL else owner)
+        runs, next_cursor = store.list_runs(scheduled_task_id, limit=limit, after_id=after)
+        journal = open_store(conversation_store)
+        served = [run for run in runs if run.conversation_id is not None]
+        if journal is None or not served:
+            return {"runs": [], "next_cursor": next_cursor}
+        plans = await asyncio.to_thread(
+            journal.run_start_plans, [(run.id, run.conversation_id or "") for run in served]
+        )
+        found = [(run, plan) for run, plan in zip(served, plans, strict=True) if plan is not None]
+        statuses = await asyncio.to_thread(journal.plan_step_statuses, [plan for _, plan in found])
+        current_plans = await asyncio.to_thread(
+            journal.current_run_plan_ids, [plan for _, plan in found]
+        )
+        sessions = await asyncio.to_thread(
+            conversation_store.get_conversations, [plan.conversation_id for _, plan in found]
+        )
+        return {
+            "runs": [
+                {
+                    "run_id": run.id,
+                    "plan_id": plan.id,
+                    "workflow_id": plan.workflow_id,
+                    "plan_name": plan.content.get("name"),
+                    "is_current": (
+                        plan.id in current_plans
+                        and (session := sessions.get(plan.conversation_id)) is not None
+                        and session.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY) == run.id
+                        and not session.archived
+                    ),
+                    "steps": plan.content.get("steps", []),
+                    "statuses": [
+                        entry_to_response(entry).model_dump(mode="json")
+                        for entry in step_statuses.values()
+                    ],
+                }
+                for (run, plan), step_statuses in zip(found, statuses, strict=True)
+            ],
             "next_cursor": next_cursor,
         }
 

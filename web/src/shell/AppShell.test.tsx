@@ -3178,6 +3178,29 @@ describe("Session overview", () => {
 });
 
 describe("Right workspace card visibility", () => {
+  it.each([true, false, undefined])(
+    "preserves a pinned Tasks tab with native to-dos on workflows=%s",
+    (workflows) => {
+      mockConversations([{ id: "conv_tasks", permission_level: null }]);
+      useChatStore.setState({
+        todos: [{ content: "Only item", status: "pending", activeForm: "" }],
+      });
+      onTestFinished(() => useChatStore.setState({ todos: [] }));
+      writePinnedWorkspaceTabs(["files", "tasks"]);
+      writeSessionWorkspaceState("conv_tasks", { open: true, rightRailTab: "tasks" });
+
+      renderShell(
+        "/c/conv_tasks",
+        serverInfo({
+          session_journal: false,
+          features: workflows === undefined ? {} : { workflows },
+        }),
+      );
+
+      expect(screen.getByRole("tab", { name: "Tasks" })).toHaveAttribute("aria-selected", "true");
+    },
+  );
+
   it.each([true, false])(
     "waits for capabilities before validating restored search (enabled=%s)",
     async (enabled) => {

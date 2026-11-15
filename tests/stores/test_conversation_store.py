@@ -10,7 +10,7 @@ import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import MagicMock
 
 import pytest
@@ -99,6 +99,152 @@ def test_fork_drops_import_provenance_labels(
     assert fork.labels["kept"] == "yes"
     assert IMPORT_SOURCE_LABEL_KEY not in fork.labels
     assert IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY not in fork.labels
+
+
+@pytest.mark.parametrize("value", ["new", None])
+def test_replace_label_if_changes_only_the_expected_value(
+    conversation_store: SqlAlchemyConversationStore, value: str | None
+) -> None:
+    """A writer undoing its own label never overwrites a later writer's."""
+    source = conversation_store.create_conversation()
+    conversation_store.set_labels(source.id, {"k": "mine"})
+
+    assert not conversation_store.replace_label_if(source.id, "k", expected="theirs", value=value)
+    assert conversation_store.get_conversation(source.id).labels["k"] == "mine"
+    assert conversation_store.replace_label_if(source.id, "k", expected="mine", value=value)
+    assert conversation_store.get_conversation(source.id).labels.get("k") == value
+    assert not conversation_store.replace_label_if(source.id, "absent", expected="x", value="y")
+
+
+def test_replace_label_if_can_require_the_label_to_be_absent(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``expected=None`` sets a label only if no writer has set it yet."""
+    source = conversation_store.create_conversation()
+
+    assert conversation_store.replace_label_if(source.id, "k", expected=None, value="first")
+    assert not conversation_store.replace_label_if(source.id, "k", expected=None, value="second")
+    assert conversation_store.get_conversation(source.id).labels["k"] == "first"
+    with pytest.raises(ValueError, match="expected value or a new value"):
+        conversation_store.replace_label_if(source.id, "other", expected=None, value=None)
+
+
+def test_swap_label_returns_the_value_it_replaced(
+    conversation_store: SqlAlchemyConversationStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The previous value comes from the write itself, even when another writer gets in first."""
+    source = conversation_store.create_conversation()
+    assert conversation_store.swap_label(source.id, "k", "a") is None
+    assert conversation_store.swap_label(source.id, "k", "b") == "a"
+
+    read = conversation_store.get_conversation
+    reads = 0
+
+    def read_then_lose_the_race(conversation_id: str) -> Any:
+        nonlocal reads
+        reads += 1
+        conversation = read(conversation_id)
+        if reads == 1:
+            conversation_store.set_labels(conversation_id, {"k": "c"})
+        return conversation
+
+    monkeypatch.setattr(conversation_store, "get_conversation", read_then_lose_the_race)
+
+    assert conversation_store.swap_label(source.id, "k", "d") == "c"
+    assert (reads, read(source.id).labels["k"]) == (2, "d")
+
+
+def test_swap_label_gives_up_on_a_label_that_keeps_changing(
+    conversation_store: SqlAlchemyConversationStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = conversation_store.create_conversation()
+    read = conversation_store.get_conversation
+    writes = iter(range(100))
+
+    def read_then_lose_the_race(conversation_id: str) -> Any:
+        conversation = read(conversation_id)
+        conversation_store.set_labels(conversation_id, {"k": f"other-{next(writes)}"})
+        return conversation
+
+    monkeypatch.setattr(conversation_store, "get_conversation", read_then_lose_the_race)
+
+    with pytest.raises(RuntimeError, match="kept changing"):
+        conversation_store.swap_label(source.id, "k", "mine")
+    assert read(source.id).labels["k"].startswith("other-")
+
+
+@pytest.mark.parametrize("initial_run", [None, "d" * 32])
+@pytest.mark.parametrize(
+    ("settlements", "expected"),
+    [
+        ((("a", "rollback"), ("b", "rollback"), ("c", "rollback")), None),
+        ((("c", "rollback"), ("b", "rollback"), ("a", "rollback")), None),
+        ((("b", "rollback"), ("a", "rollback"), ("c", "rollback")), None),
+        ((("b", "commit"), ("a", "rollback"), ("c", "rollback")), "b"),
+        ((("b", "commit"), ("c", "rollback"), ("a", "commit")), "b"),
+        ((("c", "commit"), ("b", "rollback"), ("a", "rollback")), "c"),
+    ],
+)
+def test_overlapping_run_attempts_preserve_the_last_sent_run(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+    initial_run: str | None,
+    settlements: tuple[tuple[str, Literal["commit", "rollback"]], ...],
+    expected: str | None,
+) -> None:
+    """Separate replicas settle overlapping attempts without reviving an unsent run."""
+    from omnigent.stores.conversation_store import (
+        SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX,
+        SCHEDULED_TASK_RUN_LABEL_KEY,
+    )
+
+    session_id = conversation_store.create_conversation().id
+    if initial_run is not None:
+        conversation_store.set_labels(session_id, {SCHEDULED_TASK_RUN_LABEL_KEY: initial_run})
+    for run in "abc":
+        for _ in range(2):
+            SqlAlchemyConversationStore(db_uri).update_scheduled_run_label(
+                session_id, run * 32, action="begin"
+            )
+    for run, action in settlements:
+        for _ in range(2):
+            SqlAlchemyConversationStore(db_uri).update_scheduled_run_label(
+                session_id, run * 32, action=action
+            )
+
+    labels = conversation_store.get_conversation(session_id).labels
+    assert labels.get(SCHEDULED_TASK_RUN_LABEL_KEY) == (expected * 32 if expected else initial_run)
+    assert not any(key.startswith(SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX) for key in labels)
+
+
+def test_fork_drops_the_automation_run_label(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A fork serves no automation run, so its journal entries are not the run's."""
+    from omnigent.stores.conversation_store import (
+        SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
+        SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+        SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX,
+        SCHEDULED_TASK_RUN_LABEL_KEY,
+    )
+
+    source = conversation_store.create_conversation()
+    conversation_store.set_labels(
+        source.id,
+        {
+            SCHEDULED_TASK_RUN_LABEL_KEY: "0123456789abcdef0123456789abcdef",
+            SCHEDULED_TASK_ACTIVITY_LABEL_KEY: "older-run",
+            SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY: "older-run",
+        },
+    )
+    conversation_store.update_scheduled_run_label(source.id, "1" * 32, action="begin")
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert SCHEDULED_TASK_RUN_LABEL_KEY not in fork.labels
+    assert SCHEDULED_TASK_ACTIVITY_LABEL_KEY not in fork.labels
+    assert SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY not in fork.labels
+    assert not any(key.startswith(SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX) for key in fork.labels)
 
 
 def test_fork_drops_sandbox_repo_label(

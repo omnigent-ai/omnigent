@@ -18,6 +18,7 @@ import {
   useRunScheduledTaskNow,
   useScheduledTask,
   useScheduledTaskRuns,
+  useScheduledTaskRunSteps,
   useScheduledTasks,
   useUpdateScheduledTask,
 } from "./useScheduledTasks";
@@ -26,6 +27,7 @@ vi.mock("@/lib/scheduledTasksApi", () => ({
   listScheduledTasks: vi.fn(),
   getScheduledTask: vi.fn(),
   listScheduledTaskRuns: vi.fn(),
+  listScheduledTaskRunSteps: vi.fn(),
   createScheduledTask: vi.fn(),
   updateScheduledTask: vi.fn(),
   deleteScheduledTask: vi.fn(),
@@ -287,6 +289,92 @@ describe("hasUnsettledRun (the refetchInterval stop condition)", () => {
 });
 
 describe("useScheduledTaskRuns live refresh", () => {
+  it("refreshes steps when a run is replaced or its settled session advances", async () => {
+    const { wrapper } = makeWrapper();
+    const previous = Array.from({ length: 20 }, (_, index) => ({
+      ...SUCCEEDED_RUN,
+      id: `run-old-${index}`,
+    }));
+    const current = [{ ...SUCCEEDED_RUN, id: "run-new" }, ...previous.slice(0, 19)];
+    const stepsFor = (runs: api.ScheduledTaskRun[]) =>
+      runs.map((run) => ({
+        runId: run.id,
+        planId: `plan-${run.id}`,
+        isCurrent: true,
+        workflowId: null,
+        planName: null,
+        steps: [],
+        statuses: [],
+      }));
+    vi.mocked(api.listScheduledTaskRunSteps)
+      .mockResolvedValueOnce(stepsFor(previous))
+      .mockResolvedValueOnce(stepsFor(current));
+    const { result, rerender } = renderHook(
+      ({ runs }) => useScheduledTaskRunSteps("st_1", runs, true),
+      { wrapper, initialProps: { runs: previous } },
+    );
+    await waitFor(() => expect(result.current.has("run-old-0")).toBe(true));
+    rerender({ runs: current });
+    await waitFor(() => expect(result.current.has("run-new")).toBe(true));
+    expect(api.listScheduledTaskRunSteps).toHaveBeenCalledTimes(2);
+    const working = [{ ...RUNNING_RUN, id: "run-working" }, ...current.slice(0, 19)];
+    vi.mocked(api.listScheduledTaskRunSteps).mockResolvedValueOnce(stepsFor(working));
+    rerender({ runs: working });
+    await waitFor(() => expect(result.current.has("run-working")).toBe(true));
+    const finished: api.ScheduledTaskRunSteps = {
+      ...stepsFor(working)[0]!,
+      workflowId: "a".repeat(32),
+      steps: [{ id: "check", name: "Check results", goal: null, depends_on: [] }],
+      statuses: [
+        {
+          id: "status-started",
+          position: 1,
+          created_at: 1_700_000_500,
+          scheduled_task_run_id: "run-working",
+          step: "check",
+          author: { type: "agent" },
+          kind: "status",
+          content: { status: "started" },
+        },
+      ],
+    };
+    const settled = [{ ...SUCCEEDED_RUN, id: "run-working" }, ...current.slice(0, 19)];
+    vi.mocked(api.listScheduledTaskRunSteps).mockResolvedValueOnce([finished]);
+    rerender({ runs: settled });
+    await waitFor(() => expect(result.current.get("run-working")).toEqual(finished));
+    expect(api.listScheduledTaskRunSteps).toHaveBeenCalledTimes(4);
+
+    // A short continuation can finish between history polls; a visible busy/idle
+    // cycle must also avoid restoring the previous, still-fresh idle snapshot.
+    const refreshSession = async (conversationStatus: string, position: number) => {
+      const updatedAt = 1_700_000_510 + position;
+      const refreshed: api.ScheduledTaskRunSteps = {
+        ...finished,
+        statuses: [
+          {
+            ...finished.statuses[0]!,
+            id: `status-${position}`,
+            position,
+            created_at: updatedAt,
+            content: { status: conversationStatus === "running" ? "started" : "done" },
+          },
+        ],
+      };
+      vi.mocked(api.listScheduledTaskRunSteps).mockResolvedValueOnce([refreshed]);
+      rerender({
+        runs: [
+          { ...settled[0]!, conversationStatus, conversationUpdatedAt: updatedAt },
+          ...settled.slice(1),
+        ],
+      });
+      await waitFor(() => expect(result.current.get("run-working")).toEqual(refreshed));
+    };
+    await refreshSession("idle", 2);
+    await refreshSession("running", 3);
+    await refreshSession("idle", 4);
+    expect(api.listScheduledTaskRunSteps).toHaveBeenCalledTimes(7);
+  });
+
   it("keeps refetching a >20s run until it settles, WITHOUT a remount", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: false });
     try {
