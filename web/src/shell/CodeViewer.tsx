@@ -547,6 +547,11 @@ export interface CodeViewerProps {
   searchOpen: boolean;
   setSearchOpen: (open: boolean) => void;
   /**
+   * Whether the viewer is the surface the user is working in, so Cmd+F opens
+   * this file's find rather than the chat's. Unset means always.
+   */
+  ownsFindShortcut?: () => boolean;
+  /**
    * Bumped by FileViewer on each Cmd+F. Forwarded to the Monaco editor so a
    * press with the find widget already open refocuses its input.
    */
@@ -593,6 +598,7 @@ export function CodeViewer({
   mediaActive = panelOpen,
   searchOpen,
   setSearchOpen,
+  ownsFindShortcut,
   searchFocusNonce,
   searchInputRef,
   viewMode,
@@ -762,6 +768,7 @@ export function CodeViewer({
     if (!panelOpen || !isMarkdownEditor) return;
     const handler = (e: KeyboardEvent) => {
       if (hasCommandModifier(e) && e.key === "f") {
+        if (ownsFindShortcut && !ownsFindShortcut()) return;
         e.preventDefault();
         setSearchOpen(true);
         setTimeout(() => searchInputRef.current?.focus(), 0);
@@ -772,7 +779,7 @@ export function CodeViewer({
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [panelOpen, isMarkdownEditor, searchOpen, setSearchOpen, searchInputRef]);
+  }, [panelOpen, isMarkdownEditor, searchOpen, setSearchOpen, searchInputRef, ownsFindShortcut]);
 
   // Open search on Cmd+F / Ctrl+F in the Shiki source view.
   useEffect(() => {
@@ -781,6 +788,8 @@ export function CodeViewer({
     if (!panelOpen || isMarkdownEditor || showMonaco) return;
     const handler = (e: KeyboardEvent) => {
       if (hasCommandModifier(e) && e.key === "f") {
+        // Beside the chat, Cmd+F belongs to whichever surface the user is in.
+        if (ownsFindShortcut && !ownsFindShortcut()) return;
         e.preventDefault();
         setSearchOpen(true);
         setTimeout(() => searchInputRef.current?.focus(), 0);
@@ -806,7 +815,15 @@ export function CodeViewer({
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [panelOpen, isMarkdownEditor, showMonaco, searchOpen, setSearchOpen, searchInputRef]);
+  }, [
+    panelOpen,
+    isMarkdownEditor,
+    showMonaco,
+    searchOpen,
+    setSearchOpen,
+    searchInputRef,
+    ownsFindShortcut,
+  ]);
 
   // In Monaco mode the custom search bar isn't rendered; the editor mirrors its
   // native find widget to `searchOpen` (open when set, close when cleared). This

@@ -79,6 +79,7 @@ vi.mock("./ModelViewer", () => ({
 }));
 
 import * as permissions from "@/hooks/usePermissions";
+import { isMacPlatform } from "@/lib/hotkeys";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -147,6 +148,8 @@ interface ViewerOptions {
   /** How the server sent the content: text, or base64 for a non-UTF-8 or binary file. */
   encoding?: "utf-8" | "base64";
   searchOpen?: boolean;
+  setSearchOpen?: (open: boolean) => void;
+  ownsFindShortcut?: () => boolean;
 }
 
 function renderViewer(
@@ -176,13 +179,39 @@ function viewerElement(content: string, panelOpen: boolean, path: string, opts: 
       panelOpen={panelOpen}
       mediaActive={opts.mediaActive}
       searchOpen={opts.searchOpen ?? false}
-      setSearchOpen={() => {}}
+      setSearchOpen={opts.setSearchOpen ?? (() => {})}
+      ownsFindShortcut={opts.ownsFindShortcut}
       searchInputRef={noopRef}
       viewMode={opts.viewMode ?? "source"}
       onRequestEditMode={opts.onRequestEditMode}
     />
   );
 }
+
+describe("Cmd+F on a rendered preview", () => {
+  it.each([
+    ["the viewer is where the user is working", true],
+    ["the user is working in the chat beside it", false],
+  ])("opens the file's find only when %s", (_label, owned) => {
+    const setSearchOpen = vi.fn();
+    renderViewer("name\nalpha\n", true, "sales.csv", {
+      viewMode: "preview",
+      setSearchOpen,
+      ownsFindShortcut: () => owned,
+    });
+    const mac = isMacPlatform();
+    const event = new KeyboardEvent("keydown", {
+      key: "f",
+      metaKey: mac,
+      ctrlKey: !mac,
+      cancelable: true,
+    });
+    window.dispatchEvent(event);
+    expect(setSearchOpen.mock.calls).toEqual(owned ? [[true]] : []);
+    // Left alone, the press reaches the browser (or the chat) as before.
+    expect(event.defaultPrevented).toBe(owned);
+  });
+});
 
 describe("video previews", () => {
   it("does not mount a player when the editor remains open in a hidden rail", () => {
@@ -1277,6 +1306,9 @@ describe("CodeViewer data-file routing", () => {
         ranges: Range[];
         constructor(...ranges: Range[]) {
           this.ranges = ranges;
+        }
+        add(range: Range) {
+          this.ranges.push(range);
         }
       },
     );

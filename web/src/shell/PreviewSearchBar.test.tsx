@@ -18,6 +18,9 @@ class FakeHighlight {
   constructor(...ranges: unknown[]) {
     this.ranges = ranges;
   }
+  add(range: unknown) {
+    this.ranges.push(range);
+  }
 }
 
 beforeEach(() => {

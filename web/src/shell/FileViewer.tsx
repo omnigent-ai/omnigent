@@ -1109,6 +1109,7 @@ function FileViewerBody({
   // file makes it active) and flipped by clicks / focus moves. When the user
   // works in the chat/composer, Cmd+F falls through to the browser's find.
   const viewerIsActiveSurfaceRef = useRef(true);
+  const ownsFindShortcut = useCallback(() => viewerIsActiveSurfaceRef.current, []);
   // Mirrors the ref for rendering, which marks the viewer as owning Escape.
   const [viewerIsActiveSurface, setViewerIsActiveSurface] = useState(true);
   useEffect(() => {
@@ -2057,6 +2058,7 @@ function FileViewerBody({
               mediaActive={onScreen}
               searchOpen={searchOpen}
               setSearchOpen={setSearchOpen}
+              ownsFindShortcut={ownsFindShortcut}
               searchFocusNonce={searchFocusNonce}
               searchInputRef={searchInputRef}
               viewMode={viewMode}
