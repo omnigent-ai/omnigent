@@ -116,13 +116,19 @@ describe("launchBestOfN", () => {
     }
   });
 
-  it("keeps going when one attempt fails and reports each failure", async () => {
+  it("keeps going when one attempt fails or is denied, and reports each failure", async () => {
+    const cursor = testAgent("ag_cursor", "cursor-native-ui", {
+      display_name: "Cursor",
+      harness: "cursor-native",
+    });
     vi.mocked(createSession).mockImplementation(async (agentId) => {
       if (agentId === "ag_codex") throw new Error("branch already exists");
       return { id: `conv_${agentId}` } as unknown as Session;
     });
     vi.mocked(postEvent).mockImplementation(async (id) => {
       if (id === "conv_ag_polly") throw new Error("runner offline");
+      // A policy denial resolves: the request succeeded but no turn started.
+      if (id === "conv_ag_cursor") return { queued: false, denied: true };
       return { queued: true };
     });
     vi.mocked(updateSession).mockResolvedValue({} as Session);
@@ -132,19 +138,27 @@ describe("launchBestOfN", () => {
       hostId: "host_1",
       repository: "/repo",
       prompt: "Task",
-      agents: [claude, codex, polly],
+      agents: [claude, codex, polly, cursor],
     });
 
-    expect(result.sessionIds).toEqual(["conv_ag_claude", "conv_ag_polly"]);
+    // A denied attempt stays in the run; nothing retries around the policy.
+    expect(result.sessionIds).toEqual(["conv_ag_claude", "conv_ag_polly", "conv_ag_cursor"]);
     expect(result.failures).toEqual([
       { agentName: "Codex", message: "branch already exists" },
       { agentName: "Polly", message: "The task wasn't sent: runner offline" },
+      { agentName: "Cursor", message: "A policy blocked the task, so no turn started." },
+    ]);
+    expect(vi.mocked(postEvent).mock.calls.map(([id]) => id)).toEqual([
+      "conv_ag_claude",
+      "conv_ag_polly",
+      "conv_ag_cursor",
     ]);
     // Only created attempts are linked, and a blank base branch uses the repository's HEAD.
-    expect(updateSession).toHaveBeenCalledTimes(2);
-    expect(updateSession).toHaveBeenCalledWith("conv_ag_polly", {
-      labels: { [BEST_OF_N_ATTEMPTS_LABEL]: "conv_ag_claude,conv_ag_polly" },
-    });
+    expect(updateSession).toHaveBeenCalledTimes(3);
+    for (const id of result.sessionIds)
+      expect(updateSession).toHaveBeenCalledWith(id, {
+        labels: { [BEST_OF_N_ATTEMPTS_LABEL]: "conv_ag_claude,conv_ag_polly,conv_ag_cursor" },
+      });
     expect(vi.mocked(createSession).mock.calls[2][2]?.git?.baseBranch).toBeUndefined();
     // A composed agent gets no native terminal labels.
     expect(vi.mocked(createSession).mock.calls[2][2]?.labels).toEqual({
