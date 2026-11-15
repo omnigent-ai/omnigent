@@ -113,6 +113,7 @@ from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
+    SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX,
     SCHEDULED_TASK_RUN_LABEL_KEY,
@@ -3363,7 +3364,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         fresh_items: list[tuple[int, NewConversationItem]],
         stamp: int,
     ) -> None:
-        """Latch activity for the current run in the same transaction as its items."""
+        """Latch the session-creating run's activity independently of continuations."""
         if not any(
             item.type in {"function_call", "function_call_output", "reasoning", "native_tool"}
             or (item.type == "message" and getattr(item.data, "role", None) == "assistant")
@@ -3376,14 +3377,20 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationLabel.workspace_id == current_workspace_id(),
                     SqlConversationLabel.conversation_id == conversation_id,
                     SqlConversationLabel.key.in_(
-                        (SCHEDULED_TASK_RUN_LABEL_KEY, SCHEDULED_TASK_ACTIVITY_LABEL_KEY)
+                        (
+                            SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+                            SCHEDULED_TASK_RUN_LABEL_KEY,
+                            SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
+                        )
                     ),
                 )
             )
             .tuples()
             .all()
         )
-        run_id = labels.get(SCHEDULED_TASK_RUN_LABEL_KEY)
+        run_id = labels.get(SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY) or labels.get(
+            SCHEDULED_TASK_RUN_LABEL_KEY
+        )
         if run_id and labels.get(SCHEDULED_TASK_ACTIVITY_LABEL_KEY) != run_id:
             _upsert_prepared_labels(
                 session, conversation_id, {SCHEDULED_TASK_ACTIVITY_LABEL_KEY: run_id}, stamp
@@ -3635,6 +3642,38 @@ class SqlAlchemyConversationStore(ConversationStore):
             return result.rowcount > 0
 
         return run_write_transaction(self._conv_session_immediate, "replace_label_if", write)
+
+    def clear_scheduled_run_label(
+        self, conversation_id: str, run_id: str, *, pending_run_finished: bool = False
+    ) -> bool:
+        """Clear only the observed run, recovering an abandoned pending stamp."""
+        from omnigent.server.scheduled.run_reconciler import STALE_RUN_MAX_AGE_SECONDS
+
+        def write(session: Session) -> bool:
+            self._lock_conversation(session, conversation_id)
+            owner_key = (current_workspace_id(), conversation_id)
+            current = session.get(SqlConversationLabel, (*owner_key, SCHEDULED_TASK_RUN_LABEL_KEY))
+            if current is None or current.value != run_id:
+                return False
+            pending = session.get(
+                SqlConversationLabel,
+                (*owner_key, SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX + run_id),
+            )
+            if (
+                pending is not None
+                and not pending_run_finished
+                and pending.updated_at > now_epoch() - STALE_RUN_MAX_AGE_SECONDS
+            ):
+                return False
+            session.delete(current)
+            if pending is not None:
+                # Older pending nodes cannot restore a label that no longer names them.
+                session.delete(pending)
+            return True
+
+        return run_write_transaction(
+            self._conv_session_immediate, "clear_scheduled_run_label", write
+        )
 
     def update_scheduled_run_label(
         self,

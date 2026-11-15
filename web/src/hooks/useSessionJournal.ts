@@ -252,14 +252,29 @@ export function useSessionJournal(
   // newest page. Read the current one whenever the plan changes.
   const runBoundary = useQuery({
     queryKey: [...sessionJournalKey(conversationId), "run-boundary", planId],
-    queryFn: () =>
-      fetchJournalPage(conversationId!, { kind: "plan_status", order: "desc", limit: "1" }),
+    queryFn: async () => {
+      const boundary = await fetchJournalPage(conversationId!, {
+        kind: "plan_status",
+        order: "desc",
+        limit: "1",
+      });
+      const start = boundary.data[0];
+      if (!start?.workflow_id) return boundary.data;
+      // The run's original plan carries its saved identity across later replans.
+      const origin = await fetchJournalPage(conversationId!, {
+        kind: "plan",
+        order: "asc",
+        after: start.id,
+        limit: "1",
+      });
+      return mergeJournalEntries(boundary.data, origin.data);
+    },
     enabled: active && planId !== undefined,
     staleTime: Number.POSITIVE_INFINITY,
     refetchOnWindowFocus: false,
   });
   const entries = useMemo(
-    () => mergeJournalEntries(journalEntries, runBoundary.data?.data ?? []),
+    () => mergeJournalEntries(journalEntries, runBoundary.data ?? []),
     [journalEntries, runBoundary.data],
   );
   const error =

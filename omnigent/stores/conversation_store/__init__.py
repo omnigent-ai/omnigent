@@ -188,6 +188,7 @@ SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY = "omnigent.scheduled_task_worktree_sou
 # Server-owned: the automation run this session serves, set before each run's
 # prompt is sent. Journal entries the session records are attributed to it.
 SCHEDULED_TASK_RUN_LABEL_KEY = "omnigent.scheduled_task_run"
+SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY = "omnigent.scheduled_task_initial_run"
 SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX = "omnigent.pending_scheduled_run."
 # The run whose agent has appended real activity; copied history never sets it.
 SCHEDULED_TASK_ACTIVITY_LABEL_KEY = "omnigent.scheduled_task_activity"
@@ -263,6 +264,7 @@ _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY = "omnigent.sandbox.requested_host_id"
 _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     CREATED_BY_SESSION_LABEL_KEY,
     SCHEDULED_TASK_RUN_LABEL_KEY,
+    SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
     SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     # A fork of an automation's copy isn't what the automation runs from.
@@ -1473,6 +1475,16 @@ class ConversationStore(ABC):
         A rollback removes this attempt from the pending chain even if another
         attempt replaced it. A commit retains it as a valid predecessor once
         sending may have begun. Each operation must be atomic across replicas.
+        """
+        raise NotImplementedError
+
+    def clear_scheduled_run_label(
+        self, conversation_id: str, run_id: str, *, pending_run_finished: bool = False
+    ) -> bool:
+        """End a human's inherited attribution without clearing a newer dispatch.
+
+        A pending dispatch is retained unless its run is terminal or its stamp
+        has exceeded the scheduler's stale-run window.
         """
         raise NotImplementedError
 

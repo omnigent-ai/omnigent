@@ -4,7 +4,12 @@ import type { PropsWithChildren } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
-import { sessionJournalKey, sessionTaskList, type JournalPage } from "@/lib/sessionJournal";
+import {
+  planWorkflowId,
+  sessionJournalKey,
+  sessionTaskList,
+  type JournalPage,
+} from "@/lib/sessionJournal";
 import { noteSessionStreamClosed, noteSessionStreamOpen } from "@/lib/sessionStreamSignals";
 import { journalEntry, journalPage, journalPlan } from "@/test/journalFixtures";
 import {
@@ -45,7 +50,7 @@ beforeEach(() => {
   vi.mocked(authenticatedFetch).mockImplementation(async (url) => {
     const params = new URL(String(url), "http://test").searchParams;
     const kind = params.get("kind");
-    const step = params.get("step");
+    const step = params.get("step") ?? params.get("after");
     const page = kind ? byKind[step ? `${kind}:${step}` : kind] : queued.shift();
     return new Response(JSON.stringify(page ?? journalPage([])));
   });
@@ -69,22 +74,32 @@ describe("useSessionJournal", () => {
   });
 
   it("reads the newest plan and statuses when older pages exist", async () => {
-    const plan = journalPlan(0, ["a"], ["b"]);
-    const done = journalEntry(1, { kind: "status", step: "a", content: { status: "done" } });
+    const workflowId = "0123456789abcdef0123456789abcdef";
+    const boundary = journalEntry(0, {
+      kind: "plan_status",
+      workflow_id: workflowId,
+      content: { status: "started" },
+    });
+    const origin = { ...journalPlan(1, ["a"], ["b"]), workflow_id: workflowId };
+    const plan = journalPlan(3, ["a"], ["b"]);
+    const done = journalEntry(2, { kind: "status", step: "a", content: { status: "done" } });
     const busy = Array.from({ length: 1001 }, (_, index) =>
-      journalEntry(index + 2, { kind: "status", step: "b", content: { status: "started" } }),
+      journalEntry(index + 4, { kind: "status", step: "b", content: { status: "started" } }),
     ).reverse();
     byKind = {
       plan: journalPage([plan]),
       status: journalPage(busy.slice(0, 1000), { has_more: true }),
       "status:a": journalPage([done]),
       "status:b": journalPage([busy[0]]),
+      plan_status: journalPage([boundary]),
+      "plan:e0": journalPage([origin]),
     };
     respond(journalPage([busy[0]], { has_more: true }));
     const { result } = renderHook(() => useSessionJournal(SESSION, true), { wrapper });
     await waitFor(() =>
-      expect(result.current.entries.map((entry) => entry.position)).toEqual([0, 1, 1002]),
+      expect(result.current.entries.map((entry) => entry.position)).toEqual([0, 1, 2, 3, 1004]),
     );
+    expect(planWorkflowId(result.current.entries)).toBe(workflowId);
     expect(result.current.hasOlder).toBe(true);
     expect(requestedQueries().map((query) => Object.fromEntries(query))).toEqual([
       { order: "desc", limit: "100" },
@@ -92,12 +107,13 @@ describe("useSessionJournal", () => {
       { kind: "status", step: "a", order: "desc", limit: "1" },
       { kind: "status", step: "b", order: "desc", limit: "1" },
       { kind: "plan_status", order: "desc", limit: "1" },
+      { kind: "plan", order: "asc", after: "e0", limit: "1" },
     ]);
 
     respond(journalPage(busy.slice(1, 101), { has_more: true }));
     act(() => result.current.loadOlder());
-    await waitFor(() => expect(result.current.entries).toHaveLength(103));
-    expect(requestedQueries()[5].get("after")).toBe("e1002");
+    await waitFor(() => expect(result.current.entries).toHaveLength(105));
+    expect(requestedQueries()[6].get("after")).toBe("e1004");
     expect(result.current.entries).toContainEqual(done);
   });
 

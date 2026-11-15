@@ -86,6 +86,7 @@ CAP_MCP_INVENTORY = "mcp_inventory"
 CAP_HARNESS_STARTUP = "harness_startup"
 CAP_PLUGINS = "plugins"
 CAP_SKILL_CONTENT = "skill_content"
+CAP_WORKFLOWS = "workflows"
 CAP_MCP_TOOLS = "mcp_tools"
 CAP_MCP_SERVER_ENABLED = "mcp_server_enabled"
 CAP_REFRESH_HARNESSES = "refresh_harnesses"
@@ -108,6 +109,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
     CAP_PLUGINS,
     CAP_SKILL_CONTENT,
+    CAP_WORKFLOWS,
     CAP_MCP_TOOLS,
     CAP_MCP_SERVER_ENABLED,
     CAP_MCP_REGISTRY,

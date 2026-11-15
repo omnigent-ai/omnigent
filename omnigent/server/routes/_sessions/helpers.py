@@ -11254,7 +11254,9 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
         CREATED_BY_SESSION_LABEL_KEY,
         FAMILY_PIN_LABEL_PREFIX,
         SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
+        SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+        SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX,
         SCHEDULED_TASK_RUN_LABEL_KEY,
         SCHEDULED_TASK_SOURCE_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
@@ -11263,10 +11265,15 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
 
     if any(key.startswith(FAMILY_PIN_LABEL_PREFIX) for key in labels):
         raise OmnigentError("Family pins are server-owned", code=ErrorCode.INVALID_INPUT)
+    if any(key.startswith(SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX) for key in labels):
+        raise OmnigentError(
+            "Scheduled run labels are server-internal", code=ErrorCode.INVALID_INPUT
+        )
     for key in (
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
         SCHEDULED_TASK_RUN_LABEL_KEY,
         SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
+        SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
         # Deleting a session also deletes the automation this label names.
         SCHEDULED_TASK_SOURCE_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,

@@ -8,9 +8,9 @@ plan a run copies into the session's journal, whose entries carry the
 workflow's ID in ``session_journal_entries.workflow_id``. Workflows have no
 versions; an edit rewrites the row. The primary key is ``(workspace_id, id)``,
 and ``uq_workflows_user_id_name`` enforces unique names per owner. Single-user
-workflows use the reserved ``local`` owner. The plan is encoded JSON in a binary
-column capped at 16,383 stored bytes. The table has no database defaults:
-writes name the workspace.
+workflows use the reserved ``local`` owner. Description and plan storage envelopes
+are binary columns capped at 2,000 and 16,383 stored bytes respectively. The table
+has no database defaults: writes name the workspace.
 
 Deployment: apply this migration before a server that uses the table.
 Servers that migrate at startup do so on their own. Processes already running
@@ -50,7 +50,9 @@ def upgrade() -> None:
         sa.Column("id", Uuid16(), nullable=False),
         sa.Column("user_id", sa.String(128), nullable=False),
         sa.Column("name", sa.String(80), nullable=False),
-        sa.Column("description", sa.String(2000), nullable=False),
+        sa.Column(
+            "description", sa.LargeBinary().with_variant(VARBINARY(2000), "mysql"), nullable=False
+        ),
         sa.Column(
             "plan", sa.LargeBinary().with_variant(VARBINARY(16_383), "mysql"), nullable=False
         ),

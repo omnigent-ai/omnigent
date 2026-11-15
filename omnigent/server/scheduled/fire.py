@@ -147,6 +147,7 @@ from omnigent.server.schemas import SessionEventInput
 from omnigent.server.session_mcp_selection import SessionMcpSelection, session_mcp_selection
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+    SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SCHEDULED_TASK_RUN_LABEL_KEY,
     SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
@@ -852,6 +853,7 @@ async def _run_fire_for_task(
                     task, session_mcp_selection(deps.app_state), recorder.managed_host_id
                 ),
                 SCHEDULED_TASK_RUN_LABEL_KEY: recorder.run_id,
+                SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY: recorder.run_id,
             },
         )
         log_session_created(conv.id)

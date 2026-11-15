@@ -31,7 +31,7 @@ def _migrate(uri: str, engine: sa.Engine, revision: str, *, down: bool = False) 
 
 
 @pytest.mark.parametrize(
-    "previous_revision", ["base", "9a2c7e6b4f10", "27d16059fab9", "e9b6a17c20d4"]
+    "previous_revision", ["base", "ce12af3da168", "9a2c7e6b4f10", "27d16059fab9", "e9b6a17c20d4"]
 )
 def test_upgrade_matches_the_model_and_downgrade_drops_the_table(
     tmp_path: Path, previous_revision: str
@@ -39,6 +39,11 @@ def test_upgrade_matches_the_model_and_downgrade_drops_the_table(
     uri = f"sqlite:///{tmp_path / 'workflows.db'}"
     engine = sa.create_engine(uri)
     _migrate(uri, engine, previous_revision)
+    if previous_revision == "ce12af3da168":
+        initial_columns = {
+            column["name"]: column for column in sa.inspect(engine).get_columns(_TABLE)
+        }
+        assert isinstance(initial_columns["description"]["type"], sa.LargeBinary)
     _migrate(uri, engine, "head")
     inspector = sa.inspect(engine)
 

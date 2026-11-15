@@ -28,6 +28,7 @@ from omnigent.runtime import pending_elicitations
 from omnigent.server import session_live_state
 from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
+    SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
     SCHEDULED_TASK_RUN_LABEL_KEY,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -583,8 +584,23 @@ def test_an_idle_edge_ends_a_scheduled_run_only_after_its_agent_worked(
     if copied_items:
         append_items(conversation.id, transcript[:copied_items])
         conversation = conversations.fork_conversation(conversation.id, copy_journal=False)
-    conversations.set_labels(conversation.id, {SCHEDULED_TASK_RUN_LABEL_KEY: "run_1"})
+    conversations.set_labels(
+        conversation.id,
+        {
+            SCHEDULED_TASK_RUN_LABEL_KEY: "run_1",
+            SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY: "run_1",
+        },
+    )
     append_items(conversation.id, transcript[copied_items:])
+    if ends_the_run:
+        conversations.update_scheduled_run_label(conversation.id, "continuation", action="begin")
+        append_items(conversation.id, [_transcript_item("message", _FIRED_AT + 10, "assistant")])
+        assert (
+            conversations.get_conversation(conversation.id).labels[
+                SCHEDULED_TASK_ACTIVITY_LABEL_KEY
+            ]
+            == "run_1"
+        )
     append_items(
         conversation.id,
         [_transcript_item("resource_event", _FIRED_AT + 100) for _ in range(bookkeeping_tail)],

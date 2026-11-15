@@ -3759,16 +3759,24 @@ def register_events_routes(
         conv = refreshed_conv
         # A human's next turn ends attribution from an earlier continuation.
         # Leave a newer fire or a prompt still being dispatched untouched.
+        pending_run_finished = False
         if (
             interactive_run_id
-            and SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX + interactive_run_id not in conv.labels
-            and await asyncio.to_thread(
-                conversation_store.replace_label_if,
-                session_id,
-                SCHEDULED_TASK_RUN_LABEL_KEY,
-                expected=interactive_run_id,
-                value=None,
-            )
+            and SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX + interactive_run_id in conv.labels
+        ):
+            scheduled_store = getattr(request.app.state, "scheduled_task_store", None)
+            if scheduled_store is not None:
+                pending_run = await asyncio.to_thread(scheduled_store.get_run, interactive_run_id)
+                pending_run_finished = pending_run is not None and pending_run.status not in {
+                    "scheduled",
+                    "starting",
+                    "running",
+                }
+        if interactive_run_id and await asyncio.to_thread(
+            conversation_store.clear_scheduled_run_label,
+            session_id,
+            interactive_run_id,
+            pending_run_finished=pending_run_finished,
         ):
             conv.labels.pop(SCHEDULED_TASK_RUN_LABEL_KEY, None)
         # Recheck the bound runtime: forks and host restarts can change it

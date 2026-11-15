@@ -73,10 +73,12 @@ def test_mysql_payload_types_are_bounded_and_keep_the_codec(
     codec = column.type.dialect_impl(dialect)
     bind = codec.bind_processor(dialect)
     read = codec.result_processor(dialect, None)
-    value = '{"steps": []}'
+    value = b'\x00\x00{"steps": []}'
     assert bind is not None and read is not None
-    assert isinstance(bind(value), bytes)
+    assert bind(value) == value
     assert read(bind(value)) == value
+    with pytest.raises(ValueError):
+        bind(value + b"x" * limit)
 
 
 def _migrate(uri: str, engine: sa.Engine, revision: str, *, down: bool = False) -> None:

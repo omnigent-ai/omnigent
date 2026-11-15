@@ -59,7 +59,7 @@ import {
 } from "@/lib/sessionJournal";
 import { messageDeepLinkParams } from "@/lib/messageDeepLink";
 import { Link, useSearchParams } from "@/lib/routing";
-import { taskMarkerTarget } from "@/lib/taskActivity";
+import { readTaskActivity, taskMarkerId, taskMarkerTarget } from "@/lib/taskActivity";
 import { cn } from "@/lib/utils";
 import type { TaskAction } from "@/lib/workflow";
 import { PlanRunButton } from "@/shell/PlanRunButton";
@@ -473,6 +473,7 @@ function StepRow({
   onShowInChat,
   menuAction,
   failedNames,
+  nativeMarkerIds,
 }: {
   item: StepProgress;
   number: number;
@@ -487,6 +488,7 @@ function StepRow({
   menuAction?: TaskMenuAction;
   /** The failed tasks it waits on, by name, when that's why it can't start. */
   failedNames?: readonly string[];
+  nativeMarkerIds: ReadonlySet<string>;
 }) {
   const [open, setOpen] = useState(false);
   const detail = stepDetail(item, failedNames);
@@ -494,7 +496,8 @@ function StepRow({
   const emphasized =
     item.state === "running" || item.state === "needs_input" || item.state === "failed";
   // A click goes to the task's marker in the chat; one that hasn't started has none.
-  const markerId = taskMarkerTarget(item);
+  const target = taskMarkerTarget(item);
+  const markerId = item.native && target && !nativeMarkerIds.has(target) ? null : target;
   // The agent's own tasks have no history to open.
   const hasHistory = !item.native;
   const tint = flash
@@ -1100,6 +1103,7 @@ function TaskList({
   flashStep,
   onShowInChat,
   menuActionFor,
+  nativeMarkerIds,
 }: {
   progress: readonly StepProgress[];
   entries: readonly JournalEntry[];
@@ -1108,6 +1112,7 @@ function TaskList({
   onShowInChat: (markerId: string) => void;
   /** What a task's ⋯ menu offers: Run, Continue, Retry or Stop; none when absent. */
   menuActionFor: (item: StepProgress) => TaskMenuAction | undefined;
+  nativeMarkerIds: ReadonlySet<string>;
 }) {
   const blocked = failedUpstream(progress);
   return (
@@ -1124,6 +1129,7 @@ function TaskList({
             flash={flashStep === item.step.id}
             onShowInChat={onShowInChat}
             menuAction={menuActionFor(item)}
+            nativeMarkerIds={nativeMarkerIds}
             failedNames={blocked.get(item.step.id)?.map((id) => names.get(id) ?? id)}
           />
         ))}
@@ -1204,6 +1210,18 @@ export function TasksPanel({
   const questions = useMemo(
     () => new Map<string, string>(JSON.parse(questionsJson) as [string, string][]),
     [questionsJson],
+  );
+  const nativeMarkersJson = useConversationEntryValue(conversationId, (state) =>
+    JSON.stringify(
+      state.blocks.flatMap((block) => {
+        const activity = block.type === "native_tool" ? readTaskActivity(block.data) : null;
+        return activity?.kind === "task" && activity.native ? [taskMarkerId(activity)] : [];
+      }),
+    ),
+  );
+  const nativeMarkerIds = useMemo(
+    () => new Set<string>(JSON.parse(nativeMarkersJson) as string[]),
+    [nativeMarkersJson],
   );
   // The agent can't read a message while it waits on a task's question, so that
   // task's Continue shows the question instead.
@@ -1294,6 +1312,7 @@ export function TasksPanel({
               flashStep={flashStep}
               onShowInChat={showInChat}
               menuActionFor={menuActionFor}
+              nativeMarkerIds={nativeMarkerIds}
             />
           </>
         )}

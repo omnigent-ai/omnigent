@@ -60,7 +60,7 @@ export function useSessionTasks(
   const workersRunning = children.some(
     (child) => child.busy && parentIdFromLabels(child.labels) === null,
   );
-  const sessionWorking = useSessionWorking(conversationId ?? null, workersRunning);
+  const sessionWorking = useSessionWorking(conversationId ?? null) || workersRunning;
   // A question or permission prompt in the chat waiting for the user's answer. A
   // workflow question marks only its own task, which the journal already shows.
   const awaitingUser = useConversationEntryValue(conversationId ?? null, (state) =>

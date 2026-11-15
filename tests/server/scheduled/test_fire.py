@@ -3647,7 +3647,10 @@ async def test_a_legacy_fire_names_its_run_on_the_session_before_sending(continu
     A new session is created with the label; a continued one gets it just before
     the prompt goes in. Either way it names the row the fire then writes.
     """
-    from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+    from omnigent.stores.conversation_store import (
+        SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+        SCHEDULED_TASK_RUN_LABEL_KEY,
+    )
 
     if continued:
         conv_store: Any = _ExistingConversationStore(_continued_session())
@@ -3673,6 +3676,9 @@ async def test_a_legacy_fire_names_its_run_on_the_session_before_sending(continu
         }
     else:
         assert conv_store.created[0]["labels"][SCHEDULED_TASK_RUN_LABEL_KEY] == run["run_id"]
+        assert (
+            conv_store.created[0]["labels"][SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY] == run["run_id"]
+        )
 
 
 @pytest.mark.asyncio
@@ -3711,6 +3717,8 @@ async def test_a_continued_session_that_cannot_be_stamped_records_a_failed_run()
         "cancelled_while_stamping",
         "two_before_send_first_fails_first",
         "two_before_send_last_fails_first",
+        "settlement_failure",
+        "abandoned_pending",
     ],
 )
 async def test_a_continued_dispatch_that_fails_keeps_the_label_honest(
@@ -3747,6 +3755,8 @@ async def test_a_continued_dispatch_that_fails_keeps_the_label_honest(
         def update_scheduled_run_label(
             self, conversation_id: str, run_id: str, *, action: Any
         ) -> None:
+            if action != "begin" and failure in {"settlement_failure", "abandoned_pending"}:
+                raise RuntimeError("settlement storage unavailable")
             if action == "begin":
                 if failure == "after_an_earlier_stamp":
                     real.set_labels(conversation_id, {SCHEDULED_TASK_RUN_LABEL_KEY: run_c})
@@ -3819,13 +3829,35 @@ async def test_a_continued_dispatch_that_fails_keeps_the_label_honest(
         assert [(run["status"], run["error_code"]) for run in store.runs] == [
             ("failed", "launch_failed")
         ] * (2 if overlapping else 1)
-    label = real.get_conversation(session_id).labels[SCHEDULED_TASK_RUN_LABEL_KEY]
-    assert label == {
-        "while_sending": run_b,
-        "after_a_later_stamp": run_c,
-        "after_an_earlier_stamp": run_c,
-    }.get(failure, run_a)
     assert sent == ([session_id] if failure == "while_sending" else [])
+    if failure in {"settlement_failure", "abandoned_pending"}:
+        from omnigent.server.scheduled.run_reconciler import STALE_RUN_MAX_AGE_SECONDS
+        from omnigent.stores.conversation_store import SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX
+
+        assert run_b is not None
+        fresh = SqlAlchemyConversationStore(db_uri)
+        assert fresh.get_conversation(session_id).labels[SCHEDULED_TASK_RUN_LABEL_KEY] == run_b
+        assert not fresh.clear_scheduled_run_label(session_id, run_a, pending_run_finished=True)
+        assert not fresh.clear_scheduled_run_label(session_id, run_b)
+        if failure == "abandoned_pending":
+            later = int(time.time()) + STALE_RUN_MAX_AGE_SECONDS + 1
+            monkeypatch.setattr(
+                "omnigent.stores.conversation_store.sqlalchemy_store.now_epoch", lambda: later
+            )
+        assert fresh.clear_scheduled_run_label(
+            session_id, run_b, pending_run_finished=failure == "settlement_failure"
+        )
+        fresh.update_scheduled_run_label(session_id, run_b, action="rollback")
+        labels = fresh.get_conversation(session_id).labels
+        assert SCHEDULED_TASK_RUN_LABEL_KEY not in labels
+        assert SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX + run_b not in labels
+    else:
+        label = real.get_conversation(session_id).labels[SCHEDULED_TASK_RUN_LABEL_KEY]
+        assert label == {
+            "while_sending": run_b,
+            "after_a_later_stamp": run_c,
+            "after_an_earlier_stamp": run_c,
+        }.get(failure, run_a)
 
 
 @pytest.mark.asyncio

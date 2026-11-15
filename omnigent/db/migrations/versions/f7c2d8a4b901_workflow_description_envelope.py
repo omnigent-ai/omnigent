@@ -1,6 +1,7 @@
-"""Store workflow descriptions in bounded binary storage envelopes.
+"""Upgrade pre-release workflow descriptions to bounded binary storage envelopes.
 
-Stop writers and apply before upgrading the application. Existing descriptions
+Fresh databases already create the binary column; this upgrade is a no-op.
+For pre-release text schemas, stop writers before upgrading. Existing descriptions
 are preserved; new writes use the same plaintext/ciphertext
 envelope as journal content and saved plans, capped at 2,000 stored bytes.
 If an existing description cannot fit, shorten it before retrying; its source

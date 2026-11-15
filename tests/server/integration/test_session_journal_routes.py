@@ -612,19 +612,28 @@ async def test_a_full_journal_refuses_new_entries_with_journal_full(
 
 
 @pytest.mark.parametrize(
-    "label", [SCHEDULED_TASK_RUN_LABEL_KEY, "omnigent.scheduled_task_activity"]
+    "label",
+    [
+        SCHEDULED_TASK_RUN_LABEL_KEY,
+        "omnigent.scheduled_task_activity",
+        "omnigent.scheduled_task_initial_run",
+        "omnigent.pending_scheduled_run.reserved",
+    ],
 )
+@pytest.mark.parametrize("user", [ALICE, BOB])
 async def test_clients_cannot_set_the_run_label(
-    client: httpx.AsyncClient, db_uri: str, label: str
+    client: httpx.AsyncClient, db_uri: str, label: str, user: str
 ) -> None:
     session_id = _session(db_uri)
+    SqlAlchemyPermissionStore(db_uri).grant(BOB, session_id, LEVEL_EDIT)
     resp = await client.patch(
         f"/v1/sessions/{session_id}",
         json={"labels": {label: uuid.uuid4().hex}},
-        headers=_headers(),
+        headers=_headers(user),
     )
     assert resp.status_code == 400, resp.text
     assert "server-internal" in resp.text
+    assert label not in SqlAlchemyConversationStore(db_uri).get_conversation(session_id).labels
 
 
 async def test_the_server_advertises_the_journal(client: httpx.AsyncClient) -> None:
@@ -840,8 +849,9 @@ async def test_a_workflow_question_marks_its_task_and_returns_the_answer(
     }
 
 
+@pytest.mark.parametrize("settled", [True, False])
 async def test_a_human_turn_after_a_continued_automation_restores_interactive_attribution(
-    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch, settled: bool
 ) -> None:
     from omnigent.server.routes._sessions.helpers import _publish_status
     from tests.server.integration.test_sessions_harness_override import _stub_late_runner_bind
@@ -869,7 +879,8 @@ async def test_a_human_turn_after_a_continued_automation_restores_interactive_at
         fired_at=1,
     )
     conversations.update_scheduled_run_label(session_id, run.id, action="begin")
-    conversations.update_scheduled_run_label(session_id, run.id, action="commit")
+    if settled:
+        conversations.update_scheduled_run_label(session_id, run.id, action="commit")
     journal = f"/v1/sessions/{session_id}/journal"
     automated = await client.post(
         journal,

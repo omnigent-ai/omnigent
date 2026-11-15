@@ -9,7 +9,12 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from omnigent.harness_aliases import canonicalize_harness
-from omnigent.host.frames import HostSkillsFrame, HostSkillsResultFrame, encode_host_frame
+from omnigent.host.frames import (
+    CAP_WORKFLOWS,
+    HostSkillsFrame,
+    HostSkillsResultFrame,
+    encode_host_frame,
+)
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_EDIT, AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags
@@ -137,9 +142,9 @@ def create_skills_router(
             if host is not None:
                 raise host_absent_error(host)
             raise HTTPException(status_code=503, detail="session host is offline")
-        workflows_enabled = getattr(request.app.state, "feature_flags", FeatureFlags()).enabled(
-            Feature.WORKFLOWS
-        )
+        workflows_enabled = CAP_WORKFLOWS in conn.hello.capabilities and getattr(
+            request.app.state, "feature_flags", FeatureFlags()
+        ).enabled(Feature.WORKFLOWS)
         result = await request_host_skills(
             host_registry=host_registry,
             host_conn=conn,

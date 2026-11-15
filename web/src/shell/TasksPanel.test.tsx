@@ -159,6 +159,28 @@ describe("TasksPanel", () => {
     showJournal([]);
     setSession({
       sessionStatus: "running",
+      blocks: [
+        {
+          type: "native_tool",
+          ctx: {
+            agent: null,
+            depth: 0,
+            turn: 0,
+            timestamp: 0,
+            responseId: "turn",
+            itemId: "marker",
+          },
+          toolType: "subagent_activity",
+          label: "Started Document it",
+          data: {
+            type: "resource_event",
+            event_type: "session.journal.task",
+            resource_type: "journal",
+            resource_id: "task-2",
+            resource: { name: "Document it", status: "started", native: true },
+          },
+        },
+      ],
       todos: [
         { content: "Add the flag", status: "completed", activeForm: "Adding the flag" },
         { content: "Document it", status: "in_progress", activeForm: "Documenting it" },
@@ -203,9 +225,16 @@ describe("TasksPanel", () => {
         features: workflows === undefined ? {} : { workflows },
       } as never);
       showJournal([journalPlan(0, ["profile"])]);
-      setSession({ todos: [{ content: "Only item", status: "pending", activeForm: "" }] });
+      setSession({
+        todos: [
+          { content: "Only item", status: "pending", activeForm: "" },
+          { content: "Started item", status: "in_progress", activeForm: "Working" },
+          { content: "Finished item", status: "completed", activeForm: "" },
+        ],
+      });
       renderPanel();
-      expect(screen.getByTestId("tasks-row")).toHaveTextContent("Only item");
+      expect(screen.getAllByTestId("tasks-row")[0]).toHaveTextContent("Only item");
+      expect(screen.queryAllByTestId("tasks-row-show-in-chat")).toHaveLength(0);
       expect(vi.mocked(useSessionJournal)).toHaveBeenLastCalledWith("conv", false);
     },
   );
@@ -832,6 +861,10 @@ describe("TasksPanel", () => {
 
   it("counts a busy sub-agent as work, but not a side chat", () => {
     showJournal([journalPlan(0, ["deploy"]), status(1, "deploy", "started")]);
+    vi.mocked(useOptionalLoadedConversations).mockReturnValue({
+      ...conversationPage([conversation("conv", { status: "idle" })]).data!,
+      pageParams: [undefined],
+    });
     const busy = (labels: Record<string, string>) =>
       vi.mocked(useChildSessions).mockReturnValue({
         children: [{ id: "child", busy: true, labels }] as ChildSessionInfo[],
