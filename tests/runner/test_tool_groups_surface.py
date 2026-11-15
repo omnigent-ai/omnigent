@@ -11,7 +11,7 @@ from omnigent.runner.tool_dispatch import (
     _ungranted_tool_reason,
     build_native_relay_tool_schemas,
 )
-from omnigent.spec.types import AgentSpec, ToolGroupsConfig
+from omnigent.spec.types import MEMORY_TOOL_NAMES, AgentSpec, ToolGroupsConfig
 from omnigent.tools.manager import ToolManager
 
 _ALL_OFF = ToolGroupsConfig(
@@ -48,6 +48,7 @@ def _relay_names(spec: AgentSpec) -> set[str]:
 
 def test_native_relay_carries_every_group_by_default() -> None:
     """Without a ``tool_groups:`` block the relay advertises every gated tool."""
+    assert _gated() >= MEMORY_TOOL_NAMES
     missing = _gated() - _relay_names(_spec(ToolGroupsConfig()))
     assert not missing, f"relay dropped {sorted(missing)} with every group on"
 

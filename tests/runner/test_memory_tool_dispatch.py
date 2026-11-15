@@ -306,14 +306,21 @@ async def test_a_memory_name_defined_in_another_tool_file_keeps_its_own_schema(
     spec = parse(tmp_path)
     client = _RecordingClient()
 
-    await execute_tool(
-        tool_name="memory_get",
-        arguments=json.dumps({"path": "/a"}),
-        server_client=client,
-        agent_spec=spec,
-        conversation_id=_SESSION,
-        local_tool_workdir=tmp_path,
-    )
+    async def run(name: str, arguments: dict[str, str]) -> str:
+        return await execute_tool(
+            tool_name=name,
+            arguments=json.dumps(arguments),
+            server_client=client,
+            agent_spec=spec,
+            conversation_id=_SESSION,
+            local_tool_workdir=tmp_path,
+        )
+
+    # The runner handles it exactly as it handles the file's other tool. Today it
+    # refuses both: it grants Python tools by their declared name, the file stem
+    # (see ``_granted_tool_names``). If that changes, assert "own" here instead.
+    sibling = await run("lookup", {"query": "q"})
+    assert await run("memory_get", {"path": "/a"}) == sibling.replace("lookup", "memory_get")
 
     schemas = {
         s["function"]["name"]: s["function"]
@@ -332,14 +339,6 @@ def test_toolmanager_registers_memory_unless_the_group_is_off() -> None:
 
     assert registered(_spec()) >= _NAMES
     assert not (_NAMES & registered(_spec(ToolGroupsConfig(memory=False))))
-
-
-def test_native_relay_advertises_memory_and_honours_the_group() -> None:
-    def relayed(spec: AgentSpec) -> set[str]:
-        return {schema["name"] for schema in build_native_relay_tool_schemas(spec)}
-
-    assert relayed(_spec()) >= _NAMES
-    assert not (_NAMES & relayed(_spec(ToolGroupsConfig(memory=False))))
 
 
 async def test_without_backend_search_memory_search_is_neither_offered_nor_proxied() -> None:
