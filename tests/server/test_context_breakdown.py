@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from omnigent.entities import ConversationItem
 from omnigent.entities.conversation import (
+    COMPACTION_SUMMARY_REPLAY_PROMPT,
     CompactionData,
     FunctionCallData,
     FunctionCallOutputData,
@@ -19,6 +22,7 @@ from omnigent.entities.conversation import (
 )
 from omnigent.entities.file import StoredFile
 from omnigent.mcp_selection import MCP_SELECTION_PREFIX
+from omnigent.runner.session_history import build_session_history
 from omnigent.runtime.prompt import (
     build_instructions_nullable,
     build_native_startup_instructions,
@@ -127,10 +131,46 @@ def test_scan_history_counts_a_generated_image_once() -> None:
     item = {"type": "image_generation_call", "id": "ig_1", "result": "A" * 400_000}
     items = [_item("nt_1", "native_tool", NativeToolData(item=item))]
 
-    history, _ = scan_history(items)
+    history, _ = scan_history(items, native=True)
 
     rest = estimate_text_tokens(json.dumps({"type": "image_generation_call", "id": "ig_1"}))
     assert history.estimated_tokens == rest + IMAGE_TOKEN_ESTIMATE
+    # The runner's turn replay does not send provider tool items.
+    assert scan_history(items)[0].item_count == 0
+
+
+def _runner_replay(items: list[ConversationItem]) -> list[dict[str, object]]:
+    """The input the runner's turn replay builds from *items* (oldest first)."""
+    session_history = build_session_history(
+        _background_tasks=set(),
+        _last_server_item_id={},
+        _persist_cancellation_items=AsyncMock(),
+        _session_histories={},
+        _session_spec_cache={},
+        server_client=MagicMock(spec=httpx.AsyncClient),
+    )
+    return session_history.convert_raw_items_to_input([item.to_api_dict() for item in items])
+
+
+def _replayed_live_ids(items: list[ConversationItem]) -> list[object]:
+    """Stored messages (by id) and tool records (by call id) the runner replays."""
+    stored = {item.id for item in items}
+    compactions = [item.data for item in items if isinstance(item.data, CompactionData)]
+    # Skip the entries the latest checkpoint itself replays.
+    checkpoint_entries = (
+        0 if not compactions else len(compactions[-1].compacted_messages or []) or 2
+    )
+    replayed: list[object] = []
+    for entry in _runner_replay(items)[checkpoint_entries:]:
+        if entry.get("type") in ("function_call", "function_call_output"):
+            replayed.append(f"{entry['type']}:{entry.get('call_id')}")
+        elif entry.get("id") in stored:
+            replayed.append(entry.get("id"))
+    return replayed
+
+
+# Every summary-only checkpoint replays this prompt before its summary.
+_REPLAY_PROMPT_TOKENS = estimate_text_tokens(COMPACTION_SUMMARY_REPLAY_PROMPT)
 
 
 def test_scan_history_replaces_compacted_items_with_the_latest_summary() -> None:
@@ -143,22 +183,38 @@ def test_scan_history_replaces_compacted_items_with_the_latest_summary() -> None
             CompactionData(summary="old", last_item_id="msg_1", token_count=999),
         ),
         _user("msg_3", _text("y" * 4_000)),
-        _assistant("msg_4", "z" * 40),
+        # After the anchor but before the compaction record: replay drops it.
+        _user("msg_4", _text("z" * 40), {"type": "input_image", "file_id": "file_gap"}),
         _item(
             "cmp_new",
             "compaction",
             CompactionData(summary="new", last_item_id="msg_3", token_count=50),
         ),
-        _user("msg_5", _text("w" * 40)),
+        _user("msg_5", _text("w" * 40), {"type": "input_image", "file_id": "file_live"}),
+        _item(
+            "fc_1",
+            "function_call",
+            FunctionCallData(agent="a", name="grep", arguments="b" * 36, call_id="c1"),
+        ),
+        _item(
+            "fco_1", "function_call_output", FunctionCallOutputData(call_id="c1", output="c" * 80)
+        ),
+        _item("nt_1", "native_tool", NativeToolData(item={"type": "web_search_call"})),
     ]
 
-    history, _ = scan_history(reversed(items))
+    history, attachments = scan_history(reversed(items))
 
-    # msg_4 sits between the summary boundary and the compaction item, so it stays live.
-    assert history.item_count == 2
-    assert history.summarized_item_count == 3
-    assert history.summary_tokens == 50
-    assert history.estimated_tokens == 50 + 10 + 10
+    assert _replayed_live_ids(items) == [
+        "msg_5",
+        "function_call:c1",
+        "function_call_output:c1",
+    ]
+    assert history.item_count == 3
+    assert history.summarized_item_count == 4
+    summary = _REPLAY_PROMPT_TOKENS + estimate_text_tokens("new")
+    assert history.summary_tokens == summary
+    assert history.estimated_tokens == summary + 10 + 10 + 20
+    assert [ref.file_id for ref in attachments] == ["file_live"]
 
 
 def test_scan_history_marks_a_capped_scan_partial() -> None:
@@ -193,7 +249,9 @@ def test_scan_history_keeps_live_counts_exact_when_the_cap_lands_in_the_summary(
     [("", "msg_1"), ("summary", ""), ("summary", "synthetic_abc")],
     ids=["empty-summary", "empty-anchor", "synthetic-anchor"],
 )
-def test_scan_history_ignores_a_compaction_the_runtime_rejects(summary: str, anchor: str) -> None:
+def test_scan_history_replays_any_latest_compaction_like_the_runner(
+    summary: str, anchor: str
+) -> None:
     items = [
         _user("msg_1", _text("a" * 40)),
         _item(
@@ -211,11 +269,13 @@ def test_scan_history_ignores_a_compaction_the_runtime_rejects(summary: str, anc
 
     history, _ = scan_history(reversed(items))
 
-    # Like the runtime, a broken latest compaction replays the whole history.
-    assert history.item_count == 2
-    assert history.summarized_item_count == 0
-    assert history.summary_tokens == 0
-    assert history.estimated_tokens == 20
+    # The runner's turn replay does not validate the latest compaction.
+    assert _replayed_live_ids(items) == ["msg_2"]
+    assert history.item_count == 1
+    assert history.summarized_item_count == 1
+    summary_tokens = _REPLAY_PROMPT_TOKENS + estimate_text_tokens(summary)
+    assert history.summary_tokens == summary_tokens
+    assert history.estimated_tokens == summary_tokens + 10
 
 
 def test_scan_history_sizes_a_native_summary_without_a_token_count() -> None:
@@ -230,8 +290,8 @@ def test_scan_history_sizes_a_native_summary_without_a_token_count() -> None:
 
     history, _ = scan_history(reversed(items))
 
-    assert history.summary_tokens == 100
-    assert history.estimated_tokens == 100
+    assert history.summary_tokens == _REPLAY_PROMPT_TOKENS + 100
+    assert history.estimated_tokens == _REPLAY_PROMPT_TOKENS + 100
 
     # A forwarder-shaped checkpoint: placeholder summary plus retained messages.
     image = {"type": "input_image", "file_id": "file_img"}
@@ -320,18 +380,21 @@ def test_scan_history_sizes_a_native_summary_without_a_token_count() -> None:
         (None, "inline", IMAGE_TOKEN_ESTIMATE),
     ]
 
-    # The runtime replays the latest compaction, summary-only or not, from its anchor.
+    # The runner replays the latest compaction, summary-only or not, in place of all before it.
     runtime = breakdown_for("claude-sdk")
-    assert runtime.history.summary_tokens == estimate_text_tokens("placeholder")
+    assert runtime.history.summary_tokens == _REPLAY_PROMPT_TOKENS + estimate_text_tokens(
+        "placeholder"
+    )
     assert runtime.history.item_count == 1
     assert runtime.history.summarized_item_count == 3
 
-    # Without it, the runtime replays the retained messages and every item after the anchor.
+    # Without it, the runner replays the retained messages and every item after them.
     items = [item for item in items if item.id != "cmp_fallback"]
     runtime = breakdown_for("claude-sdk")
     assert runtime.history.summary_tokens == checkpoint_tokens
-    assert runtime.history.item_count == 3
-    assert runtime.history.summarized_item_count == 1
+    assert _replayed_live_ids(items) == [covered_id, "msg_new"]
+    assert runtime.history.item_count == 2
+    assert runtime.history.summarized_item_count == 2
 
 
 def _stored(

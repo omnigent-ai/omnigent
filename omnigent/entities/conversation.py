@@ -628,6 +628,13 @@ def is_omitted_binary_payload(value: object) -> bool:
     )
 
 
+# User turn the runner replays before a summary-only compaction's summary.
+COMPACTION_SUMMARY_REPLAY_PROMPT = (
+    "[Automatically generated summary of prior conversation context.]\n\n"
+    "Please provide a summary of our conversation so far."
+)
+
+
 class CompactionData(BaseModel):
     """
     Data payload for a compaction summary item.

@@ -3294,10 +3294,9 @@ class ContextBreakdownHistory(BaseModel):
     :param item_count: Messages and tool calls/results still sent in full.
     :param summarized_item_count: Earlier messages and tool calls/results
         replaced by a compaction summary.
-    :param summary_tokens: Size of what replaces the compacted history: the
-        checkpoint's retained messages when it has them, else the summary's
-        recorded token count (or its size when none was recorded); ``0`` when
-        the history was never compacted.
+    :param summary_tokens: Estimated size of what replaces the compacted
+        history: the checkpoint's retained messages when it has them, else the
+        replayed summary and its prompt; ``0`` when never compacted.
     :param partial: The scan stopped at its item cap before the summarized
         range, so the live counts are lower bounds.
     :param summarized_partial: The scan stopped inside the summarized range,

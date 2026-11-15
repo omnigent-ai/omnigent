@@ -246,8 +246,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   workspace, or not delivered (file removed, or a native harness could not
   write it to disk); a native harness receives each attachment it can decode
   as a file path. History notes how many earlier items a compaction summary
-  replaced. A server without the breakdown route still shows the
-  measured header.
+  replaced. An open breakdown refreshes when a turn starts, when it ends, and
+  when a later entry arrives. A server without the breakdown route still shows
+  the measured header.
 - `review-context`: submitting an Agent comment in PR Changes attaches a chip
   to the session composer. Hover previews the comment, click reveals it in
   Changes, and X deletes the saved comment. Failed deletion retains the chip.
@@ -586,7 +587,8 @@ Other connection providers alone do not enable the managed MCP picker.
   hover tooltip, that each row is labelled measured or estimate, and that the
   attachment rows name the files with their sizes. Cross-check with
   `GET /v1/sessions/<id>/context-breakdown`. Component coverage:
-  `web/src/components/composer/ComposerContextBreakdown.test.tsx`; server
+  `web/src/components/composer/ComposerContextBreakdown.test.tsx` and
+  `web/src/components/composer/ComposerContextRing.test.tsx`; server
   estimates: `tests/server/test_context_breakdown.py`; read access:
   `tests/server/integration/test_sessions_permissions.py::test_context_breakdown_requires_read_access`.
 - **`blocked-start`:** on a fresh new-session page with no working directory,

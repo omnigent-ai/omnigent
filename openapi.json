@@ -2096,7 +2096,7 @@
           },
           "summary_tokens": {
             "default": 0,
-            "description": "Size of what replaces the compacted history: the checkpoint's retained messages when it has them, else the summary's recorded token count (or its size when none was recorded); `0` when the history was never compacted.",
+            "description": "Estimated size of what replaces the compacted history: the checkpoint's retained messages when it has them, else the replayed summary and its prompt; `0` when never compacted.",
             "format": "int64",
             "title": "Summary Tokens",
             "type": "integer"
