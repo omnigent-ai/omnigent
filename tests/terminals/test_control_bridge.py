@@ -391,7 +391,13 @@ async def test_control_bridge_outer_cancellation_joins_child_tasks() -> None:
         )
     )
     try:
-        await asyncio.sleep(0.2)
+        # Cancel only once the bridge's reader task is running.
+        await poll_until_async(
+            lambda: any(
+                pending.get_name() == "tmux-control-read" and not pending.done()
+                for pending in asyncio.all_tasks()
+            )
+        )
         assert task.cancel()
         [task_result] = await asyncio.gather(task, return_exceptions=True)
         assert isinstance(task_result, asyncio.CancelledError)
@@ -1719,10 +1725,10 @@ async def test_control_bridge_stalled_item_cap_does_not_repaint_forever(
         # Allow one already-pending trailing repaint, then ensure the capture
         # count converges while the output send remains blocked.
         captures_when_output_stopped = capture_calls
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.05)  # custom-lint: disable=sleep-then-assert -- convergence window
         captures_after_burst = capture_calls
         assert captures_after_burst - captures_when_output_stopped <= 1
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.05)  # custom-lint: disable=sleep-then-assert -- convergence window
         assert capture_calls == captures_after_burst
 
         ws.release_output.set()
@@ -1834,9 +1840,15 @@ async def test_control_bridge_saturation_prioritizes_repaint(
 async def test_capture_pane_snapshot_repaints_visible_content() -> None:
     """Gap recovery captures a clear-screen snapshot with pane content."""
     sock, target = await _new_private_tmux("printf 'SNAPMARK\\n'; sleep 30")
-    await asyncio.sleep(0.3)
     try:
+        # Capture until the printf has rendered into the pane.
+        deadline = asyncio.get_running_loop().time() + 5.0
         snapshot = await control_bridge._capture_pane_snapshot(str(sock), target)
+        while (snapshot is None or b"SNAPMARK" not in snapshot) and (
+            asyncio.get_running_loop().time() < deadline
+        ):
+            await asyncio.sleep(0.05)
+            snapshot = await control_bridge._capture_pane_snapshot(str(sock), target)
     finally:
         await _kill_tmux(sock)
 
