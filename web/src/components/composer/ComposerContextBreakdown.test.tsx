@@ -114,7 +114,7 @@ describe("ComposerContextBreakdown", () => {
     expect(screen.getByText("shot.png · 2.0 KB").closest("li")).toHaveTextContent("~1.6K");
     expect(screen.getByText("spec.pdf · 4.0 KB").closest("li")).toHaveTextContent("Size only");
     expect(screen.getByText("logs.zip · 1.0 KB").closest("li")).toHaveTextContent("In workspace");
-    expect(screen.getByText("old.csv").closest("li")).toHaveTextContent("File removed");
+    expect(screen.getByText("old.csv").closest("li")).toHaveTextContent("Not delivered");
     expect(itemizedEstimate(data)).toBe(2_000 + 1_600 + 10_000);
   });
 

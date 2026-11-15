@@ -141,6 +141,7 @@ class _AttachmentRef:
     filename: str | None
     is_image: bool
     inline_bytes: int | None
+    has_data_uri: bool = False
 
 
 @dataclass
@@ -153,6 +154,12 @@ class _HistoryScan:
     compaction_seen: bool = False
     summary_boundary_id: str | None = None
     summarized: bool = False
+
+
+def _has_data_uri(block: dict[str, object]) -> bool:
+    """Whether a native harness can write the block to disk (it decodes only data URIs)."""
+    payload = block.get("image_url") or block.get("file_data")
+    return isinstance(payload, str) and payload.startswith("data:")
 
 
 def _inline_payload_bytes(block: dict[str, object]) -> int | None:
@@ -189,6 +196,7 @@ def _message_tokens(data: MessageData, scan: _HistoryScan) -> int:
                     filename=filename if isinstance(filename, str) else None,
                     is_image=block_type == "input_image",
                     inline_bytes=_inline_payload_bytes(block),
+                    has_data_uri=_has_data_uri(block),
                 )
             )
     if attachments:
@@ -298,13 +306,21 @@ def resolve_attachment(
 
     :param ref: The attachment block found in the history.
     :param lookup_file: Returns the session's stored file for an id, or ``None``.
-    :param native: The session runs a native harness, which hands every
-        attachment to its CLI as a file path.
+    :param native: The session runs a native harness, which hands each
+        attachment it can write to disk to its CLI as a file path.
     :returns: The attachment row for the breakdown.
     """
     if ref.file_id is None:
         # Bytes carried inline in the message itself.
         size = ref.inline_bytes
+        if native:
+            # Only a data URI materializes; a remote URL or bare base64 reaches
+            # the CLI as a "could not be loaded" marker.
+            return ContextBreakdownAttachment(
+                filename=ref.filename,
+                bytes=size,
+                delivery="workspace" if ref.has_data_uri else "missing",
+            )
         tokens: int | None = None
         if ref.is_image:
             tokens = IMAGE_TOKEN_ESTIMATE

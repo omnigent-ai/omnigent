@@ -337,7 +337,19 @@ def test_breakdown_estimates_spec_prompt_skills_and_selected_tools() -> None:
 def test_breakdown_reflects_native_harness_prompt_and_attachment_paths() -> None:
     spec = _spec()
     image = _stored("file_img", "shot.png", "image/png", 900)
-    items = [_user("msg_1", {"type": "input_image", "file_id": "file_img"})]
+    items = [
+        _user(
+            "msg_1",
+            {"type": "input_image", "file_id": "file_img"},
+            {
+                "type": "input_image",
+                "filename": "paste.png",
+                "image_url": "data:image/png;base64,QUJDRA==",
+            },
+            {"type": "input_image", "filename": "remote.png", "image_url": "https://x.test/a.png"},
+            {"type": "input_file", "filename": "bare.txt", "file_data": "QUJDRA=="},
+        )
+    ]
 
     breakdown = build_context_breakdown(
         "conv_1",
@@ -351,9 +363,17 @@ def test_breakdown_reflects_native_harness_prompt_and_attachment_paths() -> None
     assert breakdown.system_prompt_tokens == estimate_text_tokens(
         build_native_startup_instructions(spec)
     )
-    # A native CLI receives every attachment as a path, not inline content.
-    assert [(row.delivery, row.estimated_tokens) for row in breakdown.attachments] == [
-        ("workspace", None)
+    # A native CLI receives every attachment as a path, uploaded or sent as a data URI.
+    rows = [
+        (row.filename, row.delivery, row.bytes, row.estimated_tokens)
+        for row in breakdown.attachments
+    ]
+    assert rows == [
+        ("shot.png", "workspace", 900, None),
+        ("paste.png", "workspace", 4, None),
+        # Only data URIs materialize, so these reach the CLI as "could not be loaded".
+        ("remote.png", "missing", None, None),
+        ("bare.txt", "missing", 4, None),
     ]
 
 
