@@ -384,6 +384,10 @@ class ScheduledTaskStore(ABC):
         """
         ...
 
+    def get_run(self, run_id: str) -> ScheduledTaskRun | None:
+        """Read one run by ID in the current workspace."""
+        raise NotImplementedError
+
     @abstractmethod
     def list_runs(
         self,

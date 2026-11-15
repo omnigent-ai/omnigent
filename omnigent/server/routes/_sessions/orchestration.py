@@ -341,6 +341,7 @@ from omnigent.server.routes._sessions.helpers import (
     _priced_cost_for_display,
     _provision_managed_sandbox,
     _prune_pre_resolved_harness_elicitations,
+    _publish_child_status_to_parent,
     _publish_elicitation_request_to_ancestors,
     _publish_elicitation_resolved,
     _publish_elicitation_resolved_to_ancestors,
@@ -7933,27 +7934,27 @@ async def _forward_event_to_runner(
     # A web send is persisted under its client stable id (see _web_send_stable_id).
     item = _build_new_item(body, turn_id, created_by=created_by, adopt_stable_id=True)
     item = item.model_copy(update={"replaces_pending_id": startup_input_id})
-    persisted_items = await asyncio.to_thread(
-        conversation_store.append,
-        session_id,
-        [item],
-    )
-    if (
-        item.stable_id is not None
-        and persisted_items[0].deduplicated
-        and not _stable_id_reuse_is_exact_retry(persisted_items[0], item)
-    ):
-        # A persisted retry may still need forwarding if the first attempt
-        # failed before reaching the runner. A different body under the id
-        # (a pre-adoption web bundle resending an edited restored draft) is a
-        # new message: give it a store-assigned id so it runs under the item
-        # that holds it.
-        item = _build_new_item(body, turn_id, created_by=created_by)
-        persisted_items = await asyncio.to_thread(
+
+    async def persist_input() -> list[ConversationItem]:
+        persisted = await asyncio.to_thread(
             conversation_store.append,
             session_id,
             [item],
         )
+        if (
+            item.stable_id is not None
+            and persisted[0].deduplicated
+            and not _stable_id_reuse_is_exact_retry(persisted[0], item)
+        ):
+            # An edited restored draft reusing a stable ID is a new message.
+            replacement = _build_new_item(body, turn_id, created_by=created_by)
+            persisted = await asyncio.to_thread(
+                conversation_store.append, session_id, [replacement]
+            )
+        return persisted
+
+    # Run controls wait for routing and a fresh guard before entering replayable history.
+    persisted_items = await persist_input() if body.workflow_run_id is None else None
     await _seed_missing_title_from_user_message(
         conv,
         item,
@@ -8034,11 +8035,6 @@ async def _forward_event_to_runner(
         # registration), so a non-renderer viewer keeps tools advertised
         # — no worse than the pre-hint behavior.
         "browser_renderer_available": session_stream.has_subscribers(session_id),
-        # Id of the item just persisted for this turn. On a cold runner
-        # cache the runner reloads history (which includes this item in
-        # PRE-resolution form) and drops it by id, appending its own
-        # resolved copy — id-based dedup, not a role/content guess.
-        "persisted_item_id": persisted_items[0].id,
     }
     if agent_revision is not None:
         runner_body["agent_revision"] = agent_revision
@@ -8373,6 +8369,14 @@ async def _forward_event_to_runner(
     _effective_harness = _routed_harness or conv.harness_override
     if _effective_harness is not None and _effective_harness != "auto":
         runner_body["harness_override"] = _effective_harness
+
+    if persisted_items is None:
+        from omnigent.server.session_journal import require_current_workflow_run
+
+        await require_current_workflow_run(conversation_store, session_id, body.workflow_run_id)
+        persisted_items = await persist_input()
+    # A cold runner replaces this stored, unresolved input with the resolved body by ID.
+    runner_body["persisted_item_id"] = persisted_items[0].id
 
     # The runner's sessions-native POST returns 202 immediately
     # and starts the turn as a background task. No streaming
@@ -8906,8 +8910,11 @@ async def _dispatch_session_event_to_runner_impl(
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
     """
+    from omnigent.server.session_journal import require_current_workflow_run
+
     if runner_router is not None:
         await asyncio.to_thread(runner_router.require_runtime_support, conv)
+    await require_current_workflow_run(conversation_store, session_id, body.workflow_run_id)
     if body.type == "message":
         disconnect_outcome.note_user_turn(conv.id)
     if body.type == "message" and _codex_side_chat_thread_id(conv) is not None:
@@ -9166,6 +9173,10 @@ async def _dispatch_session_event_to_runner_impl(
         # already-running pane.
         forwarded = False
         try:
+            # Native initialization or model routing may outlast the run shown by the UI.
+            await require_current_workflow_run(
+                conversation_store, session_id, body.workflow_run_id
+            )
             if pending_id is not None:
                 pending_inputs.mark_delivery_stage(session_id, pending_id, "forward_requested")
             await _forward_native_terminal_message(
@@ -14638,6 +14649,7 @@ async def _run_runner_status_probe(
                     _session_status_cache[session_id] = raw
                     if raw in ("idle", "running", "waiting", "failed"):
                         session_live_state.persist_live_status(session_id, raw)
+                        _publish_child_status_to_parent(session_id, raw)
                     _runner_status_probe_backoff.pop(session_id, None)
                     return raw
                 failure = "HTTP 200 with a malformed body"
