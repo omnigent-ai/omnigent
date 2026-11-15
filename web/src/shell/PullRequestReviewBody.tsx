@@ -18,7 +18,7 @@ interface ReviewCodeContext {
 
 const ReviewCode = createContext<ReviewCodeContext | null>(null);
 
-function ReviewCodeBlock({ children }: ComponentProps<"pre">) {
+function ReviewCodeBlock({ children, ...props }: ComponentProps<"pre">) {
   const context = useContext(ReviewCode);
   if (
     !context ||
@@ -26,7 +26,7 @@ function ReviewCodeBlock({ children }: ComponentProps<"pre">) {
     children.props.className !== "language-suggestion" ||
     (children.props.children != null && typeof children.props.children !== "string")
   )
-    return <ChatCodeBlockPre>{children}</ChatCodeBlockPre>;
+    return <ChatCodeBlockPre {...props}>{children}</ChatCodeBlockPre>;
 
   // Markdown adds one terminating newline to fenced code, including an empty suggestion.
   const replacement = (children.props.children ?? "").replace(/\r?\n$/, "");

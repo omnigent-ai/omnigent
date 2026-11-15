@@ -43,6 +43,7 @@ import {
 
 import { VegaLiteChart } from "@/components/charts/VegaLiteChart";
 import { isVegaLiteLanguage } from "@/components/charts/vegaLiteSpec";
+import { rehypeMarkUnclosedFences, UNCLOSED_FENCE_PROP } from "@/components/charts/unclosedFences";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { MarkdownErrorBoundary } from "./MarkdownErrorBoundary";
@@ -650,7 +651,10 @@ function ChatCodeBlockWrapToggle({ wrap, onToggle }: { wrap: boolean; onToggle: 
   );
 }
 
-export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
+export function ChatCodeBlockPre({
+  children,
+  [UNCLOSED_FENCE_PROP]: unclosedFence,
+}: ComponentProps<"pre"> & { [UNCLOSED_FENCE_PROP]?: unknown }) {
   const code = extractCodeText(children);
   const renderLocalReviewComment = useContext(LocalReviewCommentRendererContext);
   const getCode = useCallback(() => code, [code]);
@@ -730,8 +734,10 @@ export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
     if (comment) return renderLocalReviewComment(comment);
   }
 
-  // A chart draws once its fence closes; until then the spec streams as code.
-  if (isChart && !fenceOpen) return <VegaLiteChart spec={code} source={codeBlock(block)} />;
+  // A chart draws only after its closing fence, so a reply that stops mid-spec stays code.
+  if (isChart && !fenceOpen && !unclosedFence) {
+    return <VegaLiteChart spec={code} source={codeBlock(block)} />;
+  }
 
   if (!isMermaid) return codeBlock(block);
 
@@ -800,11 +806,16 @@ export const MessageResponse = memo(
 
     const messageControls = useMemo(() => getChatCodeControls(controls), [controls]);
     const mermaidOptions = useMemo(() => mermaidOptionsForTheme(themeMode), [themeMode]);
-    let rehypePlugins = SECURE_STREAMDOWN_REHYPE_PLUGINS;
-    if (allowWorkspaceImages) rehypePlugins = WORKSPACE_IMAGE_STREAMDOWN_REHYPE_PLUGINS;
-    else if (markFileLinks) rehypePlugins = FILE_LINK_STREAMDOWN_REHYPE_PLUGINS;
+    let securePlugins = SECURE_STREAMDOWN_REHYPE_PLUGINS;
+    if (allowWorkspaceImages) securePlugins = WORKSPACE_IMAGE_STREAMDOWN_REHYPE_PLUGINS;
+    else if (markFileLinks) securePlugins = FILE_LINK_STREAMDOWN_REHYPE_PLUGINS;
     else if (allowGitHubAttachmentImages)
-      rehypePlugins = GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS;
+      securePlugins = GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS;
+    // Chart fences need to know whether they closed, whatever the streaming state.
+    const rehypePlugins = useMemo(
+      () => (allowCharts ? [...securePlugins, rehypeMarkUnclosedFences] : securePlugins),
+      [allowCharts, securePlugins],
+    );
 
     return (
       <MarkdownErrorBoundary source={props.children}>

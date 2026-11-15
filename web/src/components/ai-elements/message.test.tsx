@@ -470,6 +470,19 @@ describe("a streaming Mermaid fence", () => {
     expect(container.querySelector('svg[id^="mermaid-"]')).toHaveTextContent("Alpha");
   }, 15_000);
 
+  it("still draws an unclosed fence once streaming stops on a chart surface", async () => {
+    const { container, rerender } = render(
+      <MessageResponse allowCharts isStreaming>
+        {open}
+      </MessageResponse>,
+    );
+    rerender(<MessageResponse allowCharts>{open}</MessageResponse>);
+
+    await waitFor(() => expect(container.querySelector('svg[id^="mermaid-"]')).not.toBeNull(), {
+      timeout: 10_000,
+    });
+  }, 15_000);
+
   it("replaces the source of a streamed fence that can't draw with the error card", async () => {
     const invalid = "```mermaid\nsequenceDiagram\n    A->>B: hi\n    Note over A,B: once; twice\n";
     const { container, rerender } = render(
@@ -703,12 +716,17 @@ describe("MessageResponse vega-lite charts", () => {
   const closed = `Results:\n\n\`\`\`vega-lite\n${spec}\n\`\`\`\n`;
   const response = (
     text: string,
-    { allowCharts = true, enabled = true, isStreaming = false } = {},
+    {
+      allowCharts = true,
+      enabled = true,
+      isStreaming = false,
+      mode = undefined as "static" | "streaming" | undefined,
+    } = {},
   ) => (
     <CapabilitiesProvider
       info={{ ...FALLBACK_SERVER_INFO, features: { vega_lite_charts: enabled } }}
     >
-      <MessageResponse allowCharts={allowCharts} isStreaming={isStreaming}>
+      <MessageResponse allowCharts={allowCharts} isStreaming={isStreaming} mode={mode}>
         {text}
       </MessageResponse>
     </CapabilitiesProvider>
@@ -736,13 +754,53 @@ describe("MessageResponse vega-lite charts", () => {
 
   it("streams an open fence as code and draws once it closes", async () => {
     const open = `Results:\n\n\`\`\`vega-lite\n${spec}\n`;
+    const codeBlock = () => container.querySelector('[data-streamdown="code-block"]');
     const { container, rerender } = render(response(open, { isStreaming: true }));
-    expect(container.querySelector('[data-streamdown="code-block"]')).toHaveTextContent('"team"');
+    expect(codeBlock()).toHaveTextContent('"team"');
     expect(screen.queryByTestId("vega-lite-chart")).toBeNull();
 
-    rerender(response(closed, { isStreaming: true }));
+    // The reply stops before the closing fence: the complete JSON still stays code.
+    rerender(response(open));
+    await waitFor(() => expect(codeBlock()).toHaveTextContent('"team"'));
+    expect(screen.queryByTestId("vega-lite-chart")).toBeNull();
+
+    rerender(response(closed));
 
     expect(await screen.findByTestId("vega-lite-chart")).toBeInTheDocument();
+  });
+
+  it("keeps an unclosed repeat of a closed chart as code in static text", async () => {
+    const repeated = `${closed}\nAgain:\n\n\`\`\`vega-lite\n${spec}\n`;
+    const { container } = render(response(repeated, { mode: "static" }));
+
+    await waitFor(() => expect(screen.getAllByTestId("vega-lite-chart")).toHaveLength(1));
+    expect(container.querySelector('[data-streamdown="code-block"]')).toHaveTextContent('"team"');
+  });
+
+  it.each([
+    ["a tilde fence", `~~~vega-lite\n${spec}\n~~~\n`],
+    ["a fence on a list marker", `1. \`\`\`vega-lite\n   ${spec}\n   \`\`\`\n`],
+    ["a fence in a blockquote", `> \`\`\`vega-lite\n> ${spec}\n> \`\`\`\n`],
+    ["a longer closing fence", `\`\`\`vega-lite\n${spec}\n\`\`\`\`\n`],
+  ])("draws %s once it closes", async (_label, text) => {
+    render(response(text, { mode: "static" }));
+
+    expect(await screen.findByTestId("vega-lite-chart")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["a tilde fence", `~~~vega-lite\n${spec}\n`],
+    ["a fence on a list marker", `1. \`\`\`vega-lite\n   ${spec}\n`],
+    ["a fence in a blockquote", `> \`\`\`vega-lite\n> ${spec}\n`],
+  ])("keeps %s that never closed as code after streaming stops", async (_label, text) => {
+    const { container, rerender } = render(response(text, { isStreaming: true }));
+
+    rerender(response(text));
+
+    await waitFor(() =>
+      expect(container.querySelector('[data-streamdown="code-block"]')).toHaveTextContent('"team"'),
+    );
+    expect(screen.queryByTestId("vega-lite-chart")).toBeNull();
   });
 });
 
