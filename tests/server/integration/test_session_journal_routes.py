@@ -19,6 +19,7 @@ from omnigent.runner.identity import (
     token_bound_runner_id,
 )
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, RESERVED_USER_LOCAL
+from omnigent.stores import session_journal_store
 from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
@@ -593,6 +594,21 @@ async def test_a_missing_session_is_not_found(client: httpx.AsyncClient) -> None
     assert (await client.get(url, headers=_headers())).status_code == 404
     body = _write("note", {"body": "x"}, "tool:1")
     assert (await client.post(url, json=body, headers=_runner(session_id))).status_code == 404
+
+
+async def test_a_full_journal_refuses_new_entries_with_journal_full(
+    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(session_journal_store, "JOURNAL_MAX_ENTRIES", 1)
+    session_id = _session(db_uri)
+    url = f"/v1/sessions/{session_id}/journal"
+    first = _write("note", {"body": "x"}, "tool:1")
+    assert (await client.post(url, json=first, headers=_runner(session_id))).status_code == 200
+    second = _write("note", {"body": "y"}, "tool:2")
+    full = await client.post(url, json=second, headers=_runner(session_id))
+    assert full.status_code == 409 and "journal_full" in full.text
+    # A retry of a write that already landed still returns its entry.
+    assert (await client.post(url, json=first, headers=_runner(session_id))).status_code == 200
 
 
 @pytest.mark.parametrize(

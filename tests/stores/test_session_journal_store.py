@@ -15,13 +15,18 @@ from omnigent.db import current_query_name
 from omnigent.db.compression import EncryptedTextPayload, decode, encode_encrypted
 from omnigent.db.db_models import MAX_STORED_VALUE_BYTES
 from omnigent.entities import MessageData, NewConversationItem
-from omnigent.entities.session_journal import InvalidJournalEntryError, StepNotReadyError
+from omnigent.entities.session_journal import (
+    InvalidJournalEntryError,
+    JournalFullError,
+    StepNotReadyError,
+)
 from omnigent.errors import StaleCursorError
 from omnigent.server.journal_markers import (
     record_journal_checkpoint,
     record_plan_marker,
     record_status_marker,
 )
+from omnigent.stores import session_journal_store
 from omnigent.stores.conversation_store import ConversationAlreadyExistsError
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.session_journal_store import (
@@ -794,3 +799,16 @@ def test_a_deployment_encrypts_content_a_batch_at_a_time(
     bloated = _SealedJournal(db_uri, overhead=MAX_STORED_VALUE_BYTES)
     with pytest.raises(JournalEntryTooLargeError):
         _note(bloated, "k4")
+
+
+def test_a_full_journal_refuses_new_entries_but_returns_retried_ones(
+    journal: SessionJournalStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(session_journal_store, "JOURNAL_MAX_ENTRIES", 3)
+    journal.append(SESSION, "plan", _plan("a"), idempotency_key="k0", start_run=False)
+    _note(journal, "k1")
+    _note(journal, "k2")
+    with pytest.raises(JournalFullError):
+        _note(journal, "k3")
+    assert _note(journal, "k1").created is False
+    assert [entry.position for entry in journal.list_entries(SESSION).entries] == [0, 1, 2]

@@ -37,6 +37,7 @@ from omnigent.entities.session_journal import (
     JournalAppend,
     JournalEntry,
     JournalEntryTooLargeError,
+    JournalFullError,
     StepNotReadyError,
     normalize_status,
     normalize_step_id,
@@ -297,6 +298,8 @@ def create_session_journal_router(
             raise OmnigentError(f"entry_too_large: {exc}", code=ErrorCode.INVALID_INPUT) from exc
         except StepNotReadyError as exc:
             raise OmnigentError(f"step_not_ready: {exc}", code=ErrorCode.CONFLICT) from exc
+        except JournalFullError as exc:
+            raise OmnigentError(f"journal_full: {exc}", code=ErrorCode.CONFLICT) from exc
         except InvalidJournalEntryError as exc:
             raise OmnigentError(f"invalid_entry: {exc}", code=ErrorCode.INVALID_INPUT) from exc
         await _observe_entry(store, session, appended, user_id=user_id)
