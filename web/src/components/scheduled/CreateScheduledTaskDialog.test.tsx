@@ -4305,10 +4305,13 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(submit).toBeEnabled();
 
     // Over-long instructions would crowd the item out of a worker's first message.
-    type("task-trigger-instructions", "x".repeat(2001));
+    type("task-trigger-instructions", "x".repeat(16_000));
+    expect(submit).toBeEnabled();
+    expect(screen.queryByTestId("task-trigger-too-long")).toBeNull();
+    type("task-trigger-instructions", "x".repeat(16_001));
     expect(submit).toBeDisabled();
     expect(screen.getByTestId("task-trigger-too-long")).toHaveTextContent(
-      "Keep instructions to 2,000 characters or fewer",
+      "Keep instructions to 16,000 characters or fewer",
     );
     // The Instructions panel is hidden behind the Trigger tab, so the reason stays visible here.
     expect(screen.getByRole("tab", { name: "Trigger" })).toHaveAttribute("aria-selected", "true");
@@ -4316,7 +4319,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(screen.getByTestId("task-trigger-instructions-invalid")).toBeInTheDocument();
     expect(screen.getByTestId("task-trigger-instructions-too-long-notice")).toBeVisible();
     expect(screen.getByTestId("task-trigger-instructions-too-long-notice")).toHaveTextContent(
-      "Keep instructions to 2,000 characters or fewer",
+      "Keep instructions to 16,000 characters or fewer",
     );
     fireEvent.click(screen.getByRole("button", { name: "Edit instructions" }));
     expect(screen.getByRole("tab", { name: "Instructions" })).toHaveAttribute(
