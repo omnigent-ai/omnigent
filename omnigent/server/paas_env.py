@@ -101,4 +101,6 @@ def detect_base_url(
     hf_host = environ.get("SPACE_HOST")
     if hf_host:
         return f"https://{hf_host}"
-    return f"http://{host}:{port}"
+    from omnigent.util.server_url import format_host_port
+
+    return f"http://{format_host_port(host, port)}"

@@ -113,6 +113,11 @@ import {
 } from "@/lib/sse";
 import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import { applyJournalEntry } from "@/hooks/useSessionJournal";
+import { isFirstPlan } from "@/lib/sessionJournal";
+import { showTasksTabBesideChat } from "@/store/sessionTasksActions";
+import { noteSessionStreamClosed, noteSessionStreamOpen } from "@/lib/sessionStreamSignals";
+import { invalidateAgentCosts } from "@/hooks/useAgentCosts";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import {
@@ -1065,6 +1070,8 @@ export interface ConversationState {
    * tokens, total cost) is derived from this map on the frontend.
    */
   sessionUsageByModel: Record<string, ModelUsage> | null;
+  /** True while this conversation's first separate usage read is in flight. */
+  sessionUsageLoading: boolean;
   /**
    * Worktree branch checked out for the active session, surfaced in the
    * composer status line. Seeded from the session snapshot on bind
@@ -1537,6 +1544,10 @@ conversationRegistry.subscribeDisposed((id) => {
 
 // Reconnects share a binding; only one usage request may hydrate it at a time.
 const sessionUsageHydrations = new WeakSet<AbortController>();
+// An entry's latest first usage read: only it clears `sessionUsageLoading`. Once a read
+// settles, later background reads keep the known answer on screen.
+const firstSessionUsageHydration = new WeakMap<ConversationEntry, AbortController>();
+const settledSessionUsage = new WeakSet<ConversationEntry>();
 const sessionUsageRevisions = new WeakMap<ConversationEntry, { cost: number; models: number }>();
 
 // Snapshot reconciliation must teach the already-running stream pump which
@@ -2321,6 +2332,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   tokensUsed: null,
   sessionCostUsd: null,
   sessionUsageByModel: null,
+  sessionUsageLoading: false,
   gitBranch: null,
   todos: [],
   codexModelOptions: [],
@@ -4663,6 +4675,17 @@ function scheduleEntryFlush(id: string): void {
   });
 }
 conversationRegistry.subscribe(scheduleEntryFlush);
+// A moved total (live event, usage read or reconnect) means some agent's cost moved.
+useChatStore.subscribe((state, previous) => {
+  if (
+    queryClient === null ||
+    state.conversationId !== previous.conversationId ||
+    state.sessionCostUsd === previous.sessionCostUsd
+  ) {
+    return;
+  }
+  invalidateAgentCosts(queryClient);
+});
 // Queue edits (release, delete, reorder, a failed send's return) land on the root, not the entry.
 useChatStore.subscribe((state, previous) => {
   if (state.queuedMessages === previous.queuedMessages) return;
@@ -5607,6 +5630,10 @@ async function hydrateSessionUsage(id: string): Promise<void> {
     return;
   }
   sessionUsageHydrations.add(controller);
+  if (!settledSessionUsage.has(entry)) {
+    firstSessionUsageHydration.set(entry, controller);
+    entrySetter(entry)({ sessionUsageLoading: true });
+  }
   const revisionsBeforeFetch = sessionUsageRevisions.get(entry) ?? { cost: 0, models: 0 };
   try {
     const usage = await getSessionUsage(id, { signal: controller.signal });
@@ -5634,6 +5661,11 @@ async function hydrateSessionUsage(id: string): Promise<void> {
     // Usage is optional display data; retain known totals or leave them unknown.
   } finally {
     sessionUsageHydrations.delete(controller);
+    if (firstSessionUsageHydration.get(entry) === controller) {
+      firstSessionUsageHydration.delete(entry);
+      if (!controller.signal.aborted) settledSessionUsage.add(entry);
+      entrySetter(entry)({ sessionUsageLoading: false });
+    }
   }
 }
 
@@ -6802,6 +6834,8 @@ export async function startStreamPump(
       openedHost = getSessionHost(id);
       liveAttempt = attempt;
       let maxAgeTimer: ReturnType<typeof setTimeout> | null = null;
+      // Whether this attempt opened, so its close is signaled exactly once.
+      let streamOpened = false;
       try {
         const idle = presenceIdle.idleNow();
         let streamRes: Response;
@@ -6897,6 +6931,8 @@ export async function startStreamPump(
         const streamEpoch = streamRes.headers.get("x-omnigent-stream-epoch");
         if (!hasConnected) clearSseLog(id);
         hasConnected = true;
+        streamOpened = true;
+        noteSessionStreamOpen(id, reconnecting);
         hostReaddressed = false;
         failedOpens = 0;
         consecutive404s = 0;
@@ -6985,6 +7021,7 @@ export async function startStreamPump(
           markLivePreviewsInterrupted(id, set);
         }
       } finally {
+        if (streamOpened) noteSessionStreamClosed(id);
         if (maxAgeTimer !== null) clearTimeout(maxAgeTimer);
         liveAttempt = null;
         controller.signal.removeEventListener("abort", onOuterAbort);
@@ -9610,6 +9647,17 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         queryClient?.invalidateQueries({
           queryKey: childSessionsQueryKey(event.conversationId),
         });
+      }
+      return;
+    case "session_journal_appended":
+      // A new journal entry for the Tasks tab; the cache drops duplicates by ID.
+      if (queryClient) applyJournalEntry(queryClient, event.conversationId, event.entry);
+      // The agent's first plan, arriving while its session is on screen, opens the tab.
+      if (
+        isFirstPlan(event.entry) &&
+        event.conversationId === useChatStore.getState().conversationId
+      ) {
+        showTasksTabBesideChat(event.conversationId);
       }
       return;
     case "session_changed_files_invalidated":

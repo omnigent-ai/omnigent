@@ -1079,13 +1079,11 @@ describe("PullRequestPanel", () => {
       expect(
         labels.compareDocumentPosition(checks) & Node.DOCUMENT_POSITION_FOLLOWING,
       ).toBeTruthy();
-      // Reviewers and labels share one row, split by a vertical divider, above a divider.
+      // Reviewers and labels share one row, the labels column bordering the reviewers,
+      // above a divider.
       const row = reviewers.parentElement!.parentElement!;
       expect(row).toContainElement(labels);
-      expect(row.querySelector('[data-slot="separator"]')).toHaveAttribute(
-        "data-orientation",
-        "vertical",
-      );
+      expect(labels.parentElement).toHaveClass("border-l");
       expect(row.nextElementSibling).toHaveAttribute("data-slot", "separator");
     });
 

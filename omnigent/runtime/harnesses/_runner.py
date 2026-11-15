@@ -390,6 +390,8 @@ def _create_uvicorn_config(
         )
     if bind:
         host, _, port = bind.rpartition(":")
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
         return uvicorn.Config(
             app,
             host=host,

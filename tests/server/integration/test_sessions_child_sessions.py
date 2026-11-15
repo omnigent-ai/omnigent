@@ -131,6 +131,97 @@ async def test_child_sessions_404_for_nonexistent_session(
     assert resp.status_code == 404
 
 
+# ── Agent costs ──────────────────────────────────────────
+
+
+async def test_agent_costs_report_subtree_totals_and_ancestor_estimates(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    session = await _create_parent_session(client)
+    store = SqlAlchemyConversationStore(db_uri)
+    codex = _seed_child(conv_store=store, parent_id=session["id"], title="codex:a")
+    grandchild = _seed_child(conv_store=store, parent_id=codex.id, title="codex:b")
+    free = _seed_child(conv_store=store, parent_id=session["id"], title="worker:c")
+    mirror = _seed_child(conv_store=store, parent_id=session["id"], title="Explore:d")
+    nested = _seed_child(conv_store=store, parent_id=mirror.id, title="Explore:e")
+    unpriced = _seed_child(conv_store=store, parent_id=session["id"], title="worker:f")
+    # The Claude root reports its nested sub-agent too; a sibling's claim is ignored.
+    store.set_session_usage(
+        session["id"],
+        {
+            "total_cost_usd": 1.0,
+            "subagent_costs_usd": {mirror.id: 0.25, nested.id: 0.1, codex.id: 9.0},
+        },
+    )
+    store.set_session_usage(
+        codex.id, {"total_cost_usd": 0.5, "subagent_costs_usd": {unpriced.id: 7.0}}
+    )
+    store.set_session_usage(grandchild.id, {"total_cost_usd": 0.25})
+    store.set_session_usage(free.id, {"total_cost_usd": 0.0})
+
+    resp = await client.get(f"/v1/sessions/{session['id']}/agent_costs")
+
+    assert resp.status_code == 200
+    rows = resp.json()["data"]
+    assert {row["id"]: (row["cost_usd"], row["estimated_cost_usd"]) for row in rows} == {
+        # Own and descendant spend; estimates are never added.
+        session["id"]: (1.75, None),
+        # A priced cost wins over any estimate.
+        codex.id: (0.75, None),
+        grandchild.id: (0.25, None),
+        # A known zero stays zero; nothing priced falls back to an ancestor's estimate,
+        # kept apart so a client reading only cost_usd never shows it as priced.
+        free.id: (0.0, None),
+        mirror.id: (None, 0.25),
+        nested.id: (None, 0.1),
+        unpriced.id: (None, None),
+    }
+    child_resp = await client.get(f"/v1/sessions/{codex.id}/agent_costs")
+    assert {row["id"] for row in child_resp.json()["data"]} == {codex.id, grandchild.id}
+    # The reporting ancestor may sit above the requested subtree.
+    mirror_resp = await client.get(f"/v1/sessions/{mirror.id}/agent_costs")
+    assert {row["id"]: row["estimated_cost_usd"] for row in mirror_resp.json()["data"]} == {
+        mirror.id: 0.25,
+        nested.id: 0.1,
+    }
+    missing = await client.get("/v1/sessions/ad563e906854634c49e1a6fd2fbb31d4/agent_costs")
+    assert missing.status_code == 404
+
+
+async def test_agent_costs_paginate_and_bound_the_tree_read(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes.sessions import routes_items
+
+    session = await _create_parent_session(client)
+    store = SqlAlchemyConversationStore(db_uri)
+    for name in ("a", "b"):
+        _seed_child(conv_store=store, parent_id=session["id"], title=f"worker:{name}")
+    url = f"/v1/sessions/{session['id']}/agent_costs"
+
+    pages: list[dict[str, Any]] = []
+    after: str | None = None
+    while not pages or pages[-1]["has_more"]:
+        params = {"limit": 2, **({"after": after} if after else {})}
+        pages.append((await client.get(url, params=params)).json())
+        after = pages[-1]["last_id"]
+    assert [len(page["data"]) for page in pages] == [2, 1]
+    assert len({row["id"] for page in pages for row in page["data"]}) == 3
+    stale = await client.get(url, params={"after": "ad563e906854634c49e1a6fd2fbb31d4"})
+    assert (stale.status_code, stale.json()["error"]["code"]) == (400, "stale_cursor")
+
+    # A tree past the read cap reports no costs rather than reading it all, and a
+    # continuation across that growth restarts instead of ending early.
+    monkeypatch.setattr(routes_items, "_SPAWN_TREE_READ_CAP", 1)
+    capped = (await client.get(url)).json()
+    assert (capped["data"], capped["has_more"]) == ([], False)
+    grown = await client.get(url, params={"after": pages[0]["last_id"]})
+    assert (grown.status_code, grown.json()["error"]["code"]) == (400, "stale_cursor")
+
+
 # ── Empty ────────────────────────────────────────────────
 
 
@@ -1418,6 +1509,18 @@ async def test_native_subagent_session_stamps_terminal_ui_labels(
             ["--dangerously-bypass-approvals-and-sandbox"],
         ),
         (
+            "codex-native",
+            {"permission_mode": "approve-for-me"},
+            [
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "on-request",
+                "-c",
+                'approvals_reviewer="auto_review"',
+            ],
+        ),
+        (
             "cursor-native",
             {"yolo": True},
             ["--yolo"],
@@ -1431,19 +1534,10 @@ async def test_native_subagent_yolo_args_derived_from_trusted_spec(
     expected_args: list[str],
 ) -> None:
     """
-    A YOLO-declaring native worker bundle gets bypass ``terminal_launch_args``.
+    Named workers persist the permission arguments declared by their own spec.
 
-    The worker sub-agent's own bundle declares its full-bypass intent
-    (``permission_mode: bypassPermissions`` for claude-native,
-    ``yolo: true`` for codex-native / cursor-native). On a sub-agent create,
-    the server derives the matching flag list from that trusted,
-    server-loaded spec and persists it as the child session's
-    ``terminal_launch_args`` — which the runner appends to the native CLI
-    argv so the headless worker can edit without stalling on an
-    ApprovalCard.
-
-    A failure here means the translation seam regressed and the worker
-    would launch in its default prompting mode (and hang headless).
+    Explicit Codex automatic review must survive named sub-agent resolution
+    instead of falling back to the headless bypass default.
     """
     parent = await _create_parent_with_subagents(
         client,
@@ -1460,8 +1554,6 @@ async def test_native_subagent_yolo_args_derived_from_trusted_spec(
         },
     )
     assert resp.status_code == 201, resp.text
-    # The persisted child session carries exactly the YOLO bypass flags;
-    # an empty / None value would mean the worker launches prompting.
     assert resp.json()["terminal_launch_args"] == expected_args
 
 

@@ -32,6 +32,7 @@ from omnigent.tools.builtins import (
     SysProjectListTool,
     SysProjectUpdateTool,
     SysReadInboxTool,
+    SysReminderSetTool,
     SysScheduledTaskCreateTool,
     SysScheduledTaskDeleteTool,
     SysScheduledTaskListTool,
@@ -195,6 +196,7 @@ class ToolManager:
         self._register_comment_tools()
         self._register_policy_tools()
         self._register_scheduled_task_tools()
+        self._register_journal_tools()
         self._register_browser_tools()
 
     def _register_policy_tools(self) -> None:
@@ -219,10 +221,10 @@ class ToolManager:
         Auto-register the scheduled-task management builtins.
 
         Registered without spec opt-in so an agent can create, list,
-        update, and delete recurring scheduled tasks at runtime;
-        ``tool_groups.scheduled_tasks: false`` drops all four. The runner
-        dispatches them via the Omnigent server's ``/v1/scheduled-tasks``
-        REST endpoints.
+        update, and delete recurring scheduled tasks, and set one-time
+        reminders, at runtime; ``tool_groups.scheduled_tasks: false`` drops
+        all five. The runner dispatches them via the Omnigent server's
+        ``/v1/scheduled-tasks`` REST endpoints.
         """
         if not self._spec.tool_groups.scheduled_tasks:
             return
@@ -231,8 +233,24 @@ class ToolManager:
             SysScheduledTaskListTool(),
             SysScheduledTaskUpdateTool(),
             SysScheduledTaskDeleteTool(),
+            SysReminderSetTool(),
         ):
             self._tools[tool.name()] = tool
+
+    def _register_journal_tools(self) -> None:
+        """
+        Auto-register the ``sys_journal_*`` tools for the session's journal.
+
+        Registered without spec opt-in, so every agent can keep a plan, step
+        statuses and notes; ``tool_groups.journal: false`` drops all four. The
+        runner dispatches them via the server's ``/v1/sessions/{id}/journal``.
+        """
+        if not self._spec.tool_groups.journal:
+            return
+        from omnigent.tools.builtins.journal import JOURNAL_TOOLS
+
+        for tool_class in JOURNAL_TOOLS:
+            self._tools[tool_class.name()] = tool_class()
 
     def _register_async_inbox_tools(self) -> None:
         """

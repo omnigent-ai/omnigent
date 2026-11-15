@@ -49,6 +49,8 @@ from omnigent.host.frames import (
     SERVER_CAP_TMUX_READINESS,
     SERVER_CAPABILITIES_HEADER,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostCloneRepositoryFrame,
+    HostCloneRepositoryResultFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -3173,6 +3175,64 @@ async def test_fast_capability_discovery_is_included_in_hello(
     assert hello.gateway_inference == {"codex-native": True}
 
 
+@pytest.mark.parametrize("serving", [True, False])
+async def test_hello_advertises_the_workspace_socket_only_while_it_runs(
+    monkeypatch: pytest.MonkeyPatch, serving: bool
+) -> None:
+    """The server can mint direct-access tokens only for a host that serves the socket."""
+    host = _make_host_process()
+
+    async def _discover() -> None:
+        host._capabilities_initialized = True
+
+    monkeypatch.setattr(host, "_initialize_capabilities", _discover)
+    if serving:
+        host._workspace_socket = SimpleNamespace(  # type: ignore[assignment]
+            path=Path("/tmp/omnigent-workspace-x/workspace.sock"), token_key="key-abc"
+        )
+    tunnel = _BlockingTunnel()
+    serve_task = asyncio.create_task(host._serve_frames(tunnel))  # type: ignore[arg-type]
+    try:
+        await asyncio.wait_for(tunnel.first_send.wait(), timeout=1.0)
+    finally:
+        await _cancel(serve_task)
+
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    if serving:
+        assert hello.workspace_socket == "/tmp/omnigent-workspace-x/workspace.sock"
+        assert hello.workspace_token_key == "key-abc"
+    else:
+        assert hello.workspace_socket is None
+        assert hello.workspace_token_key is None
+
+
+@pytest.mark.parametrize(
+    ("features", "enabled"),
+    [("workspace_direct_access", True), ("", False), ("not_a_feature", False)],
+)
+async def test_workspace_direct_access_follows_omnigent_features(
+    monkeypatch: pytest.MonkeyPatch, features: str, enabled: bool
+) -> None:
+    """The host opens its socket only when enabled, and an invalid list never stops the host."""
+    from omnigent.host.connect import _workspace_direct_access_enabled
+
+    monkeypatch.setenv("OMNIGENT_FEATURES", features)
+
+    assert _workspace_direct_access_enabled() is enabled
+
+
+async def test_workspace_socket_without_its_extra_leaves_the_host_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Enabling direct access without `omnigent[workspace-api]` turns it off, not the host."""
+    monkeypatch.setenv("OMNIGENT_FEATURES", "workspace_direct_access")
+    # None in sys.modules makes the import fail as if connectrpc weren't installed.
+    monkeypatch.setitem(sys.modules, "omnigent.host.workspace_service", None)
+
+    assert await _make_host_process()._start_workspace_socket() is None
+
+
 async def test_slow_capability_discovery_blocks_registration_and_frame_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5776,6 +5836,40 @@ def test_handle_list_dir_pagination_last_page_has_more_false(
     assert result.status == "ok"
     assert len(result.entries) == 2
     assert result.has_more is False
+
+
+async def test_dispatch_clone_repository_keeps_orphan_reaper_paused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The clone worker owns its git exit status until it finishes."""
+    host = _make_host_process()
+    started = threading.Event()
+    release = threading.Event()
+    destination = str(tmp_path / "app")
+
+    def _clone(frame: HostCloneRepositoryFrame) -> HostCloneRepositoryResultFrame:
+        started.set()
+        if not release.wait(timeout=1.0):
+            raise AssertionError("test did not release the clone worker")
+        return HostCloneRepositoryResultFrame(
+            request_id=frame.request_id, status="ok", path=frame.path
+        )
+
+    monkeypatch.setattr("omnigent.host.connect.clone_repository", _clone)
+    tunnel = _FakeTunnel()
+    request = HostCloneRepositoryFrame(
+        request_id="clone-1", url="https://git.example.com/team/app.git", path=destination
+    )
+    dispatch = asyncio.create_task(host._dispatch_host_frame(tunnel, request))  # type: ignore[arg-type]
+    assert await asyncio.to_thread(started.wait, 1.0)
+    assert host._owned_subprocess_ops == 1
+
+    release.set()
+    await dispatch
+    assert host._owned_subprocess_ops == 0
+    assert decode_host_frame(tunnel.sent[0]) == HostCloneRepositoryResultFrame(
+        request_id="clone-1", status="ok", path=destination
+    )
 
 
 # ── host.create_dir handler ─────────────────────────────

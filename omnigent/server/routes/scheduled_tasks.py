@@ -8,7 +8,9 @@ sync on every mutation so a change takes effect without a restart.
 Ownership mirrors hosts: tasks are scoped to the calling user (``"local"`` when
 auth is disabled). The RRULE is validated on create/update with
 :func:`validate_rrule` — an invalid rule (bad syntax, never-fires, fires-once, or
-below the minimum-interval floor) is a 400.
+below the minimum-interval floor) is a 400. With the database scheduler and the
+``one_time_automations`` release feature, an explicit ``COUNT=1`` is accepted as a
+one-time schedule such as a reminder.
 """
 
 from __future__ import annotations
@@ -62,16 +64,24 @@ from omnigent.server.scheduled.harness_settings import (
     validate_scheduled_permission_mode,
     validate_scheduled_permission_support,
 )
-from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
+from omnigent.server.scheduled.rrule import (
+    RRuleSearchError,
+    RRuleValidationError,
+    is_one_time_rule,
+    validate_rrule,
+)
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.scheduled.telemetry import log_task_created
 from omnigent.server.session_mcp_selection import MAX_SESSION_MCP_SERVICES, session_mcp_selection
 from omnigent.server.session_orchestration import require_owned_session
+from omnigent.server.workflows import require_workflows
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
+from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import (
     AutomationFailure,
+    ScheduledTaskFirstRunMismatchError,
     ScheduledTaskStore,
     encode_mcp_services,
 )
@@ -101,6 +111,10 @@ class AutomationFailurePage(BaseModel):
 
     data: list[AutomationFailure]
     next_cursor: str | None
+
+
+# 9999-12-31T23:59:59Z, the last second ``datetime`` can format.
+_MAX_FIRST_RUN_AT = 253402300799
 
 
 class CreateScheduledTaskRequest(BaseModel):
@@ -138,6 +152,11 @@ class CreateScheduledTaskRequest(BaseModel):
     # A session the caller owns. Create copies it, and every run starts a new
     # session from that copy; responses carry the copy's id here.
     source_session_id: str | None = Field(default=None, min_length=1)
+    # Expected first-run epoch; reject the create if the schedule resolves differently.
+    first_run_at: int | None = Field(default=None, gt=0, le=_MAX_FIRST_RUN_AT)
+    # "reminder" marks a one-time message into session_id, which clients can list
+    # apart from automations.
+    kind: Literal["automation", "reminder"] = "automation"
 
     @model_validator(mode="after")
     def _validate_create(self) -> CreateScheduledTaskRequest:
@@ -149,6 +168,12 @@ class CreateScheduledTaskRequest(BaseModel):
             raise ValueError(_SESSION_ID_WITHOUT_CONTINUE_MSG)
         if self.source_session_id is not None and self.session_mode != "new":
             raise ValueError(_SOURCE_SESSION_CONTINUE_MSG)
+        if self.kind == "reminder" and (
+            self.session_id is None or not is_one_time_rule(self.rrule)
+        ):
+            raise ValueError(
+                "kind 'reminder' needs a one-time (COUNT=1) rule that continues a given session_id"
+            )
         _validate_worktree_target(
             self.base_branch, self.execution_target, self.host_id, self.workspace
         )
@@ -259,6 +284,7 @@ def _to_response(
         "session_mode": task.session_mode,
         "session_id": task.session_id,
         "source_session_id": task.source_session_id,
+        "kind": task.kind,
         "workspace": task.workspace,
         "base_branch": task.base_branch,
         "host_id": task.host_id,
@@ -332,7 +358,18 @@ def _run_to_response(
     }
 
 
-async def _validate_rrule_or_400(rrule: str, session_mode: str, execution_target: str) -> None:
+def one_time_schedules_supported(request: Request) -> bool:
+    """Whether creation accepts single-fire rules; see :func:`validate_rrule`.
+
+    Also gated by the ``one_time_automations`` release feature, because an older
+    database scheduler polling the same database would pause such a task.
+    """
+    return bool(getattr(request.app.state, "one_time_automations_enabled", False))
+
+
+async def _validate_rrule_or_400(
+    rrule: str, session_mode: str, execution_target: str, *, allow_single_fire: bool
+) -> None:
     """Raise a 400 ``OmnigentError`` if the RRULE is invalid."""
     try:
         await asyncio.to_thread(
@@ -340,6 +377,7 @@ async def _validate_rrule_or_400(rrule: str, session_mode: str, execution_target
             rrule,
             session_mode=session_mode,
             execution_target=execution_target,
+            allow_single_fire=allow_single_fire,
         )
     except RRuleValidationError as exc:
         raise OmnigentError(f"invalid rrule: {exc}", code=ErrorCode.INVALID_INPUT) from exc
@@ -912,7 +950,18 @@ def create_scheduled_tasks_router(
             conversation_store=conversation_store,
             permission_store=permission_store,
         )
-        await _validate_rrule_or_400(body.rrule, body.session_mode, body.execution_target)
+        await _validate_rrule_or_400(
+            body.rrule,
+            body.session_mode,
+            body.execution_target,
+            allow_single_fire=one_time_schedules_supported(request),
+        )
+        if body.first_run_at is not None and not one_time_schedules_supported(request):
+            # Only the database scheduler saves the next run the check compares.
+            raise OmnigentError(
+                "first_run_at needs one-time automations, which this server does not enable",
+                code=ErrorCode.INVALID_INPUT,
+            )
         _validate_timezone_or_400(body.timezone)
         permission_mode = validate_scheduled_permission_mode(body.permission_mode)
         agent, workspace, model_override, reasoning_effort = await _validate_launch_inputs(
@@ -1008,12 +1057,28 @@ def create_scheduled_tasks_router(
                 host_id=host_id,
                 project_id=project_id,
                 execution_target=body.execution_target,
+                first_run_at=body.first_run_at,
+                kind=body.kind,
             )
         except Exception as exc:
             if source_copy is not None:
                 await _delete_session_quietly(source_copy.id)
             if bound.id != agent.id:
                 agent_store.delete(bound.id)
+            if isinstance(exc, ScheduledTaskFirstRunMismatchError):
+                actual = (
+                    datetime.fromtimestamp(exc.actual, UTC).isoformat()
+                    if exc.actual is not None
+                    else "never"
+                )
+                raise OmnigentError(
+                    "The schedule's first run would be "
+                    f"{actual}, not {datetime.fromtimestamp(exc.expected, UTC).isoformat()} "
+                    "as requested: the request may have arrived after that time, the "
+                    "client's clock may be behind the server's, or the rule may not match "
+                    "it. The task was not created.",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
             if isinstance(exc, RRuleSearchError):
                 raise OmnigentError(
                     "Could not calculate the next run time for this schedule. "
@@ -1045,8 +1110,16 @@ def create_scheduled_tasks_router(
         )
 
     @router.get("/scheduled-tasks")
-    async def list_scheduled_tasks(request: Request) -> dict[str, list[dict[str, Any]]]:
+    async def list_scheduled_tasks(
+        request: Request,
+        kind: Literal["automation", "all"] = Query(default="automation"),
+    ) -> dict[str, list[dict[str, Any]]]:
         """List the caller's scheduled tasks.
+
+        Lists automations unless *kind* is ``all``, so the reminders agents set for
+        their own sessions stay off the Automations page. There is no reminders-only
+        view: this list reads every task the owner has, and a selective filter needs
+        an indexed, paginated query first.
 
         Lazy-on-read stale backstop: before returning, force-fail any of this
         owner's runs still ``running`` past the 6h max age (``incomplete``), so
@@ -1059,7 +1132,11 @@ def create_scheduled_tasks_router(
         """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        tasks = [t for t in store.list(owner_user_id=owner_id) if _owns_task(t, owner_id)]
+        tasks = [
+            t
+            for t in store.list(owner_user_id=owner_id)
+            if _owns_task(t, owner_id) and (kind == "all" or t.kind == "automation")
+        ]
         task_ids = [t.id for t in tasks]
         running = store.list_running_runs_for_tasks(task_ids)
         # Force-fail stale orphans FIRST so the completion badge below reports a
@@ -1213,6 +1290,68 @@ def create_scheduled_tasks_router(
             "next_cursor": next_cursor,
         }
 
+    @router.get(
+        "/scheduled-tasks/{scheduled_task_id}/run-steps",
+        dependencies=[Depends(require_workflows)],
+    )
+    async def list_scheduled_task_run_steps(
+        request: Request,
+        scheduled_task_id: str,
+        limit: int = Query(default=20, ge=1, le=50),
+        after: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        """The plan steps of one page of a scheduled task's runs, for their timelines.
+
+        Pages like ``GET /scheduled-tasks/{id}/runs``, most recent first. Each
+        run that wrote a plan lists the steps of its first plan and each step's
+        newest status entry: one run-index lookup per run, then one
+        kind-and-step lookup per step. The response is ``{"runs": [{"run_id",
+        "workflow_id", "plan_name", "is_current", "steps", "statuses"}], "next_cursor"}``.
+        """
+        from omnigent.server.session_journal import entry_to_response, open_store
+
+        owner = _owner(request)
+        _require_owned(scheduled_task_id, None if owner == RESERVED_USER_LOCAL else owner)
+        runs, next_cursor = store.list_runs(scheduled_task_id, limit=limit, after_id=after)
+        journal = open_store(conversation_store)
+        served = [run for run in runs if run.conversation_id is not None]
+        if journal is None or not served:
+            return {"runs": [], "next_cursor": next_cursor}
+        plans = await asyncio.to_thread(
+            journal.run_start_plans, [(run.id, run.conversation_id or "") for run in served]
+        )
+        found = [(run, plan) for run, plan in zip(served, plans, strict=True) if plan is not None]
+        statuses = await asyncio.to_thread(journal.plan_step_statuses, [plan for _, plan in found])
+        current_plans = await asyncio.to_thread(
+            journal.current_run_plan_ids, [plan for _, plan in found]
+        )
+        sessions = await asyncio.to_thread(
+            conversation_store.get_conversations, [plan.conversation_id for _, plan in found]
+        )
+        return {
+            "runs": [
+                {
+                    "run_id": run.id,
+                    "plan_id": plan.id,
+                    "workflow_id": plan.workflow_id,
+                    "plan_name": plan.content.get("name"),
+                    "is_current": (
+                        plan.id in current_plans
+                        and (session := sessions.get(plan.conversation_id)) is not None
+                        and session.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY) == run.id
+                        and not session.archived
+                    ),
+                    "steps": plan.content.get("steps", []),
+                    "statuses": [
+                        entry_to_response(entry).model_dump(mode="json")
+                        for entry in step_statuses.values()
+                    ],
+                }
+                for (run, plan), step_statuses in zip(found, statuses, strict=True)
+            ],
+            "next_cursor": next_cursor,
+        }
+
     @router.post("/scheduled-tasks/{scheduled_task_id}/run", status_code=202)
     async def run_scheduled_task_now(
         request: Request,
@@ -1309,6 +1448,7 @@ def create_scheduled_tasks_router(
                 body.rrule if body.rrule is not None else existing.rrule,
                 target_session_mode,
                 target_execution,
+                allow_single_fire=one_time_schedules_supported(request),
             )
         if target_session_mode == "new":
             if fields.get("session_id") is not None:

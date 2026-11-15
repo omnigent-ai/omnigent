@@ -18,9 +18,12 @@ from typing import NoReturn
 from unittest.mock import MagicMock
 
 import pytest
+from fastapi import FastAPI
+from pydantic import ValidationError
 
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.artifact_store.s3 import S3ArtifactStore
+from tests._helpers.providers import isolate_provider_resolution
 
 _ENTRYPOINT_MODULE = "deploy.docker.entrypoint"
 _BOOT_MODULES = (
@@ -133,8 +136,7 @@ def _entrypoint_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Minimal env for ``_resolve_config``: a DB URL and a tmp artifact dir,
     auth disabled so it doesn't mint accounts secrets, and no ambient
     artifact-store URI (each test sets it as needed)."""
-    # Point config at an empty file so the resolver doesn't read the developer's
-    # ambient ~/.omnigent/config.yaml (keeps the test hermetic; CI has none).
+    isolate_provider_resolution(monkeypatch, tmp_path / "providers")
     config_file = tmp_path / "config.yaml"
     config_file.write_text("{}\n")
     monkeypatch.setenv("OMNIGENT_CONFIG", str(config_file))
@@ -142,6 +144,7 @@ def _entrypoint_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("ARTIFACT_DIR", str(tmp_path / "artifacts"))
     monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
     monkeypatch.delenv("OMNIGENT_ARTIFACT_URI", raising=False)
+    monkeypatch.delenv("OMNIGENT_MCP_REGISTRY", raising=False)
 
 
 def test_resolve_config_captures_s3_artifact_uri(
@@ -192,36 +195,87 @@ def test_select_artifact_store(
     assert isinstance(_select_artifact_store(resolved), expected_type)
 
 
-# ── routing wiring ────────────────────────────────────────────────────────
-# A Docker deploy must honour its own `routing:` block rather than running on
-# all-default knobs, so the settings that reach RuntimeCaps are the parsed ones.
+# ── config wiring parity with `omnigent server` ───────────────────────────
+# build_app on a migrated SQLite DB must honour the same config keys the CLI
+# passes to create_app / RuntimeCaps, rather than silently dropping them.
 
 
-def test_build_routing_carries_the_configured_settings() -> None:
-    from deploy.docker.entrypoint import _build_routing
+def _build_app_from_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, config_yaml: str
+) -> FastAPI:
+    from deploy.docker.entrypoint import _resolve_config, build_app, run_migrations
 
-    cfg = {
-        "routing": {
-            "provider": "external",
-            "base_url": "https://host/ai-gateway/routing/v1",
-            "router_name": "task_v1",
-            "model_prefix": ["databricks-", "system.ai."],
-        }
-    }
-    client, settings = _build_routing(cfg, None)
-
-    assert settings.model_prefixes == ("databricks-", "system.ai.")
-    assert client is not None
-    assert client._model_prefixes == ["databricks-", "system.ai."]
+    (tmp_path / "config.yaml").write_text(config_yaml)
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'entrypoint.db'}")
+    resolved = _resolve_config()
+    run_migrations(resolved.database_url)
+    return build_app(resolved).app
 
 
-def test_build_routing_defaults_without_a_routing_block() -> None:
-    from deploy.docker.entrypoint import _build_routing
-    from omnigent.server.smart_routing import RoutingSettings
+def test_build_app_passes_configured_policy_and_debug_router_modules(
+    _entrypoint_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from omnigent.runtime import get_caps
+    from omnigent.server import app as server_app
 
-    client, settings = _build_routing({}, None)
-    assert client is None
-    assert settings == RoutingSettings()
+    create_app_kwargs: dict[str, object] = {}
+    real_create_app = server_app.create_app
+
+    def _recording_create_app(**kwargs: object) -> FastAPI:
+        create_app_kwargs.update(kwargs)
+        return real_create_app(**kwargs)
+
+    monkeypatch.setattr(server_app, "create_app", _recording_create_app)
+
+    app = _build_app_from_config(
+        monkeypatch,
+        tmp_path,
+        "native_hook_allow_cache_seconds: 45\n"
+        "policy_modules: [acme.policies]\n"
+        "debug_router_modules: [tests._helpers.runner_lifecycle_controls]\n",
+    )
+
+    # policy_modules feed load_registry in the lifespan, so assert the handoff.
+    assert create_app_kwargs["policy_modules"] == ["acme.policies"]
+    cache_seconds = get_caps().native_hook_allow_cache_seconds
+    assert cache_seconds is not None and cache_seconds() == 45.0
+    assert "/__runner_lifecycle/state/{runner_id}" in {route.path for route in app.routes}
+
+
+def test_build_app_wires_both_routing_backends(
+    _entrypoint_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from omnigent.runtime import get_caps
+    from omnigent.server.smart_routing import ExternalRoutingClient, LLMRoutingClient
+
+    # Stub the policy-LLM plumbing so the built-in judge needs no credential.
+    monkeypatch.setattr(
+        "omnigent.runtime.policies.builder._resolve_server_llm_connection",
+        lambda server_llm: None,
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.policies.builder._build_policy_llm_client",
+        lambda server_llm, connection: MagicMock(),
+    )
+
+    _build_app_from_config(
+        monkeypatch,
+        tmp_path,
+        "llm: {model: test-judge}\n"
+        "routing:\n"
+        "  provider: external\n"
+        "  base_url: https://router.example.test/ai-gateway/routing/v1\n"
+        "  router_name: task_v1\n"
+        "  model_prefix: [databricks-, system.ai.]\n",
+    )
+
+    caps = get_caps()
+    assert caps.routing_backends is not None
+    assert isinstance(caps.routing_backends.external, ExternalRoutingClient)
+    assert isinstance(caps.routing_backends.local, LLMRoutingClient)
+    assert caps.routing_client is caps.routing_backends.external
+    assert caps.routing_settings.model_prefixes == ("databricks-", "system.ai.")
+    assert caps.native_hook_allow_cache_seconds is None
 
 
 @pytest.mark.parametrize(
@@ -235,3 +289,50 @@ def test_resolve_execution_timeout(cfg: dict[str, int], expected_timeout: int) -
     from deploy.docker.entrypoint import _resolve_execution_timeout
 
     assert _resolve_execution_timeout(cfg) == expected_timeout
+
+
+# ── MCP registry wiring ───────────────────────────────────────────────────
+# OMNIGENT_MCP_REGISTRY must mount the managed-MCP routes in the container,
+# exactly as it does under `omnigent server`.
+
+
+@pytest.mark.parametrize("catalog_kind", ["public", "invalid", "missing_cipher"])
+def test_build_app_mounts_mcp_registry_from_env(
+    _entrypoint_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, catalog_kind: str
+) -> None:
+    from omnigent.server import mcp_registry
+
+    monkeypatch.setattr(mcp_registry, "build_secret_cipher", lambda: None)
+    auth = "bearer" if catalog_kind == "missing_cipher" else "none"
+    registry_file = tmp_path / "mcp-registry.yaml"
+    registry_file.write_text(
+        "services:\n"
+        "  - id: tracker\n"
+        "    title: Tracker\n"
+        "    url: https://mcp.example.test/mcp\n"
+        f"    auth: {auth}\n"
+        "    tools: [read_ticket]\n"
+    )
+    if catalog_kind == "invalid":
+        registry_file.write_text("unexpected: true\n")
+    monkeypatch.setenv("OMNIGENT_MCP_REGISTRY", str(registry_file))
+
+    if catalog_kind == "invalid":
+        with pytest.raises(ValidationError) as error:
+            _build_app_from_config(monkeypatch, tmp_path, "{}\n")
+        assert any(
+            entry["loc"] == ("unexpected",) and entry["type"] == "extra_forbidden"
+            for entry in error.value.errors()
+        )
+        return
+    if catalog_kind == "missing_cipher":
+        with pytest.raises(
+            ValueError, match="MCP account connections require the existing KMS or Vault cipher"
+        ):
+            _build_app_from_config(monkeypatch, tmp_path, "{}\n")
+        return
+
+    app = _build_app_from_config(monkeypatch, tmp_path, "{}\n")
+
+    assert list(app.state.mcp_registry.services) == ["tracker"]
+    assert "/v1/mcp-registry/services" in {route.path for route in app.routes}
