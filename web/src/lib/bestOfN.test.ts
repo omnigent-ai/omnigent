@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { testAgent } from "@/test/agentFixtures";
 import type { Session } from "@/lib/types";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
-import { createSession, postEvent, updateSession } from "@/lib/sessionsApi";
+import { ApiError, createSession, postEvent, updateSession } from "@/lib/sessionsApi";
 import {
   BEST_OF_N_ATTEMPTS_LABEL,
   BEST_OF_N_GROUP_LABEL,
@@ -221,23 +221,53 @@ describe("verifiedOtherAttempts", () => {
       if (id === "conv_d") return session(id, { labels: run("conv_d,conv_e") });
       if (id === "conv_e") return session(id, { permissionLevel: 2 });
       if (id === "conv_f") return session(id, { archived: true });
-      if (id === "conv_g") throw new Error("not found");
+      if (id === "conv_g") throw new ApiError("Not found", 404, null);
+      if (id === "conv_h") throw new ApiError("Forbidden", 403, null);
       return session(id, { title: null });
     });
 
     const verified = await verifiedOtherAttempts(
       "conv_a",
-      run("conv_a,conv_b,conv_c,conv_d,conv_e,conv_f,conv_g"),
+      run("conv_a,conv_b,conv_c,conv_d,conv_e,conv_f,conv_g,conv_h"),
       fetchSession,
     );
 
-    expect(verified).toEqual([{ id: "conv_b", title: "conv_b" }]);
+    // Missing and forbidden sessions are confirmed exclusions, not unresolved.
+    expect(verified).toEqual({ attempts: [{ id: "conv_b", title: "conv_b" }], unresolved: [] });
+  });
+
+  it("reports a failed lookup as unresolved until a retry confirms it", async () => {
+    let failing = true;
+    const fetchSession = vi.fn(async (id: string) => {
+      if (id === "conv_c" && failing) throw new ApiError("Internal Server Error", 500, null);
+      return session(id, { labels: run("conv_a,conv_b,conv_c") });
+    });
+    const labels = run("conv_a,conv_b,conv_c");
+
+    expect(await verifiedOtherAttempts("conv_a", labels, fetchSession)).toEqual({
+      attempts: [{ id: "conv_b", title: "Title conv_b" }],
+      unresolved: ["conv_c"],
+    });
+    failing = false;
+    expect(await verifiedOtherAttempts("conv_a", labels, fetchSession)).toEqual({
+      attempts: [
+        { id: "conv_b", title: "Title conv_b" },
+        { id: "conv_c", title: "Title conv_c" },
+      ],
+      unresolved: [],
+    });
+    // A network failure is no proof either.
+    fetchSession.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    expect((await verifiedOtherAttempts("conv_a", labels, fetchSession)).unresolved).toEqual([
+      "conv_b",
+    ]);
   });
 
   it("checks nothing for a session that isn't an attempt", async () => {
     const fetchSession = vi.fn();
-    expect(await verifiedOtherAttempts("conv_a", {}, fetchSession)).toEqual([]);
-    expect(await verifiedOtherAttempts("conv_z", run("conv_a,conv_b"), fetchSession)).toEqual([]);
+    const none = { attempts: [], unresolved: [] };
+    expect(await verifiedOtherAttempts("conv_a", {}, fetchSession)).toEqual(none);
+    expect(await verifiedOtherAttempts("conv_z", run("conv_a,conv_b"), fetchSession)).toEqual(none);
     expect(fetchSession).not.toHaveBeenCalled();
   });
 });

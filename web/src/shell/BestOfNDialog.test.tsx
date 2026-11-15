@@ -14,7 +14,7 @@ import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useBulkArchiveConversations } from "@/hooks/useConversations";
 import { useGridSessions } from "@/grid/GridSessionsContext";
 import { launchBestOfN } from "@/lib/bestOfN";
-import { fetchFirstUserPrompt, getSessionSlim } from "@/lib/sessionsApi";
+import { ApiError, fetchFirstUserPrompt, getSessionSlim } from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
 import { BestOfNDialog, KeepAttemptDialog, canStartBestOfN } from "./BestOfNDialog";
 
@@ -282,11 +282,41 @@ describe("KeepAttemptDialog", () => {
   it("archives only sessions whose own labels place them in the run", async () => {
     vi.mocked(getSessionSlim).mockImplementation(async (id) => {
       if (id === "conv_b") return attempt(id, { labels: run("conv_a,conv_b", "other") });
-      throw new Error("not found");
+      throw new ApiError("Not found", 404, null);
     });
     renderKeep();
     expect(await screen.findByText("No other attempts of this run can be archived.")).toBeVisible();
     expect(screen.getByTestId("keep-attempt-confirm")).toBeDisabled();
+  });
+
+  it("won't keep until every listed attempt is checked, then archives them all", async () => {
+    let failing = true;
+    vi.mocked(getSessionSlim).mockImplementation(async (id) => {
+      if (id === "conv_c" && failing) throw new ApiError("Internal Server Error", 500, null);
+      return attempt(id);
+    });
+    renderKeep();
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't check 1 other attempt.");
+    expect(screen.getByTestId("keep-attempt-others")).toHaveTextContent(/^Title conv_b$/);
+    expect(screen.getByTestId("keep-attempt-confirm")).toBeDisabled();
+
+    failing = false;
+    fireEvent.click(screen.getByTestId("keep-attempt-recheck"));
+    await waitFor(() =>
+      expect(screen.getByTestId("keep-attempt-others")).toHaveTextContent(
+        "Title conv_bTitle conv_c",
+      ),
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
+    fireEvent.click(screen.getByTestId("keep-attempt-confirm"));
+    await waitFor(() => expect(deleteRunGrids).toHaveBeenCalledWith("g"));
+    expect(mutateAsync).toHaveBeenCalledWith(
+      expect.objectContaining({ ids: ["conv_b", "conv_c"] }),
+    );
+    expect(mutateAsync.mock.invocationCallOrder[0]).toBeLessThan(
+      deleteRunGrids.mock.invocationCallOrder[0],
+    );
   });
 
   it("stays on the grid when archiving fails", async () => {
