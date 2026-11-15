@@ -372,6 +372,14 @@ class FakeConversationStore:
         self.set_labels(conversation_id, {key: value})
         return None
 
+    def update_scheduled_run_label(
+        self, conversation_id: str, run_id: str, *, action: str
+    ) -> None:
+        from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+
+        if action == "begin":
+            self.swap_label(conversation_id, SCHEDULED_TASK_RUN_LABEL_KEY, run_id)
+
     def clear_host_binding(self, conversation_id: str, **kwargs: Any) -> None:
         self.updated.append({"id": conversation_id, "clear_host_binding": kwargs})
 
@@ -3701,6 +3709,8 @@ async def test_a_continued_session_that_cannot_be_stamped_records_a_failed_run()
         "after_an_earlier_stamp",
         "cancelled_before_send",
         "cancelled_while_stamping",
+        "two_before_send_first_fails_first",
+        "two_before_send_last_fails_first",
     ],
 )
 async def test_a_continued_dispatch_that_fails_keeps_the_label_honest(
@@ -3713,7 +3723,8 @@ async def test_a_continued_dispatch_that_fails_keeps_the_label_honest(
     label goes back to A, also when B's fire is cancelled. Once sending began
     the prompt may have gone in, so B keeps it. Another run C's stamp is never
     lost: not one written after B's, nor one written after B checked the session
-    but before B's stamp.
+    but before B's stamp. If both later dispatches fail before sending, A gets
+    the label back regardless of which failure settles first.
     """
     from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -3733,20 +3744,26 @@ async def test_a_continued_dispatch_that_fails_keeps_the_label_honest(
                 conv.labels = dict(real.get_conversation(conversation_id).labels)
             return conv
 
-        def swap_label(self, conversation_id: str, key: str, value: str) -> str | None:
-            if failure == "after_an_earlier_stamp":
-                real.set_labels(conversation_id, {key: run_c})
-            elif failure == "cancelled_while_stamping":
-                stamp_entered.set()
-                assert stamp_released.wait(10)
-            return real.swap_label(conversation_id, key, value)
+        def update_scheduled_run_label(
+            self, conversation_id: str, run_id: str, *, action: Any
+        ) -> None:
+            if action == "begin":
+                if failure == "after_an_earlier_stamp":
+                    real.set_labels(conversation_id, {SCHEDULED_TASK_RUN_LABEL_KEY: run_c})
+                elif failure == "cancelled_while_stamping":
+                    stamp_entered.set()
+                    assert stamp_released.wait(10)
+            SqlAlchemyConversationStore(db_uri).update_scheduled_run_label(
+                conversation_id, run_id, action=action
+            )
 
-        def replace_label_if(self, conversation_id: str, key: str, **kwargs: Any) -> bool:
-            return real.replace_label_if(conversation_id, key, **kwargs)
-
-    store = FakeScheduledTaskStore(
-        rows={"task_1": _task(session_mode="continue", session_id=session_id)}
-    )
+    overlapping = failure.startswith("two_before_send")
+    entered = {task_id: asyncio.Event() for task_id in ("task_1", "task_2")}
+    released = {task_id: asyncio.Event() for task_id in entered}
+    tasks = {"task_1": _task(session_mode="continue", session_id=session_id)}
+    if overlapping:
+        tasks["task_2"] = _task(id="task_2", session_mode="continue", session_id=session_id)
+    store = FakeScheduledTaskStore(rows=tasks)
     sent: list[str] = []
 
     async def _runner_start(conv_id: str, *args: Any) -> None:
@@ -3768,9 +3785,25 @@ async def test_a_continued_dispatch_that_fails_keeps_the_label_honest(
     deps = _deps(store, conversation_store=_Conversations(_continued_session(id=session_id)))
 
     async def _launch(conv: Any, task: Any) -> None:
+        if overlapping:
+            entered[task.id].set()
+            await released[task.id].wait()
         await fire_mod._send_prompt(deps, conv, object(), task)
 
-    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    on_fire = build_on_fire(deps, launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    if overlapping:
+        await asyncio.wait_for(entered["task_1"].wait(), 10)
+        [first_fire] = fire_mod._PENDING_FIRES
+        await on_fire(0, "task_2")
+        await asyncio.wait_for(entered["task_2"].wait(), 10)
+        [second_fire] = fire_mod._PENDING_FIRES - {first_fire}
+        attempts = [("task_1", first_fire), ("task_2", second_fire)]
+        if failure == "two_before_send_last_fails_first":
+            attempts.reverse()
+        for task_id, attempt in attempts:
+            released[task_id].set()
+            await asyncio.wait_for(asyncio.shield(attempt), 10)
     if failure == "cancelled_while_stamping":
         assert await asyncio.to_thread(stamp_entered.wait, 10)
         for fire in fire_mod._PENDING_FIRES:
@@ -3785,7 +3818,7 @@ async def test_a_continued_dispatch_that_fails_keeps_the_label_honest(
     else:
         assert [(run["status"], run["error_code"]) for run in store.runs] == [
             ("failed", "launch_failed")
-        ]
+        ] * (2 if overlapping else 1)
     label = real.get_conversation(session_id).labels[SCHEDULED_TASK_RUN_LABEL_KEY]
     assert label == {
         "while_sending": run_b,

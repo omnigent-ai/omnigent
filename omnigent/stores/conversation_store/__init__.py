@@ -6,7 +6,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 from omnigent.entities import (
     Agent,
@@ -188,6 +188,7 @@ SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY = "omnigent.scheduled_task_worktree_sou
 # Server-owned: the automation run this session serves, set before each run's
 # prompt is sent. Journal entries the session records are attributed to it.
 SCHEDULED_TASK_RUN_LABEL_KEY = "omnigent.scheduled_task_run"
+SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX = "omnigent.pending_scheduled_run."
 # The run whose agent has appended real activity; copied history never sets it.
 SCHEDULED_TASK_ACTIVITY_LABEL_KEY = "omnigent.scheduled_task_activity"
 
@@ -291,6 +292,14 @@ class CreatedSession:
 
     conversation: Conversation
     agent: Agent
+
+
+@dataclass(frozen=True)
+class SessionTodosUpdate:
+    """An accepted native task snapshot and the state it atomically replaced."""
+
+    id: str
+    previous: list[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -1452,6 +1461,21 @@ class ConversationStore(ABC):
                 return previous
         raise RuntimeError(f"label {key!r} on {conversation_id!r} kept changing")
 
+    def update_scheduled_run_label(
+        self,
+        conversation_id: str,
+        run_id: str,
+        *,
+        action: Literal["begin", "commit", "rollback"],
+    ) -> None:
+        """Begin or settle a continued run's tentative session attribution.
+
+        A rollback removes this attempt from the pending chain even if another
+        attempt replaced it. A commit retains it as a valid predecessor once
+        sending may have begun. Each operation must be atomic across replicas.
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def list_projects(
         self,
@@ -1531,8 +1555,8 @@ class ConversationStore(ABC):
         self,
         conversation_id: str,
         todos: list[dict[str, Any]],
-    ) -> bool:
-        """Persist the native Plan snapshot; empty clears, missing metadata returns false."""
+    ) -> SessionTodosUpdate | None:
+        """Persist the Plan snapshot and return its update; missing metadata returns None."""
         raise NotImplementedError
 
     def add_new_sibling(self, source_id: str, session_id: str, *, user_id: str | None) -> None:

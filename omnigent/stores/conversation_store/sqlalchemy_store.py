@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
 from itertools import batched
 from pathlib import PureWindowsPath
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 from sqlalchemy import (
     ColumnElement,
@@ -112,6 +113,7 @@ from omnigent.stores.conversation_store import (
     PROJECT_LABEL_KEY,
     SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX,
     SCHEDULED_TASK_RUN_LABEL_KEY,
     SIDE_CHAT_COPY_ID_PREFIX_LEN,
     ConversationAlreadyExistsError,
@@ -123,6 +125,7 @@ from omnigent.stores.conversation_store import (
     ProfileHostBinding,
     SessionActivity,
     SessionConnectivity,
+    SessionTodosUpdate,
     SpawnTreeUsage,
     family_pinned_label_key,
     pinned_label_key,
@@ -1823,14 +1826,14 @@ class SqlAlchemyConversationStore(ConversationStore):
         self,
         conversation_id: str,
         todos: list[dict[str, Any]],
-    ) -> bool:
+    ) -> SessionTodosUpdate | None:
         """Store a validated Plan snapshot in metadata; empty clears it.
 
-        :returns: ``False`` when the metadata row no longer exists, else ``True``.
+        :returns: The accepted update and its previous snapshot, or ``None`` if missing.
         """
         validated = validate_session_todos(todos)
 
-        def write(session: Session) -> bool:
+        def write(session: Session) -> SessionTodosUpdate | None:
             q = select(SqlConversationMetadata).where(
                 SqlConversationMetadata.workspace_id == current_workspace_id(),
                 SqlConversationMetadata.id == conversation_id,
@@ -1839,10 +1842,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                 q = q.with_for_update()
             meta = session.scalars(q).first()
             if meta is None:
-                return False
-            state, _ = _decode_session_state(meta.session_state)
+                return None
+            state, previous = _decode_session_state(meta.session_state)
             meta.session_state = _encode_session_state(state, validated)
-            return True
+            return SessionTodosUpdate(id=uuid.uuid4().hex, previous=previous)
 
         return run_write_transaction(self._session_immediate, "set_session_todos", write)
 
@@ -3613,6 +3616,90 @@ class SqlAlchemyConversationStore(ConversationStore):
             return result.rowcount > 0
 
         return run_write_transaction(self._conv_session_immediate, "replace_label_if", write)
+
+    def update_scheduled_run_label(
+        self,
+        conversation_id: str,
+        run_id: str,
+        *,
+        action: Literal["begin", "commit", "rollback"],
+    ) -> None:
+        """Splice tentative run attribution under the conversation's row lock.
+
+        Each pending label holds two run IDs: its predecessor and successor.
+        A change touches only this node, its immediate neighbors and the current
+        run label, so overlapping attempts never require an unbounded scan.
+        """
+        if action not in ("begin", "commit", "rollback"):
+            raise ValueError(f"unknown scheduled run label action: {action}")
+
+        def write(session: Session) -> None:
+            self._lock_conversation(session, conversation_id)
+            owner_key = (current_workspace_id(), conversation_id)
+            updates: dict[str, str] = {}
+            stamp = now_epoch()
+
+            def pending(pending_id: str | None) -> SqlConversationLabel | None:
+                if not pending_id:
+                    return None
+                return session.get(
+                    SqlConversationLabel,
+                    (*owner_key, SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX + pending_id),
+                )
+
+            def link(pending_id: str, previous: str | None, following: str | None) -> None:
+                value = json.dumps([previous, following], separators=(",", ":"))
+                if len(value) > LABEL_VALUE_MAX_LEN:
+                    raise ValueError("pending scheduled run links exceed the label size limit")
+                updates[SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX + pending_id] = value
+
+            node = pending(run_id)
+            if action == "begin":
+                if node is not None:
+                    return
+                current = session.get(
+                    SqlConversationLabel, (*owner_key, SCHEDULED_TASK_RUN_LABEL_KEY)
+                )
+                previous = current.value if current is not None else None
+                if previous == run_id:
+                    return
+                predecessor = pending(previous)
+                if previous is not None and predecessor is not None:
+                    older, _ = json.loads(predecessor.value)
+                    link(previous, older, run_id)
+                link(run_id, previous, None)
+                updates[SCHEDULED_TASK_RUN_LABEL_KEY] = run_id
+            elif node is not None:
+                previous, following = json.loads(node.value)
+                predecessor = pending(previous)
+                if predecessor is not None:
+                    older, next_id = json.loads(predecessor.value)
+                    if next_id == run_id:
+                        link(previous, older, following if action == "rollback" else None)
+                if action == "rollback":
+                    successor = pending(following)
+                    if successor is not None:
+                        prior_id, newer = json.loads(successor.value)
+                        if prior_id == run_id:
+                            link(following, previous, newer)
+                    match = (
+                        SqlConversationLabel.workspace_id == owner_key[0],
+                        SqlConversationLabel.conversation_id == conversation_id,
+                        SqlConversationLabel.key == SCHEDULED_TASK_RUN_LABEL_KEY,
+                        SqlConversationLabel.value == run_id,
+                    )
+                    session.execute(
+                        delete(SqlConversationLabel).where(*match)
+                        if previous is None
+                        else update(SqlConversationLabel)
+                        .where(*match)
+                        .values(value=previous, updated_at=stamp)
+                    )
+                session.delete(node)
+            if updates:
+                _upsert_labels(session, conversation_id, updates, stamp)
+
+        run_write_transaction(self._conv_session_immediate, "update_scheduled_run_label", write)
 
     def list_conversations(
         self,
@@ -6745,6 +6832,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 and not key.startswith(f"{PINNED_LABEL_KEY}.")
                 and not key.startswith(FAMILY_PIN_LABEL_PREFIX)
+                and not key.startswith(SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX)
                 and not key.startswith(f"{_SANDBOX_REPO_LABEL_KEY}.")
                 and not (source_workspace_missing and key.startswith("omnigent.last_task_error_"))
             }

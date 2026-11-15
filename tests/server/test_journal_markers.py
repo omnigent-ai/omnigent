@@ -72,13 +72,28 @@ def test_a_to_do_marks_starting_and_completing_matched_by_id_or_position() -> No
 
 
 @pytest.mark.asyncio
-async def test_a_retried_to_do_update_adds_its_markers_once(db_uri: str) -> None:
+async def test_a_retried_to_do_update_adds_its_markers_once(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.runtime import session_stream
+
+    published = []
+    monkeypatch.setattr(session_stream, "publish", lambda _id, event: published.append(event))
     store = SqlAlchemyConversationStore(db_uri)
     session_id = store.create_conversation().id
     before = [_todo("Add the flag", "pending", "1")]
-    after = [_todo("Add the flag", "in_progress", "1")]
-    for _ in range(2):
-        await record_todo_markers(store, session_id, before, after)
+    store.set_session_todos(session_id, before)
+    for status in ("in_progress", "completed", "in_progress", "completed"):
+        after = [_todo("Add the flag", status, "1")]
+        update = store.set_session_todos(session_id, after)
+        assert update is not None
+        for _ in range(2):
+            await record_todo_markers(
+                store, session_id, update.previous, after, update_id=update.id
+            )
+    replay = SqlAlchemyConversationStore(db_uri).set_session_todos(session_id, after)
+    assert replay is not None
+    await record_todo_markers(store, session_id, replay.previous, after, update_id=replay.id)
     items = store.list_items(session_id, limit=10).data
     assert [
         (item.data.event_type, item.data.resource_id, item.data.resource) for item in items
@@ -88,11 +103,14 @@ async def test_a_retried_to_do_update_adds_its_markers_once(db_uri: str) -> None
             "1",
             {
                 "name": "Add the flag",
-                "status": "started",
+                "status": status,
                 "text": None,
                 "entry_id": None,
                 "native": True,
             },
         )
+        for status in ("started", "done", "started", "done")
     ]
+    assert len(published) == len(items) == 4
+    assert [event["item"]["id"] for event in published] == [item.id for item in items]
     assert PLAN_EVENT_TYPE != TASK_EVENT_TYPE

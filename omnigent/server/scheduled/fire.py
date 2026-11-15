@@ -1130,10 +1130,10 @@ async def _continue_session(
     # a cancelled fire can still learn whether the write landed.
     stamp = asyncio.ensure_future(
         asyncio.to_thread(
-            deps.conversation_store.swap_label,
+            deps.conversation_store.update_scheduled_run_label,
             session_id,
-            SCHEDULED_TASK_RUN_LABEL_KEY,
             recorder.run_id,
+            action="begin",
         )
     )
     try:
@@ -1142,8 +1142,7 @@ async def _continue_session(
         start_fire_stage("runner_start", session_id=session_id)
         await dispatch(conv, task)
     except BaseException as exc:
-        if not progress.started:
-            await _undo_run_label(deps, session_id, recorder.run_id, stamp)
+        await _settle_run_label(deps, session_id, recorder.run_id, stamp, sent=progress.started)
         if not isinstance(exc, Exception):
             raise
         _logger.exception(
@@ -1158,44 +1157,47 @@ async def _continue_session(
             error_code="launch_failed",
         )
         return
+    else:
+        await _settle_run_label(deps, session_id, recorder.run_id, stamp, sent=True)
     finally:
         _PROMPT_SEND_PROGRESS.reset(progress_token)
     await recorder.finish("succeeded", conversation_id=session_id)
     _logger.info("scheduled fire: task %s continued session %s", task.id, session_id)
 
 
-async def _undo_run_label(
-    deps: FireDeps, session_id: str, run_id: str, stamp: asyncio.Future[str | None]
+async def _settle_run_label(
+    deps: FireDeps,
+    session_id: str,
+    run_id: str,
+    stamp: asyncio.Future[None],
+    *,
+    sent: bool,
 ) -> None:
-    """Give attribution back to the session's previous run after a prompt that never went in.
+    """Settle tentative attribution after dispatch or a failure before sending.
 
-    An earlier run may still be working in the session, and what it records
-    belongs to it. Waits for an outstanding *stamp* first, and is shielded, so
-    a cancelled fire still restores the label. Conditional on the label still
-    naming *run_id*, so a later run's stamp is never overwritten.
+    Waits for an outstanding *stamp* first, and is shielded, so a cancelled
+    fire still settles the write. Once sending began, delivery is uncertain
+    and later failed attempts must be able to restore this run's label.
     """
 
-    async def undo() -> None:
+    async def settle() -> None:
         await asyncio.wait([stamp])
         if stamp.cancelled() or stamp.exception() is not None:
             return  # The stamp never landed.
-        previous_run = stamp.result()
         try:
             await asyncio.to_thread(
-                deps.conversation_store.replace_label_if,
+                deps.conversation_store.update_scheduled_run_label,
                 session_id,
-                SCHEDULED_TASK_RUN_LABEL_KEY,
-                expected=run_id,
-                value=previous_run,
+                run_id,
+                action="commit" if sent else "rollback",
             )
         except Exception:
-            # The run fails either way; a kept label only misattributes until the next run.
             _logger.exception(
-                "scheduled fire: could not restore the previous run label on session %s",
+                "scheduled fire: could not settle the run label on session %s",
                 session_id,
             )
 
-    await asyncio.shield(asyncio.ensure_future(undo()))
+    await asyncio.shield(asyncio.ensure_future(settle()))
 
 
 _NEW_SESSION_HINT = "edit the automation to start a new session on its next run"

@@ -10,7 +10,7 @@ import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import MagicMock
 
 import pytest
@@ -173,12 +173,57 @@ def test_swap_label_gives_up_on_a_label_that_keeps_changing(
     assert read(source.id).labels["k"].startswith("other-")
 
 
+@pytest.mark.parametrize("initial_run", [None, "d" * 32])
+@pytest.mark.parametrize(
+    ("settlements", "expected"),
+    [
+        ((("a", "rollback"), ("b", "rollback"), ("c", "rollback")), None),
+        ((("c", "rollback"), ("b", "rollback"), ("a", "rollback")), None),
+        ((("b", "rollback"), ("a", "rollback"), ("c", "rollback")), None),
+        ((("b", "commit"), ("a", "rollback"), ("c", "rollback")), "b"),
+        ((("b", "commit"), ("c", "rollback"), ("a", "commit")), "b"),
+        ((("c", "commit"), ("b", "rollback"), ("a", "rollback")), "c"),
+    ],
+)
+def test_overlapping_run_attempts_preserve_the_last_sent_run(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+    initial_run: str | None,
+    settlements: tuple[tuple[str, Literal["commit", "rollback"]], ...],
+    expected: str | None,
+) -> None:
+    """Separate replicas settle overlapping attempts without reviving an unsent run."""
+    from omnigent.stores.conversation_store import (
+        SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX,
+        SCHEDULED_TASK_RUN_LABEL_KEY,
+    )
+
+    session_id = conversation_store.create_conversation().id
+    if initial_run is not None:
+        conversation_store.set_labels(session_id, {SCHEDULED_TASK_RUN_LABEL_KEY: initial_run})
+    for run in "abc":
+        for _ in range(2):
+            SqlAlchemyConversationStore(db_uri).update_scheduled_run_label(
+                session_id, run * 32, action="begin"
+            )
+    for run, action in settlements:
+        for _ in range(2):
+            SqlAlchemyConversationStore(db_uri).update_scheduled_run_label(
+                session_id, run * 32, action=action
+            )
+
+    labels = conversation_store.get_conversation(session_id).labels
+    assert labels.get(SCHEDULED_TASK_RUN_LABEL_KEY) == (expected * 32 if expected else initial_run)
+    assert not any(key.startswith(SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX) for key in labels)
+
+
 def test_fork_drops_the_automation_run_label(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     """A fork serves no automation run, so its journal entries are not the run's."""
     from omnigent.stores.conversation_store import (
         SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
+        SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX,
         SCHEDULED_TASK_RUN_LABEL_KEY,
     )
 
@@ -190,11 +235,13 @@ def test_fork_drops_the_automation_run_label(
             SCHEDULED_TASK_ACTIVITY_LABEL_KEY: "older-run",
         },
     )
+    conversation_store.update_scheduled_run_label(source.id, "1" * 32, action="begin")
 
     fork = conversation_store.fork_conversation(source.id)
 
     assert SCHEDULED_TASK_RUN_LABEL_KEY not in fork.labels
     assert SCHEDULED_TASK_ACTIVITY_LABEL_KEY not in fork.labels
+    assert not any(key.startswith(SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX) for key in fork.labels)
 
 
 def test_fork_drops_sandbox_repo_label(

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -170,15 +169,16 @@ async def record_todo_markers(
     session_id: str,
     previous: Sequence[Mapping[str, Any]],
     todos: Sequence[Mapping[str, Any]],
+    *,
+    update_id: str,
 ) -> None:
     """Mark each of the agent's own tasks that started or completed since *previous*."""
-    # Keyed on the snapshot it moved from, so a retried identical post adds nothing.
-    basis = hashlib.sha256(json.dumps(list(previous), sort_keys=True).encode()).hexdigest()
+    # A reopened task can repeat the same transition; only retries share an update ID.
     for key, todo, status in todo_transitions(previous, todos):
         await _append(
             store,
             session_id,
-            f"todo:{key}:{status}:{basis}",
+            f"todo:{key}:{status}:{update_id}",
             ResourceEventData(
                 event_type=TASK_EVENT_TYPE,
                 resource_id=key,
