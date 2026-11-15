@@ -18,12 +18,17 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+from omnigent.stores.workflow_store import WorkflowStore
 
 
 def test_account_generation_survives_delete_and_rejects_old_writes(db_uri: str) -> None:
     accounts = SqlAlchemyAccountStore(db_uri)
     permissions = SqlAlchemyPermissionStore(db_uri)
     old = accounts.create_user_with_password("alice", "test-password-hash")
+    workflows = WorkflowStore(db_uri)
+    saved = workflows.create(
+        user_id="alice", name="Private workflow", description="Private steps.", steps=[]
+    )
     assert old.account_generation is not None
     assert accounts.delete_user("alice") is True
     assert accounts.get_user("alice") is None
@@ -35,6 +40,7 @@ def test_account_generation_survives_delete_and_rejects_old_writes(db_uri: str) 
         for write in (
             lambda: permissions.ensure_user("alice"),
             lambda: permissions.grant("alice", uuid.uuid4().hex, 3),
+            lambda: permissions.grant_for_scheduled_task("alice", uuid.uuid4().hex, 1),
             lambda: HostStore(db_uri).upsert_on_connect(uuid.uuid4().hex, "laptop", "alice"),
             lambda: DeviceGrantStore(db_uri).create_redeemed_grant(
                 "late-grant",
@@ -50,12 +56,21 @@ def test_account_generation_survives_delete_and_rejects_old_writes(db_uri: str) 
             lambda: SqlAlchemyConversationStore(db_uri).set_daily_ask_approved(
                 "alice", "2026-09-18", 0.5
             ),
+            lambda: workflows.create(
+                user_id="alice", name="Late workflow", description="Late steps.", steps=[]
+            ),
+            lambda: workflows.update(saved.id, user_id="alice", name="Late edit"),
+            lambda: workflows.delete(saved.id, user_id="alice"),
         ):
             with pytest.raises(OmnigentError, match="revoked"):
                 write()
     with account_authority_scope("alice", new.account_generation):
         permissions.ensure_user("alice")
         assert HostStore(db_uri).upsert_on_connect(uuid.uuid4().hex, "laptop", "alice")
+        assert workflows.list_page(user_id="alice", limit=10) == ([], False)
+        assert workflows.get(saved.id, user_id="alice") is None
+        assert workflows.update(saved.id, user_id="alice", name="Replacement edit") is None
+        assert workflows.delete(saved.id, user_id="alice") is False
 
 
 def test_host_replacement_serializes_with_account_deletion(
@@ -187,6 +202,10 @@ def test_session_revocation_moves_only_current_registration_work(db_uri: str) ->
     assert hosts.get_host(predecessor_host_id) is None
     assert stored_host_generation(predecessor_host_id) == first
     old = accounts.create_user_with_password("alice", "second-hash").account_generation
+    workflows = WorkflowStore(db_uri)
+    workflow = workflows.create(
+        user_id="alice", name="Preserved workflow", description="Keep these steps.", steps=[]
+    )
     task = create_task()
     host_id = register_managed_host("managed")
     grants.create_redeemed_grant(
@@ -211,6 +230,7 @@ def test_session_revocation_moves_only_current_registration_work(db_uri: str) ->
     assert new not in (None, old)
     assert not accounts.accepts_generation("alice", old)
     assert accounts.accepts_generation("alice", new)
+    assert workflows.get(workflow.id, user_id="alice") == workflow
     assert tasks.get(task.id).account_generation == new
     assert tasks.get(predecessor_task.id).account_generation == first
     assert stored_host_generation(predecessor_host_id) == first
@@ -304,6 +324,177 @@ def test_username_reuse_does_not_inherit_connections_projects_or_spending(db_uri
                 projects.save_order(order, user_id="alice")
 
 
+def _create_task(db_uri: str, owner: str) -> str:
+    return (
+        SqlAlchemyScheduledTaskStore(db_uri)
+        .create(uuid.uuid4().hex, "job", "hello", "FREQ=DAILY", owner, uuid.uuid4().hex, "UTC")
+        .id
+    )
+
+
+def test_deletion_removes_automation_grants_held_and_owned(db_uri, monkeypatch):
+    from omnigent.db.db_models import workspace_scope
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    # One grant or task per batch, so each cleanup spans several transactions.
+    monkeypatch.setattr(accounts, "_cleanup_batch_size", 1)
+    with workspace_scope(202):
+        permissions.ensure_user("alice")
+        elsewhere = _create_task(db_uri, "dave")
+        permissions.grant_for_scheduled_task("alice", elsewhere, 1)
+    accounts.create_user_with_password("alice", "alice-hash")
+    for grantee in ("carol", "erin"):
+        permissions.ensure_user(grantee)
+    owned, owned_deleted, other, another = (
+        _create_task(db_uri, owner) for owner in ("alice", "alice", "dave", "dave")
+    )
+    for task_id, grantee in (
+        (owned, "carol"),
+        (owned, "erin"),
+        (owned_deleted, "carol"),
+        (other, "alice"),
+        (other, "carol"),
+        (another, "alice"),
+    ):
+        permissions.grant_for_scheduled_task(grantee, task_id, 1)
+    # Marking a task deleted leaves its grants in place.
+    assert SqlAlchemyScheduledTaskStore(db_uri).update(owned_deleted, state="deleted")
+
+    assert accounts.delete_user("alice") is True
+    for task_id in (owned, owned_deleted, another):
+        assert permissions.list_for_scheduled_task(task_id) == ([], None)
+    assert [grant.user_id for grant in permissions.list_for_scheduled_task(other)[0]] == ["carol"]
+    with pytest.raises(OmnigentError, match="revoked"):
+        permissions.grant_for_scheduled_task("alice", other, 1)
+    accounts.create_user_with_password("alice", "replacement-hash")
+    assert permissions.resolve_scheduled_task_access(["alice"], other) is None
+    with workspace_scope(202):
+        assert permissions.resolve_scheduled_task_access(["alice"], elsewhere) == 1
+
+
+def test_reregistration_finishes_an_interrupted_grant_cleanup(db_uri, monkeypatch):
+    from omnigent.stores.permission_store import sqlalchemy_store as permission_module
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    monkeypatch.setattr(accounts, "_cleanup_batch_size", 1)
+    accounts.create_user_with_password("bob", "bob-hash")
+    task_ids = [_create_task(db_uri, "dave") for _ in range(3)]
+    for task_id in task_ids:
+        permissions.grant_for_scheduled_task("bob", task_id, 1)
+
+    def held_grants() -> int:
+        return sum(
+            permissions.resolve_scheduled_task_access(["bob"], task_id) is not None
+            for task_id in task_ids
+        )
+
+    delete_batch = permission_module._delete_grant_batch
+    batches = 0
+
+    def interrupted_after_one_batch(*args, **kwargs):
+        nonlocal batches
+        batches += 1
+        if batches > 1:
+            raise RuntimeError("test cleanup interruption")
+        return delete_batch(*args, **kwargs)
+
+    monkeypatch.setattr(permission_module, "_delete_grant_batch", interrupted_after_one_batch)
+    assert accounts.delete_user("bob") is True
+    assert held_grants() == 2
+    monkeypatch.setattr(permission_module, "_delete_grant_batch", delete_batch)
+
+    # A grant still held refuses the name; registration's own cleanup is skipped here.
+    finish_cleanup = accounts_module.delete_deleted_account_grants
+    monkeypatch.setattr(accounts_module, "delete_deleted_account_grants", lambda *a, **k: 0)
+    with pytest.raises(OmnigentError) as caught:
+        accounts.create_user_with_password("bob", "replacement-hash")
+    assert caught.value.code == ErrorCode.CONFLICT
+    assert accounts.get_user("bob") is None
+    monkeypatch.setattr(accounts_module, "delete_deleted_account_grants", finish_cleanup)
+
+    assert accounts.create_user_with_password("bob", "replacement-hash").id == "bob"
+    assert held_grants() == 0
+
+
+def test_owned_task_cleanup_spares_a_replacement_accounts_live_task(db_uri, monkeypatch):
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    workflows = WorkflowStore(db_uri)
+    accounts.create_user_with_password("alice", "alice-hash")
+    old_workflow = workflows.create(
+        user_id="alice", name="Plan", description="Old account steps.", steps=[]
+    )
+    for grantee in ("bob", "carol"):
+        permissions.ensure_user(grantee)
+    old_task = _create_task(db_uri, "alice")
+    permissions.grant_for_scheduled_task("carol", old_task, 1)
+    reached, resume = Event(), Event()
+    owned_task_keys = accounts._owned_task_keys
+
+    def paused_before_owned_tasks(*args, **kwargs):
+        reached.set()
+        assert resume.wait(10)
+        return owned_task_keys(*args, **kwargs)
+
+    # Pause after the held grants are gone and before the owned-task pass.
+    monkeypatch.setattr(accounts, "_owned_task_keys", paused_before_owned_tasks)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        deleting = pool.submit(accounts.delete_user, "alice")
+        try:
+            assert reached.wait(10)
+            accounts.create_user_with_password("alice", "replacement-hash")
+            new_task = _create_task(db_uri, "alice")
+            permissions.grant_for_scheduled_task("bob", new_task, 1)
+            new_workflow = workflows.create(
+                user_id="alice", name="Plan", description="New account steps.", steps=[]
+            )
+        finally:
+            resume.set()
+        assert deleting.result(timeout=10) is True
+    assert permissions.list_for_scheduled_task(old_task) == ([], None)
+    assert [grant.user_id for grant in permissions.list_for_scheduled_task(new_task)[0]] == ["bob"]
+    assert workflows.get(old_workflow.id, user_id="alice") is None
+    assert workflows.get(new_workflow.id, user_id="alice") == new_workflow
+
+
+def test_reregistration_finishes_an_interrupted_workflow_cleanup(db_uri, monkeypatch):
+    import sqlalchemy as sa
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    workflows = WorkflowStore(db_uri)
+    monkeypatch.setattr(accounts, "_cleanup_batch_size", 1)
+    accounts.create_user_with_password("alice", "alice-hash")
+    saved = [
+        workflows.create(user_id="alice", name=f"Plan {i}", description="Private steps.", steps=[])
+        for i in range(3)
+    ]
+    deletes = 0
+
+    def interrupt_cleanup(_connection, _cursor, _statement, parameters, context, _executemany):
+        nonlocal deletes
+        query = getattr(context.compiled, "statement", None)
+        if isinstance(query, sa.Delete) and query.table.name == "workflows":
+            # The database fails after one committed batch; retries must retain the tombstone.
+            assert len(parameters) == 2  # workspace and one workflow ID
+            deletes += 1
+            if deletes > 1:
+                raise RuntimeError("test workflow cleanup interruption")
+
+    sa.event.listen(accounts._engine, "before_cursor_execute", interrupt_cleanup)
+    try:
+        assert accounts.delete_user("alice") is True
+        assert sum(workflows.get(item.id, user_id="alice") is not None for item in saved) == 2
+        with pytest.raises(RuntimeError, match="test workflow cleanup interruption"):
+            accounts.create_user_with_password("alice", "replacement-hash")
+        assert accounts.get_user("alice") is None
+    finally:
+        sa.event.remove(accounts._engine, "before_cursor_execute", interrupt_cleanup)
+    assert accounts.create_user_with_password("alice", "replacement-hash").id == "alice"
+    assert workflows.list_page(user_id="alice", limit=10) == ([], False)
+
+
 def test_deletion_removes_all_preferences_only_for_user_in_workspace(db_uri: str) -> None:
     from sqlalchemy import select
     from sqlalchemy.orm import Session
@@ -311,10 +502,18 @@ def test_deletion_removes_all_preferences_only_for_user_in_workspace(db_uri: str
     from omnigent.db.db_models import SqlPreference, workspace_scope
 
     accounts = SqlAlchemyAccountStore(db_uri)
+    workflows = WorkflowStore(db_uri)
+    saved = {}
     for workspace_id in (101, 102):
         with workspace_scope(workspace_id):
             for user_id in ("alice", "bob"):
                 accounts.create_user_with_password(user_id, "test-password-hash")
+                saved[workspace_id, user_id] = workflows.create(
+                    user_id=user_id,
+                    name="Private workflow",
+                    description="Private steps.",
+                    steps=[],
+                )
     with Session(accounts._engine) as session:
         session.add_all(
             SqlPreference(workspace_id=workspace_id, user_id=user_id, key=key, value="{}")
@@ -338,6 +537,10 @@ def test_deletion_removes_all_preferences_only_for_user_in_workspace(db_uri: str
         for workspace_id, user_id in ((101, "bob"), (102, "alice"), (102, "bob"))
         for key in ("project_order", "theme")
     }
+    for (workspace_id, user_id), workflow in saved.items():
+        with workspace_scope(workspace_id):
+            expected = None if (workspace_id, user_id) == (101, "alice") else workflow
+            assert workflows.get(workflow.id, user_id=user_id) == expected
 
 
 def test_cleanup_failure_rolls_back_revocation(
@@ -353,6 +556,10 @@ def test_cleanup_failure_rolls_back_revocation(
     session_id, host_id = uuid.uuid4().hex, uuid.uuid4().hex
     permissions.grant("alice", session_id, 3)
     hosts.upsert_on_connect(host_id, "laptop", "alice")
+    permissions.ensure_user("carol")
+    owned_task, other_task = _create_task(db_uri, "alice"), _create_task(db_uri, "dave")
+    permissions.grant_for_scheduled_task("carol", owned_task, 1)
+    permissions.grant_for_scheduled_task("alice", other_task, 1)
     costs.add_daily_cost("alice", "2026-09-18", 1.0)
     costs.set_daily_ask_approved("alice", "2026-09-18", 0.5)
 
@@ -369,6 +576,10 @@ def test_cleanup_failure_rolls_back_revocation(
         "cost_usd": 1.0,
         "ask_approved_usd": 0.5,
     }
+    # The task tombstone rolls back, and grant cleanup only follows a committed deletion.
+    assert SqlAlchemyScheduledTaskStore(db_uri).get(owned_task).state == "active"
+    assert permissions.resolve_scheduled_task_access(["carol"], owned_task) == 1
+    assert permissions.resolve_scheduled_task_access(["alice"], other_task) == 1
 
 
 @pytest.mark.parametrize("operation", ["cost", "approval", "subagent_cost"])
@@ -496,6 +707,105 @@ def test_budget_writes_serialize_with_deletion(db_uri, monkeypatch, writer_name,
         "cost_usd": 0.0,
         "ask_approved_usd": 0.0,
     }
+
+
+@pytest.mark.parametrize("delete_first", [False, True])
+def test_automation_grant_serializes_with_owner_deletion(db_uri, monkeypatch, delete_first):
+    from omnigent.stores.permission_store import sqlalchemy_store as permission_module
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    accounts.create_user_with_password("alice", "alice-hash")
+    permissions.ensure_user("carol")
+    task_id = _create_task(db_uri, "alice")
+    permissions.grant_for_scheduled_task("carol", task_id, 1)
+    reached, resume, second_started = Event(), Event(), Event()
+    # Pause each writer once it holds the task row: deletion after it tombstones the
+    # task, the grant before it writes the grant row the cleanup after deletion removes.
+    module, name = (
+        (accounts_module, "_revoke_durable_authority")
+        if delete_first
+        else (permission_module, "_lock_live_scheduled_task")
+    )
+    original = getattr(module, name)
+
+    def paused_lock(*args, **kwargs):
+        result = original(*args, **kwargs)
+        reached.set()
+        assert resume.wait(10)
+        return result
+
+    monkeypatch.setattr(module, name, paused_lock)
+
+    def grant():
+        return permissions.grant_for_scheduled_task("carol", task_id, 1)
+
+    def second():
+        second_started.set()
+        return grant() if delete_first else accounts.delete_user("alice")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(accounts.delete_user, "alice") if delete_first else pool.submit(grant)
+        try:
+            assert reached.wait(10)
+            waiting = pool.submit(second)
+            assert second_started.wait(10)
+            with pytest.raises(TimeoutError):
+                waiting.result(timeout=0.1)
+        finally:
+            resume.set()
+        first.result(timeout=10)
+        if delete_first:
+            with pytest.raises(OmnigentError) as caught:
+                waiting.result(timeout=10)
+            assert caught.value.code == ErrorCode.NOT_FOUND
+        else:
+            assert waiting.result(timeout=10) is True
+    assert permissions.list_for_scheduled_task(task_id) == ([], None)
+
+
+def test_owner_grant_and_pause_lock_the_account_before_the_task(db_uri, monkeypatch):
+    from omnigent.stores.permission_store import sqlalchemy_store as permission_module
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    tasks = SqlAlchemyScheduledTaskStore(db_uri)
+    alice = accounts.create_user_with_password("alice", "alice-hash")
+    permissions.ensure_user("carol")
+    task_id = _create_task(db_uri, "alice")
+    holds_account, resume, pause_started = Event(), Event(), Event()
+    original = permission_module._lock_live_scheduled_task
+
+    def paused_before_task_lock(*args, **kwargs):
+        holds_account.set()
+        assert resume.wait(10)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(permission_module, "_lock_live_scheduled_task", paused_before_task_lock)
+
+    def as_alice(write):
+        with account_authority_scope("alice", alice.account_generation):
+            return write()
+
+    def pause():
+        pause_started.set()
+        return as_alice(lambda: tasks.update(task_id, state="paused"))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        granting = pool.submit(
+            as_alice, lambda: permissions.grant_for_scheduled_task("carol", task_id, 1)
+        )
+        try:
+            assert holds_account.wait(10)
+            pausing = pool.submit(pause)
+            assert pause_started.wait(10)
+            # Long enough for a pause that took the task row first to reach the account.
+            with pytest.raises(TimeoutError):
+                pausing.result(timeout=0.5)
+        finally:
+            resume.set()
+        assert granting.result(timeout=10).user_id == "carol"
+        assert pausing.result(timeout=10).state == "paused"
 
 
 def test_unbound_saved_authority_cannot_acquire_new_account(db_uri: str) -> None:
@@ -833,11 +1143,12 @@ def test_target_scope_preserves_actor_and_target_checks(db_uri, revoked_user):
         accounts.create_user_with_password(user_id, "replacement-hash")
     with account_authority_scope(actor.id, actor.account_generation):
         with target_account_scope(target.id, target.account_generation):
-            with pytest.raises(OmnigentError, match="revoked") as caught:
-                permissions.grant(target.id, uuid.uuid4().hex, 1)
-            assert caught.value.code == (
-                ErrorCode.CONFLICT if revoked_user == "target" else ErrorCode.UNAUTHORIZED
-            )
+            for grant in (permissions.grant, permissions.grant_for_scheduled_task):
+                with pytest.raises(OmnigentError, match="revoked") as caught:
+                    grant(target.id, uuid.uuid4().hex, 1)
+                assert caught.value.code == (
+                    ErrorCode.CONFLICT if revoked_user == "target" else ErrorCode.UNAUTHORIZED
+                )
     with account_authority_scope(actor.id, accounts.get_user(actor.id).account_generation):
         with target_account_scope(target.id, accounts.get_user(target.id).account_generation):
             permissions.ensure_user(target.id)
@@ -862,10 +1173,13 @@ def test_target_without_registration_cannot_acquire_new_account(db_uri, existing
             if existing_external_user:
                 assert accounts.delete_user("target") is True
             accounts.create_user_with_password("target", "new-password-hash")
-            with pytest.raises(OmnigentError, match="revoked"):
-                permissions.ensure_user("target")
-            with pytest.raises(OmnigentError, match="revoked"):
-                permissions.grant("target", uuid.uuid4().hex, 1)
+            for write in (
+                lambda: permissions.ensure_user("target"),
+                lambda: permissions.grant("target", uuid.uuid4().hex, 1),
+                lambda: permissions.grant_for_scheduled_task("target", uuid.uuid4().hex, 1),
+            ):
+                with pytest.raises(OmnigentError, match="revoked"):
+                    write()
 
 
 @pytest.mark.parametrize("change", ["host_owner", "session_owner", "host", "runner", "permission"])

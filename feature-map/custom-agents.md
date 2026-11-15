@@ -30,8 +30,7 @@ and deletes owned agents.
 
 ## Driving it with the repro environment
 
-Preconditions: follow [Verify Omnigent](skills/verify-omnigent/SKILL.md). The
-`custom_agents_settings_ui` release flag is on by default; do not disable it.
+Preconditions: follow [Verify Omnigent](skills/verify-omnigent/SKILL.md).
 The server must advertise `agent_install: true` and `agent_detail: true`.
 Deletion on a detail page also needs the response to include `user_owned`. Editing
 requires `user_owned: true` and `agent_config_edit: true`.

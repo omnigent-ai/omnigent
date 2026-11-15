@@ -62,14 +62,16 @@ export type FeatureKey =
   | "canvas"
   | "arca_shutdown_warnings"
   | "import_review"
-  | "custom_agents_settings_ui"
   | "sidebar_grouping_ui"
   | "workspace_content_search"
   | "grid_sessions_display_ui"
   | "automations_v2"
   | "splittable_terminal_view_ui"
   | "sidebar_windowed_rows"
-  | "session_orchestration";
+  | "session_orchestration"
+  | "workflows"
+  | "session_overview"
+  | "project_repository_creation";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
@@ -285,9 +287,9 @@ export interface ServerInfo {
   /** Sandbox automations accept a repository URL as their workspace. */
   scheduled_task_sandbox_workspaces?: boolean;
   /**
-   * True when a managed create accepts ``host_id`` naming its new sandbox
-   * host. Older servers reject it, so the create omits it there. Fails to
-   * ``false``.
+   * True when a managed create, fork or move accepts ``host_id`` naming its
+   * new sandbox host. Web JSON sends a minted id only when this is true.
+   * Fails to ``false``.
    */
   request_managed_sandbox_host_id?: boolean;
   /** True when sandbox forks accept an explicit `workspaces` list; absent on older servers. */
@@ -325,6 +327,16 @@ export interface ServerInfo {
   session_pull_requests?: boolean;
   /** Session comments preserve PR revision and line anchors; absent on older servers. */
   comment_anchor_metadata?: boolean;
+  /**
+   * True when the server keeps session journals (``/v1/sessions/{id}/journal`` and
+   * ``session.journal.appended``), which the Tasks tab shows; absent on older servers (off).
+   */
+  session_journal?: boolean;
+  /**
+   * True when the server keeps each user's saved workflows (``/v1/workflows``), which
+   * Run a workflow offers; absent on older servers (off).
+   */
+  workflows?: boolean;
   /**
    * True when the server stores each user's session title instructions
    * (``/v1/settings/session-title-instructions``); absent on older servers (off).
@@ -539,11 +551,7 @@ export function sandboxProfilesEnabled(info: ServerInfo | "loading"): boolean {
 }
 
 export function customAgentsSettingsEnabled(info: ServerInfo | "loading"): boolean {
-  return (
-    isFeatureEnabled(info, "custom_agents_settings_ui") &&
-    info !== "loading" &&
-    info.agent_install === true
-  );
+  return info !== "loading" && info.agent_install === true;
 }
 
 let cachedServerInfo: ServerInfo | null = null;
@@ -612,7 +620,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
       // Route through the host transport (`hostFetch`) so the embed hits the
       // proxied omnigent API; standalone `hostFetch` falls back to plain
       // `fetch("/v1/info")`, preserving the original behavior.
-      const res = await hostFetch("/v1/info");
+      const res = await hostFetch("/v1/info", undefined, { hostless: true });
       if (res.ok) {
         const data = (await res.json()) as Partial<ServerInfo>;
         const smartRoutingEnabled = data.smart_routing_enabled === true;
@@ -691,6 +699,8 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_claude_sdk_clear: data.session_claude_sdk_clear === true,
           session_rewind: data.session_rewind === true,
           session_pull_requests: data.session_pull_requests === true,
+          session_journal: data.session_journal === true,
+          workflows: data.workflows === true,
           session_title_instructions: data.session_title_instructions === true,
           admin_view: data.admin_view === true,
           comment_anchor_metadata: data.comment_anchor_metadata === true,

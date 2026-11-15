@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
 from itertools import batched
 from pathlib import PureWindowsPath
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 from sqlalchemy import (
     ColumnElement,
@@ -29,6 +30,7 @@ from sqlalchemy import (
     tuple_,
     update,
 )
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import QueryableAttribute, Session, load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.sql.selectable import Subquery
@@ -101,6 +103,7 @@ from omnigent.stores.conversation_store import (
     _INSTANCE_SCOPED_LABEL_KEYS,
     _SANDBOX_REPO_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
+    CREATED_BY_SESSION_LABEL_KEY,
     FAMILY_PIN_LABEL_PREFIX,
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
@@ -110,7 +113,11 @@ from omnigent.stores.conversation_store import (
     PENDING_INPUT_RESPONSE_ID,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
+    SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
+    SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX,
+    SCHEDULED_TASK_RUN_LABEL_KEY,
     SIDE_CHAT_COPY_ID_PREFIX_LEN,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
@@ -121,9 +128,17 @@ from omnigent.stores.conversation_store import (
     ProfileHostBinding,
     SessionActivity,
     SessionConnectivity,
+    SessionTodosUpdate,
+    SpawnTreeUsage,
     family_pinned_label_key,
     pinned_label_key,
     runner_seen_is_fresh,
+)
+from omnigent.stores.conversation_store.activity_error import (
+    LATEST_ACTIVITY_ERROR_LABEL_KEY,
+    LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY,
+    ActivityErrorSummary,
+    fold_activity_error,
 )
 from omnigent.stores.conversation_store.overrides import (
     decode_session_overrides as _decode_session_overrides,
@@ -141,6 +156,15 @@ from omnigent.stores.sandbox_profile_store import (
     profile_labels,
     reject_profile_labels,
     same_profile_identity,
+)
+from omnigent.stores.session_journal_store import (
+    JOURNAL_DELETE_BATCH,
+    copy_journal_for_fork,
+    delete_journal_entries_batch,
+    delete_journal_heads,
+    discard_fork_journal,
+    fork_journal_entry_id,
+    reserve_fork_journal,
 )
 from omnigent.util.session_lifecycle import title_without_closed_marker
 
@@ -939,7 +963,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         super().__init__(storage_location, conversation_storage_location)
         # Omnigent DB: agents, hosts, policies, files, user_daily_costs,
-        # session_permissions, comments, omnigent_conversation_metadata.
+        # session_permissions, comments, omnigent_conversation_metadata,
+        # session_journal_entries, session_journal_heads.
         self._engine = get_or_create_engine(storage_location)
         self._session = make_named_managed_session_maker(
             self._engine,
@@ -1196,7 +1221,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             if parent_conversation_id is not None and not title:
                 title = f"untitled:{new_id}"
 
-            def insert_conversation(ap_sess: Session) -> SqlConversation:
+            def insert_conversation(ap_sess: Session) -> tuple[SqlConversation, dict[str, str]]:
                 # Application-level (parent, title) uniqueness — there is no DB
                 # unique constraint. Only children are scoped; top-level sessions
                 # (NULL parent) may reuse titles freely. The SELECT seeks this
@@ -1224,6 +1249,24 @@ class SqlAlchemyConversationStore(ConversationStore):
                             f"sub-agent name already exists under parent "
                             f"{parent_conversation_id!r}: title={title!r}"
                         )
+                creation_labels = dict(prepared_labels)
+                # Workers retain the automated work that launched them even if
+                # their parent later returns to an interactive turn.
+                for source_id in dict.fromkeys(
+                    (prepared_labels.get(CREATED_BY_SESSION_LABEL_KEY), parent_conversation_id)
+                ):
+                    if source_id is None:
+                        continue
+                    inherited = {}
+                    for key in (SCHEDULED_TASK_ORIGIN_LABEL_KEY, SCHEDULED_TASK_RUN_LABEL_KEY):
+                        label = ap_sess.get(
+                            SqlConversationLabel, (current_workspace_id(), source_id, key)
+                        )
+                        if label is not None:
+                            inherited[key] = label.value
+                    if inherited:
+                        creation_labels = {**inherited, **creation_labels}
+                        break
                 row = SqlConversation(
                     id=new_id,
                     created_at=now,
@@ -1235,11 +1278,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                     session_overrides=encoded_overrides,
                 )
                 ap_sess.add(row)
-                if prepared_labels:
-                    _upsert_prepared_labels(ap_sess, new_id, prepared_labels, now)
-                return row
+                if creation_labels:
+                    _upsert_prepared_labels(ap_sess, new_id, creation_labels, now)
+                return row, creation_labels
 
-            row = run_write_transaction(
+            row, creation_labels = run_write_transaction(
                 self._conv_session_immediate,
                 "insert_conversation",
                 insert_conversation,
@@ -1286,7 +1329,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             except OmnigentError:
                 self._discard_unbound_conversation(new_id)
                 raise
-            return _to_conversation(row, meta, prepared_labels)
+            return _to_conversation(row, meta, creation_labels)
         except IntegrityError as exc:
             # Translate a caller-supplied-id PK collision into a clean exception
             # type. Per-parent title uniqueness is enforced by the SELECT above,
@@ -1804,14 +1847,14 @@ class SqlAlchemyConversationStore(ConversationStore):
         self,
         conversation_id: str,
         todos: list[dict[str, Any]],
-    ) -> bool:
+    ) -> SessionTodosUpdate | None:
         """Store a validated Plan snapshot in metadata; empty clears it.
 
-        :returns: ``False`` when the metadata row no longer exists, else ``True``.
+        :returns: The accepted update and its previous snapshot, or ``None`` if missing.
         """
         validated = validate_session_todos(todos)
 
-        def write(session: Session) -> bool:
+        def write(session: Session) -> SessionTodosUpdate | None:
             q = select(SqlConversationMetadata).where(
                 SqlConversationMetadata.workspace_id == current_workspace_id(),
                 SqlConversationMetadata.id == conversation_id,
@@ -1820,10 +1863,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                 q = q.with_for_update()
             meta = session.scalars(q).first()
             if meta is None:
-                return False
-            state, _ = _decode_session_state(meta.session_state)
+                return None
+            state, previous = _decode_session_state(meta.session_state)
             meta.session_state = _encode_session_state(state, validated)
-            return True
+            return SessionTodosUpdate(id=uuid.uuid4().hex, previous=previous)
 
         return run_write_transaction(self._session_immediate, "set_session_todos", write)
 
@@ -3356,6 +3399,7 @@ class SqlAlchemyConversationStore(ConversationStore):
 
             fts_rows: list[tuple[str, str, str]] = []
             row_values: list[dict[str, object]] = []
+            fresh_items: list[tuple[int, NewConversationItem]] = []
             batch_stable: dict[str, ConversationItem] = {}
             for item, prepared, search in prepared_rows:
                 if item.stable_id is not None:
@@ -3378,6 +3422,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 else:
                     next_pos += 1
                 values["position"] = position
+                fresh_items.append((position, item))
                 item_id = cast(str, values["id"])
                 if search:
                     fts_rows.append((item_id, conversation_id, search))
@@ -3402,6 +3447,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             if row_values:
                 session.execute(insert(SqlConversationItem), row_values)
             insert_fts_bulk(session, fts_rows)
+            self._fold_latest_activity_error(session, conversation_id, fresh_items, now)
+            self._record_scheduled_run_activity(session, conversation_id, fresh_items, now)
 
             # Persist the advanced counter so the next append reads it instead
             # of scanning; this also lazily backfills a pre-counter conversation.
@@ -3415,6 +3462,93 @@ class SqlAlchemyConversationStore(ConversationStore):
             "append_conversation_items",
             write,
         )
+
+    @staticmethod
+    def _record_scheduled_run_activity(
+        session: Session,
+        conversation_id: str,
+        fresh_items: list[tuple[int, NewConversationItem]],
+        stamp: int,
+    ) -> None:
+        """Latch the session-creating run's activity independently of continuations."""
+        if not any(
+            item.type in {"function_call", "function_call_output", "reasoning", "native_tool"}
+            or (item.type == "message" and getattr(item.data, "role", None) == "assistant")
+            for _, item in fresh_items
+        ):
+            return
+        labels = dict(
+            session.execute(
+                select(SqlConversationLabel.key, SqlConversationLabel.value).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id == conversation_id,
+                    SqlConversationLabel.key.in_(
+                        (
+                            SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+                            SCHEDULED_TASK_RUN_LABEL_KEY,
+                            SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
+                        )
+                    ),
+                )
+            )
+            .tuples()
+            .all()
+        )
+        run_id = labels.get(SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY) or labels.get(
+            SCHEDULED_TASK_RUN_LABEL_KEY
+        )
+        if run_id and labels.get(SCHEDULED_TASK_ACTIVITY_LABEL_KEY) != run_id:
+            _upsert_prepared_labels(
+                session, conversation_id, {SCHEDULED_TASK_ACTIVITY_LABEL_KEY: run_id}, stamp
+            )
+
+    def _fold_latest_activity_error(
+        self,
+        session: Session,
+        conversation_id: str,
+        fresh_items: list[tuple[int, NewConversationItem]],
+        stamp: int,
+    ) -> None:
+        """
+        Fold newly inserted items into the latest-activity-error label.
+
+        Runs inside the append transaction under the conversation row lock. The
+        stored value is read once and rewritten only when the fold changes it.
+
+        :param session: The append's open write session.
+        :param conversation_id: The conversation being appended to.
+        :param fresh_items: ``(position, item)`` for every inserted item, in order.
+        :param stamp: The append's timestamp, e.g. ``1753900000``.
+        """
+        items = [item for _, item in fresh_items]
+        if fold_activity_error(items) is None:
+            return
+        keys = (LATEST_ACTIVITY_ERROR_LABEL_KEY, LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY)
+        stored = dict(
+            session.execute(
+                select(SqlConversationLabel.key, SqlConversationLabel.value).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id == conversation_id,
+                    SqlConversationLabel.key.in_(keys),
+                )
+            )
+            .tuples()
+            .all()
+        )
+        previous_value = stored.get(LATEST_ACTIVITY_ERROR_LABEL_KEY)
+        previous = ActivityErrorSummary(
+            previous_value if previous_value in ("error", "disconnected") else "",
+            stored.get(LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY, ""),
+        )
+        summary = fold_activity_error(items, previous)
+        assert summary is not None
+        labels = {
+            LATEST_ACTIVITY_ERROR_LABEL_KEY: summary.value,
+            LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY: summary.response_id,
+        }
+        changed = {key: value for key, value in labels.items() if stored.get(key) != value}
+        if changed:
+            _upsert_prepared_labels(session, conversation_id, changed, stamp)
 
     def list_projects(
         self,
@@ -3556,6 +3690,180 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
 
         run_write_transaction(self._conv_session_immediate, "delete_label", write)
+
+    def replace_label_if(
+        self,
+        conversation_id: str,
+        key: str,
+        *,
+        expected: str | None,
+        value: str | None,
+    ) -> bool:
+        """Change one label in a single conditional write. See base class for contract."""
+        from sqlalchemy.exc import IntegrityError
+
+        if expected is None and value is None:
+            raise ValueError("replace_label_if needs an expected value or a new value")
+        if value is not None:
+            value = _prepare_label_updates({key: value})[key]
+        else:
+            _prepare_label_updates({key: ""})
+        if expected is None:
+
+            def insert_absent(session: Session) -> None:
+                session.execute(
+                    insert(SqlConversationLabel).values(
+                        workspace_id=current_workspace_id(),
+                        conversation_id=conversation_id,
+                        key=key,
+                        value=value,
+                        updated_at=now_epoch(),
+                    )
+                )
+
+            try:
+                run_write_transaction(
+                    self._conv_session_immediate, "replace_label_if", insert_absent
+                )
+            except IntegrityError:
+                # Another writer set the label first.
+                return False
+            return True
+        match = (
+            SqlConversationLabel.workspace_id == current_workspace_id(),
+            SqlConversationLabel.conversation_id == conversation_id,
+            SqlConversationLabel.key == key,
+            SqlConversationLabel.value == expected,
+        )
+
+        def write(session: Session) -> bool:
+            statement = (
+                delete(SqlConversationLabel).where(*match)
+                if value is None
+                else update(SqlConversationLabel)
+                .where(*match)
+                .values(value=value, updated_at=now_epoch())
+            )
+            result = cast("CursorResult[Any]", session.execute(statement))
+            return result.rowcount > 0
+
+        return run_write_transaction(self._conv_session_immediate, "replace_label_if", write)
+
+    def clear_scheduled_run_label(
+        self, conversation_id: str, run_id: str, *, pending_run_finished: bool = False
+    ) -> bool:
+        """Clear only the observed run, recovering an abandoned pending stamp."""
+        from omnigent.server.scheduled.run_reconciler import STALE_RUN_MAX_AGE_SECONDS
+
+        def write(session: Session) -> bool:
+            self._lock_conversation(session, conversation_id)
+            owner_key = (current_workspace_id(), conversation_id)
+            current = session.get(SqlConversationLabel, (*owner_key, SCHEDULED_TASK_RUN_LABEL_KEY))
+            if current is None or current.value != run_id:
+                return False
+            pending = session.get(
+                SqlConversationLabel,
+                (*owner_key, SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX + run_id),
+            )
+            if (
+                pending is not None
+                and not pending_run_finished
+                and pending.updated_at > now_epoch() - STALE_RUN_MAX_AGE_SECONDS
+            ):
+                return False
+            session.delete(current)
+            if pending is not None:
+                # Older pending nodes cannot restore a label that no longer names them.
+                session.delete(pending)
+            return True
+
+        return run_write_transaction(
+            self._conv_session_immediate, "clear_scheduled_run_label", write
+        )
+
+    def update_scheduled_run_label(
+        self,
+        conversation_id: str,
+        run_id: str,
+        *,
+        action: Literal["begin", "commit", "rollback"],
+    ) -> None:
+        """Splice tentative run attribution under the conversation's row lock.
+
+        Each pending label holds two run IDs: its predecessor and successor.
+        A change touches only this node, its immediate neighbors and the current
+        run label, so overlapping attempts never require an unbounded scan.
+        """
+        if action not in ("begin", "commit", "rollback"):
+            raise ValueError(f"unknown scheduled run label action: {action}")
+
+        def write(session: Session) -> None:
+            self._lock_conversation(session, conversation_id)
+            owner_key = (current_workspace_id(), conversation_id)
+            updates: dict[str, str] = {}
+            stamp = now_epoch()
+
+            def pending(pending_id: str | None) -> SqlConversationLabel | None:
+                if not pending_id:
+                    return None
+                return session.get(
+                    SqlConversationLabel,
+                    (*owner_key, SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX + pending_id),
+                )
+
+            def link(pending_id: str, previous: str | None, following: str | None) -> None:
+                value = json.dumps([previous, following], separators=(",", ":"))
+                if len(value) > LABEL_VALUE_MAX_LEN:
+                    raise ValueError("pending scheduled run links exceed the label size limit")
+                updates[SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX + pending_id] = value
+
+            node = pending(run_id)
+            if action == "begin":
+                if node is not None:
+                    return
+                current = session.get(
+                    SqlConversationLabel, (*owner_key, SCHEDULED_TASK_RUN_LABEL_KEY)
+                )
+                previous = current.value if current is not None else None
+                if previous == run_id:
+                    return
+                predecessor = pending(previous)
+                if previous is not None and predecessor is not None:
+                    older, _ = json.loads(predecessor.value)
+                    link(previous, older, run_id)
+                link(run_id, previous, None)
+                updates[SCHEDULED_TASK_RUN_LABEL_KEY] = run_id
+            elif node is not None:
+                previous, following = json.loads(node.value)
+                predecessor = pending(previous)
+                if predecessor is not None:
+                    older, next_id = json.loads(predecessor.value)
+                    if next_id == run_id:
+                        link(previous, older, following if action == "rollback" else None)
+                if action == "rollback":
+                    successor = pending(following)
+                    if successor is not None:
+                        prior_id, newer = json.loads(successor.value)
+                        if prior_id == run_id:
+                            link(following, previous, newer)
+                    match = (
+                        SqlConversationLabel.workspace_id == owner_key[0],
+                        SqlConversationLabel.conversation_id == conversation_id,
+                        SqlConversationLabel.key == SCHEDULED_TASK_RUN_LABEL_KEY,
+                        SqlConversationLabel.value == run_id,
+                    )
+                    session.execute(
+                        delete(SqlConversationLabel).where(*match)
+                        if previous is None
+                        else update(SqlConversationLabel)
+                        .where(*match)
+                        .values(value=previous, updated_at=stamp)
+                    )
+                session.delete(node)
+            if updates:
+                _upsert_labels(session, conversation_id, updates, stamp)
+
+        run_write_transaction(self._conv_session_immediate, "update_scheduled_run_label", write)
 
     def list_conversations(
         self,
@@ -4125,6 +4433,53 @@ class SqlAlchemyConversationStore(ConversationStore):
             first_id=rows[0].id if rows else None,
             last_id=rows[-1].id if rows else None,
             has_more=page.has_more,
+        )
+
+    def list_spawn_tree_usage(
+        self, root_conversation_id: str, *, limit: int
+    ) -> PagedList[SpawnTreeUsage]:
+        """Walk the root index for ids and parents, then read usage by those ids."""
+        with self._conv_session("list_spawn_tree_usage") as session:
+            members = session.execute(
+                select(SqlConversation.id, SqlConversation.parent_conversation_id)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.root_conversation_id == root_conversation_id,
+                )
+                .order_by(SqlConversation.id)
+                .limit(limit + 1)
+            ).all()
+        has_more = len(members) > limit
+        members = members[:limit]
+        usage_by_id: dict[str, str | None] = {}
+        if members:
+            with self._session("list_spawn_tree_usage") as session:
+                usage_by_id = {
+                    str(row.id): row.session_usage
+                    for row in session.execute(
+                        select(
+                            SqlConversationMetadata.id, SqlConversationMetadata.session_usage
+                        ).where(
+                            SqlConversationMetadata.workspace_id == current_workspace_id(),
+                            SqlConversationMetadata.id.in_([row.id for row in members]),
+                        )
+                    ).all()
+                }
+        rows = [
+            SpawnTreeUsage(
+                id=str(row.id),
+                parent_conversation_id=(
+                    str(row.parent_conversation_id) if row.parent_conversation_id else None
+                ),
+                session_usage=json.loads(usage) if (usage := usage_by_id.get(str(row.id))) else {},
+            )
+            for row in members
+        ]
+        return PagedList(
+            data=rows,
+            first_id=rows[0].id if rows else None,
+            last_id=rows[-1].id if rows else None,
+            has_more=has_more,
         )
 
     @staticmethod
@@ -5976,6 +6331,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         up_to_response_id: str | None = None,
         before_item_id: str | None = None,
         copy_items: bool = True,
+        copy_journal: bool = True,
         continue_source: bool = False,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
@@ -6109,6 +6465,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param copy_items: ``False`` copies no items at all, whatever the
             source holds when the fork commits. A truncation; exclusive with
             both cutoffs.
+        :param copy_journal: ``False`` leaves the source's journal behind, so
+            the fork starts with none, e.g. an automation run's copy of its
+            source session, which plans its own work.
         :param continue_source: Also copy the source's workspace and branch,
             its host (in the same write that creates the fork, holding the
             host row lock; a deleted host is not copied), its routing
@@ -6167,6 +6526,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             up_to_response_id=up_to_response_id,
             before_item_id=before_item_id,
             copy_items=copy_items,
+            copy_journal=copy_journal,
             continue_source=continue_source,
             project_id=project_id,
             file_id_map=file_id_map,
@@ -6201,6 +6561,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         up_to_response_id: str | None = None,
         before_item_id: str | None = None,
         copy_items: bool = True,
+        copy_journal: bool = True,
         continue_source: bool = False,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
@@ -6230,6 +6591,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
 
         with self._conv_session("prepare_fork_conversation") as session:
+            if session.get(SqlConversation, (current_workspace_id(), new_conv_id)) is not None:
+                raise ConversationAlreadyExistsError(
+                    f"conversation id {new_conv_id!r} already exists"
+                )
             source = session.get(SqlConversation, (current_workspace_id(), source_conversation_id))
             if source is None:
                 raise LookupError(f"conversation not found: {source_conversation_id!r}")
@@ -6366,6 +6731,58 @@ class SqlAlchemyConversationStore(ConversationStore):
             if cutoff_position is not None:
                 items_query = items_query.where(SqlConversationItem.position <= cutoff_position)
             source_items = session.execute(items_query).scalars().all() if copy_items else []
+            # The fork carries the journal its history wrote: all of it, or for a
+            # truncated fork what was written by its last copied item. A side chat
+            # is about the session, not a continuation, so it starts with none, as
+            # does a fork whose caller leaves the journal behind.
+            copy_journal = copy_journal and copy_items and side_chat_parent_id is None
+            journal_through: list[str] | None = [] if cutoff_position is not None else None
+            remapped_journal_data: dict[int, str] = {}
+            if copy_journal:
+                marker_positions = [
+                    pos
+                    for pos, item in enumerate(source_items)
+                    if decode_item_type(item.type) == "resource_event"
+                    and item.response_id.startswith("journal_")
+                ]
+                decoded_markers = (
+                    self._decode_item_data_batch(
+                        [source_items[pos].data for pos in marker_positions]
+                    )
+                    if marker_positions
+                    else []
+                )
+                changed_positions: list[int] = []
+                changed_markers: list[str] = []
+                for pos, payload in zip(marker_positions, decoded_markers, strict=True):
+                    data = json.loads(payload)
+                    resource = data.get("resource")
+                    if data.get("resource_type") != "journal" or not isinstance(resource, dict):
+                        continue
+                    entry_id = resource.get("entry_id")
+                    if not isinstance(entry_id, str):
+                        continue
+                    try:
+                        entry_id = uuid_to_bytes(entry_id).hex()
+                    except ValueError:
+                        continue
+                    if journal_through is not None:
+                        journal_through.append(entry_id)
+                    resource["entry_id"] = fork_journal_entry_id(new_conv_id, entry_id)
+                    if data.get("resource_id") == entry_id:
+                        data["resource_id"] = resource["entry_id"]
+                    changed_positions.append(pos)
+                    changed_markers.append(json.dumps(data))
+                if changed_markers:
+                    remapped_journal_data = dict(
+                        zip(
+                            changed_positions,
+                            self._encode_item_data_batch(changed_markers),
+                            strict=True,
+                        )
+                    )
+                if journal_through == []:
+                    copy_journal = False
 
             # Compaction cursors refer to item IDs. Since every copied item gets
             # a fresh ID, build the complete mapping before copying any payloads
@@ -6514,7 +6931,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                         "data": remapped_compaction_data.get(
                             pos,
                             remapped_file_data.get(
-                                pos, remapped_error_data.get(pos, src_item.data)
+                                pos,
+                                remapped_journal_data.get(
+                                    pos, remapped_error_data.get(pos, src_item.data)
+                                ),
                             ),
                         ),
                         "search_text": search_text,
@@ -6576,6 +6996,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 and not key.startswith(f"{PINNED_LABEL_KEY}.")
                 and not key.startswith(FAMILY_PIN_LABEL_PREFIX)
+                and not key.startswith(SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX)
                 and not key.startswith(f"{_SANDBOX_REPO_LABEL_KEY}.")
                 and not (source_workspace_missing and key.startswith("omnigent.last_task_error_"))
             }
@@ -6674,11 +7095,25 @@ class SqlAlchemyConversationStore(ConversationStore):
                 _upsert_labels(session, new_conv_id, fork_labels, now)
             return new_conv
 
-        new_conv = run_write_transaction(
-            self._conv_session_immediate,
-            "insert_fork_conversation",
-            insert_ap,
-        )
+        # Journal rows are invisible until the conversation is published. A failed
+        # batch must not expose a fork with only part of its plan history.
+        reserve_fork_journal(self._session_immediate, new_conv_id)
+        try:
+            if copy_journal:
+                copy_journal_for_fork(
+                    self._session_immediate,
+                    source_conversation_id,
+                    new_conv_id,
+                    through_entry_ids=journal_through,
+                )
+            new_conv = run_write_transaction(
+                self._conv_session_immediate,
+                "insert_fork_conversation",
+                insert_ap,
+            )
+        except BaseException:
+            discard_fork_journal(self._session_immediate, new_conv_id)
+            raise
 
         # Write fork metadata (and cloned agent if any) to the Omnigent DB.
         def insert_metadata(
@@ -6880,7 +7315,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         Collects the full subtree of conversation IDs (the target plus
         all direct/indirect children), then deletes their items, labels,
         comments, policies, and session-permission rows before deleting
-        the conversation rows themselves (children before parent).
+        the conversation rows themselves (children before parent), and
+        finally their journals.
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -7046,5 +7482,27 @@ class SqlAlchemyConversationStore(ConversationStore):
                 "delete_conversation_metadata",
                 lambda session, batch=batch_ids: delete_metadata(session, batch),
             )
+        self._delete_session_journals(subtree_ids)
 
         return True
+
+    def _delete_session_journals(self, conversation_ids: list[str]) -> None:
+        """Delete the sessions' journals, at most one batch of entries per transaction.
+
+        Heads go first, so an append racing the deletion finds its session gone.
+        """
+        for batch_ids in batched(conversation_ids, _DELETE_METADATA_BATCH_SIZE):
+            run_write_transaction(
+                self._session_immediate,
+                "delete_session_journal_heads",
+                lambda session, batch=batch_ids: delete_journal_heads(session, batch),
+            )
+            while (
+                run_write_transaction(
+                    self._session_immediate,
+                    "delete_session_journal_entries",
+                    lambda session, batch=batch_ids: delete_journal_entries_batch(session, batch),
+                )
+                == JOURNAL_DELETE_BATCH
+            ):
+                pass

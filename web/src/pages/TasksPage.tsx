@@ -148,10 +148,15 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
       if (q && !t.name.toLowerCase().includes(q)) return false;
       return true;
     });
+    // The server's next run is authoritative (it counts COUNT from the task's
+    // creation, which the client can't); the local estimate is only a fallback.
     const nextRunByTaskId = new Map(
       matches
         .filter((t) => t.state === "active")
-        .map((t) => [t.id, nextRunAtMs(t.rrule, t.timezone)]),
+        .map((t) => {
+          const server = t.nextRunAt != null ? Date.parse(t.nextRunAt) : Number.NaN;
+          return [t.id, Number.isNaN(server) ? nextRunAtMs(t.rrule, t.timezone) : server];
+        }),
     );
     // Sort: ACTIVE first (soonest next-run at the top), PAUSED last. The
     // least-actionable (paused) rows sink to the bottom rather than leading the

@@ -71,3 +71,85 @@ def test_live_and_dumped_specs_share_the_union(
         dumped["components"]["schemas"]["ServerStreamEvent"]
         == live_spec["components"]["schemas"]["ServerStreamEvent"]
     )
+
+
+def test_session_create_documents_json_and_multipart(live_spec: dict[str, Any]) -> None:  # type: ignore[explicit-any]
+    body = live_spec["paths"]["/v1/sessions"]["post"]["requestBody"]
+    assert body["required"] is True
+    assert set(body["content"]) == {"application/json", "multipart/form-data"}
+
+
+def test_session_create_keeps_legacy_and_project_requirements(live_spec: dict[str, Any]) -> None:  # type: ignore[explicit-any]
+    content = live_spec["paths"]["/v1/sessions"]["post"]["requestBody"]["content"]
+    legacy, project = content["application/json"]["schema"]["anyOf"]
+    assert legacy["allOf"] == [
+        {"$ref": "#/components/schemas/SessionCreateRequest"},
+        {"properties": {"project_id": {"type": "null"}}},
+    ]
+    assert project["allOf"] == [
+        {"$ref": "#/components/schemas/ProjectSessionCreateRequest"},
+        {"required": ["project_id"], "properties": {"project_id": {"type": "string"}}},
+    ]
+    schemas = live_spec["components"]["schemas"]
+    assert "agent_id" in schemas["SessionCreateRequest"]["required"]
+    assert "agent_id" not in schemas["ProjectSessionCreateRequest"].get("required", [])
+
+
+@pytest.mark.parametrize(
+    "name", ["SessionCreateRequest", "ProjectSessionCreateRequest", "SessionCreateMetadata"]
+)
+def test_session_create_registers_public_model_fields(
+    live_spec: dict[str, Any],  # type: ignore[explicit-any]
+    name: str,
+) -> None:
+    schema = live_spec["components"]["schemas"][name]
+    properties = schema["properties"]
+    assert "requested_host_id" not in properties
+    assert {
+        "project_id",
+        "host_type",
+        "initial_input",
+        "mcp_registry_services",
+    } <= properties.keys()
+    if name == "SessionCreateMetadata":
+        assert schema["additionalProperties"] is False
+    else:
+        assert properties["initial_items"]["items"] == {
+            "$ref": "#/components/schemas/SessionEventInput"
+        }
+
+
+def test_session_create_multipart_keeps_bundle_precedence(live_spec: dict[str, Any]) -> None:  # type: ignore[explicit-any]
+    multipart = live_spec["paths"]["/v1/sessions"]["post"]["requestBody"]["content"][
+        "multipart/form-data"
+    ]
+    bundled, files_only = multipart["schema"]["oneOf"]
+    assert set(bundled["required"]) == {"metadata", "bundle"}
+    assert bundled["properties"]["metadata"] == {
+        "$ref": "#/components/schemas/SessionCreateMetadata"
+    }
+    assert bundled["properties"]["bundle"]["format"] == "binary"
+    assert set(files_only["required"]) == {"metadata", "initial_files"}
+    assert files_only["not"] == {"required": ["bundle"]}
+    assert (
+        files_only["properties"]["metadata"]["allOf"][0]
+        == (
+            live_spec["paths"]["/v1/sessions"]["post"]["requestBody"]["content"][
+                "application/json"
+            ]["schema"]
+        )
+    )
+    assert multipart["encoding"]["metadata"] == {"contentType": "application/json"}
+    assert multipart["encoding"]["bundle"] == {"contentType": "application/gzip"}
+    for shape in (bundled, files_only):
+        assert shape["properties"]["initial_files"]["items"] == {
+            "type": "string",
+            "format": "binary",
+        }
+    startup_metadata = bundled["dependentSchemas"]["initial_files"]["properties"]["metadata"]
+    assert set(startup_metadata["required"]) == {"host_type", "initial_input"}
+    assert startup_metadata["properties"] == {
+        "host_type": {"const": "managed"},
+        "initial_input": {"$ref": "#/components/schemas/SessionStartupInput"},
+    }
+    assert files_only["properties"]["metadata"]["allOf"][1] == startup_metadata

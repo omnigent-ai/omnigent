@@ -672,8 +672,8 @@ already uploaded or registered an agent. The response is the full
     child (`parent_session_id`) create, is a 422; an id that names an
     existing host, or whose `managed-<first 8 hex>` name one of the
     caller's hosts already uses, is a 409 `already_exists`, raised
-    before the session is created. JSON creates only: the multipart
-    bundle create does not take it.
+    before the session is created. The multipart bundle create takes
+    it in `metadata` the same way.
     Provisioning runs in the BACKGROUND: the create returns
     immediately with `host_id` / `workspace` null, and they appear
     on `GET /v1/sessions/{id}` once the sandbox host registers. A

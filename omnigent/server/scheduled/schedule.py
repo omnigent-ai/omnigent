@@ -13,6 +13,7 @@ from omnigent.server.scheduled.rrule import (
     RRuleSearchError,
     RRuleValidationError,
     get_next_fire_time,
+    is_one_time_rule,
 )
 
 _logger = logging.getLogger(__name__)
@@ -98,6 +99,15 @@ def strip_trigger_header(prompt: str) -> str:
     """Return ``prompt`` without the trigger form's header line, if it has one."""
     match = _TRIGGER_HEADER.match(prompt)
     return prompt[match.end() :] if match else prompt
+
+
+def fits_reminder(task: ScheduledTask) -> bool:
+    """Whether a task can be a reminder: a one-time message into a known session."""
+    return (
+        task.session_mode == "continue"
+        and task.session_id is not None
+        and is_one_time_rule(task.rrule)
+    )
 
 
 def is_trigger_automation(task: ScheduledTask) -> bool:

@@ -14,6 +14,8 @@ from omnigent.host.frames import (
     LAUNCH_HANDLER_FAILED_ERROR_CODE,
     SERVER_CAP_TMUX_READINESS,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostCloneRepositoryFrame,
+    HostCloneRepositoryResultFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -861,6 +863,8 @@ def test_hello_frame_round_trip() -> None:
         runners=["runner_token_aaa", "runner_token_bbb"],
         interactive_shells=["zsh", "bash"],
         connection_id="host-connection-1",
+        workspace_socket="/tmp/omnigent-workspace-x/workspace.sock",
+        workspace_token_key="key-abc",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHelloFrame)
@@ -870,6 +874,10 @@ def test_hello_frame_round_trip() -> None:
     assert decoded.runners == ["runner_token_aaa", "runner_token_bbb"]
     assert decoded.interactive_shells == ["zsh", "bash"]
     assert decoded.connection_id == "host-connection-1"
+    assert decoded.workspace_socket == "/tmp/omnigent-workspace-x/workspace.sock"
+    assert decoded.workspace_token_key == "key-abc"
+    # The signing key must never reach a log line through the frame's repr.
+    assert "key-abc" not in repr(decoded)
 
 
 def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None:
@@ -890,6 +898,8 @@ def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None
     # empty set (feature unsupported), not choke on the missing key.
     assert decoded.capabilities == []
     assert decoded.connection_id is None
+    assert decoded.workspace_socket is None
+    assert decoded.workspace_token_key is None
 
 
 def test_hello_frame_capabilities_round_trip() -> None:
@@ -2287,6 +2297,55 @@ def test_list_worktrees_result_frame_rejects_non_list() -> None:
         decode_host_frame(bad)
 
 
+# ── host.clone_repository frames ────────────────────────
+
+
+def test_clone_repository_frame_round_trip() -> None:
+    """Request frames keep the URL, destination and optional branch verbatim."""
+    original = HostCloneRepositoryFrame(
+        request_id="req_clone_1",
+        url="https://git.example.com/team/app.git",
+        path="~/code/app",
+        branch="release",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostCloneRepositoryFrame)
+    assert decoded == original
+
+
+def test_clone_repository_frame_defaults_branch_to_none() -> None:
+    """A request without a branch decodes to the remote default (``None``)."""
+    decoded = decode_host_frame(
+        '{"kind": "host.clone_repository", "request_id": "r", '
+        '"url": "https://git.example.com/team/app.git", "path": "/tmp/app"}'
+    )
+    assert isinstance(decoded, HostCloneRepositoryFrame)
+    assert decoded.branch is None
+
+
+def test_clone_repository_result_round_trip_keeps_error_code() -> None:
+    """The error class survives the wire so the route can pick the HTTP status."""
+    original = HostCloneRepositoryResultFrame(
+        request_id="req_clone_2",
+        status="failed",
+        error="The clone took too long and was stopped",
+        error_code="clone_timeout",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostCloneRepositoryResultFrame)
+    assert decoded == original
+
+
+def test_clone_repository_result_success_round_trip() -> None:
+    """A successful result carries the checkout path and no error."""
+    original = HostCloneRepositoryResultFrame(
+        request_id="req_clone_3", status="ok", path="/home/alice/code/app"
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostCloneRepositoryResultFrame)
+    assert decoded == original
+
+
 # ── host.create_dir frames ──────────────────────────────
 
 
@@ -3042,3 +3101,16 @@ def test_enablement_fields_survive_inventory_allow_list():
     assert decoded.mcp_servers[0]["enabled"] == "false"
     assert decoded.mcp_servers[0]["locked"] == "true"
     assert "command" not in decoded.mcp_servers[0]
+
+
+def test_workspace_call_and_reply_frames_round_trip_bytes() -> None:
+    """Request and response messages are raw protobuf bytes; base64 must carry them intact."""
+    from omnigent.host.frames import HostWorkspaceCallFrame, HostWorkspaceReplyFrame
+
+    call = HostWorkspaceCallFrame("req1", "~/project", "ReadFile", b"\x00\xff\n")
+    reply = HostWorkspaceReplyFrame("req1", message=b"\x00\xff\n")
+    end = HostWorkspaceReplyFrame("req1", done=True, error_code="not_found", error_message="gone")
+
+    assert decode_host_frame(encode_host_frame(call)) == call
+    assert decode_host_frame(encode_host_frame(reply)) == reply
+    assert decode_host_frame(encode_host_frame(end)) == end

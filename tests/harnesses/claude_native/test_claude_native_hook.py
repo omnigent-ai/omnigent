@@ -34,6 +34,7 @@ from omnigent.harnesses.claude_native.bridge import (
 )
 from omnigent.native import native_policy_hook, policy_allow_cache
 from omnigent.native.elicitation_reattach import PRE_RESOLVED_ELICITATION_TTL_S
+from omnigent.telemetry.request_headers import client_user_agent
 from tests.native_hook_helpers import make_failing_client, make_verdict_client
 
 
@@ -879,7 +880,17 @@ def test_non_session_start_hook_does_not_emit_conversation_url_context(
     assert captured.err == ""
 
 
+@pytest.mark.parametrize(
+    "persisted_headers",
+    [
+        {"Authorization": "Bearer xyz"},
+        # The launching CLI's httpx snapshot lowercases its User-Agent.
+        {"Authorization": "Bearer xyz", "user-agent": "omnigent-cli/0.22.0 python-httpx/0.28.1"},
+    ],
+    ids=["title-case-only", "persisted-lowercase-user-agent"],
+)
 def test_permission_request_hook_posts_to_active_session_from_bridge_config(
+    persisted_headers: dict[str, str],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -959,7 +970,7 @@ def test_permission_request_hook_posts_to_active_session_from_bridge_config(
     build_hook_settings(
         bridge_dir,
         ap_server_url="http://127.0.0.1:8787",
-        ap_auth_headers={"Authorization": "Bearer xyz"},
+        ap_auth_headers=persisted_headers,
     )
     payload = {"hook_event_name": "PermissionRequest", "tool_name": "Bash"}
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
@@ -983,7 +994,8 @@ def test_permission_request_hook_posts_to_active_session_from_bridge_config(
     assert re.fullmatch(r"elicit_claude_[0-9a-f]{32}", sent["_omnigent_elicitation_id"]), (
         f"re-attach id outside the claude-hook namespace: {sent.get('_omnigent_elicitation_id')!r}"
     )
-    assert posted["headers"] == {"Authorization": "Bearer xyz"}
+    # Exactly one User-Agent, the hook process's own, whatever casing was persisted.
+    assert posted["headers"] == {"Authorization": "Bearer xyz", "User-Agent": client_user_agent()}
     assert json.loads(captured.out)["hookSpecificOutput"]["permissionDecision"] == "allow"
     assert captured.err == ""
 
@@ -1795,7 +1807,10 @@ def test_evaluate_policy_pre_tool_use_converts_and_returns_deny(
     assert sent["event"]["data"]["name"] == "Bash"
     assert sent["event"]["data"]["arguments"] == {"command": "rm -rf /"}
     # Auth headers from permission_hook.json are sent.
-    assert posted["headers"] == {"Authorization": "Bearer test-token"}
+    assert posted["headers"] == {
+        "Authorization": "Bearer test-token",
+        "User-Agent": client_user_agent(),
+    }
     # The EvaluationResponse is converted back to Claude's PreToolUse format.
     result = json.loads(captured.out)
     assert result["hookSpecificOutput"]["permissionDecision"] == "deny"

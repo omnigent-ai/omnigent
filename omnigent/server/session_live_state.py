@@ -38,9 +38,11 @@ unaffected.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import functools
 import logging
+import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -48,6 +50,10 @@ from typing import TYPE_CHECKING, Any
 
 from omnigent.db.enum_codecs import SESSION_LIVE_STATUS
 from omnigent.db.workspace_cache import WorkspaceScopedCache
+from omnigent.stores.conversation_store import (
+    SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
+    SCHEDULED_TASK_RUN_LABEL_KEY,
+)
 
 if TYPE_CHECKING:
     from omnigent.stores import ConversationStore
@@ -81,6 +87,10 @@ _last_blocked_on: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 # Handoffs to another replica per session. A write queued before a handoff sees
 # the count change and is skipped, so it cannot overwrite the new owner's value.
 _handoffs: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+# Only active children are indexed; run pages never enumerate a parent's history.
+_active_child_parents: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+_active_child_counts: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+_child_activity_lock = threading.Lock()
 # This process's own last touch_runner_liveness() stamp per runner id.
 # Never erased by clear_runner_liveness — only configure() resets it.
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by globally-unique runner_id
@@ -108,6 +118,39 @@ def configure(
     _last_blocked_on.clear()
     _handoffs.clear()
     _last_liveness_stamp.clear()
+    with _child_activity_lock:
+        _active_child_parents.clear()
+        _active_child_counts.clear()
+
+
+def _remove_active_child(session_id: str) -> None:
+    """Caller holds the activity lock."""
+    parent_id = _active_child_parents.pop(session_id, None)
+    if parent_id is not None:
+        remaining = _active_child_counts[parent_id] - 1
+        if remaining:
+            _active_child_counts[parent_id] = remaining
+        else:
+            _active_child_counts.pop(parent_id, None)
+
+
+def record_child_status(
+    session_id: str, parent_id: str | None, status: str | None, *, handoffs: int
+) -> None:
+    """Maintain this replica's live-child rollup from ordered status events."""
+    with _child_activity_lock:
+        if handoff_count(session_id) != handoffs:
+            return
+        _remove_active_child(session_id)
+        if parent_id is not None and status in ("running", "waiting"):
+            _active_child_parents[session_id] = parent_id
+            _active_child_counts[parent_id] = _active_child_counts.get(parent_id, 0) + 1
+
+
+def has_active_child(parent_id: str) -> bool:
+    """Whether this replica observes a running or waiting direct child."""
+    with _child_activity_lock:
+        return _active_child_counts.get(parent_id, 0) > 0
 
 
 def conversation_store() -> ConversationStore | None:
@@ -172,6 +215,8 @@ def persist_live_status(session_id: str, status: str) -> None:
     """
     if _store is None:
         return
+    if status not in ("running", "waiting"):
+        record_child_status(session_id, None, status, handoffs=handoff_count(session_id))
     if status not in _KNOWN_LIVE_STATUSES:
         # ``SessionStatusEvent.status`` permits values the live-status codec
         # can't encode (``"launching"``), and the relay forwards raw event
@@ -243,7 +288,9 @@ def _submit_while_owned(
 
 def forget_live_status(session_id: str) -> None:
     """Drop this process's dedupe state and queued writes for a session handed off."""
-    _handoffs[session_id] = _handoffs.get(session_id, 0) + 1
+    with _child_activity_lock:
+        _handoffs[session_id] = _handoffs.get(session_id, 0) + 1
+        _remove_active_child(session_id)
     _last_status.pop(session_id, None)
     _last_blocked_on.pop(session_id, None)
 
@@ -252,6 +299,7 @@ def persist_scheduled_run_completion(
     conversation_id: str,
     run_status: str,
     *,
+    turn_completed: bool = False,
     error_code: str | None = None,
     error: str | None = None,
 ) -> None:
@@ -273,6 +321,10 @@ def persist_scheduled_run_completion(
     ``live_status`` mirror. A bare executor would run at workspace 0 and match
     no rows on a multi-tenant replica.
 
+    A confirmed turn completion can precede transcript mirroring. Other idle
+    edges require agent activity: Claude Code also reports idle while starting,
+    before it has read the run's prompt.
+
     Idempotent by construction: ``update_run`` is conditional on
     ``WHERE status = running``, so a run already terminal (a fire-time
     ``skipped``/``failed``, or the startup/lazy backstop) is never clobbered
@@ -284,6 +336,8 @@ def persist_scheduled_run_completion(
     :param conversation_id: The fired conversation whose turn just ended.
     :param run_status: Terminal run status to set — ``"succeeded"`` (turn
         completed) or ``"failed"`` (turn errored/cancelled/disconnected).
+    :param turn_completed: The harness confirmed the turn ended, even if its
+        transcript has not reached the server yet.
     :param error_code: Short failure classification when ``run_status`` is
         ``"failed"`` (e.g. the conversation's ``last_task_error_code``).
     :param error: Optional human-readable failure detail for ``"failed"``.
@@ -298,6 +352,13 @@ def persist_scheduled_run_completion(
             # Not a scheduled fire, or its run is already terminal — nothing to
             # do. This is the common case (interactive sessions).
             return
+        if (
+            run_status == "succeeded"
+            and not turn_completed
+            and not _agent_worked_on_run(conversation_id, run.id)
+        ):
+            # The agent hasn't started on the run's prompt, so this idle isn't its end.
+            return
         store.update_run(
             run.id,
             status=run_status,
@@ -307,6 +368,21 @@ def persist_scheduled_run_completion(
         )
 
     submit("scheduled_run_completion", _transition)
+
+
+def _agent_worked_on_run(conversation_id: str, run_id: str) -> bool:
+    """Read durable activity evidence that bookkeeping cannot push out of a page."""
+    conversations = _store
+    if conversations is None:
+        return True
+    conversation = conversations.get_conversation(conversation_id)
+    if conversation is None:
+        return False
+    # Runs launched before run labels existed retain their idle-completion behavior.
+    return (
+        SCHEDULED_TASK_RUN_LABEL_KEY not in conversation.labels
+        or conversation.labels.get(SCHEDULED_TASK_ACTIVITY_LABEL_KEY) == run_id
+    )
 
 
 def persist_pending_count(conversation_id: str, count: int) -> None:
@@ -459,6 +535,27 @@ def touch_runner_liveness(runner_ids: list[str]) -> None:
     for runner_id in runner_ids:
         _last_liveness_stamp[runner_id] = now
     submit("runner_liveness", _store.touch_runner_liveness, list(runner_ids), now)
+
+
+async def stamp_runner_liveness(runner_id: str) -> None:
+    """
+    Stamp ``runner_last_seen`` now and wait for the write to land.
+
+    Called before a reconnecting runner's tunnel is registered. The background
+    stamp can queue behind other writes, and in that gap another replica may
+    settle the runner's running sessions as orphaned. A failed write is logged
+    and the connection proceeds, as with the background stamp.
+
+    :param runner_id: The reconnecting runner's id, e.g. ``"runner_abc123"``.
+    """
+    if _store is None:
+        return
+    now = int(time.time())
+    _last_liveness_stamp[runner_id] = now
+    try:
+        await asyncio.to_thread(_store.touch_runner_liveness, [runner_id], now)
+    except Exception:  # best-effort, like the background stamp
+        _logger.warning("liveness stamp failed for %s", runner_id, exc_info=True)
 
 
 def last_liveness_stamp(runner_id: str) -> int | None:

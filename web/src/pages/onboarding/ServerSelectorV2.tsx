@@ -115,7 +115,8 @@ export interface ServerSelectorV2Setup {
   /** Subscribe to the CLI installer's output lines; returns an unsubscribe. */
   onInstallLog?: (cb: (line: string) => void) => () => void;
   /** Runners the "Where do you work today?" step offers for `url`, and whether
-   *  its host CLI comes bundled (no CLI install). Absent → this laptop only. */
+   *  its host CLI comes bundled (no CLI install). Neither, or absent → a remote
+   *  server opens without the runner step; the local install offers this laptop. */
   getRunnerOptions?: (url: string) => Promise<{ remote: boolean; bundledCli?: boolean }>;
   /** Connect the picked runner to `url` before opening it. Absent → the runner
    *  step just opens the server. */
@@ -190,18 +191,20 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   const [runnerError, setRunnerError] = useState<string>();
   // Bumped per pick, so a slow lookup can't replace a newer pick's runner step.
   const runnerPick = useRef(0);
+  // Resolves false for a remote server with no runner to set up (no remote
+  // environment or bundled host CLI, or a failed lookup), so it just opens.
+  // The local install keeps the laptop step.
   const pickRunnerFor = async (url: string) => {
     const pick = ++runnerPick.current;
-    // A failed lookup falls back to this laptop only.
     const options = await setup.getRunnerOptions?.(url).catch(() => undefined);
-    if (pick !== runnerPick.current) return;
-    setRunnerTarget({
-      url,
-      remote: options?.remote === true,
-      bundledCli: options?.bundledCli === true,
-    });
+    if (pick !== runnerPick.current) return true;
+    const remote = options?.remote === true;
+    const bundledCli = options?.bundledCli === true;
+    if (!remote && !bundledCli && !isLocalInstall(url)) return false;
+    setRunnerTarget({ url, remote, bundledCli });
     setRunnerError(undefined);
     setStep("runner");
+    return true;
   };
   // What the terminal step runs after any install (Back → `back`): start the
   // local server (a picked local install's `url` opens as-is when up), or
@@ -290,9 +293,10 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
     }
     return connectToServer(url);
   };
-  // MDM landing: a new user picks a runner first; a returning user just opens it.
+  // MDM landing: a new user picks a runner first where the server offers one;
+  // any other server, or a returning user, just opens it.
   const joinFromLanding = async (url: string) => {
-    if (!returning) return pickRunnerFor(url);
+    if (!returning && (await pickRunnerFor(url))) return;
     setLandingError(undefined);
     const result = await connect(url, "landing");
     if (result.error) setLandingError(result.error);

@@ -3,7 +3,7 @@ import { useScheduleEscape } from "./useScheduleEscape";
 // Dialog for creating or editing a scheduled task. Reuses the existing agent,
 // host, and workspace pickers where the backend can persist those fields.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   BoxIcon,
   CalendarOffIcon,
@@ -53,6 +53,11 @@ import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { ComposerHarnessTrigger } from "@/components/composer/ComposerControls";
 import { PickerSectionHeader } from "@/components/composer/HarnessMenuRow";
 import { TriggerTemplateFields } from "@/components/scheduled/TriggerTemplateFields";
+import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
+import { WorkflowField } from "@/components/scheduled/WorkflowField";
+import { type SavedWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
+import { skillInvocationPrefix } from "@/lib/harnessSetup";
+import { parseSavedWorkflowMessage, savedWorkflowMessage } from "@/lib/workflow";
 import {
   TriggerWorkerHarnessField,
   TriggerWorkerSettingsFields,
@@ -199,6 +204,10 @@ interface AutomationTypeDraft {
   sessionMode: ScheduledTaskSessionMode;
 }
 
+function SettingsGroupHeading({ children }: { children: ReactNode }) {
+  return <h3 className="text-sm font-medium text-foreground">{children}</h3>;
+}
+
 export function CreateScheduledTaskDialog({
   open,
   onOpenChange,
@@ -209,6 +218,7 @@ export function CreateScheduledTaskDialog({
   sessionLink = "",
   editingTask = null,
   sourceSession = null,
+  lockedWorkflow = null,
   onCreated,
 }: {
   open: boolean;
@@ -224,6 +234,8 @@ export function CreateScheduledTaskDialog({
   editingTask?: ScheduledTask | null;
   /** Create the automation from this session: every run starts from a copy of it. */
   sourceSession?: AutomationSourceSession | null;
+  /** Create the automation from this saved workflow: runs follow it, and it can't be changed. */
+  lockedWorkflow?: SavedWorkflow | null;
   /** Called once with the new automation after it is created (not after an edit). */
   onCreated?: (task: ScheduledTask) => void;
 }) {
@@ -231,6 +243,7 @@ export function CreateScheduledTaskDialog({
   const { data: hosts, isPending: hostsPending } = useHosts({ enabled: open });
   const info = useServerInfo();
   const anchoredScheduling = isFeatureEnabled(info, "automations_v2");
+  const workflowsEnabled = isFeatureEnabled(info, "workflows");
   const subhourSupported = info !== "loading" && info.scheduled_task_subhour === true;
   const triggerPollMinutes = info !== "loading" ? (info.automation_trigger_poll_minutes ?? 10) : 10;
   const triggerHeadersSupported =
@@ -307,6 +320,9 @@ export function CreateScheduledTaskDialog({
 
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
+  // A saved workflow for each run to follow; the instructions then hold the run's details.
+  const [workflowChoice, setWorkflowChoice] = useState<SavedWorkflow | null>(null);
+  const savedWorkflows = useSavedWorkflows({ enabled: open });
   // The rendered template text around the instructions of an older trigger. Never shown.
   const [systemPrompt, setSystemPrompt] = useState<string | null>(null);
   const promptFieldsRef = useRef<HTMLDivElement>(null);
@@ -374,6 +390,7 @@ export function CreateScheduledTaskDialog({
     );
     setPickedPermission(backToOriginal ? (editingTask?.permissionMode ?? "") : "");
     setPermissionPicked(false);
+    setNewTriggerWorkerSettings(null);
   }
 
   // ── Nested dropdown dismiss guard ─────────────────────────────────────────
@@ -556,6 +573,9 @@ export function CreateScheduledTaskDialog({
   const [switchedWorkerPlacement, setSwitchedWorkerPlacement] = useState<WorkerPlacement | null>(
     null,
   );
+  // A new trigger's workers follow the polling session's settings until changed; null = follow.
+  const [newTriggerWorkerSettings, setNewTriggerWorkerSettings] =
+    useState<TriggerWorkerSettings | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [scheduleUnsupported, setScheduleUnsupported] = useState(false);
   const defaultTriggerSchedule = useMemo(
@@ -584,6 +604,7 @@ export function CreateScheduledTaskDialog({
       editSourceDrafts.current = {};
       setSwitchedWorkerSettings(null);
       setSwitchedWorkerPlacement(null);
+      setNewTriggerWorkerSettings(null);
       setTriggerType(sourceSession ? "schedule" : (initialTrigger ?? "schedule"));
       resetMenus();
       // A source switch keeps the saved trigger's task-session choice.
@@ -591,18 +612,21 @@ export function CreateScheduledTaskDialog({
         editingTask && isTaskSessionTriggerPrompt(editingTask.prompt) ? "continue" : "new",
       );
       const savedPrompt = editingTask?.prompt ?? initialPrompt ?? "";
-      if (editingTriggerConfig !== null) {
-        setPrompt("");
-        setSystemPrompt(null);
-      } else if (hasTriggerHeader(savedPrompt)) {
-        // The header no longer matches, so trust only the text the model runs.
-        setPrompt(stripTriggerHeader(savedPrompt));
-        setSystemPrompt(null);
-      } else {
-        const parts = splitTriggerPrompt(savedPrompt);
-        setPrompt(parts.userPrompt);
-        setSystemPrompt(parts.systemPrompt);
-      }
+      // An invalid header is ignored; only its rendered prompt remains authoritative.
+      const parts = editingTriggerConfig
+        ? { userPrompt: editingTriggerConfig.instructions, systemPrompt: null }
+        : hasTriggerHeader(savedPrompt)
+          ? { userPrompt: stripTriggerHeader(savedPrompt), systemPrompt: null }
+          : splitTriggerPrompt(savedPrompt);
+      const savedRun = workflowsEnabled ? parseSavedWorkflowMessage(parts.userPrompt) : null;
+      setWorkflowChoice(
+        workflowsEnabled
+          ? (lockedWorkflow ??
+              (savedRun && { id: savedRun.id, name: savedRun.name, description: "" }))
+          : null,
+      );
+      setPrompt(editingTriggerConfig ? "" : (savedRun?.details ?? parts.userPrompt));
+      setSystemPrompt(parts.systemPrompt);
       setTimezone(editingTask?.timezone ?? localTimezone());
       if (editingTask) {
         const parsedSchedule = savedSchedule;
@@ -630,7 +654,7 @@ export function CreateScheduledTaskDialog({
             ...fields
           } = editingTriggerConfig;
           setTrigger(source);
-          setTriggerFields(fields);
+          setTriggerFields({ ...fields, instructions: savedRun?.details ?? fields.instructions });
           setSwitchedWorkerSettings(triggerWorkerSettingsOf(worker));
           setSwitchedWorkerPlacement(worker.placement);
         } else {
@@ -677,6 +701,8 @@ export function CreateScheduledTaskDialog({
     savedSchedule,
     savedWorkspace,
     sourceSession,
+    lockedWorkflow,
+    workflowsEnabled,
   ]);
 
   // A new task starts on a server sandbox when one is offered, so it doesn't
@@ -774,6 +800,10 @@ export function CreateScheduledTaskDialog({
   // The resolved Host for the pinned id, or undefined when none is pinned.
   const selectedHost = hostId === "" ? undefined : hostOptions.find((h) => h.host_id === hostId);
   function handleWorkerSettingsChange(settings: TriggerWorkerSettings) {
+    if (!isEdit) {
+      setNewTriggerWorkerSettings(settings);
+      return;
+    }
     if (trigger !== null) {
       setSwitchedWorkerSettings(settings);
       return;
@@ -781,13 +811,14 @@ export function CreateScheduledTaskDialog({
     const updated = updateTriggerWorkerSettings(effectivePrompt, settings);
     if (updated === null) return;
     const parts = splitTriggerPrompt(updated);
-    setPrompt(parts.userPrompt);
+    setPrompt(withoutWorkflow(parts.userPrompt));
     setSystemPrompt(parts.systemPrompt);
   }
 
-  let workerSettings: TriggerWorkerSettings | null = null;
+  const creatingTriggerWorkers = !isEdit && trigger !== null;
+  let editedWorkerSettings: TriggerWorkerSettings | null = null;
   if (editingWorkerSettings) {
-    workerSettings =
+    editedWorkerSettings =
       trigger !== null
         ? switchedWorkerSettings
         : readTriggerWorkerSettings(combineTriggerPrompt(prompt, systemPrompt));
@@ -801,14 +832,18 @@ export function CreateScheduledTaskDialog({
   }
   const workerSandboxMode = workerPlacement === "managed" || sandboxMode;
   const workerAgent = agents?.find(
-    (agent) => agent.id === (workerSettings?.agentId ?? editingTask?.agentId),
+    (agent) =>
+      agent.id === (editedWorkerSettings?.agentId ?? editingTask?.agentId ?? effectiveAgentId),
   );
+  const workerModel = creatingTriggerWorkers
+    ? (newTriggerWorkerSettings?.model ?? pickedModel)
+    : (editedWorkerSettings?.model ?? "");
   const workerHarnessSettings = useScheduledHarnessSettings(
     workerAgent,
     workerSandboxMode ? undefined : selectedHost,
     workerSandboxMode,
-    workerSettings?.model ?? "",
-    open && workerSettings !== null,
+    workerModel,
+    open && (editedWorkerSettings !== null || creatingTriggerWorkers),
   );
   const harnessSettings = useScheduledHarnessSettings(
     agents?.find((agent) => agent.id === effectiveAgentId),
@@ -838,14 +873,23 @@ export function CreateScheduledTaskDialog({
       : permissionChoice;
   const sessionPermissionModesSupported =
     info !== "loading" && info.session_create_permission_modes === true;
-  // A new template's workers run the polling session's agent, so its mode applies to them,
-  // except one that skips approval, which the server refuses for a session an agent starts.
+  // A new template's workers default to the polling session's mode, except one that
+  // skips approval, which the server refuses for a session an agent starts.
   const workerPermissionMode =
     sessionPermissionModesSupported &&
     effectivePermission !== "" &&
     !APPROVAL_SKIPPING_PERMISSION_MODES.has(effectivePermission)
       ? effectivePermission
       : undefined;
+  let workerSettings: TriggerWorkerSettings | null = editedWorkerSettings;
+  if (creatingTriggerWorkers) {
+    workerSettings = newTriggerWorkerSettings ?? {
+      agentId: null,
+      model: supportsModel ? pickedModel : "",
+      effort: supportsModel ? pickedEffort : "",
+      permissionMode: workerPermissionMode ?? "",
+    };
+  }
   const originalTargetSelected =
     editingTask?.executionTarget === "managed_sandbox"
       ? sandboxMode
@@ -905,6 +949,8 @@ export function CreateScheduledTaskDialog({
     }
     setPickedModel(restore ? (editingTask?.modelOverride ?? "") : "");
     setPickedEffort(restore ? (editingTask?.reasoningEffort ?? "") : "");
+    // Each target supplies its own model catalog.
+    setNewTriggerWorkerSettings(null);
     setBaseBranch(
       restore && !nextSandbox && nextWorkspace === savedWorkspace
         ? (editingTask?.baseBranch ?? null)
@@ -990,6 +1036,31 @@ export function CreateScheduledTaskDialog({
     unsupportedByScheduler ||
     validateSchedule(schedule, { allowPastEnd, sessionMode, subhourSupported, executionTarget }) !==
       null;
+  const workflowPrefix = skillInvocationPrefix(harnessSettings.harness);
+  const withWorkflow = (text: string) =>
+    workflowChoice ? savedWorkflowMessage(workflowPrefix, workflowChoice, text, false) : text;
+  // The saved list's copy, once loaded, has the workflow's current name.
+  const workflowShown =
+    workflowChoice &&
+    (savedWorkflows.workflows.find((workflow) => workflow.id === workflowChoice.id) ??
+      workflowChoice);
+  const withoutWorkflow = (text: string) =>
+    (workflowChoice && parseSavedWorkflowMessage(text)?.details) ?? text;
+  const workflowField =
+    workflowsEnabled && (savedWorkflows.workflows.length > 0 || workflowChoice) ? (
+      <WorkflowField
+        workflows={savedWorkflows.workflows}
+        pagination={savedWorkflows.pagination}
+        value={workflowShown}
+        onChange={setWorkflowChoice}
+        onOpenChange={handleSelectOpenChange}
+        locked={lockedWorkflow !== null}
+      />
+    ) : null;
+  const promptTriggerFields = {
+    ...triggerFields,
+    instructions: withWorkflow(triggerFields.instructions),
+  };
   const triggerPromptContext = {
     sessionLink,
     pollingIntervalMinutes:
@@ -999,10 +1070,10 @@ export function CreateScheduledTaskDialog({
   // An edit keeps the saved workers; a new trigger's workers run where the manager
   // runs (beside it on a connected host, or each in its own sandbox).
   const renderedTriggerConfig: TriggerConfig | null =
-    trigger !== null && triggerFieldsComplete(triggerFields, trigger)
+    trigger !== null && triggerFieldsComplete(promptTriggerFields, trigger)
       ? {
           source: trigger,
-          ...triggerFields,
+          ...promptTriggerFields,
           ...(triggerTaskSessionMode === "continue" ? { taskSessionMode: "continue" } : {}),
           worker: {
             placement: workerPlacement ?? (sandboxMode ? "managed" : "same_host"),
@@ -1023,7 +1094,9 @@ export function CreateScheduledTaskDialog({
     renderedTriggerPrompt = renderTriggerConfigPrompt(renderedTriggerConfig, triggerPromptContext);
   }
   const effectivePrompt =
-    trigger !== null ? renderedTriggerPrompt : combineTriggerPrompt(prompt, systemPrompt);
+    trigger !== null
+      ? renderedTriggerPrompt
+      : combineTriggerPrompt(withWorkflow(prompt), systemPrompt);
   const triggerMode =
     trigger !== null ||
     (sessionMode === "continue" && (editingTemplateTrigger || isTriggerPrompt(effectivePrompt)));
@@ -1093,6 +1166,7 @@ export function CreateScheduledTaskDialog({
   const displayedPermission = reusesExistingSession
     ? editablePermissionMode(editingTask?.permissionMode)
     : effectivePermission;
+  const workerGroupName = sendsToTaskSession ? "Task session" : "Matching sessions";
   const automationModelOptions = [...harnessSettings.models];
   if (
     displayedModel !== "" &&
@@ -1216,7 +1290,8 @@ export function CreateScheduledTaskDialog({
     !curationPending &&
     name.trim() !== "" &&
     (startsFromSession ||
-      (effectivePrompt.trim() !== "" && (trigger !== null || prompt.trim() !== ""))) &&
+      (effectivePrompt.trim() !== "" &&
+        (trigger !== null || withWorkflow(prompt).trim() !== ""))) &&
     (trigger !== null || systemPrompt === null || systemPrompt.trim() !== "") &&
     (isEdit || effectiveAgentId !== null) &&
     (isEdit || sandboxMode || hostId !== "") &&
@@ -1469,6 +1544,40 @@ export function CreateScheduledTaskDialog({
     }
   }
 
+  // Editing a trigger hides the top-row agent and permission pickers, so its polling
+  // session's settings get their own fields.
+  const pollingModelFields = (
+    <ModelEffortFields
+      model={displayedModel}
+      effort={displayedEffort}
+      permissionMode={displayedPermission}
+      settings={harnessSettings}
+      disabled={curationPending || reusesExistingSession}
+      idPrefix="task-polling"
+      onModelChange={handleModelChange}
+      onEffortChange={handleEffortChange}
+      onPermissionModeChange={(mode) => {
+        sourcePrefilledRef.current = true;
+        setPickedPermission(mode);
+        setPermissionPicked(true);
+      }}
+      onSelectOpenChange={handleSelectOpenChange}
+    />
+  );
+  const workerFields = workerSettings !== null && (
+    <TriggerWorkerSettingsFields
+      value={workerSettings}
+      settings={workerHarnessSettings}
+      permissionModesSupported={sessionPermissionModesSupported}
+      pollingPermissionMode={displayedPermission}
+      taskSession={sendsToTaskSession}
+      creating={creatingTriggerWorkers}
+      followsPolling={creatingTriggerWorkers && newTriggerWorkerSettings === null}
+      disabled={curationPending}
+      onSelectOpenChange={handleSelectOpenChange}
+      onChange={handleWorkerSettingsChange}
+    />
+  );
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent
@@ -1691,20 +1800,27 @@ export function CreateScheduledTaskDialog({
                           }) !== null
                         }
                         taskSessionMode={triggerTaskSessionMode}
+                        workflowField={workflowField}
+                        instructionsAreDetails={workflowChoice !== null}
                       />
                     ) : (
                       <div ref={promptFieldsRef} className="flex flex-col gap-1.5">
+                        {workflowField && <div className="mb-3.5">{workflowField}</div>}
                         <Textarea
                           id="task-prompt"
                           aria-label={
-                            startsFromSession ? "Additional instructions" : "Instructions"
+                            startsFromSession || workflowChoice
+                              ? "Additional instructions"
+                              : "Instructions"
                           }
                           value={prompt}
                           rows={5}
                           placeholder={
-                            startsFromSession
-                              ? "Optional. For example: Use this week's data."
-                              : "What should the agent do each run?"
+                            workflowChoice
+                              ? "Optional. Instructions to customize the workflow."
+                              : startsFromSession
+                                ? "Optional. For example: Use this week's data."
+                                : "What should the agent do each run?"
                           }
                           data-testid="task-prompt-input"
                           componentId="tasks.scheduled.prompt"
@@ -2268,26 +2384,39 @@ export function CreateScheduledTaskDialog({
                             </p>
                           )}
                           {editingWorkerSettings && workerSettings !== null && editingTask ? (
-                            <div className="space-y-3 rounded-xl border border-border p-3">
-                              <TriggerWorkerHarnessField
-                                value={workerSettings}
-                                pollingAgentId={editingTask.agentId}
-                                agents={agentList}
-                                selectedAgent={workerAgent}
-                                disabled={curationPending}
-                                onSelectOpenChange={handleSelectOpenChange}
-                                onChange={handleWorkerSettingsChange}
-                              />
-                              <TriggerWorkerSettingsFields
-                                value={workerSettings}
-                                settings={workerHarnessSettings}
-                                permissionModesSupported={sessionPermissionModesSupported}
-                                taskSession={sendsToTaskSession}
-                                disabled={curationPending}
-                                onSelectOpenChange={handleSelectOpenChange}
-                                onChange={handleWorkerSettingsChange}
-                              />
-                            </div>
+                            <>
+                              {(harnessSettings.supportsModel ||
+                                harnessSettings.permissions.length > 0) && (
+                                <div
+                                  className="space-y-3 rounded-xl border border-border p-3"
+                                  data-testid="task-polling-settings"
+                                >
+                                  <SettingsGroupHeading>Polling session</SettingsGroupHeading>
+                                  {pollingModelFields}
+                                  <p className="text-sm text-muted-foreground">
+                                    {reusesExistingSession
+                                      ? "The current polling session keeps these. Check Start a new session on the next run to change them."
+                                      : "The next run starts a new polling session with these."}
+                                  </p>
+                                </div>
+                              )}
+                              <div
+                                className="space-y-3 rounded-xl border border-border p-3"
+                                data-testid="task-matching-settings"
+                              >
+                                <SettingsGroupHeading>{workerGroupName}</SettingsGroupHeading>
+                                <TriggerWorkerHarnessField
+                                  value={workerSettings}
+                                  pollingAgentId={editingTask.agentId}
+                                  agents={agentList}
+                                  selectedAgent={workerAgent}
+                                  disabled={curationPending}
+                                  onSelectOpenChange={handleSelectOpenChange}
+                                  onChange={handleWorkerSettingsChange}
+                                />
+                                {workerFields}
+                              </div>
+                            </>
                           ) : editingWorkerSettings ? (
                             <p className="text-sm text-muted-foreground" role="status">
                               Worker controls are unavailable for these customized instructions.
@@ -2305,6 +2434,23 @@ export function CreateScheduledTaskDialog({
                               </p>
                             )
                           )}
+                          {creatingTriggerWorkers &&
+                            workerSettings !== null &&
+                            (harnessSettings.supportsModel ||
+                              harnessSettings.permissions.length > 0) && (
+                              <div
+                                className="space-y-3 rounded-xl border border-border p-3"
+                                data-testid="task-matching-settings"
+                              >
+                                <SettingsGroupHeading>{workerGroupName}</SettingsGroupHeading>
+                                <p className="text-sm text-muted-foreground">
+                                  The agent, model, effort, and permissions above run the polling
+                                  session, which checks for new matches. A lighter model keeps
+                                  frequent checks cheaper.
+                                </p>
+                                {workerFields}
+                              </div>
+                            )}
                           {reusesExistingSession && (
                             <div
                               className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-sm text-foreground"

@@ -132,7 +132,7 @@ export function retryListFetch(failureCount: number, error: unknown): boolean {
  * mutations that actually change archived membership or a project label
  * invalidate this key explicitly instead.
  */
-const ARCHIVED_PROJECT_NAMES_KEY = ["archived-project-names"] as const;
+export const ARCHIVED_PROJECT_NAMES_KEY = ["archived-project-names"] as const;
 
 export type SessionSortBy = "updated_at" | "created_at";
 /** `?search_scope=`: `title` and `content` are disjoint groups of one search. */

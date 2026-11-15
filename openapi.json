@@ -212,6 +212,94 @@
         "title": "AgentConfigPatch",
         "type": "object"
       },
+      "AgentCost": {
+        "description": "Display cost of one agent in a session tree.",
+        "properties": {
+          "cost_usd": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Priced USD cost of this agent including its sub-agents (the same total its own session reports), or `None` when nothing in that subtree is priced.",
+            "title": "Cost Usd"
+          },
+          "estimated_cost_usd": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When `cost_usd` is `None`, an ancestor harness's transcript estimate for this agent, which that ancestor's total already includes; otherwise `None`.",
+            "title": "Estimated Cost Usd"
+          },
+          "id": {
+            "description": "Session id, e.g. `\"conv_child123\"`.",
+            "title": "Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "AgentCost",
+        "type": "object"
+      },
+      "AgentCostList": {
+        "description": "A page of costs for a session and its descendants; `data` lists `AgentCost`.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/AgentCost"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Id"
+          },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "title": "AgentCostList",
+        "type": "object"
+      },
       "AgentDetailObject": {
         "description": "Agent summary with caller ownership for management actions.",
         "properties": {
@@ -1358,6 +1446,39 @@
         "title": "ClientTaskCancelEvent",
         "type": "object"
       },
+      "CloneRepositoryRequest": {
+        "description": "Request body for `POST /v1/hosts/{host_id}/repositories/clone`.",
+        "properties": {
+          "branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional branch to check out, e.g. `\"main\"`; `None` clones the remote default.",
+            "title": "Branch"
+          },
+          "path": {
+            "description": "Absolute or tilde-prefixed destination that must not exist yet, e.g. `\"~/code/app\"`. Its parent folder must already exist.",
+            "title": "Path",
+            "type": "string"
+          },
+          "url": {
+            "description": "Clone URL, e.g. `\"https://git.example.com/team/app.git\"`. Must not embed credentials.",
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "path"
+        ],
+        "title": "CloneRepositoryRequest",
+        "type": "object"
+      },
       "CodexGoalObject": {
         "description": "Current Codex goal state for a Codex-native session.\n\nMirrors Codex app-server's `ThreadGoal` shape using Omnigent's\nsnake-case API convention. `created_at` and `updated_at` are optional\nbecause older app-server documentation examples omit them even though the\ncurrent protocol includes them.",
         "properties": {
@@ -1439,6 +1560,32 @@
           "time_used_seconds"
         ],
         "title": "CodexGoalObject",
+        "type": "object"
+      },
+      "CodexGoalReadResponse": {
+        "description": "Goal read with explicit availability from the native backend.",
+        "properties": {
+          "available": {
+            "description": "Whether the backend confirmed the goal, including its absence. An unavailable read must not replace the caller's snapshot.",
+            "title": "Available",
+            "type": "boolean"
+          },
+          "goal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CodexGoalObject"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "goal",
+          "available"
+        ],
+        "title": "CodexGoalReadResponse",
         "type": "object"
       },
       "CodexGoalResponse": {
@@ -2208,6 +2355,20 @@
             "title": "Execution Target",
             "type": "string"
           },
+          "first_run_at": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "format": "int64",
+                "maximum": 253402300799.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Run At"
+          },
           "host_id": {
             "anyOf": [
               {
@@ -2219,6 +2380,15 @@
               }
             ],
             "title": "Host Id"
+          },
+          "kind": {
+            "default": "automation",
+            "enum": [
+              "automation",
+              "reminder"
+            ],
+            "title": "Kind",
+            "type": "string"
           },
           "max_cost_usd": {
             "anyOf": [
@@ -2395,6 +2565,36 @@
           "handler"
         ],
         "title": "CreateSessionPolicyRequest",
+        "type": "object"
+      },
+      "CreateWorkflowRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `POST /v1/workflows`.",
+        "properties": {
+          "description": {
+            "description": "What the workflow is for, at most 2,000 characters and 2,000 stored bytes after compression and the deployment's storage envelope.",
+            "title": "Description",
+            "type": "string"
+          },
+          "name": {
+            "description": "One line of at most 80 characters, unique among the caller's workflows.",
+            "title": "Name",
+            "type": "string"
+          },
+          "steps": {
+            "description": "Empty or omitted to create a draft. Otherwise a graph with unique step IDs, dependencies inside it, no cycles, and at most 100 steps.",
+            "items": {
+              "$ref": "#/components/schemas/WorkflowStep"
+            },
+            "title": "Steps",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "description"
+        ],
+        "title": "CreateWorkflowRequest",
         "type": "object"
       },
       "CreatedEvent": {
@@ -3564,6 +3764,12 @@
       "GrantPermissionRequest": {
         "description": "Request body for `PUT /v1/sessions/{id}/permissions`.",
         "properties": {
+          "ensure_minimum": {
+            "default": false,
+            "description": "Preserve a stronger existing grant atomically.",
+            "title": "Ensure Minimum",
+            "type": "boolean"
+          },
           "level": {
             "description": "Numeric permission level: `1` = read, `2` = edit, `3` = manage.",
             "format": "int64",
@@ -5813,6 +6019,332 @@
         "title": "ProjectOrderResponse",
         "type": "object"
       },
+      "ProjectSessionCreateRequest": {
+        "description": "Project-opted create shape whose agent may be filled by the server.\n\nThe public legacy `SessionCreateRequest` deliberately keeps\n`agent_id` required so requests without `project_id` retain their exact\nvalidation and OpenAPI contract.",
+        "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Agent Id"
+          },
+          "cost_control_mode_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Cost Control Mode Override"
+          },
+          "git": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionGitOptions"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "harness_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Harness Override"
+          },
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Host Id"
+          },
+          "host_type": {
+            "default": "external",
+            "enum": [
+              "external",
+              "managed"
+            ],
+            "title": "Host Type",
+            "type": "string"
+          },
+          "inference_configuration_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Inference Configuration Revision"
+          },
+          "initial_input": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionStartupInput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "initial_items": {
+            "items": {
+              "$ref": "#/components/schemas/SessionEventInput"
+            },
+            "title": "Initial Items",
+            "type": "array"
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Labels",
+            "type": "object"
+          },
+          "mcp_registry_services": {
+            "items": {
+              "pattern": "^[a-z][a-z0-9_-]{0,39}$",
+              "type": "string"
+            },
+            "maxItems": 40,
+            "title": "Mcp Registry Services",
+            "type": "array"
+          },
+          "model_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Model Override"
+          },
+          "parent_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Parent Session Id"
+          },
+          "permission_mode": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Permission Mode"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Project Id"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reasoning Effort"
+          },
+          "sandbox_profile_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sandbox Profile Id"
+          },
+          "sandbox_profile_revision": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sandbox Profile Revision"
+          },
+          "sandbox_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sandbox Provider"
+          },
+          "sibling_source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sibling Source Id"
+          },
+          "smart_routing_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Smart Routing Message"
+          },
+          "sub_agent_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sub Agent Name"
+          },
+          "subagent_routing_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Subagent Routing Override"
+          },
+          "terminal_launch_args": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Terminal Launch Args"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Title"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workspace"
+          },
+          "workspaces": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workspaces"
+          }
+        },
+        "title": "ProjectSessionCreateRequest",
+        "type": "object"
+      },
       "PullRequestCommentAnchor": {
         "description": "Immutable PR coordinates for a session-only review comment.",
         "properties": {
@@ -6684,7 +7216,7 @@
                 "type": "null"
               }
             ],
-            "description": "Sandbox provider being launched, e.g. `\"arclet\"`, or `None` when unknown.",
+            "description": "Sandbox provider being launched, or `None` when unknown.",
             "title": "Provider"
           },
           "stage": {
@@ -6998,6 +7530,11 @@
             "title": "Scheduled Task Mcp Services",
             "type": "boolean"
           },
+          "scheduled_task_one_time": {
+            "default": false,
+            "title": "Scheduled Task One Time",
+            "type": "boolean"
+          },
           "scheduled_task_projects": {
             "default": false,
             "title": "Scheduled Task Projects",
@@ -7075,6 +7612,11 @@
             "title": "Session Fork Workspaces",
             "type": "boolean"
           },
+          "session_journal": {
+            "default": false,
+            "title": "Session Journal",
+            "type": "boolean"
+          },
           "session_list_scoped_archives": {
             "default": true,
             "title": "Session List Scoped Archives",
@@ -7150,6 +7692,11 @@
           },
           "smart_routing_sources": {
             "$ref": "#/components/schemas/SmartRoutingSourcesInfo"
+          },
+          "workflows": {
+            "default": false,
+            "title": "Workflows",
+            "type": "boolean"
           }
         },
         "required": [
@@ -7215,6 +7762,7 @@
             "session.heartbeat": "#/components/schemas/SessionHeartbeatEvent",
             "session.input.consumed": "#/components/schemas/SessionInputConsumedEvent",
             "session.interrupted": "#/components/schemas/SessionInterruptedEvent",
+            "session.journal.appended": "#/components/schemas/SessionJournalAppendedEvent",
             "session.mcp_startup": "#/components/schemas/SessionMcpStartupEvent",
             "session.model": "#/components/schemas/SessionModelEvent",
             "session.model_options": "#/components/schemas/SessionModelOptionsEvent",
@@ -7311,6 +7859,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionChildSessionUpdatedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionJournalAppendedEvent"
           },
           {
             "$ref": "#/components/schemas/SessionChangedFilesInvalidatedEvent"
@@ -7871,6 +8422,573 @@
         "title": "SessionContentBlock",
         "type": "object"
       },
+      "SessionCreateMetadata": {
+        "additionalProperties": false,
+        "description": "Metadata JSON part for multipart `POST /v1/sessions`.\n\nThe uploaded agent tarball supplies the agent spec. This JSON\npart carries only session-level metadata so request metadata\ncannot disagree with the agent bundle.",
+        "properties": {
+          "git": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionGitOptions"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional external-host worktree creation or binding options."
+          },
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional host to launch the runner on, e.g. `\"host_a1b2c3d4...\"`. When set, the server generates a binding token, writes the expected runner_id to the session row, and sends a `host.launch_runner` frame to the host. `None` for CLI-initiated sessions where the caller manages runner spawning. With `host_type: \"managed\"` it instead names the NEW sandbox host (32 lowercase hex, as on the JSON create) and is moved to `requested_host_id`.",
+            "title": "Host Id"
+          },
+          "host_type": {
+            "default": "external",
+            "description": "How the session's host is obtained \u2014 `\"external\"` (the default: the caller manages the runner, e.g. a local `omnigent run`) or `\"managed\"` (the server provisions a sandbox host). The uploaded bundle's session-scoped agent runs on the provisioned sandbox; its spec is fetched by the managed runner over its tunnel, same as any session-scoped agent.",
+            "enum": [
+              "external",
+              "managed"
+            ],
+            "title": "Host Type",
+            "type": "string"
+          },
+          "inference_configuration_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Inference Configuration Revision"
+          },
+          "initial_input": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionStartupInput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Initial guardrails labels to set on the session. Empty dict (the default) starts with no labels.",
+            "title": "Labels",
+            "type": "object"
+          },
+          "mcp_registry_services": {
+            "items": {
+              "pattern": "^[a-z][a-z0-9_-]{0,39}$",
+              "type": "string"
+            },
+            "maxItems": 40,
+            "title": "Mcp Registry Services",
+            "type": "array"
+          },
+          "model_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional per-session LLM model override, e.g. `\"databricks-claude-sonnet-4-6\"`; the same session-level field as the JSON create's `model_override`, so the bundle's model stays its default. Validated against the shared model-id charset. `None` means use the agent default.",
+            "title": "Model Override"
+          },
+          "parent_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional parent session id, e.g. `\"conv_abc123\"`. When set, the new session is created as a sub-agent child of that session (`kind=\"sub_agent\"`) and inherits the parent's runner binding for co-location. The caller must have READ access to the parent. `None` creates a top-level session.",
+            "title": "Parent Session Id"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Project Id"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional per-session reasoning-effort hint. Accepted metadata values are `\"none\"`, `\"minimal\"`, `\"low\"`, `\"medium\"`, `\"high\"`, `\"xhigh\"`, `\"max\"`, and `\"ultra\"`. Provider-specific support is validated when a turn executes. `None` means use the agent default.",
+            "title": "Reasoning Effort"
+          },
+          "sandbox_profile_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sandbox Profile Id"
+          },
+          "sandbox_profile_revision": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sandbox Profile Revision"
+          },
+          "sandbox_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Which configured sandbox provider to provision on `host_type: \"managed\"` (one of the server's `sandbox_providers`); `None` takes the server's first. Only valid with `host_type: \"managed\"`.",
+            "title": "Sandbox Provider"
+          },
+          "sibling_source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sibling Source Id"
+          },
+          "terminal_launch_args": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional pass-through CLI args for a native terminal wrapper (claude / codex), e.g. `[\"--dangerously-skip-permissions\"]`. Set at create-time so the runner has them before it boots. Bounds (count / length) are validated server-side. `None` for non-native sessions. See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.",
+            "title": "Terminal Launch Args"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional human-readable title for the session, e.g. `\"debugging auth flow\"`.",
+            "title": "Title"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Absolute path on the host where the runner should start, e.g. `\"/Users/corey/universe/src/foo\"`. Required when `host_id` is set; validated against the uploaded agent's `os_env.cwd` boundary at session create (per designs/SESSION_WORKSPACE_SELECTION.md). Optional otherwise.",
+            "title": "Workspace"
+          },
+          "workspaces": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Repository URLs to clone into a managed sandbox.",
+            "title": "Workspaces"
+          }
+        },
+        "title": "SessionCreateMetadata",
+        "type": "object"
+      },
+      "SessionCreateRequest": {
+        "description": "Legacy create shape, preserving required-string `agent_id`.",
+        "properties": {
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "cost_control_mode_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Cost Control Mode Override"
+          },
+          "git": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionGitOptions"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "harness_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Harness Override"
+          },
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Host Id"
+          },
+          "host_type": {
+            "default": "external",
+            "enum": [
+              "external",
+              "managed"
+            ],
+            "title": "Host Type",
+            "type": "string"
+          },
+          "inference_configuration_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Inference Configuration Revision"
+          },
+          "initial_input": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionStartupInput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "initial_items": {
+            "items": {
+              "$ref": "#/components/schemas/SessionEventInput"
+            },
+            "title": "Initial Items",
+            "type": "array"
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Labels",
+            "type": "object"
+          },
+          "mcp_registry_services": {
+            "items": {
+              "pattern": "^[a-z][a-z0-9_-]{0,39}$",
+              "type": "string"
+            },
+            "maxItems": 40,
+            "title": "Mcp Registry Services",
+            "type": "array"
+          },
+          "model_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Model Override"
+          },
+          "parent_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Parent Session Id"
+          },
+          "permission_mode": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Permission Mode"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Project Id"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reasoning Effort"
+          },
+          "sandbox_profile_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sandbox Profile Id"
+          },
+          "sandbox_profile_revision": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sandbox Profile Revision"
+          },
+          "sandbox_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sandbox Provider"
+          },
+          "sibling_source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sibling Source Id"
+          },
+          "smart_routing_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Smart Routing Message"
+          },
+          "sub_agent_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sub Agent Name"
+          },
+          "subagent_routing_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Subagent Routing Override"
+          },
+          "terminal_launch_args": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Terminal Launch Args"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Title"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workspace"
+          },
+          "workspaces": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workspaces"
+          }
+        },
+        "required": [
+          "agent_id"
+        ],
+        "title": "SessionCreateRequest",
+        "type": "object"
+      },
       "SessionCreatedEvent": {
         "description": "A child (sub-agent) session was spawned from this session.\n\nEmitted by `omnigent/tools/builtins/spawn.py:_spawn_one`\nonto the **parent** session's conversation stream after the\nchild conversation row is created and the child task has been\nstarted. Per the session-rearchitecture spec \u00a73 (\"Event types\nand direction\") and \u00a77 (\"Flow: client interacts with\nsub-agent\"), this lets clients watching the parent session's\nSSE subscribe directly to the child's stream without polling\nhistory for the tunneled `function_call` item.\n\nThe wire shape is FLAT (not enveloped):\n`{\"type\": \"session.created\", \"conversation_id\": <parent>, \"child_session_id\": <child>, \"agent_id\": <agent or None>, \"parent_session_id\": <parent>, \"sequence_number\": null}`.\n\nThe existing tunneled `function_call` ConversationItem\n(carried inside `OutputItemDoneEvent`) is retained\nfor compatibility \u2014 clients that don't yet implement the\n\"subscribe to child stream\" pattern can keep rendering sub-\nagent calls from the parent's persistent history.",
         "properties": {
@@ -8057,6 +9175,84 @@
           "type"
         ],
         "title": "SessionErrorItem",
+        "type": "object"
+      },
+      "SessionEventInput": {
+        "description": "A single client-submitted event/input item for a session.\n\nUsed both as an element of `initial_items` on session\ncreation and as the body of `POST /v1/sessions/{id}/events`.\nCarries a discriminator (`type`) and a free-form `data`\npayload whose shape is interpreted by the route layer based\non `type` (e.g. user message, function-call output,\napproval, interrupt).",
+        "properties": {
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional internal attribution actor for runner- originated events that are triggered by a prior human turn.",
+            "title": "Created By"
+          },
+          "data": {
+            "additionalProperties": true,
+            "description": "Type-specific payload. Shape varies by `type`; for `\"message\"` this looks like `{\"role\": \"user\", \"content\": [{\"type\": \"input_text\", \"text\": \"Hello\"}]}`. For `\"interrupt\"` this is typically `{}`.",
+            "title": "Data",
+            "type": "object"
+          },
+          "model_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional per-event LLM model override used when this event starts a fresh agent turn. Distinct from the session's bound agent; it substitutes for the agent spec's `llm.model` for that turn.",
+            "title": "Model Override"
+          },
+          "tools": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional OpenAI function-tool dicts registered when this event creates a new task. Mirrors `CreateResponseRequest.tools`, e.g. `[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"...\", \"parameters\": {...}}}]`. Ignored when the event steers into an active task: that task's tools are fixed at start time.",
+            "title": "Tools"
+          },
+          "type": {
+            "description": "Discriminator for the event/input kind, e.g. `\"message\"`, `\"function_call_output\"`, `\"interrupt\"`.",
+            "title": "Type",
+            "type": "string"
+          },
+          "workflow_run_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional plan-entry ID limiting a user message to that workflow run. A superseded run is rejected with HTTP 409.",
+            "title": "Workflow Run Id"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "title": "SessionEventInput",
         "type": "object"
       },
       "SessionFamily": {
@@ -8783,6 +9979,322 @@
         "title": "SessionItemList",
         "type": "object"
       },
+      "SessionJournalAppendRequest": {
+        "additionalProperties": false,
+        "description": "Body of `POST /v1/sessions/{id}/journal`, sent by the session's runner.",
+        "properties": {
+          "content": {
+            "additionalProperties": true,
+            "description": "The kind's fields, e.g. `{\"status\": \"done\", \"text\": \"PR merged\"}`.",
+            "title": "Content",
+            "type": "object"
+          },
+          "idempotency_key": {
+            "description": "Names the write, e.g. `\"tool:<tool call ID>\"`; a retry with the same key returns the first attempt's entry.",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "kind": {
+            "description": "The kind the agent writes.",
+            "enum": [
+              "status",
+              "note",
+              "plan"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "start_run": {
+            "default": true,
+            "description": "False when saving the current plan as a workflow, preserving its progress; True when invoking a saved workflow again.",
+            "title": "Start Run",
+            "type": "boolean"
+          },
+          "step": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The plan step the entry is about.",
+            "title": "Step"
+          },
+          "workflow_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The saved workflow associated with a plan.",
+            "title": "Workflow Id"
+          }
+        },
+        "required": [
+          "kind",
+          "content",
+          "idempotency_key"
+        ],
+        "title": "SessionJournalAppendRequest",
+        "type": "object"
+      },
+      "SessionJournalAppendedEvent": {
+        "description": "An entry was appended to the session's journal.\n\nTransient: the journal itself is the source of truth, and a client that\nreconnects catches up with `GET \u2026/journal?order=asc&after=<last entry ID>`.",
+        "properties": {
+          "conversation_id": {
+            "description": "The session whose journal grew.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "entry": {
+            "$ref": "#/components/schemas/SessionJournalEntry",
+            "description": "The new entry."
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.journal.appended",
+            "description": "Always `\"session.journal.appended\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "entry"
+        ],
+        "title": "SessionJournalAppendedEvent",
+        "type": "object"
+      },
+      "SessionJournalAuthor": {
+        "description": "Who wrote a journal entry, derived from its kind and, for plans, its source.",
+        "properties": {
+          "type": {
+            "description": "`\"agent\"` for the session's agent, `\"omnigent\"` for entries Omnigent writes.",
+            "enum": [
+              "agent",
+              "omnigent"
+            ],
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "title": "SessionJournalAuthor",
+        "type": "object"
+      },
+      "SessionJournalEntry": {
+        "description": "One entry of a session's journal.",
+        "properties": {
+          "author": {
+            "$ref": "#/components/schemas/SessionJournalAuthor"
+          },
+          "content": {
+            "additionalProperties": true,
+            "description": "e.g. `{\"status\": \"done\", \"text\": \"PR merged\"}` for a status, `{\"body\": \"\u2026\"}` for a note, or `{\"version\": 2, \"source\": \"agent\", \"steps\": [...]}` for a plan.",
+            "title": "Content",
+            "type": "object"
+          },
+          "created_at": {
+            "description": "Unix epoch seconds when it was appended.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "id": {
+            "description": "Entry ID, a bare 32-character hex UUID.",
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "description": "The entry kind; `content` holds its fields.",
+            "enum": [
+              "status",
+              "note",
+              "dispatch",
+              "dispatch_result",
+              "plan",
+              "plan_status"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "position": {
+            "description": "The entry's place in the journal: 0, 1, 2, \u2026",
+            "format": "int64",
+            "title": "Position",
+            "type": "integer"
+          },
+          "scheduled_task_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The automation run the session was serving, or `None`.",
+            "title": "Scheduled Task Run Id"
+          },
+          "step": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The plan step it is about, e.g. `\"propose\"`, or `None`.",
+            "title": "Step"
+          },
+          "workflow_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The saved workflow the entry was written under, or `None`: set on the plan that starts a run of it, and on the statuses and notes written while that plan is current.",
+            "title": "Workflow Id"
+          }
+        },
+        "required": [
+          "id",
+          "position",
+          "created_at",
+          "author",
+          "kind",
+          "content"
+        ],
+        "title": "SessionJournalEntry",
+        "type": "object"
+      },
+      "SessionJournalInputRequest": {
+        "additionalProperties": false,
+        "description": "Body of `POST /v1/sessions/{id}/journal/input-requests`, sent by the session's runner.",
+        "properties": {
+          "idempotency_key": {
+            "description": "Names the request, e.g. `\"tool:<tool call ID>\"`; a retry with the same key reuses the first attempt's status and question.",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "questions": {
+            "description": "1 to 3 questions, each with a `question`, a short `header`, 2 to 4 `options` (`label`, optional `description`) and an optional `recommended` option label.",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Questions",
+            "type": "array"
+          },
+          "step": {
+            "description": "The task in the current plan that waits for the answer, e.g. `\"deploy\"`.",
+            "title": "Step",
+            "type": "string"
+          }
+        },
+        "required": [
+          "step",
+          "questions",
+          "idempotency_key"
+        ],
+        "title": "SessionJournalInputRequest",
+        "type": "object"
+      },
+      "SessionJournalInputRequested": {
+        "description": "Response of `POST /v1/sessions/{id}/journal/input-requests`.",
+        "properties": {
+          "elicitation_id": {
+            "description": "The question's elicitation; the runner waits for its answer.",
+            "title": "Elicitation Id",
+            "type": "string"
+          },
+          "entry": {
+            "$ref": "#/components/schemas/SessionJournalEntry",
+            "description": "The task's `needs_input` status."
+          }
+        },
+        "required": [
+          "entry",
+          "elicitation_id"
+        ],
+        "title": "SessionJournalInputRequested",
+        "type": "object"
+      },
+      "SessionJournalPage": {
+        "description": "One page of a session's journal, for `GET /v1/sessions/{id}/journal`.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/SessionJournalEntry"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Id"
+          },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "title": "SessionJournalPage",
+        "type": "object"
+      },
       "SessionLabelsResponse": {
         "description": "Lightweight response body for `GET /v1/sessions/{id}/labels`.",
         "properties": {
@@ -9301,7 +10813,7 @@
                 "type": "null"
               }
             ],
-            "description": "Id for the new sandbox host, 32 lowercase hex characters, sent only when `GET /v1/info` reports `request_managed_sandbox_host_id`; `None` lets the server mint one.",
+            "description": "Id for the new sandbox host, 32 lowercase hex characters; `None` lets the server mint one.",
             "title": "Host Id"
           },
           "sandbox_provider": {
@@ -11477,7 +12989,7 @@
               }
             ],
             "default": null,
-            "description": "Sandbox provider being launched, e.g. `\"arclet\"`, or `None` when unknown.",
+            "description": "Sandbox provider being launched, or `None` when unknown.",
             "title": "Provider"
           },
           "sequence_number": {
@@ -11617,6 +13129,78 @@
           "type"
         ],
         "title": "SessionSlashCommandItem",
+        "type": "object"
+      },
+      "SessionStartupInput": {
+        "description": "A first user input the server accepts durably before provisioning a host.",
+        "properties": {
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Created By"
+          },
+          "data": {
+            "additionalProperties": true,
+            "title": "Data",
+            "type": "object"
+          },
+          "model_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Model Override"
+          },
+          "tools": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tools"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          },
+          "workflow_run_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workflow Run Id"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "title": "SessionStartupInput",
         "type": "object"
       },
       "SessionStatusEvent": {
@@ -13719,6 +15303,65 @@
         "title": "UpdateSessionRequest",
         "type": "object"
       },
+      "UpdateWorkflowRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `PATCH /v1/workflows/{workflow_id}`; `None` keeps a field.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A new description, subject to the same character and stored-byte limits as creation.",
+            "title": "Description"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A new name.",
+            "title": "Name"
+          },
+          "planning_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The private owned session for iterating on the plan.",
+            "title": "Planning Session Id"
+          },
+          "steps": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/WorkflowStep"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "New steps, replacing the old ones.",
+            "title": "Steps"
+          }
+        },
+        "title": "UpdateWorkflowRequest",
+        "type": "object"
+      },
       "UpsertMCPServerRequest": {
         "description": "Request body for creating or updating a session agent MCP server.\n\n`env` is still excluded. `headers` is accepted for HTTP servers;\nwhen omitted, existing headers in the bundle are preserved unchanged.",
         "properties": {
@@ -14052,6 +15695,425 @@
           "type"
         ],
         "title": "ValidationError",
+        "type": "object"
+      },
+      "WorkflowDeleted": {
+        "description": "Response for `DELETE /v1/workflows/{workflow_id}`.",
+        "properties": {
+          "deleted": {
+            "const": true,
+            "default": true,
+            "description": "Always `True`.",
+            "title": "Deleted",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "The deleted workflow's ID.",
+            "title": "Id",
+            "type": "string"
+          },
+          "object": {
+            "const": "workflow.deleted",
+            "default": "workflow.deleted",
+            "description": "Discriminator; always `\"workflow.deleted\"`.",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "WorkflowDeleted",
+        "type": "object"
+      },
+      "WorkflowList": {
+        "description": "One page of the caller's workflows by name, for `GET /v1/workflows`.",
+        "properties": {
+          "data": {
+            "description": "The page's workflows, without their steps.",
+            "items": {
+              "$ref": "#/components/schemas/WorkflowSummary"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The page's first workflow ID, or `None` when empty.",
+            "title": "First Id"
+          },
+          "has_more": {
+            "default": false,
+            "description": "Whether another page follows.",
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The page's last workflow ID, retained for older clients.",
+            "title": "Last Id"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Pass it as `after` for the next page. Retains the name boundary if that workflow is renamed or deleted; `None` on the last page.",
+            "title": "Next Cursor"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "description": "Discriminator; always `\"list\"`.",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "title": "WorkflowList",
+        "type": "object"
+      },
+      "WorkflowObject": {
+        "description": "A saved workflow with its steps, the plan a run copies into a journal.",
+        "properties": {
+          "created_at": {
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "is_draft": {
+            "default": false,
+            "title": "Is Draft",
+            "type": "boolean"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "object": {
+            "const": "workflow",
+            "default": "workflow",
+            "title": "Object",
+            "type": "string"
+          },
+          "planning_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The conversation for proposing revisions, separate from runs.",
+            "title": "Planning Session Id"
+          },
+          "steps": {
+            "description": "The workflow's graph.",
+            "items": {
+              "$ref": "#/components/schemas/WorkflowStep"
+            },
+            "title": "Steps",
+            "type": "array"
+          },
+          "updated_at": {
+            "format": "int64",
+            "title": "Updated At",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "description",
+          "created_at",
+          "updated_at",
+          "steps"
+        ],
+        "title": "WorkflowObject",
+        "type": "object"
+      },
+      "WorkflowRun": {
+        "description": "One run of a saved workflow: a session that started it.",
+        "properties": {
+          "archived": {
+            "default": false,
+            "description": "Whether the session is archived.",
+            "title": "Archived",
+            "type": "boolean"
+          },
+          "background_work_running": {
+            "default": false,
+            "description": "Whether background work outlives the session's turn.",
+            "title": "Background Work Running",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "The run's ID: that of the plan entry that started it.",
+            "title": "Id",
+            "type": "string"
+          },
+          "is_current": {
+            "default": false,
+            "description": "Whether this is the session's current run, which can take actions.",
+            "title": "Is Current",
+            "type": "boolean"
+          },
+          "progress": {
+            "$ref": "#/components/schemas/WorkflowRunProgress",
+            "description": "Where the run's steps stand."
+          },
+          "session_id": {
+            "description": "The session that ran it.",
+            "title": "Session Id",
+            "type": "string"
+          },
+          "session_status": {
+            "description": "The session's status, `\"idle\"`, `\"running\"` or `\"failed\"`, including active direct sub-agents.",
+            "enum": [
+              "idle",
+              "running",
+              "failed"
+            ],
+            "title": "Session Status",
+            "type": "string"
+          },
+          "started_at": {
+            "description": "Unix epoch seconds when the run's plan was written.",
+            "format": "int64",
+            "title": "Started At",
+            "type": "integer"
+          },
+          "statuses": {
+            "description": "Each of those steps' newest status entry; a step with none yet is left out.",
+            "items": {
+              "$ref": "#/components/schemas/SessionJournalEntry"
+            },
+            "title": "Statuses",
+            "type": "array"
+          },
+          "steps": {
+            "description": "The steps of the plan that started the run.",
+            "items": {
+              "$ref": "#/components/schemas/WorkflowStep"
+            },
+            "title": "Steps",
+            "type": "array"
+          },
+          "title": {
+            "description": "The session's title; empty when it has none yet.",
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "session_id",
+          "title",
+          "started_at",
+          "session_status",
+          "progress"
+        ],
+        "title": "WorkflowRun",
+        "type": "object"
+      },
+      "WorkflowRunList": {
+        "description": "One page of a saved workflow's runs, newest first, for\n`GET /v1/workflows/{id}/runs`.",
+        "properties": {
+          "data": {
+            "description": "The page's runs in sessions the caller can read.",
+            "items": {
+              "$ref": "#/components/schemas/WorkflowRun"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Pass it as `before` for the next page; `None` on the last page.",
+            "title": "Next Cursor"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "description": "Discriminator; always `\"list\"`.",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "title": "WorkflowRunList",
+        "type": "object"
+      },
+      "WorkflowRunProgress": {
+        "description": "Where a run's steps stand: the steps of the plan that started it, counted\nby their current status in the session.",
+        "properties": {
+          "done": {
+            "default": 0,
+            "description": "Steps done.",
+            "format": "int64",
+            "title": "Done",
+            "type": "integer"
+          },
+          "failed": {
+            "default": 0,
+            "description": "Steps that failed.",
+            "format": "int64",
+            "title": "Failed",
+            "type": "integer"
+          },
+          "needs_input": {
+            "default": 0,
+            "description": "Steps waiting for the user.",
+            "format": "int64",
+            "title": "Needs Input",
+            "type": "integer"
+          },
+          "started": {
+            "default": 0,
+            "description": "Steps in progress.",
+            "format": "int64",
+            "title": "Started",
+            "type": "integer"
+          },
+          "total": {
+            "description": "Steps in that plan, e.g. `5`.",
+            "format": "int64",
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total"
+        ],
+        "title": "WorkflowRunProgress",
+        "type": "object"
+      },
+      "WorkflowStep": {
+        "additionalProperties": false,
+        "description": "One step of a saved workflow, in the journal plan's step format.",
+        "properties": {
+          "depends_on": {
+            "description": "IDs of the steps that must be done before it.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Depends On",
+            "type": "array"
+          },
+          "goal": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What the step achieves, at most 300 characters, or `None`.",
+            "title": "Goal"
+          },
+          "id": {
+            "description": "Stable step ID, e.g. `\"build\"`: lowercase letters, digits, `-` and `_`, starting with a letter or digit; at most 64 characters.",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "description": "One line of at most 80 characters, e.g. `\"Build\"`.",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "WorkflowStep",
+        "type": "object"
+      },
+      "WorkflowSummary": {
+        "description": "A saved workflow as a list page returns it, without its steps.",
+        "properties": {
+          "created_at": {
+            "description": "Unix epoch seconds when it was saved.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "description": {
+            "description": "What the workflow is for.",
+            "title": "Description",
+            "type": "string"
+          },
+          "id": {
+            "description": "Workflow ID, a bare 32-character hex UUID.",
+            "title": "Id",
+            "type": "string"
+          },
+          "is_draft": {
+            "default": false,
+            "description": "Derived from whether the saved plan has no steps.",
+            "title": "Is Draft",
+            "type": "boolean"
+          },
+          "name": {
+            "description": "One line, unique among the owner's workflows.",
+            "title": "Name",
+            "type": "string"
+          },
+          "object": {
+            "const": "workflow",
+            "default": "workflow",
+            "description": "Discriminator; always `\"workflow\"`.",
+            "title": "Object",
+            "type": "string"
+          },
+          "updated_at": {
+            "description": "Unix epoch seconds of the last write.",
+            "format": "int64",
+            "title": "Updated At",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "description",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "WorkflowSummary",
         "type": "object"
       }
     },
@@ -16143,6 +18205,62 @@
         ]
       }
     },
+    "/v1/hosts/{host_id}/repositories/clone": {
+      "post": {
+        "description": "Clone a git repository into a new directory on a host.\n\nUsed by the New project dialog to check out the project's repository\nbefore the project is saved. Owner-scoped like the directory routes.\nThe host refuses to clone into an existing path.\n\n**Parameters**\n\n- `body` \u2014 The clone URL, optional branch, and destination path.\n\n**Returns:** `{\"object\": \"repository\", \"path\": \"<checkout abs path>\"}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 403 if not owned by the caller, 400 on invalid input, 409 when the destination exists or the host predates clone support, 504 on clone timeout, 502 on clone failure or lost contact.",
+        "operationId": "clone_host_repository_v1_hosts__host_id__repositories_clone_post",
+        "parameters": [
+          {
+            "description": "Host identifier, e.g. `\"host_a1b2c3d4...\"`.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloneRepositoryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Clone Host Repository V1 Hosts  Host Id  Repositories Clone Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Clone Host Repository",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
     "/v1/hosts/{host_id}/runners": {
       "post": {
         "description": "Launch a runner on a host for a session.\n\nGenerates a binding token, writes the expected runner_id\nto the session row, sends the launch command to the host,\nand waits for the host's acknowledgement.\n\n**Parameters**\n\n- `body` \u2014 Launch request with `session_id` and `workspace`.\n\n**Returns:** `{\"runner_id\": ..., \"status\": \"launching\"}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 409 if host offline, 403 if caller doesn't own the host, 400 if session already has a runner.",
@@ -17346,8 +19464,24 @@
     },
     "/v1/scheduled-tasks": {
       "get": {
-        "description": "List the caller's scheduled tasks.\n\nLazy-on-read stale backstop: before returning, force-fail any of this\nowner's runs still `running` past the 6h max age (`incomplete`), so\na future Tasks-list \"last-run status\" badge never shows a stale orphan\nas `running`. Pure age check \u2014 one indexed, owner-scoped query for the\nowner's running runs, then a conditional `update_run`; NO per-run\nconversation I/O. Young in-flight runs are untouched, and completion of\na normal run is handled event-driven (the `_publish_status` hook), not\nhere.",
+        "description": "List the caller's scheduled tasks.\n\nLists automations unless *kind* is `all`, so the reminders agents set for\ntheir own sessions stay off the Automations page. There is no reminders-only\nview: this list reads every task the owner has, and a selective filter needs\nan indexed, paginated query first.\n\nLazy-on-read stale backstop: before returning, force-fail any of this\nowner's runs still `running` past the 6h max age (`incomplete`), so\na future Tasks-list \"last-run status\" badge never shows a stale orphan\nas `running`. Pure age check \u2014 one indexed, owner-scoped query for the\nowner's running runs, then a conditional `update_run`; NO per-run\nconversation I/O. Young in-flight runs are untouched, and completion of\na normal run is handled event-driven (the `_publish_status` hook), not\nhere.",
         "operationId": "list_scheduled_tasks_v1_scheduled_tasks_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "default": "automation",
+              "enum": [
+                "automation",
+                "all"
+              ],
+              "title": "Kind",
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -17366,6 +19500,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "List Scheduled Tasks",
@@ -17660,6 +19804,79 @@
           }
         },
         "summary": "Run Scheduled Task Now",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
+    "/v1/scheduled-tasks/{scheduled_task_id}/run-steps": {
+      "get": {
+        "description": "The plan steps of one page of a scheduled task's runs, for their timelines.\n\nPages like `GET /scheduled-tasks/{id}/runs`, most recent first. Each\nrun that wrote a plan lists the steps of its first plan and each step's\nnewest status entry: one run-index lookup per run, then one\nkind-and-step lookup per step. The response is `{\"runs\": [{\"run_id\", \"workflow_id\", \"plan_name\", \"is_current\", \"steps\", \"statuses\"}], \"next_cursor\"}`.",
+        "operationId": "list_scheduled_task_run_steps_v1_scheduled_tasks__scheduled_task_id__run_steps_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Scheduled Task Run Steps V1 Scheduled Tasks  Scheduled Task Id  Run Steps Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Scheduled Task Run Steps",
         "tags": [
           "scheduled_tasks"
         ]
@@ -17991,6 +20208,186 @@
       "post": {
         "description": "Create a session.\n\n`application/json` preserves the existing contract: bind to\nan already-registered agent by `agent_id` and return the full\nsession snapshot. `multipart/form-data` is the Alpha\nrunner-state create path: the request carries a JSON\n`metadata` part and a `bundle` file part, then the server\nstores the bundle and creates the conversation row plus\nsession-scoped agent row in one database transaction.\n\n**Returns:** `SessionResponse` for JSON create, or `CreatedSessionResponse` for bundled create.\n\n**Raises**\n\n- `OmnigentError` \u2014 If metadata, bundle, or agent lookup validation fails, artifact storage is unavailable, or database creation fails.",
         "operationId": "create_session_v1_sessions_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "allOf": [
+                      {
+                        "$ref": "#/components/schemas/SessionCreateRequest"
+                      },
+                      {
+                        "properties": {
+                          "project_id": {
+                            "type": "null"
+                          }
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "allOf": [
+                      {
+                        "$ref": "#/components/schemas/ProjectSessionCreateRequest"
+                      },
+                      {
+                        "properties": {
+                          "project_id": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "project_id"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            "multipart/form-data": {
+              "encoding": {
+                "bundle": {
+                  "contentType": "application/gzip"
+                },
+                "metadata": {
+                  "contentType": "application/json"
+                }
+              },
+              "schema": {
+                "description": "A bundle selects bundled creation, even with initial_files. Without a bundle, initial_files selects the JSON create contract. Send metadata as JSON text in a part without a filename.",
+                "oneOf": [
+                  {
+                    "dependentSchemas": {
+                      "initial_files": {
+                        "properties": {
+                          "metadata": {
+                            "properties": {
+                              "host_type": {
+                                "const": "managed"
+                              },
+                              "initial_input": {
+                                "$ref": "#/components/schemas/SessionStartupInput"
+                              }
+                            },
+                            "required": [
+                              "host_type",
+                              "initial_input"
+                            ]
+                          }
+                        }
+                      }
+                    },
+                    "properties": {
+                      "bundle": {
+                        "contentMediaType": "application/gzip",
+                        "description": "Gzipped tar of the agent directory.",
+                        "format": "binary",
+                        "type": "string"
+                      },
+                      "initial_files": {
+                        "description": "Files attached to initial_input, sent as repeated initial_files parts.",
+                        "items": {
+                          "format": "binary",
+                          "type": "string"
+                        },
+                        "minItems": 1,
+                        "type": "array"
+                      },
+                      "metadata": {
+                        "$ref": "#/components/schemas/SessionCreateMetadata"
+                      }
+                    },
+                    "required": [
+                      "metadata",
+                      "bundle"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "not": {
+                      "required": [
+                        "bundle"
+                      ]
+                    },
+                    "properties": {
+                      "initial_files": {
+                        "description": "Files attached to initial_input, sent as repeated initial_files parts.",
+                        "items": {
+                          "format": "binary",
+                          "type": "string"
+                        },
+                        "minItems": 1,
+                        "type": "array"
+                      },
+                      "metadata": {
+                        "allOf": [
+                          {
+                            "anyOf": [
+                              {
+                                "allOf": [
+                                  {
+                                    "$ref": "#/components/schemas/SessionCreateRequest"
+                                  },
+                                  {
+                                    "properties": {
+                                      "project_id": {
+                                        "type": "null"
+                                      }
+                                    }
+                                  }
+                                ]
+                              },
+                              {
+                                "allOf": [
+                                  {
+                                    "$ref": "#/components/schemas/ProjectSessionCreateRequest"
+                                  },
+                                  {
+                                    "properties": {
+                                      "project_id": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "project_id"
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          },
+                          {
+                            "properties": {
+                              "host_type": {
+                                "const": "managed"
+                              },
+                              "initial_input": {
+                                "$ref": "#/components/schemas/SessionStartupInput"
+                              }
+                            },
+                            "required": [
+                              "host_type",
+                              "initial_input"
+                            ]
+                          }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "metadata",
+                      "initial_files"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "201": {
             "content": {
@@ -18652,6 +21049,90 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/agent_costs": {
+      "get": {
+        "description": "List display costs for a session and the sub-agents beneath it.\n\nSubtree totals come from one spawn-tree read (ids, parents and usage\nonly) bounded like `child_sessions?descendants=true`; a tree past\nthat cap reports no costs. READ on the session covers its\ndescendants, as for `child_sessions`.\n\n**Returns:** A page of `AgentCostList` in spawn-tree order.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 without READ; 404 when no session exists.\n- `StaleCursorError` \u2014 If *after* is not an agent of the subtree, or the tree outgrew the read cap since the page it came from.",
+        "operationId": "list_agent_costs_v1_sessions__session_id__agent_costs_get",
+        "parameters": [
+          {
+            "description": "Session whose subtree to report, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Maximum agents in the page (1-1000, default 100).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Id of the last agent of the previous page, or `None`.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentCostList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The `after`/`before` cursor names an item that no longer exists (it was deleted, or archived out of the filtered set) so the keyset bound cannot be resolved. The `error.code` is `stale_cursor`. Enumeration cannot continue from this cursor: restart from the first page, without a cursor."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Agent Costs",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/auto-title": {
       "post": {
         "description": "Replace the deterministic first-message title when still current.",
@@ -18920,7 +21401,7 @@
         ]
       },
       "get": {
-        "description": "Read the current Codex app-server goal for a Codex-native session.\n\n**Returns:** Current Codex goal state, or `goal=None` when no goal is set.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 for non-Codex sessions, 404 for missing sessions, or 503 when no live Codex runner can read the goal.",
+        "description": "Read the current Codex app-server goal for a Codex-native session.\n\n**Returns:** Current Codex goal state and availability. Legacy runner replies leave availability unspecified. `X-Omnigent-Codex-Goal-Read: strict` opts into unavailable-read errors. Background reads report `available=False` for absent or idle runners. Strict reads return 503 when no live runner is available and 502 for malformed runner replies; structured runner errors preserve their status.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 for non-Codex sessions or 404 for missing sessions.",
         "operationId": "get_codex_goal_v1_sessions__session_id__codex_goal_get",
         "parameters": [
           {
@@ -18939,7 +21420,15 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CodexGoalResponse"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/CodexGoalReadResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CodexGoalResponse"
+                    }
+                  ],
+                  "title": "Response Get Codex Goal V1 Sessions  Session Id  Codex Goal Get"
                 }
               }
             },
@@ -19544,6 +22033,251 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/journal": {
+      "get": {
+        "description": "One page of the session's journal by position; requires read access.\n\n`after` continues in the sort order and `before` goes against it,\nboth taking entry IDs, as for conversation items.",
+        "operationId": "list_session_journal_v1_sessions__session_id__journal_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Before"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "default": "asc",
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "title": "Order",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "status",
+                    "note",
+                    "dispatch",
+                    "dispatch_result",
+                    "plan",
+                    "plan_status"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "step",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Step"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionJournalPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Journal",
+        "tags": [
+          "session_journal"
+        ]
+      },
+      "post": {
+        "description": "Append an entry written by the session's agent; only its runner calls this.",
+        "operationId": "append_session_journal_entry_v1_sessions__session_id__journal_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionJournalAppendRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionJournalEntry"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Append Session Journal Entry",
+        "tags": [
+          "session_journal"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/journal/input-requests": {
+      "post": {
+        "description": "Mark a task waiting for the user and ask them; only the session's runner calls this.\n\nThe task gets a `needs_input` status naming the first question, and the\nquestions go out as an elicitation with the web's question form. A retry\nwith the same idempotency key reuses the status and the elicitation ID.",
+        "operationId": "request_session_journal_input_v1_sessions__session_id__journal_input_requests_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionJournalInputRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionJournalInputRequested"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Request Session Journal Input",
+        "tags": [
+          "session_journal"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/labels": {
       "get": {
         "description": "Return only the labels for a session.\n\nNative runner bridge setup needs labels during harness spawn,\nbut the full session snapshot also loads history, skills,\nrunner status, and agent metadata. This endpoint keeps that\nspawn-time dependency to one authorized conversation read.\n\n**Returns:** The session id and labels.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists.",
@@ -19906,7 +22640,7 @@
         ]
       },
       "put": {
-        "description": "Grant or update a permission on a session.\n\nRequires manage-level access. Upserts the grant \u2014 can\nupgrade or downgrade an existing level. Auto-creates the\ngrantee user if they don't exist yet.\n\n**Parameters**\n\n- `body` \u2014 The grant request with `user_id` and `level`.\n\n**Returns:** The resulting `PermissionObject`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access, 401 if unauthenticated.",
+        "description": "Grant or update a permission on a session.\n\nRequires manage-level access. Upserts the grant \u2014 can\nupgrade or downgrade an existing level unless `ensure_minimum`\npreserves stronger access. Auto-creates the\ngrantee user if they don't exist yet.\n\n**Parameters**\n\n- `body` \u2014 The grant request with `user_id` and `level`.\n\n**Returns:** The resulting `PermissionObject`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access, 401 if unauthenticated.",
         "operationId": "grant_permission_v1_sessions__session_id__permissions_put",
         "parameters": [
           {
@@ -23527,6 +26261,106 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/workspace/direct-access": {
+      "post": {
+        "description": "Give the session owner a short-lived token for its host's workspace socket.\n\nThe owner's desktop app, on the same machine as the host, uses it to call\nthe workspace API without a server round trip. Unconfined sessions only:\nthe host reads the workspace itself and applies no sandbox's hidden paths.\nAny refusal leaves the client on the server route.",
+        "operationId": "create_workspace_direct_access_v1_sessions__session_id__workspace_direct_access_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Workspace Direct Access",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/workspace/{service}/{method}": {
+      "post": {
+        "description": "Serve the workspace API to any client, answered by the session's host.\n\nSame read gate as the file routes; the API never takes absolute paths.\nSide chats and sub-agents use the host and workspace of the session that\nowns them. Unconfined sessions only, because the host applies no sandbox's\nhidden paths. A host on another replica gets the REST wrong-replica error,\nso the client's fetch re-addresses it; other refusals are Connect errors.",
+        "operationId": "call_workspace_api_v1_sessions__session_id__workspace__service___method__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "service",
+            "required": true,
+            "schema": {
+              "title": "Service",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "method",
+            "required": true,
+            "schema": {
+              "title": "Method",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Call Workspace Api",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions/{source_id}/fork": {
       "post": {
         "description": "Fork an existing session into a new session.\n\nDeep-copies the source session's conversation items and\nclones the agent into a new session. When `body.agent_id`\nis set, the fork binds that agent instead of the\nsource's \u2014 switching harness (e.g. Claude-SDK \u2192 Claude Code,\nor Claude \u2192 Codex). The source's model settings carry over\nonly within the same provider family; a same-family native\ntarget also carries conversation history (the runner rebuilds\nits transcript). The REPL/CLI binds the fork to its runner via\n`PATCH /v1/sessions/{id}` after creation.\n\nWhen `body.up_to_response_id` is set, only history up to and\nincluding that response is copied into the fork (a \"fork from\nthis response\"); a native target then rebuilds its transcript\nfrom the truncated items instead of resuming the source's full\nnative transcript.\n\nThe dialog's run-config picks (`body.model_override`,\n`body.reasoning_effort`, `body.terminal_launch_args` \u2014 the\npermission-/approval-mode selector) override what the fork would\notherwise inherit. Each is opt-in: a field omitted from the request\nkeeps the inherited value (model/effort within the same provider\nfamily; launch args on a same-agent fork), while a field present\nwins \u2014 a clear alias (`\"default\"`) resets to the bound agent's\ndefault, and an explicit launch-args list also drops the source's\ncopied permission-mode / codex-bypass labels so they can't shadow\nthe freshly chosen mode.\n\nA sub-agent source is allowed, which is how a sub-agent is\npromoted to a session of its own: the fork is always a fresh\ntop-level conversation (no parent, its own spawn-tree root, its\nown owner grant), so it appears in the sidebar and outlives the\nparent. The source keeps running under its parent untouched,\nand the fork does not adopt the source's own children.\n\n`body.host_type: \"managed\"` gives the fork its own\nserver-provisioned sandbox instead of leaving it unbound for the\ncaller to bind a host to. It schedules the same background launch\na managed create does \u2014 this POST returns before the sandbox\nexists \u2014 and the sandbox is registered to the FORKING caller, not\nto the source session's owner. The fork's workspace is the\nrepository named by `body.workspace`, or the one the source\nrecorded when that field is omitted. `body.host_id` names the\nfork's new sandbox host, as on a managed create.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionForkRequest`.\n\n**Returns:** A `SessionResponse` describing the newly created fork (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if *source_id* does not exist or `body.agent_id` names no agent; 403/404 if the caller lacks read access on the source, or on the session that owns a session-scoped `body.agent_id`; 403 for a side chat unless the caller owns the source's root session; 400 if the source has no agent binding, `body.up_to_response_id` names no response in the source session, or a managed fork asks for a sandbox this server has not configured; 409 if `body.host_id` is already in use; 410 if the source's agent was removed or a required bundle copy finds its source missing.",
@@ -24052,6 +26886,335 @@
         "summary": "Update Alert",
         "tags": [
           "usage"
+        ]
+      }
+    },
+    "/v1/workflows": {
+      "get": {
+        "description": "List the caller's workflows by name, without their steps.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 400 for an invalid cursor or a foreign workflow ID.",
+        "operationId": "list_workflows_v1_workflows_get",
+        "parameters": [
+          {
+            "description": "Page size, e.g. `50`.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The previous page's `next_cursor`; legacy workflow IDs also work.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "description": "Only the workflow with this exact name, for `/workflow <name>`.",
+            "in": "query",
+            "name": "name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Name"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Workflows",
+        "tags": [
+          "workflows"
+        ]
+      },
+      "post": {
+        "description": "Save a workflow owned by the caller.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 400 for an invalid field or steps too large to store, 409 if the caller already has a workflow with this name.",
+        "operationId": "create_workflow_v1_workflows_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateWorkflowRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Workflow",
+        "tags": [
+          "workflows"
+        ]
+      }
+    },
+    "/v1/workflows/{workflow_id}": {
+      "delete": {
+        "description": "Delete one of the caller's workflows.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 404 if the caller has no such workflow.",
+        "operationId": "delete_workflow_v1_workflows__workflow_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workflow_id",
+            "required": true,
+            "schema": {
+              "title": "Workflow Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowDeleted"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Workflow",
+        "tags": [
+          "workflows"
+        ]
+      },
+      "get": {
+        "description": "Return one of the caller's workflows, with its steps.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 404 if the caller has no such workflow.",
+        "operationId": "get_workflow_v1_workflows__workflow_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workflow_id",
+            "required": true,
+            "schema": {
+              "title": "Workflow Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Workflow",
+        "tags": [
+          "workflows"
+        ]
+      },
+      "patch": {
+        "description": "Change one of the caller's workflows; fields left out keep their values.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 400 for an invalid field, 404 if the caller has no such workflow, 409 if another of the caller's workflows has the new name.",
+        "operationId": "update_workflow_v1_workflows__workflow_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workflow_id",
+            "required": true,
+            "schema": {
+              "title": "Workflow Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateWorkflowRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Workflow",
+        "tags": [
+          "workflows"
+        ]
+      }
+    },
+    "/v1/workflows/{workflow_id}/runs": {
+      "get": {
+        "description": "List one of the caller's workflows' runs, newest first.\n\nA run is the plan that named the workflow, so a session that ran it\ntwice is listed twice. Sessions the caller can't read are left out.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 404 if the caller has no such workflow, 400 for an invalid cursor.",
+        "operationId": "list_workflow_runs_v1_workflows__workflow_id__runs_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workflow_id",
+            "required": true,
+            "schema": {
+              "title": "Workflow Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size, e.g. `20`.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The previous page's `next_cursor`.",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Before"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowRunList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Workflow Runs",
+        "tags": [
+          "workflows"
         ]
       }
     }

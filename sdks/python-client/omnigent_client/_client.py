@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.server.schemas import UsageReport
+from omnigent.version import VERSION
 
 from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
 from ._files import FilesNamespace
@@ -20,6 +21,9 @@ from ._session import Session
 from ._sessions import SessionsNamespace
 from ._sessions_chat import SessionsChat, ToolCallable
 from ._tool_handler import StreamHooks, ToolHandler
+
+# Default User-Agent for SDK requests, e.g. ``omnigent-client/0.22.0 python-httpx/0.28.1``.
+SDK_USER_AGENT = f"omnigent-client/{VERSION} python-httpx/{httpx.__version__}"
 
 
 def _port_or_default(url: httpx.URL) -> int | None:
@@ -109,6 +113,9 @@ class OmnigentClient:
         request, allowing transparent token refresh for OAuth
         flows. ``None`` (default) relies on static ``headers``.
     :param request_hooks: Async HTTP request hooks, run after authentication.
+    :param transport: Optional ``httpx.AsyncBaseTransport`` that sends every
+        request, e.g. one that routes requests across server replicas or a
+        test ``httpx.MockTransport``. ``None`` uses httpx's network transport.
     :param timeout: Default timeout for non-streaming HTTP requests in
         seconds. SSE streams use a 600-second read timeout so server-side
         tool execution can pause the stream for several minutes. Session
@@ -129,6 +136,7 @@ class OmnigentClient:
         auth: httpx.Auth | None = None,
         timeout: float = 30.0,
         request_hooks: list[Callable[[httpx.Request], Awaitable[None]]] | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         # Announce this as a first-party non-browser client via the sentinel
@@ -137,9 +145,16 @@ class OmnigentClient:
         # requires a trusted Origin; the SDK sends none of its own, so the
         # sentinel is what lets it through. Caller-supplied headers win on
         # conflict (so an explicit Origin override is still honored).
-        default_headers = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
+        # The User-Agent names the SDK so the server can tell an SDK script from
+        # Omnigent's own components, whose headers override it. httpx.Headers
+        # merges case-insensitively, so "user-agent" also replaces the default.
+        default_headers = httpx.Headers(
+            {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN, "User-Agent": SDK_USER_AGENT}
+        )
         if headers:
             default_headers.update(headers)
+        # Only a caller's transport replaces httpx's own; None leaves the default in place.
+        transport_kwargs: dict[str, Any] = {} if transport is None else {"transport": transport}
         self._http = httpx.AsyncClient(
             headers=default_headers,
             auth=auth,
@@ -158,6 +173,7 @@ class OmnigentClient:
             # environment for local targets. Loopback is plain HTTP with
             # explicit headers, so losing netrc/CA env with it costs nothing.
             trust_env=not is_loopback_url(self._base_url),
+            **transport_kwargs,
         )
 
         self.sessions = SessionsNamespace(self._http, self._base_url)

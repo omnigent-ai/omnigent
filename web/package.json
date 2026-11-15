@@ -108,6 +108,7 @@
     "zustand": "^5.0.12"
   },
   "devDependencies": {
+    "@bufbuild/buf": "^1.75.0",
     "@storybook/react-vite": "^10.6.1",
     "@tailwindcss/vite": "^4.2.4",
     "@testing-library/dom": "^10.4.1",

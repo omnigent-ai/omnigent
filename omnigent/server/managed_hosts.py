@@ -1246,12 +1246,42 @@ def parse_repo_workspace(workspace: str) -> RepoWorkspace:
                 f"'{url}' is not a usable ssh repository URL — expected 'git@<host>:<org>/<repo>'"
             )
     else:
+        # Never echo the URL: an unrecognised scheme (e.g. ``HTTPS://``) can still carry userinfo.
         raise ValueError(
-            f"'{url}' is not a supported repository URL — use "
+            "not a supported repository URL — use "
             "'https://<host>/<org>/<repo>' or 'git@<host>:<org>/<repo>'"
         )
     branch = _validate_clone_branch(fragment) if sep else None
     return RepoWorkspace(url=url, branch=branch, repo_name=_derive_repo_name(url))
+
+
+def parse_project_repository(repository: object) -> RepoWorkspace:
+    """
+    Parse a project's saved ``{"url": ..., "branch": ...}`` repository.
+
+    The project config is opaque client JSON, so this is the only place its
+    repository shape is checked. The branch is kept apart from the URL so a
+    ``#`` in the URL is rejected rather than read as a fragment.
+
+    :param repository: The raw repository value, e.g.
+        ``{"url": "https://git.example.com/team/app.git", "branch": "main"}``.
+    :returns: The validated :class:`RepoWorkspace`.
+    :raises ValueError: When the value is not an object with a string ``url``
+        and an optional string ``branch``, or the URL or branch is malformed.
+    """
+    if not isinstance(repository, dict) or "url" not in repository:
+        raise ValueError("repository must be an object with a 'url' and an optional 'branch'")
+    if not set(repository) <= {"url", "branch"}:
+        raise ValueError("repository may only set 'url' and 'branch'")
+    url = repository["url"]
+    branch = repository.get("branch")
+    if not isinstance(url, str) or (branch is not None and not isinstance(branch, str)):
+        raise ValueError("repository 'url' and 'branch' must be strings")
+    url = url.strip()
+    if "#" in url:
+        raise ValueError("repository 'url' must not contain '#'; set 'branch' instead")
+    branch = branch.strip() if branch else ""
+    return parse_repo_workspace(f"{url}#{branch}" if branch else url)
 
 
 def _modal_launcher_factory(
@@ -5205,8 +5235,8 @@ async def stop_archived_session_sandbox(
     The provider's ``stop_on_archive`` setting, passed through the launcher's
     ``stop_when_archived`` hook, decides. Only the sandbox of a session bound to
     it directly, and used by no other session (see
-    :func:`_sandbox_has_other_users`), is stopped; scheduled task runs are
-    skipped. Any failure before the stop leaves the sandbox running.
+    :func:`_sandbox_has_other_users`), is stopped; the scheduler's own sessions
+    and retained host are skipped. Any failure before the stop leaves it running.
 
     Nothing holds new work off while the provider stops the sandbox: a session
     unarchived and messaged during that call can start a runner the stop then
@@ -5220,13 +5250,26 @@ async def stop_archived_session_sandbox(
         hosts are not configured.
     :returns: ``True`` when the provider stopped the sandbox.
     """
-    from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
+    from omnigent.db.db_models import current_workspace_id
+    from omnigent.server.scheduled.schedule import continued_sandbox_host_id
+    from omnigent.stores.conversation_store import (
+        CREATED_BY_SESSION_LABEL_KEY,
+        SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    )
 
     if config is None or conv.host_id is None:
         return False
-    if conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY):
-        return False
     try:
+        task_id = conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY)
+        if task_id:
+            # Workers inherit provenance but can own independent sandboxes.
+            is_worker = bool(
+                conv.parent_conversation_id or conv.labels.get(CREATED_BY_SESSION_LABEL_KEY)
+            )
+            if not is_worker or conv.host_id == continued_sandbox_host_id(
+                task_id, current_workspace_id()
+            ):
+                return False
         host = await asyncio.to_thread(host_store.get_host, conv.host_id)
         if host is None or host.sandbox_id is None:
             return False

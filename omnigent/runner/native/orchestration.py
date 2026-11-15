@@ -2922,10 +2922,17 @@ async def _auto_create_pi_terminal(
     # failure must not block the terminal launch, so fall back to no tools.
     pi_tools: list[_JsonObject] = []
     try:
-        from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
+        from omnigent.runner.journal_tools import server_workflows_enabled
+        from omnigent.runner.tool_dispatch import (
+            build_native_relay_tool_schemas,
+            filter_workflow_tool_schemas,
+        )
 
         spec_for_tools = _unwrap_resolved_spec(agent_spec)
-        pi_tools = build_native_relay_tool_schemas(spec_for_tools)
+        pi_tools = filter_workflow_tool_schemas(
+            build_native_relay_tool_schemas(spec_for_tools),
+            enabled=await server_workflows_enabled(server_client),
+        )
     except Exception:  # tool registration is additive
         _logger.warning(
             "Failed to build pi-native tool schemas for session %s; "
@@ -7442,9 +7449,9 @@ async def _agy_cascade_is_locally_owned(bridge_dir: Path, cascade_id: str) -> bo
     :returns: ``True`` when the conversation db exists in this session's Gemini
         dir within the grace window.
     """
-    from omnigent.harnesses.antigravity_native.bridge import agy_gemini_dir
+    from omnigent.harnesses.antigravity_native.bridge import agy_conversation_db
 
-    db = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "conversations" / f"{cascade_id}.db"
+    db = agy_conversation_db(bridge_dir, cascade_id)
     deadline = time.monotonic() + _AGY_CASCADE_OWNERSHIP_GRACE_S
     while True:
         if await asyncio.to_thread(db.is_file):
@@ -7603,13 +7610,26 @@ async def _cold_start_agy_conversation(
             session_id,
         )
         return None
-    # Persist the real id (replacing the ``agy_conv_*`` placeholder) so
-    # ``read_bridge_state`` returns it and the reader/executor address the
-    # cold-started conversation. Offloaded (file I/O).
-    if not await asyncio.to_thread(update_conversation_id, bridge_dir, cascade_id):
+    # Refuse to replace a real id: the reader may have adopted the TUI-minted
+    # cascade meanwhile, and the headless phantom must not clobber it.
+    if not await asyncio.to_thread(
+        update_conversation_id, bridge_dir, cascade_id, expect_placeholder=True
+    ):
+        state = await asyncio.to_thread(read_bridge_state, bridge_dir)
+        if state is not None and not is_placeholder_conversation_id(state.conversation_id):
+            _logger.info(
+                "Antigravity cold-start: bridge state already binds conversation %s for "
+                "session %s (the reader adopted it meanwhile); discarding cold-start "
+                "cascade %s.",
+                state.conversation_id,
+                session_id,
+                cascade_id,
+            )
+            return state.conversation_id
         _logger.warning(
             "Antigravity cold-start: could not persist cold-started conversation id %s for "
-            "session %s (no bridge state to update); the reader will stay on the placeholder id.",
+            "session %s (no bridge state to update, or the binding changed concurrently); "
+            "the reader will stay on the placeholder id.",
             cascade_id,
             session_id,
         )
@@ -8825,48 +8845,64 @@ def _codex_ensure_response_with_policy_notice(
 def _ensure_orchestrator_skills_in_bundle(
     bundle_dir: Path,
     agent_spec: object,
+    *,
+    workflows_enabled: bool = False,
 ) -> None:
     """
-    Link the ``build-omnigent`` skill into a bundle's ``skills/`` dir.
+    Link Omnigent's own skills into a bundle's ``skills/`` dir.
 
     Called before native bridge launches so ``--plugin-dir`` (claude) or
-    ``CODEX_HOME/skills/`` (codex) picks up the skill. Injects
-    unconditionally for every agent — every ``omnigent claude`` /
-    ``omnigent codex`` user should be able to author new agents. The
-    skill isn't already present guard is idempotent. Best-effort: a
-    failure to link is logged but does not abort the terminal launch.
+    ``CODEX_HOME/skills/`` (codex) picks the skills up. ``build-omnigent``
+    is linked for every agent — every ``omnigent claude`` / ``omnigent
+    codex`` user should be able to author new agents — and each framework
+    skill, such as ``workflow``, when its server flag and tool group allow it.
+    Existing user skills are left alone. Best-effort: a failure to link is
+    logged but does not abort the terminal launch.
 
     :param bundle_dir: Materialized agent-bundle root, e.g.
         ``/tmp/omnigent-ap-chat-xyz/bundle``.
-    :param agent_spec: The session's AgentSpec (unused after gate
-        removal; retained for call-site compat).
+    :param agent_spec: The session's AgentSpec; decides the framework skills.
+    :param workflows_enabled: Whether the server advertises workflow tools.
     """
-    del agent_spec  # no longer gated; inject unconditionally
-    skill_name = "build-omnigent"
-    target_dir = bundle_dir / "skills" / skill_name
-    if target_dir.exists():
-        return
     # Anchored on the package root, not a ``.parent`` count off this file:
     # moving this module deeper must not silently break the source path.
-    source = _OMNIGENT_PACKAGE_DIR / "onboarding" / "agent" / "skills" / skill_name
-    if not source.is_dir():
-        _logger.debug(
-            "Orchestrator skill source %s is not a directory; skipping injection",
-            source,
-            extra={"session_id": runner_primary_session_id()},
-        )
-        return
-    try:
-        target_dir.parent.mkdir(parents=True, exist_ok=True)
-        target_dir.symlink_to(source)
-    except OSError:
-        _logger.debug(
-            "Could not link %s skill into bundle %s",
-            skill_name,
-            bundle_dir,
-            exc_info=True,
-            extra={"session_id": runner_primary_session_id()},
-        )
+    onboarding_skills = _OMNIGENT_PACKAGE_DIR / "onboarding" / "agent" / "skills"
+    sources = {"build-omnigent": onboarding_skills / "build-omnigent"}
+    from omnigent.spec.skill_sources import FRAMEWORK_SKILLS_DIR, framework_skill_names
+
+    # Include disabled names so a reused bundle loses stale framework links.
+    sources.update({name: FRAMEWORK_SKILLS_DIR / name for name in framework_skill_names()})
+    enabled = {"build-omnigent"}
+    spec = _unwrap_resolved_spec(agent_spec)
+    if isinstance(spec, AgentSpec):
+        enabled.update(framework_skill_names(spec))
+    if not workflows_enabled:
+        enabled.difference_update({"workflow", "save-workflow"})
+    for name, source in sources.items():
+        target_dir = bundle_dir / "skills" / name
+        try:
+            if name not in enabled:
+                if target_dir.is_symlink() and target_dir.resolve() == source.resolve():
+                    target_dir.unlink()
+                continue
+            if target_dir.exists():
+                continue
+            if not source.is_dir():
+                _logger.debug(
+                    "Orchestrator skill source %s is not a directory; skipping injection",
+                    source,
+                    extra={"session_id": runner_primary_session_id()},
+                )
+                continue
+            target_dir.parent.mkdir(parents=True, exist_ok=True)
+            target_dir.symlink_to(source)
+        except OSError:
+            _logger.debug(
+                "Could not update the %s skill in the agent bundle",
+                name,
+                exc_info=True,
+                extra={"session_id": runner_primary_session_id()},
+            )
 
 
 #: Omnigent MCP tools an auto-harness Claude session must be able to call
@@ -9877,10 +9913,21 @@ async def _auto_create_claude_terminal(
         router_started=subagent_router_dir is not None,
     )
     if bundle_dir is None:
+        from omnigent.runner.journal_tools import server_workflows_enabled
+
         # Reuse the bridge's owned directory across retries and terminal transfers.
         # Its dead-owner cleanup also reclaims these generated skill links.
         bundle_dir = bridge_dir / "skill-bundle"
-        _ensure_orchestrator_skills_in_bundle(bundle_dir, agent_spec)
+        spec = _unwrap_resolved_spec(agent_spec)
+        _ensure_orchestrator_skills_in_bundle(
+            bundle_dir,
+            agent_spec,
+            workflows_enabled=(
+                isinstance(spec, AgentSpec)
+                and spec.tool_groups.journal
+                and await server_workflows_enabled(server_client)
+            ),
+        )
     claude_args = augment_claude_args(
         base_claude_args,
         active_harnesses=runner_mcp_disabled_servers_active_harnesses(),

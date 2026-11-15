@@ -12,7 +12,7 @@ import shutil
 import sys
 import threading
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call
@@ -21,6 +21,7 @@ import pytest
 
 from omnigent.debug_logging import record_to_row
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
+from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment
 from omnigent.inner.terminal import TerminalInstance
@@ -559,6 +560,34 @@ def test_list_resources_filters_by_type(tmp_path: Path) -> None:
     assert all(r.type == "terminal" for r in term_page.data)
 
 
+def test_wake_session_terminal_watchers_targets_only_status_terminals(tmp_path: Path) -> None:
+    """A turn edge wakes native agent terminals' watchers, not generic ones."""
+    tr = TerminalRegistry()
+    _seed_terminal(tr, "conv_1", "claude", "main", tmp_path)
+    _seed_terminal(tr, "conv_1", "bash", "s1", tmp_path)
+    reg = SessionResourceRegistry(terminal_registry=tr)
+    reg._terminal_roles[("conv_1", terminal_resource_id("claude", "main"))] = (
+        CLAUDE_NATIVE_TERMINAL_ROLE
+    )
+
+    woke: list[tuple[str, bool]] = []
+    for entry in tr.list_for_conversation("conv_1"):
+        entry.instance.wake_idle_watcher = (  # type: ignore[method-assign]
+            lambda name=entry.terminal_name, *, expect_output=False: woke.append(
+                (name, expect_output)
+            )
+        )
+
+    reg.wake_session_terminal_watchers("conv_1")
+
+    assert woke == [("claude", True)]
+
+
+def test_wake_session_terminal_watchers_without_registry_is_noop() -> None:
+    """With no terminal registry the wake hook is a safe no-op."""
+    SessionResourceRegistry().wake_session_terminal_watchers("conv_x")
+
+
 @pytest.mark.asyncio
 async def test_terminal_resource_role_is_private_and_cleared_on_close(
     tmp_path: Path,
@@ -770,9 +799,11 @@ async def test_auxiliary_terminal_exit_publishes_resource_exit_only(
         on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        idle_poll_backoff_allowed: object | None = None,
         replace: bool = False,
     ) -> None:
-        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s
+        del on_idle, on_activity, on_tick, idle_threshold_s
+        del poll_interval_s, idle_poll_backoff_allowed
         callbacks["on_exit"] = on_exit
         callbacks["replace"] = replace
 
@@ -843,9 +874,11 @@ async def test_auxiliary_codex_exit_persists_redacted_final_screen(
         on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        idle_poll_backoff_allowed: object | None = None,
         replace: bool = False,
     ) -> None:
-        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
+        del on_idle, on_activity, on_tick, idle_threshold_s
+        del poll_interval_s, idle_poll_backoff_allowed, replace
         callbacks["on_exit"] = on_exit
 
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
@@ -896,9 +929,10 @@ async def _observe_native_agent_terminal_and_capture(
         on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        idle_poll_backoff_allowed: object | None = None,
         replace: bool = False,
     ) -> None:
-        del idle_threshold_s, poll_interval_s, replace
+        del idle_threshold_s, poll_interval_s, idle_poll_backoff_allowed, replace
         callbacks["on_idle"] = on_idle
         callbacks["on_activity"] = on_activity
         callbacks["on_exit"] = on_exit
@@ -937,6 +971,7 @@ class _FakeStatusPoller:
         self._on_failure = on_failure
         self.on_background = on_background
         self.active = False
+        self.reports_idle = False
         self.blocked_on: str | None = None
         self.ticks = 0
         self.retired = False
@@ -1019,6 +1054,7 @@ async def _observe_native_with_fake_poller(
         on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        idle_poll_backoff_allowed: object | None = None,
         replace: bool = False,
     ) -> None:
         del idle_threshold_s, poll_interval_s, replace
@@ -1026,6 +1062,7 @@ async def _observe_native_with_fake_poller(
         callbacks["on_activity"] = on_activity
         callbacks["on_exit"] = on_exit
         callbacks["on_tick"] = on_tick
+        callbacks["idle_poll_backoff_allowed"] = idle_poll_backoff_allowed
 
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[attr-defined]
     await registry.observe_required_terminal(
@@ -1191,6 +1228,69 @@ async def test_claude_native_wires_status_poller_tick(tmp_path: Path) -> None:
     on_tick()
     on_tick()
     assert pollers[0].ticks == 2
+
+
+@pytest.mark.asyncio
+async def test_claude_native_backoff_predicate_tracks_file_idle(tmp_path: Path) -> None:
+    """Native idle-poll backoff is gated on the status file's idle reading.
+
+    While the file owns the session's status the predicate holds the base
+    cadence until Claude itself reads idle, so a quiet-but-working pane never
+    delays the file-driven turn edge. Without the file, pane quiescence alone
+    governs backoff.
+    """
+    callbacks, _statuses, pollers, _registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_backoff"
+    )
+    allowed = callbacks["idle_poll_backoff_allowed"]
+    assert callable(allowed)
+    poller = pollers[0]
+
+    # File unresolved: pane quiescence governs, so backoff is allowed.
+    poller.active = False
+    poller.reports_idle = False
+    assert allowed()
+
+    # File owns status while Claude runs (or is unknown): hold the base cadence.
+    poller.active = True
+    poller.reports_idle = False
+    assert not allowed()
+
+    # File owns status and Claude reads idle: allow backoff.
+    poller.reports_idle = True
+    assert allowed()
+
+
+@pytest.mark.asyncio
+async def test_non_claude_native_terminal_has_no_idle_poll_backoff_gate(
+    tmp_path: Path,
+) -> None:
+    """Only claude-native wires the status-file backoff gate.
+
+    Other native roles have no status file to arbitrate their turn edge, so
+    the watcher receives no backoff predicate and pane quiescence alone
+    governs their polling.
+    """
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    registry.set_session_status_publisher(lambda *_args: None)
+    registry.set_terminal_exit_publisher(lambda *_args: None)
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault("conv_codex_gate", {})[("codex", "main")] = (
+        instance
+    )
+    captured: dict[str, object] = {"backoff": "unset"}
+
+    def _capture_watcher(
+        *_args: object, idle_poll_backoff_allowed: object | None = None, **_kwargs: object
+    ) -> None:
+        captured["backoff"] = idle_poll_backoff_allowed
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
+    await registry.observe_required_terminal(
+        "conv_codex_gate", "codex", "main", instance, resource_role=CODEX_NATIVE_TERMINAL_ROLE
+    )
+    assert captured["backoff"] is None
 
 
 @pytest.mark.asyncio
@@ -2799,9 +2899,11 @@ async def test_required_terminal_exit_without_observed_status_is_failure(tmp_pat
         on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        idle_poll_backoff_allowed: object | None = None,
         replace: bool = False,
     ) -> None:
-        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
+        del on_idle, on_activity, on_tick, idle_threshold_s
+        del poll_interval_s, idle_poll_backoff_allowed, replace
         callbacks["on_exit"] = on_exit
 
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
@@ -3087,19 +3189,42 @@ async def test_cleanup_session_closes_primary_env(
 
 
 @pytest.mark.asyncio
-async def test_cleanup_session_primary_close_is_off_loop_and_cancellation_safe() -> None:
-    """Primary environment cleanup finishes after repeated cancellation."""
+@pytest.mark.parametrize("cancel_stage", ["primary_close", "terminal_cleanup"])
+async def test_cleanup_session_primary_close_is_off_loop_and_cancellation_safe(
+    monkeypatch: pytest.MonkeyPatch,
+    cancel_stage: str,
+) -> None:
+    """Every detached environment closes off-loop before repeated cancellation escapes."""
+    import omnigent.inner.os_env as os_env_module
+
     reg = SessionResourceRegistry()
     started = threading.Event()
     release = threading.Event()
     finished = threading.Event()
     heartbeat_ran_while_blocked = asyncio.Event()
+    loop_thread = threading.get_ident()
+    closed_on: list[int] = []
+    if cancel_stage == "terminal_cleanup":
+        terminals = TerminalRegistry()
 
-    class _BlockingEnvironment(_FakeOSEnvironment):
+        async def blocked_terminal_cleanup(session_id: str) -> None:
+            del session_id
+            started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(terminals, "cleanup_conversation", blocked_terminal_cleanup)
+        reg._terminal_registry = terminals
+
+    class _TrackedEnvironment(_FakeOSEnvironment):
+        def close(self) -> None:
+            closed_on.append(threading.get_ident())
+            super().close()
+
+    class _BlockingEnvironment(_TrackedEnvironment):
         def close(self) -> None:
             started.set()
             assert release.wait(timeout=2.0)
-            self._closed = True
+            super().close()
             finished.set()
 
     environment = _BlockingEnvironment(
@@ -3107,6 +3232,14 @@ async def test_cleanup_session_primary_close_is_off_loop_and_cancellation_safe()
         cwd=Path("/tmp"),
     )
     reg._primary_envs["conv_blocked_cleanup"] = environment
+    tool_environment = _TrackedEnvironment(spec=environment.spec, cwd=environment.cwd)
+    monkeypatch.setattr(
+        os_env_module, "create_os_environment", lambda *args, **kwargs: tool_environment
+    )
+    lease = await reg.lease_tool_environment("conv_blocked_cleanup", environment.spec)
+    assert lease is not None
+    await lease.release(reusable=True)
+    skills_dir = reg.codex_skills_dir("conv_blocked_cleanup")
 
     async def heartbeat() -> None:
         while not finished.is_set():
@@ -3131,7 +3264,7 @@ async def test_cleanup_session_primary_close_is_off_loop_and_cancellation_safe()
         await asyncio.sleep(0)
         cleanup_task.cancel()
         release.set()
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError) as cancelled:
             await cleanup_task
     finally:
         release.set()
@@ -3144,6 +3277,10 @@ async def test_cleanup_session_primary_close_is_off_loop_and_cancellation_safe()
 
     assert finished.is_set()
     assert environment._closed
+    assert tool_environment._closed
+    assert len(closed_on) == 2 and all(thread != loop_thread for thread in closed_on)
+    assert cancelled.value is not None
+    assert not skills_dir.exists()
     assert not reg.has_primary_env("conv_blocked_cleanup")
     assert heartbeat_ran_while_blocked.is_set()
 
@@ -3492,9 +3629,10 @@ async def test_blocked_reason_survives_pane_redraws(tmp_path: Path) -> None:
         on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        idle_poll_backoff_allowed: object | None = None,
         replace: bool = False,
     ) -> None:
-        del idle_threshold_s, poll_interval_s, replace
+        del idle_threshold_s, poll_interval_s, idle_poll_backoff_allowed, replace
         callbacks["on_idle"] = on_idle
         callbacks["on_activity"] = on_activity
         callbacks["on_exit"] = on_exit
@@ -3977,3 +4115,174 @@ async def test_non_claude_terminal_never_acknowledges_billing_notice(
         on_tick()
 
     acknowledge.assert_not_called()
+
+
+@pytest.mark.parametrize("retire_during_replacement", [False, True])
+async def test_cancelled_tool_environment_replacement_closes_the_unused_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retire_during_replacement: bool
+) -> None:
+    """Cancellation closes an undelivered lease even if session cleanup already retired it."""
+    import omnigent.inner.os_env as os_env_module
+
+    close_started = threading.Event()
+    release_close = threading.Event()
+
+    class _SlowCloseEnvironment(_FakeOSEnvironment):
+        def close(self) -> None:
+            close_started.set()
+            assert release_close.wait(timeout=5)
+            super().close()
+
+    created: list[_SlowCloseEnvironment] = []
+
+    def _create(spec: OSEnvSpec, **kwargs: object) -> _SlowCloseEnvironment:
+        del kwargs
+        created.append(_SlowCloseEnvironment(spec=spec, cwd=Path(spec.cwd or ".")))
+        return created[-1]
+
+    monkeypatch.setattr(os_env_module, "create_os_environment", _create)
+    registry = SessionResourceRegistry()
+    old_spec = _agent_spec_with_sandbox_none(tmp_path / "old").os_env
+    new_spec = _agent_spec_with_sandbox_none(tmp_path / "new").os_env
+
+    first = await registry.lease_tool_environment("conv", old_spec)
+    assert first is not None
+    await first.release(reusable=True)
+
+    replacing = asyncio.create_task(registry.lease_tool_environment("conv", new_spec))
+    assert await asyncio.to_thread(close_started.wait, 5)
+    if retire_during_replacement:
+        await registry.cleanup_session("conv")
+    replacing.cancel()
+    release_close.set()
+    with pytest.raises(asyncio.CancelledError):
+        await replacing
+
+    lease = await registry.lease_tool_environment("conv", new_spec)
+    assert lease is not None
+    assert created[0]._closed and created[1]._closed
+    assert lease.environment is created[2]
+    await lease.release(reusable=True)
+    await registry.cleanup_session("conv")
+    assert created[2]._closed
+
+
+async def test_failed_tool_environment_replacement_keeps_the_old_one_owned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spec change whose environment cannot be built leaves the old one for cleanup."""
+    import omnigent.inner.os_env as os_env_module
+
+    def _create(spec: OSEnvSpec, **kwargs: object) -> _FakeOSEnvironment:
+        del kwargs
+        if spec.start_in_scratch:
+            raise ValueError("os_env.start_in_scratch requires an active sandbox")
+        return _FakeOSEnvironment(spec=spec, cwd=Path(spec.cwd or "."))
+
+    monkeypatch.setattr(os_env_module, "create_os_environment", _create)
+    registry = SessionResourceRegistry()
+    spec = _agent_spec_with_sandbox_none(tmp_path).os_env
+    first = await registry.lease_tool_environment("conv", spec)
+    assert first is not None
+    await first.release(reusable=True)
+
+    with pytest.raises(ValueError, match="start_in_scratch"):
+        await registry.lease_tool_environment("conv", replace(spec, start_in_scratch=True))
+
+    environment = first.environment
+    assert isinstance(environment, _FakeOSEnvironment)
+    assert not environment._closed
+    await registry.cleanup_session("conv")
+    assert environment._closed
+
+
+@pytest.mark.parametrize(
+    "changed_key,hold_first",
+    [
+        pytest.param("sandbox", False, id="sandbox"),
+        pytest.param("session", False, id="session"),
+        pytest.param("environment", False, id="environment"),
+        pytest.param("environment", True, id="held-environment"),
+        pytest.param("cwd-symlink", False, marks=pytest.mark.posix_only, id="cwd-symlink"),
+    ],
+)
+async def test_tool_environment_reuse_checks_session_spec_and_resolved_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_key: str, hold_first: bool
+) -> None:
+    """Only an unchanged session, spec and resolved workspace/policy reuse the lease."""
+    import omnigent.inner.os_env as os_env_module
+    import omnigent.runner.resource_registry as registry_module
+    from omnigent.inner.sandbox import resolve_sandbox
+
+    monkeypatch.setattr(
+        os_env_module,
+        "create_os_environment",
+        lambda spec, **kwargs: _FakeOSEnvironment(spec=spec, cwd=Path(spec.cwd or ".").resolve()),
+    )
+    masked = [tmp_path / "first"]
+    monkeypatch.setattr(
+        registry_module,
+        "resolve_sandbox",
+        lambda spec, cwd: replace(resolve_sandbox(spec, cwd), mask_paths=list(masked)),
+    )
+    registry = SessionResourceRegistry()
+    spec = _agent_spec_with_sandbox_none(tmp_path / "workspace").os_env
+    if changed_key == "cwd-symlink":
+        link = tmp_path / "link"
+        link.symlink_to(spec.cwd, target_is_directory=True)
+        spec = replace(spec, cwd=str(link))
+
+    first = await registry.lease_tool_environment("conv", spec)
+    assert first is not None
+    if not hold_first:
+        await first.release(reusable=True)
+        again = await registry.lease_tool_environment("conv", spec)
+        assert again is first
+        await again.release(reusable=True)
+
+    changed_spec = spec
+    session_id = "conv"
+    if changed_key == "sandbox":
+        masked[0] = tmp_path / "retargeted"
+    elif changed_key == "session":
+        session_id = "other"
+    elif changed_key == "environment":
+        changed_spec = replace(
+            spec,
+            sandbox=replace(spec.sandbox, env_passthrough=["TEST_HARMLESS_PASSTHROUGH"]),
+        )
+    elif changed_key == "cwd-symlink":
+        target = tmp_path / "retargeted-workspace"
+        target.mkdir()
+        link.unlink()
+        link.symlink_to(target, target_is_directory=True)
+
+    rebuilt = await registry.lease_tool_environment(session_id, changed_spec)
+    assert rebuilt is not None and rebuilt is not first
+    assert isinstance(first.environment, _FakeOSEnvironment)
+    assert first.environment._closed is (changed_key != "session" and not hold_first)
+    if hold_first:
+        await first.release(reusable=True)
+        assert first.environment._closed
+        assert isinstance(rebuilt.environment, _FakeOSEnvironment)
+        assert not rebuilt.environment._closed
+    await rebuilt.release(reusable=True)
+    again = await registry.lease_tool_environment(session_id, changed_spec)
+    assert again is rebuilt
+    await again.release(reusable=True)
+
+    if changed_key in {"session", "environment"}:
+        restored = await registry.lease_tool_environment("conv", spec)
+        assert restored is not None
+        if changed_key == "session":
+            assert restored is first
+        else:
+            assert restored is not first and restored is not rebuilt
+            assert isinstance(rebuilt.environment, _FakeOSEnvironment)
+            assert rebuilt.environment._closed
+        await restored.release(reusable=True)
+
+    await registry.cleanup_session("conv")
+    await registry.cleanup_session("other")
+    assert first.environment._closed
+    assert isinstance(rebuilt.environment, _FakeOSEnvironment) and rebuilt.environment._closed

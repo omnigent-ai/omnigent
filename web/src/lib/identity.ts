@@ -249,8 +249,8 @@ function sessionIdForHostResolve(url: string): string | null {
  * caller only awaits a non-null result, so the common no-op path adds NO
  * microtask hop (a fetch still dispatches synchronously, as before the gate).
  */
-function beginSessionHostResolve(url: string): Promise<void> | null {
-  const sessionId = sessionIdForHostResolve(url);
+function beginSessionHostResolve(url: string, method: string | undefined): Promise<void> | null {
+  const sessionId = sessionIdForRecovery(url, method);
   return sessionId === null ? null : resolveSessionHost(sessionId);
 }
 
@@ -328,11 +328,6 @@ function isBodyHostKeyedRequest(url: string, body: BodyInit | null | undefined):
   return (typeof body === "string" || body instanceof FormData) && BODY_HOST_KEYED_RE.test(url);
 }
 
-// Writes whose events (`projects_changed`, a scheduled task's or run's
-// `session_added`) reach only updates streams on the replica that handled them.
-const DISCOVERY_PUBLISHING_WRITE_RE =
-  /\/v1\/(?:projects(?:[/?#]|$)|scheduled-tasks(?:[?#]|$|\/[^/?#]+\/run(?:[?#]|$)))/;
-
 const SCHEDULED_TASK_WRITE_RE = /\/v1\/scheduled-tasks(?:\/[^/?#]+)?(?:[?#]|$)/;
 
 // A scheduled-task create or edit naming a connected host is validated against
@@ -347,11 +342,6 @@ function scheduledTaskHostId(url: string, init: RequestInit | undefined): string
   } catch {
     return null;
   }
-}
-
-function isDiscoveryPublishingWrite(url: string, method: string | undefined): boolean {
-  const verb = (method ?? "GET").toUpperCase();
-  return verb !== "GET" && verb !== "HEAD" && DISCOVERY_PUBLISHING_WRITE_RE.test(url);
 }
 
 // Admin flag from the same `/v1/me` probe. Mode-agnostic (the shared
@@ -449,7 +439,7 @@ function isTransientIdentityStatus(status: number): boolean {
  */
 async function probeIdentity(): Promise<boolean> {
   try {
-    const res = await hostFetch("/v1/me");
+    const res = await hostFetch("/v1/me", undefined, { hostless: true });
     if (res.status === 401) {
       // OIDC / accounts mode: server requires authentication.
       // Redirect to the login URL provided in the response body —
@@ -628,7 +618,7 @@ export async function authenticatedFetch(
   // Null (the common case: warm map, non-session route, or standalone) means no
   // bootstrap is needed — we skip the await so the fetch still dispatches in the
   // same tick, exactly as before the gate.
-  const hostResolve = beginSessionHostResolve(url);
+  const hostResolve = beginSessionHostResolve(url, init?.method);
   if (hostResolve !== null) await hostResolve;
   // Whether WE (not the caller) stamped a host's slice key on this request; only
   // then is a keyless re-address meaningful on a wrong-replica (wrong_replica) response.
@@ -638,10 +628,11 @@ export async function authenticatedFetch(
   let derivedHostId: string | null = null;
   // Sent without a key because its host's tunnels connected without one.
   let unkeyed = false;
+  // Names no host (lists, probes, discovery writes). It is keyed by the modal
+  // host, and a wrong_replica reply to it is returned as-is.
+  let hostless = false;
   const callerKeyed = headers.has(SLICE_KEY_HEADER);
   if (!callerKeyed && isHostRoutingEnabled()) {
-    // Prefer the destination host unless proven keyless. Writes that publish
-    // discovery events share the updates-stream key; the rest use the client key.
     const scope = hostScopeForUrl(url);
     if (isManagedLaunchRequest(url, init?.body)) {
       derivedHostId = hostIdFromBody(url, init?.body);
@@ -651,8 +642,8 @@ export async function authenticatedFetch(
       derivedHostId = hostIdFromBody(url, init?.body);
     } else if (scheduledTaskHostId(url, init) !== null) {
       derivedHostId = scheduledTaskHostId(url, init);
-    } else if (isDiscoveryPublishingWrite(url, init?.method)) {
-      headers.set(SLICE_KEY_HEADER, updatesRoutingKey());
+    } else {
+      hostless = true;
     }
     // Skip keying a host we've already PROVEN routes keyless (its tunnels dialed
     // in without a key → they live on the default replica). This spares the long
@@ -665,6 +656,8 @@ export async function authenticatedFetch(
       stampedSliceKey = true;
     } else if (derivedHostId) {
       unkeyed = true;
+    } else if (hostless) {
+      headers.set(SLICE_KEY_HEADER, updatesRoutingKey());
     } else if (!headers.has(SLICE_KEY_HEADER)) {
       headers.set(SLICE_KEY_HEADER, clientRoutingKey());
     }
@@ -713,14 +706,15 @@ export async function authenticatedFetch(
     }
   } else if (
     derivedHostId === null &&
+    !hostless &&
     !callerKeyed &&
     isDatabricksWorkspace() &&
     (await _isWrongReplica(res))
   ) {
-    // A request on the client or updates key missed. For a session request,
-    // refresh its host (the first managed message can outlive provisioning) and
-    // try that host's key; then try the unkeyed default replica, which holds
-    // hosts whose tunnels connected without a key.
+    // A session request whose host was unknown missed. Refresh its host (the first
+    // managed message can outlive provisioning) and try that host's key; then try
+    // the unkeyed default replica, which holds hosts whose tunnels connected
+    // without a key.
     const sessionId = sessionIdForRecovery(url, init?.method);
     let hostId: string | null = null;
     let demoted = false;
@@ -812,11 +806,11 @@ const SIGN_IN_PROBE_PATH = "/v1/me";
  */
 export async function isSignInExpired(signal?: AbortSignal): Promise<boolean> {
   try {
-    const res = await hostFetch(SIGN_IN_PROBE_PATH, {
-      redirect: "manual",
-      cache: "no-store",
-      signal,
-    });
+    const res = await hostFetch(
+      SIGN_IN_PROBE_PATH,
+      { redirect: "manual", cache: "no-store", signal },
+      { hostless: true },
+    );
     return res.type === "opaqueredirect" || res.status === 401 || res.status === 403;
   } catch {
     return false;

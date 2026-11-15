@@ -5168,6 +5168,52 @@ async def test_post_external_assistant_message_persists_and_streams(
     assert published[0][1]["item"]["model"] == "claude-native-ui"
 
 
+async def test_post_external_assistant_message_rejects_over_length_response_id(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A response_id longer than the ``String(64)`` column is a 400, not a 500.
+
+    An over-length id used to pass the non-empty check and fail the insert,
+    which the transcript forwarders retry as a transient server error. The
+    route must reject it as invalid input before persisting anything, while
+    an id exactly at the limit still round-trips.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    rejected = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_assistant_message",
+            "data": {
+                "agent": "claude-native-ui",
+                "text": "too long",
+                "response_id": "r" * 65,
+            },
+        },
+    )
+    assert rejected.status_code == 400, rejected.text
+    assert "response_id" in rejected.text
+    assert (await client.get(f"/v1/sessions/{session['id']}")).json()["items"] == []
+
+    at_limit = "r" * 64
+    accepted = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_assistant_message",
+            "data": {
+                "agent": "claude-native-ui",
+                "text": "fits",
+                "response_id": at_limit,
+            },
+        },
+    )
+    assert accepted.status_code == 202, accepted.text
+    items = (await client.get(f"/v1/sessions/{session['id']}")).json()["items"]
+    assert [item["response_id"] for item in items] == [at_limit]
+
+
 async def test_post_external_conversation_item_persists_and_streams_visible_items(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -9035,15 +9081,15 @@ async def test_post_external_model_options_populates_picker_and_publishes(
     assert snapshot["model_options"][1]["displayName"] == "anthropic-claude-opus-4-1"
 
 
-async def test_post_external_model_options_empty_evicts_cache(
+async def test_post_external_model_options_empty_hides_picker(
     client: httpx.AsyncClient,
 ) -> None:
     """
     An empty ``data.models`` clears any prior pushed catalog; a non-list 400s.
 
-    Empty means "no catalog to show" — the entry is evicted so the picker
-    hides rather than serving a stale list. A malformed (non-list) payload
-    fails loud at the boundary.
+    Empty means "no catalog to show" — cache that authoritative result so
+    host recovery cannot restore a stale list. A malformed (non-list)
+    payload fails loud at the boundary.
     """
     from omnigent.server.routes import sessions as _mod
 
@@ -9067,7 +9113,9 @@ async def test_post_external_model_options_empty_evicts_cache(
         json={"type": "external_model_options", "data": {"models": []}},
     )
     assert cleared.status_code == 202, cleared.text
-    assert session["id"] not in _mod._pushed_model_options_cache
+    assert _mod._pushed_model_options_cache[session["id"]] == []
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["model_options"] == []
 
     bad = await client.post(
         f"/v1/sessions/{session['id']}/events",
@@ -10078,12 +10126,22 @@ async def test_post_external_session_todos_publishes_session_todos(
     assert resp.status_code == 202, resp.text
     assert resp.json() == {"queued": False}
 
-    # Exactly one session.todos event must be published; no extra events.
-    assert [ev["type"] for _, ev in published] == ["session.todos"]
-    assert published[0][0] == session["id"]
+    # One chat marker each for the task that completed and the one that
+    # started, then exactly one session.todos event.
+    assert [ev["type"] for _, ev in published] == [
+        "response.output_item.done",
+        "response.output_item.done",
+        "session.todos",
+    ]
+    markers = [ev["item"]["resource"] for _, ev in published[:2]]
+    assert [(m["name"], m["status"]) for m in markers] == [
+        ("Write tests", "done"),
+        ("Fix the bug", "started"),
+    ]
+    assert {session_id for session_id, _ in published} == {session["id"]}
     # The full todos list is forwarded verbatim to subscribers.
-    assert published[0][1]["todos"] == todos
-    assert published[0][1]["conversation_id"] == session["id"]
+    assert published[2][1]["todos"] == todos
+    assert published[2][1]["conversation_id"] == session["id"]
 
 
 async def test_post_external_session_todos_updates_snapshot(
@@ -10430,6 +10488,59 @@ async def test_post_external_conversation_item_auto_assigns_response_id(
         "auto-assigned response_id must be a non-empty string"
     )
     assert published[0][1]["type"] == "session.input.consumed"
+
+
+async def test_post_external_conversation_item_rejects_over_length_response_id(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A response_id longer than the ``String(64)`` column is a 400, not a 500.
+
+    An over-length id used to pass the non-empty check and fail the insert,
+    which the native forwarders retry as a transient server error and, for a
+    source-keyed item, loop on forever. The route must reject it as invalid
+    input before persisting anything, while an id exactly at the limit still
+    round-trips.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    rejected = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "response_id": "r" * 65,
+                "item_data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "too long"}],
+                },
+            },
+        },
+    )
+    assert rejected.status_code == 400, rejected.text
+    assert "response_id" in rejected.text
+    assert (await client.get(f"/v1/sessions/{session['id']}")).json()["items"] == []
+
+    at_limit = "r" * 64
+    accepted = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "response_id": at_limit,
+                "item_data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "fits"}],
+                },
+            },
+        },
+    )
+    assert accepted.status_code == 202, accepted.text
+    items = (await client.get(f"/v1/sessions/{session['id']}")).json()["items"]
+    assert [item["response_id"] for item in items] == [at_limit]
 
 
 async def test_external_user_message_seeds_title_on_claude_native_session(

@@ -2,6 +2,7 @@
 // They must not carry across links that switch to another session.
 export const SESSION_SCOPED_SEARCH_PARAMS = [
   "file",
+  "fullscreen",
   "diff",
   "comment",
   "view",

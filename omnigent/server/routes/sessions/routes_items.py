@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 
 from fastapi import (
     APIRouter,
@@ -23,9 +24,11 @@ from omnigent.server._elicitation_registry import (
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.auth import (
+    LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
 )
+from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
@@ -40,13 +43,18 @@ from omnigent.server.routes._errors import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._sessions.common import (
+    _session_status_cache,
     get_server_runner_router,
     set_server_runner_router,
 )
+from omnigent.server.routes._sessions.helpers import SessionLiveness
 from omnigent.server.routes._sessions.orchestration import (
+    _agent_costs,
     _child_session_summaries_from_conversations,
+    _settle_orphaned_running_rows,
 )
 from omnigent.server.schemas import (
+    AgentCostList,
     ChildSessionList,
     PaginatedList,
     SessionItemList,
@@ -54,6 +62,7 @@ from omnigent.server.schemas import (
     SideChatSummary,
 )
 from omnigent.stores import AgentStore, ConversationStore
+from omnigent.stores.conversation_store import runner_seen_is_fresh
 from omnigent.stores.permission_store import PermissionStore
 
 # ``?descendants=true`` depth: the default matches the CLI tree and the web
@@ -67,6 +76,21 @@ _SPAWN_TREE_READ_CAP = 2000
 _ITEM_TYPE_PATTERN = f"^({'|'.join(ITEM_TYPE_TO_DATA_CLS)})$"
 
 
+def _is_settle_candidate(conv: Conversation) -> bool:
+    """Whether a read would consider *conv* for settling, before any owner check.
+
+    Mirrors the cheap filters in ``_settle_orphaned_running_rows``, so a read
+    with no candidate never needs the parent-chain OWNER check.
+    """
+    return (
+        conv.agent_id is not None
+        and conv.runner_id is not None
+        and conv.live_status in ("running", "waiting")
+        and _session_status_cache.get(conv.id) is None
+        and not runner_seen_is_fresh(conv.runner_last_seen)
+    )
+
+
 def register_items_routes(
     router: APIRouter,
     *,
@@ -74,8 +98,77 @@ def register_items_routes(
     agent_store: AgentStore,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
+    liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
 ) -> None:
     """Register the items routes on router."""
+
+    async def _may_settle_children(
+        user_id: str | None, parent: Conversation, displayed_level: int | None
+    ) -> bool:
+        """Whether the caller may settle the orphaned children of *parent*.
+
+        Only a top-level session's displayed level is authoritative. A
+        sub-agent's direct grant can be narrower than what its parent chain
+        gives, so it always resolves OWNER through the chain. Permissions off
+        settles for everyone.
+
+        :param user_id: The authenticated caller.
+        :param parent: The session whose children are listed.
+        :param displayed_level: The caller's level from the access check.
+        :returns: ``True`` when the caller owns the parent (or is admin).
+        """
+        if permission_store is None:
+            return True
+        if (
+            parent.parent_conversation_id is None
+            and displayed_level is not None
+            and displayed_level >= LEVEL_OWNER
+        ):
+            return True
+        return await asyncio.to_thread(
+            check_session_access,
+            user_id,
+            parent.id,
+            LEVEL_OWNER,
+            permission_store,
+            conversation_store,
+        )
+
+    def _owner_check(
+        user_id: str | None, parent: Conversation, displayed_level: int | None
+    ) -> Callable[[], Awaitable[bool]]:
+        """Return a memoised, lazy OWNER check for *parent*'s children.
+
+        The parent-chain query runs at most once, and only when a read finds a
+        settle candidate.
+        """
+        resolved: list[bool] = []
+
+        async def may_settle() -> bool:
+            if not resolved:
+                resolved.append(await _may_settle_children(user_id, parent, displayed_level))
+            return resolved[0]
+
+        return may_settle
+
+    async def _settle_children(
+        request: Request, rows: list[Conversation], may_settle: Callable[[], Awaitable[bool]]
+    ) -> None:
+        """Settle orphaned ``running`` children as the session list does, so
+        the tree and runners polling this list never see a dead turn as live.
+        Only the parent's owner may settle; the owner check runs only when a
+        row is a candidate. See :func:`_may_settle_children`."""
+        if not any(_is_settle_candidate(conv) for conv in rows):
+            return
+        if not await may_settle():
+            return
+        await _settle_orphaned_running_rows(
+            rows,
+            conversation_store=conversation_store,
+            liveness_lookup=liveness_lookup,
+            host_store=getattr(request.app.state, "host_store", None),
+            may_settle=lambda _conv: True,
+        )
 
     @router.get(
         "/sessions/{session_id}/items",
@@ -136,6 +229,72 @@ def register_items_routes(
             first_id=page.first_id,
             last_id=page.last_id,
             has_more=page.has_more,
+        )
+
+    # ── GET /sessions/{session_id}/agent_costs ───────────────────
+
+    @router.get(
+        "/sessions/{session_id}/agent_costs",
+        response_model=AgentCostList,
+        responses={**STALE_CURSOR_RESPONSE},
+    )
+    async def list_agent_costs(
+        request: Request,
+        session_id: str,
+        limit: int = Query(default=100, ge=1, le=1000),
+        after: str | None = Query(default=None),
+    ) -> AgentCostList:
+        """
+        List display costs for a session and the sub-agents beneath it.
+
+        Subtree totals come from one spawn-tree read (ids, parents and usage
+        only) bounded like ``child_sessions?descendants=true``; a tree past
+        that cap reports no costs. READ on the session covers its
+        descendants, as for ``child_sessions``.
+
+        :param request: Inbound HTTP request carrying the caller identity.
+        :param session_id: Session whose subtree to report, e.g. ``"conv_abc123"``.
+        :param limit: Maximum agents in the page (1-1000, default 100).
+        :param after: Id of the last agent of the previous page, or ``None``.
+        :returns: A page of :class:`AgentCostList` in spawn-tree order.
+        :raises OmnigentError: 403 without READ; 404 when no session exists.
+        :raises StaleCursorError: If *after* is not an agent of the subtree, or
+            the tree outgrew the read cap since the page it came from.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        conv = access.conversation
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        tree = await asyncio.to_thread(
+            conversation_store.list_spawn_tree_usage,
+            conv.root_conversation_id or conv.id,
+            # The tree's root row plus up to the cap of sub-agents.
+            limit=_SPAWN_TREE_READ_CAP + 1,
+        )
+        if tree.has_more:
+            if after is not None:
+                # The tree outgrew one read since the first page: the client restarts.
+                raise StaleCursorError(after)
+            # Subtree totals need the whole tree, so an oversized one reports none.
+            return AgentCostList()
+        costs = _agent_costs(tree.data, conv.id)
+        start = 0
+        if after is not None:
+            position = next((i for i, cost in enumerate(costs) if cost.id == after), None)
+            if position is None:
+                raise StaleCursorError(after)
+            start = position + 1
+        window = costs[start : start + limit]
+        return AgentCostList(
+            data=window,
+            first_id=window[0].id if window else None,
+            last_id=window[-1].id if window else None,
+            has_more=start + limit < len(costs),
         )
 
     # ── GET /sessions/{session_id}/child_sessions ────────────────
@@ -217,9 +376,10 @@ def register_items_routes(
             parent = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if parent is None:
             raise _session_not_found()
+        may_settle = _owner_check(user_id, parent, access.level)
         if descendants:
             subtree = await _list_descendant_sessions(
-                parent, limit=limit, after=after, max_depth=max_depth
+                request, parent, may_settle, limit=limit, after=after, max_depth=max_depth
             )
             if subtree is not None:
                 return subtree
@@ -237,6 +397,7 @@ def register_items_routes(
             sort_by="created_at",
             title=title_filter,
         )
+        await _settle_children(request, page.data, may_settle)
         data = await _child_session_summaries_from_conversations(
             page.data,
             session_id,
@@ -250,7 +411,13 @@ def register_items_routes(
         )
 
     async def _list_descendant_sessions(
-        parent: Conversation, *, limit: int, after: str | None, max_depth: int
+        request: Request,
+        parent: Conversation,
+        may_settle: Callable[[], Awaitable[bool]],
+        *,
+        limit: int,
+        after: str | None,
+        max_depth: int,
     ) -> PaginatedList | None:
         """Return a page of *parent*'s sub-agent subtree, breadth-first.
 
@@ -314,6 +481,7 @@ def register_items_routes(
                 raise StaleCursorError(after)
             start = position + 1
         window = ordered[start : start + limit]
+        await _settle_children(request, window, may_settle)
         summaries = await _child_session_summaries_from_conversations(
             window, parent.id, conversation_store, parent_ids=parent_ids
         )
