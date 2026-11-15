@@ -1108,10 +1108,14 @@ class SqlAlchemyConversationStore(ConversationStore):
             # short-circuit on equal values), which is what we
             # want here.
             session.execute(
-                text("UPDATE conversations SET updated_at = updated_at WHERE id = :id"),
+                text(
+                    "UPDATE conversations SET updated_at = updated_at "
+                    "WHERE workspace_id = :workspace_id AND id = :id"
+                ),
                 # Raw SQL bypasses the Uuid16 decorator; bind the 16-byte form
-                # so the WHERE matches the binary id column.
-                {"id": uuid_to_bytes(conversation_id)},
+                # so the WHERE matches the binary id column. The full primary
+                # key keeps this a point lookup rather than a table scan.
+                {"workspace_id": current_workspace_id(), "id": uuid_to_bytes(conversation_id)},
             )
 
     def create_conversation(

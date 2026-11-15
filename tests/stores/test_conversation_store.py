@@ -338,6 +338,38 @@ def test_board_acceptance_needs_an_unchanged_review(
     assert saved.updated_at == reviewed
 
 
+def test_board_acceptance_uses_only_indexed_lookups(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Accept runs inside SQLite's write transaction, so none of its statements
+    may scan a table (docs/DATABASE_BEST_PRACTICES.md, bounded queries)."""
+    engine = conversation_store._conv_engine
+    if engine.dialect.name != "sqlite":
+        pytest.skip("SQLite query-plan check; other engines lock with SELECT ... FOR UPDATE")
+    for _ in range(3):
+        conversation_store.create_conversation()
+    session = conversation_store.create_conversation()
+    statements: list[tuple[str, Any]] = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith(("SELECT", "UPDATE", "DELETE")):
+            statements.append((statement, parameters))
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        assert conversation_store.accept_board_review(
+            session.id, session.updated_at, str(session.updated_at + 1)
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+    assert any(s.lstrip().upper().startswith("UPDATE CONVERSATIONS") for s, _ in statements)
+    with engine.connect() as conn:
+        for statement, parameters in statements:
+            plan = str(conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all())
+            assert "SCAN " not in plan, (statement, plan)
+
+
 @pytest.mark.parametrize("writer", ["append", "update_title", "rename_if_matches"])
 def test_activity_writers_drop_the_board_acceptance(
     conversation_store: SqlAlchemyConversationStore,
