@@ -8,6 +8,7 @@ import contextlib
 import errno
 import json
 import logging
+import threading
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -4399,9 +4400,60 @@ def test_bridge_state_polling_backs_off_after_fast_window(
 
 
 @pytest.mark.asyncio
-async def test_cancelled_bridge_polling_wait_exits_cleanly(tmp_path: Path) -> None:
-    """Cancelling a queued first turn interrupts its polling sleep."""
+@pytest.mark.parametrize(
+    ("filename", "read_number"),
+    [
+        (None, 0),
+        ("state.json", 1),
+        ("state.json", 2),
+        ("state.json", 3),
+        ("startup_error.json", 1),
+        ("startup_timeout.json", 1),
+        ("startup_timeout.json", 2),
+    ],
+)
+async def test_cancelled_bridge_polling_wait_exits_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, filename: str | None, read_number: int
+) -> None:
+    """Stop interrupts sleep or stalled startup reads without submitting late input."""
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    _FakeCodexNativeClient.created = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    loop = asyncio.get_running_loop()
+    read_started = asyncio.Event()
+    release_read = threading.Event()
+    read_finished = threading.Event()
+    original_stat = Path.stat
+    original_open = Path.open
+    reads = 0
+
+    def hold_read(path: Path) -> None:
+        nonlocal reads
+        if filename is not None and path == tmp_path / filename:
+            reads += 1
+            if reads == read_number:
+                loop.call_soon_threadsafe(read_started.set)
+                try:
+                    assert release_read.wait(2), "startup read blocked the event loop"
+                finally:
+                    read_finished.set()
+
+    def delayed_stat(path: Path, *args, **kwargs):
+        hold_read(path)
+        return original_stat(path, *args, **kwargs)
+
+    def delayed_open(path: Path, *args, **kwargs):
+        hold_read(path)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        Path,
+        "open" if filename == "startup_timeout.json" else "stat",
+        delayed_open if filename == "startup_timeout.json" else delayed_stat,
+    )
 
     async def _drive() -> None:
         async for _event in executor.run_turn(
@@ -4412,10 +4464,24 @@ async def test_cancelled_bridge_polling_wait_exits_cleanly(tmp_path: Path) -> No
             pass
 
     task = asyncio.create_task(_drive())
-    await asyncio.sleep(0)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    try:
+        if filename is None:
+            await asyncio.sleep(0)
+        else:
+            await asyncio.wait_for(read_started.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+        assert not release_read.is_set()
+        _start_state(tmp_path)
+    finally:
+        release_read.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if filename is not None:
+            assert await asyncio.to_thread(read_finished.wait, 2)
+    assert task.cancelled()
+    assert _FakeCodexNativeClient.created == []
 
 
 @pytest.mark.parametrize(

@@ -198,9 +198,9 @@ async def _wait_for_bridge_state(
     startup_timeout_observed: bool,
 ) -> tuple[CodexNativeBridgeState | None, float, float, bool]:
     """Poll startup files quickly at first, then back off to a modest cadence."""
-    state = read_bridge_state(bridge_dir)
+    state = await asyncio.to_thread(read_bridge_state, bridge_dir)
     while state is None and waited_seconds < max_wait_seconds:
-        if read_bridge_startup_error(bridge_dir) is not None:
+        if await asyncio.to_thread(read_bridge_startup_error, bridge_dir) is not None:
             break
         poll_interval = (
             _BRIDGE_STATE_FAST_POLL_SECONDS
@@ -210,11 +210,13 @@ async def _wait_for_bridge_state(
         sleep_seconds = min(poll_interval, max_wait_seconds - waited_seconds)
         await asyncio.sleep(sleep_seconds)
         waited_seconds += sleep_seconds
-        state = read_bridge_state(bridge_dir)
+        state = await asyncio.to_thread(read_bridge_state, bridge_dir)
         if state is not None:
             break
         if not startup_timeout_observed:
-            advertised_wait_seconds = _bridge_state_wait_seconds(bridge_dir)
+            advertised_wait_seconds = await asyncio.to_thread(
+                _bridge_state_wait_seconds, bridge_dir
+            )
             if advertised_wait_seconds > _LEGACY_BRIDGE_STATE_WAIT_SECONDS:
                 extended_wait_seconds = max(
                     max_wait_seconds,
@@ -1209,12 +1211,14 @@ class CodexNativeExecutor(Executor):
         # during the expected startup window, then back off. Once state exists,
         # the decision/RPC/write below runs under the lock — re-reading state
         # so it's atomic with respect to a steer that landed during the wait.
-        state = read_bridge_state(self._bridge_dir)
+        state = await asyncio.to_thread(read_bridge_state, self._bridge_dir)
         waited_seconds = 0.0
         max_wait_seconds = _LEGACY_BRIDGE_STATE_WAIT_SECONDS
         startup_timeout_observed = False
         if state is None:
-            max_wait_seconds = _bridge_state_wait_seconds(self._bridge_dir)
+            max_wait_seconds = await asyncio.to_thread(
+                _bridge_state_wait_seconds, self._bridge_dir
+            )
             startup_timeout_observed = max_wait_seconds > _LEGACY_BRIDGE_STATE_WAIT_SECONDS
             if startup_timeout_observed:
                 _logger.debug(
