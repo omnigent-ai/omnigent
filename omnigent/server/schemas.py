@@ -1477,6 +1477,8 @@ class SessionEventInput(BaseModel):
         tools are fixed at start time.
     :param created_by: Optional internal attribution actor for runner-
         originated events that are triggered by a prior human turn.
+    :param workflow_run_id: Optional plan-entry ID limiting a user message to
+        that workflow run. A superseded run is rejected with HTTP 409.
     """
 
     type: str
@@ -1487,6 +1489,7 @@ class SessionEventInput(BaseModel):
     model_override: str | None = None
     tools: list[dict[str, Any]] | None = None
     created_by: str | None = None
+    workflow_run_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
 
     @field_validator("data")
     @classmethod
@@ -2233,8 +2236,7 @@ class SandboxStatus(BaseModel):
         has none) → ``starting`` (starting the in-sandbox host) →
         ``connecting`` (launching the agent runner) → ``ready`` /
         ``failed``.
-    :param provider: Sandbox provider being launched, e.g. ``"arclet"``,
-        or ``None`` when unknown.
+    :param provider: Sandbox provider being launched, or ``None`` when unknown.
     :param details: What the user needs to do when
         ``stage == "action_required"``, e.g. ``"Sign in on your laptop."``.
         ``None`` otherwise.
@@ -2914,6 +2916,22 @@ class CodexGoalResponse(BaseModel):
     goal: CodexGoalObject | None
 
 
+class CodexGoalReadResponse(CodexGoalResponse):
+    """Goal read with explicit availability from the native backend.
+
+    :param available: Whether the backend confirmed the goal, including its
+        absence. An unavailable read must not replace the caller's snapshot.
+    """
+
+    available: Annotated[bool, Strict()]
+
+    @model_validator(mode="after")
+    def _validate_unavailable_goal(self) -> Self:
+        if not self.available and self.goal is not None:
+            raise ValueError("An unavailable goal read cannot contain a goal")
+        return self
+
+
 class SetCodexGoalRequest(BaseModel):
     """
     Request body for ``PUT /v1/sessions/{id}/codex_goal``.
@@ -3357,6 +3375,310 @@ class SessionPullRequestList(BaseModel):
     last_id: str | None = None
     has_more: bool = False
     synced: bool = False
+
+
+JournalEntryKind = Literal["status", "note", "dispatch", "dispatch_result", "plan", "plan_status"]
+
+
+class SessionJournalAuthor(BaseModel):
+    """
+    Who wrote a journal entry, derived from its kind and, for plans, its source.
+
+    :param type: ``"agent"`` for the session's agent, ``"omnigent"`` for
+        entries Omnigent writes.
+    """
+
+    type: Literal["agent", "omnigent"]
+
+
+class SessionJournalEntry(BaseModel):
+    """
+    One entry of a session's journal.
+
+    :param id: Entry ID, a bare 32-character hex UUID.
+    :param position: The entry's place in the journal: 0, 1, 2, …
+    :param created_at: Unix epoch seconds when it was appended.
+    :param scheduled_task_run_id: The automation run the session was serving,
+        or ``None``.
+    :param step: The plan step it is about, e.g. ``"propose"``, or ``None``.
+    :param kind: The entry kind; ``content`` holds its fields.
+    :param content: e.g. ``{"status": "done", "text": "PR merged"}`` for a
+        status, ``{"body": "…"}`` for a note, or ``{"version": 2, "source":
+        "agent", "steps": [...]}`` for a plan.
+    :param workflow_id: The saved workflow the entry was written under, or
+        ``None``: set on the plan that starts a run of it, and on the statuses
+        and notes written while that plan is current.
+    """
+
+    id: str
+    position: int
+    created_at: int
+    scheduled_task_run_id: str | None = None
+    step: str | None = None
+    author: SessionJournalAuthor
+    kind: JournalEntryKind
+    content: dict[str, Any]
+    workflow_id: str | None = None
+
+
+class SessionJournalPage(BaseModel):
+    """
+    One page of a session's journal, for ``GET /v1/sessions/{id}/journal``.
+    """
+
+    object: Literal["list"] = "list"
+    data: list[SessionJournalEntry] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
+
+
+class WorkflowStep(BaseModel):
+    """
+    One step of a saved workflow, in the journal plan's step format.
+
+    :param id: Stable step ID, e.g. ``"build"``: lowercase letters, digits,
+        ``-`` and ``_``, starting with a letter or digit; at most 64 characters.
+    :param name: One line of at most 80 characters, e.g. ``"Build"``.
+    :param goal: What the step achieves, at most 300 characters, or ``None``.
+    :param depends_on: IDs of the steps that must be done before it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    name: str
+    goal: str | None = None
+    depends_on: list[str] = Field(default_factory=list)
+
+
+class WorkflowSummary(BaseModel):
+    """
+    A saved workflow as a list page returns it, without its steps.
+
+    :param id: Workflow ID, a bare 32-character hex UUID.
+    :param object: Discriminator; always ``"workflow"``.
+    :param name: One line, unique among the owner's workflows.
+    :param description: What the workflow is for.
+    :param created_at: Unix epoch seconds when it was saved.
+    :param updated_at: Unix epoch seconds of the last write.
+    :param is_draft: Derived from whether the saved plan has no steps.
+    """
+
+    id: str
+    object: Literal["workflow"] = "workflow"
+    name: str
+    description: str
+    created_at: int
+    updated_at: int
+    is_draft: bool = False
+
+
+class WorkflowObject(WorkflowSummary):
+    """
+    A saved workflow with its steps, the plan a run copies into a journal.
+
+    :param steps: The workflow's graph.
+    :param planning_session_id: The conversation for proposing revisions, separate from runs.
+    """
+
+    steps: list[WorkflowStep]
+    planning_session_id: str | None = None
+
+
+class WorkflowList(BaseModel):
+    """
+    One page of the caller's workflows by name, for ``GET /v1/workflows``.
+
+    :param object: Discriminator; always ``"list"``.
+    :param data: The page's workflows, without their steps.
+    :param first_id: The page's first workflow ID, or ``None`` when empty.
+    :param last_id: The page's last workflow ID, retained for older clients.
+    :param next_cursor: Pass it as ``after`` for the next page. Retains the name
+        boundary if that workflow is renamed or deleted; ``None`` on the last page.
+    :param has_more: Whether another page follows.
+    """
+
+    object: Literal["list"] = "list"
+    data: list[WorkflowSummary] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    next_cursor: str | None = None
+    has_more: bool = False
+
+
+class WorkflowRunProgress(BaseModel):
+    """
+    Where a run's steps stand: the steps of the plan that started it, counted
+    by their current status in the session.
+
+    :param total: Steps in that plan, e.g. ``5``.
+    :param started: Steps in progress.
+    :param done: Steps done.
+    :param needs_input: Steps waiting for the user.
+    :param failed: Steps that failed.
+    """
+
+    total: int
+    started: int = 0
+    done: int = 0
+    needs_input: int = 0
+    failed: int = 0
+
+
+class WorkflowRun(BaseModel):
+    """
+    One run of a saved workflow: a session that started it.
+
+    :param id: The run's ID: that of the plan entry that started it.
+    :param session_id: The session that ran it.
+    :param title: The session's title; empty when it has none yet.
+    :param started_at: Unix epoch seconds when the run's plan was written.
+    :param is_current: Whether this is the session's current run, which can take actions.
+    :param session_status: The session's status, ``"idle"``, ``"running"`` or
+        ``"failed"``, including active direct sub-agents.
+    :param background_work_running: Whether background work outlives the session's turn.
+    :param archived: Whether the session is archived.
+    :param progress: Where the run's steps stand.
+    :param steps: The steps of the plan that started the run.
+    :param statuses: Each of those steps' newest status entry; a step with
+        none yet is left out.
+    """
+
+    id: str
+    session_id: str
+    title: str
+    started_at: int
+    is_current: bool = False
+    session_status: Literal["idle", "running", "failed"]
+    background_work_running: bool = False
+    archived: bool = False
+    progress: WorkflowRunProgress
+    steps: list[WorkflowStep] = Field(default_factory=list)
+    statuses: list[SessionJournalEntry] = Field(default_factory=list)
+
+
+class WorkflowRunList(BaseModel):
+    """
+    One page of a saved workflow's runs, newest first, for
+    ``GET /v1/workflows/{id}/runs``.
+
+    :param object: Discriminator; always ``"list"``.
+    :param data: The page's runs in sessions the caller can read.
+    :param next_cursor: Pass it as ``before`` for the next page; ``None`` on
+        the last page.
+    """
+
+    object: Literal["list"] = "list"
+    data: list[WorkflowRun] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+class CreateWorkflowRequest(BaseModel):
+    """
+    Request body for ``POST /v1/workflows``.
+
+    :param name: One line of at most 80 characters, unique among the caller's
+        workflows.
+    :param description: What the workflow is for, at most 2,000 characters and
+        2,000 stored bytes after compression and the deployment's storage envelope.
+    :param steps: Empty or omitted to create a draft. Otherwise a graph with unique
+        step IDs, dependencies inside it, no cycles, and at most 100 steps.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    description: str
+    steps: list[WorkflowStep] = Field(default_factory=list)
+
+
+class UpdateWorkflowRequest(BaseModel):
+    """
+    Request body for ``PATCH /v1/workflows/{workflow_id}``; ``None`` keeps a field.
+
+    :param name: A new name.
+    :param description: A new description, subject to the same character and
+        stored-byte limits as creation.
+    :param steps: New steps, replacing the old ones.
+    :param planning_session_id: The private owned session for iterating on the plan.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = None
+    description: str | None = None
+    steps: list[WorkflowStep] | None = None
+    planning_session_id: str | None = None
+
+
+class WorkflowDeleted(BaseModel):
+    """
+    Response for ``DELETE /v1/workflows/{workflow_id}``.
+
+    :param id: The deleted workflow's ID.
+    :param object: Discriminator; always ``"workflow.deleted"``.
+    :param deleted: Always ``True``.
+    """
+
+    id: str
+    object: Literal["workflow.deleted"] = "workflow.deleted"
+    deleted: Literal[True] = True
+
+
+class SessionJournalAppendRequest(BaseModel):
+    """
+    Body of ``POST /v1/sessions/{id}/journal``, sent by the session's runner.
+
+    :param kind: The kind the agent writes.
+    :param content: The kind's fields, e.g. ``{"status": "done", "text": "PR merged"}``.
+    :param step: The plan step the entry is about.
+    :param idempotency_key: Names the write, e.g. ``"tool:<tool call ID>"``; a
+        retry with the same key returns the first attempt's entry.
+    :param workflow_id: The saved workflow associated with a plan.
+    :param start_run: False when saving the current plan as a workflow, preserving
+        its progress; True when invoking a saved workflow again.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["status", "note", "plan"]
+    content: dict[str, Any]
+    step: str | None = None
+    idempotency_key: str = Field(min_length=1, max_length=128)
+    workflow_id: str | None = None
+    start_run: bool = True
+
+
+class SessionJournalInputRequest(BaseModel):
+    """
+    Body of ``POST /v1/sessions/{id}/journal/input-requests``, sent by the session's runner.
+
+    :param step: The task in the current plan that waits for the answer, e.g. ``"deploy"``.
+    :param questions: 1 to 3 questions, each with a ``question``, a short
+        ``header``, 2 to 4 ``options`` (``label``, optional ``description``) and
+        an optional ``recommended`` option label.
+    :param idempotency_key: Names the request, e.g. ``"tool:<tool call ID>"``; a
+        retry with the same key reuses the first attempt's status and question.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    step: str
+    questions: list[dict[str, Any]]
+    idempotency_key: str = Field(min_length=1, max_length=128)
+
+
+class SessionJournalInputRequested(BaseModel):
+    """
+    Response of ``POST /v1/sessions/{id}/journal/input-requests``.
+
+    :param entry: The task's ``needs_input`` status.
+    :param elicitation_id: The question's elicitation; the runner waits for its answer.
+    """
+
+    entry: SessionJournalEntry
+    elicitation_id: str
 
 
 class SessionListItem(BaseModel):
@@ -4394,8 +4716,7 @@ class SessionSandboxStatusEvent(_SSEEventBase):
     :param stage: The launch stage just entered, e.g.
         ``"provisioning"`` — see :class:`SandboxStatus` for the full
         pipeline order.
-    :param provider: Sandbox provider being launched, e.g. ``"arclet"``,
-        or ``None`` when unknown.
+    :param provider: Sandbox provider being launched, or ``None`` when unknown.
     :param details: What the user needs to do when
         ``stage == "action_required"``, e.g. ``"Sign in on your laptop."``.
         ``None`` otherwise.
@@ -5594,6 +5915,23 @@ class SessionChildSessionUpdatedEvent(_SSEEventBase):
     child: dict[str, Any]
 
 
+class SessionJournalAppendedEvent(_SSEEventBase):
+    """
+    An entry was appended to the session's journal.
+
+    Transient: the journal itself is the source of truth, and a client that
+    reconnects catches up with ``GET …/journal?order=asc&after=<last entry ID>``.
+
+    :param type: Always ``"session.journal.appended"``.
+    :param conversation_id: The session whose journal grew.
+    :param entry: The new entry.
+    """
+
+    type: Literal["session.journal.appended"]
+    conversation_id: str
+    entry: SessionJournalEntry
+
+
 class SessionChangedFilesInvalidatedEvent(_SSEEventBase):
     """
     The session's changed-files list may have changed — refetch it.
@@ -5738,6 +6076,7 @@ ServerStreamEvent = Annotated[
     | SessionResourceCreatedEvent
     | SessionResourceDeletedEvent
     | SessionChildSessionUpdatedEvent
+    | SessionJournalAppendedEvent
     | SessionChangedFilesInvalidatedEvent
     | SessionTerminalActivityEvent
     # ── Transient (SSE-only) — incremental token deltas ────────

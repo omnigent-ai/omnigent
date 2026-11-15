@@ -45,6 +45,10 @@ vi.mock("@/hooks/useSessionMentionEntries", () => ({
 // ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
 // (default: no PR) so these tests don't need a QueryClientProvider, matching
 // the workspace-files stub above.
+// Run a workflow lists saved workflows from a TanStack query; none here.
+vi.mock("@/hooks/useSavedWorkflows", () => ({
+  useSavedWorkflows: () => ({ workflows: [], refresh: () => {} }),
+}));
 vi.mock("@/hooks/usePullRequests", () => ({
   usePullRequestInfo: () => usePullRequestInfoMock(),
 }));
