@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field, replace
@@ -680,6 +681,107 @@ async def test_codex_listener_refusal_preserves_a_live_backend_connection(
         }
     finally:
         await accepted.close()
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "recover",
+        "cancel",
+        "pane-replaced",
+        "owner-removed",
+        "backend-replaced",
+        "process-replaced",
+    ],
+)
+async def test_codex_settings_recovery_keeps_bridge_reads_responsive(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    session = native_session
+    read_started = asyncio.Event()
+    read_finished = threading.Event()
+    release_read = threading.Event()
+    safety_release = threading.Event()
+    loop = asyncio.get_running_loop()
+    connect = app_server.CodexAppServerClient.connect
+    stat = Path.stat
+    refused = False
+    hold_next_read = False
+
+    async def stop_before_connect(rpc: app_server.CodexAppServerClient) -> None:
+        nonlocal refused, hold_next_read
+        if not refused:
+            refused = True
+            await session.codex.close()
+            hold_next_read = True
+            raise ConnectionRefusedError("The listener stopped during the settings connection")
+        await connect(rpc)
+
+    def hold_stat(path: Path, *args: Any, **kwargs: Any) -> Any:
+        nonlocal hold_next_read
+        if hold_next_read and path == session.codex.bridge_dir / bridge._STATE_FILE:
+            hold_next_read = False
+            loop.call_soon_threadsafe(read_started.set)
+            try:
+                if not release_read.wait(budget(5)):
+                    safety_release.set()
+                return stat(path, *args, **kwargs)
+            finally:
+                read_finished.set()
+        return stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(app_server.CodexAppServerClient, "connect", stop_before_connect)
+    monkeypatch.setattr(Path, "stat", hold_stat)
+    replacement = SimpleNamespace(
+        bridge_dir=session.codex.bridge_dir, proc=SimpleNamespace(returncode=0), close=AsyncMock()
+    )
+    change = asyncio.create_task(
+        client.patch(
+            f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+        )
+    )
+    try:
+        await asyncio.wait_for(read_started.wait(), timeout=budget(10))
+        assert (await session.runner.get("/health")).status_code == 200
+        assert not safety_release.is_set(), "recovery bridge read blocked the event loop"
+        if outcome == "cancel":
+            change.cancel()
+            await asyncio.gather(change, return_exceptions=True)
+            assert change.cancelled()
+        elif outcome == "pane-replaced":
+            pane = make_test_terminal_instance("codex", "main", session.codex.bridge_dir)
+            monkeypatch.setattr(pane, "_tmux", AsyncMock())
+            session.terminals._by_conversation[session.session_id][("codex", "main")] = pane
+        elif outcome == "owner-removed":
+            session.resources._terminal_roles.pop(
+                (session.session_id, terminal_resource_id("codex", "main"))
+            )
+        elif outcome == "backend-replaced":
+            native_runtime._AUTO_CODEX_APP_SERVERS[session.session_id] = replacement
+        elif outcome == "process-replaced":
+            session.codex.proc = SimpleNamespace(returncode=0)
+        release_read.set()
+        assert await asyncio.to_thread(read_finished.wait, budget(5))
+        if outcome != "cancel":
+            response = await asyncio.wait_for(change, timeout=budget(5))
+        assert not safety_release.is_set(), "control waited for the filesystem safety release"
+    finally:
+        release_read.set()
+        change.cancel()
+        await asyncio.gather(change, return_exceptions=True)
+
+    if outcome == "recover":
+        session.assert_applied(response)
+        assert session.codex.launches == 2
+    else:
+        assert session.codex.applied_updates == []
+        assert session.codex.launches == 1
+        if outcome != "cancel":
+            assert response.status_code == 503, response.text
+    replacement.close.assert_not_awaited()
 
 
 @pytest.mark.parametrize("model_options", [False, True], ids=["settings", "model-options"])
