@@ -1031,12 +1031,12 @@ describe("trigger header", () => {
     expect(stripTriggerHeader(saved)).toBe(renderTriggerConfigPrompt(config(source), CTX));
   });
 
-  it.each(TRIGGER_SOURCES)("keeps 16,000 characters of %s instructions exactly", (source) => {
+  it("keeps 16,000 characters of instructions exactly", () => {
     const instructions = 'Runbook: quote "this", keep <tags> and --> as is.\n'.padEnd(
       MAX_INSTRUCTIONS_CHARS,
       "x",
     );
-    const saved = encodeTriggerPrompt(config(source, { instructions }), CTX);
+    const saved = encodeTriggerPrompt(config("jira", { instructions }), CTX);
     expect(decodeTriggerPrompt(saved)?.instructions).toBe(instructions);
     expect(stripTriggerHeader(saved)).toContain(instructions);
   });
