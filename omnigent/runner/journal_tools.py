@@ -341,6 +341,7 @@ async def _request_input(
                 conversation_id=conversation_id,
                 publish_event=_stream_publisher(publish_event),
                 retry_on_server_reconnect=True,
+                keep_pending_on_reconnect=True,
                 on_registered=publish_question,
             )
         except _InputRequestFailed as exc:

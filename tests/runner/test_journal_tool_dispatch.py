@@ -28,6 +28,7 @@ from omnigent.runner.tool_dispatch import (
     build_native_relay_tool_schemas,
     filter_workflow_tool_schemas,
 )
+from omnigent.runtime import pending_elicitations
 from omnigent.spec.parser import parse_tool_groups
 from omnigent.spec.types import AgentSpec
 from omnigent.tools import ToolManager
@@ -371,29 +372,49 @@ async def test_a_question_waits_for_the_answer_and_returns_it(
 async def test_a_question_is_raised_again_after_the_server_reconnects() -> None:
     keys: list[object] = []
     elicitation_id = workflow_elicitation_id(SESSION, "tool:toolu_10")
+    first_question = asyncio.Event()
+    replacement_question = asyncio.Event()
+    delayed_events: list[dict] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         keys.append(json.loads(request.content)["idempotency_key"])
+        pending_elicitations.record_publish(
+            SESSION, {"type": "response.elicitation_request", "elicitation_id": elicitation_id}
+        )
+        (first_question if len(keys) == 1 else replacement_question).set()
         return httpx.Response(200, json={"entry": _STATUS, "elicitation_id": elicitation_id})
 
-    async def reconnect_then_answer() -> None:
-        while not pending_approvals.has_pending(SESSION):
-            await asyncio.sleep(0.01)
-        pending_approvals.notify_server_reconnect()
-        while len(keys) < 2:
-            await asyncio.sleep(0.01)
-        await _answer_when_asked(elicitation_id, (True, {"Deploy to prod now?": "Deploy"}))
-
     async with _client(handler) as client:
-        helper = asyncio.create_task(reconnect_then_answer())
-        result = await _run(
-            client,
-            "sys_workflow_request_input",
-            {"step": "deploy", "questions": [_QUESTION]},
-            call_id="toolu_10",
-            publish_event=lambda *_: None,
+        waiting = asyncio.create_task(
+            _run(
+                client,
+                "sys_workflow_request_input",
+                {"step": "deploy", "questions": [_QUESTION]},
+                call_id="toolu_10",
+                publish_event=lambda _session, event: delayed_events.append(event),
+            )
         )
-        await helper
+        try:
+            await asyncio.wait_for(first_question.wait(), timeout=5)
+            pending_approvals.notify_server_reconnect()
+            await asyncio.wait_for(replacement_question.wait(), timeout=5)
+            # Runner stream delivery can lag behind the replacement HTTP request.
+            for event in delayed_events:
+                pending_elicitations.record_publish(SESSION, event)
+            delayed_events.clear()
+            assert pending_elicitations.count_for(SESSION) == 1
+            assert pending_approvals.has_pending(SESSION)
+            assert pending_approvals.resolve(
+                elicitation_id, True, {"Deploy to prod now?": "Deploy"}
+            )
+            result = await asyncio.wait_for(waiting, timeout=5)
+            for event in delayed_events:
+                pending_elicitations.record_publish(SESSION, event)
+            assert pending_elicitations.count_for(SESSION) == 0
+        finally:
+            waiting.cancel()
+            await asyncio.gather(waiting, return_exceptions=True)
+            pending_elicitations.resolve(SESSION, elicitation_id)
     assert keys == ["tool:toolu_10", "tool:toolu_10"]
     assert result["answers"] == [{"question": "Deploy to prod now?", "answer": "Deploy"}]
 

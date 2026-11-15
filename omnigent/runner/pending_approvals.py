@@ -252,6 +252,7 @@ async def wait_for_user_verdict(
     publish_event: Callable[[str, dict[str, object]], None],
     timeout_seconds: float | None = None,
     retry_on_server_reconnect: bool = False,
+    keep_pending_on_reconnect: bool = False,
     on_registered: Callable[[], Awaitable[None]] | None = None,
 ) -> Verdict:
     """
@@ -287,6 +288,8 @@ async def wait_for_user_verdict(
     :param retry_on_server_reconnect: Wake with :class:`ServerReconnected`
         after a tunnel reconnect so the caller can recreate server-owned
         approval state.
+    :param keep_pending_on_reconnect: Retain a question that the caller re-registers
+        with the same ID; a delayed resolution would clear its replacement.
     :param on_registered: Publish a question only after its answer can be delivered.
     :returns: The user's :class:`Verdict`. Declines and timeouts
         carry ``approved=False`` and no content.
@@ -301,6 +304,7 @@ async def wait_for_user_verdict(
     # exit path (verdict, timeout, cancellation) so the flag never leaks.
     _session_pending[conversation_id] = _session_pending.get(conversation_id, 0) + 1
     answered = False
+    reconnecting = False
     try:
         with pause_tool_call_deadline(effective_timeout):
             if on_registered is not None:
@@ -309,6 +313,9 @@ async def wait_for_user_verdict(
         answered = True
     except TimeoutError:
         verdict = Verdict(approved=False)
+    except ServerReconnected:
+        reconnecting = True
+        raise
     finally:
         cleanup(elicitation_id)
         if not fut.done():
@@ -320,20 +327,15 @@ async def wait_for_user_verdict(
             _session_pending[conversation_id] = _remaining
         else:
             _session_pending.pop(conversation_id, None)
-        # Signal the Omnigent server's pending-elicitations index that
-        # this prompt is done. Idempotent on the happy path (the
-        # AP-side dispatch already cleared the entry); on timeout
-        # / cancellation this event is the ONLY signal the server
-        # gets, so it must fire on every exit path.
-        resolved: dict[str, object] = {
-            "type": "response.elicitation_resolved",
-            "elicitation_id": elicitation_id,
-        }
-        if not answered:
-            # Nobody decided anything: let the card say the prompt expired
-            # rather than render the neutral "Resolved elsewhere" pill.
-            resolved["reason"] = "unanswered"
-        publish_event(conversation_id, resolved)
+        # Timeout and cancellation still clear the prompt; re-registration is not an answer.
+        if not (reconnecting and keep_pending_on_reconnect):
+            resolved: dict[str, object] = {
+                "type": "response.elicitation_resolved",
+                "elicitation_id": elicitation_id,
+            }
+            if not answered:
+                resolved["reason"] = "unanswered"
+            publish_event(conversation_id, resolved)
     return verdict
 
 

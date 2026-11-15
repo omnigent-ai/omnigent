@@ -392,6 +392,7 @@ export interface ScheduledTaskRunSteps {
   isCurrent: boolean;
   /** The saved workflow the plan runs, when it named one. */
   workflowId: string | null;
+  planName: string | null;
   steps: JournalPlanStep[];
   statuses: JournalEntry[];
 }
@@ -416,6 +417,7 @@ export async function listScheduledTaskRunSteps(
       run_id: string;
       is_current?: boolean;
       workflow_id: string | null;
+      plan_name?: string | null;
       steps: JournalPlanStep[];
       statuses: JournalEntry[];
     }[];
@@ -424,6 +426,7 @@ export async function listScheduledTaskRunSteps(
     runId: run.run_id,
     isCurrent: run.is_current === true,
     workflowId: run.workflow_id,
+    planName: run.plan_name ?? null,
     steps: run.steps,
     statuses: run.statuses,
   }));

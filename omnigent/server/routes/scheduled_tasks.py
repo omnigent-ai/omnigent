@@ -1306,7 +1306,7 @@ def create_scheduled_tasks_router(
         run that wrote a plan lists the steps of its first plan and each step's
         newest status entry: one run-index lookup per run, then one
         kind-and-step lookup per step. The response is ``{"runs": [{"run_id",
-        "workflow_id", "steps", "statuses"}], "next_cursor"}``.
+        "workflow_id", "plan_name", "is_current", "steps", "statuses"}], "next_cursor"}``.
         """
         from omnigent.server.session_journal import entry_to_response, open_store
 
@@ -1333,6 +1333,7 @@ def create_scheduled_tasks_router(
                 {
                     "run_id": run.id,
                     "workflow_id": plan.workflow_id,
+                    "plan_name": plan.content.get("name"),
                     "is_current": (
                         plan.id in current_plans
                         and (session := sessions.get(plan.conversation_id)) is not None

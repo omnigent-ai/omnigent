@@ -6981,21 +6981,54 @@ describe("Composer workflow entry point", () => {
 
   it.each([true, false])(
     "asks the main agent to stop the workflow without clearing a draft (main turn active: %s)",
-    (isWorking) => {
+    async (isWorking) => {
+      const original = useChatStore.getState();
+      const queued = [{ queueId: "q_held", text: "Later work", conversationId: "conv_test" }];
       setComposerState({
         conversationId: "conv_test",
         sessionHarness: "openai-agents",
         skills: [],
+        status: isWorking ? "streaming" : "idle",
+        sessionStatus: "running",
+        queuedMessages: queued,
+      });
+      writeAlwaysSteer(false);
+      const fetchMessage = vi.spyOn(globalThis, "fetch").mockImplementation(
+        async () =>
+          new Response(JSON.stringify({ queued: true, item_id: "stop_message" }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+      );
+      onTestFinished(() => {
+        fetchMessage.mockRestore();
+        localStorage.clear();
+        useChatStore.setState({
+          queuedMessages: original.queuedMessages,
+          status: original.status,
+          sessionStatus: original.sessionStatus,
+        });
       });
       const onStop = vi.fn();
-      const onSend = vi.fn();
+      const onSend = vi.fn(useChatStore.getState().enqueueMessage);
       const error = vi.spyOn(toast, "error");
       const { rerender } = renderWithWorkflows(
         <Composer {...composerProps({ onStop, onSend, isWorking })} />,
       );
       fireEvent.change(textarea(), { target: { value: "An unsent note" } });
       act(() => useSessionTasksActions.getState().stopWork.conv_test?.());
-      expect(onSend).toHaveBeenCalledWith(stopPlanMessage(null));
+      await waitFor(() =>
+        expect(fetchMessage).toHaveBeenCalledWith(
+          "/v1/sessions/conv_test/events",
+          expect.objectContaining({ method: "POST" }),
+        ),
+      );
+      expect(JSON.parse(fetchMessage.mock.calls[0]![1]!.body as string)).toMatchObject({
+        type: "message",
+        data: { role: "user", content: [{ type: "input_text", text: stopPlanMessage(null) }] },
+      });
+      expect(onSend).not.toHaveBeenCalled();
+      expect(useChatStore.getState().queuedMessages).toEqual(queued);
       expect(onStop).not.toHaveBeenCalled();
       expect(textarea().value).toBe("An unsent note");
 
@@ -7008,7 +7041,7 @@ describe("Composer workflow entry point", () => {
       expect(error).toHaveBeenCalledWith(
         "The session is offline. Reconnect it to stop the workflow.",
       );
-      expect(onSend).toHaveBeenCalledOnce();
+      expect(fetchMessage).toHaveBeenCalledOnce();
       expect(onStop).not.toHaveBeenCalled();
       error.mockRestore();
     },

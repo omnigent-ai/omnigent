@@ -1348,6 +1348,7 @@ async def test_an_automations_runs_list_the_steps_of_their_first_plans(
     assert [run["run_id"] for run in page["runs"]] == [run_ids[0]]
     (shown,) = page["runs"]
     assert shown["is_current"] is True
+    assert shown["plan_name"] == "Triage"
     assert [step["id"] for step in shown["steps"]] == ["explore", "fix"]
     assert [(s["step"], s["content"]["status"]) for s in shown["statuses"]] == [
         ("explore", "done")

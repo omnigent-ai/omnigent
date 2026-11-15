@@ -301,6 +301,7 @@ describe("useScheduledTaskRuns live refresh", () => {
         runId: run.id,
         isCurrent: true,
         workflowId: null,
+        planName: null,
         steps: [],
         statuses: [],
       }));

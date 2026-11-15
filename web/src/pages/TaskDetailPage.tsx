@@ -85,7 +85,6 @@ import { isFeatureEnabled, sandboxOptionLabel } from "@/lib/capabilities";
 import { ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
 import type { ScheduledTaskRun, ScheduledTaskRunSteps } from "@/lib/scheduledTasksApi";
 import { stepProgress } from "@/lib/sessionJournal";
-import { parseSavedWorkflowMessage } from "@/lib/workflow";
 import { cn } from "@/lib/utils";
 
 const RUN_HIGHLIGHT_DURATION_MS = 3_000;
@@ -126,10 +125,8 @@ function TaskDetail({ taskId }: { taskId: string }) {
     isError: runsError,
     isFetchedAfterMount: runsFetchedAfterMount,
   } = useScheduledTaskRuns(taskId, taskId !== "", awaitingRunRow);
-  // An automation that runs a saved workflow shows each run's tasks.
-  const savedWorkflow =
-    task && isFeatureEnabled(info, "workflows") ? parseSavedWorkflowMessage(task.prompt) : null;
-  const runSteps = useScheduledTaskRunSteps(taskId, runs, savedWorkflow !== null);
+  const workflowsEnabled = isFeatureEnabled(info, "workflows");
+  const runSteps = useScheduledTaskRunSteps(taskId, runs, workflowsEnabled);
 
   const updateMutation = useUpdateScheduledTask();
   const deleteMutation = useDeleteScheduledTask();
@@ -595,8 +592,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
               run={run}
               now={now}
               highlighted={run.id === highlightedRunId}
-              steps={savedWorkflow ? runSteps.get(run.id) : undefined}
-              workflowName={savedWorkflow?.name}
+              steps={workflowsEnabled ? runSteps.get(run.id) : undefined}
             />
           ))}
         </ul>
@@ -700,14 +696,12 @@ function RunRow({
   now,
   highlighted,
   steps,
-  workflowName,
 }: {
   run: ScheduledTaskRun;
   now: Date;
   highlighted: boolean;
-  /** The plan the run started with, when the automation runs a saved workflow. */
+  /** The plan the run started with, independent of the automation's current prompt. */
   steps?: ScheduledTaskRunSteps;
-  workflowName?: string;
 }) {
   const timestamp = formatRunTimestamp(run.firedAt ?? run.scheduledAt, now);
   // A workflow run's tasks, as the workflow's page shows them.
@@ -851,7 +845,7 @@ function RunRow({
             {control && (
               <RunPlanButton
                 sessionId={sessionId}
-                planName={workflowName ?? null}
+                planName={steps?.planName ?? null}
                 control={control}
                 refreshKeys={refreshKeys}
               />
@@ -866,7 +860,7 @@ function RunRow({
       )}
       {graphOpen && showTasks && steps && (
         <WorkflowGraphOverlay
-          title={workflowName ?? "Workflow"}
+          title={steps.planName ?? "Workflow"}
           subtitle={
             <>
               <span>{timestamp ?? "—"}</span>

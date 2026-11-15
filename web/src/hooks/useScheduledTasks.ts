@@ -184,7 +184,7 @@ const RUN_STEPS_PAGE = 20;
  * newest 20 refresh, and only while one of them is in flight.
  *
  * @param runs - The task's runs, most recent first, from `useScheduledTaskRuns`.
- * @param enabled - Whether to ask, e.g. when the automation runs a saved workflow.
+ * @param enabled - Whether the server supports workflow history.
  */
 export function useScheduledTaskRunSteps(
   id: string,

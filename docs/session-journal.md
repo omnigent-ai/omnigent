@@ -170,10 +170,12 @@ workflow").
 To run a saved workflow on a schedule or a trigger, pick it in New
 automation's **Workflow (optional)** field. Each run follows the workflow
 without a plan review, and the automation's **Additional instructions**
-customize it. No one is watching the run, so nothing in it waits for you:
-the agent answers its own questions with the option it would recommend, and
-says so in the task's status. A task that needs you, such as a sign-in, fails
-saying what it needs, and the agent goes on with the rest.
+customize it. No one is watching the run, so nothing in it waits for you.
+The agent chooses reversible defaults within your existing authorization
+and records them in the task's status. A task that needs an ungranted approval,
+a consequential decision, an explicitly required review, or a sign-in fails
+saying what it needs. The agent cannot approve those actions itself and goes
+on with independent tasks.
 
 The journal API enforces this using the session's existing server-owned
 `omnigent.scheduled_task_origin` and `omnigent.scheduled_task_run` labels.

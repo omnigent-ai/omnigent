@@ -1427,6 +1427,7 @@ describe("runs of a saved workflow", () => {
     runId: "run_1",
     isCurrent: true,
     workflowId: "9".repeat(32),
+    planName: "Triage",
     steps: [
       { id: "explore", name: "Explore", goal: null, depends_on: [] },
       { id: "fix", name: "Fix", goal: null, depends_on: ["explore"] },
@@ -1594,7 +1595,7 @@ describe("runs of a saved workflow", () => {
     expect(screen.queryByTestId("run-workflow-button")).toBeNull();
   });
 
-  it("asks for no plans when the automation runs no saved workflow", () => {
+  it("asks for no plans when the server disables workflows", () => {
     setTask(task());
     setRuns([run({ id: "run_1", status: "succeeded", conversationId: "c_9" })]);
     renderPage();
@@ -1606,5 +1607,35 @@ describe("runs of a saved workflow", () => {
     );
     expect(screen.queryByTestId("tasks-progress-segment")).toBeNull();
     expect(screen.queryByTestId("run-graph-button")).toBeNull();
+  });
+
+  it.each([
+    "Summarize the new issues.",
+    `/workflow Run the saved workflow "Weekly report" (ID ${"8".repeat(32)}).`,
+  ])("keeps recorded workflow history after editing the prompt to %s", (prompt) => {
+    setTask(task({ prompt }));
+    setRuns([run({ id: "run_1", status: "succeeded", conversationId: "c_9" })]);
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(new Map([["run_1", STEPS]]));
+    render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: true } }}
+      >
+        {pageTree()}
+      </CapabilitiesProvider>,
+    );
+
+    expect(hooks.useScheduledTaskRunSteps).toHaveBeenLastCalledWith(
+      "st_1",
+      expect.any(Array),
+      true,
+    );
+    const row = screen.getByTestId("task-detail-run");
+    expect(within(row).getAllByTestId("tasks-progress-segment")).toHaveLength(2);
+    expect(within(row).getByRole("link", { name: "Open workflow “Triage”" })).toHaveAttribute(
+      "href",
+      `/workflows/${"9".repeat(32)}`,
+    );
+    fireEvent.click(within(row).getByTestId("run-graph-button"));
+    expect(screen.getByTestId("workflow-graph-overlay")).toHaveAttribute("data-title", "Triage");
   });
 });
