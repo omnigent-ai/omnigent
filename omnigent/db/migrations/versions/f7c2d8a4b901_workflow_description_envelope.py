@@ -11,6 +11,7 @@ Encrypted descriptions must be decrypted by their deployment before downgrade.
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import nullcontext
 
 import sqlalchemy as sa
 import zstandard
@@ -44,6 +45,9 @@ def _alter_type(*, to_binary: bool) -> None:
 
 def upgrade() -> None:
     """Preserve existing descriptions as UTF-8 bytes."""
+    if op.get_bind().dialect.name == "cockroachdb":
+        _copy_cockroach_description(to_binary=True)
+        return
     if op.get_bind().dialect.name in ("sqlite", "cloudflare_d1"):
         # SQLite text can start with NUL. Frame it before casting to binary so
         # the reader cannot mistake legacy user text for a storage envelope.
@@ -73,6 +77,8 @@ def _plaintext(value: str | bytes | memoryview) -> str:
 
 def _rewrite_descriptions(
     transform: Callable[[str | bytes | memoryview], str | bytes | None],
+    *,
+    target: str = "description",
 ) -> None:
     connection = op.get_bind()
     workflows = sa.table(
@@ -81,10 +87,15 @@ def _rewrite_descriptions(
         sa.column("id"),
         sa.column("description"),
     )
-    query = sa.select(workflows).order_by(workflows.c.workspace_id, workflows.c.id)
+    if target != "description":
+        workflows.append_column(sa.column(target))
+    query = sa.select(workflows.c.workspace_id, workflows.c.id, workflows.c.description).order_by(
+        workflows.c.workspace_id, workflows.c.id
+    )
     page = connection.execute(query.limit(_BATCH_SIZE)).all()
+    cockroach = connection.dialect.name == "cockroachdb"
     if page:
-        with op.get_context().autocommit_block():
+        with nullcontext() if cockroach else op.get_context().autocommit_block():
             while page:
                 for workspace_id, row_id, description in page:
                     value = transform(description)
@@ -96,8 +107,10 @@ def _rewrite_descriptions(
                             workflows.c.workspace_id == workspace_id,
                             workflows.c.id == row_id,
                         )
-                        .values(description=value)
+                        .values({target: value})
                     )
+                if cockroach:
+                    _publish_cockroach_schema(connection)
                 workspace_id, row_id = page[-1].workspace_id, page[-1].id
                 page = connection.execute(
                     query.where(
@@ -112,8 +125,54 @@ def _rewrite_descriptions(
                 ).all()
 
 
+def _publish_cockroach_schema(connection: sa.Connection) -> None:
+    # CockroachDB must publish schema changes before the copy or next DDL.
+    connection.commit()
+    connection.execute(sa.text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+
+
+def _copy_cockroach_description(*, to_binary: bool) -> None:
+    """Avoid CockroachDB's experimental text/bytes ALTER COLUMN TYPE."""
+    connection = op.get_bind()
+    temporary = "_description_bytes" if to_binary else "_description_text"
+    target_type = _BINARY if to_binary else sa.String(2000)
+    columns = {
+        column["name"]: column["type"]
+        for column in sa.inspect(connection).get_columns("workflows")
+    }
+    if temporary not in columns:
+        # DDL may commit before Alembic records the revision; a retry is harmless.
+        if isinstance(columns["description"], sa.LargeBinary) == to_binary:
+            return
+        op.add_column("workflows", sa.Column(temporary, target_type, nullable=True))
+        _publish_cockroach_schema(connection)
+
+    if "description" in columns:
+        _rewrite_descriptions(
+            lambda value: (
+                b"\x00\x00" + _plaintext(value).encode("utf-8") if to_binary else _plaintext(value)
+            ),
+            target=temporary,
+        )
+        _publish_cockroach_schema(connection)
+        with op.batch_alter_table("workflows") as batch:
+            batch.drop_column("description")
+        _publish_cockroach_schema(connection)
+
+    # Resume even if the source was already dropped by a nontransactional DDL.
+    with op.batch_alter_table("workflows") as batch:
+        batch.alter_column(temporary, existing_type=target_type, nullable=False)
+    _publish_cockroach_schema(connection)
+    with op.batch_alter_table("workflows") as batch:
+        batch.alter_column(temporary, new_column_name="description", existing_type=target_type)
+    _publish_cockroach_schema(connection)
+
+
 def downgrade() -> None:
     """Restore UTF-8 descriptions before converting the column back to text."""
+    if op.get_bind().dialect.name == "cockroachdb":
+        _copy_cockroach_description(to_binary=False)
+        return
     sqlite = op.get_bind().dialect.name in ("sqlite", "cloudflare_d1")
     _rewrite_descriptions(
         lambda value: _plaintext(value) if sqlite else _plaintext(value).encode("utf-8")

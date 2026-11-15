@@ -8,8 +8,9 @@ import pytest
 import sqlalchemy as sa
 from alembic import command
 
+from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
 from omnigent.db.db_models import SqlWorkflow
-from omnigent.db.utils import _build_alembic_config, clear_engine_cache
+from omnigent.db.utils import _build_alembic_config, clear_engine_cache, get_or_create_engine
 from omnigent.stores.workflow_store import WorkflowStore
 
 _PREVIOUS = "5d872cd6632a"
@@ -19,8 +20,11 @@ _TABLE = "workflows"
 def _migrate(uri: str, engine: sa.Engine, revision: str, *, down: bool = False) -> None:
     config = _build_alembic_config(uri)
     with engine.connect() as conn:
+        if engine.dialect.name == "cockroachdb":
+            _prepare_crdb_schema_transaction(conn, _crdb_server_version(engine))
         config.attributes["connection"] = conn
         (command.downgrade if down else command.upgrade)(config, revision)
+        conn.commit()
 
 
 @pytest.mark.parametrize(
@@ -60,40 +64,54 @@ def test_upgrade_matches_the_model_and_downgrade_drops_the_table(
     "description", ["Review café notes in C:\\reports.", "\x00\x02legacy text"]
 )
 def test_description_envelopes_preserve_legacy_text_and_downgrade(
-    tmp_path: Path, description: str
+    db_uri: str, description: str
 ) -> None:
-    uri = f"sqlite:///{tmp_path / 'descriptions.db'}"
-    engine = sa.create_engine(uri)
+    engine = get_or_create_engine(db_uri)
+    if engine.dialect.name == "postgresql" and "\x00" in description:
+        pytest.skip("PostgreSQL text cannot contain NUL")
     previous = "e9b6a17c20d4"
-    _migrate(uri, engine, previous)
-    workflow_id = "0123456789abcdef0123456789abcdef"
-    with engine.begin() as connection:
-        connection.execute(
-            sa.text(
-                "INSERT INTO workflows (workspace_id, id, user_id, name, description, plan, "
-                "created_at, updated_at, planning_session_id) "
-                "VALUES (0, :id, NULL, 'Review', :description, :plan, 1, 1, NULL)"
-            ),
-            {"id": bytes.fromhex(workflow_id), "description": description, "plan": '{"steps":[]}'},
-        )
-    _migrate(uri, engine, "head")
-    store = WorkflowStore(uri)
-    assert store.get(workflow_id, user_id=None).description == description
-    updated = store.update(workflow_id, user_id=None, description=description * 5)
-    with engine.connect() as connection:
-        assert isinstance(
-            connection.execute(sa.text("SELECT description FROM workflows")).scalar_one(), bytes
-        )
-    _migrate(uri, engine, previous, down=True)
-    with engine.connect() as connection:
-        assert (
-            connection.execute(sa.text("SELECT description FROM workflows")).scalar_one()
-            == updated.description
-        )
-    _migrate(uri, engine, "head")
-    assert store.get(workflow_id, user_id=None) == updated
-    engine.dispose()
-    clear_engine_cache()
+    _migrate(db_uri, engine, previous, down=True)
+    try:
+        workflow_id = "0123456789abcdef0123456789abcdef"
+        with engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    "INSERT INTO workflows (workspace_id, id, user_id, name, description, plan, "
+                    "created_at, updated_at, planning_session_id) "
+                    "VALUES (0, :id, NULL, 'Review', :description, :plan, 1, 1, NULL)"
+                ),
+                {
+                    "id": bytes.fromhex(workflow_id),
+                    "description": description,
+                    "plan": b'{"steps":[]}',
+                },
+            )
+        _migrate(db_uri, engine, "head")
+        store = WorkflowStore(db_uri)
+        assert store.get(workflow_id, user_id=None).description == description
+        updated = store.update(workflow_id, user_id=None, description=description * 5)
+        columns = {column["name"]: column for column in sa.inspect(engine).get_columns(_TABLE)}
+        assert isinstance(columns["description"]["type"], sa.LargeBinary)
+        assert not columns["description"]["nullable"]
+        assert not any(name.startswith("_description_") for name in columns)
+        with engine.connect() as connection:
+            assert isinstance(
+                connection.execute(sa.text("SELECT description FROM workflows")).scalar_one(),
+                bytes,
+            )
+        _migrate(db_uri, engine, previous, down=True)
+        columns = {column["name"]: column for column in sa.inspect(engine).get_columns(_TABLE)}
+        assert isinstance(columns["description"]["type"], sa.String)
+        assert not columns["description"]["nullable"]
+        with engine.connect() as connection:
+            assert (
+                connection.execute(sa.text("SELECT description FROM workflows")).scalar_one()
+                == updated.description
+            )
+        _migrate(db_uri, engine, "head")
+        assert store.get(workflow_id, user_id=None) == updated
+    finally:
+        _migrate(db_uri, engine, "head")
 
 
 def test_drafts_downgrade_cleanly_and_existing_plans_upgrade_as_runnable(tmp_path: Path) -> None:
