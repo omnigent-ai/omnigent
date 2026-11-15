@@ -7,6 +7,7 @@ import { useSessionJournal, type SessionJournalView } from "@/hooks/useSessionJo
 import { useSessionWorking } from "@/hooks/useSessionWorking";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
+import { hasPendingOwnElicitation } from "@/lib/blocks";
 import { parentIdFromLabels } from "@/lib/sessionHost";
 import {
   pausedLabel,
@@ -63,11 +64,11 @@ export function useSessionTasks(
   // A question or permission prompt in the chat waiting for the user's answer. A
   // workflow question marks only its own task, which the journal already shows.
   const awaitingUser = useConversationEntryValue(conversationId ?? null, (state) =>
-    state.blocks.some(
-      (block) =>
-        block.type === "elicitation" &&
-        block.status === "pending" &&
-        block.phase !== WORKFLOW_QUESTION_PHASE,
+    hasPendingOwnElicitation(
+      state.blocks.filter(
+        (block) => block.type === "elicitation" && block.phase !== WORKFLOW_QUESTION_PHASE,
+      ),
+      conversationId ?? null,
     ),
   );
   const entries = journalSupported ? journal.entries : NO_ENTRIES;

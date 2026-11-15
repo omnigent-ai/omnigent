@@ -762,20 +762,36 @@ describe("TasksPanel", () => {
     expect(screen.getByText("1 waiting for you")).toHaveClass("text-brand-accent");
   });
 
-  it("shows a running task waiting for you while a prompt in the chat waits", () => {
+  it.each([
+    ["own blocking", {}, true],
+    ["own explicit target", { targetSessionId: "conv" }, true],
+    ["nonblocking", { isBlocking: false }, false],
+    ["mirrored child", { targetSessionId: "child" }, false],
+  ] as const)("only pauses for own blocking chat prompts: %s", (_label, fields, waiting) => {
     showJournal([journalPlan(0, ["tests"]), status(1, "tests", "started")]);
     setSession({ sessionStatus: "running" });
-    renderPanel();
-    const row = () => screen.getByTestId("tasks-row");
-    expect(row().dataset.state).toBe("running");
-    const prompt = { type: "elicitation", elicitationId: "e1", status: "pending" };
-    setSession({ blocks: [prompt] as unknown as ConversationState["blocks"] });
-    expect(row().dataset.state).toBe("needs_input");
-    expect(row().textContent).toContain("Waiting for you · Respond in the chat");
-    setSession({
-      blocks: [{ ...prompt, status: "responded" }] as unknown as ConversationState["blocks"],
-    });
-    expect(row().dataset.state).toBe("running");
+    const withdrawStop = registerStopWork("conv", vi.fn());
+    const withdrawAction = registerTaskAction("conv", vi.fn());
+    try {
+      renderPanel();
+      const row = () => screen.getByTestId("tasks-row");
+      expect(row().dataset.state).toBe("running");
+      const prompt = { type: "elicitation", elicitationId: "e1", status: "pending", ...fields };
+      setSession({ blocks: [prompt] as unknown as ConversationState["blocks"] });
+      expect(row().dataset.state).toBe(waiting ? "needs_input" : "running");
+      expect(row().textContent?.includes("Waiting for you · Respond in the chat")).toBe(waiting);
+      fireEvent.pointerDown(within(row()).getByTestId("tasks-row-menu"), { button: 0 });
+      const action = screen.getByTestId(waiting ? "tasks-row-proceed" : "tasks-row-stop");
+      expect(action).toHaveTextContent(waiting ? "Continue" : "Stop");
+      fireEvent.click(action);
+      setSession({
+        blocks: [{ ...prompt, status: "responded" }] as unknown as ConversationState["blocks"],
+      });
+      expect(row().dataset.state).toBe("running");
+    } finally {
+      act(withdrawStop);
+      act(withdrawAction);
+    }
   });
 
   it("leaves the other running tasks running while a workflow question waits", () => {

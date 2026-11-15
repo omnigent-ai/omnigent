@@ -351,6 +351,7 @@ class WorkflowStore:
         """Delete an owned workflow; ``False`` if the owner has no such workflow."""
 
         def write(session: Session) -> bool:
+            require_active_account(session, user_id)
             row = session.execute(
                 _using(select(SqlWorkflow).where(*_owned(workflow_id, user_id)), "PRIMARY")
             ).scalar_one_or_none()

@@ -357,6 +357,10 @@ and owner; single-user mode stores the reserved `local` owner. Names follow the
 database's collation: case-insensitive on MySQL, case-sensitive on SQLite and
 PostgreSQL. `GET /v1/info` reports `workflows: true` on servers that store them.
 
+Deleting an account removes its saved workflows in bounded batches. Reusing a
+deleted username waits for any interrupted cleanup to finish, so a new account
+cannot inherit the old workflows. Rotating credentials preserves workflows.
+
 ## Usage telemetry
 
 Workflow events use the same server-side structured debug-log sink as automation
