@@ -261,8 +261,25 @@ describe("collectTurnWork", () => {
       ),
       tool("lint", "lint_sql", { sql: "SELECT * FROM t" }, "ok"),
       tool("format", "format_sql", { sql_text: "select 1" }, "select 1"),
+      // A SQL tool's statement need not have a FROM.
+      tool("fn", "execute_sql", { statement: "SELECT current_catalog()" }, '[["main"]]'),
+      tool("now", "run_sql", { query: "SELECT now()" }, "[]"),
+      // A question to a text-to-SQL tool, or one that isn't a statement, is not SQL.
+      tool("nl", "text_to_sql", { query: "Select the top customers" }, "SELECT 1"),
+      tool("ask", "execute_sql", { query: "top customers by revenue" }, "Error: syntax"),
+      tool("agent", "sql_agent", { query: "Show me revenue by region" }, "ok"),
+      tool("use", "execute_sql", { query: "Use the sales table to find churn" }, "Error"),
+      tool("gen", "sql_generator", { query: "Select the top customers" }, "SELECT 1"),
+      tool("nl2", "text_2_sql", { query: "Select the top customers" }, "SELECT 1"),
+      tool("py", "sql_to_python", { query: "SELECT now()" }, "now()"),
+      tool("usedb", "execute_sql", { statement: "USE main.sales" }, "{}"),
     ]);
-    expect(work.queries.map((query) => query.text)).toEqual(["SELECT 1"]);
+    expect(work.queries.map((query) => query.text)).toEqual([
+      "SELECT 1",
+      "SELECT current_catalog()",
+      "SELECT now()",
+      "USE main.sales",
+    ]);
   });
 
   it("does not treat a `code` value as code unless the tool runs code", () => {
@@ -286,6 +303,28 @@ describe("collectTurnWork", () => {
     ]);
   });
 
+  it("lists URLs and tables from calls that read them", () => {
+    const work = collectTurnWork([
+      tool(
+        "get",
+        "mcp__api__fetch_resource",
+        { url: "https://api.example.com/a", method: "GET" },
+        "{}",
+      ),
+      tool("read", "web_read", { url: "https://example.com/b" }, "text"),
+      tool("t", "list_table_columns", { table: "main.s.t" }, "[]"),
+      tool("nav", "browser_navigate", { url: "https://example.com/d" }, "ok"),
+      tool("http", "http_request", { url: "https://example.com/e", method: "GET" }, "{}"),
+    ]);
+    expect(work.sources.map((source) => [source.kind, source.value])).toEqual([
+      ["url", "https://api.example.com/a"],
+      ["url", "https://example.com/b"],
+      ["table", "main.s.t"],
+      ["url", "https://example.com/d"],
+      ["url", "https://example.com/e"],
+    ]);
+  });
+
   it("lists no source from a call that failed, was cancelled or wrote its target", () => {
     const work = collectTurnWork([
       tool(
@@ -298,6 +337,35 @@ describe("collectTurnWork", () => {
       tool("forbidden", "WebFetch", { url: "https://example.com/x" }, "Error: 403 Forbidden"),
       tool("drop", "drop_table", { table_name: "main.tmp.scratch" }, "{}"),
       tool("hook", "create_webhook", { url: "https://hooks.example.com/a" }, "{}"),
+      // A tool whose name says nothing of reading, or whose action is not a read.
+      tool(
+        "unlink",
+        "sys_session_link_pr",
+        { url: "https://github.com/example/project/pull/1", action: "remove" },
+        '{"ok": true}',
+      ),
+      tool(
+        "link",
+        "sys_session_link_pr",
+        { url: "https://github.com/example/project/pull/2" },
+        "{}",
+      ),
+      tool(
+        "delete",
+        "mcp__api__fetch_resource",
+        { url: "https://api.example.com/items/1", method: "DELETE" },
+        "{}",
+      ),
+      tool("tagged", "databricks__get_table", { table_name: "main.s.t", action: "drop" }, "{}"),
+      tool("pr", "open_pull_request", { url: "https://github.com/example/project" }, "{}"),
+      tool(
+        "load",
+        "load_table",
+        { table: "main.s.loaded", uri: "https://example.com/a.csv" },
+        "{}",
+      ),
+      tool("close", "get_and_close_issue", { url: "https://example.com/issues/1" }, "{}"),
+      tool("arr", "fetch_url", { url: "https://example.com/c", method: ["DELETE"] }, "{}"),
       tool("ins", "run_sql", { sql: "INSERT INTO main.s.t VALUES (1)", table: "main.s.t" }, "{}"),
       tool(
         "badsql",

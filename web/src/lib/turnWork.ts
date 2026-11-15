@@ -263,6 +263,7 @@ const NON_EXECUTING_TOOL_WORDS = new Set([
   "convert",
   "transpile",
   "generate",
+  "generator",
 ]);
 // Statement openings, strict enough that "Show me the top customers" is not SQL.
 const SQL_START_RE =
@@ -271,13 +272,20 @@ const SQL_START_RE =
 // customers from EMEA" has none), required where the tool may take a question.
 const SQL_STRUCTURE_RE =
   /[*;,()=<>]|\b\w+\.\w+\b|\b(?:group\s+by|order\s+by|limit\s+\d|join|having|union)\b/i;
+const SQL_KEYWORD_START_RE =
+  /^(?:select|with|insert|update|delete|merge|create|alter|drop|truncate|pragma|values|call|use|set|explain|describe|desc|show|grant|revoke|copy|optimize|vacuum|analyze|refresh|cache|uncache|msck)\b/i;
 const READ_ONLY_SQL_RE = /^(?:select|with|show|describe|desc|explain|values)\b/i;
 const LEADING_SQL_COMMENTS_RE = /^(?:\s+|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*/;
 
 function sqlArgument(tool: string, args: Record<string, unknown>): string | null {
   const toolWords = identifierWords(tool);
   if (toolWords.some((word) => NON_EXECUTING_TOOL_WORDS.has(word))) return null;
-  const sqlTool = toolWords.includes("sql");
+  // `text_to_sql` and `sql_to_python` convert SQL; they do not run it.
+  const sqlIndex = toolWords.indexOf("sql");
+  const converts = [toolWords[sqlIndex - 1], toolWords[sqlIndex + 1]].some(
+    (word) => word === "to" || word === "2",
+  );
+  const sqlTool = sqlIndex >= 0 && !converts;
   const queryTool = toolWords.some((word) => QUERY_TOOL_WORDS.has(word));
   for (const [key, value] of Object.entries(args)) {
     if (typeof value !== "string" || value.trim() === "") continue;
@@ -291,8 +299,15 @@ function sqlArgument(tool: string, args: Record<string, unknown>): string | null
       return value;
     }
     const last = keyWords.at(-1);
-    if (last === undefined || !QUERY_KEY_WORDS.has(last) || !looksLikeSql(value)) continue;
-    if (sqlTool || (queryTool && SQL_STRUCTURE_RE.test(value))) return value;
+    if (last === undefined || !QUERY_KEY_WORDS.has(last)) continue;
+    // A SQL tool's statement needs no FROM (`SELECT current_catalog()`), only a
+    // keyword and SQL punctuation; a generic query tool's text must read fully as SQL.
+    const statement = withoutLeadingComments(value);
+    const readsAsSql =
+      looksLikeSql(value) ||
+      (SQL_KEYWORD_START_RE.test(statement) && SQL_STRUCTURE_RE.test(statement));
+    if (sqlTool && readsAsSql) return value;
+    if (queryTool && looksLikeSql(value) && SQL_STRUCTURE_RE.test(value)) return value;
   }
   return null;
 }
@@ -396,10 +411,16 @@ const URL_KEYS = ["url", "uri"];
 const WRITE_TOOL_WORDS = new Set([
   "add",
   "alter",
+  "approve",
+  "archive",
+  "assign",
+  "attach",
+  "close",
   "create",
   "delete",
   "drop",
   "edit",
+  "detach",
   "insert",
   "merge",
   "patch",
@@ -411,8 +432,10 @@ const WRITE_TOOL_WORDS = new Set([
   "remove",
   "rename",
   "replace",
+  "save",
   "send",
   "set",
+  "share",
   "submit",
   "subscribe",
   "truncate",
@@ -421,6 +444,72 @@ const WRITE_TOOL_WORDS = new Set([
   "upsert",
   "write",
 ]);
+
+// Tool-name words for calls that read what their arguments name.
+const READ_TOOL_WORDS = new Set([
+  "browse",
+  "crawl",
+  "crawling",
+  "describe",
+  "download",
+  "extract",
+  "fetch",
+  "get",
+  "goto",
+  "inspect",
+  "list",
+  "lookup",
+  "navigate",
+  "preview",
+  "query",
+  "read",
+  "retrieve",
+  "sample",
+  "scrape",
+  "search",
+  "select",
+  "show",
+  "view",
+  "visit",
+]);
+// Arguments that pick what a multi-purpose tool does (`action: "remove"`).
+const ACTION_KEYS = ["action", "method", "operation", "op"];
+const READ_ACTIONS = new Set([
+  "browse",
+  "crawl",
+  "describe",
+  "extract",
+  "fetch",
+  "get",
+  "head",
+  "list",
+  "navigate",
+  "options",
+  "query",
+  "read",
+  "scrape",
+  "search",
+  "show",
+  "view",
+]);
+
+/**
+ * Whether a call's name says it reads what its arguments name, and no write
+ * word or non-read action (`sys_session_link_pr` with `action: "remove"`) says otherwise.
+ */
+function readsItsTargets(name: string, args: Record<string, unknown>): boolean {
+  const words = identifierWords(splitToolName(name).tool);
+  if (words.some((word) => WRITE_TOOL_WORDS.has(word))) return false;
+  const actions = ACTION_KEYS.map((key) => ownValue(args, key)).filter(
+    (action) => action !== undefined && action !== null,
+  );
+  const readActions = actions.every(
+    (action) => typeof action === "string" && READ_ACTIONS.has(action.trim().toLowerCase()),
+  );
+  if (!readActions) return false;
+  // `http_request` with `method: "GET"` reads, though its name doesn't say so.
+  return words.some((word) => READ_TOOL_WORDS.has(word)) || actions.length > 0;
+}
 
 /** The sources a call's name and arguments say it read. */
 function sourceRefs(
@@ -436,16 +525,14 @@ function sourceRefs(
     const path = formatToolTitle(name, args).filePath;
     if (path !== undefined) out.push({ kind: "file", value: path });
   }
-  const writes = identifierWords(splitToolName(name).tool).some((word) =>
-    WRITE_TOOL_WORDS.has(word),
-  );
+  const reads = query === null && readsItsTargets(name, args);
   const readsTable =
     query === null
-      ? !writes
+      ? reads
       : query.language === "sql" && READ_ONLY_SQL_RE.test(withoutLeadingComments(query.text));
   const table = readsTable ? argumentTable(args) : null;
   if (table !== null) out.push({ kind: "table", value: table });
-  if (!writes) {
+  if (reads) {
     for (const key of URL_KEYS) {
       const url = webUrl(ownValue(args, key));
       if (url !== null) out.push({ kind: "url", value: url });
