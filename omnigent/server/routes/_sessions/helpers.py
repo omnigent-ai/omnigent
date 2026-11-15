@@ -95,7 +95,10 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
-from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
+from omnigent.native.permission_modes import (
+    PERMISSION_LAUNCH_ARGS,
+    created_session_launch_args,
+)
 from omnigent.native.session_todos import validate_session_todos
 from omnigent.policies.types import EvaluationContext
 from omnigent.runner.identity import (
@@ -11147,6 +11150,35 @@ def _derive_terminal_launch_args_from_spec(
     return None
 
 
+def _inherited_codex_approval_launch_args(
+    parent: Conversation | None, harness: str | None, spec: AgentSpec | None
+) -> list[str] | None:
+    """
+    Launch args that start a codex-native child in its parent's live approval mode.
+
+    A child spec that declares its own stance keeps it. A parent mode that skips
+    approval isn't inherited, the same as one the creating agent requests.
+
+    :param parent: The child's parent session, or ``None``.
+    :param harness: The child's canonical harness, e.g. ``"codex-native"``.
+    :param spec: The child's own agent spec, when it loaded.
+    :returns: The CLI args, or ``None`` to keep the harness default.
+    """
+    if harness != _CODEX_NATIVE_HARNESS or parent is None:
+        return None
+    if spec is not None and _spec_harness(spec) == harness:
+        config = spec.executor.config
+        if config.get("permission_mode") is not None or config.get("yolo") is not None:
+            return None
+    mode = parent.labels.get(_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY)
+    if not mode:
+        return None
+    try:
+        return created_session_launch_args(harness, mode)
+    except ValueError:
+        return None
+
+
 def _native_subagent_wrapper_labels_from_spec(sub_spec: AgentSpec) -> dict[str, str]:
     """
     Resolve terminal-first wrapper labels from an already-loaded sub-spec.
@@ -12973,6 +13005,7 @@ __all__ = [
     "_handle_mcp_tools_list",
     "_host_model_options_via_registry",
     "_if_none_match_matches",
+    "_inherited_codex_approval_launch_args",
     "_invalidate_runner_backed_snapshot_state",
     "_is_claude_native_subagent",
     "_is_codex_native_subagent",

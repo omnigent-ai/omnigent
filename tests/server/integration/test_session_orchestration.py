@@ -1151,12 +1151,13 @@ async def _upload_codex_worker(auth_client, sub_agents=None, **config) -> str:
 
 
 @pytest.mark.parametrize(
-    ("placement", "permission_mode", "spec_config", "expected"),
+    ("placement", "permission_mode", "spec_config", "parent_mode", "expected"),
     [
         pytest.param(
             "managed",
             "approve-for-me",
             {},
+            None,
             PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
             id="worker",
         ),
@@ -1164,15 +1165,17 @@ async def _upload_codex_worker(auth_client, sub_agents=None, **config) -> str:
             "child",
             "approve-for-me",
             {},
+            None,
             PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
             id="child",
         ),
         # The request replaces the spec's own bypass opt-in, even with the harness default.
-        pytest.param("child", "default", {"yolo": True}, None, id="request-over-spec"),
+        pytest.param("child", "default", {"yolo": True}, None, None, id="request-over-spec"),
         pytest.param(
             "child",
             None,
             {"yolo": True},
+            None,
             ["--dangerously-bypass-approvals-and-sandbox"],
             id="spec-without-request",
         ),
@@ -1180,9 +1183,32 @@ async def _upload_codex_worker(auth_client, sub_agents=None, **config) -> str:
             "child",
             None,
             {"permission_mode": "approve-for-me"},
+            None,
             PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
             id="spec-permission-mode",
         ),
+        pytest.param(
+            "child",
+            None,
+            {},
+            "approve-for-me",
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            id="parent-mode",
+        ),
+        pytest.param("child", "default", {}, "approve-for-me", None, id="request-over-parent"),
+        pytest.param(
+            "child", None, {"yolo": False}, "approve-for-me", None, id="spec-over-parent"
+        ),
+        pytest.param(
+            "child",
+            None,
+            {"permission_mode": "default"},
+            "approve-for-me",
+            None,
+            id="spec-default-over-parent",
+        ),
+        # Like a requested mode, a parent's approval-skipping mode isn't passed on.
+        pytest.param("child", None, {}, "full-access", None, id="parent-skips-approval"),
     ],
 )
 async def test_created_session_launches_in_the_requested_permission_mode(
@@ -1194,12 +1220,17 @@ async def test_created_session_launches_in_the_requested_permission_mode(
     placement,
     permission_mode,
     spec_config,
+    parent_mode,
     expected,
 ):
     from omnigent.server.routes.sessions import routes_core
 
     source, _, _ = peers
     worker_agent_id = await _upload_codex_worker(auth_client, **spec_config)
+    if parent_mode is not None:
+        SqlAlchemyConversationStore(db_uri).set_labels(
+            source["id"], {"omnigent.codex_native.approval_mode": parent_mode}
+        )
 
     async def launch(**kwargs):
         pass

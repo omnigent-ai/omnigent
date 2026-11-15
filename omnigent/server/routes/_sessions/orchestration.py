@@ -302,6 +302,7 @@ from omnigent.server.routes._sessions.helpers import (
     _get_runner_client,
     _handle_advise_models_mcp,
     _HostRunnerStopAttempt,
+    _inherited_codex_approval_launch_args,
     _invalidate_runner_backed_snapshot_state,
     _is_codex_native_subagent,
     _is_kiro_native_session,
@@ -13114,6 +13115,10 @@ async def _create_session_from_existing_agent(
                 f"invalid terminal_launch_args in agent spec: {exc}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+    if needs_launch_args_from_spec and validated_launch_args is None:
+        validated_launch_args = _inherited_codex_approval_launch_args(
+            _parent_for_routing, selected_harness, own_spec
+        )
 
     if reasoning_effort is None:
         effort_spec: AgentSpec | None = sub_spec if sub_spec is not None else own_spec
