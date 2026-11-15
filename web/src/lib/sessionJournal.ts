@@ -132,10 +132,12 @@ export function currentPlan(entries: readonly JournalEntry[]): JournalEntry | nu
  * too; a plan that shares none, such as one that replaced it, didn't.
  */
 export function planWorkflowId(entries: readonly JournalEntry[]): string | null {
-  const plan = currentPlan(entries);
+  const boundary = entries.findLastIndex((entry) => entry.kind === "plan_status");
+  const invocation = entries.slice(boundary + 1);
+  const plan = currentPlan(invocation);
   if (!plan) return null;
   if (plan.workflow_id) return plan.workflow_id;
-  const start = entries.findLast((entry) => entry.kind === "plan" && entry.workflow_id);
+  const start = invocation.findLast((entry) => entry.kind === "plan" && entry.workflow_id);
   if (!start?.workflow_id) return null;
   const startStepIds = new Set(planSteps(start).map((step) => step.id));
   return planSteps(plan).some((step) => startStepIds.has(step.id)) ? start.workflow_id : null;

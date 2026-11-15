@@ -81,6 +81,17 @@ describe("planWorkflowId", () => {
     expect(planWorkflowId([plan(0, ["a"])])).toBeNull();
     expect(planWorkflowId([journalEntry(0)])).toBeNull();
   });
+
+  it("inherits a saved workflow only within the current invocation", () => {
+    const boundary = journalEntry(1, {
+      kind: "plan_status",
+      content: { status: "started" },
+    });
+    const nextPlan = plan(2, ["explore"]);
+    expect(planWorkflowId([start, boundary, nextPlan])).toBeNull();
+    const nextStart = { ...nextPlan, workflow_id: WORKFLOW };
+    expect(planWorkflowId([start, boundary, nextStart, plan(3, ["explore"])])).toBe(WORKFLOW);
+  });
 });
 
 describe("stepProgress", () => {
