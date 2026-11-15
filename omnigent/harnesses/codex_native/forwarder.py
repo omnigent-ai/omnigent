@@ -9435,10 +9435,7 @@ async def _persist_codex_compaction_item(
     compacted = None
     if bridge_dir is not None:
         try:
-            state = read_bridge_state(bridge_dir)
-            rollout = _latest_thread_rollout(state) if state is not None else None
-            if rollout is not None:
-                compacted = _read_compacted_history(rollout)
+            compacted = await asyncio.to_thread(_read_codex_compaction_snapshot, bridge_dir)
         except Exception:
             _logger.debug(
                 "Failed to read codex rollout for compaction persist",
@@ -9462,6 +9459,13 @@ async def _persist_codex_compaction_item(
         json={"type": "compaction", "data": data},
     )
     resp.raise_for_status()
+
+
+def _read_codex_compaction_snapshot(bridge_dir: Path) -> dict[str, object] | None:
+    """Discover and read a thread's compaction snapshot on the I/O worker."""
+    state = read_bridge_state(bridge_dir)
+    rollout = _latest_thread_rollout(state) if state is not None else None
+    return _read_compacted_history(rollout) if rollout is not None else None
 
 
 def _latest_thread_rollout(state: CodexNativeBridgeState) -> Path | None:
