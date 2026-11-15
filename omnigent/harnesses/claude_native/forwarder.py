@@ -6978,7 +6978,7 @@ async def _persist_native_compaction_item(
                 raise ValueError("Missing compaction summary identity")
         from claude_agent_sdk import get_session_messages
 
-        claude_sid = read_claude_session_id(bridge_dir)
+        claude_sid = await asyncio.to_thread(read_claude_session_id, bridge_dir)
         if not claude_sid:
             raise ValueError("Claude native session id is unavailable")
         msgs = await asyncio.to_thread(get_session_messages, claude_sid)
@@ -7002,7 +7002,7 @@ async def _persist_native_compaction_item(
         if not native_messages:
             raise ValueError("Claude session reader returned no usable messages")
         sdk_message_count = len(native_messages)
-        transcript_path = read_transcript_path(bridge_dir)
+        transcript_path = await asyncio.to_thread(read_transcript_path, bridge_dir)
         if expected_summary_uuid is None:
             if transcript_path is None:
                 raise ValueError("Claude transcript path is unavailable")

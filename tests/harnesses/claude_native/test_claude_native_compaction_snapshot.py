@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import threading
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -235,6 +236,82 @@ def _persist(
             )
 
     asyncio.run(run())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata_reader", ["read_claude_session_id", "read_transcript_path"])
+@pytest.mark.parametrize("outcome", ["complete", "cancel", "read_error"])
+async def test_snapshot_metadata_does_not_block_the_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    metadata_reader: str,
+    outcome: str,
+) -> None:
+    bridge, _ = _write_transcript(tmp_path, monkeypatch, _transcript())
+    entered = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    loop = asyncio.get_running_loop()
+    original = getattr(forwarder, metadata_reader)
+
+    def hold_read(bridge_dir: Path) -> object:
+        loop.call_soon_threadsafe(entered.set)
+        try:
+            assert release.wait(3), "test did not release metadata read"
+            if outcome == "read_error":
+                raise OSError("snapshot metadata unavailable")
+            return original(bridge_dir)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(forwarder, metadata_reader, hold_read)
+    posted: list[dict[str, Any]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": [{"id": "last-item"}]})
+        posted.append(json.loads(request.content))
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="https://fixture.invalid"
+    ) as client:
+        task = asyncio.create_task(
+            _persist_native_compaction_item(
+                client, session_id="conversation-test", bridge_dir=bridge
+            )
+        )
+        emergency_release = threading.Timer(2, release.set)
+        emergency_release.start()
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=3)
+            assert not release.is_set(), "metadata read blocked the runner event loop"
+            assert posted == []
+            if outcome == "cancel":
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            release.set()
+            if outcome == "read_error":
+                with pytest.raises(_CompactionSnapshotError) as caught:
+                    await task
+                assert isinstance(caught.value.__cause__, OSError)
+            elif outcome == "complete":
+                await task
+        finally:
+            release.set()
+            emergency_release.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            assert await asyncio.to_thread(finished.wait, 3)
+    if outcome != "complete":
+        assert posted == []
+        return
+    assert len(posted) == 1
+    data = posted[0]["data"]
+    assert data["last_item_id"] == "last-item"
+    assert [message["content"] for message in data["compacted_messages"]] == [
+        _transcript()[index]["message"]["content"] for index in (5, 1, 2, 3)
+    ]
 
 
 @pytest.mark.parametrize("segment_only", [False, True])
