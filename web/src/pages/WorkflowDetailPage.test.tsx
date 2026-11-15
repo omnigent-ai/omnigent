@@ -159,6 +159,7 @@ function run(
     title,
     startedAt: Date.parse("2026-11-12T15:04:00Z") / 1000,
     sessionStatus: "idle" as const,
+    isCurrent: true,
     archived: false,
     progress: { total: 2, started: 0, done: 0, needsInput: 0, failed: 0, ...progress },
     steps: WORKFLOW.steps,
@@ -502,6 +503,46 @@ describe("WorkflowDetailPage", () => {
     expect(within(row).getByRole("button", { name: "Continue the plan" })).toBeInTheDocument();
     expect(screen.getByTestId("workflow-graph-overlay")).toHaveTextContent("explore:stopped");
   });
+
+  it.each([false, true])(
+    "keeps a superseded run read-only while its session works (completed=%s)",
+    async (completed) => {
+      mockWorkflow({});
+      const session = "a".repeat(32);
+      mockRuns([
+        {
+          ...run(session, "Historical run", { done: completed ? 2 : 0 }, [
+            status("explore", completed ? "done" : "started"),
+            ...(completed ? [status("fix", "done")] : []),
+          ]),
+          id: "historical",
+          isCurrent: false,
+          sessionStatus: "running",
+          backgroundWorkRunning: true,
+        },
+        run(session, "Current run", { started: 1 }, [status("explore", "started")]),
+      ]);
+      vi.mocked(useOptionalLoadedConversations).mockReturnValue({
+        ...conversationPage([conversation(session, { background_work_running: true })]).data!,
+        pageParams: [undefined],
+      });
+      renderPage();
+      const [historical, current] = screen.getAllByTestId("workflow-run");
+      expect(historical).toHaveAttribute("data-run-state", completed ? "done" : "stopped");
+      expect(within(historical!).queryByTestId("plan-stop")).toBeNull();
+      expect(within(historical!).queryByTestId("plan-continue")).toBeNull();
+      expect(within(current!).getByRole("button", { name: "Stop" })).toBeInTheDocument();
+      fireEvent.focus(within(historical!).getAllByTestId("tasks-progress-segment")[0]!);
+      expect(await screen.findByTestId("tasks-progress-card")).toHaveTextContent(
+        "Explore the failures",
+      );
+      expect(screen.queryByTestId("tasks-progress-menu")).toBeNull();
+      fireEvent.click(within(historical!).getByTestId("run-graph-button"));
+      expect(screen.getByTestId("workflow-graph-overlay")).toHaveTextContent(
+        `explore:${completed ? "done" : "stopped"}`,
+      );
+    },
+  );
 
   it("sends a task's ⋯ action on a run's timeline card to the run's session", async () => {
     vi.mocked(sendUserMessage).mockResolvedValue({ queued: true });

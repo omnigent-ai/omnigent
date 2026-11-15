@@ -53,6 +53,7 @@ from omnigent.server.session_orchestration import (
 )
 from omnigent.server.workflow_telemetry import log_workflow_saved
 from omnigent.stores import ConversationStore
+from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.session_journal_store import SessionJournalStore
 from omnigent.stores.workflow_store import (
@@ -352,19 +353,27 @@ def create_workflows_router(
             [plan.conversation_id for plan in readable]
         )
         statuses = journal.plan_step_statuses(readable)
+        current_plans = journal.current_run_plan_ids(readable)
         runs = []
         for plan, step_statuses in zip(readable, statuses, strict=True):
             session = sessions[plan.conversation_id]
+            is_current = (
+                plan.id in current_plans
+                and plan.scheduled_task_run_id == session.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY)
+            )
             runs.append(
                 WorkflowRun(
                     id=plan.id,
                     session_id=plan.conversation_id,
                     title=session.title or "",
                     started_at=plan.created_at,
+                    is_current=is_current,
                     session_status=_session_status_with_child_rollup(
                         session.id, children.get(session.id, []), session.live_status
-                    ),
-                    background_work_running=session.background_work_running is True,
+                    )
+                    if is_current
+                    else "idle",
+                    background_work_running=is_current and session.background_work_running is True,
                     archived=session.archived,
                     progress=_progress(plan, step_statuses),
                     steps=[WorkflowStep(**step) for step in plan.content.get("steps", [])],

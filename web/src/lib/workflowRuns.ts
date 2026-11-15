@@ -14,6 +14,8 @@ export interface WorkflowRun {
   title: string;
   /** Unix epoch seconds when the run's plan was written. */
   startedAt: number;
+  /** Only the current run can use its session's activity and accept actions. */
+  isCurrent: boolean;
   sessionStatus: "idle" | "running" | "failed";
   /** Work that outlives the parent turn, such as background shells or an active goal. */
   backgroundWorkRunning?: boolean;
@@ -34,7 +36,7 @@ export interface WorkflowRun {
 
 /** The session's turn, delegated work, or work left running between turns. */
 export function isWorkflowRunWorking(run: WorkflowRun): boolean {
-  return run.sessionStatus === "running" || run.backgroundWorkRunning === true;
+  return run.isCurrent && (run.sessionStatus === "running" || run.backgroundWorkRunning === true);
 }
 
 /** Where each of the run's steps stands, as the Tasks tab works it out. */
@@ -42,7 +44,7 @@ export function runStepProgress(
   run: WorkflowRun,
   sessionWorking = isWorkflowRunWorking(run),
 ): StepProgress[] {
-  return stepProgress(run.steps, run.statuses, sessionWorking);
+  return stepProgress(run.steps, run.statuses, run.isCurrent && sessionWorking);
 }
 
 /** How a run's row looks: its icon and its one-line state. */
@@ -66,8 +68,9 @@ export function describeWorkflowRun(
   const count = `${done} of ${total} done`;
   if (needsInput > 0) return { kind: "waiting", label: "Waiting for you" };
   if (total > 0 && done === total) return { kind: "done", label: "Done" };
-  if (sessionWorking) return { kind: "running", label: count };
+  if (run.isCurrent && sessionWorking) return { kind: "running", label: count };
   if (failed > 0) return { kind: "failed", label: `Failed · ${count}` };
-  if (run.sessionStatus === "failed") return { kind: "failed", label: `Session failed · ${count}` };
+  if (run.isCurrent && run.sessionStatus === "failed")
+    return { kind: "failed", label: `Session failed · ${count}` };
   return { kind: "stopped", label: count };
 }

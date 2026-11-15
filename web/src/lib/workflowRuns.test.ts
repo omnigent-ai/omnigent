@@ -12,6 +12,7 @@ function run(
     title: "Fix the upload test",
     startedAt: 1_762_900_000,
     sessionStatus,
+    isCurrent: true,
     archived: false,
     progress: { total: 5, started: 0, done: 0, needsInput: 0, failed: 0, ...progress },
     steps: [],
@@ -61,6 +62,14 @@ describe("describeWorkflowRun", () => {
     expect(describeWorkflowRun(run({ done: 3 }))).toEqual({
       kind: "stopped",
       label: "3 of 5 done",
+    });
+  });
+
+  it("does not attribute a newer session's failure or activity to a historical run", () => {
+    const historical = { ...run({ done: 1 }, "failed"), isCurrent: false };
+    expect(describeWorkflowRun(historical, true)).toEqual({
+      kind: "stopped",
+      label: "1 of 5 done",
     });
   });
 });

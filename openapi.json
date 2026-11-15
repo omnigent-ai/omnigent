@@ -15607,6 +15607,12 @@
             "title": "Id",
             "type": "string"
           },
+          "is_current": {
+            "default": false,
+            "description": "Whether this is the session's current run, which can take actions.",
+            "title": "Is Current",
+            "type": "boolean"
+          },
           "progress": {
             "$ref": "#/components/schemas/WorkflowRunProgress",
             "description": "Where the run's steps stand."

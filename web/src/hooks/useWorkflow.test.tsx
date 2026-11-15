@@ -16,6 +16,7 @@ const COMPLETED_RUN = {
   title: "Completed run",
   started_at: 1,
   session_status: "idle",
+  is_current: true,
   background_work_running: false,
   archived: false,
   progress: { total: 2, started: 0, done: 2, needs_input: 0, failed: 0 },

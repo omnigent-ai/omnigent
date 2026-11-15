@@ -462,14 +462,17 @@ function WorkflowRunRow({
   workflowId: string;
   workflowName: string;
 }) {
-  const sessionWorking = useSessionWorking(run.sessionId, isWorkflowRunWorking(run));
+  const sessionWorking = useSessionWorking(
+    run.isCurrent ? run.sessionId : null,
+    isWorkflowRunWorking(run),
+  );
   const state = describeWorkflowRun(run, sessionWorking);
   const progress = useMemo(() => runStepProgress(run, sessionWorking), [run, sessionWorking]);
   // Stop while the run's session works; play once it stopped with tasks left.
-  const control = run.archived ? null : planRunControl(progress, run.statuses, sessionWorking);
+  const canAct = run.isCurrent && !run.archived;
+  const control = canAct ? planRunControl(progress, run.statuses, sessionWorking) : null;
   const refreshKeys = [["workflow-runs", workflowId]];
-  // Its tasks' ⋯ menus, on the timeline's cards and the graph's nodes; an archived run has none.
-  const taskMenus = useRunTaskMenus(run.archived ? null : run.sessionId, refreshKeys);
+  const taskMenus = useRunTaskMenus(canAct ? run.sessionId : null, refreshKeys);
   const [graphOpen, setGraphOpen] = useState(false);
   const sessionPath = `/c/${encodeURIComponent(run.sessionId)}`;
   const title = run.title || "Untitled session";

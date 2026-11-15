@@ -107,6 +107,7 @@ interface RawRun {
   session_id: string;
   title: string;
   started_at: number;
+  is_current?: boolean;
   session_status: WorkflowRun["sessionStatus"];
   background_work_running?: boolean;
   archived: boolean;
@@ -144,6 +145,7 @@ export function useWorkflowRuns(workflowId: string) {
           sessionId: run.session_id,
           title: run.title,
           startedAt: run.started_at,
+          isCurrent: run.is_current === true,
           sessionStatus: run.session_status,
           backgroundWorkRunning: run.background_work_running ?? false,
           archived: run.archived,

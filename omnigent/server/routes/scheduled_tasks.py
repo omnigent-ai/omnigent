@@ -77,6 +77,7 @@ from omnigent.server.session_orchestration import require_owned_session
 from omnigent.server.workflows import require_workflows
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
+from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import (
     AutomationFailure,
@@ -1321,11 +1322,23 @@ def create_scheduled_tasks_router(
         )
         found = [(run, plan) for run, plan in zip(served, plans, strict=True) if plan is not None]
         statuses = await asyncio.to_thread(journal.plan_step_statuses, [plan for _, plan in found])
+        current_plans = await asyncio.to_thread(
+            journal.current_run_plan_ids, [plan for _, plan in found]
+        )
+        sessions = await asyncio.to_thread(
+            conversation_store.get_conversations, [plan.conversation_id for _, plan in found]
+        )
         return {
             "runs": [
                 {
                     "run_id": run.id,
                     "workflow_id": plan.workflow_id,
+                    "is_current": (
+                        plan.id in current_plans
+                        and (session := sessions.get(plan.conversation_id)) is not None
+                        and session.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY) == run.id
+                        and not session.archived
+                    ),
                     "steps": plan.content.get("steps", []),
                     "statuses": [
                         entry_to_response(entry).model_dump(mode="json")

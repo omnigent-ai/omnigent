@@ -389,6 +389,7 @@ export async function listScheduledTaskRuns(id: string): Promise<ScheduledTaskRu
 /** The plan a run started with: its steps and each step's newest status. */
 export interface ScheduledTaskRunSteps {
   runId: string;
+  isCurrent: boolean;
   /** The saved workflow the plan runs, when it named one. */
   workflowId: string | null;
   steps: JournalPlanStep[];
@@ -413,6 +414,7 @@ export async function listScheduledTaskRunSteps(
   const body = await readJsonOrThrow<{
     runs?: {
       run_id: string;
+      is_current?: boolean;
       workflow_id: string | null;
       steps: JournalPlanStep[];
       statuses: JournalEntry[];
@@ -420,6 +422,7 @@ export async function listScheduledTaskRunSteps(
   }>(res);
   return (body.runs ?? []).map((run) => ({
     runId: run.run_id,
+    isCurrent: run.is_current === true,
     workflowId: run.workflow_id,
     steps: run.steps,
     statuses: run.statuses,

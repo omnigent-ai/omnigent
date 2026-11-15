@@ -711,7 +711,8 @@ function RunRow({
 }) {
   const timestamp = formatRunTimestamp(run.firedAt ?? run.scheduledAt, now);
   // A workflow run's tasks, as the workflow's page shows them.
-  const sessionWorking = run.status === "running" || run.conversationStatus === "running";
+  const sessionWorking =
+    steps?.isCurrent === true && (run.status === "running" || run.conversationStatus === "running");
   const progress = useMemo(
     () => (steps ? stepProgress(steps.steps, steps.statuses, sessionWorking) : []),
     [steps, sessionWorking],
@@ -725,14 +726,14 @@ function RunRow({
     : null;
   // Stop while the run's session works; play once it stopped with tasks left.
   const control =
-    showTasks && steps ? planRunControl(progress, steps.statuses, sessionWorking) : null;
+    showTasks && steps?.isCurrent ? planRunControl(progress, steps.statuses, sessionWorking) : null;
   // What the run's buttons and task menus refresh once its session takes them.
   const refreshKeys = [
     scheduledTaskRunsKey(run.scheduledTaskId),
     ["scheduled-task-run-steps", run.scheduledTaskId],
   ];
   // Its tasks' ⋯ menus, on the timeline's cards and the graph's nodes.
-  const taskMenus = useRunTaskMenus(sessionId, refreshKeys);
+  const taskMenus = useRunTaskMenus(steps?.isCurrent ? sessionId : null, refreshKeys);
   // Room on the row's link for the buttons over its right end.
   const buttonPadding = ["", "pr-11", "pr-18", "pr-25"][
     1 + (workflowId ? 1 : 0) + (control ? 1 : 0)
@@ -741,14 +742,15 @@ function RunRow({
   // Unread only applies to a succeeded run that produced a conversation.
   const unread = useRunUnread(run);
   const failure = isUnsuccessfulRun(run) ? describeRunFailure(run.errorCode, run.status) : null;
+  const showSessionActivity = steps === undefined || steps.isCurrent;
   const inFlightLabel =
     IN_FLIGHT_RUN_LABELS[run.status] ??
-    (isSessionStillRunning(run) ? "Session running" : undefined);
+    (showSessionActivity && isSessionStillRunning(run) ? "Session running" : undefined);
 
   const body = (
     <>
       <span className="flex size-5 shrink-0 items-center justify-center">
-        <RunStatusIcon run={run} unread={unread} />
+        <RunStatusIcon run={run} unread={unread} showSessionActivity={showSessionActivity} />
       </span>
       <span className="flex min-w-0 flex-1 flex-col">
         <span className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
@@ -769,15 +771,17 @@ function RunRow({
             </span>
           )}
         </span>
-        {(run.conversationPendingApprovals ?? 0) > 0 && run.conversationId && (
-          <span
-            className="text-xs text-amber-600 dark:text-amber-400"
-            role="status"
-            data-testid="run-pending-approval"
-          >
-            Session needs approval · Open to review
-          </span>
-        )}
+        {showSessionActivity &&
+          (run.conversationPendingApprovals ?? 0) > 0 &&
+          run.conversationId && (
+            <span
+              className="text-xs text-amber-600 dark:text-amber-400"
+              role="status"
+              data-testid="run-pending-approval"
+            >
+              Session needs approval · Open to review
+            </span>
+          )}
         {failure && (
           <span className="text-xs text-muted-foreground" data-testid="run-failure">
             {failure.stage && (
@@ -892,7 +896,15 @@ function RunRow({
  *   5. succeeded + READ / no conversation → muted grey dot, tooltip = "Completed".
  *   6. scheduled           → muted grey dot, no tooltip (not started yet).
  */
-function RunStatusIcon({ run, unread }: { run: ScheduledTaskRun; unread: boolean }) {
+function RunStatusIcon({
+  run,
+  unread,
+  showSessionActivity,
+}: {
+  run: ScheduledTaskRun;
+  unread: boolean;
+  showSessionActivity: boolean;
+}) {
   if (run.status === "failed" || run.status === "incomplete") {
     return (
       <IndicatorWithTooltip tooltip="Failed">
@@ -931,7 +943,7 @@ function RunStatusIcon({ run, unread }: { run: ScheduledTaskRun; unread: boolean
       </IndicatorWithTooltip>
     );
   }
-  if (isSessionStillRunning(run)) {
+  if (showSessionActivity && isSessionStillRunning(run)) {
     return (
       <IndicatorWithTooltip tooltip="Session still running" announce={false}>
         <Loader2Icon

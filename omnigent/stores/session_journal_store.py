@@ -612,6 +612,23 @@ class SessionJournalStore:
             row = self._newest_kind_row(session, conversation_id, _PLAN_KIND)
         return None if row is None else self._entries([row])[0]
 
+    def current_run_plan_ids(self, plans: Sequence[JournalEntry]) -> set[str]:
+        """Which plans belong to their session's latest run, including its replans.
+
+        Uses one indexed run-boundary lookup per distinct session in the page.
+        """
+        with self._session("read_current_run_plans") as session:
+            boundaries = {
+                conversation_id: self._newest_kind_row(session, conversation_id, _PLAN_STATUS_KIND)
+                for conversation_id in dict.fromkeys(plan.conversation_id for plan in plans)
+            }
+            return {
+                plan.id
+                for plan in plans
+                if (boundary := boundaries[plan.conversation_id]) is None
+                or plan.position > boundary.position
+            }
+
     def list_workflow_runs(
         self, workflow_id: str, *, limit: int = 20, before: str | None = None
     ) -> WorkflowRunPage:

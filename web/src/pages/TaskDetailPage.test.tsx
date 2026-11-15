@@ -1425,6 +1425,7 @@ describe("runs of a saved workflow", () => {
   const WORKFLOW_PROMPT = `/workflow Run the saved workflow "Triage" (ID ${"9".repeat(32)}).`;
   const STEPS: ScheduledTaskRunSteps = {
     runId: "run_1",
+    isCurrent: true,
     workflowId: "9".repeat(32),
     steps: [
       { id: "explore", name: "Explore", goal: null, depends_on: [] },
@@ -1502,6 +1503,59 @@ describe("runs of a saved workflow", () => {
     fireEvent.click(within(overlay).getByRole("button", { name: "Close graph" }));
     expect(screen.queryByTestId("workflow-graph-overlay")).toBeNull();
   });
+
+  it.each([false, true])(
+    "keeps earlier continuations read-only (completed=%s)",
+    async (completed) => {
+      setTask(task({ prompt: WORKFLOW_PROMPT }));
+      setRuns([
+        run({
+          id: "run_1",
+          status: "succeeded",
+          conversationId: "c_9",
+          conversationStatus: "running",
+        }),
+        run({
+          id: "run_2",
+          status: "running",
+          conversationId: "c_9",
+          conversationStatus: "running",
+        }),
+      ]);
+      const historical = {
+        ...STEPS,
+        isCurrent: false,
+        statuses: completed
+          ? [...STEPS.statuses, { ...STEPS.statuses[0]!, id: "s2", step: "fix" }]
+          : [{ ...STEPS.statuses[0]!, content: { status: "started", text: "Working" } }],
+      };
+      vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(
+        new Map([
+          ["run_1", historical],
+          ["run_2", { ...STEPS, runId: "run_2" }],
+        ]),
+      );
+      render(
+        <CapabilitiesProvider
+          info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: true } }}
+        >
+          {pageTree()}
+        </CapabilitiesProvider>,
+      );
+      const [old, current] = screen.getAllByTestId("task-detail-run");
+      expect(within(old!).queryByTestId("plan-stop")).toBeNull();
+      expect(within(old!).queryByTestId("plan-continue")).toBeNull();
+      expect(within(old!).queryByTestId("run-status-label")).toBeNull();
+      expect(within(current!).getByRole("button", { name: "Stop" })).toBeInTheDocument();
+      fireEvent.focus(within(old!).getAllByTestId("tasks-progress-segment")[0]!);
+      expect(await screen.findByTestId("tasks-progress-card")).toHaveTextContent("Explore");
+      expect(screen.queryByTestId("tasks-progress-menu")).toBeNull();
+      fireEvent.click(within(old!).getByTestId("run-graph-button"));
+      expect(screen.getByTestId("workflow-graph-overlay")).toHaveTextContent(
+        `explore:${completed ? "done" : "stopped"}`,
+      );
+    },
+  );
 
   it("opens the run's workflow left of the graph button, with the Workflows page on", () => {
     setTask(task({ prompt: WORKFLOW_PROMPT }));

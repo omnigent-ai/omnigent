@@ -1117,6 +1117,7 @@ async def test_a_workflows_runs_list_the_sessions_that_ran_it(
     first_plan = SessionJournalStore(db_uri).current_plan(first)
     assert by_session[first]["id"] == first_plan.id
     assert by_session[first]["session_status"] == "idle"
+    assert all(run["is_current"] for run in by_session.values())
     assert by_session[first]["progress"] == {
         "total": 2,
         "started": 0,
@@ -1165,6 +1166,26 @@ async def test_a_workflows_runs_list_the_sessions_that_ran_it(
     bad = await client.get(f"{url}?before=nope", headers=_headers(ALICE))
     assert bad.status_code == 400
 
+    journal = SessionJournalStore(db_uri)
+    # Editing the current plan retains its run; another workflow supersedes it.
+    journal.append(first, "plan", plan, idempotency_key="replan")
+    page = (await client.get(url, headers=_headers(ALICE))).json()
+    assert next(run for run in page["data"] if run["id"] == first_plan.id)["is_current"]
+    journal.append(first, "plan", plan, idempotency_key="another-run", workflow_id=workflow_id)
+    page = (await client.get(url, headers=_headers(ALICE))).json()
+    first_runs = [run for run in page["data"] if run["session_id"] == first]
+    assert [run["is_current"] for run in first_runs] == [True, False]
+    journal.append(
+        first, "plan", plan, idempotency_key="another-workflow", workflow_id=uuid.uuid4().hex
+    )
+    _publish_status(first, "running")
+    conversations.set_background_work_running(first, True)
+    page = (await client.get(url, headers=_headers(ALICE))).json()
+    for historical in (run for run in page["data"] if run["session_id"] == first):
+        assert historical["is_current"] is False
+        assert historical["session_status"] == "idle"
+        assert historical["background_work_running"] is False
+
 
 async def test_an_automations_runs_list_the_steps_of_their_first_plans(
     client: httpx.AsyncClient, db_uri: str
@@ -1211,6 +1232,7 @@ async def test_an_automations_runs_list_the_steps_of_their_first_plans(
     # The run whose session wrote no plan has no steps to show.
     assert [run["run_id"] for run in page["runs"]] == [run_ids[0]]
     (shown,) = page["runs"]
+    assert shown["is_current"] is True
     assert [step["id"] for step in shown["steps"]] == ["explore", "fix"]
     assert [(s["step"], s["content"]["status"]) for s in shown["statuses"]] == [
         ("explore", "done")
@@ -1218,3 +1240,31 @@ async def test_an_automations_runs_list_the_steps_of_their_first_plans(
     assert page["next_cursor"] is None
     other = await client.get(f"/v1/scheduled-tasks/{task.id}/run-steps", headers=_headers(BOB))
     assert other.status_code == 404
+
+    replan = _write("plan", {"name": "Triage", "steps": steps}, "tool:replan")
+    assert (await client.post(url, json=replan, headers=_runner(planned))).status_code == 200
+    runs_url = f"/v1/scheduled-tasks/{task.id}/run-steps"
+    assert (await client.get(runs_url, headers=_headers(ALICE))).json()["runs"][0]["is_current"]
+
+    # A newer continuation supersedes the old run even before it writes a plan.
+    latest = tasks.create_run(
+        uuid.uuid4().hex,
+        task.id,
+        "running",
+        1_762_498_803,
+        conversation_id=planned,
+        fired_at=1_762_498_804,
+    )
+    SqlAlchemyConversationStore(db_uri).set_labels(
+        planned, {SCHEDULED_TASK_RUN_LABEL_KEY: latest.id}
+    )
+    assert not (await client.get(runs_url, headers=_headers(ALICE))).json()["runs"][0][
+        "is_current"
+    ]
+    body = _write("plan", {"name": "Triage", "steps": steps}, "tool:next-run")
+    assert (await client.post(url, json=body, headers=_runner(planned))).status_code == 200
+    runs = (await client.get(runs_url, headers=_headers(ALICE))).json()["runs"]
+    assert [(run["run_id"], run["is_current"]) for run in runs] == [
+        (latest.id, True),
+        (run_ids[0], False),
+    ]

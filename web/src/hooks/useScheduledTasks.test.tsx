@@ -299,6 +299,7 @@ describe("useScheduledTaskRuns live refresh", () => {
     const stepsFor = (runs: api.ScheduledTaskRun[]) =>
       runs.map((run) => ({
         runId: run.id,
+        isCurrent: true,
         workflowId: null,
         steps: [],
         statuses: [],
