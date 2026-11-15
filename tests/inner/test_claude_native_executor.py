@@ -387,20 +387,19 @@ async def test_run_turn_holds_a_message_until_the_transcript_disk_has_space(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("end", ["cancelled", "model-error"])
 async def test_run_turn_cancels_a_full_disk_hold_without_failing(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    end: str,
 ) -> None:
-    """Closing a full-disk turn releases the wait without an error or keystrokes."""
+    """Cancellation or failed model preparation releases held input without keystrokes."""
     transcript = tmp_path / "projects" / "session.jsonl"
     (tmp_path / claude_bridge._STATE_FILE).write_text(
         json.dumps({"transcript_path": str(transcript)}), encoding="utf-8"
     )
-    monkeypatch.setattr(
-        claude_native_executor,
-        "_transcript_disk_full",
-        Mock(return_value=True),
-    )
+    disk_full = Mock(return_value=True)
+    monkeypatch.setattr(claude_native_executor, "_transcript_disk_full", disk_full)
     injected = Mock()
     monkeypatch.setattr(claude_native_executor, "inject_user_message", injected)
     executor = ClaudeNativeExecutor(tmp_path)
@@ -411,15 +410,100 @@ async def test_run_turn_cancels_a_full_disk_hold_without_failing(
     )
 
     assert isinstance(await turn.__anext__(), TextChunk)
-    assert isinstance(await turn.__anext__(), ExecutorWait)
-    pending_next = asyncio.create_task(turn.__anext__())
-    await asyncio.sleep(0)
-    pending_next.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await pending_next
+    if end == "model-error":
+        disk_full.return_value = False
+        monkeypatch.setattr(
+            executor, "_model_command_arg", Mock(side_effect=RuntimeError("model cache failed"))
+        )
+        failure = await turn.__anext__()
+        assert isinstance(failure, ExecutorError)
+        assert failure.message == "model cache failed"
+    else:
+        assert isinstance(await turn.__anext__(), ExecutorWait)
+        pending_next = asyncio.create_task(turn.__anext__())
+        await asyncio.sleep(0)
+        pending_next.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pending_next
     await turn.aclose()
 
     injected.assert_not_called()
+    disk_full.return_value = False
+    assert await executor.enqueue_session_message("session", "after cancellation") is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disk_full, active_after_probe", [(True, True), (False, False)])
+async def test_enqueue_keeps_unadmitted_message_queued_without_preparing_attachments(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    disk_full: bool,
+    active_after_probe: bool,
+) -> None:
+    """Check transcript capacity and post-probe ownership before any attachment write."""
+    monkeypatch.setattr(
+        claude_native_executor, "_transcript_disk_full", Mock(return_value=disk_full)
+    )
+    monkeypatch.setattr(
+        claude_native_executor,
+        "_session_is_active",
+        Mock(side_effect=[True, active_after_probe]),
+    )
+    prepared = Mock(return_value="prepared attachment")
+    monkeypatch.setattr(claude_native_executor, "_content_to_text", prepared)
+    injected = Mock()
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", injected)
+    executor = ClaudeNativeExecutor(tmp_path)
+
+    accepted = await executor.enqueue_session_message("session", "keep this message")
+
+    assert accepted is False
+    prepared.assert_not_called()
+    injected.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("queued_before_hold", [False, True])
+async def test_live_message_cannot_overtake_a_disk_held_turn_after_space_returns(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    queued_before_hold: bool,
+) -> None:
+    """Returning capacity does not let a newer message pass the suspended original."""
+    disk_full = Mock(return_value=True)
+    monkeypatch.setattr(claude_native_executor, "_transcript_disk_full", disk_full)
+    injected = Mock()
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", injected)
+    executor = ClaudeNativeExecutor(tmp_path)
+    live_send: asyncio.Task[bool] | None = None
+    if queued_before_hold:
+        await executor._inject_lock.acquire()
+        live_send = asyncio.create_task(
+            executor.enqueue_session_message("session", "newer message")
+        )
+        await asyncio.sleep(0)
+    turn = executor.run_turn(
+        messages=[{"role": "user", "content": "original message"}],
+        tools=[],
+        system_prompt="ignored",
+    )
+
+    assert isinstance(await turn.__anext__(), TextChunk)
+    disk_full.return_value = False
+    try:
+        injected.assert_not_called()
+        if live_send is None:
+            assert await executor.enqueue_session_message("session", "newer message") is False
+            result = await turn.__anext__()
+        else:
+            original_send = asyncio.create_task(turn.__anext__())
+            executor._inject_lock.release()
+            assert await live_send is False
+            result = await original_send
+        assert result == TurnComplete(response=None)
+        injected.assert_called_once_with(tmp_path, content="original message")
+    finally:
+        await turn.aclose()
 
 
 @pytest.mark.asyncio
@@ -513,14 +597,17 @@ async def test_enqueue_session_message_rejects_stale_session_after_clear(
         (tmp_path / "bridge.json").write_text('{"active_session_id": "conv_old"}')
         ready_for_lock = asyncio.Event()
 
-        def content_to_text(_content: object, _bridge_dir: Path) -> str:
-            ready_for_lock.set()
-            return "old steering"
+        session_is_active = claude_native_executor._session_is_active
 
-        monkeypatch.setattr(claude_native_executor, "_content_to_text", content_to_text)
+        def check_session(bridge_dir: Path, request_session_id: str | None) -> bool:
+            active = session_is_active(bridge_dir, request_session_id)
+            ready_for_lock.set()
+            return active
+
+        monkeypatch.setattr(claude_native_executor, "_session_is_active", check_session)
         async with executor._inject_lock:
             pending = asyncio.create_task(executor.enqueue_session_message("main", "old steering"))
-            await ready_for_lock.wait()
+            await asyncio.wait_for(ready_for_lock.wait(), timeout=5)
             (tmp_path / "bridge.json").write_text('{"active_session_id": "conv_new"}')
         injected = await pending
     else:
