@@ -18,6 +18,7 @@ class LoadSkillTool(Tool):
     and host-scope skills (``.claude/skills/``, ``.agents/skills/``,
     ``~/.claude/skills/``, ``~/.agents/skills/``). Returns the
     skill content with an optional resource file listing appended.
+    Framework fallbacks never replace a bundled or host-scope skill.
 
     :param skills: The agent's bundled skill list.
     :param agent_root: Path to the agent's working directory,
@@ -33,6 +34,8 @@ class LoadSkillTool(Tool):
         skills: list[SkillSpec],
         agent_root: Path | None = None,
         skills_filter: str | list[str] = "all",
+        *,
+        fallback_skills: list[SkillSpec] | None = None,
     ) -> None:
         """
         Initialize with bundled + host-scope skills.
@@ -42,6 +45,8 @@ class LoadSkillTool(Tool):
             skill discovery.
         :param skills_filter: Host-scope skill filter from
             the agent spec.
+        :param fallback_skills: Framework skills used only when no bundled
+            or host-scope skill has the same name.
         """
         all_skills = list(skills)
         from omnigent.spec.parser import discover_host_skills
@@ -58,12 +63,16 @@ class LoadSkillTool(Tool):
         for hs in host_skills:
             if hs.name not in bundled_names:
                 all_skills.append(hs)
+        discovered_names = {skill.name for skill in all_skills}
+        all_skills.extend(
+            skill for skill in fallback_skills or [] if skill.name not in discovered_names
+        )
         self._skills = all_skills
         self._skills_by_name: dict[str, SkillSpec] = {s.name: s for s in all_skills}
 
     @property
     def skills(self) -> list[SkillSpec]:
-        """All discovered skills (bundled + host-scope)."""
+        """All bundled, host-scope and fallback skills, in precedence order."""
         return self._skills
 
     @classmethod

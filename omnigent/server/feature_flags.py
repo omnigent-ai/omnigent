@@ -47,6 +47,7 @@ class Feature(StrEnum):
     ONE_TIME_AUTOMATIONS = "one_time_automations"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
     SIDEBAR_WINDOWED_ROWS = "sidebar_windowed_rows"
+    WORKFLOWS = "workflows"
     SESSION_OVERVIEW = "session_overview"
     PROJECT_REPOSITORY_CREATION = "project_repository_creation"
     WORKSPACE_DIRECT_ACCESS = "workspace_direct_access"
@@ -223,6 +224,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         feature=Feature.SIDEBAR_WINDOWED_ROWS,
         description="Mount only the sidebar session rows near the viewport",
         owner="web",
+        review_by_release="0.24.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.WORKFLOWS,
+        description="Workflows and session journals across the API, UI and agent tools",
+        owner="server",
         review_by_release="0.24.0",
     ),
     FeatureDefinition(
