@@ -721,9 +721,8 @@ async def serve_tunnel(
                         not ever_connected
                         and auth_token is None
                         and auth_token_factory is not None
-                        and (
-                            not getattr(auth_token_factory, "declined", False)
-                            or getattr(auth_token_factory, "declined_without_proxy_bearer", False)
+                        and await asyncio.to_thread(
+                            _auth_factory_requires_credential, auth_token_factory
                         )
                         and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
                     ):
@@ -939,6 +938,13 @@ async def serve_tunnel(
         # promptly at the base delay instead of doubling toward the cap.
         if not recycle:
             delay_s = min(delay_s * 2, _MAX_RECONNECT_DELAY_S)
+
+
+def _auth_factory_requires_credential(factory: Callable[[], str | None]) -> bool:
+    """Read lock-backed decline flags on the token worker, like credential minting."""
+    return not getattr(factory, "declined", False) or getattr(
+        factory, "declined_without_proxy_bearer", False
+    )
 
 
 async def _sign_in_pending(factory: Callable[[], str | None] | None) -> bool:
