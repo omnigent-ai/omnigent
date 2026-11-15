@@ -23,6 +23,8 @@ import {
 } from "@/components/scheduled/triggerTemplates";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import * as hooks from "@/hooks/useScheduledTasks";
+import { useOptionalLoadedConversations } from "@/hooks/useSidebarData";
+import type * as SidebarDataModule from "@/hooks/useSidebarData";
 import {
   markConversationSeen,
   markConversationUnread,
@@ -38,6 +40,7 @@ import type {
   ScheduledTaskRun,
   ScheduledTaskRunSteps,
 } from "@/lib/scheduledTasksApi";
+import { conversation, conversationPage } from "@/test/sidebarMockHelpers";
 
 const navigate = vi.fn();
 let routeParams = { taskId: "st_1" };
@@ -58,6 +61,10 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
   useUpdateScheduledTask: vi.fn(),
   useDeleteScheduledTask: vi.fn(),
   useRunScheduledTaskNow: vi.fn(),
+}));
+vi.mock("@/hooks/useSidebarData", async (importOriginal) => ({
+  ...(await importOriginal<typeof SidebarDataModule>()),
+  useOptionalLoadedConversations: vi.fn(),
 }));
 // The graph has its own tests (React Flow runs out of memory in jsdom); here the
 // full-screen view lists where each task stands.
@@ -234,6 +241,7 @@ function setRuns(
 
 beforeEach(() => {
   routeParams = { taskId: "st_1" };
+  vi.mocked(useOptionalLoadedConversations).mockReturnValue(undefined);
   useAvailableAgents.mockImplementation(defaultAgentCatalog);
   navigate.mockReset();
   updateMutate.mockReset();
@@ -1471,15 +1479,17 @@ describe("runs of a saved workflow", () => {
         )
       : WORKFLOW_PROMPT;
     setTask(task({ prompt }));
-    setRuns([run({ id: "run_1", status: "succeeded", conversationId: "c_9" })]);
+    const completedRun = run({ id: "run_1", status: "succeeded", conversationId: "c_9" });
+    setRuns([completedRun]);
     vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(new Map([["run_1", STEPS]]));
-    render(
+    const renderWorkflowPage = () => (
       <CapabilitiesProvider
         info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: true } }}
       >
         {pageTree()}
-      </CapabilitiesProvider>,
+      </CapabilitiesProvider>
     );
+    const { rerender } = render(renderWorkflowPage());
 
     expect(screen.getByRole("heading", { name: "Runs" })).toBeInTheDocument();
     expect(hooks.useScheduledTaskRunSteps).toHaveBeenLastCalledWith(
@@ -1504,6 +1514,53 @@ describe("runs of a saved workflow", () => {
     expect(overlay).toHaveTextContent("explore:done fix:ready");
     fireEvent.click(within(overlay).getByRole("button", { name: "Close graph" }));
     expect(screen.queryByTestId("workflow-graph-overlay")).toBeNull();
+
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(
+      new Map([
+        [
+          "run_1",
+          {
+            ...STEPS,
+            statuses: [
+              ...STEPS.statuses,
+              {
+                ...STEPS.statuses[0]!,
+                id: "s2",
+                position: 2,
+                step: "fix",
+                content: { status: "started", text: "Working" },
+              },
+            ],
+          },
+        ],
+      ]),
+    );
+    for (const activity of [{ background_work_running: true }, { status: "running" as const }]) {
+      setRuns([completedRun]);
+      vi.mocked(useOptionalLoadedConversations).mockReturnValue({
+        ...conversationPage([conversation("c_9", activity)]).data!,
+        pageParams: [undefined],
+      });
+      rerender(renderWorkflowPage());
+      expect(within(row).getByRole("button", { name: "Stop" })).toBeInTheDocument();
+      expect(within(row).getAllByTestId("tasks-progress-segment")[1]).toHaveAttribute(
+        "aria-label",
+        "Task 2, Fix: Running",
+      );
+      fireEvent.click(within(row).getByTestId("run-graph-button"));
+      expect(screen.getByTestId("workflow-graph-overlay")).toHaveTextContent("fix:running");
+
+      // The sidebar settles before the next run-list refresh.
+      setRuns([{ ...completedRun, conversationStatus: "running" }]);
+      vi.mocked(useOptionalLoadedConversations).mockReturnValue({
+        ...conversationPage([conversation("c_9")]).data!,
+        pageParams: [undefined],
+      });
+      rerender(renderWorkflowPage());
+      expect(within(row).getByRole("button", { name: "Continue the plan" })).toBeInTheDocument();
+      expect(screen.getByTestId("workflow-graph-overlay")).toHaveTextContent("fix:stopped");
+      fireEvent.click(screen.getByRole("button", { name: "Close graph" }));
+    }
   });
 
   it.each([false, true])(
@@ -1537,6 +1594,10 @@ describe("runs of a saved workflow", () => {
           ["run_2", { ...STEPS, runId: "run_2" }],
         ]),
       );
+      vi.mocked(useOptionalLoadedConversations).mockReturnValue({
+        ...conversationPage([conversation("c_9", { background_work_running: true })]).data!,
+        pageParams: [undefined],
+      });
       render(
         <CapabilitiesProvider
           info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: true } }}

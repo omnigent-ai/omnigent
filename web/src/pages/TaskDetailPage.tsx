@@ -65,6 +65,7 @@ import {
 } from "@/hooks/useUnseenConversations";
 import { useNow } from "@/hooks/useNow";
 import { useSession } from "@/hooks/useSession";
+import { useSessionWorking } from "@/hooks/useSessionWorking";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
 import { useProjects } from "@/hooks/useConversations";
@@ -705,8 +706,11 @@ function RunRow({
 }) {
   const timestamp = formatRunTimestamp(run.firedAt ?? run.scheduledAt, now);
   // A workflow run's tasks, as the workflow's page shows them.
-  const sessionWorking =
-    steps?.isCurrent === true && (run.status === "running" || run.conversationStatus === "running");
+  const working = useSessionWorking(
+    steps?.isCurrent === true ? run.conversationId : null,
+    run.status === "running" || run.conversationStatus === "running",
+  );
+  const sessionWorking = steps?.isCurrent === true && working;
   const progress = useMemo(
     () => (steps ? stepProgress(steps.steps, steps.statuses, sessionWorking) : []),
     [steps, sessionWorking],
