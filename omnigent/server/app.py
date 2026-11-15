@@ -212,6 +212,7 @@ from omnigent.stores.user_settings_store import (
     open_user_settings_store,
     session_owner_title_instructions,
 )
+from omnigent.tools.builtins.session_message import SESSION_MESSAGE_MAX_CHARS
 from omnigent.util.event_loop_watchdog import monitor_event_loop
 
 if TYPE_CHECKING:
@@ -339,6 +340,9 @@ class ServerInfoResponse(BaseModel):
     # before dispatch; older servers would send it to the model.
     scheduled_task_trigger_headers: bool = True
     automation_trigger_poll_minutes: int = 10
+    # Longest session message this server delivers; older servers omit it and
+    # deliver at most 8,000 characters.
+    session_message_max_chars: int = SESSION_MESSAGE_MAX_CHARS
     # Scheduled permissions use the selected native harness's vocabulary.
     scheduled_task_harness_settings: bool = True
     # Session creates accept ``permission_mode``; older servers ignore it.

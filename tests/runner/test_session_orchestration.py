@@ -7,6 +7,7 @@ from uuid import uuid4
 import httpx
 import pytest
 
+from omnigent.host.frames import CAP_LONG_SESSION_MESSAGES, HOST_CAPABILITIES
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas, execute_tool
 from omnigent.session_host import SessionRoutingTransport
@@ -25,6 +26,12 @@ def test_native_message_schema(spec, runner_features, monkeypatch):
     schema = next(s for s in schemas if s["name"] == "sys_session_message")
     assert schema["parameters"]["required"] == ["session_id", "message"]
     assert schema["parameters"]["properties"]["message"]["maxLength"] == SESSION_MESSAGE_MAX_CHARS
+
+
+def test_hosts_advertise_long_session_messages():
+    # Automation forms allow long instructions only on hosts with this token.
+    assert SESSION_MESSAGE_MAX_CHARS == 32_000
+    assert CAP_LONG_SESSION_MESSAGES in HOST_CAPABILITIES
 
 
 def test_create_schema_exposes_project_name_and_permission_mode():

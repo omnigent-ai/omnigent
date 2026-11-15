@@ -4268,8 +4268,23 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(screen.getByTestId("task-trigger-untrusted-note")).toBeInTheDocument();
   });
 
+  function mockLaptop(longSessionMessagesSupported: boolean) {
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [
+        {
+          host_id: "host_1",
+          name: "laptop",
+          owner: "me",
+          status: "online",
+          long_session_messages_supported: longSessionMessagesSupported,
+        },
+      ],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+  }
+
   it("keeps submit disabled until the scope, every condition and the instructions are filled", () => {
-    renderTrigger("jira");
+    mockLaptop(true);
+    renderTrigger("jira", { session_message_max_chars: 32_000 });
     const submit = screen.getByTestId("create-scheduled-task-submit");
     expect(submit).toBeDisabled();
     expect(screen.queryByTestId("task-trigger-preview")).toBeNull();
@@ -4329,6 +4344,38 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(screen.getByTestId("task-trigger-too-long")).toBeVisible();
     expect(screen.queryByTestId("task-trigger-instructions-too-long-notice")).toBeNull();
   });
+
+  it.each([
+    [
+      "an older host",
+      { session_message_max_chars: 32_000 },
+      false,
+      'Update Omnigent on "laptop" and keep it online to allow up to 16,000.',
+    ],
+    ["an older server", {}, true, "Update the Omnigent server to allow up to 16,000."],
+  ])(
+    "keeps the 2,000-character instructions limit on %s",
+    async (_case, extraInfo, hostSupported, upgradeHint) => {
+      mockLaptop(hostSupported);
+      renderTrigger("jira", extraInfo);
+      const submit = screen.getByTestId("create-scheduled-task-submit");
+      fillJira();
+
+      // Its runner or server would refuse each worker message over 8,000 characters.
+      type("task-trigger-instructions", "x".repeat(9_000));
+      expect(submit).toBeDisabled();
+      expect(screen.getByTestId("task-trigger-instructions-too-long-notice")).toHaveTextContent(
+        "Keep instructions to 2,000 characters or fewer so each session's first message has " +
+          `room for the item. ${upgradeHint}`,
+      );
+
+      type("task-trigger-instructions", "x".repeat(2_000));
+      expect(submit).toBeEnabled();
+      const prompt = await submittedPrompt();
+      expect(prompt).toContain("and a message under 8000 characters.");
+      expect(prompt).not.toContain("32000");
+    },
+  );
 
   it("compiles the builder rows into the saved hourly continue-mode task", async () => {
     // A host-transformed link isn't a prefix, so it must reach the prompt as given.

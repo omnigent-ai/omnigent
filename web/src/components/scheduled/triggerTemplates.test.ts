@@ -16,6 +16,7 @@ import {
   isTriggerPrompt,
   triggerPromptSource,
   readTriggerWorkerSettings,
+  LEGACY_MAX_INSTRUCTIONS_CHARS,
   MAX_INSTRUCTIONS_CHARS,
   renderTriggerConfigPrompt,
   renderTriggerPrompt,
@@ -28,6 +29,7 @@ import {
   triggerEventDescription,
   stripTriggerHeader,
   triggerFieldsComplete,
+  triggerMessageBudget,
   triggerScopeOperators,
   updateTriggerWorkerSettings,
   withTriggerEvent,
@@ -370,6 +372,80 @@ describe("triggerFieldsComplete", () => {
   ])("%s", (_name, overrides, complete) => {
     expect(triggerFieldsComplete(fields(overrides))).toBe(complete);
   });
+});
+
+describe("trigger message budget", () => {
+  const FULL = { messageMaxChars: 32000, instructionsMaxChars: 16000 };
+  const LEGACY = { messageMaxChars: 8000, instructionsMaxChars: 2000 };
+  const laptop = (supported?: boolean) => ({
+    name: "laptop",
+    ...(supported === undefined ? {} : { long_session_messages_supported: supported }),
+  });
+
+  it.each([
+    ["a managed sandbox", 32000, "managed_sandbox" as const, FULL, null],
+    ["a current host", 32000, laptop(true), FULL, null],
+    [
+      "an older host",
+      32000,
+      laptop(false),
+      LEGACY,
+      'Update Omnigent on "laptop" and keep it online to allow up to 16,000.',
+    ],
+    [
+      "a host an older server can't vouch for",
+      32000,
+      laptop(),
+      LEGACY,
+      'Update Omnigent on "laptop" and keep it online to allow up to 16,000.',
+    ],
+    [
+      "no host yet",
+      32000,
+      undefined,
+      LEGACY,
+      "Connect a host with the current Omnigent to allow up to 16,000.",
+    ],
+    [
+      "an older server",
+      undefined,
+      "managed_sandbox" as const,
+      LEGACY,
+      "Update the Omnigent server to allow up to 16,000.",
+    ],
+    [
+      "a server with the old limit",
+      8000,
+      laptop(true),
+      LEGACY,
+      "Update the Omnigent server to allow up to 16,000.",
+    ],
+  ])("on %s", (_case, serverMaxChars, target, budget, upgradeHint) => {
+    expect(triggerMessageBudget(serverMaxChars, target)).toEqual({ ...budget, upgradeHint });
+  });
+
+  it("checks instructions against the budget it is given", () => {
+    const instructions = (length: number) => fields({ instructions: "x".repeat(length) });
+    expect(triggerFieldsComplete(instructions(2000), "jira", LEGACY_MAX_INSTRUCTIONS_CHARS)).toBe(
+      true,
+    );
+    expect(triggerFieldsComplete(instructions(9000), "jira", LEGACY_MAX_INSTRUCTIONS_CHARS)).toBe(
+      false,
+    );
+  });
+
+  it.each(["new", "continue"] as const)(
+    "asks %s-mode workers for messages within the budget",
+    (taskSessionMode) => {
+      const prompt = renderTriggerPrompt("jira", fields(), {
+        ...CTX,
+        taskSessionMode,
+        messageMaxChars: 8000,
+      });
+      expect(prompt).toContain("and a message under 8000 characters.");
+      expect(prompt).not.toContain("32000");
+    },
+  );
 });
 
 describe("Slack DM triggers", () => {
@@ -898,6 +974,16 @@ describe("trigger header", () => {
       renderTriggerPrompt(source, rest, { ...CTX, placement: worker.placement }),
     );
     expect(stripTriggerHeader(saved)).toBe(renderTriggerConfigPrompt(config(source), CTX));
+  });
+
+  it.each(TRIGGER_SOURCES)("keeps 16,000 characters of %s instructions exactly", (source) => {
+    const instructions = 'Runbook: quote "this", keep <tags> and --> as is.\n'.padEnd(
+      MAX_INSTRUCTIONS_CHARS,
+      "x",
+    );
+    const saved = encodeTriggerPrompt(config(source, { instructions }), CTX);
+    expect(decodeTriggerPrompt(saved)?.instructions).toBe(instructions);
+    expect(stripTriggerHeader(saved)).toContain(instructions);
   });
 
   it("round-trips custom fields, event targets, task sessions and worker permissions", () => {
