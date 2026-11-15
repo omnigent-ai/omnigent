@@ -41,3 +41,31 @@ export function useConversationEntryState(id: string | null): ConversationState 
   }, [id]);
   return useSyncExternalStore(subscribe, getSnapshot);
 }
+
+/**
+ * One value from a specific conversation's live state, re-rendering only when
+ * that value changes rather than on every frame of the conversation.
+ *
+ * @param id Conversation id to observe, or null for none.
+ * @param select Picks the value; it must return the same reference while the
+ *   value is unchanged, e.g. `(state) => state.todos`.
+ */
+export function useConversationEntryValue<T>(
+  id: string | null,
+  select: (state: ConversationState) => T,
+): T {
+  const subscribe = useCallback(
+    (onChange: () => void) => {
+      if (id === null) return () => {};
+      return conversationRegistry.subscribe((changedId) => {
+        if (changedId === id) onChange();
+      });
+    },
+    [id],
+  );
+  const getSnapshot = () => {
+    const entry = id === null ? undefined : conversationRegistry.peek(id);
+    return select(entry === undefined ? EMPTY_STATE : entry.getState());
+  };
+  return useSyncExternalStore(subscribe, getSnapshot);
+}

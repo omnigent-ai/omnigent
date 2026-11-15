@@ -68,6 +68,11 @@ from omnigent.models.model_override import (
 from omnigent.native.native_coding_agents import public_agent_name
 from omnigent.policies.builtins.safety import scheduled_task_review_error
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+from omnigent.runner.journal_tools import (
+    JOURNAL_TOOL_NAMES,
+    execute_journal_tool,
+    server_workflows_enabled,
+)
 from omnigent.runner.session_requests import remember_session_host
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.tools import ToolManager
@@ -472,6 +477,10 @@ _SCHEDULED_TASK_TOOLS = frozenset(
     }
 )
 
+# Priority 5l.2: The session journal — the runner proxies the server's
+# /v1/sessions/{id}/journal routes (see omnigent/runner/journal_tools.py).
+_JOURNAL_TOOLS = JOURNAL_TOOL_NAMES
+
 # Priority 5m: Embedded-browser tools.
 # Runner dispatch POSTs a blocking action request to the server, which parks a
 # Future + publishes ``browser.action_request`` on the session stream; the
@@ -526,6 +535,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _AGENT_TOOLS
     | _POLICY_TOOLS
     | _SCHEDULED_TASK_TOOLS
+    | _JOURNAL_TOOLS
     | _TERMINAL_TOOLS
     # ``browser_*`` must ride the native relay: the Omnigent desktop app
     # runs native (claude/codex/pi) sessions, which ignore ``request.tools``
@@ -557,13 +567,26 @@ def strip_browser_tool_schemas(schemas: list[_JsonObject]) -> list[_JsonObject]:
     :param schemas: Tool schemas in either supported shape.
     :returns: The same list minus any ``browser_*`` entries.
     """
+    return _strip_tool_schemas(schemas, _BROWSER_TOOLS)
+
+
+def filter_workflow_tool_schemas(
+    schemas: list[_JsonObject], *, enabled: bool
+) -> list[_JsonObject]:
+    """Hide journal and workflow tools unless the server enables workflows."""
+    return schemas if enabled else _strip_tool_schemas(schemas, _JOURNAL_TOOLS)
+
+
+def _strip_tool_schemas(
+    schemas: list[_JsonObject], names: set[str] | frozenset[str]
+) -> list[_JsonObject]:
     kept: list[_JsonObject] = []
     for schema in schemas:
         name: object = schema.get("name")
         if not isinstance(name, str):
             function = _string_object_dict(schema.get("function"))
             name = function.get("name") if function is not None else None
-        if isinstance(name, str) and name in _BROWSER_TOOLS:
+        if isinstance(name, str) and name in names:
             continue
         kept.append(schema)
     return kept
@@ -955,6 +978,7 @@ _ALL_LOCAL_TOOLS = (
     | _AGENT_TOOLS
     | _POLICY_TOOLS
     | _SCHEDULED_TASK_TOOLS
+    | _JOURNAL_TOOLS
 )
 _PLACEHOLDER_CWDS = (None, "", ".", "./")
 
@@ -7574,6 +7598,7 @@ async def execute_tool(
     filesystem_registry: FilesystemRegistry | None = None,
     effective_harness: str | None = None,
     wake_on_async_result: AsyncResultWake | None = None,
+    call_id: str | None = None,
 ) -> str:
     """
     Execute a tool and return the output string.
@@ -7604,6 +7629,8 @@ async def execute_tool(
     :param wake_on_async_result: Callback a ``sys_call_async`` background
         task invokes after queueing its completed or failed result, so the
         runner can wake a session that is no longer in a turn.
+    :param call_id: The harness's tool call ID, when the caller has one; the
+        journal tools key their writes on it.
     :returns: Tool output string.
     """
     if not arguments.strip():
@@ -7841,6 +7868,7 @@ async def execute_tool(
                 args,
                 agent_spec=agent_spec,
                 runner_workspace=runner_workspace,
+                workflows_enabled=await server_workflows_enabled(server_client),
             )
         elif tool_name in _COMMENT_TOOLS:
             output = await _execute_comment_tool(
@@ -7871,6 +7899,15 @@ async def execute_tool(
                 arguments,
                 server_client=server_client,
                 conversation_id=conversation_id,
+            )
+        elif tool_name in _JOURNAL_TOOLS:
+            output = await execute_journal_tool(
+                tool_name,
+                arguments,
+                server_client=server_client,
+                conversation_id=conversation_id,
+                call_id=call_id,
+                publish_event=publish_event,
             )
         elif tool_name in _BROWSER_TOOLS:
             output = await _execute_browser_tool(
@@ -8053,6 +8090,7 @@ async def dispatch_tool_locally(
         publish_event=publish_event,
         effective_harness=effective_harness,
         wake_on_async_result=wake_on_async_result,
+        call_id=call_id,
     )
 
     # A file-mutating tool just ran — nudge the web to refetch the
@@ -10075,12 +10113,13 @@ def _execute_skill_tool(
     *,
     agent_spec: AgentSpec | None,
     runner_workspace: Path | None,
+    workflows_enabled: bool = False,
 ) -> str:
     """
     Runner-local handler for ``load_skill`` and ``read_skill_file``.
 
     Both tools are built from one registry — the agent spec's bundled
-    skills merged with host-scope discovery from the runner workspace —
+    skills merged with host-scope discovery and enabled framework fallbacks —
     so anything ``load_skill`` can load, ``read_skill_file`` can read.
 
     :param tool_name: ``"load_skill"`` or ``"read_skill_file"``.
@@ -10088,8 +10127,10 @@ def _execute_skill_tool(
     :param agent_spec: The session's AgentSpec.
     :param runner_workspace: The runner's workspace path for
         host-scope skill discovery.
+    :param workflows_enabled: Whether the server enables workflow skills.
     :returns: Tool output string.
     """
+    from omnigent.spec.skill_sources import framework_skills
     from omnigent.tools.builtins.load_skill import LoadSkillTool
     from omnigent.tools.builtins.read_skill_file import ReadSkillFileTool
 
@@ -10107,6 +10148,9 @@ def _execute_skill_tool(
         bundled_skills,
         agent_root=runner_workspace,
         skills_filter=skills_filter,
+        fallback_skills=(
+            framework_skills(agent_spec) if workflows_enabled and agent_spec is not None else []
+        ),
     )
     tool: Tool = load_tool if tool_name == "load_skill" else ReadSkillFileTool(load_tool.skills)
 

@@ -1156,14 +1156,19 @@ tool_groups:
   comments: false         # list_comments / update_comment
   policies: false         # sys_add_policy / sys_policy_registry
   agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
+  journal: false          # sys_journal_read / _write_plan / _write_status / _write_note, sys_workflow_request_input / _save / _load / _list
   projects: false         # sys_project_* / sys_session_update
 ```
 
 Every group defaults to `true`, so omitting the block changes nothing. Values
 must be booleans and group names must match exactly; a typo fails the load
-rather than silently leaving the group registered. Disabling `browser` also
-drops the embedded-browser guidance from the composed system prompt. The block
-is read the same way from a `config.yaml` bundle and a single-file agent YAML.
+rather than silently leaving the group registered. The `journal` group also
+requires the server's `workflows` feature flag, which defaults off; enable it
+with `OMNIGENT_FEATURES=workflows` on the server. Disabling `browser` also
+drops the embedded-browser guidance from the composed system prompt, and
+disabling `journal` also drops the `/workflow` and `/save-workflow` skills (see
+[Session journal](session-journal.md)). The block is read the same way from a
+`config.yaml` bundle and a single-file agent YAML.
 
 `agent_discovery: false` is rejected while `spawn: true` or the
 `scheduled_tasks` group is on: `sys_session_create` and

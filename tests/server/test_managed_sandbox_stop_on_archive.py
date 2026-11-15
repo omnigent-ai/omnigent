@@ -7,6 +7,7 @@ from dataclasses import replace
 import click
 import pytest
 
+from omnigent.db.db_models import current_workspace_id
 from omnigent.onboarding.sandboxes.base import SandboxCapabilityError
 from omnigent.server.managed_hosts import (
     ManagedSandboxConfig,
@@ -17,7 +18,11 @@ from omnigent.server.managed_hosts import (
     stop_archived_session_sandbox,
 )
 from omnigent.server.routes._sessions import orchestration
-from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
+from omnigent.server.scheduled.schedule import continued_sandbox_host_id
+from omnigent.stores.conversation_store import (
+    CREATED_BY_SESSION_LABEL_KEY,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
 from tests.server.helpers import FakeSandboxLauncher, HostStartInvocation
@@ -39,7 +44,13 @@ def _deployment(fake: FakeSandboxLauncher, *, stop_on_archive: bool = True):
 
 
 async def _archived_session_on_a_sandbox(
-    db_uri: str, *, can_resume: bool = True, labels=None, git_branch=None, runner_id=None
+    db_uri: str,
+    *,
+    can_resume: bool = True,
+    labels=None,
+    git_branch=None,
+    runner_id=None,
+    host_id=None,
 ):
     host_store = HostStore(db_uri)
     conversations = SqlAlchemyConversationStore(db_uri)
@@ -51,7 +62,7 @@ async def _archived_session_on_a_sandbox(
 
     fake = FakeSandboxLauncher(on_host_start=register, can_resume=can_resume)
     launched = await launch_managed_host(
-        config=_deployment(fake), owner=_OWNER, host_store=host_store
+        config=_deployment(fake), owner=_OWNER, host_store=host_store, host_id=host_id
     )
     conv = conversations.create_conversation(
         host_id=launched.host_id,
@@ -195,12 +206,27 @@ async def test_keeps_a_sandbox_its_provider_cannot_resume(db_uri):
     assert fake.stopped == []
 
 
-async def test_keeps_a_scheduled_task_runs_sandbox(db_uri):
+@pytest.mark.parametrize("placement", ["scheduler", "independent-worker", "retained-host-worker"])
+async def test_scheduled_sandbox_retention_does_not_cover_independent_workers(db_uri, placement):
+    task_id = "0123456789abcdef0123456789abcdef"
+    retained_host = continued_sandbox_host_id(task_id, current_workspace_id())
+    labels = {SCHEDULED_TASK_ORIGIN_LABEL_KEY: task_id}
+    creator = None
+    if placement != "scheduler":
+        creator = SqlAlchemyConversationStore(db_uri).create_conversation(labels=labels)
+        labels = {CREATED_BY_SESSION_LABEL_KEY: creator.id}
     fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(
-        db_uri, labels={SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task-1"}
+        db_uri,
+        labels=labels,
+        host_id=retained_host if placement == "retained-host-worker" else None,
     )
-    assert await _stop(fake, host_store, conversations, conv) is False
-    assert fake.stopped == []
+    assert conv.labels[SCHEDULED_TASK_ORIGIN_LABEL_KEY] == task_id
+    if creator is not None:
+        # The worker's provenance and the host's retention outlive the creator.
+        assert await conversations.delete_conversation(creator.id)
+    stopped = placement == "independent-worker"
+    assert await _stop(fake, host_store, conversations, conv) is stopped
+    assert fake.stopped == ([host_store.get_host(conv.host_id).sandbox_id] if stopped else [])
 
 
 @pytest.mark.parametrize(
