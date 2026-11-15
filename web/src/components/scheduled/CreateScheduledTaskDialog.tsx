@@ -75,6 +75,7 @@ import {
   hasTriggerHeader,
   isTriggerPrompt,
   readTriggerWorkerPlacement,
+  readTriggerMessageMaxChars,
   readTriggerWorkerSettings,
   renderTriggerConfigPrompt,
   splitTriggerPrompt,
@@ -1032,10 +1033,13 @@ export function CreateScheduledTaskDialog({
   // first ONLINE host so unconfigured agents show "needs setup" right away.
   const badgeHost =
     selectedHost ?? hostOptions.find((h) => h.status === "online") ?? hostOptions[0];
-  // Trigger messages fit what both the server and the polling host deliver.
+  // Trigger messages fit what both the server and the pinned polling host deliver.
   const messageBudget = triggerMessageBudget(
     info === "loading" ? undefined : info.session_message_max_chars,
-    sandboxMode ? "managed_sandbox" : badgeHost,
+    sandboxMode ? "managed_sandbox" : selectedHost,
+    editingTemplateTrigger && originalTargetSelected
+      ? readTriggerMessageMaxChars(editingTask.prompt)
+      : null,
   );
 
   // A workspace is only valid with a host — mirror the server's pairing rule so

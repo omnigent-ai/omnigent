@@ -15,6 +15,7 @@ import {
   hasTriggerHeader,
   isTriggerPrompt,
   triggerPromptSource,
+  readTriggerMessageMaxChars,
   readTriggerWorkerSettings,
   LEGACY_MAX_INSTRUCTIONS_CHARS,
   MAX_INSTRUCTIONS_CHARS,
@@ -404,7 +405,7 @@ describe("trigger message budget", () => {
       32000,
       undefined,
       LEGACY,
-      "Connect a host with the current Omnigent to allow up to 16,000.",
+      "Pick a host with the current Omnigent to allow up to 16,000.",
     ],
     [
       "an older server",
@@ -423,6 +424,49 @@ describe("trigger message budget", () => {
   ])("on %s", (_case, serverMaxChars, target, budget, upgradeHint) => {
     expect(triggerMessageBudget(serverMaxChars, target)).toEqual({ ...budget, upgradeHint });
   });
+
+  it.each([
+    ["the full limit on an older host", 32000, 32000, laptop(false), FULL, null],
+    [
+      "the full limit on an older server",
+      32000,
+      undefined,
+      laptop(true),
+      LEGACY,
+      "Update the Omnigent server to allow up to 16,000.",
+    ],
+    [
+      "the old limit on an older host",
+      8000,
+      32000,
+      laptop(false),
+      LEGACY,
+      'Update Omnigent on "laptop" and keep it online to allow up to 16,000.',
+    ],
+  ])(
+    "keeps a trigger saved with %s",
+    (_case, saved, serverMaxChars, target, budget, upgradeHint) => {
+      expect(triggerMessageBudget(serverMaxChars, target, saved)).toEqual({
+        ...budget,
+        upgradeHint,
+      });
+    },
+  );
+
+  it.each(["new", "continue"] as const)(
+    "reads the message limit a saved %s-mode prompt asks for",
+    (taskSessionMode) => {
+      const prompt = (messageMaxChars?: number) =>
+        renderTriggerPrompt("jira", fields(), {
+          ...CTX,
+          taskSessionMode,
+          ...(messageMaxChars === undefined ? {} : { messageMaxChars }),
+        });
+      expect(readTriggerMessageMaxChars(prompt())).toBe(32000);
+      expect(readTriggerMessageMaxChars(prompt(8000))).toBe(8000);
+      expect(readTriggerMessageMaxChars("Summarize the inbox.")).toBeNull();
+    },
+  );
 
   it("checks instructions against the budget it is given", () => {
     const instructions = (length: number) => fields({ instructions: "x".repeat(length) });

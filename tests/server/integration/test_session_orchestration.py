@@ -119,7 +119,7 @@ async def test_private_sender_can_message_shared_receiver(
 async def test_message_long_enough_for_automation_instructions_is_delivered(auth_client, peers):
     source, target, _ = peers
     # Room for 16,000 characters of automation instructions plus the matched item.
-    message = "Long task " + "a" * (32_000 - len("Long task "))
+    message = "Long task " + "a" * (SESSION_MESSAGE_MAX_CHARS - len("Long task "))
     result = await _send(auth_client, source, target, message)
     assert result.get("queued") is True, result
     items = await auth_client.get(f"/v1/sessions/{target['id']}/items")

@@ -584,17 +584,22 @@ export type TriggerPollingTarget =
  * The full budget only when the server and the polling host both deliver long
  * messages: an older server or runner refuses any message over 8,000 characters.
  * Managed sandboxes are provisioned by the server, so they follow its limit.
+ * A trigger saved with the full budget for the same target keeps it, so a host
+ * that is offline or on another replica doesn't block unrelated edits.
  */
 export function triggerMessageBudget(
   serverMessageMaxChars: number | undefined,
   target: TriggerPollingTarget,
+  savedMessageMaxChars: number | null = null,
 ): TriggerMessageBudget {
   const fullBudget = MAX_INSTRUCTIONS_CHARS.toLocaleString("en-US");
   let upgradeHint: string | null = null;
   if ((serverMessageMaxChars ?? 0) < SESSION_MESSAGE_MAX_CHARS) {
     upgradeHint = `Update the Omnigent server to allow up to ${fullBudget}.`;
+  } else if ((savedMessageMaxChars ?? 0) >= SESSION_MESSAGE_MAX_CHARS) {
+    upgradeHint = null;
   } else if (target === undefined) {
-    upgradeHint = `Connect a host with the current Omnigent to allow up to ${fullBudget}.`;
+    upgradeHint = `Pick a host with the current Omnigent to allow up to ${fullBudget}.`;
   } else if (target !== "managed_sandbox" && target.long_session_messages_supported !== true) {
     upgradeHint = `Update Omnigent on "${target.name}" and keep it online to allow up to ${fullBudget}.`;
   }
@@ -724,7 +729,7 @@ const WORKER_SETTINGS_PATTERN = new RegExp(
     `(?:, model (${QUOTED_WORKER_VALUE}))?` +
     `(?:, reasoning_effort (${QUOTED_WORKER_VALUE}))?` +
     `(?:, permission_mode (${QUOTED_WORKER_VALUE}))?` +
-    // Prompts saved before the message limit was raised still say 8000.
+    // Saved prompts may carry an older message limit; keep it as written.
     `, and a message under (\\d+) characters\\.`,
   "g",
 );
@@ -757,6 +762,12 @@ function workerSettingsMatch(prompt: string) {
 /** Read the generated creation call without treating worker task text as configuration. */
 export function readTriggerWorkerSettings(prompt: string): TriggerWorkerSettings | null {
   return workerSettingsMatch(prompt)?.settings ?? null;
+}
+
+/** The message limit a saved prompt's creation call asks for, e.g. 32000. */
+export function readTriggerMessageMaxChars(prompt: string): number | null {
+  const parsed = workerSettingsMatch(prompt);
+  return parsed === null ? null : Number(parsed.match[6]);
 }
 
 /** Placement remains part of the authored instructions when the poller moves. */

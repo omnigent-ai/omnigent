@@ -4377,6 +4377,54 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     },
   );
 
+  it("keeps a saved trigger's 16,000-character instructions when its host can't vouch for them", async () => {
+    mockLaptop(false);
+    const instructions = "x".repeat(12_000);
+    const saved = encodeTriggerPrompt(
+      {
+        source: "jira",
+        ...emptyTriggerFields("jira"),
+        scope: "ES",
+        instructions,
+        worker: {
+          placement: "same_host",
+          agentId: null,
+          model: "",
+          effort: "",
+          permissionMode: "",
+        },
+      },
+      { sessionLink: "https://example.test/c/CONVERSATION_ID" },
+    );
+    const task = scheduledTask({
+      prompt: saved,
+      sessionMode: "continue",
+      sessionId: "poller",
+      hostId: "host_1",
+    });
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          scheduled_task_session_modes: true,
+          scheduled_task_trigger_headers: true,
+          session_message_max_chars: 32_000,
+        }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={task} />
+      </CapabilitiesProvider>,
+    );
+    expect(screen.getByTestId("task-trigger-instructions")).toHaveValue(instructions);
+    expect(screen.queryByTestId("task-trigger-instructions-too-long-notice")).toBeNull();
+
+    type("task-trigger-instructions", `${instructions} Then triage it.`);
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const prompt = updateMutateAsync.mock.calls[0][0].input.prompt;
+    expect(prompt).toContain("and a message under 32000 characters.");
+    expect(prompt).toContain(`${instructions} Then triage it.`);
+  });
+
   it("compiles the builder rows into the saved hourly continue-mode task", async () => {
     // A host-transformed link isn't a prefix, so it must reach the prompt as given.
     renderTrigger("jira", {}, "https://host.example.com/embed#/c/CONVERSATION_ID?o=42");
