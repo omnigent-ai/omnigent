@@ -51,6 +51,8 @@ PLAN_SOURCES: tuple[str, ...] = ("agent", "workflow")
 IDEMPOTENCY_KEY_MAX_CHARS = 128
 # One page of a journal read; the agent's tool reads at most 100 entries at a time.
 JOURNAL_PAGE_MAX = 1000
+# A session's journal holds at most this many entries, run boundaries included.
+JOURNAL_MAX_ENTRIES = 10_000
 
 
 class InvalidJournalEntryError(ValueError):
@@ -71,6 +73,14 @@ class JournalEntryTooLargeError(InvalidJournalEntryError):
             "file and reference it"
         )
         self.size = size
+        self.limit = limit
+
+
+class JournalFullError(InvalidJournalEntryError):
+    """The session's journal already holds :data:`JOURNAL_MAX_ENTRIES` entries."""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(f"the session's journal holds at most {limit} entries")
         self.limit = limit
 
 

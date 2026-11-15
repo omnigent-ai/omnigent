@@ -49,11 +49,13 @@ from omnigent.db.utils import (
 from omnigent.entities.session_journal import (
     IDEMPOTENCY_KEY_MAX_CHARS,
     JOURNAL_KINDS,
+    JOURNAL_MAX_ENTRIES,
     JOURNAL_PAGE_MAX,
     InvalidJournalEntryError,
     JournalAppend,
     JournalEntry,
     JournalEntryTooLargeError,
+    JournalFullError,
     JournalPage,
     StepNotReadyError,
     WorkflowRunPage,
@@ -70,10 +72,11 @@ _PLAN_STATUS_KIND = encode_journal_entry_kind("plan_status")
 _KINDS_A_FORK_LEAVES = frozenset(
     encode_journal_entry_kind(kind) for kind in ("dispatch", "dispatch_result")
 )
-# Session deletion removes at most this many entries per transaction.
-JOURNAL_DELETE_BATCH = 500
+# Session deletion removes at most this many entries per transaction, and a
+# statement's IN list names at most this many keys.
+JOURNAL_DELETE_BATCH = 200
 # Journal copies read and write at most this many entries per transaction.
-JOURNAL_COPY_BATCH = 250
+JOURNAL_COPY_BATCH = 200
 
 _Statement = TypeVar("_Statement", bound=Select[Any])
 
@@ -391,6 +394,8 @@ class SessionJournalStore:
         :returns: The entry, and whether this call appended it.
         :raises InvalidJournalEntryError: If a field is invalid.
         :raises JournalEntryTooLargeError: If the stored content is too large.
+        :raises JournalFullError: If the journal already holds
+            :data:`~omnigent.entities.session_journal.JOURNAL_MAX_ENTRIES` entries.
         :raises StepNotReadyError: If a status names a step whose dependencies in
             the current plan aren't all done.
         :raises JournalSessionNotFoundError: If the session doesn't exist.
@@ -473,6 +478,8 @@ class SessionJournalStore:
                 )
                 if waiting:
                     raise StepNotReadyError(entry_step, waiting)
+            if position + (2 if starts_run else 1) > JOURNAL_MAX_ENTRIES:
+                raise JournalFullError(JOURNAL_MAX_ENTRIES)
             stamp = now_epoch()
             entry_id = uuid.uuid4().hex
             if starts_run:

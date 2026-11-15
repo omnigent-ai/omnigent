@@ -62,7 +62,9 @@ the task list reads the run boundary even when it predates the loaded page.
 
 Limits: a plan has at most 100 steps and 32 KiB of JSON, and its name at most 80
 characters; status text is required except for `started`; a note is at most 4
-KiB. Every stored entry is at most 16,383 bytes after compression. Step names,
+KiB. Every stored entry is at most 16,383 bytes after compression, and a
+session's journal holds at most 10,000 entries: an append past that is refused
+with `journal_full`. Step names,
 goals, status text and the agent's questions have no length limit of their own;
 a goal keeps its line breaks.
 
