@@ -42,7 +42,7 @@ describe("goal API facade", () => {
     await expect(updateGoalStatus("conv", "paused")).resolves.toEqual({ goal: CODEX_GOAL });
     await expect(clearGoal("conv")).resolves.toEqual({ cleared: true });
 
-    expect(mockGetCodexGoal).toHaveBeenCalledWith("conv");
+    expect(mockGetCodexGoal).toHaveBeenCalledWith("conv", undefined);
     expect(mockSetCodexGoal).toHaveBeenCalledWith("conv", {
       objective: "Ship goal mode",
       tokenBudget: 40_000,
@@ -50,5 +50,22 @@ describe("goal API facade", () => {
     });
     expect(mockUpdateCodexGoalStatus).toHaveBeenCalledWith("conv", "paused");
     expect(mockClearCodexGoal).toHaveBeenCalledWith("conv");
+  });
+
+  it.each([true, false])("delegates the strict=%s read option", async (strict) => {
+    const options = { strict };
+    mockGetCodexGoal.mockResolvedValueOnce({ goal: null });
+
+    await expect(getGoal("conv", options)).resolves.toEqual({ goal: null });
+
+    expect(mockGetCodexGoal).toHaveBeenCalledWith("conv", options);
+  });
+
+  it("preserves unavailable background reads without creating an empty goal", async () => {
+    mockGetCodexGoal.mockResolvedValueOnce({ available: false });
+
+    await expect(getGoal("conv", { strict: false })).resolves.toEqual({ available: false });
+
+    expect(mockGetCodexGoal).toHaveBeenCalledWith("conv", { strict: false });
   });
 });

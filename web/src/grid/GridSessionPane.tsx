@@ -10,6 +10,8 @@ import {
 import { createPortal } from "react-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { useDraggable, useDroppable } from "@dnd-kit/core";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { cn } from "@/lib/utils";
 import { Maximize2Icon, XIcon } from "lucide-react";
 import { SideChatPane } from "@/components/chat/SideChatPane";
@@ -93,6 +95,7 @@ export function GridSessionPane({
   const { session, isLoading: sessionLoading } = useSession(sessionId);
   const state = useConversationEntryState(sessionId);
   const canEdit = useCanEdit(sessionId);
+  const serverInfo = useServerInfo();
   const permissionLevel = session?.permissionLevel ?? (canEdit ? null : 1);
   const grids = useGridSessions()!;
   const title = session?.title || "Session";
@@ -520,6 +523,12 @@ export function GridSessionPane({
                 }}
                 showFilesPanel={showFiles}
                 showGithubTab={showFiles}
+                showTasksTab={
+                  (isFeatureEnabled(serverInfo, "workflows") &&
+                    serverInfo !== "loading" &&
+                    serverInfo.session_journal === true) ||
+                  (state.todos?.length ?? 0) > 0
+                }
                 showBrowserTab={supportsBrowser()}
                 onReveal={onOpenWorkspace}
                 changedCount={changedCount}

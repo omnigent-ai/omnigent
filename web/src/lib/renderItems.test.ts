@@ -1590,6 +1590,39 @@ describe("buildBubbles — tool joining", () => {
     expect(t.state).toBe("input-available");
   });
 
+  it("leaves out journal writes the chat marks, keeping rejected ones and other tools", () => {
+    const active: ActiveResponse = { responseId: "resp_1", state: "streaming", error: null };
+    const call = (itemId: string, name: string, callId: string): AnyBlock => ({
+      type: "tool_group",
+      ctx: ctx({ itemId }),
+      executions: [mkExec(name, callId)],
+      iteration: 0,
+    });
+    const result = (callId: string, name: string, output: string): AnyBlock => ({
+      type: "tool_result",
+      ctx: ctx({ itemId: `out_${callId}` }),
+      name,
+      callId,
+      agentName: "test",
+      output,
+    });
+    const status = "mcp__omnigent__sys_journal_write_status";
+    const blocks: AnyBlock[] = [
+      call("fc_1", status, "accepted"),
+      result("accepted", status, '{"id": "e1", "position": 1}'),
+      call("fc_2", status, "rejected"),
+      result("rejected", status, '{"error": "invalid_entry: step ship is not in the plan"}'),
+      call("fc_3", "Read", "read"),
+      result("read", "Read", "file content"),
+      // Still running: its plan line lands once the journal accepts it.
+      call("fc_4", "sys_journal_write_plan", "running"),
+    ];
+    const items = (buildBubbles(blocks, active)[0] as Extract<Bubble, { kind: "assistant" }>).items;
+    expect(items.map((item) => (item.kind === "tool" ? item.execution.callId : item.kind))).toEqual(
+      ["rejected", "read"],
+    );
+  });
+
   it("settles an older result-less tool once the streaming turn moves past it", () => {
     const active: ActiveResponse = { responseId: "resp_1", state: "streaming", error: null };
     const blocks: AnyBlock[] = [

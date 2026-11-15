@@ -13,7 +13,50 @@ import string
 
 import pytest
 
-from omnigent.db.compression import _MIN_COMPRESS_BYTES, CompressedText, decode, encode
+from omnigent.db.compression import (
+    _MIN_COMPRESS_BYTES,
+    CompressedText,
+    EncryptedTextPayload,
+    decode,
+    encode,
+    encode_encrypted,
+)
+
+
+def test_encrypted_envelopes_require_a_deployment_decryptor() -> None:
+    encrypted = EncryptedTextPayload(b"\xff\x00opaque", {"provider": "example", "key_id": "key-7"})
+    envelope = encode_encrypted(encrypted)
+    with pytest.raises(ValueError, match="configured decryptor"):
+        decode(envelope)
+    with pytest.raises(ValueError, match="configured decryptor"):
+        CompressedText().process_result_value(envelope, None)
+
+    # The deployment owns encryption; this callback checks the codec's handoff.
+    def decrypt(payload: EncryptedTextPayload) -> str:
+        assert payload == encrypted
+        return "café"
+
+    def encrypt(plaintext: str) -> EncryptedTextPayload:
+        assert plaintext == "café"
+        return encrypted
+
+    codec = CompressedText(max_stored_bytes=len(envelope), encrypt=encrypt, decrypt=decrypt)
+    assert codec.process_result_value(codec.process_bind_param("café", None), None) == "café"
+    smaller = CompressedText(max_stored_bytes=len(envelope) - 1, encrypt=encrypt, decrypt=decrypt)
+    with pytest.raises(ValueError, match="size limit"):
+        smaller.process_bind_param("café", None)
+    assert decode(memoryview(envelope), decrypt=decrypt, max_decoded_bytes=5) == "café"
+    with pytest.raises(ValueError, match="size limit"):
+        decode(envelope, decrypt=decrypt, max_decoded_bytes=4)
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [b"\x00\x02", b"\x00\x02\x00\x00\x00\x10{}", b"\x00\x02\x00\x00\x00\x02{}x", b"\x00\x03text"],
+)
+def test_invalid_envelopes_never_fall_back_to_plaintext(envelope: bytes) -> None:
+    with pytest.raises(ValueError):
+        decode(envelope)
 
 
 @pytest.mark.parametrize("write_content_size", [False, True])
