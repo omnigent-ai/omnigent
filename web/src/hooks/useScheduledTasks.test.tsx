@@ -289,7 +289,7 @@ describe("hasUnsettledRun (the refetchInterval stop condition)", () => {
 });
 
 describe("useScheduledTaskRuns live refresh", () => {
-  it("loads steps when a new settled run replaces one on a full history page", async () => {
+  it("refreshes steps when a run is replaced or its settled session advances", async () => {
     const { wrapper } = makeWrapper();
     const previous = Array.from({ length: 20 }, (_, index) => ({
       ...SUCCEEDED_RUN,
@@ -321,11 +321,58 @@ describe("useScheduledTaskRuns live refresh", () => {
     vi.mocked(api.listScheduledTaskRunSteps).mockResolvedValueOnce(stepsFor(working));
     rerender({ runs: working });
     await waitFor(() => expect(result.current.has("run-working")).toBe(true));
-    const finished = { ...stepsFor(working)[0], workflowId: "a".repeat(32) };
+    const finished: api.ScheduledTaskRunSteps = {
+      ...stepsFor(working)[0]!,
+      workflowId: "a".repeat(32),
+      steps: [{ id: "check", name: "Check results", goal: null, depends_on: [] }],
+      statuses: [
+        {
+          id: "status-started",
+          position: 1,
+          created_at: 1_700_000_500,
+          scheduled_task_run_id: "run-working",
+          step: "check",
+          author: { type: "agent" },
+          kind: "status",
+          content: { status: "started" },
+        },
+      ],
+    };
+    const settled = [{ ...SUCCEEDED_RUN, id: "run-working" }, ...current.slice(0, 19)];
     vi.mocked(api.listScheduledTaskRunSteps).mockResolvedValueOnce([finished]);
-    rerender({ runs: [{ ...SUCCEEDED_RUN, id: "run-working" }, ...current.slice(0, 19)] });
+    rerender({ runs: settled });
     await waitFor(() => expect(result.current.get("run-working")).toEqual(finished));
     expect(api.listScheduledTaskRunSteps).toHaveBeenCalledTimes(4);
+
+    // A short continuation can finish between history polls; a visible busy/idle
+    // cycle must also avoid restoring the previous, still-fresh idle snapshot.
+    const refreshSession = async (conversationStatus: string, position: number) => {
+      const updatedAt = 1_700_000_510 + position;
+      const refreshed: api.ScheduledTaskRunSteps = {
+        ...finished,
+        statuses: [
+          {
+            ...finished.statuses[0]!,
+            id: `status-${position}`,
+            position,
+            created_at: updatedAt,
+            content: { status: conversationStatus === "running" ? "started" : "done" },
+          },
+        ],
+      };
+      vi.mocked(api.listScheduledTaskRunSteps).mockResolvedValueOnce([refreshed]);
+      rerender({
+        runs: [
+          { ...settled[0]!, conversationStatus, conversationUpdatedAt: updatedAt },
+          ...settled.slice(1),
+        ],
+      });
+      await waitFor(() => expect(result.current.get("run-working")).toEqual(refreshed));
+    };
+    await refreshSession("idle", 2);
+    await refreshSession("running", 3);
+    await refreshSession("idle", 4);
+    expect(api.listScheduledTaskRunSteps).toHaveBeenCalledTimes(7);
   });
 
   it("keeps refetching a >20s run until it settles, WITHOUT a remount", async () => {

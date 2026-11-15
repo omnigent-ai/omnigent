@@ -181,7 +181,8 @@ const RUN_STEPS_PAGE = 20;
 /**
  * The plans an automation's runs started with, by run ID, for their timelines.
  * Asks for the given runs 20 at a time, paging as the run list does; only the
- * newest 20 refresh, and only while one of them is in flight.
+ * newest 20 poll, and only while one of them is in flight. Session updates also
+ * refresh a page when a short continuation finishes between history polls.
  *
  * @param runs - The task's runs, most recent first, from `useScheduledTaskRuns`.
  * @param enabled - Whether the server supports workflow history.
@@ -205,7 +206,12 @@ export function useScheduledTaskRunSteps(
           "scheduled-task-run-steps",
           id,
           after ?? null,
-          page.map((run) => [run.id, run.status, run.conversationStatus]),
+          page.map((run) => [
+            run.id,
+            run.status,
+            run.conversationStatus,
+            run.conversationUpdatedAt,
+          ]),
         ],
         queryFn: () => listScheduledTaskRunSteps(id, { limit: RUN_STEPS_PAGE, after }),
         enabled,
