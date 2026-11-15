@@ -18,12 +18,17 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+from omnigent.stores.workflow_store import WorkflowStore
 
 
 def test_account_generation_survives_delete_and_rejects_old_writes(db_uri: str) -> None:
     accounts = SqlAlchemyAccountStore(db_uri)
     permissions = SqlAlchemyPermissionStore(db_uri)
     old = accounts.create_user_with_password("alice", "test-password-hash")
+    workflows = WorkflowStore(db_uri)
+    saved = workflows.create(
+        user_id="alice", name="Private workflow", description="Private steps.", steps=[]
+    )
     assert old.account_generation is not None
     assert accounts.delete_user("alice") is True
     assert accounts.get_user("alice") is None
@@ -51,12 +56,21 @@ def test_account_generation_survives_delete_and_rejects_old_writes(db_uri: str) 
             lambda: SqlAlchemyConversationStore(db_uri).set_daily_ask_approved(
                 "alice", "2026-09-18", 0.5
             ),
+            lambda: workflows.create(
+                user_id="alice", name="Late workflow", description="Late steps.", steps=[]
+            ),
+            lambda: workflows.update(saved.id, user_id="alice", name="Late edit"),
+            lambda: workflows.delete(saved.id, user_id="alice"),
         ):
             with pytest.raises(OmnigentError, match="revoked"):
                 write()
     with account_authority_scope("alice", new.account_generation):
         permissions.ensure_user("alice")
         assert HostStore(db_uri).upsert_on_connect(uuid.uuid4().hex, "laptop", "alice")
+        assert workflows.list_page(user_id="alice", limit=10) == ([], False)
+        assert workflows.get(saved.id, user_id="alice") is None
+        assert workflows.update(saved.id, user_id="alice", name="Replacement edit") is None
+        assert workflows.delete(saved.id, user_id="alice") is False
 
 
 def test_host_replacement_serializes_with_account_deletion(
@@ -188,6 +202,10 @@ def test_session_revocation_moves_only_current_registration_work(db_uri: str) ->
     assert hosts.get_host(predecessor_host_id) is None
     assert stored_host_generation(predecessor_host_id) == first
     old = accounts.create_user_with_password("alice", "second-hash").account_generation
+    workflows = WorkflowStore(db_uri)
+    workflow = workflows.create(
+        user_id="alice", name="Preserved workflow", description="Keep these steps.", steps=[]
+    )
     task = create_task()
     host_id = register_managed_host("managed")
     grants.create_redeemed_grant(
@@ -212,6 +230,7 @@ def test_session_revocation_moves_only_current_registration_work(db_uri: str) ->
     assert new not in (None, old)
     assert not accounts.accepts_generation("alice", old)
     assert accounts.accepts_generation("alice", new)
+    assert workflows.get(workflow.id, user_id="alice") == workflow
     assert tasks.get(task.id).account_generation == new
     assert tasks.get(predecessor_task.id).account_generation == first
     assert stored_host_generation(predecessor_host_id) == first
@@ -402,7 +421,11 @@ def test_reregistration_finishes_an_interrupted_grant_cleanup(db_uri, monkeypatc
 def test_owned_task_cleanup_spares_a_replacement_accounts_live_task(db_uri, monkeypatch):
     accounts = SqlAlchemyAccountStore(db_uri)
     permissions = SqlAlchemyPermissionStore(db_uri)
+    workflows = WorkflowStore(db_uri)
     accounts.create_user_with_password("alice", "alice-hash")
+    old_workflow = workflows.create(
+        user_id="alice", name="Plan", description="Old account steps.", steps=[]
+    )
     for grantee in ("bob", "carol"):
         permissions.ensure_user(grantee)
     old_task = _create_task(db_uri, "alice")
@@ -424,11 +447,52 @@ def test_owned_task_cleanup_spares_a_replacement_accounts_live_task(db_uri, monk
             accounts.create_user_with_password("alice", "replacement-hash")
             new_task = _create_task(db_uri, "alice")
             permissions.grant_for_scheduled_task("bob", new_task, 1)
+            new_workflow = workflows.create(
+                user_id="alice", name="Plan", description="New account steps.", steps=[]
+            )
         finally:
             resume.set()
         assert deleting.result(timeout=10) is True
     assert permissions.list_for_scheduled_task(old_task) == ([], None)
     assert [grant.user_id for grant in permissions.list_for_scheduled_task(new_task)[0]] == ["bob"]
+    assert workflows.get(old_workflow.id, user_id="alice") is None
+    assert workflows.get(new_workflow.id, user_id="alice") == new_workflow
+
+
+def test_reregistration_finishes_an_interrupted_workflow_cleanup(db_uri, monkeypatch):
+    import sqlalchemy as sa
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    workflows = WorkflowStore(db_uri)
+    monkeypatch.setattr(accounts, "_cleanup_batch_size", 1)
+    accounts.create_user_with_password("alice", "alice-hash")
+    saved = [
+        workflows.create(user_id="alice", name=f"Plan {i}", description="Private steps.", steps=[])
+        for i in range(3)
+    ]
+    deletes = 0
+
+    def interrupt_cleanup(_connection, _cursor, _statement, parameters, context, _executemany):
+        nonlocal deletes
+        query = getattr(context.compiled, "statement", None)
+        if isinstance(query, sa.Delete) and query.table.name == "workflows":
+            # The database fails after one committed batch; retries must retain the tombstone.
+            assert len(parameters) == 2  # workspace and one workflow ID
+            deletes += 1
+            if deletes > 1:
+                raise RuntimeError("test workflow cleanup interruption")
+
+    sa.event.listen(accounts._engine, "before_cursor_execute", interrupt_cleanup)
+    try:
+        assert accounts.delete_user("alice") is True
+        assert sum(workflows.get(item.id, user_id="alice") is not None for item in saved) == 2
+        with pytest.raises(RuntimeError, match="test workflow cleanup interruption"):
+            accounts.create_user_with_password("alice", "replacement-hash")
+        assert accounts.get_user("alice") is None
+    finally:
+        sa.event.remove(accounts._engine, "before_cursor_execute", interrupt_cleanup)
+    assert accounts.create_user_with_password("alice", "replacement-hash").id == "alice"
+    assert workflows.list_page(user_id="alice", limit=10) == ([], False)
 
 
 def test_deletion_removes_all_preferences_only_for_user_in_workspace(db_uri: str) -> None:
@@ -438,10 +502,18 @@ def test_deletion_removes_all_preferences_only_for_user_in_workspace(db_uri: str
     from omnigent.db.db_models import SqlPreference, workspace_scope
 
     accounts = SqlAlchemyAccountStore(db_uri)
+    workflows = WorkflowStore(db_uri)
+    saved = {}
     for workspace_id in (101, 102):
         with workspace_scope(workspace_id):
             for user_id in ("alice", "bob"):
                 accounts.create_user_with_password(user_id, "test-password-hash")
+                saved[workspace_id, user_id] = workflows.create(
+                    user_id=user_id,
+                    name="Private workflow",
+                    description="Private steps.",
+                    steps=[],
+                )
     with Session(accounts._engine) as session:
         session.add_all(
             SqlPreference(workspace_id=workspace_id, user_id=user_id, key=key, value="{}")
@@ -465,6 +537,10 @@ def test_deletion_removes_all_preferences_only_for_user_in_workspace(db_uri: str
         for workspace_id, user_id in ((101, "bob"), (102, "alice"), (102, "bob"))
         for key in ("project_order", "theme")
     }
+    for (workspace_id, user_id), workflow in saved.items():
+        with workspace_scope(workspace_id):
+            expected = None if (workspace_id, user_id) == (101, "alice") else workflow
+            assert workflows.get(workflow.id, user_id=user_id) == expected
 
 
 def test_cleanup_failure_rolls_back_revocation(

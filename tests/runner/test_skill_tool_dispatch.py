@@ -2,21 +2,24 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
-from omnigent.runner.tool_dispatch import _execute_skill_tool
+from omnigent.runner.tool_dispatch import _execute_skill_tool, execute_tool
+from omnigent.spec.types import AgentSpec, ToolGroupsConfig
 
 SKILL_MD = (
     "---\nname: example\ndescription: An example skill.\n---\n\nBody of the example skill.\n"
 )
 
 
-def _write_host_skill(workspace: Path) -> None:
+def _write_host_skill(workspace: Path, name: str = "example") -> None:
     """Install a host-scope skill with a root-level auxiliary file."""
-    skill_dir = workspace / ".claude" / "skills" / "example"
+    skill_dir = workspace / ".claude" / "skills" / name
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(SKILL_MD)
     (skill_dir / "EXTRA.md").write_text("Auxiliary content.\n")
@@ -31,61 +34,122 @@ def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
+@pytest.mark.parametrize(
+    ("features", "journal"),
+    [
+        ({"workflows": True}, True),
+        ({"workflows": False}, True),
+        ({}, True),
+        ({"workflows": True}, False),
+    ],
+)
+async def test_framework_skills_load_only_when_server_and_tool_group_enable_them(
+    tmp_path: Path,
+    isolated_home: Path,
+    features: dict[str, bool],
+    journal: bool,
+) -> None:
+    spec = AgentSpec(
+        spec_version=1,
+        skills_filter="none",
+        tool_groups=ToolGroupsConfig(journal=journal),
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/info"
+        return httpx.Response(200, json={"features": features})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server.test"
+    ) as client:
+        for name, heading in (
+            ("workflow", "# Run a workflow"),
+            ("save-workflow", "# Save a workflow"),
+        ):
+            result = await execute_tool(
+                tool_name="load_skill",
+                arguments=json.dumps({"name": name}),
+                agent_spec=spec,
+                runner_workspace=tmp_path,
+                server_client=client,
+            )
+            if features.get("workflows") and journal:
+                assert heading in result
+            else:
+                assert "not found" in result
+
+
+@pytest.mark.parametrize("name", ["example", "workflow"])
 def test_read_skill_file_resolves_host_scope_skill(
     tmp_path: Path,
     isolated_home: Path,
+    name: str,
 ) -> None:
     """A skill load_skill can load, read_skill_file can read."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    _write_host_skill(workspace)
-    spec = SimpleNamespace(skills=[], skills_filter="all")
+    _write_host_skill(workspace, name)
+    spec = AgentSpec(spec_version=1, skills_filter="all")
 
     loaded = _execute_skill_tool(
         "load_skill",
-        {"name": "example"},
+        {"name": name},
         agent_spec=spec,
         runner_workspace=workspace,
+        workflows_enabled=True,
     )
     assert "Body of the example skill." in loaded
 
     read = _execute_skill_tool(
         "read_skill_file",
-        {"skill_name": "example", "path": "EXTRA.md"},
+        {"skill_name": name, "path": "EXTRA.md"},
         agent_spec=spec,
         runner_workspace=workspace,
+        workflows_enabled=True,
     )
     assert read == "Auxiliary content.\n"
 
 
+@pytest.mark.parametrize("name", ["bundled", "save-workflow"])
 def test_read_skill_file_resolves_bundled_skill(
     tmp_path: Path,
     isolated_home: Path,
+    name: str,
 ) -> None:
     """Bundled skills keep working — the fix must not regress them."""
     from omnigent.spec.types import SkillSpec
 
-    skill_dir = tmp_path / "bundle" / "skills" / "bundled"
+    skill_dir = tmp_path / "bundle" / "skills" / name
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(SKILL_MD)
     (skill_dir / "NOTES.md").write_text("Bundled notes.\n")
-    spec = SimpleNamespace(
+    spec = AgentSpec(
+        spec_version=1,
         skills=[
             SkillSpec(
-                name="bundled",
+                name=name,
                 description="A bundled skill.",
                 content="Bundled body.",
                 skill_dir=skill_dir,
+                user_invocable=False,
             )
         ],
         skills_filter="all",
     )
 
-    read = _execute_skill_tool(
-        "read_skill_file",
-        {"skill_name": "bundled", "path": "NOTES.md"},
+    assert _execute_skill_tool(
+        "load_skill",
+        {"name": name},
         agent_spec=spec,
         runner_workspace=tmp_path / "bundle",
+        workflows_enabled=True,
+    ).startswith("Bundled body.")
+    read = _execute_skill_tool(
+        "read_skill_file",
+        {"skill_name": name, "path": "NOTES.md"},
+        agent_spec=spec,
+        runner_workspace=tmp_path / "bundle",
+        workflows_enabled=True,
     )
     assert read == "Bundled notes.\n"
 
