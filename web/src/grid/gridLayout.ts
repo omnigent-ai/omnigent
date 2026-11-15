@@ -6,6 +6,8 @@ export type GridLayout = string | { axis: Axis; children: [GridLayout, GridLayou
 export interface SessionGrid {
   id: string;
   name?: string;
+  /** The best-of-N run this grid was opened for. */
+  run?: string;
   layout: GridLayout;
 }
 
@@ -130,6 +132,7 @@ export function parseSessionGrids(raw: string | null): SessionGrid[] {
         !value.id ||
         (value.name !== undefined &&
           (typeof value.name !== "string" || value.name.length > USER_SESSION_TITLE_MAX_CHARS)) ||
+        (value.run !== undefined && (typeof value.run !== "string" || !value.run)) ||
         seen.has(value.id) ||
         !validLayout(value.layout)
       )

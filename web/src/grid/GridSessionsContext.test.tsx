@@ -68,6 +68,12 @@ function Probe() {
       >
         Open run
       </button>
+      <button type="button" onClick={() => grids?.openGrid(["first", "second"], "Pair", "g")}>
+        Open run pair
+      </button>
+      <button type="button" onClick={() => grids?.deleteRunGrids("g")}>
+        Delete run
+      </button>
       <button type="button" onClick={() => grids?.closePane("second")}>
         Close
       </button>
@@ -173,6 +179,29 @@ it("opens a new grid of given sessions, and declines without saved grids", () =>
   expect(screen.getByText("Open run")).toHaveAttribute("data-opened", "false");
   expect(screen.getByTestId("path")).toHaveTextContent("/c/first");
   expect(localStorage.getItem(key)).toBeNull();
+});
+
+it("deletes only grids tagged with the run, and untags a grid the user extends", () => {
+  const key = "omnigent:session-grids:one:alice";
+  const mine = { id: "mine", layout: splitGrid("first", "first", "second", "right") };
+  localStorage.setItem(key, JSON.stringify([mine]));
+  const view = render(tree("/c/first"));
+  fireEvent.click(screen.getByText("Open run pair"));
+  expect(JSON.parse(localStorage.getItem(key)!)[1]).toMatchObject({ name: "Pair", run: "g" });
+  // Deleting the open run grid leaves it for the landing page, outside this tree.
+  fireEvent.click(screen.getByText("Delete run"));
+  expect(JSON.parse(localStorage.getItem(key)!)).toEqual([mine]);
+  expect(screen.queryByTestId("path")).toBeNull();
+  view.unmount();
+
+  render(tree("/c/first"));
+  fireEvent.click(screen.getByText("Open run pair"));
+  fireEvent.click(screen.getByText("Add third"));
+  const extended = JSON.parse(localStorage.getItem(key)!)[1];
+  expect(gridSessionIds(extended.layout)).toEqual(["first", "third", "second"]);
+  expect(extended.run).toBeUndefined();
+  fireEvent.click(screen.getByText("Delete run"));
+  expect(JSON.parse(localStorage.getItem(key)!)).toHaveLength(2);
 });
 
 it("gates creation and keeps an unsaved grid usable when storage is full", () => {

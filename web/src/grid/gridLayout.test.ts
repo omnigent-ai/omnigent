@@ -87,8 +87,13 @@ describe("session grid layouts", () => {
       ["a", "b", "c"],
       ["a", "b", "c", "d"],
     ]) {
-      const grid = { id: ids.join(""), layout: gridLayoutForSessions(ids)! };
+      const grid = { id: ids.join(""), run: "g1", layout: gridLayoutForSessions(ids)! };
       expect(parseSessionGrids(JSON.stringify([grid]))).toEqual([grid]);
+    }
+    // A run tag must be a non-empty string.
+    for (const run of ["", 7, null]) {
+      const grid = { id: "bad", run, layout: gridLayoutForSessions(["a", "b"])! };
+      expect(parseSessionGrids(JSON.stringify([grid]))).toEqual([]);
     }
     for (const ids of [
       [],
