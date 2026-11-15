@@ -92,7 +92,7 @@ from omnigent.harnesses.codex_native.timeouts import (
     APP_SERVER_READY_TIMEOUT_SECONDS as _APP_SERVER_READY_TIMEOUT_SECONDS,
 )
 from omnigent.inner import _proc
-from omnigent.inner._subprocess_lifecycle import subprocess_exited
+from omnigent.inner._subprocess_lifecycle import await_cleanup_task, subprocess_exited
 from omnigent.inner.codex_executor import (
     _CODEX_ROUTER_HOOK_MODULE,
     _clean_codex_env,
@@ -2657,6 +2657,26 @@ class CodexNativeAppServer:
             name="codex-native-app-server-stderr",
         )
 
+    def _prepare_policy_hook_files(
+        self, config_source: Path, router_bridge_dir: Path | None
+    ) -> None:
+        """Write policy hooks and bridge coordinates before launching Codex."""
+        _write_codex_policy_hooks_file(
+            self.codex_home,
+            self.bridge_dir,
+            self.python_executable,
+            router_bridge_dir=router_bridge_dir,
+            router_session_id=codex_router_session_id(self.env),
+            user_hooks_source=config_source / _CODEX_HOOKS_FILE,
+            turn_routing=_turn_router_advertised(self.bridge_dir),
+        )
+        if self.ap_server_url:
+            write_policy_hook_config(
+                self.bridge_dir,
+                ap_server_url=self.ap_server_url,
+                ap_auth_headers=self.ap_auth_headers or {},
+            )
+
     async def start(self) -> None:
         """
         Start the Codex app-server and wait for the socket.
@@ -2811,25 +2831,17 @@ class CodexNativeAppServer:
             # needs go in the bridge dir's policy_hook.json; without
             # ap_server_url the hook is still registered + trusted but
             # no-ops.
-            _write_codex_policy_hooks_file(
-                self.codex_home,
-                self.bridge_dir,
-                self.python_executable,
-                router_bridge_dir=router_bridge_dir,
-                router_session_id=codex_router_session_id(self.env),
-                user_hooks_source=config_source / _CODEX_HOOKS_FILE,
-                # The runner only advertises a route-turn endpoint for a
-                # session that launched with Smart Routing on, so its presence
-                # is the switch for the first-message routing hook. Same
-                # rendezvous-as-switch shape as the subagent router above.
-                turn_routing=_turn_router_advertised(self.bridge_dir),
-            )
-            if self.ap_server_url:
-                write_policy_hook_config(
-                    self.bridge_dir,
-                    ap_server_url=self.ap_server_url,
-                    ap_auth_headers=self.ap_auth_headers or {},
+            preparation = asyncio.create_task(
+                asyncio.to_thread(
+                    self._prepare_policy_hook_files, config_source, router_bridge_dir
                 )
+            )
+            try:
+                await asyncio.shield(preparation)
+            except asyncio.CancelledError:
+                # A replacement launch must not race this worker's file writes.
+                await await_cleanup_task(preparation)
+                raise
         if self.reconcile_process_registry:
             reconcile_codex_native_process_registry()
         # Off the loop: sqlite reads plus, only when a lease is found, one

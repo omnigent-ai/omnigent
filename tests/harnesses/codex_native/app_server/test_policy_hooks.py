@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
+import os
 import sys
+import threading
 from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -372,8 +378,20 @@ async def test_old_codex_skips_policy_hook_and_records_reason(
         await server.close()
 
 
+@pytest.mark.parametrize(
+    ("blocked_write", "outcome"),
+    [(None, "success")]
+    + [
+        (write, outcome)
+        for write in ("hooks", "credentials")
+        for outcome in ("success", "cancel", "write_error")
+    ],
+)
 async def test_supported_codex_registers_hook_and_enforces(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    blocked_write: str | None,
+    outcome: str,
 ) -> None:
     """
     codex >= 0.129 registers the hook and reports enforcement active.
@@ -392,13 +410,68 @@ async def test_supported_codex_registers_hook_and_enforces(
     _set_codex_version(monkeypatch, (0, 129, 0))
 
     server = _test_app_server(tmp_path, codex_home, bridge_dir, workspace)
-    await server.start()
+    server.ap_server_url = "http://127.0.0.1:9999"
+    server.ap_auth_headers = {"Authorization": "Bearer synthetic-policy-token"}
+    entered = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    loop = asyncio.get_running_loop()
+    original_replace = os.replace
+    blocked_path = (
+        codex_home / "hooks.json" if blocked_write == "hooks" else bridge_dir / "policy_hook.json"
+    )
+
+    def replace(source: Any, target: Any, *args: Any, **kwargs: Any) -> None:
+        if blocked_write is not None and Path(target) == blocked_path:
+            loop.call_soon_threadsafe(entered.set)
+            release.wait(timeout=5.0)
+            finished.set()
+            if outcome == "write_error":
+                raise PermissionError("synthetic hook write failure")
+        original_replace(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", replace)
+    spawn = AsyncMock()
+    monkeypatch.setattr(server, "_spawn_app_server_process", spawn)
+    task = asyncio.create_task(server.start())
     try:
+        if blocked_write is not None:
+            await asyncio.wait_for(entered.wait(), timeout=10.0)
+            assert not finished.is_set(), "policy-hook I/O blocked the event loop"
+            spawn.assert_not_awaited()
+            if outcome == "cancel":
+                task.cancel()
+                await asyncio.sleep(0)
+                task.cancel()
+                await asyncio.sleep(0)
+                assert not task.done(), "cancelled startup abandoned its policy-hook writer"
+            release.set()
+        if blocked_write is not None and outcome == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert finished.is_set()
+            spawn.assert_not_awaited()
+            return
+        if blocked_write is not None and outcome == "write_error":
+            with pytest.raises(PermissionError, match="synthetic hook write failure"):
+                await task
+            spawn.assert_not_awaited()
+            return
+        await task
+        spawn.assert_awaited_once()
         # Hook registered for a supported codex.
         assert (codex_home / "hooks.json").exists()
+        assert json.loads((bridge_dir / "policy_hook.json").read_text())["ap_auth_headers"] == {
+            "Authorization": "Bearer synthetic-policy-token"
+        }
         # None == enforcement active (no degrade reason).
         assert server.policy_hook_disabled_reason is None
     finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, PermissionError):
+            await task
         await server.close()
 
 
