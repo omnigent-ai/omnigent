@@ -1277,6 +1277,25 @@ describe("Sidebar session list", () => {
     expect(usage).toHaveClass("bg-[var(--sidebar-active)]");
   });
 
+  it("hides Workflows navigation while the release feature is off", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    expect(screen.queryByTestId("workflows-nav")).toBeNull();
+  });
+
+  it("shows and highlights Workflows navigation when the release feature is on", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/workflows", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      features: { workflows: true },
+    });
+
+    const workflows = screen.getByTestId("workflows-nav");
+    expect(workflows).toHaveAttribute("href", "/workflows");
+    expect(workflows).toHaveClass("bg-[var(--sidebar-active)]");
+  });
+
   it("hides Canvas navigation while the release feature is off", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar(true, "/canvas");
@@ -1482,6 +1501,17 @@ describe("Sidebar session list", () => {
     expect(screen.getByTestId("new-chat-button")).toBeInTheDocument();
     expect(screen.getByTestId("scheduled-tasks-nav")).toBeInTheDocument();
     expect(screen.getByTestId("inbox-button")).toBeInTheDocument();
+  });
+
+  it("marks Workflows active (not New session) on a workflow's page", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/workflows/1e7bf4052f44451895933c8413947d27", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      features: { workflows: true },
+    });
+
+    expect(screen.getByTestId("workflows-nav")).toHaveClass("bg-[var(--sidebar-active)]");
+    expect(screen.getByTestId("new-chat-button")).not.toHaveClass("bg-[var(--sidebar-active)]");
   });
 
   it("marks Automations active (not New session) on /tasks/:taskId (detail route)", () => {

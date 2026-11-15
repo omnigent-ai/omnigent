@@ -8,7 +8,7 @@ import type * as ConversationModule from "@/components/ai-elements/conversation"
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
-import { useUserMessageNav } from "./useUserMessageNav";
+import { scrollToMessage, useUserMessageNav } from "./useUserMessageNav";
 
 const releaseScrollLock = vi.hoisted(() => vi.fn());
 vi.mock("@/components/ai-elements/conversation", async (importOriginal) => {
@@ -216,5 +216,48 @@ describe("useUserMessageNav", () => {
     expect(useChatStore.getState().flashItemId).toBe("a");
     act(() => vi.advanceTimersByTime(1));
     expect(useChatStore.getState().flashItemId).toBe(null);
+  });
+});
+
+describe("scrollToMessage", () => {
+  it("flashes as soon as the target is in view, not after the scroll settles", () => {
+    let report: IntersectionObserverCallback = () => {};
+    const observed: Element[] = [];
+    const original = globalThis.IntersectionObserver;
+    globalThis.IntersectionObserver = class {
+      constructor(callback: IntersectionObserverCallback) {
+        report = callback;
+      }
+      observe(element: Element) {
+        observed.push(element);
+      }
+      disconnect() {}
+      unobserve() {}
+      takeRecords() {
+        return [];
+      }
+      root = null;
+      rootMargin = "";
+      thresholds = [];
+    } as unknown as typeof IntersectionObserver;
+    try {
+      document.body.innerHTML = `<div data-message-id="journal-e2">Completed Deploy</div>`;
+      const flash = vi.fn();
+      scrollToMessage("journal-e2", flash);
+      expect(observed.map((element) => element.textContent)).toEqual(["Completed Deploy"]);
+      expect(flash).not.toHaveBeenCalled();
+      act(() =>
+        report(
+          [{ target: observed[0], isIntersecting: true, intersectionRatio: 1 } as never],
+          {} as never,
+        ),
+      );
+      expect(flash).toHaveBeenCalledWith("journal-e2");
+      // The settle timer that would have flashed later finds it already done.
+      act(() => vi.advanceTimersByTime(SETTLE_MS));
+      expect(flash).toHaveBeenCalledTimes(1);
+    } finally {
+      globalThis.IntersectionObserver = original;
+    }
   });
 });
