@@ -110,18 +110,27 @@ def test_session_catalog_ends_with_the_framework_workflow_skills(tmp_path: Path)
     plain = _bundle({"skills/bundled/SKILL.md": _skill("bundled")}, tool_groups={})
     own = _bundle({"skills/workflow/SKILL.md": _skill("workflow")}, tool_groups={})
     frame = HostSkillsFrame("request", "session", str(tmp_path), "session", "agent", "1")
-
-    catalog = HostSkillDiscovery(lambda _: _response(plain)).discover(frame, tmp_path)
-    assert [skill["name"] for skill in catalog] == ["bundled", "save-workflow", "workflow"]
-    assert catalog[1]["description"].startswith("Save this session's plan")
-    assert catalog[2]["description"].startswith("Plan and run a multi-step workflow")
+    discovery = HostSkillDiscovery(lambda _: _response(plain))
     spec = load(plain, dest=tmp_path / "runner-bundle", expand_env=False)
-    resolved = resolve_session_skills(spec, (tmp_path,), tmp_path / "runner-bundle")
-    assert catalog == [{"name": s.name, "description": s.description} for s in resolved]
-
-    overridden = HostSkillDiscovery(lambda _: _response(own)).discover(frame, tmp_path)
-    assert {"name": "workflow", "description": "workflow description"} in overridden
-    assert [skill["name"] for skill in overridden].count("workflow") == 1
+    custom = HostSkillDiscovery(lambda _: _response(own))
+    for enabled in (False, True, False):
+        current = replace(frame, workflows_enabled=enabled)
+        catalog = discovery.discover(current, tmp_path)
+        expected = ["bundled", "save-workflow", "workflow"] if enabled else ["bundled"]
+        assert [skill["name"] for skill in catalog] == expected
+        if enabled:
+            assert catalog[1]["description"].startswith("Save this session's plan")
+            assert catalog[2]["description"].startswith("Plan and run a multi-step workflow")
+        resolved = resolve_session_skills(
+            spec,
+            (tmp_path,),
+            tmp_path / "runner-bundle",
+            workflows_enabled=enabled,
+        )
+        assert catalog == [{"name": s.name, "description": s.description} for s in resolved]
+        overridden = custom.discover(current, tmp_path)
+        assert {"name": "workflow", "description": "workflow description"} in overridden
+        assert [skill["name"] for skill in overridden].count("workflow") == 1
 
 
 @pytest.mark.parametrize("remove_link", [True, False], ids=["removed", "permission-denied"])

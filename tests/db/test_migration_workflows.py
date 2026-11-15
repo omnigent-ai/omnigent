@@ -162,11 +162,9 @@ def test_oversized_legacy_description_stays_intact_until_corrected(db_uri: str) 
     assert store.get(saved.id, user_id=None) == saved
 
 
-def test_drafts_downgrade_cleanly_and_existing_plans_upgrade_as_runnable(tmp_path: Path) -> None:
-    uri = f"sqlite:///{tmp_path / 'drafts.db'}"
-    engine = sa.create_engine(uri)
-    _migrate(uri, engine, "head")
-    store = WorkflowStore(uri)
+def test_drafts_downgrade_cleanly_and_existing_plans_upgrade_as_runnable(db_uri: str) -> None:
+    engine = get_or_create_engine(db_uri)
+    store = WorkflowStore(db_uri)
     saved = store.create(
         user_id=None, name="saved", description="Run it.", steps=[{"id": "a", "name": "A"}]
     )
@@ -183,16 +181,19 @@ def test_drafts_downgrade_cleanly_and_existing_plans_upgrade_as_runnable(tmp_pat
             cleanup_reads.append(parameters)
             assert "LIMIT" in statement
         if isinstance(query, sa.Delete) and query.table.name == "workflows":
-            assert _conn.get_execution_options().get("isolation_level") == "AUTOCOMMIT"
+            if engine.dialect.name == "cockroachdb":
+                assert _conn.in_transaction()
+            else:
+                assert _conn.get_execution_options().get("isolation_level") == "AUTOCOMMIT"
 
     sa.event.listen(engine, "before_cursor_execute", inspect_cleanup)
-    _migrate(uri, engine, "3b9e4c71d2a8", down=True)
-    sa.event.remove(engine, "before_cursor_execute", inspect_cleanup)
+    try:
+        _migrate(db_uri, engine, "3b9e4c71d2a8", down=True)
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", inspect_cleanup)
+        _migrate(db_uri, engine, "head")
     assert len(cleanup_reads) >= 3
-    _migrate(uri, engine, "head")
     assert store.get(saved.id, user_id=None) == saved
     assert store.get(draft.id, user_id=None) is None
     with engine.connect() as connection:
         assert connection.execute(sa.text("SELECT COUNT(*) FROM workflows")).scalar_one() == 1
-    engine.dispose()
-    clear_engine_cache()

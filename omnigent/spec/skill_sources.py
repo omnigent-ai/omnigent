@@ -318,6 +318,7 @@ def resolve_session_skills(
     bundle_dir: Path | None,
     *,
     warnings: list[str] | None = None,
+    workflows_enabled: bool = False,
 ) -> list[SkillSpec]:
     """Use identical precedence and filters for menu discovery and invocation."""
     from omnigent.harness_aliases import canonicalize_harness
@@ -350,7 +351,8 @@ def resolve_session_skills(
             seen_dirs.add(resolved_dir)
         merged.append(skill)
     # Last, so an agent's or user's own skill of the same name wins.
-    merged.extend(skill for skill in framework_skills(spec) if skill.name not in seen)
+    if workflows_enabled:
+        merged.extend(skill for skill in framework_skills(spec) if skill.name not in seen)
     return merged
 
 

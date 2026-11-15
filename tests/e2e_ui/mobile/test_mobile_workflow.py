@@ -161,8 +161,8 @@ def test_mobile_kebab_lists_file_surfaces_and_omits_absent_ones(
     agents, and is not claude-native — so the menu must list Files and
     Changes (the two files surfaces — folder tree and changed-files list)
     and Agents (unconditional — the panel lists at least the main
-    agent, badge "1") and Tasks (every session keeps a journal, and the
-    empty drawer offers a workflow), and must NOT list Shells. The session's
+    agent, badge "1") and Tasks when the server supports journals. It must
+    not list Shells. The session's
     only terminal is the auto-created embedded Omnigent REPL, which is
     plumbing for the Chat/Terminal pill, not inventory — listing it
     read as a phantom "main" terminal on agents that don't run a TUI,
@@ -185,8 +185,13 @@ def test_mobile_kebab_lists_file_surfaces_and_omits_absent_ones(
     # the inventory (reachable via the Chat/Terminal pill instead). An
     # entry here means the REPL leaked back into the kebab gating.
     expect(page.get_by_role("menuitem", name="Shells")).to_have_count(0)
-    # Tasks is listed before the session has any: its drawer offers a workflow.
-    expect(page.get_by_role("menuitem", name="Tasks", exact=True)).to_be_visible()
+    info = httpx.get(f"{base_url}/v1/info", timeout=10.0)
+    info.raise_for_status()
+    tasks = page.get_by_role("menuitem", name="Tasks", exact=True)
+    if info.json().get("session_journal") is True:
+        expect(tasks).to_be_visible()
+    else:
+        expect(tasks).to_have_count(0)
 
 
 def test_mobile_shells_drawer_exposes_new_shell_before_shells_exist(

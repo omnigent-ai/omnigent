@@ -1390,6 +1390,7 @@ class HostSkillsFrame:
     agent_version: str | None = None
     sub_agent_name: str | None = None
     skills_filter: str | list[str] = "all"
+    workflows_enabled: bool = False
 
 
 @dataclass
@@ -2310,6 +2311,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "agent_version": frame.agent_version,
                 "sub_agent_name": frame.sub_agent_name,
                 "skills_filter": frame.skills_filter,
+                "workflows_enabled": frame.workflows_enabled,
             }
         )
     if isinstance(frame, HostSkillsResultFrame):
@@ -2893,6 +2895,7 @@ def _decode_known_host_frame(
                 agent_version=_optional_nullable_str(msg, "agent_version"),
                 sub_agent_name=_optional_nullable_str(msg, "sub_agent_name"),
                 skills_filter=skills_filter,
+                workflows_enabled=msg.get("workflows_enabled") is True,
             )
         case HostFrameKind.SKILLS_RESULT:
             return _decode_skills_result(msg)

@@ -120,6 +120,9 @@ def test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog(
         isolated_host(tmp_path / "host", live_server, env=host_env) as host,
     ):
         host.wait_online(client, timeout=60, poll_interval=0.2)
+        info = client.get("/v1/info")
+        info.raise_for_status()
+        workflows_enabled = info.json().get("features", {}).get("workflows") is True
         assert _PLUGIN_SKILL in _skill_names(
             client, host_id=host.host_id, harness="codex-native", path=str(workspace)
         )
@@ -173,8 +176,9 @@ def test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog(
     assert plugin_rows == 0, f"{observed}: a plugin skill was listed despite the failed inventory"
     assert api.status_code == 200, observed
     body = api.json()
-    # Only Omnigent's own workflow skills remain; they don't come from Codex's inventory.
-    assert [skill["name"] for skill in body["skills"]] == ["save-workflow", "workflow"], observed
+    # Framework skills do not come from Codex's inventory, and require the server feature.
+    expected = ["save-workflow", "workflow"] if workflows_enabled else []
+    assert [skill["name"] for skill in body["skills"]] == expected, observed
     assert [w for w in body["warnings"] if _WARNING_ROW in w and _EXIT_SUMMARY in w], (
         f"{observed}: a failed plugin inventory was answered as a successful empty catalog"
     )

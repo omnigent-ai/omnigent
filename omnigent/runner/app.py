@@ -1468,7 +1468,7 @@ def create_runner_app(
     # snapshot and updated by ``effort_change``. In-process harnesses learn the
     # effort only from the forwarded turn body, which is built field by field.
     _session_reasoning_effort: dict[str, str] = {}
-    _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
+    _session_skills_cache: dict[str, tuple[float, list[SkillSpec], bool]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     _session_cursor_model_names: dict[str, dict[str, str]] = {}
     _session_claude_launch_configs: dict[str, ClaudeNativeUcodeConfig | None] = {}
@@ -8676,10 +8676,11 @@ def create_runner_app(
             return None
 
     async def _resolve_session_skills(session_id: str) -> list[SkillSpec]:
+        workflows_enabled = await server_workflows_enabled(server_client)
         cached = _session_skills_cache.get(session_id)
         if cached is not None:
-            expires_at, cached_skills = cached
-            if time.monotonic() < expires_at:
+            expires_at, cached_skills, cached_workflows_enabled = cached
+            if time.monotonic() < expires_at and cached_workflows_enabled == workflows_enabled:
                 return cached_skills
         entry = await _resolve_session_spec_entry(session_id)
         spec = _unwrap_resolved_spec(entry) if entry is not None else None
@@ -8703,11 +8704,16 @@ def create_runner_app(
             roots.append(Path.cwd())
 
         skills = await asyncio.to_thread(
-            resolve_session_skills, spec, tuple(roots), _resolved_spec_workdir(entry)
+            resolve_session_skills,
+            spec,
+            tuple(roots),
+            _resolved_spec_workdir(entry),
+            workflows_enabled=workflows_enabled,
         )
         _session_skills_cache[session_id] = (
             time.monotonic() + _SESSION_SKILLS_CACHE_TTL_SECONDS,
             skills,
+            workflows_enabled,
         )
         return skills
 

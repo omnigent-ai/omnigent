@@ -137,6 +137,9 @@ def create_skills_router(
             if host is not None:
                 raise host_absent_error(host)
             raise HTTPException(status_code=503, detail="session host is offline")
+        workflows_enabled = getattr(request.app.state, "feature_flags", FeatureFlags()).enabled(
+            Feature.WORKFLOWS
+        )
         result = await request_host_skills(
             host_registry=host_registry,
             host_conn=conn,
@@ -147,6 +150,7 @@ def create_skills_router(
             agent_version=agent_version,
             sub_agent_name=sub_agent_name,
             skills_filter=spec.skills_filter if spec is not None else "all",
+            workflows_enabled=workflows_enabled,
         )
         if result.status != "ok":
             raise HTTPException(
@@ -172,9 +176,7 @@ def create_skills_router(
                 for skill in spec.skills
                 if skill.user_invocable
             ] + [skill for skill in skills if skill.name not in reserved]
-            if getattr(request.app.state, "feature_flags", FeatureFlags()).enabled(
-                Feature.WORKFLOWS
-            ):
+            if workflows_enabled:
                 # Framework skills come last, as in resolve_session_skills.
                 listed = reserved | {skill.name for skill in skills}
                 skills += [
@@ -198,6 +200,7 @@ async def request_host_skills(
     agent_version: str | None = None,
     sub_agent_name: str | None = None,
     skills_filter: str | list[str] = "all",
+    workflows_enabled: bool = False,
 ) -> HostSkillsResultFrame:
     """Request skill metadata over the host tunnel, with bounded waiting and cleanup."""
     request_id = secrets.token_hex(8)
@@ -216,6 +219,7 @@ async def request_host_skills(
                     agent_version=agent_version,
                     sub_agent_name=sub_agent_name,
                     skills_filter=skills_filter,
+                    workflows_enabled=workflows_enabled,
                 )
             ),
         )

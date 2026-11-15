@@ -18,6 +18,7 @@ import time
 from collections.abc import Callable
 
 import httpx
+import pytest
 from playwright.sync_api import Page, expect
 
 _PREVIEW = '[data-testid="tasks-preview"]'
@@ -147,6 +148,7 @@ def test_tasks_preview_opens_tasks_tab_tracks_updates_and_clears(
     )
 
 
+@pytest.mark.min_server_version("0.23.0")
 def test_task_markers_and_the_tasks_tab_link_both_ways(
     page: Page,
     seeded_session: tuple[str, str],

@@ -119,10 +119,14 @@ def presession_app(skills_app):
 
 @pytest.mark.parametrize("user", ["owner", "editor"])
 @pytest.mark.parametrize("acknowledged", [True, False])
+@pytest.mark.parametrize("workflows_enabled", [False, True])
 async def test_session_catalog_needs_no_runner_and_allows_shared_editors(
-    skills_app, user: str, acknowledged: bool
+    skills_app, user: str, acknowledged: bool, workflows_enabled: bool
 ) -> None:
     app, _, conn, conv, agent, _ = skills_app
+    app.state.feature_flags = resolve_feature_flags(
+        {"OMNIGENT_FEATURES": "workflows" if workflows_enabled else ""}
+    )
     assert conv.runner_id is None
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -134,6 +138,7 @@ async def test_session_catalog_needs_no_runner_and_allows_shared_editors(
             (await asyncio.wait_for(conn.outbound_queue.get(), budget(2))).data
         )
         assert isinstance(frame, HostSkillsFrame)
+        assert frame.workflows_enabled is workflows_enabled
         assert (
             frame.session_id,
             frame.path,
@@ -283,11 +288,7 @@ async def test_presession_catalog_matches_filtered_invocations(
         )
         response = await task
     assert response.status_code == 200
-    expected = resolve_session_skills(spec, (tmp_path,), None)
-    if not workflows_enabled:
-        from omnigent.spec.skill_sources import FRAMEWORK_SKILLS_DIR
-
-        expected = [s for s in expected if s.skill_dir != FRAMEWORK_SKILLS_DIR / s.name]
+    expected = resolve_session_skills(spec, (tmp_path,), None, workflows_enabled=workflows_enabled)
     assert response.json()["skills"] == [
         {"name": s.name, "description": s.description, "display_name": s.display_name}
         for s in expected

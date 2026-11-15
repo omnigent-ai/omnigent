@@ -11,6 +11,7 @@ writers first. Draft cleanup commits bounded batches and can be restarted.
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 
 import sqlalchemy as sa
 from alembic import op
@@ -24,6 +25,13 @@ branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 
 _CLEANUP_BATCH = 250
+
+
+def _commit_cockroach_batch(connection: sa.Connection) -> None:
+    # The CRDB migration caller owns the transaction, so Alembic cannot autocommit it.
+    if connection.dialect.name == "cockroachdb":
+        connection.commit()
+        connection.execute(sa.text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
 
 
 def upgrade() -> None:
@@ -44,17 +52,21 @@ def downgrade() -> None:
     key = sa.tuple_(workflows.c.workspace_id, workflows.c.id)
     query = sa.select(workflows).order_by(workflows.c.workspace_id, workflows.c.id)
     page = connection.execute(query.limit(_CLEANUP_BATCH)).all()
+    cockroach = connection.dialect.name == "cockroachdb"
     if page:
         # Each cleanup statement commits independently; the revision is advanced
         # only after cleanup and DDL finish, so an interrupted downgrade is retryable.
-        with op.get_context().autocommit_block():
+        with nullcontext() if cockroach else op.get_context().autocommit_block():
             while page:
                 drafts = [
                     (row.workspace_id, row.id) for row in page if not json.loads(row.plan)["steps"]
                 ]
                 if drafts:
                     connection.execute(workflows.delete().where(key.in_(drafts)))
+                _commit_cockroach_batch(connection)
                 after = (page[-1].workspace_id, page[-1].id)
                 page = connection.execute(query.where(key > after).limit(_CLEANUP_BATCH)).all()
+    _commit_cockroach_batch(connection)
     with op.batch_alter_table("workflows") as batch:
         batch.drop_column("planning_session_id")
+    _commit_cockroach_batch(connection)
