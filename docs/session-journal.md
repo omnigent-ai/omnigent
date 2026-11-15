@@ -73,7 +73,11 @@ Workflow descriptions are capped at 2,000 stored bytes, with the existing limit
 of 2,000 characters; saved plans and journal entries are capped at 16,383 bytes.
 The OSS stores write plaintext variants. A deployment that enables content
 encryption must supply its codec for these stores as well as conversation items;
-encrypted rows fail closed without a configured decryptor.
+encrypted rows fail closed without a configured decryptor. The journal store
+encodes content itself, a batch per call, so a deployment encrypts journal
+content by overriding `SessionJournalStore._encode_contents` and
+`_decode_contents` rather than through a column codec; the 16,383-byte limit
+counts the encrypted bytes.
 
 ## Agent tools
 

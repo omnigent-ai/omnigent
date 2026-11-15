@@ -1828,7 +1828,8 @@ class SqlSessionJournalEntry(OmnigentBase):
         for entries about no step, such as plans.
     :param idempotency_key: Names the write that appended the entry, e.g.
         ``"tool:toolu_01…"``, so a retried append returns the existing entry.
-    :param content: The kind's fields as compressed JSON, at most
+    :param content: The kind's fields as the journal store encodes them:
+        compressed JSON, or a deployment's encrypted envelope, at most
         :data:`MAX_STORED_VALUE_BYTES` bytes stored.
     """
 
@@ -1850,10 +1851,9 @@ class SqlSessionJournalEntry(OmnigentBase):
     workflow_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     step: Mapped[str | None] = mapped_column(String(64), nullable=True)
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
-    content: Mapped[str] = mapped_column(
-        CompressedText(max_stored_bytes=MAX_STORED_VALUE_BYTES, bounded_binary=True),
-        nullable=False,
-    )
+    # Encoded by the journal store rather than the column type, so a deployment
+    # that encrypts content can do a whole page in one call.
+    content: Mapped[bytes] = mapped_column(BoundedBinary(MAX_STORED_VALUE_BYTES), nullable=False)
 
     # Every index is non-unique and ends with the primary key: the heads lock,
     # not the database, keeps positions and idempotency keys unique.

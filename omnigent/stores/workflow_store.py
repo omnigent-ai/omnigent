@@ -4,7 +4,7 @@ Workflows are rows of ``workflows`` in the database that holds the session
 metadata. Every read and write is scoped to the caller: another owner's
 workflow reads as missing. Creates and edits serialize on an owner's retained
 preference row before checking names, including owners without an account row.
-Every workflow query is served by the primary key or by
+Every workflow query is served by, and on MySQL pinned to, the primary key or
 ``ix_workflows_user_id_name``.
 """
 
@@ -12,9 +12,9 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any
+from typing import Any, TypeVar
 
-from sqlalchemy import ColumnElement, select, tuple_
+from sqlalchemy import ColumnElement, Select, and_, or_, select, update
 from sqlalchemy.orm import Session, undefer
 
 from omnigent.db import compression
@@ -37,6 +37,8 @@ from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
 WORKFLOW_PAGE_MAX = 200
 
+_Statement = TypeVar("_Statement", bound=Select[Any])
+
 
 class WorkflowNameTakenError(Exception):
     """The owner already has a workflow with this name."""
@@ -49,6 +51,11 @@ def _owned(workflow_id: str, user_id: str | None) -> tuple[ColumnElement[bool], 
         SqlWorkflow.id == workflow_id,
         SqlWorkflow.user_id == user_id,
     )
+
+
+def _using(statement: _Statement, index: str) -> _Statement:
+    """Pin a workflows read to *index* on MySQL, the primary key or the owner-and-name index."""
+    return statement.with_hint(SqlWorkflow, f"FORCE INDEX ({index})", "mysql")
 
 
 def _lock_owner(session: Session, user_id: str | None) -> None:
@@ -111,7 +118,9 @@ class WorkflowStore:
         )
         if exclude_id is not None:
             stmt = stmt.where(SqlWorkflow.id != exclude_id)
-        return session.execute(stmt.limit(1)).first() is not None
+        return (
+            session.execute(_using(stmt.limit(1), "ix_workflows_user_id_name")).first() is not None
+        )
 
     def create(
         self, *, user_id: str | None, name: object, description: object, steps: object
@@ -167,9 +176,12 @@ class WorkflowStore:
         """Return one of the owner's workflows with its steps, or ``None``."""
         with self._session("get_workflow") as session:
             row = session.execute(
-                select(SqlWorkflow)
-                .where(*_owned(workflow_id, user_id))
-                .options(undefer(SqlWorkflow.plan))
+                _using(
+                    select(SqlWorkflow)
+                    .where(*_owned(workflow_id, user_id))
+                    .options(undefer(SqlWorkflow.plan)),
+                    "PRIMARY",
+                )
             ).scalar_one_or_none()
             return None if row is None else _to_workflow(row)
 
@@ -209,13 +221,21 @@ class WorkflowStore:
                 except InvalidUuidError as exc:
                     raise InvalidWorkflowError("after must be a workflow ID") from exc
                 after_name = session.execute(
-                    select(SqlWorkflow.name).where(*_owned(after, user_id))
+                    _using(select(SqlWorkflow.name).where(*_owned(after, user_id)), "PRIMARY")
                 ).scalar_one_or_none()
                 if after_name is None:
                     raise InvalidWorkflowError("after must be the ID of one of your workflows")
-                stmt = stmt.where(tuple_(SqlWorkflow.name, SqlWorkflow.id) > (after_name, after))
+                stmt = stmt.where(
+                    or_(
+                        SqlWorkflow.name > after_name,
+                        and_(SqlWorkflow.name == after_name, SqlWorkflow.id > after),
+                    )
+                )
             rows = session.scalars(
-                stmt.order_by(SqlWorkflow.name, SqlWorkflow.id).limit(limit + 1)
+                _using(
+                    stmt.order_by(SqlWorkflow.name, SqlWorkflow.id).limit(limit + 1),
+                    "ix_workflows_user_id_name",
+                )
             ).all()
             return [_to_workflow(row) for row in rows[:limit]], len(rows) > limit
 
@@ -246,9 +266,12 @@ class WorkflowStore:
             require_active_account(session, user_id)
             _lock_owner(session, user_id)
             row = session.execute(
-                select(SqlWorkflow)
-                .where(*_owned(workflow_id, user_id))
-                .options(undefer(SqlWorkflow.plan))
+                _using(
+                    select(SqlWorkflow)
+                    .where(*_owned(workflow_id, user_id))
+                    .options(undefer(SqlWorkflow.plan)),
+                    "PRIMARY",
+                )
             ).scalar_one_or_none()
             if row is None:
                 return None
@@ -262,14 +285,35 @@ class WorkflowStore:
                 session, user_id=user_id, name=workflow_name, exclude_id=workflow_id
             ):
                 raise WorkflowNameTakenError(f"a workflow named {workflow_name!r} already exists")
-            row.name = workflow_name
-            row.description = text
+            values: dict[str, Any] = {
+                "name": workflow_name,
+                "description": text,
+                "updated_at": now_epoch(),
+            }
             if steps is not None:
-                row.plan = _plan_text(workflow_steps)
+                values["plan"] = _plan_text(workflow_steps)
             if planning_session_id is not None:
-                row.planning_session_id = planning_session_id
-            row.updated_at = now_epoch()
-            return _to_workflow(row)
+                values["planning_session_id"] = planning_session_id
+            session.execute(
+                update(SqlWorkflow)
+                .where(
+                    SqlWorkflow.workspace_id == current_workspace_id(),
+                    SqlWorkflow.id == workflow_id,
+                )
+                .values(**values)
+                .with_hint("FORCE INDEX (PRIMARY)", dialect_name="mysql")
+                .execution_options(synchronize_session=False)
+            )
+            return Workflow(
+                id=row.id,
+                user_id=row.user_id,
+                name=workflow_name,
+                description=text,
+                created_at=row.created_at,
+                updated_at=values["updated_at"],
+                steps=workflow_steps,
+                planning_session_id=values.get("planning_session_id", row.planning_session_id),
+            )
 
         return run_write_transaction(self._session_immediate, "update_workflow", write)
 
@@ -278,7 +322,7 @@ class WorkflowStore:
 
         def write(session: Session) -> bool:
             row = session.execute(
-                select(SqlWorkflow).where(*_owned(workflow_id, user_id))
+                _using(select(SqlWorkflow).where(*_owned(workflow_id, user_id)), "PRIMARY")
             ).scalar_one_or_none()
             if row is None:
                 return False

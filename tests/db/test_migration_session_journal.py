@@ -20,10 +20,29 @@ _ENTRIES = "session_journal_entries"
 _HEADS = "session_journal_heads"
 
 
+def test_mysql_journal_content_is_bounded_bytes_the_store_encodes() -> None:
+    migration = import_module("omnigent.db.migrations.versions.5d872cd6632a_add_session_journal")
+    dialect = mysql.dialect()
+    output = StringIO()
+    context = MigrationContext.configure(
+        dialect_name="mysql", opts={"as_sql": True, "output_buffer": output}
+    )
+    with Operations.context(context):
+        migration.upgrade()
+    column = SqlSessionJournalEntry.__table__.c.content
+    assert str(column.type.compile(dialect=dialect)) == "VARBINARY(16383)"
+    assert "content VARBINARY(16383) NOT NULL" in output.getvalue()
+    # The journal store encodes content itself, so the column passes bytes through.
+    bind = column.type.dialect_impl(dialect).bind_processor(dialect)
+    stored = b"\x00\x00{}"
+    assert bind is not None and bind(stored) == stored
+    with pytest.raises(ValueError):
+        bind(stored + b"x" * 16_383)
+
+
 @pytest.mark.parametrize(
     ("revision", "column", "limit"),
     [
-        ("5d872cd6632a_add_session_journal", SqlSessionJournalEntry.__table__.c.content, 16_383),
         ("ce12af3da168_add_workflows", SqlWorkflow.__table__.c.plan, 16_383),
         ("f7c2d8a4b901_workflow_description_envelope", SqlWorkflow.__table__.c.description, 2000),
     ],

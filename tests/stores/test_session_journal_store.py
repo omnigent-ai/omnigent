@@ -6,11 +6,13 @@ import asyncio
 import random
 import string
 import threading
+from collections.abc import Sequence
 
 import pytest
 import sqlalchemy as sa
 
 from omnigent.db import current_query_name
+from omnigent.db.compression import EncryptedTextPayload, decode, encode_encrypted
 from omnigent.db.db_models import MAX_STORED_VALUE_BYTES
 from omnigent.entities import MessageData, NewConversationItem
 from omnigent.entities.session_journal import InvalidJournalEntryError, StepNotReadyError
@@ -725,3 +727,70 @@ def test_an_automation_runs_start_plan_is_its_first(journal: SessionJournalStore
     )
     assert not retry.created and retry.entry == second
     assert len(journal.list_entries(SESSION, kind="plan_status").entries) == 2
+
+
+class _SealedJournal(SessionJournalStore):
+    """A deployment that encrypts journal content with a key service, one call per batch."""
+
+    def __init__(self, storage_location: str, *, overhead: int = 4) -> None:
+        super().__init__(storage_location)
+        self.overhead = overhead
+        self.calls: list[tuple[str, int]] = []
+
+    def _encode_contents(self, texts: Sequence[str]) -> list[bytes]:
+        self.calls.append(("encrypt", len(texts)))
+        return [
+            encode_encrypted(
+                EncryptedTextPayload(text.encode()[::-1], {"key": "k" * self.overhead})
+            )
+            for text in texts
+        ]
+
+    def _decode_contents(self, stored: Sequence[bytes]) -> list[str]:
+        self.calls.append(("decrypt", len(stored)))
+        return [
+            decode(bytes(value), decrypt=lambda payload: payload.ciphertext[::-1].decode()) or ""
+            for value in stored
+        ]
+
+
+def test_a_deployment_encrypts_content_a_batch_at_a_time(
+    db_uri: str, conversations: SqlAlchemyConversationStore
+) -> None:
+    del conversations
+    sealed = _SealedJournal(db_uri)
+    steps = [{"id": "a", "name": "A"}, {"id": "b", "name": "B", "depends_on": ["a"]}]
+    sealed.append(SESSION, "plan", {"name": "The plan", "steps": steps}, idempotency_key="k1")
+    sealed.append(
+        SESSION, "status", {"status": "done", "text": "ok"}, idempotency_key="k2", step="a"
+    )
+    sealed.calls.clear()
+    # The entry is encrypted before the lock; the plan and the dependency's newest
+    # status are each decrypted once.
+    sealed.append(SESSION, "status", {"status": "started"}, idempotency_key="k3", step="b")
+    assert sealed.calls == [("encrypt", 1), ("decrypt", 1), ("decrypt", 1)]
+
+    sealed.calls.clear()
+    entries = sealed.list_entries(SESSION).entries
+    assert [entry.content.get("status") for entry in entries] == [None, "done", "started"]
+    statuses = sealed.plan_step_statuses([entries[0]])
+    assert {step: entry.content["status"] for step, entry in statuses[0].items()} == {
+        "a": "done",
+        "b": "started",
+    }
+    assert sealed.calls == [("decrypt", 3), ("decrypt", 2)]
+
+    # Stored values say they're encrypted, so a store without the key fails closed.
+    with sa.create_engine(db_uri).connect() as conn:
+        stored = conn.execute(
+            sa.text("SELECT content FROM session_journal_entries WHERE conversation_id = :id"),
+            {"id": bytes.fromhex(SESSION)},
+        ).scalars()
+        assert {bytes(value)[:2] for value in stored} == {b"\x00\x02"}
+    with pytest.raises(ValueError, match="decryptor"):
+        SessionJournalStore(db_uri).list_entries(SESSION)
+
+    # The limit counts the encrypted envelope, not just the compressed text.
+    bloated = _SealedJournal(db_uri, overhead=MAX_STORED_VALUE_BYTES)
+    with pytest.raises(JournalEntryTooLargeError):
+        _note(bloated, "k4")

@@ -9,7 +9,11 @@ first attempt wrote instead of writing it twice.
 
 An entry's content is the kind's compressed JSON, at most
 :data:`~omnigent.db.db_models.MAX_STORED_VALUE_BYTES` bytes stored. The store
-checks the size before writing, so an agent gets ``entry_too_large``.
+encodes it, not the column type: a deployment that encrypts journal content
+overrides :meth:`SessionJournalStore._encode_contents` and
+:meth:`SessionJournalStore._decode_contents` to transform a whole batch in one
+call. The size check runs on the encoded bytes, so an agent gets
+``entry_too_large`` before the write, encryption overhead included.
 """
 
 from __future__ import annotations
@@ -59,8 +63,6 @@ from omnigent.entities.session_journal import (
 from omnigent.errors import StaleCursorError
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
-# Headroom for compression framing on incompressible text.
-_FRAMING_BYTES = 32
 _PLAN_KIND = encode_journal_entry_kind("plan")
 _STATUS_KIND = encode_journal_entry_kind("status")
 _PLAN_STATUS_KIND = encode_journal_entry_kind("plan_status")
@@ -101,15 +103,17 @@ class JournalSessionNotFoundError(Exception):
     """The session doesn't exist, or was deleted while the append ran."""
 
 
-def _stored_content(content: Mapping[str, Any]) -> str:
-    """The entry's JSON for the ``content`` column, refused when it doesn't fit compressed."""
-    text = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
-    if len(text.encode()) + _FRAMING_BYTES <= MAX_STORED_VALUE_BYTES:
-        return text
-    size = len(compression.encode(text) or b"")
-    if size > MAX_STORED_VALUE_BYTES:
-        raise JournalEntryTooLargeError("the stored entry", size, MAX_STORED_VALUE_BYTES)
-    return text
+def _set_next_position(session: Session, conversation_id: str, next_position: int) -> None:
+    """Advance a session's heads row, a primary-key update."""
+    session.execute(
+        update(SqlSessionJournalHead)
+        .where(
+            SqlSessionJournalHead.workspace_id == current_workspace_id(),
+            SqlSessionJournalHead.conversation_id == conversation_id,
+        )
+        .values(next_position=next_position)
+        .with_hint("FORCE INDEX (PRIMARY)", dialect_name="mysql")
+    )
 
 
 def _entry_id(value: str, name: str) -> str:
@@ -161,8 +165,42 @@ class SessionJournalStore:
             engine, query_name_prefix="omnigent.session_journal", immediate=True
         )
 
+    def _encode_contents(self, texts: Sequence[str]) -> list[bytes]:
+        """Encode entries' JSON for the ``content`` column, one value per text, in order.
+
+        Compressed and framed by default. A deployment that encrypts journal
+        content overrides this and :meth:`_decode_contents`, transforming the
+        whole batch in one call; its values must say they're encrypted
+        (:func:`~omnigent.db.compression.encode_encrypted`) so a reader without
+        the key fails closed.
+        """
+        return [compression.encode(text) or b"" for text in texts]
+
+    def _decode_contents(self, stored: Sequence[bytes]) -> list[str]:
+        """Decode a batch of ``content`` values, the inverse of :meth:`_encode_contents`.
+
+        An encrypted value raises here: only the deployment that wrote it can read it.
+        """
+        return [compression.decode(bytes(value)) or "" for value in stored]
+
+    def _stored_contents(self, contents: Sequence[Mapping[str, Any]]) -> list[bytes]:
+        """The entries' encoded ``content``, refused when one doesn't fit the column."""
+        stored = self._encode_contents(
+            [
+                json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+                for content in contents
+            ]
+        )
+        for value in stored:
+            if len(value) > MAX_STORED_VALUE_BYTES:
+                raise JournalEntryTooLargeError(
+                    "the stored entry", len(value), MAX_STORED_VALUE_BYTES
+                )
+        return stored
+
     def _entries(self, rows: Sequence[SqlSessionJournalEntry]) -> list[JournalEntry]:
-        """Decode rows into entries."""
+        """Decode rows into entries, their contents in one batch."""
+        contents = self._decode_contents([row.content for row in rows]) if rows else []
         return [
             JournalEntry(
                 id=row.id,
@@ -172,10 +210,10 @@ class SessionJournalStore:
                 kind=decode_journal_entry_kind(row.kind),
                 step=row.step,
                 scheduled_task_run_id=row.scheduled_task_run_id,
-                content=json.loads(row.content),
+                content=json.loads(content),
                 workflow_id=row.workflow_id,
             )
-            for row in rows
+            for row, content in zip(rows, contents, strict=True)
         ]
 
     # ── Appends ───────────────────────────────────────
@@ -211,6 +249,7 @@ class SessionJournalStore:
                 SqlSessionJournalHead.conversation_id == conversation_id,
             )
             .with_for_update()
+            .with_hint(SqlSessionJournalHead, "FORCE INDEX (PRIMARY)", "mysql")
         ).scalar_one()
 
     @staticmethod
@@ -277,17 +316,21 @@ class SessionJournalStore:
             return []
         # A saved workflow starts fresh; replans retain progress within that run.
         run = self._newest_kind_row(session, conversation_id, _PLAN_STATUS_KIND)
-        waiting = []
-        for dependency in current["depends_on"]:
-            newest = self._newest_status_row(
+        newest = [
+            self._newest_status_row(
                 session,
                 conversation_id,
                 dependency,
                 start_position=run.position if run is not None else None,
             )
-            if newest is None or self._entries([newest])[0].content.get("status") != "done":
-                waiting.append(dependency)
-        return waiting
+            for dependency in current["depends_on"]
+        ]
+        done = {
+            entry.step
+            for entry in self._entries([row for row in newest if row is not None])
+            if entry.content.get("status") == "done"
+        }
+        return [dependency for dependency in current["depends_on"] if dependency not in done]
 
     @staticmethod
     def _newest_status_row(
@@ -368,7 +411,7 @@ class SessionJournalStore:
                 raise InvalidJournalEntryError("only a plan names a workflow")
             workflow_id = _workflow_id(workflow_id)
         # A plan's version is known only under the lock, so its size is checked there.
-        stored = None if kind == "plan" else _stored_content(fields)
+        stored = None if kind == "plan" else self._stored_contents([fields])[0]
         code = encode_journal_entry_kind(kind)
 
         def write(session: Session) -> tuple[SqlSessionJournalEntry, bool, dict[str, Any] | None]:
@@ -395,6 +438,7 @@ class SessionJournalStore:
                     )
                 return earlier, False, None
             entry_text, entry_content = stored, fields
+            run_started_text = None
             starts_run = False
             if kind == "plan":
                 previous = self._newest_kind_row(session, conversation_id, _PLAN_KIND)
@@ -402,13 +446,17 @@ class SessionJournalStore:
                     1 if previous is None else self._entries([previous])[0].content["version"] + 1
                 )
                 entry_content = {"version": version, **fields}
-                entry_text = _stored_content(entry_content)
                 starts_run = workflow_id is not None and start_run
                 if scheduled_task_run_id is not None and not starts_run:
                     boundary = self._newest_kind_row(session, conversation_id, _PLAN_STATUS_KIND)
                     starts_run = (
                         boundary is None or boundary.scheduled_task_run_id != scheduled_task_run_id
                     )
+                encoded = self._stored_contents(
+                    [entry_content, *([{"status": "started"}] if starts_run else [])]
+                )
+                entry_text = encoded[0]
+                run_started_text = encoded[1] if starts_run else None
             entry_step = step
             entry_workflow_id = workflow_id
             if kind == "note":
@@ -440,7 +488,7 @@ class SessionJournalStore:
                         workflow_id=workflow_id,
                         step=None,
                         idempotency_key=f"run:{entry_id}",
-                        content=_stored_content({"status": "started"}),
+                        content=run_started_text,
                     )
                 )
                 position += 1
@@ -458,14 +506,7 @@ class SessionJournalStore:
                 content=entry_text,
             )
             session.add(row)
-            session.execute(
-                update(SqlSessionJournalHead)
-                .where(
-                    SqlSessionJournalHead.workspace_id == current_workspace_id(),
-                    SqlSessionJournalHead.conversation_id == conversation_id,
-                )
-                .values(next_position=position + 1)
-            )
+            _set_next_position(session, conversation_id, position + 1)
             return row, True, entry_content
 
         row, created, entry_content = run_write_transaction(
@@ -492,11 +533,13 @@ class SessionJournalStore:
     def _position(session: Session, conversation_id: str, entry_id: str) -> int:
         position = session.execute(
             _using(
-                select(SqlSessionJournalEntry.position).where(
+                select(SqlSessionJournalEntry.position)
+                .where(
                     SqlSessionJournalEntry.workspace_id == current_workspace_id(),
                     SqlSessionJournalEntry.conversation_id == conversation_id,
                     SqlSessionJournalEntry.id == entry_id,
-                ),
+                )
+                .limit(1),
                 "ix_session_journal_entries_id",
             )
         ).scalar_one_or_none()
@@ -635,7 +678,7 @@ class SessionJournalStore:
             that wrote no plan.
         """
         entries = SqlSessionJournalEntry
-        plans: list[JournalEntry | None] = []
+        rows: list[SqlSessionJournalEntry | None] = []
         with self._session("read_run_start_plans") as session:
             for run_id, conversation_id in runs:
                 row = session.execute(
@@ -652,8 +695,9 @@ class SessionJournalStore:
                         "ix_session_journal_entries_scheduled_task_run_id",
                     )
                 ).scalar_one_or_none()
-                plans.append(None if row is None else self._entries([row])[0])
-        return plans
+                rows.append(row)
+            found = iter(self._entries([row for row in rows if row is not None]))
+        return [None if row is None else next(found) for row in rows]
 
     def plan_step_statuses(self, plans: Sequence[JournalEntry]) -> list[dict[str, JournalEntry]]:
         """For each plan, its steps' newest statuses before the next run starts.
@@ -665,10 +709,10 @@ class SessionJournalStore:
         :returns: One ``{step: entry}`` per plan, in order, e.g. the ``done``
             status of ``"tests"``; a step with no status yet is left out.
         """
-        statuses: list[dict[str, JournalEntry]] = []
+        found: list[tuple[int, str, SqlSessionJournalEntry]] = []
         entries = SqlSessionJournalEntry
         with self._session("read_plan_step_statuses") as session:
-            for plan in plans:
+            for index, plan in enumerate(plans):
                 boundary = self._newest_kind_row(
                     session, plan.conversation_id, _PLAN_STATUS_KIND, before_position=plan.position
                 )
@@ -686,7 +730,6 @@ class SessionJournalStore:
                         "ix_session_journal_entries_kind",
                     )
                 ).scalar_one_or_none()
-                current: dict[str, JournalEntry] = {}
                 for step in plan.content.get("steps", []):
                     row = self._newest_status_row(
                         session,
@@ -696,8 +739,11 @@ class SessionJournalStore:
                         end_position=next_position,
                     )
                     if row is not None:
-                        current[step["id"]] = self._entries([row])[0]
-                statuses.append(current)
+                        found.append((index, step["id"], row))
+            decoded = self._entries([row for _, _, row in found])
+        statuses: list[dict[str, JournalEntry]] = [{} for _ in plans]
+        for (index, step_id, _), entry in zip(found, decoded, strict=True):
+            statuses[index][step_id] = entry
         return statuses
 
 
@@ -714,12 +760,15 @@ def reserve_fork_journal(sessions: NamedManagedSessionMaker, fork_id: str) -> No
     with sessions("reserve_fork_journal") as session:
         if session.get(SqlConversationMetadata, (current_workspace_id(), fork_id)) or (
             session.execute(
-                select(SqlSessionJournalEntry.position)
-                .where(
-                    SqlSessionJournalEntry.workspace_id == current_workspace_id(),
-                    SqlSessionJournalEntry.conversation_id == fork_id,
+                _using(
+                    select(SqlSessionJournalEntry.position)
+                    .where(
+                        SqlSessionJournalEntry.workspace_id == current_workspace_id(),
+                        SqlSessionJournalEntry.conversation_id == fork_id,
+                    )
+                    .limit(1),
+                    "PRIMARY",
                 )
-                .limit(1)
             ).first()
             is not None
         ):
@@ -844,14 +893,7 @@ def copy_journal_for_fork(
             sessions, "copy_fork_journal_batch", copy_batch
         )
     with sessions("finish_fork_journal") as session:
-        session.execute(
-            update(SqlSessionJournalHead)
-            .where(
-                SqlSessionJournalHead.workspace_id == current_workspace_id(),
-                SqlSessionJournalHead.conversation_id == fork_id,
-            )
-            .values(next_position=copied)
-        )
+        _set_next_position(session, fork_id, copied)
     return copied
 
 
@@ -891,12 +933,15 @@ def delete_journal_entries_batch(session: Session, conversation_ids: Sequence[st
     :returns: How many were deleted; fewer than a batch means none are left.
     """
     keys = session.execute(
-        select(SqlSessionJournalEntry.conversation_id, SqlSessionJournalEntry.position)
-        .where(
-            SqlSessionJournalEntry.workspace_id == current_workspace_id(),
-            SqlSessionJournalEntry.conversation_id.in_(conversation_ids),
+        _using(
+            select(SqlSessionJournalEntry.conversation_id, SqlSessionJournalEntry.position)
+            .where(
+                SqlSessionJournalEntry.workspace_id == current_workspace_id(),
+                SqlSessionJournalEntry.conversation_id.in_(conversation_ids),
+            )
+            .limit(JOURNAL_DELETE_BATCH),
+            "PRIMARY",
         )
-        .limit(JOURNAL_DELETE_BATCH)
     ).all()
     positions: dict[str, list[int]] = {}
     for conversation_id, position in keys:
