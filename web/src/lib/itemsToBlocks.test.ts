@@ -940,3 +940,26 @@ describe("itemsToBlocks — edge cases", () => {
     expect(texts.some((t) => t.includes("continued from a previous conversation"))).toBe(false);
   });
 });
+
+describe("task markers", () => {
+  it("become chat notices, placed and folded like sub-agent markers", () => {
+    const marker = {
+      id: "item_marker",
+      type: "resource_event",
+      response_id: "journal_abc",
+      event_type: "session.journal.task",
+      resource_type: "journal",
+      resource_id: "deploy",
+      resource: {
+        name: "Deploy the swap",
+        status: "started",
+        text: null,
+        entry_id: "e1",
+        native: false,
+      },
+    } as unknown as ConversationItem;
+    expect(itemsToBlocks([marker])).toMatchObject([
+      { type: "native_tool", toolType: "subagent_activity", data: { resource_id: "deploy" } },
+    ]);
+  });
+});
