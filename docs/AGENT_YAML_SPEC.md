@@ -635,6 +635,20 @@ to share one policy across `sys_os_*` and terminals, and how to set up network
 egress rules, see the `sandbox:` examples below and the sandbox source under
 `omnigent/inner/`.
 
+Runner-local `sys_os_read`, `sys_os_write` and `sys_os_edit` calls reuse a helper
+within a session when the environment spec, sandbox mounts and inherited
+environment values remain unchanged.
+Calls configured with `sandbox.credential_proxy` use a disposable environment for
+each runner-local tool invocation. Credential sources resolve at helper startup;
+snapshot and change-tracking reads share that helper with the requested operation.
+A safe retry can start a replacement and resolve the sources again. The next tool
+invocation starts a fresh helper, so these calls retain helper startup cost.
+A `sys_os_shell` call retires that tool helper before returning, including on
+success: shell descendants may outlive the command. The next tool call starts a
+fresh helper. Shell calls therefore still incur helper startup cost; warm shell
+reuse needs a complete per-request process lifetime boundary. This tool lease
+policy does not change shared copy-on-write environments or forked environments.
+
 ### Secretless credential proxy
 
 `sandbox.credential_proxy` lets sandboxed tools authenticate to external hosts

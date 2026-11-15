@@ -941,6 +941,12 @@ describe("Composer Claude goal control", () => {
 });
 
 describe("Composer goal slash command", () => {
+  const goalSessions = [
+    ["codex-native", { showGoalControl: true }],
+    ["codex", { showPollyCodexGoalControl: true }],
+    ["claude-sdk", { showClaudeGoalControl: true }],
+  ] as const;
+
   beforeEach(() => {
     setComposerState({ conversationId: "conv_goal", sessionHarness: "codex-native", skills: [] });
     vi.mocked(getGoal).mockResolvedValue({ goal: null });
@@ -952,11 +958,7 @@ describe("Composer goal slash command", () => {
     vi.restoreAllMocks();
   });
 
-  it.each([
-    ["codex-native", { showGoalControl: true }],
-    ["codex", { showPollyCodexGoalControl: true }],
-    ["claude-sdk", { showClaudeGoalControl: true }],
-  ] as const)(
+  it.each(goalSessions)(
     "opens the existing Goal dialog for bare /goal in %s",
     async (sessionHarness, controls) => {
       const onSend = vi.fn();
@@ -974,25 +976,30 @@ describe("Composer goal slash command", () => {
     },
   );
 
-  it.each([
-    ["codex-native", { showGoalControl: true }],
-    ["codex", { showPollyCodexGoalControl: true }],
-    ["claude-sdk", { showClaudeGoalControl: true }],
-  ] as const)(
-    "opens Goal from the %s slash menu with a same-named skill",
-    async (sessionHarness, controls) => {
+  it.each(
+    goalSessions.flatMap(([sessionHarness, controls]) =>
+      ["goal", "Goal"].map((name) => ({ sessionHarness, controls, name })),
+    ),
+  )(
+    "opens Goal from the $sessionHarness slash menu with a $name skill",
+    async ({ sessionHarness, controls, name }) => {
       const onSend = vi.fn();
       const onSendSlashCommand = vi.fn();
       setComposerState({
         sessionHarness,
-        skills: [{ name: "goal", description: "Project goal skill", display_name: "Project goal" }],
+        skills: [{ name, description: "Project goal skill", display_name: "Project goal" }],
       });
       renderWithTooltips(
         <Composer {...composerProps({ onSend, onSendSlashCommand, ...controls })} />,
       );
       fireEvent.change(textarea(), { target: { value: "/go" } });
       if (sessionHarness === "codex-native") {
-        expect(screen.getByRole("button", { name: /^\$goal/ })).toBeInTheDocument();
+        expect(
+          screen.getByRole("button", { name: (label) => label.startsWith(`$${name}`) }),
+        ).toBeInTheDocument();
+      } else {
+        expect(screen.getAllByTestId(/^slash-menu-item-goal$/i)).toHaveLength(1);
+        expect(screen.queryByText("Project goal skill")).toBeNull();
       }
       fireEvent.click(
         screen.getByRole("button", { name: /^\/goal\s*View or set the goal for this session$/ }),
@@ -1004,25 +1011,102 @@ describe("Composer goal slash command", () => {
     },
   );
 
-  it("sends the full goal objective as a message rather than a skill invocation", () => {
+  it.each(
+    goalSessions.flatMap(([sessionHarness, controls]) =>
+      [
+        [
+          "/goal Finish the implementation and pass all tests",
+          "/goal Finish the implementation and pass all tests",
+        ],
+        ["/Goal Fix CI", "/goal Fix CI"],
+        ["/goal\nFix CI", "/goal Fix CI"],
+      ].map(([text, sent]) => ({ sessionHarness, controls, text, sent })),
+    ),
+  )(
+    "sends $text as canonical plaintext in $sessionHarness",
+    ({ sessionHarness, controls, text, sent }) => {
+      const onSend = vi.fn();
+      const onSendSlashCommand = vi.fn();
+      useChatStore.setState({ sessionHarness });
+      renderWithTooltips(
+        <Composer {...composerProps({ onSend, onSendSlashCommand, ...controls })} />,
+      );
+      fireEvent.change(textarea(), {
+        target: { value: text },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      expect(onSend.mock.calls[0]?.[0]).toBe(sent);
+      expect(onSendSlashCommand).not.toHaveBeenCalled();
+      expect(screen.queryByRole("dialog", { name: "Goal" })).toBeNull();
+    },
+  );
+
+  it.each(["goal", "Goal"])("keeps the %s skill available mid-sentence", (name) => {
     const onSend = vi.fn();
     const onSendSlashCommand = vi.fn();
-    useChatStore.setState({ sessionHarness: "codex" });
+    setComposerState({
+      sessionHarness: "codex",
+      skills: [{ name, description: "Project goal skill" }],
+    });
     renderWithTooltips(
       <Composer
         {...composerProps({ onSend, onSendSlashCommand, showPollyCodexGoalControl: true })}
       />,
     );
-    fireEvent.change(textarea(), {
-      target: { value: "/goal Finish the implementation and pass all tests" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Send" }));
-    expect(onSend.mock.calls[0]?.[0]).toBe("/goal Finish the implementation and pass all tests");
+
+    fireEvent.change(textarea(), { target: { value: "please /go" } });
+    expect(screen.getByTestId(`slash-menu-item-${name}`)).toHaveTextContent("Project goal skill");
+    expect(screen.getByText("Skills")).toBeVisible();
+    expect(screen.queryByText("Commands")).toBeNull();
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+
+    expect(textarea()).toHaveValue(`please /${name} `);
+    expect(onSend).not.toHaveBeenCalled();
     expect(onSendSlashCommand).not.toHaveBeenCalled();
-    expect(screen.queryByRole("dialog", { name: "Goal" })).toBeNull();
   });
 
-  it("preserves a same-named skill when no Goal control is supported", () => {
+  it("keeps a longer goal-prefixed skill callable", () => {
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    setComposerState({
+      sessionHarness: "codex",
+      skills: [{ name: "goal fix", description: "Project goal skill" }],
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({ onSend, onSendSlashCommand, showPollyCodexGoalControl: true })}
+      />,
+    );
+
+    fireEvent.change(textarea(), { target: { value: "/goal fix CI" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(onSendSlashCommand).toHaveBeenCalledWith("goal fix", "CI");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it.each(["/Goal Fix CI", "/goal"])(
+    "keeps an attached %s draft on the ordinary message path",
+    (text) => {
+      const onSend = vi.fn();
+      renderWithTooltips(<Composer {...composerProps({ onSend, showGoalControl: true })} />);
+      fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
+        target: { files: [new File(["hello"], "notes.txt", { type: "text/plain" })] },
+      });
+
+      fireEvent.change(textarea(), { target: { value: text } });
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+      expect(onSend.mock.calls[0]?.[0]).toBe(text);
+      expect(onSend.mock.calls[0]?.[1]).toHaveLength(1);
+      expect(screen.queryByRole("dialog", { name: "Goal" })).toBeNull();
+    },
+  );
+
+  it.each([
+    ["/goal", ""],
+    ["/goal Fix CI", "Fix CI"],
+  ])("preserves a same-named skill without Goal control (%s)", (text, args) => {
     const onSend = vi.fn();
     const onSendSlashCommand = vi.fn();
     setComposerState({
@@ -1030,9 +1114,9 @@ describe("Composer goal slash command", () => {
       skills: [{ name: "goal", description: "Project goal skill" }],
     });
     renderWithTooltips(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
-    fireEvent.change(textarea(), { target: { value: "/goal" } });
+    fireEvent.change(textarea(), { target: { value: text } });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
-    expect(onSendSlashCommand).toHaveBeenCalledWith("goal", "");
+    expect(onSendSlashCommand).toHaveBeenCalledWith("goal", args);
     expect(onSend).not.toHaveBeenCalled();
     expect(screen.queryByRole("dialog", { name: "Goal" })).toBeNull();
   });
@@ -1065,39 +1149,145 @@ describe("Composer Codex goal control", () => {
 });
 
 describe("Composer native goal state", () => {
+  const goal: GoalApiModule.Goal = {
+    objective: "Finish the implementation",
+    status: "active",
+    tokenBudget: null,
+    tokensUsed: 0,
+    timeUsedSeconds: 0,
+    createdAt: null,
+    updatedAt: null,
+  };
+
   afterEach(() => {
     cleanup();
+    vi.mocked(getGoal).mockReset();
     vi.restoreAllMocks();
+    vi.useRealTimers();
   });
 
-  it("loads the goal when a detached runner reconnects", async () => {
-    const mockGetGoal = vi.mocked(getGoal);
-    mockGetGoal.mockResolvedValueOnce({
-      goal: {
-        objective: "Finish the implementation",
-        status: "active",
+  it.each(["goal submission", "native activity"])(
+    "reconciles %s after idle backoff even when the first read precedes setup",
+    async (activity) => {
+      const previousState = useChatStore.getState();
+      onTestFinished(() => useChatStore.setState(previousState, true));
+      vi.useFakeTimers();
+      const mockGetGoal = vi.mocked(getGoal).mockResolvedValue({ available: false });
+      const onSend = vi.fn();
+      setComposerState({ conversationId: "conv_goal", sessionHarness: "codex-native", skills: [] });
+      const props = composerProps({ showGoalControl: true, runnerOnline: true, onSend });
+      const { rerender } = renderWithTooltips(<Composer {...props} />);
+      await act(async () => {});
+      /* oxlint-disable no-await-in-loop */
+      for (const delay of [10_000, 20_000, 40_000]) {
+        await act(() => vi.advanceTimersByTimeAsync(delay));
+      }
+      /* oxlint-enable no-await-in-loop */
+      expect(mockGetGoal).toHaveBeenCalledTimes(4);
+      expect(screen.queryByTestId("composer-goal-mode")).toBeNull();
+
+      if (activity === "goal submission") {
+        fireEvent.change(textarea(), { target: { value: "/Goal\nFinish the implementation" } });
+        fireEvent.click(screen.getByRole("button", { name: "Send" }));
+        expect(onSend).toHaveBeenCalledWith("/goal Finish the implementation", undefined);
+      } else {
+        rerender(
+          <TooltipProvider>
+            <Composer {...props} isWorking={true} status="streaming" />
+          </TooltipProvider>,
+        );
+        expect(onSend).not.toHaveBeenCalled();
+      }
+      await act(async () => {});
+      expect(mockGetGoal).toHaveBeenCalledTimes(5);
+      await act(() => vi.advanceTimersByTimeAsync(4_999));
+      expect(mockGetGoal).toHaveBeenCalledTimes(5);
+      await act(() => vi.advanceTimersByTimeAsync(1));
+      expect(mockGetGoal).toHaveBeenCalledTimes(6);
+
+      mockGetGoal.mockResolvedValue({ goal });
+      await act(() => vi.advanceTimersByTimeAsync(5_000));
+
+      expect(screen.getByTestId("composer-goal-mode")).toHaveAccessibleName(
+        `Goal active: ${goal.objective}`,
+      );
+      expect(mockGetGoal).toHaveBeenCalledTimes(7);
+      expect(mockGetGoal.mock.calls.every(([, options]) => options?.strict === false)).toBe(true);
+      expect(screen.queryByRole("dialog", { name: "Goal" })).toBeNull();
+    },
+  );
+
+  it.each([false, undefined])(
+    "keeps Goal usable with runnerOnline=%s and reconnects",
+    async (runnerOnline) => {
+      const mockGetGoal = vi.mocked(getGoal);
+      mockGetGoal.mockResolvedValue({ goal });
+      const updatedGoal = { ...goal, objective: "Finish the implementation and tests" };
+      const mockSetGoal = vi
+        .spyOn(await import("@/lib/goalApi"), "setGoal")
+        .mockResolvedValueOnce({ goal: updatedGoal });
+      useChatStore.setState({ conversationId: "conv_goal" });
+
+      const { rerender } = renderWithTooltips(
+        <Composer {...composerProps({ showGoalControl: true, runnerOnline })} />,
+      );
+      expect(mockGetGoal).not.toHaveBeenCalled();
+
+      fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
+      fireEvent.click(screen.getByTestId("composer-goal-action"));
+      await waitFor(() =>
+        expect(screen.getByTestId("goal-current")).toHaveTextContent(goal.objective),
+      );
+      expect(mockGetGoal).toHaveBeenCalledTimes(1);
+      expect(mockGetGoal).toHaveBeenNthCalledWith(1, "conv_goal", { strict: true });
+      expect(screen.queryByText(/Could not read goal/)).toBeNull();
+
+      rerender(
+        <TooltipProvider>
+          <Composer
+            {...composerProps({
+              showGoalControl: true,
+              runnerOnline: runnerOnline === false ? undefined : false,
+            })}
+          />
+        </TooltipProvider>,
+      );
+      expect(mockGetGoal).toHaveBeenCalledTimes(1);
+      expect(screen.getByTestId("goal-current")).toHaveTextContent(goal.objective);
+
+      fireEvent.change(screen.getByTestId("goal-objective"), {
+        target: { value: updatedGoal.objective },
+      });
+      fireEvent.click(screen.getByTestId("goal-save"));
+      await waitFor(() =>
+        expect(screen.getByTestId("goal-current")).toHaveTextContent(updatedGoal.objective),
+      );
+      expect(mockSetGoal).toHaveBeenCalledWith("conv_goal", {
+        objective: updatedGoal.objective,
         tokenBudget: null,
-        tokensUsed: 0,
-        timeUsedSeconds: 0,
-        createdAt: null,
-        updatedAt: null,
-      },
-    });
-    useChatStore.setState({ conversationId: "conv_goal" });
+        status: "active",
+      });
+      expect(screen.getByTestId("composer-goal-mode")).toHaveAccessibleName(
+        `Goal active: ${updatedGoal.objective}`,
+      );
 
-    const { rerender } = renderWithTooltips(
-      <Composer {...composerProps({ showGoalControl: true, runnerOnline: false })} />,
-    );
-    expect(mockGetGoal).not.toHaveBeenCalled();
+      mockGetGoal.mockResolvedValue({ goal: updatedGoal });
+      rerender(
+        <TooltipProvider>
+          <Composer {...composerProps({ showGoalControl: true, runnerOnline: true })} />
+        </TooltipProvider>,
+      );
 
-    rerender(
-      <TooltipProvider>
-        <Composer {...composerProps({ showGoalControl: true, runnerOnline: true })} />
-      </TooltipProvider>,
-    );
-
-    await waitFor(() => expect(mockGetGoal).toHaveBeenCalledWith("conv_goal"));
-  });
+      await waitFor(() => expect(mockGetGoal).toHaveBeenCalledTimes(3));
+      expect(mockGetGoal.mock.calls.slice(1)).toEqual(
+        expect.arrayContaining([
+          ["conv_goal", { strict: true }],
+          ["conv_goal", { strict: false }],
+        ]),
+      );
+      expect(screen.getByTestId("goal-current")).toHaveTextContent(updatedGoal.objective);
+    },
+  );
 });
 
 describe("Composer slash-command menu", () => {
