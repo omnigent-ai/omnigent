@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import random
 import string
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
 import pytest
+from sqlalchemy import Update, event, select
 
-from omnigent.db.db_models import MAX_STORED_VALUE_BYTES
+from omnigent.db import compression
+from omnigent.db.db_models import MAX_STORED_VALUE_BYTES, SqlPreference, SqlWorkflow
+from omnigent.db.utils import get_or_create_engine
 from omnigent.entities.workflow import InvalidWorkflowError, Workflow
+from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.stores.workflow_store import WorkflowNameTakenError, WorkflowStore
 
 ALICE = "alice@example.com"
@@ -44,7 +49,24 @@ def test_a_saved_workflow_reads_back_only_for_its_owner(store: WorkflowStore) ->
     assert store.get(saved.id, user_id=BOB) is None
     assert store.get(saved.id, user_id=None) is None
     local = _save(store, "local", user_id=None)
+    assert local.user_id == RESERVED_USER_LOCAL
     assert store.get(local.id, user_id=None) == local
+    assert store.get(local.id, user_id=RESERVED_USER_LOCAL) == local
+    with get_or_create_engine(store.storage_location).connect() as connection:
+        assert (
+            connection.execute(
+                select(SqlWorkflow.user_id).where(SqlWorkflow.id == local.id)
+            ).scalar_one()
+            == RESERVED_USER_LOCAL
+        )
+        assert (
+            connection.execute(
+                select(SqlPreference.key)
+                .where(SqlPreference.user_id == "__workflow_owners__")
+                .limit(1)
+            ).first()
+            is None
+        )
 
 
 @pytest.mark.parametrize("user_id", [ALICE, None])
@@ -56,7 +78,13 @@ def test_names_are_unique_per_owner(store: WorkflowStore, user_id: str | None) -
     release = _save(store, "release", user_id=user_id)
     with pytest.raises(WorkflowNameTakenError):
         store.update(release.id, user_id=user_id, name="deploy")
+    assert store.get(release.id, user_id=user_id) == release
     assert store.update(deploy.id, user_id=user_id, name="deploy") is not None
+    if get_or_create_engine(store.storage_location).dialect.name == "mysql":
+        with pytest.raises(WorkflowNameTakenError):
+            _save(store, "Deploy", user_id=user_id)
+    else:
+        assert _save(store, "Deploy", user_id=user_id).name == "Deploy"
 
 
 @pytest.mark.parametrize("user_id", [ALICE, None])
@@ -204,3 +232,108 @@ def test_a_draft_becomes_runnable_when_its_plan_is_saved(store: WorkflowStore) -
     assert saved is not None and saved.steps
     assert store.get(draft.id, user_id=ALICE) == saved
     assert store.list_page(user_id=ALICE, limit=10)[0] == [saved]
+
+
+class _SealedWorkflows(WorkflowStore):
+    """A fake key service, using reversible bytes to exercise the batch codec contract."""
+
+    def __init__(self, storage_location: str, *, overheads: tuple[int, int] = (4, 4)) -> None:
+        super().__init__(storage_location)
+        self.overheads = overheads
+        self.calls: list[tuple[str, int]] = []
+
+    def _encode_texts(self, texts: Sequence[str]) -> list[bytes]:
+        self.calls.append(("encrypt", len(texts)))
+        return [
+            compression.encode_encrypted(
+                compression.EncryptedTextPayload(
+                    text.encode()[::-1], {"key": "k" * self.overheads[index % 2]}
+                )
+            )
+            for index, text in enumerate(texts)
+        ]
+
+    def _decode_texts(self, stored: Sequence[bytes]) -> list[bytes | str]:
+        self.calls.append(("decrypt", len(stored)))
+        return [
+            (
+                compression.decode(
+                    value, decrypt=lambda payload: payload.ciphertext[::-1].decode()
+                )
+                or ""
+            ).encode()
+            for value in stored
+        ]
+
+
+def test_a_deployment_encodes_workflow_texts_a_page_at_a_time(db_uri: str) -> None:
+    plain = WorkflowStore(db_uri)
+    sealed = _SealedWorkflows(db_uri)
+    first = _save(plain, "a")
+    second = sealed.create(user_id=ALICE, name="b", description="Résumé du travail.", steps=STEPS)
+    third = _save(sealed, "c")
+    assert sealed.calls == [("encrypt", 2), ("encrypt", 2)]
+
+    sealed.calls.clear()
+    assert sealed.list_page(user_id=ALICE, limit=2) == ([first, second], True)
+    assert sealed.calls == [("decrypt", 4)]
+    sealed.calls.clear()
+    assert sealed.list_page(user_id=ALICE, limit=2, after=second.id) == ([third], False)
+    assert sealed.calls == [("decrypt", 2)]
+    sealed.calls.clear()
+    assert sealed.get(second.id, user_id=ALICE) == second
+    assert sealed.calls == [("decrypt", 2)]
+
+    engine = get_or_create_engine(db_uri)
+    updates: list[set[str]] = []
+
+    def capture_update(_connection, _cursor, _statement, _parameters, context, _executemany):
+        compiled = context.compiled
+        query = getattr(compiled, "statement", None)
+        if isinstance(query, Update) and query.table.name == "workflows":
+            updates.append(set(compiled.params))
+
+    sealed.calls.clear()
+    event.listen(engine, "before_cursor_execute", capture_update)
+    try:
+        updated = sealed.update(second.id, user_id=ALICE, description="Updated résumé.")
+    finally:
+        event.remove(engine, "before_cursor_execute", capture_update)
+    assert updated is not None and updated.description == "Updated résumé."
+    assert updated.steps == second.steps
+    assert sealed.calls == [("decrypt", 2), ("encrypt", 1)]
+    assert len(updates) == 1 and "plan" not in updates[0]
+    assert sealed.get(second.id, user_id=ALICE) == updated
+
+    sealed.calls.clear()
+    replanned = sealed.update(second.id, user_id=ALICE, steps=[{"id": "only", "name": "Only"}])
+    assert sealed.calls == [("decrypt", 2), ("encrypt", 2)]
+    assert replanned is not None and [step["id"] for step in replanned.steps] == ["only"]
+    assert sealed.get(second.id, user_id=ALICE) == replanned
+    with engine.connect() as connection:
+        stored = connection.execute(
+            select(SqlWorkflow.description, SqlWorkflow.plan).where(SqlWorkflow.id == second.id)
+        ).one()
+        assert [value[:2] for value in stored] == [b"\x00\x02", b"\x00\x02"]
+    with pytest.raises(ValueError, match="decryptor"):
+        plain.get(second.id, user_id=ALICE)
+    with pytest.raises(ValueError, match="decryptor"):
+        plain.list_page(user_id=ALICE, name="b", limit=1)
+
+
+@pytest.mark.parametrize(
+    ("field", "limit", "index"), [("description", 2000, 0), ("steps", 16_383, 1)]
+)
+def test_workflow_limits_count_the_encrypted_envelope(
+    db_uri: str, field: str, limit: int, index: int
+) -> None:
+    sealed = _SealedWorkflows(db_uri)
+    saved = _save(sealed, "saved")
+    overheads = [4, 4]
+    overheads[index] = limit
+    bloated = _SealedWorkflows(db_uri, overheads=(overheads[0], overheads[1]))
+    with pytest.raises(InvalidWorkflowError, match=rf"{field}:.*limit is {limit}"):
+        _save(bloated, "too large")
+    with pytest.raises(InvalidWorkflowError, match=rf"{field}:.*limit is {limit}"):
+        bloated.update(saved.id, user_id=ALICE, description="A new description.", steps=STEPS)
+    assert sealed.get(saved.id, user_id=ALICE) == saved

@@ -73,11 +73,15 @@ Workflow descriptions are capped at 2,000 stored bytes, with the existing limit
 of 2,000 characters; saved plans and journal entries are capped at 16,383 bytes.
 The OSS stores write plaintext variants. A deployment that enables content
 encryption must supply its codec for these stores as well as conversation items;
-encrypted rows fail closed without a configured decryptor. The journal store
-encodes content itself, a batch per call, so a deployment encrypts journal
-content by overriding `SessionJournalStore._encode_contents` and
-`_decode_contents` rather than through a column codec; the 16,383-byte limit
-counts the encrypted bytes.
+encrypted rows fail closed without a configured decryptor. The stores encode
+content themselves, a batch per call. A deployment encrypts journal content by
+overriding `SessionJournalStore._encode_contents` and `_decode_contents`, and
+workflow descriptions and plans by overriding `WorkflowStore._encode_texts`
+and `_decode_texts`. Each codec returns one value per input, in order, and uses
+`compression.encode_encrypted` to frame ciphertext. A workflow list page decodes
+all its descriptions and plans in one call; get and update each decode once.
+The 2,000-byte description limit and 16,383-byte plan and journal limits count
+the full encrypted envelope. Metadata edits leave the stored plan unchanged.
 
 ## Agent tools
 
@@ -345,9 +349,11 @@ it ran.
   left out keep their values.
 - `DELETE /v1/workflows/{id}`: deletes it.
 
-Workflows live in `workflows`, keyed by workspace and ID, with the steps as
-compressed JSON of at most 16,383 bytes stored. `GET /v1/info` reports
-`workflows: true` on servers that store them.
+Workflows live in `workflows`, keyed by workspace and ID, with encoded JSON
+steps of at most 16,383 bytes stored. A unique index enforces names per workspace
+and owner; single-user mode stores the reserved `local` owner. Names follow the
+database's collation: case-insensitive on MySQL, case-sensitive on SQLite and
+PostgreSQL. `GET /v1/info` reports `workflows: true` on servers that store them.
 
 ## Usage telemetry
 

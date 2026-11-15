@@ -7,9 +7,10 @@ Revises: 5d872cd6632a
 plan a run copies into the session's journal, whose entries carry the
 workflow's ID in ``session_journal_entries.workflow_id``. Workflows have no
 versions; an edit rewrites the row. The primary key is ``(workspace_id, id)``,
-and ``ix_workflows_user_id_name`` lists an owner's workflows by name. The plan
-is compressed JSON in a binary column, which the ORM caps at 16,383 stored
-bytes. The table has no database defaults: writes name the workspace.
+and ``uq_workflows_user_id_name`` enforces unique names per owner. Single-user
+workflows use the reserved ``local`` owner. The plan is encoded JSON in a binary
+column capped at 16,383 stored bytes. The table has no database defaults:
+writes name the workspace.
 
 Deployment: apply this migration before a server that uses the table.
 Servers that migrate at startup do so on their own. Processes already running
@@ -19,8 +20,9 @@ schema revision the build does not know.
 
 Rollback: stop the servers, downgrade with a build that includes this
 migration (``OMNIGENT_DB_URL=<uri> alembic -c omnigent/db/alembic.ini
-downgrade 5d872cd6632a``), then start the older build. Downgrade drops the
-table and every saved workflow.
+downgrade ce12af3da168@5d872cd6632a``), then start the older build. This
+branch-qualified downgrade drops every saved workflow while preserving the
+automation branch.
 """
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 
 _TABLE = "workflows"
-_INDEX = "ix_workflows_user_id_name"
+_INDEX = "uq_workflows_user_id_name"
 
 
 def upgrade() -> None:
@@ -46,7 +48,7 @@ def upgrade() -> None:
         _TABLE,
         sa.Column("workspace_id", sa.BigInteger(), nullable=False),
         sa.Column("id", Uuid16(), nullable=False),
-        sa.Column("user_id", sa.String(128), nullable=True),
+        sa.Column("user_id", sa.String(128), nullable=False),
         sa.Column("name", sa.String(80), nullable=False),
         sa.Column("description", sa.String(2000), nullable=False),
         sa.Column(
@@ -56,7 +58,7 @@ def upgrade() -> None:
         sa.Column("updated_at", sa.BigInteger(), nullable=False),
         sa.PrimaryKeyConstraint("workspace_id", "id"),
     )
-    op.create_index(_INDEX, _TABLE, ["workspace_id", "user_id", "name", "id"])
+    op.create_index(_INDEX, _TABLE, ["workspace_id", "user_id", "name"], unique=True)
 
 
 def downgrade() -> None:

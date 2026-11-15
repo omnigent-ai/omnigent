@@ -1961,8 +1961,7 @@ class SqlWorkflow(OmnigentBase):
     rewrites the row, and each run's journal keeps the plan it ran.
 
     :param id: UUID of the workflow, in the session ID's format (bare hex).
-    :param user_id: The owning user, or ``None`` in single-user mode. Names are
-        unique per owner, checked by the store rather than by a unique key.
+    :param user_id: The owning user, or the reserved ``local`` user in single-user mode.
     :param name: One line, e.g. ``"nightly-build"``; a run's plan takes this name.
     :param description: What the workflow is for; a run gives it to the agent as
         the goal.
@@ -1980,19 +1979,16 @@ class SqlWorkflow(OmnigentBase):
     )
     id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
     # String(128) matches every other user-identity column.
-    user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
     # A run's plan takes this name, and plan names are at most 80 characters.
     name: Mapped[str] = mapped_column(String(80), nullable=False)
     # Opaque user content uses the same storage envelope as journal text and plans.
-    description: Mapped[str] = mapped_column(
-        CompressedText(
-            max_stored_bytes=WORKFLOW_DESCRIPTION_MAX_STORED_BYTES, bounded_binary=True
-        ),
-        nullable=False,
+    description: Mapped[bytes] = mapped_column(
+        BoundedBinary(WORKFLOW_DESCRIPTION_MAX_STORED_BYTES), nullable=False
     )
     # Deferred so callers load the compressed plan explicitly.
-    plan: Mapped[str] = mapped_column(
-        CompressedText(max_stored_bytes=MAX_STORED_VALUE_BYTES, bounded_binary=True),
+    plan: Mapped[bytes] = mapped_column(
+        BoundedBinary(MAX_STORED_VALUE_BYTES),
         nullable=False,
         deferred=True,
     )
@@ -2001,9 +1997,7 @@ class SqlWorkflow(OmnigentBase):
     planning_session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
 
     __table_args__ = (
-        # An owner's workflows by name: the list, `/workflow <name>` and the
-        # store's duplicate-name check. Not unique: NULL owners never collide.
-        Index("ix_workflows_user_id_name", "workspace_id", "user_id", "name", "id"),
+        Index("uq_workflows_user_id_name", "workspace_id", "user_id", "name", unique=True),
     )
 
 

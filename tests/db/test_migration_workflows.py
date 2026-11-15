@@ -15,7 +15,7 @@ from omnigent.db.db_models import SqlWorkflow
 from omnigent.db.utils import _build_alembic_config, clear_engine_cache, get_or_create_engine
 from omnigent.stores.workflow_store import WorkflowStore
 
-_PREVIOUS = "5d872cd6632a"
+_ROLLBACK_TARGET = "ce12af3da168@5d872cd6632a"
 _TABLE = "workflows"
 
 
@@ -52,12 +52,16 @@ def test_upgrade_matches_the_model_and_downgrade_drops_the_table(
     assert {index["name"]: index["column_names"] for index in indexes} == {
         index.name: [column.name for column in index.columns] for index in table.indexes
     }
-    assert not any(index["unique"] for index in indexes)
+    assert {index["name"] for index in indexes if index["unique"]} == {"uq_workflows_user_id_name"}
+    assert not columns["user_id"]["nullable"]
     assert inspector.get_unique_constraints(_TABLE) == []
     assert isinstance(columns["description"]["type"], sa.LargeBinary)
 
-    _migrate(uri, engine, _PREVIOUS, down=True)
-    assert _TABLE not in sa.inspect(engine).get_table_names()
+    _migrate(uri, engine, _ROLLBACK_TARGET, down=True)
+    inspector = sa.inspect(engine)
+    assert _TABLE not in inspector.get_table_names()
+    assert {"inbox_items", "scheduled_task_shares"} <= set(inspector.get_table_names())
+    assert "kind" in {column["name"] for column in inspector.get_columns("scheduled_tasks")}
     engine.dispose()
     clear_engine_cache()
 
@@ -85,7 +89,7 @@ def test_description_envelopes_preserve_legacy_text_and_downgrade(
                 sa.text(
                     "INSERT INTO workflows (workspace_id, id, user_id, name, description, plan, "
                     "created_at, updated_at, planning_session_id) "
-                    "VALUES (0, :id, NULL, 'Review', :description, :plan, 1, 1, NULL)"
+                    "VALUES (0, :id, 'local', 'Review', :description, :plan, 1, 1, NULL)"
                 ),
                 {
                     "id": bytes.fromhex(workflow_id),

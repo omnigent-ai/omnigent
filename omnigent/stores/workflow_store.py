@@ -2,19 +2,20 @@
 
 Workflows are rows of ``workflows`` in the database that holds the session
 metadata. Every read and write is scoped to the caller: another owner's
-workflow reads as missing. Creates and edits serialize on an owner's retained
-preference row before checking names, including owners without an account row.
+workflow reads as missing. A unique owner-and-name index arbitrates competing saves.
 Every workflow query is served by, and on MySQL pinned to, the primary key or
-``ix_workflows_user_id_name``.
+``uq_workflows_user_id_name``. Description and plan codecs run in batches in the store.
 """
 
 from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Sequence
 from typing import Any, TypeVar
 
 from sqlalchemy import ColumnElement, Select, and_, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, undefer
 
 from omnigent.db import compression
@@ -25,7 +26,6 @@ from omnigent.db.db_models import (
     SqlWorkflow,
     current_workspace_id,
 )
-from omnigent.db.preference_rows import upsert_preference_row
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -33,9 +33,11 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities.workflow import InvalidWorkflowError, Workflow, normalize_workflow
+from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
 WORKFLOW_PAGE_MAX = 200
+_OWNER_NAME_INDEX = "uq_workflows_user_id_name"
 
 _Statement = TypeVar("_Statement", bound=Select[Any])
 
@@ -49,7 +51,7 @@ def _owned(workflow_id: str, user_id: str | None) -> tuple[ColumnElement[bool], 
     return (
         SqlWorkflow.workspace_id == current_workspace_id(),
         SqlWorkflow.id == workflow_id,
-        SqlWorkflow.user_id == user_id,
+        SqlWorkflow.user_id == (RESERVED_USER_LOCAL if user_id is None else user_id),
     )
 
 
@@ -58,36 +60,23 @@ def _using(statement: _Statement, index: str) -> _Statement:
     return statement.with_hint(SqlWorkflow, f"FORCE INDEX ({index})", "mysql")
 
 
-def _lock_owner(session: Session, user_id: str | None) -> None:
-    """The upsert holds one owner lock until commit, even when no workflow exists."""
-    # Retain the row when workflows are deleted so later saves use the same lock.
-    upsert_preference_row(session, user_id="__workflow_owners__", key=user_id or "", value="{}")
-
-
-def _check_stored_size(text: str, field: str, limit: int) -> None:
-    size = len(compression.encode(text) or b"")
-    if size > limit:
-        raise InvalidWorkflowError(f"{field}: {size} bytes compressed; the limit is {limit}")
+def _is_name_conflict(error: IntegrityError) -> bool:
+    """Identify this unique index without masking other integrity errors."""
+    constraint = getattr(getattr(error.orig, "diag", None), "constraint_name", None)
+    if constraint is not None:  # PostgreSQL and CockroachDB.
+        return constraint == _OWNER_NAME_INDEX
+    args = getattr(error.orig, "args", ())
+    if len(args) > 1 and args[0] == 1062:  # MySQL names the key, sometimes table-qualified.
+        key = str(args[1]).rsplit("for key ", 1)[-1].strip("'`").rsplit(".", 1)[-1]
+        return key == _OWNER_NAME_INDEX
+    return str(error.orig) == (
+        "UNIQUE constraint failed: workflows.workspace_id, workflows.user_id, workflows.name"
+    )
 
 
 def _plan_text(steps: list[dict[str, Any]]) -> str:
-    """The stored plan, refused when it doesn't fit the column compressed."""
-    text = json.dumps({"steps": steps}, ensure_ascii=False, separators=(",", ":"))
-    _check_stored_size(text, "steps", MAX_STORED_VALUE_BYTES)
-    return text
-
-
-def _to_workflow(row: SqlWorkflow) -> Workflow:
-    return Workflow(
-        id=row.id,
-        user_id=row.user_id,
-        name=row.name,
-        description=row.description,
-        created_at=row.created_at,
-        updated_at=row.updated_at,
-        steps=json.loads(row.plan)["steps"],
-        planning_session_id=row.planning_session_id,
-    )
+    """Serialize the plan before applying the deployment's storage codec."""
+    return json.dumps({"steps": steps}, ensure_ascii=False, separators=(",", ":"))
 
 
 class WorkflowStore:
@@ -108,19 +97,55 @@ class WorkflowStore:
             engine, query_name_prefix="omnigent.workflows", immediate=True
         )
 
-    def _name_taken(
-        self, session: Session, *, user_id: str | None, name: str, exclude_id: str | None
-    ) -> bool:
-        stmt = select(SqlWorkflow.id).where(
-            SqlWorkflow.workspace_id == current_workspace_id(),
-            SqlWorkflow.user_id == user_id,
-            SqlWorkflow.name == name,
+    def _encode_texts(self, texts: Sequence[str]) -> list[bytes]:
+        """Encode a whole batch; deployments override this and :meth:`_decode_texts`.
+
+        Encrypted values must use :func:`compression.encode_encrypted` so a reader
+        without the deployment's key fails closed. Return one value per text, in order.
+        """
+        return [compression.encode(text) or b"" for text in texts]
+
+    def _decode_texts(self, stored: Sequence[bytes]) -> list[bytes | str]:
+        """Decode a batch in order; encrypted frames require the deployment's override."""
+        return [compression.decode(value) or "" for value in stored]
+
+    def _stored_texts(self, description: str, plan: str | None) -> list[bytes]:
+        texts = [description] if plan is None else [description, plan]
+        stored = self._encode_texts(texts)
+        limits = [
+            ("description", WORKFLOW_DESCRIPTION_MAX_STORED_BYTES),
+            ("steps", MAX_STORED_VALUE_BYTES),
+        ][: len(texts)]
+        for value, (field, limit) in zip(stored, limits, strict=True):
+            if len(value) > limit:
+                raise InvalidWorkflowError(
+                    f"{field}: {len(value)} stored bytes; the limit is {limit}"
+                )
+        return stored
+
+    def _workflows(self, rows: Sequence[SqlWorkflow]) -> list[Workflow]:
+        """Decode a page's descriptions and plans in one call."""
+        texts = (
+            self._decode_texts([value for row in rows for value in (row.description, row.plan)])
+            if rows
+            else []
         )
-        if exclude_id is not None:
-            stmt = stmt.where(SqlWorkflow.id != exclude_id)
-        return (
-            session.execute(_using(stmt.limit(1), "ix_workflows_user_id_name")).first() is not None
-        )
+        pairs = zip(texts[::2], texts[1::2], strict=True)
+        return [
+            Workflow(
+                id=row.id,
+                user_id=row.user_id,
+                name=row.name,
+                description=description.decode("utf-8")
+                if isinstance(description, bytes)
+                else description,
+                created_at=row.created_at,
+                updated_at=row.updated_at,
+                steps=json.loads(plan)["steps"],
+                planning_session_id=row.planning_session_id,
+            )
+            for row, (description, plan) in zip(rows, pairs, strict=True)
+        ]
 
     def create(
         self, *, user_id: str | None, name: object, description: object, steps: object
@@ -138,12 +163,11 @@ class WorkflowStore:
         workflow_name, text, workflow_steps = normalize_workflow(
             name=name, description=description, steps=steps
         )
-        _check_stored_size(text, "description", WORKFLOW_DESCRIPTION_MAX_STORED_BYTES)
-        plan = _plan_text(workflow_steps)
+        stored_description, stored_plan = self._stored_texts(text, _plan_text(workflow_steps))
         now = now_epoch()
         workflow = Workflow(
             id=uuid.uuid4().hex,
-            user_id=user_id,
+            user_id=RESERVED_USER_LOCAL if user_id is None else user_id,
             name=workflow_name,
             description=text,
             created_at=now,
@@ -153,24 +177,26 @@ class WorkflowStore:
 
         def write(session: Session) -> Workflow:
             require_active_account(session, user_id)
-            _lock_owner(session, user_id)
-            if self._name_taken(session, user_id=user_id, name=workflow_name, exclude_id=None):
-                raise WorkflowNameTakenError(f"a workflow named {workflow_name!r} already exists")
             session.add(
                 SqlWorkflow(
                     workspace_id=current_workspace_id(),
                     id=workflow.id,
-                    user_id=user_id,
+                    user_id=workflow.user_id,
                     name=workflow_name,
-                    description=text,
-                    plan=plan,
+                    description=stored_description,
+                    plan=stored_plan,
                     created_at=now,
                     updated_at=now,
                 )
             )
             return workflow
 
-        return run_write_transaction(self._session_immediate, "create_workflow", write)
+        try:
+            return run_write_transaction(self._session_immediate, "create_workflow", write)
+        except IntegrityError as exc:
+            if _is_name_conflict(exc):
+                raise WorkflowNameTakenError("a workflow with this name already exists") from exc
+            raise
 
     def get(self, workflow_id: str, *, user_id: str | None) -> Workflow | None:
         """Return one of the owner's workflows with its steps, or ``None``."""
@@ -183,7 +209,7 @@ class WorkflowStore:
                     "PRIMARY",
                 )
             ).scalar_one_or_none()
-            return None if row is None else _to_workflow(row)
+            return None if row is None else self._workflows([row])[0]
 
     def list_page(
         self,
@@ -209,7 +235,7 @@ class WorkflowStore:
                 select(SqlWorkflow)
                 .where(
                     SqlWorkflow.workspace_id == current_workspace_id(),
-                    SqlWorkflow.user_id == user_id,
+                    SqlWorkflow.user_id == (RESERVED_USER_LOCAL if user_id is None else user_id),
                 )
                 .options(undefer(SqlWorkflow.plan))
             )
@@ -234,10 +260,10 @@ class WorkflowStore:
             rows = session.scalars(
                 _using(
                     stmt.order_by(SqlWorkflow.name, SqlWorkflow.id).limit(limit + 1),
-                    "ix_workflows_user_id_name",
+                    _OWNER_NAME_INDEX,
                 )
             ).all()
-            return [_to_workflow(row) for row in rows[:limit]], len(rows) > limit
+            return self._workflows(rows[:limit]), len(rows) > limit
 
     def update(
         self,
@@ -264,34 +290,33 @@ class WorkflowStore:
 
         def write(session: Session) -> Workflow | None:
             require_active_account(session, user_id)
-            _lock_owner(session, user_id)
             row = session.execute(
                 _using(
                     select(SqlWorkflow)
                     .where(*_owned(workflow_id, user_id))
-                    .options(undefer(SqlWorkflow.plan)),
+                    .options(undefer(SqlWorkflow.plan))
+                    .with_for_update(),
                     "PRIMARY",
                 )
             ).scalar_one_or_none()
             if row is None:
                 return None
+            current = self._workflows([row])[0]
             workflow_name, text, workflow_steps = normalize_workflow(
                 name=row.name if name is None else name,
-                description=row.description if description is None else description,
-                steps=json.loads(row.plan)["steps"] if steps is None else steps,
+                description=current.description if description is None else description,
+                steps=current.steps if steps is None else steps,
             )
-            _check_stored_size(text, "description", WORKFLOW_DESCRIPTION_MAX_STORED_BYTES)
-            if workflow_name != row.name and self._name_taken(
-                session, user_id=user_id, name=workflow_name, exclude_id=workflow_id
-            ):
-                raise WorkflowNameTakenError(f"a workflow named {workflow_name!r} already exists")
+            stored = self._stored_texts(
+                text, None if steps is None else _plan_text(workflow_steps)
+            )
             values: dict[str, Any] = {
                 "name": workflow_name,
-                "description": text,
+                "description": stored[0],
                 "updated_at": now_epoch(),
             }
             if steps is not None:
-                values["plan"] = _plan_text(workflow_steps)
+                values["plan"] = stored[1]
             if planning_session_id is not None:
                 values["planning_session_id"] = planning_session_id
             session.execute(
@@ -315,7 +340,12 @@ class WorkflowStore:
                 planning_session_id=values.get("planning_session_id", row.planning_session_id),
             )
 
-        return run_write_transaction(self._session_immediate, "update_workflow", write)
+        try:
+            return run_write_transaction(self._session_immediate, "update_workflow", write)
+        except IntegrityError as exc:
+            if _is_name_conflict(exc):
+                raise WorkflowNameTakenError("a workflow with this name already exists") from exc
+            raise
 
     def delete(self, workflow_id: str, *, user_id: str | None) -> bool:
         """Delete an owned workflow; ``False`` if the owner has no such workflow."""
