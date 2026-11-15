@@ -33,8 +33,9 @@ import {
   BEST_OF_N_MIN_ATTEMPTS,
   bestOfNRepository,
   launchBestOfN,
+  otherBestOfNAttemptIds,
   verifiedOtherAttempts,
-  type VerifiedAttempt,
+  type VerifiedAttempts,
 } from "@/lib/bestOfN";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, pickerCuration, type ServerInfo } from "@/lib/capabilities";
@@ -381,25 +382,37 @@ export function KeepAttemptDialog({
   const checkboxId = useId();
   const cleanupSupported = info !== "loading" && info.archive_worktree_cleanup === true;
   const [removeWorktrees, setRemoveWorktrees] = useState(false);
-  const [others, setOthers] = useState<VerifiedAttempt[] | null>(null);
+  const [verified, setVerified] = useState<VerifiedAttempts | null>(null);
+  const [checks, setChecks] = useState(0);
   const [archiving, setArchiving] = useState(false);
   const labelKey = JSON.stringify(labels ?? {});
 
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
-    setOthers(null);
-    verifiedOtherAttempts(sessionId, JSON.parse(labelKey), (id) => getSessionSlim(id))
-      .then((verified) => !cancelled && setOthers(verified))
-      .catch(() => !cancelled && setOthers([]));
+    const keptLabels = JSON.parse(labelKey) as Record<string, string>;
+    setVerified(null);
+    verifiedOtherAttempts(sessionId, keptLabels, (id) => getSessionSlim(id))
+      .then((result) => !cancelled && setVerified(result))
+      .catch(
+        () =>
+          !cancelled &&
+          setVerified({
+            attempts: [],
+            unresolved: otherBestOfNAttemptIds(sessionId, keptLabels),
+          }),
+      );
     return () => {
       cancelled = true;
     };
-  }, [open, sessionId, labelKey]);
+  }, [open, sessionId, labelKey, checks]);
 
+  const others = verified?.attempts ?? null;
+  const unresolved = verified?.unresolved.length ?? 0;
   const count = others?.length ?? 0;
   const keep = async () => {
-    if (others === null || count === 0) return;
+    // A partial list would leave unchecked attempts running after "Kept".
+    if (others === null || count === 0 || unresolved > 0) return;
     const ids = others.map((attempt) => attempt.id);
     setArchiving(true);
     try {
@@ -429,9 +442,11 @@ export function KeepAttemptDialog({
           <DialogDescription>
             {others === null
               ? "Checking the other attempts…"
-              : count === 0
-                ? "No other attempts of this run can be archived."
-                : `${title} stays. ${count === 1 ? "This attempt is" : `These ${count} attempts are`} archived; you can unarchive ${count === 1 ? "it" : "them"} later.`}
+              : unresolved > 0
+                ? "Every other attempt of this run must be checked before keeping this one."
+                : count === 0
+                  ? "No other attempts of this run can be archived."
+                  : `${title} stays. ${count === 1 ? "This attempt is" : `These ${count} attempts are`} archived; you can unarchive ${count === 1 ? "it" : "them"} later.`}
           </DialogDescription>
         </DialogHeader>
         {count > 0 && (
@@ -441,7 +456,22 @@ export function KeepAttemptDialog({
             ))}
           </ul>
         )}
-        {cleanupSupported && count > 0 && (
+        {unresolved > 0 && (
+          <div role="alert" className="flex items-center gap-2 text-sm text-destructive">
+            Couldn't check {unresolved === 1 ? "1 other attempt" : `${unresolved} other attempts`}.
+            <Button
+              type="button"
+              variant="ghost"
+              size="xs"
+              disabled={archiving}
+              onClick={() => setChecks((value) => value + 1)}
+              data-testid="keep-attempt-recheck"
+            >
+              Check again
+            </Button>
+          </div>
+        )}
+        {cleanupSupported && count > 0 && unresolved === 0 && (
           <div className="flex items-center gap-2">
             <Checkbox
               id={checkboxId}
@@ -467,7 +497,7 @@ export function KeepAttemptDialog({
           </Button>
           <Button
             type="button"
-            disabled={count === 0 || archiving}
+            disabled={count === 0 || unresolved > 0 || archiving}
             onClick={() => void keep()}
             data-testid="keep-attempt-confirm"
             componentId="best_of_n.keep.confirm"

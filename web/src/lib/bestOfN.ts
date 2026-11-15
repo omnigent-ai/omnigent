@@ -11,7 +11,7 @@ import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { nativeDisplayNameForAgent, nativeWrapperLabelsForAgent } from "@/lib/nativeCodingAgents";
 import { randomUUID } from "@/lib/randomUUID";
 import { isOwnerLevel } from "@/lib/permissionsApi";
-import { createSession, postEvent, updateSession } from "@/lib/sessionsApi";
+import { ApiError, createSession, postEvent, updateSession } from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
 import { splitWorktreePath } from "@/lib/worktreePaths";
 
@@ -168,10 +168,24 @@ export interface VerifiedAttempt {
   title: string;
 }
 
+export interface VerifiedAttempts {
+  /** Owned, active attempts of the same run, safe to archive. */
+  attempts: VerifiedAttempt[];
+  /** Listed attempts whose lookup failed for another reason than missing or forbidden. */
+  unresolved: string[];
+}
+
+/** A lookup that proves the session is gone or not the viewer's, not a passing failure. */
+function confirmsExclusion(error: unknown): boolean {
+  return error instanceof ApiError && (error.status === 403 || error.status === 404);
+}
+
 /**
  * The other attempts "Keep this attempt" may archive: owned, active sessions
  * whose own labels put them in the kept attempt's run. Anyone who can edit a
  * session can change its labels, so the kept session's list alone is not trusted.
+ * Lookups that fail for another reason are reported as unresolved, so a caller
+ * never treats a partial list as the whole run.
  *
  * @param keptId - The attempt being kept.
  * @param keptLabels - Its labels, naming the run's group and attempts.
@@ -181,20 +195,24 @@ export async function verifiedOtherAttempts(
   keptId: string,
   keptLabels: Record<string, string> | null | undefined,
   fetchSession: (id: string) => Promise<Session>,
-): Promise<VerifiedAttempt[]> {
+): Promise<VerifiedAttempts> {
   const group = keptLabels?.[BEST_OF_N_GROUP_LABEL];
   const ids = otherBestOfNAttemptIds(keptId, keptLabels);
-  if (!group || ids.length === 0) return [];
+  const verified: VerifiedAttempts = { attempts: [], unresolved: [] };
+  if (!group || ids.length === 0) return verified;
   const sessions = await Promise.allSettled(ids.map((id) => fetchSession(id)));
-  return sessions.flatMap((result, index) => {
-    if (result.status !== "fulfilled") return [];
+  sessions.forEach((result, index) => {
+    if (result.status === "rejected") {
+      if (!confirmsExclusion(result.reason)) verified.unresolved.push(ids[index]);
+      return;
+    }
     const session = result.value;
     const sameRun =
       session.id === ids[index] &&
       session.labels?.[BEST_OF_N_GROUP_LABEL] === group &&
       bestOfNAttemptIds(session.labels).includes(keptId);
-    return sameRun && session.archived !== true && isOwnerLevel(session.permissionLevel ?? null)
-      ? [{ id: session.id, title: session.title || session.id }]
-      : [];
+    if (sameRun && session.archived !== true && isOwnerLevel(session.permissionLevel ?? null))
+      verified.attempts.push({ id: session.id, title: session.title || session.id });
   });
+  return verified;
 }
