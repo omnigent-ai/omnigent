@@ -23,7 +23,9 @@ def _migrate(uri: str, engine: sa.Engine, revision: str, *, down: bool = False) 
         (command.downgrade if down else command.upgrade)(config, revision)
 
 
-@pytest.mark.parametrize("previous_revision", ["base", "9a2c7e6b4f10", "27d16059fab9"])
+@pytest.mark.parametrize(
+    "previous_revision", ["base", "9a2c7e6b4f10", "27d16059fab9", "e9b6a17c20d4"]
+)
 def test_upgrade_matches_the_model_and_downgrade_drops_the_table(
     tmp_path: Path, previous_revision: str
 ) -> None:
@@ -46,9 +48,50 @@ def test_upgrade_matches_the_model_and_downgrade_drops_the_table(
     }
     assert not any(index["unique"] for index in indexes)
     assert inspector.get_unique_constraints(_TABLE) == []
+    assert isinstance(columns["description"]["type"], sa.LargeBinary)
 
     _migrate(uri, engine, _PREVIOUS, down=True)
     assert _TABLE not in sa.inspect(engine).get_table_names()
+    engine.dispose()
+    clear_engine_cache()
+
+
+@pytest.mark.parametrize(
+    "description", ["Review café notes in C:\\reports.", "\x00\x02legacy text"]
+)
+def test_description_envelopes_preserve_legacy_text_and_downgrade(
+    tmp_path: Path, description: str
+) -> None:
+    uri = f"sqlite:///{tmp_path / 'descriptions.db'}"
+    engine = sa.create_engine(uri)
+    previous = "e9b6a17c20d4"
+    _migrate(uri, engine, previous)
+    workflow_id = "0123456789abcdef0123456789abcdef"
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                "INSERT INTO workflows (workspace_id, id, user_id, name, description, plan, "
+                "created_at, updated_at, planning_session_id) "
+                "VALUES (0, :id, NULL, 'Review', :description, :plan, 1, 1, NULL)"
+            ),
+            {"id": bytes.fromhex(workflow_id), "description": description, "plan": '{"steps":[]}'},
+        )
+    _migrate(uri, engine, "head")
+    store = WorkflowStore(uri)
+    assert store.get(workflow_id, user_id=None).description == description
+    updated = store.update(workflow_id, user_id=None, description=description * 5)
+    with engine.connect() as connection:
+        assert isinstance(
+            connection.execute(sa.text("SELECT description FROM workflows")).scalar_one(), bytes
+        )
+    _migrate(uri, engine, previous, down=True)
+    with engine.connect() as connection:
+        assert (
+            connection.execute(sa.text("SELECT description FROM workflows")).scalar_one()
+            == updated.description
+        )
+    _migrate(uri, engine, "head")
+    assert store.get(workflow_id, user_id=None) == updated
     engine.dispose()
     clear_engine_cache()
 

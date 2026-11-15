@@ -65,6 +65,13 @@ KiB. Every stored entry is at most 16,383 bytes after compression. Step names,
 goals, status text and the agent's questions have no length limit of their own;
 a goal keeps its line breaks.
 
+Journal content, saved plans and workflow descriptions use bounded binary storage
+envelopes. The frame identifies raw plaintext, compressed plaintext, or ciphertext
+with its encryption configuration; the stored-byte limit includes the full frame.
+The OSS stores write plaintext variants. A deployment that enables content
+encryption must supply its codec for these stores as well as conversation items;
+encrypted rows fail closed without a configured decryptor.
+
 ## Agent tools
 
 With workflows enabled, the eight tools make up the `journal` tool group, which every agent has. An agent

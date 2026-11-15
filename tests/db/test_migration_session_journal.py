@@ -25,6 +25,7 @@ _HEADS = "session_journal_heads"
     [
         ("5d872cd6632a_add_session_journal", SqlSessionJournalEntry.__table__.c.content),
         ("ce12af3da168_add_workflows", SqlWorkflow.__table__.c.plan),
+        ("f7c2d8a4b901_workflow_description_envelope", SqlWorkflow.__table__.c.description),
     ],
 )
 def test_mysql_payload_types_are_bounded_and_keep_the_codec(

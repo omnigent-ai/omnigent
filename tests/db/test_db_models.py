@@ -1052,9 +1052,12 @@ class TestSqlUserDailyCost:
 
 
 class TestSqlWorkflow:
-    def test_plan_writes_enforce_the_16_kib_stored_limit(self) -> None:
+    @pytest.mark.parametrize("column_name", ["description", "plan"])
+    def test_user_content_writes_enforce_the_16_kib_stored_limit(self, column_name: str) -> None:
         table = SqlWorkflow.__table__
-        assert table.c.plan.type.max_stored_bytes == MAX_STORED_VALUE_BYTES == 16 * 1024 - 1
+        assert (
+            table.c[column_name].type.max_stored_bytes == MAX_STORED_VALUE_BYTES == 16 * 1024 - 1
+        )
         plan = '{"steps":[{"id":"build","name":"Build","goal":null,"depends_on":[]}]}'
         engine = sa.create_engine("sqlite://")
         try:
@@ -1076,6 +1079,6 @@ class TestSqlWorkflow:
             # Random text barely compresses, so this stores above the limit.
             oversized = "".join(random.Random(0).choices(string.ascii_letters, k=24_000))
             with pytest.raises(StatementError, match="size limit"), engine.begin() as connection:
-                connection.execute(table.update().values(plan=oversized))
+                connection.execute(table.update().values({column_name: oversized}))
         finally:
             engine.dispose()

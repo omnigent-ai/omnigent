@@ -1982,8 +1982,11 @@ class SqlWorkflow(OmnigentBase):
     user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # A run's plan takes this name, and plan names are at most 80 characters.
     name: Mapped[str] = mapped_column(String(80), nullable=False)
-    # A few paragraphs: at most 8,000 bytes in UTF-8.
-    description: Mapped[str] = mapped_column(String(2000), nullable=False)
+    # Opaque user content uses the same storage envelope as journal text and plans.
+    description: Mapped[str] = mapped_column(
+        CompressedText(max_stored_bytes=MAX_STORED_VALUE_BYTES, bounded_binary=True),
+        nullable=False,
+    )
     # Deferred so callers load the compressed plan explicitly.
     plan: Mapped[str] = mapped_column(
         CompressedText(max_stored_bytes=MAX_STORED_VALUE_BYTES, bounded_binary=True),
