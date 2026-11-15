@@ -259,6 +259,37 @@ directory footer, and extension hooks remain active; extensions can modify the
 final prompt. This setting supports `pi` and `pi-native` only. Native settings
 apply on the next terminal launch; explicit native CLI arguments remain available.
 
+### Pi extension providers (LunaRoute)
+
+Pi extensions installed with `pi install` (listed in the `packages` of your Pi
+`settings.json`) load in Omnigent Pi sessions. When Omnigent routes Pi through a
+managed provider, it runs Pi with a per-session agent directory and links your
+Pi `auth.json`, `models-store.json` and `lunaroute.json` into it, so extension
+providers find their login and model catalog. Logins and token refreshes written
+there update your own files.
+
+A model qualified with a Pi-extension provider, `lunaroute/<model-id>`, runs on
+your own Pi configuration instead of an Omnigent-managed provider: `pi` and
+`pi-native` pass it to Pi as `--model lunaroute/<model-id>` without a managed
+`--provider` or model prefix. Other models keep the configured provider. An
+inference binding still requires its managed provider. `LUNAROUTE_*` environment
+variables reach the `pi` harness.
+
+To use LunaRoute, run `pi install npm:@lunaroute/pi-extension` and
+`/login lunaroute` in Pi once, then select a LunaRoute model:
+
+```yaml
+spec_version: 1
+name: lunaroute-worker
+executor:
+  type: omnigent
+  model: lunaroute/glm-5.3-flash
+  config:
+    harness: pi
+```
+
+The polly example includes this setup as the `pi-lunaroute` worker.
+
 ### GitHub Copilot
 
 `harness: copilot` runs the agent through the

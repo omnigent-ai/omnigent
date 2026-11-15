@@ -90,7 +90,7 @@ def test_prepare_managed_pi_agent_dir_deep_merges_nested_overlay(tmp_path: Path)
 
 
 def test_prepare_managed_pi_agent_dir_links_only_supported_resources(tmp_path: Path) -> None:
-    """Supported resources and context files are linked; prompts and session state are not."""
+    """Supported resources, context files and user Pi state are linked; prompts are not."""
     global_agent = tmp_path / "global-agent"
     for directory in (
         "npm",
@@ -107,6 +107,8 @@ def test_prepare_managed_pi_agent_dir_links_only_supported_resources(tmp_path: P
         "mcp-auth.json",
         "keybindings.json",
         "auth.json",
+        "models-store.json",
+        "lunaroute.json",
         "models.json",
         "AGENTS.override.md",
         "AGENTS.md",
@@ -130,6 +132,9 @@ def test_prepare_managed_pi_agent_dir_links_only_supported_resources(tmp_path: P
         "prompts",
         "themes",
         "keybindings.json",
+        "auth.json",
+        "models-store.json",
+        "lunaroute.json",
         "AGENTS.override.md",
         "AGENTS.md",
         "CLAUDE.md",
@@ -137,13 +142,37 @@ def test_prepare_managed_pi_agent_dir_links_only_supported_resources(tmp_path: P
         assert (managed / name).readlink() == global_agent / name
     for name in (
         "sessions",
-        "auth.json",
         "models.json",
         "SYSTEM.md",
         "APPEND_SYSTEM.md",
     ):
         assert not (managed / name).exists(), name
     assert not (managed / "settings.json").is_symlink()
+
+
+def test_user_pi_state_is_linked_writable_and_never_clobbers_managed_files(
+    tmp_path: Path,
+) -> None:
+    """Logins persist through the link; absent sources and managed files are left alone."""
+    global_agent = tmp_path / "global-agent"
+    global_agent.mkdir()
+    (global_agent / "auth.json").write_text('{"example": {}}', encoding="utf-8")
+    (global_agent / "models-store.json").write_text("{}", encoding="utf-8")
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    managed_store = managed / "models-store.json"
+    managed_store.write_text('{"managed": {}}', encoding="utf-8")
+
+    prepare_managed_pi_agent_dir(managed, global_agent_dir=global_agent)
+
+    assert (managed / "auth.json").readlink() == global_agent / "auth.json"
+    # A login written by the managed Pi lands in the user's own file.
+    (managed / "auth.json").write_text('{"refreshed": {}}', encoding="utf-8")
+    assert (global_agent / "auth.json").read_text(encoding="utf-8") == '{"refreshed": {}}'
+    assert not managed_store.is_symlink()
+    assert managed_store.read_text(encoding="utf-8") == '{"managed": {}}'
+    assert not (managed / "lunaroute.json").exists()
+    assert not (managed / "lunaroute.json").is_symlink()
 
 
 def test_prepare_managed_pi_agent_dir_replaces_stale_links_on_reuse(tmp_path: Path) -> None:

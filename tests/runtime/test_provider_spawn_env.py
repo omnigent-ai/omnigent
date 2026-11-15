@@ -1007,6 +1007,22 @@ def test_pi_uses_anthropic_global_default(config_home: Path) -> None:
     assert env["HARNESS_PI_MODEL"] == "claude-default-model"
 
 
+@pytest.mark.parametrize(
+    ("model", "uses_gateway"),
+    [("lunaroute/glm-5.3-flash", False), ("claude-picked-model", True)],
+)
+def test_pi_extension_model_skips_global_default_provider(
+    config_home: Path, model: str, uses_gateway: bool
+) -> None:
+    """A ``lunaroute/<id>`` model keeps Pi on its own config; other models keep the gateway."""
+    _write_config(config_home, _anthropic_default_config())
+
+    env = _build_pi_spawn_env(_make_spec(harness="pi", model=model), workdir=None)
+
+    assert env["HARNESS_PI_MODEL"] == model
+    assert any(name.startswith("HARNESS_PI_GATEWAY") for name in env) is uses_gateway
+
+
 def test_pi_gateway_routing_log_reports_the_resolved_base_url(
     config_home: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

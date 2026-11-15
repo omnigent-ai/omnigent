@@ -865,6 +865,67 @@ def test_resolve_prefers_pi_own_login_for_served_reference(
     assert provider is None
 
 
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("lunaroute/glm-5.3-flash", True),
+        ("lunaroute/", False),
+        ("lunaroute", False),
+        ("openai/gpt-4o-mini", False),
+        ("omnigent/glm-5.3", False),
+        (None, False),
+    ],
+)
+def test_is_pi_extension_provider_model(model: str | None, expected: bool) -> None:
+    assert creds.is_pi_extension_provider_model(model) is expected
+
+
+def test_resolve_leaves_pi_extension_model_on_pi_own_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A LunaRoute model is not wrapped in ``--provider omnigent``, even before login."""
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+
+    provider = creds.resolve_pi_native_provider(
+        model="lunaroute/glm-5.3-flash", config_loader=_openrouter_default_pi_config
+    )
+
+    assert provider is None
+    assert creds.pi_own_login_model_arg("lunaroute/glm-5.3-flash") == "lunaroute/glm-5.3-flash"
+
+
+def test_provider_launch_seeds_bridge_agent_dir_with_user_pi_state(tmp_path: Path) -> None:
+    """The managed bridge dir loads the user's packages and links their Pi logins."""
+    global_agent = tmp_path / "global-agent"
+    global_agent.mkdir()
+    (global_agent / "settings.json").write_text(
+        json.dumps({"packages": ["npm:@example/pi-extension"]})
+    )
+    (global_agent / "auth.json").write_text("{}")
+    (global_agent / "models-store.json").write_text("{}")
+    (global_agent / "models.json").write_text('{"providers": {}}')
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://api.anthropic.com",
+        api="anthropic-messages",
+        model="claude-sonnet-4-6",
+        api_key="sk-secret",
+        auth_header=False,
+    )
+    agent_dir = tmp_path / "bridge" / "pi-agent"
+
+    creds.pi_native_provider_launch(agent_dir, provider, global_agent_dir=global_agent)
+
+    settings = json.loads((agent_dir / "settings.json").read_text())
+    assert settings["packages"] == ["npm:@example/pi-extension"]
+    for name in ("auth.json", "models-store.json"):
+        assert (agent_dir / name).readlink() == global_agent / name
+    assert not (agent_dir / "lunaroute.json").exists()
+    models_path = agent_dir / "models.json"
+    assert not models_path.is_symlink()
+    assert "omnigent" in json.loads(models_path.read_text())["providers"]
+
+
 def test_resolve_keeps_gateway_routing_for_unserved_slash_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

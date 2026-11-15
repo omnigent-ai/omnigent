@@ -895,6 +895,124 @@ def test_ensure_rpc_launch_selector_matches_registration(base_urls, model, expec
     assert seen["model"] == f"{expected_provider}/{model}"
 
 
+@pytest.mark.parametrize(
+    ("model", "expected_selector", "uses_gateway"),
+    [
+        ("lunaroute/glm-5.3-flash", "lunaroute/glm-5.3-flash", False),
+        ("databricks-gpt-5-5", "databricks-openai/databricks-gpt-5-5", True),
+    ],
+    ids=["pi-extension-model", "gateway-model"],
+)
+def test_ensure_rpc_passes_pi_extension_models_through(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    expected_selector: str,
+    uses_gateway: bool,
+) -> None:
+    """A gateway executor launches ``lunaroute/<id>`` on Pi's own config, unprefixed.
+
+    Drives the real ``_ensure_rpc`` and ``_build_env_and_dir`` with only the
+    subprocess spawn and tool server stubbed.
+    """
+    user_agent_dir = tmp_path / "user-pi-agent"
+    user_agent_dir.mkdir()
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(user_agent_dir))
+    host = "https://workspace.example.com"
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch("omnigent.inner.pi_executor._fetch_shell_command_token", return_value="tok"),
+    ):
+        executor = PiExecutor(
+            cwd=str(tmp_path / "workspace"),
+            gateway=True,
+            gateway_host=host,
+            base_urls_override={"claude": f"{host}/ai-gateway/anthropic"},
+            gateway_auth_command="printf tok",
+        )
+    executor._tool_server = SimpleNamespace(token="bridge-token")
+    seen: dict[str, object] = {}
+
+    async def fake_start(self, pi_path, **kwargs):
+        seen.update(kwargs)
+
+    load_wire_apis = AsyncMock(return_value={})
+
+    async def _test():
+        with (
+            patch.object(_PiRpcSession, "start", fake_start),
+            patch.object(executor, "_load_gateway_model_wire_apis", load_wire_apis),
+            patch.object(executor, "_ensure_tool_server", AsyncMock(return_value=12345)),
+        ):
+            return await executor._ensure_rpc("session", "system", model, [])
+
+    rpc = _run(_test())
+    try:
+        assert seen["model"] == expected_selector
+        env = seen["env"]
+        assert isinstance(env, dict)
+        managed_dir = env.get("PI_CODING_AGENT_DIR")
+        if uses_gateway:
+            assert managed_dir == rpc._tmp_dir
+            assert (Path(rpc._tmp_dir) / "models.json").exists()
+            load_wire_apis.assert_awaited_once()
+        else:
+            # Pi keeps the user's own agent dir: settings, logins and extensions.
+            assert managed_dir == str(user_agent_dir)
+            assert not (Path(rpc._tmp_dir) / "models.json").exists()
+            load_wire_apis.assert_not_awaited()
+    finally:
+        shutil.rmtree(rpc._tmp_dir, ignore_errors=True)
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_error"),
+    [
+        ("lunaroute/glm-5.3-flash", "Failed to start Pi: spawn stub"),
+        ("databricks-gpt-5-5", "gateway unavailable"),
+    ],
+)
+def test_run_turn_skips_gateway_auth_for_pi_extension_models(
+    model: str, expected_error: str
+) -> None:
+    """Only gateway-routed turns need the gateway credential."""
+    host = "https://workspace.example.com"
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch("omnigent.inner.pi_executor._fetch_shell_command_token", return_value="tok"),
+    ):
+        executor = PiExecutor(
+            gateway=True,
+            gateway_host=host,
+            base_urls_override={"claude": f"{host}/ai-gateway/anthropic"},
+            gateway_auth_command="printf tok",
+        )
+
+    async def _test():
+        with (
+            patch.object(
+                executor,
+                "_get_gateway_token",
+                AsyncMock(side_effect=OSError("gateway unavailable")),
+            ),
+            patch.object(
+                executor, "_ensure_rpc", AsyncMock(side_effect=RuntimeError("spawn stub"))
+            ),
+        ):
+            return [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": "hi"}], [], "system", ExecutorConfig(model=model)
+                )
+            ]
+
+    events = _run(_test())
+
+    assert [event.message for event in events if isinstance(event, ExecutorError)] == [
+        expected_error
+    ]
+
+
 class TestGenerateExtensionJs(unittest.TestCase):
     def test_contains_tool_names(self):
         schemas = [
@@ -5066,6 +5184,21 @@ def test_clean_pi_env_passes_pi_and_proxy_config(monkeypatch) -> None:
     assert env.get("PI_SKIP_VERSION_CHECK") == "1"
     assert env.get("HTTPS_PROXY") == "http://proxy:8080"
     assert env.get("NODE_EXTRA_CA_CERTS") == "/etc/ssl/corp-ca.pem"
+
+
+def test_clean_pi_env_passes_pi_extension_provider_settings(monkeypatch) -> None:
+    """``LUNAROUTE_*`` settings reach the LunaRoute Pi extension; other vendors stay out."""
+    from omnigent.inner.pi_executor import _clean_pi_env
+
+    monkeypatch.setenv("LUNAROUTE_ROUTING_URL", "https://gw.example.com/v1")
+    monkeypatch.setenv("LUNAROUTE_WEB_TOOLS", "off")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-synthetic")
+
+    env = _clean_pi_env()
+
+    assert env.get("LUNAROUTE_ROUTING_URL") == "https://gw.example.com/v1"
+    assert env.get("LUNAROUTE_WEB_TOOLS") == "off"
+    assert "OPENROUTER_API_KEY" not in env
 
 
 def test_clean_pi_env_includes_omnigent_session_marker(monkeypatch) -> None:

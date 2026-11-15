@@ -24,8 +24,12 @@ DEFAULT_PI_AGENT_DIR = Path.home() / ".pi" / "agent"
 _PI_RESOURCE_TYPES = ("extensions", "skills", "prompts", "themes")
 # Pi loads the first of these per directory unless ``--no-context-files`` is set.
 PI_CONTEXT_FILE_NAMES = ("AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD")
+# User Pi state linked (never copied) so ``/login`` and OAuth refreshes persist:
+# provider logins, Pi's cached model catalogs, and Pi-extension settings files.
+PI_USER_STATE_FILE_NAMES = ("auth.json", "models-store.json", "lunaroute.json")
 _PI_AGENT_RESOURCES = (
     *_PI_RESOURCE_TYPES,
+    *PI_USER_STATE_FILE_NAMES,
     *PI_CONTEXT_FILE_NAMES,
     "npm",
     "git",
@@ -148,8 +152,11 @@ def prepare_managed_pi_agent_dir(
     through a managed ``mcp.json`` copy when the user's file lacks them (see
     :func:`omnigent.inner.pi_mcp.sync_managed_pi_mcp_config`).
     Global context files (``AGENTS.md`` et al.) are linked so Pi applies them
-    unless ``--no-context-files`` is set; ``SYSTEM.md``, ``APPEND_SYSTEM.md``
-    and model credentials are not linked.
+    unless ``--no-context-files`` is set; ``SYSTEM.md`` and ``APPEND_SYSTEM.md``
+    are not linked. The user's Pi logins and extension state
+    (:data:`PI_USER_STATE_FILE_NAMES`) are linked so extension providers such
+    as LunaRoute find their key and model catalog; a file the managed dir
+    already owns (e.g. ``models.json``) is never replaced.
 
     Project-scoped ``.pi/settings.json`` at the session cwd is still read by
     Pi at runtime and overrides these global settings per Pi's normal rules.

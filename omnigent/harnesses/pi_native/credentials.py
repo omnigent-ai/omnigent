@@ -122,6 +122,11 @@ _SURFACE_PROVIDER_IDS: dict[DatabricksPiSurface, str] = {
 }
 
 _PI_MANAGED_PROVIDER_IDS = frozenset({_PI_PROVIDER_ID, *_SURFACE_PROVIDER_IDS.values()})
+
+# Pi providers registered by Pi extensions (``pi install``) that authenticate
+# from the user's own Pi agent dir. A ``<provider>/<model>`` selection naming
+# one runs on Pi's own configuration instead of an Omnigent-managed provider.
+PI_EXTENSION_PROVIDER_IDS = frozenset({"lunaroute"})
 # Databricks Unity Gateway Anthropic Messages surface. Pi speaks this protocol
 # natively (``api: anthropic-messages``); the gateway authenticates with a
 # workspace bearer token, so we set ``authHeader`` (Authorization: Bearer).
@@ -155,6 +160,19 @@ def _split_pi_native_model_selection(selection: str | None) -> tuple[str, str] |
     if separator and provider_id in _PI_MANAGED_PROVIDER_IDS and model_id:
         return provider_id, model_id
     return None
+
+
+def is_pi_extension_provider_model(model: str | None) -> bool:
+    """Return whether *model* is ``provider/id`` for a Pi-extension provider.
+
+    :param model: Model selection, e.g. ``"lunaroute/glm-5.3-flash"``.
+    :returns: ``True`` when the provider is in :data:`PI_EXTENSION_PROVIDER_IDS`
+        and a model id follows it.
+    """
+    if not model:
+        return False
+    provider_id, separator, model_id = model.partition("/")
+    return bool(separator and model_id) and provider_id in PI_EXTENSION_PROVIDER_IDS
 
 
 class _PiProviderCompat(TypedDict, total=False):
@@ -1787,6 +1805,13 @@ def resolve_pi_native_provider(
         )
     try:
         # Preserve Pi-login references unless they name a configured provider.
+        if bare and not names_configured_provider and is_pi_extension_provider_model(model):
+            _LOGGER.info(
+                "pi-native: model %r is served by a Pi extension provider; Pi will use its "
+                "own configuration.",
+                model,
+            )
+            return None
         if bare and not names_configured_provider and pi_own_login_serves_reference(model):
             # Warn: the same id could also be served by the configured default
             # provider, so this routes credentials/billing by host login state.

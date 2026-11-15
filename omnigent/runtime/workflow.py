@@ -1678,9 +1678,11 @@ def _build_pi_spawn_env(
     """
     env: dict[str, str] = {}
     model = _resolve_bound_launch_model(spec, "pi")
+    from omnigent.harnesses.pi_native.credentials import is_pi_extension_provider_model
     from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
 
-    if binding_for_harness(load_runtime_inference_config(), "pi") is not None:
+    bound = binding_for_harness(load_runtime_inference_config(), "pi") is not None
+    if bound:
         env["HARNESS_PI_PRESERVE_MODEL_IDS"] = "true"
     if model is not None:
         env["HARNESS_PI_MODEL"] = model
@@ -1688,9 +1690,15 @@ def _build_pi_spawn_env(
     # Generic-provider branch (slotted ahead of the legacy-profile /
     # databricks-prefix path): a ProviderAuth on the spec, or — when the spec
     # declares no auth — the per-family global default. pi consumes both
-    # families (see :func:`_apply_provider_to_pi`). Otherwise the existing
-    # path is unchanged.
-    provider = _resolve_provider_for_build(spec, harness_type="pi", for_launch=True)
+    # families (see :func:`_apply_provider_to_pi`). A Pi-extension model
+    # (``lunaroute/<id>``) keeps Pi on its own configuration unless an
+    # inference binding requires a managed provider.
+    native_provider = not bound and is_pi_extension_provider_model(model)
+    provider = (
+        None
+        if native_provider
+        else _resolve_provider_for_build(spec, harness_type="pi", for_launch=True)
+    )
     if provider is not None:
         configure_agent_harness_with_provider(env, provider, harness_type="pi")
         if "HARNESS_PI_PRESERVE_MODEL_IDS" in env and provider.family(OPENAI_FAMILY) is not None:

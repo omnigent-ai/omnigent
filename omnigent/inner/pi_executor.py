@@ -63,6 +63,7 @@ from omnigent.harnesses.pi_native.credentials import (
     _databricks_workspace_url_for_gateway,
     _is_databricks_ai_gateway_url,
     global_pi_agent_dir,
+    is_pi_extension_provider_model,
 )
 from omnigent.inner.agent_env import clean_agent_env
 from omnigent.inner.native_attachments import parse_data_uri
@@ -767,10 +768,12 @@ def _find_pi_cli() -> str | None:
 # Prefix-matched env var names allowed into the Pi subprocess. Only
 # known-safe categories pass: Pi's own config knobs, proxy settings,
 # TLS trust overrides, Node.js runtime knobs (Pi is a Node CLI), and
-# locale. Credential families (``DATABRICKS_*``, ``AWS_*``, LLM
+# locale, and Pi-extension provider settings (``LUNAROUTE_*`` endpoint and
+# feature switches). Credential families (``DATABRICKS_*``, ``AWS_*``, LLM
 # provider API keys, ...) deliberately do NOT match.
 _PI_ENV_ALLOW_PREFIXES: tuple[str, ...] = (
     "PI_",
+    "LUNAROUTE_",
     "HTTP_",
     "HTTPS_",
     "ALL_PROXY",
@@ -2535,6 +2538,14 @@ class PiExecutor(Executor):
             model = re.sub(r"\[.*?\]$", "", model)
         return model
 
+    def _uses_gateway(self, model: str | None) -> bool:
+        """Return whether a turn on *model* routes through the gateway providers.
+
+        A Pi-extension model (``lunaroute/<id>``) runs on the user's own Pi
+        configuration, so it skips the gateway even when one is configured.
+        """
+        return self._gateway and not is_pi_extension_provider_model(model)
+
     def _generic_openai_wire_api(self) -> str | None:
         """Return the configured wire only for a non-Databricks gateway."""
         openai_base_url = (self._base_urls_override or {}).get("openai")
@@ -2725,6 +2736,8 @@ class PiExecutor(Executor):
         tool_server_port: int | None,
         tool_server_token: str | None,
         models_json: _PiModelsConfig | None,
+        *,
+        gateway: bool | None = None,
     ) -> PiSubprocessConfig:
         """Build env dict, temp dir, and extra CLI args for a Pi subprocess.
 
@@ -2737,8 +2750,11 @@ class PiExecutor(Executor):
             *tool_server_port* is.
         :param models_json: Provider configuration resolved off-loop before
             allocating session files; ``None`` for Pi-owned configuration.
+        :param gateway: Whether this subprocess uses the gateway providers;
+            ``None`` uses the executor's configuration.
         """
-        if self._gateway and models_json is None:
+        use_gateway = self._gateway if gateway is None else gateway
+        if use_gateway and models_json is None:
             raise ValueError("Gateway provider configuration must be resolved before startup")
         env = dict(self._env)
         tmp_parent = None
@@ -2748,7 +2764,7 @@ class PiExecutor(Executor):
         tmp_dir = tempfile.mkdtemp(prefix="omnigent_pi_", dir=tmp_parent)
         extra_args: list[str] = list(self._extra_args)
 
-        if self._gateway:
+        if use_gateway:
             assert tool_server_port is not None and tool_server_token is not None
             assert models_json is not None
             auth_client = _write_gateway_auth_client(tmp_dir, tool_server_port, tool_server_token)
@@ -2781,7 +2797,7 @@ class PiExecutor(Executor):
         # path, merge the retry block into ``<cwd>/.pi/settings.json``.
         # Gateway runs apply retry via :func:`prepare_managed_pi_agent_dir`
         # into the managed agent dir instead.
-        if not self._gateway:
+        if not use_gateway:
             retry_settings = self._retry_policy.pi.settings()
             settings_dir_root = self._cwd or tmp_dir
             settings_path = os.path.join(settings_dir_root, ".pi", "settings.json")
@@ -3023,9 +3039,10 @@ class PiExecutor(Executor):
         ):
             return state.rpc
 
-        wire_catalog = await self._load_gateway_model_wire_apis()
+        gateway = self._uses_gateway(effective_model)
+        wire_catalog = await self._load_gateway_model_wire_apis() if gateway else {}
         models_json = None
-        if self._gateway:
+        if gateway:
             models_json = await run_sync_on_thread(
                 _build_models_json,
                 self._gateway_workspace_url or self._databricks_host,
@@ -3043,7 +3060,7 @@ class PiExecutor(Executor):
         tool_server_port = await self._ensure_tool_server(tools)
         tool_server_token = self._tool_server.token if self._tool_server is not None else None
         subprocess_config = self._build_env_and_dir(
-            tools, tool_server_port, tool_server_token, models_json
+            tools, tool_server_port, tool_server_token, models_json, gateway=gateway
         )
         env = subprocess_config.env
         tmp_dir = subprocess_config.tmp_dir
@@ -3055,7 +3072,7 @@ class PiExecutor(Executor):
         # For Databricks models, prefix with the provider name so Pi resolves
         # the model from our custom provider in models.json.
         pi_model: str | None
-        if self._gateway and effective_model:
+        if gateway and effective_model:
             provider = _pi_provider_for_model(
                 effective_model,
                 wire_catalog.get(effective_model.lower()),
@@ -3090,14 +3107,14 @@ class PiExecutor(Executor):
         system_prompt: str,
         config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
-        if self._gateway:
+        model = await self._resolve_model(config)
+        if self._uses_gateway(model):
             try:
                 await self._get_gateway_token(before_turn=True)
             except OSError as exc:
                 yield ExecutorError(message=str(exc), retryable=False)
                 return
         session_key = self._session_key(messages)
-        model = await self._resolve_model(config)
         try:
             thinking = _pi_thinking_from_config(config)
         except ValueError as exc:

@@ -3,9 +3,9 @@
 polly is the standalone multi-agent coding orchestrator (successor to the
 deleted nessie example, whose deep structural pins were folded in here).
 Loads the bundle and asserts the distinctive wiring stays intact: the
-claude-sdk orchestrator brain, the seven cross-vendor coding sub-agents
-(claude_code / codex / opencode / cursor / hermes / agy / pi, which implement,
-review, and explore),
+claude-sdk orchestrator brain, the eight cross-vendor coding sub-agents
+(claude_code / codex / opencode / cursor / hermes / agy / pi / pi-lunaroute,
+which implement, review, and explore),
 the three spine skills, and the bounds/blast-radius guardrails. Pure spec-load
 — no LLM, no credentials.
 
@@ -69,11 +69,12 @@ def test_orchestrator_executor(polly_spec: AgentSpec) -> None:
 
 def test_coding_subagents(polly_spec: AgentSpec) -> None:
     """
-    The bundle has exactly seven coding sub-agents: ``claude_code`` (claude-native),
+    The bundle has exactly eight coding sub-agents: ``claude_code`` (claude-native),
     ``codex`` (codex-native), ``opencode`` (opencode-native), ``cursor``
     (cursor-native), ``hermes`` (hermes-native), and ``agy`` (antigravity-native)
     on the native terminal harnesses, plus ``pi`` (pi) as the headless
-    multi-model worker. All implement, review, and explore. The native
+    multi-model worker and ``pi-lunaroute`` (pi on LunaRoute models). All
+    implement, review, and explore. The native
     harnesses render terminal-first (Chat / Terminal pill) so the human can
     watch or take over.
 
@@ -89,6 +90,7 @@ def test_coding_subagents(polly_spec: AgentSpec) -> None:
         "hermes",
         "opencode",
         "pi",
+        "pi-lunaroute",
     ]
     assert fam["claude_code"] == "claude-native"
     assert fam["codex"] == "codex-native"
@@ -97,7 +99,8 @@ def test_coding_subagents(polly_spec: AgentSpec) -> None:
     assert fam["hermes"] == "hermes-native"
     assert fam["agy"] == "antigravity-native"
     assert fam["pi"] == "pi"
-    # Seven distinct vendors → any implementer's diff is reviewable by another.
+    assert fam["pi-lunaroute"] == "pi"
+    # Seven distinct harnesses → any implementer's diff is reviewable by another.
     assert len(set(fam.values())) == 7
     # Headless bypass knobs so workers don't stall on ApprovalCards.
     by_name = {a.name: a for a in polly_spec.sub_agents}
@@ -106,7 +109,16 @@ def test_coding_subagents(polly_spec: AgentSpec) -> None:
     assert by_name["codex"].executor.config.get("yolo") in (True, "True", "true")
     assert by_name["cursor"].executor.config.get("yolo") in (True, "True", "true")
     assert by_name["cursor"].executor.model == "grok-4.5"
-    for name in ("claude_code", "codex", "opencode", "cursor", "hermes", "agy", "pi"):
+    for name in (
+        "claude_code",
+        "codex",
+        "opencode",
+        "cursor",
+        "hermes",
+        "agy",
+        "pi",
+        "pi-lunaroute",
+    ):
         prompt = (_POLLY_BUNDLE / "agents" / name / "config.yaml").read_text(encoding="utf-8")
         assert "IMPLEMENT — write real product code" in prompt
         assert "REVIEW — verify another agent's diff" in prompt
@@ -141,6 +153,20 @@ def test_pi_subagent_is_headless_scaffold_worker(polly_spec: AgentSpec) -> None:
     assert pi.executor.config.get("yolo") is None
     assert pi.os_env is not None
     assert pi.os_env.type == "caller_process"
+
+
+def test_pi_lunaroute_subagent_runs_on_lunaroute_model(polly_spec: AgentSpec) -> None:
+    """``pi-lunaroute`` is the pi worker pinned to a LunaRoute Pi-extension model."""
+    from omnigent.harnesses.pi_native.credentials import is_pi_extension_provider_model
+
+    worker = next(a for a in polly_spec.sub_agents if a.name == "pi-lunaroute")
+    assert worker.executor.config.get("harness") == "pi"
+    assert worker.executor.model == "lunaroute/glm-5.3-flash"
+    assert is_pi_extension_provider_model(worker.executor.model)
+    assert worker.os_env is not None
+    assert worker.os_env.type == "caller_process"
+    config = " ".join((_POLLY_BUNDLE / "config.yaml").read_text(encoding="utf-8").split())
+    assert "`pi` -> `pi`, and `pi-lunaroute` -> `pi`" in config
 
 
 def test_spine_skills_present(polly_spec: AgentSpec) -> None:
@@ -251,7 +277,16 @@ def test_polly_test_count_ground_truth_guidance() -> None:
     assert "miscount`, `over-report`, or `fabrication`" in config_compact
     assert "exact file set/command/commit" in cross_review_compact
 
-    for name in ("claude_code", "codex", "opencode", "cursor", "hermes", "agy", "pi"):
+    for name in (
+        "claude_code",
+        "codex",
+        "opencode",
+        "cursor",
+        "hermes",
+        "agy",
+        "pi",
+        "pi-lunaroute",
+    ):
         worker = (_POLLY_BUNDLE / "agents" / name / "config.yaml").read_text(encoding="utf-8")
         worker_compact = " ".join(worker.split())
         assert "When you report test results, include the exact command and file set" in (
@@ -355,8 +390,9 @@ def test_investigation_skill_delegates_read_only_work() -> None:
     assert "Use for any read-only task: investigation, debugging, audit" in compact
     assert (
         "Dispatch each task to `claude_code`, `codex`, `opencode`, `cursor`, `hermes`, "
-        "`agy`, or `pi`: "
-        '`sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"agy"|"pi", '
+        "`agy`, `pi`, or `pi-lunaroute`: "
+        '`sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"agy"|"pi"'
+        '|"pi-lunaroute", '
         'title="explore-<task_slug>", '
         'args={purpose: "explore", input: "<question + exact scope + evidence requested>"})`'
     ) in compact
@@ -428,7 +464,16 @@ def test_orchestrator_guardrails(polly_spec: AgentSpec) -> None:
 def test_subagent_guardrails(polly_spec: AgentSpec) -> None:
     """Each sub-agent carries the blast_radius gate (push/destructive)."""
     by_name = {a.name: a for a in polly_spec.sub_agents}
-    for name in ("claude_code", "codex", "opencode", "cursor", "hermes", "agy", "pi"):
+    for name in (
+        "claude_code",
+        "codex",
+        "opencode",
+        "cursor",
+        "hermes",
+        "agy",
+        "pi",
+        "pi-lunaroute",
+    ):
         guardrails = by_name[name].guardrails
         assert guardrails is not None, name
         assert [p.name for p in guardrails.policies] == ["blast_radius"], name
@@ -461,6 +506,6 @@ def test_function_policies_have_nonempty_arguments(polly_spec: AgentSpec) -> Non
             )
             checked += 1
     # orchestrator: blast_radius + spawn_bounds + headless_subagent_purpose_guard
-    # = 3; sub-agents: blast_radius x7 (claude_code, codex, opencode, cursor,
-    # hermes, agy, pi) = 7 -> 10 total. Fewer = a policy dropped.
-    assert checked == 10, f"expected 10 function policies in the bundle, inspected {checked}"
+    # = 3; sub-agents: blast_radius x8 (claude_code, codex, opencode, cursor,
+    # hermes, agy, pi, pi-lunaroute) = 8 -> 11 total. Fewer = a policy dropped.
+    assert checked == 11, f"expected 11 function policies in the bundle, inspected {checked}"
