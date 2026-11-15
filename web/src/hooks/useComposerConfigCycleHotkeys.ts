@@ -72,13 +72,17 @@ export function useComposerConfigCycleHotkeys(
       )
         return;
       // Ctrl on macOS too: Cmd+Alt+M minimizes every window.
-      const section = matchesShortcut(event, "model.cycle")
-        ? "models"
-        : matchesShortcut(event, "effort.cycle")
-          ? "efforts"
-          : undefined;
-      if (section === undefined) return;
-      const choices = section === "models" ? latest.current.models : latest.current.efforts;
+      let section: "models" | "efforts";
+      let choices: readonly ComposerConfigChoice[] | undefined;
+      if (matchesShortcut(event, "model.cycle")) {
+        section = "models";
+        choices = latest.current.models;
+      } else if (matchesShortcut(event, "effort.cycle")) {
+        section = "efforts";
+        choices = latest.current.efforts;
+      } else {
+        return;
+      }
       if (!choices?.length) return;
       const embedRoot = getEmbedRoot();
       if (isEmbedded && (!embedRoot || !event.composedPath().includes(embedRoot))) return;

@@ -175,7 +175,7 @@ const BINDINGS = {
     label: "Toggle voice dictation",
     chords: () => [{ mod: true, alt: true, code: "KeyV" }],
   },
-  // These two never checked for AltGr and compared the key exactly.
+  // Approval chords allow AltGr and compare the key exactly, as they always have.
   "approval.accept": {
     label: "Accept approval prompt",
     chords: () => [{ mod: true, key: "Enter", exactKey: true, matchesAltGraph: true }],

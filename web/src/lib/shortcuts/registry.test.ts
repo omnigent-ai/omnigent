@@ -344,11 +344,23 @@ describe("Chat and Pane bindings", () => {
     const dictation = press({ key: "√", code: "KeyV", metaKey: true, altKey: true });
     expect(matchesShortcut(dictation, "dictation.toggle", mac)).toBe(true);
     expect(matchesShortcut(dictation, "dictation.toggle", other)).toBe(false);
+    const ctrlAltV = { key: "v", code: "KeyV", ctrlKey: true, altKey: true };
+    expect(matchesShortcut(press(ctrlAltV), "dictation.toggle", other)).toBe(true);
+    // AltGr reports as Ctrl+Alt, so AltGr+V types a character instead.
+    expect(matchesShortcut(press({ ...ctrlAltV, altGraph: true }), "dictation.toggle", other)).toBe(
+      false,
+    );
   });
 
   it("accepts with ⌘↵ and declines with a bare Esc, comparing the key exactly", () => {
     expect(matchesShortcut(press({ key: "Enter", metaKey: true }), "approval.accept", mac)).toBe(
       true,
+    );
+    expect(matchesShortcut(press({ key: "Enter", ctrlKey: true }), "approval.accept", other)).toBe(
+      true,
+    );
+    expect(matchesShortcut(press({ key: "Enter", ctrlKey: true }), "approval.accept", mac)).toBe(
+      false,
     );
     expect(matchesShortcut(press({ key: "enter", metaKey: true }), "approval.accept", mac)).toBe(
       false,
