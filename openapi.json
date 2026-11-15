@@ -7998,6 +7998,12 @@
             "title": "Session List Scoped Archives",
             "type": "boolean"
           },
+          "session_message_max_chars": {
+            "default": 32000,
+            "format": "int64",
+            "title": "Session Message Max Chars",
+            "type": "integer"
+          },
           "session_move_source_checks": {
             "default": false,
             "title": "Session Move Source Checks",
