@@ -472,7 +472,7 @@ function WorkflowRunRow({
   const canAct = run.isCurrent && !run.archived;
   const control = canAct ? planRunControl(progress, run.statuses, sessionWorking) : null;
   const refreshKeys = [["workflow-runs", workflowId]];
-  const taskMenus = useRunTaskMenus(canAct ? run.sessionId : null, refreshKeys);
+  const taskMenus = useRunTaskMenus(canAct ? run.sessionId : null, refreshKeys, run.id);
   const [graphOpen, setGraphOpen] = useState(false);
   const sessionPath = `/c/${encodeURIComponent(run.sessionId)}`;
   const title = run.title || "Untitled session";
@@ -520,6 +520,7 @@ function WorkflowRunRow({
         {control && (
           <RunPlanButton
             sessionId={run.sessionId}
+            runId={run.id}
             planName={workflowName}
             control={control}
             refreshKeys={refreshKeys}

@@ -568,6 +568,7 @@ describe("WorkflowDetailPage", () => {
       expect(sendUserMessage).toHaveBeenCalledWith(
         session,
         taskActionMessage("retry", "Fix the test"),
+        `plan-${session}`,
       ),
     );
     await waitFor(() => expect(screen.queryByTestId("tasks-progress-card")).toBeNull());
@@ -626,6 +627,7 @@ describe("WorkflowDetailPage", () => {
       expect(sendUserMessage).toHaveBeenCalledWith(
         session,
         expect.stringContaining('continue the task "Fix the test"'),
+        `plan-${session}`,
       ),
     );
     expect(navigate).not.toHaveBeenCalled();

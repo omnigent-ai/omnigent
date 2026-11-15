@@ -344,7 +344,9 @@ it ran.
   `name` (an exact name).
 - `POST /v1/workflows`: `name` (one line of at most 80 characters, unique among
   the caller's workflows; 409 otherwise), `description` (at most 2,000
-  characters) and `steps`.
+  characters and 2,000 stored bytes, including compression/encryption framing)
+  and `steps`. Text within the character limit can exceed the stored-byte limit;
+  the server rejects it without saving and reports the stored size and limit.
 - `GET /v1/workflows/{id}`: one workflow, with its steps. Another user's
   workflow is 404.
 - `PATCH /v1/workflows/{id}`: any of `name`, `description` and `steps`; fields

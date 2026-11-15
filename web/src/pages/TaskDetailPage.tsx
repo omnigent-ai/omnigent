@@ -720,14 +720,20 @@ function RunRow({
     : null;
   // Stop while the run's session works; play once it stopped with tasks left.
   const control =
-    showTasks && steps?.isCurrent ? planRunControl(progress, steps.statuses, sessionWorking) : null;
+    showTasks && steps?.isCurrent && steps.planId
+      ? planRunControl(progress, steps.statuses, sessionWorking)
+      : null;
   // What the run's buttons and task menus refresh once its session takes them.
   const refreshKeys = [
     scheduledTaskRunsKey(run.scheduledTaskId),
     ["scheduled-task-run-steps", run.scheduledTaskId],
   ];
   // Its tasks' ⋯ menus, on the timeline's cards and the graph's nodes.
-  const taskMenus = useRunTaskMenus(steps?.isCurrent ? sessionId : null, refreshKeys);
+  const taskMenus = useRunTaskMenus(
+    steps?.isCurrent ? sessionId : null,
+    refreshKeys,
+    steps?.planId ?? null,
+  );
   // Room on the row's link for the buttons over its right end.
   const buttonPadding = ["", "pr-11", "pr-18", "pr-25"][
     1 + (workflowId ? 1 : 0) + (control ? 1 : 0)
@@ -842,9 +848,10 @@ function RunRow({
             className="pr-3 pb-2.5 pl-10"
           />
           <div className="absolute top-1.5 right-2 z-10 flex items-center gap-0.5">
-            {control && (
+            {control && steps?.planId && (
               <RunPlanButton
                 sessionId={sessionId}
+                runId={steps.planId}
                 planName={steps?.planName ?? null}
                 control={control}
                 refreshKeys={refreshKeys}

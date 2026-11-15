@@ -2457,7 +2457,7 @@
         "description": "Request body for `POST /v1/workflows`.",
         "properties": {
           "description": {
-            "description": "What the workflow is for, at most 2,000 characters.",
+            "description": "What the workflow is for, at most 2,000 characters and 2,000 stored bytes after compression and the deployment's storage envelope.",
             "title": "Description",
             "type": "string"
           },
@@ -9077,6 +9077,20 @@
             "description": "Discriminator for the event/input kind, e.g. `\"message\"`, `\"function_call_output\"`, `\"interrupt\"`.",
             "title": "Type",
             "type": "string"
+          },
+          "workflow_run_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional plan-entry ID limiting a user message to that workflow run. A superseded run is rejected with HTTP 409.",
+            "title": "Workflow Run Id"
           }
         },
         "required": [
@@ -13012,6 +13026,19 @@
           "type": {
             "title": "Type",
             "type": "string"
+          },
+          "workflow_run_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workflow Run Id"
           }
         },
         "required": [
@@ -15111,7 +15138,7 @@
                 "type": "null"
               }
             ],
-            "description": "A new description.",
+            "description": "A new description, subject to the same character and stored-byte limits as creation.",
             "title": "Description"
           },
           "name": {

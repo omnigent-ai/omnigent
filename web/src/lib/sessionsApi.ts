@@ -1898,10 +1898,15 @@ export function stopSession(sessionId: string): Promise<PostEventResponse> {
 }
 
 /** Send *text* to a session as a plain user message, e.g. from a page other than its chat. */
-export function sendUserMessage(sessionId: string, text: string): Promise<PostEventResponse> {
+export function sendUserMessage(
+  sessionId: string,
+  text: string,
+  workflowRunId?: string,
+): Promise<PostEventResponse> {
   return postEvent(sessionId, {
     type: "message",
     data: { role: "user", content: [{ type: "input_text", text }] },
+    ...(workflowRunId ? { workflow_run_id: workflowRunId } : {}),
   });
 }
 

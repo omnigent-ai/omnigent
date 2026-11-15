@@ -1425,6 +1425,7 @@ describe("runs of a saved workflow", () => {
   const WORKFLOW_PROMPT = `/workflow Run the saved workflow "Triage" (ID ${"9".repeat(32)}).`;
   const STEPS: ScheduledTaskRunSteps = {
     runId: "run_1",
+    planId: "plan_1",
     isCurrent: true,
     workflowId: "9".repeat(32),
     planName: "Triage",

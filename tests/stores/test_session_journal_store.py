@@ -717,6 +717,10 @@ def test_an_automation_runs_start_plan_is_its_first(journal: SessionJournalStore
 
     plans = journal.run_start_plans([(RUN, SESSION), (other_run, SESSION), (RUN, OTHER)])
     assert [plan.id if plan else None for plan in plans] == [first.id, None, None]
+    assert journal.is_current_run(SESSION, first.id, RUN)
+    assert not journal.is_current_run(OTHER, first.id, RUN)
+    assert not journal.is_current_run(SESSION, MISSING, RUN)
+    assert not journal.is_current_run(SESSION, first.id, other_run)
     completed = journal.plan_step_statuses([first])
     assert {step: entry.content["status"] for step, entry in completed[0].items()} == {
         "a": "done",
@@ -725,6 +729,8 @@ def test_an_automation_runs_start_plan_is_its_first(journal: SessionJournalStore
     second = journal.append(
         SESSION, "plan", content, idempotency_key="k4", scheduled_task_run_id=other_run
     ).entry
+    assert not journal.is_current_run(SESSION, first.id, RUN)
+    assert journal.is_current_run(SESSION, second.id, other_run)
     with pytest.raises(StepNotReadyError, match="b waits on a"):
         journal.append(
             SESSION,

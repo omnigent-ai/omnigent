@@ -79,10 +79,19 @@ function status(position: number, step: string, value: string, text?: string, ru
 
 /** Shows the URL's search string, where a task's click asks the chat for its marker. */
 function SearchProbe() {
-  return <output data-testid="search">{useLocation().search}</output>;
+  const location = useLocation();
+  return (
+    <output data-testid="search" data-pathname={location.pathname}>
+      {location.search}
+    </output>
+  );
 }
 
-function renderPanel(onStartWorkflow?: () => void, onShowInChat?: () => void) {
+function renderPanel(
+  onStartWorkflow?: () => void,
+  onShowInChat?: () => void,
+  initialEntry = "/c/conv",
+) {
   return render(
     <>
       <TasksPanel
@@ -95,7 +104,7 @@ function renderPanel(onStartWorkflow?: () => void, onShowInChat?: () => void) {
     </>,
     {
       wrapper: ({ children }) => (
-        <MemoryRouter initialEntries={["/c/conv"]}>{children}</MemoryRouter>
+        <MemoryRouter initialEntries={[initialEntry]}>{children}</MemoryRouter>
       ),
     },
   );
@@ -435,31 +444,35 @@ describe("TasksPanel", () => {
     }
   });
 
-  it("takes a started task's click to its newest marker in the chat; one not started doesn't link", () => {
-    const onShowInChat = vi.fn();
-    showJournal([
-      journalPlan(0, ["deploy"], ["verify", ["deploy"]], ["video", ["verify"]]),
-      status(1, "deploy", "started"),
-      status(2, "deploy", "done", "Pod 1/1"),
-      status(3, "verify", "started"),
-    ]);
-    renderPanel(undefined, onShowInChat);
-    const [deploy, verify, video] = screen.getAllByTestId("tasks-row");
-    // A finished task goes to where it ended, a running one to its newest start.
-    for (const [row, marker] of [
-      [deploy, "journal-e2"],
-      [verify, "journal-e3"],
-    ] as const) {
-      fireEvent.click(within(row).getByTestId("tasks-row-show-in-chat"));
-      const search = new URLSearchParams(screen.getByTestId("search").textContent ?? "");
-      expect(search.get("message")).toBe(marker);
-      expect(search.get("message_request")).toBeTruthy();
-    }
-    expect(onShowInChat).toHaveBeenCalledTimes(2);
-    expect(within(video).queryByTestId("tasks-row-show-in-chat")).toBeNull();
-    // Its history opens from the chevron instead.
-    expect(within(video).getByTestId("tasks-row-history")).toBeTruthy();
-  });
+  it.each(["/c/conv", "/grid"])(
+    "takes a started task from %s to its newest chat marker; one not started doesn't link",
+    (initialEntry) => {
+      const onShowInChat = vi.fn();
+      showJournal([
+        journalPlan(0, ["deploy"], ["verify", ["deploy"]], ["video", ["verify"]]),
+        status(1, "deploy", "started"),
+        status(2, "deploy", "done", "Pod 1/1"),
+        status(3, "verify", "started"),
+      ]);
+      renderPanel(undefined, onShowInChat, initialEntry);
+      const [deploy, verify, video] = screen.getAllByTestId("tasks-row");
+      // A finished task goes to where it ended, a running one to its newest start.
+      for (const [row, marker] of [
+        [deploy, "journal-e2"],
+        [verify, "journal-e3"],
+      ] as const) {
+        fireEvent.click(within(row).getByTestId("tasks-row-show-in-chat"));
+        const search = new URLSearchParams(screen.getByTestId("search").textContent ?? "");
+        expect(search.get("message")).toBe(marker);
+        expect(search.get("message_request")).toBeTruthy();
+        expect(screen.getByTestId("search")).toHaveAttribute("data-pathname", "/c/conv");
+      }
+      expect(onShowInChat).toHaveBeenCalledTimes(2);
+      expect(within(video).queryByTestId("tasks-row-show-in-chat")).toBeNull();
+      // Its history opens from the chevron instead.
+      expect(within(video).getByTestId("tasks-row-history")).toBeTruthy();
+    },
+  );
 
   it("scrolls to and highlights the task a chat marker asks for", async () => {
     const scrollIntoView = vi.fn();

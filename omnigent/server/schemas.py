@@ -1477,6 +1477,8 @@ class SessionEventInput(BaseModel):
         tools are fixed at start time.
     :param created_by: Optional internal attribution actor for runner-
         originated events that are triggered by a prior human turn.
+    :param workflow_run_id: Optional plan-entry ID limiting a user message to
+        that workflow run. A superseded run is rejected with HTTP 409.
     """
 
     type: str
@@ -1487,6 +1489,7 @@ class SessionEventInput(BaseModel):
     model_override: str | None = None
     tools: list[dict[str, Any]] | None = None
     created_by: str | None = None
+    workflow_run_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
 
     @field_validator("data")
     @classmethod
@@ -3553,7 +3556,8 @@ class CreateWorkflowRequest(BaseModel):
 
     :param name: One line of at most 80 characters, unique among the caller's
         workflows.
-    :param description: What the workflow is for, at most 2,000 characters.
+    :param description: What the workflow is for, at most 2,000 characters and
+        2,000 stored bytes after compression and the deployment's storage envelope.
     :param steps: Empty or omitted to create a draft. Otherwise a graph with unique
         step IDs, dependencies inside it, no cycles, and at most 100 steps.
     """
@@ -3570,7 +3574,8 @@ class UpdateWorkflowRequest(BaseModel):
     Request body for ``PATCH /v1/workflows/{workflow_id}``; ``None`` keeps a field.
 
     :param name: A new name.
-    :param description: A new description.
+    :param description: A new description, subject to the same character and
+        stored-byte limits as creation.
     :param steps: New steps, replacing the old ones.
     :param planning_session_id: The private owned session for iterating on the plan.
     """

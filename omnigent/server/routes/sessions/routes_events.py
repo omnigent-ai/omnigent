@@ -1336,6 +1336,9 @@ def register_events_routes(
                 _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             ),
         )
+        from omnigent.server.session_journal import require_current_workflow_run
+
+        await require_current_workflow_run(conversation_store, session_id, body.workflow_run_id)
         native_harness = (
             await asyncio.to_thread(
                 _native_pane_harness, conv, agent_store=agent_store, agent_cache=agent_cache
@@ -1377,6 +1380,7 @@ def register_events_routes(
             conv.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY)
             if isinstance(request, Request)
             and not peer_message
+            and body.workflow_run_id is None
             and not request.headers.get(ORCHESTRATION_SOURCE_HEADER)
             and not request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER)
             and not conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY)

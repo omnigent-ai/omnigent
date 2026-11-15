@@ -1329,9 +1329,16 @@ async def test_a_workflows_runs_list_the_sessions_that_ran_it(
         assert historical["background_work_running"] is False
 
 
+@pytest.mark.parametrize("supersede_during_dispatch", [False, True])
 async def test_an_automations_runs_list_the_steps_of_their_first_plans(
-    client: httpx.AsyncClient, db_uri: str
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    supersede_during_dispatch: bool,
 ) -> None:
+    from omnigent.server.routes import sessions as sessions_mod
+    from tests.server.integration.test_sessions_harness_override import _stub_late_runner_bind
+
     tasks = SqlAlchemyScheduledTaskStore(db_uri)
     task = tasks.create(
         uuid.uuid4().hex,
@@ -1375,6 +1382,7 @@ async def test_an_automations_runs_list_the_steps_of_their_first_plans(
     assert [run["run_id"] for run in page["runs"]] == [run_ids[0]]
     (shown,) = page["runs"]
     assert shown["is_current"] is True
+    plan_id = shown["plan_id"]
     assert shown["plan_name"] == "Triage"
     assert [step["id"] for step in shown["steps"]] == ["explore", "fix"]
     assert [(s["step"], s["content"]["status"]) for s in shown["statuses"]] == [
@@ -1384,10 +1392,30 @@ async def test_an_automations_runs_list_the_steps_of_their_first_plans(
     other = await client.get(f"/v1/scheduled-tasks/{task.id}/run-steps", headers=_headers(BOB))
     assert other.status_code == 404
 
+    # Exercise dispatch through the real route while capturing the runner transport.
+    forwarded = _stub_late_runner_bind(monkeypatch)
+    action = {
+        "type": "message",
+        "data": {"role": "user", "content": [{"type": "input_text", "text": "Stop the plan"}]},
+        "workflow_run_id": plan_id,
+    }
+    events_url = f"/v1/sessions/{planned}/events"
+    current = await client.post(events_url, json=action, headers=_headers(ALICE))
+    assert current.status_code == 202, current.text
+    assert forwarded.get("posts")
+    assert (
+        SqlAlchemyConversationStore(db_uri)
+        .get_conversation(planned)
+        .labels[SCHEDULED_TASK_RUN_LABEL_KEY]
+        == run_ids[0]
+    )
+
     replan = _write("plan", {"name": "Triage", "steps": steps}, "tool:replan")
     assert (await client.post(url, json=replan, headers=_runner(planned))).status_code == 200
     runs_url = f"/v1/scheduled-tasks/{task.id}/run-steps"
     assert (await client.get(runs_url, headers=_headers(ALICE))).json()["runs"][0]["is_current"]
+    current = await client.post(events_url, json=action, headers=_headers(ALICE))
+    assert current.status_code == 202, current.text
 
     # A newer continuation supersedes the old run even before it writes a plan.
     latest = tasks.create_run(
@@ -1398,8 +1426,31 @@ async def test_an_automations_runs_list_the_steps_of_their_first_plans(
         conversation_id=planned,
         fired_at=1_762_498_804,
     )
-    SqlAlchemyConversationStore(db_uri).set_labels(
-        planned, {SCHEDULED_TASK_RUN_LABEL_KEY: latest.id}
+
+    def supersede() -> None:
+        SqlAlchemyConversationStore(db_uri).set_labels(
+            planned, {SCHEDULED_TASK_RUN_LABEL_KEY: latest.id}
+        )
+
+    if supersede_during_dispatch:
+        get_runner_client = sessions_mod._get_runner_client
+
+        async def advance_before_runner(*args, **kwargs):
+            supersede()
+            return await get_runner_client(*args, **kwargs)
+
+        monkeypatch.setattr(sessions_mod, "_get_runner_client", advance_before_runner)
+    else:
+        supersede()
+    forwarded.clear()
+    stale = await client.post(events_url, json=action, headers=_headers(ALICE))
+    assert stale.status_code == 409 and "no longer current" in stale.text
+    assert not forwarded.get("posts")
+    assert (
+        SqlAlchemyConversationStore(db_uri)
+        .get_conversation(planned)
+        .labels[SCHEDULED_TASK_RUN_LABEL_KEY]
+        == latest.id
     )
     assert not (await client.get(runs_url, headers=_headers(ALICE))).json()["runs"][0][
         "is_current"

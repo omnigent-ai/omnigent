@@ -30,6 +30,7 @@ function renderButton(control: "play" | "stop") {
     <QueryClientProvider client={queryClient}>
       <RunPlanButton
         sessionId="sess_1"
+        runId="plan_1"
         planName="Triage flaky tests"
         control={control}
         refreshKeys={[["workflow-runs", "wf_1"]]}
@@ -56,6 +57,7 @@ describe("RunPlanButton", () => {
     expect(api.sendUserMessage).toHaveBeenCalledWith(
       "sess_1",
       expect.stringContaining('Continue the plan "Triage flaky tests" from where you left off'),
+      "plan_1",
     );
     expect(api.sendUserMessage.mock.calls[0]![1]).toContain("Resume or restart");
     expect(api.sendUserMessage.mock.calls[0]![1]).toContain("Omnigent sessions");
@@ -72,6 +74,7 @@ describe("RunPlanButton", () => {
       expect(api.sendUserMessage).toHaveBeenCalledWith(
         "sess_1",
         expect.stringContaining('Stop the plan "Triage flaky tests"'),
+        "plan_1",
       ),
     );
     const message = api.sendUserMessage.mock.calls[0]![1] as string;
@@ -82,15 +85,19 @@ describe("RunPlanButton", () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["workflow-runs", "wf_1"] });
   });
 
-  it("reports a stop message that could not reach the agent", async () => {
-    api.sendUserMessage.mockRejectedValueOnce(new Error("The session is offline."));
-    renderButton("stop");
-    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+  it.each(["The session is offline.", "This run is no longer current."])(
+    "reports a rejected stop and refreshes the runs: %s",
+    async (message) => {
+      api.sendUserMessage.mockRejectedValueOnce(new Error(message));
+      const { invalidate } = renderButton("stop");
+      fireEvent.click(screen.getByRole("button", { name: "Stop" }));
 
-    await waitFor(() => expect(toastError).toHaveBeenCalledWith("The session is offline."));
-    expect(api.interrupt).not.toHaveBeenCalled();
-    expect(screen.getByRole("button", { name: "Stop" })).toBeEnabled();
-  });
+      await waitFor(() => expect(toastError).toHaveBeenCalledWith(message));
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["workflow-runs", "wf_1"] });
+      expect(api.interrupt).not.toHaveBeenCalled();
+      expect(screen.getByRole("button", { name: "Stop" })).toBeEnabled();
+    },
+  );
 
   it("reports a denied stop message without interrupting the main agent", async () => {
     api.sendUserMessage.mockResolvedValueOnce({ queued: false, denied: true });
@@ -104,7 +111,7 @@ describe("RunPlanButton", () => {
   it("uses the same coordinated stop from a run's task menus", async () => {
     api.sendUserMessage.mockResolvedValue({ queued: true });
     const client = new QueryClient();
-    const { result } = renderHook(() => useRunTaskMenus("sess_1", []), {
+    const { result } = renderHook(() => useRunTaskMenus("sess_1", [], "plan_1"), {
       wrapper: ({ children }) => (
         <QueryClientProvider client={client}>
           <MemoryRouter>{children}</MemoryRouter>
@@ -125,6 +132,7 @@ describe("RunPlanButton", () => {
     expect(api.sendUserMessage).toHaveBeenCalledWith(
       "sess_1",
       expect.stringContaining("Stop the plan"),
+      "plan_1",
     );
     expect(api.sendUserMessage.mock.calls[0]![1]).toContain("recursively");
     expect(api.interrupt).not.toHaveBeenCalled();

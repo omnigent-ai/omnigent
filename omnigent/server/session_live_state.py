@@ -257,6 +257,7 @@ def persist_scheduled_run_completion(
     conversation_id: str,
     run_status: str,
     *,
+    turn_completed: bool = False,
     error_code: str | None = None,
     error: str | None = None,
 ) -> None:
@@ -278,9 +279,9 @@ def persist_scheduled_run_completion(
     ``live_status`` mirror. A bare executor would run at workspace 0 and match
     no rows on a multi-tenant replica.
 
-    An ``idle`` edge succeeds the run only once its agent has written to the
-    session (see :func:`_agent_worked_on_run`): Claude Code reports idle while
-    it starts, before it has read the run's prompt.
+    A confirmed turn completion can precede transcript mirroring. Other idle
+    edges require agent activity: Claude Code also reports idle while starting,
+    before it has read the run's prompt.
 
     Idempotent by construction: ``update_run`` is conditional on
     ``WHERE status = running``, so a run already terminal (a fire-time
@@ -293,6 +294,8 @@ def persist_scheduled_run_completion(
     :param conversation_id: The fired conversation whose turn just ended.
     :param run_status: Terminal run status to set — ``"succeeded"`` (turn
         completed) or ``"failed"`` (turn errored/cancelled/disconnected).
+    :param turn_completed: The harness confirmed the turn ended, even if its
+        transcript has not reached the server yet.
     :param error_code: Short failure classification when ``run_status`` is
         ``"failed"`` (e.g. the conversation's ``last_task_error_code``).
     :param error: Optional human-readable failure detail for ``"failed"``.
@@ -307,7 +310,11 @@ def persist_scheduled_run_completion(
             # Not a scheduled fire, or its run is already terminal — nothing to
             # do. This is the common case (interactive sessions).
             return
-        if run_status == "succeeded" and not _agent_worked_on_run(conversation_id, run.id):
+        if (
+            run_status == "succeeded"
+            and not turn_completed
+            and not _agent_worked_on_run(conversation_id, run.id)
+        ):
             # The agent hasn't started on the run's prompt, so this idle isn't its end.
             return
         store.update_run(

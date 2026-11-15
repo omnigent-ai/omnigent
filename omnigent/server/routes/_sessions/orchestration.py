@@ -8905,8 +8905,11 @@ async def _dispatch_session_event_to_runner_impl(
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
     """
+    from omnigent.server.session_journal import require_current_workflow_run
+
     if runner_router is not None:
         await asyncio.to_thread(runner_router.require_runtime_support, conv)
+    await require_current_workflow_run(conversation_store, session_id, body.workflow_run_id)
     if body.type == "message":
         disconnect_outcome.note_user_turn(conv.id)
     if body.type == "message" and _codex_side_chat_thread_id(conv) is not None:
@@ -9165,6 +9168,10 @@ async def _dispatch_session_event_to_runner_impl(
         # already-running pane.
         forwarded = False
         try:
+            # Native initialization or model routing may outlast the run shown by the UI.
+            await require_current_workflow_run(
+                conversation_store, session_id, body.workflow_run_id
+            )
             if pending_id is not None:
                 pending_inputs.mark_delivery_stage(session_id, pending_id, "forward_requested")
             await _forward_native_terminal_message(

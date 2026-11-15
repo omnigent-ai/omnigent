@@ -58,7 +58,7 @@ import {
   type StepStatus,
 } from "@/lib/sessionJournal";
 import { messageDeepLinkParams } from "@/lib/messageDeepLink";
-import { Link, useSearchParams } from "@/lib/routing";
+import { Link, useLocation, useNavigate } from "@/lib/routing";
 import { readTaskActivity, taskMarkerId, taskMarkerTarget } from "@/lib/taskActivity";
 import { cn } from "@/lib/utils";
 import type { TaskAction } from "@/lib/workflow";
@@ -1194,13 +1194,16 @@ export function TasksPanel({
     // The rail or drawer may still be opening; its rows mount by the next frame.
     requestAnimationFrame(() => jumpToStep(taskToShow.stepId));
   }, [active, showPlan, taskToShow, conversationId, jumpToStep]);
-  const [, setSearchParams] = useSearchParams();
+  const location = useLocation();
+  const navigate = useNavigate();
   const showInChat = useCallback(
     (markerId: string) => {
       onShowInChat?.();
-      setSearchParams((current) => messageDeepLinkParams(current, markerId), { replace: true });
+      const pathname = `/c/${encodeURIComponent(conversationId)}`;
+      const search = messageDeepLinkParams(new URLSearchParams(location.search), markerId);
+      navigate(`${pathname}?${search}`, { replace: location.pathname === pathname });
     },
-    [onShowInChat, setSearchParams],
+    [conversationId, location.pathname, location.search, navigate, onShowInChat],
   );
   // The question each waiting task's agent waits on, by step ID. A string, so the
   // selection only changes when the questions do.

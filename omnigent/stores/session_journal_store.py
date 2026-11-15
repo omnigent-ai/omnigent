@@ -637,6 +637,37 @@ class SessionJournalStore:
                 or plan.position > boundary.position
             }
 
+    def is_current_run(
+        self, conversation_id: str, plan_id: str, scheduled_task_run_id: str | None
+    ) -> bool:
+        """Check a run action without decrypting the plan's content."""
+        with self._session("read_run_current") as session:
+            plan = session.execute(
+                _using(
+                    select(
+                        SqlSessionJournalEntry.kind,
+                        SqlSessionJournalEntry.position,
+                        SqlSessionJournalEntry.scheduled_task_run_id,
+                    )
+                    .where(
+                        SqlSessionJournalEntry.workspace_id == current_workspace_id(),
+                        SqlSessionJournalEntry.conversation_id == conversation_id,
+                        SqlSessionJournalEntry.id == _entry_id(plan_id, "workflow_run_id"),
+                    )
+                    .order_by(SqlSessionJournalEntry.position)
+                    .limit(1),
+                    "ix_session_journal_entries_id",
+                )
+            ).one_or_none()
+            if (
+                plan is None
+                or plan.kind != _PLAN_KIND
+                or plan.scheduled_task_run_id != scheduled_task_run_id
+            ):
+                return False
+            boundary = self._newest_kind_row(session, conversation_id, _PLAN_STATUS_KIND)
+            return boundary is None or plan.position > boundary.position
+
     def list_workflow_runs(
         self, workflow_id: str, *, limit: int = 20, before: str | None = None
     ) -> WorkflowRunPage:

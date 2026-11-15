@@ -62,6 +62,7 @@ def normalize_workflow(
         characters; whitespace is collapsed.
     :param description: Non-empty text of at most
         :data:`WORKFLOW_DESCRIPTION_MAX_CHARS` characters; it may span lines.
+        The store also enforces its 2,000-byte encoded limit.
     :param steps: Empty for a draft; otherwise checked as the journal checks a plan's: unique
         step IDs, dependencies inside the graph, no cycles, at most 100 steps.
     :returns: ``(name, description, steps)``.

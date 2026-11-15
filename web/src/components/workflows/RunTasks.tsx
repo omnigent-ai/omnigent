@@ -25,22 +25,23 @@ type RunRefreshKeys = readonly (readonly unknown[])[];
  * Messages a run's session from a page other than its chat, then
  * refreshes the lists that show the run.
  */
-function useRunSession(sessionId: string, refreshKeys: RunRefreshKeys) {
+function useRunSession(sessionId: string, refreshKeys: RunRefreshKeys, runId: string | null) {
   const queryClient = useQueryClient();
   const [pending, setPending] = useState(false);
   const act = async (request: () => Promise<void>) => {
     setPending(true);
     try {
       await request();
-      for (const queryKey of refreshKeys) void queryClient.invalidateQueries({ queryKey });
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Couldn't reach the session.");
     } finally {
+      for (const queryKey of refreshKeys) void queryClient.invalidateQueries({ queryKey });
       setPending(false);
     }
   };
   const post = async (text: string) => {
-    const result = await sendUserMessage(sessionId, text);
+    if (!runId) return;
+    const result = await sendUserMessage(sessionId, text, runId);
     if (result.denied) toast.error("A policy blocked the message.");
   };
   return {
@@ -76,10 +77,11 @@ async function pendingQuestionFor(sessionId: string, stepId: string): Promise<st
 export function useRunTaskMenus(
   sessionId: string | null | undefined,
   refreshKeys: RunRefreshKeys,
+  runId: string | null,
 ): ((item: StepProgress) => TaskMenuAction | undefined) | undefined {
-  const session = useRunSession(sessionId ?? "", refreshKeys);
+  const session = useRunSession(sessionId ?? "", refreshKeys, runId);
   const navigate = useNavigate();
-  if (!sessionId) return undefined;
+  if (!sessionId || !runId) return undefined;
   // The agent can't read a message while it waits on the task's question, so
   // Continue opens the session at the question instead.
   const proceed = (item: StepProgress) =>
@@ -142,19 +144,21 @@ export function RunTimeline({
  */
 export function RunPlanButton({
   sessionId,
+  runId,
   planName,
   control,
   refreshKeys,
   className,
 }: {
   sessionId: string;
+  runId: string;
   /** The plan's name for the control message, e.g. the workflow's. */
   planName: string | null;
   control: PlanRunControl;
   refreshKeys: RunRefreshKeys;
   className?: string;
 }) {
-  const session = useRunSession(sessionId, refreshKeys);
+  const session = useRunSession(sessionId, refreshKeys, runId);
   return (
     <PlanRunButton
       control={control}

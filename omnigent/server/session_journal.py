@@ -115,6 +115,34 @@ def open_store(conversation_store: object) -> SessionJournalStore | None:
         return store
 
 
+async def require_current_workflow_run(
+    conversations: ConversationStore, conversation_id: str, plan_id: str | None
+) -> None:
+    """Reject run controls from a page that still displays an older invocation."""
+    if plan_id is None:
+        return
+
+    def is_current() -> bool:
+        journal = open_store(conversations)
+        conversation = conversations.get_conversation(conversation_id)
+        return (
+            journal is not None
+            and conversation is not None
+            and not conversation.archived
+            and journal.is_current_run(
+                conversation_id,
+                plan_id,
+                conversation.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY),
+            )
+        )
+
+    if not await asyncio.to_thread(is_current):
+        raise OmnigentError(
+            "This run is no longer current. Refresh the runs and try again.",
+            code=ErrorCode.CONFLICT,
+        )
+
+
 def _same_session(left: str, right: str) -> bool:
     try:
         return uuid_to_bytes(left.strip()) == uuid_to_bytes(right)
