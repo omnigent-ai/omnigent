@@ -24,11 +24,11 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useBulkArchiveConversations, type Conversation } from "@/hooks/useConversations";
-import { gridSessionIds } from "@/grid/gridLayout";
 import { useGridSessions } from "@/grid/GridSessionsContext";
 import { partitionPickerEntries, selectableSessionAgents } from "@/lib/agentGrouping";
 import { readDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import {
+  BEST_OF_N_GROUP_LABEL,
   BEST_OF_N_MAX_ATTEMPTS,
   BEST_OF_N_MIN_ATTEMPTS,
   bestOfNRepository,
@@ -223,7 +223,7 @@ export function BestOfNDialog({
       const name = `Best of ${result.sessionIds.length}`;
       if (
         result.sessionIds.length < BEST_OF_N_MIN_ATTEMPTS ||
-        !grids?.openGrid(result.sessionIds, name)
+        !grids?.openGrid(result.sessionIds, name, result.groupId)
       )
         navigate(`/c/${result.sessionIds[0]}`);
     } catch (caught) {
@@ -415,12 +415,9 @@ export function KeepAttemptDialog({
     }
     onOpenChange(false);
     toast.success(`Kept ${title}. Archived ${count} other attempt${count === 1 ? "" : "s"}.`);
-    // Drop a saved grid that only held this run's attempts, then open the kept one.
-    const attempts = new Set([sessionId, ...ids]);
-    const runGrid = grids?.grids.find((grid) =>
-      gridSessionIds(grid.layout).every((id) => attempts.has(id)),
-    );
-    if (runGrid) grids?.deleteGrid(runGrid.id);
+    // Drop the grid this run opened (never one the user built), then open the kept attempt.
+    const run = labels?.[BEST_OF_N_GROUP_LABEL];
+    if (run) grids?.deleteRunGrids(run);
     navigate(`/c/${sessionId}`);
   };
 

@@ -55,7 +55,7 @@ const source = {
   agent_id: "ag_codex",
 };
 const openGrid = vi.fn();
-const deleteGrid = vi.fn();
+const deleteRunGrids = vi.fn();
 const mutateAsync = vi.fn();
 
 function wrap(children: ReactNode, info: Partial<ServerInfo> = {}) {
@@ -85,7 +85,7 @@ beforeEach(() => {
     ],
     enabled: true,
     openGrid,
-    deleteGrid,
+    deleteRunGrids,
   } as unknown as ReturnType<typeof useGridSessions>);
   vi.mocked(useBulkArchiveConversations).mockReturnValue({
     mutateAsync,
@@ -149,7 +149,7 @@ describe("BestOfNDialog", () => {
     fireEvent.click(screen.getByTestId("best-of-n-start"));
 
     await waitFor(() =>
-      expect(openGrid).toHaveBeenCalledWith(["conv_a", "conv_b", "conv_c"], "Best of 3"),
+      expect(openGrid).toHaveBeenCalledWith(["conv_a", "conv_b", "conv_c"], "Best of 3", "g"),
     );
     expect(launchBestOfN).toHaveBeenCalledWith({
       sourceSessionId: "conv_source",
@@ -276,6 +276,7 @@ describe("KeepAttemptDialog", () => {
     expect(toast.success).toHaveBeenCalledWith(
       "Kept Attempt 1 · Codex. Archived 2 other attempts.",
     );
+    expect(deleteRunGrids).toHaveBeenCalledExactlyOnceWith("g");
   });
 
   it("archives only sessions whose own labels place them in the run", async () => {
@@ -294,7 +295,7 @@ describe("KeepAttemptDialog", () => {
     vi.mocked(useGridSessions).mockReturnValue({
       grids: [{ id: "run", layout: { axis: "columns", children: ["conv_a", "conv_b"] } }],
       openGrid,
-      deleteGrid,
+      deleteRunGrids,
     } as unknown as ReturnType<typeof useGridSessions>);
     renderKeep();
     await screen.findByTestId("keep-attempt-others");
@@ -304,22 +305,10 @@ describe("KeepAttemptDialog", () => {
         "Some attempts couldn't be archived. Try again from their menus.",
       ),
     );
-    expect(deleteGrid).not.toHaveBeenCalled();
+    expect(deleteRunGrids).not.toHaveBeenCalled();
     expect(navigateMock).not.toHaveBeenCalled();
-    expect(screen.getByTestId("keep-attempt-confirm")).toBeEnabled();
-  });
-
-  it("deletes the saved grid that held only this run", async () => {
-    vi.mocked(getSessionSlim).mockImplementation(async (id) => attempt(id));
-    renderKeep();
-    await screen.findByTestId("keep-attempt-others");
-    fireEvent.click(screen.getByTestId("keep-attempt-confirm"));
-    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_a"));
-    // "run" holds conv_a and conv_b; "other" also holds an unrelated session.
-    expect(deleteGrid).toHaveBeenCalledExactlyOnceWith("run");
+    // Without server worktree cleanup there is nothing to opt into.
     expect(screen.queryByTestId("keep-attempt-remove-worktrees")).toBeNull();
-    expect(mutateAsync).toHaveBeenCalledWith(
-      expect.objectContaining({ deleteWorktreeIds: undefined }),
-    );
+    expect(screen.getByTestId("keep-attempt-confirm")).toBeEnabled();
   });
 });
