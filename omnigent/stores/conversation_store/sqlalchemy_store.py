@@ -707,6 +707,8 @@ def _fetch_labels(
 def _fetch_labels_bulk(
     session: Session,
     conversation_ids: list[str],
+    *,
+    keys: tuple[str, ...] | None = None,
 ) -> dict[str, dict[str, str]]:
     """
     Load labels for many conversations in a single query.
@@ -719,22 +721,25 @@ def _fetch_labels_bulk(
     :param conversation_ids: Conversation IDs to fetch labels
         for, e.g. ``["conv_a", "conv_b"]``. Duplicates are
         tolerated but yield the same map entries.
+    :param keys: Optional exact label keys to load, e.g.
+        ``PROFILE_LABEL_KEYS``. ``None`` loads every label.
     :returns: Mapping ``{conversation_id: {key: value}}``.
         Conversations with no label rows are absent from the
         outer map (callers should default to ``{}``).
     """
     if not conversation_ids:
         return {}
-    rows = session.execute(
-        select(
-            SqlConversationLabel.conversation_id,
-            SqlConversationLabel.key,
-            SqlConversationLabel.value,
-        ).where(
-            SqlConversationLabel.workspace_id == current_workspace_id(),
-            SqlConversationLabel.conversation_id.in_(conversation_ids),
-        )
-    ).all()
+    statement = select(
+        SqlConversationLabel.conversation_id,
+        SqlConversationLabel.key,
+        SqlConversationLabel.value,
+    ).where(
+        SqlConversationLabel.workspace_id == current_workspace_id(),
+        SqlConversationLabel.conversation_id.in_(conversation_ids),
+    )
+    if keys is not None:
+        statement = statement.where(SqlConversationLabel.key.in_(keys))
+    rows = session.execute(statement).all()
     out: dict[str, dict[str, str]] = {}
     for conv_id, key, value in rows:
         out.setdefault(conv_id, {})[key] = value
@@ -5603,6 +5608,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             if meta is None:
                 raise ConversationNotFoundError(f"conversation {conversation_id!r} does not exist")
             return self._profile_host_binding(meta, snapshot)
+
+    def get_profile_labels(self, conversation_ids: list[str]) -> dict[str, dict[str, str]]:
+        with self._conv_session("read_host_session_profiles") as labels:
+            return _fetch_labels_bulk(labels, conversation_ids, keys=PROFILE_LABEL_KEYS)
 
     def bind_profiled_host(
         self,

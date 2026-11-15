@@ -112,9 +112,10 @@ integration evidence separately; the browser test does not exercise them.
   profile revoked since it was accepted refuses the command with a 403 and
   leaves no continuation
   (`tests/server/integration/test_sandbox_profile_launch.py::test_offline_clear_continuation_keeps_the_accepted_profile`).
-- Missing sandboxes use the bound session's reference for replacement. Legacy host
-  recovery rejects histories over 200 sessions; use controller lookup for larger
-  histories. Runner-host discovery and reconnect liveness have a separate limit
+- Missing sandboxes use the bound session's reference for replacement. Host
+  recovery reads saved profiles from the host's sessions in pages of 500 and rejects
+  histories over 10,000 sessions; a controller lookup that returns the assignment
+  skips this scan. Runner-host discovery and reconnect liveness have a separate limit
   of 10,000 attached sessions; launch a new runner on overflow. Rotation, adoption
   and rollback use a smaller source lookup of at most 201 candidates and preserve
   the binding if no source is found. Ordinary hosts skip recovery scans.

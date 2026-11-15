@@ -14,7 +14,8 @@ if TYPE_CHECKING:
     from omnigent.stores.conversation_store import ConversationStore
 
 PROFILE_LABEL_PREFIX = "sandbox_profile:"
-PROFILE_HOST_SESSION_LIMIT = 200
+PROFILE_HOST_SESSION_LIMIT = 10_000
+PROFILE_HOST_PAGE_SIZE = 500
 _FIELDS = ("provider", "id", "revision", "user_id", "name")
 PROFILE_LABEL_KEYS = tuple(
     PROFILE_LABEL_PREFIX + field for field in (*_FIELDS, "description:0", "description:1")
@@ -132,19 +133,22 @@ class SandboxProfileStore:
             else:
                 if binding.host_id == host_id and binding.profile_snapshot:
                     return json.loads(binding.profile_snapshot)
-        ids = self.conversations.list_host_conversation_ids(
-            host_id, limit=PROFILE_HOST_SESSION_LIMIT + 1
-        )
-        if len(ids) > PROFILE_HOST_SESSION_LIMIT:
-            raise ValueError(
-                "Host history exceeds the profile lookup limit; "
-                "enable controller assignment lookup"
+        accepted, after, scanned = None, None, 0
+        while True:
+            ids = self.conversations.list_host_conversation_ids(
+                host_id, after=after, limit=PROFILE_HOST_PAGE_SIZE
             )
-        accepted = None
-        for session_id in ids:
-            snapshot = self.get_session_snapshot(session_id)
-            if snapshot is not None:
-                if accepted is not None and not same_profile_identity(accepted, snapshot):
-                    raise ValueError("Sessions on this host have conflicting sandbox profiles")
-                accepted = snapshot
-        return accepted
+            scanned += len(ids)
+            if scanned > PROFILE_HOST_SESSION_LIMIT:
+                raise ValueError(
+                    "Host history exceeds the profile lookup limit; start a new session"
+                )
+            for labels in self.conversations.get_profile_labels(ids).values():
+                snapshot = profile_from_labels(labels)
+                if snapshot is not None:
+                    if accepted is not None and not same_profile_identity(accepted, snapshot):
+                        raise ValueError("Sessions on this host have conflicting sandbox profiles")
+                    accepted = snapshot
+            if len(ids) < PROFILE_HOST_PAGE_SIZE:
+                return accepted
+            after = ids[-1]

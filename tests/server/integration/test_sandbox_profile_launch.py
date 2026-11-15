@@ -90,6 +90,9 @@ async def test_unprofiled_session_survives_provider_opt_in(env, controller, oper
     session_id = await env.settled(await env.create("json"))
     before = env.conversations.get_conversation(session_id)
     assert env.recording.allocations == [None]
+    # A long-lived host accumulates many older unprofiled sessions.
+    for _ in range(250):
+        env.conversations.create_conversation(host_id=before.host_id, workspace="/workspace")
 
     env.app.state.feature_flags = FeatureFlags(frozenset({Feature.SANDBOX_PROFILES}))
     env.app.state.sandbox_config = ManagedSandboxDeployment.single(enabled_config)
