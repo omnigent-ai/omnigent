@@ -1331,15 +1331,15 @@ async def forward_claude_transcript_to_session(
         at startup would stop authenticating mid-session.
     :returns: Never normally returns; cancel the task to stop it.
     """
-    state = _read_forward_state(bridge_dir)
+    state = await asyncio.to_thread(_read_forward_state, bridge_dir)
     hook_state: HookForwardState | None = None
-    subagent_state = _read_subagent_forward_state(bridge_dir)
+    subagent_state = await asyncio.to_thread(_read_subagent_forward_state, bridge_dir)
     # Live assistant-text streaming. The delta cursor is independent of
     # the transcript/subagent cursors and survives /clear and /fork
     # (the deltas file belongs to the long-lived Claude process). The
     # dedupe ring is per-process and not persisted: the byte offset
     # prevents re-reads on the normal path.
-    delta_state = _read_delta_forward_state(bridge_dir)
+    delta_state = await asyncio.to_thread(_read_delta_forward_state, bridge_dir)
     seen_delta_keys: dict[tuple[str, int], None] = {}
     item_retries = _PostRetryTracker()
     status_retries = _PostRetryTracker()
