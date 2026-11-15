@@ -102,6 +102,7 @@ from omnigent.tools.builtins.scheduled_tasks import (
     resolve_reminder_time,
 )
 from omnigent.tools.builtins.session_message import (
+    LEGACY_SESSION_MESSAGE_MAX_CHARS,
     SESSION_MESSAGE_MAX_CHARS,
     SysSessionMessageTool,
     peer_session_messaging_enabled,
@@ -3870,8 +3871,16 @@ async def _execute_session_create(
             endpoint += "/host"
         host_id = None
         info_data: _JsonObject = {}
+        # Independent first tasks are delivered after creation, so check the server's
+        # limit first rather than leave a session without its task.
+        long_first_task = (
+            placement in ("same_host", "host")
+            and isinstance(message, str)
+            and len(message) > LEGACY_SESSION_MESSAGE_MAX_CHARS
+        )
         if (
             placement in ("managed", "host")
+            or long_first_task
             or args.get("project_id") is not None
             or args.get("project_name") is not None
             or permission_mode is not None
@@ -3880,6 +3889,17 @@ async def _execute_session_create(
             info = await server_client.get("/v1/info", timeout=30.0)
             info.raise_for_status()
             info_data = info.json()
+        if long_first_task:
+            server_max_chars = info_data.get("session_message_max_chars")
+            if not isinstance(server_max_chars, int) or isinstance(server_max_chars, bool):
+                server_max_chars = LEGACY_SESSION_MESSAGE_MAX_CHARS
+            if len(str(message)) > server_max_chars:
+                return json.dumps(
+                    {
+                        "error": "This server accepts initial messages of up to "
+                        f"{server_max_chars} characters; no session was created"
+                    }
+                )
         if (placement == "host" or args.get("project_id") is not None) and info_data.get(
             "scripted_sessions"
         ) is not True:

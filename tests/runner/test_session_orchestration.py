@@ -12,7 +12,10 @@ from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas, execute_tool
 from omnigent.session_host import SessionRoutingTransport
 from omnigent.spec.types import AgentSpec
-from omnigent.tools.builtins.session_message import SESSION_MESSAGE_MAX_CHARS
+from omnigent.tools.builtins.session_message import (
+    LEGACY_SESSION_MESSAGE_MAX_CHARS,
+    SESSION_MESSAGE_MAX_CHARS,
+)
 
 
 @pytest.mark.parametrize("spec", [AgentSpec(spec_version=1), None])
@@ -819,6 +822,59 @@ async def test_independent_initial_message_is_validated_before_creation(placemen
             )
         )
     assert f"initial message of 1–{SESSION_MESSAGE_MAX_CHARS} characters" in result["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("server_info", "server_max_chars"),
+    [
+        ({}, LEGACY_SESSION_MESSAGE_MAX_CHARS),
+        ({"session_message_max_chars": 8_000}, 8_000),
+        ({"session_message_max_chars": SESSION_MESSAGE_MAX_CHARS}, None),
+    ],
+    ids=["older_server", "old_limit", "current_server"],
+)
+async def test_long_first_task_needs_a_server_that_delivers_it(server_info, server_max_chars):
+    session_id = uuid4().hex
+    message = "a" * (LEGACY_SESSION_MESSAGE_MAX_CHARS + 1)
+    posts = []
+
+    def respond(request):
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json=server_info)
+        posts.append(request)
+        if request.url.path.endswith("/events"):
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(
+            201, json={"id": session_id, "agent_id": "worker", "family": {"id": "manager"}}
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {"agent_id": "worker", "placement": "same_host", "message": message}
+                ),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+    if server_max_chars is not None:
+        assert result["error"] == (
+            f"This server accepts initial messages of up to {server_max_chars} characters; "
+            "no session was created"
+        )
+        assert not posts
+        return
+    assert [request.url.path for request in posts] == [
+        "/v1/sessions/orchestrated",
+        f"/v1/sessions/{session_id}/events",
+    ]
+    assert json.loads(posts[1].content)["data"]["message"] == message
+    assert result["initial_message"] == {"queued": True}
 
 
 @pytest.mark.asyncio

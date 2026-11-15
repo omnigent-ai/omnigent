@@ -7,6 +7,8 @@ from omnigent.tools.base import Tool
 
 # Sized so an automation's worker can receive long owner instructions plus the matched item.
 SESSION_MESSAGE_MAX_CHARS = 32_000
+# Servers that don't advertise session_message_max_chars deliver at most this.
+LEGACY_SESSION_MESSAGE_MAX_CHARS = 8_000
 
 
 def peer_session_messaging_enabled() -> bool:
