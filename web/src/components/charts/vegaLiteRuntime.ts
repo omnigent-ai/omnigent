@@ -19,7 +19,9 @@ let modulesPromise: Promise<VegaModules> | null = null;
 export const MAX_EXPRESSION_ITEMS = 100_000;
 
 /** Thrown by a chart expression that asks for more than the limits allow. */
-export class ChartLimitError extends Error {}
+export class ChartLimitError extends Error {
+  override name = "ChartLimitError";
+}
 
 type ExpressionFunction = ((this: unknown, ...args: unknown[]) => unknown) & {
   [LIMITED]?: true;
@@ -28,7 +30,7 @@ interface TimeInterval {
   count?: (start: Date, end: Date) => number;
 }
 
-// Marks a wrapped function, so reloading this module doesn't wrap it twice.
+// Marks what this module patches inside Vega, so reloading it doesn't patch twice.
 const LIMITED = Symbol.for("omnigent.chartExpressionLimit");
 
 /** Wrap expression function *name* so a call *check* refuses throws instead of running. */
@@ -97,6 +99,7 @@ export function loadVegaModules(): Promise<VegaModules> {
   ]).then(
     ([vega, vegaLite, interpreter]) => {
       installExpressionLimits(vega);
+      installSafeSvgRendering(vega);
       return {
         vega,
         compile: vegaLite.compile,
@@ -215,7 +218,7 @@ export const CONTAINED_EVENTS = {
   globalCursor: false,
 } as const;
 
-const CURSOR_KEYWORD = /^[a-z-]+$/i;
+const CSS_KEYWORD = /^[a-z-]+$/i;
 
 /** *text* with CSS escapes (e.g. ``\72`` for ``r``) decoded. */
 function decodeCssEscapes(text: string): string {
@@ -227,17 +230,19 @@ function decodeCssEscapes(text: string): string {
 }
 
 function isKeywordCursor(cursor: unknown): boolean {
-  if (typeof cursor === "string") return CURSOR_KEYWORD.test(cursor);
+  if (typeof cursor === "string") return CSS_KEYWORD.test(cursor);
   if (typeof cursor !== "object" || cursor === null || Array.isArray(cursor)) return false;
   const keys = Object.keys(cursor);
   const { value } = cursor as Record<string, unknown>;
-  return keys.length === 1 && typeof value === "string" && CURSOR_KEYWORD.test(value);
+  return keys.length === 1 && typeof value === "string" && CSS_KEYWORD.test(value);
 }
 
 /**
  * The first reason a compiled Vega spec could load a remote file, or null.
  * A CSS `url(...)` in a color or cursor would load one, and so would a cursor
- * computed from data or a `cursor` signal.
+ * computed from data or a `cursor` signal. Inline rows are skipped: a value from
+ * data only reaches a paint or cursor through the scene, which
+ * {@link clearRemoteSceneValues} checks as it draws.
  */
 export function unsafeCompiledReason(spec: unknown): string | null {
   const pending: [key: string, value: unknown][] = [["", spec]];
@@ -260,6 +265,7 @@ export function unsafeCompiledReason(spec: unknown): string | null {
     }
     if (typeof node !== "object" || node === null) continue;
     for (const [childKey, value] of Object.entries(node)) {
+      if (childKey === "values") continue;
       if (childKey === "cursor" && !isKeywordCursor(value)) {
         return "A mark's cursor must be a CSS keyword such as `pointer`.";
       }
@@ -267,6 +273,130 @@ export function unsafeCompiledReason(spec: unknown): string | null {
     }
   }
   return null;
+}
+
+// `url(` that isn't a reference to one of the chart's own gradients or clip paths.
+const REMOTE_CSS_URL = /url\((?!\s*['"]?#)/i;
+
+/** Whether *value*, written out as Vega writes it, would load a file. */
+export function loadsRemoteFile(value: unknown): boolean {
+  if (value == null) return false;
+  const text = String(value);
+  // Most values are plain colors; only text with `(` or an escape can hold `url(`.
+  if (!text.includes("(") && !text.includes("\\")) return false;
+  return REMOTE_CSS_URL.test(decodeCssEscapes(text));
+}
+
+/** A scenegraph mark or item: groups and marks hold their children in `items`. */
+interface SceneNode {
+  items?: SceneNode[];
+  fill?: unknown;
+  stroke?: unknown;
+  cursor?: unknown;
+  blend?: unknown;
+}
+
+interface Gradient {
+  gradient: string;
+  id?: unknown;
+  stops?: { color?: unknown }[];
+}
+
+function isGradient(value: unknown): value is Gradient {
+  return typeof value === "object" && value !== null && "gradient" in value;
+}
+
+/** Whether a paint is safe to write: a color, or a gradient Vega defines in the chart itself. */
+function isSafePaint(paint: unknown): boolean {
+  if (!isGradient(paint)) return !loadsRemoteFile(paint);
+  // The id goes into the gradient's `url(#id)` reference and the stops become colors.
+  const idIsPlain = paint.id === undefined || /^[\w-]+$/.test(String(paint.id));
+  return idIsPlain && (paint.stops ?? []).every((stop) => !loadsRemoteFile(stop?.color));
+}
+
+// Marks a scene root whose remote values were cleared; a symbol survives a module reload.
+const REMOTE_VALUES_CLEARED = Symbol.for("omnigent.chartRemoteValuesCleared");
+
+/**
+ * Clear evaluated paints, cursors and blend modes that would load a file, such
+ * as a color an expression built as `'ur' + 'l(...)'`, before they reach the
+ * page or an export. Marks *root* when it cleared anything.
+ */
+export function clearRemoteSceneValues(root: SceneNode): void {
+  const pending = [root];
+  let cleared = false;
+  while (pending.length > 0) {
+    const node = pending.pop()!;
+    for (const paint of ["fill", "stroke"] as const) {
+      if (!isSafePaint(node[paint])) {
+        node[paint] = null;
+        cleared = true;
+      }
+    }
+    if (node.cursor != null && !CSS_KEYWORD.test(String(node.cursor))) {
+      node.cursor = null;
+      cleared = true;
+    }
+    // The SVG export writes the blend mode into a style attribute as is.
+    if (node.blend != null && !CSS_KEYWORD.test(String(node.blend))) {
+      node.blend = null;
+      cleared = true;
+    }
+    for (const child of node.items ?? []) pending.push(child);
+  }
+  if (cleared) (root as Record<symbol, unknown>)[REMOTE_VALUES_CLEARED] = true;
+}
+
+/** Whether {@link clearRemoteSceneValues} has cleared anything in *root*. */
+export function hadRemoteSceneValues(root: object): boolean {
+  return (root as Record<symbol, unknown>)[REMOTE_VALUES_CLEARED] === true;
+}
+
+// Vega's renderers draw a scene in `_render`, the method its subclasses override.
+type SceneRenderer = new (...args: never[]) => {
+  _render: (scene: SceneNode, ...rest: unknown[]) => unknown;
+  background: (...color: unknown[]) => unknown;
+};
+interface RenderModule {
+  renderer: SceneRenderer;
+  headless: SceneRenderer;
+  [LIMITED]?: true;
+}
+interface Scenegraph {
+  renderModule: ((name: string) => RenderModule) &
+    ((name: string, module: RenderModule) => unknown);
+}
+
+/** Draw and export SVG through renderers that clear remote paints and cursors first. */
+function installSafeSvgRendering(vega: typeof VegaModule): void {
+  const scenegraph = vega as unknown as Scenegraph;
+  const svg = scenegraph.renderModule("svg");
+  if (svg[LIMITED]) return;
+  const safe = (Base: SceneRenderer): SceneRenderer =>
+    class extends Base {
+      constructor(...args: never[]) {
+        super(...args);
+        /* eslint-disable no-underscore-dangle */
+        const render = this._render.bind(this);
+        this._render = (scene, ...rest) => {
+          clearRemoteSceneValues(scene);
+          return render(scene, ...rest);
+        };
+        /* eslint-enable no-underscore-dangle */
+        // A spec's background signal reaches the renderer here, not through the scene.
+        const setBackground = this.background.bind(this);
+        this.background = (...color) =>
+          color.length > 0 && !isSafePaint(color[0])
+            ? setBackground(null)
+            : setBackground(...color);
+      }
+    };
+  scenegraph.renderModule("svg", {
+    ...svg,
+    renderer: safe(svg.renderer),
+    headless: safe(svg.headless),
+    [LIMITED]: true,
+  });
 }
 
 const MAX_TOOLTIP_VALUE_CHARS = 500;
@@ -418,11 +548,14 @@ export async function renderVegaLiteChart(
   // Vega logs expression errors rather than throwing; a limit hit while drawing fails the chart.
   const logger = vega.logger(vega.Error);
   const logError = logger.error.bind(logger);
-  let limitHit: ChartLimitError | undefined;
+  let limitHit: Error | undefined;
   let firstRun = true;
   logger.error = (...args: readonly unknown[]) => {
     if (firstRun) {
-      limitHit ??= args.find((arg): arg is ChartLimitError => arg instanceof ChartLimitError);
+      // By name, as a reloaded module's ChartLimitError is a different class.
+      limitHit ??= args.find(
+        (arg): arg is Error => arg instanceof Error && arg.name === "ChartLimitError",
+      );
     }
     return logError(...args);
   };
@@ -443,8 +576,12 @@ export async function renderVegaLiteChart(
     await view.runAsync();
     firstRun = false;
     if (limitHit !== undefined) throw new ChartLimitError(limitHit.message);
+    if (hadRemoteSceneValues((view.scenegraph() as unknown as { root: object }).root)) {
+      throw new Error("Chart colors and cursors can't load remote files.");
+    }
   } catch (error) {
     finalize();
+    target.remove();
     throw error;
   }
 

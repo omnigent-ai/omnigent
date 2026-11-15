@@ -25,7 +25,9 @@ Charts show tooltips, follow light and dark mode, and download as PNG or SVG.
   non-keyword cursor, or a spec over 1,000,000 characters shows an error with
   the source. While drawing, `sequence()`, `pad()`, `timeSequence()` and
   `utcSequence()` are capped at 100,000 items and `format()` widths at 1,000,
-  however the call is written. Images and links don't load, expressions run in Vega's interpreter,
+  however the call is written. Colors, cursors, blend modes and backgrounds an
+  expression builds into a `url(...)` never reach the page or a download: in the
+  first draw they fail the chart, and later they are cleared. Images and links don't load, expressions run in Vega's interpreter,
   inputs stay inside the chart, and a chart can't listen to page elements, keys
   or timers.
 - `states`: drawing, drawn, refused or failed to compile (error and source),

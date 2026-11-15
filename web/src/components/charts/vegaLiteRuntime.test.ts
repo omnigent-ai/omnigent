@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ChartDrawCancelled,
   ChartLimitError,
+  clearRemoteSceneValues,
+  hadRemoteSceneValues,
   blockedLoader,
   chartThemeConfig,
   createChartTooltip,
@@ -207,7 +209,44 @@ describe("renderVegaLiteChart confinement", () => {
           color: { field: "paint", scale: null },
         },
       },
-      /url/,
+      /remote file/,
+    ],
+    [
+      "a url() color an expression wraps in an array",
+      {
+        data: { values: [{ x: 1 }] },
+        transform: [{ calculate: "['ur' + 'l(https://e.test/p.svg#g)']", as: "paint" }],
+        mark: "point",
+        encoding: {
+          x: { field: "x", type: "quantitative" },
+          color: { field: "paint", scale: null },
+        },
+      },
+      /remote file/,
+    ],
+    [
+      "a blend mode an expression builds into CSS",
+      {
+        ...BAR_SPEC,
+        mark: {
+          type: "bar",
+          blend: { expr: "'multiply; fill: ur' + 'l(https://e.test/p.svg#g)'" },
+        },
+      },
+      /remote file/,
+    ],
+    [
+      "a url() color an expression builds",
+      {
+        data: { values: [{ x: 1 }] },
+        transform: [{ calculate: "'ur' + 'l(https://e.test/p.svg#g)'", as: "paint" }],
+        mark: "point",
+        encoding: {
+          x: { field: "x", type: "quantitative" },
+          color: { field: "paint", scale: null },
+        },
+      },
+      /remote file/,
     ],
   ])("refuses %s", async (_label, spec, message) => {
     const container = mountContainer();
@@ -262,6 +301,83 @@ describe("renderVegaLiteChart confinement", () => {
     formattedChart.finalize();
   });
 
+  it("draws rows with ordinary cursor and url columns", async () => {
+    const container = mountContainer();
+    const spec = {
+      data: {
+        values: [
+          { cursor: "page2", link: "see url(docs)", n: 1 },
+          { cursor: 2, link: "", n: 2 },
+        ],
+      },
+      mark: { type: "point", tooltip: true },
+      encoding: { x: { field: "n", type: "quantitative" } },
+    };
+
+    const chart = await renderVegaLiteChart(container, spec, () => COLORS);
+
+    expect(container.querySelectorAll("g.mark-symbol path")).toHaveLength(2);
+    chart.finalize();
+  });
+
+  it("keeps the chart's own gradient fills", async () => {
+    const container = mountContainer();
+    const gradient = {
+      gradient: "linear",
+      stops: [
+        { offset: 0, color: "white" },
+        { offset: 1, color: "darkgreen" },
+      ],
+    };
+    const spec = { ...BAR_SPEC, mark: { type: "bar", color: gradient } };
+
+    const chart = await renderVegaLiteChart(container, spec, () => COLORS);
+
+    // Vega points gradient fills at the page's own `#gradient_N` definitions.
+    const fill = container.querySelector("g.mark-rect path")?.getAttribute("fill");
+    expect(fill).toMatch(/^url\(.*#gradient_\d+\)$/);
+    expect(await (await chart.toBlob("svg")).text()).toMatch(/fill="url\(.*#gradient_\d+\)"/);
+    chart.finalize();
+  });
+
+  it("clears a url() color that appears after the first draw, on the page and in exports", async () => {
+    const container = mountContainer();
+    const spec = {
+      data: { values: [{ x: 1 }, { x: 2 }] },
+      params: [{ name: "p", value: 0, bind: { input: "range", min: 0, max: 1, step: 1 } }],
+      mark: {
+        type: "point",
+        filled: true,
+        fill: { expr: "p ? 'ur' + 'l(https://e.test/p.svg#g)' : 'red'" },
+      },
+      encoding: { x: { field: "x", type: "quantitative" } },
+    };
+    const writes = vi.spyOn(Element.prototype, "setAttribute");
+    const chart = await renderVegaLiteChart(container, spec, () => COLORS);
+    const slider = container.querySelector<HTMLInputElement>('input[type="range"]')!;
+
+    slider.value = "1";
+    slider.dispatchEvent(new Event("input"));
+    await pause(50);
+
+    expect(writes.mock.calls.some(([, value]) => String(value).includes("e.test"))).toBe(false);
+    expect(container.innerHTML).not.toContain("e.test");
+    expect(await (await chart.toBlob("svg")).text()).not.toContain("e.test");
+    chart.finalize();
+  });
+
+  it("drops a spec background that would load a file, on the page and in exports", async () => {
+    const container = mountContainer();
+    const spec = { ...BAR_SPEC, background: { expr: "'ur' + 'l(https://e.test/p.svg#g)'" } };
+    const chart = await renderVegaLiteChart(container, spec, () => COLORS);
+
+    const svg = await (await chart.toBlob("svg")).text();
+
+    expect(svg).not.toContain("e.test");
+    expect(container.innerHTML).not.toContain("e.test");
+    chart.finalize();
+  });
+
   it("allows a keyword cursor", async () => {
     const container = mountContainer();
     const spec = { ...BAR_SPEC, mark: { type: "bar", cursor: "pointer" } };
@@ -300,6 +416,49 @@ describe("renderVegaLiteChart confinement", () => {
     }
     expect(container.innerHTML).not.toContain(COLORS.background);
     chart.finalize();
+  });
+});
+
+describe("clearRemoteSceneValues", () => {
+  it("clears paints and cursors that load files and keeps the chart's own references", () => {
+    const item = {
+      fill: ["URL(https://e.test/p.svg#g)"],
+      stroke: "\\55rl('//e.test/s.svg')",
+      cursor: "url(c.png), auto",
+      blend: "multiply; fill: red",
+    };
+    const remoteGradient = {
+      fill: { gradient: "linear", id: "a) url(https://e.test/p.svg#g", stops: [] },
+      stroke: { gradient: "linear", stops: [{ color: "url(https://e.test/s.svg)" }] },
+    };
+    const gradient = { gradient: "linear", id: "fade", stops: [{ color: "white" }] };
+    const kept = {
+      fill: "url( '#gradient_1')",
+      stroke: gradient,
+      cursor: "pointer",
+      blend: "multiply",
+    };
+    const scene = { items: [{ items: [{ items: [item, remoteGradient, kept] }] }] };
+
+    clearRemoteSceneValues(scene);
+
+    expect(item).toEqual({ fill: null, stroke: null, cursor: null, blend: null });
+    expect(remoteGradient).toEqual({ fill: null, stroke: null });
+    expect(kept).toEqual({
+      fill: "url( '#gradient_1')",
+      stroke: gradient,
+      cursor: "pointer",
+      blend: "multiply",
+    });
+    expect(hadRemoteSceneValues(scene)).toBe(true);
+  });
+
+  it("leaves a scene with nothing to clear unmarked", () => {
+    const scene = { items: [{ fill: "steelblue", stroke: "#333", cursor: "pointer" }] };
+
+    clearRemoteSceneValues(scene);
+
+    expect(hadRemoteSceneValues(scene)).toBe(false);
   });
 });
 
