@@ -2838,7 +2838,7 @@ def register_events_routes(
                         cost_usd=None,
                     )
                 )
-            forward_body = body.model_dump()
+            forward_body = body.model_dump(exclude={"workflow_run_id"})
             forward_body["data"] = data
             runner_result = await _forward_session_change_to_runner(
                 session_id,
