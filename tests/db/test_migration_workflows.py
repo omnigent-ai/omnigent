@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 from pathlib import Path
 
 import pytest
@@ -61,14 +62,19 @@ def test_upgrade_matches_the_model_and_downgrade_drops_the_table(
 
 
 @pytest.mark.parametrize(
-    "description", ["Review café notes in C:\\reports.", "\x00\x02legacy text"]
+    "description",
+    [
+        "Review café notes in C:\\reports.",
+        "\x00\x02legacy text",
+        pytest.param("界" * 2000, id="multibyte-limit"),
+    ],
 )
 def test_description_envelopes_preserve_legacy_text_and_downgrade(
     db_uri: str, description: str
 ) -> None:
     engine = get_or_create_engine(db_uri)
-    if engine.dialect.name == "postgresql" and "\x00" in description:
-        pytest.skip("PostgreSQL text cannot contain NUL")
+    if engine.dialect.name in ("postgresql", "cockroachdb") and "\x00" in description:
+        pytest.skip("The PostgreSQL driver cannot bind legacy text containing NUL")
     previous = "e9b6a17c20d4"
     _migrate(db_uri, engine, previous, down=True)
     try:
@@ -89,7 +95,9 @@ def test_description_envelopes_preserve_legacy_text_and_downgrade(
         _migrate(db_uri, engine, "head")
         store = WorkflowStore(db_uri)
         assert store.get(workflow_id, user_id=None).description == description
-        updated = store.update(workflow_id, user_id=None, description=description * 5)
+        updated = store.update(
+            workflow_id, user_id=None, description=description * min(5, 2000 // len(description))
+        )
         columns = {column["name"]: column for column in sa.inspect(engine).get_columns(_TABLE)}
         assert isinstance(columns["description"]["type"], sa.LargeBinary)
         assert not columns["description"]["nullable"]
@@ -98,6 +106,10 @@ def test_description_envelopes_preserve_legacy_text_and_downgrade(
             assert isinstance(
                 connection.execute(sa.text("SELECT description FROM workflows")).scalar_one(),
                 bytes,
+            )
+            assert (
+                len(connection.execute(sa.text("SELECT description FROM workflows")).scalar_one())
+                <= 2000
             )
         _migrate(db_uri, engine, previous, down=True)
         columns = {column["name"]: column for column in sa.inspect(engine).get_columns(_TABLE)}
@@ -112,6 +124,36 @@ def test_description_envelopes_preserve_legacy_text_and_downgrade(
         assert store.get(workflow_id, user_id=None) == updated
     finally:
         _migrate(db_uri, engine, "head")
+
+
+def test_oversized_legacy_description_stays_intact_until_corrected(db_uri: str) -> None:
+    engine = get_or_create_engine(db_uri)
+    store = WorkflowStore(db_uri)
+    saved = store.create(user_id=None, name="Review", description="Review notes.", steps=[])
+    _migrate(db_uri, engine, "e9b6a17c20d4", down=True)
+    noise = random.Random(0)
+    description = "".join(chr(noise.randrange(0x4E00, 0x9FFF)) for _ in range(2000))
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text("UPDATE workflows SET description = :description"),
+            {"description": description},
+        )
+    try:
+        with pytest.raises(ValueError, match="description exceeds 2000 stored bytes"):
+            _migrate(db_uri, engine, "head")
+        with engine.connect() as connection:
+            assert (
+                connection.execute(sa.text("SELECT description FROM workflows")).scalar_one()
+                == description
+            )
+    finally:
+        with engine.begin() as connection:
+            connection.execute(
+                sa.text("UPDATE workflows SET description = :description"),
+                {"description": saved.description},
+            )
+        _migrate(db_uri, engine, "head")
+    assert store.get(saved.id, user_id=None) == saved
 
 
 def test_drafts_downgrade_cleanly_and_existing_plans_upgrade_as_runnable(tmp_path: Path) -> None:

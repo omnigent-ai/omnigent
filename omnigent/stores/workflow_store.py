@@ -19,7 +19,12 @@ from sqlalchemy.orm import Session, undefer
 
 from omnigent.db import compression
 from omnigent.db.account_authority import require_active_account
-from omnigent.db.db_models import MAX_STORED_VALUE_BYTES, SqlWorkflow, current_workspace_id
+from omnigent.db.db_models import (
+    MAX_STORED_VALUE_BYTES,
+    WORKFLOW_DESCRIPTION_MAX_STORED_BYTES,
+    SqlWorkflow,
+    current_workspace_id,
+)
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -45,14 +50,16 @@ def _owned(workflow_id: str, user_id: str | None) -> tuple[ColumnElement[bool], 
     )
 
 
+def _check_stored_size(text: str, field: str, limit: int) -> None:
+    size = len(compression.encode(text) or b"")
+    if size > limit:
+        raise InvalidWorkflowError(f"{field}: {size} bytes compressed; the limit is {limit}")
+
+
 def _plan_text(steps: list[dict[str, Any]]) -> str:
     """The stored plan, refused when it doesn't fit the column compressed."""
     text = json.dumps({"steps": steps}, ensure_ascii=False, separators=(",", ":"))
-    size = len(compression.encode(text) or b"")
-    if size > MAX_STORED_VALUE_BYTES:
-        raise InvalidWorkflowError(
-            f"the steps take {size} bytes compressed; the limit is {MAX_STORED_VALUE_BYTES}"
-        )
+    _check_stored_size(text, "steps", MAX_STORED_VALUE_BYTES)
     return text
 
 
@@ -115,6 +122,7 @@ class WorkflowStore:
         workflow_name, text, workflow_steps = normalize_workflow(
             name=name, description=description, steps=steps
         )
+        _check_stored_size(text, "description", WORKFLOW_DESCRIPTION_MAX_STORED_BYTES)
         plan = _plan_text(workflow_steps)
         now = now_epoch()
         workflow = Workflow(
@@ -239,6 +247,7 @@ class WorkflowStore:
                 description=row.description if description is None else description,
                 steps=json.loads(row.plan)["steps"] if steps is None else steps,
             )
+            _check_stored_size(text, "description", WORKFLOW_DESCRIPTION_MAX_STORED_BYTES)
             require_active_account(session, user_id)
             if workflow_name != row.name and self._name_taken(
                 session, user_id=user_id, name=workflow_name, exclude_id=workflow_id

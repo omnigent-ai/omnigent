@@ -69,6 +69,8 @@ a goal keeps its line breaks.
 Journal content, saved plans and workflow descriptions use bounded binary storage
 envelopes. The frame identifies raw plaintext, compressed plaintext, or ciphertext
 with its encryption configuration; the stored-byte limit includes the full frame.
+Workflow descriptions are capped at 2,000 stored bytes, with the existing limit
+of 2,000 characters; saved plans and journal entries are capped at 16,383 bytes.
 The OSS stores write plaintext variants. A deployment that enables content
 encryption must supply its codec for these stores as well as conversation items;
 encrypted rows fail closed without a configured decryptor.

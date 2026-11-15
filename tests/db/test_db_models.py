@@ -19,7 +19,6 @@ from sqlalchemy.dialects import mysql, sqlite
 from sqlalchemy.exc import IntegrityError, OperationalError, StatementError
 
 from omnigent.db.db_models import (
-    MAX_STORED_VALUE_BYTES,
     SqlAccountToken,
     SqlAgent,
     SqlComment,
@@ -1052,12 +1051,12 @@ class TestSqlUserDailyCost:
 
 
 class TestSqlWorkflow:
-    @pytest.mark.parametrize("column_name", ["description", "plan"])
-    def test_user_content_writes_enforce_the_16_kib_stored_limit(self, column_name: str) -> None:
+    @pytest.mark.parametrize(("column_name", "limit"), [("description", 2000), ("plan", 16_383)])
+    def test_user_content_writes_enforce_the_column_stored_limit(
+        self, column_name: str, limit: int
+    ) -> None:
         table = SqlWorkflow.__table__
-        assert (
-            table.c[column_name].type.max_stored_bytes == MAX_STORED_VALUE_BYTES == 16 * 1024 - 1
-        )
+        assert table.c[column_name].type.max_stored_bytes == limit
         plan = '{"steps":[{"id":"build","name":"Build","goal":null,"depends_on":[]}]}'
         engine = sa.create_engine("sqlite://")
         try:
@@ -1077,7 +1076,7 @@ class TestSqlWorkflow:
                 )
                 assert connection.execute(sa.select(table.c.plan)).scalar_one() == plan
             # Random text barely compresses, so this stores above the limit.
-            oversized = "".join(random.Random(0).choices(string.ascii_letters, k=24_000))
+            oversized = "".join(random.Random(0).choices(string.ascii_letters, k=limit * 2))
             with pytest.raises(StatementError, match="size limit"), engine.begin() as connection:
                 connection.execute(table.update().values({column_name: oversized}))
         finally:

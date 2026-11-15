@@ -144,6 +144,18 @@ def test_a_workflow_deletes_once_and_only_for_its_owner(store: WorkflowStore) ->
     assert store.get(saved.id, user_id=ALICE) is None
 
 
+def test_description_storage_is_capped_at_2000_bytes(store: WorkflowStore) -> None:
+    saved = store.create(user_id=ALICE, name="review", description="d" * 2000, steps=STEPS)
+    noise = random.Random(0)
+    description = "".join(chr(noise.randrange(0x4E00, 0x9FFF)) for _ in range(2000))
+    with pytest.raises(InvalidWorkflowError, match=r"description.*limit is 2000"):
+        store.create(user_id=ALICE, name="oversized", description=description, steps=STEPS)
+    with pytest.raises(InvalidWorkflowError, match=r"description.*limit is 2000"):
+        store.update(saved.id, user_id=ALICE, description=description)
+    assert store.get(saved.id, user_id=ALICE) == saved
+    assert store.list_page(user_id=ALICE, limit=10) == ([saved], False)
+
+
 def test_a_draft_becomes_runnable_when_its_plan_is_saved(store: WorkflowStore) -> None:
     draft = store.create(user_id=ALICE, name="draft", description="Plan a release.", steps=[])
     assert draft.steps == []

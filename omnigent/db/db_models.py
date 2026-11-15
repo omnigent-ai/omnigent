@@ -628,6 +628,7 @@ class SqlSessionPermission(OmnigentBase):
 # Largest stored value of a new compressed column: under the 16 KiB per-value
 # limit in docs/DATABASE_BEST_PRACTICES.md, which forbids exactly 16,384 bytes.
 MAX_STORED_VALUE_BYTES = 16 * 1024 - 1
+WORKFLOW_DESCRIPTION_MAX_STORED_BYTES = 2000
 
 # MySQL stores these documents as BLOB (at most 65,535 bytes), so writes that
 # compress past that fail before reaching MySQL. Other dialects keep the uncapped codec.
@@ -1984,7 +1985,9 @@ class SqlWorkflow(OmnigentBase):
     name: Mapped[str] = mapped_column(String(80), nullable=False)
     # Opaque user content uses the same storage envelope as journal text and plans.
     description: Mapped[str] = mapped_column(
-        CompressedText(max_stored_bytes=MAX_STORED_VALUE_BYTES, bounded_binary=True),
+        CompressedText(
+            max_stored_bytes=WORKFLOW_DESCRIPTION_MAX_STORED_BYTES, bounded_binary=True
+        ),
         nullable=False,
     )
     # Deferred so callers load the compressed plan explicitly.

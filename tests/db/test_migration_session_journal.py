@@ -21,25 +21,36 @@ _HEADS = "session_journal_heads"
 
 
 @pytest.mark.parametrize(
-    ("revision", "column"),
+    ("revision", "column", "limit"),
     [
-        ("5d872cd6632a_add_session_journal", SqlSessionJournalEntry.__table__.c.content),
-        ("ce12af3da168_add_workflows", SqlWorkflow.__table__.c.plan),
-        ("f7c2d8a4b901_workflow_description_envelope", SqlWorkflow.__table__.c.description),
+        ("5d872cd6632a_add_session_journal", SqlSessionJournalEntry.__table__.c.content, 16_383),
+        ("ce12af3da168_add_workflows", SqlWorkflow.__table__.c.plan, 16_383),
+        ("f7c2d8a4b901_workflow_description_envelope", SqlWorkflow.__table__.c.description, 2000),
     ],
 )
 def test_mysql_payload_types_are_bounded_and_keep_the_codec(
-    revision: str, column: sa.Column
+    revision: str, column: sa.Column, limit: int
 ) -> None:
+    migration = import_module(f"omnigent.db.migrations.versions.{revision}")
+    dialect = mysql.dialect()
     output = StringIO()
     context = MigrationContext.configure(
         dialect_name="mysql", opts={"as_sql": True, "output_buffer": output}
     )
-    with Operations.context(context):
-        import_module(f"omnigent.db.migrations.versions.{revision}").upgrade()
-    dialect = mysql.dialect()
-    assert str(column.type.compile(dialect=dialect)) == "VARBINARY(16383)"
-    assert f"{column.name} VARBINARY(16383) NOT NULL" in output.getvalue()
+    if column.name == "description":
+        # The data-copy migration needs an online connection; compile its target column.
+        output.write(
+            str(
+                sa.schema.CreateColumn(
+                    sa.Column(column.name, migration._BINARY, nullable=False)
+                ).compile(dialect=dialect)
+            )
+        )
+    else:
+        with Operations.context(context):
+            migration.upgrade()
+    assert str(column.type.compile(dialect=dialect)) == f"VARBINARY({limit})"
+    assert f"{column.name} VARBINARY({limit}) NOT NULL" in output.getvalue()
     codec = column.type.dialect_impl(dialect)
     bind = codec.bind_processor(dialect)
     read = codec.result_processor(dialect, None)
