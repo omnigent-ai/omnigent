@@ -1573,9 +1573,8 @@ async def forward_claude_transcript_to_session(
                         # Claude writes a turn's reply before firing Stop, so hooks
                         # visible before this transcript read never outrun the items
                         # they end; later hooks wait for the next poll.
-                        hooks_file = bridge_dir / _HOOKS_FILE
-                        hooks_cutoff_byte_offset = (
-                            hooks_file.stat().st_size if hooks_file.is_file() else None
+                        hooks_cutoff_byte_offset = await asyncio.to_thread(
+                            _hook_end_offset, bridge_dir
                         )
                         state = await _forward_available_items(
                             client=client,
