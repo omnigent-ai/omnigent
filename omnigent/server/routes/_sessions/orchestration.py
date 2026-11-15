@@ -51,6 +51,7 @@ from omnigent.entities import (
 from omnigent.entities.conversation import (
     FunctionCallData,
     FunctionCallOutputData,
+    external_item_id,
     parse_item_data,
 )
 from omnigent.entities.permission import SessionPermission
@@ -3657,12 +3658,7 @@ def _new_external_conversation_item(
                 code=ErrorCode.INVALID_INPUT,
             )
         item = item.model_copy(
-            update={
-                "stable_id": uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"omnigent-external-item:{session_id}:{source_id.strip()}",
-                ).hex
-            }
+            update={"stable_id": external_item_id(session_id, source_id.strip())}
         )
     return item
 
