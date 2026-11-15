@@ -393,14 +393,14 @@ async def _read_native_delivery_receipt(
 
     try:
         async with asyncio.timeout(_DELIVERY_RECEIPT_TIMEOUT_SECONDS):
-            if not same_session():
+            if not await asyncio.to_thread(same_session):
                 return None
             await client.close()
             await client.connect()
             response = await client.request(
                 "thread/read", {"threadId": state.thread_id, "includeTurns": True}
             )
-            if not same_session():
+            if not await asyncio.to_thread(same_session):
                 return None
             result = _json_object(response.get("result"))
             thread = _json_object(result.get("thread")) if result is not None else None
