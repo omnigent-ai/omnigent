@@ -328,6 +328,24 @@ def test_deleting_a_session_deletes_its_journal_in_batches(
     assert _count(db_uri, "session_journal_heads", SESSION) == 0
 
 
+def test_journal_deletion_removes_ranges_across_sessions_in_key_order(
+    db_uri: str, journal: SessionJournalStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(session_journal_store, "JOURNAL_DELETE_BATCH", 3)
+    for index in range(4):
+        _note(journal, f"a{index}")
+        _note(journal, f"b{index}", session=OTHER)
+    with sa.orm.Session(sa.create_engine(db_uri)) as session:
+        removed = [
+            session_journal_store.delete_journal_entries_batch(session, [OTHER, SESSION])
+            for _ in range(4)
+        ]
+        session.commit()
+    assert removed == [3, 3, 2, 0]
+    assert _count(db_uri, "session_journal_entries", SESSION) == 0
+    assert _count(db_uri, "session_journal_entries", OTHER) == 0
+
+
 @pytest.mark.parametrize("failure", [None, "copy", "publish"])
 def test_a_fork_carries_the_journal_and_continues_it(
     conversations: SqlAlchemyConversationStore,
