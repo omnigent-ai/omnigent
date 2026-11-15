@@ -68,7 +68,11 @@ from omnigent.models.model_override import (
 from omnigent.native.native_coding_agents import public_agent_name
 from omnigent.policies.builtins.safety import scheduled_task_review_error
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
-from omnigent.runner.journal_tools import JOURNAL_TOOL_NAMES, execute_journal_tool
+from omnigent.runner.journal_tools import (
+    JOURNAL_TOOL_NAMES,
+    execute_journal_tool,
+    server_workflows_enabled,
+)
 from omnigent.runner.session_requests import remember_session_host
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.tools import ToolManager
@@ -7864,6 +7868,7 @@ async def execute_tool(
                 args,
                 agent_spec=agent_spec,
                 runner_workspace=runner_workspace,
+                workflows_enabled=await server_workflows_enabled(server_client),
             )
         elif tool_name in _COMMENT_TOOLS:
             output = await _execute_comment_tool(
@@ -10080,12 +10085,13 @@ def _execute_skill_tool(
     *,
     agent_spec: AgentSpec | None,
     runner_workspace: Path | None,
+    workflows_enabled: bool = False,
 ) -> str:
     """
     Runner-local handler for ``load_skill`` and ``read_skill_file``.
 
     Both tools are built from one registry — the agent spec's bundled
-    skills merged with host-scope discovery from the runner workspace —
+    skills merged with host-scope discovery and enabled framework fallbacks —
     so anything ``load_skill`` can load, ``read_skill_file`` can read.
 
     :param tool_name: ``"load_skill"`` or ``"read_skill_file"``.
@@ -10093,8 +10099,10 @@ def _execute_skill_tool(
     :param agent_spec: The session's AgentSpec.
     :param runner_workspace: The runner's workspace path for
         host-scope skill discovery.
+    :param workflows_enabled: Whether the server enables workflow skills.
     :returns: Tool output string.
     """
+    from omnigent.spec.skill_sources import framework_skills
     from omnigent.tools.builtins.load_skill import LoadSkillTool
     from omnigent.tools.builtins.read_skill_file import ReadSkillFileTool
 
@@ -10112,6 +10120,9 @@ def _execute_skill_tool(
         bundled_skills,
         agent_root=runner_workspace,
         skills_filter=skills_filter,
+        fallback_skills=(
+            framework_skills(agent_spec) if workflows_enabled and agent_spec is not None else []
+        ),
     )
     tool: Tool = load_tool if tool_name == "load_skill" else ReadSkillFileTool(load_tool.skills)
 

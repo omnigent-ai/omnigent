@@ -188,10 +188,16 @@ export function useSessionJournal(
   });
   useEffect(() => {
     if (!active) return;
-    return subscribeSessionStreams((id, reopened) => {
-      if (id === conversationId && reopened) void catchUp();
+    const synchronizeCached = () => {
+      if (queryClient.getQueryData(sessionJournalKey(conversationId))) {
+        void catchUp({ cancelRefetch: false });
+      }
+    };
+    synchronizeCached();
+    return subscribeSessionStreams((id) => {
+      if (id === conversationId && isSessionStreamOpen(id)) synchronizeCached();
     });
-  }, [active, conversationId, catchUp]);
+  }, [active, conversationId, queryClient, catchUp]);
   useEffect(() => {
     if (!active || (streamOpen && !catchUpError) || query.status !== "success") return;
     const timer = window.setInterval(() => void catchUp(), JOURNAL_FALLBACK_REFETCH_MS);

@@ -208,6 +208,34 @@ describe("useSessionJournal", () => {
     expect(result.current.error).toBeNull();
   });
 
+  it.each(["fresh stream", "remount", "reenable"])(
+    "catches up a cached journal after %s",
+    async (transition) => {
+      noteSessionStreamOpen(SESSION, false);
+      respond(journalPage([journalEntry(0)]));
+      const view = renderHook(({ enabled }) => useSessionJournal(SESSION, enabled), {
+        wrapper,
+        initialProps: { enabled: true },
+      });
+      await waitFor(() => expect(view.result.current.entries).toHaveLength(1));
+      if (transition === "remount") view.unmount();
+      else if (transition === "reenable") view.rerender({ enabled: false });
+      act(() => noteSessionStreamClosed(SESSION));
+      respond(journalPage([journalEntry(1)]));
+      act(() => noteSessionStreamOpen(SESSION, false));
+      const current =
+        transition === "remount"
+          ? renderHook(() => useSessionJournal(SESSION, true), { wrapper })
+          : view;
+      if (transition === "reenable") view.rerender({ enabled: true });
+      await waitFor(() =>
+        expect(current.result.current.entries.map((entry) => entry.position)).toEqual([0, 1]),
+      );
+      expect(requestedQueries()[1].get("after")).toBe("e0");
+      expect(authenticatedFetch).toHaveBeenCalledTimes(2);
+    },
+  );
+
   it.each(["none", "automatic", "manual"])(
     "catches up after reopening, with %s recovery",
     async (recovery) => {

@@ -202,12 +202,18 @@ describe("WorkflowSessionDialog", () => {
     expect(submit()).toHaveTextContent("Start planning");
     fireEvent.click(submit());
     expect(await screen.findByRole("alert")).toHaveTextContent("Couldn’t attach chat");
+    expect(screen.getByTestId("workflow-session-host")).toBeDisabled();
+    expect(screen.getByPlaceholderText("Type a path or browse…")).toBeDisabled();
+    expect(screen.getByTestId("workflow-session-agent")).toBeDisabled();
+    expect(submit()).toHaveTextContent("Retry");
+    const savedChoices = localStorage.getItem(CHOICES);
     fireEvent.click(submit());
     await waitFor(() => expect(attached).toHaveBeenCalledTimes(2));
     expect(createSession).toHaveBeenCalledOnce();
     expect(attached).toHaveBeenLastCalledWith({ id: "conv_run" }, editWorkflowPlanPrompt(WORKFLOW));
     expect(navigate).not.toHaveBeenCalled();
     expect(consumePendingInitialPrompt("conv_run")).toBeNull();
+    expect(localStorage.getItem(CHOICES)).toEqual(savedChoices);
   });
 
   it("leaves a sandbox's durable planning prompt to the server", async () => {
