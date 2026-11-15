@@ -241,6 +241,10 @@ class ErrorCode:
         indistinguishable from a completed enumeration, so the caller
         silently loses the remaining rows. The caller's remedy is to
         restart the enumeration without the cursor.
+    :cvar SUBAGENT_PARENT_INBOX_MISSING: A sub-agent's terminal status
+        reached a runner that holds no inbox for its parent (HTTP 410). The
+        runner keeps the result and hands it over if it creates that inbox,
+        so the sender must not post the status again.
     """
 
     UNAUTHORIZED = "unauthorized"
@@ -265,6 +269,7 @@ class ErrorCode:
     UPSTREAM_CANCELLED = "upstream_cancelled"
     UPSTREAM_PERMISSION_DENIED = "upstream_permission_denied"
     STALE_CURSOR = "stale_cursor"
+    SUBAGENT_PARENT_INBOX_MISSING = "subagent_parent_inbox_missing"
 
 
 # Client-facing text for ``SESSION_AGENT_MISSING``: the session's agent was
@@ -325,6 +330,8 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # succeed — the fix is to restart the enumeration without the cursor. The
     # distinct code is what a paging client keys that restart off.
     ErrorCode.STALE_CURSOR: 400,
+    # 410, not 503: a resend cannot create the parent's inbox.
+    ErrorCode.SUBAGENT_PARENT_INBOX_MISSING: 410,
 }
 
 
@@ -369,6 +376,8 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     # A stale reference: the cursor row was deleted (often by the same user
     # in another client) between two page fetches.
     ErrorCode.STALE_CURSOR: ErrorCategory.USER,
+    # The runner lacks the parent's session state.
+    ErrorCode.SUBAGENT_PARENT_INBOX_MISSING: ErrorCategory.RUNNER,
 }
 
 
@@ -415,6 +424,8 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.REFRESH_UNSUPPORTED: ErrorImpact.BENIGN,
     ErrorCode.LOGIN_UNSUPPORTED: ErrorImpact.BENIGN,
     ErrorCode.STALE_CURSOR: ErrorImpact.BENIGN,
+    # The child's own session is unaffected; its result waits on the runner.
+    ErrorCode.SUBAGENT_PARENT_INBOX_MISSING: ErrorImpact.BENIGN,
 }
 
 
@@ -457,6 +468,7 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.UPSTREAM_CANCELLED: ErrorPhase.UNKNOWN,
     ErrorCode.UPSTREAM_PERMISSION_DENIED: ErrorPhase.UNKNOWN,
     ErrorCode.STALE_CURSOR: ErrorPhase.REQUEST,
+    ErrorCode.SUBAGENT_PARENT_INBOX_MISSING: ErrorPhase.TURN,
 }
 
 

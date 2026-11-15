@@ -631,6 +631,15 @@ def test_is_subagent_delivery_not_confirmed_classifier() -> None:
     assert forwarder._is_subagent_delivery_not_confirmed(httpx.ConnectError("boom")) is False
 
 
+def test_is_subagent_parent_inbox_missing_classifier() -> None:
+    body = {"error": {"code": "subagent_parent_inbox_missing", "message": "x"}}
+    assert forwarder._is_subagent_parent_inbox_missing(_http_status_error(410, body)) is True
+    assert forwarder._is_subagent_parent_inbox_missing(_http_status_error(503, body)) is False
+    other = {"error": {"code": "workspace_missing", "message": "x"}}
+    assert forwarder._is_subagent_parent_inbox_missing(_http_status_error(410, other)) is False
+    assert forwarder._is_subagent_parent_inbox_missing(httpx.ConnectError("boom")) is False
+
+
 @pytest.mark.asyncio
 async def test_forward_progress_timeout_resets_after_each_response() -> None:
     """A healthy long drain is not cancelled while responses keep arriving."""

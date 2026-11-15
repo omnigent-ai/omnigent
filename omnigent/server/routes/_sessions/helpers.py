@@ -4908,7 +4908,8 @@ def _require_external_status_forward(
         when no runner could be reached.
     :returns: None.
     :raises OmnigentError: If the runner was unavailable or
-        rejected the forwarded status.
+        rejected the forwarded status; ``SUBAGENT_PARENT_INBOX_MISSING``
+        when the runner has no inbox for the parent.
     """
     if runner_result is None:
         raise OmnigentError(
@@ -4923,8 +4924,31 @@ def _require_external_status_forward(
             f"Runner rejected external_session_status {status!r} for "
             f"sub-agent session {session_id!r} with status "
             f"{runner_result.status_code}{suffix}",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
+            code=ErrorCode.SUBAGENT_PARENT_INBOX_MISSING
+            if _is_missing_parent_inbox(runner_result)
+            else ErrorCode.RUNNER_UNAVAILABLE,
         )
+
+
+def _is_missing_parent_inbox(runner_result: _RunnerForwardResult) -> bool:
+    """
+    Return whether the runner refused a terminal status for lack of a parent inbox.
+
+    :param runner_result: HTTP result returned by the runner.
+    :returns: ``True`` for the runner's 503 ``subagent_delivery_not_confirmed``
+        with reason ``missing_parent_inbox``.
+    """
+    if runner_result.status_code != 503:
+        return False
+    try:
+        body = json.loads(runner_result.body)
+    except ValueError:
+        return False
+    return (
+        isinstance(body, dict)
+        and body.get("error") == "subagent_delivery_not_confirmed"
+        and body.get("reason") == "missing_parent_inbox"
+    )
 
 
 def _require_collaboration_mode_forward(

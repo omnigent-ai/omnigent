@@ -4806,7 +4806,7 @@ async def _forward_available_status_events(
                     _http_status_for_log(exc),
                     extra={"session_id": session_id},
                 )
-                if status != "failed":
+                if status != "failed" and not _is_subagent_parent_inbox_missing(exc):
                     await _post_forwarder_failed_status(
                         client,
                         session_id=session_id,
@@ -7316,6 +7316,27 @@ def _is_session_not_bound(exc: httpx.HTTPError) -> bool:
     :returns: ``True`` for a 403 status response, otherwise ``False``.
     """
     return _http_status_for_log(exc) == 403
+
+
+def _is_subagent_parent_inbox_missing(exc: httpx.HTTPError) -> bool:
+    """
+    Return whether ``exc`` is the server's ``subagent_parent_inbox_missing`` 410.
+
+    The session's own turn ended normally; only its parent cannot take the
+    result here, so the dropped status must not mark the session failed.
+
+    :param exc: HTTP exception raised while posting an Omnigent event.
+    :returns: ``True`` for a 410 whose ``error.code`` is
+        ``subagent_parent_inbox_missing``.
+    """
+    if not isinstance(exc, httpx.HTTPStatusError) or exc.response.status_code != 410:
+        return False
+    try:
+        body = exc.response.json()
+    except ValueError:
+        return False
+    error = body.get("error") if isinstance(body, dict) else None
+    return isinstance(error, dict) and error.get("code") == "subagent_parent_inbox_missing"
 
 
 def _is_subagent_delivery_not_confirmed(exc: httpx.HTTPError) -> bool:

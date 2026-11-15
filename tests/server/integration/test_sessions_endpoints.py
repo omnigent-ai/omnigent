@@ -6655,9 +6655,19 @@ async def test_codex_provider_token_failure_keeps_its_recovery_after_reload(
     assert {key: snapshot_resp.json()["last_task_error"][key] for key in card} == card
 
 
+@pytest.mark.parametrize(
+    ("reason", "http_status", "code"),
+    [
+        ("missing_parent_inbox", 410, "subagent_parent_inbox_missing"),
+        ("missing_work_entry", 503, "runner_unavailable"),
+    ],
+)
 async def test_post_external_session_status_propagates_runner_delivery_failure(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    reason: str,
+    http_status: int,
+    code: str,
 ) -> None:
     """
     Runner delivery failure for a non-Codex sub-agent is preserved by AP.
@@ -6684,7 +6694,7 @@ async def test_post_external_session_status_propagates_runner_delivery_failure(
             503,
             json={
                 "error": "subagent_delivery_not_confirmed",
-                "reason": "missing_parent_inbox",
+                "reason": reason,
             },
         )
 
@@ -6712,12 +6722,13 @@ async def test_post_external_session_status_propagates_runner_delivery_failure(
             json={"type": "external_session_status", "data": {"status": "idle"}},
         )
 
-    assert status_resp.status_code == 503, status_resp.text
+    # A missing parent inbox is final (410), so the sender stops resending.
+    assert status_resp.status_code == http_status, status_resp.text
     error = status_resp.json()["error"]
-    assert error["code"] == "runner_unavailable"
+    assert error["code"] == code
     # The runner's delivery-not-confirmed reason is retained in AP's error
     # message. If absent, Omnigent flattened the failure and made diagnosis harder.
-    assert "missing_parent_inbox" in error["message"]
+    assert reason in error["message"]
 
 
 async def test_post_external_output_text_delta_publishes_transient_delta(
