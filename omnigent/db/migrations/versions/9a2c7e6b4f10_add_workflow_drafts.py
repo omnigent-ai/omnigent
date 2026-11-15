@@ -6,6 +6,8 @@ Revises: 3b9e4c71d2a8
 Existing workflows remain runnable. Apply before upgrading the server.
 Downgrade removes drafts and session links; saved plans remain intact. Stop
 writers first. Draft cleanup commits bounded batches and can be restarted.
+Decrypt saved plans with the deployment's codec before downgrading; all plans
+are checked before the first draft is removed.
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ down_revision: str | None = "3b9e4c71d2a8"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 
-_CLEANUP_BATCH = 250
+_CLEANUP_BATCH = 200
 
 
 def _commit_cockroach_batch(connection: sa.Connection) -> None:
@@ -51,7 +53,18 @@ def downgrade() -> None:
     connection = op.get_bind()
     key = sa.tuple_(workflows.c.workspace_id, workflows.c.id)
     query = sa.select(workflows).order_by(workflows.c.workspace_id, workflows.c.id)
-    page = connection.execute(query.limit(_CLEANUP_BATCH)).all()
+    # A later encrypted page must not strand a partially deleted draft set.
+    try:
+        first_page = connection.execute(query.limit(_CLEANUP_BATCH)).all()
+        page = first_page
+        while page:
+            after = (page[-1].workspace_id, page[-1].id)
+            page = connection.execute(query.where(key > after).limit(_CLEANUP_BATCH)).all()
+    except ValueError as exc:
+        raise RuntimeError(
+            "Workflow plans must be readable before downgrading; decrypt encrypted plans first"
+        ) from exc
+    page = first_page
     cockroach = connection.dialect.name == "cockroachdb"
     if page:
         # Each cleanup statement commits independently; the revision is advanced

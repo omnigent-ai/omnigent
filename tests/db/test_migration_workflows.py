@@ -10,6 +10,7 @@ import sqlalchemy as sa
 from alembic import command
 from sqlalchemy.dialects.mysql import VARBINARY
 
+from omnigent.db import compression
 from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
 from omnigent.db.db_models import SqlWorkflow
 from omnigent.db.utils import _build_alembic_config, clear_engine_cache, get_or_create_engine
@@ -166,7 +167,10 @@ def test_oversized_legacy_description_stays_intact_until_corrected(db_uri: str) 
     assert store.get(saved.id, user_id=None) == saved
 
 
-def test_drafts_downgrade_cleanly_and_existing_plans_upgrade_as_runnable(db_uri: str) -> None:
+@pytest.mark.parametrize("encrypted_plan", [False, True], ids=["plaintext", "encrypted"])
+def test_drafts_downgrade_cleanly_and_existing_plans_upgrade_as_runnable(
+    db_uri: str, encrypted_plan: bool
+) -> None:
     engine = get_or_create_engine(db_uri)
     store = WorkflowStore(db_uri)
     saved = store.create(
@@ -175,16 +179,41 @@ def test_drafts_downgrade_cleanly_and_existing_plans_upgrade_as_runnable(db_uri:
     draft = store.create(user_id=None, name="draft", description="Plan it.", steps=[])
     for index in range(251):
         store.create(user_id=None, name=f"draft {index}", description="Plan it.", steps=[])
+    sealed = None
+    if encrypted_plan:
+        with engine.begin() as connection:
+            # Place ciphertext on the last page, after earlier pages of drafts.
+            sealed = connection.execute(
+                sa.select(SqlWorkflow.id, SqlWorkflow.plan)
+                .where(SqlWorkflow.workspace_id == 0)
+                .order_by(SqlWorkflow.id.desc())
+                .limit(1)
+            ).one()
+            connection.execute(
+                sa.update(SqlWorkflow)
+                .where(SqlWorkflow.workspace_id == 0, SqlWorkflow.id == sealed.id)
+                .values(
+                    plan=compression.encode_encrypted(
+                        compression.EncryptedTextPayload(b"ciphertext", {"key": "test-key"})
+                    )
+                )
+            )
     cleanup_reads = []
+    cleanup_deletes = []
 
     def inspect_cleanup(_conn, _cursor, statement, parameters, _context, _executemany):
         query = getattr(_context.compiled, "statement", None)
-        if isinstance(query, sa.Select) and any(
-            getattr(table, "name", None) == "workflows" for table in query.get_final_froms()
+        if (
+            isinstance(query, sa.Select)
+            and "plan" in query.selected_columns
+            and any(
+                getattr(table, "name", None) == "workflows" for table in query.get_final_froms()
+            )
         ):
             cleanup_reads.append(parameters)
             assert "LIMIT" in statement
         if isinstance(query, sa.Delete) and query.table.name == "workflows":
+            cleanup_deletes.append(parameters)
             if engine.dialect.name == "cockroachdb":
                 assert _conn.in_transaction()
             else:
@@ -192,12 +221,36 @@ def test_drafts_downgrade_cleanly_and_existing_plans_upgrade_as_runnable(db_uri:
 
     sa.event.listen(engine, "before_cursor_execute", inspect_cleanup)
     try:
-        _migrate(db_uri, engine, "3b9e4c71d2a8", down=True)
+        if encrypted_plan:
+            with pytest.raises(RuntimeError, match="decrypt encrypted plans first"):
+                _migrate(db_uri, engine, "9a2c7e6b4f10@3b9e4c71d2a8", down=True)
+            assert not cleanup_deletes
+            assert len(cleanup_reads) >= 2
+            assert "planning_session_id" in {
+                column["name"] for column in sa.inspect(engine).get_columns(_TABLE)
+            }
+            with engine.connect() as connection:
+                assert (
+                    connection.execute(sa.text("SELECT COUNT(*) FROM workflows")).scalar_one()
+                    == 253
+                )
+        else:
+            _migrate(db_uri, engine, "9a2c7e6b4f10@3b9e4c71d2a8", down=True)
+            assert len(cleanup_deletes) >= 2
+            assert len(cleanup_reads) >= 3
     finally:
         sa.event.remove(engine, "before_cursor_execute", inspect_cleanup)
+        if sealed is not None:
+            with engine.begin() as connection:
+                connection.execute(
+                    sa.update(SqlWorkflow)
+                    .where(SqlWorkflow.workspace_id == 0, SqlWorkflow.id == sealed.id)
+                    .values(plan=sealed.plan)
+                )
         _migrate(db_uri, engine, "head")
-    assert len(cleanup_reads) >= 3
     assert store.get(saved.id, user_id=None) == saved
-    assert store.get(draft.id, user_id=None) is None
+    assert store.get(draft.id, user_id=None) == (draft if encrypted_plan else None)
     with engine.connect() as connection:
-        assert connection.execute(sa.text("SELECT COUNT(*) FROM workflows")).scalar_one() == 1
+        assert connection.execute(sa.text("SELECT COUNT(*) FROM workflows")).scalar_one() == (
+            253 if encrypted_plan else 1
+        )
