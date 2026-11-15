@@ -111,7 +111,7 @@ def build_sign_in_watch(
                     return
                 if any(detect_sign_in_prompt(screen) is not None for screen in screens):
                     continue
-                if _sign_in_agent_ready(conv_id, harness, screens):
+                if await _sign_in_agent_ready(conv_id, harness, screens):
                     # Post before the release on exit, so the notice lands before the resend
                     # and a resend refused again can rewatch.
                     await _post_sign_in_completed_notice(
@@ -122,7 +122,7 @@ def build_sign_in_watch(
             # Any exit resumes a held message; teardown paths drop the queue themselves.
             _release_sign_in_hold(conv_id)
 
-    def _sign_in_agent_ready(conv_id: str, harness: str | None, screens: list[str]) -> bool:
+    async def _sign_in_agent_ready(conv_id: str, harness: str | None, screens: list[str]) -> bool:
         """Return whether the agent can take a message now that no sign-in prompt is on screen."""
         if harness == "codex-native":
             from omnigent.harnesses.codex_native.bridge import read_bridge_state
@@ -130,7 +130,13 @@ def build_sign_in_watch(
 
             # Thread discovery publishes the bridge state the moment the TUI starts a thread,
             # in the directory the launch used (a rotated session's label directory).
-            return read_bridge_state(codex_native_bridge_dir(conv_id)) is not None
+            bridge_dir = codex_native_bridge_dir(conv_id)
+            state = await asyncio.to_thread(read_bridge_state, bridge_dir)
+            return (
+                state is not None
+                and state.session_id == conv_id
+                and codex_native_bridge_dir(conv_id) == bridge_dir
+            )
         if harness == "claude-native":
             from omnigent.harnesses.claude_native.bridge import _claude_prompt_rendered
 

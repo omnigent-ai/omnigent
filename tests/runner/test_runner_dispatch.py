@@ -107,6 +107,7 @@ from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy, ToolsConfi
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from tests._helpers.polling import poll_until_async
 from tests._helpers.providers import isolate_provider_resolution
+from tests.budgets import budget
 from tests.runner.conftest import (
     _FakeProcessManager as _RecoveryFakeProcessManager,
 )
@@ -14237,15 +14238,30 @@ _SIGNED_IN_SCREENS = {
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("harness", "rotated"),
-    [("codex-native", False), ("codex-native", True), ("claude-native", False)],
-    ids=["codex-native", "codex-native-rotated", "claude-native"],
+    ("harness", "rotated", "bridge_probe"),
+    [
+        ("codex-native", False, "ready"),
+        ("codex-native", True, "ready"),
+        ("claude-native", False, "ready"),
+        ("codex-native", False, "slow-read"),
+        ("codex-native", True, "foreign-session"),
+        ("codex-native", False, "moved-bridge"),
+    ],
+    ids=[
+        "codex-native",
+        "codex-native-rotated",
+        "claude-native",
+        "codex-slow-bridge-read",
+        "codex-foreign-bridge-session",
+        "codex-bridge-replaced-during-read",
+    ],
 )
 async def test_sign_in_pending_failure_posts_a_notice_once_the_agent_is_ready(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     harness: str,
     rotated: bool,
+    bridge_probe: str,
 ) -> None:
     """
     A turn that failed on a pending Databricks sign-in is followed by one "signed in" notice.
@@ -14279,6 +14295,23 @@ async def test_sign_in_pending_failure_posts_a_notice_once_the_agent_is_ready(
             return await super().post(url, **kwargs)
 
     reads = 0
+    probe_started = asyncio.Event()
+    probe_rechecked = asyncio.Event()
+    release_probe = threading.Event()
+    probe_expired = False
+    loop = asyncio.get_running_loop()
+    original_read_text = Path.read_text
+
+    def read_text(path: Path, *args: Any, **kwargs: Any) -> str:
+        nonlocal probe_expired
+        if path == bridge_dir / "state.json" and not release_probe.is_set():
+            loop.call_soon_threadsafe(probe_started.set)
+            if not release_probe.wait(timeout=budget(3)):
+                probe_expired = True
+        return original_read_text(path, *args, **kwargs)
+
+    if bridge_probe in {"slow-read", "moved-bridge"}:
+        monkeypatch.setattr(Path, "read_text", read_text)
 
     async def _read(scrollback: int = 0, *, join_wrapped: bool = False) -> dict[str, object]:
         nonlocal reads
@@ -14286,12 +14319,20 @@ async def test_sign_in_pending_failure_posts_a_notice_once_the_agent_is_ready(
         reads += 1
         if reads < 3:
             return {"screen": _SIGN_IN_PROMPT_SCREEN}
+        if bridge_probe == "foreign-session" and reads >= 4:
+            probe_started.set()
+        if bridge_probe == "moved-bridge" and reads >= 4:
+            probe_rechecked.set()
         if harness == "codex-native":
             # Thread discovery publishes the bridge state as the TUI starts a thread.
             codex_bridge.write_bridge_state(
                 bridge_dir,
                 codex_bridge.CodexNativeBridgeState(
-                    session_id=conv,
+                    session_id=(
+                        "previous-conversation"
+                        if bridge_probe == "foreign-session" and not release_probe.is_set()
+                        else conv
+                    ),
                     socket_path="ws://127.0.0.1:1",
                     thread_id="019e96aa-abcd-7343-8d3b-6f914d60936b",
                     codex_home=str(tmp_path / "codex-home"),
@@ -14349,12 +14390,24 @@ async def test_sign_in_pending_failure_posts_a_notice_once_the_agent_is_ready(
         )
         assert response.status_code == 202
         await _await_bg_turn_task(conv)
-        for _ in range(200):
-            if _notices():
-                break
-            await asyncio.sleep(0.01)
-        # Let the watcher wind down before the app is torn down.
-        await asyncio.sleep(0.05)
+        try:
+            if bridge_probe != "ready":
+                await asyncio.wait_for(probe_started.wait(), timeout=budget(5))
+                assert not probe_expired, "bridge I/O blocked the runner event loop"
+                assert not _notices(), "sign-in completed before this session was ready"
+                if bridge_probe == "moved-bridge":
+                    replacement = codex_bridge.bridge_dir_for_bridge_id("replacement-launch")
+                    monkeypatch.setitem(
+                        native_orchestration._AUTO_CODEX_BRIDGE_DIRS, conv, replacement
+                    )
+                release_probe.set()
+                if bridge_probe == "moved-bridge":
+                    await asyncio.wait_for(probe_rechecked.wait(), timeout=budget(5))
+                    assert not _notices(), "the replaced bridge reported sign-in completion"
+                    bridge_dir = replacement
+            await poll_until_async(lambda: bool(_notices()), timeout_s=budget(5))
+        finally:
+            release_probe.set()
 
     (notice,) = _notices()
     item = notice["data"]["item_data"]
