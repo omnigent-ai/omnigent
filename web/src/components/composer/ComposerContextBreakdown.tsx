@@ -93,7 +93,7 @@ function attachmentRow(attachment: ContextBreakdownAttachment, index: number) {
         label={label}
         tokens={null}
         source="unknown"
-        valueLabel="File removed"
+        valueLabel="Not delivered"
       />
     );
   }

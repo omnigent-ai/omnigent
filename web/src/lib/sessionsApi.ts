@@ -1581,7 +1581,7 @@ export async function getSessionUsage(
   };
 }
 
-/** How an attachment reaches the model: sent inline, saved to the workspace, or gone. */
+/** How an attachment reaches the model: sent inline, saved to disk, or not delivered. */
 export type ContextAttachmentDelivery = "inline" | "workspace" | "missing";
 
 export interface ContextBreakdownAttachment {

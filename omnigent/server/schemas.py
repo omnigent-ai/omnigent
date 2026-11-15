@@ -3250,11 +3250,13 @@ class ContextBreakdownAttachment(BaseModel):
         bytes sent inline in the message.
     :param filename: Display name, e.g. ``"report.pdf"``; ``None`` when unknown.
     :param content_type: Stored MIME type, e.g. ``"image/png"``.
-    :param bytes: Stored size in bytes; ``None`` when the file is gone.
+    :param bytes: Stored or inline-decoded size in bytes; ``None`` when
+        unknown (the file is gone or the block is a remote URL).
     :param delivery: ``"inline"`` (sent to the model), ``"workspace"``
-        (saved to the workspace, or any attachment of a native harness; only
-        its path reaches the model) or
-        ``"missing"`` (the file record no longer exists).
+        (saved to disk, as a native harness does with each attachment it can
+        decode; only its path reaches the model) or ``"missing"`` (not
+        delivered: the file record is gone, or a native harness could not
+        write the block to disk).
     :param estimated_tokens: Estimated prompt tokens for an inline
         attachment; ``None`` when its type has no reliable estimate (e.g. a
         PDF) or it is not inline.

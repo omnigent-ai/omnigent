@@ -243,8 +243,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   Tool definitions list the agent's MCP servers and tool counts without a size.
   Each attachment shows its size and whether it was sent inline (with an
   estimate, or "Size only" for PDFs and other binary files), saved to the
-  workspace, or removed; a native harness receives every attachment as a
-  workspace path. History notes how many earlier items a compaction summary
+  workspace, or not delivered (file removed, or a native harness could not
+  write it to disk); a native harness receives each attachment it can decode
+  as a file path. History notes how many earlier items a compaction summary
   replaced. A server without the breakdown route still shows the
   measured header.
 - `review-context`: submitting an Agent comment in PR Changes attaches a chip

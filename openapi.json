@@ -1989,7 +1989,7 @@
                 "type": "null"
               }
             ],
-            "description": "Stored size in bytes; `None` when the file is gone.",
+            "description": "Stored or inline-decoded size in bytes; `None` when unknown (the file is gone or the block is a remote URL).",
             "title": "Bytes"
           },
           "content_type": {
@@ -2005,7 +2005,7 @@
             "title": "Content Type"
           },
           "delivery": {
-            "description": "`\"inline\"` (sent to the model), `\"workspace\"` (saved to the workspace, or any attachment of a native harness; only its path reaches the model) or `\"missing\"` (the file record no longer exists).",
+            "description": "`\"inline\"` (sent to the model), `\"workspace\"` (saved to disk, as a native harness does with each attachment it can decode; only its path reaches the model) or `\"missing\"` (not delivered: the file record is gone, or a native harness could not write the block to disk).",
             "enum": [
               "inline",
               "workspace",
