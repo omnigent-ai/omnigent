@@ -686,7 +686,7 @@ async def test_refusal_on_a_stream_a_newer_turn_took_over_is_reported_not_held(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["read-raises", "watch-cancelled"])
+@pytest.mark.parametrize("failure", ["read-raises", "watch-cancelled", "pane-replaced"])
 async def test_a_failing_sign_in_watch_still_releases_the_held_message(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str
 ) -> None:
@@ -694,6 +694,7 @@ async def test_a_failing_sign_in_watch_still_releases_the_held_message(
     monkeypatch.setattr(sign_in_watch, "_SIGN_IN_WATCH_INTERVAL_S", 0.01)
     sid = uuid.uuid4().hex
     reads = 0
+    allow_ready = asyncio.Event()
 
     async def read(scrollback: int = 0, *, join_wrapped: bool = False) -> dict[str, object]:
         nonlocal reads
@@ -701,12 +702,18 @@ async def test_a_failing_sign_in_watch_still_releases_the_held_message(
         if failure == "watch-cancelled":
             return {"screen": _SIGN_IN_SCREEN}
         if reads == 1:
+            if failure == "pane-replaced":
+                replacement = make_test_terminal_instance("claude", "main", tmp_path)
+                replacement.read = read  # type: ignore[method-assign]
+                registry._by_conversation[sid][("claude", "main")] = replacement
+                return {"screen": _READY_SCREEN}
             raise RuntimeError("synthetic pane read failure")
+        if failure == "pane-replaced":
+            await allow_ready.wait()
         return {"screen": _READY_SCREEN}
 
-    app, harness, server = _build_app(
-        [_REFUSED, _DELIVERED], terminal_registry=_claude_pane(sid, tmp_path, read)
-    )
+    registry = _claude_pane(sid, tmp_path, read)
+    app, harness, server = _build_app([_REFUSED, _DELIVERED], terminal_registry=registry)
     async with _runner_client(app) as client:
         await _create_session(client, sid)
         await client.post(f"/v1/sessions/{sid}/events", json=_message("first"))
@@ -715,11 +722,19 @@ async def test_a_failing_sign_in_watch_still_releases_the_held_message(
             await _until(lambda: sid in app.state.sign_in_holds and reads > 0)
             (watch,) = [t for t in asyncio.all_tasks() if t.get_name() == f"sign-in-watch-{sid}"]
             watch.cancel()
+        if failure == "pane-replaced":
+            try:
+                await _until(lambda: reads >= 2 or len(harness.posted_bodies) > 1)
+                assert len(harness.posted_bodies) == 1
+                assert app.state.sign_in_holds[sid].waiting
+                assert not server.notices("databricks_sign_in_completed")
+            finally:
+                allow_ready.set()
         await _until(lambda: len(harness.posted_bodies) == 2 and sid not in app.state.active_turns)
 
     assert [_sent_text(body) for body in harness.posted_bodies] == ["first", "first"]
     assert sid not in app.state.sign_in_holds
-    if failure == "read-raises":
+    if failure != "watch-cancelled":
         assert reads >= 2
         (ready,) = server.notices("databricks_sign_in_completed")
         assert ready["message"] == "Claude Code is ready. Sending your message now."

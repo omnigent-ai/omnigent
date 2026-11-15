@@ -14237,15 +14237,24 @@ _SIGNED_IN_SCREENS = {
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("harness", "rotated"),
-    [("codex-native", False), ("codex-native", True), ("claude-native", False)],
-    ids=["codex-native", "codex-native-rotated", "claude-native"],
+    ("harness", "rotated", "read_fault"),
+    [
+        ("codex-native", False, None),
+        ("codex-native", True, None),
+        ("claude-native", False, None),
+        ("codex-native", False, "raises"),
+        ("codex-native", False, "missing-screen"),
+        ("codex-native", False, "empty-screen"),
+        ("codex-native", False, "replaced-pane"),
+        ("claude-native", False, "replaced-pane"),
+    ],
 )
 async def test_sign_in_pending_failure_posts_a_notice_once_the_agent_is_ready(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     harness: str,
     rotated: bool,
+    read_fault: str | None,
 ) -> None:
     """
     A turn that failed on a pending Databricks sign-in is followed by one "signed in" notice.
@@ -14279,6 +14288,7 @@ async def test_sign_in_pending_failure_posts_a_notice_once_the_agent_is_ready(
             return await super().post(url, **kwargs)
 
     reads = 0
+    allow_ready = asyncio.Event()
 
     async def _read(scrollback: int = 0, *, join_wrapped: bool = False) -> dict[str, object]:
         nonlocal reads
@@ -14286,6 +14296,8 @@ async def test_sign_in_pending_failure_posts_a_notice_once_the_agent_is_ready(
         reads += 1
         if reads < 3:
             return {"screen": _SIGN_IN_PROMPT_SCREEN}
+        if read_fault is not None and reads > 3:
+            await allow_ready.wait()
         if harness == "codex-native":
             # Thread discovery publishes the bridge state as the TUI starts a thread.
             codex_bridge.write_bridge_state(
@@ -14298,6 +14310,19 @@ async def test_sign_in_pending_failure_posts_a_notice_once_the_agent_is_ready(
                     cwd=str(tmp_path),
                 ),
             )
+        if reads == 3:
+            if read_fault == "raises":
+                raise RuntimeError("synthetic pane read failure")
+            if read_fault == "missing-screen":
+                return {}
+            if read_fault == "empty-screen":
+                return {"screen": ""}
+            if read_fault == "replaced-pane":
+                replacement = make_test_terminal_instance(pane_name, "main", tmp_path)
+                replacement.read = _read  # type: ignore[method-assign]
+                registry._by_conversation[conv][(instance.name, instance.session_key)] = (
+                    replacement
+                )
         return {"screen": _SIGNED_IN_SCREENS[harness]}
 
     pane_name = "codex" if harness == "codex-native" else "claude"
@@ -14349,6 +14374,12 @@ async def test_sign_in_pending_failure_posts_a_notice_once_the_agent_is_ready(
         )
         assert response.status_code == 202
         await _await_bg_turn_task(conv)
+        if read_fault is not None:
+            try:
+                await poll_until_async(lambda: bool(_notices()) or reads > 3)
+                assert not _notices(), "an unreadable or replaced pane cannot prove sign-in"
+            finally:
+                allow_ready.set()
         for _ in range(200):
             if _notices():
                 break
