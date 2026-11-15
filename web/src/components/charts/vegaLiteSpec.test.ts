@@ -89,14 +89,62 @@ describe("parseVegaLiteSpec", () => {
   it("refuses an unbounded impute range and sequence() in expressions", () => {
     const impute = { impute: "y", key: "x", keyvals: { start: 0, stop: 1e10 } };
     const calculate = { calculate: "length(sequence(0, 1e9))", as: "n" };
+    const axisExpression = (labelExpr: string) => ({
+      ...INLINE_SPEC,
+      encoding: { x: { field: "a", type: "quantitative", axis: { labelExpr } } },
+    });
 
     expect(errorOf(JSON.stringify({ ...INLINE_SPEC, transform: [impute] }))).toMatch(/impute/);
-    expect(errorOf(JSON.stringify({ ...INLINE_SPEC, transform: [calculate] }))).toMatch(
-      /sequence\(\)/,
-    );
+    for (const spec of [
+      { ...INLINE_SPEC, transform: [calculate] },
+      axisExpression("length(sequence(0, 1000000000))"),
+      axisExpression("length(sequence (0, 1000000000))"),
+      { ...INLINE_SPEC, params: [{ name: "n", expr: "length(sequence(0, 1e9))" }] },
+    ]) {
+      expect(errorOf(JSON.stringify(spec))).toMatch(/sequence\(\)/);
+    }
     // Prose that mentions a sequence is fine.
-    const titled = { ...INLINE_SPEC, title: "Fibonacci sequence (first 10)" };
-    expect(parseVegaLiteSpec(JSON.stringify(titled)).ok).toBe(true);
+    const prose = {
+      ...INLINE_SPEC,
+      title: "Reads per sequence(bp)",
+      encoding: { x: { field: "sequence(bp)", type: "quantitative" } },
+    };
+    expect(parseVegaLiteSpec(JSON.stringify(prose)).ok).toBe(true);
+  });
+
+  it("refuses a number format wider than the limit and allows ordinary ones", () => {
+    const withAxisFormat = (format: string) => ({
+      ...INLINE_SPEC,
+      encoding: { x: { field: "a", type: "quantitative", axis: { format } } },
+    });
+
+    expect(errorOf(JSON.stringify(withAxisFormat("01001d")))).toMatch(/number format/);
+    expect(errorOf(JSON.stringify({ ...INLINE_SPEC, config: { numberFormat: "02000d" } }))).toMatch(
+      /number format/,
+    );
+    for (const format of ["01000d", "$,.2f", "%Y-%m-%d", "%b 2024", "FY2025 Q%q"]) {
+      expect(parseVegaLiteSpec(JSON.stringify(withAxisFormat(format))).ok).toBe(true);
+    }
+  });
+
+  it.each([
+    ["too many bins", { bin: { maxbins: 5_000 } }, /maxbins/],
+    ["too many density steps", { density: "a", steps: 1e7 }, /steps/],
+    ["too fine a quantile step", { quantile: "a", step: 1e-8 }, /quantile/],
+    [
+      "too high a regression order",
+      { regression: "a", on: "a", method: "poly", order: 100 },
+      /order/,
+    ],
+  ])("refuses %s", (_label, transform, message) => {
+    expect(errorOf(JSON.stringify({ ...INLINE_SPEC, transform: [transform] }))).toMatch(message);
+  });
+
+  it("refuses custom format types, which call expression functions by name", () => {
+    for (const customFormatTypes of [true, 1]) {
+      const spec = { ...INLINE_SPEC, config: { customFormatTypes } };
+      expect(errorOf(JSON.stringify(spec))).toMatch(/Custom format types/);
+    }
   });
 });
 

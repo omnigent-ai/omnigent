@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ChartDrawCancelled,
+  ChartLimitError,
   blockedLoader,
   chartThemeConfig,
   createChartTooltip,
@@ -213,6 +214,52 @@ describe("renderVegaLiteChart confinement", () => {
 
     await expect(renderVegaLiteChart(container, spec, () => COLORS)).rejects.toThrow(message);
     expect(container.querySelector("svg")).toBeNull();
+  });
+
+  // One past each limit, so a regression fails cleanly instead of exhausting memory.
+  it.each([
+    ["a parenthesised sequence call", "length((sequence)(0, 100001))"],
+    ["an escaped sequence call", "length(sequ\\u0065nce(0, 100001))"],
+    ["a long pad", "length(pad('', 100001))"],
+    ["a pad with a long pad string", "length(pad('', 1000, pad('', 101)))"],
+    ["a numeric format width", "format(1, 1001)"],
+    ["a time sequence", "length(timeSequence('milliseconds', 0, 100001))"],
+  ])("fails %s instead of allocating it", async (_label, calculate) => {
+    const container = mountContainer();
+    const spec = { ...BAR_SPEC, transform: [{ calculate, as: "n" }] };
+
+    await expect(renderVegaLiteChart(container, spec, () => COLORS)).rejects.toBeInstanceOf(
+      ChartLimitError,
+    );
+  });
+
+  it("keeps capped functions working within their limits", async () => {
+    const container = mountContainer();
+    const spec = {
+      data: { values: [{ amount: 28 }] },
+      transform: [
+        {
+          calculate:
+            "length(sequence(0, 10)) + '|' + length(sequence(0, 10, 0)) + '|' + pad('7', 3, '0') + '|' + length(utcSequence('day', 0, 864000000))",
+          as: "summary",
+        },
+      ],
+      mark: "text",
+      encoding: { text: { field: "summary" } },
+    };
+    const formatted = {
+      data: { values: [{ amount: 28 }] },
+      mark: "text",
+      encoding: { text: { field: "amount", type: "quantitative", format: ".1f" } },
+    };
+
+    const chart = await renderVegaLiteChart(container, spec, () => COLORS);
+    expect(container.querySelector("g.mark-text text")?.textContent).toBe("10|0|700|10");
+    chart.finalize();
+
+    const formattedChart = await renderVegaLiteChart(container, formatted, () => COLORS);
+    expect(container.querySelector("g.mark-text text")?.textContent).toBe("28.0");
+    formattedChart.finalize();
   });
 
   it("allows a keyword cursor", async () => {

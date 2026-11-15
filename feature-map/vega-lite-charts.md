@@ -20,10 +20,14 @@ Charts show tooltips, follow light and dark mode, and download as PNG or SVG.
   the app.
 - `safety`: only inline data draws. A spec that loads a URL, a full Vega spec,
   invalid JSON, a sequence or impute range over 100,000 rows, `sequence()` in an
-  expression, a `url(...)` color, a non-keyword cursor, or a spec over 1,000,000
-  characters shows an error with the source. Images and links don't load,
-  expressions run in Vega's interpreter, inputs stay inside the chart, and a
-  chart can't listen to page elements, keys or timers.
+  expression, a custom format type, a number format over 1,000 wide, oversized
+  bin, density, quantile or regression settings, a `url(...)` color, a
+  non-keyword cursor, or a spec over 1,000,000 characters shows an error with
+  the source. While drawing, `sequence()`, `pad()`, `timeSequence()` and
+  `utcSequence()` are capped at 100,000 items and `format()` widths at 1,000,
+  however the call is written. Images and links don't load, expressions run in Vega's interpreter,
+  inputs stay inside the chart, and a chart can't listen to page elements, keys
+  or timers.
 - `states`: drawing, drawn, refused or failed to compile (error and source),
   and a truncated file (asks for the source view).
 - `gate`: with the flag off, fences stay code blocks and chart files open as JSON.

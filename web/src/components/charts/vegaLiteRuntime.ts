@@ -5,7 +5,7 @@ import type * as VegaModule from "vega";
 import type { expressionInterpreter as ExpressionInterpreter } from "vega-interpreter";
 import type { compile as CompileVegaLite, Config as VegaLiteConfig, TopLevelSpec } from "vega-lite";
 import { getEmbedRoot } from "@/lib/host";
-import type { VegaLiteSpec } from "./vegaLiteSpec";
+import { isOversizedFormat, MAX_VEGA_LITE_FORMAT_WIDTH, type VegaLiteSpec } from "./vegaLiteSpec";
 
 interface VegaModules {
   vega: typeof VegaModule;
@@ -15,6 +15,79 @@ interface VegaModules {
 
 let modulesPromise: Promise<VegaModules> | null = null;
 
+/** Most items `sequence()` and characters `pad()` may produce in a chart expression. */
+export const MAX_EXPRESSION_ITEMS = 100_000;
+
+/** Thrown by a chart expression that asks for more than the limits allow. */
+export class ChartLimitError extends Error {}
+
+type ExpressionFunction = ((this: unknown, ...args: unknown[]) => unknown) & {
+  [LIMITED]?: true;
+};
+interface TimeInterval {
+  count?: (start: Date, end: Date) => number;
+}
+
+// Marks a wrapped function, so reloading this module doesn't wrap it twice.
+const LIMITED = Symbol.for("omnigent.chartExpressionLimit");
+
+/** Wrap expression function *name* so a call *check* refuses throws instead of running. */
+function limitExpressionFunction(
+  vega: typeof VegaModule,
+  name: string,
+  check: (args: unknown[]) => string | null,
+): void {
+  const original = vega.expressionFunction(name) as ExpressionFunction | undefined;
+  if (!original || original[LIMITED]) return;
+  // Keeps the original's `this`: `format` reads the view's locale from it.
+  const limited: ExpressionFunction = function (this: unknown, ...args: unknown[]) {
+    const reason = check(args);
+    if (reason) throw new ChartLimitError(reason);
+    return original.apply(this, args);
+  };
+  limited[LIMITED] = true;
+  vega.expressionFunction(name, limited);
+}
+
+const tooMany = (what: string) =>
+  `${what} can produce at most ${MAX_EXPRESSION_ITEMS.toLocaleString()} items.`;
+
+/**
+ * Cap the expression functions that allocate in proportion to their arguments.
+ * This runs at evaluation time, so it holds however a spec spells the call.
+ */
+function installExpressionLimits(vega: typeof VegaModule): void {
+  limitExpressionFunction(vega, "sequence", (args) => {
+    const [start, stop, step = 1] = (args.length === 1 ? [0, args[0]] : args).map(Number);
+    return step !== 0 && Math.ceil((stop - start) / step) > MAX_EXPRESSION_ITEMS
+      ? tooMany("sequence()")
+      : null;
+  });
+  limitExpressionFunction(vega, "pad", ([text, length, character]) => {
+    const missing = Math.max(0, Number(length) - String(text).length);
+    return missing * String(character || " ").length > MAX_EXPRESSION_ITEMS
+      ? `pad() can produce at most ${MAX_EXPRESSION_ITEMS.toLocaleString()} characters.`
+      : null;
+  });
+  limitExpressionFunction(vega, "format", ([, specifier]) =>
+    isOversizedFormat(String(specifier))
+      ? `format() widths can be at most ${MAX_VEGA_LITE_FORMAT_WIDTH.toLocaleString()}.`
+      : null,
+  );
+  const intervals = vega as unknown as Record<string, (unit: unknown) => TimeInterval | undefined>;
+  for (const [name, intervalOf] of [
+    ["timeSequence", intervals.timeInterval],
+    ["utcSequence", intervals.utcInterval],
+  ] as const) {
+    limitExpressionFunction(vega, name, ([unit, start, stop, step = 1]) => {
+      const count = intervalOf(unit)?.count?.(new Date(Number(start)), new Date(Number(stop)));
+      return count !== undefined && count / Math.max(1, Number(step)) > MAX_EXPRESSION_ITEMS
+        ? tooMany(`${name}()`)
+        : null;
+    });
+  }
+}
+
 /** Load Vega, Vega-Lite and the expression interpreter once; a failed load retries next time. */
 export function loadVegaModules(): Promise<VegaModules> {
   modulesPromise ??= Promise.all([
@@ -22,11 +95,14 @@ export function loadVegaModules(): Promise<VegaModules> {
     import("vega-lite"),
     import("vega-interpreter"),
   ]).then(
-    ([vega, vegaLite, interpreter]) => ({
-      vega,
-      compile: vegaLite.compile,
-      expressionInterpreter: interpreter.expressionInterpreter,
-    }),
+    ([vega, vegaLite, interpreter]) => {
+      installExpressionLimits(vega);
+      return {
+        vega,
+        compile: vegaLite.compile,
+        expressionInterpreter: interpreter.expressionInterpreter,
+      };
+    },
     (error: unknown) => {
       modulesPromise = null;
       throw error;
@@ -339,6 +415,17 @@ export async function renderVegaLiteChart(
   target.className = "w-full";
   container.replaceChildren(target);
   const tooltip = createChartTooltip();
+  // Vega logs expression errors rather than throwing; a limit hit while drawing fails the chart.
+  const logger = vega.logger(vega.Error);
+  const logError = logger.error.bind(logger);
+  let limitHit: ChartLimitError | undefined;
+  let firstRun = true;
+  logger.error = (...args: readonly unknown[]) => {
+    if (firstRun) {
+      limitHit ??= args.find((arg): arg is ChartLimitError => arg instanceof ChartLimitError);
+    }
+    return logError(...args);
+  };
   const view = new vega.View(runtime, {
     container: target,
     renderer: "svg",
@@ -346,7 +433,7 @@ export async function renderVegaLiteChart(
     loader: blockedLoader(),
     expr: expressionInterpreter,
     tooltip: tooltip.handler,
-    logLevel: vega.Error,
+    logger,
   });
   const finalize = () => {
     view.finalize();
@@ -354,6 +441,8 @@ export async function renderVegaLiteChart(
   };
   try {
     await view.runAsync();
+    firstRun = false;
+    if (limitHit !== undefined) throw new ChartLimitError(limitHit.message);
   } catch (error) {
     finalize();
     throw error;
