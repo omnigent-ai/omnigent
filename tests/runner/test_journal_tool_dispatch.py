@@ -117,15 +117,18 @@ async def test_workflow_tool_advertisement_follows_the_server_not_the_host(
     assert "sys_session_list" in names
 
 
-@pytest.mark.parametrize("failure", ["unavailable", "invalid_json", "offline"])
+@pytest.mark.parametrize("failure", ["unavailable", "invalid_json", "offline", "read_timeout"])
 async def test_failed_workflow_flag_probes_retry_and_preserve_last_success(failure: str) -> None:
     unavailable, enabled = True, True
     requests: list[httpx.Request] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
         requests.append(request)
+        assert 0 < request.extensions["timeout"]["read"] <= 5
         if not unavailable:
             return httpx.Response(200, json={"features": {"workflows": enabled}})
+        if failure == "read_timeout":
+            raise httpx.ReadTimeout("no response", request=request)
         if failure == "offline":
             raise httpx.ConnectError("offline", request=request)
         if failure == "invalid_json":
@@ -133,6 +136,7 @@ async def test_failed_workflow_flag_probes_retry_and_preserve_last_success(failu
         return httpx.Response(503)
 
     async with _client(respond) as client:
+        client.timeout = httpx.Timeout(5.0, read=None)
         invalidate_server_workflow_flag(client)
         assert not requests
         assert await server_workflows_enabled(client) is False
@@ -681,7 +685,8 @@ async def test_a_load_of_an_unknown_name_suggests_the_closest_ones() -> None:
     assert "Release notes" not in result["similar"]
 
 
-async def test_a_list_pages_the_workflows_with_the_start_of_each_description() -> None:
+@pytest.mark.parametrize("cursor", ["2" * 32, "name:VHJpYWdlIGZsYWt5IHRlc3Rz"])
+async def test_a_list_pages_the_workflows_with_the_start_of_each_description(cursor: str) -> None:
     long = "Finds and fixes flaky tests. " * 20
     pages = {
         None: {
@@ -692,12 +697,14 @@ async def test_a_list_pages_the_workflows_with_the_start_of_each_description() -
             "last_id": "2" * 32,
             "has_more": True,
         },
-        "2" * 32: {
+        cursor: {
             "data": [{"id": "3" * 32, "name": "Upgrade a package", "description": "Bumps one."}],
             "last_id": "3" * 32,
             "has_more": False,
         },
     }
+    if cursor.startswith("name:"):
+        pages[None]["next_cursor"] = cursor
     seen: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -708,7 +715,10 @@ async def test_a_list_pages_the_workflows_with_the_start_of_each_description() -
     async with _client(handler) as client:
         first = await _run(client, "sys_workflow_list", {"limit": 2})
         rest = await _run(client, "sys_workflow_list", {"cursor": first["next_cursor"]})
-    assert seen == ["/v1/workflows?limit=2", f"/v1/workflows?limit=20&after={'2' * 32}"]
+    assert seen == [
+        "/v1/workflows?limit=2",
+        f"/v1/workflows?limit=20&{httpx.QueryParams({'after': cursor})}",
+    ]
     assert first["workflows"][0] == {
         "id": "1" * 32,
         "name": "Release notes",
@@ -717,7 +727,7 @@ async def test_a_list_pages_the_workflows_with_the_start_of_each_description() -
     preview = first["workflows"][1]["description"]
     assert len(preview) <= 200 and preview.endswith("…")
     assert long.startswith(preview.removesuffix("…"))
-    assert first["next_cursor"] == "2" * 32
+    assert first["next_cursor"] == cursor
     assert rest == {
         "workflows": [{"id": "3" * 32, "name": "Upgrade a package", "description": "Bumps one."}],
         "next_cursor": None,

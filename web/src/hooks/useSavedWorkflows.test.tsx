@@ -66,45 +66,49 @@ describe("useSavedWorkflows", () => {
     expect(result.current.workflows).toEqual([]);
   });
 
-  it("loads another bounded page only on request", async () => {
-    const first = Array.from({ length: 200 }, (_, index) => ({
-      id: `workflow-${index}`,
-      name: `Workflow ${index}`,
-      description: "",
-    }));
-    const last = { id: "workflow-200", name: "Last workflow", description: "" };
-    vi.mocked(authenticatedFetch)
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            data: first,
-            has_more: true,
-            last_id: "workflow-199",
-          }),
-        ),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            data: [last],
-            has_more: false,
-            last_id: last.id,
-          }),
-        ),
+  it.each([undefined, "name:V29ya2Zsb3cgMTk5"])(
+    "loads another bounded page only on request with cursor %s",
+    async (cursor) => {
+      const first = Array.from({ length: 200 }, (_, index) => ({
+        id: `workflow-${index}`,
+        name: `Workflow ${index}`,
+        description: "",
+      }));
+      const last = { id: "workflow-200", name: "Last workflow", description: "" };
+      vi.mocked(authenticatedFetch)
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              data: first,
+              has_more: true,
+              last_id: "workflow-199",
+              next_cursor: cursor,
+            }),
+          ),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              data: [last],
+              has_more: false,
+              last_id: last.id,
+            }),
+          ),
+        );
+      const { result } = renderWithClient(() => useSavedWorkflows());
+      await waitFor(() => expect(result.current.workflows).toHaveLength(200));
+      expect(authenticatedFetch).toHaveBeenCalledTimes(1);
+      expect(result.current.pagination.hasMore).toBe(true);
+      act(() => result.current.pagination.loadMore());
+      await waitFor(() => expect(result.current.workflows).toHaveLength(201));
+      expect(result.current.workflows.at(-1)).toEqual(last);
+      expect(result.current.pagination.hasMore).toBe(false);
+      expect(authenticatedFetch).toHaveBeenLastCalledWith(
+        `/v1/workflows?limit=200&after=${encodeURIComponent(cursor ?? "workflow-199")}`,
+        expect.anything(),
       );
-    const { result } = renderWithClient(() => useSavedWorkflows());
-    await waitFor(() => expect(result.current.workflows).toHaveLength(200));
-    expect(authenticatedFetch).toHaveBeenCalledTimes(1);
-    expect(result.current.pagination.hasMore).toBe(true);
-    act(() => result.current.pagination.loadMore());
-    await waitFor(() => expect(result.current.workflows).toHaveLength(201));
-    expect(result.current.workflows.at(-1)).toEqual(last);
-    expect(result.current.pagination.hasMore).toBe(false);
-    expect(authenticatedFetch).toHaveBeenLastCalledWith(
-      "/v1/workflows?limit=200&after=workflow-199",
-      expect.anything(),
-    );
-  });
+    },
+  );
 });
 
 describe("useDeleteWorkflow", () => {

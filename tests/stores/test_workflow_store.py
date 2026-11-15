@@ -16,7 +16,11 @@ from omnigent.db.db_models import MAX_STORED_VALUE_BYTES, SqlPreference, SqlWork
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities.workflow import InvalidWorkflowError, Workflow
 from omnigent.server.auth import RESERVED_USER_LOCAL
-from omnigent.stores.workflow_store import WorkflowNameTakenError, WorkflowStore
+from omnigent.stores.workflow_store import (
+    WorkflowNameTakenError,
+    WorkflowStore,
+    workflow_page_cursor,
+)
 
 ALICE = "alice@example.com"
 BOB = "bob@example.com"
@@ -134,7 +138,7 @@ def test_pages_go_by_name_and_filter_by_name(store: WorkflowStore, user_id: str 
         names += [workflow.name for workflow in page]
         if not has_more:
             break
-        after = page[-1].id
+        after = workflow_page_cursor(page[-1])
     assert names == ["audit", "build", "cleanup", "deploy-prod", "deploy-staging"]
     exact, _ = store.list_page(user_id=user_id, limit=10, name="build")
     assert [workflow.name for workflow in exact] == ["build"]
@@ -142,6 +146,22 @@ def test_pages_go_by_name_and_filter_by_name(store: WorkflowStore, user_id: str 
         store.list_page(user_id=BOB, limit=10, after=exact[0].id)
     with pytest.raises(InvalidWorkflowError, match="a workflow ID"):
         store.list_page(user_id=user_id, limit=10, after="not-an-id")
+    with pytest.raises(InvalidWorkflowError, match="a workflow cursor"):
+        store.list_page(user_id=user_id, limit=10, after="name:!!")
+    remaining, _ = store.list_page(user_id=user_id, limit=10, after=exact[0].id)
+    assert [workflow.name for workflow in remaining] == [
+        "cleanup",
+        "deploy-prod",
+        "deploy-staging",
+    ]
+    cursor = workflow_page_cursor(exact[0])
+    renamed = store.update(exact[0].id, user_id=user_id, name="zz-build")
+    assert renamed is not None and renamed.name == "zz-build"
+    following, _ = store.list_page(user_id=user_id, limit=2, after=cursor)
+    assert [workflow.name for workflow in following] == ["cleanup", "deploy-prod"]
+    store.delete(exact[0].id, user_id=user_id)
+    following, has_more = store.list_page(user_id=user_id, limit=10, after=cursor)
+    assert following == remaining and not has_more
 
 
 def test_an_update_keeps_what_it_leaves_out_and_checks_the_result(store: WorkflowStore) -> None:

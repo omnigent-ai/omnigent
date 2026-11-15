@@ -137,6 +137,28 @@ async def test_a_workflow_round_trips_and_stays_private(client: httpx.AsyncClien
     assert [item["id"] for item in found.json()["data"]] == [workflow["id"]]
     assert (await client.get("/v1/workflows", headers=_headers(BOB))).json()["data"] == []
 
+    created = await client.post(
+        "/v1/workflows", json={**body, "name": "weekly"}, headers=_headers(ALICE)
+    )
+    assert created.status_code == 200, created.text
+    page = (await client.get("/v1/workflows?limit=1", headers=_headers(ALICE))).json()
+    cursor = page["next_cursor"]
+    renamed = await client.patch(
+        f"/v1/workflows/{workflow['id']}", json={"name": "zz-build"}, headers=_headers(ALICE)
+    )
+    assert renamed.status_code == 200, renamed.text
+    following = await client.get(
+        "/v1/workflows", params={"limit": 1, "after": cursor}, headers=_headers(ALICE)
+    )
+    assert [item["name"] for item in following.json()["data"]] == ["weekly"]
+    deleted = await client.delete(f"/v1/workflows/{workflow['id']}", headers=_headers(ALICE))
+    assert deleted.status_code == 200, deleted.text
+    following = await client.get(
+        "/v1/workflows", params={"after": cursor}, headers=_headers(ALICE)
+    )
+    assert [item["name"] for item in following.json()["data"]] == ["weekly"]
+    assert following.json()["next_cursor"] is None
+
 
 async def test_telemetry_separates_drafts_saves_and_rejected_writes(
     client: httpx.AsyncClient, db_uri: str

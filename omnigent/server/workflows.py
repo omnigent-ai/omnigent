@@ -61,6 +61,7 @@ from omnigent.stores.workflow_store import (
     WORKFLOW_PAGE_MAX,
     WorkflowNameTakenError,
     WorkflowStore,
+    workflow_page_cursor,
 )
 from omnigent.util.uuid import normalize_uuid
 
@@ -190,10 +191,10 @@ def create_workflows_router(
         """List the caller's workflows by name, without their steps.
 
         :param limit: Page size, e.g. ``50``.
-        :param after: The previous page's ``last_id``.
+        :param after: The previous page's ``next_cursor``; legacy workflow IDs also work.
         :param name: Only the workflow with this exact name, for ``/workflow <name>``.
         :raises OmnigentError: 401 if unauthenticated in multi-user mode, 400 for
-            an ``after`` that isn't one of the caller's workflows.
+            an invalid cursor or a foreign workflow ID.
         """
         user_id = require_user(request, auth_provider)
         store = _store()
@@ -211,6 +212,7 @@ def create_workflows_router(
             data=[_summary(workflow) for workflow in page],
             first_id=page[0].id if page else None,
             last_id=page[-1].id if page else None,
+            next_cursor=workflow_page_cursor(page[-1]) if has_more and page else None,
             has_more=has_more,
         )
 

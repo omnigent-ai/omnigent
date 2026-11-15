@@ -340,8 +340,9 @@ versions: an edit rewrites the workflow, and each run's journal keeps the plan
 it ran.
 
 - `GET /v1/workflows`: the caller's workflows by name, without their steps.
-  `limit` (1–200, default 50), `after` (the previous page's `last_id`) and
-  `name` (an exact name).
+  `limit` (1–200, default 50), `after` (the previous page's `next_cursor`) and
+  `name` (an exact name). The cursor retains the page's name boundary if its
+  last workflow is renamed or deleted. Older clients can still use `last_id`.
 - `POST /v1/workflows`: `name` (one line of at most 80 characters, unique among
   the caller's workflows; 409 otherwise), `description` (at most 2,000
   characters and 2,000 stored bytes, including compression/encryption framing)

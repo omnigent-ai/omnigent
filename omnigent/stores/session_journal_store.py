@@ -1042,18 +1042,25 @@ def delete_journal_entries_batch(session: Session, conversation_ids: Sequence[st
     :returns: How many were deleted; fewer than a batch means none are left.
     """
     entries = SqlSessionJournalEntry
-    keys = session.execute(
-        _using(
-            select(entries.conversation_id, entries.position, entries.created_at)
-            .where(
-                entries.workspace_id == current_workspace_id(),
-                entries.conversation_id.in_(conversation_ids),
-            )
-            .order_by(entries.conversation_id, entries.position)
-            .limit(JOURNAL_DELETE_BATCH),
-            "PRIMARY",
+    keys = []
+    # Equality fixes the PK prefix; PostgreSQL can filter an IN list after a workspace scan.
+    for conversation_id in sorted(set(conversation_ids)):
+        if len(keys) == JOURNAL_DELETE_BATCH:
+            break
+        keys.extend(
+            session.execute(
+                _using(
+                    select(entries.conversation_id, entries.position, entries.created_at)
+                    .where(
+                        entries.workspace_id == current_workspace_id(),
+                        entries.conversation_id == conversation_id,
+                    )
+                    .order_by(entries.position)
+                    .limit(JOURNAL_DELETE_BATCH - len(keys)),
+                    "PRIMARY",
+                )
+            ).all()
         )
-    ).all()
     if keys:
         session.execute(
             delete(entries)

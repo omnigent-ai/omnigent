@@ -15558,8 +15558,20 @@
                 "type": "null"
               }
             ],
-            "description": "The page's last workflow ID; pass it as `after` for the next page.",
+            "description": "The page's last workflow ID, retained for older clients.",
             "title": "Last Id"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Pass it as `after` for the next page. Retains the name boundary if that workflow is renamed or deleted; `None` on the last page.",
+            "title": "Next Cursor"
           },
           "object": {
             "const": "list",
@@ -26468,7 +26480,7 @@
     },
     "/v1/workflows": {
       "get": {
-        "description": "List the caller's workflows by name, without their steps.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 400 for an `after` that isn't one of the caller's workflows.",
+        "description": "List the caller's workflows by name, without their steps.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 400 for an invalid cursor or a foreign workflow ID.",
         "operationId": "list_workflows_v1_workflows_get",
         "parameters": [
           {
@@ -26485,7 +26497,7 @@
             }
           },
           {
-            "description": "The previous page's `last_id`.",
+            "description": "The previous page's `next_cursor`; legacy workflow IDs also work.",
             "in": "query",
             "name": "after",
             "required": false,

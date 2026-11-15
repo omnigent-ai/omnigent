@@ -27,6 +27,7 @@ interface WorkflowPage {
   data: SavedWorkflow[];
   has_more: boolean;
   last_id: string | null;
+  next_cursor?: string | null;
 }
 
 const SAVED_WORKFLOWS_PAGE = 200;
@@ -66,7 +67,8 @@ export function useSavedWorkflows({ enabled = true }: { enabled?: boolean } = {}
       return (await res.json()) as WorkflowPage;
     },
     initialPageParam: null as string | null,
-    getNextPageParam: (last) => (last.has_more && last.last_id ? last.last_id : undefined),
+    getNextPageParam: (last) =>
+      last.has_more ? (last.next_cursor ?? last.last_id ?? undefined) : undefined,
     staleTime: 30_000,
     enabled: enabled && supported,
   });

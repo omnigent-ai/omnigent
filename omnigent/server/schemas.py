@@ -3487,8 +3487,9 @@ class WorkflowList(BaseModel):
     :param object: Discriminator; always ``"list"``.
     :param data: The page's workflows, without their steps.
     :param first_id: The page's first workflow ID, or ``None`` when empty.
-    :param last_id: The page's last workflow ID; pass it as ``after`` for the
-        next page.
+    :param last_id: The page's last workflow ID, retained for older clients.
+    :param next_cursor: Pass it as ``after`` for the next page. Retains the name
+        boundary if that workflow is renamed or deleted; ``None`` on the last page.
     :param has_more: Whether another page follows.
     """
 
@@ -3496,6 +3497,7 @@ class WorkflowList(BaseModel):
     data: list[WorkflowSummary] = Field(default_factory=list)
     first_id: str | None = None
     last_id: str | None = None
+    next_cursor: str | None = None
     has_more: bool = False
 
 

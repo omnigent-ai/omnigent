@@ -9,6 +9,7 @@ Every workflow query is served by, and on MySQL pinned to, the primary key or
 
 from __future__ import annotations
 
+import base64
 import json
 import uuid
 from collections.abc import Sequence
@@ -32,7 +33,12 @@ from omnigent.db.utils import (
     now_epoch,
     run_write_transaction,
 )
-from omnigent.entities.workflow import InvalidWorkflowError, Workflow, normalize_workflow
+from omnigent.entities.workflow import (
+    WORKFLOW_NAME_MAX_CHARS,
+    InvalidWorkflowError,
+    Workflow,
+    normalize_workflow,
+)
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
@@ -44,6 +50,11 @@ _Statement = TypeVar("_Statement", bound=Select[Any])
 
 class WorkflowNameTakenError(Exception):
     """The owner already has a workflow with this name."""
+
+
+def workflow_page_cursor(workflow: Workflow) -> str:
+    """Retain the page boundary when its workflow is renamed or deleted."""
+    return "name:" + base64.urlsafe_b64encode(workflow.name.encode()).decode("ascii")
 
 
 def _owned(workflow_id: str, user_id: str | None) -> tuple[ColumnElement[bool], ...]:
@@ -223,10 +234,10 @@ class WorkflowStore:
 
         :param user_id: The owner, or ``None`` in single-user mode.
         :param limit: Page size, 1 to :data:`WORKFLOW_PAGE_MAX`.
-        :param after: The previous page's last workflow ID.
+        :param after: The previous page's cursor, or a legacy workflow ID.
         :param name: Only the workflow with this exact name.
         :returns: ``(workflows, has_more)``.
-        :raises InvalidWorkflowError: If ``after`` isn't one of the owner's workflows.
+        :raises InvalidWorkflowError: If ``after`` is invalid or a foreign workflow ID.
         """
         if not 1 <= limit <= WORKFLOW_PAGE_MAX:
             raise InvalidWorkflowError(f"limit must be 1 to {WORKFLOW_PAGE_MAX}")
@@ -242,15 +253,27 @@ class WorkflowStore:
             if name is not None:
                 stmt = stmt.where(SqlWorkflow.name == name)
             if after is not None:
-                try:
-                    uuid_to_bytes(after)
-                except InvalidUuidError as exc:
-                    raise InvalidWorkflowError("after must be a workflow ID") from exc
-                after_name = session.execute(
-                    _using(select(SqlWorkflow.name).where(*_owned(after, user_id)), "PRIMARY")
-                ).scalar_one_or_none()
-                if after_name is None:
-                    raise InvalidWorkflowError("after must be the ID of one of your workflows")
+                if after.startswith("name:"):
+                    try:
+                        if len(after) > 4096:
+                            raise ValueError("cursor is too long")
+                        after_name = base64.b64decode(
+                            after[5:], altchars=b"-_", validate=True
+                        ).decode("utf-8")
+                        if not 1 <= len(after_name) <= WORKFLOW_NAME_MAX_CHARS:
+                            raise ValueError("cursor name has an invalid length")
+                    except ValueError as exc:
+                        raise InvalidWorkflowError("after must be a workflow cursor") from exc
+                else:
+                    try:
+                        uuid_to_bytes(after)
+                    except InvalidUuidError as exc:
+                        raise InvalidWorkflowError("after must be a workflow ID") from exc
+                    after_name = session.execute(
+                        _using(select(SqlWorkflow.name).where(*_owned(after, user_id)), "PRIMARY")
+                    ).scalar_one_or_none()
+                    if after_name is None:
+                        raise InvalidWorkflowError("after must be the ID of one of your workflows")
                 stmt = stmt.where(SqlWorkflow.name > after_name)
             rows = session.scalars(
                 _using(

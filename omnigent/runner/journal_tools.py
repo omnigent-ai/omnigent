@@ -86,7 +86,8 @@ async def server_workflows_enabled(server_client: httpx.AsyncClient | None) -> b
     if cached is not None and not cached.stale:
         return cached.enabled
     try:
-        response = await server_client.get("/v1/info")
+        # Capability discovery must not inherit a streaming client's unlimited read timeout.
+        response = await server_client.get("/v1/info", timeout=5.0)
         if response.status_code != 200:
             return cached.enabled if cached is not None else False
         info = response.json()
@@ -739,11 +740,12 @@ async def _list_workflows(
     if not 1 <= limit <= WORKFLOW_LIST_PAGE_MAX:
         return _error(f"invalid_input: limit must be 1 to {WORKFLOW_LIST_PAGE_MAX}")
     cursor = args.get("cursor")
-    if cursor is not None and not (isinstance(cursor, str) and _WORKFLOW_ID.fullmatch(cursor)):
+    if cursor is not None and not (
+        isinstance(cursor, str) and re.fullmatch(r"[A-Za-z0-9_:=-]{1,4096}", cursor)
+    ):
         return _error("invalid_input: cursor must be a next_cursor from sys_workflow_list")
     params: dict[str, Any] = {"limit": limit}
     if cursor is not None:
-        # The server pages after the previous page's last workflow.
         params["after"] = cursor
     try:
         response = await _get_workflows(server_client, "", conversation_id, **params)
@@ -762,7 +764,9 @@ async def _list_workflows(
         }
         for item in body.get("data") or []
     ]
-    next_cursor = body.get("last_id") if body.get("has_more") else None
+    next_cursor = (
+        (body.get("next_cursor") or body.get("last_id")) if body.get("has_more") else None
+    )
     return json.dumps({"workflows": workflows, "next_cursor": next_cursor}, ensure_ascii=False)
 
 

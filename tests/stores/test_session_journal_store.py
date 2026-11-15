@@ -345,15 +345,68 @@ def test_journal_deletion_removes_ranges_across_sessions_in_key_order(
     for index in range(4):
         _note(journal, f"a{index}")
         _note(journal, f"b{index}", session=OTHER)
-    with sa.orm.Session(sa.create_engine(db_uri)) as session:
-        removed = [
-            session_journal_store.delete_journal_entries_batch(session, [OTHER, SESSION])
-            for _ in range(4)
-        ]
-        session.commit()
-    assert removed == [3, 3, 2, 0]
+    engine = sa.create_engine(db_uri)
+    per_session = 4
+
+    def check_scan(_connection, cursor, statement, parameters, _context, _executemany):
+        if not statement.startswith("SELECT") or "FROM session_journal_entries" not in statement:
+            return
+        cursor.execute("EXPLAIN (ANALYZE, FORMAT JSON) " + statement, parameters)
+        nodes = [cursor.fetchone()[0][0]["Plan"]]
+        while nodes:
+            node = nodes.pop()
+            assert node.get("Rows Removed by Filter", 0) <= 3, node
+            nodes.extend(node.get("Plans", []))
+
+    if engine.dialect.name == "postgresql":
+        # Late target IDs expose a PK scan that filters out unrelated conversations.
+        per_session = 100
+        with engine.begin() as connection:
+            template = dict(
+                connection.execute(sa.select(SqlSessionJournalEntry.__table__).limit(1))
+                .mappings()
+                .one()
+            )
+            keys = [
+                (f"{index + 1:032x}", position)
+                for index in range(98)
+                for position in range(per_session)
+            ] + [
+                (session_id, position)
+                for session_id in (SESSION, OTHER)
+                for position in range(4, per_session)
+            ]
+            connection.execute(
+                sa.insert(SqlSessionJournalEntry),
+                [
+                    {
+                        **template,
+                        "conversation_id": session_id,
+                        "position": position,
+                        "id": f"{index + 1:032x}",
+                        "idempotency_key": f"scan:{position}",
+                    }
+                    for index, (session_id, position) in enumerate(keys)
+                ],
+            )
+            connection.exec_driver_sql("ANALYZE session_journal_entries")
+        sa.event.listen(engine, "before_cursor_execute", check_scan)
+    try:
+        with sa.orm.Session(engine) as session:
+            removed = [
+                session_journal_store.delete_journal_entries_batch(session, [OTHER, SESSION])
+                for _ in range((2 * per_session + 2) // 3 + 1)
+            ]
+            session.commit()
+    finally:
+        if engine.dialect.name == "postgresql":
+            sa.event.remove(engine, "before_cursor_execute", check_scan)
+        engine.dispose()
+    assert removed == [3] * (2 * per_session // 3) + [2 * per_session % 3, 0]
     assert _count(db_uri, "session_journal_entries", SESSION) == 0
     assert _count(db_uri, "session_journal_entries", OTHER) == 0
+    if per_session == 100:
+        assert _count(db_uri, "session_journal_entries", f"{1:032x}") == per_session
 
 
 @pytest.mark.parametrize("failure", [None, "copy", "publish"])
