@@ -12,6 +12,7 @@ from typing import Any, Protocol, cast
 import httpx
 
 from omnigent.debug_logging import runner_primary_session_id
+from omnigent.entities.conversation import COMPACTION_SUMMARY_REPLAY_PROMPT
 from omnigent.inner.executor import INTERRUPTION_MARKER_TEXT
 from omnigent.runner.app_support import (
     _resolve_forwarded_message_content,
@@ -197,11 +198,7 @@ def build_session_history(
                         "content": [
                             {
                                 "type": "input_text",
-                                "text": (
-                                    "[Automatically generated summary of prior "
-                                    "conversation context.]\n\n"
-                                    "Please provide a summary of our conversation so far."
-                                ),
+                                "text": COMPACTION_SUMMARY_REPLAY_PROMPT,
                             }
                         ],
                     }
@@ -364,11 +361,7 @@ def build_session_history(
                     "content": [
                         {
                             "type": "input_text",
-                            "text": (
-                                "[Automatically generated summary of prior "
-                                "conversation context.]\n\n"
-                                "Please provide a summary of our conversation so far."
-                            ),
+                            "text": COMPACTION_SUMMARY_REPLAY_PROMPT,
                         }
                     ],
                 },

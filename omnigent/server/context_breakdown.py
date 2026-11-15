@@ -14,6 +14,7 @@ from typing import Any
 
 from omnigent.entities import ConversationItem
 from omnigent.entities.conversation import (
+    COMPACTION_SUMMARY_REPLAY_PROMPT,
     CompactionData,
     FunctionCallData,
     FunctionCallOutputData,
@@ -309,20 +310,18 @@ def _checkpoint(
     Size what a compaction replays, or ``None`` when replay ignores it.
 
     Retained ``compacted_messages`` replace the summary when present. The
-    runtime rejects an empty summary or synthetic anchor; a native harness
-    replays only checkpoints with retained messages and skips live items whose
+    runner's turn replay accepts any compaction; a native harness replays only
+    checkpoints with retained messages and skips live items whose
     ``forwarded_source_ids`` they already carry.
     """
-    if native:
-        if not data.compacted_messages:
-            return None
-    else:
-        anchor = data.last_item_id
-        if not data.summary or not anchor or anchor.startswith("synthetic_"):
-            return None
+    if native and not data.compacted_messages:
+        return None
     if not data.compacted_messages:
-        # Native forwarders record 0; fall back to the summary's own size.
-        tokens = data.token_count if data.token_count > 0 else estimate_text_tokens(data.summary)
+        # Replay sends a fixed prompt and the summary; ``token_count`` records the
+        # whole post-compaction context for some harnesses, so it is not used.
+        tokens = estimate_text_tokens(COMPACTION_SUMMARY_REPLAY_PROMPT) + estimate_text_tokens(
+            data.summary
+        )
         return _Checkpoint(tokens=tokens, attachments=[], covered_item_ids=set())
     tokens = 0
     attachments: list[_AttachmentRef] = []
@@ -343,11 +342,11 @@ def _checkpoint(
     return _Checkpoint(tokens=tokens, attachments=attachments, covered_item_ids=covered)
 
 
-def _is_history_content(item: ConversationItem) -> bool:
-    """Whether an item is a message or tool call/result a summary can replace."""
-    return isinstance(
-        item.data, MessageData | FunctionCallData | FunctionCallOutputData | NativeToolData
-    )
+def _is_history_content(item: ConversationItem, *, native: bool) -> bool:
+    """Whether an item is replayable content a checkpoint can replace."""
+    if isinstance(item.data, NativeToolData):
+        return native
+    return isinstance(item.data, MessageData | FunctionCallData | FunctionCallOutputData)
 
 
 def scan_history(
@@ -360,10 +359,14 @@ def scan_history(
     """
     Estimate the live history from items read newest first.
 
-    The runtime replays the latest compaction (unless it rejects it) in place
-    of the items up to its ``last_item_id``. A native harness replays the latest
-    compaction with retained messages in place of everything before it, and
-    skips later items those messages already carry.
+    Approximates what a fresh replay sends. The runner replays the latest
+    compaction in place of every item before it
+    (``omnigent/runner/session_history.py``), then messages, tool calls/results
+    and error notices; harness adapters drop the error notices and may drop or
+    cap some of the rest, so errors are not counted. A
+    native harness replays the latest compaction with retained messages
+    instead, also keeps provider tool items, and skips later items those
+    messages already carry.
 
     :param items_newest_first: The session's items in descending position.
     :param session_id: The session, used to match a checkpoint's
@@ -375,8 +378,6 @@ def scan_history(
     history = ContextBreakdownHistory()
     live: list[_LiveEntry] = []
     checkpoint: _Checkpoint | None = None
-    compaction_seen = False
-    boundary_id: str | None = None
     summarized = False
     for scanned, item in enumerate(items_newest_first):
         if scanned >= max_items:
@@ -385,22 +386,17 @@ def scan_history(
             else:
                 history.partial = True
             break
-        if summarized or (boundary_id is not None and item.id == boundary_id):
-            summarized = True
-            if _is_history_content(item):
+        if summarized:
+            if _is_history_content(item, native=native):
                 history.summarized_item_count += 1
             continue
         if isinstance(item.data, CompactionData):
-            if native:
-                if checkpoint is None:
-                    checkpoint = _checkpoint(item.data, session_id=session_id, native=True)
-                    # Native replay drops every record before its checkpoint.
-                    summarized = checkpoint is not None
-            elif not compaction_seen:
-                compaction_seen = True
-                checkpoint = _checkpoint(item.data, session_id=session_id, native=False)
-                if checkpoint is not None:
-                    boundary_id = item.data.last_item_id
+            checkpoint = _checkpoint(item.data, session_id=session_id, native=native)
+            # Replay drops every item before its checkpoint.
+            summarized = checkpoint is not None
+            continue
+        if not native and isinstance(item.data, NativeToolData):
+            # The runner's turn replay sends only messages and tool calls/results.
             continue
         estimate = _item_tokens(item)
         if estimate is not None:
