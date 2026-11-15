@@ -13,6 +13,7 @@ import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 import { capitalizeAgentName } from "./agentLabels";
 import { agentRootName } from "./forkHarness";
 import { nativeCodingAgentForAgentName } from "./nativeCodingAgents";
+import { WORKFLOW_QUESTION_PHASE } from "./sessionJournal";
 import type { RoutingDecisionExtras } from "./routingDecision";
 import type {
   AgyPermission,
@@ -694,6 +695,8 @@ export interface ElicitationBlock {
    * elicitation.
    */
   askUserQuestion?: Record<string, unknown> | null;
+  /** For a workflow question, the ID of the plan step it's about. */
+  journalStep?: string;
   /**
    * Full ExitPlanMode tool_input (untruncated) — present when the
    * gated tool is Claude's built-in ExitPlanMode. ApprovalCard
@@ -777,6 +780,31 @@ export type AnyBlock =
 /** Whether a block is a pending card that parks the agent's turn until it is answered. */
 export function isPendingBlockingElicitation(block: AnyBlock): boolean {
   return block.type === "elicitation" && block.status === "pending" && block.isBlocking !== false;
+}
+
+/**
+ * The plan step a workflow question is about, when it's `sessionId`'s own
+ * question rather than a mirrored sub-agent's; null for any other prompt.
+ */
+export function workflowQuestionStep(
+  question: { phase: string; journalStep?: string; targetSessionId?: string | null },
+  sessionId: string | null,
+): string | null {
+  if (question.phase !== WORKFLOW_QUESTION_PHASE || !question.journalStep) return null;
+  const own = question.targetSessionId == null || question.targetSessionId === sessionId;
+  return own ? question.journalStep : null;
+}
+
+/** `sessionId`'s pending workflow questions, as `[step ID, elicitation ID]`, oldest first. */
+export function pendingWorkflowQuestions(
+  blocks: readonly AnyBlock[],
+  sessionId: string | null,
+): [string, string][] {
+  return blocks.flatMap((block): [string, string][] => {
+    if (block.type !== "elicitation" || block.status !== "pending") return [];
+    const step = workflowQuestionStep(block, sessionId);
+    return step === null ? [] : [[step, block.elicitationId]];
+  });
 }
 
 /** Whether a pending blocking card answers `sessionId`'s own prompt, not a mirrored sub-agent's. */

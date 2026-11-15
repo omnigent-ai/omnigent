@@ -933,6 +933,12 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                     )
             return failures, cursor
 
+    def get_run(self, run_id: str) -> ScheduledTaskRun | None:
+        """Read a run's durable outcome without scanning its task's history."""
+        with self._session("select_task_run") as session:
+            row = session.get(SqlScheduledTaskRun, (current_workspace_id(), run_id))
+            return _run_to_entity(row) if row is not None else None
+
     def list_runs(
         self,
         scheduled_task_id: str,

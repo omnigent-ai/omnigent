@@ -99,6 +99,7 @@ def _build_app(
     projects: bool = True,
     automations: bool | Callable[[], bool] | None = None,
     session_mcp_selection: object | None = None,
+    workflows: bool = False,
 ) -> FastAPI:
     from omnigent.server.auth import UnifiedAuthProvider
     from omnigent.stores.host_store import HostStore
@@ -124,6 +125,7 @@ def _build_app(
                 "OMNIGENT_FEATURES": (
                     ("automations_v2" if persistent else "-automations_v2")
                     + (",one_time_automations" if one_time else "")
+                    + (",workflows" if workflows else "")
                 )
             }
         ),
@@ -2685,17 +2687,25 @@ async def test_list_tasks_leaves_young_running_run_untouched(
 # scheduled-run completion.
 
 
-def _seed_running_run_for_conv(db_uri: str, conversation_id: str) -> tuple[str, str]:
+def _seed_running_run_for_conv(
+    db_uri: str, conversation_id: str, *, agent_replied: bool = True
+) -> tuple[str, str]:
     """Create a task + a ``running`` run bound to ``conversation_id``.
+
+    The session holds the run's prompt and, by default, its agent's reply.
 
     :returns: ``(task_id, run_id)``.
     """
     import uuid
 
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
         SqlAlchemyScheduledTaskStore,
     )
 
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conversations.create_conversation(conversation_id=conversation_id)
     store = SqlAlchemyScheduledTaskStore(db_uri)
     task_id = uuid.uuid4().hex
     store.create(
@@ -2716,6 +2726,11 @@ def _seed_running_run_for_conv(db_uri: str, conversation_id: str) -> tuple[str, 
         conversation_id=conversation_id,
         fired_at=1001,
     )
+    conversations.set_labels(conversation_id, {SCHEDULED_TASK_RUN_LABEL_KEY: run_id})
+    messages = [_message("user", "resp_1", "p")]
+    if agent_replied:
+        messages.append(_message("assistant", "resp_1", "done"))
+    conversations.append(conversation_id, messages)
     return task_id, run_id
 
 
@@ -2748,8 +2763,12 @@ def _wait_for_run_status(
     return None
 
 
+@pytest.mark.parametrize(
+    "agent_replied", [True, False], ids=["reply-mirrored", "stop-before-reply"]
+)
 async def test_publish_status_idle_edge_transitions_scheduled_run_to_succeeded(
     db_uri: str,
+    agent_replied: bool,
 ) -> None:
     """A completed-turn edge through _publish_status flips the run to succeeded.
 
@@ -2771,14 +2790,14 @@ async def test_publish_status_idle_edge_transitions_scheduled_run_to_succeeded(
     )
 
     conv_id = uuid.uuid4().hex
-    task_id, run_id = _seed_running_run_for_conv(db_uri, conv_id)
+    task_id, run_id = _seed_running_run_for_conv(db_uri, conv_id, agent_replied=agent_replied)
 
     session_live_state.configure(
         SqlAlchemyConversationStore(db_uri), SqlAlchemyScheduledTaskStore(db_uri)
     )
     try:
         _publish_status(conv_id, "running")
-        _publish_status(conv_id, "idle")
+        _publish_status(conv_id, "idle", turn_completed=not agent_replied)
         row = _wait_for_run_status(db_uri, task_id, run_id, "succeeded")
     finally:
         session_live_state.configure(None)
