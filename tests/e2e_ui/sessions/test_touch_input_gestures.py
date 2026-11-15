@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import time
 from typing import Literal
 
 import pytest
 from playwright.sync_api import Browser, CDPSession, Page, expect
 
+from tests._helpers.polling import poll_until
 from tests.e2e_ui._touch import new_touch_context, touch, touch_drag
 from tests.e2e_ui.conftest import set_session_title
 
@@ -54,8 +56,11 @@ def test_sidebar_resize_handle_supports_touch_drag(
             hold_before_move_s=0.15,
         )
 
-        # Give the store a beat to propagate, then require a real resize.
-        page.wait_for_timeout(300)
+        # Wait for the store to propagate the resize; the assert below explains a miss.
+        with contextlib.suppress(AssertionError):
+            poll_until(
+                lambda: _sidebar_width(page) - width_before >= 60, timeout_s=5, interval_s=0.1
+            )
         width_after = _sidebar_width(page)
         assert width_after - width_before >= 60, (
             "touch drag on the sidebar resize handle did not resize the sidebar "
