@@ -42,6 +42,7 @@ import asyncio
 import contextvars
 import functools
 import logging
+import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -86,6 +87,10 @@ _last_blocked_on: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 # Handoffs to another replica per session. A write queued before a handoff sees
 # the count change and is skipped, so it cannot overwrite the new owner's value.
 _handoffs: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+# Only active children are indexed; run pages never enumerate a parent's history.
+_active_child_parents: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+_active_child_counts: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+_child_activity_lock = threading.Lock()
 # This process's own last touch_runner_liveness() stamp per runner id.
 # Never erased by clear_runner_liveness — only configure() resets it.
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by globally-unique runner_id
@@ -113,6 +118,39 @@ def configure(
     _last_blocked_on.clear()
     _handoffs.clear()
     _last_liveness_stamp.clear()
+    with _child_activity_lock:
+        _active_child_parents.clear()
+        _active_child_counts.clear()
+
+
+def _remove_active_child(session_id: str) -> None:
+    """Caller holds the activity lock."""
+    parent_id = _active_child_parents.pop(session_id, None)
+    if parent_id is not None:
+        remaining = _active_child_counts[parent_id] - 1
+        if remaining:
+            _active_child_counts[parent_id] = remaining
+        else:
+            _active_child_counts.pop(parent_id, None)
+
+
+def record_child_status(
+    session_id: str, parent_id: str | None, status: str | None, *, handoffs: int
+) -> None:
+    """Maintain this replica's live-child rollup from ordered status events."""
+    with _child_activity_lock:
+        if handoff_count(session_id) != handoffs:
+            return
+        _remove_active_child(session_id)
+        if parent_id is not None and status in ("running", "waiting"):
+            _active_child_parents[session_id] = parent_id
+            _active_child_counts[parent_id] = _active_child_counts.get(parent_id, 0) + 1
+
+
+def has_active_child(parent_id: str) -> bool:
+    """Whether this replica observes a running or waiting direct child."""
+    with _child_activity_lock:
+        return _active_child_counts.get(parent_id, 0) > 0
 
 
 def conversation_store() -> ConversationStore | None:
@@ -177,6 +215,8 @@ def persist_live_status(session_id: str, status: str) -> None:
     """
     if _store is None:
         return
+    if status not in ("running", "waiting"):
+        record_child_status(session_id, None, status, handoffs=handoff_count(session_id))
     if status not in _KNOWN_LIVE_STATUSES:
         # ``SessionStatusEvent.status`` permits values the live-status codec
         # can't encode (``"launching"``), and the relay forwards raw event
@@ -248,7 +288,9 @@ def _submit_while_owned(
 
 def forget_live_status(session_id: str) -> None:
     """Drop this process's dedupe state and queued writes for a session handed off."""
-    _handoffs[session_id] = _handoffs.get(session_id, 0) + 1
+    with _child_activity_lock:
+        _handoffs[session_id] = _handoffs.get(session_id, 0) + 1
+        _remove_active_child(session_id)
     _last_status.pop(session_id, None)
     _last_blocked_on.pop(session_id, None)
 

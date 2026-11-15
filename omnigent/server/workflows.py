@@ -34,7 +34,7 @@ from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.server.routes._sessions.helpers import _session_status_with_child_rollup
+from omnigent.server.routes._sessions.helpers import _session_status_from_cache
 from omnigent.server.schemas import (
     CreateWorkflowRequest,
     UpdateWorkflowRequest,
@@ -47,6 +47,7 @@ from omnigent.server.schemas import (
     WorkflowStep,
     WorkflowSummary,
 )
+from omnigent.server.session_live_state import has_active_child
 from omnigent.server.session_orchestration import (
     require_named_source_private,
     require_owned_session,
@@ -349,9 +350,6 @@ def create_workflows_router(
             if plan.conversation_id in sessions
             and _readable(user_id, sessions[plan.conversation_id])
         ]
-        children = conversation_store.list_child_conversation_ids_by_parent(
-            [plan.conversation_id for plan in readable]
-        )
         statuses = journal.plan_step_statuses(readable)
         current_plans = journal.current_run_plan_ids(readable)
         runs = []
@@ -368,8 +366,10 @@ def create_workflows_router(
                     title=session.title or "",
                     started_at=plan.created_at,
                     is_current=is_current,
-                    session_status=_session_status_with_child_rollup(
-                        session.id, children.get(session.id, []), session.live_status
+                    session_status=(
+                        "running"
+                        if has_active_child(session.id)
+                        else _session_status_from_cache(session.id, session.live_status)
                     )
                     if is_current
                     else "idle",

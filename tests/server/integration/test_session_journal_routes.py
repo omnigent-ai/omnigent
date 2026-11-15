@@ -1201,10 +1201,12 @@ async def test_saving_a_workflow_names_the_sessions_plan_after_it(
 
 
 async def test_a_workflows_runs_list_the_sessions_that_ran_it(
-    client: httpx.AsyncClient, db_uri: str
+    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from omnigent.server import session_live_state
     from omnigent.server.routes._sessions.helpers import _publish_status
     from omnigent.stores.session_journal_store import SessionJournalStore
+    from tests._helpers.polling import poll_until_async
 
     steps = [
         {"id": "explore", "name": "Explore", "depends_on": []},
@@ -1276,9 +1278,23 @@ async def test_a_workflows_runs_list_the_sessions_that_ran_it(
 
     conversations = SqlAlchemyConversationStore(db_uri)
     child = _session(db_uri, parent_conversation_id=first)
+    for _ in range(60):
+        _session(db_uri, parent_conversation_id=first)
+
+    def refuse_child_scan(*args, **kwargs):
+        pytest.fail("A workflow run page must not enumerate historical children")
+
+    monkeypatch.setattr(
+        SqlAlchemyConversationStore, "list_child_conversation_ids_by_parent", refuse_child_scan
+    )
     # A parent's turn can be idle while its child or background work continues.
     for child_status in ("running", "waiting", "idle"):
         _publish_status(child, child_status)
+        await poll_until_async(
+            lambda expected=child_status != "idle": (
+                session_live_state.has_active_child(first) == expected
+            )
+        )
         page = (await client.get(url, headers=_headers(ALICE))).json()
         parent_run = next(run for run in page["data"] if run["session_id"] == first)
         assert parent_run["session_status"] == ("idle" if child_status == "idle" else "running")

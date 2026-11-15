@@ -238,13 +238,30 @@ def test_status_edges_set_and_clear_the_parked_reason() -> None:
     assert sessions_module._blocked_on_for(session_id, "permission prompt") == "permission prompt"
 
 
-def test_forget_live_status_drops_dedupe_state() -> None:
+def test_forget_live_status_drops_dedupe_state(recording_store: _RecordingStore) -> None:
     """A replica handing off a session must not keep its stale dedupe state."""
     session_live_state._last_status["conv_1"] = "running"
     session_live_state._last_blocked_on["conv_1"] = "permission prompt"
+    generation = session_live_state.handoff_count("conv_1")
+    for status in ("running", "waiting"):
+        session_live_state.record_child_status("conv_1", "parent", status, handoffs=generation)
+    session_live_state.record_child_status("conv_2", "parent", "running", handoffs=0)
+    assert session_live_state.has_active_child("parent")
     session_live_state.forget_live_status("conv_1")
     assert "conv_1" not in session_live_state._last_status
     assert "conv_1" not in session_live_state._last_blocked_on
+    assert session_live_state.has_active_child("parent")
+    # A queued event from the previous owner cannot restore the removed child.
+    session_live_state.record_child_status("conv_1", "parent", "running", handoffs=generation)
+    session_live_state.record_child_status("conv_2", "parent", "idle", handoffs=0)
+    assert not session_live_state.has_active_child("parent")
+
+    from omnigent.db.db_models import workspace_scope
+
+    with workspace_scope(17):
+        session_live_state.record_child_status("conv_1", "parent", "waiting", handoffs=0)
+        assert session_live_state.has_active_child("parent")
+    assert not session_live_state.has_active_child("parent")
 
 
 def test_pending_count_hook_persists_publish_and_resolve(
