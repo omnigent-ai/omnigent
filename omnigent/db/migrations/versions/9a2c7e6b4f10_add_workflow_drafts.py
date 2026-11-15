@@ -55,6 +55,8 @@ def downgrade() -> None:
         sa.column("plan", CompressedText()),
     )
     connection = op.get_bind()
+    # Preserve preceding revisions whose DDL already committed if preflight fails.
+    _commit_cockroach_batch(connection)
     key = sa.tuple_(workflows.c.workspace_id, workflows.c.id)
     query = sa.select(workflows).order_by(workflows.c.workspace_id, workflows.c.id)
     # A later encrypted page must not strand a partially deleted draft set.

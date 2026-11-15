@@ -589,12 +589,10 @@ class SqlAlchemyAccountStore:
             ids = self._owned_workflow_ids(session, user_id, limit=self._cleanup_batch_size)
             if ids:
                 session.execute(
-                    delete(SqlWorkflow)
-                    .where(
+                    delete(SqlWorkflow).where(
                         SqlWorkflow.workspace_id == current_workspace_id(),
                         SqlWorkflow.id.in_(sorted(ids)),
                     )
-                    .with_hint("FORCE INDEX (PRIMARY)", dialect_name="mysql")
                 )
             return len(ids)
 
