@@ -244,7 +244,11 @@ def test_extra_keys_keep_focus_and_scrollback(
         textarea.focus()
         page.keyboard.type("seq 1 400")
         page.keyboard.press("Enter")
-        page.wait_for_timeout(1_500)
+        # Wait for seq's output to overflow into scrollback (the vertical slider leaves the top).
+        page.wait_for_function(
+            "() => parseFloat(document.querySelector("
+            "'.xterm-scrollable-element .scrollbar.vertical .slider')?.style.top) > 0"
+        )
 
         is_textarea_active = "document.activeElement?.classList.contains('xterm-helper-textarea')"
         assert page.evaluate(is_textarea_active)
