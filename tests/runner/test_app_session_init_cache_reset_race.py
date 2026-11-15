@@ -29,7 +29,7 @@ import pytest
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import get_session_agent_id
 from omnigent.runner.resource_registry import SessionResourceRegistry
-from omnigent.spec.types import AgentSpec, SkillSpec
+from omnigent.spec.types import AgentSpec, SkillSpec, ToolGroupsConfig
 from tests.runner.conftest import (
     _FakeProcessManager,
     _runner_client,
@@ -76,9 +76,10 @@ class _SessionSnapshotServerClient(NullServerClient):
 def _spec(version: str) -> AgentSpec:
     """Build an agent spec carrying a version-marked, user-invocable skill.
 
-    ``skills_filter="none"`` suppresses host-skill discovery so the skills
-    read is exactly the bundled set — hermetic, independent of the dev's
-    real ``~/.claude/skills/``.
+    ``skills_filter="none"`` suppresses host-skill discovery and the journal
+    group is off, which drops Omnigent's own skills, so the skills read is
+    exactly the bundled set — hermetic, independent of the dev's real
+    ``~/.claude/skills/``.
 
     :param version: Marker distinguishing the pre-reset ("v1") from the
         post-reset ("v2") spec.
@@ -96,6 +97,7 @@ def _spec(version: str) -> AgentSpec:
             )
         ],
         skills_filter="none",
+        tool_groups=ToolGroupsConfig(journal=False),
     )
 
 
