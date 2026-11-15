@@ -2287,6 +2287,7 @@ async def test_live_host_does_not_repeat_unchanged_readiness(
 
     monkeypatch.setattr("omnigent.host.connect.configured_harness_map", _unchanged_map)
     monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", lambda: {"codex": True})
+    monkeypatch.setattr("omnigent.host.connect.acp_file_mentions_map", dict)
     monkeypatch.setattr(
         "omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S",
         0.01,
@@ -2295,6 +2296,7 @@ async def test_live_host_does_not_repeat_unchanged_readiness(
     host._configured_harnesses = {"codex": "needs-auth"}
     host._harness_accounts = {}
     host._gateway_inference = {"codex": True}
+    host._workspace_file_mentions = {}
     ws = _RecordingWS()
 
     task = asyncio.create_task(host._harness_readiness_loop(ws))
@@ -2325,6 +2327,7 @@ async def test_live_host_repushes_when_only_gateway_inference_changes(
         "omnigent.host.connect.gateway_inference_map",
         lambda: next(gateway, {"codex": True}),
     )
+    monkeypatch.setattr("omnigent.host.connect.acp_file_mentions_map", dict)
     monkeypatch.setattr(
         "omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S",
         0.01,
@@ -2333,6 +2336,7 @@ async def test_live_host_repushes_when_only_gateway_inference_changes(
     host._configured_harnesses = {"codex": True}
     host._harness_accounts = {}
     host._gateway_inference = {"codex": False}
+    host._workspace_file_mentions = {}
     ws = _RecordingWS()
 
     task = asyncio.create_task(host._harness_readiness_loop(ws))
@@ -2346,6 +2350,45 @@ async def test_live_host_repushes_when_only_gateway_inference_changes(
     assert isinstance(refresh, HostHarnessReadinessFrame)
     assert refresh.configured_harnesses == {"codex": True}
     assert refresh.gateway_inference == {"codex": True}
+    _cleanup_host(host)
+
+
+async def test_live_host_repushes_when_only_workspace_file_mentions_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A workspace_file_mentions flip alone must reach the server, readiness unchanged."""
+    file_mentions = iter(({"acp:demo": False}, {"acp:demo": True}))
+    monkeypatch.setattr(
+        "omnigent.host.connect.configured_harness_map",
+        lambda: {"codex": True},
+    )
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
+    monkeypatch.setattr(
+        "omnigent.host.connect.acp_file_mentions_map",
+        lambda: next(file_mentions, {"acp:demo": True}),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S",
+        0.01,
+    )
+    host = _make_host_process()
+    host._configured_harnesses = {"codex": True}
+    host._harness_accounts = {}
+    host._gateway_inference = {}
+    host._workspace_file_mentions = {"acp:demo": False}
+    ws = _RecordingWS()
+
+    task = asyncio.create_task(host._harness_readiness_loop(ws))
+    try:
+        await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
+    finally:
+        await _cancel(task)
+
+    assert len(ws.sent) == 1
+    refresh = decode_host_frame(ws.sent[0])
+    assert isinstance(refresh, HostHarnessReadinessFrame)
+    assert refresh.configured_harnesses == {"codex": True}
+    assert refresh.workspace_file_mentions == {"acp:demo": True}
     _cleanup_host(host)
 
 
@@ -3696,6 +3739,11 @@ async def test_capability_result_publishes_without_full_refresh(
     monkeypatch.setattr(host, "_probe_gateway_inference", _gateway)
     monkeypatch.setattr(
         host,
+        "_probe_workspace_file_mentions",
+        lambda *, startup: asyncio.sleep(0, result={}),
+    )
+    monkeypatch.setattr(
+        host,
         "_probe_harness_accounts",
         lambda *, explicit_refresh: asyncio.sleep(0, result=None),
     )
@@ -3748,6 +3796,7 @@ async def test_capability_result_publishes_without_full_refresh(
             HostHarnessReadinessFrame(
                 configured_harnesses={"codex-native": True},
                 gateway_inference={"codex-native": True},
+                workspace_file_mentions={},
             ),
         ]
         assert configured_probes == [True]

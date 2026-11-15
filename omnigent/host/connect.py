@@ -163,6 +163,7 @@ from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.host.session_env import consume_session_env_handoff
 from omnigent.inner import _proc
+from omnigent.onboarding.acp_auth import acp_file_mentions_map
 from omnigent.onboarding.harness_accounts import (
     HARNESS_ACCOUNT_KEYS,
     probe_harness_account,
@@ -1399,6 +1400,7 @@ class HostProcess:
         self._server_capabilities: frozenset[str] = frozenset()
         self._harness_accounts: HarnessAccounts | None = None
         self._gateway_inference: dict[str, bool] | None = None
+        self._workspace_file_mentions: dict[str, bool] | None = None
         self._capabilities_initialized = False
         # Invalidates deferred probe results when an install or credential
         # write has already produced a fresher snapshot. Capability state is
@@ -3406,10 +3408,11 @@ class HostProcess:
         account_generation = self._account_generation
         try:
             invalidate_harness_probe_caches()
-            configured, accounts, gateway = await asyncio.gather(
+            configured, accounts, gateway, file_mentions = await asyncio.gather(
                 self._probe_configured_harnesses(startup=False),
                 self._probe_harness_accounts(explicit_refresh=True),
                 self._probe_gateway_inference(startup=False),
+                self._probe_workspace_file_mentions(startup=False),
             )
         except Exception as exc:
             _logger.exception("Forced harness readiness refresh failed")
@@ -3432,6 +3435,7 @@ class HostProcess:
             configured_harnesses=configured,
             harness_accounts=self._harness_accounts,
             gateway_inference=gateway,
+            workspace_file_mentions=file_mentions,
         )
 
     async def _handle_probe_harness_accounts(
@@ -5023,21 +5027,36 @@ class HostProcess:
                 )
             return None
 
+    async def _probe_workspace_file_mentions(self, *, startup: bool) -> dict[str, bool] | None:
+        """Collect per-ACP-agent workspace file-mention flags without breaking startup."""
+        try:
+            return await asyncio.to_thread(acp_file_mentions_map)
+        except Exception as exc:
+            _logger.exception("Host ACP file-mention probe failed")
+            if startup:
+                _print_host_status(
+                    "⚠ Could not inspect ACP workspace_file_mentions; connecting with "
+                    f"file-mention flags unknown: {exc}",
+                    stderr=True,
+                )
+            return None
+
     async def _initialize_capabilities(self) -> None:
         """Collect startup metadata before registration, with bounded fallback."""
         if self._capabilities_initialized:
             return
         generation = self._capability_generation
         try:
-            configured, gateway = await asyncio.wait_for(
+            configured, gateway, file_mentions = await asyncio.wait_for(
                 asyncio.gather(
                     self._probe_configured_harnesses(startup=True),
                     self._probe_gateway_inference(startup=True),
+                    self._probe_workspace_file_mentions(startup=True),
                 ),
                 timeout=_HOST_CAPABILITY_INIT_TIMEOUT_S,
             )
         except TimeoutError:
-            configured = gateway = None
+            configured = gateway = file_mentions = None
             _logger.error(
                 "Host capability discovery exceeded %.0fs; continuing with unknown metadata",
                 _HOST_CAPABILITY_INIT_TIMEOUT_S,
@@ -5047,7 +5066,7 @@ class HostProcess:
                 stderr=True,
             )
         if self._capability_generation == generation:
-            self._replace_capabilities(configured, gateway)
+            self._replace_capabilities(configured, gateway, file_mentions=file_mentions)
         self._capabilities_initialized = True
 
     def _replace_capabilities(
@@ -5055,13 +5074,19 @@ class HostProcess:
         configured: dict[str, HarnessAvailability] | None,
         gateway: dict[str, bool] | None,
         accounts: HarnessAccounts | None = None,
+        *,
+        file_mentions: dict[str, bool] | None = None,
     ) -> None:
         """Replace the advisory snapshot and invalidate older probe results."""
-        readiness_changed = configured is not None or gateway is not None
+        readiness_changed = (
+            configured is not None or gateway is not None or file_mentions is not None
+        )
         if configured is not None:
             self._configured_harnesses = dict(configured)
         if gateway is not None:
             self._gateway_inference = dict(gateway)
+        if file_mentions is not None:
+            self._workspace_file_mentions = dict(file_mentions)
         if accounts is not None:
             self._harness_accounts = dict(accounts)
             self._account_generation += 1
@@ -5861,6 +5886,7 @@ class HostProcess:
             configured_harnesses=self._configured_harnesses,
             harness_accounts=self._harness_accounts,
             gateway_inference=self._gateway_inference,
+            workspace_file_mentions=self._workspace_file_mentions,
             interactive_shells=self._interactive_shells,
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
@@ -5935,6 +5961,7 @@ class HostProcess:
         """Refresh advisory capabilities without endangering the tunnel."""
         published_configured = self._configured_harnesses
         published_gateway = self._gateway_inference
+        published_file_mentions = self._workspace_file_mentions
         loop = asyncio.get_running_loop()
         next_quick = loop.time() + HARNESS_READINESS_REFRESH_INTERVAL_S
         next_full = loop.time() + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
@@ -5944,6 +5971,7 @@ class HostProcess:
             generation = self._capability_generation
             configured = self._configured_harnesses
             gateway = self._gateway_inference
+            file_mentions = self._workspace_file_mentions
             refresh_full = configured is None or now >= next_full
             if now >= next_quick:
                 next_quick = now + HARNESS_READINESS_REFRESH_INTERVAL_S
@@ -5957,17 +5985,28 @@ class HostProcess:
             if refresh_full:
                 latest = await self._probe_configured_harnesses(startup=False)
                 latest_gateway = await self._probe_gateway_inference(startup=False)
+                latest_file_mentions = await self._probe_workspace_file_mentions(startup=False)
                 next_full = now + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
                 new_configured = latest if latest is not None else configured
                 new_gateway = latest_gateway if latest_gateway is not None else gateway
+                new_file_mentions = (
+                    latest_file_mentions if latest_file_mentions is not None else file_mentions
+                )
                 if self._capability_generation == generation and (
-                    new_configured != configured or new_gateway != gateway
+                    new_configured != configured
+                    or new_gateway != gateway
+                    or new_file_mentions != file_mentions
                 ):
-                    self._replace_capabilities(new_configured, new_gateway)
+                    self._replace_capabilities(
+                        new_configured, new_gateway, file_mentions=new_file_mentions
+                    )
             configured = self._configured_harnesses
             gateway = self._gateway_inference
+            file_mentions = self._workspace_file_mentions
             if configured is not None and (
-                configured != published_configured or gateway != published_gateway
+                configured != published_configured
+                or gateway != published_gateway
+                or file_mentions != published_file_mentions
             ):
                 await self._send_text(
                     ws,
@@ -5976,11 +6015,13 @@ class HostProcess:
                             configured_harnesses=configured,
                             harness_accounts=self._harness_accounts,
                             gateway_inference=gateway,
+                            workspace_file_mentions=file_mentions,
                         )
                     ),
                 )
                 published_configured = configured
                 published_gateway = gateway
+                published_file_mentions = file_mentions
 
     def _raise_connection_error(self, frame: HostConnectionErrorFrame) -> None:
         """Raise the lifecycle exception requested by a server error frame."""
@@ -6223,6 +6264,7 @@ class HostProcess:
                 self._replace_capabilities(
                     refresh_result.configured_harnesses,
                     refresh_result.gateway_inference,
+                    file_mentions=refresh_result.workspace_file_mentions,
                 )
             await self._send_text(ws, self._encode_frame(refresh_result))
         elif isinstance(frame, HostHarnessLoginFrame):

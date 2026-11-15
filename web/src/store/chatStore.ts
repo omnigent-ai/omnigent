@@ -862,9 +862,9 @@ export interface ConversationState {
   sessionReasoningEffort: string | null;
   sessionModelSeeded: boolean;
   /**
-   * Selected host id seeded at optimistic create, so the temp composer can run
-   * routing's per-family gateway guard against the real chosen host before the
-   * server session (which then owns ``hostId``) exists. ``null`` when unknown.
+   * Host id bound to the active session. Seeded at optimistic create, hydrated
+   * from the session snapshot on bind, and updated on ``session_host_bound``.
+   * ``null`` when unknown or unbound.
    */
   sessionHostId: string | null;
   /**
@@ -5009,6 +5009,7 @@ function sessionBindingPatch(
   | "pendingModelChange"
   | "sessionModelOverride"
   | "sessionHarness"
+  | "sessionHostId"
   | "subAgentName"
   | "costControlModeOverride"
   | "subagentRoutingOverride"
@@ -5043,6 +5044,7 @@ function sessionBindingPatch(
       ? state.sessionModelOverride
       : (session.modelOverride ?? null),
     sessionHarness: session.harness ?? null,
+    sessionHostId: session.hostId ?? null,
     subAgentName: session.subAgentName ?? null,
     costControlModeOverride: session.costControlModeOverride ?? null,
     subagentRoutingOverride: session.subagentRoutingOverride ?? null,

@@ -1308,7 +1308,9 @@ def harness_catalog() -> list[dict[str, object]]:
         for agent in acp_agents():
             acp_row: dict[str, object] = {"id": f"acp:{agent.slug}", "label": agent.name}
             if acp_capability is not None:
-                acp_row["capabilities"] = acp_capability.as_dict()
+                caps = acp_capability.as_dict()
+                caps["workspace_file_mentions"] = agent.workspace_file_mentions
+                acp_row["capabilities"] = caps
             rows.append(acp_row)
     except Exception:  # a malformed acp: block must never break the catalog
         _logger.debug("acp catalog rows skipped", exc_info=True)

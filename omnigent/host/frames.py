@@ -327,6 +327,10 @@ class HostHelloFrame:
         ``omnigent.gateway_inference``). A family that could not be evaluated
         is omitted. ``None`` means unknown (an older host, or a startup probe
         that failed) — never treat it as "nothing is gateway-backed".
+    :param workspace_file_mentions: Per-ACP-agent flag for whether that agent
+        opens workspace-relative ``[Attached: <path>]`` markers with its own
+        file tools, e.g. ``{"acp:claude-code": True}``. ``None`` means unknown
+        (older host or unreported).
     :param interactive_shells: Ordered interactive shells installed on this
         machine, with its login shell first. ``None`` means an older host did
         not report an inventory.
@@ -351,6 +355,7 @@ class HostHelloFrame:
     configured_harnesses: dict[str, HarnessAvailability] | None = None
     harness_accounts: HarnessAccounts | None = None
     gateway_inference: dict[str, bool] | None = None
+    workspace_file_mentions: dict[str, bool] | None = None
     interactive_shells: list[str] | None = None
     telemetry_opt_out: bool = False
     installation_id: str | None = None
@@ -391,6 +396,7 @@ class HostHarnessReadinessFrame:
     configured_harnesses: dict[str, HarnessAvailability]
     harness_accounts: HarnessAccounts | None = None
     gateway_inference: dict[str, bool] | None = None
+    workspace_file_mentions: dict[str, bool] | None = None
 
 
 @dataclass
@@ -1022,6 +1028,7 @@ class HostRefreshHarnessesResultFrame:
     configured_harnesses: dict[str, HarnessAvailability] | None = None
     harness_accounts: HarnessAccounts | None = None
     gateway_inference: dict[str, bool] | None = None
+    workspace_file_mentions: dict[str, bool] | None = None
     error: str | None = None
 
 
@@ -1800,6 +1807,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 **_encode_configured_harnesses(frame.configured_harnesses),
                 "harness_accounts": frame.harness_accounts,
                 "gateway_inference": frame.gateway_inference,
+                "workspace_file_mentions": frame.workspace_file_mentions,
                 "interactive_shells": frame.interactive_shells,
                 "telemetry_opt_out": frame.telemetry_opt_out,
                 "installation_id": frame.installation_id,
@@ -1825,6 +1833,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 **_encode_configured_harnesses(frame.configured_harnesses),
                 "harness_accounts": frame.harness_accounts,
                 "gateway_inference": frame.gateway_inference,
+                "workspace_file_mentions": frame.workspace_file_mentions,
             }
         )
     if isinstance(frame, HostLaunchRunnerFrame):
@@ -2090,6 +2099,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 **_encode_configured_harnesses(frame.configured_harnesses),
                 "harness_accounts": frame.harness_accounts,
                 "gateway_inference": frame.gateway_inference,
+                "workspace_file_mentions": frame.workspace_file_mentions,
                 "error": frame.error,
             }
         )
@@ -2986,6 +2996,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         configured_harnesses=_decode_configured_harnesses(msg),
         harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
+        workspace_file_mentions=optional_str_bool_map(msg, "workspace_file_mentions"),
         interactive_shells=(
             _optional_str_list(msg, "interactive_shells")
             if msg.get("interactive_shells") is not None
@@ -3016,6 +3027,7 @@ def _decode_harness_readiness(msg: _JsonObject) -> HostHarnessReadinessFrame:
         configured_harnesses=configured_harnesses,
         harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
+        workspace_file_mentions=optional_str_bool_map(msg, "workspace_file_mentions"),
     )
 
 
@@ -3429,6 +3441,7 @@ def _decode_refresh_harnesses_result(msg: _JsonObject) -> HostRefreshHarnessesRe
         configured_harnesses=_decode_configured_harnesses(msg),
         harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
+        workspace_file_mentions=optional_str_bool_map(msg, "workspace_file_mentions"),
         error=_optional_nullable_str(msg, "error"),
     )
 

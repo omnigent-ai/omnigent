@@ -366,6 +366,7 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
     antigravity: "Antigravity",
     copilot: "Copilot",
   }),
+  useFileMentionHarnesses: () => new Set<string>(),
   // The setup dialog reads server-authored steps from here; stub codex-native's
   // two-step flow (install → login) so the dialog renders without a real fetch.
   useHarnessSetupSteps: () => ({
@@ -10781,6 +10782,49 @@ describe("NewChatLandingScreen @-file-mention", () => {
       testAgent("sdk1", "my-sdk-agent", { display_name: "SDK Agent", harness: "claude-sdk" }),
     ]);
     renderLanding();
+    fireEvent.change(input(), { target: { value: "@", selectionStart: 1 } });
+    expect(screen.queryByTitle("Open omnigent")).not.toBeInTheDocument();
+  });
+
+  it("opens the menu and delivers [Attached: …] for an acp:<slug> agent when the host advertises workspace_file_mentions", async () => {
+    mockAgents([testAgent("acp1", "Demo ACP", { display_name: "Demo ACP", harness: "acp:demo" })]);
+    mockHosts([
+      {
+        ...host("online"),
+        configured_harnesses: { "acp:demo": true },
+        workspace_file_mentions: { "acp:demo": true },
+      },
+    ]);
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_acp" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.change(input(), { target: { value: "Read @", selectionStart: 6 } });
+    expect(screen.getByTitle("Open omnigent")).toBeInTheDocument();
+    fireEvent.click(screen.getByTitle("Attach README.md"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(setPendingInitialPromptMock).toHaveBeenCalled());
+    const [, payload] = setPendingInitialPromptMock.mock.calls[0]!;
+    expect((payload as { text: string }).text).toBe("Read [Attached: README.md]");
+  });
+
+  it("does NOT open the file menu for an acp:<slug> agent when the host omits workspace_file_mentions", async () => {
+    mockAgents([testAgent("acp1", "Demo ACP", { display_name: "Demo ACP", harness: "acp:demo" })]);
+    mockHosts([
+      {
+        ...host("online"),
+        configured_harnesses: { "acp:demo": true },
+        workspace_file_mentions: { "acp:demo": false },
+      },
+    ]);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
     fireEvent.change(input(), { target: { value: "@", selectionStart: 1 } });
     expect(screen.queryByTitle("Open omnigent")).not.toBeInTheDocument();
   });

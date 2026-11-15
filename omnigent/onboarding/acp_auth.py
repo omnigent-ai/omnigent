@@ -59,6 +59,9 @@ class AcpAgentEntry:
         Pi forks like ``omp``) to prevent XML tool-call fragments from leaking
         into their responses when no MCP relay is active. See
         :attr:`omnigent.inner.acp_executor.AcpAgentConfig.inject_system_prompt`.
+    :param workspace_file_mentions: Whether the agent opens workspace-relative
+        ``[Attached: <path>]`` markers in user messages with its own file tools.
+        Enables ``@``-file mentions and "Attach to agent" in the web UI.
     :param env_passthrough: Environment variable *names* the agent may read at
         spawn, e.g. ``("XAI_API_KEY",)``. The spawn env is deny-by-default and
         the executor cannot know which variable an arbitrary agent
@@ -75,6 +78,7 @@ class AcpAgentEntry:
     send_model: bool = False
     omnigent_mcp: bool = True
     inject_system_prompt: bool = True
+    workspace_file_mentions: bool = False
     env_passthrough: tuple[str, ...] = ()
 
 
@@ -168,6 +172,9 @@ def acp_agents(config: dict[str, object] | None = None) -> list[AcpAgentEntry]:
         inject_system_prompt = raw.get("inject_system_prompt", True)
         if not isinstance(inject_system_prompt, bool):
             raise ValueError("acp agent inject_system_prompt must be a boolean")
+        workspace_file_mentions = raw.get("workspace_file_mentions", False)
+        if not isinstance(workspace_file_mentions, bool):
+            raise ValueError("acp agent workspace_file_mentions must be a boolean")
         entries.append(
             AcpAgentEntry(
                 slug=slug,
@@ -178,6 +185,7 @@ def acp_agents(config: dict[str, object] | None = None) -> list[AcpAgentEntry]:
                 send_model=bool(raw.get("send_model", False)),
                 omnigent_mcp=omnigent_mcp,
                 inject_system_prompt=inject_system_prompt,
+                workspace_file_mentions=workspace_file_mentions,
                 env_passthrough=parse_env_passthrough(raw.get("env_passthrough")),
             )
         )
@@ -241,10 +249,17 @@ def acp_agents_settings(entries: list[AcpAgentEntry]) -> dict[str, object]:
             item["omnigent_mcp"] = False
         if not e.inject_system_prompt:
             item["inject_system_prompt"] = False
+        if e.workspace_file_mentions:
+            item["workspace_file_mentions"] = True
         if e.env_passthrough:
             item["env_passthrough"] = list(e.env_passthrough)
         agents.append(item)
     return {ACP_CONFIG_KEY: {_AGENTS_FIELD: agents}}
+
+
+def acp_file_mentions_map(config: dict[str, object] | None = None) -> dict[str, bool]:
+    """Return per-ACP-agent ``workspace_file_mentions`` flags keyed by ``acp:<slug>``."""
+    return {f"acp:{entry.slug}": entry.workspace_file_mentions for entry in acp_agents(config)}
 
 
 def command_binary_on_path(command: str) -> bool:

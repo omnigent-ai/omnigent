@@ -455,6 +455,7 @@ def create_host_tunnel_router(
             # started learns the host's gateway backing here, so a server
             # restart converges as soon as each host reconnects.
             host_registry.record_gateway_inference(host_id, frame.gateway_inference)
+            host_registry.record_workspace_file_mentions(host_id, frame.workspace_file_mentions)
             stage = "connected"
             conn.diagnostics.settings.update(
                 tunnel_side="server",
@@ -909,6 +910,12 @@ async def _receive_loop(
                 dict(frame.gateway_inference) if frame.gateway_inference is not None else None
             )
             host_registry.record_gateway_inference(host_id, frame.gateway_inference)
+            conn.hello.workspace_file_mentions = (
+                dict(frame.workspace_file_mentions)
+                if frame.workspace_file_mentions is not None
+                else None
+            )
+            host_registry.record_workspace_file_mentions(host_id, frame.workspace_file_mentions)
             if on_host_update is not None:
                 try:
                     await on_host_update(host_id, conn.owner)
@@ -1086,6 +1093,7 @@ async def _receive_loop(
                         "configured_harnesses": frame.configured_harnesses,
                         "harness_accounts": frame.harness_accounts,
                         "gateway_inference": frame.gateway_inference,
+                        "workspace_file_mentions": frame.workspace_file_mentions,
                         "error": frame.error,
                     }
                 )
