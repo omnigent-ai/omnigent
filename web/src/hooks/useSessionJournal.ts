@@ -16,6 +16,7 @@ import {
 import { useEffect, useMemo, useSyncExternalStore } from "react";
 import {
   fetchJournalPage,
+  currentPlan,
   mergeJournalEntries,
   planSteps,
   sessionJournalKey,
@@ -201,8 +202,11 @@ export function useSessionJournal(
   // among them, so read those two kinds on their own. Shares the journal's key
   // prefix, so reloading the newest page resets it too.
   const olderExist = query.hasNextPage;
+  const visiblePlanId = query.data?.pages
+    .flatMap((page) => page.data)
+    .find((entry) => entry.kind === "plan")?.id;
   const planAndStatuses = useQuery({
-    queryKey: [...sessionJournalKey(conversationId), "plan-and-statuses"],
+    queryKey: [...sessionJournalKey(conversationId), "plan-and-statuses", visiblePlanId],
     queryFn: async () => {
       const plan = await fetchJournalPage(conversationId!, {
         kind: "plan",
@@ -229,7 +233,7 @@ export function useSessionJournal(
 
   const pages = query.data?.pages;
   const extraPages = olderExist ? planAndStatuses.data : undefined;
-  const entries = useMemo(
+  const journalEntries = useMemo(
     () =>
       mergeJournalEntries(
         ...(extraPages ?? []).map((page) => page.data),
@@ -237,10 +241,32 @@ export function useSessionJournal(
       ),
     [pages, extraPages],
   );
-  const error = query.error ?? (olderExist ? planAndStatuses.error : null);
+  const planId = currentPlan(journalEntries)?.id;
+  // Run boundaries are not sent with the live plan event and can predate the
+  // newest page. Read the current one whenever the plan changes.
+  const runBoundary = useQuery({
+    queryKey: [...sessionJournalKey(conversationId), "run-boundary", planId],
+    queryFn: () =>
+      fetchJournalPage(conversationId!, { kind: "plan_status", order: "desc", limit: "1" }),
+    enabled: active && planId !== undefined,
+    staleTime: Number.POSITIVE_INFINITY,
+    refetchOnWindowFocus: false,
+  });
+  const entries = useMemo(
+    () => mergeJournalEntries(journalEntries, runBoundary.data?.data ?? []),
+    [journalEntries, runBoundary.data],
+  );
+  const error =
+    query.error ??
+    (olderExist ? planAndStatuses.error : null) ??
+    (planId ? runBoundary.error : null);
   return {
     entries: error ? [] : entries,
-    isLoading: active && (query.isPending || (olderExist && planAndStatuses.isPending)),
+    isLoading:
+      active &&
+      (query.isPending ||
+        (olderExist && planAndStatuses.isPending) ||
+        (planId !== undefined && runBoundary.isPending)),
     error: error ?? catchUpError,
     hasOlder: query.hasNextPage,
     loadingOlder: query.isFetchingNextPage,

@@ -107,6 +107,17 @@ describe("stepProgress", () => {
     expect(idle[2].startedAt).toBeNull();
     expect(idle[3].status).toBeNull();
     expect(stepProgress(steps, entries, true)[1].state).toBe("running");
+    const replanned = [...entries, plan(9, ["a"], ["b"], ["c"], ["d"])];
+    expect(stepProgress(steps, replanned, false)).toEqual(idle);
+    const nextRun = [
+      ...replanned,
+      journalEntry(10, { kind: "plan_status", content: { status: "started" } }),
+      plan(11, ["a"], ["b"], ["c"], ["d"]),
+      status(12, "b", "started"),
+    ];
+    const restarted = stepProgress(steps, nextRun, true);
+    expect(restarted.map((item) => item.state)).toEqual(["ready", "running", "ready", "ready"]);
+    expect(restarted[1].startedAt).toBe(nextRun.at(-1)!.created_at);
   });
 
   it("marks a start after an earlier one as a restart", () => {

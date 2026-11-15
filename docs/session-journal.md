@@ -56,8 +56,9 @@ The workflow skill keeps the agent working while any step is ready or started:
 it ends its turn only once everything left is done, failed or waiting for the
 user, unless told to stop sooner.
 
-A status belongs to a step ID, not to a plan version. When the agent replans, a
-step that keeps its ID keeps its status, so finished work stays finished.
+A status belongs to a step ID within a run, not to a plan version. Replanning
+or saving the plan keeps that progress. Starting another invocation resets it;
+the task list reads the run boundary even when it predates the loaded page.
 
 Limits: a plan has at most 100 steps and 32 KiB of JSON, and its name at most 80
 characters; status text is required except for `started`; a note is at most 4

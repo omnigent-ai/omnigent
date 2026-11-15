@@ -201,6 +201,10 @@ export function stepProgress(
 ): StepProgress[] {
   const statuses = new Map<string, JournalEntry[]>();
   for (const entry of entries) {
+    if (entry.kind === "plan_status") {
+      statuses.clear();
+      continue;
+    }
     if (!entry.step || entry.kind !== "status" || !statusOf(entry)) continue;
     const list = statuses.get(entry.step);
     if (list) list.push(entry);

@@ -4,7 +4,7 @@ import type { PropsWithChildren } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
-import { sessionJournalKey, type JournalPage } from "@/lib/sessionJournal";
+import { sessionJournalKey, sessionTaskList, type JournalPage } from "@/lib/sessionJournal";
 import { noteSessionStreamClosed, noteSessionStreamOpen } from "@/lib/sessionStreamSignals";
 import { journalEntry, journalPage, journalPlan } from "@/test/journalFixtures";
 import {
@@ -91,12 +91,13 @@ describe("useSessionJournal", () => {
       { kind: "plan", order: "desc", limit: "1" },
       { kind: "status", step: "a", order: "desc", limit: "1" },
       { kind: "status", step: "b", order: "desc", limit: "1" },
+      { kind: "plan_status", order: "desc", limit: "1" },
     ]);
 
     respond(journalPage(busy.slice(1, 101), { has_more: true }));
     act(() => result.current.loadOlder());
     await waitFor(() => expect(result.current.entries).toHaveLength(103));
-    expect(requestedQueries()[4].get("after")).toBe("e1002");
+    expect(requestedQueries()[5].get("after")).toBe("e1002");
     expect(result.current.entries).toContainEqual(done);
   });
 
@@ -114,6 +115,34 @@ describe("useSessionJournal", () => {
       expect(result.current.entries.map((entry) => entry.position)).toEqual([0, 1, 2]),
     );
     expect(authenticatedFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["live", "paginated"])("resets prior run progress in %s journals", async (mode) => {
+    const original = journalPlan(0, ["a"]);
+    const done = journalEntry(1, { kind: "status", step: "a", content: { status: "done" } });
+    const boundary = journalEntry(2, { kind: "plan_status", content: { status: "started" } });
+    const next = journalPlan(3, ["a"]);
+    if (mode === "live") respond(journalPage([done, original]));
+    else {
+      respond(journalPage([journalEntry(104)], { has_more: true }));
+      byKind = {
+        plan: journalPage([next]),
+        "status:a": journalPage([done]),
+        plan_status: journalPage([boundary]),
+      };
+    }
+    const { result } = renderHook(() => useSessionJournal(SESSION, true), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    if (mode === "live") {
+      expect(sessionTaskList(result.current.entries, [], true).progress[0].state).toBe("done");
+      byKind.plan_status = journalPage([boundary]);
+      act(() => applyJournalEntry(queryClient, SESSION, next));
+    }
+    await waitFor(() =>
+      expect(sessionTaskList(result.current.entries, [], true).progress[0].state).toBe("ready"),
+    );
+    expect(result.current.entries).toContainEqual(done);
+    expect(result.current.entries).toContainEqual(boundary);
   });
 
   it.each(["initial", "refetch", "reset"])(
