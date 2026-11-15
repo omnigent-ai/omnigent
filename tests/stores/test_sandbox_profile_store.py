@@ -152,8 +152,10 @@ def test_reference_survives_restart_without_schema_changes(store):
         for index in inspect(store._engine).get_indexes("omnigent_conversation_metadata")
     )
     assert all(len(value) <= 256 for value in store.get_conversation(session.id).labels.values())
+    assert store.get_profile_labels([session.id]) == {session.id: profile_labels(PROFILE)}
     with workspace_scope(42):
         assert profiles.get_session_snapshot(session.id) is None
+        assert store.get_profile_labels([session.id]) == {}
 
 
 def test_profiled_host_binding_and_its_rollback_reset_the_background_flag(store):
