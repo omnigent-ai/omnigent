@@ -9,6 +9,7 @@ from omnigent.db.db_models import workspace_scope
 from omnigent.stores.sandbox_profile_store import (
     PROFILE_HOST_PAGE_SIZE,
     PROFILE_HOST_SESSION_LIMIT,
+    PROFILE_LABEL_KEYS,
     SandboxProfileStore,
     profile_labels,
 )
@@ -96,16 +97,17 @@ def test_host_recovery_has_a_fixed_work_bound_and_skips_ordinary_hosts(store, mo
     pages = PROFILE_HOST_SESSION_LIMIT // PROFILE_HOST_PAGE_SIZE
     assert len(queries) == 2 * pages + 1
     for engine, statement, parameters in queries:
+        reads_host_page = "conversation_metadata" in statement
+        # A fully profiled page returns every profile key for each of its sessions.
+        row_limit = PROFILE_HOST_PAGE_SIZE * (1 if reads_host_page else len(PROFILE_LABEL_KEYS))
         with engine.connect() as connection:
-            assert len(connection.exec_driver_sql(statement, parameters).all()) <= (
-                PROFILE_HOST_PAGE_SIZE
-            )
+            assert len(connection.exec_driver_sql(statement, parameters).all()) <= row_limit
             if engine.dialect.name == "sqlite":
                 plan = str(
                     connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
                 )
                 assert "SCAN" not in plan and "TEMP B-TREE" not in plan
-                if "conversation_metadata" in statement:
+                if reads_host_page:
                     assert "ix_conversation_metadata_host_id" in plan
     hydrate.assert_not_called()
 
