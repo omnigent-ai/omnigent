@@ -134,7 +134,7 @@ describe("BoardPage", () => {
       conversation({
         id: "conv_done",
         title: "Shipped",
-        labels: { [BOARD_ACCEPTED_LABEL_KEY]: "1700000100" },
+        labels: { [BOARD_ACCEPTED_LABEL_KEY]: "1700000101" },
       }),
       conversation({ id: "conv_shared", title: "Someone else's", permission_level: 2 }),
     ]);
@@ -183,7 +183,7 @@ describe("BoardPage", () => {
 
   it("reopens an accepted session by clearing its acceptance", async () => {
     mockRows([
-      conversation({ title: "Shipped", labels: { [BOARD_ACCEPTED_LABEL_KEY]: "1700000100" } }),
+      conversation({ title: "Shipped", labels: { [BOARD_ACCEPTED_LABEL_KEY]: "1700000101" } }),
     ]);
     renderPage();
 
@@ -222,7 +222,7 @@ describe("BoardPage", () => {
       conversation({
         title: "Broke, accepted",
         status: "failed",
-        labels: { [BOARD_ACCEPTED_LABEL_KEY]: "1700000100" },
+        labels: { [BOARD_ACCEPTED_LABEL_KEY]: "1700000101" },
       }),
     ]);
     renderPage();

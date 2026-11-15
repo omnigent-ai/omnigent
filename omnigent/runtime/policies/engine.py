@@ -29,7 +29,11 @@ from omnigent.spec.types import (
     StateUpdate,
     StateUpdateAction,
 )
-from omnigent.stores.conversation_store import ConversationStore, DailyCostState
+from omnigent.stores.conversation_store import (
+    BOARD_ACCEPTED_LABEL_KEY,
+    ConversationStore,
+    DailyCostState,
+)
 
 # Number of recent conversation items the engine fetches from
 # the conversation store and threads onto :class:`EvaluationContext`
@@ -1127,7 +1131,9 @@ def _filter_writable_labels(
     When ``spec.set_labels`` is a list (FunctionPolicy /
     PromptPolicy), any key in the returned dict that is NOT
     in the list is silently dropped. When ``spec.set_labels``
-    is absent or not a list, every key passes through.
+    is absent or not a list, every key passes through. The web
+    Board's acceptance stamp is always dropped: only a user's
+    Accept may write it.
 
     :param set_labels: The label writes the policy returned.
     :param spec: The policy's spec.
@@ -1137,9 +1143,11 @@ def _filter_writable_labels(
     if not set_labels:
         return None
     whitelist = getattr(spec, "set_labels", None)
-    if not isinstance(whitelist, list):
-        return dict(set_labels)
-    return {k: v for k, v in set_labels.items() if k in whitelist}
+    return {
+        k: v
+        for k, v in set_labels.items()
+        if k != BOARD_ACCEPTED_LABEL_KEY and (not isinstance(whitelist, list) or k in whitelist)
+    }
 
 
 def _condition_matches(

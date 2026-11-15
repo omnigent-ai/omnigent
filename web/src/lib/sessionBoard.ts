@@ -6,9 +6,10 @@ import type { Conversation } from "@/hooks/useConversations";
 import { getSessionState } from "@/hooks/useSessionState";
 
 /**
- * Session label recording the user's acceptance of a session's work. Its value
- * is the session's `updated_at` (epoch seconds) when it was accepted, so any
- * later activity moves the session back out of Done.
+ * Session label recording the user's acceptance of a session's work. The client
+ * sends the `updated_at` it reviewed; the server stores one second past it
+ * (epoch seconds) and refuses an Accept within two seconds of it, so any later
+ * write gives the session an `updated_at` at least as new and reopens it.
  */
 export const BOARD_ACCEPTED_LABEL_KEY = "omnigent.board.accepted";
 
@@ -30,8 +31,8 @@ export const BOARD_COLUMNS: readonly BoardColumn[] = [
 ];
 
 /**
- * The `updated_at` the user accepted, or null when the session was never
- * accepted (or the label was cleared to an empty value).
+ * The server's acceptance stamp, or null when the session was never accepted
+ * (or the label was cleared to an empty value).
  */
 export function boardAcceptedAt(row: Pick<Conversation, "labels">): number | null {
   const raw = row.labels?.[BOARD_ACCEPTED_LABEL_KEY];
@@ -40,14 +41,10 @@ export function boardAcceptedAt(row: Pick<Conversation, "labels">): number | nul
   return Number.isFinite(value) ? value : null;
 }
 
-/**
- * Whether the user accepted the session and nothing has happened since.
- * `updated_at` has whole-second resolution, so activity in the accepted second
- * itself is not seen as new.
- */
+/** Whether the user accepted the session and nothing has happened since. */
 export function isBoardAccepted(row: Pick<Conversation, "labels" | "updated_at">): boolean {
   const acceptedAt = boardAcceptedAt(row);
-  return acceptedAt !== null && acceptedAt >= row.updated_at;
+  return acceptedAt !== null && acceptedAt > row.updated_at;
 }
 
 /**

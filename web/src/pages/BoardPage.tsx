@@ -5,9 +5,10 @@
  *
  * Columns derive from the shared sidebar rows (kept live by the
  * `WS /v1/sessions/updates` stream), so the board needs no extra list fetch.
- * A session reaches Done only when the user accepts it: Accept stores the
- * session's current `updated_at` in the `omnigent.board.accepted` label, and
- * any later activity moves the card back out (see `@/lib/sessionBoard`).
+ * A session reaches Done only when the user accepts it: Accept sends the
+ * reviewed `updated_at`, the server stores a later stamp in the
+ * `omnigent.board.accepted` label, and any later activity moves the card back
+ * out (see `@/lib/sessionBoard`).
  */
 
 import { useMemo } from "react";
@@ -138,7 +139,7 @@ function BoardCard({
               variant="outline"
               disabled={acceptPending}
               onClick={() =>
-                setAccepted.mutate({ row: conversation, acceptedAt: conversation.updated_at })
+                setAccepted.mutate({ row: conversation, reviewedAt: conversation.updated_at })
               }
               componentId="board.accept"
               aria-label={`Accept ${title}`}
@@ -151,7 +152,7 @@ function BoardCard({
               size="sm"
               variant="ghost"
               disabled={acceptPending}
-              onClick={() => setAccepted.mutate({ row: conversation, acceptedAt: null })}
+              onClick={() => setAccepted.mutate({ row: conversation, reviewedAt: null })}
               componentId="board.reopen"
               aria-label={`Reopen ${title}`}
             >

@@ -27,7 +27,7 @@ const accepted = (at: number) => ({ [BOARD_ACCEPTED_LABEL_KEY]: String(at) });
 
 describe("boardAcceptedAt", () => {
   it("reads the accepted timestamp and ignores empty or malformed values", () => {
-    expect(boardAcceptedAt(row({ labels: accepted(1_700_000_100) }))).toBe(1_700_000_100);
+    expect(boardAcceptedAt(row({ labels: accepted(1_700_000_101) }))).toBe(1_700_000_101);
     expect(boardAcceptedAt(row({ labels: { [BOARD_ACCEPTED_LABEL_KEY]: "" } }))).toBeNull();
     expect(boardAcceptedAt(row({ labels: { [BOARD_ACCEPTED_LABEL_KEY]: "soon" } }))).toBeNull();
     expect(boardAcceptedAt(row())).toBeNull();
@@ -36,14 +36,22 @@ describe("boardAcceptedAt", () => {
 
 describe("isBoardAccepted", () => {
   it("holds until the session changes after acceptance", () => {
-    expect(isBoardAccepted(row({ labels: accepted(1_700_000_100) }))).toBe(true);
+    expect(isBoardAccepted(row({ labels: accepted(1_700_000_101) }))).toBe(true);
     expect(isBoardAccepted(row({ labels: accepted(1_700_000_099) }))).toBe(false);
+  });
+
+  it("reopens on activity within the second the server stamped the acceptance", () => {
+    // The server stamps a second after the reviewed activity; a write landing
+    // in that same second gives updated_at equal to the stamp.
+    expect(
+      isBoardAccepted(row({ updated_at: 1_700_000_101, labels: accepted(1_700_000_101) })),
+    ).toBe(false);
   });
 });
 
 describe("boardColumn", () => {
   it("puts pending approvals and terminal prompts in Needs you, even when accepted", () => {
-    const labels = accepted(1_700_000_100);
+    const labels = accepted(1_700_000_101);
     expect(boardColumn(row({ status: "running", pending_elicitations_count: 1, labels }))).toBe(
       "needs_you",
     );
@@ -59,14 +67,14 @@ describe("boardColumn", () => {
 
   it("keeps idle work in Needs review until it is accepted", () => {
     expect(boardColumn(row())).toBe("needs_review");
-    expect(boardColumn(row({ labels: accepted(1_700_000_100) }))).toBe("done");
+    expect(boardColumn(row({ labels: accepted(1_700_000_101) }))).toBe("done");
     // New activity after acceptance reopens the review.
     expect(boardColumn(row({ labels: accepted(1_700_000_050) }))).toBe("needs_review");
   });
 
   it("asks for attention on a failed turn until the user accepts it", () => {
     expect(boardColumn(row({ status: "failed" }))).toBe("needs_you");
-    expect(boardColumn(row({ status: "failed", labels: accepted(1_700_000_100) }))).toBe("done");
+    expect(boardColumn(row({ status: "failed", labels: accepted(1_700_000_101) }))).toBe("done");
   });
 });
 
@@ -76,7 +84,7 @@ describe("canAcceptOnBoard", () => {
     expect(canAcceptOnBoard(row({ status: "failed" }))).toBe(true);
     expect(canAcceptOnBoard(row({ status: "running" }))).toBe(false);
     expect(canAcceptOnBoard(row({ pending_elicitations_count: 2 }))).toBe(false);
-    expect(canAcceptOnBoard(row({ labels: accepted(1_700_000_100) }))).toBe(false);
+    expect(canAcceptOnBoard(row({ labels: accepted(1_700_000_101) }))).toBe(false);
   });
 });
 

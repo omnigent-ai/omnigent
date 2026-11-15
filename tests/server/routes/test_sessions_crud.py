@@ -948,41 +948,42 @@ async def test_patch_session_pins_and_unpins(
     assert user_key not in conv.labels
 
 
-async def test_patch_board_acceptance_label_keeps_activity_time(
+async def _listed_session(client: httpx.AsyncClient, session_id: str) -> dict:
+    resp = await client.get("/v1/sessions")
+    assert resp.status_code == 200, resp.text
+    return next(row for row in resp.json()["data"] if row["id"] == session_id)
+
+
+async def test_patch_board_acceptance_stamps_server_time_and_keeps_activity_time(
     client: httpx.AsyncClient,
     session_id: str,
     db_uri: str,
 ) -> None:
-    """The web Board stores acceptance as the session's ``updated_at`` in the
-    ``omnigent.board.accepted`` label and compares the two, so writing or
-    clearing that label must not count as session activity."""
+    """The web Board sends the ``updated_at`` it reviewed; the server stores the
+    stamp one second past it in ``omnigent.board.accepted``. Writing or clearing
+    that label must not count as session activity."""
     from sqlalchemy import update
 
     from omnigent.db.db_models import SqlConversation
 
     # Age the row so a same-second bump can't hide a regression.
-    accepted_at = 1_700_000_000
+    reviewed_at = 1_700_000_000
     with make_managed_session_maker(get_or_create_engine(db_uri))() as session:
         session.execute(
             update(SqlConversation)
             .where(SqlConversation.id == session_id)
-            .values(updated_at=accepted_at)
+            .values(updated_at=reviewed_at)
         )
         session.commit()
 
-    async def listed_row() -> dict:
-        resp = await client.get("/v1/sessions")
-        assert resp.status_code == 200, resp.text
-        return next(row for row in resp.json()["data"] if row["id"] == session_id)
-
     resp = await client.patch(
         f"/v1/sessions/{session_id}",
-        json={"labels": {"omnigent.board.accepted": str(accepted_at)}},
+        json={"labels": {"omnigent.board.accepted": str(reviewed_at)}},
     )
     assert resp.status_code == 200, resp.text
-    row = await listed_row()
-    assert row["labels"]["omnigent.board.accepted"] == str(accepted_at)
-    assert row["updated_at"] == accepted_at
+    row = await _listed_session(client, session_id)
+    assert row["labels"]["omnigent.board.accepted"] == str(reviewed_at + 1)
+    assert row["updated_at"] == reviewed_at
 
     # Reopening clears the value without bumping the activity time either.
     resp = await client.patch(
@@ -990,9 +991,83 @@ async def test_patch_board_acceptance_label_keeps_activity_time(
         json={"labels": {"omnigent.board.accepted": ""}},
     )
     assert resp.status_code == 200, resp.text
-    row = await listed_row()
+    row = await _listed_session(client, session_id)
     assert row["labels"].get("omnigent.board.accepted", "") == ""
-    assert row["updated_at"] == accepted_at
+    assert row["updated_at"] == reviewed_at
+
+
+async def test_activity_in_the_acceptance_second_reopens_it(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Activity, Accept and a rename in one server second leave nothing marked
+    accepted (Accept is refused); a rename right after a later Accept reopens it.
+    The server clock is frozen so each step lands in a chosen second."""
+    import time
+
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlConversation
+
+    reviewed_at = 1_700_000_000
+    with make_managed_session_maker(get_or_create_engine(db_uri))() as session:
+        session.execute(
+            update(SqlConversation)
+            .where(SqlConversation.id == session_id)
+            .values(updated_at=reviewed_at)
+        )
+        session.commit()
+    accept = {"labels": {"omnigent.board.accepted": str(reviewed_at)}}
+
+    # Still the reviewed second: refused, so a later same-second write can't hide.
+    monkeypatch.setattr(time, "time", lambda: reviewed_at + 0.4)
+    resp = await client.patch(f"/v1/sessions/{session_id}", json=accept)
+    assert resp.status_code == 409, resp.text
+
+    # Once late commits from the reviewed second have settled: accepted with the
+    # stamp, then renamed within the same second as the Accept.
+    monkeypatch.setattr(time, "time", lambda: reviewed_at + 2.2)
+    resp = await client.patch(f"/v1/sessions/{session_id}", json=accept)
+    assert resp.status_code == 200, resp.text
+    assert (await _listed_session(client, session_id))["labels"]["omnigent.board.accepted"] == str(
+        reviewed_at + 1
+    )
+    monkeypatch.setattr(time, "time", lambda: reviewed_at + 2.7)
+    resp = await client.patch(f"/v1/sessions/{session_id}", json={"title": "Renamed after accept"})
+    assert resp.status_code == 200, resp.text
+
+    row = await _listed_session(client, session_id)
+    # The Board reads a session as accepted only while the stamp > updated_at.
+    assert row["updated_at"] == reviewed_at + 2
+    assert not int(row["labels"]["omnigent.board.accepted"]) > row["updated_at"]
+
+
+async def test_new_session_cannot_seed_a_board_acceptance(
+    client: httpx.AsyncClient,
+) -> None:
+    agent = await create_test_agent(client, name="board-seed")
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "labels": {"omnigent.board.accepted": "9999999999"}},
+    )
+    assert resp.status_code == 400, resp.text
+
+
+async def test_board_acceptance_of_a_stale_review_is_refused(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    """Accepting a version older than the session's latest activity is a conflict."""
+    current = await _listed_session(client, session_id)
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.board.accepted": str(current["updated_at"] - 60)}},
+    )
+    assert resp.status_code == 409, resp.text
+    row = await _listed_session(client, session_id)
+    assert "omnigent.board.accepted" not in row["labels"]
 
 
 async def test_archiving_clears_the_callers_pin(

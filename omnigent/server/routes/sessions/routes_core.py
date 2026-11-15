@@ -270,6 +270,11 @@ from omnigent.server.schemas import (
     SupersessionReason,
     UpdateSessionRequest,
 )
+from omnigent.server.session_board import (
+    BOARD_ACCEPTED_LABEL_KEY,
+    reject_board_acceptance_seed,
+    stamp_board_acceptance,
+)
 from omnigent.server.session_orchestration import (
     require_archive_outside_source_lineage,
     require_named_source_private,
@@ -1968,6 +1973,7 @@ def register_core_routes(
         )
         _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
         _reject_server_reserved_label_seed(parsed_metadata.labels, at_creation=True)
+        reject_board_acceptance_seed(parsed_metadata.labels)
         from omnigent.tools.browser_agent_tools import apply_browser_agent_tools_creation_labels
 
         apply_browser_agent_tools_creation_labels(parsed_metadata.labels, request.headers)
@@ -3815,6 +3821,10 @@ def register_core_routes(
             )
             family_pin_value = str(int(time.time() * 1000)) if body.family_pinned else ""
         labels_to_set = dict(body.labels or {})
+        if BOARD_ACCEPTED_LABEL_KEY in labels_to_set:
+            labels_to_set[BOARD_ACCEPTED_LABEL_KEY] = await stamp_board_acceptance(
+                conversation_store, session_id, labels_to_set[BOARD_ACCEPTED_LABEL_KEY]
+            )
         if PROJECT_LABEL_KEY in labels_to_set and (
             not set_project or labels_to_set[PROJECT_LABEL_KEY]
         ):

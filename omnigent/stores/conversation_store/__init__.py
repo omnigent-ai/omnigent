@@ -131,6 +131,10 @@ class DailyCostState(TypedDict):
 # mirrors the canonical key as ``PINNED_LABEL_KEY``.
 PINNED_LABEL_KEY = "omnigent.pinned"
 
+# The web Board's acceptance stamp: one second past the ``updated_at`` the user
+# reviewed, written only by session PATCH (see ``omnigent.server.session_board``).
+BOARD_ACCEPTED_LABEL_KEY = "omnigent.board.accepted"
+
 # Marks a top-level fork created as a side chat. A side chat surfaces only as a
 # Workspace-rail tab, so a conversation carrying this label is hidden from the
 # left sidebar (the ``GET /v1/sessions`` list filters it out). The fork
@@ -284,6 +288,8 @@ _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     # A truncated fork's newest item differs; its next append recomputes it.
     LATEST_ACTIVITY_ERROR_LABEL_KEY,
     LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY,
+    # Acceptance covers the source's reviewed work, not the fork's.
+    BOARD_ACCEPTED_LABEL_KEY,
 }
 
 

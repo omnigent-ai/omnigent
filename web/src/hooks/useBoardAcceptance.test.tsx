@@ -54,6 +54,11 @@ function cachedLabels(client: QueryClient, key: readonly unknown[]) {
   return client.getQueryData<ConversationsInfiniteData>(key)?.pages[0].data[0].labels;
 }
 
+function pinnedLabels(client: QueryClient) {
+  return client.getQueryData<{ conversations: Conversation[] }>(PINNED_CONVERSATIONS_KEY)
+    ?.conversations[0].labels;
+}
+
 function renderMutation(client: QueryClient) {
   const wrapper = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={client}>{children}</QueryClientProvider>
@@ -86,7 +91,7 @@ describe("setSessionBoardAccepted", () => {
 });
 
 describe("useSetBoardAccepted", () => {
-  it("writes the label into every cached copy of the row before the PATCH returns", async () => {
+  it("writes the label into every cached copy of the row, then the server's stamp", async () => {
     let respond: (response: Response) => void = () => {};
     vi.mocked(authenticatedFetch).mockImplementation(
       () =>
@@ -97,35 +102,78 @@ describe("useSetBoardAccepted", () => {
     const client = seededClient(row());
     const { result } = renderMutation(client);
 
-    act(() => result.current.mutate({ row: row(), acceptedAt: 1_700_000_100 }));
+    act(() => result.current.mutate({ row: row(), reviewedAt: 1_700_000_100 }));
 
-    const expected = { keep: "1", [BOARD_ACCEPTED_LABEL_KEY]: "1700000100" };
-    await waitFor(() => expect(cachedLabels(client, LIST_KEY)).toEqual(expected));
-    expect(cachedLabels(client, FOLDER_KEY)).toEqual(expected);
-    expect(
-      client.getQueryData<{ conversations: Conversation[] }>(PINNED_CONVERSATIONS_KEY)
-        ?.conversations[0].labels,
-    ).toEqual(expected);
+    // Optimistically just past the reviewed time, so the card reads as accepted.
+    const optimistic = { keep: "1", [BOARD_ACCEPTED_LABEL_KEY]: "1700000101" };
+    await waitFor(() => expect(cachedLabels(client, LIST_KEY)).toEqual(optimistic));
+    expect(cachedLabels(client, FOLDER_KEY)).toEqual(optimistic);
+    expect(pinnedLabels(client)).toEqual(optimistic);
 
-    respond(new Response(JSON.stringify(row(expected)), { status: 200 }));
+    const stored = { keep: "1", [BOARD_ACCEPTED_LABEL_KEY]: "1700000105" };
+    respond(new Response(JSON.stringify(row(stored)), { status: 200 }));
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(cachedLabels(client, LIST_KEY)).toEqual(expected);
+    expect(cachedLabels(client, LIST_KEY)).toEqual(stored);
+    expect(pinnedLabels(client)).toEqual(stored);
     expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it("keeps the acceptance when a pinned-list refetch started before Accept resolves", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValue(
+      new Response(JSON.stringify(row({ [BOARD_ACCEPTED_LABEL_KEY]: "1700000101" })), {
+        status: 200,
+      }),
+    );
+    const client = seededClient(row());
+    let resolveStale: (data: unknown) => void = () => {};
+    const staleRefetch = client
+      .fetchQuery({
+        queryKey: PINNED_CONVERSATIONS_KEY,
+        queryFn: () =>
+          new Promise((resolve) => {
+            resolveStale = resolve;
+          }),
+        staleTime: 0,
+      })
+      .catch(() => undefined);
+    const { result } = renderMutation(client);
+
+    act(() => result.current.mutate({ row: row(), reviewedAt: 1_700_000_100 }));
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    resolveStale({ conversations: [row()], filterHonored: true });
+    await staleRefetch;
+
+    expect(pinnedLabels(client)?.[BOARD_ACCEPTED_LABEL_KEY]).toBe("1700000101");
   });
 
   it("restores the previous acceptance and says so when the PATCH fails", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValue(
       new Response(JSON.stringify({ error: { message: "nope" } }), { status: 403 }),
     );
-    const before = row({ [BOARD_ACCEPTED_LABEL_KEY]: "1700000100" });
+    const before = row({ [BOARD_ACCEPTED_LABEL_KEY]: "1700000101" });
     const client = seededClient(before);
     const { result } = renderMutation(client);
 
-    act(() => result.current.mutate({ row: before, acceptedAt: null }));
+    act(() => result.current.mutate({ row: before, reviewedAt: null }));
 
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect(cachedLabels(client, LIST_KEY)).toEqual(before.labels);
     expect(cachedLabels(client, FOLDER_KEY)).toEqual(before.labels);
     expect(showToast).toHaveBeenCalledWith("Couldn't reopen the session.");
+  });
+
+  it("explains a refused Accept when the session changed since review", async () => {
+    const message = "The session changed since you reviewed it. Review it again before accepting.";
+    vi.mocked(authenticatedFetch).mockResolvedValue(
+      new Response(JSON.stringify({ error: { code: "conflict", message } }), { status: 409 }),
+    );
+    const client = seededClient(row());
+    const { result } = renderMutation(client);
+
+    act(() => result.current.mutate({ row: row(), reviewedAt: 1_700_000_100 }));
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(cachedLabels(client, LIST_KEY)).toEqual(row().labels);
+    expect(showToast).toHaveBeenCalledWith(message);
   });
 });

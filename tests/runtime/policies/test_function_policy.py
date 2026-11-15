@@ -744,6 +744,27 @@ async def test_function_policy_without_whitelist_writes_freely(
     assert engine.labels == {"any": "value", "other": "thing"}
 
 
+@pytest.mark.parametrize("whitelist", [None, ["omnigent.board.accepted", "any"]])
+@pytest.mark.asyncio
+async def test_function_policy_cannot_write_the_board_acceptance(
+    conversation_store: SqlAlchemyConversationStore,
+    whitelist: list[str] | None,
+) -> None:
+    """Only a user's Accept stamps the Board acceptance; a policy writing it,
+    whitelisted or not, would keep a session marked accepted indefinitely."""
+
+    def fn(event: dict) -> PolicyResult:
+        return PolicyResult(
+            action=PolicyAction.ALLOW,
+            set_labels={"any": "value", "omnigent.board.accepted": "9999999999"},
+        )
+
+    policy = FunctionPolicy(_spec(set_labels=whitelist), fn)
+    engine = _build_engine(conversation_store, [policy])
+    await engine.evaluate(EvaluationContext(phase=Phase.REQUEST, content="x"))
+    assert engine.labels == {"any": "value"}
+
+
 # ── Composition: FunctionPolicy + FunctionPolicy together ─
 
 

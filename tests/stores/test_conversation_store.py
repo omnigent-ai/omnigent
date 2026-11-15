@@ -296,6 +296,23 @@ def test_fork_drops_the_automation_source_label(
     assert SCHEDULED_TASK_SOURCE_LABEL_KEY not in fork.labels
 
 
+def test_fork_drops_the_board_acceptance(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Acceptance covers the source's reviewed work, so a fork starts unaccepted."""
+    from omnigent.stores.conversation_store import BOARD_ACCEPTED_LABEL_KEY
+
+    source = conversation_store.create_conversation()
+    conversation_store.set_labels(
+        source.id, {BOARD_ACCEPTED_LABEL_KEY: "9999999999", "kept": "yes"}
+    )
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert fork.labels["kept"] == "yes"
+    assert BOARD_ACCEPTED_LABEL_KEY not in fork.labels
+
+
 @pytest.mark.parametrize("closed_by", ["label", "legacy_title"])
 def test_fork_of_a_closed_child_is_open(
     conversation_store: SqlAlchemyConversationStore,
