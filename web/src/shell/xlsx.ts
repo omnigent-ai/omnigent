@@ -353,7 +353,10 @@ function cellText(
     const inline = descendants(cell, "is")[0];
     return inline ? runText(inline) : "";
   }
-  const value = descendants(cell, "v")[0]?.textContent ?? "";
+  const valueElement = descendants(cell, "v")[0];
+  const value = valueElement?.textContent ?? "";
+  // A text formula's saved result can be empty; that blank is what Excel shows.
+  if (type === "str" && valueElement) return value;
   if (value === "") {
     // A formula the writer saved without computing; show what it would compute.
     const formula = descendants(cell, "f")[0]?.textContent;

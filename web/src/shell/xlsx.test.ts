@@ -175,6 +175,15 @@ describe("readWorkbook time formats and limits", () => {
   });
 });
 
+describe("formula results", () => {
+  // Hand-built: a text formula whose saved result is blank, and an untyped
+  // formula saved without computing (`<v/>`), beside a filled cell.
+  it("shows a saved blank result as blank and an uncomputed formula as its text", async () => {
+    const [sheet] = await readWorkbook(fixture("formula-results.xlsx"));
+    expect(sheet.table?.rows).toEqual([["row", "", "=B2*2"]]);
+  });
+});
+
 describe("workbook relationships", () => {
   // Hand-built: the same sheet (shared-string header and row, a date-styled
   // serial) with one part moved where only its relationship says.
