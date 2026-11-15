@@ -151,6 +151,9 @@ export async function launchBestOfN(input: BestOfNLaunchInput): Promise<BestOfNL
     const { agentName } = attempts[index];
     if (sent.status === "rejected")
       failures.push({ agentName, message: `The task wasn't sent: ${errorMessage(sent.reason)}` });
+    // A policy-denied task resolves without starting a turn; the attempt stays.
+    else if (sent.value.denied)
+      failures.push({ agentName, message: "A policy blocked the task, so no turn started." });
     if (linked.status === "rejected")
       failures.push({
         agentName,
