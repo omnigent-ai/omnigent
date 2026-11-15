@@ -60,7 +60,10 @@ def test_host_recovery_has_a_fixed_work_bound_and_skips_ordinary_hosts(store, mo
     assert catalog.get_host_snapshot(host_id) is None
     lookup.assert_not_called()
 
-    reference = store.create_conversation(host_id=host_id, workspace="/workspace")
+    # The reference sorts last, so the full scan finds its profile on the final page.
+    reference = store.create_conversation(
+        conversation_id="f" * 32, host_id=host_id, workspace="/workspace"
+    )
     profiles = SandboxProfileStore(store)
     profiles.bind_session(reference.id, PROFILE)
     for supplied_host in (host_id, f"host_{host_id}", str(UUID(host_id))):
@@ -70,7 +73,9 @@ def test_host_recovery_has_a_fixed_work_bound_and_skips_ordinary_hosts(store, mo
     lookup.assert_not_called()
 
     assert profiles.get_host_snapshot(host_id) == PROFILE
-    _seed_host_history(store, host_id, PROFILE_HOST_SESSION_LIMIT - 250)
+    _seed_host_history(store, host_id, PROFILE_HOST_SESSION_LIMIT - 251)
+    assert profiles.get_host_snapshot(host_id) == PROFILE
+    _seed_host_history(store, host_id, 1)
     hydrate = Mock(side_effect=AssertionError("Overflow must not hydrate session history"))
     monkeypatch.setattr(store, "get_conversation", hydrate)
     engines = {store._engine, store._conv_engine}
