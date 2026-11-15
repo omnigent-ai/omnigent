@@ -1329,12 +1329,12 @@ async def test_a_workflows_runs_list_the_sessions_that_ran_it(
         assert historical["background_work_running"] is False
 
 
-@pytest.mark.parametrize("supersede_during_dispatch", [False, True])
+@pytest.mark.parametrize("supersede_at", ["before_dispatch", "runner_lookup", "sdk_routing"])
 async def test_an_automations_runs_list_the_steps_of_their_first_plans(
     client: httpx.AsyncClient,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
-    supersede_during_dispatch: bool,
+    supersede_at: str,
 ) -> None:
     from omnigent.server.routes import sessions as sessions_mod
     from tests.server.integration.test_sessions_harness_override import _stub_late_runner_bind
@@ -1432,7 +1432,8 @@ async def test_an_automations_runs_list_the_steps_of_their_first_plans(
             planned, {SCHEDULED_TASK_RUN_LABEL_KEY: latest.id}
         )
 
-    if supersede_during_dispatch:
+    conversations = SqlAlchemyConversationStore(db_uri)
+    if supersede_at == "runner_lookup":
         get_runner_client = sessions_mod._get_runner_client
 
         async def advance_before_runner(*args, **kwargs):
@@ -1440,12 +1441,24 @@ async def test_an_automations_runs_list_the_steps_of_their_first_plans(
             return await get_runner_client(*args, **kwargs)
 
         monkeypatch.setattr(sessions_mod, "_get_runner_client", advance_before_runner)
+    elif supersede_at == "sdk_routing":
+        from omnigent.server import smart_routing
+
+        conversations.update_conversation(planned, cost_control_mode_override="on")
+
+        async def advance_during_routing(*args, **kwargs):
+            supersede()
+            return None, None, None
+
+        monkeypatch.setattr(smart_routing, "route_turn_or_decline", advance_during_routing)
     else:
         supersede()
     forwarded.clear()
+    before = conversations.list_items(planned, limit=100).data
     stale = await client.post(events_url, json=action, headers=_headers(ALICE))
     assert stale.status_code == 409 and "no longer current" in stale.text
     assert not forwarded.get("posts")
+    assert conversations.list_items(planned, limit=100).data == before
     assert (
         SqlAlchemyConversationStore(db_uri)
         .get_conversation(planned)
@@ -1455,10 +1468,20 @@ async def test_an_automations_runs_list_the_steps_of_their_first_plans(
     assert not (await client.get(runs_url, headers=_headers(ALICE))).json()["runs"][0][
         "is_current"
     ]
-    body = _write("plan", {"name": "Triage", "steps": steps}, "tool:next-run")
+    # The continued run reuses its plan without an explicit plan write.
+    blocked = _write("status", {"status": "started"}, "tool:next-fix", step="fix")
+    response = await client.post(url, json=blocked, headers=_runner(planned))
+    assert response.status_code == 409 and "step_not_ready" in response.text
+    body = _write("status", {"status": "started"}, "tool:next-run", step="explore")
     assert (await client.post(url, json=body, headers=_runner(planned))).status_code == 200
     runs = (await client.get(runs_url, headers=_headers(ALICE))).json()["runs"]
     assert [(run["run_id"], run["is_current"]) for run in runs] == [
         (latest.id, True),
         (run_ids[0], False),
+    ]
+    assert [(s["step"], s["content"]["status"]) for s in runs[0]["statuses"]] == [
+        ("explore", "started")
+    ]
+    assert [(s["step"], s["content"]["status"]) for s in runs[1]["statuses"]] == [
+        ("explore", "done")
     ]

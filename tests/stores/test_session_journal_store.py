@@ -79,7 +79,13 @@ def _count(db_uri: str, table: str, session: str) -> int:
 def test_appends_take_consecutive_positions_and_plans_count_versions(
     journal: SessionJournalStore,
 ) -> None:
-    first = journal.append(SESSION, "plan", _plan("baseline", "goal"), idempotency_key="tool:1")
+    first = journal.append(
+        SESSION,
+        "plan",
+        _plan("baseline", "goal"),
+        idempotency_key="tool:1",
+        scheduled_task_run_id=RUN,
+    )
     status = journal.append(
         SESSION,
         "status",
@@ -89,10 +95,14 @@ def test_appends_take_consecutive_positions_and_plans_count_versions(
         scheduled_task_run_id=RUN,
     )
     second = journal.append(
-        SESSION, "plan", _plan("baseline", "opt", "goal"), idempotency_key="tool:3"
+        SESSION,
+        "plan",
+        _plan("baseline", "opt", "goal"),
+        idempotency_key="tool:3",
+        scheduled_task_run_id=RUN,
     )
 
-    assert [first.entry.position, status.entry.position, second.entry.position] == [0, 1, 2]
+    assert [first.entry.position, status.entry.position, second.entry.position] == [1, 2, 3]
     assert first.entry.content["version"] == 1 and second.entry.content["version"] == 2
     assert first.entry.step is None and first.entry.content["source"] == "agent"
     assert status.entry.content == {"status": "done", "text": "p95 430 ms"}
@@ -355,7 +365,13 @@ def test_a_fork_carries_the_journal_and_continues_it(
     db_uri: str,
 ) -> None:
     monkeypatch.setattr("omnigent.stores.session_journal_store.JOURNAL_COPY_BATCH", 2)
-    journal.append(SESSION, "plan", _plan("deploy", "video"), idempotency_key="k0")
+    journal.append(
+        SESSION,
+        "plan",
+        _plan("deploy", "video"),
+        idempotency_key="k0",
+        scheduled_task_run_id=RUN,
+    )
     journal.append(
         SESSION,
         "status",
@@ -364,7 +380,14 @@ def test_a_fork_carries_the_journal_and_continues_it(
         step="deploy",
         scheduled_task_run_id=RUN,
     )
-    journal.append(SESSION, "note", {"body": "Swap is up"}, idempotency_key="k2", step="video")
+    journal.append(
+        SESSION,
+        "note",
+        {"body": "Swap is up"},
+        idempotency_key="k2",
+        step="video",
+        scheduled_task_run_id=RUN,
+    )
     source = journal.list_entries(SESSION).entries
 
     reads = 0
@@ -396,7 +419,7 @@ def test_a_fork_carries_the_journal_and_continues_it(
                     connection.execute(
                         sa.text("SELECT COUNT(*) FROM session_journal_entries")
                     ).scalar_one()
-                    == 3
+                    == 4
                 )
                 assert (
                     connection.execute(
@@ -416,7 +439,7 @@ def test_a_fork_carries_the_journal_and_continues_it(
     assert [e.created_at for e in copied] == [e.created_at for e in source]
     assert not {e.id for e in copied} & {e.id for e in source}
     # A run's history lists each entry once, under the session that served it.
-    assert [e.scheduled_task_run_id for e in copied] == [None, None, None]
+    assert [e.scheduled_task_run_id for e in copied] == [None, None, None, None]
     assert journal.current_plan(fork.id).content == journal.current_plan(SESSION).content
     # Retrying a caller-supplied target must preserve its published journal,
     # including when the new source has no journal to stage.
@@ -428,8 +451,8 @@ def test_a_fork_carries_the_journal_and_continues_it(
     started = journal.append(
         fork.id, "status", {"status": "started"}, idempotency_key="k3", step="video"
     )
-    assert started.entry.position == 3
-    assert len(journal.list_entries(SESSION).entries) == 3
+    assert started.entry.position == 4
+    assert len(journal.list_entries(SESSION).entries) == 4
 
 
 @pytest.mark.parametrize("copy_journal", [False, True])
@@ -728,7 +751,13 @@ def test_plan_step_statuses_reads_each_steps_newest_status(
     ]
 
 
-def test_an_automation_runs_start_plan_is_its_first(journal: SessionJournalStore) -> None:
+@pytest.mark.parametrize("continuation_kind", ["plan", "status", "note"])
+@pytest.mark.parametrize("encrypted", [False, True])
+def test_an_automation_runs_start_plan_is_its_first(
+    journal: SessionJournalStore, continuation_kind: str, encrypted: bool
+) -> None:
+    if encrypted:
+        journal = _SealedJournal(journal.storage_location)
     other_run = "1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f"
     journal.append(SESSION, "plan", _plan("old"), idempotency_key="k0")
     content = {
@@ -771,9 +800,37 @@ def test_an_automation_runs_start_plan_is_its_first(journal: SessionJournalStore
         "a": "done",
         "b": "done",
     }
-    second = journal.append(
-        SESSION, "plan", content, idempotency_key="k4", scheduled_task_run_id=other_run
+    if continuation_kind != "plan":
+        # A continuation may reuse the graph without writing another plan.
+        before = journal.list_entries(SESSION).entries
+        with pytest.raises(StepNotReadyError, match="b waits on a"):
+            journal.append(
+                SESSION,
+                "status",
+                {"status": "started"},
+                idempotency_key="blocked",
+                step="b",
+                scheduled_task_run_id=other_run,
+            )
+        assert journal.list_entries(SESSION).entries == before
+    continuation_content = (
+        content
+        if continuation_kind == "plan"
+        else {"status": "started"}
+        if continuation_kind == "status"
+        else {"body": "Starting the next occurrence"}
+    )
+    started = journal.append(
+        SESSION,
+        continuation_kind,
+        continuation_content,
+        idempotency_key="k4",
+        step="a" if continuation_kind == "status" else None,
+        scheduled_task_run_id=other_run,
     ).entry
+    second = journal.run_start_plans([(other_run, SESSION)])[0]
+    assert second is not None
+    assert second.content["steps"] == first.content["steps"]
     assert not journal.is_current_run(SESSION, first.id, RUN)
     assert journal.is_current_run(SESSION, second.id, other_run)
     with pytest.raises(StepNotReadyError, match="b waits on a"):
@@ -797,9 +854,14 @@ def test_an_automation_runs_start_plan_is_its_first(journal: SessionJournalStore
     assert journal.plan_step_statuses([second])[0]["a"].content["status"] == "started"
     # Retrying the start must not insert another boundary or reset dependencies.
     retry = journal.append(
-        SESSION, "plan", content, idempotency_key="k4", scheduled_task_run_id=other_run
+        SESSION,
+        continuation_kind,
+        continuation_content,
+        idempotency_key="k4",
+        step="a" if continuation_kind == "status" else None,
+        scheduled_task_run_id=other_run,
     )
-    assert not retry.created and retry.entry == second
+    assert not retry.created and retry.entry == started
     assert len(journal.list_entries(SESSION, kind="plan_status").entries) == 2
 
 
@@ -881,3 +943,31 @@ def test_a_full_journal_refuses_new_entries_but_returns_retried_ones(
         _note(journal, "k3")
     assert _note(journal, "k1").created is False
     assert [entry.position for entry in journal.list_entries(SESSION).entries] == [0, 1, 2]
+    # A continued occurrence needs room for its boundary, copied plan and status.
+    monkeypatch.setattr(session_journal_store, "JOURNAL_MAX_ENTRIES", 5)
+    with pytest.raises(JournalFullError):
+        journal.append(
+            SESSION,
+            "status",
+            {"status": "started"},
+            idempotency_key="next-run",
+            scheduled_task_run_id=RUN,
+        )
+    assert [entry.position for entry in journal.list_entries(SESSION).entries] == [0, 1, 2]
+    monkeypatch.setattr(session_journal_store, "JOURNAL_MAX_ENTRIES", 6)
+    next_run = journal.append(
+        SESSION,
+        "status",
+        {"status": "started"},
+        idempotency_key="next-run",
+        scheduled_task_run_id=RUN,
+    )
+    retry = journal.append(
+        SESSION,
+        "status",
+        {"status": "started"},
+        idempotency_key="next-run",
+        scheduled_task_run_id=RUN,
+    )
+    assert next_run.entry.position == 5
+    assert retry.entry == next_run.entry and not retry.created

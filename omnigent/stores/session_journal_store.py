@@ -308,6 +308,8 @@ class SessionJournalStore:
         conversation_id: str,
         steps: list[dict[str, Any]] | None,
         step: str,
+        *,
+        start_position: int | None = None,
     ) -> list[str]:
         """The steps *step* depends on whose newest status isn't ``done``, in plan order.
 
@@ -318,13 +320,15 @@ class SessionJournalStore:
         if current is None or not current["depends_on"]:
             return []
         # A saved workflow starts fresh; replans retain progress within that run.
-        run = self._newest_kind_row(session, conversation_id, _PLAN_STATUS_KIND)
+        if start_position is None:
+            run = self._newest_kind_row(session, conversation_id, _PLAN_STATUS_KIND)
+            start_position = run.position if run is not None else None
         newest = [
             self._newest_status_row(
                 session,
                 conversation_id,
                 dependency,
-                start_position=run.position if run is not None else None,
+                start_position=start_position,
             )
             for dependency in current["depends_on"]
         ]
@@ -387,6 +391,8 @@ class SessionJournalStore:
         :param step: The plan step the entry is about. A status without one
             names the only step of a one-step plan; a plan never has one.
         :param scheduled_task_run_id: The automation run the session is serving.
+            Its first write starts fresh progress, copying the current plan if
+            the write isn't itself a plan.
         :param workflow_id: The saved workflow a plan starts a run of, e.g.
             ``"0123…cdef"``. Only a plan names one; a status or note takes the
             current plan's.
@@ -444,41 +450,55 @@ class SessionJournalStore:
                 return earlier, False, None
             entry_text, entry_content = stored, fields
             run_started_text = None
-            starts_run = False
+            copied_plan_text = None
+            previous = self._newest_kind_row(session, conversation_id, _PLAN_KIND)
+            boundary = self._newest_kind_row(session, conversation_id, _PLAN_STATUS_KIND)
+            starts_run = (kind == "plan" or previous is not None) and (
+                (kind == "plan" and workflow_id is not None and start_run)
+                or (boundary.scheduled_task_run_id if boundary else None) != scheduled_task_run_id
+            )
+            previous_content = (
+                self._entries([previous])[0].content
+                if previous is not None and (kind != "note" or starts_run)
+                else None
+            )
             if kind == "plan":
-                previous = self._newest_kind_row(session, conversation_id, _PLAN_KIND)
-                version = (
-                    1 if previous is None else self._entries([previous])[0].content["version"] + 1
-                )
+                version = 1 if previous_content is None else previous_content["version"] + 1
                 entry_content = {"version": version, **fields}
-                starts_run = workflow_id is not None and start_run
-                if not starts_run:
-                    boundary = self._newest_kind_row(session, conversation_id, _PLAN_STATUS_KIND)
-                    starts_run = (
-                        boundary.scheduled_task_run_id if boundary else None
-                    ) != scheduled_task_run_id
                 encoded = self._stored_contents(
                     [entry_content, *([{"status": "started"}] if starts_run else [])]
                 )
                 entry_text = encoded[0]
                 run_started_text = encoded[1] if starts_run else None
+            elif starts_run:
+                assert previous_content is not None
+                copied_plan_text, run_started_text = self._stored_contents(
+                    [
+                        {**previous_content, "version": previous_content["version"] + 1},
+                        {"status": "started"},
+                    ]
+                )
             entry_step = step
-            entry_workflow_id = workflow_id
-            if kind == "note":
-                plan = self._newest_kind_row(session, conversation_id, _PLAN_KIND)
-                entry_workflow_id = plan.workflow_id if plan is not None else None
+            entry_workflow_id = (
+                workflow_id if kind == "plan" else previous.workflow_id if previous else None
+            )
             if kind == "status":
-                plan = self._newest_kind_row(session, conversation_id, _PLAN_KIND)
-                entry_workflow_id = plan.workflow_id if plan is not None else None
-                steps = self._entries([plan])[0].content["steps"] if plan is not None else None
+                steps = previous_content["steps"] if previous_content is not None else None
                 if entry_step is None:
                     entry_step = self._default_step(steps)
                 waiting = self._unfinished_dependencies(
-                    session, conversation_id, steps, entry_step
+                    session,
+                    conversation_id,
+                    steps,
+                    entry_step,
+                    start_position=position if starts_run else None,
                 )
                 if waiting:
                     raise StepNotReadyError(entry_step, waiting)
-            if position + (2 if starts_run else 1) > JOURNAL_MAX_ENTRIES:
+            if (
+                position + 1 + int(starts_run) + int(copied_plan_text is not None)
+                > JOURNAL_MAX_ENTRIES
+            ):
                 raise JournalFullError(JOURNAL_MAX_ENTRIES)
             stamp = now_epoch()
             entry_id = uuid.uuid4().hex
@@ -492,10 +512,27 @@ class SessionJournalStore:
                         id=uuid.uuid4().hex,
                         kind=_PLAN_STATUS_KIND,
                         scheduled_task_run_id=scheduled_task_run_id,
-                        workflow_id=workflow_id,
+                        workflow_id=entry_workflow_id,
                         step=None,
                         idempotency_key=f"run:{entry_id}",
                         content=run_started_text,
+                    )
+                )
+                position += 1
+            if copied_plan_text is not None:
+                session.add(
+                    SqlSessionJournalEntry(
+                        workspace_id=current_workspace_id(),
+                        conversation_id=conversation_id,
+                        position=position,
+                        created_at=stamp,
+                        id=uuid.uuid4().hex,
+                        kind=_PLAN_KIND,
+                        scheduled_task_run_id=scheduled_task_run_id,
+                        workflow_id=entry_workflow_id,
+                        step=None,
+                        idempotency_key=f"plan:{entry_id}",
+                        content=copied_plan_text,
                     )
                 )
                 position += 1
