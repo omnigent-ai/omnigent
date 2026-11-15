@@ -436,7 +436,7 @@ def test_kimi_worker_row_survives_generic_provider(
     crash_note = page.get_by_text(re.compile(r"provider resolution failed"))
     if crash_note.count():
         crash_note.first.scroll_into_view_if_needed()
-    page.wait_for_timeout(1_200)
+    page.wait_for_timeout(1_200)  # custom-lint: disable=sleep-then-assert -- video framing
 
     outputs = _tool_outputs(chat.base_url, chat.session_id, "sys_list_models")
     assert outputs, "no sys_list_models tool result found in the transcript"
