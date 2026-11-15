@@ -5779,6 +5779,7 @@ class HostProcess:
             connection_id=connection_id,
             workspace_socket=str(listener.path) if (listener := self._workspace_socket) else None,
             workspace_token_key=listener.token_key if listener else None,
+            cli_command=cli_invocation(name="omni"),
         )
         try:
             encoded_hello = self._encode_frame(hello)

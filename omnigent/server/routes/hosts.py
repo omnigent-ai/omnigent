@@ -1032,6 +1032,9 @@ def create_hosts_router(
                 # gateway-backed".
                 "gateway_inference": host_registry.gateway_inference(host.host_id),
                 "interactive_shells": host_registry.interactive_shells(host.host_id),
+                # How to invoke the CLI on that machine (e.g. "acme omni");
+                # ``None`` when offline here or from an older host.
+                "cli_command": conn.hello.cli_command if conn is not None else None,
             }
             if (
                 harness_setup_enabled
@@ -1093,6 +1096,7 @@ def create_hosts_router(
             # memory, so ``None`` is "no report on this replica yet".
             "gateway_inference": host_registry.gateway_inference(host.host_id),
             "interactive_shells": host_registry.interactive_shells(host.host_id),
+            "cli_command": conn.hello.cli_command if conn is not None else None,
             "runners": [],
         }
         if (

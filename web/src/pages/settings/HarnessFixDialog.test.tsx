@@ -163,6 +163,27 @@ describe("HarnessFixDialog", () => {
     },
   );
 
+  it("names the host's wrapper CLI in the manual setup command", () => {
+    renderDialog({
+      mode: "install",
+      harness: "cursor-native",
+      harnessLabel: "Cursor",
+      host: { ...baseProps.host, cli_command: "acme omni" },
+    });
+
+    expect(
+      screen.getByText((_, element) =>
+        Boolean(
+          element?.tagName === "P" &&
+          element.textContent ===
+            "Run acme omni setup on Local laptop to finish setting up Cursor.",
+        ),
+      ),
+    ).toBeVisible();
+    expect(screen.getByRole("button", { name: "Copy acme omni setup" })).toBeVisible();
+    expect(screen.queryByText("omni setup", { exact: true })).toBeNull();
+  });
+
   it("shows the Isaac setup fallback without calling the credential endpoint", async () => {
     vi.mocked(authenticatedFetch).mockImplementation(async (input, init) => {
       const url = String(input);

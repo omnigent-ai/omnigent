@@ -56,6 +56,7 @@ def _make_hello(
     gateway_inference: dict[str, bool] | None = None,
     harness_accounts: dict[str, dict[str, object]] | None = None,
     capabilities: list[str] | None = None,
+    cli_command: str | None = None,
 ) -> str:
     """Encode a HostHelloFrame for tests.
 
@@ -66,6 +67,8 @@ def _make_hello(
     :param gateway_inference: Per-harness AI-Gateway-backed inference map to
         report, e.g. ``{"claude-native": True}``; ``None`` mimics a host that
         doesn't report it.
+    :param cli_command: CLI invocation to report, e.g. ``"acme omni"``;
+        ``None`` mimics an older host.
     :returns: JSON-encoded hello frame.
     """
     return encode_host_frame(
@@ -77,6 +80,7 @@ def _make_hello(
             gateway_inference=gateway_inference,
             harness_accounts=harness_accounts,
             capabilities=capabilities or [],
+            cli_command=cli_command,
         )
     )
 
@@ -154,6 +158,7 @@ async def _connect_host(
     gateway_inference: dict[str, bool] | None = None,
     harness_accounts: dict[str, dict[str, object]] | None = None,
     capabilities: list[str] | None = None,
+    cli_command: str | None = None,
 ) -> ApplicationCommunicator:
     """Connect a mock host via WebSocket tunnel.
 
@@ -165,6 +170,7 @@ async def _connect_host(
         e.g. ``{"codex": False}``; ``None`` mimics an older host.
     :param gateway_inference: Gateway-inference map for the hello frame,
         e.g. ``{"codex": True}``; ``None`` mimics a host that doesn't report it.
+    :param cli_command: CLI invocation for the hello frame, e.g. ``"acme omni"``.
     :returns: Connected ASGI communicator.
     """
     path = f"/v1/hosts/{host_id}/tunnel"
@@ -182,6 +188,7 @@ async def _connect_host(
                 gateway_inference,
                 harness_accounts,
                 capabilities,
+                cli_command,
             ),
         },
     )
@@ -435,8 +442,8 @@ async def test_hosts_api_surfaces_gateway_inference(
     host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:
     """
-    Verify the gateway-inference map a host reports in its hello is held in
-    memory and surfaced by both GET /v1/hosts and GET /v1/hosts/{id}.
+    Verify the gateway-inference map and CLI command a host reports in its
+    hello are surfaced by both GET /v1/hosts and GET /v1/hosts/{id}.
 
     This is the signal the web UI gates Smart Routing on. If it is dropped
     anywhere along hello → host registry → hosts route, the UI would offer
@@ -448,6 +455,7 @@ async def test_hosts_api_surfaces_gateway_inference(
         registry,
         configured_harnesses={"claude-native": True, "codex": True},
         gateway_inference={"claude-native": True, "codex": False},
+        cli_command="acme omni",
     )
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -459,8 +467,10 @@ async def test_hosts_api_surfaces_gateway_inference(
         "claude-native": True,
         "codex": False,
     }
+    assert listing.json()["hosts"][0]["cli_command"] == "acme omni"
     assert single.status_code == 200
     assert single.json()["gateway_inference"] == {"claude-native": True, "codex": False}
+    assert single.json()["cli_command"] == "acme omni"
 
 
 async def test_hosts_api_gateway_inference_null_for_older_host(
@@ -482,8 +492,10 @@ async def test_hosts_api_gateway_inference_null_for_older_host(
 
     assert listing.status_code == 200
     assert listing.json()["hosts"][0]["gateway_inference"] is None
+    assert listing.json()["hosts"][0]["cli_command"] is None
     assert single.status_code == 200
     assert single.json()["gateway_inference"] is None
+    assert single.json()["cli_command"] is None
 
 
 async def test_gateway_inference_reconverges_after_a_server_restart(
