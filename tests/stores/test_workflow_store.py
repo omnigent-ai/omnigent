@@ -119,14 +119,15 @@ def test_competing_saves_cannot_claim_the_same_name(
     assert page == winners and not has_more
 
 
-def test_pages_go_by_name_and_filter_by_name(store: WorkflowStore) -> None:
+@pytest.mark.parametrize("user_id", [ALICE, None])
+def test_pages_go_by_name_and_filter_by_name(store: WorkflowStore, user_id: str | None) -> None:
     for name in ("deploy-prod", "build", "deploy-staging", "audit", "cleanup"):
-        _save(store, name)
+        _save(store, name, user_id=user_id)
     _save(store, "deploy-bob", user_id=BOB)
     names: list[str] = []
     after = None
     while True:
-        page, has_more = store.list_page(user_id=ALICE, limit=2, after=after)
+        page, has_more = store.list_page(user_id=user_id, limit=2, after=after)
         assert all(
             [step["id"] for step in workflow.steps] == ["build", "test"] for workflow in page
         )
@@ -135,12 +136,12 @@ def test_pages_go_by_name_and_filter_by_name(store: WorkflowStore) -> None:
             break
         after = page[-1].id
     assert names == ["audit", "build", "cleanup", "deploy-prod", "deploy-staging"]
-    exact, _ = store.list_page(user_id=ALICE, limit=10, name="build")
+    exact, _ = store.list_page(user_id=user_id, limit=10, name="build")
     assert [workflow.name for workflow in exact] == ["build"]
     with pytest.raises(InvalidWorkflowError, match="one of your workflows"):
         store.list_page(user_id=BOB, limit=10, after=exact[0].id)
     with pytest.raises(InvalidWorkflowError, match="a workflow ID"):
-        store.list_page(user_id=ALICE, limit=10, after="not-an-id")
+        store.list_page(user_id=user_id, limit=10, after="not-an-id")
 
 
 def test_an_update_keeps_what_it_leaves_out_and_checks_the_result(store: WorkflowStore) -> None:

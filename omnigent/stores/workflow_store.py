@@ -14,7 +14,7 @@ import uuid
 from collections.abc import Sequence
 from typing import Any, TypeVar
 
-from sqlalchemy import ColumnElement, Select, and_, or_, select, update
+from sqlalchemy import ColumnElement, Select, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, undefer
 
@@ -251,15 +251,10 @@ class WorkflowStore:
                 ).scalar_one_or_none()
                 if after_name is None:
                     raise InvalidWorkflowError("after must be the ID of one of your workflows")
-                stmt = stmt.where(
-                    or_(
-                        SqlWorkflow.name > after_name,
-                        and_(SqlWorkflow.name == after_name, SqlWorkflow.id > after),
-                    )
-                )
+                stmt = stmt.where(SqlWorkflow.name > after_name)
             rows = session.scalars(
                 _using(
-                    stmt.order_by(SqlWorkflow.name, SqlWorkflow.id).limit(limit + 1),
+                    stmt.order_by(SqlWorkflow.name).limit(limit + 1),
                     _OWNER_NAME_INDEX,
                 )
             ).all()
