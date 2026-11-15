@@ -24,7 +24,7 @@ from collections.abc import Mapping, Sequence
 from itertools import batched
 from typing import Any, TypeVar
 
-from sqlalchemy import Select, and_, delete, or_, select, tuple_, update
+from sqlalchemy import Select, delete, select, tuple_, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -689,35 +689,46 @@ class SessionJournalStore:
         except InvalidUuidError as exc:
             raise ValueError("workflow_id must be a workflow ID") from exc
         entries = SqlSessionJournalEntry
-        stmt = select(entries).where(
-            entries.workspace_id == current_workspace_id(),
-            entries.workflow_id == workflow,
-            entries.kind == _PLAN_KIND,
+        stmt = (
+            select(entries)
+            .where(
+                entries.workspace_id == current_workspace_id(),
+                entries.workflow_id == workflow,
+                entries.kind == _PLAN_KIND,
+            )
+            .order_by(
+                entries.created_at.desc(), entries.conversation_id.desc(), entries.position.desc()
+            )
         )
+        ranges = [stmt]
         if before is not None:
             created_at, conversation_id, position = _parse_run_cursor(before)
-            # The bound starts every engine's scan at the cursor; the OR settles ties.
-            stmt = stmt.where(
-                entries.created_at <= created_at,
-                or_(
-                    entries.created_at < created_at,
-                    and_(
-                        entries.created_at == created_at, entries.conversation_id < conversation_id
-                    ),
-                    and_(
-                        entries.created_at == created_at,
-                        entries.conversation_id == conversation_id,
-                        entries.position < position,
-                    ),
+            # Disjoint ranges seek to each cursor component, including deep timestamp ties.
+            ranges = [
+                stmt.where(
+                    entries.created_at == created_at,
+                    entries.conversation_id == conversation_id,
+                    entries.position < position,
                 ),
-            )
-        stmt = stmt.order_by(
-            entries.created_at.desc(), entries.conversation_id.desc(), entries.position.desc()
-        ).limit(limit + 1)
+                stmt.where(
+                    entries.created_at == created_at,
+                    entries.conversation_id < conversation_id,
+                ),
+                stmt.where(entries.created_at < created_at),
+            ]
+        rows: list[SqlSessionJournalEntry] = []
         with self._session("list_workflow_runs") as session:
-            rows = list(
-                session.execute(_using(stmt, "ix_session_journal_entries_workflow")).scalars()
-            )
+            for candidate_range in ranges:
+                rows.extend(
+                    session.execute(
+                        _using(
+                            candidate_range.limit(limit + 1 - len(rows)),
+                            "ix_session_journal_entries_workflow",
+                        )
+                    ).scalars()
+                )
+                if len(rows) > limit:
+                    break
         plans = self._entries(rows[:limit])
         return WorkflowRunPage(
             plans=plans, next_cursor=_run_cursor(plans[-1]) if len(rows) > limit else None

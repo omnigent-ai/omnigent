@@ -13,7 +13,7 @@ import sqlalchemy as sa
 
 from omnigent.db import current_query_name
 from omnigent.db.compression import EncryptedTextPayload, decode, encode_encrypted
-from omnigent.db.db_models import MAX_STORED_VALUE_BYTES
+from omnigent.db.db_models import MAX_STORED_VALUE_BYTES, SqlSessionJournalEntry
 from omnigent.entities import MessageData, NewConversationItem
 from omnigent.entities.session_journal import (
     InvalidJournalEntryError,
@@ -630,6 +630,51 @@ def test_a_workflows_runs_page_newest_first_across_sessions(
         journal.list_workflow_runs(WORKFLOW, before="100.nope.1")
     with pytest.raises(ValueError, match="workflow_id"):
         journal.list_workflow_runs("nope")
+
+    if journal._dialect == "sqlite":
+        engine = session_journal_store.get_or_create_engine(journal.storage_location)
+        instructions, connections = [], set()
+
+        def capture(connection, cursor, statement, parameters, context, executemany):
+            if statement.startswith("SELECT"):
+                raw = connection.connection.driver_connection
+                connections.add(raw)
+                raw.set_progress_handler(lambda: instructions.append(1) or 0, 1)
+
+        def measured_page():
+            instructions.clear()
+            sa.event.listen(engine, "before_cursor_execute", capture)
+            try:
+                page = journal.list_workflow_runs(WORKFLOW, limit=2, before=first.next_cursor)
+                assert instructions
+                return page, len(instructions)
+            finally:
+                sa.event.remove(engine, "before_cursor_execute", capture)
+                for connection in connections:
+                    connection.set_progress_handler(None, 0)
+
+        baseline_page, baseline_cost = measured_page()
+        # Many other sessions share the cursor's second but precede it in the index.
+        with engine.begin() as connection:
+            template = dict(
+                connection.execute(
+                    sa.select(SqlSessionJournalEntry.__table__).where(
+                        SqlSessionJournalEntry.id == first.plans[0].id
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            connection.execute(
+                sa.insert(SqlSessionJournalEntry),
+                [
+                    {**template, "conversation_id": f"{2**127 + index:032x}"}
+                    for index in range(2000)
+                ],
+            )
+        deep_page, deep_cost = measured_page()
+        assert deep_page == baseline_page
+        assert deep_cost <= baseline_cost + 100, (baseline_cost, deep_cost)
 
 
 @pytest.mark.parametrize("next_workflow", [None, WORKFLOW, OTHER_WORKFLOW])
