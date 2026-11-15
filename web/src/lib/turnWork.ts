@@ -316,6 +316,19 @@ const CODE_RUNTIME_WORDS = new Set([
   "repl",
 ]);
 const CODE_RUN_WORDS = new Set(["exec", "execute", "run", "eval"]);
+// Tool-name words for handling code without running it, unless a run word says otherwise.
+const CODE_HANDLING_WORDS = new Set([
+  ...NON_EXECUTING_TOOL_WORDS,
+  "analyze",
+  "check",
+  "create",
+  "edit",
+  "explain",
+  "review",
+  "save",
+  "update",
+  "write",
+]);
 const PYTHON_TOOL_WORDS = new Set(["python", "ipython", "jupyter", "notebook"]);
 
 function codeArgument(
@@ -325,9 +338,11 @@ function codeArgument(
   const code = args.code;
   if (typeof code !== "string" || code.trim() === "") return null;
   const words = identifierWords(tool);
+  const namesRun = words.some((word) => CODE_RUN_WORDS.has(word));
+  // `lint_python` inspects code; `generate_and_run_code` still runs it.
+  if (!namesRun && words.some((word) => CODE_HANDLING_WORDS.has(word))) return null;
   const runsCode =
-    words.some((word) => CODE_RUNTIME_WORDS.has(word)) ||
-    (words.includes("code") && words.some((word) => CODE_RUN_WORDS.has(word)));
+    words.some((word) => CODE_RUNTIME_WORDS.has(word)) || (words.includes("code") && namesRun);
   if (!runsCode) return null;
   const declared = typeof args.language === "string" ? args.language.toLowerCase() : null;
   const python =
@@ -479,20 +494,26 @@ function nativeQuery(item: NativeToolItem, key: string, code: string): TurnQuery
 
 function nativeSearchQuery(item: NativeToolItem): string | null {
   if (item.toolType !== "web_search_call") return null;
+  // A search that reports any outcome but completion read nothing; older records carry none.
+  const status = item.data.status;
+  if (typeof status === "string" && status !== "completed") return null;
   const action = item.data.action;
   const query = isRecord(action) ? action.query : undefined;
   return typeof query === "string" && query.trim() !== "" ? query.trim() : null;
 }
 
 // Fields a query result reports its rows in, at the top level or under `manifest`/`result`.
-const ROW_COUNT_KEYS = ["row_count", "rowCount", "total_row_count", "num_rows", "rows_returned"];
+// A total counts the whole result; any other count may be one page of it.
+const TOTAL_ROW_COUNT_KEYS = ["total_row_count", "totalRowCount", "total_rows", "totalRows"];
+const PAGE_ROW_COUNT_KEYS = ["row_count", "rowCount", "num_rows", "rows_returned"];
 const ROW_ARRAY_KEYS = ["rows", "data_array", "records", "results", "data"];
 // Markers that the rows returned are one page of a longer result.
-const MORE_ROWS_KEYS = ["next_page_token", "nextPageToken", "next_chunk_index"];
+const MORE_ROWS_KEYS = ["next_page_token", "nextPageToken", "pageToken", "next_chunk_index"];
+const ENVELOPE_KEYS = ["manifest", "result"];
 
 interface RowCount {
   count: number;
-  /** The rows are a page; the full result has more. */
+  /** The rows are a page, or were cut short; the full result has more. */
   partial: boolean;
 }
 
@@ -501,33 +522,56 @@ function isRowArray(value: unknown): value is unknown[] {
 }
 
 function hasMoreRows(record: Record<string, unknown>): boolean {
-  if (record.has_more === true || record.hasMore === true || record.truncated === true) return true;
+  if (record.has_more === true || record.hasMore === true) return true;
   return MORE_ROWS_KEYS.some((key) => {
     const value = ownValue(record, key);
     return (typeof value === "string" && value !== "") || typeof value === "number";
   });
 }
 
-function rowCount(value: unknown, depth = 0): RowCount | null {
-  if (isRowArray(value)) return { count: value.length, partial: false };
-  if (!isRecord(value)) return null;
-  for (const key of ROW_COUNT_KEYS) {
-    const count = ownValue(value, key);
-    if (typeof count === "number" && Number.isInteger(count) && count >= 0) {
-      return { count, partial: false };
-    }
-  }
-  for (const key of ROW_ARRAY_KEYS) {
-    const rows = ownValue(value, key);
-    if (isRowArray(rows)) return { count: rows.length, partial: hasMoreRows(value) };
-  }
-  if (depth > 0) return null;
-  // A manifest's total wins over the page of rows a result carries inline.
-  for (const key of ["manifest", "result"]) {
-    const counted = rowCount(ownValue(value, key), depth + 1);
-    if (counted !== null) return counted;
+/** A non-negative integer count, also as a digit string (BigQuery's `totalRows`). */
+function countField(record: Record<string, unknown>, keys: readonly string[]): number | null {
+  for (const key of keys) {
+    const count = ownValue(record, key);
+    if (typeof count === "number" && Number.isInteger(count) && count >= 0) return count;
+    if (typeof count === "string" && /^\d+$/.test(count)) return Number(count);
   }
   return null;
+}
+
+/**
+ * Rows a query result reports. The record and its `manifest`/`result` envelopes
+ * are read together, so a marker on any of them applies to a count on another.
+ * A total stays exact across pages, but not when the result was truncated.
+ */
+function rowCount(value: unknown): RowCount | null {
+  if (isRowArray(value)) return { count: value.length, partial: false };
+  if (!isRecord(value)) return null;
+  const records = [value];
+  const envelopeArrays: unknown[][] = [];
+  for (const key of ENVELOPE_KEYS) {
+    const envelope = ownValue(value, key);
+    if (isRecord(envelope)) records.push(envelope);
+    else if (isRowArray(envelope)) envelopeArrays.push(envelope);
+  }
+  const truncated = records.some((record) => record.truncated === true);
+  const partial = truncated || records.some(hasMoreRows);
+  for (const record of records) {
+    const total = countField(record, TOTAL_ROW_COUNT_KEYS);
+    if (total !== null) return { count: total, partial: truncated };
+  }
+  for (const record of records) {
+    const count = countField(record, PAGE_ROW_COUNT_KEYS);
+    if (count !== null) return { count, partial };
+  }
+  for (const record of records) {
+    for (const key of ROW_ARRAY_KEYS) {
+      const rows = ownValue(record, key);
+      if (isRowArray(rows)) return { count: rows.length, partial };
+    }
+  }
+  const [rows] = envelopeArrays;
+  return rows === undefined ? null : { count: rows.length, partial };
 }
 
 function sqlResultSize(parsed: ParsedToolOutput): string {

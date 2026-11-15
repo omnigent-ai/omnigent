@@ -203,11 +203,32 @@ describe("collectTurnWork", () => {
         label: "Web search",
         data: { action: { type: "search", query: "gdp 2026" } },
       },
+      {
+        kind: "native_tool",
+        itemId: "ws_2",
+        toolType: "web_search_call",
+        label: "Web search",
+        data: { status: "failed", action: { type: "search", query: "failed search" } },
+      },
     ]);
     expect(work.queries).toMatchObject([
       { language: "python", text: "1 + 1", status: "completed", resultSize: null },
     ]);
     expect(work.sources).toMatchObject([{ kind: "web_search", value: "gdp 2026" }]);
+  });
+
+  it("offers no Sources for a native search that failed", () => {
+    const items: RenderItem[] = [
+      {
+        kind: "native_tool",
+        itemId: "ws_failed",
+        toolType: "web_search_call",
+        label: "Web search",
+        data: { status: "failed", action: { type: "search", query: "gdp 2026" } },
+      },
+    ];
+    expect(hasTurnWork(items)).toBe(false);
+    expect(collectTurnWork(items).sources).toEqual([]);
   });
 
   it("is empty for a turn without data work", () => {
@@ -250,8 +271,19 @@ describe("collectTurnWork", () => {
       tool("flow", "run_workflow", { code: "WF1" }, "{}"),
       tool("oauth", "exchange_auth_code", { code: "secret-code" }, "{}"),
       tool("exec", "execute_code", { code: "x = 1", language: "javascript" }, ""),
+      // Runtime-named tools that only inspect or produce code do not run it.
+      tool("lint", "lint_python", { code: "print(1)" }, "ok"),
+      tool("format", "format_notebook", { code: "print(1)" }, "print(1)"),
+      tool("gen", "generate_python_code", { code: "print(1)" }, "ok"),
+      tool("save", "write_python_file", { code: "print(1)" }, "ok"),
+      tool("explain", "explain_python_code", { code: "print(1)" }, "ok"),
+      // A run word in the name means the code still runs.
+      tool("both", "generate_and_run_code", { code: "y = 2" }, ""),
     ]);
-    expect(work.queries.map((query) => [query.language, query.text])).toEqual([["code", "x = 1"]]);
+    expect(work.queries.map((query) => [query.language, query.text])).toEqual([
+      ["code", "x = 1"],
+      ["code", "y = 2"],
+    ]);
   });
 
   it("lists no source from a call that failed, was cancelled or wrote its target", () => {
@@ -297,12 +329,62 @@ describe("collectTurnWork", () => {
   it("marks a page of rows as partial and counts rows only for SQL", () => {
     const page = JSON.stringify({ rows: [{ a: 1 }, { a: 2 }], has_more: true });
     const chunk = JSON.stringify({ result: { data_array: [[1]], next_chunk_index: 1 } });
+    // A page's own count is not the result's total while more rows follow.
+    const countedPage = JSON.stringify({
+      row_count: 2,
+      rows: [{ a: 1 }, { a: 2 }],
+      has_more: true,
+    });
+    const countedChunk = JSON.stringify({ result: { num_rows: 1, next_chunk_index: 1 } });
+    const pagedAbove = JSON.stringify({ has_more: true, result: { row_count: 3 } });
+    const total = JSON.stringify({
+      manifest: { total_row_count: 40 },
+      result: { row_count: 10, next_chunk_index: 1 },
+    });
     const work = collectTurnWork([
       tool("page", "run_sql", { sql: "SELECT a FROM t" }, page),
       tool("chunk", "run_sql", { sql: "SELECT a FROM t" }, chunk),
+      tool("countedPage", "run_sql", { sql: "SELECT a FROM t" }, countedPage),
+      tool("countedChunk", "run_sql", { sql: "SELECT a FROM t" }, countedChunk),
+      tool("pagedAbove", "run_sql", { sql: "SELECT a FROM t" }, pagedAbove),
+      tool("total", "run_sql", { sql: "SELECT a FROM t" }, total),
       tool("py", "run_python", { code: "print([1, 2, 3])" }, "[1, 2, 3]"),
     ]);
-    expect(work.queries.map((query) => query.resultSize)).toEqual(["2+ rows", "1+ rows", "1 line"]);
+    expect(work.queries.map((query) => query.resultSize)).toEqual([
+      "2+ rows",
+      "1+ rows",
+      "2+ rows",
+      "1+ rows",
+      "3+ rows",
+      "40 rows",
+      "1 line",
+    ]);
+  });
+
+  it("keeps a total exact across pages, but not past a truncation", () => {
+    const sql = { sql: "SELECT a FROM t" };
+    const sizes = [
+      // A total beside one page of rows, or behind a top-level page count.
+      { total_row_count: 40, rows: [{ a: 1 }], has_more: true },
+      { has_more: true, manifest: { total_row_count: 40 } },
+      { row_count: 10, has_more: true, manifest: { total_row_count: 40 } },
+      // A limit cut the result, so its total is a floor.
+      { manifest: { total_row_count: 100, truncated: true }, result: { row_count: 100 } },
+      // A truncation marked on the manifest applies to the result's rows.
+      { manifest: { truncated: true }, result: { data_array: [[1], [2]] } },
+      // BigQuery reports totals as digit strings and pages with `pageToken`.
+      { totalRows: "40", rows: [{ f: [] }], pageToken: "x" },
+      { rows: [{ f: [] }, { f: [] }], pageToken: "x" },
+    ].map((output, index) => tool(`size${index}`, "run_sql", sql, JSON.stringify(output)));
+    expect(collectTurnWork(sizes).queries.map((query) => query.resultSize)).toEqual([
+      "40 rows",
+      "40 rows",
+      "40 rows",
+      "100+ rows",
+      "2+ rows",
+      "40 rows",
+      "2+ rows",
+    ]);
   });
 
   it("keys repeated call ids apart", () => {
