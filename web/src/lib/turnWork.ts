@@ -19,7 +19,9 @@ import {
   isRecord,
   ownValue,
   parseToolOutput,
+  contentEnvelopeText,
   editErrorMessage,
+  toolErrorMessage,
 } from "@/lib/toolValue";
 
 export type ToolRenderItem = Extract<RenderItem, { kind: "tool" | "native_tool" }>;
@@ -92,7 +94,7 @@ interface QueryCall {
 export function hasTurnWork(items: readonly RenderItem[]): boolean {
   return items.some((item) => {
     if (item.kind === "native_tool") {
-      return nativeQueryCall(item) !== null || nativeSearchQuery(item) !== null;
+      return nativeQueryCall(item) !== null || nativeWebSources(item).length > 0;
     }
     if (item.kind !== "tool") return false;
     const { name, arguments: args } = item.execution;
@@ -129,8 +131,7 @@ export function collectTurnWork(items: readonly RenderItem[]): TurnWork {
     if (item.kind === "native_tool") {
       const call = nativeQueryCall(item);
       if (call !== null) queries.push(nativeQuery(item, `${index}:${item.itemId ?? ""}`, call));
-      const search = nativeSearchQuery(item);
-      if (search !== null) addSources([{ kind: "web_search", value: search }], item);
+      addSources(nativeWebSources(item), item);
     }
   });
 
@@ -172,7 +173,7 @@ function toolQuery(item: ToolCallItem, key: string, call: QueryCall): TurnQuery 
   if (item.output === null) return { ...base, ...callStatus(item.state, null), resultSize: null };
 
   if (call.outputFormat !== undefined) {
-    const parsed = parseShellToolOutput(item.output, call.outputFormat);
+    const parsed = parseShellToolOutput(readResult(item.output).text, call.outputFormat);
     let failure: string | null = null;
     if (parsed.timedOut) failure = "Timed out";
     else if (parsed.exitCode !== null && parsed.exitCode !== 0) failure = `Exit ${parsed.exitCode}`;
@@ -180,12 +181,12 @@ function toolQuery(item: ToolCallItem, key: string, call: QueryCall): TurnQuery 
     return { ...base, ...status, resultSize: sizeUnlessFailed(status, lineCount(parsed.text)) };
   }
 
-  const parsed = parseToolOutput(item.output);
+  const { parsed, failure } = readResult(item.output);
   const statement = call.language === "sql" ? statementState(parsed) : null;
   const status =
     statement !== null && item.state === "output-available"
       ? statement
-      : callStatus(item.state, recordedFailure(item.output));
+      : callStatus(item.state, failure);
   const size = call.language === "sql" ? sqlResultSize(parsed) : lineCount(parsed.text);
   return { ...base, ...status, resultSize: sizeUnlessFailed(status, size) };
 }
@@ -196,15 +197,35 @@ function sizeUnlessFailed(status: { status: TurnCallStatus }, size: string): str
 
 function completedWithoutFailure(item: ToolCallItem): boolean {
   if (item.state !== "output-available") return false;
-  return item.output === null || recordedFailure(item.output) === null;
+  return item.output === null || readResult(item.output).failure === null;
+}
+
+interface RecordedResult {
+  /** The tool's own output text, out of any Pi envelope. */
+  text: string;
+  parsed: ParsedToolOutput;
+  /** The reported failure, or `null` when the result reports none. */
+  failure: string | null;
 }
 
 /**
- * A non-shell tool's reported failure, including OpenCode's `[error] ...`
- * envelope (shared with edit tools), or `null` when it reports none.
+ * A recorded result, unwrapped from Pi's `{"content": [...], "isError": false}`
+ * envelope. Unwrapped text is the tool's own output (a file's contents), so only
+ * a JSON error record in it counts as a failure; otherwise OpenCode's `[error] ...`
+ * and the other recorded failure shapes do.
  */
-function recordedFailure(output: string): string | null {
-  return editErrorMessage(output);
+function readResult(output: string): RecordedResult {
+  const outer = parseToolOutput(output);
+  // `parseToolOutput` already unwrapped an MCP content-block array; don't peel twice.
+  const envelope =
+    outer.kind === "json" && outer.text === output ? contentEnvelopeText(outer.value) : null;
+  if (envelope === null) return { text: output, parsed: outer, failure: editErrorMessage(output) };
+  const inner = parseToolOutput(envelope);
+  return {
+    text: envelope,
+    parsed: inner,
+    failure: inner.kind === "json" ? toolErrorMessage(inner) : null,
+  };
 }
 
 function callStatus(
@@ -427,7 +448,9 @@ function argumentDataSource(args: Record<string, unknown>): string | null {
   return scope;
 }
 
-const WEB_SEARCH_TOOLS = new Set(["WebSearch", "web_search"]);
+// Web search and fetch tools across harnesses (Claude, Omnigent, OpenCode).
+const WEB_SEARCH_TOOLS = new Set(["WebSearch", "web_search", "websearch"]);
+const WEB_FETCH_TOOLS = new Set(["WebFetch", "web_fetch", "webfetch", "web_read"]);
 const URL_KEYS = ["url", "uri"];
 // Tool-name words for calls that change or send something; their table and
 // URL arguments are targets, not sources.
@@ -530,8 +553,12 @@ function readsItsTargets(name: string, args: Record<string, unknown>): boolean {
     (action) => typeof action === "string" && READ_ACTIONS.has(action.trim().toLowerCase()),
   );
   if (!readActions) return false;
-  // `http_request` with `method: "GET"` reads, though its name doesn't say so.
-  return words.some((word) => READ_TOOL_WORDS.has(word)) || actions.length > 0;
+  // OpenCode's `webfetch` is one word; `http_request` with `method: "GET"` reads too.
+  return (
+    WEB_FETCH_TOOLS.has(stripOmnigentPrefix(name)) ||
+    words.some((word) => READ_TOOL_WORDS.has(word)) ||
+    actions.length > 0
+  );
 }
 
 /** The sources a call's name and arguments say it read. */
@@ -599,14 +626,22 @@ function nativeQuery(item: NativeToolItem, key: string, code: string): TurnQuery
   };
 }
 
-function nativeSearchQuery(item: NativeToolItem): string | null {
-  if (item.toolType !== "web_search_call") return null;
-  // A search that reports any outcome but completion read nothing; older records carry none.
+/** A provider web call's search or opened page; `action.type` is "search" or "open_page". */
+function nativeWebSources(item: NativeToolItem): SourceRef[] {
+  if (item.toolType !== "web_search_call") return [];
+  // A call that reports any outcome but completion read nothing; older records carry none.
   const status = item.data.status;
-  if (typeof status === "string" && status !== "completed") return null;
+  if (typeof status === "string" && status !== "completed") return [];
   const action = item.data.action;
-  const query = isRecord(action) ? action.query : undefined;
-  return typeof query === "string" && query.trim() !== "" ? query.trim() : null;
+  if (!isRecord(action)) return [];
+  if (action.type === "open_page") {
+    const url = webUrl(action.url);
+    return url === null ? [] : [{ kind: "url", value: url }];
+  }
+  const query = action.query;
+  return typeof query === "string" && query.trim() !== ""
+    ? [{ kind: "web_search", value: query.trim() }]
+    : [];
 }
 
 // Fields a query result reports its rows in, at the top level or under `manifest`/`result`.

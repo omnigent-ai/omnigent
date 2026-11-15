@@ -341,6 +341,81 @@ describe("collectTurnWork", () => {
     expect(work.sources.map((source) => source.value)).toEqual(["t0", "t1", "t2", "t3"]);
   });
 
+  it("reads statement state and rows inside Pi's content envelope", () => {
+    const envelope = (value: unknown) =>
+      JSON.stringify({ content: [{ type: "text", text: JSON.stringify(value) }], isError: false });
+    const work = collectTurnWork([
+      tool(
+        "failed",
+        "execute_sql",
+        { statement: "SELECT * FROM missing", table: "main.s.missing" },
+        envelope({ status: { state: "FAILED", error: { message: "missing table" } } }),
+      ),
+      tool(
+        "ok",
+        "execute_sql",
+        { statement: "SELECT * FROM orders", table: "main.s.orders" },
+        envelope({ manifest: { total_row_count: 3 }, result: { data_array: [[1], [2], [3]] } }),
+      ),
+      tool("errored", "describe_table", { table: "main.s.gone" }, envelope({ error: "not found" })),
+    ]);
+    expect(work.queries).toMatchObject([
+      { status: "failed", error: "missing table", resultSize: null },
+      { status: "completed", resultSize: "3 rows" },
+    ]);
+    expect(work.sources.map((source) => source.value)).toEqual(["main.s.orders"]);
+  });
+
+  it("keeps a Pi read whose file text looks like an error, and counts Pi shell lines", () => {
+    const envelope = (text: string) =>
+      JSON.stringify({ content: [{ type: "text", text }], isError: false });
+    const work = collectTurnWork([
+      tool("log", "read", { path: "/ws/errors.log" }, envelope("Error: disk full\nok")),
+      tool("sh", "bash", { command: "ls" }, envelope("a\nb\nc")),
+      // An MCP content array is unwrapped once, not peeled a second time.
+      tool(
+        "mcp",
+        "execute_sql",
+        { statement: "SELECT * FROM t" },
+        JSON.stringify([
+          { type: "text", text: JSON.stringify({ content: [{ type: "text", text: "Error: x" }] }) },
+        ]),
+      ),
+    ]);
+    expect(work.sources.map((source) => source.value)).toEqual(["/ws/errors.log"]);
+    expect(work.queries.map((query) => [query.status, query.resultSize])).toEqual([
+      ["completed", "3 lines"],
+      ["completed", "1 line"],
+    ]);
+  });
+
+  it("reads OpenCode's web tools and provider page opens", () => {
+    const items: RenderItem[] = [
+      tool("ocsearch", "websearch", { query: "interest rates" }, "results"),
+      tool("ocfetch", "webfetch", { url: "https://example.com/report" }, "page"),
+      {
+        kind: "native_tool",
+        itemId: "open_1",
+        toolType: "web_search_call",
+        label: "Web open",
+        data: { status: "completed", action: { type: "open_page", url: "https://example.com/p" } },
+      },
+      {
+        kind: "native_tool",
+        itemId: "open_bad",
+        toolType: "web_search_call",
+        label: "Web open",
+        data: { action: { type: "open_page", url: "javascript:alert(1)" } },
+      },
+    ];
+    expect(collectTurnWork(items).sources.map((source) => [source.kind, source.value])).toEqual([
+      ["web_search", "interest rates"],
+      ["url", "https://example.com/report"],
+      ["url", "https://example.com/p"],
+    ]);
+    expect(hasTurnWork([items[2]!])).toBe(true);
+  });
+
   it("lists URLs and tables from calls that read them", () => {
     const work = collectTurnWork([
       tool(
