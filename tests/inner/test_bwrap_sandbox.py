@@ -417,6 +417,193 @@ def test_wrap_launcher_argv_starts_with_bwrap_and_ends_with_command(
     ]
 
 
+def test_launch_fingerprint_tracks_new_and_replaced_masked_dotfiles(tmp_path: Path) -> None:
+    """A new dotfile, or one atomically replaced under its mask, changes the fingerprint."""
+    backend = _make_backend()
+    policy = _make_policy(tmp_path)
+    argv = [sys.executable, "-c", "pass"]
+    (tmp_path / ".env").write_text("old")
+    launched = backend.launch_fingerprint(argv, policy, tmp_path)
+    assert backend.launch_fingerprint(argv, policy, tmp_path) == launched
+
+    replacement = tmp_path / "env.new"
+    replacement.write_text("new")
+    os.replace(replacement, tmp_path / ".env")
+    replaced = backend.launch_fingerprint(argv, policy, tmp_path)
+    assert replaced != launched
+
+    masked = tmp_path / ".env"
+    before = masked.stat()
+    masked.chmod(before.st_mode ^ 0o100)
+    after = masked.stat()
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    assert after.st_ctime_ns != before.st_ctime_ns
+    changed = backend.launch_fingerprint(argv, policy, tmp_path)
+    assert changed != replaced
+
+    (tmp_path / ".npmrc").write_text("token")
+    assert backend.launch_fingerprint(argv, policy, tmp_path) != changed
+
+
+@pytest.mark.parametrize("parent_change", ["directory", "symlink", "symlink-target"])
+def test_launch_fingerprint_tracks_masked_ancestors(tmp_path: Path, parent_change: str) -> None:
+    """A changed mask ancestor invalidates even when its leaf identity is unchanged."""
+    cwd = tmp_path / "workspace"
+    parent = cwd / "parent"
+    parent.mkdir(parents=True)
+    staged = cwd / "staged" if parent_change == "symlink" else tmp_path / "staged"
+    staged.mkdir()
+    secret = parent / "secret"
+    secret.write_text("synthetic masked contents")
+    (staged / "secret").hardlink_to(secret)
+    masked = secret
+    if parent_change != "directory":
+        link = cwd / "link"
+        link.symlink_to(parent, target_is_directory=True)
+        masked = link / "secret"
+
+    policy = _make_policy(cwd, mask_paths=[masked])
+    backend = _make_backend()
+    argv = [sys.executable, "-c", "pass"]
+    before = masked.stat()
+    launched = backend.launch_fingerprint(argv, policy, cwd)
+    (parent / "visible").write_text("ordinary directory content churn")
+    assert backend.launch_fingerprint(argv, policy, cwd) == launched
+
+    if parent_change == "symlink":
+        link.unlink()
+        link.symlink_to(staged, target_is_directory=True)
+    else:
+        parent.rename(tmp_path / "displaced")
+        staged.rename(parent)
+    after = masked.stat()
+    assert (after.st_dev, after.st_ino, after.st_ctime_ns) == (
+        before.st_dev,
+        before.st_ino,
+        before.st_ctime_ns,
+    )
+    assert backend.launch_fingerprint(argv, policy, cwd) != launched
+
+
+def test_launch_fingerprint_tracks_explicit_mask_replacement(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    cwd = tmp_path / "workspace"
+    cwd.mkdir()
+    target = tmp_path / "masked-target"
+    target.write_text("old")
+    policy = replace(_make_policy(cwd), deny_unix_socket_paths=[target])
+    backend = _make_backend()
+    argv = [sys.executable, "-c", "pass"]
+    launched = backend.launch_fingerprint(argv, policy, cwd)
+    assert backend.launch_fingerprint(argv, policy, cwd) == launched
+
+    replacement = tmp_path / "replacement"
+    replacement.write_text("new")
+    replacement.replace(target)
+    assert backend.launch_fingerprint(argv, policy, cwd) != launched
+
+
+def test_launch_fingerprint_tracks_granted_roots_but_not_scratch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retargeted roots and replaced default files count; per-launch scratch churn does not."""
+    import dataclasses
+
+    import omnigent.inner.bwrap_sandbox as bwrap_module
+
+    etc_file = tmp_path / "resolv.conf"
+    etc_file.write_text("nameserver 192.0.2.1\n")
+    monkeypatch.setattr(bwrap_module, "_DEFAULT_ETC_FILES", (str(etc_file),))
+    default_ro = tmp_path / "toolchain"
+    default_etc = tmp_path / "certificates"
+    default_ro.mkdir()
+    default_etc.mkdir()
+    monkeypatch.setattr(bwrap_module, "_DEFAULT_RO_DIRS", (str(default_ro),))
+    monkeypatch.setattr(bwrap_module, "_DEFAULT_ETC_DIRS", (str(default_etc),))
+    backend = _make_backend()
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    granted = tmp_path / "granted"
+    granted.symlink_to(tmp_path / "a")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    policy = dataclasses.replace(
+        _make_policy(cwd, read_roots=[granted], write_roots=[scratch]),
+        mask_scan_skip_roots=[scratch],
+    )
+    argv = [sys.executable, "-c", "pass"]
+    launched = backend.launch_fingerprint(argv, policy, cwd)
+
+    (scratch / ".cache").mkdir()
+    (scratch / "replaced").mkdir()
+    (default_ro / "installed-file").touch()
+    (default_etc / "certificate").touch()
+    assert backend.launch_fingerprint(argv, policy, cwd) == launched
+
+    for directory in (default_ro, default_etc):
+        directory.rename(directory.with_suffix(".old"))
+        directory.mkdir()
+        replaced = backend.launch_fingerprint(argv, policy, cwd)
+        assert replaced != launched
+        launched = replaced
+
+    replacement = tmp_path / "resolv.conf.new"
+    replacement.write_text("nameserver 192.0.2.2\n")
+    os.replace(replacement, etc_file)
+    refreshed = backend.launch_fingerprint(argv, policy, cwd)
+    assert refreshed != launched
+
+    granted.unlink()
+    granted.symlink_to(tmp_path / "b")
+    assert backend.launch_fingerprint(argv, policy, cwd) != refreshed
+
+
+@pytest.mark.parametrize("inside_mask", [False, True])
+def test_launch_fingerprint_tracks_interpreter_mounts(tmp_path: Path, inside_mask: bool) -> None:
+    """Implicit interpreter grants track directory replacement and symlink retargeting."""
+    from omnigent.inner.bwrap_sandbox import (
+        _ensure_executable_visible,
+        _interpreter_reexpose_after_mask,
+    )
+
+    cwd = tmp_path / "workspace"
+    cwd.mkdir()
+    installs = cwd / ".local" if inside_mask else tmp_path / "installs"
+    version = installs / "version-a"
+    (version / "bin").mkdir(parents=True)
+    (version / "bin" / "python").touch()
+    current = installs / "current"
+    current.symlink_to(version, target_is_directory=True)
+    argv = [str(current / "bin" / "python")]
+    if inside_mask:
+        assert not _ensure_executable_visible(argv, cwd)
+        assert _interpreter_reexpose_after_mask(argv, [installs])
+    else:
+        assert _ensure_executable_visible(argv, cwd)
+
+    backend = _make_backend()
+    policy = _make_policy(cwd)
+    launched = backend.launch_fingerprint(argv, policy, cwd)
+    (version / "bin" / "ordinary-content").touch()
+    assert backend.launch_fingerprint(argv, policy, cwd) == launched
+
+    version.rename(installs / "previous")
+    (version / "bin").mkdir(parents=True)
+    (version / "bin" / "python").touch()
+    replaced = backend.launch_fingerprint(argv, policy, cwd)
+    assert replaced != launched
+
+    other = installs / "version-b"
+    (other / "bin").mkdir(parents=True)
+    (other / "bin" / "python").touch()
+    current.unlink()
+    current.symlink_to(other, target_is_directory=True)
+    assert backend.launch_fingerprint(argv, policy, cwd) != replaced
+
+
 def test_wrap_launcher_argv_includes_required_mounts_and_chdir(
     tmp_path: Path,
 ) -> None:
