@@ -23,7 +23,10 @@ import omnigent.inner.terminal as terminal_mod
 import omnigent.util.tmux_compat as tmux_compat
 from omnigent.errors import ErrorCategory, ErrorImpact, classify_exception
 from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
+from omnigent.inner.claude_model_access import ClaudeModelAccess
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
+from omnigent.inner.egress.ca import ensure_ca, ensure_ca_bundle
+from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.inner.terminal import (
     TerminalInstance,
     _apply_utf8_locale_default,
@@ -3853,6 +3856,120 @@ def test_create_terminal_instance_denies_control_socket_but_keeps_private_dir_wr
         )
     finally:
         shutil.rmtree(instance.private_dir, ignore_errors=True)
+
+
+@pytest.fixture
+def terminal_proxy_ca(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep terminal relay certificates separate from the host's cached CA."""
+    cert, key = ensure_ca(cache_dir=tmp_path / "ca")
+    bundle = ensure_ca_bundle(cert, cache_dir=tmp_path / "ca")
+    monkeypatch.setattr("omnigent.inner.egress.controller.ensure_ca", lambda: (cert, key))
+    monkeypatch.setattr("omnigent.inner.egress.controller.ensure_ca_bundle", lambda _: bundle)
+
+
+@pytest.mark.parametrize("allow_private", [False, True])
+async def test_terminal_model_relay_honors_private_opt_in_without_egress_rules(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_proxy_ca: None,
+    allow_private: bool,
+) -> None:
+    """Automatic model access retains the spec's private-destination policy."""
+    policy = SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False)
+    # Resolve a policy without requiring an installed OS sandbox or launching tmux.
+    monkeypatch.setattr(terminal_mod, "_require_supported_tmux", lambda: None)
+    monkeypatch.setattr("omnigent.inner.os_env.resolve_sandbox", lambda *_: policy)
+    created = create_terminal_instance(
+        "shell",
+        "main",
+        TerminalEnvSpec(),
+        parent_os_env_spec=OSEnvSpec(
+            cwd=str(tmp_path),
+            sandbox=OSEnvSandboxSpec(
+                allow_network=False,
+                egress_allow_private_destinations=allow_private,
+            ),
+        ),
+    )
+    instance = created.instance
+    instance.model_access = ClaudeModelAccess(
+        "https://127.0.0.1", "authorization", lambda: "parent-only-key"
+    )
+    try:
+        assert not instance.egress_rules
+        assert instance.sandbox_policy is not None
+        instance._bootstrap_egress_proxy(instance.sandbox_policy, {})
+        assert instance._egress_handle is not None
+        proxy = instance._egress_handle._proxy
+        # Exercise the real guard: replacing it would hide a dropped opt-in.
+        if allow_private:
+            assert await proxy._assert_destination_allowed("127.0.0.1", 443) is None
+        else:
+            with pytest.raises(PermissionError, match="egress_allow_private_destinations"):
+                await proxy._assert_destination_allowed("127.0.0.1", 443)
+    finally:
+        await instance.close()
+
+
+async def test_terminal_model_relay_restores_thinking_only_for_selected_gateway(
+    tmp_path: Path,
+    terminal_proxy_ca: None,
+) -> None:
+    """The terminal's signer restores thinking without changing ordinary egress."""
+    access = ClaudeModelAccess(
+        "https://gateway.test/anthropic", "authorization", lambda: "parent-only-key"
+    )
+    instance = TerminalInstance(
+        "shell",
+        "main",
+        tmp_path / "terminal/tmux.sock",
+        tmp_path / "terminal",
+        model_access=access,
+        egress_rules=["POST other.test/**"],
+    )
+    policy = SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False)
+    body = json.dumps(
+        {
+            "model": "databricks-claude-opus-4-8",
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+    ).encode()
+    try:
+        instance._bootstrap_egress_proxy(policy, {})
+        assert instance._egress_handle is not None
+        proxy = instance._egress_handle._proxy
+        signed = proxy._reconstruct_request(
+            bearer_token="parent-only-key",
+            method="POST",
+            connect_host=access.host,
+            sni_host=access.host,
+            request_host=access.host,
+            target="/anthropic/v1/messages?beta=true",
+            headers=[
+                ("Authorization", f"Bearer {access.placeholder}"),
+                ("Content-Type", "application/json"),
+            ],
+            body=body,
+        )
+        expected = json.loads(body)
+        expected["thinking"]["display"] = "summarized"
+        assert json.loads(signed.body) == expected
+        assert signed.header("Content-Length") == str(len(signed.body))
+        assert signed.header("Authorization") == "Bearer parent-only-key"
+
+        for host, path in (
+            ("other.test", "/anthropic/v1/messages"),
+            (access.host, "/v1/messages"),
+            (access.host, "/anthropic/v1/messages/count_tokens"),
+        ):
+            headers = f"Content-Length: {len(body)}\r\n\r\n".encode()
+            assert proxy._transform_request_body("POST", host, 443, path, headers, body) == (
+                headers,
+                body,
+            )
+    finally:
+        await instance.close()
 
 
 # ── UTF-8 locale default for native TUI panes (issue #2427) ──────────────────

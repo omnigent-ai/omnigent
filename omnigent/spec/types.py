@@ -417,6 +417,7 @@ class ApiKeyAuth:
     :param base_url: Optional OpenAI-compatible endpoint URL,
         e.g. ``"https://my-gateway.example.com/v1"``. When omitted,
         the default ``https://api.openai.com/v1`` is used.
+    :param source_env_names: Credential environment names retained before expansion.
     """
 
     # Required: the resolved API key value (env-var refs expanded at parse time).
@@ -424,6 +425,8 @@ class ApiKeyAuth:
     # Optional: custom endpoint; None means use the default OpenAI endpoint.
     base_url: str | None = None
     type: Literal["api_key"] = "api_key"
+    # Original credential env refs survive expansion for child-process scrubbing.
+    source_env_names: tuple[str, ...] = field(default=(), repr=False, compare=False, kw_only=True)
 
 
 @dataclass(frozen=True)

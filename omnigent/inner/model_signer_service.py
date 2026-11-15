@@ -18,7 +18,7 @@ import sys
 import tempfile
 import threading
 import weakref
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, TypeVar
@@ -38,11 +38,11 @@ from .egress.rules import parse_rules
 from .model_auth import (
     PROVIDER_AUTH_REQUIRED,
     ProviderAuthRequired,
-    mint_ucode_token,
+    mint_profile_token,
 )
 from .model_credential import CredentialLifecycle
 from .model_egress import FrozenModelRoute
-from .model_signing import SigningRejected, reconstruct_signed_request
+from .model_signing import SignedModelRequest, SigningRejected, reconstruct_signed_request
 
 _CONFIG_KEYS = frozenset({"binding_id", "endpoint", "routes"})
 _UCODE_CONFIG_KEYS = _CONFIG_KEYS | {"auth_profile"}
@@ -165,11 +165,14 @@ def _parse_strict_header_lines(
     return parsed
 
 
-def _parse_strict_request_headers(raw: bytes) -> tuple[list[tuple[str, str]], int]:
+def _parse_strict_request_headers(
+    raw: bytes, *, allow_connection_close: bool = False
+) -> tuple[list[tuple[str, str]], int]:
     parsed = _parse_strict_header_lines(raw)
     by_name = {name.lower(): value for name, value in parsed}
     connection = by_name.get("connection")
-    if connection is not None and connection.lower() != "keep-alive":
+    allowed_connections = ("keep-alive", "close") if allow_connection_close else ("keep-alive",)
+    if connection is not None and connection.lower() not in allowed_connections:
         raise SigningRejected("request contains an unsupported Connection header")
     for name in by_name:
         if name in _REQUEST_REJECTED_HEADERS or name.startswith(
@@ -322,7 +325,7 @@ class _SignerRelay(EgressProxy):
         body: bytes,
     ) -> bool:
         del request_line
-        headers, _ = _parse_strict_request_headers(headers_raw)
+        headers, _ = self._request_headers(headers_raw)
         request_host = next(
             (value for name, value in headers if name.lower() == "host"),
             "",
@@ -330,9 +333,7 @@ class _SignerRelay(EgressProxy):
         task = asyncio.current_task()
         sni_host = self._tls_sni_by_task.get(task) if task is not None else None
         try:
-            reconstruct_signed_request(
-                route=self._route,
-                placeholder=self._placeholder,
+            self._reconstruct_request(
                 bearer_token=_VALIDATION_BEARER,
                 method=method,
                 connect_host=host,
@@ -350,9 +351,7 @@ class _SignerRelay(EgressProxy):
         except ProviderAuthRequired:
             await self._send_auth_required(client_writer)
             return False
-        signed = reconstruct_signed_request(
-            route=self._route,
-            placeholder=self._placeholder,
+        signed = self._reconstruct_request(
             bearer_token=bearer_token,
             method=method,
             connect_host=host,
@@ -361,7 +360,6 @@ class _SignerRelay(EgressProxy):
             target=path,
             headers=headers,
             body=body,
-            trusted_headers=self._trusted_headers,
         )
         if port != 443:
             await self._send_forbidden(client_writer, "")
@@ -408,6 +406,37 @@ class _SignerRelay(EgressProxy):
             upstream_writer.close()
             with contextlib.suppress(Exception):
                 await upstream_writer.wait_closed()
+
+    @staticmethod
+    def _request_headers(raw: bytes) -> tuple[list[tuple[str, str]], int]:
+        return _parse_strict_request_headers(raw)
+
+    def _reconstruct_request(
+        self,
+        *,
+        bearer_token: str,
+        method: str,
+        connect_host: str,
+        sni_host: str,
+        request_host: str,
+        target: str,
+        headers: Sequence[tuple[str, str]],
+        body: bytes,
+    ) -> SignedModelRequest:
+        """Authorize a provider request before resolving or attaching credentials."""
+        return reconstruct_signed_request(
+            route=self._route,
+            placeholder=self._placeholder,
+            bearer_token=bearer_token,
+            method=method,
+            connect_host=connect_host,
+            sni_host=sni_host,
+            request_host=request_host,
+            target=target,
+            headers=headers,
+            body=body,
+            trusted_headers=self._trusted_headers,
+        )
 
     def _observe_upstream_status(self, status: int) -> None:
         if status == 401:
@@ -944,7 +973,7 @@ async def _run(config_fd: int) -> int:
         assert auth_profile is not None
         host = f"https://{route.host}"
         credential_lifecycle = CredentialLifecycle(
-            helper=lambda: mint_ucode_token(host=host, profile=auth_profile),
+            helper=lambda: mint_profile_token(host=host, profile=auth_profile),
             auth_required=lambda: ProviderAuthRequired.for_authority(host, auth_profile),
             max_cache_age_s=_UCODE_MAX_CACHE_AGE_SECONDS,
             refresh_skew_s=_UCODE_REFRESH_SKEW_SECONDS,

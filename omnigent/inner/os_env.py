@@ -64,6 +64,7 @@ from .tcp_egress import TcpEgressBroker, apply_tcp_egress_env, start_tcp_egress_
 if TYPE_CHECKING:
     import asyncio
 
+    from .claude_model_access import ClaudeModelAccess
     from .egress import EgressProxyHandle
     from .egress.proxy import EgressProxy
 from .sandbox import (
@@ -389,6 +390,11 @@ class OSEnvironment(ABC):
         if policy.copy_on_write_roots:
             raise RuntimeError("This environment cannot own copy-on-write mounts")
 
+    def isolate_model_credentials(self, access: ClaudeModelAccess) -> None:
+        """Apply the owning session's credential boundary before executing tools."""
+        del access
+        raise NotImplementedError("This OS environment cannot isolate model credentials")
+
     @property
     def copy_on_write_environment(self) -> CopyOnWriteEnvironment | None:
         return None
@@ -463,7 +469,19 @@ class _HelperProcessClient:
         # exits, and each request runs on its own short-lived thread.
         self._spawner = ThreadPoolExecutor(max_workers=1, thread_name_prefix="os-env-helper")
         self._closed = False
+        self._model_access: ClaudeModelAccess | None = None
         atexit.register(self.close)
+
+    def isolate_model_credentials(self, access: ClaudeModelAccess) -> SandboxPolicy:
+        with self._lock:
+            if not self.sandbox.active:
+                return self.sandbox
+            protected = access.protect_sources(self.sandbox, self.cwd)
+            if self._model_access is not access:
+                self._stop_locked()
+            self._model_access = access
+            self.sandbox = protected
+            return protected
 
     def request(self, payload: OpRequest) -> OpResult:
         if payload.get("op") == "git":
@@ -576,6 +594,11 @@ class _HelperProcessClient:
 
     def _start_unchecked_locked(self) -> None:
         sandbox = self.sandbox
+        if sandbox.active:
+            # Editable installs need the framework inside the helper's mount namespace.
+            sandbox = with_additional_read_roots(sandbox, [Path(__file__).resolve().parents[1]])
+            if self._model_access is not None:
+                sandbox = self._model_access.protect_sources(sandbox, self.cwd)
         if self._copy_on_write_environment is not None:
             self._copy_on_write_environment.prepare(sandbox)
         env = build_helper_env(os.environ, sandbox)
@@ -615,6 +638,12 @@ class _HelperProcessClient:
                     sandbox=sandbox,
                     cwd=self.cwd,
                 )
+            if self._model_access is not None:
+                home = self._tmpdir / "home"
+                (home / ".claude").mkdir(parents=True)
+                self._model_access.worker_environment(env, home)
+            if credential_runtime is not None:
+                # Restore only the validated placeholders and config after scrubbing.
                 env.update(credential_runtime.helper_env_updates)
                 # Materialize placeholder-only config files (e.g. a
                 # ``.databrickscfg`` listing proxied profiles with
@@ -622,11 +651,9 @@ class _HelperProcessClient:
                 # tool at them. No real secret is written to the sandbox.
                 _write_credential_proxy_files(env, credential_runtime.sandbox_files, self._tmpdir)
 
-        # Start L7 egress proxy if rules are configured. The proxy
-        # listens on a Unix socket in the scratch tmpdir; the helper
-        # starts a relay inside the network namespace that bridges
-        # loopback TCP to this socket.
-        if self._egress_rules and self._tmpdir is not None:
+        # Model inference always uses the relay; ordinary HTTP access needs rules.
+        # The helper bridges private loopback to the parent's Unix socket.
+        if (self._egress_rules or self._model_access is not None) and self._tmpdir is not None:
             sandbox = self._start_egress_proxy_locked(
                 sandbox,
                 env,
@@ -923,6 +950,7 @@ class _HelperProcessClient:
             config FD to pick up.
         """
 
+        from .claude_gateway_shim import gateway_body_transform
         from .egress import apply_egress_env, start_egress_proxy
 
         assert self._tmpdir is not None
@@ -939,6 +967,10 @@ class _HelperProcessClient:
             allow_private_destinations=self._egress_allow_private_destinations,
             require_auth=True,
             credential_rewrites=credential_rewrites,
+            model_access=self._model_access,
+            request_body_transform=gateway_body_transform(self._model_access.base_url)
+            if self._model_access is not None
+            else None,
         )
 
         # S4 (security): hold the controller refs on the client so
@@ -970,6 +1002,7 @@ class _HelperProcessClient:
 
         return replace(
             sandbox,
+            allow_network=False if self._model_access is not None else sandbox.allow_network,
             egress_relay_port=handle.relay_port,
             egress_socket_path=str(handle.socket_path),
         )
@@ -1010,6 +1043,9 @@ class CallerProcessOSEnvironment(OSEnvironment):
     _copy_on_write_environment: CopyOnWriteEnvironment | None = None
     _owns_copy_on_write: bool = False
     _relaunch_when_stale: bool = False
+
+    def isolate_model_credentials(self, access: ClaudeModelAccess) -> None:
+        self.sandbox = self._helper.isolate_model_credentials(access)
 
     @property
     def copy_on_write_environment(self) -> CopyOnWriteEnvironment | None:
@@ -1168,6 +1204,7 @@ def create_os_environment(
     sandbox_policy: SandboxPolicy | None = None,
     additional_read_roots: Sequence[Path] = (),
     relaunch_when_stale: bool = False,
+    model_access: ClaudeModelAccess | None = None,
 ) -> OSEnvironment | None:
     """Instantiate the configured OS environment.
 
@@ -1184,6 +1221,10 @@ def create_os_environment(
     cwd = Path(spec.cwd or os.getcwd()).resolve(strict=False)
     fork_dir: Path | None = None
     if spec.fork:
+        if model_access is not None:
+            original_policy = sandbox_policy or resolve_sandbox(spec, cwd)
+            if original_policy.active:
+                model_access.protect_sources(original_policy, cwd)
         fork_dir = Path(tempfile.mkdtemp(prefix="omnigent-fork-"))
         effective_cwd = fork_dir / "root"
         _copy_tree(cwd, effective_cwd)
@@ -1205,7 +1246,7 @@ def create_os_environment(
     egress_allow_private = (
         spec.sandbox.egress_allow_private_destinations if spec.sandbox else False
     )
-    return CallerProcessOSEnvironment(
+    environment = CallerProcessOSEnvironment(
         spec=spec,
         cwd=cwd,
         sandbox=sandbox,
@@ -1217,6 +1258,9 @@ def create_os_environment(
         _egress_allow_private_destinations=egress_allow_private,
         _relaunch_when_stale=relaunch_when_stale,
     )
+    if model_access is not None:
+        environment.isolate_model_credentials(model_access)
+    return environment
 
 
 def default_os_env_spec_for_type(env_type: str) -> OSEnvSpec:

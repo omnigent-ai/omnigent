@@ -44,6 +44,8 @@ if TYPE_CHECKING:
 
 from . import _proc
 from .agent_env import strip_desktop_session_env
+from .claude_gateway_shim import gateway_body_transform
+from .claude_model_access import ClaudeModelAccess
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from .egress import EgressProxyHandle, apply_egress_env, start_egress_proxy
 from .git_ssh import GitSshBroker, apply_git_ssh_env, start_git_ssh_broker
@@ -54,6 +56,7 @@ from .os_env import (
 )
 from .sandbox import (
     SandboxPolicy,
+    _default_sandbox_for_platform,
     cleanup_private_tmpdir,
     create_exec_launcher,
     create_private_tmpdir,
@@ -1081,6 +1084,8 @@ def build_terminal_os_env_spec(
             cwd=os.getcwd(),
             sandbox=OSEnvSandboxSpec(type="none"),
         )
+    elif effective_os_env_spec.sandbox is None:
+        effective_os_env_spec.sandbox = _default_sandbox_for_platform()
 
     if cwd_override is not None:
         if not spec.allow_cwd_override:
@@ -1206,6 +1211,7 @@ class TerminalInstance:
     # the policy into the launcher script.
     egress_rules: list[str] | None = None
     egress_allow_private_destinations: bool = False
+    model_access: ClaudeModelAccess | None = field(default=None, repr=False)
     scrollback: int = 10000
     tmux_allow_passthrough: bool = False
     tmux_start_on_attach: bool = False
@@ -1778,6 +1784,7 @@ class TerminalInstance:
         self._last_exit_status = None
         self._last_exit_signal = None
         effective_cwd = str(cwd or self.private_dir)
+        self.launch_cwd = effective_cwd
 
         try:
             launch_environment = self.lifecycle_trace.launch_environment(self.diagnostic_id)
@@ -1813,7 +1820,7 @@ class TerminalInstance:
         sandbox_for_launcher: SandboxPolicy | None = self.sandbox_policy
         if sandbox_for_launcher is not None and sandbox_for_launcher.active:
             env = strip_desktop_session_env(env)
-            if self.egress_rules:
+            if self.egress_rules or self.model_access is not None:
                 sandbox_for_launcher = self._bootstrap_egress_proxy(sandbox_for_launcher, env)
             if sandbox_for_launcher.git_ssh:
                 sandbox_for_launcher = self._bootstrap_git_ssh(sandbox_for_launcher, env)
@@ -2052,8 +2059,15 @@ class TerminalInstance:
             scratch tmpdir added to ``write_roots`` so bwrap
             bind-mounts it inside the namespace.
         """
-        assert self.egress_rules, "caller checked self.egress_rules"
+        assert self.egress_rules or self.model_access is not None
         self._egress_tmpdir = create_private_tmpdir()
+        if self.model_access is not None:
+            sandbox = self.model_access.protect_sources(
+                sandbox, Path(self.launch_cwd or os.getcwd())
+            )
+            home = self._egress_tmpdir / "home"
+            (home / ".claude").mkdir(parents=True)
+            self.model_access.worker_environment(env, home)
         # Add the scratch tmpdir to write_roots BEFORE encoding the
         # policy into the launcher. Without this, bwrap won't bind
         # the tmpdir into the namespace and the CA bundle /
@@ -2061,7 +2075,7 @@ class TerminalInstance:
         # be invisible.
         sandbox = with_additional_write_roots(sandbox, [self._egress_tmpdir])
         self._egress_handle = start_egress_proxy(
-            rules=self.egress_rules,
+            rules=self.egress_rules or [],
             tmpdir=self._egress_tmpdir,
             allow_private_destinations=self.egress_allow_private_destinations,
             # Terminal path uses ``require_auth=False``: tmux closes
@@ -2074,6 +2088,10 @@ class TerminalInstance:
             # still apply; see the controller's docstring for the
             # full trade-off discussion.
             require_auth=False,
+            model_access=self.model_access,
+            request_body_transform=gateway_body_transform(self.model_access.base_url)
+            if self.model_access is not None
+            else None,
         )
         apply_egress_env(
             env,
@@ -2083,6 +2101,7 @@ class TerminalInstance:
         )
         return replace(
             sandbox,
+            allow_network=False,
             egress_relay_port=self._egress_handle.relay_port,
             egress_socket_path=str(self._egress_handle.socket_path),
         )
@@ -3088,6 +3107,7 @@ def create_terminal_instance(
     cwd_override: str | None = None,
     sandbox_override: str | None = None,
     conversation_link: str | None = None,
+    model_access: ClaudeModelAccess | None = None,
 ) -> TerminalCreateResult:
     """Create a terminal instance from a spec.
 
@@ -3113,6 +3133,8 @@ def create_terminal_instance(
         one of ``"none"`` or ``"linux_bwrap"``.
     :param conversation_link: Optional web UI link for the owning
         conversation, e.g. ``"/c/conv_abc123"``.
+    :param model_access: Parent-owned model authority used to validate the
+        original fork source before copying any files.
     :returns: A :class:`TerminalCreateResult` carrying the new instance
         and the resolved cwd to pass to ``launch()``.
     """
@@ -3124,14 +3146,6 @@ def create_terminal_instance(
         )
     _require_supported_tmux()
 
-    # Create the instance's private directory.
-    private_dir = Path(tempfile.mkdtemp(prefix=_TERMINAL_DIR_PREFIX))
-    socket_path = private_dir / "tmux.sock"
-    # Record the owning process so a later startup can reap this tmux
-    # server if we die without graceful shutdown (SIGKILL, harness
-    # teardown) — see ``reap_orphaned_terminals``.
-    owner_claim.write_owner_claim(private_dir)
-
     # Resolve os_env spec.  If none specified, inherit from parent.
     effective_os_env_spec = build_terminal_os_env_spec(
         spec,
@@ -3139,15 +3153,33 @@ def create_terminal_instance(
         cwd_override=cwd_override,
         sandbox_override=sandbox_override,
     )
+    source_cwd = Path(effective_os_env_spec.cwd or os.getcwd()).resolve()
+    if (
+        effective_os_env_spec.fork
+        and model_access is not None
+        and effective_os_env_spec.sandbox is not None
+        and effective_os_env_spec.sandbox.type != "none"
+    ):
+        source_policy = resolve_sandbox(effective_os_env_spec, source_cwd)
+        if source_policy.active:
+            try:
+                model_access.protect_sources(source_policy, source_cwd)
+            except ValueError as exc:
+                raise RuntimeError(f"terminal model access rejected: {exc}") from exc
+
+    # Validate the fork source before allocating or populating its private tree.
+    private_dir = Path(tempfile.mkdtemp(prefix=_TERMINAL_DIR_PREFIX))
+    socket_path = private_dir / "tmux.sock"
+    # The owner claim lets startup reap a tmux server after an abrupt parent exit.
+    owner_claim.write_owner_claim(private_dir)
 
     os_env: OSEnvironment | None = None
     cwd: Path
 
     if effective_os_env_spec.fork:
         # Copy the directory tree for fork isolation.
-        src_cwd = Path(effective_os_env_spec.cwd or os.getcwd()).resolve()
         fork_root = private_dir / "root"
-        _copy_tree(src_cwd, fork_root)
+        _copy_tree(source_cwd, fork_root)
         cwd = fork_root
 
         # Create an os_env pointing at the fork for mount support.
@@ -3160,7 +3192,7 @@ def create_terminal_instance(
         )
         os_env = create_os_environment(forked_spec)
     else:
-        cwd = Path(effective_os_env_spec.cwd or os.getcwd()).resolve()
+        cwd = source_cwd
         inherited_policy = None
         if parent_environment is not None and (spec.os_env is None or spec.os_env == "inherit"):
             inherited_policy = getattr(parent_environment, "sandbox", None)
@@ -3208,7 +3240,7 @@ def create_terminal_instance(
         # on the spec; resolved state on the policy).
         if sandbox_spec.egress_rules:
             egress_rules = list(sandbox_spec.egress_rules)
-            egress_allow_private = bool(sandbox_spec.egress_allow_private_destinations)
+        egress_allow_private = bool(sandbox_spec.egress_allow_private_destinations)
 
     instance = TerminalInstance(
         name=name,

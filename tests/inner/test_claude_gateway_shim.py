@@ -19,6 +19,7 @@ import uvicorn
 
 from omnigent.inner.claude_gateway_shim import (
     ClaudeGatewayShim,
+    gateway_body_transform,
     restore_thinking_display,
 )
 
@@ -114,6 +115,29 @@ def test_restore_passes_through_unparseable_bodies(body: bytes) -> None:
 
 
 # ── shim integration tests (real local upstream) ──────────
+
+
+@pytest.mark.parametrize(
+    "method,host,port,path,patched",
+    [
+        ("POST", "gateway.example", 8443, "/anthropic/v1/messages", True),
+        ("POST", "gateway.example", 8443, "/anthropic/v1/messages?beta=true", True),
+        ("GET", "gateway.example", 8443, "/anthropic/v1/messages", False),
+        ("POST", "other.example", 8443, "/anthropic/v1/messages", False),
+        ("POST", "gateway.example", 443, "/anthropic/v1/messages", False),
+        ("POST", "gateway.example", 8443, "/v1/messages", False),
+    ],
+)
+def test_egress_gateway_patch_is_scoped_to_the_model_endpoint(
+    method: str, host: str, port: int, path: str, patched: bool
+) -> None:
+    body = _body("databricks-claude-opus-4-8", {"type": "adaptive"})
+    transform = gateway_body_transform("https://gateway.example:8443/anthropic/")
+    result = transform(method, host, port, path, body)
+    if patched:
+        assert json.loads(result)["thinking"]["display"] == "summarized"
+    else:
+        assert result == body
 
 
 @dataclass

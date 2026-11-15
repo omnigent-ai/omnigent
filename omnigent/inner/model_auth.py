@@ -9,13 +9,17 @@ import re
 import shutil
 import stat
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport, terminate_subprocess
 from .egress.rules import is_dns_safe_host
+
+if TYPE_CHECKING:
+    from .sandbox import SandboxPolicy
 
 PROVIDER_AUTH_REQUIRED = "PROVIDER_AUTH_REQUIRED"
 
@@ -51,6 +55,7 @@ class ProviderAuthRequired(RuntimeError):
 class _TrustedExecutable:
     path: Path
     identity: tuple[int, int]
+    interpreter: Path | None = None
 
 
 def _validated_authority(host: str, profile: str) -> tuple[str, str]:
@@ -109,7 +114,7 @@ def _is_beneath(path: Path, parent: Path) -> bool:
     return True
 
 
-def _resolve_ucode_executable() -> _TrustedExecutable:
+def _resolve_auth_executable() -> _TrustedExecutable:
     candidate = shutil.which("ucode")
     if candidate is None:
         raise FileNotFoundError("trusted ucode executable is unavailable")
@@ -141,8 +146,63 @@ def _resolve_ucode_executable() -> _TrustedExecutable:
     return _TrustedExecutable(path=resolved, identity=(info.st_dev, info.st_ino))
 
 
-def _ucode_auth_token_argv(executable: Path, *, host: str, profile: str) -> list[str]:
-    """Build the fixed argv supported by ucode's hidden auth-token command."""
+def _pin_auth_python_runtime(executable: _TrustedExecutable) -> _TrustedExecutable:
+    """Pin a supported interpreter without executing the credential helper."""
+    with executable.path.open("rb") as source:
+        shebang = source.readline(4096).decode("utf-8", errors="replace").strip()
+    words = shebang[2:].split() if shebang.startswith("#!") else []
+    if (
+        len(words) != 1
+        or not Path(words[0]).is_absolute()
+        or re.fullmatch(r"python(?:3(?:\.\d+)?)?", Path(words[0]).name) is None
+    ):
+        raise ValueError("profile authentication requires an absolute Python interpreter shebang")
+    interpreter = Path(words[0])
+    _validate_provenance_chain(interpreter.parent)
+    with interpreter.open("rb") as source:
+        if source.read(2) == b"#!":
+            raise ValueError("profile authentication requires a native Python interpreter")
+    return replace(executable, interpreter=interpreter)
+
+
+def _validate_auth_runtime(executable: _TrustedExecutable, policy: SandboxPolicy) -> None:
+    """Reject grants that can replace helper code or either Python startup runtime."""
+    from .sandbox import (
+        _isolated_launcher_import_roots,
+        _launcher_path_variants,
+        _validate_launcher_runtime,
+        _validate_launcher_write_grants,
+    )
+
+    entries = _launcher_path_variants(executable.path)
+    trees: set[Path] = set()
+    if executable.interpreter is None:
+        raise ValueError("profile authentication requires a pinned Python runtime")
+    for interpreter in _launcher_path_variants(executable.interpreter):
+        entries.add(interpreter)
+        entries.add(interpreter.parent / "pyvenv.cfg")
+        entries.add(interpreter.parent.parent / "pyvenv.cfg")
+        trees.update(interpreter.parent.parent / name for name in ("lib", "lib64"))
+    entries = {variant for path in entries for variant in _launcher_path_variants(path)}
+    trees = {variant for path in trees for variant in _launcher_path_variants(path)}
+    try:
+        _validate_launcher_write_grants(policy, entries, trees)
+        # The liveness supervisor also starts Python in the trusted parent.
+        _validate_launcher_runtime(policy)
+        roots = _isolated_launcher_import_roots(str(executable.interpreter))
+        _validate_launcher_write_grants(
+            policy,
+            set(),
+            {variant for root in roots for variant in _launcher_path_variants(root)},
+        )
+    except OSError as exc:
+        raise ValueError(
+            "model auth executable and runtime must stay outside sandbox-writable paths"
+        ) from exc
+
+
+def _profile_token_argv(executable: Path, *, host: str, profile: str) -> list[str]:
+    """Build the fixed argv for the profile token authentication command."""
     host, profile = _validated_authority(host, profile)
     return [
         str(executable),
@@ -155,7 +215,7 @@ def _ucode_auth_token_argv(executable: Path, *, host: str, profile: str) -> list
     ]
 
 
-def _ucode_env() -> dict[str, str]:
+def _auth_env(config_file: Path | None = None) -> dict[str, str]:
     env = {
         name: value
         for name in ("HOME", "PATH", "LANG", "LC_ALL", "TZ")
@@ -164,6 +224,8 @@ def _ucode_env() -> dict[str, str]:
     # requests honors NETRC. Pointing it at the null device prevents implicit
     # ~/.netrc discovery while retaining HOME for Databricks CLI credentials.
     env["NETRC"] = os.devnull
+    if config_file is not None:
+        env["DATABRICKS_CONFIG_FILE"] = str(config_file)
     return env
 
 
@@ -193,24 +255,33 @@ def _parse_token(stdout: bytes, returncode: int | None) -> str:
     return token_bytes.decode("ascii")
 
 
-async def mint_ucode_token(*, host: str, profile: str) -> str:
+async def mint_profile_token(
+    *,
+    host: str,
+    profile: str,
+    _executable: _TrustedExecutable | None = None,
+    _config_file: Path | None = None,
+) -> str:
     """Mint one opaque credential without accepting a command or a shell."""
     host, profile = _validated_authority(host, profile)
     proc: asyncio.subprocess.Process | None = None
     liveness_read_fd: int | None = None
     liveness_write_fd: int | None = None
     try:
-        executable = _resolve_ucode_executable()
+        executable = _executable or _resolve_auth_executable()
         current = executable.path.stat()
         if (current.st_dev, current.st_ino) != executable.identity:
             raise PermissionError("trusted ucode executable changed before launch")
-        helper_argv = _ucode_auth_token_argv(executable.path, host=host, profile=profile)
+        helper_argv = _profile_token_argv(executable.path, host=host, profile=profile)
+        if executable.interpreter is not None:
+            helper_argv = [str(executable.interpreter), "-I", *helper_argv]
         pass_fds: tuple[int, ...] = ()
         if os.name == "posix":
             liveness_read_fd, liveness_write_fd = os.pipe()
             os.set_inheritable(liveness_read_fd, True)
             helper_argv = [
                 sys.executable,
+                "-I",
                 str(Path(__file__).with_name("_liveness_exec.py")),
                 "--liveness-fd",
                 str(liveness_read_fd),
@@ -222,7 +293,7 @@ async def mint_ucode_token(*, host: str, profile: str) -> str:
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
-            env=_ucode_env(),
+            env=_auth_env(_config_file),
             pass_fds=pass_fds,
             **_proc.spawn_kwargs(),
         )

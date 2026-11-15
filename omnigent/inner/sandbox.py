@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import base64
+import importlib.util
 import json
 import logging
 import os
 import shlex
 import shutil
+import site
+import stat
 import subprocess
 import sys
+import sysconfig
 import tempfile
 from abc import ABC, abstractmethod
-from collections.abc import MutableMapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -51,6 +57,7 @@ _LAUNCHER_WRAPPED_ENV = "OMNIGENT_LAUNCHER_SPAWN_WRAPPED"
 # dir the host pass created, so cleanup can never touch a spec-supplied
 # write root that merely happens to sit under the system tempdir.
 _LAUNCHER_PRIVATE_TMPDIR_ENV = "OMNIGENT_LAUNCHER_SPAWN_PRIVATE_TMPDIR"
+_LAUNCHER_ENV_MARKER = "# omnigent-launcher-env-v1:"
 
 # Trusted outer-launcher hint consumed before sandbox environment filtering.
 # Active sandbox helpers and launcher targets strip it; unsandboxed children keep it.
@@ -206,18 +213,8 @@ class SandboxPolicy:
     credential_proxy: CredentialProxySpec | None = None
     git_ssh: list[GitSshBinding] | None = None
     tcp_egress: list[TcpEgressRoute] | None = None
-    # Parent-side only: write roots the dotfile / escaping-symlink mask
-    # scan must NOT walk. Framework code adds the sandbox's own runtime
-    # scaffolding to ``write_roots`` via
-    # :func:`with_additional_write_roots` (the per-helper scratch tmpdir
-    # holding the egress ``.egress.sock``, the CA bundle, credential-proxy
-    # files, harness state dirs). Those are created fresh by the framework
-    # and never hold pre-existing user secrets, so scanning them is
-    # pointless — and actively harmful: the scan would ``--bind-try
-    # /dev/null`` the dotfile ``.egress.sock``, breaking the egress relay.
-    # Every root recorded here is dropped from the scan set (along with
-    # anything nested under it). Built parent-side during arg emission;
-    # like ``credential_proxy`` it is intentionally NOT serialised.
+    # Framework scratch roots must survive launcher serialization without
+    # masking their private runtime files, including the egress socket.
     mask_scan_skip_roots: list[Path] | None = None
 
     def to_jsonable(self) -> dict[str, JsonValue]:
@@ -272,6 +269,7 @@ class SandboxPolicy:
                 if self.credential_source_paths is not None
                 else None
             ),
+            "mask_scan_skip_roots": _json_string_list(self.mask_scan_skip_roots or []),
         }
         return result
 
@@ -342,6 +340,11 @@ class SandboxPolicy:
             if isinstance(credential_source_paths_data, list)
             else None
         )
+        mask_scan_skip_data = data.get("mask_scan_skip_roots", [])
+        if not isinstance(mask_scan_skip_data, list) or any(
+            not isinstance(path, str) for path in mask_scan_skip_data
+        ):
+            raise ValueError("Invalid mask_scan_skip_roots")
         cow_roots = data.get("copy_on_write_roots", [])
         if not isinstance(cow_roots, list) or any(not isinstance(p, str) for p in cow_roots):
             raise ValueError("Invalid copy_on_write_roots")
@@ -374,6 +377,7 @@ class SandboxPolicy:
             tcp_egress_socket_path=tcp_egress_socket_path,
             deny_unix_socket_paths=deny_unix_socket_paths,
             credential_source_paths=credential_source_paths,
+            mask_scan_skip_roots=[Path(str(path)) for path in mask_scan_skip_data] or None,
         )
 
 
@@ -665,7 +669,7 @@ def protect_credential_source(
                 raise ValueError("refresh source must stay outside sandbox-writable paths")
             if any(candidate.is_relative_to(root) for root in read_roots):
                 raise ValueError("refresh source must stay outside sandbox-readable paths")
-    if path.exists() and path.stat().st_nlink != 1:
+    if path.exists() and not path.is_dir() and path.stat().st_nlink != 1:
         raise ValueError("refresh source must not be hard-linked")
     canonical = path.resolve()
     if sandbox.credential_source_paths is None:
@@ -1174,7 +1178,12 @@ def cleanup_private_tmpdir(tmpdir: Path | None) -> None:
 
 
 def run_launcher(
-    encoded_sandbox: str, target_path: str, argv: list[str], *, cwd: str | None = None
+    encoded_sandbox: str,
+    target_path: str,
+    argv: list[str],
+    *,
+    cwd: str | None = None,
+    env_overrides: Mapping[str, str] | None = None,
 ) -> int:
     """
     Activate the sandbox and exec the wrapped target inside it.
@@ -1196,6 +1205,8 @@ def run_launcher(
         inside the sandbox, e.g. ``"/usr/bin/python3"``.
     :param argv: Arguments passed to *target_path* (the launcher's own
         ``sys.argv[1:]``).
+    :param env_overrides: Sanitized per-launch values applied after environment
+        pruning. These must contain placeholders rather than host credentials.
     :returns: The target process's exit code.
     :raises ValueError: If *encoded_sandbox* does not decode to a dict.
     """
@@ -1208,8 +1219,7 @@ def run_launcher(
     decoded = _decode_json_arg(encoded_sandbox)
     if not isinstance(decoded, dict):
         raise ValueError("Invalid launcher sandbox payload")
-    # The JSON policy omits parent-owned mask exemptions; recover the
-    # broker dirs before bwrap scans dotfiles and hides their sockets.
+    # Restore broker exemptions for older launcher payloads before dotfile scans.
     sandbox = _restore_broker_socket_roots(SandboxPolicy.from_jsonable(decoded))
 
     # Older launcher payloads may not have frozen host-local choices. Resolve
@@ -1221,13 +1231,20 @@ def run_launcher(
     ):
         sandbox = get_backend(sandbox.backend_type).prepare_launcher_policy(sandbox)
 
-    # Unsandboxed children may launch their own runner and still need the hint.
-    if sandbox.active:
-        os.environ.pop(HOST_SANDBOX_BACKEND_ENV, None)
-
     # Before any wrap / exec so neither the re-exec'd launcher nor the target
     # can see env vars the spawner didn't deliberately pass.
     _prune_environ_to_spawn_allowlist(sandbox)
+    if env_overrides is not None:
+        os.environ.update(env_overrides)
+        if sandbox.spawn_env_allowlist is not None:
+            # Re-exec inherits sanitized values; only their names enter the policy.
+            sandbox = with_spawn_env_allowlist(
+                sandbox, [*sandbox.spawn_env_allowlist, *env_overrides]
+            )
+
+    # Unsandboxed children may launch their own runner and still need the hint.
+    if sandbox.active:
+        os.environ.pop(HOST_SANDBOX_BACKEND_ENV, None)
 
     # Spawn-time wrap re-exec for backends whose sandbox enforcement
     # is installed by the spawning process (``bwrap`` /
@@ -1265,9 +1282,11 @@ def run_launcher(
         # seatbelt (bwrap masked it via its ``--tmpfs /tmp`` fallback).
         host_tmpdir = create_private_tmpdir()
         try:
+            # Editable installs need the framework package inside the mount
+            # namespace so the re-executed launcher can import itself.
+            sandbox = with_additional_read_roots(sandbox, [Path(__file__).resolve().parents[1]])
             sandbox = with_additional_write_roots(sandbox, [host_tmpdir])
             set_sandbox_env(os.environ, host_tmpdir)
-            encoded_sandbox = _encode_json_arg(sandbox.to_jsonable())
             # Name the dir for the in-wrap pass: it adopts this exact
             # path (no second mint) and owns the cleanup on exit.
             os.environ[_LAUNCHER_PRIVATE_TMPDIR_ENV] = str(host_tmpdir)
@@ -1286,17 +1305,8 @@ def run_launcher(
             # The inline carries the RE-ENCODED policy so the in-wrap
             # pass decodes the same granted scratch root the profile
             # was built from.
-            project_root = repr(str(_project_root()))
-            inline = (
-                "import sys; "
-                f"sys.path.insert(0, {project_root}); "
-                "from omnigent.inner.sandbox import run_launcher; "
-                f"raise SystemExit(run_launcher({encoded_sandbox!r}, "
-                f"{target_path!r}, sys.argv[1:]))"
-            )
-            # -P keeps the wrap's cwd (the workspace) off sys.path, as in
-            # the host-side launcher script.
-            launcher_argv = [sys.executable, "-P", "-c", inline, *argv]
+            inline = _launcher_inline_source(target_path, sandbox, cwd=cwd)
+            launcher_argv = [sys.executable, "-I", "-c", inline, *argv]
             wrapped = list(
                 backend.wrap_launcher_argv(
                     launcher_argv,
@@ -1379,8 +1389,36 @@ def run_launcher(
         cleanup_private_tmpdir(tmpdir)
 
 
+def _read_launcher_env_overrides(path: str) -> dict[str, str]:
+    """Load the snapshot from the private launcher, never from process arguments."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    with os.fdopen(os.open(path, flags), encoding="utf-8") as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode) or (
+            os.name != "nt" and (info.st_uid != os.getuid() or info.st_mode & 0o077)
+        ):
+            raise OSError("Sandbox launcher environment snapshot must be an owner-only file")
+        payloads = [
+            line[len(_LAUNCHER_ENV_MARKER) :].strip()
+            for line in source
+            if line.startswith(_LAUNCHER_ENV_MARKER)
+        ]
+    if len(payloads) != 1:
+        raise ValueError("Invalid sandbox launcher environment snapshot")
+    decoded = _decode_json_arg(payloads[0])
+    if not isinstance(decoded, dict) or any(
+        not isinstance(value, str) for value in decoded.values()
+    ):
+        raise ValueError("Invalid sandbox launcher environment snapshot")
+    return cast(dict[str, str], decoded)
+
+
 def _launcher_inline_source(
-    target_path: str, sandbox: SandboxPolicy, *, cwd: str | None = None
+    target_path: str,
+    sandbox: SandboxPolicy,
+    *,
+    cwd: str | None = None,
+    env_overrides_path: str | None = None,
 ) -> str:
     """Build the ``python -c`` program the exec launcher runs.
 
@@ -1388,17 +1426,149 @@ def _launcher_inline_source(
     project root goes on ``sys.path`` so the import works from any cwd.
     """
     encoded = _encode_json_arg(sandbox.to_jsonable())
+    overrides = (
+        f"_read_launcher_env_overrides({env_overrides_path!r})"
+        if env_overrides_path is not None
+        else "None"
+    )
     return (
         "import logging, sys; "
         f"sys.path.insert(0, {str(_project_root())!r}); "
         "logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stderr); "
-        "from omnigent.inner.sandbox import run_launcher; "
-        f"raise SystemExit(run_launcher({encoded!r}, {target_path!r}, sys.argv[1:], cwd={cwd!r}))"
+        "from omnigent.inner.sandbox import run_launcher, _read_launcher_env_overrides; "
+        f"raise SystemExit(run_launcher({encoded!r}, {target_path!r}, sys.argv[1:], "
+        f"cwd={cwd!r}, env_overrides={overrides}))"
     )
 
 
+def _launcher_path_variants(path: Path) -> set[Path]:
+    """Keep lexical names and every symlink hop that can redirect startup."""
+    current = path.absolute()
+    variants = {current, current.resolve()}
+    for _ in range(40):
+        for entry in [*reversed(current.parents), current]:
+            if entry.is_symlink():
+                target = entry.readlink()
+                if not target.is_absolute():
+                    target = entry.parent / target
+                current = target / current.relative_to(entry)
+                variants.add(current)
+                break
+        else:
+            return variants
+    raise OSError(f"Cannot validate sandbox launcher symlink chain: {path}")
+
+
+@lru_cache(maxsize=32)
+def _isolated_launcher_import_roots(interpreter: str) -> tuple[Path, ...]:
+    """Snapshot startup imports before any contained process can modify them."""
+    program = """
+import json, os, sys
+paths = []
+for path in sys.path:
+    if os.path.isabs(path):
+        paths.append(path)
+    else:
+        finder = sys.path_importer_cache.get(path)
+        if not (isinstance(finder, type)
+                and finder.__module__.startswith('__editable__')
+                and finder.__name__ == '_EditableNamespaceFinder'):
+            raise ValueError('unsupported relative isolated startup import root')
+print(json.dumps(paths))
+"""
+    try:
+        completed = subprocess.run(
+            [interpreter, "-I", "-c", program],
+            cwd=os.path.abspath(os.sep),
+            env={"PATH": os.defpath},
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        paths = json.loads(completed.stdout)
+        if (
+            not isinstance(paths, list)
+            or not paths
+            or any(not isinstance(path, str) or not Path(path).is_absolute() for path in paths)
+        ):
+            raise ValueError("invalid isolated startup import roots")
+        return tuple(Path(path) for path in paths)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        raise OSError("Cannot validate sandbox launcher isolated startup imports") from None
+
+
+def _validate_launcher_write_grants(
+    sandbox: SandboxPolicy, entries: set[Path], trees: set[Path]
+) -> None:
+    for grant in [*sandbox.write_roots, *sandbox.write_files]:
+        for writable in _launcher_path_variants(grant):
+            for trusted in entries | trees:
+                if trusted.is_relative_to(writable) or (
+                    trusted in trees and writable.is_relative_to(trusted)
+                ):
+                    raise OSError(
+                        f"Cannot build sandbox exec launcher: write grant {str(grant)!r} "
+                        f"conflicts with trusted launcher runtime {str(trusted)!r}. "
+                        "The interpreter, runtime libraries, and framework imports must "
+                        "be outside sandbox write grants; run Omnigent from a separate "
+                        "read-only installation (including its venv)."
+                    )
+
+
+def _validate_launcher_runtime(sandbox: SandboxPolicy) -> None:
+    """Reject writes to code or startup configuration used before containment."""
+    if not sandbox.active or sandbox.backend_type not in _SPAWN_WRAP_BACKENDS:
+        return
+
+    # Prefixes are replacement-sensitive entries, not writable subtrees:
+    # /usr/local/workspace is safe when the interpreter prefix is /usr/local.
+    entries = {
+        Path(sys.prefix),
+        Path(sys.base_prefix),
+        Path(sys.exec_prefix),
+        Path(sys.base_exec_prefix),
+    }
+    trees = {Path(__file__).absolute().parents[2], _project_root()}
+    for prefix in list(entries):
+        entries.add(prefix / "pyvenv.cfg")
+        trees.update(prefix / name for name in ("lib", "lib64", "Lib", "DLLs"))
+    for executable in _launcher_path_variants(Path(sys.executable)):
+        entries.add(executable)
+        entries.add(executable.parent / "pyvenv.cfg")
+        entries.add(executable.parent.parent / "pyvenv.cfg")
+        trees.add(executable.parent.parent / "lib")
+
+    paths = sysconfig.get_paths()
+    trees.update(Path(paths[key]) for key in ("stdlib", "platstdlib", "purelib", "platlib"))
+    trees.update(Path(path) for path in site.getsitepackages())
+    # copy_on_write imports _proc (and psutil) before the spawn-time wrap.
+    dependency = importlib.util.find_spec("psutil")
+    if dependency is None or dependency.origin is None:
+        raise OSError("Cannot validate sandbox launcher runtime: psutil has no import path")
+    entries.add(Path(dependency.origin))
+    trees.update(Path(path) for path in dependency.submodule_search_locations or [])
+
+    trusted_entries = {variant for path in entries for variant in _launcher_path_variants(path)}
+    trusted_trees = {variant for path in trees for variant in _launcher_path_variants(path)}
+    # Reject mutable interpreter/site files before running the startup probe.
+    _validate_launcher_write_grants(sandbox, trusted_entries, trusted_trees)
+    # The parent may add workspaces to sys.path. Only isolated startup roots,
+    # including .pth additions, are imported by the launcher before containment.
+    isolated_trees = {
+        variant
+        for path in _isolated_launcher_import_roots(sys.executable)
+        for variant in _launcher_path_variants(path)
+    }
+    _validate_launcher_write_grants(sandbox, set(), isolated_trees)
+
+
 def create_exec_launcher(
-    target_path: str, sandbox: SandboxPolicy, *, cwd: str | None = None
+    target_path: str,
+    sandbox: SandboxPolicy,
+    *,
+    cwd: str | None = None,
+    env_overrides: Mapping[str, str] | None = None,
 ) -> str:
     """Write an executable launcher that runs ``target_path`` inside ``sandbox``.
 
@@ -1409,9 +1579,11 @@ def create_exec_launcher(
 
     :param target_path: The real binary the launcher ultimately spawns.
     :param sandbox: Policy baked into the launcher and applied before the spawn.
+    :param env_overrides: Snapshot of sanitized per-launch values, stored only
+        in the private script. Supply placeholders only, never host credentials.
     :returns: Path to the launcher script; the caller owns deleting it.
-    :raises OSError: If the running interpreter cannot be named in the
-        launcher, which would produce an unrunnable script.
+    :raises OSError: If the interpreter cannot be named or write grants could
+        poison the launcher's trusted runtime before containment.
     :raises ValueError: If a write grant includes the launcher directory.
     """
     if sandbox.tcp_egress and sandbox.tcp_egress_socket_path is None:
@@ -1428,7 +1600,6 @@ def create_exec_launcher(
             # Path-based spawners may filter the launcher environment. Freeze
             # host-local choices here, immediately before encoding the policy.
             sandbox = get_backend(sandbox.backend_type).prepare_launcher_policy(sandbox)
-    inline = _launcher_inline_source(target_path, sandbox, cwd=cwd)
     interpreter = sys.executable
     if not interpreter:
         raise OSError(
@@ -1437,26 +1608,39 @@ def create_exec_launcher(
             "regular Python installation, or disable the CLI sandbox wrap."
         )
 
-    if os.name == "nt":
-        # Windows resolves ``.py`` through PATHEXT; keep the ``#!`` line so
-        # the ``py`` launcher (a common .py association) picks the *current*
-        # interpreter rather than the machine default.
-        fd, path = tempfile.mkstemp(prefix="omnigent-sandbox-", suffix=".py", dir=launcher_dir)
-        script = f"#!{interpreter}\n{inline}\n"
-    else:
-        # ``/bin/sh`` is the only interpreter guaranteed to be a native
-        # executable. Naming ``sys.executable`` in a shebang instead
-        # breaks whenever it is a wrapper script, sits behind a path
-        # too long for the kernel's shebang buffer, or contains spaces —
-        # each of which surfaces as an opaque ENOEXEC from the spawner.
-        # Spawners usually run it from the agent workspace. -P keeps that cwd
-        # off sys.path but, unlike -I, still honours the runtime's PYTHONPATH.
-        fd, path = tempfile.mkstemp(prefix="omnigent-sandbox-", suffix=".sh", dir=launcher_dir)
-        script = f'#!/bin/sh\nexec {shlex.quote(interpreter)} -P -c {shlex.quote(inline)} "$@"\n'
-
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(script)
-    os.chmod(path, 0o700)
+    _validate_launcher_runtime(sandbox)
+    suffix = ".py" if os.name == "nt" else ".sh"
+    fd, path = tempfile.mkstemp(prefix="omnigent-sandbox-", suffix=suffix, dir=launcher_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            if sandbox.active:
+                _validate_launcher_write_grants(
+                    sandbox, _launcher_path_variants(Path(path)), set()
+                )
+            inline = (
+                _launcher_inline_source(target_path, sandbox, cwd=cwd, env_overrides_path=path)
+                if env_overrides is not None
+                else _launcher_inline_source(target_path, sandbox, cwd=cwd)
+            )
+            if os.name == "nt":
+                # The py launcher selects this interpreter through the shebang.
+                script = f"#!{interpreter} -I\n{inline}\n"
+            else:
+                # A native shell shebang also supports Python wrapper scripts
+                # and interpreter paths containing spaces.
+                script = (
+                    f"#!/bin/sh\nexec {shlex.quote(interpreter)} -I -c "
+                    f'{shlex.quote(inline)} "$@"\n'
+                )
+            if env_overrides is not None:
+                snapshot = _encode_json_arg(cast(JsonValue, dict(env_overrides)))
+                script += f"{_LAUNCHER_ENV_MARKER}{snapshot}\n"
+            fh.write(script)
+        os.chmod(path, 0o700)
+    except BaseException:
+        with suppress(OSError):
+            os.unlink(path)
+        raise
     return path
 
 

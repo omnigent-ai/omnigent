@@ -13,10 +13,10 @@ from omnigent.inner._proc import process_alive
 from omnigent.inner.model_auth import (
     PROVIDER_AUTH_REQUIRED,
     ProviderAuthRequired,
-    _resolve_ucode_executable,
+    _profile_token_argv,
+    _resolve_auth_executable,
     _TrustedExecutable,
-    _ucode_auth_token_argv,
-    mint_ucode_token,
+    mint_profile_token,
 )
 
 _HOST = "https://workspace.cloud.databricks.com"
@@ -32,7 +32,7 @@ def _write_ucode(path: Path, body: str) -> Path:
 def test_ucode_argv_is_fixed_and_contains_only_validated_authority(tmp_path: Path) -> None:
     executable = _write_ucode(tmp_path / "ucode", "exit 0\n").resolve()
 
-    assert _ucode_auth_token_argv(executable, host=_HOST, profile=_PROFILE) == [
+    assert _profile_token_argv(executable, host=_HOST, profile=_PROFILE) == [
         str(executable),
         "auth-token",
         "--host",
@@ -54,7 +54,7 @@ def test_ucode_resolution_rejects_writable_parent(
     monkeypatch.setenv("PATH", str(unsafe_bin))
 
     with pytest.raises(PermissionError, match="unsafe"):
-        _resolve_ucode_executable()
+        _resolve_auth_executable()
 
 
 def test_ucode_resolution_rejects_unsafe_symlink_chain(
@@ -72,7 +72,7 @@ def test_ucode_resolution_rejects_unsafe_symlink_chain(
     monkeypatch.setenv("PATH", str(unsafe_links))
 
     with pytest.raises(PermissionError, match="unsafe"):
-        _resolve_ucode_executable()
+        _resolve_auth_executable()
 
 
 async def test_ucode_replacement_after_validation_fails_before_exec(
@@ -81,7 +81,7 @@ async def test_ucode_replacement_after_validation_fails_before_exec(
 ) -> None:
     executable = _write_ucode(tmp_path / "ucode", "printf 'first-token\\n'\n")
     monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}/usr/bin:/bin")
-    original_resolve = _resolve_ucode_executable
+    original_resolve = _resolve_auth_executable
 
     def _resolve_then_replace() -> _TrustedExecutable:
         resolved = original_resolve()
@@ -90,11 +90,11 @@ async def test_ucode_replacement_after_validation_fails_before_exec(
         return resolved
 
     monkeypatch.setattr(
-        "omnigent.inner.model_auth._resolve_ucode_executable", _resolve_then_replace
+        "omnigent.inner.model_auth._resolve_auth_executable", _resolve_then_replace
     )
 
     with pytest.raises(ProviderAuthRequired):
-        await mint_ucode_token(host=_HOST, profile=_PROFILE)
+        await mint_profile_token(host=_HOST, profile=_PROFILE)
 
 
 @pytest.mark.parametrize(
@@ -118,7 +118,7 @@ async def test_ucode_adapter_rejects_untrusted_host_and_profile(
     monkeypatch.setenv("PATH", str(tmp_path))
 
     with pytest.raises(ValueError):
-        await mint_ucode_token(host=host, profile=profile)
+        await mint_profile_token(host=host, profile=profile)
 
 
 async def test_ucode_adapter_uses_hermetic_environment_and_fixed_argv(
@@ -149,10 +149,11 @@ printf 'opaque-token-value\\n'
         "SSL_CERT_DIR",
         "CURL_HOME",
         "COOKIE",
+        "DATABRICKS_CONFIG_FILE",
     ):
         monkeypatch.setenv(name, "attacker-controlled")
 
-    assert await mint_ucode_token(host=_HOST, profile=_PROFILE) == "opaque-token-value"
+    assert await mint_profile_token(host=_HOST, profile=_PROFILE) == "opaque-token-value"
     assert args_file.read_text(encoding="utf-8").splitlines() == [
         "auth-token",
         "--host",
@@ -181,7 +182,7 @@ async def test_ucode_helper_gets_an_owned_process_group(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
 
-    assert await mint_ucode_token(host=_HOST, profile=_PROFILE) == "opaque-token-value"
+    assert await mint_profile_token(host=_HOST, profile=_PROFILE) == "opaque-token-value"
     if os.name == "posix":
         assert observed_kwargs["start_new_session"] is True
     else:
@@ -199,7 +200,7 @@ async def test_cancelled_ucode_mint_terminates_helper(
     )
     monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}/usr/bin:/bin")
 
-    mint = asyncio.create_task(mint_ucode_token(host=_HOST, profile=_PROFILE))
+    mint = asyncio.create_task(mint_profile_token(host=_HOST, profile=_PROFILE))
     while not started.exists():
         await asyncio.sleep(0)
     mint.cancel()
@@ -223,7 +224,7 @@ async def test_nonzero_helper_leader_exit_does_not_leave_descendants(
     monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}/usr/bin:/bin")
 
     with pytest.raises(ProviderAuthRequired):
-        await mint_ucode_token(host=_HOST, profile=_PROFILE)
+        await mint_profile_token(host=_HOST, profile=_PROFILE)
 
     child_pid = int(child_pid_path.read_text(encoding="utf-8"))
     for _ in range(100):
@@ -257,7 +258,7 @@ async def test_ucode_adapter_rejects_noncanonical_stdout(
     monkeypatch.setenv("PATH", str(tmp_path))
 
     with pytest.raises(ProviderAuthRequired) as raised:
-        await mint_ucode_token(host=_HOST, profile=_PROFILE)
+        await mint_profile_token(host=_HOST, profile=_PROFILE)
 
     assert raised.value.code == PROVIDER_AUTH_REQUIRED
     assert "token" not in str(raised.value).lower()
@@ -275,7 +276,7 @@ async def test_ucode_adapter_bounds_stdout_and_hides_stderr(
     monkeypatch.setenv("PATH", str(tmp_path))
 
     with pytest.raises(ProviderAuthRequired) as raised:
-        await mint_ucode_token(host=_HOST, profile=_PROFILE)
+        await mint_profile_token(host=_HOST, profile=_PROFILE)
 
     message = str(raised.value)
     assert raised.value.code == PROVIDER_AUTH_REQUIRED

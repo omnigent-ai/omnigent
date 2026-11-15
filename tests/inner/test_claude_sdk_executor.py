@@ -3,7 +3,6 @@
 import asyncio
 import base64
 import json
-import logging
 import os
 import shutil
 import subprocess
@@ -583,7 +582,7 @@ class TestConstructor(unittest.TestCase):
         self.assertTrue(executor._os_env)
         self.assertEqual(executor._os_env_spec, spec)
         self.assertEqual(executor._cli_path, "/tmp/omnigent-claude-wrapper")
-        self.assertEqual(executor._cwd, "/tmp/work")
+        self.assertEqual(executor._cwd, str(Path("/tmp/work").resolve(strict=False)))
 
     def test_prepare_claude_cli_path_adds_internal_roots_to_read_allowlist(self):
         from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
@@ -592,7 +591,7 @@ class TestConstructor(unittest.TestCase):
 
         captured: dict[str, SandboxPolicy] = {}
 
-        def _capture_launcher(_path: str, sandbox: SandboxPolicy) -> str:
+        def _capture_launcher(_path: str, sandbox: SandboxPolicy, *, cwd: str) -> str:
             captured["sandbox"] = sandbox
             return "/tmp/launcher"
 
@@ -2138,6 +2137,7 @@ class TestGatewayModelVocabulary(unittest.TestCase):
             note="",
         )
         executor = ClaudeSDKExecutor.__new__(ClaudeSDKExecutor)
+        executor._prepared_cli = None
         executor._gateway = True
         executor._gateway_vocabulary = None
         env = {
@@ -4871,7 +4871,9 @@ async def test_sandboxed_managed_cli_sees_its_own_relay_and_the_managed_config_o
     workspace.mkdir()
     launchers: dict[str, SandboxPolicy] = {}
 
-    def record_launcher(target: str, policy: SandboxPolicy) -> str:
+    def record_launcher(
+        target: str, policy: SandboxPolicy, *, cwd=None, env_overrides=None
+    ) -> str:
         path = tmp_path / f"launcher-{len(launchers)}.sh"
         path.write_text("")
         launchers[str(path)] = policy
@@ -5124,51 +5126,18 @@ def test_resolve_sandbox_cwd_roots_relative_at_runner_workspace(monkeypatch) -> 
 
 
 @pytest.mark.parametrize("env_value", ["1", "true", "yes"])
-def test_prepare_claude_cli_path_bypasses_wrapper_when_env_set(
-    monkeypatch, caplog, env_value: str
+def test_prepare_claude_cli_path_rejects_bypass_when_sandbox_required(
+    monkeypatch, env_value: str
 ) -> None:
-    """
-    ``OMNIGENT_CLAUDE_SDK_NO_SANDBOX`` (any truthy value) must skip
-    ``create_exec_launcher`` and hand back the raw CLI path. Used as a
-    diagnostic knob to isolate the sandbox as a cause of the silent
-    claude-sdk connect hang on the nightly Linux runner.
-    """
+    """Diagnostic flags cannot authorize uncontained skill execution."""
     from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     monkeypatch.setenv("OMNIGENT_CLAUDE_SDK_NO_SANDBOX", env_value)
-
-    def _fail_if_called(*args, **kwargs) -> str:
-        raise AssertionError("create_exec_launcher must not be called when bypass is enabled")
-
-    monkeypatch.setattr(
-        "omnigent.inner.claude_sdk_executor.create_exec_launcher",
-        _fail_if_called,
-    )
-
-    spec = OSEnvSpec(
-        type="caller_process",
-        cwd="/tmp/work",
-        sandbox=OSEnvSandboxSpec(
-            type="linux_bwrap",
-            read_paths=["."],
-            write_paths=["."],
-            allow_network=True,
-        ),
-    )
-    with caplog.at_level(logging.WARNING, logger="omnigent.inner.claude_sdk_executor"):
-        prepared = prepare_claude_cli_path("/usr/bin/claude", spec)
-
-    assert prepared.cli_path == "/usr/bin/claude"
-    # Bypass keeps native tools off so the diagnostic isolates the
-    # CLI-startup variable; matches the fallback shape used when the
-    # sandbox can't be applied for other reasons (line 569-574).
-    assert prepared.enable_native_tools is False
-    # The bypass must be loud in CI: a missing warning means a future
-    # diagnostic run could silently fall through without us noticing.
-    assert any("Sandbox bypass active" in record.getMessage() for record in caplog.records), [
-        r.getMessage() for r in caplog.records
-    ]
+    launcher = Mock()
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor.create_exec_launcher", launcher)
+    with pytest.raises(OSError, match="conflicts with the required Claude sandbox"):
+        prepare_claude_cli_path("/usr/bin/claude", _wrap_probe_spec())
+    launcher.assert_not_called()
 
 
 def test_prepare_tight_cli_process_bypasses_wrapper_when_env_set(monkeypatch) -> None:
@@ -5217,73 +5186,84 @@ def _active_policy():
     )
 
 
-def test_prepare_claude_cli_path_degrades_when_resolve_sandbox_fails(monkeypatch, caplog) -> None:
-    """
-    A ``resolve_sandbox`` failure (e.g. ``sandbox-exec`` missing on the
-    host) must NOT crash the seat at connect time. The prepare degrades
-    to the raw CLI with native tools disabled — the same confinement
-    shape as the ``OMNIGENT_CLAUDE_SDK_NO_SANDBOX`` bypass — and warns.
-    """
-    from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
-
-    def _raise_resolve(*args, **kwargs):
-        raise OSError("darwin_seatbelt requires sandbox-exec on PATH")
-
-    monkeypatch.setattr("omnigent.inner.claude_sdk_executor.resolve_sandbox", _raise_resolve)
-
-    def _fail_if_called(*args, **kwargs) -> str:
-        raise AssertionError("create_exec_launcher must not run when resolve failed")
-
-    monkeypatch.setattr("omnigent.inner.claude_sdk_executor.create_exec_launcher", _fail_if_called)
-
-    with caplog.at_level(logging.WARNING, logger="omnigent.inner.claude_sdk_executor"):
-        prepared = prepare_claude_cli_path("/usr/bin/claude", _wrap_probe_spec())
-
-    assert prepared.cli_path == "/usr/bin/claude"
-    assert prepared.enable_native_tools is False
-    assert any(
-        "Cannot resolve the configured sandbox" in record.getMessage() for record in caplog.records
-    ), [r.getMessage() for r in caplog.records]
-
-
-def test_prepare_claude_cli_path_degrades_when_wrap_probe_fails(monkeypatch, caplog) -> None:
-    """
-    When the backend can resolve but the spawn-time wrap can't be built
-    (un-grantable interpreter layout, profile-size cap, cwd-scan
-    overflow), the OSError previously fired inside ``run_launcher`` and
-    killed the CLI spawn with an opaque connect timeout. The prepare-
-    time probe must catch it and degrade — unwrapped CLI, native tools
-    OFF, loud warning — never raise.
-    """
+def test_prepare_claude_cli_path_resolution_failure_prevents_launch(monkeypatch) -> None:
+    """A missing backend must stop startup before any skill can be loaded."""
     from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
 
     monkeypatch.setattr(
         "omnigent.inner.claude_sdk_executor.resolve_sandbox",
-        lambda *a, **k: _active_policy(),
+        Mock(side_effect=OSError("sandbox-exec unavailable")),
     )
+    launcher = Mock()
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor.create_exec_launcher", launcher)
+    with pytest.raises(OSError, match="sandbox-exec unavailable"):
+        prepare_claude_cli_path("/usr/bin/claude", _wrap_probe_spec())
+    launcher.assert_not_called()
 
-    class _RefusingBackend:
-        def wrap_launcher_argv(self, *args, **kwargs):
-            raise OSError("would require widening the sandbox read view")
+
+def test_prepare_claude_cli_path_wrap_failure_prevents_launch(monkeypatch) -> None:
+    """An unbuildable sandbox cannot fall back to the original CLI."""
+    from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
 
     monkeypatch.setattr(
-        "omnigent.inner.claude_sdk_executor.get_backend",
-        lambda name: _RefusingBackend(),
+        "omnigent.inner.claude_sdk_executor.resolve_sandbox", lambda *a, **k: _active_policy()
     )
+    backend = Mock()
+    backend.wrap_launcher_argv.side_effect = OSError("cannot wrap")
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor.get_backend", lambda _: backend)
+    launcher = Mock()
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor.create_exec_launcher", launcher)
+    with pytest.raises(OSError, match="cannot wrap"):
+        prepare_claude_cli_path("/usr/bin/claude", _wrap_probe_spec())
+    launcher.assert_not_called()
 
-    def _fail_if_called(*args, **kwargs) -> str:
-        raise AssertionError("create_exec_launcher must not run when the wrap probe failed")
 
-    monkeypatch.setattr("omnigent.inner.claude_sdk_executor.create_exec_launcher", _fail_if_called)
+@pytest.mark.asyncio
+async def test_sandboxed_sdk_exposes_bash_for_skill_expansion(monkeypatch) -> None:
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, PreparedClaudeCli
+    from omnigent.inner.datamodel import OSEnvSpec
 
-    with caplog.at_level(logging.WARNING, logger="omnigent.inner.claude_sdk_executor"):
-        prepared = prepare_claude_cli_path("/usr/bin/claude", _wrap_probe_spec())
+    captured_options = {}
 
-    assert prepared.cli_path == "/usr/bin/claude"
-    assert prepared.enable_native_tools is False
-    assert any("cannot wrap the Claude CLI" in record.getMessage() for record in caplog.records), [
-        r.getMessage() for r in caplog.records
-    ]
+    class _ResultMessage:
+        session_id = "sandboxed-skill"
+        result = "done"
+
+    class _FakeSDK(_sdk_types(), _SDKTools):
+        ResultMessage = _ResultMessage
+
+        class ClaudeSDKClient(_SDKClient):
+            def __init__(self, options):
+                captured_options["tools"] = options.tools
+                captured_options["allowed_tools"] = options.allowed_tools
+
+            async def query(self, prompt, session_id="default"):
+                pass
+
+            async def receive_response(self):
+                yield _ResultMessage()
+
+    monkeypatch.setattr(
+        "omnigent.inner.claude_sdk_executor._find_system_claude", lambda: "/bin/claude"
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.claude_sdk_executor.prepare_claude_cli_path",
+        lambda *args, **kwargs: PreparedClaudeCli("/bin/wrapped", True, sandboxed=True),
+    )
+    executor = ClaudeSDKExecutor(os_env=OSEnvSpec())
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor._ensure_sdk", lambda: _FakeSDK)
+    try:
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "hi", "session_id": "sandboxed-skill"}], [], ""
+            )
+        ]
+        assert captured_options["tools"] == ["Skill", "ToolSearch", "Bash"]
+        assert "Bash" in captured_options["allowed_tools"]
+        assert isinstance(events[-1], TurnComplete)
+    finally:
+        await executor.close()
 
 
 def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
@@ -5315,7 +5295,7 @@ def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
     )
     monkeypatch.setattr(
         "omnigent.inner.claude_sdk_executor.create_exec_launcher",
-        lambda path, sandbox: "/tmp/launcher",
+        lambda path, sandbox, **kwargs: "/tmp/launcher",
     )
 
     prepared = prepare_claude_cli_path("/usr/bin/claude", _wrap_probe_spec())

@@ -7681,6 +7681,12 @@ async def execute_tool(
                 conversation_id=conversation_id,
                 runner_workspace=runner_workspace,
                 filesystem_registry=filesystem_registry,
+                bundle_dir=(
+                    None
+                    if local_tool_workdir is _UNSET_LOCAL_TOOL_WORKDIR
+                    else cast(Path | None, local_tool_workdir)
+                ),
+                effective_harness=effective_harness,
             )
         elif tool_name in _REST_TOOLS:
             output = await _execute_rest_tool(
@@ -8312,6 +8318,8 @@ async def _execute_os_env_tool(
     runner_workspace: Path | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
     resource_registry: SessionResourceRegistry | None = None,
+    bundle_dir: Path | None = None,
+    effective_harness: str | None = None,
 ) -> str:
     """
     Execute sys_os_* through a runner-local OSEnvironment.
@@ -8324,6 +8332,8 @@ async def _execute_os_env_tool(
         workspace, e.g. ``"conv_123"``.
     :param runner_workspace: Optional CLI launch workspace used for
         placeholder cwd values in remote app sessions.
+    :param bundle_dir: Extracted bundle workdir from resolved spec provenance.
+    :param effective_harness: Session harness override, ahead of the spec default.
     :param filesystem_registry: Optional registry for tracking agent
         file modifications. When provided, ``sys_os_write`` and
         ``sys_os_edit`` calls record changed paths so the
@@ -8344,6 +8354,24 @@ async def _execute_os_env_tool(
         effective_spec = _effective_runner_os_env_spec(
             agent_spec, conversation_id, runner_workspace
         )
+        model_access = None
+        if (
+            agent_spec is not None
+            and _effective_harness_name(agent_spec, effective_harness) == "claude-sdk"
+            and (effective_spec.sandbox is None or effective_spec.sandbox.type != "none")
+        ):
+            from omnigent.runtime.workflow import claude_terminal_model_access
+
+            model_access = await asyncio.to_thread(
+                claude_terminal_model_access,
+                agent_spec,
+                bundle_dir=bundle_dir,
+                effective_harness=effective_harness,
+            )
+            if model_access is None:
+                raise ValueError(
+                    "Claude SDK callbacks require a model credential isolation policy"
+                )
         needs_shared_environment = effective_spec.sandbox is not None and any(
             p.copy_on_write for p in effective_spec.sandbox.write_path_specs
         )
@@ -8380,10 +8408,14 @@ async def _execute_os_env_tool(
                     else []
                 )
                 os_env = create_os_environment(
-                    effective_spec, additional_read_roots=additional_read_roots
+                    effective_spec,
+                    additional_read_roots=additional_read_roots,
+                    model_access=model_access,
                 )
         if os_env is None:
             return "Error: unable to create OSEnvironment"
+        if model_access is not None and not owns_environment:
+            await asyncio.to_thread(os_env.isolate_model_credentials, model_access)
 
         if tool_name == SysOsReadTool.name():
             result = await os_env.read(

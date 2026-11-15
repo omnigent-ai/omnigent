@@ -753,27 +753,8 @@ def _build_profile(
             ";;   - iokit-open: every IOKit driver including camera,",
             ";;     microphone, GPU; helper has no use for any of them.",
             ";;",
-            ";; M3 (security note): mach-lookup and sysctl-read are",
-            ";; granted broadly. Both are read-only / lookup-only",
-            ";; surfaces with no narrowing facility usable from SBPL",
-            ";; v1 — per-service (allow mach-lookup (global-name",
-            ';; "com.apple.foo")) is SBPL v2, gated behind',
-            ";; (version 2) and a private entitlement. libSystem's",
-            ";; startup path consults ~40 Mach services (notifyd,",
-            ";; opendirectoryd, securityd, configd, ...) and",
-            ";; ~hundreds of sysctl names (kern.osversion, hw.ncpu,",
-            ";; kern.maxfilesperproc, kern.boottime, ...) on every",
-            ';; python3 -c "import sys" boot; per-service allowlist',
-            ";; would need empirical enumeration on every macOS minor",
-            ";; version or wholesale rely on Apple's reference SBPL",
-            ";; profiles (which we intentionally do NOT inherit — see",
-            ";; M1/M2 comments). Read-only sysctls and Mach service",
-            ";; lookups are not privileged enough to enable the",
-            ";; sandbox escapes that mach-priv-host-port / iokit-open",
-            ";; enable, so the trade-off is acceptable. Operators",
-            ";; needing tighter isolation should consider EXC handlers",
-            ";; or codesigning-based entitlement gating outside the",
-            ";; sandbox layer.",
+            ";; Runtime startup needs broad Mach lookup and sysctl read.",
+            ";; Credential isolation adds Keychain service denials below.",
             "(allow mach-lookup)",
             "(allow ipc-posix-shm)",
             "(allow ipc-posix-sem)",
@@ -1168,8 +1149,12 @@ def _build_profile(
 
     for source_path in policy.credential_source_paths or []:
         quoted = _quote(str(source_path.resolve()))
-        lines.append(f"(deny file-read* file-write* (literal {quoted}))")
+        lines.append(f"(deny file-read* file-write* (subpath {quoted}))")
         lines.append(f"(deny network-outbound (remote unix-socket (path-literal {quoted})))")
+
+    if policy.credential_source_paths is not None:
+        # Keychain reads use securityd IPC and can bypass filesystem denials.
+        lines.append('(deny mach-lookup (global-name-regex #".*(securityd|secd|keychain).*"))')
 
     return "\n".join(lines) + "\n"
 

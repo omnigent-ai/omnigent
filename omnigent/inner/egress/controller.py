@@ -40,12 +40,16 @@ import threading
 from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from omnigent._platform import IS_WINDOWS
 from omnigent.inner.credential_proxy import CredentialRewriteRule
 from omnigent.inner.egress.ca import ensure_ca, ensure_ca_bundle
-from omnigent.inner.egress.proxy import EgressProxy
+from omnigent.inner.egress.proxy import EgressProxy, RequestBodyTransform
 from omnigent.inner.egress.rules import parse_rules
+
+if TYPE_CHECKING:
+    from omnigent.inner.claude_model_access import ClaudeModelAccess
 
 _EGRESS_SOCKET_NAME = ".egress.sock"
 _CA_ENV_KEYS = (
@@ -129,6 +133,8 @@ def start_egress_proxy(
     allow_private_destinations: bool,
     require_auth: bool,
     credential_rewrites: Sequence[CredentialRewriteRule] | None = None,
+    request_body_transform: RequestBodyTransform | None = None,
+    model_access: ClaudeModelAccess | None = None,
 ) -> EgressProxyHandle:
     """Start the parent-side MITM egress proxy.
 
@@ -156,6 +162,8 @@ def start_egress_proxy(
         injection by default, plus synthetic-placeholder swap for entries
         that opted into ``inject_env`` (secretless ``credential_proxy``
         support).
+    :param request_body_transform: Trusted compatibility patch applied only
+        after the request passes egress policy checks.
     :returns: A live :class:`EgressProxyHandle`. Caller must invoke
         :meth:`EgressProxyHandle.stop` on cleanup.
     :raises OSError: On Windows, where the L7 egress proxy (a Unix-socket
@@ -190,7 +198,8 @@ def start_egress_proxy(
         # it slots into Basic-auth base64 without further escaping.
         auth_token = secrets.token_urlsafe(32)
 
-    proxy = EgressProxy(
+    proxy_factory = EgressProxy if model_access is None else model_access.create_proxy
+    proxy = proxy_factory(
         parsed_rules,
         ca_cert_path,
         ca_key_path,
@@ -213,20 +222,36 @@ def start_egress_proxy(
         # it (no out-of-band channel through tmux).
         auth_token=auth_token,
         credential_rewrites=list(credential_rewrites or []),
+        request_body_transform=request_body_transform,
     )
 
     loop = asyncio.new_event_loop()
     started = threading.Event()
 
+    startup_errors: list[BaseException] = []
+
     def _run_proxy() -> None:
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(proxy.start_unix(str(socket_path)))
-        started.set()
-        loop.run_forever()
+        try:
+            loop.run_until_complete(proxy.start_unix(str(socket_path)))
+        except BaseException as exc:  # noqa: BLE001 — propagate thread startup failures to the caller
+            startup_errors.append(exc)
+        finally:
+            started.set()
+        if not startup_errors:
+            loop.run_forever()
+        loop.run_until_complete(proxy.stop())
+        loop.close()
 
     thread = threading.Thread(target=_run_proxy, name="egress-proxy", daemon=True)
     thread.start()
-    started.wait(timeout=10)
+    if not started.wait(timeout=10):
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=3)
+        raise TimeoutError("egress proxy did not become ready")
+    if startup_errors:
+        thread.join(timeout=3)
+        raise OSError("egress proxy could not start") from startup_errors[0]
 
     # Pick a random ephemeral port. Bind+close-immediately to ask
     # the kernel for a free port; a same-host attacker racing to
