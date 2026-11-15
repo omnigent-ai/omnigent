@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field, replace
@@ -945,8 +946,27 @@ def _assert_codex_unconfirmed(
 
 
 @pytest.mark.parametrize("native_session", ["starting"], indirect=True)
+@pytest.mark.parametrize(
+    "observation",
+    [
+        "ready",
+        "initial-read",
+        "poll-read",
+        "timeout",
+        "cancel",
+        "removed",
+        "replaced",
+        "stopped",
+        "initial-removed",
+        "initial-replaced",
+        "initial-stopped",
+    ],
+)
 async def test_model_change_waits_for_codex_startup(
-    client: httpx.AsyncClient, native_session: _NativeSession, monkeypatch: pytest.MonkeyPatch
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+    observation: str,
 ) -> None:
     session = native_session
     assert session.codex.ready_gate is not None
@@ -954,24 +974,91 @@ async def test_model_change_waits_for_codex_startup(
     assert session.terminals.get(session.session_id, "codex", "main") is not None
     assert not session.codex.ready.is_set()
     missing = _observe_missing_bridge(monkeypatch, session)
+    read_started = asyncio.Event()
+    read_finished = threading.Event()
+    release_read = threading.Event()
+    safety_release = threading.Event()
+    loop = asyncio.get_running_loop()
+    stat = Path.stat
+    reads = 0
+    held_read = 1 if observation.startswith("initial-") else 2
+    outcome = observation.removeprefix("initial-")
+
+    def hold_stat(path: Path, *args: Any, **kwargs: Any) -> Any:
+        nonlocal reads
+        if path == session.codex.bridge_dir / bridge._STATE_FILE:
+            reads += 1
+            if reads == held_read and observation != "ready":
+                loop.call_soon_threadsafe(read_started.set)
+                try:
+                    if not release_read.wait(budget(5)):
+                        safety_release.set()
+                    return stat(path, *args, **kwargs)
+                finally:
+                    read_finished.set()
+        return stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", hold_stat)
+    if observation == "timeout":
+        monkeypatch.setattr(native_controls, "_CODEX_SETTINGS_READY_TIMEOUT_S", 0.5)
     change = asyncio.create_task(
         client.patch(
             f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
         )
     )
     try:
-        await asyncio.wait_for(missing.wait(), timeout=budget(5))
+        if observation == "ready":
+            await asyncio.wait_for(missing.wait(), timeout=budget(5))
+        else:
+            await asyncio.wait_for(read_started.wait(), timeout=budget(10))
+            health = await session.runner.get("/health")
+            assert health.status_code == 200
+            assert not safety_release.is_set(), "bridge read blocked the runner event loop"
         assert session.codex.applied_updates == []
+        if observation == "timeout":
+            response = await asyncio.wait_for(change, timeout=budget(2))
+            _assert_codex_unconfirmed(session, response)
+        elif observation == "cancel":
+            change.cancel()
+            await asyncio.gather(change, return_exceptions=True)
+            assert change.cancelled()
+        elif outcome == "removed":
+            session.terminals._by_conversation[session.session_id].pop(("codex", "main"))
+        elif outcome == "replaced":
+            session.terminals._by_conversation[session.session_id][("codex", "main")] = (
+                make_test_terminal_instance("codex", "main", session.codex.bridge_dir)
+            )
+        elif outcome == "stopped":
+            pane = session.terminals.get(session.session_id, "codex", "main")
+            assert pane is not None
+            pane.running = False
         session.codex.ready_gate.set()
         await asyncio.wait_for(session.codex.ready.wait(), timeout=budget(5))
-        response = await asyncio.wait_for(change, timeout=budget(5))
+        release_read.set()
+        if observation != "ready":
+            assert await asyncio.to_thread(read_finished.wait, budget(5))
+        if observation not in {"timeout", "cancel"}:
+            response = await asyncio.wait_for(change, timeout=budget(5))
+        else:
+            assert session.codex.applied_updates == []
+            response = await client.patch(
+                f"/v1/sessions/{session.session_id}",
+                json={"model_override": _REQUESTED_MODEL},
+            )
+            session.assert_applied(response)
+        assert not safety_release.is_set(), "control waited for the filesystem safety release"
     finally:
+        release_read.set()
         session.codex.ready_gate.set()
         change.cancel()
         await asyncio.gather(change, return_exceptions=True)
 
     assert session.codex.launches == 1
-    session.assert_applied(response)
+    if outcome in {"removed", "replaced", "stopped"}:
+        assert response.status_code == 503, response.text
+        assert session.codex.applied_updates == []
+    else:
+        session.assert_applied(response)
 
 
 async def test_model_change_allows_cold_launch_before_waiting_for_bridge(

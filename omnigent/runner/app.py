@@ -4350,7 +4350,7 @@ def create_runner_app(
         from omnigent.harnesses.codex_native.bridge import read_bridge_state
 
         bridge_dir = await _codex_native_bridge_dir_for_session(conv_id)
-        state = read_bridge_state(bridge_dir)
+        state = await asyncio.to_thread(read_bridge_state, bridge_dir)
         if state is None:
             _logger.log(
                 missing_state_log_level,

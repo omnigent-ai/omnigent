@@ -441,15 +441,35 @@ def build_native_controls(
         from omnigent.harnesses.codex_native.bridge import read_bridge_state
 
         terminal_registry = resource_registry.terminal_registry
+        terminal = (
+            terminal_registry.get(conv_id, "codex", "main")
+            if terminal_registry is not None
+            else None
+        )
+
+        def terminal_is_current() -> bool:
+            return resource_registry.terminal_registry is terminal_registry and (
+                terminal_registry is None
+                or (
+                    terminal is not None
+                    and terminal_registry.get(conv_id, "codex", "main") is terminal
+                    and terminal.running
+                )
+            )
+
         state, bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
             conv_id, action="settings update", missing_state_log_level=logging.DEBUG
         )
+        if not terminal_is_current():
+            return None
         if state is not None or terminal_registry is None:
             return state
         # Fresh launches publish asynchronously. Poll the resolved directory so
         # waiting never repeats the server label lookup or starts another pane.
-        while terminal_registry.get(conv_id, "codex", "main") is not None:
-            state = read_bridge_state(bridge_dir)
+        while terminal_is_current():
+            state = await asyncio.to_thread(read_bridge_state, bridge_dir)
+            if not terminal_is_current():
+                return None
             if state is not None:
                 return state if state.session_id == conv_id else None
             await asyncio.sleep(_CODEX_SETTINGS_READY_POLL_S)
