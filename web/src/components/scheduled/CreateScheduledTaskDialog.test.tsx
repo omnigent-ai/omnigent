@@ -4415,10 +4415,8 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(screen.queryByText(/Update the Omnigent server/)).toBeNull();
   });
 
-  it("keeps a saved trigger's 16,000-character instructions when its host can't vouch for them", async () => {
+  it("keeps a saved trigger's long instructions when its host can't vouch for them", async () => {
     mockLaptop(false);
-    const instructions = longInstructions;
-    const task = longTriggerTask;
     render(
       <CapabilitiesProvider
         info={{
@@ -4428,18 +4426,114 @@ describe("CreateScheduledTaskDialog trigger template", () => {
           session_message_max_chars: 32_000,
         }}
       >
-        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={task} />
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={longTriggerTask} />
       </CapabilitiesProvider>,
     );
-    expect(screen.getByTestId("task-trigger-instructions")).toHaveValue(instructions);
+    expect(screen.getByTestId("task-trigger-instructions")).toHaveValue(longInstructions);
     expect(screen.queryByTestId("task-trigger-instructions-too-long-notice")).toBeNull();
 
-    type("task-trigger-instructions", `${instructions} Then triage it.`);
+    type("task-trigger-instructions", `${longInstructions} Then triage it.`);
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     const prompt = updateMutateAsync.mock.calls[0][0].input.prompt;
     expect(prompt).toContain("and a message under 32000 characters.");
-    expect(prompt).toContain(`${instructions} Then triage it.`);
+    expect(prompt).toContain(`${longInstructions} Then triage it.`);
+  });
+
+  it("keeps a sandbox trigger saved under the older limit at that limit on an unrelated edit", async () => {
+    vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+      data: { models: [], configured: false, status: "ready" },
+    } as unknown as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+    const saved = encodeTriggerPrompt(
+      {
+        source: "jira",
+        ...emptyTriggerFields("jira"),
+        scope: "ES",
+        instructions: "Triage it.",
+        worker: {
+          placement: "same_host",
+          agentId: null,
+          model: "",
+          effort: "",
+          permissionMode: "",
+        },
+      },
+      { sessionLink: "https://example.test/c/CONVERSATION_ID", messageMaxChars: 8000 },
+    );
+    const task = scheduledTask({
+      prompt: saved,
+      sessionMode: "continue",
+      sessionId: "poller",
+      executionTarget: "managed_sandbox",
+    });
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          scheduled_task_session_modes: true,
+          scheduled_task_trigger_headers: true,
+          session_message_max_chars: 32_000,
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "modal",
+          sandbox_provider_capabilities: { modal: { default_models: true } },
+        }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={task} />
+      </CapabilitiesProvider>,
+    );
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const prompt = updateMutateAsync.mock.calls[0][0].input.prompt;
+    expect(prompt).toContain("and a message under 8000 characters.");
+    expect(prompt).not.toContain("32000");
+  });
+
+  it("checks instructions against the host picked, keeping them across a switch", async () => {
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [
+        {
+          host_id: "host_1",
+          name: "laptop",
+          owner: "me",
+          status: "online",
+          long_session_messages_supported: true,
+        },
+        {
+          host_id: "host_2",
+          name: "old-box",
+          owner: "me",
+          status: "online",
+          long_session_messages_supported: false,
+        },
+      ],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+    renderTrigger("jira", { session_message_max_chars: 32_000 });
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    const pickHost = async (name: string) => {
+      const hostTrigger = screen.getByTestId("task-host-trigger");
+      fireEvent.pointerDown(
+        hostTrigger,
+        new MouseEvent("pointerdown", { bubbles: true, button: 0 }),
+      );
+      fireEvent.click(hostTrigger);
+      fireEvent.click(await screen.findByRole("option", { name }));
+    };
+    fillJira();
+    type("task-trigger-instructions", "x".repeat(9_000));
+    expect(submit).toBeEnabled();
+
+    await pickHost("old-box");
+    expect(submit).toBeDisabled();
+    expect(screen.getByTestId("task-trigger-instructions-too-long-notice")).toHaveTextContent(
+      'Update Omnigent on "old-box" and keep it online to allow up to 16,000.',
+    );
+    expect(screen.getByTestId("task-trigger-instructions")).toHaveValue("x".repeat(9_000));
+
+    await pickHost("laptop");
+    expect(submit).toBeEnabled();
+    expect(screen.queryByTestId("task-trigger-instructions-too-long-notice")).toBeNull();
+    expect(await submittedPrompt()).toContain("and a message under 32000 characters.");
   });
 
   it("compiles the builder rows into the saved hourly continue-mode task", async () => {
