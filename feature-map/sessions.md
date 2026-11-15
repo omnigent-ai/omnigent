@@ -777,8 +777,14 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/server/routes/test_sessions_crud.py::test_activity_in_the_acceptance_second_reopens_it`,
   `tests/server/routes/test_sessions_crud.py::test_board_acceptance_of_a_stale_review_is_refused`
   and
-  `tests/server/routes/test_sessions_crud.py::test_new_session_cannot_seed_a_board_acceptance`
-  cover the stored stamp, same-second activity, the 409 and creation seeding.
+  `tests/server/routes/test_sessions_crud.py::test_new_session_starts_without_a_seeded_board_acceptance`
+  cover the stored stamp, same-second activity, the 409 and creation seeding;
+  `tests/server/routes/test_sessions_crud.py::test_native_clear_replacement_keeps_creating_surface`
+  covers a native `/clear` replacement of an accepted or reopened session. The
+  store's locked accept and the activity writers that drop it, including an
+  append paused before its transaction, are covered in
+  `tests/stores/test_conversation_store.py::test_delayed_activity_writer_reopens_the_board_acceptance`
+  and its neighbours.
   To check manually, enable `session_board` on the isolated server, run one
   session to idle, open **Board**, and confirm the card sits in Needs review.
   Choose **Accept**: it moves to Done and stays there after a reload. Send the
@@ -1393,13 +1399,13 @@ its discoverability.
 - Sandbox expiry and explicit whole-host destruction remain separate from
   deleting one session. Shared compute means a shared filesystem, not history.
 
-- The Board's Done column needs the acceptance label to be newer than the
-  session's `updated_at`. The server stores one second past the reviewed
-  activity and refuses **Accept** with a message if the session changed after
-  the card was shown, or within the last two seconds. Forks start
-  unaccepted. Renaming, archiving, filing a session into a project, or
-  changing its model, effort or harness also bumps `updated_at`, so those
-  actions move an accepted card back to Needs review. The board lists only the sessions the sidebar has loaded; use **Load
+- The Board's Done column needs the acceptance label to be present and newer
+  than the session's `updated_at`. **Accept** is refused with a message if the
+  session changed after the card was shown, or within the last two seconds.
+  Every write that advances `updated_at` deletes the label, so new sessions,
+  forks and native `/clear` replacements start unaccepted, and renaming,
+  archiving, filing a session into a project, or changing its model, effort or
+  harness moves an accepted card back to Needs review. The board lists only the sessions the sidebar has loaded; use **Load
   more sessions** for older ones.
 
 - Existing side chats on separate runners must still be closed individually.

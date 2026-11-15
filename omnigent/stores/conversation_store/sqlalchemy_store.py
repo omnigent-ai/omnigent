@@ -102,6 +102,7 @@ from omnigent.stores.conversation_store import (
     _INSTANCE_SCOPED_LABEL_KEYS,
     _SANDBOX_REPO_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
+    BOARD_ACCEPTED_LABEL_KEY,
     CREATED_BY_SESSION_LABEL_KEY,
     FAMILY_PIN_LABEL_PREFIX,
     FORK_CARRY_HISTORY_LABEL_KEY,
@@ -672,6 +673,27 @@ def _dialect_upsert_labels(
         },
     )
     session.execute(stmt)
+
+
+def _drop_board_acceptance(session: Session, conversation_id: str) -> None:
+    """
+    Reopen web Board work the user accepted, inside an activity write.
+
+    Every write that advances a session's ``updated_at`` calls this in its own
+    transaction, so a writer that commits after an acceptance clears it
+    whatever timestamp the writer sampled.
+
+    :param session: The activity write's session.
+    :param conversation_id: The session whose activity is being written.
+    """
+    with query_name_scope("omnigent.conversation_store.drop_board_acceptance"):
+        session.execute(
+            delete(SqlConversationLabel).where(
+                SqlConversationLabel.workspace_id == current_workspace_id(),
+                SqlConversationLabel.conversation_id == conversation_id,
+                SqlConversationLabel.key == BOARD_ACCEPTED_LABEL_KEY,
+            )
+        )
 
 
 def _fetch_labels(
@@ -3263,7 +3285,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                 for item in items
             )
             if conv_row is not None and has_new_conversation_activity:
-                conv_row.updated_at = now
+                # Stamp the commit, not the pre-encode sample: a stalled append
+                # must not look like activity a reviewer already saw.
+                conv_row.updated_at = max(now, now_epoch())
+                _drop_board_acceptance(session, conversation_id)
 
             # Allocate item positions from the conversation's maintained
             # next_position counter instead of running a MAX(position) aggregate
@@ -3557,6 +3582,33 @@ class SqlAlchemyConversationStore(ConversationStore):
                         .exists()
                     )
             return [row[0] for row in ap_sess.execute(stmt).all()]
+
+    def accept_board_review(
+        self, conversation_id: str, reviewed_updated_at: int, stamp: str
+    ) -> bool:
+        """
+        Store a web Board acceptance unless the session changed since review.
+
+        Checks ``updated_at`` and writes the label under the conversation's
+        write lock, so it serializes with activity writers: one that commits
+        afterwards drops the label (see :func:`_drop_board_acceptance`).
+
+        :param conversation_id: The session being accepted, e.g. ``"conv_abc123"``.
+        :param reviewed_updated_at: The ``updated_at`` the user reviewed.
+        :param stamp: The acceptance value to store, e.g. ``"1700000101"``.
+        :returns: ``False`` when the session is missing or changed since review.
+        """
+        prepared = _prepare_label_updates({BOARD_ACCEPTED_LABEL_KEY: stamp})
+
+        def write(session: Session) -> bool:
+            self._lock_conversation(session, conversation_id)
+            row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
+            if row is None or row.updated_at != reviewed_updated_at:
+                return False
+            _upsert_prepared_labels(session, conversation_id, prepared, now_epoch())
+            return True
+
+        return run_write_transaction(self._conv_session_immediate, "accept_board_review", write)
 
     def delete_label(
         self,
@@ -4639,6 +4691,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                 row.archived = archived
                 ap_changed = True
+            if ap_changed or label_updates:
+                _drop_board_acceptance(ap_sess, conversation_id)
             if label_updates:
                 _upsert_labels(ap_sess, conversation_id, label_updates, now)
                 ap_changed = True
@@ -4772,6 +4826,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             if changed:
                 row.session_overrides = _encode_session_overrides(overrides)
                 row.updated_at = now_epoch()
+                _drop_board_acceptance(session, conversation_id)
 
         run_write_transaction(
             self._conv_session_immediate, "restore_session_settings_if_matches", restore
@@ -4815,7 +4870,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .values(session_overrides=encoded, updated_at=now_epoch())
                 ),
             )
-            return result.rowcount == 1
+            if result.rowcount != 1:
+                return False
+            _drop_board_acceptance(session, conversation_id)
+            return True
 
     def rename_conversation_if_title_matches(
         self,
@@ -4842,7 +4900,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                 ),
             )
-            return result.rowcount == 1
+            if result.rowcount != 1:
+                return False
+            _drop_board_acceptance(session, conversation_id)
+            return True
 
         if not run_write_transaction(
             self._conv_session_immediate,
@@ -5965,6 +6026,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             if changed:
                 ap_row.updated_at = updated_at
+                _drop_board_acceptance(ap_sess, conversation_id)
             labels = _fetch_labels(ap_sess, conversation_id)
             return ap_row, labels
 

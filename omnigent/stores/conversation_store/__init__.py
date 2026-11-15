@@ -1400,6 +1400,28 @@ class ConversationStore(ABC):
         """
         ...
 
+    def accept_board_review(
+        self, conversation_id: str, reviewed_updated_at: int, stamp: str
+    ) -> bool:
+        """
+        Store a web Board acceptance unless the session changed since review.
+
+        Stores override this to check and write in one transaction that
+        serializes with activity writers, which drop the acceptance label
+        (``BOARD_ACCEPTED_LABEL_KEY``) whenever they advance ``updated_at``.
+
+        :param conversation_id: The session being accepted, e.g. ``"conv_abc123"``.
+        :param reviewed_updated_at: The ``updated_at`` the user reviewed.
+        :param stamp: The acceptance value to store, e.g. ``"1700000101"``.
+        :returns: ``False`` when the session is missing or its ``updated_at``
+            no longer matches; ``True`` once the label is stored.
+        """
+        conversation = self.get_conversation(conversation_id)
+        if conversation is None or conversation.updated_at != reviewed_updated_at:
+            return False
+        self.set_labels(conversation_id, {BOARD_ACCEPTED_LABEL_KEY: stamp})
+        return True
+
     @abstractmethod
     def delete_label(
         self,

@@ -313,6 +313,124 @@ def test_fork_drops_the_board_acceptance(
     assert BOARD_ACCEPTED_LABEL_KEY not in fork.labels
 
 
+def _user_message(text: str) -> NewConversationItem:
+    return NewConversationItem(
+        type="message",
+        response_id="resp_board",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
+    )
+
+
+def test_board_acceptance_needs_an_unchanged_review(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    from omnigent.stores.conversation_store import BOARD_ACCEPTED_LABEL_KEY
+
+    session = conversation_store.create_conversation()
+    reviewed = session.updated_at
+
+    assert not conversation_store.accept_board_review(session.id, reviewed - 1, "1")
+    assert not conversation_store.accept_board_review(uuid.uuid4().hex, reviewed, "1")
+    assert conversation_store.accept_board_review(session.id, reviewed, str(reviewed + 1))
+    saved = conversation_store.get_conversation(session.id)
+    assert saved is not None
+    assert saved.labels[BOARD_ACCEPTED_LABEL_KEY] == str(reviewed + 1)
+    assert saved.updated_at == reviewed
+
+
+@pytest.mark.parametrize("writer", ["append", "update_title", "rename_if_matches"])
+def test_activity_writers_drop_the_board_acceptance(
+    conversation_store: SqlAlchemyConversationStore,
+    writer: str,
+) -> None:
+    """Any write that advances updated_at reopens accepted Board work."""
+    from omnigent.stores.conversation_store import BOARD_ACCEPTED_LABEL_KEY
+
+    session = conversation_store.create_conversation(title="Before")
+    assert conversation_store.accept_board_review(
+        session.id, session.updated_at, str(session.updated_at + 1)
+    )
+
+    if writer == "append":
+        conversation_store.append(session.id, [_user_message("more work")])
+    elif writer == "update_title":
+        conversation_store.update_conversation(session.id, title="After")
+    else:
+        assert conversation_store.rename_conversation_if_title_matches(
+            session.id, "Before", "After"
+        )
+
+    saved = conversation_store.get_conversation(session.id)
+    assert saved is not None
+    assert BOARD_ACCEPTED_LABEL_KEY not in saved.labels
+
+
+def test_stalled_append_committing_before_accept_blocks_it(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An append that sampled the reviewed second but committed later stamps its
+    commit time, so an Accept of the earlier review is refused."""
+    from omnigent.stores.conversation_store import sqlalchemy_store
+
+    clock = [1_700_000_100]
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: clock[0])
+    session = conversation_store.create_conversation()
+    assert session.updated_at == 1_700_000_100
+    encode = conversation_store._encode_item_data_batch
+
+    def stall_then_encode(raw: list[str]) -> list[Any]:
+        clock[0] = 1_700_000_103  # the append sampled 100; it commits at 103
+        return encode(raw)
+
+    monkeypatch.setattr(conversation_store, "_encode_item_data_batch", stall_then_encode)
+    conversation_store.append(session.id, [_user_message("late output")])
+
+    saved = conversation_store.get_conversation(session.id)
+    assert saved is not None
+    assert saved.updated_at == 1_700_000_103
+    assert not conversation_store.accept_board_review(session.id, 1_700_000_100, "1700000101")
+
+
+def test_delayed_activity_writer_reopens_the_board_acceptance(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An append that sampled its timestamp before Accept but commits after it
+    still reopens the work, whatever updated_at it writes."""
+    from omnigent.stores.conversation_store import BOARD_ACCEPTED_LABEL_KEY
+
+    session = conversation_store.create_conversation()
+    paused = threading.Event()
+    release = threading.Event()
+    encode = conversation_store._encode_item_data_batch
+
+    def pause_then_encode(raw: list[str]) -> list[Any]:
+        paused.set()
+        assert release.wait(timeout=10)
+        return encode(raw)
+
+    # Encoding runs after append samples its timestamp and before its transaction.
+    monkeypatch.setattr(conversation_store, "_encode_item_data_batch", pause_then_encode)
+    writer = threading.Thread(
+        target=conversation_store.append, args=(session.id, [_user_message("late output")])
+    )
+    writer.start()
+    try:
+        assert paused.wait(timeout=10)
+        assert conversation_store.accept_board_review(
+            session.id, session.updated_at, str(session.updated_at + 1)
+        )
+    finally:
+        release.set()
+        writer.join(timeout=10)
+    assert not writer.is_alive()
+
+    saved = conversation_store.get_conversation(session.id)
+    assert saved is not None
+    assert BOARD_ACCEPTED_LABEL_KEY not in saved.labels
+
+
 @pytest.mark.parametrize("closed_by", ["label", "legacy_title"])
 def test_fork_of_a_closed_child_is_open(
     conversation_store: SqlAlchemyConversationStore,

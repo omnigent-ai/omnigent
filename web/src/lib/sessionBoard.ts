@@ -7,9 +7,9 @@ import { getSessionState } from "@/hooks/useSessionState";
 
 /**
  * Session label recording the user's acceptance of a session's work. The client
- * sends the `updated_at` it reviewed; the server stores one second past it
- * (epoch seconds) and refuses an Accept within two seconds of it, so any later
- * write gives the session an `updated_at` at least as new and reopens it.
+ * sends the `updated_at` it reviewed; the server stores one second past it if
+ * that is still current, and every later write that advances `updated_at`
+ * deletes the label, so new activity reopens the work.
  */
 export const BOARD_ACCEPTED_LABEL_KEY = "omnigent.board.accepted";
 

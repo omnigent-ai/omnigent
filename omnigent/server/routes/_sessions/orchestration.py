@@ -413,7 +413,7 @@ from omnigent.server.schemas import (
     SessionStatusEvent,
     SessionUsageEvent,
 )
-from omnigent.server.session_board import reject_board_acceptance_seed
+from omnigent.server.session_board import drop_board_acceptance_seed
 from omnigent.server.session_mcp_selection import session_mcp_selection
 from omnigent.server.startup_inputs import (
     STARTUP_LABEL,
@@ -12527,7 +12527,7 @@ async def _create_session_from_existing_agent(
 
     _reject_reserved_cost_control_label_seed(body.labels)
     _reject_server_reserved_label_seed(body.labels, at_creation=True)
-    reject_board_acceptance_seed(body.labels)
+    drop_board_acceptance_seed(body.labels)
     from omnigent.tools.browser_agent_tools import apply_browser_agent_tools_creation_labels
 
     apply_browser_agent_tools_creation_labels(body.labels, request.headers)
