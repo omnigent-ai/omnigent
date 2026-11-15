@@ -583,7 +583,8 @@ export type TriggerPollingTarget =
 /**
  * The full budget only when the server and the polling host both deliver long
  * messages: an older server or runner refuses any message over 8,000 characters.
- * Managed sandboxes are provisioned by the server, so they follow its limit.
+ * A managed sandbox's image can predate its server and can't report support
+ * before it starts, so sandboxes keep the older budget.
  * A trigger saved with the full budget for the same target keeps it, so a host
  * that is offline or on another replica doesn't block unrelated edits.
  */
@@ -600,7 +601,9 @@ export function triggerMessageBudget(
     upgradeHint = null;
   } else if (target === undefined) {
     upgradeHint = `Pick a host with the current Omnigent to allow up to ${fullBudget}.`;
-  } else if (target !== "managed_sandbox" && target.long_session_messages_supported !== true) {
+  } else if (target === "managed_sandbox") {
+    upgradeHint = `Run it on a host with the current Omnigent to allow up to ${fullBudget}.`;
+  } else if (target.long_session_messages_supported !== true) {
     upgradeHint = `Update Omnigent on "${target.name}" and keep it online to allow up to ${fullBudget}.`;
   }
   return upgradeHint === null

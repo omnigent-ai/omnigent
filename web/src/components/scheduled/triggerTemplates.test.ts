@@ -332,7 +332,7 @@ describe("saved trigger prompts", () => {
 
 describe("triggerFieldsComplete", () => {
   // Instructions are capped so each worker's first message has room for the item.
-  it.each<[string, Partial<TriggerFields>, boolean]>([
+  it.each<[string, Partial<TriggerFields>, boolean, number?]>([
     ["scope and instructions, no conditions", { conditions: [] }, true],
     ["blank scope", { scope: "  " }, false],
     ["equals matches one scope", { scopeOperator: "is", scope: "ES" }, true],
@@ -370,8 +370,22 @@ describe("triggerFieldsComplete", () => {
     ["empty instructions", { instructions: "" }, false],
     ["16,000 characters of instructions", { instructions: "x".repeat(16_000) }, true],
     ["instructions over the cap", { instructions: "x".repeat(MAX_INSTRUCTIONS_CHARS + 1) }, false],
-  ])("%s", (_name, overrides, complete) => {
-    expect(triggerFieldsComplete(fields(overrides))).toBe(complete);
+    [
+      "2,000 characters within the older budget",
+      { instructions: "x".repeat(2000) },
+      true,
+      LEGACY_MAX_INSTRUCTIONS_CHARS,
+    ],
+    [
+      "instructions over the older budget",
+      { instructions: "x".repeat(LEGACY_MAX_INSTRUCTIONS_CHARS + 1) },
+      false,
+      LEGACY_MAX_INSTRUCTIONS_CHARS,
+    ],
+  ])("%s", (_name, overrides, complete, instructionsMaxChars) => {
+    expect(triggerFieldsComplete(fields(overrides), undefined, instructionsMaxChars)).toBe(
+      complete,
+    );
   });
 });
 
@@ -384,7 +398,13 @@ describe("trigger message budget", () => {
   });
 
   it.each([
-    ["a managed sandbox", 32000, "managed_sandbox" as const, FULL, null],
+    [
+      "a managed sandbox",
+      32000,
+      "managed_sandbox" as const,
+      LEGACY,
+      "Run it on a host with the current Omnigent to allow up to 16,000.",
+    ],
     ["a current host", 32000, laptop(true), FULL, null],
     [
       "an older host",
@@ -427,6 +447,7 @@ describe("trigger message budget", () => {
 
   it.each([
     ["the full limit on an older host", 32000, 32000, laptop(false), FULL, null],
+    ["the full limit on a managed sandbox", 32000, 32000, "managed_sandbox" as const, FULL, null],
     [
       "the full limit on an older server",
       32000,
@@ -467,16 +488,6 @@ describe("trigger message budget", () => {
       expect(readTriggerMessageMaxChars("Summarize the inbox.")).toBeNull();
     },
   );
-
-  it("checks instructions against the budget it is given", () => {
-    const instructions = (length: number) => fields({ instructions: "x".repeat(length) });
-    expect(triggerFieldsComplete(instructions(2000), "jira", LEGACY_MAX_INSTRUCTIONS_CHARS)).toBe(
-      true,
-    );
-    expect(triggerFieldsComplete(instructions(9000), "jira", LEGACY_MAX_INSTRUCTIONS_CHARS)).toBe(
-      false,
-    );
-  });
 
   it.each(["new", "continue"] as const)(
     "asks %s-mode workers for messages within the budget",

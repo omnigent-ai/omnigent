@@ -1034,13 +1034,19 @@ export function CreateScheduledTaskDialog({
   const badgeHost =
     selectedHost ?? hostOptions.find((h) => h.status === "online") ?? hostOptions[0];
   // Trigger messages fit what both the server and the pinned polling host deliver.
-  const messageBudget = triggerMessageBudget(
-    info === "loading" ? undefined : info.session_message_max_chars,
-    sandboxMode ? "managed_sandbox" : selectedHost,
+  const savedMessageMaxChars =
     editingTemplateTrigger && originalTargetSelected
       ? readTriggerMessageMaxChars(editingTask.prompt)
-      : null,
+      : null;
+  const loadedMessageBudget = triggerMessageBudget(
+    // Until server info loads, a saved trigger keeps its limit; Save waits for it.
+    curationPending ? (savedMessageMaxChars ?? undefined) : info.session_message_max_chars,
+    sandboxMode ? "managed_sandbox" : selectedHost,
+    savedMessageMaxChars,
   );
+  const messageBudget = curationPending
+    ? { ...loadedMessageBudget, upgradeHint: null }
+    : loadedMessageBudget;
 
   // A workspace is only valid with a host — mirror the server's pairing rule so
   // the user gets inline feedback instead of a 400. In sandbox mode there is no

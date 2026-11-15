@@ -4377,15 +4377,14 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     },
   );
 
-  it("keeps a saved trigger's 16,000-character instructions when its host can't vouch for them", async () => {
-    mockLaptop(false);
-    const instructions = "x".repeat(12_000);
-    const saved = encodeTriggerPrompt(
+  const longInstructions = "x".repeat(12_000);
+  const longTriggerTask = scheduledTask({
+    prompt: encodeTriggerPrompt(
       {
         source: "jira",
         ...emptyTriggerFields("jira"),
         scope: "ES",
-        instructions,
+        instructions: longInstructions,
         worker: {
           placement: "same_host",
           agentId: null,
@@ -4395,13 +4394,31 @@ describe("CreateScheduledTaskDialog trigger template", () => {
         },
       },
       { sessionLink: "https://example.test/c/CONVERSATION_ID" },
+    ),
+    sessionMode: "continue",
+    sessionId: "poller",
+    hostId: "host_1",
+  });
+
+  it.each([
+    ["is loading", "loading" as const],
+    ["is the boot fallback", SERVER_INFO_OFFLINE_FALLBACK],
+  ])("doesn't flag a saved trigger's long instructions while server info %s", (_case, info) => {
+    mockLaptop(false);
+    render(
+      <CapabilitiesProvider info={info}>
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={longTriggerTask} />
+      </CapabilitiesProvider>,
     );
-    const task = scheduledTask({
-      prompt: saved,
-      sessionMode: "continue",
-      sessionId: "poller",
-      hostId: "host_1",
-    });
+    expect(screen.getByTestId("task-trigger-instructions")).toHaveValue(longInstructions);
+    expect(screen.queryByTestId("task-trigger-instructions-too-long-notice")).toBeNull();
+    expect(screen.queryByText(/Update the Omnigent server/)).toBeNull();
+  });
+
+  it("keeps a saved trigger's 16,000-character instructions when its host can't vouch for them", async () => {
+    mockLaptop(false);
+    const instructions = longInstructions;
+    const task = longTriggerTask;
     render(
       <CapabilitiesProvider
         info={{
