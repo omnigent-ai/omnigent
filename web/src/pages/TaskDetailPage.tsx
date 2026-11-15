@@ -41,10 +41,21 @@ import {
   stripTriggerHeader,
 } from "@/components/scheduled/triggerTemplates";
 import {
+  RunGraphButton,
+  RunPlanButton,
+  RunTimeline,
+  RunWorkflowButton,
+  useRunTaskMenus,
+} from "@/components/workflows/RunTasks";
+import { planRunControl } from "@/shell/PlanRunButton";
+import { WorkflowGraphOverlay } from "@/components/workflows/WorkflowStepsGraph";
+import {
   useDeleteScheduledTask,
   useRunScheduledTaskNow,
   useScheduledTask,
+  scheduledTaskRunsKey,
   useScheduledTaskRuns,
+  useScheduledTaskRunSteps,
   useUpdateScheduledTask,
 } from "@/hooks/useScheduledTasks";
 import {
@@ -54,6 +65,7 @@ import {
 } from "@/hooks/useUnseenConversations";
 import { useNow } from "@/hooks/useNow";
 import { useSession } from "@/hooks/useSession";
+import { useSessionWorking } from "@/hooks/useSessionWorking";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
 import { useProjects } from "@/hooks/useConversations";
@@ -70,9 +82,10 @@ import {
   formatRunTimestamp,
 } from "@/lib/scheduleText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { sandboxOptionLabel } from "@/lib/capabilities";
+import { isFeatureEnabled, sandboxOptionLabel } from "@/lib/capabilities";
 import { ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
-import type { ScheduledTaskRun } from "@/lib/scheduledTasksApi";
+import type { ScheduledTaskRun, ScheduledTaskRunSteps } from "@/lib/scheduledTasksApi";
+import { stepProgress } from "@/lib/sessionJournal";
 import { cn } from "@/lib/utils";
 
 const RUN_HIGHLIGHT_DURATION_MS = 3_000;
@@ -88,6 +101,7 @@ export function TaskDetailPage() {
 
 function TaskDetail({ taskId }: { taskId: string }) {
   const navigate = useNavigate();
+  const info = useServerInfo();
   const now = useNow();
   // Saving or switching a trigger re-renders its prompt, whose workers post this share link.
   const rebasePath = useRebasePath();
@@ -112,6 +126,8 @@ function TaskDetail({ taskId }: { taskId: string }) {
     isError: runsError,
     isFetchedAfterMount: runsFetchedAfterMount,
   } = useScheduledTaskRuns(taskId, taskId !== "", awaitingRunRow);
+  const workflowsEnabled = isFeatureEnabled(info, "workflows");
+  const runSteps = useScheduledTaskRunSteps(taskId, runs, workflowsEnabled);
 
   const updateMutation = useUpdateScheduledTask();
   const deleteMutation = useDeleteScheduledTask();
@@ -226,7 +242,6 @@ function TaskDetail({ taskId }: { taskId: string }) {
     pinnedAgentIds: task != null ? [task.agentId] : [],
   });
   const { data: hosts } = useHosts();
-  const info = useServerInfo();
   const { data: projects } = useProjects({ enabled: task?.projectId != null });
   const sandboxLabel = sandboxOptionLabel(info !== "loading" ? info.sandbox_provider : null);
   const agent = agents?.find((candidate) => candidate.id === task?.agentId);
@@ -549,8 +564,8 @@ function TaskDetail({ taskId }: { taskId: string }) {
 
       <hr className="my-6 border-border" />
 
-      {/* Run history. */}
-      <h2 className="mb-2 text-sm font-medium text-muted-foreground">Run history</h2>
+      {/* Runs. */}
+      <h2 className="mb-2 text-sm font-medium text-muted-foreground">Runs</h2>
       {runs?.some((run) => run.sessionCostUsd != null) && (
         <p className="mb-2 text-xs text-muted-foreground">
           Session cost is each session’s current recorded total. Runs sharing a session show the
@@ -573,7 +588,13 @@ function TaskDetail({ taskId }: { taskId: string }) {
       ) : (
         <ul className="flex flex-col gap-1" data-testid="task-detail-runs">
           {(runs ?? []).map((run) => (
-            <RunRow key={run.id} run={run} now={now} highlighted={run.id === highlightedRunId} />
+            <RunRow
+              key={run.id}
+              run={run}
+              now={now}
+              highlighted={run.id === highlightedRunId}
+              steps={workflowsEnabled ? runSteps.get(run.id) : undefined}
+            />
           ))}
         </ul>
       )}
@@ -675,24 +696,65 @@ function RunRow({
   run,
   now,
   highlighted,
+  steps,
 }: {
   run: ScheduledTaskRun;
   now: Date;
   highlighted: boolean;
+  /** The plan the run started with, independent of the automation's current prompt. */
+  steps?: ScheduledTaskRunSteps;
 }) {
   const timestamp = formatRunTimestamp(run.firedAt ?? run.scheduledAt, now);
+  // A workflow run's tasks, as the workflow's page shows them.
+  const working = useSessionWorking(
+    steps?.isCurrent === true ? run.conversationId : null,
+    run.status === "running" || run.conversationStatus === "running",
+  );
+  const sessionWorking = steps?.isCurrent === true && working;
+  const progress = useMemo(
+    () => (steps ? stepProgress(steps.steps, steps.statuses, sessionWorking) : []),
+    [steps, sessionWorking],
+  );
+  const sessionId = run.conversationId;
+  const showTasks = progress.length > 0 && sessionId != null;
+  const [graphOpen, setGraphOpen] = useState(false);
+  // The saved workflow the run's plan follows, when the Workflows page can open it.
+  const workflowId = isFeatureEnabled(useServerInfo(), "workflows")
+    ? (steps?.workflowId ?? null)
+    : null;
+  // Stop while the run's session works; play once it stopped with tasks left.
+  const control =
+    showTasks && steps?.isCurrent && steps.planId
+      ? planRunControl(progress, steps.statuses, sessionWorking)
+      : null;
+  // What the run's buttons and task menus refresh once its session takes them.
+  const refreshKeys = [
+    scheduledTaskRunsKey(run.scheduledTaskId),
+    ["scheduled-task-run-steps", run.scheduledTaskId],
+  ];
+  // Its tasks' ⋯ menus, on the timeline's cards and the graph's nodes.
+  const taskMenus = useRunTaskMenus(
+    steps?.isCurrent ? sessionId : null,
+    refreshKeys,
+    steps?.planId ?? null,
+  );
+  // Room on the row's link for the buttons over its right end.
+  const buttonPadding = ["", "pr-11", "pr-18", "pr-25"][
+    1 + (workflowId ? 1 : 0) + (control ? 1 : 0)
+  ];
   const duration = formatRunDuration(run.firedAt, run.finishedAt);
   // Unread only applies to a succeeded run that produced a conversation.
   const unread = useRunUnread(run);
   const failure = isUnsuccessfulRun(run) ? describeRunFailure(run.errorCode, run.status) : null;
+  const showSessionActivity = steps === undefined || steps.isCurrent;
   const inFlightLabel =
     IN_FLIGHT_RUN_LABELS[run.status] ??
-    (isSessionStillRunning(run) ? "Session running" : undefined);
+    (showSessionActivity && isSessionStillRunning(run) ? "Session running" : undefined);
 
   const body = (
     <>
       <span className="flex size-5 shrink-0 items-center justify-center">
-        <RunStatusIcon run={run} unread={unread} />
+        <RunStatusIcon run={run} unread={unread} showSessionActivity={showSessionActivity} />
       </span>
       <span className="flex min-w-0 flex-1 flex-col">
         <span className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
@@ -713,15 +775,17 @@ function RunRow({
             </span>
           )}
         </span>
-        {(run.conversationPendingApprovals ?? 0) > 0 && run.conversationId && (
-          <span
-            className="text-xs text-amber-600 dark:text-amber-400"
-            role="status"
-            data-testid="run-pending-approval"
-          >
-            Session needs approval · Open to review
-          </span>
-        )}
+        {showSessionActivity &&
+          (run.conversationPendingApprovals ?? 0) > 0 &&
+          run.conversationId && (
+            <span
+              className="text-xs text-amber-600 dark:text-amber-400"
+              role="status"
+              data-testid="run-pending-approval"
+            >
+              Session needs approval · Open to review
+            </span>
+          )}
         {failure && (
           <span className="text-xs text-muted-foreground" data-testid="run-failure">
             {failure.stage && (
@@ -756,7 +820,12 @@ function RunRow({
       data-testid="task-detail-run"
       data-run-status={run.status}
       data-run-unread={run.status === "succeeded" ? unread : undefined}
-      className={cn("rounded-lg", highlighted && "animate-message-highlight")}
+      className={cn(
+        "relative rounded-lg",
+        highlighted && "animate-message-highlight",
+        // The row's timeline sits under its link, so the whole row lights up, once.
+        showTasks && "transition-colors hover:bg-muted has-[a:focus-visible]:bg-muted",
+      )}
       style={highlighted ? { animationDuration: `${RUN_HIGHLIGHT_DURATION_MS}ms` } : undefined}
     >
       {run.conversationId ? (
@@ -765,13 +834,58 @@ function RunRow({
           data-testid="run-open"
           className={cn(
             commonClassName,
-            "cursor-pointer transition-colors hover:bg-muted focus-visible:bg-muted focus-visible:outline-none",
+            "cursor-pointer focus-visible:outline-none",
+            showTasks ? buttonPadding : "transition-colors hover:bg-muted focus-visible:bg-muted",
           )}
         >
           {body}
         </Link>
       ) : (
         <div className={commonClassName}>{body}</div>
+      )}
+      {showTasks && (
+        <>
+          <RunTimeline
+            sessionId={sessionId}
+            progress={progress}
+            menuActionFor={taskMenus}
+            className="pr-3 pb-2.5 pl-10"
+          />
+          <div className="absolute top-1.5 right-2 z-10 flex items-center gap-0.5">
+            {control && steps?.planId && (
+              <RunPlanButton
+                sessionId={sessionId}
+                runId={steps.planId}
+                planName={steps?.planName ?? null}
+                control={control}
+                refreshKeys={refreshKeys}
+              />
+            )}
+            {workflowId && <RunWorkflowButton workflowId={workflowId} />}
+            <RunGraphButton
+              runName={`the ${timestamp ?? ""} run`}
+              onClick={() => setGraphOpen(true)}
+            />
+          </div>
+        </>
+      )}
+      {graphOpen && showTasks && steps && (
+        <WorkflowGraphOverlay
+          title={steps.planName ?? "Workflow"}
+          subtitle={
+            <>
+              <span>{timestamp ?? "—"}</span>
+              <span aria-hidden>·</span>
+              <Link to={`/c/${sessionId}`} className="text-foreground hover:underline">
+                Open session
+              </Link>
+            </>
+          }
+          steps={steps.steps}
+          progress={progress}
+          menuActionFor={taskMenus}
+          onClose={() => setGraphOpen(false)}
+        />
       )}
     </li>
   );
@@ -787,7 +901,15 @@ function RunRow({
  *   5. succeeded + READ / no conversation → muted grey dot, tooltip = "Completed".
  *   6. scheduled           → muted grey dot, no tooltip (not started yet).
  */
-function RunStatusIcon({ run, unread }: { run: ScheduledTaskRun; unread: boolean }) {
+function RunStatusIcon({
+  run,
+  unread,
+  showSessionActivity,
+}: {
+  run: ScheduledTaskRun;
+  unread: boolean;
+  showSessionActivity: boolean;
+}) {
   if (run.status === "failed" || run.status === "incomplete") {
     return (
       <IndicatorWithTooltip tooltip="Failed">
@@ -826,7 +948,7 @@ function RunStatusIcon({ run, unread }: { run: ScheduledTaskRun; unread: boolean
       </IndicatorWithTooltip>
     );
   }
-  if (isSessionStillRunning(run)) {
+  if (showSessionActivity && isSessionStillRunning(run)) {
     return (
       <IndicatorWithTooltip tooltip="Session still running" announce={false}>
         <Loader2Icon

@@ -468,3 +468,10 @@ def test_agent_owner_legacy_null_is_admin_only(
 def test_delegated_runner_credentials_allow_gateway_only():
     assert delegated_path_allowed("/v1/mcp/tracker")
     assert not delegated_path_allowed("/v1/mcp-registry/services/tracker/connection")
+
+
+def test_delegated_credentials_reach_the_workflows_api():
+    """An agent's workflow tools call /v1/workflows with the runner's credentials."""
+    assert delegated_path_allowed("/v1/workflows")
+    assert delegated_path_allowed("/v1/workflows/0123456789abcdef0123456789abcdef")
+    assert not delegated_path_allowed("/v1/workflowsX")

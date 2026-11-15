@@ -11,6 +11,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RenderItem } from "@/lib/renderItems";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
@@ -1552,6 +1554,50 @@ describe("BlockRenderer dispatch", () => {
       fireEvent.click(screen.getByText("Worked for 42s"));
       expect(screen.getByText("Dispatching two sub-agents.")).toBeDefined();
       expect(screen.getByText("Called 2 tools")).toBeDefined();
+    });
+
+    describe("task markers", () => {
+      const marker = (entryId: string, status: string, name: string): RenderItem => ({
+        kind: "subagent_activity",
+        itemId: `item_${entryId}`,
+        data: {
+          type: "resource_event",
+          event_type: "session.journal.task",
+          resource_type: "journal",
+          resource_id: "hello",
+          resource: { name, status, text: null, entry_id: entryId, native: false },
+        },
+      });
+
+      it("keeps a settled turn's task markers in view instead of folding its work", () => {
+        render(
+          <MemoryRouter>
+            <CapabilitiesProvider
+              info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: true } }}
+            >
+              <BlockRenderer
+                items={[
+                  tool(1, "Agent"),
+                  marker("e1", "started", "Say hello"),
+                  tool(2, "Agent"),
+                  marker("e2", "done", "Say hello"),
+                  { kind: "text", itemId: "m1", text: "Said hello.", final: true },
+                ]}
+                sessionStatus="idle"
+                workedForS={9}
+              />
+            </CapabilitiesProvider>
+          </MemoryRouter>,
+        );
+        expect(screen.queryByRole("button", { name: "Worked for 9s" })).toBeNull();
+        expect(screen.getAllByTestId("task-activity").map((node) => node.textContent)).toEqual([
+          "Started Say hello",
+          "Completed Say hello",
+        ]);
+        // The tool calls on either side of a marker stay in their own group.
+        expect(screen.getAllByText("Called 1 tool")).toHaveLength(2);
+        expect(screen.getByText("Said hello.")).toBeDefined();
+      });
     });
 
     describe("sub-agent notices", () => {

@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 
 from omnigent.errors import OmnigentError
 from omnigent.host.frames import (
+    CAP_WORKFLOWS,
     HostHelloFrame,
     HostSkillsFrame,
     HostSkillsResultFrame,
@@ -25,6 +26,7 @@ from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.host.skills import HostSkillDiscovery
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ
+from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions.routes_agent import register_agent_routes
 from omnigent.server.routes.skills import create_skills_router
@@ -118,10 +120,21 @@ def presession_app(skills_app):
 
 @pytest.mark.parametrize("user", ["owner", "editor"])
 @pytest.mark.parametrize("acknowledged", [True, False])
+@pytest.mark.parametrize(
+    "workflows_enabled,host_supports_workflows", [(False, True), (True, True), (True, False)]
+)
 async def test_session_catalog_needs_no_runner_and_allows_shared_editors(
-    skills_app, user: str, acknowledged: bool
+    skills_app,
+    user: str,
+    acknowledged: bool,
+    workflows_enabled: bool,
+    host_supports_workflows: bool,
 ) -> None:
     app, _, conn, conv, agent, _ = skills_app
+    conn.hello.capabilities = [CAP_WORKFLOWS] if host_supports_workflows else []
+    app.state.feature_flags = resolve_feature_flags(
+        {"OMNIGENT_FEATURES": "workflows" if workflows_enabled else ""}
+    )
     assert conv.runner_id is None
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -133,6 +146,7 @@ async def test_session_catalog_needs_no_runner_and_allows_shared_editors(
             (await asyncio.wait_for(conn.outbound_queue.get(), budget(2))).data
         )
         assert isinstance(frame, HostSkillsFrame)
+        assert frame.workflows_enabled is (workflows_enabled and host_supports_workflows)
         assert (
             frame.session_id,
             frame.path,
@@ -204,12 +218,24 @@ async def test_session_target_cannot_be_overridden(skills_app, overrides: dict[s
 
 
 @pytest.mark.parametrize("skill_filter", ["all", "none", ["allowed"]])
+@pytest.mark.parametrize(
+    "workflows_enabled,host_supports_workflows", [(False, True), (True, True), (True, False)]
+)
 async def test_presession_catalog_matches_filtered_invocations(
-    presession_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, skill_filter: str | list[str]
+    presession_app,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    skill_filter: str | list[str],
+    workflows_enabled: bool,
+    host_supports_workflows: bool,
 ) -> None:
     app, _, conn, _, agent, _ = presession_app
+    conn.hello.capabilities = [CAP_WORKFLOWS] if host_supports_workflows else []
+    app.state.feature_flags = resolve_feature_flags(
+        {"OMNIGENT_FEATURES": "workflows" if workflows_enabled else ""}
+    )
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
-    for name in ("bundled", "hidden", "allowed", "denied"):
+    for name in ("bundled", "hidden", "allowed", "denied", "save-workflow"):
         directory = tmp_path / ".claude" / "skills" / name
         directory.mkdir(parents=True)
         (directory / "SKILL.md").write_text(
@@ -221,6 +247,7 @@ async def test_presession_catalog_matches_filtered_invocations(
         skills_filter=skill_filter,
         skills=[
             SkillSpec(name="bundled", description="Bundled precedence", content="Instructions"),
+            SkillSpec(name="workflow", description="Custom workflow", content="Instructions"),
             SkillSpec(
                 name="hidden", description="Hidden", content="Instructions", user_invocable=False
             ),
@@ -234,8 +261,8 @@ async def test_presession_catalog_matches_filtered_invocations(
 
     builtin = builtin_agent_object(agent, app.state.agent_cache)
     session = session_agent_object(agent, app.state.agent_cache, mcp_servers_editable=True)
-    assert [s.name for s in builtin.skills] == ["bundled"]
-    assert [s.name for s in session.skills] == ["bundled"]
+    assert [s.name for s in builtin.skills] == ["bundled", "workflow"]
+    assert [s.name for s in session.skills] == ["bundled", "workflow"]
     # `skills: none` runs claude-sdk with no setting sources, so /mcp hides user servers.
     assert builtin.loads_user_settings is session.loads_user_settings is (skill_filter != "none")
     discovery = HostSkillDiscovery(
@@ -273,7 +300,9 @@ async def test_presession_catalog_matches_filtered_invocations(
         )
         response = await task
     assert response.status_code == 200
-    expected = resolve_session_skills(spec, (tmp_path,), None)
+    expected = resolve_session_skills(
+        spec, (tmp_path,), None, workflows_enabled=workflows_enabled and host_supports_workflows
+    )
     assert response.json()["skills"] == [
         {"name": s.name, "description": s.description, "display_name": s.display_name}
         for s in expected
