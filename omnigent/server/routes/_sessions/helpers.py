@@ -4930,6 +4930,29 @@ def _require_external_status_forward(
         )
 
 
+def _is_parent_inbox_refusal_report(data: dict[str, Any]) -> bool:
+    """
+    Return whether a status is a forwarder's report of a ``subagent_parent_inbox_missing`` 410.
+
+    A claude-native forwarder that predates that code answers the 410 to its
+    Stop-hook status with a ``failed`` status of its own. It reports only that
+    the parent could not take the result, so it is neither published nor
+    forwarded, which would replace the result the runner keeps.
+
+    :param data: The ``external_session_status`` event data.
+    :returns: ``True`` for a ``failed`` status whose ``failure_context`` is a
+        forwarder-delivery failure of a hook status answered 410.
+    """
+    context = data.get("failure_context")
+    return (
+        data.get("status") == "failed"
+        and isinstance(context, dict)
+        and context.get("failure_source") == "forwarder_delivery"
+        and context.get("http_status") == 410
+        and str(context.get("forwarder_source_id", "")).startswith("hook:")
+    )
+
+
 def _is_missing_parent_inbox(runner_result: _RunnerForwardResult) -> bool:
     """
     Return whether the runner refused a terminal status for lack of a parent inbox.
@@ -13002,6 +13025,7 @@ __all__ = [
     "_is_codex_native_subagent",
     "_is_devin_native_subagent",
     "_is_kiro_native_session",
+    "_is_parent_inbox_refusal_report",
     "_last_task_error_from_labels",
     "_last_task_error_runner_id_from_labels",
     "_latest_assistant_text_from_store",

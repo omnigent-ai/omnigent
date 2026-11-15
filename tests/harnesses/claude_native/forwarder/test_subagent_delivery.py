@@ -1136,6 +1136,56 @@ async def test_concurrent_subagent_502s_recover_without_phantom_completion(
 
 
 @pytest.mark.asyncio
+async def test_subagent_status_settles_after_a_permanent_refusal(tmp_path: Path) -> None:
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    subagents_dir = tmp_path / "subagents"
+    subagents_dir.mkdir()
+    (subagents_dir / "agent-settle.jsonl").write_text("", encoding="utf-8")
+    entry = forwarder.SubagentEntry(
+        subagent_id="settle",
+        child_conversation_id="conv_child_settle",
+        last_activity_ts=time.time() - forwarder._SUBAGENT_IDLE_THRESHOLD_S - 60,
+        last_status="running",
+        delivery_error="sub-agent transcript incomplete",
+    )
+    checkpoint = forwarder._SubagentStateCheckpoint(
+        bridge_dir, forwarder.SubagentForwardState(subagents={"settle": entry})
+    )
+    posts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal posts
+        posts += 1
+        return httpx.Response(
+            410, json={"error": {"code": "subagent_parent_inbox_missing", "message": "x"}}
+        )
+
+    status_tracker = forwarder._PostRetryTracker(base_delay_s=0.0, max_delay_s=0.0)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        for _ in range(6):
+            await forwarder._forward_one_subagent(
+                client=client,
+                parent_session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                subagents_dir=subagents_dir,
+                entry=checkpoint.state.subagents["settle"],
+                agent_name="claude-native-ui",
+                checkpoint=checkpoint,
+                item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                status_retry_tracker=status_tracker,
+                batch_capability=forwarder._SessionEventBatchCapability(),
+                status_capability=forwarder._SubagentStatusCapability(),
+            )
+
+    # Three tries of the permanent refusal, then the status settles.
+    assert posts == 3
+    assert checkpoint.state.subagents["settle"].last_status == "failed"
+
+
+@pytest.mark.asyncio
 async def test_subagent_item_drop_writes_dead_letter(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,

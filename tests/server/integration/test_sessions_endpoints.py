@@ -6731,6 +6731,68 @@ async def test_post_external_session_status_propagates_runner_delivery_failure(
     assert reason in error["message"]
 
 
+async def test_post_external_session_status_acks_forwarder_report_of_parent_inbox_refusal(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An older forwarder's failed status after the 410 is acked, not forwarded."""
+    forwarded: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """
+        Accept session creates and record forwarded events.
+
+        :param request: Request sent to the fake runner.
+        :returns: Session-create acceptance or 204 for an event.
+        """
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            body = json.loads(request.content)
+            return httpx.Response(201, json={"id": body["session_id"]})
+        forwarded.append(request.url.path)
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    ) as fake_runner:
+        _route_to_runner(monkeypatch, fake_runner)
+        agent = await create_test_agent(client, sub_agents=[{"name": "worker"}])
+        parent = await _create_session(client, agent["id"])
+        child_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "parent_session_id": parent["id"],
+                "sub_agent_name": "worker",
+                "title": "worker:native",
+            },
+        )
+        assert child_resp.status_code == 201, child_resp.text
+        child = child_resp.json()
+        forwarded.clear()
+
+        status_resp = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={
+                "type": "external_session_status",
+                "data": {
+                    "status": "failed",
+                    "output": "hook status idle rejected",
+                    "failure_context": {
+                        "failure_source": "forwarder_delivery",
+                        "forwarder_source_id": "hook:1:120:idle",
+                        "http_status": 410,
+                    },
+                },
+            },
+        )
+        snapshot = await client.get(f"/v1/sessions/{child['id']}")
+
+    assert status_resp.status_code == 202, status_resp.text
+    assert forwarded == []
+    assert snapshot.json().get("last_task_error") is None
+
+
 async def test_post_external_output_text_delta_publishes_transient_delta(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

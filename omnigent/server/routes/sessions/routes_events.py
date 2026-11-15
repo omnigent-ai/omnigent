@@ -214,6 +214,7 @@ from omnigent.server.routes._sessions.helpers import (
     _handle_external_session_todos,
     _is_codex_native_subagent,
     _is_devin_native_subagent,
+    _is_parent_inbox_refusal_report,
     _launch_runner_on_host,
     _native_coding_agent_for_session,
     _owns_host_runner,
@@ -2630,6 +2631,8 @@ def register_events_routes(
                     f"{sorted(_EXTERNAL_SESSION_STATUS_VALUES)}; got {status!r}",
                     code=ErrorCode.INVALID_INPUT,
                 )
+            if _is_parent_inbox_refusal_report(body.data):
+                return {"queued": False}
             failure_intake = (
                 failed_status_intake_attributes(
                     body.data,
