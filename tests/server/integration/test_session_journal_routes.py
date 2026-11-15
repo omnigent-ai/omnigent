@@ -868,6 +868,8 @@ async def test_automation_workflows_cannot_wait_for_user_input(
         ],
     }
     assert (await run("sys_journal_write_plan", plan))["version"] == 1
+    journal = f"/v1/sessions/{session_id}/journal"
+    initial_entries = (await client.get(journal)).json()["data"]
     for tool, args in (
         (
             "sys_journal_write_status",
@@ -879,9 +881,8 @@ async def test_automation_workflows_cannot_wait_for_user_input(
         assert result["error"].startswith("unattended_input_not_allowed:"), result
         assert "failed" in result["error"] and "authorization" in result["error"]
         assert pending_elicitations.snapshot_for(session_id) == []
-    journal = f"/v1/sessions/{session_id}/journal"
     entries = (await client.get(journal)).json()["data"]
-    assert [entry["kind"] for entry in entries] == ["plan"]
+    assert entries == initial_entries
 
     # The agent can record the blocker and finish independent work after the rejection.
     for step, status, text in (
