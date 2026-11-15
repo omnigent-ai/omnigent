@@ -4406,7 +4406,7 @@ def create_runner_app(
             else _native_runtime.codex_native_bridge_dir(conv_id)
         )
 
-    def _codex_goal_bridge_is_inactive(conv_id: str, state: CodexNativeBridgeState) -> bool:
+    async def _codex_goal_bridge_is_inactive(conv_id: str, state: CodexNativeBridgeState) -> bool:
         """Recognize an unloaded bridge without a recorded startup failure."""
         from omnigent.harnesses.codex_native.bridge import (
             bridge_dir_for_codex_home,
@@ -4422,9 +4422,16 @@ def create_runner_app(
         ):
             return False
         bridge_dir = bridge_dir_for_codex_home(Path(state.codex_home))
+        if (
+            await asyncio.to_thread(read_bridge_state, bridge_dir) != state
+            or await asyncio.to_thread(read_bridge_startup_error, bridge_dir) is not None
+        ):
+            return False
+        # A terminal or backend can appear while the filesystem reads are pending.
         return (
-            read_bridge_state(bridge_dir) == state
-            and read_bridge_startup_error(bridge_dir) is None
+            resource_registry.terminal_registry is registry
+            and registry.get(conv_id, "codex", "main") is None
+            and conv_id not in _native_runtime._AUTO_CODEX_APP_SERVERS
         )
 
     codex_goal_runner = CodexGoalRunner(
