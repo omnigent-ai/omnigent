@@ -246,6 +246,20 @@ describe("collectTurnWork", () => {
         "ok",
       ),
       tool("q2", "ask_query", { query: "Select customers from last quarter who churned" }, "ok"),
+      // Ordinary prose punctuation is not SQL structure.
+      tool(
+        "comma",
+        "databricks__query_space",
+        { query: "Select the top 5 customers from EMEA, ordered by revenue" },
+        "ok",
+      ),
+      tool(
+        "paren",
+        "databricks__query_space",
+        { query: "Select the top 5 customers from EMEA (last month)" },
+        "ok",
+      ),
+      tool("eg", "ask_query", { query: "Select customers from EMEA, e.g. top accounts" }, "ok"),
       tool("q3", "run_query", { query: "SELECT * FROM orders" }, "[]"),
     ]);
     expect(work.queries.map((query) => query.text)).toEqual(["SELECT * FROM orders"]);
@@ -272,12 +286,16 @@ describe("collectTurnWork", () => {
       tool("gen", "sql_generator", { query: "Select the top customers" }, "SELECT 1"),
       tool("nl2", "text_2_sql", { query: "Select the top customers" }, "SELECT 1"),
       tool("py", "sql_to_python", { query: "SELECT now()" }, "now()"),
+      tool("pysql", "sql_to_python", { sql: "SELECT now()" }, "datetime.now()"),
+      // A run word means the SQL still runs, whatever the output format.
+      tool("csv", "run_sql_to_csv", { sql: "SELECT * FROM orders" }, "a,b"),
       tool("usedb", "execute_sql", { statement: "USE main.sales" }, "{}"),
     ]);
     expect(work.queries.map((query) => query.text)).toEqual([
       "SELECT 1",
       "SELECT current_catalog()",
       "SELECT now()",
+      "SELECT * FROM orders",
       "USE main.sales",
     ]);
   });
@@ -301,6 +319,26 @@ describe("collectTurnWork", () => {
       ["code", "x = 1"],
       ["code", "y = 2"],
     ]);
+  });
+
+  it("reads a plain column list as SQL on a generic query tool", () => {
+    const work = collectTurnWork([
+      tool("cols", "run_query", { query: "SELECT id, name FROM users" }, "[]"),
+      tool("prose", "run_query", { query: "Select revenue, churn from EMEA, by region" }, "ok"),
+    ]);
+    expect(work.queries.map((query) => query.text)).toEqual(["SELECT id, name FROM users"]);
+  });
+
+  it("keeps a read-only statement's table though literals or functions name a write", () => {
+    const work = collectTurnWork(
+      [
+        "SELECT replace(email, '@', '') FROM users",
+        "SELECT * FROM audit WHERE op IN ('insert', 'delete')",
+        "-- copy of the report\nSELECT * FROM report",
+        "SHOW CREATE TABLE orders",
+      ].map((sql, index) => tool(`ro${index}`, "run_sql", { sql, table: `t${index}` }, "[]")),
+    );
+    expect(work.sources.map((source) => source.value)).toEqual(["t0", "t1", "t2", "t3"]);
   });
 
   it("lists URLs and tables from calls that read them", () => {
@@ -373,9 +411,25 @@ describe("collectTurnWork", () => {
         { sql: "SELECT * FROM x", table: "main.s.x" },
         "Error: no such table",
       ),
+      // A CTE ahead of a write still writes its target.
+      tool(
+        "cte",
+        "run_sql",
+        { sql: "WITH x AS (SELECT 1 AS id) INSERT INTO orders SELECT id FROM x", table: "orders" },
+        "{}",
+      ),
+      // OpenCode reports any failed tool as `[error] ...`.
+      tool("ocread", "read", { filePath: "/ws/missing.md" }, "[error] File not found"),
+      tool("ocpy", "run_python", { code: "open('missing.csv')" }, "[error] FileNotFoundError"),
     ]);
     expect(work.sources).toEqual([]);
-    expect(work.queries.map((query) => query.status)).toEqual(["completed", "failed"]);
+    expect(work.queries.map((query) => [query.text.slice(0, 12), query.status])).toEqual([
+      ["INSERT INTO ", "completed"],
+      ["SELECT * FRO", "failed"],
+      ["WITH x AS (S", "completed"],
+      ["open('missin", "failed"],
+    ]);
+    expect(work.queries.at(-1)!.error).toBe("FileNotFoundError");
   });
 
   it("reports a statement API's own failure and pending state", () => {

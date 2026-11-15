@@ -19,7 +19,7 @@ import {
   isRecord,
   ownValue,
   parseToolOutput,
-  toolErrorMessage,
+  editErrorMessage,
 } from "@/lib/toolValue";
 
 export type ToolRenderItem = Extract<RenderItem, { kind: "tool" | "native_tool" }>;
@@ -185,7 +185,7 @@ function toolQuery(item: ToolCallItem, key: string, call: QueryCall): TurnQuery 
   const status =
     statement !== null && item.state === "output-available"
       ? statement
-      : callStatus(item.state, toolErrorMessage(parsed));
+      : callStatus(item.state, recordedFailure(item.output));
   const size = call.language === "sql" ? sqlResultSize(parsed) : lineCount(parsed.text);
   return { ...base, ...status, resultSize: sizeUnlessFailed(status, size) };
 }
@@ -196,7 +196,15 @@ function sizeUnlessFailed(status: { status: TurnCallStatus }, size: string): str
 
 function completedWithoutFailure(item: ToolCallItem): boolean {
   if (item.state !== "output-available") return false;
-  return item.output === null || toolErrorMessage(parseToolOutput(item.output)) === null;
+  return item.output === null || recordedFailure(item.output) === null;
+}
+
+/**
+ * A non-shell tool's reported failure, including OpenCode's `[error] ...`
+ * envelope (shared with edit tools), or `null` when it reports none.
+ */
+function recordedFailure(output: string): string | null {
+  return editErrorMessage(output);
 }
 
 function callStatus(
@@ -268,24 +276,31 @@ const NON_EXECUTING_TOOL_WORDS = new Set([
 // Statement openings, strict enough that "Show me the top customers" is not SQL.
 const SQL_START_RE =
   /^(?:with\s+\w+(?:\s*\([^)]*\))?\s+as\s*\(|select\s[\s\S]*\bfrom\s|select\s+[\d'"*(@-]|show\s+(?:tables|views|databases|schemas|catalogs|columns|functions|grants|partitions|create|tblproperties)\b|(?:describe|desc)\s+(?:table|extended|formatted|detail|history|schema|database|catalog|function|[\w`"]+\.[\w`"]+)|explain\s+(?:select|with|insert|update|delete|analyze|extended|formatted|cost)\b|insert\s+(?:into|overwrite)\s|update\s+\S+\s+set\s|delete\s+from\s|merge\s+into\s|create\s+(?:or\s+replace\s+)?(?:temp\s+|temporary\s+)?(?:table|view|schema|database|index|function)\b|alter\s+(?:table|view|schema)\s|drop\s+(?:table|view|schema|database|index)\b|pragma\s|values\s*\()/i;
-// Punctuation, qualified names or clauses prose rarely has ("Select the top 5
-// customers from EMEA" has none), required where the tool may take a question.
+// Operators, function calls, qualified names or clauses prose rarely has; commas
+// and spaced parentheses are ordinary punctuation ("from EMEA (last month)").
 const SQL_STRUCTURE_RE =
-  /[*;,()=<>]|\b\w+\.\w+\b|\b(?:group\s+by|order\s+by|limit\s+\d|join|having|union)\b/i;
+  /[*;=<>]|\w\(|\b[A-Za-z_]\w*\.[A-Za-z_]\w+|\b(?:group\s+by|order\s+by|limit\s+\d|join\s+\S+\s+(?:\w+\s+)?(?:on|using)\b|union\s+(?:all\s+)?select\b)|^select\s+[\w.]+(?:\s*,\s*[\w.]+)+\s+from\s+[\w.`"]+\s*(?:;|$|\b(?:where|group|order|limit|join|as)\b)/i;
 const SQL_KEYWORD_START_RE =
   /^(?:select|with|insert|update|delete|merge|create|alter|drop|truncate|pragma|values|call|use|set|explain|describe|desc|show|grant|revoke|copy|optimize|vacuum|analyze|refresh|cache|uncache|msck)\b/i;
 const READ_ONLY_SQL_RE = /^(?:select|with|show|describe|desc|explain|values)\b/i;
+// Anywhere in a statement, marks it as possibly writing (`WITH x AS (...) INSERT INTO t`).
+const SQL_WRITE_WORD_RE =
+  /\b(?:insert|upsert|update|delete|merge|into|create|drop|alter|truncate|copy|grant|revoke|vacuum|optimize|refresh)\b|\breplace\s+(?:into|table|view)\b/i;
+// String literals, quoted identifiers and comments, which may name write words harmlessly.
+const SQL_QUOTED_OR_COMMENT_RE = /'(?:[^']|'')*'|"(?:[^"]|"")*"|`[^`]*`|--[^\n]*|\/\*[\s\S]*?\*\//g;
 const LEADING_SQL_COMMENTS_RE = /^(?:\s+|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*/;
 
 function sqlArgument(tool: string, args: Record<string, unknown>): string | null {
   const toolWords = identifierWords(tool);
   if (toolWords.some((word) => NON_EXECUTING_TOOL_WORDS.has(word))) return null;
-  // `text_to_sql` and `sql_to_python` convert SQL; they do not run it.
+  // `text_to_sql` and `sql_to_python` convert SQL; `run_sql_to_csv` still runs it.
   const sqlIndex = toolWords.indexOf("sql");
-  const converts = [toolWords[sqlIndex - 1], toolWords[sqlIndex + 1]].some(
-    (word) => word === "to" || word === "2",
-  );
-  const sqlTool = sqlIndex >= 0 && !converts;
+  const converts =
+    [toolWords[sqlIndex - 1], toolWords[sqlIndex + 1]].some(
+      (word) => word === "to" || word === "2",
+    ) && !toolWords.some((word) => CODE_RUN_WORDS.has(word));
+  if (sqlIndex >= 0 && converts) return null;
+  const sqlTool = sqlIndex >= 0;
   const queryTool = toolWords.some((word) => QUERY_TOOL_WORDS.has(word));
   for (const [key, value] of Object.entries(args)) {
     if (typeof value !== "string" || value.trim() === "") continue;
@@ -310,6 +325,14 @@ function sqlArgument(tool: string, args: Record<string, unknown>): string | null
     if (queryTool && looksLikeSql(value) && SQL_STRUCTURE_RE.test(value)) return value;
   }
   return null;
+}
+
+/** Conservatively read-only: a read opening and no write keyword anywhere. */
+function isReadOnlySql(text: string): boolean {
+  const code = text.replace(SQL_QUOTED_OR_COMMENT_RE, " ").trim();
+  // `SHOW CREATE TABLE t` reads a definition.
+  const scanned = code.replace(/^show\s+create\b/i, "show");
+  return READ_ONLY_SQL_RE.test(code) && !SQL_WRITE_WORD_RE.test(scanned);
 }
 
 function withoutLeadingComments(text: string): string {
@@ -526,10 +549,7 @@ function sourceRefs(
     if (path !== undefined) out.push({ kind: "file", value: path });
   }
   const reads = query === null && readsItsTargets(name, args);
-  const readsTable =
-    query === null
-      ? reads
-      : query.language === "sql" && READ_ONLY_SQL_RE.test(withoutLeadingComments(query.text));
+  const readsTable = query === null ? reads : query.language === "sql" && isReadOnlySql(query.text);
   const table = readsTable ? argumentTable(args) : null;
   if (table !== null) out.push({ kind: "table", value: table });
   if (reads) {
