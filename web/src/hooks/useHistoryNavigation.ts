@@ -98,12 +98,10 @@ export function useHistoryNavigation(isMac = isMacPlatform()): void {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.repeat || event.defaultPrevented) return;
-      const delta = matchesShortcut(event, "history.back", { mac: isMac })
-        ? -1
-        : matchesShortcut(event, "history.forward", { mac: isMac })
-          ? 1
-          : 0;
-      if (delta === 0) return;
+      let delta: -1 | 1;
+      if (matchesShortcut(event, "history.back", { mac: isMac })) delta = -1;
+      else if (matchesShortcut(event, "history.forward", { mac: isMac })) delta = 1;
+      else return;
       const focused = document.activeElement;
       if (focused instanceof Element && focused.closest(BRACKET_OWNING_SURFACES)) return;
       event.preventDefault();
