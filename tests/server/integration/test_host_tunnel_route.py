@@ -172,9 +172,10 @@ async def _send_hello_and_wait(
     await communicator.send_input(
         {"type": "websocket.receive", "text": _make_hello(name, runners, connection_id)},
     )
-    await asyncio.wait_for(
-        _wait_registered(registry, host_id),
-        timeout=budget(2.0),
+    await poll_until_async(
+        lambda: registry.get(host_id) is not None,
+        timeout_s=budget(2.0),
+        interval_s=0.01,
     )
 
 
