@@ -15,6 +15,7 @@ from omnigent.entities.conversation import (
     MessageData,
     NativeToolData,
     ReasoningData,
+    external_item_id,
 )
 from omnigent.entities.file import StoredFile
 from omnigent.mcp_selection import MCP_SELECTION_PREFIX
@@ -29,6 +30,7 @@ from omnigent.server.context_breakdown import (
     estimate_text_tokens,
     scan_history,
 )
+from omnigent.server.schemas import SessionContextBreakdown
 from omnigent.spec.types import AgentSpec, MCPServerConfig, SkillSpec
 
 
@@ -230,6 +232,106 @@ def test_scan_history_sizes_a_native_summary_without_a_token_count() -> None:
 
     assert history.summary_tokens == 100
     assert history.estimated_tokens == 100
+
+    # A forwarder-shaped checkpoint: placeholder summary plus retained messages.
+    image = {"type": "input_image", "file_id": "file_img"}
+    function_call = {"type": "function_call", "call_id": "c1", "name": "grep"}
+    function_call["arguments"] = "a" * 400
+    checkpoint = CompactionData(
+        summary="[Claude Code compaction — context was compacted in the terminal]",
+        last_item_id="msg_old",
+        token_count=0,
+        compacted_messages=[
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "r" * 400}, image],
+                "forwarded_source_ids": ["rec-1"],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "k" * 40_000},
+                    # Prior-turn thinking is not input context.
+                    {"type": "thinking", "thinking": "t" * 400, "signature": "s" * 8_000},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"},
+                    },
+                    {"type": "document", "source": {"type": "text", "data": "d" * 400}},
+                ],
+            },
+            {**function_call, "id": "fc_snapshot"},
+            {"role": "assistant", "content": "p" * 40},
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "url", "url": "https://x.test/a"}}
+                ],
+            },
+        ],
+    )
+    covered_id = external_item_id("conv_1", "rec-1")
+    items = [
+        _user("msg_old", _text("o" * 4_000)),
+        # Written between the forwarder's read and its checkpoint POST.
+        _user("msg_gap", _text("g" * 400)),
+        _item("cmp", "compaction", checkpoint),
+        # Forwarded after the checkpoint, which already carries it.
+        _user(covered_id, _text("r" * 400), image),
+        # A later summary-only checkpoint, which native replay skips.
+        _item(
+            "cmp_fallback",
+            "compaction",
+            CompactionData(summary="placeholder", last_item_id=covered_id, token_count=0),
+        ),
+        _assistant("msg_new", "n" * 40),
+    ]
+    stored_image = _stored("file_img", "shot.png", "image/png", 900)
+
+    def breakdown_for(harness: str) -> SessionContextBreakdown:
+        return build_context_breakdown(
+            "conv_1",
+            spec=None,
+            harness=harness,
+            labels={},
+            items_newest_first=reversed(items),
+            lookup_file={"file_img": stored_image}.get,
+        )
+
+    native = breakdown_for("claude-native")
+    checkpoint_tokens = 100 + 10_000 + 100 + estimate_text_tokens(json.dumps(function_call)) + 10
+    # The retained messages, not the placeholder summary, size the checkpoint.
+    assert native.history.summary_tokens == checkpoint_tokens
+    # Native replay drops everything before the checkpoint and the item it carries.
+    assert native.history.item_count == 1
+    assert native.history.summarized_item_count == 2
+    assert native.history.estimated_tokens == checkpoint_tokens + 10
+    # The retained image is listed once; the snapshot-stripped one was not delivered.
+    rows = [(row.filename, row.delivery, row.estimated_tokens) for row in native.attachments]
+    assert rows == [
+        ("shot.png", "workspace", None),
+        (None, "missing", None),
+        (None, "inline", IMAGE_TOKEN_ESTIMATE),
+    ]
+
+    # The runtime replays the latest compaction, summary-only or not, from its anchor.
+    runtime = breakdown_for("claude-sdk")
+    assert runtime.history.summary_tokens == estimate_text_tokens("placeholder")
+    assert runtime.history.item_count == 1
+    assert runtime.history.summarized_item_count == 3
+
+    # Without it, the runtime replays the retained messages and every item after the anchor.
+    items = [item for item in items if item.id != "cmp_fallback"]
+    runtime = breakdown_for("claude-sdk")
+    assert runtime.history.summary_tokens == checkpoint_tokens
+    assert runtime.history.item_count == 3
+    assert runtime.history.summarized_item_count == 1
 
 
 def _stored(

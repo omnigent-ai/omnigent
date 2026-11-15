@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import Any
 
 from omnigent.entities import ConversationItem
 from omnigent.entities.conversation import (
@@ -18,6 +19,8 @@ from omnigent.entities.conversation import (
     FunctionCallOutputData,
     MessageData,
     NativeToolData,
+    external_item_id,
+    is_omitted_binary_payload,
 )
 from omnigent.entities.file import StoredFile
 from omnigent.errors import OmnigentError
@@ -49,6 +52,11 @@ MAX_SCANNED_ITEMS = 2_000
 
 _TEXT_BLOCK_TYPES = frozenset({"input_text", "output_text", "text", "refusal"})
 _ATTACHMENT_BLOCK_TYPES = frozenset({"input_image", "input_file"})
+# Provider-shaped binary blocks, e.g. in a native harness's checkpoint messages.
+_PROVIDER_BINARY_BLOCK_TYPES = frozenset({"image", "document"})
+_THINKING_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
+# Bookkeeping keys on a retained checkpoint entry that are never sent to the model.
+_SNAPSHOT_ENVELOPE_KEYS = frozenset({"id", "forwarded_source_ids", "message_id", "status"})
 
 
 def estimate_text_tokens(text: str) -> int:
@@ -142,31 +150,41 @@ class _AttachmentRef:
     is_image: bool
     inline_bytes: int | None
     has_data_uri: bool = False
+    # A compaction snapshot replaced the payload with a marker.
+    omitted: bool = False
+    # A provider-shaped block a checkpoint replays to the model as-is.
+    provider_block: bool = False
 
 
 @dataclass
-class _HistoryScan:
-    """Accumulated history estimate while reading items newest first."""
+class _LiveEntry:
+    """One live item's estimate, kept until overlap with a checkpoint is known."""
 
-    history: ContextBreakdownHistory = field(default_factory=ContextBreakdownHistory)
-    # Each message's attachments in block order, messages newest first.
-    attachment_groups: list[list[_AttachmentRef]] = field(default_factory=list)
-    compaction_seen: bool = False
-    summary_boundary_id: str | None = None
-    summarized: bool = False
+    item_id: str
+    tokens: int
+    attachments: list[_AttachmentRef]
 
 
-def _has_data_uri(block: dict[str, object]) -> bool:
-    """Whether a native harness can write the block to disk (it decodes only data URIs)."""
-    payload = block.get("image_url") or block.get("file_data")
-    return isinstance(payload, str) and payload.startswith("data:")
+@dataclass
+class _Checkpoint:
+    """What the model receives in place of the compacted history."""
+
+    tokens: int
+    attachments: list[_AttachmentRef]
+    # Items the checkpoint's retained messages already carry.
+    covered_item_ids: set[str]
 
 
-def _inline_payload_bytes(block: dict[str, object]) -> int | None:
+def _block_payload(block: dict[str, Any]) -> object:
+    """The data-URI field a native harness decodes (``image_url`` first)."""
+    return block.get("image_url") or block.get("file_data")
+
+
+def _inline_payload_bytes(block: dict[str, Any]) -> int | None:
     """Decoded size of a block's inline base64 payload, if it carries one."""
     for key in ("file_data", "image_url"):
         payload = block.get(key)
-        if not isinstance(payload, str) or not payload:
+        if not isinstance(payload, str) or not payload or is_omitted_binary_payload(payload):
             continue
         if payload.startswith("data:"):
             payload = payload.split(",", 1)[-1]
@@ -177,34 +195,91 @@ def _inline_payload_bytes(block: dict[str, object]) -> int | None:
     return None
 
 
-def _message_tokens(data: MessageData, scan: _HistoryScan) -> int:
-    """Estimate a message's text and record its attachments."""
+def _attachment_ref(block: dict[str, Any]) -> _AttachmentRef:
+    """Describe an ``input_image`` / ``input_file`` block."""
+    file_id = block.get("file_id")
+    filename = block.get("filename")
+    payload = _block_payload(block)
+    return _AttachmentRef(
+        file_id=file_id if isinstance(file_id, str) else None,
+        filename=filename if isinstance(filename, str) else None,
+        is_image=block.get("type") == "input_image",
+        inline_bytes=_inline_payload_bytes(block),
+        has_data_uri=isinstance(payload, str) and payload.startswith("data:"),
+        omitted=is_omitted_binary_payload(payload),
+    )
+
+
+def _provider_block_ref(block: dict[str, Any]) -> _AttachmentRef:
+    """Describe a provider-shaped ``image`` / ``document`` block from a checkpoint."""
+    source = block.get("source")
+    data = source.get("data") if isinstance(source, dict) else None
+    return _AttachmentRef(
+        file_id=None,
+        filename=None,
+        is_image=block.get("type") == "image",
+        inline_bytes=None,
+        omitted=is_omitted_binary_payload(data),
+        provider_block=True,
+    )
+
+
+def _snapshot_block_tokens(block: dict[str, Any]) -> tuple[int, _AttachmentRef | None]:
+    """Estimate a checkpoint block outside the plain text and attachment types."""
+    block_type = block.get("type")
+    if block_type in _THINKING_BLOCK_TYPES:
+        # Prior-turn thinking does not count toward the input context.
+        return 0, None
+    if block_type in _PROVIDER_BINARY_BLOCK_TYPES:
+        source = block.get("source")
+        if isinstance(source, dict) and source.get("type") == "text":
+            data = source.get("data")
+            return (estimate_text_tokens(data) if isinstance(data, str) else 0), None
+        return 0, _provider_block_ref(block)
+    # Tool calls and results inside a transcript message.
+    return _estimate_without_binary(block), None
+
+
+def _content_tokens(
+    content: object, *, snapshot: bool = False
+) -> tuple[int, list[_AttachmentRef]]:
+    """
+    Estimate message content and collect its attachments, in block order.
+
+    Live messages count text and attachment blocks; a checkpoint's retained
+    transcript messages also carry tool and provider blocks that it replays.
+    """
+    if isinstance(content, str):
+        return estimate_text_tokens(content), []
     tokens = 0
     attachments: list[_AttachmentRef] = []
-    for block in data.content:
+    for block in content if isinstance(content, list) else []:
+        if not isinstance(block, dict):
+            continue
         block_type = block.get("type")
         if block_type in _TEXT_BLOCK_TYPES:
             text = block.get("text")
             if isinstance(text, str):
                 tokens += estimate_text_tokens(text)
         elif block_type in _ATTACHMENT_BLOCK_TYPES:
-            file_id = block.get("file_id")
-            filename = block.get("filename")
-            attachments.append(
-                _AttachmentRef(
-                    file_id=file_id if isinstance(file_id, str) else None,
-                    filename=filename if isinstance(filename, str) else None,
-                    is_image=block_type == "input_image",
-                    inline_bytes=_inline_payload_bytes(block),
-                    has_data_uri=_has_data_uri(block),
-                )
-            )
-    if attachments:
-        scan.attachment_groups.append(attachments)
-    return tokens
+            attachments.append(_attachment_ref(block))
+        elif snapshot:
+            block_tokens, ref = _snapshot_block_tokens(block)
+            tokens += block_tokens
+            if ref is not None:
+                attachments.append(ref)
+    return tokens, attachments
 
 
-def _item_tokens(item: ConversationItem, scan: _HistoryScan) -> int | None:
+def _snapshot_entry_tokens(entry: dict[str, Any]) -> tuple[int, list[_AttachmentRef]]:
+    """Estimate one retained checkpoint entry: a message, or a tool call/output record."""
+    if entry.get("type", "message") == "message" and "content" in entry:
+        return _content_tokens(entry["content"], snapshot=True)
+    payload = {key: value for key, value in entry.items() if key not in _SNAPSHOT_ENVELOPE_KEYS}
+    return _estimate_without_binary(payload), []
+
+
+def _item_tokens(item: ConversationItem) -> tuple[int, list[_AttachmentRef]] | None:
     """
     Estimate one live item, or ``None`` when it is not model context.
 
@@ -212,31 +287,60 @@ def _item_tokens(item: ConversationItem, scan: _HistoryScan) -> int | None:
     """
     data = item.data
     if isinstance(data, MessageData):
-        return _message_tokens(data, scan)
+        return _content_tokens(data.content)
     if isinstance(data, FunctionCallData):
-        return estimate_text_tokens(data.name + data.arguments)
+        return estimate_text_tokens(data.name + data.arguments), []
     if isinstance(data, FunctionCallOutputData):
-        return _estimate_tool_output_tokens(data.output)
+        return _estimate_tool_output_tokens(data.output), []
     if isinstance(data, NativeToolData):
         native_item = data.item
         if native_item.get("type") == "image_generation_call" and "result" in native_item:
             # The generated image is stored as bare base64 under ``result``.
             rest = {key: value for key, value in native_item.items() if key != "result"}
-            return _estimate_without_binary(rest) + IMAGE_TOKEN_ESTIMATE
-        return _estimate_without_binary(native_item)
+            return _estimate_without_binary(rest) + IMAGE_TOKEN_ESTIMATE, []
+        return _estimate_without_binary(native_item), []
     return None
 
 
-def _apply_compaction(data: CompactionData, scan: _HistoryScan) -> None:
-    """Start the summarized range at a valid compaction and count its summary."""
-    anchor = data.last_item_id
-    if not data.summary or not anchor or anchor.startswith("synthetic_"):
-        return
-    scan.summary_boundary_id = anchor
-    # Native forwarders record 0; fall back to the summary's own size.
-    tokens = data.token_count if data.token_count > 0 else estimate_text_tokens(data.summary)
-    scan.history.summary_tokens = tokens
-    scan.history.estimated_tokens += tokens
+def _checkpoint(
+    data: CompactionData, *, session_id: str | None, native: bool
+) -> _Checkpoint | None:
+    """
+    Size what a compaction replays, or ``None`` when replay ignores it.
+
+    Retained ``compacted_messages`` replace the summary when present. The
+    runtime rejects an empty summary or synthetic anchor; a native harness
+    replays only checkpoints with retained messages and skips live items whose
+    ``forwarded_source_ids`` they already carry.
+    """
+    if native:
+        if not data.compacted_messages:
+            return None
+    else:
+        anchor = data.last_item_id
+        if not data.summary or not anchor or anchor.startswith("synthetic_"):
+            return None
+    if not data.compacted_messages:
+        # Native forwarders record 0; fall back to the summary's own size.
+        tokens = data.token_count if data.token_count > 0 else estimate_text_tokens(data.summary)
+        return _Checkpoint(tokens=tokens, attachments=[], covered_item_ids=set())
+    tokens = 0
+    attachments: list[_AttachmentRef] = []
+    covered: set[str] = set()
+    for entry in data.compacted_messages:
+        if not isinstance(entry, dict):
+            continue
+        entry_tokens, entry_attachments = _snapshot_entry_tokens(entry)
+        tokens += entry_tokens
+        attachments.extend(entry_attachments)
+        source_ids = entry.get("forwarded_source_ids")
+        if native and session_id is not None and isinstance(source_ids, list):
+            covered.update(
+                external_item_id(session_id, source_id)
+                for source_id in source_ids
+                if isinstance(source_id, str)
+            )
+    return _Checkpoint(tokens=tokens, attachments=attachments, covered_item_ids=covered)
 
 
 def _is_history_content(item: ConversationItem) -> bool:
@@ -249,49 +353,70 @@ def _is_history_content(item: ConversationItem) -> bool:
 def scan_history(
     items_newest_first: Iterable[ConversationItem],
     *,
+    session_id: str | None = None,
+    native: bool = False,
     max_items: int = MAX_SCANNED_ITEMS,
 ) -> tuple[ContextBreakdownHistory, list[_AttachmentRef]]:
     """
     Estimate the live history from items read newest first.
 
-    Only the latest compaction counts, as in the runtime's history load: items
-    up to its ``last_item_id`` are replaced by its summary, and items after it
-    are still sent in full. A compaction the runtime rejects (empty summary or
-    synthetic anchor) leaves the full history live.
+    The runtime replays the latest compaction (unless it rejects it) in place
+    of the items up to its ``last_item_id``. A native harness replays the latest
+    compaction with retained messages in place of everything before it, and
+    skips later items those messages already carry.
 
     :param items_newest_first: The session's items in descending position.
+    :param session_id: The session, used to match a checkpoint's
+        ``forwarded_source_ids`` to item ids; ``None`` skips that matching.
+    :param native: The session runs a native harness.
     :param max_items: Items to read before marking the result partial.
     :returns: The history estimate and live attachments, oldest first.
     """
-    scan = _HistoryScan()
-    history = scan.history
+    history = ContextBreakdownHistory()
+    live: list[_LiveEntry] = []
+    checkpoint: _Checkpoint | None = None
+    compaction_seen = False
+    boundary_id: str | None = None
+    summarized = False
     for scanned, item in enumerate(items_newest_first):
         if scanned >= max_items:
-            if scan.summarized:
+            if summarized:
                 history.summarized_partial = True
             else:
                 history.partial = True
             break
-        if scan.summarized:
-            if _is_history_content(item):
-                history.summarized_item_count += 1
-            continue
-        if scan.summary_boundary_id is not None and item.id == scan.summary_boundary_id:
-            scan.summarized = True
+        if summarized or (boundary_id is not None and item.id == boundary_id):
+            summarized = True
             if _is_history_content(item):
                 history.summarized_item_count += 1
             continue
         if isinstance(item.data, CompactionData):
-            if not scan.compaction_seen:
-                scan.compaction_seen = True
-                _apply_compaction(item.data, scan)
+            if native:
+                if checkpoint is None:
+                    checkpoint = _checkpoint(item.data, session_id=session_id, native=True)
+                    # Native replay drops every record before its checkpoint.
+                    summarized = checkpoint is not None
+            elif not compaction_seen:
+                compaction_seen = True
+                checkpoint = _checkpoint(item.data, session_id=session_id, native=False)
+                if checkpoint is not None:
+                    boundary_id = item.data.last_item_id
             continue
-        tokens = _item_tokens(item, scan)
-        if tokens is None:
+        estimate = _item_tokens(item)
+        if estimate is not None:
+            live.append(_LiveEntry(item.id, *estimate))
+    covered = checkpoint.covered_item_ids if checkpoint is not None else set()
+    attachments: list[_AttachmentRef] = []
+    if checkpoint is not None:
+        history.summary_tokens = checkpoint.tokens
+        history.estimated_tokens += checkpoint.tokens
+        attachments.extend(checkpoint.attachments)
+    for entry in reversed(live):
+        if entry.item_id in covered:
             continue
         history.item_count += 1
-        history.estimated_tokens += tokens
-    attachments = [ref for group in reversed(scan.attachment_groups) for ref in group]
+        history.estimated_tokens += entry.tokens
+        attachments.extend(entry.attachments)
     return history, attachments
 
 
@@ -313,6 +438,15 @@ def resolve_attachment(
     if ref.file_id is None:
         # Bytes carried inline in the message itself.
         size = ref.inline_bytes
+        if ref.omitted:
+            # A compaction snapshot dropped the payload, so only a marker remains.
+            return ContextBreakdownAttachment(filename=ref.filename, delivery="missing")
+        if ref.provider_block:
+            # Replayed to the model as-is from the checkpoint.
+            return ContextBreakdownAttachment(
+                delivery="inline",
+                estimated_tokens=IMAGE_TOKEN_ESTIMATE if ref.is_image else None,
+            )
         if native:
             # Only a data URI materializes; a remote URL or bare base64 reaches
             # the CLI as a "could not be loaded" marker.
@@ -382,8 +516,10 @@ def build_context_breakdown(
     :param max_items: Items to read before marking the history partial.
     :returns: The estimated breakdown.
     """
-    history, refs = scan_history(items_newest_first, max_items=max_items)
     native = is_native_harness(harness)
+    history, refs = scan_history(
+        items_newest_first, session_id=session_id, native=native, max_items=max_items
+    )
     breakdown = SessionContextBreakdown(
         session_id=session_id,
         history=history,
