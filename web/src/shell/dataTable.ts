@@ -92,14 +92,14 @@ export function detectDelimiter(text: string, path: string): string {
   let bestAgreement = 0;
   let bestFields = 1;
   for (const delimiter of CANDIDATE_DELIMITERS) {
-    const { records } = parseRecords(text, delimiter, {
-      keepRecords: SNIFF_RECORDS,
+    // Only field counts are needed, so no field text is kept: a huge cell in
+    // the sample can't cut the sample short.
+    const { fieldCounts } = parseRecords(text, delimiter, {
+      keepRecords: 0,
       scanRecords: SNIFF_RECORDS,
-      keepFields: DATA_TABLE_MAX_COLUMNS,
-      keepChars: DATA_TABLE_MAX_CHARS,
     });
     const tally = new Map<number, number>();
-    for (const fields of records) tally.set(fields.length, (tally.get(fields.length) ?? 0) + 1);
+    for (const fields of fieldCounts) tally.set(fields, (tally.get(fields) ?? 0) + 1);
     let fieldCount = 1;
     let agreement = 0;
     for (const [count, agreeing] of tally) {
@@ -108,7 +108,7 @@ export function detectDelimiter(text: string, path: string): string {
         agreement = agreeing;
       }
     }
-    if (fieldCount < 2 || agreement * 2 < records.length) continue;
+    if (fieldCount < 2 || agreement * 2 < fieldCounts.length) continue;
     if (agreement > bestAgreement || (agreement === bestAgreement && fieldCount > bestFields)) {
       best = delimiter;
       bestAgreement = agreement;
@@ -126,7 +126,8 @@ export function detectDelimiter(text: string, path: string): string {
  * while their field text fits in *keepChars*; the first record that doesn't
  * ends keeping, so the kept records are always a prefix. The first record is
  * kept, its text cut at *keepChars*. Each kept record keeps at most
- * *keepFields* fields; *widest* counts the fields of every record, kept or not.
+ * *keepFields* fields; *widest* counts the fields of every record, kept or not,
+ * and *fieldCounts* lists each scanned record's.
  */
 function parseRecords(
   text: string,
@@ -137,8 +138,9 @@ function parseRecords(
     scanRecords = Number.POSITIVE_INFINITY,
     keepFields = Number.POSITIVE_INFINITY,
   }: { keepRecords: number; keepChars?: number; scanRecords?: number; keepFields?: number },
-): { records: string[][]; count: number; widest: number } {
+): { records: string[][]; count: number; widest: number; fieldCounts: number[] } {
   const records: string[][] = [];
+  const fieldCounts: number[] = [];
   let count = 0;
   let widest = 0;
   let fieldCount = 0;
@@ -170,6 +172,7 @@ function parseRecords(
     if (recordHasContent || fieldHasChars) {
       count += 1;
       widest = Math.max(widest, fieldCount + 1);
+      fieldCounts.push(fieldCount + 1);
       if (keeping) {
         if (fields.length < keepFields) fields.push(field);
         // The header is kept even cut short; any later record that overflows ends keeping.
@@ -230,7 +233,7 @@ function parseRecords(
     }
   }
   if ((fieldHasChars || recordHasContent) && count < scanRecords) endRecord();
-  return { records, count, widest };
+  return { records, count, widest, fieldCounts };
 }
 
 const NUMBER_PATTERN = /^[-+]?(\d{1,3}(,\d{3})+|\d+)?(\.\d+)?([eE][-+]?\d+)?%?$/;

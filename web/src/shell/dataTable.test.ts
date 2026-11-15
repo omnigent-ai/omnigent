@@ -143,6 +143,15 @@ describe("detectDelimiter", () => {
     expect(detectDelimiter("a;b;c\n1;2;3\n4;5\n", "x.csv")).toBe(";");
   });
 
+  it("decides from every sampled record, however long a cell in them is", () => {
+    // The third record alone fills the table's text budget; the rest still count.
+    const text = `left,right;value\nhello,world;1\n${"x".repeat(DATA_TABLE_MAX_CHARS)};2\n${"y;3\n".repeat(17)}`;
+    expect(detectDelimiter(text, "report.csv")).toBe(";");
+    const table = parseDataTable(text, "report.csv");
+    expect(table?.header).toEqual(["left,right", "value"]);
+    expect(table?.rows[0]).toEqual(["hello,world", "1"]);
+  });
+
   it("decides from the first records only", () => {
     const head = Array.from({ length: 20 }, (_, i) => `${i};x`).join("\n");
     const tail = Array.from({ length: 100 }, () => "a,b,c,d").join("\n");
