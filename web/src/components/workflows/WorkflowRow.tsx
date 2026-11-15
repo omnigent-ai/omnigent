@@ -22,7 +22,7 @@ import { cn } from "@/lib/utils";
 export interface WorkflowRowProps {
   workflow: SavedWorkflow;
   onRun: (workflow: SavedWorkflow) => void;
-  onCreateAutomation: (workflow: SavedWorkflow) => void;
+  onCreateAutomation?: (workflow: SavedWorkflow) => void;
   onDelete: (workflow: SavedWorkflow) => void;
 }
 
@@ -111,7 +111,7 @@ function WorkflowMenuItems({
   Item: ComponentType<MenuItemProps>;
   workflow: SavedWorkflow;
   onRun: (workflow: SavedWorkflow) => void;
-  onCreateAutomation: (workflow: SavedWorkflow) => void;
+  onCreateAutomation?: (workflow: SavedWorkflow) => void;
   onDelete: (workflow: SavedWorkflow) => void;
 }) {
   const { trackClick } = useOmnigentAnalytics();
@@ -128,17 +128,19 @@ function WorkflowMenuItems({
         <PlayIcon className="size-4" />
         Run
       </Item>
-      <Item
-        disabled={workflow.is_draft}
-        onSelect={() => {
-          trackClick("workflows.row.create_automation", "button");
-          onCreateAutomation(workflow);
-        }}
-        data-testid="workflow-create-automation"
-      >
-        <ClockIcon className="size-4" />
-        Create automation
-      </Item>
+      {onCreateAutomation && (
+        <Item
+          disabled={workflow.is_draft}
+          onSelect={() => {
+            trackClick("workflows.row.create_automation", "button");
+            onCreateAutomation(workflow);
+          }}
+          data-testid="workflow-create-automation"
+        >
+          <ClockIcon className="size-4" />
+          Create automation
+        </Item>
+      )}
       <Item
         variant="destructive"
         onSelect={() => {

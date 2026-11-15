@@ -241,6 +241,7 @@ describe("WorkflowDetailPage", () => {
     "saves a draft and later edits after closing the planner (mobile=%s)",
     async (mobile) => {
       vi.mocked(useIsMobileViewport).mockReturnValue(mobile);
+      vi.mocked(useServerInfo).mockReturnValue(FALLBACK_SERVER_INFO);
       const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
       vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
       mockRuns([]);
@@ -665,37 +666,59 @@ describe("WorkflowDetailPage", () => {
     expect(fetchNextPage).toHaveBeenCalled();
   });
 
-  it("runs it, makes an automation of it, or confirms deletion and goes back", () => {
-    vi.mocked(useServerInfo).mockReturnValue({
-      ...FALLBACK_SERVER_INFO,
-      automations_enabled: false,
-    });
-    mockWorkflow({});
-    mockRuns([]);
-    renderPage();
+  it.each(["loading", false, true, undefined] as const)(
+    "keeps workflow actions available and gates automation creation (%s)",
+    (automations) => {
+      vi.mocked(useServerInfo).mockReturnValue(
+        automations === "loading"
+          ? "loading"
+          : {
+              ...FALLBACK_SERVER_INFO,
+              automations_enabled: automations,
+            },
+      );
+      mockWorkflow({});
+      mockRuns([]);
+      const { rerender } = renderPage();
 
-    fireEvent.click(screen.getByTestId("workflow-detail-run"));
-    expect(JSON.parse(screen.getByTestId("workflow-session-dialog").textContent!)).toEqual({
-      kind: "run",
-      workflow: { id: WORKFLOW.id, name: WORKFLOW.name, description: WORKFLOW.description },
-    });
-    fireEvent.click(screen.getByTestId("workflow-detail-create-automation"));
-    expect(screen.getByTestId("new-automation-dialog")).toHaveTextContent("Triage flaky tests");
+      fireEvent.click(screen.getByTestId("workflow-detail-run"));
+      expect(JSON.parse(screen.getByTestId("workflow-session-dialog").textContent!)).toEqual({
+        kind: "run",
+        workflow: { id: WORKFLOW.id, name: WORKFLOW.name, description: WORKFLOW.description },
+      });
+      if (automations === "loading" || automations === false) {
+        expect(screen.queryByTestId("workflow-detail-create-automation")).toBeNull();
+        expect(screen.queryByTestId("new-automation-dialog")).toBeNull();
+      } else {
+        fireEvent.click(screen.getByTestId("workflow-detail-create-automation"));
+        expect(screen.getByTestId("new-automation-dialog")).toHaveTextContent("Triage flaky tests");
+      }
+      fireEvent.click(screen.getByRole("button", { name: "Edit workflow" }));
+      expect(screen.getByTestId("planning-chat")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Delete workflow" }));
-    expect(deleteWorkflow).not.toHaveBeenCalled();
-    const dialog = screen.getByRole("dialog", { name: "Delete workflow?" });
-    fireEvent.click(within(dialog).getByRole("button", { name: "Delete workflow" }));
-    const [id, { onSuccess, onError }] = deleteWorkflow.mock.calls[0] as [
-      string,
-      { onSuccess: () => void; onError: () => void },
-    ];
-    expect(id).toBe(WORKFLOW.id);
-    act(onSuccess);
-    expect(navigate).toHaveBeenCalledWith("/workflows");
-    onError();
-    expect(showToast).toHaveBeenCalledWith("Couldn’t delete “Triage flaky tests”.");
-  });
+      // A capability refresh can disable an already-open creation dialog.
+      vi.mocked(useServerInfo).mockReturnValue({
+        ...FALLBACK_SERVER_INFO,
+        automations_enabled: false,
+      });
+      rerender(<WorkflowDetailPage />);
+      expect(screen.queryByTestId("new-automation-dialog")).toBeNull();
+
+      fireEvent.click(screen.getByRole("button", { name: "Delete workflow" }));
+      expect(deleteWorkflow).not.toHaveBeenCalled();
+      const dialog = screen.getByRole("dialog", { name: "Delete workflow?" });
+      fireEvent.click(within(dialog).getByRole("button", { name: "Delete workflow" }));
+      const [id, { onSuccess, onError }] = deleteWorkflow.mock.calls[0] as [
+        string,
+        { onSuccess: () => void; onError: () => void },
+      ];
+      expect(id).toBe(WORKFLOW.id);
+      act(onSuccess);
+      expect(navigate).toHaveBeenCalledWith("/workflows");
+      onError();
+      expect(showToast).toHaveBeenCalledWith("Couldn’t delete “Triage flaky tests”.");
+    },
+  );
 
   it("tells a missing workflow from one that failed to load", () => {
     mockWorkflow({ data: undefined, isError: true, error: new WorkflowNotFoundError() });

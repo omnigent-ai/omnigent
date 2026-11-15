@@ -153,27 +153,52 @@ describe("WorkflowsPage", () => {
     });
   });
 
-  it("opens New automation locked to the workflow, then the automation it creates", () => {
-    mockWorkflows({ workflows: WORKFLOWS });
-    render(
-      <CapabilitiesProvider
-        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { automations_v2: true } }}
-      >
-        <WorkflowsPage />
-      </CapabilitiesProvider>,
-    );
-    expect(screen.queryByTestId("new-automation-dialog")).toBeNull();
+  it.each(["loading", false, true, undefined] as const)(
+    "gates New automation on availability (%s), locks the workflow and opens what it creates",
+    (automations) => {
+      mockWorkflows({ workflows: WORKFLOWS });
+      const { rerender } = render(
+        <CapabilitiesProvider
+          info={
+            automations === "loading"
+              ? "loading"
+              : {
+                  ...SERVER_INFO_OFFLINE_FALLBACK,
+                  automations_enabled: automations,
+                  features: { automations_v2: true },
+                }
+          }
+        >
+          <WorkflowsPage />
+        </CapabilitiesProvider>,
+      );
+      expect(screen.queryByTestId("new-automation-dialog")).toBeNull();
 
-    openMenu(rows()[1]!);
-    fireEvent.click(screen.getByTestId("workflow-create-automation"));
-    const dialog = screen.getByTestId("new-automation-dialog");
-    expect(dialog).toHaveTextContent("Release a new version");
-    expect(dialog).toHaveAttribute("data-name", "Release a new version");
+      openMenu(rows()[1]!);
+      if (automations === "loading" || automations === false) {
+        expect(screen.queryByTestId("workflow-create-automation")).toBeNull();
+        expect(screen.getByTestId("workflow-run")).not.toHaveAttribute("aria-disabled", "true");
+        expect(screen.getByTestId("workflow-delete")).not.toHaveAttribute("aria-disabled", "true");
+        return;
+      }
+      fireEvent.click(screen.getByTestId("workflow-create-automation"));
+      const dialog = screen.getByTestId("new-automation-dialog");
+      expect(dialog).toHaveTextContent("Release a new version");
+      expect(dialog).toHaveAttribute("data-name", "Release a new version");
 
-    fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
-    expect(showToast).toHaveBeenCalledWith("Automation created");
-    expect(navigate).toHaveBeenCalledWith("/tasks/task-1");
-  });
+      fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+      expect(showToast).toHaveBeenCalledWith("Automation created");
+      expect(navigate).toHaveBeenCalledWith("/tasks/task-1");
+      rerender(
+        <CapabilitiesProvider
+          info={{ ...SERVER_INFO_OFFLINE_FALLBACK, automations_enabled: false }}
+        >
+          <WorkflowsPage />
+        </CapabilitiesProvider>,
+      );
+      expect(screen.queryByTestId("new-automation-dialog")).toBeNull();
+    },
+  );
 
   it("searches names and descriptions", () => {
     mockWorkflows({ workflows: WORKFLOWS });
@@ -247,7 +272,11 @@ describe("WorkflowsPage", () => {
 
   it("lists drafts but disables their execution actions", () => {
     mockWorkflows({ workflows: [{ ...WORKFLOWS[0]!, is_draft: true }] });
-    render(<WorkflowsPage />);
+    render(
+      <CapabilitiesProvider info={SERVER_INFO_OFFLINE_FALLBACK}>
+        <WorkflowsPage />
+      </CapabilitiesProvider>,
+    );
     expect(screen.getByText("Draft · No saved plan")).toBeInTheDocument();
     openMenu(rows()[0]!);
     expect(screen.getByTestId("workflow-run")).toHaveAttribute("aria-disabled", "true");

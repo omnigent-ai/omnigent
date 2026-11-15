@@ -46,6 +46,7 @@ import {
 } from "@/hooks/useWorkflow";
 import { useSessionJournal } from "@/hooks/useSessionJournal";
 import { useSessionWorking } from "@/hooks/useSessionWorking";
+import { useAutomationsEnabled } from "@/hooks/useConversations";
 import { useSession } from "@/hooks/useSession";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { WorkflowPlanningChat } from "@/components/workflows/WorkflowPlanningChat";
@@ -74,6 +75,7 @@ export function WorkflowDetailPage() {
 function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const navigate = useNavigate();
   const info = useServerInfo();
+  const automationsEnabled = useAutomationsEnabled();
   const now = useNow();
   const { data: workflow, isLoading, isError, error, refetch } = useWorkflow(workflowId);
   const runs = useWorkflowRuns(workflowId);
@@ -189,15 +191,17 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
             >
               <Trash2Icon className="size-4" />
             </Button>
-            <Button
-              variant="outline"
-              data-testid="workflow-detail-create-automation"
-              disabled={!canRun}
-              onClick={() => setAutomationOpen(true)}
-            >
-              <ClockIcon className="size-4" />
-              Create automation
-            </Button>
+            {automationsEnabled && (
+              <Button
+                variant="outline"
+                data-testid="workflow-detail-create-automation"
+                disabled={!canRun}
+                onClick={() => setAutomationOpen(true)}
+              >
+                <ClockIcon className="size-4" />
+                Create automation
+              </Button>
+            )}
             <Button
               data-testid="workflow-detail-run"
               disabled={!canRun}
@@ -332,7 +336,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
           onOpenChange={setSessionOpen}
         />
         <CreateScheduledTaskDialog
-          open={automationOpen}
+          open={automationsEnabled && automationOpen}
           onOpenChange={setAutomationOpen}
           initialName={workflow.name}
           lockedWorkflow={summary}

@@ -18,13 +18,19 @@ const WORKFLOW: SavedWorkflow = {
   description: "Reruns the suite and files an issue for each flaky test.",
 };
 
-function renderRow(workflow: SavedWorkflow = WORKFLOW) {
+function renderRow(workflow: SavedWorkflow = WORKFLOW, automationsEnabled = true) {
   const handlers = {
     onRun: vi.fn(),
     onCreateAutomation: vi.fn(),
     onDelete: vi.fn(),
   };
-  render(<WorkflowRow workflow={workflow} {...handlers} />);
+  render(
+    <WorkflowRow
+      workflow={workflow}
+      {...handlers}
+      onCreateAutomation={automationsEnabled ? handlers.onCreateAutomation : undefined}
+    />,
+  );
   return handlers;
 }
 
@@ -59,29 +65,37 @@ describe("WorkflowRow", () => {
     expect(screen.queryByText(/Updated/)).toBeNull();
   });
 
-  it("offers Run, Create automation and Delete in the ⋯ menu", () => {
-    const { onRun, onCreateAutomation, onDelete } = renderRow();
+  it.each([false, true])("offers available actions in the ⋯ menu (automations=%s)", (enabled) => {
+    const { onRun, onCreateAutomation, onDelete } = renderRow(WORKFLOW, enabled);
 
     expect(screen.getByRole("button", { name: "Actions for Fix flaky tests" })).toBeInTheDocument();
     openMenu();
-    expect(itemNames()).toEqual(["Run", "Create automation", "Delete"]);
+    expect(itemNames()).toEqual(
+      enabled ? ["Run", "Create automation", "Delete"] : ["Run", "Delete"],
+    );
     fireEvent.click(screen.getByTestId("workflow-run"));
     expect(onRun).toHaveBeenCalledWith(WORKFLOW);
 
-    openMenu();
-    fireEvent.click(screen.getByTestId("workflow-create-automation"));
-    expect(onCreateAutomation).toHaveBeenCalledWith(WORKFLOW);
+    if (enabled) {
+      openMenu();
+      fireEvent.click(screen.getByTestId("workflow-create-automation"));
+      expect(onCreateAutomation).toHaveBeenCalledWith(WORKFLOW);
+    } else {
+      expect(onCreateAutomation).not.toHaveBeenCalled();
+    }
 
     openMenu();
     fireEvent.click(screen.getByTestId("workflow-delete"));
     expect(onDelete).toHaveBeenCalledWith(WORKFLOW);
   });
 
-  it("offers the same actions on right-click", () => {
-    const { onRun } = renderRow();
+  it.each([false, true])("offers the same actions on right-click (automations=%s)", (enabled) => {
+    const { onRun } = renderRow(WORKFLOW, enabled);
 
     fireEvent.contextMenu(screen.getByTestId("workflow-row"));
-    expect(itemNames()).toEqual(["Run", "Create automation", "Delete"]);
+    expect(itemNames()).toEqual(
+      enabled ? ["Run", "Create automation", "Delete"] : ["Run", "Delete"],
+    );
     fireEvent.click(screen.getByTestId("workflow-run"));
     expect(onRun).toHaveBeenCalledWith(WORKFLOW);
   });

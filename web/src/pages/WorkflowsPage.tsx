@@ -23,6 +23,7 @@ import {
   WorkflowSessionDialog,
 } from "@/components/workflows/WorkflowSessionDialog";
 import { type SavedWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
+import { useAutomationsEnabled } from "@/hooks/useConversations";
 import { automationPagePath } from "@/lib/automationFromSession";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useNavigate } from "@/lib/routing";
@@ -33,6 +34,7 @@ export function WorkflowsPage() {
   const createDraft = useCreateWorkflowDraft();
   const navigate = useNavigate();
   const info = useServerInfo();
+  const automationsEnabled = useAutomationsEnabled();
   const [search, setSearch] = useState("");
   const [creating, setCreating] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<SavedWorkflow | null>(null);
@@ -118,10 +120,14 @@ export function WorkflowsPage() {
               key={workflow.id}
               workflow={workflow}
               onRun={() => startSession({ kind: "run", workflow })}
-              onCreateAutomation={() => {
-                setAutomationTarget(workflow);
-                setAutomationOpen(true);
-              }}
+              onCreateAutomation={
+                automationsEnabled
+                  ? () => {
+                      setAutomationTarget(workflow);
+                      setAutomationOpen(true);
+                    }
+                  : undefined
+              }
               onDelete={() => setDeleteTarget(workflow)}
             />
           ))}
@@ -157,7 +163,7 @@ export function WorkflowsPage() {
         open={sessionOpen}
         onOpenChange={setSessionOpen}
       />
-      {automationTarget && (
+      {automationsEnabled && automationTarget && (
         <CreateScheduledTaskDialog
           open={automationOpen}
           onOpenChange={setAutomationOpen}
