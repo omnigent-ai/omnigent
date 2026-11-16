@@ -83,6 +83,10 @@ _EXECUTION_TARGETS = ("connected_host", "managed_sandbox")
 # The polling interval a minute-based rule names, e.g. "FREQ=MINUTELY;INTERVAL=10".
 _MINUTELY_RRULE = re.compile(r"FREQ=MINUTELY;INTERVAL=(\d+)")
 
+# Line and paragraph separators and bidirectional controls, which JSON leaves raw but which
+# could lay out a value as other lines of an approval review.
+_LAYOUT_CONTROLS = re.compile("[\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
+
 _PERMISSION_MODE_DESC = (
     "Permission mode for this task and, by default, the sessions it starts, in the "
     "selected harness's vocabulary: Claude Code (e.g. 'acceptEdits'), Codex ('default', "
@@ -276,13 +280,13 @@ def _trigger_properties(*, update: bool) -> dict[str, Any]:
             "type": "string",
             "enum": list(_SCOPE_MATCHES),
             "description": described(
-                _SCOPE_MATCH_DESC, "As in create; part of the search, defaulting to 'exact'."
+                _SCOPE_MATCH_DESC, "As in create; part of the search for pagerduty."
             ),
         },
         "target": {
             "type": "string",
             "description": described(
-                _TARGET_DESC, "As in create; part of the search, defaulting to 'me'."
+                _TARGET_DESC, "As in create; part of the search for an event with a target."
             ),
         },
         "conditions": {
@@ -382,15 +386,15 @@ class SysTriggeredTaskCreateTool(Tool):
             "ticket created in a Jira project or a review requested from you on GitHub. "
             "Give the provider, what to watch (event, scope, conditions) and the "
             "instructions each session gets; the item's details are added for it. New "
-            "matches usually start a session within about 10 minutes. The first check "
-            "also picks up items from about the hour before; for assignments and review "
-            "requests, only changes after that check count. The agent needs the "
-            "provider's tools where the task runs (an MCP server for Jira, Slack, Linear "
-            "or PagerDuty, which mcp_services can start, or the GitHub CLI or a GitHub MCP "
-            "server); without them it reports what is missing. What it posts uses your "
-            "accounts and ends with 'Sent with Omnigent'. The task also appears on the "
-            "Automations page. "
-            "Manage it with sys_triggered_task_list, sys_triggered_task_update and "
+            "matches start a session at the next check (every 10 minutes by default, or "
+            "hourly where the server can't check more often). The first check also picks "
+            "up items from about the hour before; for assignments and review requests, "
+            "only changes after that check count. The agent needs the provider's tools "
+            "where the task runs (an MCP server for Jira, Slack, Linear or PagerDuty, "
+            "which mcp_services can start, or the GitHub CLI or a GitHub MCP server); "
+            "without them it reports what is missing. What it posts uses your accounts and "
+            "ends with 'Sent with Omnigent'. The task also appears on the Automations "
+            "page. Manage it with sys_triggered_task_list, sys_triggered_task_update and "
             "sys_triggered_task_delete."
         )
 
@@ -674,6 +678,15 @@ def _partial_search_error(args: Mapping[str, object]) -> str | None:
     if not any(key in args for key in SEARCH_ARGUMENTS):
         return None
     absent = [key for key in _RESTATED_SEARCH_ARGUMENTS if key not in args]
+    provider, event = args.get("provider"), args.get("event")
+    if provider in TRIGGER_SOURCES:
+        source = cast(Any, provider)
+        events = {spec.id: spec for spec in TRIGGER_TEMPLATES[source].events}
+        # Left out, these would fall back to create's defaults rather than the saved values.
+        if event in events and events[event].target is not None and "target" not in args:
+            absent.append("target")
+        if "contains" in trigger_scope_operators(source) and "scope_match" not in args:
+            absent.append("scope_match")
     if not absent:
         return None
     return (
@@ -1092,9 +1105,19 @@ def describe_trigger_arguments(args: Mapping[str, object]) -> list[str]:
             continue
         value = args[key]
         if key == "conditions" and isinstance(value, list) and value:
-            rows = [json.dumps(row, ensure_ascii=False) for row in cast(list[object], value)]
+            rows = [review_json(row) for row in cast(list[object], value)]
             lines.append("conditions (all must match):")
             lines.extend(f"  - {row}" for row in rows)
         else:
-            lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+            lines.append(f"{key}: {review_json(value)}")
     return lines
+
+
+def review_json(value: object) -> str:
+    """*value* as JSON for an approval review: readable text, with layout controls escaped.
+
+    :param value: A decoded tool argument, e.g. ``["ES"]``.
+    :returns: E.g. ``'["ES"]'``; a line separator in a string becomes ``\\u2028``.
+    """
+    encoded = json.dumps(value, ensure_ascii=False)
+    return _LAYOUT_CONTROLS.sub(lambda match: f"\\u{ord(match.group()):04x}", encoded)

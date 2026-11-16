@@ -85,11 +85,8 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         # browse the registry and add policies at runtime.
         "sys_add_policy",
         "sys_policy_registry",
-        # Scheduled-task management tools are always auto-registered
-        # so agents can create, list, update, and delete recurring
-        # runs and triggered tasks, and set one-time reminders, without
-        # spec opt-in. They are runner-dispatched via the Omnigent
-        # server's REST API.
+        # Scheduled, triggered and reminder tools register without spec opt-in;
+        # the runner dispatches them to the server's REST API.
         "sys_scheduled_task_create",
         "sys_scheduled_task_list",
         "sys_scheduled_task_update",
@@ -1769,7 +1766,7 @@ def _grouped_spec(**groups: bool) -> AgentSpec:
 
 
 def test_tool_groups_default_registers_every_group() -> None:
-    """An absent ``tool_groups:`` block changes nothing: all 19 register."""
+    """An absent ``tool_groups:`` block changes nothing: every group's tools register."""
     names = _tool_names(_grouped_spec())
     for group, members in _TOOL_GROUP_MEMBERS.items():
         assert members <= names, f"{group} members missing by default: {members - names}"

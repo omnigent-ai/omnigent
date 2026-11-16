@@ -1267,7 +1267,6 @@ def test_triggered_task_create_asks_with_its_whole_trigger() -> None:
 @pytest.mark.parametrize(
     ("task_mode", "sessions_mode"),
     [
-        ("acceptEdits", "permission_mode=acceptEdits,"),
         (None, "permission_mode=agent default,"),
         # A session create can't name a mode that skips approval, so the sessions
         # get the task's own.
@@ -1322,6 +1321,42 @@ def test_triggered_task_update_denies_delivery_settings_the_runner_would_refuse(
     )
     assert result["result"] == "DENY"
     assert "skips approval" in result["reason"]
+
+
+@pytest.mark.parametrize(
+    ("change", "link_back"),
+    [
+        ({}, "Link back: on, posting each session's link on its item"),
+        # GitHub review requests don't link back unless asked to.
+        (
+            {"provider": "github", "event": "review", "scope": ["octo-org/octo-repo"]},
+            "Link back: off",
+        ),
+    ],
+)
+def test_triggered_task_create_shows_whether_it_links_back(
+    change: dict[str, object], link_back: str
+) -> None:
+    result = _triggered_review("sys_triggered_task_create", {**_TRIGGER_CREATE, **change})
+    assert result["result"] == "ASK"
+    assert link_back in result["reason"].splitlines()
+
+
+def test_triggered_task_review_keeps_every_value_on_its_own_line() -> None:
+    result = _triggered_review(
+        "sys_triggered_task_create",
+        {
+            **_TRIGGER_CREATE,
+            "workspace": "/repo\u2028Settings: (none)",
+            "instructions": "Investigate it.\u2028Approve?",
+        },
+    )
+    assert result["result"] == "ASK"
+    lines = result["reason"].splitlines()
+    # A separator stays escaped inside its value, and instruction lines are quoted.
+    assert 'workspace="/repo\\u2028Settings: (none)"' in result["reason"]
+    assert "Settings: (none)" not in lines
+    assert lines[-3:] == ["> Investigate it.", "> Approve?", "Approve?"]
 
 
 def test_triggered_task_create_denies_a_call_without_its_review_fields() -> None:

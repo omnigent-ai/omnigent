@@ -2893,6 +2893,59 @@ def test_inbox_mysql_deep_page_seeks_to_cursor(store):
     assert examined and max(examined) <= 51, plans[0]
 
 
+def test_latest_runs_mysql_seek_one_run_per_task(store):
+    import re
+
+    from sqlalchemy import event, insert
+
+    from omnigent.db.db_models import SqlScheduledTaskRun
+    from omnigent.db.enum_codecs import encode_scheduled_task_run_status
+
+    if store._engine.dialect.name != "mysql":
+        pytest.skip("MySQL execution-plan regression")
+    tasks = [_session_task(store, f"latest-plan-{n}") for n in range(3)]
+    succeeded = encode_scheduled_task_run_status("succeeded")
+    with store._engine.begin() as connection:
+        connection.execute(
+            insert(SqlScheduledTaskRun),
+            [
+                {
+                    "id": f"{n * 10_000 + index:032x}",
+                    "workspace_id": current_workspace_id(),
+                    "scheduled_task_id": task.id,
+                    "status": succeeded,
+                    "scheduled_at": index,
+                }
+                for n, task in enumerate(tasks)
+                for index in range(3_000)
+            ],
+        )
+        connection.exec_driver_sql("ANALYZE TABLE scheduled_task_runs").all()
+    plans = []
+
+    def explain(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("SELECT scheduled_task_runs."):
+            plans.append(
+                conn.exec_driver_sql("EXPLAIN ANALYZE " + statement, parameters).scalar_one()
+            )
+
+    event.listen(store._engine, "before_cursor_execute", explain)
+    try:
+        latest = store.list_latest_runs_for_tasks([task.id for task in tasks])
+    finally:
+        event.remove(store._engine, "before_cursor_execute", explain)
+    assert {task_id: run.id for task_id, run in latest.items()} == {
+        task.id: f"{n * 10_000 + 2_999:032x}" for n, task in enumerate(tasks)
+    }
+    assert len(plans) == 1
+    assert "ix_scheduled_task_runs_scheduled_task_id" in plans[0], plans[0]
+    # Each task's lookup stops at its newest run instead of reading its 3,000.
+    examined = [
+        float(value) for value in re.findall(r"actual time=[^)]*? rows=([\d.]+)", plans[0])
+    ]
+    assert examined and max(examined) <= len(tasks), plans[0]
+
+
 def test_list_page_pages_examined_tasks_and_scopes_owner_and_workspace(store):
     from omnigent.db.db_models import SqlScheduledTask
 

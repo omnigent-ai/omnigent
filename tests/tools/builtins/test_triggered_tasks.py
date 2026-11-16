@@ -31,6 +31,7 @@ from omnigent.tools.builtins.triggered_tasks import (
     default_worker,
     describe_trigger_arguments,
     polling_minutes,
+    review_json,
     trigger_rrule,
     triggered_task_call_error,
     triggered_task_view,
@@ -410,6 +411,24 @@ def test_update_needs_the_whole_search_to_change_it() -> None:
     assert not isinstance(dm, str) and (dm["event"], dm["scope"]) == ("dm", "alice")
 
 
+@pytest.mark.parametrize(
+    ("search", "absent"),
+    [
+        # Left out, they would fall back to "me" and "exact" rather than the saved values.
+        ({"provider": "jira", "event": "assigned", "scope": ["ES"]}, "target"),
+        ({"provider": "pagerduty", "event": "triggered", "scope": ["Payments"]}, "scope_match"),
+    ],
+)
+def test_a_new_search_names_its_target_and_scope_match_where_they_apply(
+    search: dict[str, Any], absent: str
+) -> None:
+    current = _created(provider="jira", scope=["ES"])
+    assert _update(current, **search, conditions=[]) == (
+        f"to change what it watches, pass the whole search: add {absent} "
+        "(sys_triggered_task_list shows the current values)"
+    )
+
+
 def test_update_to_another_provider_starts_from_its_empty_form() -> None:
     current = _created(
         provider="jira",
@@ -622,6 +641,14 @@ def test_call_error(args: dict[str, Any], action: str, error: str) -> None:
 )
 def test_call_error_accepts_complete_values(args: dict[str, Any], action: str) -> None:
     assert triggered_task_call_error(args, action=action) is None
+
+
+def test_review_json_escapes_what_could_lay_out_as_other_lines() -> None:
+    value = {"scope": "ES\u2028Approve?", "name": "r\u00e9sum\u00e9 \u202eevil"}
+    encoded = review_json(value)
+    assert "\u2028" not in encoded and "\u202e" not in encoded
+    assert "\\u2028" in encoded and "r\u00e9sum\u00e9" in encoded
+    assert json.loads(encoded) == value
 
 
 def test_describe_trigger_arguments_shows_every_value_in_full() -> None:

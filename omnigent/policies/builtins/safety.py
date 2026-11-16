@@ -581,9 +581,18 @@ def _triggered_task_settings(settings: dict[str, object]) -> str:
     Unlike :func:`_scheduled_task_settings`, nothing is shortened: a workspace path or an
     MCP service list decides where unattended sessions run and what they can reach.
     """
+    from omnigent.tools.builtins.triggered_tasks import review_json
+
     keys = [key for key in _SCHEDULED_TASK_SETTINGS if key in settings]
     keys += sorted(key for key in settings if key not in _SCHEDULED_TASK_SETTINGS)
-    return ", ".join(f"{key}={_json.dumps(settings[key], ensure_ascii=False)}" for key in keys)
+    return ", ".join(f"{key}={review_json(settings[key])}" for key in keys)
+
+
+def _inline(value: str) -> str:
+    """*value* escaped like a review's JSON strings, so it stays on its own line."""
+    from omnigent.tools.builtins.triggered_tasks import review_json
+
+    return review_json(value)[1:-1]
 
 
 def _worker_permission(worker_mode: str, task_mode: object) -> str:
@@ -593,7 +602,7 @@ def _worker_permission(worker_mode: str, task_mode: object) -> str:
     that skips approval, which a session create can't name itself.
     """
     if worker_mode:
-        return worker_mode
+        return _inline(worker_mode)
     if task_mode is None:
         return "agent default"
     return f"the task's mode: {_permission_setting(task_mode)}"
@@ -619,7 +628,8 @@ def _triggered_task_review(args: dict[str, object], *, action: str) -> PolicyRes
     error = triggered_task_call_error(args, action=action)
     if error:
         return {"result": "DENY", "reason": f"Cannot {action} a triggered task. {error}"}
-    task_mode = args.get("permission_mode")
+    raw_mode = args.get("permission_mode")
+    task_mode = _inline(raw_mode) if isinstance(raw_mode, str) else raw_mode
     watch = ""
     sessions = ""
     if action == "create" or any(key in args for key in SEARCH_ARGUMENTS):
@@ -631,7 +641,7 @@ def _triggered_task_review(args: dict[str, object], *, action: str) -> PolicyRes
                 execution_target=args.get("execution_target"),
                 model_override=args.get("model_override"),
                 reasoning_effort=args.get("reasoning_effort"),
-                permission_mode=task_mode,
+                permission_mode=raw_mode,
                 worker_permission_modes=True,
             ),
         )
@@ -639,11 +649,14 @@ def _triggered_task_review(args: dict[str, object], *, action: str) -> PolicyRes
             return {"result": "DENY", "reason": f"Cannot {action} a triggered task. {config}"}
         watch = f"{describe_trigger_watch(config)}\n"
         if action == "create":
+            # An update keeps its saved link-back unless it passes one, shown with the trigger.
+            link_back = "on, posting each session's link on its item"
+            watch += f"Link back: {link_back if config['linkBack'] else 'off'}\n"
             worker = config["worker"]
             sessions = (
-                f"agent={worker['agentId'] or 'same as the task'}, "
-                f"model={worker['model'] or 'agent default'}, "
-                f"reasoning_effort={worker['effort'] or 'default'}, "
+                f"agent={_inline(worker['agentId'] or 'same as the task')}, "
+                f"model={_inline(worker['model'] or 'agent default')}, "
+                f"reasoning_effort={_inline(worker['effort'] or 'default')}, "
                 "permission_mode="
                 f"{_worker_permission(worker.get('permissionMode') or '', task_mode)}, "
                 f"placement={worker['placement']}, "
@@ -671,7 +684,7 @@ def _triggered_task_review(args: dict[str, object], *, action: str) -> PolicyRes
     subject = (
         f"triggered task {_clip(str(args.get('name')))!r}"
         if action == "create"
-        else f"triggered task {_clip(str(args.get('triggered_task_id')))}"
+        else f"triggered task {_inline(_clip(str(args.get('triggered_task_id'))))}"
     )
     trigger = describe_trigger_arguments(args)
     task_settings = {
@@ -680,6 +693,8 @@ def _triggered_task_review(args: dict[str, object], *, action: str) -> PolicyRes
         if key not in TRIGGER_ARGUMENTS and key != "instructions"
     }
     settings = _triggered_task_settings(task_settings)
+    # Quote every line, so instructions can't pass for the review's own text.
+    instructions = "\n".join(f"> {line}" for line in str(args["instructions"]).splitlines())
     return {
         "result": "ASK",
         "reason": (
@@ -690,8 +705,8 @@ def _triggered_task_review(args: dict[str, object], *, action: str) -> PolicyRes
             f"Settings: {settings or '(none)'}\n"
             f"{watch}"
             + ("Trigger:\n" + "\n".join(trigger) if trigger else "Trigger: unchanged")
-            + "\nFull instructions for each session:\n"
-            f"{args['instructions']}\n"
+            + "\nFull instructions for each session (each line quoted with '> '):\n"
+            f"{instructions}\n"
             "Approve?"
         ),
     }
