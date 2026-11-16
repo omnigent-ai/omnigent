@@ -227,7 +227,8 @@ describe("BestOfNDialog", () => {
 });
 
 describe("KeepAttemptDialog", () => {
-  const run = (attempts: string, group = "g") => ({
+  const GROUP = "1a2b3c4d";
+  const run = (attempts: string, group = GROUP) => ({
     "omnigent.best_of_n.group": group,
     "omnigent.best_of_n.attempts": attempts,
   });
@@ -236,6 +237,8 @@ describe("KeepAttemptDialog", () => {
       id,
       title: `Title ${id}`,
       labels: run("conv_a,conv_b,conv_c"),
+      gitBranch: `best-of-n-${GROUP}-1-codex`,
+      family: { id: "fam_run", representative_id: null, pinned: false },
       permissionLevel: null,
       archived: false,
       ...overrides,
@@ -276,17 +279,22 @@ describe("KeepAttemptDialog", () => {
     expect(toast.success).toHaveBeenCalledWith(
       "Kept Attempt 1 · Codex. Archived 2 other attempts.",
     );
-    expect(deleteRunGrids).toHaveBeenCalledExactlyOnceWith("g");
+    expect(deleteRunGrids).toHaveBeenCalledExactlyOnceWith(GROUP);
   });
 
   it("archives only sessions whose own labels place them in the run", async () => {
     vi.mocked(getSessionSlim).mockImplementation(async (id) => {
-      if (id === "conv_b") return attempt(id, { labels: run("conv_a,conv_b", "other") });
+      if (id === "conv_a") return attempt(id);
+      // Matching, reciprocal labels an editor forged on an unrelated session.
+      if (id === "conv_b") return attempt(id, { gitBranch: "feature/login" });
+      if (id === "conv_c") return attempt(id, { labels: run("conv_a,conv_c", "0f0f0f0f") });
       throw new ApiError("Not found", 404, null);
     });
     renderKeep();
     expect(await screen.findByText("No other attempts of this run can be archived.")).toBeVisible();
     expect(screen.getByTestId("keep-attempt-confirm")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("keep-attempt-confirm"));
+    expect(mutateAsync).not.toHaveBeenCalled();
   });
 
   it("won't keep until every listed attempt is checked, then archives them all", async () => {
@@ -310,7 +318,7 @@ describe("KeepAttemptDialog", () => {
     );
     expect(screen.queryByRole("alert")).toBeNull();
     fireEvent.click(screen.getByTestId("keep-attempt-confirm"));
-    await waitFor(() => expect(deleteRunGrids).toHaveBeenCalledWith("g"));
+    await waitFor(() => expect(deleteRunGrids).toHaveBeenCalledWith(GROUP));
     expect(mutateAsync).toHaveBeenCalledWith(
       expect.objectContaining({ ids: ["conv_b", "conv_c"] }),
     );

@@ -124,12 +124,12 @@ it("keeps the user's own grid and removes the run's grid only after archiving", 
   localStorage.setItem(
     KEY,
     JSON.stringify([
-      grid("run", ["conv_a", "conv_b", "conv_c"], "g"),
+      grid("run", ["conv_a", "conv_b", "conv_c"], "1a2b3c4d"),
       grid("custom", ["conv_a", "conv_c"]),
     ]),
   );
   const labels = {
-    "omnigent.best_of_n.group": "g",
+    "omnigent.best_of_n.group": "1a2b3c4d",
     "omnigent.best_of_n.attempts": "conv_a,conv_b,conv_c",
   };
   vi.mocked(getSessionSlim).mockImplementation(
@@ -138,6 +138,8 @@ it("keeps the user's own grid and removes the run's grid only after archiving", 
         id,
         title: `Title ${id}`,
         labels,
+        gitBranch: `best-of-n-1a2b3c4d-1-${id}`,
+        family: { id: "fam_run", representative_id: null, pinned: false },
         permissionLevel: null,
         archived: id === "conv_b",
       }) as unknown as Session,

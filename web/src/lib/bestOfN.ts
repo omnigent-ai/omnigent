@@ -180,12 +180,17 @@ function confirmsExclusion(error: unknown): boolean {
   return error instanceof ApiError && (error.status === 403 || error.status === 404);
 }
 
+/** A run's group id, as `launchBestOfN` mints it. */
+const RUN_GROUP = /^[0-9a-f]{8}$/;
+
 /**
- * The other attempts "Keep this attempt" may archive: owned, active sessions
- * whose own labels put them in the kept attempt's run. Anyone who can edit a
- * session can change its labels, so the kept session's list alone is not trusted.
- * Lookups that fail for another reason are reported as unresolved, so a caller
- * never treats a partial list as the whole run.
+ * The other attempts "Keep this attempt" may archive: owned, active sessions of
+ * the kept attempt's run. Labels are editable by anyone with edit access, so
+ * membership also needs evidence editors can't change: the worktree branch the
+ * server recorded when the session was created (`best-of-n-<group>-…`) and the
+ * server-assigned family, both matching the kept attempt's. Lookups that fail
+ * for another reason than missing or forbidden are reported as unresolved, so
+ * a caller never treats a partial list as the whole run.
  *
  * @param keptId - The attempt being kept.
  * @param keptLabels - Its labels, naming the run's group and attempts.
@@ -199,8 +204,23 @@ export async function verifiedOtherAttempts(
   const group = keptLabels?.[BEST_OF_N_GROUP_LABEL];
   const ids = otherBestOfNAttemptIds(keptId, keptLabels);
   const verified: VerifiedAttempts = { attempts: [], unresolved: [] };
-  if (!group || ids.length === 0) return verified;
-  const sessions = await Promise.allSettled(ids.map((id) => fetchSession(id)));
+  if (!group || !RUN_GROUP.test(group) || ids.length === 0) return verified;
+  const [keptResult, ...sessions] = await Promise.allSettled([
+    fetchSession(keptId),
+    ...ids.map((id) => fetchSession(id)),
+  ]);
+  if (keptResult.status === "rejected") {
+    if (!confirmsExclusion(keptResult.reason)) verified.unresolved.push(...ids);
+    return verified;
+  }
+  const family = keptResult.value.family?.id;
+  const branchPrefix = `best-of-n-${group}-`;
+  const inRun = (session: Session) =>
+    !!family &&
+    session.family?.id === family &&
+    session.gitBranch?.startsWith(branchPrefix) === true &&
+    session.labels?.[BEST_OF_N_GROUP_LABEL] === group;
+  if (keptResult.value.id !== keptId || !inRun(keptResult.value)) return verified;
   sessions.forEach((result, index) => {
     if (result.status === "rejected") {
       if (!confirmsExclusion(result.reason)) verified.unresolved.push(ids[index]);
@@ -209,7 +229,7 @@ export async function verifiedOtherAttempts(
     const session = result.value;
     const sameRun =
       session.id === ids[index] &&
-      session.labels?.[BEST_OF_N_GROUP_LABEL] === group &&
+      inRun(session) &&
       bestOfNAttemptIds(session.labels).includes(keptId);
     if (sameRun && session.archived !== true && isOwnerLevel(session.permissionLevel ?? null))
       verified.attempts.push({ id: session.id, title: session.title || session.id });

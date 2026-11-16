@@ -201,15 +201,20 @@ describe("launchBestOfN ordering", () => {
 });
 
 describe("verifiedOtherAttempts", () => {
-  const run = (attempts: string, group = "g") => ({
+  const GROUP = "1a2b3c4d";
+  const run = (attempts: string, group = GROUP) => ({
     [BEST_OF_N_GROUP_LABEL]: group,
     [BEST_OF_N_ATTEMPTS_LABEL]: attempts,
   });
+  const family = (id: string) => ({ id, representative_id: null, pinned: false });
+  // Server-recorded evidence: the worktree branch from creation and the family.
   const session = (id: string, overrides: Partial<Session> = {}) =>
     ({
       id,
       title: `Title ${id}`,
-      labels: run("conv_a,conv_b,conv_c,conv_d,conv_e,conv_f"),
+      labels: run("conv_a,conv_b,conv_c,conv_d,conv_e,conv_f,conv_i,conv_j"),
+      gitBranch: `best-of-n-${GROUP}-1-codex`,
+      family: family("fam_run"),
       permissionLevel: null,
       archived: false,
       ...overrides,
@@ -223,17 +228,41 @@ describe("verifiedOtherAttempts", () => {
       if (id === "conv_f") return session(id, { archived: true });
       if (id === "conv_g") throw new ApiError("Not found", 404, null);
       if (id === "conv_h") throw new ApiError("Forbidden", 403, null);
-      return session(id, { title: null });
+      // Unrelated sessions an editor gave matching, reciprocal labels: their
+      // server-recorded branch or family gives them away.
+      if (id === "conv_i") return session(id, { gitBranch: "feature/login" });
+      if (id === "conv_j") return session(id, { family: family("fam_other") });
+      return session(id, { title: id === "conv_b" ? null : `Title ${id}` });
     });
 
     const verified = await verifiedOtherAttempts(
       "conv_a",
-      run("conv_a,conv_b,conv_c,conv_d,conv_e,conv_f,conv_g,conv_h"),
+      run("conv_a,conv_b,conv_c,conv_d,conv_e,conv_f,conv_g,conv_h,conv_i,conv_j"),
       fetchSession,
     );
 
     // Missing and forbidden sessions are confirmed exclusions, not unresolved.
     expect(verified).toEqual({ attempts: [{ id: "conv_b", title: "conv_b" }], unresolved: [] });
+  });
+
+  it("trusts no attempt list on a kept session the server doesn't place in the run", async () => {
+    const forgedKept = vi.fn(async (id: string) =>
+      session(id, id === "conv_a" ? { gitBranch: "main" } : {}),
+    );
+    expect(await verifiedOtherAttempts("conv_a", run("conv_a,conv_b"), forgedKept)).toEqual({
+      attempts: [],
+      unresolved: [],
+    });
+    const familyless = vi.fn(async (id: string) => session(id, { family: null }));
+    expect(
+      (await verifiedOtherAttempts("conv_a", run("conv_a,conv_b"), familyless)).attempts,
+    ).toEqual([]);
+    // A group that isn't a launched run's id isn't looked up at all.
+    const fetchSession = vi.fn(async (id: string) => session(id));
+    expect(
+      await verifiedOtherAttempts("conv_a", run("conv_a,conv_b", "feature"), fetchSession),
+    ).toEqual({ attempts: [], unresolved: [] });
+    expect(fetchSession).not.toHaveBeenCalled();
   });
 
   it("reports a failed lookup as unresolved until a retry confirms it", async () => {
@@ -256,10 +285,11 @@ describe("verifiedOtherAttempts", () => {
       ],
       unresolved: [],
     });
-    // A network failure is no proof either.
+    // A network failure is no proof either; failing on the kept attempt leaves the whole run unchecked.
     fetchSession.mockRejectedValueOnce(new TypeError("Failed to fetch"));
     expect((await verifiedOtherAttempts("conv_a", labels, fetchSession)).unresolved).toEqual([
       "conv_b",
+      "conv_c",
     ]);
   });
 

@@ -115,6 +115,7 @@ def test_best_of_n_starts_attempts_in_a_grid_and_keeps_one(
                     title=body["title"],
                     agent_id=body["agent_id"],
                     labels={_GROUP: body["labels"][_GROUP]},
+                    git_branch=body["git"]["branch_name"],
                     family={
                         "id": "bon-source",
                         "representative_id": "bon-source",
