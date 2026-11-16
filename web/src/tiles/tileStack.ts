@@ -2,8 +2,8 @@
 // untouched for a day) unless you chose to keep them out. Stacked tiles leave
 // the grid and give up their live stream. Saved per device by session id.
 
-import { useSyncExternalStore } from "react";
 import type { Conversation } from "@/hooks/useConversations";
+import { createLocalJsonStore } from "./localJsonStore";
 import { needsYou } from "./tileSelection";
 
 export const QUIET_STACK_AFTER_MS = 24 * 60 * 60 * 1000;
@@ -66,50 +66,13 @@ export function pruneStack(state: TileStackState, liveIds: ReadonlySet<string>):
 
 // ── Persistence ───────────────────────────────────────────────────────────────
 
-const STACK_KEY = "omnigent:tiles-stack";
-const listeners = new Set<() => void>();
-let cache: { raw: string | null; value: TileStackState } = { raw: null, value: EMPTY };
+const ids = (list: unknown) =>
+  Array.isArray(list) ? list.filter((id): id is string => typeof id === "string") : [];
 
-function readStack(): TileStackState {
-  let raw: string | null;
-  try {
-    raw = localStorage.getItem(STACK_KEY);
-  } catch {
-    return EMPTY;
-  }
-  if (raw === cache.raw) return cache.value;
-  let value = EMPTY;
-  try {
-    const parsed = JSON.parse(raw ?? "null") as Partial<TileStackState> | null;
-    const ids = (list: unknown) =>
-      Array.isArray(list) ? list.filter((id): id is string => typeof id === "string") : [];
-    value = { parked: ids(parsed?.parked), kept: ids(parsed?.kept) };
-  } catch {
-    // A corrupt entry reads as an empty Stack.
-  }
-  cache = { raw, value };
-  return value;
-}
+const stackStore = createLocalJsonStore<TileStackState>("omnigent:tiles-stack", EMPTY, (raw) => {
+  const parsed = raw as Partial<TileStackState> | null;
+  return { parked: ids(parsed?.parked), kept: ids(parsed?.kept) };
+});
 
-export function writeTileStack(state: TileStackState): void {
-  try {
-    localStorage.setItem(STACK_KEY, JSON.stringify(state));
-  } catch {
-    // Storage unavailable: the Stack still works for this page view.
-  }
-  for (const listener of listeners) listener();
-}
-
-function subscribe(listener: () => void) {
-  listeners.add(listener);
-  const onStorage = (event: StorageEvent) => event.key === STACK_KEY && listener();
-  window.addEventListener("storage", onStorage);
-  return () => {
-    listeners.delete(listener);
-    window.removeEventListener("storage", onStorage);
-  };
-}
-
-export function useTileStack(): TileStackState {
-  return useSyncExternalStore(subscribe, readStack);
-}
+export const writeTileStack = stackStore.write;
+export const useTileStack = stackStore.use;
