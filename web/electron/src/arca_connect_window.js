@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * The Arca connect console: a modal window owned by the shell, used in place of
+ * The connect console: a non-modal window owned by the shell, used in place of
  * a native consent dialog. It shows the exact `arca ssh` command that will run
  * and, after the user confirms, streams its live stdout/stderr into an embedded
  * terminal pane.
@@ -12,6 +12,8 @@
  * click here carries the same authority the native dialog had (see
  * confirmHostEnrollment for why consent must live outside the server's page).
  * Confirm/cancel messages are accepted only from this window's own webContents.
+ * It isn't modal, so the app stays usable during a slow start; that changes
+ * nothing about consent, since only this window's own clicks count.
  *
  * All Electron surfaces are injected so the flow is unit-testable.
  */
@@ -24,6 +26,8 @@ const CONTENT_WIDTH = 720;
 const MIN_CONTENT_HEIGHT = 300;
 const RUNNING_CONTENT_HEIGHT = 500;
 const MAX_CONTENT_HEIGHT = 640;
+/** How long a successful run's "Connected" message shows before the window closes. */
+const SUCCESS_CLOSE_DELAY_MS = 1500;
 const { arcaTarget } = require("./arcaIdentity");
 
 /**
@@ -38,6 +42,7 @@ const { arcaTarget } = require("./arcaIdentity");
  *   startLogin: (serverUrl: string) => ReturnType<typeof import("./arca").startArcaLogin>,
  *   loginCommandLine: (serverUrl: string) => string,
  *   log?: (message: string) => void,
+ *   closeDelayMs?: number,
  * }} deps
  * @returns {{ run: (parentWin: unknown, serverUrl: string, options?: { reason?: "preview-reconnect" }) => Promise<object> }}
  */
@@ -51,6 +56,7 @@ function createArcaConnectFlow({
   startLogin,
   loginCommandLine,
   log = () => {},
+  closeDelayMs = SUCCESS_CLOSE_DELAY_MS,
 }) {
   /**
    * Button routing, keyed by the console window's webContents id and kept
@@ -96,8 +102,9 @@ function createArcaConnectFlow({
    * Open the console over `parentWin` and drive one connect to `serverUrl`.
    * Resolves with the connect result: `{ ok: false }` (not approved) when the
    * user cancels or closes before confirming; the command's own result after
-   * a confirmed run. The window stays open after a run so the user can read
-   * the output; the promise resolves as soon as the command settles.
+   * a confirmed run. A successful run closes the window shortly after; a
+   * failed one leaves it open so the user can read the output. The promise
+   * resolves as soon as the command settles.
    *
    * @param {unknown} parentWin
    * @param {string} serverUrl
@@ -130,7 +137,7 @@ function createArcaConnectFlow({
       // reveals its terminal pane (see index.html's data-phase styling).
       const win = new BrowserWindow({
         parent: parentWin ?? undefined,
-        modal: true,
+        modal: false,
         width: CONTENT_WIDTH,
         height: MIN_CONTENT_HEIGHT,
         useContentSize: true,
@@ -212,7 +219,20 @@ function createArcaConnectFlow({
             error: result.ok === true ? null : (result.error ?? "Connecting to Arca failed."),
           });
           settle({ ...result, shownInConsole: true });
+          if (result.ok === true) closeSoon();
         });
+      };
+
+      // Nothing is left to read after a success, so the window gets out of the way.
+      const closeSoon = () => {
+        const timer = setTimeout(() => {
+          try {
+            if (!win.isDestroyed()) win.close();
+          } catch {
+            // Already closing.
+          }
+        }, closeDelayMs);
+        timer.unref?.();
       };
 
       consoles.set(consoleId, {

@@ -571,6 +571,11 @@ A decline briefly suppresses repeat prompts, while failed runs remain retryable.
 **Run on Arca** is hidden for an online remembered host only when the desktop
 advertises preview recovery; older shells keep the action visible.
 
+The connect console is not modal, so the app window stays usable while a slow
+start runs; only clicks in the console itself count as consent. After a
+successful run the console closes itself about 1.5 seconds later. After a
+failure it stays open with the command's output.
+
 The exception covers HTTP(S) `localhost`, `127.0.0.1`, `[::1]`, and
 `*.localhost` subdomains, including redirects and links that would open a new
 window (which stay in the same pane).
