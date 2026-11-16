@@ -3590,14 +3590,15 @@ function ComposerImpl(
 
   /**
    * Execute a slash command by name + optional argument string.
-   * Clears the input and error state on success (or sets an error on
-   * bad usage). Returns ``true`` when the command was recognised.
+   * Clears the last text field (where commands are typed, after any reply
+   * quotes) and error state on success (or sets an error on bad usage).
+   * Returns ``true`` when the command was recognised.
    */
   const executeSlashCommand = (cmd: string, arg: string): boolean => {
     switch (cmd) {
       case "/goal": {
         dirtyRef.current = true;
-        setValue("");
+        editText(null, "");
         setCommandError(null);
         setGoalDialogOpen(true);
         return true;
@@ -3608,7 +3609,7 @@ function ComposerImpl(
           return true;
         }
         dirtyRef.current = true;
-        setValue("");
+        editText(null, "");
         setCommandError(null);
         onNewSession();
         return true;
@@ -3623,7 +3624,7 @@ function ComposerImpl(
           return true;
         }
         dirtyRef.current = true;
-        setValue("");
+        editText(null, "");
         setCommandError(null);
         void useChatStore
           .getState()
@@ -3643,7 +3644,7 @@ function ComposerImpl(
           return true;
         }
         dirtyRef.current = true;
-        setValue("");
+        editText(null, "");
         setCommandError(null);
         setRewindPickerOpen(true);
         return true;
@@ -3683,7 +3684,7 @@ function ComposerImpl(
           return true;
         }
         dirtyRef.current = true;
-        setValue("");
+        editText(null, "");
         setCommandError(null);
         if (
           sessionHarness === "claude-native" ||
@@ -3714,7 +3715,7 @@ function ComposerImpl(
         }
         const level = arg.toLowerCase() === "default" ? null : arg.toLowerCase();
         dirtyRef.current = true;
-        setValue("");
+        editText(null, "");
         setCommandError(null);
         void useChatStore
           .getState()
@@ -3748,7 +3749,7 @@ function ComposerImpl(
           return true;
         }
         dirtyRef.current = true;
-        setValue("");
+        editText(null, "");
         setCommandError(null);
         // Confirmation is a durable `[System: model changed to X]` note the
         // server appends to the transcript (see _persist_model_change_note) —
@@ -3811,7 +3812,7 @@ function ComposerImpl(
           return true;
         }
         dirtyRef.current = true;
-        setValue("");
+        editText(null, "");
         setCommandError(null);
         setPermissionPickerOpenNonce((n) => n + 1);
         return true;
@@ -4211,13 +4212,16 @@ function ComposerImpl(
     const openGenericSideChat = (question: string) => {
       const sourceId = useChatStore.getState().conversationId;
       if (sourceId === null) return;
+      const submitted = fullText;
       setCommandError(null);
       createSideChat(sourceId).then(
         ({ childSessionId }) => {
-          // Clear the composer only once the side chat exists, so a failed
-          // create keeps the user's typed question instead of dropping it.
-          dirtyRef.current = true;
-          replaceText("");
+          // Clear the composer only once the side chat exists, so a failed create
+          // keeps the typed question; edits made while it was pending win.
+          if (valueRef.current === submitted) {
+            dirtyRef.current = true;
+            replaceText("");
+          }
           useChatStore.getState().openSideChatWithDraft(childSessionId, question, sourceId);
         },
         // Surface the failure as a toast, not an inline composer error; the
@@ -4230,9 +4234,12 @@ function ComposerImpl(
     // invokes a known catalog skill by its full name, with no attachments.
     // Built-ins run locally; anything unhandled falls through to plaintext.
     const tailText = draft.text.trim();
+    const noAttachedContext =
+      files.length === 0 && !hasMentions && localReviewComments.length === 0;
     // A known command typed after reply quotes runs with the quotes as context.
     const quotedCommand =
       draft.quotes.length > 0 &&
+      noAttachedContext &&
       (matchSlashCommandInvocation(tailText, slashCommandNames) !== null ||
         Object.hasOwn(offeredBuiltinCommands, tailText.split(/\s+/)[0].toLowerCase()));
     const commandText = quotedCommand ? tailText : trimmed;
@@ -4247,9 +4254,7 @@ function ComposerImpl(
     if (
       (draft.quotes.length === 0 || quotedCommand) &&
       (skill !== null || isSlashCommandText(commandText)) &&
-      files.length === 0 &&
-      !hasMentions &&
-      localReviewComments.length === 0
+      noAttachedContext
     ) {
       const parts = commandText.split(/\s+/);
       const cmd = parts[0].toLowerCase();
@@ -4291,7 +4296,7 @@ function ComposerImpl(
       if (cmd === "/model" && !arg && showModels && canOpenModelPicker) {
         runCommand(() => {
           dirtyRef.current = true;
-          setValue("");
+          editText(null, "");
           setCommandError(null);
           setPickerOpenNonce((n) => n + 1);
         });

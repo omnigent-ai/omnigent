@@ -6973,6 +6973,22 @@ describe("Composer reply quotes", () => {
     expect(textarea()).toHaveValue("");
   });
 
+  it("clears only a quoted built-in's text when it is sent from an earlier field", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps();
+    render(<Composer {...props} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "My context" } });
+    act(() => ref.current?.appendReplyQuote("Use the filler pattern"));
+    fireEvent.change(textarea(), { target: { value: "/new" } });
+    const earlier = screen.getByLabelText("Reply text before quote 1");
+    act(() => earlier.focus());
+    fireEvent.keyDown(earlier, { key: "Enter" });
+
+    expect(props.onNewSession).toHaveBeenCalledOnce();
+    expect(earlier).toHaveValue("My context");
+    expect(textarea()).toHaveValue("");
+  });
+
   it("invokes a skill chosen after a reply quote with the quote as context", () => {
     setComposerState({
       sessionHarness: "openai-agents",
@@ -6998,27 +7014,47 @@ describe("Composer reply quotes", () => {
     expect(textarea()).toHaveValue("");
   });
 
-  it("carries reply quotes into a side chat opened with /side", async () => {
-    setComposerState({ sessionHarness: "openai-agents", sideChatToOpen: null, sideChatDrafts: {} });
-    composerSessionSnapshot.sideChatAllowed = true;
-    vi.spyOn(sessionsApi, "createSideChat").mockResolvedValue({ childSessionId: "conv_side" });
-    const ref = createRef<ComponentRef<typeof Composer>>();
-    try {
-      renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} ref={ref} />);
-      act(() => ref.current?.appendReplyQuote("Use the filler pattern"));
-      fireEvent.change(textarea(), { target: { value: "/side why this one?" } });
-      fireEvent.keyDown(textarea(), { key: "Enter" });
+  it.each([false, true])(
+    "carries reply quotes into a side chat opened with /side (quote added while pending: %s)",
+    async (addQuoteWhilePending) => {
+      setComposerState({
+        sessionHarness: "openai-agents",
+        sideChatToOpen: null,
+        sideChatDrafts: {},
+      });
+      composerSessionSnapshot.sideChatAllowed = true;
+      let finishCreate = () => {};
+      vi.spyOn(sessionsApi, "createSideChat").mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            finishCreate = () => resolve({ childSessionId: "conv_side" });
+          }),
+      );
+      const ref = createRef<ComponentRef<typeof Composer>>();
+      try {
+        renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} ref={ref} />);
+        act(() => ref.current?.appendReplyQuote("Use the filler pattern"));
+        fireEvent.change(textarea(), { target: { value: "/side why this one?" } });
+        fireEvent.keyDown(textarea(), { key: "Enter" });
+        if (addQuoteWhilePending) act(() => ref.current?.appendReplyQuote("A later quote"));
+        await act(async () => finishCreate());
 
-      await waitFor(() =>
         expect(useChatStore.getState().sideChatDrafts).toEqual({
           conv_side: "why this one?\n\n> Use the filler pattern",
-        }),
-      );
-      expect(screen.queryByTestId("composer-reply-quote")).toBeNull();
-    } finally {
-      composerSessionSnapshot.sideChatAllowed = null;
-    }
-  });
+        });
+        const remaining = screen.queryAllByTestId("composer-reply-quote");
+        if (addQuoteWhilePending) {
+          expect(remaining).toHaveLength(2);
+          expect(remaining[1]).toHaveTextContent("A later quote");
+        } else {
+          expect(remaining).toHaveLength(0);
+          expect(textarea()).toHaveValue("");
+        }
+      } finally {
+        composerSessionSnapshot.sideChatAllowed = null;
+      }
+    },
+  );
 
   it.each([
     ["a skill", "/deslop tighten it", "/deslop tighten it"],
@@ -7039,6 +7075,25 @@ describe("Composer reply quotes", () => {
       `${command}\n\n> Use the filler pattern`,
       undefined,
       { version: 1, quotes: [{ before: command, text: "Use the filler pattern" }], text: "" },
+    );
+  });
+
+  it("keeps a quoted command after the quote when the reply tags a file", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps({ showGoalControl: true });
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    render(<Composer {...props} ref={ref} />);
+    act(() =>
+      useChatStore.setState({
+        pendingComposerAttachments: [{ path: "src/example.ts", isDir: false }],
+      }),
+    );
+    act(() => ref.current?.appendReplyQuote("Actual card"));
+    fireEvent.change(textarea(), { target: { value: "/goal Fix CI" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(vi.mocked(props.onSend).mock.calls[0]?.[0]).toBe(
+      "[Attached file: src/example.ts] \n\n> Actual card\n\n/goal Fix CI",
     );
   });
 });
