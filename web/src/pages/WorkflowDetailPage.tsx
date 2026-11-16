@@ -55,6 +55,7 @@ import { useSession } from "@/hooks/useSession";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { WorkflowPlanningChat } from "@/components/workflows/WorkflowPlanningChat";
 import { automationPagePath } from "@/lib/automationFromSession";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { Link, useNavigate, useParams } from "@/lib/routing";
 import { formatRunTimestamp } from "@/lib/scheduleText";
@@ -101,10 +102,11 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const { session: planningSession, error: planningSessionError } = useSession(
     workflow?.planning_session_id,
   );
-  const canReadProposal =
-    !!planningSession &&
-    !planningSession.archived &&
-    !(planningSessionError instanceof ApiError && planningSessionError.status === 404);
+  // Known archived or deleted; a session still loading may yet open.
+  const planningSessionGone =
+    !!planningSession?.archived ||
+    (planningSessionError instanceof ApiError && planningSessionError.status === 404);
+  const canReadProposal = !!planningSession && !planningSessionGone;
   const journal = useSessionJournal(
     canReadProposal ? planningSession.id : undefined,
     canReadProposal,
@@ -181,7 +183,9 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const openPlanner = () => {
     if (showPlanner) setPlannerFlash((count) => count + 1);
     setPlannerOpen(true);
-    if (canReadProposal) useChatStore.getState().requestSideChatFocus(planningSession.id);
+    // A session still loading keeps the request until its composer mounts.
+    const sessionId = workflow.planning_session_id;
+    if (sessionId && !planningSessionGone) useChatStore.getState().requestSideChatFocus(sessionId);
   };
 
   return (
@@ -482,6 +486,8 @@ function WorkflowDescription({ workflowId, text }: { workflowId: string; text: s
   const save = () => {
     if (draft === null) return;
     const next = draft.trim();
+    // The shortcut follows the Save button: a workflow needs a description.
+    if (!next) return;
     if (next === text) {
       close();
       return;
@@ -549,6 +555,8 @@ function WorkflowDescription({ workflowId, text }: { workflowId: string; text: s
             disabled={update.isPending}
             onChange={(event) => setDraft(event.currentTarget.value)}
             onKeyDown={(event) => {
+              // These keys end an IME composition first; leave them to the IME.
+              if (isImeCompositionKeyEvent(event)) return;
               if (event.key === "Escape") {
                 event.preventDefault();
                 cancel();

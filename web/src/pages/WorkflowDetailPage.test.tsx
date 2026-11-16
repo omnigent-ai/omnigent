@@ -26,7 +26,7 @@ import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import type * as IdentityModule from "@/lib/identity";
 import type * as RoutingModule from "@/lib/routing";
 import { sessionJournalKey, type JournalEntry, type StepProgress } from "@/lib/sessionJournal";
-import { getSession, sendUserMessage } from "@/lib/sessionsApi";
+import { ApiError, getSession, sendUserMessage } from "@/lib/sessionsApi";
 import { taskActionMessage } from "@/lib/workflow";
 import type * as SessionsApi from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
@@ -398,9 +398,11 @@ describe("WorkflowDetailPage", () => {
     const planner = "e".repeat(32);
     mockWorkflow({ data: { ...WORKFLOW, planning_session_id: planner } });
     mockRuns([]);
+    // Pressed before the planning session loads, the request waits for its composer.
+    vi.mocked(useSession).mockReturnValue({ session: null, isLoading: true, error: null });
     vi.useFakeTimers();
     try {
-      renderPage();
+      const { rerender } = renderPage();
       const edit = screen.getByRole("button", { name: "Edit plan with agent" });
 
       fireEvent.click(edit);
@@ -410,6 +412,12 @@ describe("WorkflowDetailPage", () => {
 
       // The real composer drops the request as it takes focus.
       useChatStore.getState().clearSideChatComposer(planner);
+      vi.mocked(useSession).mockReturnValue({
+        session: { id: planner, archived: false, labels: {} } as Session,
+        isLoading: false,
+        error: null,
+      });
+      rerender(<WorkflowDetailPage />);
       fireEvent.click(edit);
       expect(useChatStore.getState().sideChatComposers[planner]?.autoFocus).toBe(true);
       expect(screen.getByTestId("workflow-planning-chat-flash")).toBeInTheDocument();
@@ -419,6 +427,21 @@ describe("WorkflowDetailPage", () => {
       useChatStore.getState().clearSideChatComposer(planner);
       vi.useRealTimers();
     }
+  });
+
+  it.each([
+    ["archived", { session: { archived: true, labels: {} } as Session, error: null }],
+    ["deleted", { session: null, error: new ApiError("Session not found", 404, null) }],
+  ])("queues no composer focus for a %s planning session", (_, state) => {
+    const planner = "f".repeat(32);
+    mockWorkflow({ data: { ...WORKFLOW, planning_session_id: planner } });
+    mockRuns([]);
+    vi.mocked(useSession).mockReturnValue({ ...state, isLoading: false });
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit plan with agent" }));
+    expect(screen.getByTestId("planning-chat")).toBeInTheDocument();
+    expect(useChatStore.getState().sideChatComposers[planner]).toBeUndefined();
   });
 
   it("shows the workflow, its steps, and the sessions that ran it", () => {
@@ -555,9 +578,19 @@ describe("WorkflowDetailPage", () => {
       expect(screen.queryByRole("textbox", editorName)).toBeNull();
 
       fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
-      fireEvent.change(screen.getByRole("textbox", editorName), {
+      const editor = screen.getByRole("textbox", editorName);
+      // The shortcut can't save an empty description, just as the button can't.
+      fireEvent.change(editor, { target: { value: "   " } });
+      fireEvent.keyDown(editor, { key: "Enter", ctrlKey: true });
+      expect(patches).toEqual([]);
+      fireEvent.change(editor, {
         target: { value: "  Finds flaky tests and fixes the clear ones.  " },
       });
+      // Keys that end an IME composition neither cancel nor save.
+      fireEvent.keyDown(editor, { key: "Escape", isComposing: true });
+      fireEvent.keyDown(editor, { key: "Enter", ctrlKey: true, isComposing: true });
+      expect(confirm).not.toHaveBeenCalled();
+      expect(patches).toEqual([]);
       fireEvent.click(screen.getByRole("button", { name: "Save" }));
       expect(await screen.findByRole("alert")).toHaveTextContent("Couldn’t save the description");
       // Escape asks before discarding the edit.
