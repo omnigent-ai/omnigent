@@ -53,11 +53,55 @@ describe("ReasoningView — expandable gating", () => {
     // the trigger to expand first. Asserting on the actual text after
     // expanding proves the content path still renders end-to-end, not
     // just that a button exists.
-    render(<ReasoningView text="Considered the options." isStreaming={false} duration={2.5} />);
+    render(
+      <ReasoningView
+        text={"Weighing the options.\n\nPicked the cheaper one."}
+        isStreaming={false}
+        duration={2.5}
+      />,
+    );
     const trigger = screen.getByRole("button");
     expect(trigger).toBeTruthy();
-    expect(screen.queryByText("Considered the options.")).toBeNull(); // collapsed
+    expect(screen.queryByText("Picked the cheaper one.")).toBeNull(); // collapsed
     fireEvent.click(trigger);
-    expect(screen.getByText("Considered the options.")).toBeTruthy(); // expanded
+    expect(screen.getByText("Picked the cheaper one.")).toBeTruthy(); // expanded
+  });
+});
+
+describe("ReasoningView — header preview", () => {
+  it("previews the first non-blank line of a settled thought instead of its duration", () => {
+    render(
+      <ReasoningView
+        text={"\n  Checking the lockfile first.\nThen the build config."}
+        isStreaming={false}
+        duration={2.5}
+      />,
+    );
+    expect(screen.getByRole("button")).toHaveTextContent(
+      /^Thinking: Checking the lockfile first\.$/,
+    );
+    expect(screen.queryByText(/Thought for/)).toBeNull();
+  });
+
+  it("strips markdown markers from the preview line", () => {
+    render(
+      <ReasoningView
+        text={"## **Planning** the `retry` fix\n\nDetails."}
+        isStreaming={false}
+        duration={undefined}
+      />,
+    );
+    expect(screen.getByRole("button")).toHaveTextContent(/^Thinking: Planning the retry fix$/);
+  });
+
+  it("keeps the shimmer while streaming rather than previewing partial text", () => {
+    render(<ReasoningView text="Checking the lockfile" isStreaming={true} duration={undefined} />);
+    expect(screen.getByText("Thinking...")).toBeTruthy();
+    expect(screen.queryByText(/Thinking:/)).toBeNull();
+  });
+
+  it("falls back to the duration label when a settled thought has no text", () => {
+    render(<ReasoningView text="" isStreaming={false} duration={3} />);
+    expect(screen.getByText("Thought for 3.0 seconds")).toBeTruthy();
   });
 });

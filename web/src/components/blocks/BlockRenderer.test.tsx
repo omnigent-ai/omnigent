@@ -358,7 +358,7 @@ describe("BlockRenderer dispatch", () => {
 
   it("hides a live turn's reasoning duration after assistant text arrives", () => {
     const items: RenderItem[] = [
-      { kind: "reasoning", itemId: "live-reasoning", text: "still working", duration: 5 },
+      { kind: "reasoning", itemId: "live-reasoning", text: "", duration: 5 },
       { kind: "text", itemId: "live-text", text: "Partial answer", final: false },
     ];
 
@@ -383,7 +383,7 @@ describe("BlockRenderer dispatch", () => {
       </>,
     );
 
-    expect(screen.getByText("Thought for a few seconds")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Thinking: finished" })).toBeInTheDocument();
     expect(screen.getAllByText("Thinking...")).toHaveLength(1);
   });
 
@@ -727,7 +727,12 @@ describe("BlockRenderer dispatch", () => {
 
     it("keeps the answer and follow-up in order around separate work runs", () => {
       const items: RenderItem[] = [
-        { kind: "reasoning", itemId: "r0", text: "Considering the request.", duration: 4 },
+        {
+          kind: "reasoning",
+          itemId: "r0",
+          text: "Considering the request.\n\nChecking the inputs.",
+          duration: 4,
+        },
         tool(1, "Bash"),
         { kind: "text", itemId: "m0", text: "Here is the substantive answer.", final: true },
         tool(2, "Agent"),
@@ -750,13 +755,13 @@ describe("BlockRenderer dispatch", () => {
       expect(
         folds[1]!.compareDocumentPosition(followUp) & Node.DOCUMENT_POSITION_FOLLOWING,
       ).toBeTruthy();
-      expect(screen.queryByText("Considering the request.")).toBeNull();
+      expect(screen.queryByText("Checking the inputs.")).toBeNull();
       fireEvent.click(folds[0]!);
       expect(folds[0]).toHaveAttribute("aria-expanded", "true");
       expect(folds[1]).toHaveAttribute("aria-expanded", "false");
       expect(screen.getByText("Ran 1 shell command")).toBeDefined();
-      fireEvent.click(screen.getByText(/Thought for/));
-      expect(screen.getByText("Considering the request.")).toBeDefined();
+      fireEvent.click(screen.getByRole("button", { name: "Thinking: Considering the request." }));
+      expect(screen.getByText("Checking the inputs.")).toBeDefined();
       fireEvent.click(folds[1]!);
       expect(folds[0]).toHaveAttribute("aria-expanded", "true");
       expect(folds[1]).toHaveAttribute("aria-expanded", "true");
@@ -1989,7 +1994,12 @@ describe("BlockRenderer dispatch", () => {
         { kind: "text", itemId: "m0", text: "Checking the CLI.", final: true },
         tool(1, "Bash"),
         { kind: "text", itemId: "m1", text: "Server started on 8838.", final: true },
-        { kind: "reasoning", itemId: null, text: "Finishing checks.", duration: undefined },
+        {
+          kind: "reasoning",
+          itemId: null,
+          text: "Finishing checks.\n\nAll green.",
+          duration: undefined,
+        },
       ];
       render(
         <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
@@ -2000,10 +2010,10 @@ describe("BlockRenderer dispatch", () => {
       // Both messages stay visible while the tool and trailing reasoning fold.
       expect(screen.getByText("Server started on 8838.")).toBeDefined();
       expect(screen.getByText("Checking the CLI.")).toBeDefined();
-      expect(screen.queryByText("Finishing checks.")).toBeNull();
+      expect(screen.queryByText("All green.")).toBeNull();
       fireEvent.click(screen.getByRole("button", { name: "Worked" }));
-      fireEvent.click(screen.getByText(/Thought/));
-      expect(screen.getByText("Finishing checks.")).toBeDefined();
+      fireEvent.click(screen.getByRole("button", { name: "Thinking: Finishing checks." }));
+      expect(screen.getByText("All green.")).toBeDefined();
     });
 
     it("never folds a bubble made only of streaming artifacts", () => {
