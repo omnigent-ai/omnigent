@@ -161,3 +161,72 @@ def test_assistant_copy_offers_rendered_html_and_markdown(
         assert "src/App.tsx" in html, f"the cited path was lost: {html!r}"
     finally:
         ctx.close()
+
+
+_LINKED_REPLY = (
+    "Start with the [changelog](https://example.com/changelog), then follow the "
+    "[migration guide](https://example.com/migrate) before upgrading."
+)
+
+# Select the reply's text the way a drag would, so Ctrl+C runs the browser's
+# own copy event against the rendered links.
+_SELECT_REPLY = """
+(selector) => {
+  const bubble = [...document.querySelectorAll(selector)]
+    .find((node) => node.textContent.includes("before upgrading."));
+  const paragraph = bubble.querySelector('[data-testid="assistant-text-section"] p');
+  const range = document.createRange();
+  range.selectNodeContents(paragraph);
+  const selection = window.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+  return selection.toString();
+}
+"""
+
+
+def test_selection_copy_keeps_links(
+    browser: Browser,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Ctrl+C on selected reply text carries its links in both flavors.
+
+    A failure means a pasted selection lost its links again: plain-text
+    targets got the link words without their URLs, or rich-text targets got
+    the browser's default HTML instead of clean anchors.
+    """
+    base_url, session_id = seeded_session
+    httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_assistant_message",
+            "data": {"agent": _AGENT_NAME, "text": _LINKED_REPLY},
+        },
+        timeout=10.0,
+    ).raise_for_status()
+
+    ctx = browser.new_context()
+    ctx.grant_permissions(["clipboard-read", "clipboard-write"])
+    try:
+        page = ctx.new_page()
+        page.goto(f"{base_url}/c/{session_id}")
+        bubble = page.locator(_ASSISTANT_BUBBLE).filter(has_text="before upgrading.")
+        expect(bubble.get_by_role("link", name="migration guide")).to_be_visible(timeout=30_000)
+
+        selected = page.evaluate(_SELECT_REPLY, _ASSISTANT_BUBBLE)
+        assert selected.startswith("Start with the changelog"), selected
+        page.keyboard.press("Control+c")
+        flavors = page.evaluate(_READ_FLAVORS)
+
+        assert flavors.get("text/plain") == (
+            "Start with the [changelog](<https://example.com/changelog>), then follow "
+            "the [migration guide](<https://example.com/migrate>) before upgrading."
+        )
+        html = flavors.get("text/html", "")
+        assert '<a href="https://example.com/changelog">changelog</a>' in html, html
+        assert '<a href="https://example.com/migrate">migration guide</a>' in html, html
+        # The browser's default copy inlines computed styles and app attributes.
+        assert "style=" not in html, html
+        assert "data-streamdown" not in html, html
+    finally:
+        ctx.close()

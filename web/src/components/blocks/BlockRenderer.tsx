@@ -22,6 +22,7 @@ import type { ReactNode } from "react";
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ChevronRightIcon } from "lucide-react";
 import { LIVE_ITEM_PREFIX } from "@/lib/blocks";
+import { copySelectionWithLinks } from "@/lib/selectionCopy";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
 import { formatDuration } from "@/lib/relativeTime";
@@ -887,6 +888,7 @@ function renderItem(
           key={key}
           data-testid="assistant-text-section"
           className={cn("min-w-0", followsText && "mt-2")}
+          onCopy={copySelectionWithLinks}
         >
           <FilePathAwareMessageResponse
             className="chat-markdown text-message"

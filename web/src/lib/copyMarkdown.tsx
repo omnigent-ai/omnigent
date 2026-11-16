@@ -20,7 +20,7 @@ interface HastNode {
 // A scheme the paste target can resolve on its own. An in-app href
 // ("src/App.tsx", "/c/123") would resolve against whatever app received the
 // paste, landing there as a dead link.
-const PASTEABLE_HREF = /^(?:https?|mailto):/i;
+export const PASTEABLE_HREF = /^(?:https?|mailto):/i;
 
 /**
  * Strips what only means something inside the app, so the fragment stands on
