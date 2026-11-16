@@ -463,7 +463,13 @@ describe("WorkflowDetailPage", () => {
         const body = JSON.parse(String(options.body));
         patches.push(body);
         now += 100;
-        stored = { ...stored, ...body, is_draft: false, updated_at: now };
+        stored = {
+          ...stored,
+          steps: body.steps,
+          description: body.description ?? stored.description,
+          is_draft: false,
+          updated_at: now,
+        };
       }
       return new Response(JSON.stringify(stored));
     });
@@ -500,7 +506,14 @@ describe("WorkflowDetailPage", () => {
     await screen.findByTestId("workflow-detail-title");
     expect(description()).toBe(WORKFLOW.description);
     await saveAndReload();
-    expect(patches).toEqual([{ steps: WORKFLOW.steps, description: WORKFLOW.description }]);
+    // Each new description names the one it replaces, so the server keeps a newer one.
+    expect(patches).toEqual([
+      {
+        steps: WORKFLOW.steps,
+        description: WORKFLOW.description,
+        expected_description: "Pull the board's open tickets and group them",
+      },
+    ]);
     expect(description()).toBe(WORKFLOW.description);
     expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
 
@@ -513,14 +526,18 @@ describe("WorkflowDetailPage", () => {
     expect(description()).toBe("Fixes one flaky test.");
     expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes");
     await saveAndReload();
-    expect(patches[1]).toEqual({ steps: WORKFLOW.steps, description: "Fixes one flaky test." });
+    expect(patches[1]).toEqual({
+      steps: WORKFLOW.steps,
+      description: "Fixes one flaky test.",
+      expected_description: WORKFLOW.description,
+    });
 
-    // An edit made after the newest proposal stands; Save plan applies only its steps.
+    // An edit in the same second as the newest proposal stands; Save plan applies only its steps.
     const edited = [
       ...WORKFLOW.steps,
       { id: "report", name: "Report", goal: null, depends_on: [] },
     ];
-    proposal.created_at = 350;
+    proposal.created_at = 400;
     proposal.content = { steps: edited, description: "Fixes flaky tests and reports them." };
     now = 400;
     stored = { ...stored, description: "Edited by hand", updated_at: now };

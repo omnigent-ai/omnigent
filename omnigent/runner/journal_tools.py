@@ -162,6 +162,20 @@ def _server_message(response: httpx.Response) -> str:
     return response.text[:500]
 
 
+# How servers from before plan descriptions refuse any plan field but name and steps.
+_PLAN_FIELDS_REFUSAL = "invalid_entry: a plan's content has exactly two fields, name and steps"
+
+
+def _refuses_plan_description(response: httpx.Response | str, body: dict[str, Any]) -> bool:
+    """Whether an older server refused this plan only because it carries a description."""
+    return (
+        isinstance(response, httpx.Response)
+        and response.status_code == 400
+        and "description" in body["content"]
+        and _server_message(response) == _PLAN_FIELDS_REFUSAL
+    )
+
+
 def _journal_error(response: httpx.Response, conversation_id: str) -> str:
     """Distinguish a missing session from other route errors, including disabled workflows."""
     message = _server_message(response)
@@ -271,6 +285,9 @@ async def _write(
         body["start_run"] = False
     url = _journal_url(conversation_id)
     response = await _post_with_retries(server_client, url, body, conversation_id)
+    if _refuses_plan_description(response, body):
+        del body["content"]["description"]
+        response = await _post_with_retries(server_client, url, body, conversation_id)
     if isinstance(response, str):
         return _error(f"{tool_name} failed: {response}")
     if _is_unrouted(response):

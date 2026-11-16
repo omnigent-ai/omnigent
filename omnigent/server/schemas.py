@@ -3600,6 +3600,8 @@ class UpdateWorkflowRequest(BaseModel):
     :param name: A new name.
     :param description: A new description, subject to the same character and
         stored-byte limits as creation.
+    :param expected_description: Apply ``description`` only while the stored
+        description is still this text, so one written meanwhile stays.
     :param steps: New steps, replacing the old ones.
     :param planning_session_id: The private owned session for iterating on the plan.
     """
@@ -3608,6 +3610,7 @@ class UpdateWorkflowRequest(BaseModel):
 
     name: str | None = None
     description: str | None = None
+    expected_description: str | None = None
     steps: list[WorkflowStep] | None = None
     planning_session_id: str | None = None
 

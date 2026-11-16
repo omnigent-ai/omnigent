@@ -162,12 +162,10 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const runList = runs.data?.pages.flatMap((page) => page.runs) ?? [];
   const proposal = canReadProposal ? currentPlan(journal.entries) : null;
   const proposedSteps = proposal ? planSteps(proposal) : null;
-  // A proposal older than the workflow's last write doesn't replace its description,
-  // so an edit made since then stands.
+  // Only a proposal written after the workflow's last write replaces its description, so an
+  // edit made since stands; timestamps are whole seconds, so a tie keeps the stored one.
   const proposedDescription =
-    proposal && proposal.created_at >= (workflow.updated_at ?? 0)
-      ? planDescription(proposal)
-      : null;
+    proposal && proposal.created_at > (workflow.updated_at ?? 0) ? planDescription(proposal) : null;
   const newDescription =
     proposedSteps?.length && proposedDescription !== workflow.description
       ? proposedDescription
@@ -290,8 +288,13 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
                 onClick={() => {
                   if (!proposedSteps) return;
                   setPlannerOpen(showPlanner);
+                  // The server keeps a description another client changed after this page loaded it.
+                  const description =
+                    newDescription === null
+                      ? {}
+                      : { description: newDescription, expected_description: workflow.description };
                   savePlan.mutate(
-                    { steps: proposedSteps, description: newDescription ?? undefined },
+                    { steps: proposedSteps, ...description },
                     { onSuccess: () => showToast("Plan saved") },
                   );
                 }}

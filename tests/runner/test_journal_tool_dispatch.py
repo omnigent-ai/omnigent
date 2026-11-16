@@ -238,6 +238,40 @@ async def test_an_older_server_without_the_journal_says_so(body: dict[str, objec
     assert read["error"] == "sys_journal_read: this Omnigent server has no session journal"
 
 
+async def test_an_older_server_takes_the_plan_without_its_description() -> None:
+    refusal = "invalid_entry: a plan's content has exactly two fields, name and steps"
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        bodies.append(body)
+        if "description" in body["content"]:
+            return httpx.Response(
+                400, json={"error": {"code": "invalid_input", "message": refusal}}
+            )
+        content = {**body["content"], "version": 1}
+        return httpx.Response(200, json={**_ENTRY, "kind": "plan", "content": content})
+
+    plan = {
+        "name": "Triage",
+        "steps": [{"id": "triage", "name": "Triage", "depends_on": []}],
+        "description": "Triages flaky tests.",
+    }
+    async with _client(handler) as client:
+        result = await _run(
+            client,
+            "sys_journal_write_plan",
+            plan,
+            call_id="toolu_7",
+            publish_event=lambda *_: None,
+        )
+    assert result == {"id": "a" * 32, "position": 0, "version": 1}
+    assert [(sorted(body["content"]), body["idempotency_key"]) for body in bodies] == [
+        (["description", "name", "steps"], "tool:toolu_7"),
+        (["name", "steps"], "tool:toolu_7"),
+    ]
+
+
 @pytest.mark.parametrize(
     "message",
     [

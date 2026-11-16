@@ -207,8 +207,9 @@ still controls that order. Creating a workflow does not run its steps.
 In the workflow page's planning chat, the agent publishes proposals only;
 **Save plan** applies them to the workflow that already exists. Each proposal
 carries a description written for its steps, which the page shows until you
-save and Save plan stores with them. A proposal written before the workflow's
-last change keeps the current description.
+save and Save plan stores with them. Only a proposal written after the
+workflow's last change replaces its description, and a description another
+client saved after the page loaded stays.
 
 Authoring reads the referenced SOPs, runbooks and relevant linked procedures
 before proposing execution steps. The plan carries forward their actions,
@@ -411,7 +412,8 @@ it ran.
 - `GET /v1/workflows/{id}`: one workflow, with its steps. Another user's
   workflow is 404.
 - `PATCH /v1/workflows/{id}`: any of `name`, `description` and `steps`; fields
-  left out keep their values.
+  left out keep their values. With `expected_description`, the new description
+  applies only while the stored one is still that text.
 - `DELETE /v1/workflows/{id}`: deletes it.
 
 Workflows live in `workflows`, keyed by workspace and ID, with encoded JSON

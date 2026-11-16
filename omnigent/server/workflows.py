@@ -301,6 +301,7 @@ def create_workflows_router(
                 user_id=user_id,
                 name=body.name,
                 description=body.description,
+                expected_description=body.expected_description,
                 steps=_steps(body.steps),
                 planning_session_id=planning_session_id,
             )

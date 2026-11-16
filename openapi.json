@@ -15760,6 +15760,18 @@
             "description": "A new description, subject to the same character and stored-byte limits as creation.",
             "title": "Description"
           },
+          "expected_description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Apply `description` only while the stored description is still this text, so one written meanwhile stays.",
+            "title": "Expected Description"
+          },
           "name": {
             "anyOf": [
               {

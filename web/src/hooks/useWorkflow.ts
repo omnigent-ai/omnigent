@@ -111,12 +111,18 @@ export function useCloneWorkflow() {
   });
 }
 
-/** Apply the reviewed proposal, its steps and any new description, to the existing workflow. */
+/**
+ * Apply the reviewed proposal, its steps and any new description, to the existing workflow.
+ * The server keeps a description that is no longer `expected_description`.
+ */
 export function useSaveWorkflowPlan(workflowId: string) {
   const onSuccess = useWorkflowSaved();
   return useMutation({
-    mutationFn: (proposal: { steps: WorkflowStep[]; description?: string }) =>
-      writeWorkflow(workflowPath(workflowId), "PATCH", proposal),
+    mutationFn: (proposal: {
+      steps: WorkflowStep[];
+      description?: string;
+      expected_description?: string;
+    }) => writeWorkflow(workflowPath(workflowId), "PATCH", proposal),
     onSuccess,
   });
 }

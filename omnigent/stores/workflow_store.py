@@ -290,6 +290,7 @@ class WorkflowStore:
         user_id: str | None,
         name: object = None,
         description: object = None,
+        expected_description: str | None = None,
         steps: object = None,
         planning_session_id: str | None = None,
     ) -> Workflow | None:
@@ -299,6 +300,8 @@ class WorkflowStore:
         :param user_id: The owner, or ``None`` in single-user mode.
         :param name: A new name, or ``None`` to keep it.
         :param description: A new description, or ``None`` to keep it.
+        :param expected_description: Apply *description* only while the stored
+            description is still this text, so a newer one written meanwhile stays.
         :param steps: New steps replacing the old ones, or ``None`` to keep them.
         :param planning_session_id: An owner-checked planning session, or ``None`` to keep it.
         :returns: The updated workflow, or ``None`` if the owner has no such workflow.
@@ -320,9 +323,12 @@ class WorkflowStore:
             if row is None:
                 return None
             current = self._workflows([row])[0]
+            stale = (
+                expected_description is not None and expected_description != current.description
+            )
             workflow_name, text, workflow_steps = normalize_workflow(
                 name=row.name if name is None else name,
-                description=current.description if description is None else description,
+                description=current.description if description is None or stale else description,
                 steps=current.steps if steps is None else steps,
             )
             stored = self._stored_texts(
