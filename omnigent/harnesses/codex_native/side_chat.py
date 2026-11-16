@@ -1,33 +1,10 @@
-"""Codex ``/side`` ephemeral side-chat support for the native Codex harness.
+"""Codex ``/side`` support for the native Codex harness.
 
-A side chat is an ephemeral fork of the active Codex thread. It inherits the
-parent's history as *reference only*, never persists to disk (``ephemeral``),
-and is driven out-of-band over the app-server via ``turn/start`` on the child
-thread id. Because the fork is a separate thread, the driven Codex TUI keeps
-showing the main conversation the whole time: the side chat surfaces only as an
-Omnigent sub-agent (rail) child, never in the left sidebar.
-
-Why a fork and not the claude-native ``/btw`` overlay: Codex ``/side`` is a
-multi-turn ephemeral fork (Codex's own ``/side`` == ``/btw`` == "start a side
-conversation in an ephemeral fork"), so modelling it as a persistent, navigable
-sub-agent chat fits its behaviour.
-
-Process split (native Codex runs across processes; each helper lives where its
-inputs do):
-
-* The **executor** (which injects turns via a bridge-state app-server client)
-  detects ``/side`` and opens the fork: :func:`side_chat_question_from_content` +
-  :func:`open_side_chat_on_client`.
-* The **forwarder** (which watches the app-server event stream and holds the
-  ``_CodexForwarderState`` + Omnigent HTTP client) auto-surfaces the fork as a
-  rail child: :func:`register_side_fork_child`, keyed off the fork's
-  ``forkedFromId`` (:func:`is_omnigent_side_fork`).
-
-Storage / cache notes (verified against the Codex source + the installed 0.147.0
-app-server schema): ``ephemeral=true`` means no rollout / no state-db row (parity
-with native ``/side``, not resumable after a runner restart), and an ephemeral
-root fork reuses the parent's session id for cache routing inside Codex, so we
-deliberately do NOT pin a ``prompt_cache_key``.
+Side chats fork the source thread with inherited history as reference context.
+Their histories are persisted so a side chat can itself be forked. A dedicated
+``threadSource`` distinguishes these forks from native main-thread replacements.
+The forwarder owns the forks and surfaces them as Omnigent side-chat children;
+the native TUI stays on the main thread.
 """
 
 from __future__ import annotations
@@ -61,6 +38,7 @@ SIDE_REFERENCE_ONLY_INSTRUCTIONS = (
 # Display name stamped on a side-chat child so the web can tell it apart from a
 # Codex-spawned sub-agent (drives the "this is a side chat" banner).
 SIDE_CHAT_DISPLAY_NAME = "Side chat"
+SIDE_CHAT_THREAD_SOURCE = "omnigent-side-chat"
 CAP_SIDE_CHAT_SETTINGS = "codex_side_chat_settings"
 EFFORT_RESET_LABEL = "omnigent.side_chat.effort_reset"
 _NICKNAME_LABEL_KEY = "omnigent.codex_native.agent_nickname"
@@ -164,7 +142,7 @@ def is_side_chat_command(text: str) -> bool:
     return side_chat_question_from_text(text) is not None
 
 
-async def fork_ephemeral_side_thread(
+async def fork_side_thread(
     codex_client: CodexAppServerClient,
     parent_thread_id: str,
     *,
@@ -172,7 +150,7 @@ async def fork_ephemeral_side_thread(
     settings: Mapping[str, str] | None = None,
 ) -> str | None:
     """
-    Fork ``parent_thread_id`` into a new ephemeral side thread.
+    Fork ``parent_thread_id`` into a side thread that can itself be forked.
 
     :param codex_client: Connected Codex app-server client.
     :param parent_thread_id: Codex thread id to fork from, e.g. ``"thread_abc"``.
@@ -183,13 +161,12 @@ async def fork_ephemeral_side_thread(
     :returns: The new child Codex thread id, or ``None`` if the response carried
         no thread id.
     """
-    # excludeTurns is required on an ephemeral fork from codex 0.154.0 on
-    # (rejected otherwise: "ephemeral paginated thread/fork requires
-    # excludeTurns: true"); it only omits the parent's turns from this response,
-    # not from the fork's inherited reference context. Matches thread/resume.
+    # Forking requires a persisted rollout. excludeTurns only trims the RPC
+    # response; the child still inherits its source's full reference context.
     params: _JsonObject = {
         "threadId": parent_thread_id,
-        "ephemeral": True,
+        "ephemeral": False,
+        "threadSource": SIDE_CHAT_THREAD_SOURCE,
         "excludeTurns": True,
     }
     if developer_instructions is not None:
@@ -341,31 +318,30 @@ async def open_side_chat_on_client(
     question: str,
     bridge_dir: Path | None = None,
     developer_instructions: str | None = SIDE_REFERENCE_ONLY_INSTRUCTIONS,
+    settings: Mapping[str, str] | None = None,
 ) -> str | None:
     """
     Open a side chat on an already-connected app-server client (executor path).
 
-    Forks an ephemeral child of ``parent_thread_id`` on the parent's current
+    Forks a child of ``parent_thread_id`` on the parent's current
     model and effort, and submits ``question`` as its first turn.
     Registration/surfacing is the forwarder's job (it observes the fork's
     ``thread/started`` on the shared event stream), so this does not touch the
     Omnigent server.
 
     :param codex_client: Connected Codex app-server client (built from bridge state).
-    :param parent_thread_id: The active (main) Codex thread id to fork from.
+    :param parent_thread_id: The source Codex thread id to fork from.
     :param question: The ``/side`` question, submitted as the first turn.
     :param bridge_dir: Parent session's bridge directory, read for its current
         settings (:func:`parent_side_chat_settings`); ``None`` keeps the
         fork's own settings.
     :param developer_instructions: Reference-only boundary instructions.
+    :param settings: Explicit source-thread settings for a nested fork.
     :returns: The child Codex thread id, or ``None`` if the fork failed.
     """
-    settings = (
-        await parent_side_chat_settings(codex_client, bridge_dir)
-        if bridge_dir is not None
-        else None
-    )
-    child_thread_id = await fork_ephemeral_side_thread(
+    if settings is None and bridge_dir is not None:
+        settings = await parent_side_chat_settings(codex_client, bridge_dir)
+    child_thread_id = await fork_side_thread(
         codex_client,
         parent_thread_id,
         developer_instructions=developer_instructions,
@@ -396,17 +372,7 @@ async def interrupt_side_turn(
 
 
 def is_omnigent_side_fork(event: _JsonObject) -> bool:
-    """
-    Return whether a ``thread/started`` event announces an ephemeral side fork.
-
-    Discriminator separating an intentional side chat from Codex's own
-    system/housekeeping ephemeral thread: a side fork is ``ephemeral=true`` AND
-    carries a ``forkedFromId`` (the parent). The housekeeping thread is
-    ephemeral with no ``forkedFromId`` (``threadSource=system``).
-
-    :param event: Codex app-server notification envelope.
-    :returns: ``True`` when the started thread is an ephemeral fork.
-    """
+    """Identify marked durable side forks and legacy ephemeral side forks."""
     if event.get("method") != "thread/started":
         return False
     params = event.get("params")
@@ -416,7 +382,14 @@ def is_omnigent_side_fork(event: _JsonObject) -> bool:
     if not isinstance(thread, dict):
         return False
     forked_from = thread.get("forkedFromId")
-    return thread.get("ephemeral") is True and isinstance(forked_from, str) and bool(forked_from)
+    return (
+        isinstance(forked_from, str)
+        and bool(forked_from)
+        and (
+            thread.get("threadSource") == SIDE_CHAT_THREAD_SOURCE
+            or thread.get("ephemeral") is True
+        )
+    )
 
 
 async def register_side_fork_child(
@@ -428,7 +401,7 @@ async def register_side_fork_child(
     event: _JsonObject,
 ) -> str | None:
     """
-    Surface an ephemeral side fork as an Omnigent sub-agent (rail) child.
+    Surface a side fork as an Omnigent sub-agent (rail) child.
 
     Called from the forwarder's event loop on each ``thread/started``. Only acts
     when ``event`` is a side fork of ``parent_thread_id`` (:func:`is_omnigent_side_fork`).
@@ -447,8 +420,14 @@ async def register_side_fork_child(
     if not is_omnigent_side_fork(event):
         return None
     thread = event["params"]["thread"]
-    if thread.get("forkedFromId") != parent_thread_id:
-        return None
+    source_thread_id = thread.get("forkedFromId")
+    if source_thread_id != parent_thread_id:
+        if not isinstance(source_thread_id, str):
+            return None
+        source_session_id = forwarder_state.session_for_child_thread(source_thread_id)
+        if source_session_id is None:
+            return None
+        parent_session_id, parent_thread_id = source_session_id, source_thread_id
     child_thread_id = thread.get("id")
     if not isinstance(child_thread_id, str) or not child_thread_id:
         return None
@@ -473,19 +452,32 @@ async def register_side_fork_child(
     return forwarder_state.session_for_child_thread(child_thread_id)
 
 
-def request_side_chat(bridge_dir: Path, question: str) -> None:
+def request_side_chat(
+    bridge_dir: Path,
+    question: str,
+    *,
+    parent_thread_id: str | None = None,
+    settings: Mapping[str, str] | None = None,
+) -> None:
     """
     Record a ``/side`` question for the forwarder to fork.
 
     :param bridge_dir: Native Codex bridge directory.
     :param question: The side-chat question.
+    :param parent_thread_id: Source side thread; omitted for the main thread.
+    :param settings: Source side-thread model and effort.
     :returns: None.
     """
     request_dir = bridge_dir / _SIDE_REQUEST_DIRNAME
     request_dir.mkdir(parents=True, exist_ok=True)
     path = request_dir / f"{uuid.uuid4().hex}.json"
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"question": question}), encoding="utf-8")
+    tmp.write_text(
+        json.dumps(
+            {"question": question, "parent_thread_id": parent_thread_id, "settings": settings}
+        ),
+        encoding="utf-8",
+    )
     tmp.replace(path)  # atomic publish, so the drainer never reads a partial file
 
 
@@ -494,6 +486,8 @@ class SideChatRequest(NamedTuple):
 
     path: Path
     question: str
+    parent_thread_id: str | None = None
+    settings: dict[str, str] | None = None
 
 
 def peek_side_chat_requests(bridge_dir: Path) -> list[SideChatRequest]:
@@ -526,7 +520,20 @@ def peek_side_chat_requests(bridge_dir: Path) -> list[SideChatRequest]:
             continue
         question = payload.get("question") if isinstance(payload, dict) else None
         if isinstance(question, str) and question:
-            requests.append(SideChatRequest(path, question))
+            parent = payload.get("parent_thread_id")
+            settings = payload.get("settings")
+            if (parent is not None and not isinstance(parent, str)) or (
+                settings is not None
+                and (
+                    not isinstance(settings, dict)
+                    or not all(
+                        isinstance(k, str) and isinstance(v, str) for k, v in settings.items()
+                    )
+                )
+            ):
+                _unlink_quietly(path)
+                continue
+            requests.append(SideChatRequest(path, question, parent, settings))
         else:
             _unlink_quietly(path)  # malformed content that can never fork
     return requests

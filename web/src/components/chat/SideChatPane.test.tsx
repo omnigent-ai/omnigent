@@ -625,6 +625,23 @@ describe("side-chat selection reply", () => {
 
   afterEach(() => window.getSelection()?.removeAllRanges());
 
+  it.each([true, false])("offers nested selection only when allowed (%s)", (allowed) => {
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    mockSession.snapshot = { sideChatAllowed: allowed };
+    const onAskInSideChat = vi.fn();
+    renderPane(<SideChatPane childId={childId} onAskInSideChat={onAskInSideChat} />);
+    const text = "Ask a question here without affecting the main conversation.";
+    selectText(screen.getByText(text));
+    const action = screen.queryByRole("button", { name: "Ask in side chat" });
+    if (allowed) {
+      fireEvent.click(action!);
+      expect(onAskInSideChat).toHaveBeenCalledWith(text);
+      expect(useChatStore.getState().sideChatComposers[childId]?.quotes).toBeUndefined();
+    } else {
+      expect(action).toBeNull();
+    }
+  });
+
   it("cancels dictation without reverting other reply edits, quotes, or attachments", () => {
     conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
     useChatStore.setState({

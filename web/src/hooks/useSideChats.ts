@@ -9,6 +9,7 @@ import { setSessionParent } from "@/lib/sessionHost";
 import { subagentTabId, subagentSessionIdFromTab } from "@/lib/subagentTabs";
 
 interface SideChatTabsState {
+  parents: Record<string, string>;
   /** Open side-chat child conversation ids, in open order. */
   tabs: string[];
   /** Open sub-agent tabs (`subagentTabId` values), in open order. */
@@ -32,6 +33,7 @@ function readSideChatTabsState(conversationId: string): SideChatTabsState {
   const selected = saved.selectedSideChatId ?? "";
   return {
     tabs,
+    parents: saved.sideChatParents ?? {},
     subagentTabs,
     closed: saved.closedSideChats ?? [],
     selected: tabs.includes(selected) || subagentTabs.includes(selected) ? selected : null,
@@ -65,6 +67,7 @@ export function useSideChats(conversationId: string) {
       );
       const saved = saveSessionWorkspaceState(conversationId, {
         openSideChats: next.tabs,
+        sideChatParents: Object.keys(next.parents).length ? next.parents : undefined,
         closedSideChats: next.closed.length > 0 ? next.closed : undefined,
         // Omitted when empty, so a session without sub-agent tabs is stored as before.
         openSubagentTabs: next.subagentTabs.length > 0 ? next.subagentTabs : undefined,
@@ -98,12 +101,16 @@ export function useSideChats(conversationId: string) {
    *  is re-selected, not duplicated (a create both returns the id and fires a
    *  `session_created`, so `open` can be reached twice for one child). */
   const open = useCallback(
-    (childId: string) =>
+    (childId: string, parentId?: string) =>
       update((current) => {
         const key = subagentSessionIdFromTab(childId) === null ? "tabs" : "subagentTabs";
         const list = current[key];
         return {
           ...current,
+          parents:
+            parentId && parentId !== conversationId
+              ? { ...current.parents, [childId]: parentId }
+              : current.parents,
           [key]: list.includes(childId) ? list : [...list, childId],
           closed: current.closed.filter(
             (id) => id !== (subagentSessionIdFromTab(childId) ?? childId),
@@ -111,13 +118,13 @@ export function useSideChats(conversationId: string) {
           selected: childId,
         };
       }),
-    [update],
+    [conversationId, update],
   );
 
   /** Add discovered chats without switching panels or reviving locally closed tabs. */
   const restore = useCallback(
-    (childIds: string[]) => {
-      for (const id of childIds) setSessionParent(id, conversationId);
+    (childIds: string[], parentId = conversationId) => {
+      for (const id of childIds) setSessionParent(id, parentId);
       update((current) => {
         const added = childIds
           .filter(
@@ -129,6 +136,10 @@ export function useSideChats(conversationId: string) {
           .slice(0, Math.max(0, MAX_OPEN_TABS - current.tabs.length));
         return {
           ...current,
+          parents:
+            parentId === conversationId
+              ? current.parents
+              : { ...current.parents, ...Object.fromEntries(added.map((id) => [id, parentId])) },
           tabs: [...current.tabs, ...added],
           selected: current.selected ?? added[0] ?? null,
         };
@@ -147,12 +158,18 @@ export function useSideChats(conversationId: string) {
         const index = current.tabs.indexOf(oldId);
         if (index === -1) return current;
         const selected = current.selected === oldId ? newId : current.selected;
+        const parents = Object.fromEntries(
+          Object.entries(current.parents).map(([child, parent]) => [
+            child === oldId ? newId : child,
+            parent === oldId ? newId : parent,
+          ]),
+        );
         if (current.tabs.includes(newId)) {
-          return { ...current, tabs: current.tabs.filter((id) => id !== oldId), selected };
+          return { ...current, parents, tabs: current.tabs.filter((id) => id !== oldId), selected };
         }
         const tabs = [...current.tabs];
         tabs[index] = newId;
-        return { ...current, tabs, selected };
+        return { ...current, parents, tabs, selected };
       }),
     [update],
   );
@@ -169,9 +186,12 @@ export function useSideChats(conversationId: string) {
         const remaining = strip.filter((id) => id !== childId);
         const selected =
           current.selected === childId
-            ? (remaining[Math.max(0, index - 1)] ?? null)
+            ? remaining.includes(current.parents[childId])
+              ? current.parents[childId]
+              : (remaining[Math.max(0, index - 1)] ?? null)
             : current.selected;
         return {
+          ...current,
           closed: !childId.startsWith("pending:")
             ? [...new Set([...current.closed, subagentSessionIdFromTab(childId) ?? childId])]
             : current.closed,
@@ -187,6 +207,7 @@ export function useSideChats(conversationId: string) {
   const tabs = useMemo(() => [...state.tabs, ...state.subagentTabs], [state]);
   return {
     tabs,
+    parents: state.parents,
     selected: state.selected,
     open,
     openPending,

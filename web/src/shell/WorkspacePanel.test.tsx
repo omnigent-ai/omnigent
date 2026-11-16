@@ -17,6 +17,7 @@ import { toast } from "sonner";
 import * as sessionsApi from "@/lib/sessionsApi";
 import * as identity from "@/lib/identity";
 import { useChatStore } from "@/store/chatStore";
+import * as chatStore from "@/store/chatStore";
 import { workspaceTabAriaShortcut, workspaceTabShortcutKeys } from "@/components/KeyboardShortcut";
 import { isMacPlatform } from "@/lib/hotkeys";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -130,11 +131,13 @@ vi.mock("@/components/chat/SideChatPane", () => ({
     readOnly,
     fullSession,
     onStart,
+    onAskInSideChat,
   }: {
     childId: string;
     readOnly?: boolean;
     fullSession?: boolean;
     onStart?: (text: string) => Promise<void>;
+    onAskInSideChat?: (text: string) => void;
   }) => (
     <div
       data-testid="side-chat-pane-stub"
@@ -142,6 +145,11 @@ vi.mock("@/components/chat/SideChatPane", () => ({
       data-full-session={String(fullSession ?? false)}
     >
       {childId}
+      {onAskInSideChat && !childId.startsWith("pending:") && (
+        <button type="button" onClick={() => onAskInSideChat("Selected answer")}>
+          Ask in side chat
+        </button>
+      )}
       {childId.startsWith("pending:") && onStart && (
         <button type="button" onClick={() => void onStart("question")}>
           Start side chat
@@ -1532,6 +1540,78 @@ describe("WorkspacePanel browser tab", () => {
 });
 
 describe("WorkspacePanel restored side chats", () => {
+  it.each([false, true])(
+    "branches from the selected side chat and navigates back (mobile: %s)",
+    async (mobile) => {
+      isMobileMock.mockReturnValue(mobile);
+      writeSessionWorkspaceState("conv_ws", {
+        openSideChats: ["side-a"],
+        selectedSideChatId: "side-a",
+      });
+      renderWorkspace({ rightRailTab: "sidechat", mobileSideChatsOpen: mobile });
+      fireEvent.click(screen.getByRole("button", { name: "Ask in side chat" }));
+      const pending = readSessionWorkspaceState("conv_ws").selectedSideChatId!;
+      expect(pending).toMatch(/^pending:/);
+      expect(readSessionWorkspaceState("conv_ws").sideChatParents?.[pending]).toBe("side-a");
+      expect(useChatStore.getState().sideChatDrafts[pending]).toBe("Selected answer");
+      expect(screen.getByRole("navigation", { name: "Side chat ancestry" })).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Back to parent side chat" }));
+      expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("side-a");
+      expect(useChatStore.getState().sideChatDrafts[pending]).toBe("Selected answer");
+    },
+  );
+
+  it.each(["codex-native", "openai"] as const)(
+    "forks from the immediate source on %s",
+    async (harness) => {
+      const before = useChatStore.getState();
+      const send = vi.fn(() => Promise.resolve());
+      useChatStore.setState({ send });
+      vi.spyOn(sessionsApi, "getSession").mockResolvedValue({
+        harness,
+        agentId: "source-agent",
+      } as Session);
+      vi.spyOn(chatStore, "ensureConversationStreamed").mockResolvedValue();
+      const create = vi
+        .spyOn(sessionsApi, "createSideChat")
+        .mockResolvedValue({ childSessionId: "nested-child" });
+      writeSessionWorkspaceState("conv_ws", {
+        openSideChats: ["side-a", "pending:nested"],
+        selectedSideChatId: "pending:nested",
+        sideChatParents: { "pending:nested": "side-a" },
+      });
+      try {
+        renderWorkspace({ rightRailTab: "sidechat" });
+        fireEvent.click(screen.getByRole("button", { name: "Start side chat" }));
+        if (harness === "codex-native") {
+          await waitFor(() =>
+            expect(send).toHaveBeenCalledWith(
+              "/side question",
+              "source-agent",
+              undefined,
+              expect.objectContaining({ pinnedConversationId: "side-a" }),
+            ),
+          );
+          act(() =>
+            useChatStore.setState({
+              sideChatToOpen: { childId: "nested-child", parentId: "side-a" },
+            }),
+          );
+        } else {
+          await waitFor(() => expect(create).toHaveBeenCalledWith("side-a", undefined));
+        }
+        await waitFor(() =>
+          expect(readSessionWorkspaceState("conv_ws").selectedSideChatId).toBe("nested-child"),
+        );
+        expect(readSessionWorkspaceState("conv_ws").sideChatParents?.["nested-child"]).toBe(
+          "side-a",
+        );
+      } finally {
+        useChatStore.setState({ send: before.send });
+      }
+    },
+  );
+
   it.each([false, true])("automatically adds saved side-chat tabs (mobile: %s)", async (mobile) => {
     isMobileMock.mockReturnValue(mobile);
     const before = useChatStore.getState();
@@ -1565,9 +1645,9 @@ describe("WorkspacePanel restored side chats", () => {
       if (!mobile) view.rerender({ rightRailTab: "sidechat" });
       expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("remote-side");
       expect(screen.getByTestId("side-chat-pane-stub")).not.toHaveAttribute("data-read-only");
-      expect(fetch.mock.calls.filter(([url]) => String(url).includes("/side_chats"))).toHaveLength(
-        1,
-      );
+      expect(
+        fetch.mock.calls.filter(([url]) => String(url).includes("/conv_ws/side_chats")),
+      ).toHaveLength(1);
     } finally {
       useChatStore.setState({ sessionHarness: before.sessionHarness });
     }
@@ -1726,9 +1806,8 @@ describe("WorkspacePanel mobile side chats", () => {
 
     const drawer = screen.getByTestId("side-chats-panel-drawer");
     expect(drawer).toHaveAttribute("data-state", "open");
-    expect(screen.getAllByTestId("side-chat-pane-stub").map((el) => el.textContent)).toEqual([
-      "conv_side_b",
-    ]);
+    expect(screen.getAllByTestId("side-chat-pane-stub")).toHaveLength(1);
+    expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_b");
     expect(drawer).toContainElement(screen.getByTestId("side-chat-pane-stub"));
 
     fireEvent.click(within(drawer).getByRole("tab", { name: "Side chat 1" }));

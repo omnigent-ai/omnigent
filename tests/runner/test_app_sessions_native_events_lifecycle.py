@@ -5689,9 +5689,23 @@ async def test_events_stop_session_on_kiro_native_503_when_kill_fails(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "command,inherited,attachment",
-    [(False, False, False), (False, True, False), (True, False, False), (True, False, True)],
-    ids=["follow-up", "inherited-default", "side-command", "side-command-attachment"],
+    "command,inherited,attachment,nested",
+    [
+        (False, False, False, False),
+        (False, True, False, False),
+        (True, False, False, False),
+        (True, False, True, False),
+        (True, False, False, True),
+        (True, False, True, True),
+    ],
+    ids=[
+        "follow-up",
+        "inherited-default",
+        "side-command",
+        "side-command-attachment",
+        "nested-side-command",
+        "nested-side-command-attachment",
+    ],
 )
 async def test_events_codex_side_chat_preserves_indentation(
     monkeypatch: pytest.MonkeyPatch,
@@ -5699,6 +5713,7 @@ async def test_events_codex_side_chat_preserves_indentation(
     command: bool,
     inherited: bool,
     attachment: bool,
+    nested: bool,
 ) -> None:
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.harnesses.codex_native import side_chat
@@ -5749,7 +5764,7 @@ async def test_events_codex_side_chat_preserves_indentation(
             {"type": "input_text", "text": f" \n /side {question}" if command else question}
         ],
     }
-    if not command:
+    if not command or nested:
         payload["codex_side_thread_id"] = "thread_side"
         payload["model_override"] = "gpt-6-sol"
         if not inherited:
@@ -5773,9 +5788,11 @@ async def test_events_codex_side_chat_preserves_indentation(
         return
     assert response.status_code == 202, response.text
     if command:
-        assert [request.question for request in side_chat.peek_side_chat_requests(bridge_dir)] == [
-            question
-        ]
+        requests = side_chat.peek_side_chat_requests(bridge_dir)
+        assert [request.question for request in requests] == [question]
+        assert requests[0].parent_thread_id == ("thread_side" if nested else None)
+        if nested:
+            assert requests[0].settings == {"model": "gpt-6-sol", "effort": "max"}
         assert fake_client.requests == []
     else:
         assert [call for call in fake_client.requests if call[0] != "model/list"] == [

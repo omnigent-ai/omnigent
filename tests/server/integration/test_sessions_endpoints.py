@@ -11224,15 +11224,17 @@ async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
     parent = await _create_session(
         client, agent["id"], labels={"omnigent.wrapper": "codex-native-ui"}
     )
-    child_response = await client.post(
-        f"/v1/sessions/{parent['id']}/events",
-        json={
-            "type": "external_codex_subagent_start",
-            "data": {"thread_id": "thread_side", "agent_nickname": "Side chat"},
-        },
-    )
-    assert child_response.status_code == 202, child_response.text
-    child_id = child_response.json()["child_session_id"]
+    child_id = parent["id"]
+    for depth in range(1, 6):
+        child_response = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={
+                "type": "external_codex_subagent_start",
+                "data": {"thread_id": f"thread_side_{depth}", "agent_nickname": "Side chat"},
+            },
+        )
+        assert child_response.status_code == 202, child_response.text
+        child_id = child_response.json()["child_session_id"]
     item_response = await client.post(
         f"/v1/sessions/{child_id}/events",
         json={
@@ -11284,7 +11286,7 @@ async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
                     f"/v1/sessions/{parent['id']}/events",
                     {
                         "type": "interrupt",
-                        "codex_side_thread_id": "thread_side",
+                        "codex_side_thread_id": "thread_side_5",
                         "codex_side_turn_id": "turn_side",
                     },
                 )
@@ -11313,9 +11315,16 @@ async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
         _session_status_cache.pop(child_id, None)
 
 
+@pytest.mark.parametrize(
+    "depth,nested_command,supported",
+    [(1, False, True), (5, False, True), (5, True, True), (5, True, False)],
+)
 async def test_codex_side_chat_message_drives_parent_thread_without_child_init(
     client: httpx.AsyncClient,
     db_uri: str,
+    depth: int,
+    nested_command: bool,
+    supported: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A side-chat follow-up must not start a runner session (and terminal) for the child."""
@@ -11328,15 +11337,20 @@ async def test_codex_side_chat_message_drives_parent_thread_without_child_init(
     parent = await _create_session(
         client, agent["id"], labels={"omnigent.wrapper": "codex-native-ui"}
     )
-    child_response = await client.post(
-        f"/v1/sessions/{parent['id']}/events",
-        json={
-            "type": "external_codex_subagent_start",
-            "data": {"thread_id": "thread_side", "agent_nickname": "Side chat"},
-        },
-    )
-    assert child_response.status_code == 202, child_response.text
-    child_id = child_response.json()["child_session_id"]
+    source_id = parent["id"]
+    for level in range(1, depth + 1):
+        child_response = await client.post(
+            f"/v1/sessions/{source_id}/events",
+            json={
+                "type": "external_codex_subagent_start",
+                "data": {"thread_id": f"thread_side_{level}", "agent_nickname": "Side chat"},
+            },
+        )
+        assert child_response.status_code == 202, child_response.text
+        child_id = child_response.json()["child_session_id"]
+        child = (await client.get(f"/v1/sessions/{child_id}")).json()
+        assert child["parent_session_id"] == source_id
+        source_id = child_id
     SqlAlchemyConversationStore(db_uri).replace_runner_id(child_id, "native-runner")
     forwarded: list[tuple[str, dict[str, Any]]] = []
 
@@ -11348,7 +11362,11 @@ async def test_codex_side_chat_message_drives_parent_thread_without_child_init(
     monkeypatch.setattr(routes_events, "_ensure_runner_session_initialized", initialize)
     monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", AsyncMock())
     monkeypatch.setattr("omnigent.server.routes.sessions._ensure_runner_relay_ready", AsyncMock())
-    content = [{"type": "input_text", "text": "and why?"}]
+    from omnigent.server.host_registry import HostRegistry
+
+    monkeypatch.setattr("omnigent.runner.routing.routing_host_id", lambda *_args: "host_test")
+    monkeypatch.setattr(HostRegistry, "host_may_support", lambda *_args: supported)
+    content = [{"type": "input_text", "text": "/side and why?" if nested_command else "and why?"}]
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://runner"
     ) as runner:
@@ -11358,12 +11376,21 @@ async def test_codex_side_chat_message_drives_parent_thread_without_child_init(
             json={"type": "message", "data": {"role": "user", "content": content}},
         )
 
+    if not supported:
+        assert response.status_code == 400, response.text
+        assert "Update and reconnect" in response.text
+        assert forwarded == []
+        return
     assert response.status_code == 202, response.text
     initialize.assert_not_awaited()
     assert forwarded == [
         (
             f"/v1/sessions/{parent['id']}/events",
-            {"type": "message", "content": content, "codex_side_thread_id": "thread_side"},
+            {
+                "type": "message",
+                "content": content,
+                "codex_side_thread_id": f"thread_side_{depth}",
+            },
         )
     ]
 

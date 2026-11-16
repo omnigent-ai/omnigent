@@ -10986,6 +10986,38 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   });
 
   describe("codex /side send", () => {
+    it("arms and consumes a nested fork on its source while the main chat stays active", async () => {
+      seedSession("conv_side_source", []);
+      await useChatStore.getState().switchTo("conv_side_source");
+      useChatStore.setState({ sessionHarness: "codex-native" });
+      seedSession("conv_main", []);
+      await useChatStore.getState().switchTo("conv_main");
+      useChatStore.setState({ sessionHarness: "openai-agents", sideChatToOpen: null });
+      await useChatStore.getState().send("/side explain this", "agent_xyz", undefined, {
+        pinnedConversationId: "conv_side_source",
+      });
+      const source = conversationRegistry.peek("conv_side_source")!;
+      expect(source.getState().awaitingSideChatFor).toBe("conv_side_source");
+      expect(source.getState().pendingUserMessages).toHaveLength(0);
+      expect(useChatStore.getState().awaitingSideChatFor).toBeNull();
+      handleSessionEvent(
+        {
+          type: "session_created",
+          conversationId: "conv_side_source",
+          parentSessionId: "conv_side_source",
+          childSessionId: "conv_nested",
+          agentId: "agent_xyz",
+        } as SessionCreatedEvent,
+        "conv_side_source",
+      );
+      expect(useChatStore.getState().conversationId).toBe("conv_main");
+      expect(useChatStore.getState().sideChatToOpen).toEqual({
+        childId: "conv_nested",
+        parentId: "conv_side_source",
+      });
+      expect(source.getState().awaitingSideChatFor).toBeNull();
+    });
+
     it("neither bubbles in the parent nor latches it into Working", async () => {
       // The command is forked into a side chat, so this session runs nothing:
       // a bubble would sit unanswered and a "streaming" latch would never clear.

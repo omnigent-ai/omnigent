@@ -3741,6 +3741,7 @@ def _side_chat_child(
         kind=kind,
         labels=labels,
         parent_conversation_id=parent_id,
+        root_conversation_id=parent_id,
         runner_id=runner_id,
     )
 

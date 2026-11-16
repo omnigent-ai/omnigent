@@ -2066,7 +2066,7 @@ def register_events_routes(
                         "Cannot identify the Codex side-chat turn to interrupt.",
                         code=ErrorCode.INVALID_INPUT,
                     )
-                target_session_id = conv.parent_conversation_id
+                target_session_id = conv.root_conversation_id or conv.parent_conversation_id
                 interrupt_payload.update(
                     codex_side_thread_id=child_thread_id,
                     codex_side_turn_id=response_id.removeprefix("codex_"),

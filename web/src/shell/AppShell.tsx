@@ -2288,7 +2288,12 @@ function AppShellImpl() {
     // one on screen (WorkspacePanel applies the same test before taking the
     // signal, so it stays queued). Keyed on `conversationId` too, so coming
     // back to the owner re-runs this and still reveals the tab.
-    if (sideChatToOpen === null || sideChatToOpen.parentId !== conversationId) return;
+    if (sideChatToOpen === null || !conversationId) return;
+    if (
+      sideChatToOpen.parentId !== conversationId &&
+      !readSessionWorkspaceState(conversationId).openSideChats?.includes(sideChatToOpen.parentId)
+    )
+      return;
     setRightPanelOpenAnimated(true);
     // Phones hide the rail, so the side chat opens in its drawer instead.
     if (isMobileViewport()) openSideChatsPanel();

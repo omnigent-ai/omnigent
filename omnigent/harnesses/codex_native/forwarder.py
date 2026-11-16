@@ -3040,7 +3040,7 @@ async def _drive_side_chat_requests(
                 requests = await asyncio.to_thread(side_chat.peek_side_chat_requests, bridge_dir)
                 for request in requests:
                     # The parent may change while filesystem I/O is in progress.
-                    parent_thread_id = target.thread_id
+                    parent_thread_id = request.parent_thread_id or target.thread_id
                     if parent_thread_id is None:
                         break
                     try:
@@ -3048,7 +3048,8 @@ async def _drive_side_chat_requests(
                             codex_client,
                             parent_thread_id=parent_thread_id,
                             question=request.question,
-                            bridge_dir=bridge_dir,
+                            bridge_dir=bridge_dir if request.parent_thread_id is None else None,
+                            settings=request.settings,
                         )
                         if child_thread_id is None:
                             raise RuntimeError("thread/fork returned no thread id")
@@ -3168,7 +3169,7 @@ async def _maybe_rotate_session_on_thread_started(
     # internal system/housekeeping thread (``ephemeral=true``, ``path=null``).
     # That thread is never persistable and cannot host goals; rotating onto it
     # strands the real turn's output as stale. Ignore all ephemeral threads.
-    if _thread_started_is_ephemeral(event):
+    if _thread_started_is_ephemeral(event) or side_chat.is_omnigent_side_fork(event):
         return False
     # Queued child handlers captured this target's tracker and coalescers;
     # deliver them before those are closed, as the serial loop used to.

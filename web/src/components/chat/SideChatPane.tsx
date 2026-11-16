@@ -168,12 +168,14 @@ export function SideChatPane({
   childId,
   selectionParentId,
   onStart,
+  onAskInSideChat,
   readOnly: restoredReadOnly = false,
   fullSession = false,
 }: {
   childId: string;
   selectionParentId?: string;
   onStart?: (text: string) => Promise<void>;
+  onAskInSideChat?: (text: string) => void;
   /** A dead, restored Codex side chat: show the transcript without a composer. */
   readOnly?: boolean;
   /** Display an existing session with its complete history and scoped composer. */
@@ -496,6 +498,7 @@ export function SideChatPane({
         {!readOnly && !starting && (
           <SelectionPopup
             containerRef={transcriptRef}
+            onAskInSideChat={!pending && session?.sideChatAllowed ? onAskInSideChat : undefined}
             onReply={(text) => {
               useChatStore.getState().updateSideChatComposer(childId, (current) => ({
                 ...current,

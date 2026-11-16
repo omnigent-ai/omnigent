@@ -8757,7 +8757,7 @@ async def _forward_codex_side_chat_turn(
         _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY,
     )
 
-    parent_id = conv.parent_conversation_id
+    parent_id = conv.root_conversation_id or conv.parent_conversation_id
     child_thread_id = (conv.labels or {}).get(_CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY)
     if not parent_id or not child_thread_id:
         return None
@@ -8917,6 +8917,18 @@ async def _dispatch_session_event_to_runner_impl(
     if body.type == "message":
         disconnect_outcome.note_user_turn(conv.id)
     if body.type == "message" and _codex_side_chat_thread_id(conv) is not None:
+        if _opens_codex_side_chat("codex-native", body) and host_registry is not None:
+            from omnigent.host.frames import CAP_CODEX_NESTED_SIDE_CHAT
+            from omnigent.runner.routing import routing_host_id
+
+            host_id = await asyncio.to_thread(routing_host_id, conv, conversation_store)
+            if host_id is not None and not host_registry.host_may_support(
+                host_id, CAP_CODEX_NESTED_SIDE_CHAT
+            ):
+                raise OmnigentError(
+                    "Update and reconnect this session's host to start a nested Codex side chat.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
         # Codex /side follow-up: drive the child on its own Codex thread via the
         # parent's runner/bridge; do not persist AP-side (the forwarder mirrors
         # the child thread echo, staying the single writer).
@@ -14332,7 +14344,9 @@ async def _codex_side_chat_fork_sealed(conv: Conversation, conv_store: Conversat
         or not is_side_chat_child(conv.labels)
     ):
         return False
-    parent = await asyncio.to_thread(conv_store.get_conversation, conv.parent_conversation_id)
+    parent = await asyncio.to_thread(
+        conv_store.get_conversation, conv.root_conversation_id or conv.parent_conversation_id
+    )
     return parent is not None and bool(parent.runner_id) and parent.runner_id != conv.runner_id
 
 

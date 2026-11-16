@@ -45,6 +45,8 @@ export interface SessionWorkspaceState {
   selectedBrowserId?: string | null;
   /** Ordered list of open side-chat tabs (child conversation ids). */
   openSideChats?: string[];
+  /** Immediate sources of nested side chats; direct children use the workspace session. */
+  sideChatParents?: Record<string, string>;
   /** Side chats closed on this device; discovery must not reopen them. */
   closedSideChats?: string[];
   /** Open sub-agent tabs (`subagentTabId` values) in open order, shown after the side chats. */
@@ -134,6 +136,13 @@ function sanitize(entry: unknown): SessionWorkspaceState {
     state.selectedBrowserId = record.selectedBrowserId;
   }
   if (Array.isArray(record.openSideChats)) state.openSideChats = uniqueIds(record.openSideChats);
+  if (record.sideChatParents && typeof record.sideChatParents === "object") {
+    state.sideChatParents = Object.fromEntries(
+      Object.entries(record.sideChatParents).filter(
+        ([child, parent]) => typeof parent === "string" && parent !== "" && child !== parent,
+      ),
+    );
+  }
   if (Array.isArray(record.closedSideChats))
     state.closedSideChats = uniqueIds(record.closedSideChats);
   if (Array.isArray(record.openSubagentTabs))

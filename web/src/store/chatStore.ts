@@ -2805,9 +2805,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // plaintext — the runner forks in-process. Generic harnesses intercept
     // `/side` in the composer and call the server side-chat endpoint instead, so
     // their `/side` text never reaches `send`.
-    const opensSideChat =
-      usesNativeSideChatFork(get().sessionHarness) && isSideChatCommand(text.trim());
     const targetState = pinnedId === null ? get() : setterForState(pinnedId);
+    const opensSideChat =
+      usesNativeSideChatFork(targetState?.sessionHarness) && isSideChatCommand(text.trim());
     const compacts =
       opts?.command === "compact" || isCompactControl(targetState?.sessionHarness, text, files);
     if (compacts && rejectBusyCompact(pinnedId ?? get().conversationId)) {
@@ -2848,7 +2848,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       return;
     }
     if (opensSideChat) {
-      useChatStore.setState({ awaitingSideChatFor: pinnedId ?? get().conversationId });
+      pinnedSetter({ awaitingSideChatFor: pinnedId ?? get().conversationId });
     }
     const skipPendingBubble = opensSideChat || compacts;
     const initialDraft =
@@ -3115,8 +3115,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // it, or the next sub-agent created under this parent would wrongly open
       // as a side-chat tab. Clear only our own arm: a newer `/side` re-arm or a
       // `session_created` that already consumed the latch must not be clobbered.
-      if (opensSideChat && get().awaitingSideChatFor === submitConversationId) {
-        useChatStore.setState({ awaitingSideChatFor: null });
+      if (
+        opensSideChat &&
+        submitConversationId &&
+        setterForState(submitConversationId)?.awaitingSideChatFor === submitConversationId
+      ) {
+        setterFor(submitConversationId)({ awaitingSideChatFor: null });
       }
       // A caller that owns its own failure UX (e.g. a codex `/side`, whose error
       // belongs to the side-chat tab, not the parent chat) takes the message and
@@ -9565,18 +9569,21 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // "+"): open it as a soft tab in the main chat's Workspace rail — the user
       // stays in the main conversation, the side chat streams beside it. Guarded
       // on `awaitingSideChatFor` so an agent-spawned sub-agent never opens a tab.
-      useChatStore.setState((s) => {
-        if (!event.childSessionId || s.awaitingSideChatFor !== event.conversationId) return {};
+      if (
+        event.childSessionId &&
+        event.conversationId &&
+        setterForState(event.conversationId)?.awaitingSideChatFor === event.conversationId
+      ) {
         // Open on the user's explicit side-chat latch: they just asked for a
         // side chat on THIS parent, so the child arriving under it is the one to
         // open. (A concurrent ordinary sub-agent under the same parent could in
         // theory be opened instead — a known, narrow edge; the latch is armed
         // only by an explicit side-chat request, so it is rare in practice.)
-        return {
-          awaitingSideChatFor: null,
+        setterFor(event.conversationId)({ awaitingSideChatFor: null });
+        useChatStore.setState({
           sideChatToOpen: { childId: event.childSessionId, parentId: event.conversationId },
-        };
-      });
+        });
+      }
       // Sub-agent spawn signal. Invalidate the parent's child-sessions
       // query so the execution-log panel re-fetches and renders the
       // new child without waiting for the next poll or manual refresh.

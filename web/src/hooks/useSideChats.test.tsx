@@ -18,6 +18,36 @@ afterEach(() => {
 });
 
 describe("side-chat soft tabs", () => {
+  it("retains five levels through rekey, reload, and closing an intermediate chat", () => {
+    const first = renderHook(() => useSideChats("main"));
+    let source = "main";
+    for (let depth = 1; depth <= 5; depth++) {
+      const child = `side-${depth}`;
+      act(() => {
+        const pending = first.result.current.openPending();
+        first.result.current.open(pending, source);
+        first.result.current.rekey(pending, child);
+      });
+      source = child;
+    }
+    first.unmount();
+    const restored = renderHook(() => useSideChats("main"));
+    expect(restored.result.current.selected).toBe("side-5");
+    expect(restored.result.current.parents).toEqual({
+      "side-2": "side-1",
+      "side-3": "side-2",
+      "side-4": "side-3",
+      "side-5": "side-4",
+    });
+    act(() => restored.result.current.close("side-3"));
+    expect(restored.result.current.selected).toBe("side-5");
+    expect(restored.result.current.tabs).toContain("side-4");
+    act(() => restored.result.current.open("side-3"));
+    expect(restored.result.current.parents["side-3"]).toBe("side-2");
+    act(() => restored.result.current.close("side-3"));
+    expect(restored.result.current.selected).toBe("side-2");
+  });
+
   it("opens an empty pending tab, then rekeys it in place to the real child", () => {
     const { result } = renderHook(() => useSideChats("session-a"));
     let pendingId = "";

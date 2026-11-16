@@ -1,4 +1,4 @@
-"""Unit tests for Codex ``/side`` ephemeral side-chat support.
+"""Unit tests for Codex ``/side`` side-chat support.
 
 Each test verifies one piece of the mechanism against the real forwarder code
 and the real ``side_chat`` helpers, with the app-server and Omnigent HTTP calls
@@ -76,9 +76,13 @@ def _text_items(text: str) -> list[_JsonObject]:
 
 
 def _fork_started(
-    *, thread_id: str, forked_from: str | None, ephemeral: bool = True
+    *, thread_id: str, forked_from: str | None, ephemeral: bool = False
 ) -> _JsonObject:
-    thread: _JsonObject = {"id": thread_id, "ephemeral": ephemeral}
+    thread: _JsonObject = {
+        "id": thread_id,
+        "ephemeral": ephemeral,
+        "threadSource": side_chat.SIDE_CHAT_THREAD_SOURCE,
+    }
     if forked_from is not None:
         thread["forkedFromId"] = forked_from
     return {"method": "thread/started", "params": {"thread": thread}}
@@ -139,20 +143,20 @@ def test_side_command_rejects_attachments(attachment_type: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# fork_ephemeral_side_thread / submit_side_turn / open_side_chat_on_client
+# fork_side_thread / submit_side_turn / open_side_chat_on_client
 # --------------------------------------------------------------------------- #
 @pytest.mark.asyncio
-async def test_fork_sends_ephemeral_fork_rpc_and_returns_child_id() -> None:
+async def test_fork_sends_durable_fork_rpc_and_returns_child_id() -> None:
     client = _FakeCodexClient({"thread/fork": {"result": {"thread": {"id": "thread_side"}}}})
 
-    child = await side_chat.fork_ephemeral_side_thread(client, "thread_parent")
+    child = await side_chat.fork_side_thread(client, "thread_parent")
 
     assert child == "thread_side"
     method, params = client.calls[0]
     assert method == "thread/fork"
     assert params["threadId"] == "thread_parent"
-    assert params["ephemeral"] is True
-    # Required by codex >= 0.154.0 for an ephemeral fork.
+    assert params["ephemeral"] is False
+    assert params["threadSource"] == side_chat.SIDE_CHAT_THREAD_SOURCE
     assert params["excludeTurns"] is True
     assert "side conversation" in params["developerInstructions"]
     assert "model" not in params
@@ -255,7 +259,7 @@ async def test_parent_side_chat_settings_reuse_the_parent_turns_catalog(
 @pytest.mark.asyncio
 async def test_fork_returns_none_when_response_has_no_thread_id() -> None:
     client = _FakeCodexClient({"thread/fork": {"result": {}}})
-    assert await side_chat.fork_ephemeral_side_thread(client, "thread_parent") is None
+    assert await side_chat.fork_side_thread(client, "thread_parent") is None
 
 
 @pytest.mark.asyncio
@@ -358,6 +362,12 @@ def test_is_omnigent_side_fork_discriminates_fork_from_system_ephemeral() -> Non
     )
     # system/housekeeping ephemeral (no forkedFromId) must NOT match
     assert not side_chat.is_omnigent_side_fork(_fork_started(thread_id="sys", forked_from=None))
+    legacy = _fork_started(thread_id="legacy", forked_from="thread_parent", ephemeral=True)
+    legacy["params"]["thread"].pop("threadSource")
+    assert side_chat.is_omnigent_side_fork(legacy)
+    ordinary = _fork_started(thread_id="user_fork", forked_from="thread_parent")
+    ordinary["params"]["thread"]["threadSource"] = "user"
+    assert not side_chat.is_omnigent_side_fork(ordinary)
     # non-thread/started
     assert not side_chat.is_omnigent_side_fork({"method": "turn/started", "params": {}})
 
@@ -400,6 +410,25 @@ async def test_register_side_fork_child_registers_matching_fork(
     assert kwargs["child_thread_id"] == "thread_side"
     # a display name, so the rail/composer tray never shows the raw thread id
     assert kwargs["item"]["agent_nickname"] == side_chat.SIDE_CHAT_DISPLAY_NAME
+    # Every level keeps its immediate source while sharing the root forwarder.
+    source_thread, source_session = "thread_side", "conv_side"
+    for depth in range(2, 6):
+        child_thread, child_session = f"thread_side_{depth}", f"conv_side_{depth}"
+        ensure = _ensure_stub(child_session)
+        monkeypatch.setattr(fwd, "_ensure_child_session", ensure)
+        assert (
+            await side_chat.register_side_fork_child(
+                object(),
+                forwarder_state=state,
+                parent_session_id="conv_parent",
+                parent_thread_id="thread_parent",
+                event=_fork_started(thread_id=child_thread, forked_from=source_thread),
+            )
+            == child_session
+        )
+        assert ensure.await_args.kwargs["parent_session_id"] == source_session
+        assert ensure.await_args.kwargs["parent_thread_id"] == source_thread
+        source_thread, source_session = child_thread, child_session
 
 
 @pytest.mark.asyncio
@@ -540,10 +569,24 @@ def test_registered_side_fork_routes_to_child_and_parent_stays_isolated() -> Non
     assert resolve("thread_rando") == (None, False)  # unknown thread dropped, no leak
 
 
-def test_side_fork_thread_started_is_rotation_ignored() -> None:
-    # the fork is ephemeral, so the rotation path skips it -> can't hijack main
-    event = _fork_started(thread_id="thread_side", forked_from="thread_parent")
-    assert fwd._thread_started_is_ephemeral(event) is True
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ephemeral", [False, True])
+async def test_side_fork_thread_started_is_rotation_ignored(
+    tmp_path: Path, ephemeral: bool
+) -> None:
+    event = _fork_started(
+        thread_id="thread_side", forked_from="thread_parent", ephemeral=ephemeral
+    )
+    target = SimpleNamespace(thread_id="thread_parent", session_id="conv_parent")
+    assert not await fwd._maybe_rotate_session_on_thread_started(
+        ap_client=object(),
+        target=target,
+        bridge_dir=tmp_path,
+        app_server_url="ws://127.0.0.1:1234",
+        event=event,
+    )
+    assert target.thread_id == "thread_parent"
+    assert target.session_id == "conv_parent"
 
 
 # --------------------------------------------------------------------------- #
@@ -649,7 +692,7 @@ async def test_drive_side_chat_requests_forks_on_the_forwarder_client(
 
     assert [m for m, _ in client.calls] == ["thread/fork", "turn/start"]
     assert client.calls[0][1]["threadId"] == "thread_parent"
-    assert client.calls[0][1]["ephemeral"] is True
+    assert client.calls[0][1]["ephemeral"] is False
     assert client.calls[1][1]["threadId"] == "thread_side"  # first turn on the fork
     assert side_chat.peek_side_chat_requests(tmp_path) == []  # request consumed after forking
 
@@ -693,8 +736,9 @@ async def test_drive_side_chat_requests_uses_the_parent_after_scanning(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("nested", [False, True])
 async def test_drive_side_chat_requests_forks_with_the_parents_switched_settings(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, nested: bool
 ) -> None:
     # The app-server's launch -c model would otherwise pair the old model with the new effort.
     _write_parent_settings(tmp_path, "gpt-6-sol", "max")
@@ -705,7 +749,12 @@ async def test_drive_side_chat_requests_forks_with_the_parents_switched_settings
             "turn/start": {"result": {"turn": {"id": "turn_1"}}},
         }
     )
-    side_chat.request_side_chat(tmp_path, "q")
+    side_chat.request_side_chat(
+        tmp_path,
+        "q",
+        parent_thread_id="thread_nested" if nested else None,
+        settings={"model": "gpt-6-sol", "effort": "medium"} if nested else None,
+    )
 
     async def _stop(_seconds: float) -> None:
         raise asyncio.CancelledError
@@ -721,8 +770,9 @@ async def test_drive_side_chat_requests_forks_with_the_parents_switched_settings
 
     forks = [params for method, params in client.calls if method == "thread/fork"]
     assert len(forks) == 1
+    assert forks[0]["threadId"] == ("thread_nested" if nested else "thread_parent")
     assert forks[0]["model"] == "gpt-6-sol"
-    assert forks[0]["config"] == {"model_reasoning_effort": "max"}
+    assert forks[0]["config"] == {"model_reasoning_effort": "medium" if nested else "max"}
     assert "side conversation" in forks[0]["developerInstructions"]
     assert [method for method, _ in client.calls][-1] == "turn/start"
 

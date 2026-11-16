@@ -7787,6 +7787,24 @@ def create_runner_app(
                         "detail": "Codex /side follow-up requires a loaded parent Codex bridge.",
                     },
                 )
+            if body_type == "message":
+                question = side_chat.side_chat_question_from_content(body.get("content"))
+                if question is not None:
+                    nested_settings: dict[str, str] = {}
+                    for key, field in (
+                        ("model", "model_override"),
+                        ("effort", "reasoning_effort"),
+                    ):
+                        value = body.get(field)
+                        if isinstance(value, str) and value:
+                            nested_settings[key] = value
+                    side_chat.request_side_chat(
+                        await _codex_native_bridge_dir_for_session(conversation_id),
+                        question,
+                        parent_thread_id=str(_side_thread_id),
+                        settings=nested_settings,
+                    )
+                    return Response(status_code=202)
             _side_client = client_for_transport(
                 _side_state.socket_path, client_name="omnigent-codex-native-runner"
             )

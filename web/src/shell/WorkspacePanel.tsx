@@ -1,6 +1,7 @@
 import { type FilePosition, FileViewerContext, type OpenFileOptions } from "./FileViewerContext";
 import {
   BotIcon,
+  ArrowLeftIcon,
   CheckIcon,
   ChevronDownIcon,
   FileIcon,
@@ -73,10 +74,10 @@ import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { SUBAGENT_TAB_FALLBACK_LABEL, SubagentTabPane, useSubagentTabLabels } from "./SubagentTab";
 import { type SubagentPanelOpener, SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { SideChatPane } from "@/components/chat/SideChatPane";
-import { useChatStore } from "@/store/chatStore";
+import { ensureConversationStreamed, useChatStore } from "@/store/chatStore";
 import { useCanStartSideChat } from "@/hooks/usePermissions";
 import { SIDE_CHAT_COMMAND_PREFIX, supportsSideChat, usesNativeSideChatFork } from "@/lib/sideChat";
-import { createSideChat, stopSession } from "@/lib/sessionsApi";
+import { createSideChat, getSession, stopSession } from "@/lib/sessionsApi";
 import { subagentSessionIdFromTab } from "@/lib/subagentTabs";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
@@ -1119,7 +1120,7 @@ function WorkspacePanelImpl({
   // pair on, so a signal rekeys the OLDEST awaiting tab (FIFO). A single ref
   // would cross-assign when two launches overlap; the generic path skips the
   // queue entirely and rekeys its own tab directly (see startPendingSideChat).
-  const awaitingPendingIdsRef = useRef<string[]>([]);
+  const awaitingPendingIdsRef = useRef<{ id: string; sourceId: string }[]>([]);
   // A side chat the server just created (Codex's native fork, or the generic
   // fork) announces itself via `sideChatToOpen`. If a pending tab is awaiting,
   // rekey it in place; otherwise open a fresh tab. AppShell reveals the rail.
@@ -1129,8 +1130,8 @@ function WorkspacePanelImpl({
     // — a fork that resolves after the user navigated elsewhere waits for its
     // own parent's rail rather than landing in whatever conversation is on
     // screen now.
-    if (sideChatToOpen.parentId !== conversationId) return;
-    const { childId } = sideChatToOpen;
+    const { childId, parentId } = sideChatToOpen;
+    if (parentId !== conversationId && !sideChats.tabs.includes(parentId)) return;
     const subagentId = subagentSessionIdFromTab(childId);
     if (subagentId !== null && sideChats.tabs.includes(subagentId)) {
       // Already open as a side chat (a Codex /side fork is listed as a sub-agent).
@@ -1138,15 +1139,16 @@ function WorkspacePanelImpl({
     } else if (childId.startsWith("pending:") || subagentId !== null) {
       // "Ask in side chat" (a not-yet-forked tab) and sub-agent tabs (an
       // existing session) must not take a slot in the Codex awaiting queue.
-      sideChats.open(childId);
+      sideChats.open(childId, parentId);
     } else {
-      const awaiting = awaitingPendingIdsRef.current.shift();
+      const index = awaitingPendingIdsRef.current.findIndex((item) => item.sourceId === parentId);
+      const awaiting = index < 0 ? undefined : awaitingPendingIdsRef.current.splice(index, 1)[0];
       if (awaiting !== undefined) {
-        sideChats.rekey(awaiting, childId);
-        useChatStore.getState().clearSideChatComposer(awaiting);
+        sideChats.rekey(awaiting.id, childId);
+        useChatStore.getState().clearSideChatComposer(awaiting.id);
       } else {
         // Generic already rekeyed its own tab; this just re-selects it (idempotent).
-        sideChats.open(childId);
+        sideChats.open(childId, parentId);
       }
     }
     onRightRailTabChange("sidechat");
@@ -1183,6 +1185,32 @@ function WorkspacePanelImpl({
       restoreSideChats(savedSideChats.map((chat) => chat.id));
     }
   }, [savedSideChats, discoverSideChats, restoreSideChats]);
+  const nestedSourceId = sideChats.selected;
+  const { data: nestedSideChats } = useQuery({
+    queryKey: ["conversation", nestedSourceId, "side_chats"],
+    queryFn: async ({ signal }): Promise<{ id: string }[]> => {
+      const response = await authenticatedFetch(
+        `/v1/sessions/${encodeURIComponent(nestedSourceId!)}/side_chats?limit=20`,
+        { signal },
+      );
+      if (response.status === 404) return [];
+      if (!response.ok) throw new Error("Could not load side chats");
+      return (await response.json()).data;
+    },
+    enabled:
+      discoverSideChats &&
+      nestedSourceId !== null &&
+      !nestedSourceId.startsWith("pending:") &&
+      subagentSessionIdFromTab(nestedSourceId) === null,
+  });
+  useEffect(() => {
+    if (nestedSideChats && nestedSourceId && discoverSideChats) {
+      restoreSideChats(
+        nestedSideChats.map((chat) => chat.id),
+        nestedSourceId,
+      );
+    }
+  }, [nestedSideChats, nestedSourceId, discoverSideChats, restoreSideChats]);
   const onNewSideChat = supportsSideChat(sideChatHarness, canStartSideChat)
     ? () => {
         useChatStore.getState().requestSideChatFocus(sideChats.openPending());
@@ -1196,9 +1224,20 @@ function WorkspacePanelImpl({
   // kept prompt-cache-warm); every other harness forks server-side and reuses
   // the parent's live runner. Rejects so the composer re-enables and keeps
   // the typed text for a retry.
-  const startPendingSideChat = (pendingId: string, text: string): Promise<void> => {
-    if (usesNativeSideChatFork(sideChatHarness)) {
-      if (parentAgentId === null) return Promise.reject(new Error("no agent"));
+  const startPendingSideChat = async (pendingId: string, text: string): Promise<void> => {
+    const sourceId = sideChats.parents[pendingId] ?? conversationId;
+    const source =
+      sourceId === conversationId
+        ? null
+        : await getSession(sourceId).catch((error) => {
+            toast.error("Couldn't load the source side chat. Try again.");
+            throw error;
+          });
+    const sourceHarness = source?.harness ?? sideChatHarness;
+    const sourceAgentId = source?.agentId ?? parentAgentId;
+    if (usesNativeSideChatFork(sourceHarness)) {
+      if (sourceAgentId === null) throw new Error("no agent");
+      if (sourceId !== conversationId) await ensureConversationStreamed(sourceId);
       // The child arrives asynchronously via session_created with no id to pair
       // on, so queue this tab to be rekeyed FIFO. The question goes to the
       // PARENT as `/side`; the native fork seeds the child's first turn. `send`
@@ -1206,16 +1245,16 @@ function WorkspacePanelImpl({
       // old to fork — the server refuses) has set `sendFailed` by the time the
       // await returns; reject then so the pending pane resets and drop the
       // queued tab so it never waits for a child that isn't coming.
-      awaitingPendingIdsRef.current.push(pendingId);
+      awaitingPendingIdsRef.current.push({ id: pendingId, sourceId });
       let sendFailed = false;
       return useChatStore
         .getState()
-        .send(SIDE_CHAT_COMMAND_PREFIX + text, parentAgentId, undefined, {
-          pinnedConversationId: conversationId,
+        .send(SIDE_CHAT_COMMAND_PREFIX + text, sourceAgentId, undefined, {
+          pinnedConversationId: sourceId,
           onError: (message) => {
             sendFailed = true;
             awaitingPendingIdsRef.current = awaitingPendingIdsRef.current.filter(
-              (id) => id !== pendingId,
+              (item) => item.id !== pendingId,
             );
             toast.error(message);
           },
@@ -1225,7 +1264,7 @@ function WorkspacePanelImpl({
         });
     }
     return createSideChat(
-      conversationId,
+      sourceId,
       useChatStore.getState().sideChatComposers[pendingId]?.settings,
     ).then(
       ({ childSessionId }) => {
@@ -1237,7 +1276,7 @@ function WorkspacePanelImpl({
         // now that the text has moved to the real child. Only on success — a
         // failed create keeps it so the user can retry.
         useChatStore.getState().clearSideChatComposer(pendingId);
-        useChatStore.getState().openSideChatWithDraft(childSessionId, text, conversationId);
+        useChatStore.getState().openSideChatWithDraft(childSessionId, text, sourceId);
       },
       (err) => {
         // The rail path had no failure feedback (unlike the composer entry
@@ -1315,6 +1354,14 @@ function WorkspacePanelImpl({
   const selectedSideChat = sideChats.selected;
   const selectedSubagentId =
     selectedSideChat === null ? null : subagentSessionIdFromTab(selectedSideChat);
+  const ancestry: string[] = [];
+  for (
+    let id = selectedSideChat;
+    id && id !== conversationId && !ancestry.includes(id);
+    id = sideChats.parents[id] ?? null
+  ) {
+    ancestry.unshift(id);
+  }
   const renderSelectedSideChatPane = () => {
     if (selectedSideChat === null) return null;
     if (selectedSubagentId !== null) {
@@ -1327,14 +1374,53 @@ function WorkspacePanelImpl({
       );
     }
     return (
-      <SideChatPane
-        key={selectedSideChat}
-        childId={selectedSideChat}
-        selectionParentId={
-          (isMobile ? mobileSideChatsOpen : open && sideChatSelected) ? conversationId : undefined
-        }
-        onStart={(text) => startPendingSideChat(selectedSideChat, text)}
-      />
+      <div className="flex h-full min-h-0 flex-col">
+        {ancestry.length > 1 && (
+          <nav
+            aria-label="Side chat ancestry"
+            className="flex shrink-0 items-center gap-1 overflow-x-auto border-b px-2 py-1"
+          >
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label="Back to parent side chat"
+              onClick={() => sideChats.open(ancestry[ancestry.length - 2])}
+            >
+              <ArrowLeftIcon className="size-4" />
+            </Button>
+            <span className="shrink-0 text-xs text-muted-foreground">Main chat</span>
+            {ancestry.map((id, index) => (
+              <Button
+                key={id}
+                variant="ghost"
+                size="sm"
+                className="shrink-0"
+                aria-current={id === selectedSideChat ? "page" : undefined}
+                onClick={() => sideChats.open(id)}
+              >
+                {chatTabLabels[id] ?? `Side chat ${index + 1}`}
+              </Button>
+            ))}
+          </nav>
+        )}
+        <div className="min-h-0 flex-1">
+          <SideChatPane
+            key={selectedSideChat}
+            childId={selectedSideChat}
+            selectionParentId={
+              (isMobile ? mobileSideChatsOpen : open && sideChatSelected)
+                ? (sideChats.parents[selectedSideChat] ?? conversationId)
+                : undefined
+            }
+            onAskInSideChat={(text) => {
+              const pendingId = sideChats.openPending();
+              sideChats.open(pendingId, selectedSideChat);
+              useChatStore.getState().openSideChatWithDraft(pendingId, text, selectedSideChat);
+            }}
+            onStart={(text) => startPendingSideChat(selectedSideChat, text)}
+          />
+        </div>
+      </div>
     );
   };
   const selectedSideChatPane = renderSelectedSideChatPane();
