@@ -157,6 +157,12 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   // Expanded, the planner covers the page. `invisible` keeps the page's scroll
   // position while taking its controls out of the tab order.
   const plannerFillsPage = showPlanner && !isMobile && plannerExpanded;
+  // Every close path resets expansion, including the phone sheet after the window
+  // narrows, so the planner reopens beside the page.
+  const closePlanner = () => {
+    setPlannerOpen(false);
+    setPlannerExpanded(false);
+  };
 
   return (
     <div className="relative flex h-full min-h-0 flex-1 overflow-hidden">
@@ -361,7 +367,12 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
       </PageScroll>
       {showPlanner &&
         (isMobile ? (
-          <Dialog open onOpenChange={setPlannerOpen}>
+          <Dialog
+            open
+            onOpenChange={(open) => {
+              if (!open) closePlanner();
+            }}
+          >
             <DialogContent
               showCloseButton={false}
               aria-describedby={undefined}
@@ -370,7 +381,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
               <DialogTitle className="sr-only">
                 {workflow.steps.length > 0 ? "Edit plan" : "Create plan"}
               </DialogTitle>
-              <WorkflowPlanningChat workflow={workflow} onClose={() => setPlannerOpen(false)} />
+              <WorkflowPlanningChat workflow={workflow} onClose={closePlanner} />
             </DialogContent>
           </Dialog>
         ) : (
@@ -387,10 +398,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
               workflow={workflow}
               expanded={plannerFillsPage}
               onExpandedChange={setPlannerExpanded}
-              onClose={() => {
-                setPlannerOpen(false);
-                setPlannerExpanded(false);
-              }}
+              onClose={closePlanner}
             />
           </aside>
         ))}
