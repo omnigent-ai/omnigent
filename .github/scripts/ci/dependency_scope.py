@@ -54,6 +54,28 @@ TOOLING_GROUP = "ci-tooling"
 TOOLING_PREFIXES = (".github/", "scripts/", "dev/", "tests/scripts/")
 TOOLING_FILES = {"tests/conftest.py"}
 TOOLING_FILE_NAMES = {Path(path).name for path in DEPENDENCY_SCOPES}
+# Dialect lanes rerun tests/stores and tests/db. Match store implementations
+# (including ones outside omnigent/stores), migrations, models, those tests,
+# and the CI that runs the lanes.
+DATABASE_PREFIXES = (
+    "omnigent/stores/",
+    "omnigent/db/",
+    "omnigent/connections/",
+    "tests/stores/",
+    "tests/db/",
+    "deploy/cockroachdb/",
+)
+DATABASE_FILES = {
+    "omnigent/server/accounts_store.py",
+    "omnigent/server/device_grant_store.py",
+    "tests/conftest.py",
+    "uv.lock",
+    "pyproject.toml",
+    ".github/workflows/ci.yml",
+    ".github/scripts/ci/dependency_scope.py",
+    ".github/scripts/ci/require_results.py",
+    ".github/actions/dependency-ci-scope/action.yml",
+}
 
 
 def pin_only(before: str, after: str, pattern: str) -> bool:
@@ -139,6 +161,10 @@ def file_scope(path: str, read=None) -> str:
     return scope
 
 
+def touches_database(paths: set[str]) -> bool:
+    return any(path.startswith(DATABASE_PREFIXES) or path in DATABASE_FILES for path in paths)
+
+
 def touches_tooling(paths: set[str]) -> bool:
     return any(
         path.startswith(TOOLING_PREFIXES)
@@ -177,7 +203,9 @@ def select_scope(files: list[dict], *, read=None, reason: str = "") -> dict[str,
         "python_matrix": python_matrix(
             backend, tooling=bool(reason) or not files or touches_tooling(paths)
         ),
-        "database": str(backend).lower(),
+        # Same unscoped runs always rerun the dialect lanes. A PR runs them only
+        # when a changed path can affect tests/stores or tests/db on another backend.
+        "database": str(bool(reason) or not files or touches_database(paths)).lower(),
         "integration": str(backend).lower(),
         "e2e": str(backend or "javascript" in scopes).lower(),
         "windows": str(backend).lower(),

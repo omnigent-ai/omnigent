@@ -203,10 +203,96 @@ def test_configuration_changes_keep_full_coverage(scope_module, path, before, af
     )
     assert selection["dependency"] == "false"
     assert selection["ui"] == "full"
-    assert selection["database"] == "true"
+    assert (
+        selection["database"]
+        == str(path in {"pyproject.toml", ".github/workflows/ci.yml"}).lower()
+    )
     assert json.loads(selection["python_matrix"])["include"] == json.loads(
         (CI / "python-matrix.json").read_text()
     )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "omnigent/stores/host_store.py",
+        "omnigent/connections/github/__init__.py",
+        "omnigent/server/accounts_store.py",
+        "omnigent/server/device_grant_store.py",
+        "omnigent/db/db_models.py",
+        "omnigent/db/migrations/versions/new_migration.py",
+        "omnigent/db/alembic.ini",
+        "omnigent/db/utils.py",
+        "tests/stores/test_host_store.py",
+        "tests/db/test_utils.py",
+        "tests/conftest.py",
+        "deploy/cockroachdb/docker-compose.yml",
+        ".github/workflows/ci.yml",
+        ".github/scripts/ci/dependency_scope.py",
+        ".github/scripts/ci/require_results.py",
+        ".github/actions/dependency-ci-scope/action.yml",
+        "uv.lock",
+        "pyproject.toml",
+    ],
+)
+def test_database_paths_run_dialect_lanes(scope_module, path):
+    selection = scope_module.select_scope([{"filename": path, "status": "modified"}])
+    assert selection["database"] == "true"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "omnigent/server/app.py",
+        "omnigent/repl/app.py",
+        "web/src/App.tsx",
+        "README.md",
+        "deploy/docker/Dockerfile",
+    ],
+)
+def test_unrelated_changes_skip_dialect_lanes(scope_module, path):
+    selection = scope_module.select_scope([{"filename": path, "status": "modified"}])
+    assert selection["database"] == "false"
+    assert selection["backend"] == "true"
+
+
+def test_added_store_file_runs_dialect_lanes(scope_module):
+    selection = scope_module.select_scope(
+        [{"filename": "omnigent/stores/new_store.py", "status": "A"}]
+    )
+    assert selection["database"] == "true"
+
+
+def test_added_unrelated_file_skips_dialect_lanes(scope_module):
+    selection = scope_module.select_scope(
+        [{"filename": "omnigent/server/new_route.py", "status": "A"}]
+    )
+    assert selection["database"] == "false"
+    assert selection["backend"] == "true"
+
+
+def test_database_path_among_unrelated_changes_runs_dialect_lanes(scope_module):
+    selection = scope_module.select_scope(
+        [
+            {"filename": "omnigent/server/app.py", "status": "modified"},
+            {"filename": "omnigent/stores/host_store.py", "status": "modified"},
+        ]
+    )
+    assert selection["database"] == "true"
+
+
+@pytest.mark.parametrize("event_name", ["push", "schedule", "workflow_dispatch"])
+def test_push_and_scheduled_runs_always_run_dialect_lanes(tmp_path, merged_repo, event_name):
+    repo, git = merged_repo
+    path = repo / "omnigent/repl/app.py"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("unrelated\n")
+    git("add", ".")
+    git("commit", "-qm", "unrelated")
+    head = git("rev-parse", "HEAD")
+    scope = run_selection(tmp_path, repo, head, head, event_name=event_name)
+    assert scope["database"] == "true"
+    assert "Push, scheduled and manual runs use full CI" in scope["reason"]
 
 
 @pytest.mark.parametrize(
@@ -596,6 +682,7 @@ def test_unknown_or_non_pr_input_keeps_full_coverage(tmp_path, merged_repo, faul
     )
     assert scope["backend"] == scope["e2e"] == scope["omnidev"] == scope["sidecar"] == "true"
     assert scope["ui"] == "full"
+    assert scope["database"] == str(fault not in {"deleted", "renamed"}).lower()
 
 
 def test_workflows_connect_selection_to_jobs():
