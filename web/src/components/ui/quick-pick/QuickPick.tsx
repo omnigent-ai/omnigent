@@ -80,6 +80,32 @@ function resultCountText(resultCount: number): string {
  * Keyboard-first picker: a query field over fuzzy-ranked rows grouped under
  * headings. The caller owns the query and what accepting a row does.
  */
+// Meta jumps to the ends and Alt moves between groups; Shift+Home/End stay with the query field.
+function navigationFor(
+  event: KeyboardEvent<HTMLInputElement>,
+  pageSize: () => number,
+): QuickPickNavigation | null {
+  switch (event.key) {
+    case "ArrowDown":
+    case "ArrowUp": {
+      const forward = event.key === "ArrowDown";
+      if (event.metaKey) return { type: forward ? "last" : "first" };
+      if (event.altKey) return { type: forward ? "nextGroup" : "previousGroup" };
+      return { type: forward ? "next" : "previous" };
+    }
+    case "Home":
+      return event.shiftKey ? null : { type: "first" };
+    case "End":
+      return event.shiftKey ? null : { type: "last" };
+    case "PageDown":
+      return { type: "pageDown", pageSize: pageSize() };
+    case "PageUp":
+      return { type: "pageUp", pageSize: pageSize() };
+    default:
+      return null;
+  }
+}
+
 export function QuickPick<Value>({
   label,
   placeholder,
@@ -132,7 +158,8 @@ export function QuickPick<Value>({
     if (activeItemId === revealedIdRef.current) return;
     revealedIdRef.current = activeItemId;
     if (activeItemId === null || pickedByPointer) return;
-    document.getElementById(optionId(activeIndex))?.scrollIntoView?.({ block: "nearest" });
+    if (activeRow)
+      document.getElementById(optionId(activeRow))?.scrollIntoView?.({ block: "nearest" });
   });
 
   const navigate = (navigation: QuickPickNavigation) => {
@@ -158,28 +185,7 @@ export function QuickPick<Value>({
   const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
     // Keys that drive an IME composition, including its Enter, belong to the composition.
     if (isImeCompositionKeyEvent(event)) return;
-    // Meta jumps to the ends and Alt between groups, as in the command menu this replaces.
-    // Shift+Home/End stay with the text field, so they still select the query.
-    const arrow = (forward: boolean): QuickPickNavigation =>
-      event.metaKey
-        ? { type: forward ? "last" : "first" }
-        : event.altKey
-          ? { type: forward ? "nextGroup" : "previousGroup" }
-          : { type: forward ? "next" : "previous" };
-    const navigation: QuickPickNavigation | null =
-      event.key === "ArrowDown"
-        ? arrow(true)
-        : event.key === "ArrowUp"
-          ? arrow(false)
-          : event.key === "Home" && !event.shiftKey
-            ? { type: "first" }
-            : event.key === "End" && !event.shiftKey
-              ? { type: "last" }
-              : event.key === "PageDown"
-                ? { type: "pageDown", pageSize: pageSize() }
-                : event.key === "PageUp"
-                  ? { type: "pageUp", pageSize: pageSize() }
-                  : null;
+    const navigation = navigationFor(event, pageSize);
     if (navigation) {
       event.preventDefault();
       navigate(navigation);

@@ -282,8 +282,24 @@ describe("QuickPick other navigation keys", () => {
 
   it("leave Ctrl+N/P and Ctrl+J/K to the text field", () => {
     const { press, active } = renderPicker();
-    for (const key of ["n", "j", "p", "k"]) press(key, { ctrlKey: true });
-    expect(active()).toBe("s1");
+    for (const key of ["n", "j", "p", "k"]) {
+      expect(press(key, { ctrlKey: true })).toBe(true);
+      expect(active()).toBe("s1");
+    }
+  });
+
+  it("pages by the rows that fit once the list is measured", () => {
+    vi.spyOn(Element.prototype, "clientHeight", "get").mockReturnValue(100);
+    vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockReturnValue(20);
+    onTestFinished(() => {
+      vi.restoreAllMocks();
+    });
+    const many = Array.from({ length: 15 }, (_, index) => item(`row-${index}`));
+    const { press, active } = renderPicker([{ sourceId: "s", ranking: "client", items: many }]);
+    press("PageDown");
+    expect(active()).toBe("row-4");
+    press("PageDown");
+    expect(active()).toBe("row-8");
   });
 
   it("ignore navigation while an IME is composing", () => {
