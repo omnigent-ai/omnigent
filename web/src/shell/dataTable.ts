@@ -236,15 +236,52 @@ function parseRecords(
   return { records, count, widest, fieldCounts };
 }
 
-const NUMBER_PATTERN = /^[-+]?(\d{1,3}(,\d{3})+|\d+)?(\.\d+)?([eE][-+]?\d+)?%?$/;
+const NUMBER_PATTERN = /^([-+]?)(\d{1,3}(?:,\d{3})+|\d+)?(?:\.(\d+))?(?:[eE]([-+]?\d+))?(%?)$/;
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/;
 
-/** The number a cell holds, ``"25%"`` as 0.25, or ``NaN`` when it holds none. */
-export function cellNumber(value: string): number {
-  const trimmed = value.trim();
-  if (!trimmed || !/\d/.test(trimmed) || !NUMBER_PATTERN.test(trimmed)) return Number.NaN;
-  const number = Number.parseFloat(trimmed.replace(/,/g, "").replace(/%$/, ""));
-  return trimmed.endsWith("%") ? number / 100 : number;
+/**
+ * A number cell held exactly, so integers past a float's precision still order:
+ * the value is ``0.digits × 10^magnitude``, with *digits* free of leading and
+ * trailing zeros and empty for zero.
+ */
+interface CellNumber {
+  negative: boolean;
+  digits: string;
+  magnitude: number;
+}
+
+/** The number a cell holds, ``"25%"`` as 0.25, or ``null`` when it holds none. */
+function cellNumber(value: string): CellNumber | null {
+  const match = value.trim().match(NUMBER_PATTERN);
+  if (!match) return null;
+  const [, sign, whole = "", fraction = "", exponent = "0", percent] = match;
+  if (!whole && !fraction) return null;
+  const integer = whole.replace(/,/g, "");
+  const allDigits = integer + fraction;
+  const significant = allDigits.replace(/^0+/, "");
+  // Trailing zeros are trimmed by a scan, which stays linear on a long run of them.
+  let end = significant.length;
+  while (end > 0 && significant[end - 1] === "0") end -= 1;
+  return {
+    negative: sign === "-",
+    digits: significant.slice(0, end),
+    magnitude:
+      integer.length -
+      (allDigits.length - significant.length) +
+      Number(exponent) -
+      (percent ? 2 : 0),
+  };
+}
+
+function compareNumbers(a: CellNumber, b: CellNumber): number {
+  const signOf = (number: CellNumber) => (number.digits === "" ? 0 : number.negative ? -1 : 1);
+  const sign = signOf(a);
+  if (sign !== signOf(b)) return sign - signOf(b);
+  if (sign === 0) return 0;
+  const order =
+    compareValues(a.magnitude, b.magnitude) ||
+    (a.digits === b.digits ? 0 : a.digits < b.digits ? -1 : 1);
+  return order === 0 ? 0 : sign * order;
 }
 
 /**
@@ -272,7 +309,7 @@ function isDateCell(value: string): boolean {
 export function inferColumnType(values: string[]): DataColumnType {
   const present = values.filter((value) => value.trim() !== "");
   if (present.length === 0) return "text";
-  if (present.every((value) => !Number.isNaN(cellNumber(value)))) return "number";
+  if (present.every((value) => cellNumber(value) !== null)) return "number";
   if (present.every(isDateCell)) return "date";
   return "text";
 }
@@ -291,7 +328,13 @@ export function compareCells(a: string, b: string, type: DataColumnType): number
   const aEmpty = a.trim() === "";
   const bEmpty = b.trim() === "";
   if (aEmpty || bEmpty) return Number(aEmpty) - Number(bEmpty);
-  if (type === "number") return compareValues(cellNumber(a), cellNumber(b));
+  if (type === "number") {
+    const aNumber = cellNumber(a);
+    const bNumber = cellNumber(b);
+    // A cell that isn't a number, which inference never leaves in a number column, sorts last.
+    if (!aNumber || !bNumber) return Number(!aNumber) - Number(!bNumber);
+    return compareNumbers(aNumber, bNumber);
+  }
   if (type === "date") return compareValues(cellDate(a), cellDate(b));
   return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
 }

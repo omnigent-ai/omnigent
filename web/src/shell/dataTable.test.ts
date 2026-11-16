@@ -223,6 +223,33 @@ describe("inferColumnType and compareCells", () => {
       "1",
       "150%",
     ]);
+    // Integers past a float's precision keep their exact order, beside decimals too.
+    expect(
+      [
+        "9007199254740993",
+        "-9007199254740992",
+        "9,007,199,254,740,992",
+        "9007199254740992.5",
+        "-9007199254740993",
+      ].sort((a, b) => compareCells(a, b, "number")),
+    ).toEqual([
+      "-9007199254740993",
+      "-9007199254740992",
+      "9,007,199,254,740,992",
+      "9007199254740992.5",
+      "9007199254740993",
+    ]);
+    expect(compareCells("9.007199254740993e15", "9007199254740993", "number")).toBe(0);
+    expect(compareCells("900719925474099300%", "9007199254740993", "number")).toBe(0);
+    expect(compareCells("-0.0", "0", "number")).toBe(0);
+    expect(
+      ["0.5", "007", "1.50", ".05", "+1", "1e2%", "1e-400", "0"].sort((a, b) =>
+        compareCells(a, b, "number"),
+      ),
+    ).toEqual(["0", "1e-400", ".05", "0.5", "+1", "1e2%", "1.50", "007"]);
+    // A long run of zeros inside a cell still compares in linear time.
+    const zeros = "0".repeat(200_000);
+    expect(compareCells(`1${zeros}2`, `1${zeros}1`, "number")).toBeGreaterThan(0);
     expect(["item10", "item2"].sort((a, b) => compareCells(a, b, "text"))).toEqual([
       "item2",
       "item10",
@@ -247,8 +274,9 @@ describe("inferColumnType and compareCells", () => {
     }
   });
 
-  it("treats two numbers too large to represent as equal", () => {
+  it("orders numbers too large for a float", () => {
     expect(compareCells("1e999", "1e999", "number")).toBe(0);
+    expect(compareCells("2e999", "1e999", "number")).toBeGreaterThan(0);
     expect(compareCells("1e999", "-1e999", "number")).toBeGreaterThan(0);
     expect(compareCells("5", "1e999", "number")).toBeLessThan(0);
   });
