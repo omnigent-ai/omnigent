@@ -96,6 +96,11 @@ export interface ScheduledTask {
    * next-run can't match the server anchor for INTERVAL>1 rules.
    */
   nextRunAt: string | null;
+  /**
+   * `false` when the server can't keep grants for this automation, e.g. a legacy
+   * one. Absent counts as shareable.
+   */
+  shareable?: boolean;
 }
 
 /** One run of a scheduled task, camelCased from `_run_to_response`. */
@@ -255,6 +260,8 @@ interface ScheduledTaskWire {
   last_run_status: ScheduledTaskRunStatus | null;
   last_run_conversation_id: string | null;
   next_run_at: string | null;
+  // Absent on servers that predate it.
+  shareable?: boolean;
 }
 
 /** Wire shape of a run row (snake_case), matching `_run_to_response`. */
@@ -343,6 +350,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     lastRunStatus: wire.last_run_status,
     lastRunConversationId: wire.last_run_conversation_id,
     nextRunAt: wire.next_run_at,
+    shareable: wire.shareable ?? true,
   };
 }
 

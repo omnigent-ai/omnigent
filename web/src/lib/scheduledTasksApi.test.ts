@@ -79,13 +79,13 @@ describe("runScheduledTaskNow", () => {
 });
 
 describe("listScheduledTasks", () => {
-  // Servers that predate task projects omit the key.
+  // Servers that predate task projects or shareable omit the keys; absent is shareable.
   it.each([
-    ["absent", {}, null],
-    ["present", { project_id: "proj_1" }, "proj_1"],
+    ["absent", {}, null, true],
+    ["present", { project_id: "proj_1", shareable: false }, "proj_1", false],
   ])(
-    "GETs /v1/scheduled-tasks and camelCases the rows (project %s)",
-    async (_, extra, projectId) => {
+    "GETs /v1/scheduled-tasks and camelCases the rows (project and shareable %s)",
+    async (_, extra, projectId, shareable) => {
       fetchMock.mockResolvedValueOnce(
         mockResponse({ scheduled_tasks: [{ ...TASK_WIRE, ...extra }] }),
       );
@@ -102,6 +102,7 @@ describe("listScheduledTasks", () => {
         hostId: null,
         workspace: null,
         projectId,
+        shareable,
       });
     },
   );

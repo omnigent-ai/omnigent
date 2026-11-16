@@ -86,13 +86,8 @@ import {
 } from "@/lib/scheduleText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AUTOMATION_SHARE_PARAM } from "@/lib/automationFromSession";
-import {
-  isFeatureEnabled,
-  isSharingOff,
-  sandboxOptionLabel,
-  SHARING_OFF_REASON,
-} from "@/lib/capabilities";
-import { canShareAutomation } from "@/lib/permissionsApi";
+import { isFeatureEnabled, sandboxOptionLabel } from "@/lib/capabilities";
+import { automationShareDisabledReason, canShareAutomation } from "@/lib/permissionsApi";
 import { ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
 import type { ScheduledTaskRun, ScheduledTaskRunSteps } from "@/lib/scheduledTasksApi";
 import { stepProgress } from "@/lib/sessionJournal";
@@ -340,8 +335,8 @@ function TaskDetail({ taskId }: { taskId: string }) {
       : (permissionOption?.label ?? task.permissionMode);
   const scheduleSummary = describeSchedule(task.rrule, task.timezone);
   const canShare = canShareAutomation(info, viewerId, task.ownerUserId);
-  // As for sessions, sharing off disables Share rather than hiding it.
-  const sharingOff = isSharingOff(info);
+  // As for sessions, a reason such as sharing off disables Share rather than hiding it.
+  const shareDisabledReason = automationShareDisabledReason(info, task);
   const nextRun = formatNextRunAt(task.nextRunAt, now);
   // A single per-task busy flag: the header actions disable while any of this
   // task's mutations are in flight.
@@ -423,14 +418,14 @@ function TaskDetail({ taskId }: { taskId: string }) {
         </h1>
         <div className="flex shrink-0 items-center gap-2">
           {canShare &&
-            (sharingOff ? (
+            (shareDisabledReason ? (
               <Tooltip>
                 <TooltipTrigger asChild>
                   {/* Disabled buttons don't receive pointer events, so the wrapper
                       owns hover/focus for the explanatory tooltip. */}
                   <span
                     tabIndex={0}
-                    aria-label={`Share automation disabled: ${SHARING_OFF_REASON}`}
+                    aria-label={`Share automation disabled: ${shareDisabledReason}`}
                     className="inline-flex"
                   >
                     <Button
@@ -444,7 +439,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
                     </Button>
                   </span>
                 </TooltipTrigger>
-                <TooltipContent>{SHARING_OFF_REASON}</TooltipContent>
+                <TooltipContent>{shareDisabledReason}</TooltipContent>
               </Tooltip>
             ) : (
               <Button
@@ -672,7 +667,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
         editingTask={task}
         sessionLink={sessionLink}
       />
-      {canShare && !sharingOff && (
+      {canShare && !shareDisabledReason && (
         <PermissionsModal
           automation={task}
           open={shareOpen || shareRequested}

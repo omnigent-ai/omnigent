@@ -33,7 +33,7 @@ import { ScheduledTaskRow } from "@/components/scheduled/ScheduledTaskRow";
 import { AUTOMATION_TEMPLATES } from "@/components/scheduled/automationTemplates";
 import { SESSION_LINK_ID_PLACEHOLDER } from "@/components/scheduled/triggerTemplates";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled, isSharingOff, SHARING_OFF_REASON } from "@/lib/capabilities";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { useNavigate, useRebasePath, useSearchParams } from "@/lib/routing";
 import { getShareableSessionLink } from "@/lib/shareLink";
 import {
@@ -44,7 +44,7 @@ import {
 } from "@/hooks/useScheduledTasks";
 import { useNow } from "@/hooks/useNow";
 import { useViewerId } from "@/hooks/useViewerId";
-import { canShareAutomation } from "@/lib/permissionsApi";
+import { automationShareDisabledReason, canShareAutomation } from "@/lib/permissionsApi";
 import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
 import { nextRunAtMs } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
@@ -416,7 +416,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
                   onShare={
                     canShareAutomation(info, viewerId, task.ownerUserId) ? handleShare : undefined
                   }
-                  shareDisabledReason={isSharingOff(info) ? SHARING_OFF_REASON : undefined}
+                  shareDisabledReason={automationShareDisabledReason(info, task)}
                 />
               ))}
             </div>

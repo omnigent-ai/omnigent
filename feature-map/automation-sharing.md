@@ -41,6 +41,12 @@ share dialog warns its owner when an automation manages that session's sharing.
   on the detail page and in the row menus, with the session Share's tooltip
   (Sharing has been disabled for this Omnigent server.), and a session's link
   does not open the automation's share dialog.
+- `legacy-automation`: when the server reports `shareable: false` for an
+  automation, such as one created before its store could keep grants, Share stays
+  visible but disabled in the same places with the tooltip This is a legacy
+  automation. Recreate it to share it., and the server refuses a grant with that
+  message. Sharing off's reason wins when both apply; a server that sends no
+  `shareable` leaves Share enabled.
 
 ## How to get to it (user POV)
 
@@ -80,10 +86,11 @@ uses, because the session Share button is disabled on a local server.
   `tests/server/integration/test_scheduled_tasks_routes.py`, the tests
   `test_owner_shares_lists_and_revokes_an_automation`,
   `test_grant_refuses_what_an_automation_cannot_be_shared_with`,
-  `test_sharing_is_advertised_and_served_together` and
+  `test_sharing_is_advertised_and_served_together`,
+  `test_an_automation_its_store_cannot_share_is_reported_and_refused` and
   `test_session_permissions_name_the_automation_that_manages_them` cover the
-  routes, refusals, capability and the managed-session marker. Run them with
-  plain `uv run --no-sync pytest`.
+  routes, refusals, capability, the `shareable` field and the managed-session
+  marker. Run them with plain `uv run --no-sync pytest`.
 - **Detail page and row menu, manually:** as alice, open an automation you own
   and choose Share. Add bob: he appears with Read, and the dialog offers no level
   picker or General access. Add `__public__`: the refusal appears under the form.
@@ -113,3 +120,6 @@ uses, because the session Share button is disabled on a local server.
   apply to runs and the managed-session warning still appears.
 - Agents cannot list or change an automation's sharing, and cannot move a shared
   automation's runs to another session, host, workspace or execution target.
+- Only a permission store that cannot keep some automation's grants reports
+  `shareable: false`. The built-in stores never do, so `legacy-automation` appears
+  only on deployments with such a store and is covered by the component tests.

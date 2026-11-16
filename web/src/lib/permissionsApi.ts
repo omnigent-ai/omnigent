@@ -6,7 +6,13 @@
  */
 
 import type { Conversation } from "@/hooks/useConversations";
-import { isSingleUserMode, type ServerInfo } from "@/lib/capabilities";
+import {
+  isSharingOff,
+  isSingleUserMode,
+  SHARING_OFF_REASON,
+  type ServerInfo,
+} from "@/lib/capabilities";
+import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 import type { Session } from "@/lib/types";
 import { authenticatedFetch } from "./identity";
 
@@ -293,4 +299,20 @@ export function canShareAutomation(
     viewerId !== null &&
     ownerUserId === viewerId
   );
+}
+
+/** Why Share is disabled on an automation the server can't keep grants for; the server says the same. */
+export const LEGACY_AUTOMATION_SHARE_REASON =
+  "This is a legacy automation. Recreate it to share it.";
+
+/**
+ * Why an offered automation Share is disabled, or `undefined` when it's enabled.
+ * Sharing off wins; a task without `shareable` (an older server) is shareable.
+ */
+export function automationShareDisabledReason(
+  info: ServerInfo | "loading",
+  task: Pick<ScheduledTask, "shareable">,
+): string | undefined {
+  if (isSharingOff(info)) return SHARING_OFF_REASON;
+  return task.shareable === false ? LEGACY_AUTOMATION_SHARE_REASON : undefined;
 }
