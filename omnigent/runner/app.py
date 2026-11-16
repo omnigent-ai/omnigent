@@ -6847,6 +6847,7 @@ def create_runner_app(
             from omnigent.runner.policy import AgentStartPolicyError
 
             _agent_id = _ds_agent_id
+            spec_cache_generation = _session_cache_generation(conv_id)
             _sub_agent_name = await _recover_sub_agent_name(conv_id)
             try:
                 launch = await _resolve_harness_launch(
@@ -6868,6 +6869,11 @@ def create_runner_app(
                 )
                 harness_name, spawn_env = launch.harness, launch.spawn_env
                 selected_spec_entry = launch.spec_entry
+                if selected_spec_entry is not None and _session_cache_generation_is_current(
+                    conv_id, spec_cache_generation
+                ):
+                    _session_spec_cache[conv_id] = selected_spec_entry
+                    _session_spec_start_harness[conv_id] = (selected_spec_entry, harness_name)
             except AgentStartPolicyError as exc:
                 return _agent_start_policy_failure(exc)
             except SessionAgentMissingError:

@@ -527,7 +527,7 @@ async def test_cached_harness_selection_preserves_single_policy_transform(
     assert dispatch_tool.call_args.kwargs["effective_harness"] == harness
     if cache_state == "original-harness":
         assert schemas.call_args.args[0] is selected
-        assert cache[_SESSION_ID] is original_cached
+        assert cache[_SESSION_ID] is selected
     if cache_state == "native-selection":
         launch_terminal.assert_awaited_once()
         context = launch_terminal.call_args.args[1]

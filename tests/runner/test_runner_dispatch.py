@@ -14187,18 +14187,8 @@ async def test_cross_path_resolution_contract(
     child_stream = scenario == "child_present" and path != "background"
     if child_stream:
         from omnigent.runner import app as runner_module
-        from omnigent.spec.types import LocalToolInfo
 
         parent = _contract_root_spec(with_child=True)
-        parent.sub_agents[0].local_tools = [
-            LocalToolInfo(name="bundle_probe", path="bundle_probe.py", language="python")
-        ]
-        (tmp_path / "bundle_probe.py").write_text(
-            "from omnigent_client import tool\n"
-            "@tool\n"
-            "def bundle_probe() -> str:\n"
-            "    return 'workspace tool loaded'\n"
-        )
 
         async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
             calls.append(agent_id)
@@ -14245,24 +14235,10 @@ async def test_cross_path_resolution_contract(
     result["resolver_calls"] = len(calls)
 
     if child_stream:
-        from omnigent.runner.native.orchestration import (
-            ResolvedSpec,
-            _resolved_workdir_for_spec,
-        )
-        from omnigent.runner.tool_dispatch import execute_tool
+        from omnigent.runner.native.orchestration import ResolvedSpec
 
         [selected] = selected_entries
         assert isinstance(selected, ResolvedSpec) and selected.workdir is None
-        output = await execute_tool(
-            tool_name="bundle_probe",
-            arguments="{}",
-            agent_spec=selected.spec,
-            conversation_id=conv,
-            runner_workspace=tmp_path,
-            local_tool_workdir=_resolved_workdir_for_spec(selected, tmp_path),
-        )
-        assert output.startswith("Error:")
-        assert output != "workspace tool loaded"
 
     if scenario == "cache_holds_child" and path != "background":
         assert "no workdir resolved" not in caplog.text

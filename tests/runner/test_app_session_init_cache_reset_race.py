@@ -209,50 +209,67 @@ async def test_lazy_metadata_policy_failure_is_structured_and_recovers(
 
 
 @pytest.mark.asyncio
-async def test_session_init_does_not_reinstate_spec_superseded_by_reset() -> None:
-    """A reset acknowledged during init wins over init's spec-cache write.
+@pytest.mark.parametrize(
+    ("stream", "pause_snapshot"),
+    [(False, False), (True, False), (True, True)],
+    ids=["session-init", "direct-stream", "direct-stream-snapshot"],
+)
+async def test_session_init_does_not_reinstate_spec_superseded_by_reset(
+    stream: bool, pause_snapshot: bool
+) -> None:
+    """A reset during init or direct-stream setup wins over its cache write.
 
-    Steps (all over the runner's HTTP API):
-
-    1. ``POST /v1/sessions`` — init starts; agent-spec resolution is slow
-       (the resolver blocks, holding init open).
-    2. ``POST /v1/sessions/{id}/agent-cache/reset`` — the invalidation the
-       server issues when the user edits the session's agent mid-init.
-       Returns 200 with the entry dropped and the generation bumped.
-    3. Resolution completes with the pre-reset ("v1") spec; init finishes.
-    4. ``GET /v1/sessions/{id}/skills`` — a spec-derived read. The reset
-       retired the v1 entry, so the read must re-resolve and serve the
-       post-reset ("v2") spec, not the superseded entry init memoized.
+    Pause the resolver or the earlier snapshot lookup, reset, then release the
+    old request. The next skills read must resolve v2. Both versions declare the
+    same harness so provenance checks cannot hide a stale cache write.
     """
-    resolver_entered = asyncio.Event()
-    release_resolver = asyncio.Event()
+    lookup_entered = asyncio.Event()
+    release_lookup = asyncio.Event()
     resolver_calls = 0
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         nonlocal resolver_calls
         del agent_id, session_id
         resolver_calls += 1
-        if resolver_calls == 1:
-            resolver_entered.set()
-            await release_resolver.wait()
-            return _spec("v1")
-        return _spec("v2")
+        if resolver_calls == 1 and not pause_snapshot:
+            lookup_entered.set()
+            await release_lookup.wait()
+        spec = _spec("v1" if resolver_calls == 1 else "v2")
+        spec.executor.config["harness"] = "claude-sdk"
+        return spec
 
+    class SnapshotClient(_SessionSnapshotServerClient):
+        async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+            if pause_snapshot and url == f"/v1/sessions/{_SESSION_ID}":
+                lookup_entered.set()
+                await release_lookup.wait()
+            return await super().get(url, **kwargs)
+
+    manager = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(
-        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        process_manager=manager,  # type: ignore[arg-type]
         spec_resolver=_resolver,
-        server_client=_SessionSnapshotServerClient(),  # type: ignore[arg-type]
+        server_client=SnapshotClient(),  # type: ignore[arg-type]
         resource_registry=SessionResourceRegistry(terminal_registry=None),
     )
 
     async with _runner_client(app) as client:
-        init_task = asyncio.create_task(
+        setup_task = asyncio.create_task(
             client.post(
-                "/v1/sessions",
-                json={"session_id": _SESSION_ID, "agent_id": _AGENT_ID},
+                f"/v1/sessions/{_SESSION_ID}/events?stream=true" if stream else "/v1/sessions",
+                json=(
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": _AGENT_ID,
+                        "harness_override": "claude-sdk",
+                    }
+                    if stream
+                    else {"session_id": _SESSION_ID, "agent_id": _AGENT_ID}
+                ),
             )
         )
-        await asyncio.wait_for(resolver_entered.wait(), timeout=10)
+        await asyncio.wait_for(lookup_entered.wait(), timeout=10)
 
         reset_resp = await client.post(
             f"/v1/sessions/{_SESSION_ID}/agent-cache/reset",
@@ -261,9 +278,12 @@ async def test_session_init_does_not_reinstate_spec_superseded_by_reset() -> Non
         assert reset_resp.status_code == 200
         assert reset_resp.json()["reset"] is True
 
-        release_resolver.set()
-        init_resp = await asyncio.wait_for(init_task, timeout=30)
-        assert init_resp.status_code == 201, init_resp.text
+        release_lookup.set()
+        setup_resp = await asyncio.wait_for(setup_task, timeout=30)
+        assert setup_resp.status_code == (200 if stream else 201), setup_resp.text
+        if stream:
+            assert "response.failed" not in setup_resp.text, setup_resp.text
+            assert manager.get_client_calls
 
         skills_resp = await client.post(
             f"/v1/sessions/{_SESSION_ID}/skills/resolve", json={"name": "missing-skill"}
@@ -276,7 +296,7 @@ async def test_session_init_does_not_reinstate_spec_superseded_by_reset() -> Non
     # consult the resolver again rather than be served init's stale write.
     assert resolver_calls == 2, (
         "spec read after an acknowledged agent-cache reset was served from the "
-        "session spec cache: session init reinstated the superseded entry "
+        "session spec cache: session setup reinstated the superseded entry "
         f"(resolver consulted {resolver_calls} time(s), expected 2)"
     )
     assert "marker-v2" in names, f"post-reset spec not served; skills = {sorted(names)}"
