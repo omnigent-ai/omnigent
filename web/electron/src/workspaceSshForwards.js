@@ -15,6 +15,15 @@ const OPEN_TIMEOUT_MS = 10_000;
 // No password or host-key prompts: those fail, and the page uses the server.
 const SSH_ARGS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"];
 
+// Teardown must reach every connection, so a directory that can't be removed is logged, not thrown.
+function removeDirectory(directory) {
+  try {
+    fs.rmSync(directory, { recursive: true, force: true });
+  } catch (error) {
+    console.warn("[omnigent] couldn't remove an SSH forward directory:", error);
+  }
+}
+
 /**
  * @param {{
  *   createSession?: typeof createSshSession,
@@ -47,7 +56,7 @@ function createWorkspaceSshForwards(deps = {}) {
       .catch(() => {})
       .finally(() => {
         retiring.delete(connection);
-        fs.rmSync(connection.dir, { recursive: true, force: true });
+        removeDirectory(connection.dir);
       });
   }
 
@@ -147,7 +156,7 @@ function createWorkspaceSshForwards(deps = {}) {
       for (const connection of [...connections.values(), ...retiring]) {
         clearTimeout(connection.timer);
         connection.session.abort();
-        fs.rmSync(connection.dir, { recursive: true, force: true });
+        removeDirectory(connection.dir);
       }
       connections.clear();
       retiring.clear();

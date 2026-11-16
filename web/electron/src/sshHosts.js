@@ -10,6 +10,12 @@ const { validateDestination } = require("./ssh_connect");
 // Recorded ids are dashless lowercase UUIDs; servers may send the dashed form.
 const canonicalHostId = (rawHostId) => String(rawHostId).replace(/-/g, "").toLowerCase();
 
+// One server's record, or an empty one when the file holds anything else for it.
+function recordFor(servers, serverTarget) {
+  const entry = Object.hasOwn(servers, serverTarget) ? servers[serverTarget] : null;
+  return entry && typeof entry === "object" && !Array.isArray(entry) ? entry : {};
+}
+
 /**
  * @param {() => string} filePath Where the record lives, e.g. in `userData`.
  */
@@ -37,7 +43,8 @@ function createSshHostStore(filePath) {
     record(serverTarget, hostId, destination) {
       const current = load();
       const key = canonicalHostId(hostId);
-      const next = { ...current, [serverTarget]: { ...current[serverTarget], [key]: destination } };
+      const forServer = recordFor(current, serverTarget);
+      const next = { ...current, [serverTarget]: { ...forServer, [key]: destination } };
       const file = filePath();
       fs.mkdirSync(path.dirname(file), { recursive: true });
       // Write a new file and rename it over the old one, so a crash can't truncate the record.
@@ -49,16 +56,15 @@ function createSshHostStore(filePath) {
         fs.rmSync(temp, { force: true });
         throw error;
       }
-      // Cached only once on disk, so a failed write isn't served until restart.
+      // Update the cache only after a successful write, so a failed record is never served.
       hosts = next;
     },
 
     /** The recorded destination for `hostId` on `serverTarget`, or null. */
     destination(serverTarget, rawHostId) {
       const hostId = canonicalHostId(rawHostId);
-      const servers = load();
-      const recorded = Object.hasOwn(servers, serverTarget) ? servers[serverTarget] : null;
-      const destination = recorded && Object.hasOwn(recorded, hostId) ? recorded[hostId] : null;
+      const recorded = recordFor(load(), serverTarget);
+      const destination = Object.hasOwn(recorded, hostId) ? recorded[hostId] : null;
       try {
         return typeof destination === "string" ? validateDestination(destination) : null;
       } catch {

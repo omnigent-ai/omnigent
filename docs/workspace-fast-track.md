@@ -31,8 +31,11 @@ answers such as "not found" go to REST, so callers keep the errors they expect.
 | Desktop app | A release with the workspace socket bridge. Older shells fall back to the server routes.                |
 
 Both flags are off by default and appear in `/v1/info`, which is how the page
-picks its route. Turn one off to stop new grants for every client at once. A
-token already issued keeps working until it expires, up to five minutes later.
+picks its route. Turn off `workspace_direct_access` to stop new direct-access
+grants for every client at once; a token already issued keeps working until it
+expires, up to five minutes later. Turn off `workspace_api_server_access` to
+stop the server workspace API route. Only `workspace_direct_access` governs
+direct-access tokens.
 
 `omnigent[workspace-api]` adds `connectrpc` and its HTTP client, `pyqwest`.
 On Linux older than glibc 2.28, `pyqwest` has no prebuilt wheel and builds from

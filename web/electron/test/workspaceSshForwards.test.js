@@ -130,6 +130,25 @@ describe("workspace calls over SSH", { skip: !unix && "needs Unix sockets" }, ()
     );
   });
 
+  it("shares one connection and one forward among reads that start while it opens", async () => {
+    let openDone;
+    ssh = fakeSsh({
+      openGate: new Promise((resolve) => {
+        openDone = resolve;
+      }),
+    });
+    forwards = createWorkspaceSshForwards({ createSession: ssh.createSession });
+    routes.forwards = forwards;
+
+    const reads = [call(routes), call(routes)];
+    openDone();
+
+    const responses = await Promise.all(reads);
+    assert.ok(responses.every((response) => response.status === 200));
+    assert.equal(ssh.sessions.length, 1);
+    assert.equal(ssh.sessions[0].forwards.length, 1);
+  });
+
   it("forwards a restarted host's new socket", async () => {
     const restarted = "/tmp/omnigent-workspace-cd34/workspace.sock";
     await call(routes);

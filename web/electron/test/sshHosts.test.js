@@ -55,6 +55,20 @@ describe("createSshHostStore", () => {
     assert.equal(createSshHostStore(() => file).destination("https://a.example/", "h"), null);
   });
 
+  it("replaces a server's value that isn't a record instead of spreading it", () => {
+    fs.writeFileSync(file, JSON.stringify({ "https://a.example/": "abc" }));
+
+    createSshHostStore(() => file).record(
+      "https://a.example/",
+      "0123456789abcdef0123456789abcdef",
+      "my-box",
+    );
+
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), {
+      "https://a.example/": { "0123456789abcdef0123456789abcdef": "my-box" },
+    });
+  });
+
   it("reads nothing from a missing, corrupt or non-object file", () => {
     assert.equal(createSshHostStore(() => file).destination("https://a.example/", "h"), null);
     for (const contents of ["{", "[]"]) {
