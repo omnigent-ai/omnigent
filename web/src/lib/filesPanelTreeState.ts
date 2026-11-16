@@ -55,10 +55,8 @@ function sanitizeState(value: unknown): TreeState {
   return state;
 }
 
-function readPersistedStore(): Store {
-  if (typeof window === "undefined") return [];
+function parseStore(raw: string | null): Store {
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) return [];
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
@@ -73,6 +71,37 @@ function readPersistedStore(): Store {
   } catch {
     return [];
   }
+}
+
+function readPersistedStore(): Store {
+  if (typeof window === "undefined") return [];
+  try {
+    return parseStore(window.localStorage.getItem(STORAGE_KEY));
+  } catch {
+    return [];
+  }
+}
+
+function sessionSnapshot(store: Store, id: string): string | undefined {
+  const entry = store.find((item) => item.id === id);
+  return entry && JSON.stringify(entry.state);
+}
+
+// Another tab's newer save of a session replaces this page's unsaved copy of it.
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", (event) => {
+    if (unsavedSessions.size === 0 || event.key !== STORAGE_KEY) return;
+    try {
+      if (event.storageArea !== null && event.storageArea !== window.localStorage) return;
+    } catch {
+      return;
+    }
+    const before = parseStore(event.oldValue);
+    const after = parseStore(event.newValue);
+    for (const id of [...unsavedSessions.keys()]) {
+      if (sessionSnapshot(before, id) !== sessionSnapshot(after, id)) unsavedSessions.delete(id);
+    }
+  });
 }
 
 function readStore(): Store {

@@ -617,19 +617,23 @@ describe("FolderTree expansion across reloads", () => {
     vi.useFakeTimers();
     lazyChildren.set("guides", [file("guides/intro.md")]);
     renderTree({
-      files: [dir("guides")],
+      files: [dir("guides"), file("notes/todo.md")],
       conversationId: "conv_save_expansion",
       browseLocation: "docs",
     });
 
+    // The default-expanded folder is shown but not saved, so the defaults stay in charge.
+    expect(screen.getByText("todo.md")).toBeInTheDocument();
+    expect(readFilesTreeExpandedPaths("conv_save_expansion", "docs")).toBeUndefined();
+
     fireEvent.click(screen.getByRole("button", { name: "guides/" }));
-    expect(readFilesTreeExpandedPaths("conv_save_expansion", "docs")).toEqual(["guides"]);
+    expect(readFilesTreeExpandedPaths("conv_save_expansion", "docs")).toEqual(["notes", "guides"]);
     expect(readFilesTreeExpandedPaths("conv_save_expansion", "")).toBeUndefined();
 
     // Collapsing is saved once its exit animation removes the folder's rows.
     fireEvent.click(screen.getByRole("button", { name: "guides/" }));
     act(() => vi.runOnlyPendingTimers());
-    expect(readFilesTreeExpandedPaths("conv_save_expansion", "docs")).toEqual([]);
+    expect(readFilesTreeExpandedPaths("conv_save_expansion", "docs")).toEqual(["notes"]);
   });
 
   it("reopens a reloaded session with its saved folders expanded", async () => {

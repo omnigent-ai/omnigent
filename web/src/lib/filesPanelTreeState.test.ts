@@ -10,6 +10,21 @@ import {
 
 const STORAGE_KEY = "omnigent:files-panel-tree-state";
 
+/** Write the store the way another tab would, including the event this page receives. */
+function saveFromAnotherTab(store: unknown): void {
+  const oldValue = localStorage.getItem(STORAGE_KEY);
+  const newValue = JSON.stringify(store);
+  localStorage.setItem(STORAGE_KEY, newValue);
+  window.dispatchEvent(
+    new StorageEvent("storage", {
+      key: STORAGE_KEY,
+      oldValue,
+      newValue,
+      storageArea: localStorage,
+    }),
+  );
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   localStorage.clear();
@@ -132,12 +147,9 @@ describe("filesPanelTreeState", () => {
     expect(readFilesTreeExpandedPaths("conv_a", "")).toEqual(["src"]);
     expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
 
-    // Another tab saves its session meanwhile; this page still sees it.
+    // Another tab saves its own session meanwhile; this page sees it and keeps its own.
     setItem.mockRestore();
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify([{ id: "conv_c", state: { browseLocation: "/opt", expanded: [] } }]),
-    );
+    saveFromAnotherTab([{ id: "conv_c", state: { browseLocation: "/opt", expanded: [] } }]);
     expect(readFilesTreeBrowseLocation("conv_c")).toBe("/opt");
     expect(readFilesTreeBrowseLocation("conv_a")).toBe("/srv");
 
@@ -146,6 +158,20 @@ describe("filesPanelTreeState", () => {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY)!) as { id: string }[];
     expect(saved.map((entry) => entry.id)).toEqual(["conv_c", "conv_a", "conv_b"]);
     expect(readFilesTreeBrowseLocation("conv_a")).toBe("/srv");
+  });
+
+  it("lets another tab's newer save of a session replace this page's unsaved copy", () => {
+    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("quota exceeded");
+    });
+    writeFilesTreeBrowseLocation("conv_a", "/srv");
+    setItem.mockRestore();
+
+    saveFromAnotherTab([{ id: "conv_a", state: { browseLocation: "/opt", expanded: [] } }]);
+    expect(readFilesTreeBrowseLocation("conv_a")).toBe("/opt");
+
+    writeFilesTreeExpandedPaths("conv_b", "", ["docs"]);
+    expect(readFilesTreeBrowseLocation("conv_a")).toBe("/opt");
   });
 
   it("treats malformed storage as empty and recovers on the next write", () => {

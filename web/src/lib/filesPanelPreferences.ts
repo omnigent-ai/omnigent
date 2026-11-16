@@ -86,7 +86,7 @@ function subscribeUnsavedShowHidden(listener: () => void): () => void {
   return () => unsavedShowHiddenListeners.delete(listener);
 }
 
-// Another window's choice, or storage accepting writes again, replaces this page's unsaved one.
+// A change to this key from another window replaces this page's unsaved choice.
 if (typeof window !== "undefined") {
   window.addEventListener("storage", (event) => {
     if (unsavedShowHidden === undefined) return;
