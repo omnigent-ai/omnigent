@@ -237,6 +237,8 @@ async def test_admin_opt_in_gates_bookkeeping_and_continuation(recovery: Any, re
         service.host_store.get_host.return_value = None
     else:
         recovery.store.supports_session_recovery = False
+    if reason != "host_opt_out":
+        del recovery.connection.hello
     recovery.store.replace_session_recovery = Mock(wraps=recovery.store.replace_session_recovery)
     assert not service.enabled(recovery.conv.host_id)
     service.record_interruption(recovery.conv)
@@ -354,6 +356,7 @@ async def test_retries_stop_after_three_failures_across_service_restarts(recover
     assert recovery.publish_status.call_args.args[2].message == (
         "Automatic resume failed. Please send a new message to continue."
     )
+    assert recovery.publish_status.call_args.kwargs["failure_origin"] == "host_session_recovery"
     await service.recover(recovery.connection, [])
     assert recovery.launch.await_count == 3
     recovery.initializer.initialize.assert_not_awaited()

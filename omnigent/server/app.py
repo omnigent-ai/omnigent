@@ -4640,8 +4640,8 @@ def create_app(
             try:
                 if (
                     host_session_recoverer is not None
-                    and host_conn.hello.recover_interrupted_sessions
                     and await asyncio.to_thread(host_session_recoverer.enabled, host_id)
+                    and host_conn.hello.recover_interrupted_sessions
                 ):
                     continue
                 fresh = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
