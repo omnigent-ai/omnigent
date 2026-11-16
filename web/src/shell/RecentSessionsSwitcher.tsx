@@ -9,6 +9,7 @@ import {
   setBrowserRecentSessionSwitchSupported,
 } from "@/lib/nativeBridge";
 import { useNavigate } from "@/lib/routing";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 
 import { conversationDisplayLabel, getConversationAgentType } from "./sidebarNav";
 
@@ -101,15 +102,7 @@ export function RecentSessionsSwitcher({
         cancel();
         return;
       }
-      if (
-        event.key !== "Tab" ||
-        !event.ctrlKey ||
-        event.altKey ||
-        event.metaKey ||
-        event.getModifierState("AltGraph")
-      ) {
-        return;
-      }
+      if (!matchesShortcut(event, "sessions.recent")) return;
 
       const direction = event.shiftKey ? -1 : 1;
       if (!openRef.current) {
