@@ -218,9 +218,9 @@ also ask for a saved workflow by name in chat ("run my flaky-test triage
 workflow").
 
 To run a saved workflow on a schedule or a trigger, pick it in New
-automation's **Workflow (optional)** field. Each run follows the workflow
-without a plan review, and the automation's **Additional instructions**
-customize it. No one is watching the run, so nothing in it waits for you.
+automation's **Workflow (optional)** field. Each run follows the workflow as
+saved, without a plan review. No one is watching the run, so nothing in it
+waits for you.
 The agent first looks up missing inputs, chooses reversible defaults and tries
 bounded recovery within your existing authorization. It records its choices
 in the journal. Missing input or approval justifies a failure only with the

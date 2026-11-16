@@ -7008,28 +7008,29 @@ describe("CreateScheduledTaskDialog workflow", () => {
     fireEvent.click(screen.getByTestId("composer-saved-workflow"));
   }
 
-  it("runs a saved workflow, with the instructions as each run's details", async () => {
+  it("runs a saved workflow as saved, without the automation's instructions", async () => {
     renderWithWorkflows(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
     expect(screen.getByTestId("task-workflow-trigger")).toHaveTextContent("No workflow");
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), {
+      target: { value: "Summarize the day." },
+    });
     chooseWorkflow();
 
     expect(screen.getByTestId("task-workflow-trigger")).toHaveTextContent("Triage flaky tests");
     // Once chosen, the field shows the workflow's name only.
     expect(screen.queryByText(/Give it: the test suite/)).toBeNull();
-    expect(screen.getByLabelText("Additional instructions")).toBe(
-      screen.getByTestId("task-prompt-input"),
+    // Text typed before choosing the workflow is hidden and not sent to its runs.
+    expect(screen.queryByTestId("task-prompt-input")).toBeNull();
+    expect(screen.getByTestId("task-workflow-note")).toHaveTextContent(
+      "Each run follows this workflow as saved.",
     );
-    // The workflow alone is enough; details are optional.
     const submit = screen.getByTestId("create-scheduled-task-submit");
     await waitFor(() => expect(submit).toBeEnabled());
-    fireEvent.change(screen.getByTestId("task-prompt-input"), {
-      target: { value: "The upload tests" },
-    });
     fireEvent.click(submit);
 
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
-    expect(mutateAsync.mock.calls[0][0].prompt).toBe(run("The upload tests"));
+    expect(mutateAsync.mock.calls[0][0].prompt).toBe(run(""));
   });
 
   it("keeps the workflow it was opened from: the field has no menu, and runs follow it", async () => {
@@ -7046,9 +7047,7 @@ describe("CreateScheduledTaskDialog workflow", () => {
     expect(field).toBeDisabled();
     fireEvent.pointerDown(field, { button: 0 });
     expect(screen.queryByTestId("composer-workflow-picker")).toBeNull();
-    expect(screen.getByLabelText("Additional instructions")).toBe(
-      screen.getByTestId("task-prompt-input"),
-    );
+    expect(screen.queryByTestId("task-prompt-input")).toBeNull();
 
     const submit = screen.getByTestId("create-scheduled-task-submit");
     await waitFor(() => expect(submit).toBeEnabled());
@@ -7060,7 +7059,7 @@ describe("CreateScheduledTaskDialog workflow", () => {
     });
   });
 
-  it("opens a workflow automation with its workflow chosen and its details", () => {
+  it("keeps instructions an automation already saved with its workflow editable", async () => {
     renderWithWorkflows(
       <CreateScheduledTaskDialog
         open
@@ -7069,7 +7068,14 @@ describe("CreateScheduledTaskDialog workflow", () => {
       />,
     );
     expect(screen.getByTestId("task-workflow-trigger")).toHaveTextContent("Triage flaky tests");
-    expect(screen.getByTestId("task-prompt-input")).toHaveValue("The upload tests");
+    const instructions = screen.getByLabelText("Additional instructions (optional)");
+    expect(instructions).toHaveValue("The upload tests");
+    expect(screen.queryByTestId("task-workflow-note")).toBeNull();
+    fireEvent.change(instructions, { target: { value: "The download tests" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.prompt).toBe(run("The download tests"));
   });
 
   it.each([false, true])(
@@ -7092,21 +7098,23 @@ describe("CreateScheduledTaskDialog workflow", () => {
           },
         },
       );
+      const instructionsOf = (text: string) =>
+        headersSupported
+          ? decodeTriggerPrompt(text)?.instructions
+          : splitTriggerPrompt(text).userPrompt;
       fireEvent.change(screen.getByTestId("task-trigger-scope"), { target: { value: "acme/app" } });
       fireEvent.mouseDown(screen.getByRole("tab", { name: "Instructions" }), { button: 0 });
+      expect(screen.getByTestId("task-trigger-instructions-required")).toBeInTheDocument();
       chooseWorkflow();
-      expect(screen.getByLabelText("Additional instructions")).toBe(
-        screen.getByTestId("task-trigger-instructions"),
-      );
-      fireEvent.change(screen.getByTestId("task-trigger-instructions"), {
-        target: { value: "Only bugs" },
-      });
+      // Each session follows the workflow as saved, so there are no instructions to require.
+      expect(screen.queryByTestId("task-trigger-instructions-required")).toBeNull();
+      expect(screen.queryByTestId("task-trigger-instructions")).toBeNull();
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
 
       await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
       const prompt = mutateAsync.mock.calls[0][0].prompt as string;
       expect(prompt).toContain("repo:acme/app");
-      expect(prompt).toContain(run("Only bugs"));
+      expect(instructionsOf(prompt)).toBe(run(""));
       expect(hasTriggerHeader(prompt)).toBe(headersSupported);
 
       const props = {
@@ -7119,17 +7127,13 @@ describe("CreateScheduledTaskDialog workflow", () => {
         fireEvent.mouseDown(screen.getByRole("tab", { name: "Instructions" }), { button: 0 });
       }
       expect(screen.getByTestId("task-workflow-trigger")).toHaveTextContent(WORKFLOW.name);
-      const instructions = screen.getByLabelText("Additional instructions");
-      expect(instructions).toHaveValue("Only bugs");
-      fireEvent.change(instructions, { target: { value: "Only upload bugs" } });
+      expect(screen.queryByLabelText("Additional instructions (optional)")).toBeNull();
+      fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Bug triage" } });
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
 
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
       const updated = updateMutateAsync.mock.calls[0][0].input.prompt as string;
-      const updatedInstructions = headersSupported
-        ? decodeTriggerPrompt(updated)?.instructions
-        : splitTriggerPrompt(updated).userPrompt;
-      expect(updatedInstructions).toBe(run("Only upload bugs"));
+      expect(instructionsOf(updated)).toBe(run(""));
       expect(updated).toContain("repo:acme/app");
     },
   );

@@ -58,7 +58,11 @@ import {
   type TriggerMcpService,
 } from "@/components/scheduled/TriggerTemplateFields";
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
-import { WorkflowField } from "@/components/scheduled/WorkflowField";
+import {
+  WORKFLOW_DETAILS_LABEL,
+  WORKFLOW_DETAILS_PLACEHOLDER,
+  WorkflowField,
+} from "@/components/scheduled/WorkflowField";
 import { type SavedWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { parseSavedWorkflowMessage, savedWorkflowMessage } from "@/lib/workflow";
@@ -335,8 +339,10 @@ export function CreateScheduledTaskDialog({
 
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
-  // A saved workflow for each run to follow; the instructions then hold the run's details.
+  // A saved workflow for each run to follow as saved, so the form hides the instructions.
   const [workflowChoice, setWorkflowChoice] = useState<SavedWorkflow | null>(null);
+  // An automation that already saved instructions with its workflow keeps them editable.
+  const [keepsWorkflowDetails, setKeepsWorkflowDetails] = useState(false);
   const savedWorkflows = useSavedWorkflows({ enabled: open });
   // The rendered template text around the instructions of an older trigger. Never shown.
   const [systemPrompt, setSystemPrompt] = useState<string | null>(null);
@@ -644,6 +650,7 @@ export function CreateScheduledTaskDialog({
               (savedRun && { id: savedRun.id, name: savedRun.name, description: "" }))
           : null,
       );
+      setKeepsWorkflowDetails(!!savedRun?.details);
       setPrompt(editingTriggerConfig ? "" : (savedRun?.details ?? parts.userPrompt));
       setSystemPrompt(parts.systemPrompt);
       setTimezone(editingTask?.timezone ?? localTimezone());
@@ -1072,8 +1079,17 @@ export function CreateScheduledTaskDialog({
     validateSchedule(schedule, { allowPastEnd, sessionMode, subhourSupported, executionTarget }) !==
       null;
   const workflowPrefix = skillInvocationPrefix(harnessSettings.harness);
+  // With a workflow, text typed before choosing it stays hidden and out of each run.
+  const showsInstructions = workflowChoice === null || keepsWorkflowDetails;
   const withWorkflow = (text: string) =>
-    workflowChoice ? savedWorkflowMessage(workflowPrefix, workflowChoice, text, false) : text;
+    workflowChoice
+      ? savedWorkflowMessage(
+          workflowPrefix,
+          workflowChoice,
+          keepsWorkflowDetails ? text : "",
+          false,
+        )
+      : text;
   // The saved list's copy, once loaded, has the workflow's current name.
   const workflowShown =
     workflowChoice &&
@@ -1090,6 +1106,7 @@ export function CreateScheduledTaskDialog({
         onChange={setWorkflowChoice}
         onOpenChange={handleSelectOpenChange}
         locked={lockedWorkflow !== null}
+        runsAsSaved={!showsInstructions}
       />
     ) : null;
   const promptTriggerFields = {
@@ -1922,42 +1939,56 @@ export function CreateScheduledTaskDialog({
                         taskSessionMode={triggerTaskSessionMode}
                         workflowField={workflowField}
                         instructionsAreDetails={workflowChoice !== null}
+                        hideInstructions={!showsInstructions}
                         mcpService={triggerMcpNote}
                         instructionsMaxChars={messageBudget.instructionsMaxChars}
                         instructionsUpgradeHint={messageBudget.upgradeHint}
                       />
                     ) : (
                       <div ref={promptFieldsRef} className="flex flex-col gap-1.5">
-                        {workflowField && <div className="mb-3.5">{workflowField}</div>}
-                        <Textarea
-                          id="task-prompt"
-                          aria-label={
-                            startsFromSession || workflowChoice
-                              ? "Additional instructions"
-                              : "Instructions"
-                          }
-                          value={prompt}
-                          rows={5}
-                          placeholder={
-                            workflowChoice
-                              ? "Optional. Instructions to customize the workflow."
-                              : startsFromSession
-                                ? "Optional. For example: Use this week's data."
-                                : "What should the agent do each run?"
-                          }
-                          data-testid="task-prompt-input"
-                          componentId="tasks.scheduled.prompt"
-                          className="min-h-40 resize-y rounded-xl text-ui focus-visible:ring-0"
-                          onChange={(e) => setPrompt(e.target.value)}
-                        />
-                        {systemPrompt !== null &&
-                          splitTriggerPrompt(effectivePrompt).systemPrompt === null && (
-                            <p role="status" className="text-sm text-warning">
-                              {prompt.trim() === ""
-                                ? "Instructions can't be empty."
-                                : "These edits change the template structure. After saving, the full text will appear as one prompt."}
-                            </p>
-                          )}
+                        {workflowField && (
+                          <div className={showsInstructions ? "mb-3.5" : undefined}>
+                            {workflowField}
+                          </div>
+                        )}
+                        {showsInstructions && (
+                          <>
+                            {workflowChoice && (
+                              <Label htmlFor="task-prompt">{WORKFLOW_DETAILS_LABEL}</Label>
+                            )}
+                            <Textarea
+                              id="task-prompt"
+                              aria-label={
+                                workflowChoice
+                                  ? undefined
+                                  : startsFromSession
+                                    ? "Additional instructions"
+                                    : "Instructions"
+                              }
+                              value={prompt}
+                              rows={5}
+                              placeholder={
+                                workflowChoice
+                                  ? WORKFLOW_DETAILS_PLACEHOLDER
+                                  : startsFromSession
+                                    ? "Optional. For example: Use this week's data."
+                                    : "What should the agent do each run?"
+                              }
+                              data-testid="task-prompt-input"
+                              componentId="tasks.scheduled.prompt"
+                              className="min-h-40 resize-y rounded-xl text-ui focus-visible:ring-0"
+                              onChange={(e) => setPrompt(e.target.value)}
+                            />
+                            {systemPrompt !== null &&
+                              splitTriggerPrompt(effectivePrompt).systemPrompt === null && (
+                                <p role="status" className="text-sm text-warning">
+                                  {prompt.trim() === ""
+                                    ? "Instructions can't be empty."
+                                    : "These edits change the template structure. After saving, the full text will appear as one prompt."}
+                                </p>
+                              )}
+                          </>
+                        )}
                       </div>
                     )}
                   </div>
