@@ -165,18 +165,24 @@ duplicating external actions. An unrecoverable step fails with a reason while
 independent work continues. A worker's claimed blocker must meet the same
 evidence requirement before the coordinator accepts it.
 
-A workflow can run another workflow as one of its steps, such as getting each
-PR in a stack ready to merge. The agent starts the other workflow in its own
-session on the same host, with the workflow skill running. For a saved
-workflow, it passes `workflow_id` to `sys_session_create`, so that session
-starts with the workflow's plan and appears in the workflow's runs. That session
-reports back with `sys_session_message` when its plan finishes, and the agent
-also checks on it periodically with a background timer of its own. Workers get
-the relevant inputs, decisions, authorization and limits, and report blockers
-to their coordinating session. That session resolves them or consolidates the
-remaining human question instead of sending the user to each worker. With the
-`sibling_sessions` feature on, these sessions are grouped with the session that
-started them.
+The agent hands off steps to nested agents rather than its harness's
+sub-agents: steps that run at the same time, long work, and steps that are
+workflows of their own, such as getting each PR in a stack ready to merge.
+Each nested agent is a session of its own, named for its step, where the step
+runs as its workflow and you can follow and message it. The agent chooses
+where each one runs for the step: on its own host and workspace, in a new
+worktree on a host, or in a new managed sandbox, falling back when the server
+doesn't offer one. It also chooses the nested agent's harness, model and
+reasoning effort for the step's complexity, starting from its own.
+For a saved workflow, the agent passes `workflow_id` to `sys_session_create`,
+so that session starts with the workflow's plan and appears in the workflow's
+runs. That session reports back with `sys_session_message` when its plan
+finishes, and the agent also checks on it periodically with a background timer
+of its own. Workers get the relevant inputs, decisions, authorization and
+limits, and report blockers to their coordinating session. That session
+resolves them or consolidates the remaining human question instead of sending
+the user to each worker. With the `sibling_sessions` feature on, these sessions
+are grouped with the session that started them.
 
 ## Saving and reusing a workflow
 
