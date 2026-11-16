@@ -277,6 +277,7 @@ class ChatSessionContract:
     skill_requests: list[dict[str, Any]] = field(default_factory=list)
     session_patches: list[dict[str, Any]] = field(default_factory=list)
     sidebar_sessions: list[dict[str, Any]] = field(default_factory=list)
+    features: dict[str, bool] = field(default_factory=dict)
     _items: list[dict[str, Any]] = field(default_factory=list)
     _session_updates: dict[str, Any] = field(default_factory=dict)
     _health_updates: dict[str, Any] = field(default_factory=dict)
@@ -452,7 +453,7 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
 
     contract.json(
         "/v1/info",
-        {
+        lambda _request: {
             "accounts_enabled": False,
             "single_user": True,
             "login_url": None,
@@ -468,7 +469,7 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
             "server_version": "browser-chat-contract",
             "smart_routing_enabled": False,
             "smart_routing_sources": {"external": False, "oss": False},
-            "features": {},
+            "features": dict(handle.features),
             "harness_install_enabled": False,
             "installable_harnesses": [],
             "dictation_available": False,

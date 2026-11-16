@@ -1109,6 +1109,112 @@
         "title": "CancelledEvent",
         "type": "object"
       },
+      "CellRunRequest": {
+        "additionalProperties": false,
+        "description": "Body of `POST /v1/sessions/{session_id}/cell-runs`.",
+        "properties": {
+          "code": {
+            "description": "Cell source, up to 64 KiB.",
+            "maxLength": 65536,
+            "minLength": 1,
+            "title": "Code",
+            "type": "string"
+          },
+          "language": {
+            "const": "python",
+            "description": "Cell language; only Python is supported.",
+            "title": "Language",
+            "type": "string"
+          },
+          "timeout_s": {
+            "default": 60,
+            "description": "Seconds before the run is stopped.",
+            "format": "int64",
+            "maximum": 300.0,
+            "minimum": 1.0,
+            "title": "Timeout S",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "language",
+          "code"
+        ],
+        "title": "CellRunRequest",
+        "type": "object"
+      },
+      "CellRunResponse": {
+        "description": "Outcome of one cell run.",
+        "properties": {
+          "duration_ms": {
+            "format": "int64",
+            "title": "Duration Ms",
+            "type": "integer"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why a failed run produced no result.",
+            "title": "Error"
+          },
+          "exit_code": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Interpreter exit code, when it exited.",
+            "title": "Exit Code"
+          },
+          "status": {
+            "description": "`completed` when the interpreter exited (any exit code), `timed_out` when the timeout stopped it, `failed` when it could not run or its result was withheld.",
+            "enum": [
+              "completed",
+              "timed_out",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "stderr": {
+            "title": "Stderr",
+            "type": "string"
+          },
+          "stderr_truncated": {
+            "title": "Stderr Truncated",
+            "type": "boolean"
+          },
+          "stdout": {
+            "title": "Stdout",
+            "type": "string"
+          },
+          "stdout_truncated": {
+            "title": "Stdout Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "status",
+          "exit_code",
+          "stdout",
+          "stderr",
+          "stdout_truncated",
+          "stderr_truncated",
+          "duration_ms"
+        ],
+        "title": "CellRunResponse",
+        "type": "object"
+      },
       "ChartBlock": {
         "additionalProperties": false,
         "description": "A chart drawn on the card; see `InboxChartV1`.",
@@ -22066,6 +22172,59 @@
           }
         },
         "summary": "Automatically Rename Session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/cell-runs": {
+      "post": {
+        "description": "Run one Python cell in the session's workspace and return its output.\n\nRequires edit access and the `code_cell_runs` feature. The run is the\nsession agent's `sys_os_shell` tool started by the caller: the\nagent must have that tool, its policies apply, and an approval they\nask for is shown in the session and awaited before anything runs.",
+        "operationId": "run_session_cell_v1_sessions__session_id__cell_runs_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CellRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CellRunResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run Session Cell",
         "tags": [
           "sessions"
         ]

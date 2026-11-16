@@ -28,6 +28,9 @@ or `seed_transcript(...)` to generate Markdown/code turns. Use
 including setting `host_id=None` and `workspace=None`. Use `set_health(...)` to
 override per-session liveness fields such as `runner_online`.
 
+Set `features` (for example `{"code_cell_runs": True}`) before navigation to
+advertise release features in `/v1/info`.
+
 Use `seed_sidebar_sessions(titles)` before navigation to list more idle sessions
 in the sidebar after this one.
 

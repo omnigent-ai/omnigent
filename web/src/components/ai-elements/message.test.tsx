@@ -15,6 +15,8 @@ import type { AnyBlock } from "@/lib/blocks";
 import { setEmbedRoot } from "@/lib/host";
 import { useChatStore } from "@/store/chatStore";
 import { MermaidPreview } from "@/shell/MermaidPreview";
+import type { CellRunResult } from "@/lib/cellRunsApi";
+import { CellRunContext } from "@/shell/CellRunContext";
 import { ShellCommandContext } from "@/shell/ShellCommandContext";
 import { Reasoning, ReasoningContent } from "./reasoning";
 import {
@@ -718,6 +720,130 @@ describe("MessageResponse shell drafts", () => {
       fireEvent.click(button);
     }
     expect(open).not.toHaveBeenCalled();
+  });
+});
+
+describe("MessageResponse cell runs", () => {
+  const result = (overrides: Partial<CellRunResult> = {}): CellRunResult => ({
+    status: "completed",
+    exitCode: 0,
+    stdout: "4\n",
+    stderr: "",
+    stdoutTruncated: false,
+    stderrTruncated: false,
+    durationMs: 1200,
+    error: null,
+    ...overrides,
+  });
+  const response = (
+    run: (code: string) => Promise<CellRunResult>,
+    source: string,
+    allow = true,
+    // Runs are shared per session and source, so cases use their own session.
+    sessionId = "conv_cells",
+  ) => (
+    <CellRunContext.Provider value={{ sessionId, run }}>
+      <MessageResponse allowCellRuns={allow}>{source}</MessageResponse>
+    </CellRunContext.Provider>
+  );
+
+  it("runs a Python block only on click and shows its output under the block", async () => {
+    let finish: (value: CellRunResult) => void = () => {};
+    const run = vi.fn(
+      () =>
+        new Promise<CellRunResult>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const code = "x = 2\nprint(x + 2)\n";
+    const { rerender } = render(response(run, `\`\`\`python\n${code}\`\`\``, false));
+    expect(screen.queryByRole("button", { name: "Run cell" })).toBeNull();
+
+    rerender(response(run, `\`\`\`python\n${code}\`\`\``));
+    const button = await screen.findByRole("button", { name: "Run cell" });
+    expect(run).not.toHaveBeenCalled();
+    expect(screen.queryByRole("region", { name: "Cell output" })).toBeNull();
+
+    fireEvent.click(button);
+    expect(run).toHaveBeenCalledExactlyOnceWith(code);
+    expect(await screen.findByRole("status")).toHaveTextContent("Running…");
+    expect(button).toBeDisabled();
+    fireEvent.click(button);
+    expect(run).toHaveBeenCalledTimes(1);
+
+    // A remounted block (theme change, virtualization) keeps the in-flight run.
+    cleanup();
+    render(response(run, `\`\`\`python\n${code}\`\`\``));
+    expect(await screen.findByRole("status")).toHaveTextContent("Running…");
+    fireEvent.click(screen.getByRole("button", { name: "Run cell" }));
+    expect(run).toHaveBeenCalledTimes(1);
+
+    finish(result({ stderr: "warning\n" }));
+    const output = await screen.findByRole("region", { name: "Cell output" });
+    await waitFor(() =>
+      expect(within(output).getByRole("status")).toHaveTextContent("Finished in 1.2 s"),
+    );
+    expect(within(output).getByLabelText("Standard output")).toHaveTextContent("4");
+    expect(within(output).getByLabelText("Standard error")).toHaveTextContent("warning");
+
+    fireEvent.click(within(output).getByRole("button", { name: "Clear output" }));
+    expect(screen.queryByRole("region", { name: "Cell output" })).toBeNull();
+  });
+
+  it("reports nonzero exits, timeouts, refusals and truncation", async () => {
+    for (const [outcome, summary, detail] of [
+      [
+        result({ exitCode: 1, stdout: "", stderr: "Traceback" }),
+        "Exited with code 1 after 1.2 s",
+        "Traceback",
+      ],
+      [
+        result({ status: "timed_out", exitCode: null, stdout: "" }),
+        "Timed out after 1.2 s",
+        "No output",
+      ],
+      [
+        result({ status: "failed", exitCode: null, stdout: "", error: "not enabled" }),
+        "Couldn't run the cell",
+        "not enabled",
+      ],
+      [result({ stdoutTruncated: true }), "Finished in 1.2 s", "Output was cut off."],
+      [
+        new Error("Denied by policy: no python"),
+        "Couldn't run the cell",
+        "Denied by policy: no python",
+      ],
+    ] as const) {
+      cleanup();
+      const sessionId = `conv_cells_${summary}_${detail}`;
+      const run = vi.fn(() =>
+        outcome instanceof Error ? Promise.reject(outcome) : Promise.resolve(outcome),
+      );
+      render(response(run, "```py\nprint(1)\n```", true, sessionId));
+      fireEvent.click(await screen.findByRole("button", { name: "Run cell" }));
+      const output = await screen.findByRole("region", { name: "Cell output" });
+      await waitFor(() => expect(within(output).getByRole("status")).toHaveTextContent(summary));
+      expect(output).toHaveTextContent(detail);
+    }
+  });
+
+  it("offers no Run action for other languages, open fences or streaming text", async () => {
+    const run = vi.fn(() => Promise.resolve(result()));
+    const { rerender } = render(response(run, "```js\nconsole.log(1)\n```", true, "conv_js"));
+    await screen.findByRole("button", { name: "Copy Code" });
+    expect(screen.queryByRole("button", { name: "Run cell" })).toBeNull();
+
+    rerender(
+      <CellRunContext.Provider value={{ sessionId: "conv_js", run }}>
+        <MessageResponse allowCellRuns isStreaming mode="static">
+          {"```python\nprint(1)"}
+        </MessageResponse>
+      </CellRunContext.Provider>,
+    );
+    const button = await screen.findByRole("button", { name: "Run cell" });
+    expect(button).toBeDisabled();
+    fireEvent.click(button);
+    expect(run).not.toHaveBeenCalled();
   });
 });
 

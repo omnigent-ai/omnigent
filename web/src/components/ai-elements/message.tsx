@@ -7,11 +7,12 @@ import { copyText } from "@/lib/clipboard";
 import { getEmbedRoot } from "@/lib/host";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { cn } from "@/lib/utils";
+import { CellRunContext } from "@/shell/CellRunContext";
 import { ShellCommandContext } from "@/shell/ShellCommandContext";
 import type { Comment } from "@/hooks/useComments";
 import { LOCAL_REVIEW_COMMENT_LANGUAGE, parseLocalReviewComment } from "@/lib/localReviewComments";
 import type { UIMessage } from "ai";
-import { ChevronLeftIcon, ChevronRightIcon, PlayIcon, XIcon } from "lucide-react";
+import { ChevronLeftIcon, ChevronRightIcon, LoaderCircleIcon, PlayIcon, XIcon } from "lucide-react";
 import type { ComponentProps, HTMLAttributes, ReactElement, ReactNode } from "react";
 import {
   cloneElement,
@@ -40,6 +41,7 @@ import {
   type StreamdownProps,
 } from "streamdown";
 
+import { CodeCellOutput, isRunnableCellLanguage, useCodeCellRun } from "./CodeCellRun";
 import { MarkdownErrorBoundary } from "./MarkdownErrorBoundary";
 import { mermaidOptionsForTheme } from "./MermaidError";
 import { FullscreenIcon, isMermaidPre, MermaidBlock, MERMAID_NO_FULLSCREEN } from "./MermaidBlock";
@@ -336,6 +338,8 @@ export type MessageResponseProps = Omit<StreamdownProps, "rehypePlugins" | "merm
   allowWorkspaceImages?: boolean;
   /** Allow shell drafts in assistant chat when a shell action is available. */
   allowShellCommands?: boolean;
+  /** Allow running Python blocks in assistant chat when cell runs are available. */
+  allowCellRuns?: boolean;
   /** The text is still growing, so its last code fence may be open. */
   isStreaming?: boolean;
   /** Render sent review snapshots as cards; nested comment bodies remain ordinary Markdown. */
@@ -655,6 +659,9 @@ export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
     ""
   ).toLowerCase();
   const showShellAction = shellCommands && /^(bash|sh|zsh|fish|shell)$/.test(language);
+  const cellRuns = useContext(CellRunContext);
+  const showRunAction = cellRuns !== null && isRunnableCellLanguage(language);
+  const cellRun = useCodeCellRun(showRunAction ? cellRuns : null, code);
   // Soft-wrap long lines by default so users don't have to scroll horizontally
   // to read code blocks. The toggle restores Streamdown's native
   // horizontal-scroll view for when column alignment matters.
@@ -683,10 +690,11 @@ export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
       className={cn(
         "chat-code-block relative",
         wrap && "chat-code-wrap",
-        showShellAction && "[&_[data-streamdown=code-block-header]]:pr-32",
+        (showShellAction || showRunAction) && "[&_[data-streamdown=code-block-header]]:pr-32",
       )}
     >
       {body}
+      {showRunAction && <CodeCellOutput onDismiss={cellRun.dismiss} state={cellRun.state} />}
       {/* Match Streamdown's action-pill height and reserve its rightmost slot
           for download. All controls stay anchored to the header. */}
       <div className="absolute top-2 right-12 z-10 -mr-1.5 flex items-center gap-0.5 border-y border-transparent py-1">
@@ -703,6 +711,24 @@ export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
             variant="ghost"
           >
             <PlayIcon aria-hidden="true" />
+          </Button>
+        )}
+        {showRunAction && (
+          <Button
+            aria-label="Run cell"
+            className={CODE_BLOCK_OVERLAY_BUTTON_CLASS}
+            disabled={cellRun.state.phase === "running" || isStreaming || fenceOpen || !code.trim()}
+            onClick={cellRun.start}
+            size="icon-sm"
+            title="Run cell in the session workspace"
+            type="button"
+            variant="ghost"
+          >
+            {cellRun.state.phase === "running" ? (
+              <LoaderCircleIcon aria-hidden="true" className="animate-spin" />
+            ) : (
+              <PlayIcon aria-hidden="true" />
+            )}
           </Button>
         )}
         <ChatCodeBlockCopyButton getCode={getCode} />
@@ -762,11 +788,14 @@ export const MessageResponse = memo(
     allowGitHubAttachmentImages = false,
     allowWorkspaceImages = false,
     allowShellCommands = false,
+    allowCellRuns = false,
     isStreaming = false,
     renderLocalReviewComment,
     ...props
   }: MessageResponseProps) => {
     const themeMode = useResolvedThemeMode();
+    const cellRuns = useContext(CellRunContext);
+    const cellRunAction = allowCellRuns ? cellRuns : null;
     const shellCommands = useContext(ShellCommandContext);
     const shellAction = useMemo(
       () =>
@@ -794,31 +823,33 @@ export const MessageResponse = memo(
     return (
       <MarkdownErrorBoundary source={props.children}>
         <ShellCommandContext.Provider value={shellAction}>
-          <LocalReviewCommentRendererContext.Provider value={renderLocalReviewComment}>
-            <StreamingTextContext.Provider value={isStreaming}>
-              {/* Streamdown is memoized and its comparator ignores the mermaid prop,
+          <CellRunContext.Provider value={cellRunAction}>
+            <LocalReviewCommentRendererContext.Provider value={renderLocalReviewComment}>
+              <StreamingTextContext.Provider value={isStreaming}>
+                {/* Streamdown is memoized and its comparator ignores the mermaid prop,
               so remount on theme change to recolor already-rendered diagrams. */}
-              <Streamdown
-                key={themeMode}
-                // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
-                className={cn(
-                  "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
-                  className,
-                )}
-                plugins={STREAMDOWN_PLUGINS}
-                // Let links open on a plain click (and cmd/ctrl-click in a new tab)
-                // instead of Streamdown's default "Open external link?" modal.
-                linkSafety={CHAT_LINK_SAFETY}
-                {...props}
-                BlockComponent={StreamingTextBlock}
-                components={messageComponents}
-                controls={messageControls}
-                mermaid={mermaidOptions}
-                // Block remote image fetches that can exfiltrate data through URLs.
-                rehypePlugins={rehypePlugins}
-              />
-            </StreamingTextContext.Provider>
-          </LocalReviewCommentRendererContext.Provider>
+                <Streamdown
+                  key={themeMode}
+                  // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
+                  className={cn(
+                    "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
+                    className,
+                  )}
+                  plugins={STREAMDOWN_PLUGINS}
+                  // Let links open on a plain click (and cmd/ctrl-click in a new tab)
+                  // instead of Streamdown's default "Open external link?" modal.
+                  linkSafety={CHAT_LINK_SAFETY}
+                  {...props}
+                  BlockComponent={StreamingTextBlock}
+                  components={messageComponents}
+                  controls={messageControls}
+                  mermaid={mermaidOptions}
+                  // Block remote image fetches that can exfiltrate data through URLs.
+                  rehypePlugins={rehypePlugins}
+                />
+              </StreamingTextContext.Provider>
+            </LocalReviewCommentRendererContext.Provider>
+          </CellRunContext.Provider>
         </ShellCommandContext.Provider>
       </MarkdownErrorBoundary>
     );

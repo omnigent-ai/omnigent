@@ -15,6 +15,7 @@ import {
 } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
+import { CellRunContext } from "./CellRunContext";
 import { ShellCommandContext, ShellCommandDraftContext } from "./ShellCommandContext";
 import {
   Outlet,
@@ -48,7 +49,8 @@ import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
-import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
+import { derivePermissionLevel, isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
+import { runSessionCell } from "@/lib/cellRunsApi";
 import {
   closeDesktopWindow,
   confirmDesktopQuit,
@@ -2482,6 +2484,17 @@ function AppShellImpl() {
     openTerminalTab,
   ]);
 
+  // Grid panes show several sessions, so a run bound to this one stays off there.
+  const cellRunsEnabled = isFeatureEnabled(serverInfo, "code_cell_runs");
+  const cellRunAction = useMemo(() => {
+    if (!cellRunsEnabled || !serverConversationId || gridRoute) return null;
+    if (!isEditorLevel(permissionLevel)) return null;
+    return {
+      sessionId: serverConversationId,
+      run: (code: string) => runSessionCell(serverConversationId, code),
+    };
+  }, [cellRunsEnabled, serverConversationId, gridRoute, permissionLevel]);
+
   // Desktop Close (⌘W / Ctrl+W), once the workspace rail has passed on it:
   // leave the open session or page for the new-session page; from the
   // new-session page itself, confirm, then close the window.
@@ -3237,7 +3250,9 @@ function AppShellImpl() {
                   <SubagentPanelOpenerContext.Provider value={openSubagentInPanel}>
                     <RenderErrorBoundary name="this page" resetKey={location.pathname}>
                       <ShellCommandContext.Provider value={shellCommandAction}>
-                        <Outlet />
+                        <CellRunContext.Provider value={cellRunAction}>
+                          <Outlet />
+                        </CellRunContext.Provider>
                       </ShellCommandContext.Provider>
                     </RenderErrorBoundary>
                   </SubagentPanelOpenerContext.Provider>
