@@ -428,7 +428,7 @@ jobs:
 
           # Reviewers read the shared snapshot; Polly passes only its path and identity.
           python3 -u <<'PYEOF'
-          import hashlib, json, pathlib, re, subprocess
+          import hashlib, json, os, pathlib, re, subprocess, time
 
           meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
           diff_sha256 = hashlib.sha256(pathlib.Path("/tmp/pr_diff.txt").read_bytes()).hexdigest()
@@ -575,6 +575,22 @@ jobs:
           naming the feature file and the entry point to update. Never blocking.
           Skip areas listed under "Not yet mapped" in `feature-map/README.md`.
           """ if touches_entry_points else ""
+
+          # The run is stopped at the deadline, so Polly publishes before it.
+          time_budget_rule = ""
+          if os.environ.get("POLLY_REVIEW_DEADLINE"):
+              stop = int(os.environ["POLLY_REVIEW_DEADLINE"])
+              stop_clock = time.strftime("%H:%M", time.gmtime(stop))
+              timer_seconds = max(stop - 7 * 60 - int(time.time()), 0)
+              time_budget_rule = f"""
+          **Time budget** — this run is stopped at {stop_clock} UTC, and a review
+          that isn't finished by then is never posted. Before you dispatch anything,
+          call `sys_timer_set` with `seconds` {timer_seconds} and `note` "time budget:
+          publish now". When it fires, dispatch nothing more and stop waiting: cancel
+          each sub-agent still running with `sys_cancel_task`, then write your review
+          from the reports you have, and say under Non-blocking notes which areas
+          weren't reviewed.
+          """
 
           prompt = f"""Review this pull request and provide structured feedback.
 
@@ -825,6 +841,7 @@ jobs:
           - Nothing else warrants a new extra — flag any new extras that don't fit one of these three categories as a blocking issue.
           {visual_demo_rule}
           {feature_map_rule}
+          {time_budget_rule}
           IMPORTANT: Your output will be posted directly as a PR comment. Output
           ONLY the final structured review — no coordination messages, no status
           updates about dispatching sub-agents, no referring to "reviewers", no "waiting for results" narration.
@@ -886,6 +903,7 @@ jobs:
             || review_status=$?
           echo "::notice::Polly review generation took $(( $(date +%s) - review_started )) seconds."
           if [ "$review_status" -eq 124 ] || [ "$review_status" -eq 137 ]; then
+            echo "timed_out=true" >> "$GITHUB_OUTPUT"
             echo "::error::Polly review timed out or was killed; no review was published. See the diagnostics artifact." | tee -a polly-stderr.log
             exit "$review_status"
           elif [ "$review_status" -ne 0 ]; then
@@ -954,6 +972,51 @@ jobs:
           } > /tmp/capacity_comment.md
           gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/capacity_comment.md \
             || echo "::notice::Could not post the capacity note (read-only token)."
+
+      # Reviewers often finish before Polly runs out of time; post their reports
+      # rather than lose them with the run.
+      - name: Collect reviewer reports after a timeout
+        id: partial
+        if: ${{ !cancelled() && steps.polly.outputs.timed_out == 'true' }}
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/polly-review-summary.py partial "$HOME/.omnigent/logs" /tmp/polly_partial.md
+          if [ ! -s /tmp/polly_partial.md ]; then
+            echo "::notice::No reviewer finished before the time limit."
+            exit 0
+          fi
+          # The same exfiltration guard as the full review.
+          if [ -n "${LLM_API_KEY:-}" ] && grep -qF "$LLM_API_KEY" /tmp/polly_partial.md; then
+            echo "::error::Reviewer reports contain LLM_API_KEY — not posting them."
+            exit 1
+          fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Post reviewer reports
+        if: ${{ !cancelled() && steps.partial.outputs.ready == 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          set -euo pipefail
+          # Not a review, so it has none of the review markers: the commit stays
+          # unreviewed and `/review` reviews it again.
+          {
+            echo "<!-- polly-partial-review -->"
+            echo "## <img src=\"https://raw.githubusercontent.com/omnigent-ai/omnigent/main/docs/images/omnigent-logo.svg\" alt=\"\" height=\"20\" valign=\"middle\" /> Polly AI Review ran out of time"
+            echo ""
+            cat /tmp/polly_partial.md
+            echo ""
+            echo "---"
+            echo "<sub>Automated by Polly · [workflow run](${RUN_URL})</sub>"
+          } > /tmp/partial_comment.md
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/partial_comment.md \
+            || echo "::notice::Could not post the reviewer reports (read-only token)."
 
       - name: Build review summary
         if: steps.creds.outputs.available == 'true'

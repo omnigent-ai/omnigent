@@ -7,6 +7,7 @@ import re
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -71,7 +72,9 @@ def prompt_workspace(tmp_path: Path) -> Path:
     return checkout
 
 
-def _generate_prompt(checkout: Path, author_association: str) -> subprocess.CompletedProcess[str]:
+def _generate_prompt(
+    checkout: Path, author_association: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     workflow = yaml.safe_load(_WORKFLOW.read_text())
     step = next(s for s in workflow["jobs"]["review"]["steps"] if s.get("id") == "ctx")
     script = step["run"].split("python3 -u <<'PYEOF'\n", 1)[1].split("\nPYEOF", 1)[0]
@@ -84,7 +87,7 @@ def _generate_prompt(checkout: Path, author_association: str) -> subprocess.Comp
     return subprocess.run(
         [sys.executable, "-c", script],
         cwd=checkout,
-        env={"PATH": str(checkout / "bin")},
+        env={"PATH": str(checkout / "bin"), **(env or {})},
         text=True,
         capture_output=True,
         timeout=10,
@@ -327,3 +330,22 @@ def test_linked_issue_lookup_writes_the_artifact_the_prompt_reads() -> None:
     prompt_read = 'json.loads(pathlib.Path("/tmp/linked_issues.json").read_text())'
     assert step["run"].index(lookup) < step["run"].index("python3 -u <<'PYEOF'")
     assert prompt_read in step["run"].split("python3 -u <<'PYEOF'", 1)[1]
+
+
+def test_prompt_tells_polly_when_the_run_stops(prompt_workspace: Path) -> None:
+    (prompt_workspace / "docs/DATABASE_BEST_PRACTICES.md").write_text("# Database practices\n")
+    prompt_file = prompt_workspace / "artifacts/review_prompt.txt"
+    # A local run without the workflow's deadline gets no budget.
+    assert _generate_prompt(prompt_workspace, "MEMBER").returncode == 0
+    assert "Time budget" not in prompt_file.read_text()
+
+    stop = int(time.time()) + 25 * 60
+    result = _generate_prompt(prompt_workspace, "MEMBER", {"POLLY_REVIEW_DEADLINE": str(stop)})
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    prompt = " ".join(prompt_file.read_text().split())
+    assert f"this run is stopped at {time.strftime('%H:%M', time.gmtime(stop))} UTC" in prompt
+    # The timer leaves seven minutes to write the review.
+    seconds = int(re.search(r"`sys_timer_set` with `seconds` (\d+)", prompt)[1])
+    assert 18 * 60 - 10 <= seconds <= 18 * 60
+    assert "cancel each sub-agent still running with `sys_cancel_task`" in prompt
