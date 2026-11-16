@@ -154,6 +154,7 @@ import {
   DATABRICKS_CONNECTION_ENTRY,
   GITHUB_CONNECTION_ENTRY,
 } from "@/pages/settings/search/catalog/integrations";
+import { TilesSettingsGroup } from "@/tiles/TilesSettingsGroup";
 import { SessionTitleInstructionsControl } from "@/components/SessionTitleInstructionsControl";
 import { McpRegistryConnections } from "@/components/McpRegistry";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
@@ -2293,6 +2294,7 @@ function GeneralSection() {
             <OpenSubagentsInPanelControl />
           </div>
         </SettingsGroup>
+        {isFeatureEnabled(info, "tiles_view") && <TilesSettingsGroup />}
         <SettingsGroup title="Terminal" testId="settings-group-terminal">
           <TerminalClipboardControl />
         </SettingsGroup>

@@ -181,6 +181,25 @@ export const GLOBAL_SHORTCUT_ENTRY = settingsEntry({
   presence: { suggestion: { states: ["shortcut taken by another app"] } },
 });
 
+export const TILES_SHOW_IN_SIDEBAR_ENTRY = settingsEntry({
+  id: "tiles-show-in-sidebar",
+  section: "general",
+  label: "Show Tiles in the sidebar",
+  description:
+    "Adds a Tiles button that switches between the single agent view and all your active agents as tiles.",
+  keywords: ["tiles", "tile view", "agents", "gallery", "sidebar"],
+  available: (availability) => availability.tilesView,
+});
+
+export const TILES_OPEN_ON_LAUNCH_ENTRY = settingsEntry({
+  id: "tiles-open-on-launch",
+  section: "general",
+  label: "Open in Tiles",
+  description: "Start on the Tile view instead of a new session when the app opens.",
+  keywords: ["tiles", "tile view", "launch", "startup", "open"],
+  available: (availability) => availability.tilesView,
+});
+
 /** The desktop app's shortcut that opens the New Agent panel; macOS, with `floating_composer`. */
 export const FLOATING_COMPOSER_SHORTCUT_ENTRY = settingsEntry({
   id: "floating-composer-shortcut",
@@ -236,6 +255,8 @@ export const GENERAL_SETTINGS = [
   BACKGROUND_SESSION_TITLES_ENTRY,
   SESSION_TITLE_INSTRUCTIONS_ENTRY,
   OPEN_SUBAGENTS_IN_PANEL_ENTRY,
+  TILES_SHOW_IN_SIDEBAR_ENTRY,
+  TILES_OPEN_ON_LAUNCH_ENTRY,
   TERMINAL_CLIPBOARD_ENTRY,
   OPEN_LINKS_IN_APP_ENTRY,
   OPEN_IN_DESKTOP_APP_ENTRY,

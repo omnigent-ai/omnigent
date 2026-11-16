@@ -44,6 +44,7 @@ export function useSettingsAvailability(): SettingsAvailability {
   const accountsEnabled = loaded?.accounts_enabled === true;
   const archiveWorktreeCleanup = loaded?.archive_worktree_cleanup === true;
   const mcpServices = providers.includes("mcp");
+  const tilesView = isFeatureEnabled(info, "tiles_view");
   const github = providers.includes("github");
   const databricks = providers.includes("databricks");
   const projectKanban = isFeatureEnabled(info, "project_kanban");
@@ -61,6 +62,7 @@ export function useSettingsAvailability(): SettingsAvailability {
       accountsEnabled,
       archiveWorktreeCleanup,
       mcpServices,
+      tilesView,
       integrationProviders: { github, databricks },
       projectKanban,
       sessionTitleInstructions,
@@ -77,6 +79,7 @@ export function useSettingsAvailability(): SettingsAvailability {
       accountsEnabled,
       archiveWorktreeCleanup,
       mcpServices,
+      tilesView,
       github,
       databricks,
       projectKanban,

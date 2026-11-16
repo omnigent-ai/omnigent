@@ -74,6 +74,7 @@ export type FeatureKey =
   | "project_kanban"
   | "project_repository_creation"
   | "workspace_direct_access"
+  | "tiles_view"
   | "workspace_api_server_access"
   | "quick_pick_palette"
   | "floating_composer"
