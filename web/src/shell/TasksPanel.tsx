@@ -42,7 +42,9 @@ import {
 import {
   failedUpstream,
   finishedTaskCount,
+  isPlanComplete,
   isRestart,
+  planGraphRevision,
   planName,
   planTally,
   planWorkflowId,
@@ -1306,7 +1308,11 @@ export function TasksPanel({
               }
               onContinuePlan={continuePlan && (() => continuePlan(planName(plan)))}
               menuActionFor={menuActionFor}
-              onStop={stopActiveWork}
+              onStop={
+                plan && isPlanComplete(progress, planGraphRevision(entries))
+                  ? undefined
+                  : stopActiveWork
+              }
             />
             <TaskList
               progress={progress}

@@ -438,6 +438,7 @@ from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
     PINNED_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
+    SCHEDULED_TASK_LAUNCH_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
@@ -12433,6 +12434,7 @@ async def _create_session_from_existing_agent(
     created_by_project_id: str | None = None,
     created_by_scheduled_task_id: str | None = None,
     created_by_labels: Mapping[str, str] | None = None,
+    launched_by_scheduled_task_id: str | None = None,
 ) -> tuple[SessionResponse, Conversation, SessionCreateInput]:
     """
     Create a session bound to an already-registered agent.
@@ -12469,6 +12471,8 @@ async def _create_session_from_existing_agent(
         any. A worker whose request carries no launch args runs in its permission mode.
     :param created_by_labels: That source's labels. A worker that picks no MCP
         services of its own starts with the source's.
+    :param launched_by_scheduled_task_id: The automation whose run's tree that source
+        is in, if any, stamped as the worker's ``SCHEDULED_TASK_LAUNCH_LABEL_KEY``.
     :returns: The newly created session snapshot, its conversation row, and
         the request body after project defaults were applied.
     :raises OmnigentError: 404 if no agent matches ``body.agent_id``;
@@ -12479,6 +12483,15 @@ async def _create_session_from_existing_agent(
         resolve_project_session_create,
         server_sandbox_providers,
     )
+    from omnigent.server.session_journal import initialize_workflow_plan, load_workflow_for_run
+    from omnigent.server.workflows import require_workflows
+
+    workflow = None
+    if body.workflow_id is not None:
+        require_workflows(request)
+        workflow = await load_workflow_for_run(
+            conversation_store, body.workflow_id, user_id=user_id
+        )
 
     # Checked before the project merge: a null (a default left off this
     # session) for a reserved key is rejected like a set would be.
@@ -13138,6 +13151,8 @@ async def _create_session_from_existing_agent(
     initial_labels[CLIENT_SURFACE_LABEL_KEY] = client_surface
     if created_by_session_id is not None:
         initial_labels[CREATED_BY_SESSION_LABEL_KEY] = created_by_session_id
+    if launched_by_scheduled_task_id is not None:
+        initial_labels[SCHEDULED_TASK_LAUNCH_LABEL_KEY] = launched_by_scheduled_task_id
     initial_labels.update(registry_labels)
     initial_labels.update(automation_permission_labels)
     initial_labels.update(inherited_mcp_labels)
@@ -13228,6 +13243,14 @@ async def _create_session_from_existing_agent(
                 harness_override=harness_override,
                 **snapshot_kwargs,
             )
+            if workflow is not None:
+                try:
+                    await initialize_workflow_plan(
+                        conversation_store, conv, workflow, user_id=user_id
+                    )
+                except Exception:
+                    await conversation_store.delete_conversation(conv.id)
+                    raise
             if body.sibling_source_id is not None:
                 from omnigent.server.session_families import complete_sibling_creation
 

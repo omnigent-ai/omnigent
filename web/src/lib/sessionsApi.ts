@@ -599,6 +599,7 @@ export async function createSession(
     subAgentName?: string | null;
     title?: string;
     projectId?: string;
+    workflowId?: string;
     hostId?: string;
     workspace?: string;
     sandbox?: {
@@ -622,6 +623,7 @@ export async function createSession(
     sub_agent_name?: string | null;
     title?: string;
     project_id?: string;
+    workflow_id?: string;
     host_id?: string;
     workspace?: string | null;
     git?: null;
@@ -636,6 +638,7 @@ export async function createSession(
     model_override?: string;
     reasoning_effort?: string;
   } = { agent_id: agentId, initial_items: initialItems };
+  if (options.workflowId !== undefined) body.workflow_id = options.workflowId;
   if (options.projectId !== undefined) {
     body.project_id = options.projectId;
     // Project launch hints must not replace the dialog's chosen placement.
