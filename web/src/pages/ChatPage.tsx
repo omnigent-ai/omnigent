@@ -4001,7 +4001,7 @@ function ComposerImpl(
     mobile: isMobile,
     mobileEnterCompletes: false,
     escapeClearsOnlyWithContent: true,
-    allowOpen: inputFocused && draft.quotes.length === 0 && files.length === 0,
+    allowOpen: inputFocused && files.length === 0,
     onSelect: applyMenuSelection,
     onTabComplete: completeMenuSelection,
     clearText: () => setValue(""),
@@ -4217,7 +4217,7 @@ function ComposerImpl(
           // Clear the composer only once the side chat exists, so a failed
           // create keeps the user's typed question instead of dropping it.
           dirtyRef.current = true;
-          setValue("");
+          replaceText("");
           useChatStore.getState().openSideChatWithDraft(childSessionId, question, sourceId);
         },
         // Surface the failure as a toast, not an inline composer error; the
@@ -4229,25 +4229,36 @@ function ComposerImpl(
     // Slash command path: text that reads as "/name ..." (not a file path) or
     // invokes a known catalog skill by its full name, with no attachments.
     // Built-ins run locally; anything unhandled falls through to plaintext.
+    // A known command typed after reply quotes runs with the quotes as context.
+    const tailText = draft.text.trim();
+    const quotedCommand =
+      draft.quotes.length > 0 &&
+      (matchSlashCommandInvocation(tailText, slashCommandNames) !== null ||
+        tailText.split(/\s+/)[0].toLowerCase() in offeredBuiltinCommands);
+    const commandText = quotedCommand ? tailText : trimmed;
+    const withQuotedContext = (text: string) =>
+      quotedCommand
+        ? serializeReplyDraft(appendReplyDraft({ quotes: [], text }, { ...draft, text: "" }))
+        : text;
     const skill = onSendSlashCommand
-      ? matchSlashCommandInvocation(trimmed, slashCommandNames)
+      ? matchSlashCommandInvocation(commandText, slashCommandNames)
       : null;
     let goalMessage: string | null = null;
     if (
-      draft.quotes.length === 0 &&
-      (skill !== null || isSlashCommandText(trimmed)) &&
+      (draft.quotes.length === 0 || quotedCommand) &&
+      (skill !== null || isSlashCommandText(commandText)) &&
       files.length === 0 &&
       !hasMentions &&
       localReviewComments.length === 0
     ) {
-      const parts = trimmed.split(/\s+/);
+      const parts = commandText.split(/\s+/);
       const cmd = parts[0].toLowerCase();
       const arg = parts[1] ?? "";
       const sendSkill = (match: { command: string; args: string }) => {
-        appendEntry(trimmed);
-        onSendSlashCommand?.(match.command.slice(1), match.args);
+        appendEntry(quotedCommand ? fullText : trimmed, storedReplyDraft);
+        onSendSlashCommand?.(match.command.slice(1), withQuotedContext(match.args));
         dirtyRef.current = true;
-        setValue("");
+        replaceText("");
         setCommandError(null);
       };
       // Commands that run here or as a `slash_command` event can't wait in the queue for
@@ -4263,7 +4274,7 @@ function ComposerImpl(
         return;
       }
       if (cmd === "/goal" && showGoal && arg) {
-        goalMessage = `/goal ${trimmed.slice(parts[0].length).trim()}`;
+        goalMessage = `/goal ${commandText.slice(parts[0].length).trim()}`;
       }
       // Bare "/model" when the session has a switchable model (claude-native):
       // sent as plaintext it would open Claude's interactive selector inside the
@@ -4299,7 +4310,7 @@ function ComposerImpl(
         runCommand(() =>
           executeSlashCommand(
             cmd,
-            cmd === "/compact" ? trimmed.slice(parts[0].length).trim() : arg,
+            cmd === "/compact" ? commandText.slice(parts[0].length).trim() : arg,
           ),
         );
         return;
@@ -4308,7 +4319,9 @@ function ComposerImpl(
       // plaintext path so its runner forks); every other harness forks
       // server-side here into an empty side chat, carrying the typed question.
       if (cmd === "/side" && !usesNativeSideChatFork(sessionHarness)) {
-        runCommand(() => openGenericSideChat(trimmed.slice(cmd.length).trim()));
+        runCommand(() =>
+          openGenericSideChat(withQuotedContext(commandText.slice(cmd.length).trim())),
+        );
         return;
       }
       // Known skill on an in-process session: send a `slash_command` event so
@@ -4341,14 +4354,19 @@ function ComposerImpl(
     const sendFiles = files.length > 0 ? files : undefined;
     if (draft.quotes.length > 0) {
       // Preserve authored whitespace and quote provenance, including mention markers.
-      const outgoing = appendReplyDraft(
-        {
-          ...draft,
-          text: expand(draft.text),
-          quotes: draft.quotes.map((quote) => ({ ...quote, before: expand(quote.before) })),
-        },
-        { quotes: [], text: reviewContext },
-      );
+      const expanded = {
+        ...draft,
+        text: expand(draft.text),
+        quotes: draft.quotes.map((quote) => ({ ...quote, before: expand(quote.before) })),
+      };
+      // The command leads its message so the harness still recognizes it.
+      const authored = quotedCommand
+        ? appendReplyDraft(
+            { quotes: [], text: expand(goalMessage ?? tailText) },
+            { ...expanded, text: "" },
+          )
+        : expanded;
+      const outgoing = appendReplyDraft(authored, { quotes: [], text: reviewContext });
       outgoing.text = withSessionMentionHint(outgoing.text, tagsSessions);
       onSend(serializeReplyDraft(outgoing), sendFiles, snapshotReplyDraft(outgoing));
     } else {
@@ -4360,8 +4378,8 @@ function ComposerImpl(
         ),
         sendFiles,
       );
-      if (goalMessage) refreshGoalAfterActivity();
     }
+    if (goalMessage) refreshGoalAfterActivity();
     dirtyRef.current = true;
     clearComposerAfterSend(resetNativeInputSession);
     clearAttachments();

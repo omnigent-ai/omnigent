@@ -6912,19 +6912,118 @@ describe("Composer reply quotes", () => {
     expect(vi.mocked(props.onSend).mock.calls[1]?.[0]).toBe(text);
   });
 
-  it("sends slash-command-looking replies as part of the quoted message", () => {
+  it("opens the slash menu when / is typed with a reply quote attached", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps()} ref={ref} />);
+    act(() => textarea().focus());
+    fireEvent.change(textarea(), { target: { value: "/" } });
+    expect(screen.getByTestId("slash-menu-item-help")).toBeInTheDocument();
+    fireEvent.change(textarea(), { target: { value: "" } });
+
+    act(() => ref.current?.appendReplyQuote("Use AttributeBackFiller as the pattern"));
+    expect(screen.getByTestId("composer-reply-quote")).toBeInTheDocument();
+    fireEvent.change(textarea(), { target: { value: "/" } });
+    expect(textarea()).toHaveFocus();
+    expect(screen.getByTestId("slash-menu-item-help")).toBeInTheDocument();
+  });
+
+  it("sends unknown slash-command-looking replies as part of the quoted message", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps();
+    render(<Composer {...props} ref={ref} />);
+    act(() => ref.current?.appendReplyQuote("Explain /frobnicate"));
+    fireEvent.change(textarea(), { target: { value: "/frobnicate" } });
+    expect(activeRow()).toBeNull();
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledWith("> Explain /frobnicate\n\n/frobnicate", undefined, {
+      version: 1,
+      quotes: [{ before: "", text: "Explain /frobnicate" }],
+      text: "/frobnicate",
+    });
+  });
+
+  it("runs a built-in chosen after a reply quote and keeps the quote", () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
     const props = composerProps();
     render(<Composer {...props} ref={ref} />);
     act(() => ref.current?.appendReplyQuote("Explain /help"));
     fireEvent.change(textarea(), { target: { value: "/help" } });
-    expect(activeRow()).toBeNull();
+    expect(activeRow()?.textContent).toContain("/help");
     fireEvent.keyDown(textarea(), { key: "Enter" });
-    expect(props.onSend).toHaveBeenCalledWith("> Explain /help\n\n/help", undefined, {
-      version: 1,
-      quotes: [{ before: "", text: "Explain /help" }],
-      text: "/help",
+
+    expect(screen.getByText(/\/help — Show available slash commands/)).toBeInTheDocument();
+    expect(props.onSend).not.toHaveBeenCalled();
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Explain /help");
+    expect(textarea()).toHaveValue("");
+  });
+
+  it("invokes a skill chosen after a reply quote with the quote as context", () => {
+    setComposerState({
+      sessionHarness: "openai-agents",
+      skills: [{ name: "deslop", description: "Remove AI slop" }],
     });
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    render(<Composer {...composerProps({ onSend, onSendSlashCommand })} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "Context first" } });
+    act(() => ref.current?.appendReplyQuote("Use the filler pattern"));
+    fireEvent.change(textarea(), { target: { value: "/des" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    fireEvent.change(textarea(), { target: { value: `${textarea().value}tighten it` } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(onSendSlashCommand).toHaveBeenCalledExactlyOnceWith(
+      "deslop",
+      "tighten it\n\nContext first\n\n> Use the filler pattern",
+    );
+    expect(onSend).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("composer-reply-quote")).toBeNull();
+    expect(textarea()).toHaveValue("");
+  });
+
+  it("carries reply quotes into a side chat opened with /side", async () => {
+    setComposerState({ sessionHarness: "openai-agents", sideChatToOpen: null, sideChatDrafts: {} });
+    composerSessionSnapshot.sideChatAllowed = true;
+    vi.spyOn(sessionsApi, "createSideChat").mockResolvedValue({ childSessionId: "conv_side" });
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    try {
+      renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} ref={ref} />);
+      act(() => ref.current?.appendReplyQuote("Use the filler pattern"));
+      fireEvent.change(textarea(), { target: { value: "/side why this one?" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+
+      await waitFor(() =>
+        expect(useChatStore.getState().sideChatDrafts).toEqual({
+          conv_side: "why this one?\n\n> Use the filler pattern",
+        }),
+      );
+      expect(screen.queryByTestId("composer-reply-quote")).toBeNull();
+    } finally {
+      composerSessionSnapshot.sideChatAllowed = null;
+    }
+  });
+
+  it.each([
+    ["a skill", "/deslop tighten it", "/deslop tighten it"],
+    ["a goal", "/GOAL\nship it", "/goal ship it"],
+  ])("leads a native session's quoted message with %s", (_kind, typed, command) => {
+    setComposerState({
+      sessionHarness: "claude-native",
+      skills: [{ name: "deslop", description: "Remove AI slop" }],
+    });
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps({ isNativeWrapper: true, showGoalControl: true });
+    render(<Composer {...props} ref={ref} />);
+    act(() => ref.current?.appendReplyQuote("Use the filler pattern"));
+    fireEvent.change(textarea(), { target: { value: typed } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(props.onSend).toHaveBeenCalledExactlyOnceWith(
+      `${command}\n\n> Use the filler pattern`,
+      undefined,
+      { version: 1, quotes: [{ before: command, text: "Use the filler pattern" }], text: "" },
+    );
   });
 });
 

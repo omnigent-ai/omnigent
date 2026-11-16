@@ -143,6 +143,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   locally: a skill of the same name runs, otherwise the text is sent. `/side`
   is the exception: outside Codex native it always opens a side chat. A native
   terminal side chat shows no menu and sends slash text to the vendor TUI.
+  With reply quotes attached, the menu still opens in the main composer's last
+  text field. Built-ins handled locally leave the quotes in the draft, except
+  `/side`, which carries them into the new side chat. A skill or other command
+  sent to the harness leads the message, followed by the quotes and the text
+  around them. Unknown slash text is sent after the quotes.
   Claude Code and Codex native sessions offer `/clear` only when `/v1/info`
   lists `clear` in `session_event_types`; claude-sdk sessions only when it
   reports `session_claude_sdk_clear`. Otherwise a typed `/clear` goes to the
@@ -156,9 +161,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   Drafts with attachments are sent as ordinary messages and do not set a goal.
   Leading `/goal` takes precedence over a same-named slash skill; inline goal
   skills and Codex native `$goal` skills remain available. For plain-text drafts
-  without quotes, mentions or review comments, mixed-case and newline-separated
-  goal commands use the same canonical message path. Drafts carrying that
-  context retain their existing handling.
+  without mentions or review comments, including a goal typed after reply quotes,
+  mixed-case and newline-separated goal commands use the same canonical message
+  path. Drafts carrying that context retain their existing handling.
   In Codex native Chat, the goal indicator follows commands and native goal
   changes without reopening the dialog. Sending an objective or resuming native
   activity promptly retries the goal while setup finishes. Automatic refresh
