@@ -5,6 +5,7 @@ import {
   MessagesSquareIcon,
   PaperclipIcon,
   PlusIcon,
+  TagIcon,
   TargetIcon,
   WorkflowIcon,
 } from "lucide-react";
@@ -56,6 +57,8 @@ export function ComposerAddMenu({
   onOpen,
   projects = EMPTY_PROJECTS,
   onProjectSelect,
+  onLabels,
+  labelCount = 0,
 }: {
   disabled: boolean;
   onAttach: () => void;
@@ -87,11 +90,16 @@ export function ComposerAddMenu({
   onOpen?: () => void;
   projects?: readonly { name: string }[];
   onProjectSelect?: (name: string) => void;
+  /** Edit the labels a new session starts with. */
+  onLabels?: () => void;
+  labelCount?: number;
 }) {
   const [open, setOpen] = useState(false);
   const [showProjects, setShowProjects] = useState(false);
   const [showWorkflows, setShowWorkflows] = useState(false);
   const listsSavedWorkflows = savedWorkflows.length > 0 && onRunSavedWorkflow !== undefined;
+  // Run once the menu has closed, so the menu's focus return can't close a
+  // dialog the action opens.
   const pendingActionRef = useRef<(() => void) | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const [geometry, setGeometry] = useState({ width: 456, alignOffset: 0, sideOffset: 6 });
@@ -222,7 +230,7 @@ export function ComposerAddMenu({
                 <span>Files and images</span>
               </DropdownMenuItem>
             </div>
-            {(showGoal || showPlan || onProjectSelect || onSideChat || onWorkflow) && (
+            {(showGoal || showPlan || onProjectSelect || onSideChat || onWorkflow || onLabels) && (
               <div className="flex flex-col gap-0.5">
                 <div className="px-2 py-1 text-xs leading-4 text-muted-foreground">Session</div>
                 <div className="flex flex-col gap-px">
@@ -303,6 +311,24 @@ export function ComposerAddMenu({
                         label="Plan"
                         description={planActive ? "Plan mode is on" : "Turn plan mode on"}
                       />
+                    </DropdownMenuItem>
+                  )}
+                  {onLabels && (
+                    <DropdownMenuItem
+                      data-testid={`${testIdPrefix}-labels-action`}
+                      onSelect={() => {
+                        pendingActionRef.current = onLabels;
+                      }}
+                    >
+                      <span className="flex size-4 shrink-0 items-center justify-center">
+                        <TagIcon className="size-3.5" />
+                      </span>
+                      <span className="shrink-0">Labels</span>
+                      <span className="truncate text-xs leading-4 text-muted-foreground">
+                        {labelCount === 0
+                          ? "Tag this session"
+                          : `${labelCount} label${labelCount === 1 ? "" : "s"}`}
+                      </span>
                     </DropdownMenuItem>
                   )}
                   {onProjectSelect && (

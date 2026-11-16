@@ -16,7 +16,7 @@ from collections.abc import Mapping
 COST_CONTROL_LABEL_NAMESPACE = "cost_control."
 
 
-def reserved_cost_control_keys(labels: Mapping[str, str]) -> tuple[str, ...]:
+def reserved_cost_control_keys(labels: Mapping[str, str | None]) -> tuple[str, ...]:
     """
     Return the policy-owned ``cost_control.*`` keys present in *labels*.
 
