@@ -478,8 +478,10 @@ async def revoke_from_task_session(
 
     The route calls this before it deletes their automation grant, which stays as
     the record that this revoke is owed: no run would make it once the automation
-    has no grants. Leaves the owner's grant, ``__public__`` and a session the
-    automation's owner doesn't own alone, as the sync does.
+    has no grants. It calls it again after the delete for a session recorded
+    meanwhile, putting the grant back if that fails. Leaves the owner's grant,
+    ``__public__`` and a session the automation's owner doesn't own alone, as the
+    sync does.
 
     :param task: The automation the grantee is being removed from.
     :param user_id: The grantee, e.g. ``"alice@example.com"``.

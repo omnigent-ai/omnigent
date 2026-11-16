@@ -4866,15 +4866,115 @@ async def test_grant_changes_reach_a_continued_session_at_once(
     assert _task_grantees(db_uri, task_id) == ["carol@example.com"]
 
 
+def _record_first_session(db_uri: str, task: Any, grantee: str) -> str:
+    """Do what a continue automation's first run does: record its new session, then share it."""
+    from omnigent.server.auth import LEVEL_READ
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
+
+    session_id = _owned_session(db_uri, labels={SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id})
+    schedules = SqlAlchemyScheduledTaskStore(db_uri)
+    assert schedules.adopt_session(task.id, session_id, snapshot=task) == "adopted"
+    SqlAlchemyPermissionStore(db_uri).grant(grantee, session_id, LEVEL_READ)
+    return session_id
+
+
+def _record_first_session_before_grant_delete(
+    monkeypatch: pytest.MonkeyPatch, db_uri: str, grantee: str
+) -> list[str]:
+    """Record and share a first run's session just before a DELETE removes the grant.
+
+    :returns: A list that holds the session's ID once it is recorded.
+    """
+    delete_grant = SqlAlchemyPermissionStore.revoke_for_scheduled_task
+    recorded: list[str] = []
+
+    def record_then_delete(
+        self: SqlAlchemyPermissionStore, user_id: str, scheduled_task_id: str
+    ) -> bool:
+        if not recorded:
+            task = SqlAlchemyScheduledTaskStore(db_uri).get(scheduled_task_id)
+            recorded.append(_record_first_session(db_uri, task, grantee))
+        return delete_grant(self, user_id, scheduled_task_id)
+
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "revoke_for_scheduled_task", record_then_delete)
+    return recorded
+
+
 @_SHARING
-async def test_a_revoke_that_cannot_reach_the_session_keeps_the_grant_for_a_retry(
-    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("recorded", ["after_task_load", "before_grant_delete"])
+async def test_revoke_observes_a_session_adopted_after_task_load(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    recorded: str,
 ) -> None:
     from omnigent.server.auth import LEVEL_OWNER
 
-    session_id = _owned_session(db_uri)
+    task_id = await _create_task(auth_client, session_mode="continue")
+    assert (await _share(auth_client, task_id, "bob@example.com")).status_code == 200
+    sessions: list[str] = []
+    if recorded == "before_grant_delete":
+        sessions = _record_first_session_before_grant_delete(
+            monkeypatch, db_uri, "bob@example.com"
+        )
+    else:
+        load = SqlAlchemyScheduledTaskStore.get
+
+        def load_then_record(self: SqlAlchemyScheduledTaskStore, scheduled_task_id: str) -> Any:
+            # The DELETE's first read sees no session; the first run records one right after.
+            task = load(self, scheduled_task_id)
+            if not sessions:
+                sessions.append(_record_first_session(db_uri, task, "bob@example.com"))
+            return task
+
+        monkeypatch.setattr(SqlAlchemyScheduledTaskStore, "get", load_then_record)
+    writes: list[str] = []
+    revoke = SqlAlchemyPermissionStore.revoke
+    delete_grant = SqlAlchemyPermissionStore.revoke_for_scheduled_task
+
+    def revoke_session(self: SqlAlchemyPermissionStore, user_id: str, session_id: str) -> bool:
+        writes.append("session")
+        return revoke(self, user_id, session_id)
+
+    def revoke_grant(
+        self: SqlAlchemyPermissionStore, user_id: str, scheduled_task_id: str
+    ) -> bool:
+        writes.append("automation")
+        return delete_grant(self, user_id, scheduled_task_id)
+
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "revoke", revoke_session)
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "revoke_for_scheduled_task", revoke_grant)
+    revoked = await auth_client.delete(
+        _permissions_url(task_id, "bob@example.com"), headers=_headers()
+    )
+    assert revoked.status_code == 204, revoked.text
+    assert _task_grantees(db_uri, task_id) == []
+    assert _session_grants(db_uri, sessions[0]) == {"alice@example.com": LEVEL_OWNER}
+    # A session recorded before the revoke reads the task goes first, so a failure keeps
+    # the grant; one recorded later is revoked once the grant is gone.
+    assert writes == (
+        ["session", "automation"] if recorded == "after_task_load" else ["automation", "session"]
+    )
+
+
+@_SHARING
+@pytest.mark.parametrize("recorded_meanwhile", [False, True])
+async def test_a_revoke_that_cannot_reach_the_session_keeps_the_grant_for_a_retry(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    recorded_meanwhile: bool,
+) -> None:
+    from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ
+
+    session_id = None if recorded_meanwhile else _owned_session(db_uri)
     task_id = await _create_task(auth_client, session_mode="continue", session_id=session_id)
     assert (await _share(auth_client, task_id, "bob@example.com")).status_code == 200
+    sessions = (
+        _record_first_session_before_grant_delete(monkeypatch, db_uri, "bob@example.com")
+        if recorded_meanwhile
+        else [session_id]
+    )
     revoke = SqlAlchemyPermissionStore.revoke
 
     def failing(self: SqlAlchemyPermissionStore, user_id: str, conversation_id: str) -> bool:
@@ -4885,13 +4985,15 @@ async def test_a_revoke_that_cannot_reach_the_session_keeps_the_grant_for_a_retr
     failed = await auth_client.delete(url, headers=_headers())
     assert failed.status_code == 500, failed.text
     assert failed.json()["error"]["code"] == "internal_error"
-    # The automation grant records that the session revoke is still owed.
-    assert _task_grantees(db_uri, task_id) == ["bob@example.com"]
-    assert "bob@example.com" in _session_grants(db_uri, session_id)
+    # The automation grant, put back if it was already deleted, records that the
+    # session revoke is still owed.
+    grants, _ = SqlAlchemyPermissionStore(db_uri).list_for_scheduled_task(task_id)
+    assert [(grant.user_id, grant.level) for grant in grants] == [("bob@example.com", LEVEL_READ)]
+    assert "bob@example.com" in _session_grants(db_uri, sessions[0])
     monkeypatch.setattr(SqlAlchemyPermissionStore, "revoke", revoke)
     assert (await auth_client.delete(url, headers=_headers())).status_code == 204
     assert _task_grantees(db_uri, task_id) == []
-    assert _session_grants(db_uri, session_id) == {"alice@example.com": LEVEL_OWNER}
+    assert _session_grants(db_uri, sessions[0]) == {"alice@example.com": LEVEL_OWNER}
 
 
 @_SHARING

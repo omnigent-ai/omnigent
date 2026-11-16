@@ -29,7 +29,7 @@ from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
-from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
+from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL
 from omnigent.server.feature_flags import Feature
 from omnigent.server.managed_hosts import is_repo_workspace
 from omnigent.server.scheduled.run_sharing import (
@@ -253,6 +253,28 @@ async def automation_managing_session(
     return task
 
 
+def _continued_session_id(task: ScheduledTask) -> str | None:
+    """The session *task*'s next run continues, or ``None`` when it starts one."""
+    return task.session_id if task.continues_session else None
+
+
+def _restore_task_grant(store: PermissionStore, user_id: str, task_id: str) -> None:
+    """Put back a removed automation grant at Read, so repeating the DELETE retries.
+
+    Pins the grantee's account as the grant route does. A failure is logged.
+    """
+    try:
+        target = store.get_user(user_id)
+        with target_account_scope(user_id, target.account_generation if target else None):
+            store.grant_for_scheduled_task(user_id, task_id, LEVEL_READ)
+    except Exception:
+        _logger.exception(
+            "automation %s: could not restore %r's grant after a failed session revoke",
+            task_id,
+            user_id,
+        )
+
+
 def _display_names(store: PermissionStore, user_ids: Sequence[str]) -> dict[str, str]:
     """The store's display names, or the IDs themselves when the lookup fails."""
     try:
@@ -443,15 +465,16 @@ def register_scheduled_task_permissions_routes(
 
         They lose a continue-session automation's session first, then the automation
         grant. If the session revoke fails, the request fails and the grant stays, so
-        repeating the DELETE retries it. Sessions of earlier runs of a new-session
-        automation keep their grants. Idempotent: 204 without touching anything when
-        they hold no automation grant.
+        repeating the DELETE retries it. A session the automation started continuing
+        meanwhile is revoked once the grant is gone, and the grant is put back if that
+        fails. Sessions of earlier runs of a new-session automation keep their grants.
+        Idempotent: 204 without touching anything when they hold no automation grant.
 
         :param scheduled_task_id: The automation.
         :param target_user_id: The grantee to remove, e.g. ``"alice@example.com"``.
         :returns: 204 No Content.
         :raises OmnigentError: 404 when the caller does not own the automation, 403
-            for an agent or a server that cannot share automations, 500 when the
+            for an agent or a server that cannot share automations, 500 when a
             session revoke fails.
         """
         store = require_sharing(request)
@@ -464,10 +487,21 @@ def register_scheduled_task_permissions_routes(
             is None
         ):
             return Response(status_code=204)
+        # Fresh, so a session a first run recorded since the load is the one revoked.
+        task = await owned_task(request, scheduled_task_id)
         await revoke_from_task_session(task, target_user_id, permission_store=store)
-        revoked = await asyncio.to_thread(store.revoke_for_scheduled_task, target_user_id, task.id)
+        if not await asyncio.to_thread(store.revoke_for_scheduled_task, target_user_id, task.id):
+            return Response(status_code=204)
+        # A first run records its session before it shares it, and shares only while the
+        # grant exists, so any session recorded after this read never reaches them.
+        current = await owned_task(request, scheduled_task_id)
+        if current.continues_session and current.session_id != _continued_session_id(task):
+            try:
+                await revoke_from_task_session(current, target_user_id, permission_store=store)
+            except OmnigentError:
+                await asyncio.to_thread(_restore_task_grant, store, target_user_id, current.id)
+                raise
         # A full sync only after a change, so an automation nobody shares never
         # overwrites its session's other shares.
-        if revoked:
-            await sync_session(request, task)
+        await sync_session(request, current)
         return Response(status_code=204)
