@@ -11,8 +11,10 @@ from pathlib import Path
 import httpx
 import pytest
 import pytest_asyncio
+import sqlalchemy as sa
 from fastapi import FastAPI
 
+from omnigent.db.db_models import SqlSessionJournalEntry
 from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
     RUNNER_TUNNEL_TOKEN_HEADER,
@@ -1285,6 +1287,20 @@ async def test_a_workflows_runs_list_the_sessions_that_ran_it(
     assert [(s["step"], s["content"]["status"]) for s in by_session[first]["statuses"]] == [
         ("explore", "done")
     ]
+
+    # Old journals have no revision metadata, but still have plan chronology.
+    legacy_content = {
+        key: value for key, value in first_plan.content.items() if key != "graph_revision"
+    }
+    with sa.create_engine(db_uri).begin() as connection:
+        connection.execute(
+            sa.update(SqlSessionJournalEntry)
+            .where(SqlSessionJournalEntry.id == first_plan.id)
+            .values(content=SessionJournalStore(db_uri)._stored_contents([legacy_content])[0])
+        )
+    legacy_runs = (await client.get(url, headers=_headers(ALICE))).json()["data"]
+    legacy_run = next(run for run in legacy_runs if run["id"] == first_plan.id)
+    assert legacy_run["plan_graph_revision"] == first_plan.position
 
     conversations = SqlAlchemyConversationStore(db_uri)
     child = _session(db_uri, parent_conversation_id=first)

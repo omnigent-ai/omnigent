@@ -306,6 +306,35 @@ describe("isPlanComplete", () => {
     ];
     expect(pausedLabel(insertedProgress, legacyEntries, false)).toBe("Stopped");
 
+    for (const stableRevision of [true, false]) {
+      const independent = plan(0, ["review"], ["report"]);
+      const reviewing = status(1, "review", "started");
+      const reported = status(2, "report", "done");
+      const dependent = plan(3, ["review"], ["report", ["review"]]);
+      if (stableRevision) {
+        for (const entry of [independent, reviewing, reported])
+          entry.content.graph_revision = "graph-1";
+        dependent.content.graph_revision = "graph-2";
+      }
+      const dependencyEntries = [independent, reviewing, reported, dependent];
+      const revision = planGraphRevision(dependencyEntries);
+      const dependencyProgress = stepProgress(planSteps(dependent), dependencyEntries, false);
+      expect(isPlanComplete(dependencyProgress, revision)).toBe(false);
+      expect(pausedLabel(dependencyProgress, dependencyEntries, false)).toBe("Stopped");
+      expect(taskPreviewText(dependencyProgress, null, revision)).toBe("Stopped: review");
+      expect(
+        isPlanComplete(stepProgress(planSteps(dependent), dependencyEntries, true), revision),
+      ).toBe(false);
+      const finishedEntries = [
+        ...dependencyEntries,
+        status(4, "review", "done"),
+        status(5, "report", "done"),
+      ];
+      expect(
+        isPlanComplete(stepProgress(planSteps(dependent), finishedEntries, false), revision),
+      ).toBe(true);
+    }
+
     const unchanged = plan(2, ["explore"], ["work", ["explore"]], ["report", ["work"]]);
     const saved = { ...unchanged, position: 4, workflow_id: "a".repeat(32) };
     const savedEntries = [

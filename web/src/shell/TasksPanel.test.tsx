@@ -724,6 +724,23 @@ describe("TasksPanel", () => {
       expect(screen.getByTestId("plan-stop")).toBeInTheDocument();
       setSession({ sessionStatus: "idle" });
       expect(screen.getByTestId("plan-continue")).toBeInTheDocument();
+
+      const dependencyEntries = [
+        journalPlan(0, ["review"], ["report"]),
+        status(1, "review", "started"),
+        status(2, "report", "done"),
+        journalPlan(3, ["review"], ["report", ["review"]]),
+      ];
+      showJournal(dependencyEntries);
+      setSession({ sessionStatus: "running" });
+      expect(screen.getByTestId("plan-stop")).toBeInTheDocument();
+      setSession({ sessionStatus: "idle" });
+      expect(screen.getByTestId("plan-continue")).toBeInTheDocument();
+      showJournal([...dependencyEntries, status(4, "review", "done"), status(5, "report", "done")]);
+      setSession({ sessionStatus: "running" });
+      expect(screen.queryByTestId("plan-stop")).toBeNull();
+      setSession({ sessionStatus: "idle" });
+      expect(screen.queryByTestId("plan-continue")).toBeNull();
     } finally {
       act(withdrawContinue);
       act(withdrawStop);

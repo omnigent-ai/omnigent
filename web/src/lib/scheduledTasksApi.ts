@@ -390,8 +390,8 @@ export async function listScheduledTaskRuns(id: string): Promise<ScheduledTaskRu
 export interface ScheduledTaskRunSteps {
   runId: string;
   planId: string | null;
-  /** Stable ID for the current graph; absent on older servers. */
-  planGraphRevision?: string;
+  /** Graph ID, or latest legacy plan position; absent on older servers. */
+  planGraphRevision?: string | number;
   isCurrent: boolean;
   /** The saved workflow the plan runs, when it named one. */
   workflowId: string | null;
@@ -419,7 +419,7 @@ export async function listScheduledTaskRunSteps(
     runs?: {
       run_id: string;
       plan_id?: string;
-      plan_graph_revision?: string | null;
+      plan_graph_revision?: string | number | null;
       is_current?: boolean;
       workflow_id: string | null;
       plan_name?: string | null;

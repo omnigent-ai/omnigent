@@ -15684,10 +15684,14 @@
                 "type": "string"
               },
               {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
                 "type": "null"
               }
             ],
-            "description": "Stable ID for this run's current graph; `None` for older plans without revision metadata.",
+            "description": "Stable graph ID, or the latest plan position for legacy journals. `None` when authoritative plan context is unavailable.",
             "title": "Plan Graph Revision"
           },
           "progress": {

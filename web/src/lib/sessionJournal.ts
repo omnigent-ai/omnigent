@@ -324,6 +324,12 @@ export function isPlanComplete(
     finalSteps.length > 0 &&
     finalSteps.every((finalStep) => {
       if (finalStep.state !== "done") return false;
+      const finalStatus = finalStep.status;
+      const graphChangedAfterCompletion =
+        finalStatus !== null &&
+        (typeof planRevision === "number"
+          ? planRevision > finalStatus.position
+          : planRevision !== undefined && planRevision !== finalStatus.content.graph_revision);
       const pending = [...finalStep.step.depends_on];
       const seen = new Set<string>();
       for (let id = pending.pop(); id !== undefined; id = pending.pop()) {
@@ -333,13 +339,8 @@ export function isPlanComplete(
         if (!upstream) continue;
         if (
           upstream.state !== "done" &&
-          finalStep.status &&
-          (upstream.status
-            ? upstream.status.position > finalStep.status.position
-            : typeof planRevision === "number"
-              ? planRevision > finalStep.status.position
-              : planRevision !== undefined &&
-                planRevision !== finalStep.status.content.graph_revision)
+          (graphChangedAfterCompletion ||
+            (upstream.status && finalStatus && upstream.status.position > finalStatus.position))
         )
           return false;
         pending.push(...upstream.step.depends_on);

@@ -37,11 +37,29 @@ describe("describeWorkflowRun", () => {
       ...run({ total: 2, done: 1, failed: 1 }),
       steps: planSteps(journalPlan(0, ["work"], ["report", ["work"]])),
       statuses: [
+        journalEntry(1, {
+          kind: "status",
+          step: "work",
+          content: { status: "failed", graph_revision: "graph-0" },
+        }),
+        journalEntry(2, {
+          kind: "status",
+          step: "report",
+          content: { status: "done", graph_revision: "graph-0" },
+        }),
+      ],
+    };
+    expect(describeWorkflowRun(completed)).toEqual({ kind: "done", label: "Finished, 1 failed" });
+    const legacy = {
+      ...completed,
+      planGraphRevision: 0,
+      statuses: [
         journalEntry(1, { kind: "status", step: "work", content: { status: "failed" } }),
         journalEntry(2, { kind: "status", step: "report", content: { status: "done" } }),
       ],
     };
-    expect(describeWorkflowRun(completed)).toEqual({ kind: "done", label: "Finished, 1 failed" });
+    expect(describeWorkflowRun(legacy)).toEqual({ kind: "done", label: "Finished, 1 failed" });
+    expect(describeWorkflowRun({ ...legacy, planGraphRevision: 3 }).kind).toBe("failed");
   });
 
   it("shows a running run's progress, even past a failed step it may retry", () => {

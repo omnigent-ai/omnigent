@@ -104,7 +104,7 @@ interface RunsPage {
 
 interface RawRun {
   id: string;
-  plan_graph_revision?: string | null;
+  plan_graph_revision?: string | number | null;
   session_id: string;
   title: string;
   started_at: number;
