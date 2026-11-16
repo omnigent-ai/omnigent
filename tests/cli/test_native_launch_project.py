@@ -20,6 +20,11 @@ _LAUNCHERS = [
     ("claude", "omnigent.harnesses.claude_native.main.run_claude_native"),
     ("codex", "omnigent.harnesses.codex_native.main.run_codex_native"),
 ]
+# Native flags that still start a new Omnigent session, so they pass through unchanged.
+_PASS_THROUGH_ARGS = {
+    "claude": ["--continue", "--session-id", "123e4567-e89b-12d3-a456-426614174000"],
+    "codex": ["--search"],
+}
 
 
 @pytest.fixture()
@@ -40,7 +45,14 @@ def launch_env(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     return captured
 
 
+def _mock_server_version(version: object = "0.22.0") -> respx.Route:
+    return respx.get(f"{_BASE}/api/version").mock(
+        return_value=httpx.Response(200, json={"version": version})
+    )
+
+
 def _mock_projects(*projects: dict[str, str]) -> respx.Route:
+    _mock_server_version()
     return respx.get(f"{_BASE}/v1/projects").mock(
         return_value=httpx.Response(200, json={"object": "list", "data": list(projects)})
     )
@@ -56,12 +68,14 @@ def test_an_existing_project_is_passed_to_the_new_session(
         {"id": _PROJECT_ID, "name": "factory workers"},
     )
     created = respx.post(f"{_BASE}/v1/projects")
+    native_args = _PASS_THROUGH_ARGS[command]
 
-    result = CliRunner().invoke(cli, [command, "--project", "  factory workers "])
+    result = CliRunner().invoke(cli, [command, "--project", "  factory workers ", *native_args])
 
     assert result.exit_code == 0, result.output
     assert launch_env["project_id"] == _PROJECT_ID
     assert launch_env["session_id"] is None
+    assert list(launch_env["extra_args"]) == native_args
     assert listed.calls.last.request.headers["authorization"] == "Bearer test-token"
     assert not created.called
     assert "created project" not in result.output
@@ -101,6 +115,7 @@ def test_a_project_that_cannot_be_resolved_stops_the_launch(
     detail: str,
     launch_env: dict[str, Any],
 ) -> None:
+    _mock_server_version()
     respx.get(f"{_BASE}/v1/projects").mock(**listing)
 
     result = CliRunner().invoke(cli, [command, "--project", "factory workers"])
@@ -113,9 +128,13 @@ def test_a_project_that_cannot_be_resolved_stops_the_launch(
 
 @pytest.mark.parametrize(("command", "launcher"), _LAUNCHERS)
 def test_without_project_nothing_is_resolved(
-    command: str, launcher: str, launch_env: dict[str, Any]
+    command: str, launcher: str, launch_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # No respx mock: any project request would fail the launch.
+    monkeypatch.setattr(
+        "omnigent.cli._resolve_launch_project_id",
+        lambda **_: pytest.fail("a launch without --project must not resolve a project"),
+    )
+
     result = CliRunner().invoke(cli, [command])
 
     assert result.exit_code == 0, result.output
@@ -213,3 +232,36 @@ def test_smart_routing_files_the_armed_session_in_the_project(
     assert payload["git"] is None
     assert launch_env["session_id"] == launched_session
     assert launch_env["project_id"] == _PROJECT_ID
+
+
+@respx.mock
+@pytest.mark.parametrize(("command", "launcher"), _LAUNCHERS)
+@pytest.mark.parametrize("routing_args", [[], ["--smart-routing"]])
+@pytest.mark.parametrize(
+    ("reported", "message"),
+    [
+        ("0.21.0", "This Omnigent server (0.21.0) can't file new sessions in a project"),
+        ("0.22.0.dev20261110", "server 0.22.0 or later"),
+        (None, "--project needs an Omnigent server that reports its version"),
+        ("unknown", "this server reported 'unknown'"),
+    ],
+)
+def test_an_older_server_stops_the_launch_before_any_write(
+    command: str,
+    launcher: str,
+    routing_args: list[str],
+    reported: object,
+    message: str,
+    launch_env: dict[str, Any],
+) -> None:
+    _mock_server_version(reported)
+    projects = respx.route(url__startswith=f"{_BASE}/v1/projects")
+    sessions = respx.route(url__startswith=f"{_BASE}/v1/sessions")
+
+    result = CliRunner().invoke(cli, [command, *routing_args, "--project", "factory workers"])
+
+    assert result.exit_code == 1, result.output
+    assert message in result.output
+    assert not projects.called
+    assert not sessions.called
+    assert launch_env == {}

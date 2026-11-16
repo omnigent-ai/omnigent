@@ -8546,6 +8546,43 @@ def _reject_project_on_resume(project: str | None, *, resuming: bool) -> None:
     )
 
 
+# First release whose session create files into a project and accepts explicit
+# null ``workspace``/``git``. Older servers reject that metadata or drop the project.
+_PROJECT_AWARE_CREATE_MIN_SERVER = "0.22.0"
+
+
+async def _require_project_aware_session_create(client: httpx.AsyncClient) -> None:
+    """
+    Refuse ``--project`` before any write when the server can't file new sessions.
+
+    :param client: Authenticated client pointed at the Omnigent server.
+    :raises click.ClickException: When the server is older than
+        :data:`_PROJECT_AWARE_CREATE_MIN_SERVER` or reports no usable version.
+    :raises httpx.HTTPError: When the version can't be fetched.
+    """
+    from packaging.version import InvalidVersion, Version
+
+    resp = await client.get("/api/version")
+    resp.raise_for_status()
+    payload = resp.json()
+    reported = payload.get("version") if isinstance(payload, dict) else None
+    try:
+        server_version = Version(reported) if isinstance(reported, str) else None
+    except InvalidVersion:
+        server_version = None
+    if server_version is None:
+        raise click.ClickException(
+            "--project needs an Omnigent server that reports its version; "
+            f"this server reported {reported!r}."
+        )
+    if server_version < Version(_PROJECT_AWARE_CREATE_MIN_SERVER):
+        raise click.ClickException(
+            f"This Omnigent server ({reported}) can't file new sessions in a project. "
+            f"--project needs server {_PROJECT_AWARE_CREATE_MIN_SERVER} or later; "
+            "upgrade the server or launch without --project."
+        )
+
+
 def _resolve_launch_project_id(*, server: str, project_name: str) -> str:
     """
     Return the id of the caller's project named *project_name*, creating it if missing.
@@ -8568,6 +8605,7 @@ def _resolve_launch_project_id(*, server: str, project_name: str) -> str:
     async def resolve() -> tuple[str, bool]:
         headers = _remote_headers(server_url=server, host_id=None)
         async with open_server_client(server, headers=headers) as client:
+            await _require_project_aware_session_create(client)
             return await resolve_project_id(client, project_name)
 
     try:
