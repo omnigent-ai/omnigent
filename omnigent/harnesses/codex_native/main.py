@@ -104,9 +104,13 @@ from omnigent.native.native_terminal import (
     bind_session_runner as _bind_session_runner,
 )
 from omnigent.native.native_terminal import (
+    file_in_launch_project,
+    post_initial_prompt,
+    request_with_429_retry,
+)
+from omnigent.native.native_terminal import (
     normalize_extra_args as _normalize_extra_args,
 )
-from omnigent.native.native_terminal import post_initial_prompt, request_with_429_retry
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
@@ -442,6 +446,7 @@ def run_codex_native(
     model: str | None = None,
     prompt: str | None = None,
     auto_open_conversation: bool = False,
+    project_id: str | None = None,
 ) -> None:
     """
     Launch Codex TUI in an Omnigent terminal.
@@ -457,6 +462,8 @@ def run_codex_native(
     :param prompt: Optional first prompt to send after launch.
     :param auto_open_conversation: When ``True``, open the
         browser conversation URL after the session is prepared.
+    :param project_id: Project to file a new session in, e.g.
+        ``"proj_abc123"``. Ignored when resuming.
     :returns: None after the terminal attach session ends.
     :raises click.ClickException: If setup fails.
     """
@@ -483,6 +490,7 @@ def run_codex_native(
             model=model,
             prompt=prompt,
             auto_open_conversation=auto_open_conversation,
+            project_id=project_id,
         )
 
 
@@ -791,6 +799,7 @@ def _run_with_remote_server(
     model: str | None,
     prompt: str | None,
     auto_open_conversation: bool = False,
+    project_id: str | None = None,
 ) -> None:
     """
     Launch Codex on an Omnigent server via a daemon-spawned runner.
@@ -805,6 +814,7 @@ def _run_with_remote_server(
     :param prompt: Optional first prompt.
     :param auto_open_conversation: When ``True``, open the
         browser conversation URL after the session is prepared.
+    :param project_id: Project to file a new session in, e.g. ``"proj_abc123"``.
     :returns: None.
     """
     from omnigent.chat import _bundle_agent, _remote_headers, _server_auth
@@ -849,6 +859,7 @@ def _run_with_remote_server(
                     host_id=host_id,
                     workspace=str(Path.cwd().resolve()),
                     startup_progress=progress,
+                    project_id=project_id,
                 )
             if resolved_session_id is None:
                 _record_launch_for_fresh_session(prepared.session_id)
@@ -917,6 +928,7 @@ async def _prepare_codex_terminal_via_daemon(
     host_id: str,
     workspace: str,
     startup_progress: RunnerStartupProgress | None = None,
+    project_id: str | None = None,
 ) -> PreparedCodexTerminal:
     """
     Create or resume a Codex-native session through a daemon runner.
@@ -941,6 +953,8 @@ async def _prepare_codex_terminal_via_daemon(
         ``"/Users/me/repo"``.
     :param startup_progress: Optional user-visible progress renderer,
         e.g. a handle from :func:`runner_startup_progress`.
+    :param project_id: Project to file a fresh session in, e.g.
+        ``"proj_abc123"``. Unused when resuming *session_id*.
     :returns: Prepared terminal details for attaching.
     :raises click.ClickException: If setup fails.
     """
@@ -959,6 +973,7 @@ async def _prepare_codex_terminal_via_daemon(
                     session_bundle,
                     bridge_id=None,
                     terminal_launch_args=persist_args or None,
+                    project_id=project_id,
                 ),
                 wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S),
             )
@@ -1649,6 +1664,7 @@ async def _create_codex_session(
     *,
     bridge_id: str | None,
     terminal_launch_args: list[str] | None = None,
+    project_id: str | None = None,
 ) -> str:
     """
     Create a bundled terminal-first Codex session.
@@ -1661,6 +1677,8 @@ async def _create_codex_session(
     :param terminal_launch_args: Pass-through Codex CLI args to persist
         for runner-owned terminal launch, e.g.
         ``["--config", "approval_policy=on-request"]``.
+    :param project_id: Project to file the session in, e.g.
+        ``"proj_abc123"``. ``None`` leaves it unfiled.
     :returns: New Omnigent session id.
     """
     labels = dict(_SESSION_LABELS)
@@ -1671,6 +1689,7 @@ async def _create_codex_session(
     }
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args
+    file_in_launch_project(metadata, project_id)
     resp = await request_with_429_retry(
         lambda: client.post(
             "/v1/sessions",

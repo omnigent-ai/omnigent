@@ -38,6 +38,7 @@ from omnigent.cli_invocation import cli_invocation
 from omnigent.db.utils import builtin_agent_id
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
+from omnigent.native.native_terminal import file_in_launch_project
 
 #: Provenance label on a CLI-routed session. The server merges the wrapper's
 #: own presentation labels (``omnigent.ui`` / ``omnigent.wrapper``) over it.
@@ -195,6 +196,7 @@ def arm_smart_routing_session(
     harness: str,
     host_id: str | None = None,
     workspace: str | None = None,
+    project_id: str | None = None,
 ) -> ArmedSession:
     """
     Create the session with Smart Routing on, and nothing routed yet.
@@ -217,6 +219,7 @@ def arm_smart_routing_session(
     :param workspace: Absolute workspace path on *host_id* — the launch cwd.
         Required by the server whenever ``host_id`` is set (it is validated
         against the agent's cwd boundary), so it is sent only with *host_id*.
+    :param project_id: Project to file the session in, e.g. ``"proj_abc123"``.
     :returns: The :class:`ArmedSession` to launch on.
     """
     body: dict[str, Any] = {
@@ -230,6 +233,7 @@ def arm_smart_routing_session(
         # host_id without workspace is a 400 — the server stats the path on the
         # host to validate the agent's cwd boundary.
         body["workspace"] = workspace
+    file_in_launch_project(body, project_id)
     try:
         with httpx.Client(
             base_url=base_url, headers=_headers(base_url, host_id=host_id), timeout=_TIMEOUT

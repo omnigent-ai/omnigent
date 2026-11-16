@@ -8825,6 +8825,7 @@ def test_run_codex_native_does_not_require_local_codex_binary(
         model: str | None,
         prompt: str | None,
         auto_open_conversation: bool,
+        project_id: str | None,
     ) -> None:
         """
         Record that the remote daemon path was selected.
@@ -8841,6 +8842,7 @@ def test_run_codex_native_does_not_require_local_codex_binary(
             model,
             prompt,
             auto_open_conversation,
+            project_id,
         )
         remote_called = True
 
@@ -9704,9 +9706,10 @@ async def test_prepare_codex_terminal_via_daemon_overlaps_create_and_host_wait(
         *,
         bridge_id: str | None,
         terminal_launch_args: list[str] | None = None,
+        project_id: str | None = None,
     ) -> str:
         """Record the create window, yielding so a concurrent wait can start."""
-        del client, bundle, bridge_id, terminal_launch_args
+        del client, bundle, bridge_id, terminal_launch_args, project_id
         order.append("create:start")
         await asyncio.sleep(0)
         order.append("create:end")

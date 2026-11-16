@@ -8505,7 +8505,85 @@ def _reject_smart_routing_resume(*, resuming: bool, flag: str = "--resume") -> N
     )
 
 
-def _smart_routing_decision(*, server: str, harness: str) -> ArmedSession:
+def _launch_project_name(
+    _ctx: click.Context, _param: click.Parameter, value: str | None
+) -> str | None:
+    """
+    Validate a native launch's ``--project`` value before any side effect.
+
+    :param value: The raw option value, e.g. ``" factory workers "``.
+    :returns: The trimmed name, or ``None`` when the option is absent.
+    :raises click.BadParameter: When the name is blank or too long.
+    """
+    if value is None:
+        return None
+    from omnigent.tools.builtins.session_projects import MAX_PROJECT_NAME_LENGTH
+
+    trimmed = value.strip()
+    if not trimmed:
+        raise click.BadParameter("the project name must not be empty")
+    if len(trimmed) > MAX_PROJECT_NAME_LENGTH:
+        raise click.BadParameter(
+            f"the project name must be at most {MAX_PROJECT_NAME_LENGTH} characters"
+        )
+    return trimmed
+
+
+def _reject_project_on_resume(project: str | None, *, resuming: bool) -> None:
+    """
+    Reject ``--project`` combined with a resume.
+
+    :param project: The validated ``--project`` name, or ``None``.
+    :param resuming: ``True`` when the invocation targets an existing session.
+    :raises click.UsageError: When both are set.
+    """
+    if project is None or not resuming:
+        return
+    raise click.UsageError(
+        "--project files a new session, so it cannot be combined with --resume. "
+        "Drop --resume to start a new session in the project, or move the existing "
+        "session from the web UI."
+    )
+
+
+def _resolve_launch_project_id(*, server: str, project_name: str) -> str:
+    """
+    Return the id of the caller's project named *project_name*, creating it if missing.
+
+    Resolved before the session exists, so a failure leaves no session behind.
+
+    :param server: Resolved Omnigent server base URL, e.g. ``"http://127.0.0.1:8123"``.
+    :param project_name: A validated project name, e.g. ``"factory workers"``.
+    :returns: The project id.
+    :raises click.ClickException: When the project can't be listed or created.
+    """
+    import asyncio
+
+    import httpx
+
+    from omnigent.chat import _remote_headers
+    from omnigent.cli_auth import open_server_client
+    from omnigent.runner.session_projects import resolve_project_id
+
+    async def resolve() -> tuple[str, bool]:
+        headers = _remote_headers(server_url=server, host_id=None)
+        async with open_server_client(server, headers=headers) as client:
+            return await resolve_project_id(client, project_name)
+
+    try:
+        project_id, created = asyncio.run(resolve())
+    except (httpx.HTTPError, ValueError) as exc:
+        raise click.ClickException(
+            f"Could not use project {project_name!r}: {type(exc).__name__}: {exc}"
+        ) from exc
+    if created:
+        click.echo(f"omnigent: created project {project_name!r}.", err=True)
+    return project_id
+
+
+def _smart_routing_decision(
+    *, server: str, harness: str, project_id: str | None = None
+) -> ArmedSession:
     """
     Preflight Smart Routing, then create the session it will route in.
 
@@ -8520,6 +8598,7 @@ def _smart_routing_decision(*, server: str, harness: str) -> ArmedSession:
 
     :param server: Resolved Omnigent server base URL.
     :param harness: Canonical native harness to bind, e.g. ``"codex-native"``.
+    :param project_id: Project to file the armed session in, e.g. ``"proj_abc123"``.
     :returns: The armed session to attach the wrapper to.
     :raises click.ClickException: When Smart Routing is unavailable.
     """
@@ -8555,6 +8634,7 @@ def _smart_routing_decision(*, server: str, harness: str) -> ArmedSession:
         # The server requires a workspace with a host_id, and this is the cwd
         # the wrapper will attach in.
         workspace=str(Path.cwd().resolve()) if host_id is not None else None,
+        project_id=project_id,
     )
     click.echo(
         armed.notice

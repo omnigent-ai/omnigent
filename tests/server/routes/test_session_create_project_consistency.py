@@ -13,6 +13,8 @@ from fastapi import FastAPI
 from pydantic.version import version_short
 
 from omnigent.db.utils import builtin_agent_id
+from omnigent.harnesses.claude_native import main as claude_native
+from omnigent.harnesses.codex_native import main as codex_native
 from omnigent.native._native_supersession import clear_replacement_create_body
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
@@ -508,6 +510,30 @@ async def test_multipart_create_defaults_workspace_and_files_atomically(
     assert session.status_code == 200, session.text
     assert session.json()["workspace"] == "/work/upload"
     assert session.json()["project_id"] == project_id
+
+
+@pytest.mark.parametrize(
+    "create_native_session",
+    [claude_native._create_claude_session, codex_native._create_codex_session],
+)
+async def test_native_cli_create_files_the_session_without_folder_defaults(
+    project_create_client: httpx.AsyncClient, create_native_session
+) -> None:
+    project_id = await _project(project_create_client, {"workspace": "/work/project"})
+    project_create_client.headers.update(_headers())
+
+    session_id = await create_native_session(
+        project_create_client,
+        build_agent_bundle(name="native-cli-launch"),
+        bridge_id=None,
+        project_id=project_id,
+    )
+
+    session = await project_create_client.get(f"/v1/sessions/{session_id}")
+    assert session.status_code == 200, session.text
+    assert session.json()["project_id"] == project_id
+    # The CLI's launch directory, not the project's saved folder, is the workspace.
+    assert session.json()["workspace"] is None
 
 
 async def test_multipart_malformed_project_config_is_structured_400(
