@@ -13,7 +13,7 @@ export const WORKFLOW_SKILL = "workflow";
 
 /**
  * Added to the workflow message when the user reviews the plan before work starts. The
- * workflow skill says how: the review comes right after the exploration every plan starts with.
+ * workflow skill places that review before executing the proposed work.
  */
 export const REVIEW_PLAN_FIRST = "Let me review the plan before you start the work.";
 
