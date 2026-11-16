@@ -57,11 +57,10 @@ import {
 import { cn } from "@/lib/utils";
 import { HarnessCredentialForm } from "@/shell/HarnessCredentialForm";
 import { FIX_DIALOG_PARTS } from "@/pages/settings/search/catalog/harnesses";
-import { useSettingsOverlayParts } from "@/pages/settings/search/settingsOwnership";
-
-// Settings names a dialog control by its part and would add a tooltip of the same name; the
-// dialog's controls keep the hover they had, so each gets an empty tooltip.
-const NO_TOOLTIP = { title: "" } as const;
+import {
+  SETTINGS_NO_TOOLTIP,
+  useSettingsOverlayParts,
+} from "@/pages/settings/search/settingsOwnership";
 
 export interface HarnessFixDialogProps {
   open: boolean;
@@ -713,7 +712,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
                 Cancel
               </Button>
               <Button
-                {...parts.control("switchConfirm", { ...NO_TOOLTIP, outside: {} })}
+                {...parts.control("switchConfirm", { ...SETTINGS_NO_TOOLTIP, outside: {} })}
                 onClick={() => void switchAccount()}
               >
                 Sign out and switch
@@ -730,7 +729,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
               </Button>
               <Button
                 {...parts.control("installAction", {
-                  ...NO_TOOLTIP,
+                  ...SETTINGS_NO_TOOLTIP,
                   name: mode === "update" ? { alternative: "update" } : undefined,
                   outside: {},
                 })}
@@ -750,7 +749,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
               </Button>
               <Button
                 {...parts.control("authenticate", {
-                  ...NO_TOOLTIP,
+                  ...SETTINGS_NO_TOOLTIP,
                   name: authenticateName(credentialDecisionPending, mode),
                   outside: {},
                 })}
@@ -778,7 +777,10 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
               >
                 Close
               </Button>
-              <Button {...parts.control("retry", { ...NO_TOOLTIP, outside: {} })} onClick={retry}>
+              <Button
+                {...parts.control("retry", { ...SETTINGS_NO_TOOLTIP, outside: {} })}
+                onClick={retry}
+              >
                 Try again
               </Button>
             </>
@@ -806,7 +808,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
                 Close
               </Button>
               <Button
-                {...parts.control("retry", { ...NO_TOOLTIP, outside: {} })}
+                {...parts.control("retry", { ...SETTINGS_NO_TOOLTIP, outside: {} })}
                 onClick={() => void startDeviceLogin()}
               >
                 Try again
@@ -823,7 +825,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
               </Button>
               <Button
                 {...parts.control("checkAgain", {
-                  ...NO_TOOLTIP,
+                  ...SETTINGS_NO_TOOLTIP,
                   name: checking ? { alternative: "checking" } : undefined,
                   outside: {},
                 })}
@@ -895,7 +897,7 @@ function SwitchAccountConfirm({
           className="h-9 rounded-lg border border-border bg-background px-3 outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
           placeholder="name@example.com"
           {...parts.control("accountHint", {
-            ...NO_TOOLTIP,
+            ...SETTINGS_NO_TOOLTIP,
             outside: { "aria-label": "Account to sign in with" },
           })}
         />
@@ -1007,7 +1009,7 @@ function CopyButton({
       variant="outline"
       size={iconOnly ? "icon-sm" : "sm"}
       {...parts.control(part, {
-        ...NO_TOOLTIP,
+        ...SETTINGS_NO_TOOLTIP,
         outside: { "aria-label": FIX_DIALOG_PARTS[part] },
       })}
       onClick={() => {
@@ -1060,7 +1062,7 @@ function ChooseCredential({
       <div
         role="radiogroup"
         {...parts.control("credentialChoice", {
-          ...NO_TOOLTIP,
+          ...SETTINGS_NO_TOOLTIP,
           outside: { "aria-label": "Credential" },
         })}
         className="flex flex-col gap-2"
@@ -1086,7 +1088,7 @@ function ChooseCredential({
         <button
           type="button"
           className="self-start text-sm text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
-          {...parts.control("useCredentialForm", { ...NO_TOOLTIP, outside: {} })}
+          {...parts.control("useCredentialForm", { ...SETTINGS_NO_TOOLTIP, outside: {} })}
           onClick={onUseCredentialForm}
         >
           Use an API key or gateway URL instead
@@ -1384,7 +1386,7 @@ function CommandRow({
             .catch(() => showToast("Couldn't copy — select and copy manually.", { duration: 0 }));
         }}
         {...parts.control(part, {
-          ...NO_TOOLTIP,
+          ...SETTINGS_NO_TOOLTIP,
           outside: { "aria-label": FIX_DIALOG_PARTS[part] },
         })}
       >
