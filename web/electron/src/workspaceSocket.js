@@ -22,6 +22,10 @@ const MAX_REQUEST_BYTES = 1024 * 1024;
 // The host caps a read at 10 MiB; this leaves room for framing.
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const TIMEOUT_MS = 30_000;
+// A host's socket on another machine, which can't be checked from here. Only
+// characters `ssh -L` can carry, in the directory shape the host makes.
+const REMOTE_SOCKET_PATH =
+  /^(\/[A-Za-z0-9._-]+)*\/omnigent-workspace-[A-Za-z0-9_]+\/workspace\.sock$/;
 
 /**
  * Whether `socketPath` is a workspace socket an Omnigent host made for this user.
@@ -55,14 +59,18 @@ function isWorkspaceSocket(socketPath) {
 /**
  * Send one workspace API call to a host's socket and buffer its response.
  *
- * @param {{socketPath: string, path: string, headers: Record<string, string>, body: Uint8Array}} request
+ * The socket is this machine's, or, for a host this desktop connected over
+ * SSH, one on that machine reached through `forwards`.
+ *
+ * @param {{hostId?: string, socketPath: string, path: string, headers: Record<string, string>, body: Uint8Array}} request
+ * @param {{
+ *   sshDestination?: (hostId: string) => string | null,
+ *   forwards?: ReturnType<typeof import("./workspaceSshForwards").createWorkspaceSshForwards>,
+ * }} [routes]
  * @returns {Promise<{status: number, headers: Record<string, string>, body: Uint8Array}>}
  */
-function workspaceSocketRequest(request) {
-  const { socketPath, path: methodPath, headers, body } = request ?? {};
-  if (!isWorkspaceSocket(socketPath)) {
-    return Promise.reject(new Error("not a workspace socket on this machine"));
-  }
+function workspaceSocketRequest(request, routes = {}) {
+  const { hostId, socketPath, path: methodPath, headers, body } = request ?? {};
   if (typeof methodPath !== "string" || !METHOD_PATH.test(methodPath)) {
     return Promise.reject(new Error("not a workspace API method"));
   }
@@ -74,6 +82,27 @@ function workspaceSocketRequest(request) {
     const value = headers?.[name];
     if (typeof value === "string") forwarded[name] = value;
   }
+  if (isWorkspaceSocket(socketPath)) return send(socketPath, methodPath, forwarded, body);
+  const destination = typeof hostId === "string" ? (routes.sshDestination?.(hostId) ?? null) : null;
+  const { forwards } = routes;
+  const remotePathOk =
+    typeof socketPath === "string" &&
+    REMOTE_SOCKET_PATH.test(socketPath) &&
+    path.posix.normalize(socketPath) === socketPath;
+  if (!destination || !forwards || !remotePathOk) {
+    return Promise.reject(new Error("not a workspace socket on this machine"));
+  }
+  return forwards
+    .localSocket(destination, socketPath)
+    .then((local) => send(local, methodPath, forwarded, body))
+    .catch((error) => {
+      // The connection may be gone (network, sleep); the next read opens a new one.
+      forwards.close(destination);
+      throw error;
+    });
+}
+
+function send(socketPath, methodPath, forwarded, body) {
   return new Promise((resolve, reject) => {
     const outgoing = http.request(
       { socketPath, path: methodPath, method: "POST", headers: forwarded, timeout: TIMEOUT_MS },
