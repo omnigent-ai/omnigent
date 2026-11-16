@@ -155,11 +155,12 @@ def test_tool_result_content_blocks_rehydrates_only_block_arrays() -> None:
         source = {"type": "base64", "media_type": media_type, "data": data}
         return {"type": "document", "source": source}
 
-    pdf = base64.b64encode(b"%PDF-1.4\n" + b"0" * 300).decode()
+    pdf = base64.b64encode(b"%PDF-1.4\n" + b"0" * 301).decode()
     wrapped = "\n".join(pdf[i : i + 76] for i in range(0, len(pdf), 76))
     text_block = {"type": "text", "text": "PDF file read: report.pdf"}
     # A base64 PDF rehydrates as a document block with canonical base64.
     assert fn(json.dumps([text_block, pdf_block(wrapped)])) == [text_block, pdf_block(pdf)]
+    assert fn(json.dumps([pdf_block(pdf.rstrip("="))])) == [pdf_block(pdf)]
     # Document blocks the API would reject keep the raw string.
     assert fn(json.dumps([pdf_block("[application/pdf content omitted]")])) is None
     assert fn(json.dumps([pdf_block(pdf, "text/plain")])) is None
@@ -334,14 +335,10 @@ def test_sanitize_replayed_image_blocks_downgrades_the_compaction_marker(
 
 def test_sanitize_replayed_image_blocks_preserves_valid_payloads() -> None:
     """A still-valid image or PDF survives sanitization, canonicalized in place."""
-    pdf_block = {
-        "type": "document",
-        "source": {
-            "type": "base64",
-            "media_type": "application/pdf",
-            "data": base64.b64encode(b"%PDF-1.4\n").decode(),
-        },
-    }
+    pdf_data = base64.b64encode(b"%PDF-1.4\n0").decode()
+    pdf_source = {"type": "base64", "media_type": "application/pdf", "data": pdf_data}
+    pdf_block = {"type": "document", "source": pdf_source}
+    unpadded_pdf = {"type": "document", "source": {**pdf_source, "data": pdf_data.rstrip("=")}}
     content = [
         {"type": "text", "text": "keep me"},
         {
@@ -349,6 +346,7 @@ def test_sanitize_replayed_image_blocks_preserves_valid_payloads() -> None:
             "source": {"type": "base64", "media_type": "image/png", "data": _TINY_PNG_BASE64},
         },
         pdf_block,
+        unpadded_pdf,
     ]
 
     sanitized = trc.sanitize_replayed_image_blocks(content)
@@ -356,7 +354,7 @@ def test_sanitize_replayed_image_blocks_preserves_valid_payloads() -> None:
     assert sanitized[0] == {"type": "text", "text": "keep me"}
     assert sanitized[1]["type"] == "image"
     assert sanitized[1]["source"]["media_type"] == "image/png"
-    assert sanitized[2] == pdf_block
+    assert sanitized[2] == sanitized[3] == pdf_block
 
 
 def test_sanitize_replayed_image_blocks_downgrades_bare_mcp_shape() -> None:

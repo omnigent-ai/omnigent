@@ -396,8 +396,22 @@ def _whitespace_normalized_base64(data: str) -> str | None:
     :param data: Candidate base64 payload.
     :returns: Canonical base64, or ``None`` when the result would not decode.
     """
+    if "".join(data.split()) == data:
+        return None
+    return _canonical_base64(data)
+
+
+def _canonical_base64(data: object) -> str | None:
+    """
+    Return *data* as padded, strictly decodable base64 without whitespace.
+
+    :param data: Candidate base64 payload.
+    :returns: The canonical spelling, or ``None`` when *data* is not base64.
+    """
+    if not isinstance(data, str):
+        return None
     compact = "".join(data.split())
-    if not compact or compact == data:
+    if not compact:
         return None
     padded = compact + "=" * (-len(compact) % 4)
     try:
@@ -405,23 +419,6 @@ def _whitespace_normalized_base64(data: str) -> str | None:
     except (binascii.Error, ValueError):
         return None
     return padded
-
-
-def _canonical_base64(data: object) -> str | None:
-    """
-    Return *data* as strictly decodable base64 without whitespace.
-
-    :param data: Candidate base64 payload.
-    :returns: The canonical spelling, or ``None`` when *data* is not base64.
-    """
-    if not isinstance(data, str) or not data:
-        return None
-    canonical = _whitespace_normalized_base64(data) or data
-    try:
-        base64.b64decode(canonical, validate=True)
-    except (binascii.Error, ValueError):
-        return None
-    return canonical
 
 
 def _document_block_from_object(block: JsonObject) -> JsonObject | None:
