@@ -19,7 +19,16 @@ import type * as IdentityModule from "@/lib/identity";
 import { sideChatSettingsMutationKey } from "@/lib/sideChat";
 
 import { type InfiniteData, QueryClient, QueryObserver } from "@tanstack/react-query";
-import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  onTestFinished,
+  vi,
+  type MockInstance,
+} from "vitest";
 import { toast } from "sonner";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import type {
@@ -15969,6 +15978,203 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  describe("periodic committed-item check", () => {
+    const id = "conv_committed_gap";
+    const before = userMessage("resp_before", "Before the gap");
+    const reply = assistantMessage("resp_missed", "Saved without a stream event");
+    let sinks: StreamSink[];
+    let controller: AbortController;
+    let bound: ReturnType<typeof bindConversationForTest>;
+    let loop: Promise<void>;
+    let warn: MockInstance<typeof console.warn>;
+
+    const itemReads = () =>
+      fetchMock.mock.calls
+        .map(([input]) => String(input))
+        .filter((url) => url.startsWith(`/v1/sessions/${id}/items?`));
+    const diagnostics = () =>
+      warn.mock.calls.filter(([message]) => String(message).includes("committed items"));
+    const advanceCheck = () =>
+      advanceWithHeartbeats(() => sinks.at(-1)!, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+
+    beforeEach(async () => {
+      Object.defineProperty(document, "hidden", { configurable: true, value: false });
+      seedSession(id, [before]);
+      sinks = routeStreamOpens();
+      controller = new AbortController();
+      bound = bindConversationForTest(id, {
+        abortController: controller,
+        blocks: itemsToBlocks([before]),
+      });
+      warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      loop = startStreamPump(id, controller, bound.set, bound.get);
+      await drainAsync();
+    });
+
+    afterEach(async () => {
+      controller.abort();
+      sinks.at(-1)!.close();
+      await drainAsync(2);
+      await loop;
+      warn.mockRestore();
+      Reflect.deleteProperty(document, "hidden");
+    });
+
+    it("recovers a newer committed item within one interval while heartbeats keep the visible chat alive", async () => {
+      seedSessionItems(id, [before, reply]);
+      await advanceCheck();
+
+      expect(bound.get().blocks.map((block) => block.ctx.itemId)).toEqual([before.id, reply.id]);
+      expect(sinks).toHaveLength(1);
+      expect(itemReads()).toEqual([
+        `/v1/sessions/${id}/items?limit=1&order=desc`,
+        `/v1/sessions/${id}/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=desc`,
+      ]);
+      expect(diagnostics()).toEqual([
+        [
+          "Recovered committed items missing from the stream",
+          { count: 1, secondsSinceLastByte: expect.any(Number) },
+        ],
+      ]);
+      expect(diagnostics()[0]![1].secondsSinceLastByte).toBeGreaterThan(14);
+      expect(diagnostics()[0]![1].secondsSinceLastByte).toBeLessThanOrEqual(15);
+      await advanceCheck();
+      expect(diagnostics()).toHaveLength(1);
+    });
+
+    it("keeps blocks identical and avoids reconciliation when there is no newer item", async () => {
+      const blocks = bound.get().blocks;
+      await advanceCheck();
+      expect(bound.get().blocks).toBe(blocks);
+      expect(itemReads()).toEqual([`/v1/sessions/${id}/items?limit=1&order=desc`]);
+      expect(diagnostics()).toEqual([]);
+    });
+
+    it("emits no diagnostic when the backfill recovers no items", async () => {
+      seedSessionItems(id, [before, reply]);
+      const route = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const response = await route(input, init);
+        if (String(input).includes("/items?limit=1&")) seedSessionItems(id, [before]);
+        return response;
+      });
+      await advanceCheck();
+      expect(itemReads()).toHaveLength(2);
+      expect(bound.get().blocks.map((block) => block.ctx.itemId)).toEqual([before.id]);
+      expect(diagnostics()).toEqual([]);
+    });
+
+    it("does no extra reads while hidden", async () => {
+      Object.defineProperty(document, "hidden", { configurable: true, value: true });
+      seedSessionItems(id, [before, reply]);
+      fetchMock.mockClear();
+      await advanceCheck();
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(diagnostics()).toEqual([]);
+    });
+
+    it.each(["streaming", "latched"] as const)(
+      "skips the item check during a %s turn",
+      async (phase) => {
+        bound.set({
+          ...(phase === "streaming"
+            ? {
+                activeResponse: {
+                  responseId: "resp_live",
+                  state: "streaming",
+                  error: null,
+                } as const,
+              }
+            : { sendLatchedAt: Date.now() }),
+        });
+        seedSessionItems(id, [before, reply]);
+        // Keep the existing status recovery from ending the turn in this control.
+        const route = fetchMock.getMockImplementation()!;
+        fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const response = await route(input, init);
+          if (String(input).startsWith(`/v1/sessions/${id}?`)) {
+            return mockResponse({ ...(await response.json()), status: "running" });
+          }
+          return response;
+        });
+        await advanceCheck();
+        expect(itemReads()).toEqual([]);
+        expect(bound.get().blocks.map((block) => block.ctx.itemId)).toEqual([before.id]);
+        expect(diagnostics()).toEqual([]);
+      },
+    );
+
+    it.each(["probe", "backfill"] as const)(
+      "discards a %s that finishes after switching chats",
+      async (phase) => {
+        seedSessionItems(id, [before, reply]);
+        const route = fetchMock.getMockImplementation()!;
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        let waiting = false;
+        fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = String(input);
+          if (
+            url.startsWith(`/v1/sessions/${id}/items?`) &&
+            url.includes(`limit=${phase === "probe" ? 1 : SESSION_HISTORY_PAGE_SIZE}&`)
+          ) {
+            waiting = true;
+            await held;
+          }
+          return route(input, init);
+        });
+        await advanceCheck();
+        expect(waiting).toBe(true);
+        const other = bindConversationForTest("conv_other");
+        const otherBlocks = other.get().blocks;
+        release();
+        await drainAsync();
+        expect(other.get().blocks).toBe(otherBlocks);
+        expect(bound.get().blocks.map((block) => block.ctx.itemId)).toEqual([before.id]);
+        expect(diagnostics()).toEqual([]);
+      },
+    );
+
+    it.each(["streaming", "latched", "hidden", "generation"] as const)(
+      "discards a backfill when %s state changes during its read",
+      async (change) => {
+        seedSessionItems(id, [before, reply]);
+        const route = fetchMock.getMockImplementation()!;
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        let waiting = false;
+        fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+          if (String(input).includes(`/items?limit=${SESSION_HISTORY_PAGE_SIZE}&`)) {
+            waiting = true;
+            await held;
+          }
+          return route(input, init);
+        });
+        await advanceCheck();
+        expect(waiting).toBe(true);
+        if (change === "streaming") {
+          bound.set({
+            activeResponse: { responseId: "resp_live", state: "streaming", error: null },
+          });
+        } else if (change === "latched") {
+          bound.set({ sendLatchedAt: Date.now() });
+        } else if (change === "hidden") {
+          Object.defineProperty(document, "hidden", { configurable: true, value: true });
+        } else {
+          bound.set({ historyGeneration: bound.get().historyGeneration + 1 });
+        }
+        release();
+        await drainAsync();
+        expect(bound.get().blocks.map((block) => block.ctx.itemId)).toEqual([before.id]);
+        expect(diagnostics()).toEqual([]);
+      },
+    );
+  });
+
   it("reconciles status when a heartbeat-only stream misses the idle event", async () => {
     seedSession("conv_heartbeat_gap", []);
     const sink = pushableStream();
@@ -16041,7 +16247,8 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       if (url.startsWith(`/v1/sessions/${id}/items`)) {
-        itemFetches += 1;
+        // Count history backfills separately from the one-item freshness probe.
+        if (!url.includes("limit=1&")) itemFetches += 1;
         if (await itemsDown(url)) {
           return mockResponse({ error: "unavailable" }, { ok: false, status: 503 });
         }

@@ -5986,8 +5986,8 @@ interface MissedEventRecovery {
   recycledTurnKeys: Set<string>;
   /** The latest reconnect backfill failed a read, so status reconciles retry it. */
   backfillOwed: boolean;
-  /** Run the reconnect backfill, with or without its status patch, recording `backfillOwed`. */
-  backfill: (settleStatus: boolean) => Promise<void>;
+  /** Guarded polls retry on their next probe; reconnects record `backfillOwed`. */
+  backfill: (settleStatus: boolean, canApply?: () => boolean) => Promise<void>;
 }
 
 /**
@@ -5999,6 +5999,7 @@ interface MissedEventRecovery {
  * idle or failed, or no longer queues a posted send still pending here, proves
  * the stream also missed that turn's items, so the stream is recycled once for
  * the reconnect backfill instead. A failed backfill is retried on this cadence until one lands.
+ * Periodic idle checks also probe the newest committed item for missed writes.
  */
 async function reconcileActiveSessionStatus(
   id: string,
@@ -6006,9 +6007,11 @@ async function reconcileActiveSessionStatus(
   set: Setter,
   get: Getter,
   recovery: MissedEventRecovery,
+  checkCommittedItems = false,
 ): Promise<void> {
   if (
     queryClient === null ||
+    document.hidden ||
     controller.signal.aborted ||
     conversationRegistry.getActive()?.id !== id ||
     get().abortController !== controller
@@ -6016,6 +6019,7 @@ async function reconcileActiveSessionStatus(
     return;
   }
   const stateBeforeFetch = get();
+  const generation = stateBeforeFetch.historyGeneration;
   const revisionBeforeFetch = streamEventRevisions.get(id) ?? 0;
   const snapshotController = new AbortController();
   const abortSnapshot = () => snapshotController.abort();
@@ -6038,6 +6042,8 @@ async function reconcileActiveSessionStatus(
   const current = get();
   if (
     controller.signal.aborted ||
+    document.hidden ||
+    current.historyGeneration !== generation ||
     isConversationDisposed(id) ||
     conversationRegistry.getActive()?.id !== id ||
     get().abortController !== controller ||
@@ -6104,6 +6110,42 @@ async function reconcileActiveSessionStatus(
     // Retry a failed or missed final-item backfill on the existing status-reconcile
     // cadence. This guarded snapshot settled status; the retry's later read must not.
     await recovery.backfill(false);
+    return;
+  }
+  const canCheckItems = (): boolean => {
+    const state = get();
+    return (
+      !controller.signal.aborted &&
+      !document.hidden &&
+      !isConversationDisposed(id) &&
+      conversationRegistry.getActive()?.id === id &&
+      state.abortController === controller &&
+      state.historyGeneration === generation &&
+      (streamEventRevisions.get(id) ?? 0) === revisionBeforeFetch &&
+      state.activeResponse?.state !== "streaming" &&
+      state.sendLatchedAt === null
+    );
+  };
+  if (
+    !checkCommittedItems ||
+    stateBeforeFetch.activeResponse?.state === "streaming" ||
+    stateBeforeFetch.sendLatchedAt !== null ||
+    !canCheckItems()
+  )
+    return;
+  // Session updated_at has second precision and includes metadata edits.
+  // Compare the newest committed id instead, without downloading the history.
+  let newest: SessionItemsPage;
+  try {
+    newest = await withReadTimeout((signal) => fetchSessionItemsPage(id, { limit: 1, signal }));
+  } catch {
+    return;
+  }
+  if (!canCheckItems()) return;
+  const newestId = newest.items[0]?.id;
+  const newestRenderedId = get().blocks.findLast((block) => block.ctx.itemId)?.ctx.itemId;
+  if (newestId && newestId !== newestRenderedId) {
+    await recovery.backfill(false, canCheckItems);
   }
 }
 
@@ -6327,6 +6369,7 @@ async function rehydrateWindowOnReconnect(
   get: Getter,
   ignoredNativeMessageIds: Set<string>,
   statusPatchFor: (s: ChatState) => Partial<ChatState>,
+  canApply?: () => boolean,
 ): Promise<ReconnectBackfill> {
   // Pinned at entry (still the caller's generation — its guards just passed).
   const generation = get().historyGeneration;
@@ -6338,7 +6381,12 @@ async function rehydrateWindowOnReconnect(
   } catch {
     return "failed";
   }
-  if (isConversationDisposed(id) || get().historyGeneration !== generation) return "skipped";
+  if (
+    isConversationDisposed(id) ||
+    get().historyGeneration !== generation ||
+    canApply?.() === false
+  )
+    return "skipped";
   const snapshotNativeMessageIds = nativeCompletedMessageIds(fresh.items);
   snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
   const freshBlocks = itemsToBlocks(fresh.items);
@@ -6434,6 +6482,7 @@ async function reconcileOnReconnect(
   get: Getter,
   ignoredNativeMessageIds: Set<string> = new Set<string>(),
   settleStatus = true,
+  canApply?: () => boolean,
 ): Promise<ReconnectBackfill> {
   if (queryClient === null) return "skipped";
   const stateBeforeFetch = get();
@@ -6454,7 +6503,8 @@ async function reconcileOnReconnect(
   const preGapElicitations = captureElicitationIdsByStatus(get().blocks, id);
   // A window reset mid-fetch (A→B→A revisit, rebind) defeats the id check alone.
   const generation = get().historyGeneration;
-  const stale = (): boolean => isConversationDisposed(id) || get().historyGeneration !== generation;
+  const stale = (): boolean =>
+    isConversationDisposed(id) || get().historyGeneration !== generation || canApply?.() === false;
   let session: Session;
   let page: SessionItemsPage;
   const client = queryClient;
@@ -6531,6 +6581,7 @@ async function reconcileOnReconnect(
       get,
       ignoredNativeMessageIds,
       statusPatchFor,
+      canApply,
     );
   }
 
@@ -6727,35 +6778,71 @@ export async function startStreamPump(
     revealedPendingIds: new Set<string>(),
     recycledTurnKeys: new Set<string>(),
     backfillOwed: false,
-    backfill: async (settleStatus) => {
+    backfill: async (settleStatus, canApply) => {
+      let recoveredCount = 0;
+      const backfillSet: Setter = canApply
+        ? (partial) =>
+            set((state) => {
+              const patch = typeof partial === "function" ? partial(state) : partial;
+              if (patch.blocks) {
+                const seen = new Set(state.blocks.map((block) => block.ctx.itemId));
+                recoveredCount = new Set(
+                  patch.blocks
+                    .map((block) => block.ctx.itemId)
+                    .filter((itemId) => itemId && !seen.has(itemId)),
+                ).size;
+              }
+              return patch;
+            })
+        : set;
       backfillRuns += 1;
       const run = backfillRuns;
       const outcome = await reconcileOnReconnect(
         id,
-        set,
+        backfillSet,
         get,
         ignoredNativeMessageIds,
         settleStatus,
+        canApply,
       );
       // A slower earlier run must not overwrite the latest run's outcome.
-      if (run === backfillRuns) missedEventRecovery.backfillOwed = outcome === "failed";
+      if (run === backfillRuns && !canApply)
+        missedEventRecovery.backfillOwed = outcome === "failed";
+      if (outcome === "applied" && recoveredCount > 0) {
+        const lastByteAt =
+          liveAttempt === null ? undefined : streamAttemptActivity.get(liveAttempt);
+        console.warn("Recovered committed items missing from the stream", {
+          count: recoveredCount,
+          secondsSinceLastByte: lastByteAt === undefined ? null : (Date.now() - lastByteAt) / 1000,
+        });
+      }
     },
   };
   // Shared by the periodic reconcile and the post-reconnect catch-up burst so
   // reconciliations stay serialized: a catch-up tick that straddles a slow
   // snapshot fetch (or the periodic tick) is skipped rather than issuing a
   // duplicate concurrent backfill.
-  const runGuardedStatusReconcile = (): void => {
+  const runGuardedStatusReconcile = (checkCommittedItems = false): void => {
     if (statusReconcileInFlight) return;
     statusReconcileInFlight = true;
-    void reconcileActiveSessionStatus(id, controller, set, get, missedEventRecovery).finally(() => {
+    void reconcileActiveSessionStatus(
+      id,
+      controller,
+      set,
+      get,
+      missedEventRecovery,
+      checkCommittedItems,
+    ).finally(() => {
       statusReconcileInFlight = false;
     });
   };
   const statusReconcileTimer =
     typeof window === "undefined"
       ? null
-      : window.setInterval(runGuardedStatusReconcile, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+      : window.setInterval(
+          () => runGuardedStatusReconcile(true),
+          ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS,
+        );
   // Pending post-reconnect catch-up timers. Tracked so each reconnect cancels
   // the previous burst before scheduling a new one — otherwise recurring
   // reconnects (the ~5-min ingress recycle) would accumulate timers on the
