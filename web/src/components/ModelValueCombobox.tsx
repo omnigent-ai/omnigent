@@ -11,7 +11,7 @@
  * the buttons beneath. The enclosing dialog is the scroll container.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { type InputHTMLAttributes, useEffect, useRef, useState } from "react";
 import { CheckIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -20,11 +20,14 @@ export function ModelValueCombobox({
   selected,
   onToggle,
   placeholder = "Select or type a value…",
+  inputProps,
 }: {
   options: string[];
   selected: string[];
   onToggle: (value: string) => void;
   placeholder?: string;
+  /** Attributes for the text field, such as its Settings name. */
+  inputProps?: InputHTMLAttributes<HTMLInputElement>;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -60,6 +63,7 @@ export function ModelValueCombobox({
   return (
     <div ref={wrapperRef} className="space-y-1">
       <input
+        {...inputProps}
         ref={inputRef}
         type="text"
         value={query}
