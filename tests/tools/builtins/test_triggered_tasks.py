@@ -610,6 +610,11 @@ _REVIEWED = {"instructions": "x", "permission_mode": None}
         ),
         ({**_REVIEWED, "name": "n", "project_name": 3}, "create", "project_name must"),
         (
+            {**_REVIEWED, "name": "n", "execution_target": "managed_sandbox", "host_id": "h1"},
+            "create",
+            "omit host_id",
+        ),
+        (
             {**_REVIEWED, "triggered_task_id": "t1", "conditions": []},
             "update",
             "pass the whole search: add provider, event, scope",

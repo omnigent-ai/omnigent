@@ -937,8 +937,10 @@ async def test_a_page_reads_only_each_tasks_latest_run(
     monkeypatch.setattr(
         store, "list_page", lambda **kwargs: ScheduledTaskStore.list_page(store, **kwargs)
     )
-    unpaged = await auth_client.get("/v1/scheduled-tasks", params={"limit": 1}, headers=_headers())
-    assert unpaged.status_code == 501, unpaged.text
+    unsupported = await auth_client.get(
+        "/v1/scheduled-tasks", params={"limit": 1}, headers=_headers()
+    )
+    assert unsupported.status_code == 501, unsupported.text
 
 
 @pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)

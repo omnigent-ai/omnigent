@@ -646,6 +646,8 @@ def triggered_task_call_error(args: Mapping[str, object], *, action: str) -> str
         return "set project_id or project_name, not both"
     if "project_name" in args and not isinstance(args["project_name"], str):
         return "project_name must be a string; use project_id: null to clear"
+    if args.get("execution_target") == "managed_sandbox" and args.get("host_id") is not None:
+        return "a managed_sandbox task runs in a fresh sandbox each check; omit host_id"
     instructions = args["instructions"]
     if not isinstance(instructions, str) or not instructions.strip():
         return "instructions must be a non-empty string"
@@ -1119,5 +1121,13 @@ def review_json(value: object) -> str:
     :param value: A decoded tool argument, e.g. ``["ES"]``.
     :returns: E.g. ``'["ES"]'``; a line separator in a string becomes ``\\u2028``.
     """
-    encoded = json.dumps(value, ensure_ascii=False)
-    return _LAYOUT_CONTROLS.sub(lambda match: f"\\u{ord(match.group()):04x}", encoded)
+    return escape_layout_controls(json.dumps(value, ensure_ascii=False))
+
+
+def escape_layout_controls(text: str) -> str:
+    """*text* with line separators and bidi controls written as ``\\uXXXX``.
+
+    :param text: Review text, e.g. ``"ES\\u2028Approve?"``.
+    :returns: The text with each such character escaped, other text unchanged.
+    """
+    return _LAYOUT_CONTROLS.sub(lambda match: f"\\u{ord(match.group()):04x}", text)

@@ -2893,6 +2893,64 @@ def test_inbox_mysql_deep_page_seeks_to_cursor(store):
     assert examined and max(examined) <= 51, plans[0]
 
 
+def test_list_page_mysql_deep_page_seeks_to_cursor(store):
+    import re
+
+    from sqlalchemy import event, insert
+
+    from omnigent.db.db_models import SqlScheduledTask
+    from omnigent.db.enum_codecs import encode_scheduled_task_state
+
+    if store._engine.dialect.name != "mysql":
+        pytest.skip("MySQL execution-plan regression")
+    active, deleted = encode_scheduled_task_state("active"), encode_scheduled_task_state("deleted")
+    with store._engine.begin() as connection:
+        connection.execute(
+            insert(SqlScheduledTask),
+            [
+                {
+                    "id": f"{index:032x}",
+                    "workspace_id": current_workspace_id(),
+                    "user_id": "page-owner",
+                    "name": "Report",
+                    "prompt": "Report",
+                    "rrule": "FREQ=DAILY",
+                    "agent_id": _uid("agent"),
+                    "created_at": index // 10,
+                    # Deleted tasks stay in the index, so a page still counts them.
+                    "state": deleted if index % 7 == 0 else active,
+                }
+                for index in range(10_000)
+            ],
+        )
+        connection.exec_driver_sql("ANALYZE TABLE scheduled_tasks").all()
+    plans = []
+
+    def explain(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("SELECT scheduled_tasks."):
+            plans.append(
+                conn.exec_driver_sql("EXPLAIN ANALYZE " + statement, parameters).scalar_one()
+            )
+
+    event.listen(store._engine, "before_cursor_execute", explain)
+    try:
+        page, cursor = store.list_page(
+            owner_user_id="page-owner", limit=50, after=(500, f"{5005:032x}")
+        )
+    finally:
+        event.remove(store._engine, "before_cursor_execute", explain)
+    assert [task.id for task in page] == [
+        f"{index:032x}" for index in range(5006, 5056) if index % 7 != 0
+    ]
+    assert cursor == (505, f"{5055:032x}")
+    assert len(plans) == 1
+    assert "Index range scan" in plans[0] and "ix_scheduled_tasks_user_scope" in plans[0]
+    examined = [
+        float(value) for value in re.findall(r"actual time=[^)]*? rows=([\d.]+)", plans[0])
+    ]
+    assert examined and max(examined) <= 51, plans[0]
+
+
 def test_latest_runs_mysql_seek_one_run_per_task(store):
     import re
 

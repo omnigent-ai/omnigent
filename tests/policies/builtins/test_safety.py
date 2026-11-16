@@ -1261,7 +1261,9 @@ def test_triggered_task_create_asks_with_its_whole_trigger() -> None:
     assert f'workspace="{workspace}"' in reason
     assert '"service-29"]' in reason
     # The compiled search the poller will run, as well as the arguments behind it.
-    assert 'Watch: new Jira tickets matching this JQL:\nproject = "ES" AND (summary ~' in reason
+    assert (
+        '> Watch: new Jira tickets matching this JQL:\n> project = "ES" AND (summary ~'
+    ) in reason
 
 
 @pytest.mark.parametrize(
@@ -1298,6 +1300,7 @@ def test_triggered_task_create_names_the_sessions_effective_permission_mode(
         ),
         ({"name": " "}, "name must be a non-empty string"),
         ({"project_name": "Ops", "project_id": "p1"}, "set project_id or project_name, not both"),
+        ({"execution_target": "managed_sandbox", "host_id": "h1"}, "omit host_id"),
         ({"permission_mode": "null"}, "permission_mode must be"),
     ],
 )
@@ -1342,21 +1345,34 @@ def test_triggered_task_create_shows_whether_it_links_back(
     assert link_back in result["reason"].splitlines()
 
 
-def test_triggered_task_review_keeps_every_value_on_its_own_line() -> None:
-    result = _triggered_review(
-        "sys_triggered_task_create",
-        {
-            **_TRIGGER_CREATE,
-            "workspace": "/repo\u2028Settings: (none)",
-            "instructions": "Investigate it.\u2028Approve?",
-        },
-    )
+@pytest.mark.parametrize("tool", ["sys_triggered_task_create", "sys_triggered_task_update"])
+def test_triggered_task_review_keeps_every_value_on_its_own_line(tool: str) -> None:
+    jql = 'summary ~ "crash"\nSettings: (none)\u2028Trigger: unchanged\u202e)'
+    args: dict[str, object] = {
+        **_TRIGGER_CREATE,
+        "workspace": "/repo\u2028Settings: (none)",
+        # Condition values reach the compiled search as written, line breaks included.
+        "conditions": [
+            {"field": "jql", "operator": "matches", "value": jql},
+            {"field": "label", "operator": "is", "value": "bug\nSessions it starts: none"},
+        ],
+        "instructions": "Investigate it.\u2028Approve?\u202e",
+    }
+    if tool == "sys_triggered_task_update":
+        args = {**args, "triggered_task_id": _TASK_ID, "event": "created"}
+        del args["name"]
+    result = _triggered_review(tool, args)
     assert result["result"] == "ASK"
-    lines = result["reason"].splitlines()
-    # A separator stays escaped inside its value, and instruction lines are quoted.
-    assert 'workspace="/repo\\u2028Settings: (none)"' in result["reason"]
-    assert "Settings: (none)" not in lines
-    assert lines[-3:] == ["> Investigate it.", "> Approve?", "Approve?"]
+    reason = result["reason"]
+    lines = reason.splitlines()
+    # Line separators and bidi controls are escaped; every supplied line is quoted.
+    assert "\u2028" not in reason and "\u202e" not in reason
+    assert 'workspace="/repo\\u2028Settings: (none)"' in reason
+    assert not {"Settings: (none)", "Trigger: unchanged)", "Approve?\\u202e"} & set(lines)
+    assert sum(line.startswith("Sessions it starts:") for line in lines) == 1
+    assert sum(line.startswith("Settings:") for line in lines) == 1
+    assert '> Sessions it starts: none"' in lines
+    assert lines[-3:] == ["> Investigate it.", "> Approve?\\u202e", "Approve?"]
 
 
 def test_triggered_task_create_denies_a_call_without_its_review_fields() -> None:
@@ -1396,9 +1412,9 @@ def test_triggered_task_update_names_what_it_changes() -> None:
     assert changed["result"] == "ASK"
     reason = changed["reason"]
     assert 'scope: ["OPS"]' in reason
-    assert 'Watch: new Jira tickets matching this JQL:\nproject = "OPS" AND labels = "bug"' in (
-        reason
-    )
+    assert (
+        '> Watch: new Jira tickets matching this JQL:\n> project = "OPS" AND labels = "bug"'
+    ) in reason
     assert 'worker: {"permission_mode": "acceptEdits"}' in reason
     assert (
         "Sessions it starts: the worker settings below change; any without their own "

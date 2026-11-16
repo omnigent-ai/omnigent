@@ -595,6 +595,13 @@ def _inline(value: str) -> str:
     return review_json(value)[1:-1]
 
 
+def _quoted(text: str) -> str:
+    """Every line of *text* quoted with ``> ``, so none can pass for the review's own."""
+    from omnigent.tools.builtins.triggered_tasks import escape_layout_controls
+
+    return "\n".join(f"> {escape_layout_controls(line)}" for line in text.splitlines())
+
+
 def _worker_permission(worker_mode: str, task_mode: object) -> str:
     """How a review names the permission mode of the sessions a trigger starts.
 
@@ -647,7 +654,11 @@ def _triggered_task_review(args: dict[str, object], *, action: str) -> PolicyRes
         )
         if isinstance(config, str):
             return {"result": "DENY", "reason": f"Cannot {action} a triggered task. {config}"}
-        watch = f"{describe_trigger_watch(config)}\n"
+        # Scope and condition values reach the compiled search as written, line breaks too.
+        watch = (
+            "What it watches (each line quoted with '> '):\n"
+            f"{_quoted(describe_trigger_watch(config))}\n"
+        )
         if action == "create":
             # An update keeps its saved link-back unless it passes one, shown with the trigger.
             link_back = "on, posting each session's link on its item"
@@ -693,8 +704,6 @@ def _triggered_task_review(args: dict[str, object], *, action: str) -> PolicyRes
         if key not in TRIGGER_ARGUMENTS and key != "instructions"
     }
     settings = _triggered_task_settings(task_settings)
-    # Quote every line, so instructions can't pass for the review's own text.
-    instructions = "\n".join(f"> {line}" for line in str(args["instructions"]).splitlines())
     return {
         "result": "ASK",
         "reason": (
@@ -706,7 +715,7 @@ def _triggered_task_review(args: dict[str, object], *, action: str) -> PolicyRes
             f"{watch}"
             + ("Trigger:\n" + "\n".join(trigger) if trigger else "Trigger: unchanged")
             + "\nFull instructions for each session (each line quoted with '> '):\n"
-            f"{instructions}\n"
+            f"{_quoted(str(args['instructions']))}\n"
             "Approve?"
         ),
     }

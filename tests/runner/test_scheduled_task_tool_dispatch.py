@@ -1438,6 +1438,20 @@ async def test_triggered_task_changes_stop_when_the_task_cant_be_read(tool: str)
 
 
 @pytest.mark.asyncio
+async def test_triggered_task_create_refuses_a_host_for_a_managed_sandbox_before_any_request() -> (
+    None
+):
+    server = _TaskServer()
+    out = await _run(
+        server,
+        "sys_triggered_task_create",
+        {**_JIRA_TRIGGER, "execution_target": "managed_sandbox", "host_id": "h1"},
+    )
+    assert "omit host_id" in str(out["error"])
+    assert server.calls == []
+
+
+@pytest.mark.asyncio
 async def test_triggered_task_update_refuses_part_of_a_search_before_any_request() -> None:
     server = _TaskServer()
     await _run(server, "sys_triggered_task_create", _JIRA_TRIGGER)
