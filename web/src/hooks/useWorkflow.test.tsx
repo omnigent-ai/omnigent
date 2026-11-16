@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
 
-import { useWorkflowRuns } from "./useWorkflow";
+import { useCloneWorkflow, useWorkflowRuns } from "./useWorkflow";
 
 // Let server data change without remounting or invalidating the real query.
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
@@ -48,6 +48,75 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+});
+
+describe("useCloneWorkflow", () => {
+  function renderClone() {
+    const client = new QueryClient();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    return { ...renderHook(() => useCloneWorkflow(), { wrapper }), client };
+  }
+
+  it.each(["Review changes", "A".repeat(80), "📋".repeat(80)])(
+    "copies the saved plan and chooses an available name within the limit: %s",
+    async (name) => {
+      const source = {
+        id: "original",
+        name,
+        description: "Review the changes.",
+        steps: [{ id: "review", name: "Review", goal: "Find bugs", depends_on: [] }],
+        planning_session_id: "planning-session",
+      };
+      const copy = { ...source, id: "copy", planning_session_id: null };
+      vi.mocked(authenticatedFetch)
+        .mockResolvedValueOnce(Response.json(source))
+        .mockResolvedValueOnce(Response.json({ detail: "Name taken" }, { status: 409 }))
+        .mockResolvedValueOnce(Response.json(copy));
+      const { result, client } = renderClone();
+      client.setQueryData(["saved-workflows"], []);
+
+      await act(async () => {
+        await result.current.mutateAsync(source.id);
+      });
+
+      expect(authenticatedFetch).toHaveBeenNthCalledWith(1, "/v1/workflows/original");
+      const writes = vi.mocked(authenticatedFetch).mock.calls.slice(1);
+      expect(writes.map(([path]) => path)).toEqual(["/v1/workflows", "/v1/workflows"]);
+      expect(writes.map(([, init]) => JSON.parse(init!.body as string))).toEqual([
+        {
+          name: [...name].slice(0, 73).join("") + " (copy)",
+          description: source.description,
+          steps: source.steps,
+        },
+        {
+          name: [...name].slice(0, 71).join("") + " (copy 2)",
+          description: source.description,
+          steps: source.steps,
+        },
+      ]);
+      expect(client.getQueryData(["workflow", copy.id])).toEqual(copy);
+      expect(client.getQueryState(["saved-workflows"])?.isInvalidated).toBe(true);
+    },
+  );
+
+  it.each(["read", "write"])("surfaces %s errors without retrying", async (operation) => {
+    if (operation === "write") {
+      vi.mocked(authenticatedFetch).mockResolvedValueOnce(
+        Response.json({ name: "Review", description: "Review changes", steps: [] }),
+      );
+    }
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(
+      Response.json({ detail: "Request failed" }, { status: 500 }),
+    );
+    const { result } = renderClone();
+
+    await act(async () => {
+      await expect(result.current.mutateAsync("original")).rejects.toThrow("Request failed");
+    });
+    expect(authenticatedFetch).toHaveBeenCalledTimes(operation === "read" ? 1 : 2);
+  });
 });
 
 describe("useWorkflowRuns live refresh", () => {
