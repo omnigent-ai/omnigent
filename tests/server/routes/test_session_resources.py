@@ -4686,10 +4686,12 @@ _DOWNLOAD_URL = (
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("scope", [None, "workspace"])
+@pytest.mark.parametrize("range_header", [None, "bytes=4096-8191", "bytes=16384-"])
 async def test_filesystem_download_streams_runner_attachment(
     client: httpx.AsyncClient,
     tmp_path: Path,
     scope: str | None,
+    range_header: str | None,
 ) -> None:
     """``?download=true`` forwards the runner's attachment and headers verbatim.
 
@@ -4719,15 +4721,27 @@ async def test_filesystem_download_streams_runner_attachment(
         )
 
     async with _runner_app_client(runner):
-        resp = await client.get(_DOWNLOAD_URL + (f"&scope={scope}" if scope else ""))
+        resp = await client.get(
+            _DOWNLOAD_URL + (f"&scope={scope}" if scope else ""),
+            headers={"Range": range_header} if range_header else {},
+        )
 
-    assert resp.status_code == 200
-    assert resp.content == payload
+    assert seen == [("data/big.bin", True, scope or "reach")]
+    if range_header == "bytes=16384-":
+        assert resp.status_code == 416
+        assert resp.headers["content-range"] == f"bytes */{len(payload)}"
+        return
+    assert resp.status_code == (206 if range_header else 200)
+    expected = payload[4096:8192] if range_header else payload
+    assert resp.content == expected
     assert resp.headers["content-disposition"] == 'attachment; filename="big.bin"'
-    assert resp.headers["content-length"] == str(len(payload))
+    assert resp.headers["content-length"] == str(len(expected))
+    assert resp.headers["accept-ranges"] == "bytes"
+    if range_header:
+        assert resp.headers["content-range"] == f"bytes 4096-8191/{len(payload)}"
+    assert "content-encoding" not in resp.headers
     assert resp.headers["cache-control"] == "no-store"
     assert resp.headers.get("X-Omnigent-File-Scope") == scope
-    assert seen == [("data/big.bin", True, scope or "reach")]
 
 
 @pytest.mark.asyncio
