@@ -105,11 +105,13 @@ def create_proactive_agent_admin_router(
     async def require_admin(request: Request) -> None:
         if not offered():
             raise HTTPException(status_code=404, detail="not found")
+        # Authenticate first: a server without a permission store still checks
+        # who is calling, it just has no admins to compare against.
+        user_id = require_user(request, auth_provider) or RESERVED_USER_LOCAL
         # The CLI gives a local single-user server a permission store too, and
         # its one user is no administrator in it; the settings routes agree.
         if permission_store is None or local_single_user_enabled():
             return
-        user_id = require_user(request, auth_provider) or RESERVED_USER_LOCAL
         if not await asyncio.to_thread(permission_store.is_admin, user_id):
             raise OmnigentError(
                 "Admin privileges required to manage the proactive agent",
