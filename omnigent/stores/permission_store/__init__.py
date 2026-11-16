@@ -18,6 +18,8 @@ from omnigent.errors import ErrorCode, OmnigentError
 
 # Largest page a grants list returns; the session permissions route allows the same.
 MAX_GRANTS_PAGE_SIZE = 1000
+# Largest page of automations shared with a caller; each is loaded and serialized.
+MAX_SHARED_SCHEDULED_TASKS_PAGE_SIZE = 100
 # Widest grantee ID: the width of users.id and of the grant tables' user_id.
 MAX_GRANTEE_ID_CHARS = 128
 
@@ -502,6 +504,41 @@ class PermissionStore(ABC):
         :returns: The highest granted level, or ``None`` when no principal has a grant.
         """
         return None
+
+    def caller_principals(self, user_id: str) -> list[str]:
+        """Return the principals *user_id* acts as for automation access.
+
+        The default is the user alone. Stores that model group membership override
+        this to add the user's groups, so a grant to a group reaches its members.
+
+        :param user_id: The caller, e.g. ``"alice@example.com"``.
+        :returns: The caller's ID followed by any groups they belong to.
+        """
+        return [user_id]
+
+    def list_scheduled_tasks_shared_with(
+        self,
+        principals: Sequence[str],  # noqa: ARG002
+        *,
+        limit: int = 50,  # noqa: ARG002
+        after_scheduled_task_id: str | None = None,  # noqa: ARG002
+    ) -> tuple[list[str], str | None]:
+        """Return one page of the live scheduled tasks shared with any of *principals*.
+
+        Ordered by task ID, each task once however many principals hold a grant on it.
+        A page can be shorter than *limit*, even empty, while ``next_cursor`` is set:
+        grants on deleted tasks are skipped, not replaced. Owner rules are the caller's.
+
+        :param principals: The caller's ID and groups, from :meth:`caller_principals`.
+        :param limit: Max task IDs to return, 1 to
+            :data:`MAX_SHARED_SCHEDULED_TASKS_PAGE_SIZE`.
+        :param after_scheduled_task_id: Exclusive cursor, a previous page's
+            ``next_cursor``.
+        :returns: Tuple of (task IDs, next_cursor), next_cursor ``None`` on the last page.
+        :raises OmnigentError: ``INVALID_INPUT`` when *limit* is out of range, from a
+            store that keeps these grants.
+        """
+        return [], None
 
     def delete_for_scheduled_task(self, scheduled_task_id: str) -> int:  # noqa: ARG002
         """Delete every grant on a scheduled task.

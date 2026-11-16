@@ -221,6 +221,18 @@ class ScheduledTaskStore(ABC):
         """
         ...
 
+    def get_many(self, scheduled_task_ids: builtins.list[str]) -> dict[str, ScheduledTask]:
+        """
+        Return the scheduled tasks with these ids, deleted ones included.
+
+        The default reads each id; stores override it with one bounded read.
+
+        :param scheduled_task_ids: Task ids, e.g. one page of a list.
+        :returns: The tasks found, by id; missing ids are absent.
+        """
+        found = (self.get(task_id) for task_id in dict.fromkeys(scheduled_task_ids))
+        return {task.id: task for task in found if task is not None}
+
     @abstractmethod
     def list(
         self,

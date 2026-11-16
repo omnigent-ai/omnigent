@@ -339,6 +339,19 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 return None
             return _to_entity(row)
 
+    def get_many(self, scheduled_task_ids: builtins.list[str]) -> dict[str, ScheduledTask]:
+        """Return the tasks with these ids by primary key, in one read. See base class."""
+        if not scheduled_task_ids:
+            return {}
+        with self._session("select_tasks_by_ids") as session:
+            rows = session.scalars(
+                select(SqlScheduledTask).where(
+                    SqlScheduledTask.workspace_id == current_workspace_id(),
+                    SqlScheduledTask.id.in_(sorted(set(scheduled_task_ids))),
+                )
+            ).all()
+            return {row.id: _to_entity(row) for row in rows}
+
     def list(
         self,
         *,

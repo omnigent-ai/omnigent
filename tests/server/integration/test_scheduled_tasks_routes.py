@@ -5584,3 +5584,243 @@ async def test_no_marker_for_a_session_its_automations_owner_does_not_own(
     listed = await auth_client.get(f"/v1/sessions/{session_id}/permissions", headers=_headers())
     assert listed.status_code == 200, listed.text
     assert listed.json()["managed_by_automation"] is None
+
+
+# ── Reading an automation shared with you ──────────────────────────────────────
+
+_BOB = _headers("bob@example.com")
+_CAROL = _headers("carol@example.com")
+
+
+def _in_groups(monkeypatch: pytest.MonkeyPatch, groups: dict[str, list[str]]) -> None:
+    """Place callers in *groups*, as a permission store that models groups would."""
+
+    def caller_principals(self: SqlAlchemyPermissionStore, user_id: str) -> list[str]:
+        return [user_id, *groups.get(user_id, [])]
+
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "caller_principals", caller_principals)
+
+
+def _read_urls(task_id: str) -> list[str]:
+    url = f"/v1/scheduled-tasks/{task_id}"
+    return [url, f"{url}/runs", f"{url}/run-steps"]
+
+
+@pytest_asyncio.fixture()
+async def workflows_client(
+    runtime_init: None, db_uri: str, tmp_path: Path, mock_llm: ControllableMockClient
+) -> AsyncIterator[httpx.AsyncClient]:
+    """A server that shares automations and serves their run steps."""
+    app = _build_app(db_uri, tmp_path, persistent=True, workflows=True)
+    _make_user(db_uri)
+    _register_host(app, _HOST_ID, "alice@example.com")
+    async with _serve(app, mock_llm, tmp_path) as client:
+        yield client
+
+
+async def test_recipients_read_an_automation_its_runs_and_their_steps(
+    workflows_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = workflows_client
+    task_id = await _create_task(client)
+    run_id = uuid.uuid4().hex
+    _seed_run(db_uri, task_id, run_id, conversation_id=_owned_session(db_uri))
+    assert (await _share(client, task_id, "bob@example.com")).status_code == 200
+    assert (await _share(client, task_id, "team")).status_code == 200
+    _in_groups(monkeypatch, {"carol@example.com": ["team"]})
+
+    def display_names(self: SqlAlchemyPermissionStore, user_ids: list[str]) -> dict[str, str]:
+        return {user_id: user_id.split("@")[0].title() for user_id in user_ids}
+
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "display_names", display_names)
+    owned = (await client.get(_read_urls(task_id)[0], headers=_headers())).json()
+    assert (owned["viewer_role"], owned["owner_display_name"]) == ("owner", None)
+    # Directly and through a group.
+    for recipient in (_BOB, _CAROL):
+        responses = [await client.get(url, headers=recipient) for url in _read_urls(task_id)]
+        assert [r.status_code for r in responses] == [200, 200, 200], responses[-1].text
+        task, runs, steps = (r.json() for r in responses)
+        assert task == {**owned, "viewer_role": "viewer", "owner_display_name": "Alice"}
+        assert [run["id"] for run in runs["runs"]] == [run_id]
+        assert steps == {"runs": [], "next_cursor": None}
+
+    # Someone it isn't shared with sees what a missing automation shows.
+    missing = await client.get(
+        _read_urls(uuid.uuid4().hex)[0], headers=_headers("dave@example.com")
+    )
+    for url in _read_urls(task_id):
+        hidden = await client.get(url, headers=_headers("dave@example.com"))
+        assert (hidden.status_code, hidden.json()) == (404, missing.json()), url
+
+    # Removing the grant, or deleting the automation, ends a recipient's access.
+    revoked = await client.delete(_permissions_url(task_id, "bob@example.com"), headers=_headers())
+    assert revoked.status_code == 204, revoked.text
+    assert [(await client.get(url, headers=_BOB)).status_code for url in _read_urls(task_id)] == [
+        404
+    ] * 3
+    assert (await client.delete(_read_urls(task_id)[0], headers=_headers())).status_code == 200
+    assert (await client.get(_read_urls(task_id)[0], headers=_CAROL)).status_code == 404
+
+
+@_SHARING
+async def test_recipients_cannot_change_an_automation(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    task_id = await _create_task(auth_client)
+    assert (await _share(auth_client, task_id, "bob@example.com")).status_code == 200
+    url = f"/v1/scheduled-tasks/{task_id}"
+    before = (await auth_client.get(url, headers=_headers())).json()
+    missing = await auth_client.get(f"/v1/scheduled-tasks/{uuid.uuid4().hex}", headers=_BOB)
+    for method, path, body in (
+        ("PATCH", url, {"name": "renamed"}),
+        ("PATCH", url, {"state": "paused"}),
+        ("POST", f"{url}/run", None),
+        ("DELETE", url, None),
+        ("GET", _permissions_url(task_id), None),
+        ("PUT", _permissions_url(task_id), {"user_id": "carol@example.com", "level": 1}),
+        ("DELETE", _permissions_url(task_id, "bob@example.com"), None),
+    ):
+        refused = await auth_client.request(method, path, json=body, headers=_BOB)
+        assert (refused.status_code, refused.json()) == (404, missing.json()), (method, path)
+    assert (await auth_client.get(url, headers=_headers())).json() == before
+    assert _task_grantees(db_uri, task_id) == ["bob@example.com"]
+
+
+@_SHARING
+@pytest.mark.parametrize("header", [ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER])
+async def test_agents_get_no_access_through_a_recipient(
+    auth_client: httpx.AsyncClient, header: str
+) -> None:
+    task_id = await _create_task(auth_client)
+    assert (await _share(auth_client, task_id, "bob@example.com")).status_code == 200
+    agent = {**_BOB, header: "agent-value"}
+    statuses = [
+        (await auth_client.get(url, headers=agent)).status_code for url in _read_urls(task_id)
+    ]
+    # Run steps need workflows, which this server leaves off.
+    assert statuses == [404, 404, 404]
+    assert (await auth_client.get(_read_urls(task_id)[0], headers=_BOB)).status_code == 200
+    listed = await auth_client.get("/v1/scheduled-tasks/shared", headers=agent)
+    assert listed.status_code == 403, listed.text
+    # The owner's agent still reads the owner's automation.
+    owner_agent = {**_headers(), header: "agent-value"}
+    assert (await auth_client.get(_read_urls(task_id)[0], headers=owner_agent)).status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("auth_app", "store_supports"), [(False, True), (True, False)], indirect=["auth_app"]
+)
+async def test_recipients_need_a_server_that_shares_automations(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    store_supports: bool,
+) -> None:
+    from omnigent.server.auth import LEVEL_READ
+    from omnigent.stores.permission_store import PermissionStore
+
+    task_id = await _create_task(auth_client)
+    # Granted while the server could share automations.
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("bob@example.com")
+    permissions.grant_for_scheduled_task("bob@example.com", task_id, LEVEL_READ)
+    if not store_supports:
+        monkeypatch.setattr(
+            SqlAlchemyPermissionStore,
+            "supports_scheduled_task_grants",
+            PermissionStore.supports_scheduled_task_grants,
+        )
+    assert (await auth_client.get(_read_urls(task_id)[0], headers=_BOB)).status_code == 404
+    assert (await auth_client.get(_read_urls(task_id)[1], headers=_BOB)).status_code == 404
+    listed = await auth_client.get("/v1/scheduled-tasks/shared", headers=_BOB)
+    assert listed.json() == {"scheduled_tasks": [], "next_cursor": None}
+    assert (await auth_client.get(_read_urls(task_id)[0], headers=_headers())).status_code == 200
+
+
+@_SHARING
+async def test_the_shared_list_pages_automations_shared_with_the_caller(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.auth import LEVEL_READ
+
+    _make_user(db_uri, "bob@example.com")
+    direct = [await _create_task(auth_client, name=f"direct {i}") for i in range(3)]
+    both = await _create_task(auth_client, name="both")
+    via_team = await _create_task(auth_client, name="team")
+    deleted = await _create_task(auth_client, name="deleted")
+    for task_id in [*direct, both, deleted]:
+        assert (await _share(auth_client, task_id, "bob@example.com")).status_code == 200
+    for task_id in (both, via_team):
+        assert (await _share(auth_client, task_id, "team")).status_code == 200
+    # Bob's own automation, shared with his group, is his, not shared with him.
+    own = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(host_id=None, workspace=None), headers=_BOB
+    )
+    assert own.status_code == 200, own.text
+    SqlAlchemyPermissionStore(db_uri).grant_for_scheduled_task(
+        "team", own.json()["id"], LEVEL_READ
+    )
+    assert (
+        await auth_client.delete(f"/v1/scheduled-tasks/{deleted}", headers=_headers())
+    ).status_code == 200
+    # A deleted automation whose grant cleanup hasn't run yet.
+    leftover = await _create_task(auth_client, name="leftover")
+    assert (await _share(auth_client, leftover, "bob@example.com")).status_code == 200
+    assert SqlAlchemyScheduledTaskStore(db_uri).update(leftover, state="deleted")
+    # A reminder goes into its session, not onto the Automations page.
+    reminder = SqlAlchemyScheduledTaskStore(db_uri).create(
+        scheduled_task_id=uuid.uuid4().hex,
+        name="Reminder: check CI",
+        prompt="check CI",
+        rrule="FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=14;BYHOUR=15;BYMINUTE=0;BYSECOND=0;COUNT=1",
+        user_id="alice@example.com",
+        agent_id=builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
+        timezone="UTC",
+        session_mode="continue",
+        session_id=_owned_session(db_uri),
+        kind="reminder",
+    )
+    SqlAlchemyPermissionStore(db_uri).grant_for_scheduled_task(
+        "bob@example.com", reminder.id, LEVEL_READ
+    )
+    _in_groups(monkeypatch, {"bob@example.com": ["team"]})
+
+    listed: list[dict[str, Any]] = []
+    cursor = None
+    pages = 0
+    while True:
+        params: dict[str, object] = {"limit": 2}
+        if cursor is not None:
+            params["after"] = cursor
+        page = await auth_client.get("/v1/scheduled-tasks/shared", params=params, headers=_BOB)
+        assert page.status_code == 200, page.text
+        assert len(page.json()["scheduled_tasks"]) <= 2
+        listed.extend(page.json()["scheduled_tasks"])
+        cursor = page.json()["next_cursor"]
+        pages += 1
+        if cursor is None:
+            break
+    expected = sorted([*direct, both, via_team])
+    assert [task["id"] for task in listed] == expected
+    # Eight automations hold grants; the ones left out only shorten their pages.
+    assert pages == 4
+    assert {(t["viewer_role"], t["owner_user_id"], t["owner_display_name"]) for t in listed} == {
+        ("viewer", "alice@example.com", "alice@example.com")
+    }
+    assert reminder.id not in [task["id"] for task in listed]
+    # Nothing is shared with Alice.
+    alice = await auth_client.get("/v1/scheduled-tasks/shared", headers=_headers())
+    assert alice.json() == {"scheduled_tasks": [], "next_cursor": None}
+    for params in ({"after": "not-a-cursor"}, {"limit": 0}, {"limit": 101}):
+        refused = await auth_client.get("/v1/scheduled-tasks/shared", params=params, headers=_BOB)
+        assert refused.status_code == 422, params
+
+
+async def test_the_local_user_has_no_automations_shared_with_them(
+    runtime_init: None, db_uri: str, tmp_path: Path, mock_llm: ControllableMockClient
+) -> None:
+    app = _build_app(db_uri, tmp_path, persistent=True, local_single_user=True)
+    async with _serve(app, mock_llm, tmp_path) as client:
+        listed = await client.get("/v1/scheduled-tasks/shared")
+    assert listed.status_code == 200, listed.text
+    assert listed.json() == {"scheduled_tasks": [], "next_cursor": None}

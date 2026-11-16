@@ -416,6 +416,33 @@ def test_get_missing_returns_none(store: SqlAlchemyScheduledTaskStore) -> None:
     assert store.get(_uid("st_nope")) is None
 
 
+def test_get_many_reads_the_workspaces_tasks_by_id(store: SqlAlchemyScheduledTaskStore) -> None:
+    """Deleted tasks come back with their state; unknown and other workspaces' ids don't."""
+
+    def create(seed: str) -> str:
+        return store.create(
+            scheduled_task_id=_uid(seed),
+            name=seed,
+            prompt="p",
+            rrule="FREQ=DAILY",
+            user_id="u",
+            agent_id=_uid("ag_1"),
+            timezone="UTC",
+        ).id
+
+    live, deleted = create("st_live"), create("st_deleted")
+    assert store.update(deleted, state="deleted")
+    with workspace_scope(7):
+        elsewhere = create("st_elsewhere")
+
+    found = store.get_many([live, deleted, live, elsewhere, _uid("st_nope")])
+    assert {task_id: task.state for task_id, task in found.items()} == {
+        live: "active",
+        deleted: "deleted",
+    }
+    assert store.get_many([]) == {}
+
+
 # ── list / list_active ────────────────────────────────────────────────────────
 
 
