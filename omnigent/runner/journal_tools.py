@@ -314,11 +314,15 @@ def answer_arrives_as_message(elicitation_id: str) -> bool:
 
 
 async def cancel_session_questions(session_id: str) -> None:
-    """Stop waiting on a deleted session's open questions, clearing them from the Inbox."""
-    questions = [item for item in _answers_by_message.values() if item.session_id == session_id]
-    for question in questions:
-        question.answer.cancel()
-    await asyncio.gather(*(question.delivery for question in questions), return_exceptions=True)
+    """Withdraw a deleted session's open questions and any answer on its way to the session."""
+    owned = [key for key, item in _answers_by_message.items() if item.session_id == session_id]
+    tasks: list[asyncio.Task[Any]] = []
+    for elicitation_id in owned:
+        question = _answers_by_message.pop(elicitation_id)
+        tasks += [question.answer, question.delivery]
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 class _InputRequestFailed(Exception):
@@ -408,6 +412,8 @@ async def _request_input(
             questions=questions,
             elicitation_id=elicitation_id,
         )
+        # No turn waits on it now, so the session's messages flow as usual.
+        pending_approvals.detach(elicitation_id, conversation_id)
         return True
 
     try:
@@ -456,28 +462,30 @@ def _deliver_answer_as_message(
 
     async def deliver() -> None:
         try:
-            verdict = await answer
-        except Exception:
-            _logger.warning(
-                "workflow question %s closed without an answer",
-                elicitation_id,
-                exc_info=True,
-                extra={"session_id": conversation_id},
-            )
-            return
+            try:
+                verdict = await answer
+            except Exception:
+                _logger.warning(
+                    "workflow question %s closed without an answer",
+                    elicitation_id,
+                    exc_info=True,
+                    extra={"session_id": conversation_id},
+                )
+                return
+            if verdict.timed_out:
+                return
+            notice = _answer_notice(step, questions, verdict)
+            if not await _deliver_subagent_wake_post(server_client, conversation_id, notice):
+                _logger.warning(
+                    "could not deliver the answer to workflow question %s",
+                    elicitation_id,
+                    extra={"session_id": conversation_id},
+                )
         finally:
+            # Registered until delivered, so deleting the session can still cancel it.
             entry = _answers_by_message.get(elicitation_id)
             if entry is not None and entry.delivery is asyncio.current_task():
                 del _answers_by_message[elicitation_id]
-        if verdict.timed_out:
-            return
-        notice = _answer_notice(step, questions, verdict)
-        if not await _deliver_subagent_wake_post(server_client, conversation_id, notice):
-            _logger.warning(
-                "could not deliver the answer to workflow question %s",
-                elicitation_id,
-                extra={"session_id": conversation_id},
-            )
 
     delivery = asyncio.create_task(deliver(), name=f"workflow-answer:{elicitation_id}")
     _answers_by_message[elicitation_id] = _OpenQuestion(conversation_id, answer, delivery)

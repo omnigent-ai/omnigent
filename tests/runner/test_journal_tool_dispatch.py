@@ -452,41 +452,54 @@ def test_a_question_returns_to_its_agent_before_the_native_tool_relay_gives_up()
     assert journal_tools._ANSWER_WAIT_IN_TURN_S < bridge._TOOL_CALL_TIMEOUT_S
 
 
-def _late_question_server(elicitation_id: str, messages: list[dict[str, object]]):
-    """Takes the question and records the messages the runner sends its session."""
+def _late_question_server(
+    elicitation_id: str,
+    messages: list[dict[str, object]],
+    asked: list[dict[str, object]] | None = None,
+):
+    """Takes the question, recording each time it's raised and the messages sent to the session."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == f"/v1/sessions/{SESSION}/events":
             messages.append(json.loads(request.content))
             return httpx.Response(200, json={"queued": True})
+        if asked is not None:
+            asked.append(json.loads(request.content))
         return httpx.Response(200, json={"entry": _STATUS, "elicitation_id": elicitation_id})
 
     return handler
 
 
+_ANSWERED_NOTICE = (
+    '[System: the user answered your question on task "deploy"]\n'
+    "Q: Deploy to prod now?\n"
+    "A: Deploy\n"
+    "Write the task's next status: started to resume it, done for an approval given, "
+    "failed for one refused. Then go on with the plan."
+)
+
+
 @pytest.mark.parametrize(
-    ("action", "content", "notice"),
+    ("action", "content", "notice", "reconnect"),
     [
-        (
-            "accept",
-            {"Deploy to prod now?": "Deploy"},
-            '[System: the user answered your question on task "deploy"]\n'
-            "Q: Deploy to prod now?\n"
-            "A: Deploy\n"
-            "Write the task's next status: started to resume it, done for an approval given, "
-            "failed for one refused. Then go on with the plan.",
-        ),
+        ("accept", {"Deploy to prod now?": "Deploy"}, _ANSWERED_NOTICE, False),
         (
             "decline",
             None,
             '[System: the user dismissed your question on task "deploy"]\n'
             "The task stays waiting for them; don't ask again unless they bring it up.",
+            False,
         ),
+        ("accept", {"Deploy to prod now?": "Deploy"}, _ANSWERED_NOTICE, True),
     ],
-    ids=["answered", "dismissed"],
+    ids=["answered", "dismissed", "answered_after_server_reconnect"],
 )
 async def test_an_answer_after_the_call_returned_reaches_the_session_as_a_message(
-    monkeypatch: pytest.MonkeyPatch, action: str, content: dict | None, notice: str
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+    content: dict | None,
+    notice: str,
+    reconnect: bool,
 ) -> None:
     from omnigent.runner import create_runner_app
     from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
@@ -495,6 +508,7 @@ async def test_an_answer_after_the_call_returned_reaches_the_session_as_a_messag
     monkeypatch.setattr(journal_tools, "_ANSWER_WAIT_IN_TURN_S", 0.2)
     elicitation_id = workflow_elicitation_id(SESSION, "tool:toolu_late")
     messages: list[dict[str, object]] = []
+    asked: list[dict[str, object]] = []
     published: list[dict[str, object]] = []
     harness = _ScriptedHarnessClient([])
     runner = create_runner_app(
@@ -502,7 +516,7 @@ async def test_an_answer_after_the_call_returned_reaches_the_session_as_a_messag
         server_client=cast(Any, NullServerClient()),
     )
     async with (
-        _client(_late_question_server(elicitation_id, messages)) as server,
+        _client(_late_question_server(elicitation_id, messages, asked)) as server,
         httpx.AsyncClient(
             transport=httpx.ASGITransport(app=runner), base_url="http://runner"
         ) as runner_client,
@@ -519,6 +533,13 @@ async def test_an_answer_after_the_call_returned_reaches_the_session_as_a_messag
             assert result["still_open"] is True
             # Nothing clears the question, so it stays answerable in the Inbox and chat.
             assert [event["type"] for event in published] == ["session.journal.appended"]
+            # No turn waits on it any more, so the session's messages aren't held back.
+            assert not pending_approvals.has_pending(SESSION)
+            if reconnect:
+                pending_approvals.notify_server_reconnect()
+                await poll_until_async(lambda: len(asked) == 2, timeout_s=5)
+                assert asked[0] == asked[1]
+                assert not pending_approvals.has_pending(SESSION)
             # The server forwards the answer to the runner as it does any other.
             response = await runner_client.post(
                 f"/v1/sessions/{SESSION}/events",
@@ -549,6 +570,53 @@ async def test_an_answer_after_the_call_returned_reaches_the_session_as_a_messag
     }
     assert not journal_tools.answer_arrives_as_message(elicitation_id)
     assert not pending_approvals.has_pending(SESSION)
+
+
+@pytest.mark.parametrize("moment", ["before_delivery_resumes", "while_the_message_is_held"])
+async def test_deleting_the_session_stops_an_answer_on_its_way(
+    monkeypatch: pytest.MonkeyPatch, moment: str
+) -> None:
+    monkeypatch.setattr(journal_tools, "_ANSWER_WAIT_IN_TURN_S", 0.2)
+    elicitation_id = workflow_elicitation_id(SESSION, "tool:toolu_deleted")
+    posting, released = asyncio.Event(), asyncio.Event()
+    delivered: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/v1/sessions/{SESSION}/events":
+            # Held, as a policy approval gate on the session's input can hold it.
+            posting.set()
+            await released.wait()
+            delivered.append(request)
+            return httpx.Response(200, json={"queued": True})
+        return httpx.Response(200, json={"entry": _STATUS, "elicitation_id": elicitation_id})
+
+    async with _client(handler) as server:
+        try:
+            result = await _run(
+                server,
+                "sys_workflow_request_input",
+                {"step": "deploy", "questions": [_QUESTION]},
+                call_id="toolu_deleted",
+                publish_event=lambda *_: None,
+            )
+            assert result["still_open"] is True
+            question = journal_tools._answers_by_message[elicitation_id]
+            assert pending_approvals.resolve(
+                elicitation_id, True, {"Deploy to prod now?": "Deploy"}
+            )
+            if moment == "before_delivery_resumes":
+                while not question.answer.done():
+                    await asyncio.sleep(0)
+                assert not posting.is_set()
+            else:
+                await asyncio.wait_for(posting.wait(), timeout=5)
+            await asyncio.wait_for(journal_tools.cancel_session_questions(SESSION), timeout=5)
+            assert question.delivery.done()
+            assert not journal_tools.answer_arrives_as_message(elicitation_id)
+        finally:
+            released.set()
+            await journal_tools.cancel_session_questions(SESSION)
+    assert delivered == []
 
 
 @pytest.mark.parametrize("ending", ["expiry", "session_deleted"])
