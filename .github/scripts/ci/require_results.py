@@ -41,6 +41,14 @@ def validate_results(suite: str, needs: dict, *, draft: bool) -> None:
         if any(outputs[key] not in {"true", "false"} for key in jobs.values()):
             raise ValueError("Invalid consumer selection outputs")
         selected = {job: outputs[key] == "true" for job, key in jobs.items()}
+        if suite == "web" and (
+            os.environ.get("EVENT_NAME") == "pull_request" or "web-vitest" in needs
+        ):
+            # Pull requests shard Vitest without coverage. Pushes run that
+            # suite inside web-test, so a skipped shard job is expected there.
+            selected["web-vitest"] = (
+                os.environ.get("EVENT_NAME") == "pull_request" and outputs["web"] == "true"
+            )
     else:
         raise ValueError(f"Unknown test suite: {suite}")
     failures = []

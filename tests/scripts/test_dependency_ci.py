@@ -639,6 +639,26 @@ def test_workflows_connect_selection_to_jobs():
     for name in ("Install other workspace dependencies", "Test and build workspace consumers"):
         step = next(step for step in web_steps if step.get("name") == name)
         assert "if" not in step
+    assert workflows["web-tests"]["jobs"]["web-test"]["name"] == "web test"
+    coverage = next(step for step in web_steps if step.get("name") == "Run tests with coverage")
+    assert coverage["if"] == "github.event_name == 'push'"
+    assert "test:coverage" in coverage["run"]
+    for name in ("Summarize coverage", "Upload UI coverage summary"):
+        step = next(step for step in web_steps if step.get("name") == name)
+        assert step["if"] == "always() && github.event_name == 'push'"
+    vitest = workflows["web-tests"]["jobs"]["web-vitest"]
+    assert vitest["needs"] == "scope"
+    assert vitest["if"] == (
+        "${{ github.event_name == 'pull_request' && !github.event.pull_request.draft "
+        "&& needs.scope.outputs.web == 'true' }}"
+    )
+    assert vitest["strategy"]["fail-fast"] is False
+    assert vitest["strategy"]["matrix"]["shard"] == [1, 2, 3, 4]
+    vitest_run = next(step["run"] for step in vitest["steps"] if step.get("name") == "Run tests")
+    # pnpm's `--` is forwarded to Vitest and disables --shard. exec must pass it.
+    assert vitest_run == (
+        "pnpm --filter web exec vitest run --shard=${{ matrix.shard }}/${{ strategy.job-total }}"
+    )
     e2e_steps = workflows["e2e"]["jobs"]["e2e"]["steps"]
     e2e_run = next(step for step in e2e_steps if step.get("uses") == "./.github/actions/e2e-run")
     action = yaml.safe_load((ROOT / ".github/actions/e2e-run/action.yml").read_text())
