@@ -1,4 +1,5 @@
 import {
+  isPlanComplete,
   type JournalEntry,
   type JournalPlanStep,
   type StepProgress,
@@ -9,6 +10,8 @@ import {
 export interface WorkflowRun {
   /** The ID of the plan entry that started the run. */
   id: string;
+  /** Graph ID, or earliest unchanged legacy graph position; absent on older servers. */
+  planGraphRevision?: string | number;
   sessionId: string;
   /** The session's title; empty when it has none yet. */
   title: string;
@@ -20,7 +23,7 @@ export interface WorkflowRun {
   /** Work that outlives the parent turn, such as background shells or an active goal. */
   backgroundWorkRunning?: boolean;
   archived: boolean;
-  /** The run's starting steps, counted by their current status. */
+  /** The run's latest steps, counted by their current status. */
   progress: {
     total: number;
     started: number;
@@ -28,7 +31,7 @@ export interface WorkflowRun {
     needsInput: number;
     failed: number;
   };
-  /** The steps of the plan that started the run. */
+  /** The latest plan's steps within this invocation. */
   steps: JournalPlanStep[];
   /** Each of those steps' newest status entry. */
   statuses: JournalEntry[];
@@ -56,8 +59,8 @@ export type WorkflowRunState =
   | { kind: "stopped"; label: string };
 
 /**
- * Where a run stands, for its row. A question for the user comes first, then
- * a finished run; a running session shows its progress; otherwise a failed
+ * Where a run stands, for its row. A finished run comes first, then a question
+ * for the user; a running session shows its progress; otherwise a failed
  * step or session says so, and a run that stopped partway shows its count.
  */
 export function describeWorkflowRun(
@@ -66,8 +69,14 @@ export function describeWorkflowRun(
 ): WorkflowRunState {
   const { total, done, needsInput, failed } = run.progress;
   const count = `${done} of ${total} done`;
+  const unknownActivePlan = run.planGraphRevision === undefined && run.isCurrent && sessionWorking;
+  if (
+    (run.planGraphRevision !== undefined &&
+      isPlanComplete(runStepProgress(run, sessionWorking), run.planGraphRevision)) ||
+    (!unknownActivePlan && total > 0 && done === total)
+  )
+    return { kind: "done", label: failed > 0 ? `Finished, ${failed} failed` : "Done" };
   if (needsInput > 0) return { kind: "waiting", label: "Waiting for you" };
-  if (total > 0 && done === total) return { kind: "done", label: "Done" };
   if (run.isCurrent && sessionWorking) return { kind: "running", label: count };
   if (failed > 0) return { kind: "failed", label: `Failed · ${count}` };
   if (run.isCurrent && run.sessionStatus === "failed")
