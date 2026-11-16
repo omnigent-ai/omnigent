@@ -270,6 +270,8 @@ describe("isPlanComplete", () => {
     expect(isPlanComplete(stepProgress(steps, entries, false))).toBe(true);
     for (const next of [
       status(2, "report", "started"),
+      status(2, "work", "started"),
+      status(2, "work", "needs_input"),
       journalEntry(2, { kind: "plan_status", content: { status: "started" } }),
     ]) {
       expect(isPlanComplete(stepProgress(steps, [...entries, next], true))).toBe(false);
@@ -279,6 +281,16 @@ describe("isPlanComplete", () => {
       { id: "publish", name: "Publish", goal: null, depends_on: ["report"] },
     ];
     expect(isPlanComplete(stepProgress(replanned, entries, false))).toBe(false);
+  });
+
+  it.each(["a", "b"])("compares %s with its own branch's completion", (upstream) => {
+    const branches = planSteps(plan(0, ["a"], ["b"], ["report-a", ["a"]], ["report-b", ["b"]]));
+    const entries = [
+      status(1, "report-a", "done"),
+      status(2, upstream, "started"),
+      status(3, "report-b", "done"),
+    ];
+    expect(isPlanComplete(stepProgress(branches, entries, true))).toBe(upstream === "b");
   });
 
   it("requires every native task to be done", () => {

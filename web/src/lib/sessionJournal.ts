@@ -290,11 +290,34 @@ export function planTally(progress: readonly StepProgress[]): Record<StepState, 
   return tally;
 }
 
-/** A plan finishes when every graph end is done, even with stale upstream statuses. */
+/** Completed final steps supersede older statuses, but newer unfinished work reopens them. */
 export function isPlanComplete(progress: readonly StepProgress[]): boolean {
   const dependencies = new Set(progress.flatMap((item) => item.step.depends_on));
   const finalSteps = progress.filter((item) => !dependencies.has(item.step.id));
-  return finalSteps.length > 0 && finalSteps.every((item) => item.state === "done");
+  const byId = new Map(progress.map((item) => [item.step.id, item]));
+  return (
+    finalSteps.length > 0 &&
+    finalSteps.every((finalStep) => {
+      if (finalStep.state !== "done") return false;
+      const pending = [...finalStep.step.depends_on];
+      const seen = new Set<string>();
+      for (let id = pending.pop(); id !== undefined; id = pending.pop()) {
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const upstream = byId.get(id);
+        if (!upstream) continue;
+        if (
+          upstream.state !== "done" &&
+          upstream.status &&
+          finalStep.status &&
+          upstream.status.position > finalStep.status.position
+        )
+          return false;
+        pending.push(...upstream.step.depends_on);
+      }
+      return true;
+    })
+  );
 }
 
 /** How many tasks are finished: done or failed, since a failed task's work is over too. */
