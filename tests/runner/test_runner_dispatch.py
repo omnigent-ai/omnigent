@@ -3420,7 +3420,7 @@ async def test_runner_os_env_dispatch_preserves_shared_and_fork_ownership(
         primary.read.assert_not_awaited()
         assert (
             create_environment.call_args_list
-            == [call(spec.os_env, additional_read_roots=[skills_dir])] * 2
+            == [call(spec.os_env, additional_read_roots=[skills_dir], model_access=None)] * 2
         )
         for environment in disposable:
             environment.read.assert_awaited_once()
