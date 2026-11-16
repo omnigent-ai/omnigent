@@ -1693,6 +1693,7 @@ function ProjectFolder({
   selectedIds,
   onToggleSelected,
   onProjectAssigned,
+  onProjectRenamed,
   onConversationsLoaded,
   reorderable,
   ordering,
@@ -1745,6 +1746,7 @@ function ProjectFolder({
   selectedIds: Set<string>;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   onProjectAssigned?: (projectName: string) => void;
+  onProjectRenamed?: (oldName: string, newName: string) => void;
   /** Report this folder's own loaded sessions to the parent, and how many of
       them it lists above "Show more". The folder paginates independently of the
       global window, so bulk-selection in the projects scope must resolve
@@ -1881,6 +1883,7 @@ function ProjectFolder({
     name,
     projectId,
     icon,
+    onProjectRenamed,
   );
 
   const headerDrag = useSortable({
@@ -2780,6 +2783,16 @@ function ConversationList({
       return next;
     });
   }, []);
+  // Expansion is keyed by name, so carry it over a rename; otherwise the
+  // renamed folder reopens collapsed, listing only the open session.
+  const renameExpandedProject = useCallback((oldName: string, newName: string) => {
+    setExpandedProjects((prev) => {
+      if (!prev.includes(oldName)) return prev;
+      const next = [...prev.filter((n) => n !== oldName && n !== newName), newName];
+      writeExpandedProjectSections(next);
+      return next;
+    });
+  }, []);
 
   const revealedDrafts = useRef(new Set<string>());
   useEffect(() => {
@@ -3585,6 +3598,7 @@ function ConversationList({
                             selectedIds={selectedIds}
                             onToggleSelected={onToggleSelected}
                             onProjectAssigned={expandProject}
+                            onProjectRenamed={renameExpandedProject}
                             onConversationsLoaded={handleFolderConversationsLoaded}
                             reorderable={reorderable}
                           />
@@ -7135,6 +7149,7 @@ function useProjectFolderMenu(
   projectName: string,
   projectId: string | null,
   icon?: string | null,
+  onRenamed?: (oldName: string, newName: string) => void,
 ): { actions: ProjectFolderMenuActions; dialogs: ReactNode } {
   const [menuOpen, setMenuOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -7255,6 +7270,7 @@ function useProjectFolderMenu(
                     oldName: projectName,
                     newName,
                   });
+                  onRenamed?.(projectName, newName);
                 }
                 if (iconChanged) {
                   const next = { ...(iconConfig ?? {}) };
