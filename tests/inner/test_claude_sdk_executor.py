@@ -7448,6 +7448,13 @@ def _make_transport_with_process(returncode):
     return _Transport()
 
 
+@pytest.fixture(autouse=True)
+def _empty_cli_context_windows():
+    """Start each test with no reported context windows, so replay budgets ignore test order."""
+    with patch.dict("omnigent.inner.claude_sdk_executor._CLI_CONTEXT_WINDOWS", clear=True):
+        yield
+
+
 def _make_recovery_fake_sdk(responses=()):
     """Fake SDK whose clients record construction and queried prompts.
 
@@ -7750,10 +7757,7 @@ async def test_rebuilt_executor_replays_within_the_window_claude_code_reported(
     reported = _sdk_result(model_usage=model_usage)
     fake_sdk = _make_recovery_fake_sdk([[reported]])
     messages = [*_long_prior_messages(), {"role": "user", "content": "What next?"}]
-    with (
-        patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk),
-        patch.dict("omnigent.inner.claude_sdk_executor._CLI_CONTEXT_WINDOWS", clear=True),
-    ):
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
         first = ClaudeSDKExecutor(model=model, context_window=declared_window)
         [event async for event in first.run_turn([{"role": "user", "content": "hi"}], [], "")]
         # A fresh executor simulates a restarted runner launching a new client.
