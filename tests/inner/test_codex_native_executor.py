@@ -1964,10 +1964,12 @@ async def test_shell_wait_slow_metadata_remains_bounded(
     started = threading.Event()
     release = threading.Event()
     finished = threading.Event()
+    holds: list[None] = []
     original_read = Path.read_text
     original_write = codex_native_executor.reconcile_shell_command_state
 
     def hold() -> None:
+        holds.append(None)
         started.set()
         assert release.wait(5), "test did not release shell metadata"
 
@@ -2000,11 +2002,12 @@ async def test_shell_wait_slow_metadata_remains_bounded(
     monkeypatch.setattr(Path, "read_text", read)
     if operation == "reconcile":
         monkeypatch.setattr(codex_native_executor, "reconcile_shell_command_state", reconcile)
+    monkeypatch.setattr(codex_native_executor, "_SHELL_RECONCILIATION_RPC_SECONDS", 0.05)
     guard = threading.Timer(3, release.set)
     guard.start()
     task = asyncio.create_task(
         codex_native_executor._wait_for_shell_completion(
-            FenceClient(), tmp_path, state, wait_seconds=0.2, require_idle=require_idle
+            FenceClient(), tmp_path, state, wait_seconds=0.5, require_idle=require_idle
         )
     )
     try:
@@ -2021,6 +2024,7 @@ async def test_shell_wait_slow_metadata_remains_bounded(
         else:
             assert await asyncio.wait_for(task, 1) == state
         assert not finished.is_set()
+        assert len(holds) == 1, "a held metadata operation was retried on another worker"
         requests = list(FenceClient.requests)
         release.set()
         assert await asyncio.to_thread(finished.wait, 2)
@@ -2032,6 +2036,33 @@ async def test_shell_wait_slow_metadata_remains_bounded(
         guard.cancel()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_shell_wait_observes_completion_during_its_final_poll(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A shell turn that ends during the last poll interval releases the waiting prompt."""
+    _seed_bridge(tmp_path, active_turn_id="turn_shell")
+    seeded = read_bridge_state(tmp_path)
+    assert seeded is not None
+    state = replace(seeded, active_shell_turn_id="turn_shell")
+    write_bridge_state(tmp_path, state)
+    monkeypatch.setattr(codex_native_executor, "_SHELL_TURN_POLL_SECONDS", 0.5)
+
+    class _FinishingShellClient(_FakeCodexNativeClient):
+        native_active_turn_id = "turn_shell"
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            asyncio.get_running_loop().call_later(
+                0.25, clear_active_turn_id_if_matches, tmp_path, "turn_shell"
+            )
+            return await super().request(method, params)
+
+    settled = await codex_native_executor._wait_for_shell_completion(
+        _FinishingShellClient(), tmp_path, state, wait_seconds=0.5
+    )
+
+    assert settled.active_turn_id is None and settled.active_shell_turn_id is None
 
 
 @pytest.mark.parametrize(

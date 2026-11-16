@@ -720,23 +720,37 @@ async def _run_codex_shell_command(
     _logger.info("Codex native submitted user shell command")
 
 
+def _shell_storage_deadline(deadline: float) -> float:
+    """Return when bridge storage work must finish, allowing one poll past the shell wait."""
+    return max(deadline, asyncio.get_running_loop().time() + _SHELL_TURN_POLL_SECONDS)
+
+
 async def _reconcile_shell_command(
     client: CodexAppServerClient,
     bridge_dir: Path,
     state: CodexNativeBridgeState,
-    timeout_seconds: float,
+    deadline: float,
 ) -> None:
     """Probe core turn state after earlier shell operations, without adding input."""
     expected_turn_id = f"omnigent-shell-fence-{uuid.uuid4().hex}"
+    rpc_seconds = min(
+        _SHELL_RECONCILIATION_RPC_SECONDS, deadline - asyncio.get_running_loop().time()
+    )
     try:
-        # Shell and steer requests share Codex's per-thread FIFO. Unlike the
-        # shell ack or thread/read, steer waits for the core operation to run.
-        async with asyncio.timeout(timeout_seconds):
+        # Bound the update by the wait, not the RPC budget, so a stall never queues another.
+        async with asyncio.timeout_at(_shell_storage_deadline(deadline)):
             try:
-                await client.request(
-                    "turn/steer",
-                    {"threadId": state.thread_id, "expectedTurnId": expected_turn_id, "input": []},
-                )
+                # Shell and steer requests share Codex's per-thread FIFO. Unlike the
+                # shell ack or thread/read, steer waits for the core operation to run.
+                async with asyncio.timeout(rpc_seconds):
+                    await client.request(
+                        "turn/steer",
+                        {
+                            "threadId": state.thread_id,
+                            "expectedTurnId": expected_turn_id,
+                            "input": [],
+                        },
+                    )
             except CodexAppServerResponseError as error:
                 if error.code != -32600:
                     return
@@ -767,10 +781,9 @@ async def _wait_for_shell_completion(
     deadline = asyncio.get_running_loop().time() + (
         _SHELL_COMPLETION_WAIT_SECONDS if wait_seconds is None else wait_seconds
     )
-    reconciled = False
     while True:
         try:
-            async with asyncio.timeout_at(deadline):
+            async with asyncio.timeout_at(_shell_storage_deadline(deadline)):
                 current = await asyncio.to_thread(read_bridge_state, bridge_dir)
         except TimeoutError:
             if not require_idle:
@@ -789,18 +802,14 @@ async def _wait_for_shell_completion(
             )
         if current.pending_shell_command_id is None and current.active_shell_turn_id is None:
             return current
-        if reconciled:
-            remaining = deadline - asyncio.get_running_loop().time()
-            await asyncio.sleep(min(_SHELL_TURN_POLL_SECONDS, max(0, remaining)))
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             if not require_idle:
                 return current
             raise _CodexNativeInputUndelivered(_CODEX_SHELL_WAIT_FAILURE)
-        await _reconcile_shell_command(
-            client, bridge_dir, current, min(_SHELL_RECONCILIATION_RPC_SECONDS, remaining)
-        )
-        reconciled = True
+        await _reconcile_shell_command(client, bridge_dir, current, deadline)
+        remaining = deadline - asyncio.get_running_loop().time()
+        await asyncio.sleep(min(_SHELL_TURN_POLL_SECONDS, max(0, remaining)))
 
 
 async def _set_codex_goal(client: CodexAppServerClient, *, thread_id: str, objective: str) -> None:
