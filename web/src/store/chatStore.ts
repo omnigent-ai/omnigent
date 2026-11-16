@@ -6141,19 +6141,20 @@ async function reconcileActiveSessionStatus(
   // Compare the newest committed id instead, without downloading the history.
   let newest: SessionItemsPage;
   try {
-    newest = await withReadTimeout((signal) => fetchSessionItemsPage(id, { limit: 1, signal }));
+    newest = await withReadTimeout((signal) => fetchSessionItemsPage(id, { limit: 2, signal }));
   } catch {
     return;
   }
   if (!canCheckItems()) return;
-  const newestItem = newest.items[0];
+  const newestItem = newest.items.at(-1);
+  const previousItem = newest.items.at(-2);
   const newestId = newestItem?.id;
   const newestRenderedId = get().blocks.findLast((block) => block.ctx.itemId)?.ctx.itemId;
   const reconciledId =
     recovery.reconciledItem?.generation === generation ? recovery.reconciledItem.itemId : null;
   if (newestId && newestId !== newestRenderedId && newestId !== reconciledId) {
     const tail = get().blocks.findLast((block) => block.type !== "response_end");
-    // Live terminal errors have no item id. Avoid duplicating one just to assign its id.
+    // Skip a live terminal error only when its committed predecessor is already visible.
     if (
       tail?.type === "error" &&
       !tail.ctx.itemId &&
@@ -6163,7 +6164,8 @@ async function reconcileActiveSessionStatus(
       newestItem.response_id === tail.ctx.responseId &&
       newestItem.source === tail.source &&
       newestItem.code === tail.code &&
-      newestItem.message === tail.message
+      newestItem.message === tail.message &&
+      (!previousItem || get().blocks.some((block) => block.ctx.itemId === previousItem.id))
     ) {
       recovery.reconciledItem = { itemId: newestId, generation };
       return;
