@@ -5761,9 +5761,17 @@ def create_runner_app(
         )
 
         relay_spec = _unwrap_spec_entry(spec_entry)
-        relay_schemas = filter_workflow_tool_schemas(
+        relay_schemas: list[_JsonObject] = filter_workflow_tool_schemas(
             build_native_relay_tool_schemas(relay_spec),
             enabled=workflows_enabled,
+        )
+        from omnigent.tools.browser_agent_tools import filter_native_relay_browser_tools
+
+        relay_schemas = await filter_native_relay_browser_tools(
+            relay_schemas,
+            session_id=session_id,
+            server_client=server_client,
+            session_labels=session_labels,
         )
         if relay_spec is not None and relay_spec.mcp_servers:
             # Native terminals consume the persistent relay, not per-turn schemas.
@@ -6415,6 +6423,9 @@ def create_runner_app(
             from omnigent.runner.tool_dispatch import strip_browser_tool_schemas
 
             _spec_tools = strip_browser_tool_schemas(_spec_tools)
+        from omnigent.tools.browser_agent_tools import filter_turn_browser_tools
+
+        _spec_tools = filter_turn_browser_tools(_spec_tools, msg_body)
         _client_tools = cast(list[_JsonObject], msg_body.get("tools") or [])
         merged_tools = _merge_request_client_tools(_spec_tools, _client_tools)
         if merged_tools:

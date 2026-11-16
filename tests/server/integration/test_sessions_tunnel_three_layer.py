@@ -84,6 +84,7 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from tests.budgets import budget
 from tests.runner.helpers import NullServerClient
 from tests.runtime.harnesses._test_scaffold_harnesses import _EchoHarness
+from tests.server.helpers import wait_for_tunnel_registration
 
 # ``claude-sdk`` is one of the harness names the agent spec validator
 # accepts. The fixture rewrites its registry entry to point at the
@@ -258,13 +259,7 @@ async def _send_hello_and_wait(
     await communicator.send_input(
         {"type": "websocket.receive", "text": encode_frame(hello)},
     )
-    registry = app.state.tunnel_registry
-
-    async def _registered() -> None:
-        while registry.get(runner_id) is None:
-            await asyncio.sleep(0.01)
-
-    await asyncio.wait_for(_registered(), timeout=budget(2.0))
+    await wait_for_tunnel_registration(communicator, app.state.tunnel_registry, runner_id)
 
 
 async def _forward_requests_to_runner(

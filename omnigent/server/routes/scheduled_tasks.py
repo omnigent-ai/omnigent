@@ -89,6 +89,10 @@ from omnigent.stores.scheduled_task_store import (
     ScheduledTaskStore,
     encode_mcp_services,
 )
+from omnigent.tools.browser_agent_tools import (
+    BROWSER_AGENT_TOOLS_CREATION_LABEL_KEYS,
+    browser_agent_tools_creation_labels,
+)
 from omnigent.util.uuid import normalize_uuid
 
 _logger = logging.getLogger(__name__)
@@ -773,6 +777,7 @@ def create_scheduled_tasks_router(
         owner: str,
         project_id: str | None,
         carry: bool,
+        browser_labels: dict[str, str],
     ) -> Conversation:
         """Copy *source*, through its last finished reply, for the task's runs to start from."""
         # Its threads can commit after the request is cancelled; the copy is deleted once they do.
@@ -785,6 +790,7 @@ def create_scheduled_tasks_router(
                 owner=owner,
                 project_id=project_id,
                 carry=carry,
+                browser_labels=browser_labels,
             )
         )
         try:
@@ -811,6 +817,7 @@ def create_scheduled_tasks_router(
         owner: str,
         project_id: str | None,
         carry: bool,
+        browser_labels: dict[str, str],
     ) -> Conversation:
         """Copy *source* and grant its owner the copy, deleting the copy if either fails."""
         from omnigent.server.scheduled.source_session import (
@@ -835,7 +842,10 @@ def create_scheduled_tasks_router(
                 created_by=owner,
                 project_id=project_id,
                 carry_history_into_native=carry,
-                labels={SCHEDULED_TASK_SOURCE_LABEL_KEY: task_id},
+                # The copy, and so every run copied from it, takes its browser
+                # tools from the creating request, not from the source.
+                labels={SCHEDULED_TASK_SOURCE_LABEL_KEY: task_id, **browser_labels},
+                dropped_label_keys=BROWSER_AGENT_TOOLS_CREATION_LABEL_KEYS,
                 up_to_response_id=up_to,
             )
         except SourceCopyIncompleteError as exc:
@@ -1033,6 +1043,7 @@ def create_scheduled_tasks_router(
                         owner=owner,
                         project_id=project_id,
                         carry=carry,
+                        browser_labels=browser_agent_tools_creation_labels(request.headers),
                     )
                 # Synchronous, so a cancel can't land after the save and release the saved ID.
                 task = store.create(

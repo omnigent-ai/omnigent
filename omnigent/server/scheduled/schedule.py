@@ -19,17 +19,22 @@ from omnigent.server.scheduled.rrule import (
 _logger = logging.getLogger(__name__)
 
 
-def next_scheduled_time(task: ScheduledTask, after: int) -> int | None:
-    """Next occurrence; search-budget errors propagate so callers preserve the cursor."""
-    if task.state != "active":
-        return None
+def task_timezone(task: ScheduledTask) -> ZoneInfo:
+    """The task's IANA timezone, or UTC when it is missing or unknown."""
     try:
-        timezone = ZoneInfo(task.timezone or "UTC")
+        return ZoneInfo(task.timezone or "UTC")
     except (ZoneInfoNotFoundError, ValueError):
         _logger.warning(
             "Unknown timezone %r for task %s; defaulting to UTC", task.timezone, task.id
         )
-        timezone = ZoneInfo("UTC")
+        return ZoneInfo("UTC")
+
+
+def next_scheduled_time(task: ScheduledTask, after: int) -> int | None:
+    """Next occurrence; search-budget errors propagate so callers preserve the cursor."""
+    if task.state != "active":
+        return None
+    timezone = task_timezone(task)
     try:
         occurrence = get_next_fire_time(
             task.rrule,

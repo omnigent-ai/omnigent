@@ -70,8 +70,10 @@ import uuid
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
+from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, Protocol
+from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
@@ -131,6 +133,7 @@ from omnigent.server.scheduled.schedule import (
     continued_sandbox_host_id,
     is_trigger_automation,
     strip_trigger_header,
+    task_timezone,
 )
 from omnigent.server.scheduled.source_session import (
     SourceCopyIncompleteError,
@@ -447,7 +450,16 @@ class _NewRunRecorder:
 def _scheduled_session_title(task: ScheduledTask) -> str:
     if is_trigger_automation(task):
         return f"[automation job] {task.name}"
-    return task.name
+    if task.session_mode == "continue":
+        return task.name
+    # Every run of a new-session task would otherwise share the task's name,
+    # leaving the sidebar with a column of identical titles.
+    return f"{task.name} ({format_run_time(time.time(), task_timezone(task))})"
+
+
+def format_run_time(epoch_seconds: float, timezone: ZoneInfo) -> str:
+    """Render a fire time like ``2026-11-13 09:05`` in the task's timezone."""
+    return f"{datetime.fromtimestamp(epoch_seconds, timezone):%Y-%m-%d %H:%M}"
 
 
 # Follows the prompt in every message a fire sends. No one watches a run, so a
