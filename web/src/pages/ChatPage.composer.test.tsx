@@ -7012,13 +7012,31 @@ describe("Composer reply quotes", () => {
     fireEvent.change(textarea(), { target: { value: `${textarea().value}tighten it` } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
 
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "Context first", text: "Use the filler pattern" }],
+      text: "/deslop tighten it",
+    };
     expect(onSendSlashCommand).toHaveBeenCalledExactlyOnceWith(
       "deslop",
       "tighten it\n\nContext first\n\n> Use the filler pattern",
+      replyDraft,
     );
     expect(onSend).not.toHaveBeenCalled();
     expect(screen.queryByTestId("composer-reply-quote")).toBeNull();
     expect(textarea()).toHaveValue("");
+
+    const text = serializeReplyDraft(replyDraft);
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: { conversationId: "conv_test", text, files: [], replyDraft },
+      }),
+    );
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Use the filler pattern");
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("Context first");
+    expect(textarea()).toHaveValue("/deslop tighten it");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(onSendSlashCommand).toHaveBeenLastCalledWith(...onSendSlashCommand.mock.calls[0]!);
   });
 
   it.each([false, true])(

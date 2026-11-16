@@ -1210,7 +1210,7 @@ export function ChatPage() {
   );
 
   const onSendSlashCommand = useCallback(
-    (name: string, args: string) => {
+    (name: string, args: string, replyDraft?: StoredReplyDraft) => {
       if (!agentId) return;
       // Slash commands aren't replayed (an edge), but still route an unbound
       // coding clone to the directory picker so it isn't a dead end.
@@ -1223,6 +1223,7 @@ export function ChatPage() {
         return;
       }
       void useChatStore.getState().sendSlashCommand(name, args, agentId, {
+        replyDraft,
         onConversationCreated: (newId) => {
           navigate(`/c/${newId}`, { replace: true });
         },
@@ -1544,7 +1545,7 @@ interface MainAgentSurfaceProps {
    * is sent as plaintext for the vendor TUI to handle. See
    * `ComposerProps.onSendSlashCommand`.
    */
-  onSendSlashCommand?: (name: string, args: string) => void;
+  onSendSlashCommand?: (name: string, args: string, replyDraft?: StoredReplyDraft) => void;
   onStop: () => void;
   onShowReconnectHelp: () => void;
   /** Sending reconnects the offline Arca host, so the composer stays enabled. */
@@ -1890,9 +1891,9 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   const handleSendSlashCommand = useMemo(
     () =>
       onSendSlashCommand && !isNativeWrapper
-        ? (name: string, args: string) => {
+        ? (name: string, args: string, replyDraft?: StoredReplyDraft) => {
             setSendScrollNonce((n) => n + 1);
-            onSendSlashCommand(name, args);
+            onSendSlashCommand(name, args, replyDraft);
           }
         : undefined,
     [onSendSlashCommand, isNativeWrapper],
@@ -2191,7 +2192,7 @@ interface ComposerProps {
    * native-terminal sessions, which always send `/skill` as plaintext so
    * the vendor TUI loads the skill itself.
    */
-  onSendSlashCommand?: (name: string, args: string) => void;
+  onSendSlashCommand?: (name: string, args: string, replyDraft?: StoredReplyDraft) => void;
   onStop: () => void;
   agents: Agent[] | undefined;
   selectedAgentId: string | null;
@@ -4265,7 +4266,11 @@ function ComposerImpl(
       const arg = parts[1] ?? "";
       const sendSkill = (match: { command: string; args: string }) => {
         appendEntry(quotedCommand ? fullText : trimmed, storedReplyDraft);
-        onSendSlashCommand?.(match.command.slice(1), withQuotedContext(match.args));
+        const name = match.command.slice(1);
+        // The quoted draft comes back to the composer if the skill can't be sent.
+        if (quotedCommand)
+          onSendSlashCommand?.(name, withQuotedContext(match.args), storedReplyDraft);
+        else onSendSlashCommand?.(name, match.args);
         dirtyRef.current = true;
         replaceText("");
         setCommandError(null);

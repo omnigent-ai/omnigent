@@ -5661,7 +5661,7 @@ describe("chatStore — sendSlashCommand", () => {
     expect(useChatStore.getState().conversationId).toBe("conv_slash_other");
   });
 
-  it("rolls back a failed slash command on the conversation that sent it", async () => {
+  it("rolls back a failed slash command and returns its quoted draft to the sender", async () => {
     // Same for a thrown POST: the old code skipped the rollback entirely once
     // the sender was backgrounded, stranding the echo and leaving `status`
     // pinned at "streaming" for that conversation.
@@ -5679,7 +5679,14 @@ describe("chatStore — sendSlashCommand", () => {
     });
 
     await useChatStore.getState().switchTo("conv_slash_fail");
-    const sending = useChatStore.getState().sendSlashCommand("deslop", "", "agent_xyz");
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "Context first", text: "Use the filler pattern" }],
+      text: "/deslop tighten it",
+    };
+    const sending = useChatStore
+      .getState()
+      .sendSlashCommand("deslop", "tighten it", "agent_xyz", { replyDraft });
     await tick();
 
     await useChatStore.getState().switchTo("conv_slash_elsewhere");
@@ -5689,6 +5696,13 @@ describe("chatStore — sendSlashCommand", () => {
     const sender = conversationRegistry.peek("conv_slash_fail")!.getState();
     expect(sender.pendingUserMessages).toEqual([]);
     expect(sender.status).toBe("idle");
+    expect(sender.failedSendDraft).toEqual({
+      conversationId: "conv_slash_fail",
+      text: serializeReplyDraft(replyDraft),
+      files: [],
+      replyDraft,
+    });
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
   });
 
   it("creates and binds a brand-new session before posting the slash_command", async () => {
@@ -5742,6 +5756,7 @@ describe("chatStore — sendSlashCommand", () => {
     expect(useChatStore.getState().status).toBe("idle");
     // And rolls back the optimistic echo — no receipt will ever pop it.
     expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
   });
 });
 
