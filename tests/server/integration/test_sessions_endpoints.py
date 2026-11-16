@@ -6724,6 +6724,7 @@ async def test_post_external_session_status_propagates_runner_delivery_failure(
     rejection = httpx.HTTPStatusError(
         "rejected", request=status_resp.request, response=status_resp
     )
+    monkeypatch.setattr(forwarder, "_forward_health", forwarder._ForwardHealth())
     retries = forwarder._PostRetryTracker(base_delay_s=0.0)
     decisions = [
         retries.record_failure("hook:idle", rejection, session_id=child["id"])

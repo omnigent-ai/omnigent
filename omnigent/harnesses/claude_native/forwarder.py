@@ -2585,6 +2585,9 @@ async def _forward_one_subagent(
             exc_info=True,
             extra={"session_id": parent_session_id},
         )
+        # The server already published this status; only the hand-off to the parent failed.
+        if decision.exhausted and _is_subagent_delivery_not_confirmed(exc):
+            await checkpoint.put(replace(new_entry, last_status=desired_status))
         return
     status_retry_tracker.clear(retry_key)
     await checkpoint.put(replace(new_entry, last_status=desired_status))
