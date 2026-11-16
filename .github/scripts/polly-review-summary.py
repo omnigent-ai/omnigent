@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import html
 import json
 import os
 import re
@@ -329,61 +328,81 @@ def linked_issues(pull_request: str) -> dict | None:
     return {"issues": issues, "omitted": omitted}
 
 
-# A sub-agent's result as the runner delivers it to Polly's inbox, e.g.
-# "[System: sub-agent task 0f1e completed — codex:review-api returned: ...]".
-_SUBAGENT_RESULT = re.compile(
-    r"\[System: sub-agent task [0-9a-f]+ (?:"
-    r"completed — (?P<done>[^\n]+?) returned: "
-    r"|cancelled — (?P<stopped>[^\n]+?); output before cancellation: )"
-)
-# The inbox joins its items with a blank line, and each item ends with "]".
-_INBOX_ITEM_BREAK = re.compile(
-    r"\]\n\n(?=\[System: (?:sub-agent task|task|inbox item|malformed) )"
-)
-# How the Codex executor logs a successful inbox read.
+# How the Codex executor logs a tool result, after the log redactor has run over it:
+# "Codex dynamic tool result: ... tool=sys_read_inbox status=success result={...}".
+_TOOL_RESULT_LOG = "Codex dynamic tool result: "
 _INBOX_READ_LOG = "tool=sys_read_inbox status=success result="
-_INBOX_TRUNCATION = re.compile(r"\n\.\.\.\[truncated (\d+) chars[^\]\n]*\]$")
+_INBOX_RESULT_PREFIX = '{"result": "'
+_EMPTY_INBOX = "Inbox is empty"
+_JSON_ESCAPE = re.compile(r'\\(["\\/bfnrt]|u[0-9a-fA-F]{4})')
+_JSON_ESCAPES = {
+    '"': '"',
+    "\\": "\\",
+    "/": "/",
+    "b": "\b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+}
+_INBOX_TRUNCATION = re.compile(
+    r"\n\.\.\.\[truncated (\d+) chars — read the full text with sys_session_get_history[^\]\n]*\]"
+)
 _PARTIAL_BUDGET = 58000
-# A section's markup, summary and cut note, around its fenced report.
+# A section's markup, summary and cut note, around its fenced text.
 _SECTION_OVERHEAD = 400
 _PARTIAL_INTRO = (
-    "Polly ran out of time before writing its review. Its reviewers finished the reports "
-    "below, but Polly didn't check them against each other or the code, so treat what they "
-    "flag as unverified. The commit still counts as unreviewed, so `/review` runs again.\n"
+    "Polly ran out of time before writing its review. Below is what its reviewers had "
+    "reported, as Polly's inbox delivered it, unedited. Polly didn't check these reports "
+    "against each other or the code, so treat what they flag as unverified. The commit "
+    "still counts as unreviewed, so `/review` runs again.\n"
 )
 
 
-def reviewer_reports(logs: Path) -> list[tuple[str, str]]:
-    """Return ``(sub-agent, report)`` pairs Polly read from its inbox, in order.
+def _inbox_text(raw: str) -> str | None:
+    """The text of one logged ``sys_read_inbox`` result, or ``None``."""
+    try:
+        value, _ = json.JSONDecoder().raw_decode(raw)
+    except ValueError:
+        # Redacting a secret can consume the result's closing quote and brace, so decode
+        # what is left of the string instead of losing every report it carries.
+        if not raw.startswith(_INBOX_RESULT_PREFIX):
+            return None
+        body = raw[len(_INBOX_RESULT_PREFIX) :].removesuffix('"}')
+        value = {
+            "result": _JSON_ESCAPE.sub(
+                lambda match: (
+                    chr(int(match[1][1:], 16)) if match[1][0] == "u" else _JSON_ESCAPES[match[1]]
+                ),
+                body,
+            )
+        }
+    text = value.get("result") if isinstance(value, dict) else value
+    if not isinstance(text, str):
+        return None
+    # Pair escaped surrogates, and replace any left alone, so the text encodes.
+    return text.encode("utf-16", "surrogatepass").decode("utf-16", "replace").strip()
 
-    Only successful ``sys_read_inbox`` results count, so text another tool returned can't
-    pass for a report. One read can carry several items.
+
+def inbox_reads(logs: Path) -> tuple[list[str], bool]:
+    """Return each successful inbox read Polly logged, in order, and if any were Codex logs.
+
+    A read stays whole: reports can quote the inbox's own framing, so splitting it into
+    items could drop findings or attribute them to the wrong sub-agent.
     """
-    reports: list[tuple[str, str]] = []
+    reads: list[str] = []
+    codex_logs = False
     for log in sorted(logs.rglob("*.log")):
-        for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+        # Records end at LF; results keep other line breaks, such as U+2028, as written.
+        for line in log.read_text(encoding="utf-8", errors="replace").split("\n"):
+            codex_logs = codex_logs or _TOOL_RESULT_LOG in line
             position = line.find(_INBOX_READ_LOG)
             if position < 0:
                 continue
-            try:
-                result, _ = json.JSONDecoder().raw_decode(line, position + len(_INBOX_READ_LOG))
-            except ValueError:
-                continue
-            text = result.get("result") if isinstance(result, dict) else result
-            if not isinstance(text, str):
-                continue
-            parts = _INBOX_ITEM_BREAK.split(text)
-            # The split takes each item's closing "]" but the last one's.
-            for item in [part + "]" for part in parts[:-1]] + parts[-1:]:
-                match = _SUBAGENT_RESULT.match(item)
-                if match is None:
-                    continue
-                body = item[match.end() :].rstrip().removesuffix("]")
-                body = body.removesuffix(", superseding its earlier cancelled notice").strip()
-                report = (match["done"] or match["stopped"], body)
-                if body and report not in reports:
-                    reports.append(report)
-    return reports
+            text = _inbox_text(line[position + len(_INBOX_READ_LOG) :].rstrip("\r"))
+            if text and not text.startswith(_EMPTY_INBOX) and text not in reads:
+                reads.append(text)
+    return reads, codex_logs
 
 
 def _fence(text: str) -> str:
@@ -398,39 +417,38 @@ def _redact(text: str, secrets: list[str]) -> str:
     return text
 
 
-def partial_review(reports: list[tuple[str, str]], secrets: list[str]) -> str:
-    """Markdown listing *reports* for a run that ran out of time, within one comment.
+def partial_review(reads: list[str], secrets: list[str]) -> str:
+    """Markdown listing each inbox read for a run that ran out of time, within one comment.
 
-    Reports are posted unedited, so each is fenced: mentions don't notify, and markup
+    Reads are posted unedited, so each is fenced: mentions don't notify, and markup
     can't render. ``<!--`` is escaped so quoted markers can't mark the commit reviewed.
     """
     used = len(_PARTIAL_INTRO.encode("utf-8"))
-    count = max(len(reports), 1)
+    count = max(len(reads), 1)
     share = max((_PARTIAL_BUDGET - used - _SECTION_OVERHEAD * count) // count, 2000)
     sections = [_PARTIAL_INTRO]
-    for index, (target, report) in enumerate(reports):
-        report = _INBOX_TRUNCATION.sub(
+    for index, read in enumerate(reads):
+        read = _INBOX_TRUNCATION.sub(
             r"\n…[\1 more characters are in this run's diagnostics artifact]",
-            _redact(report, secrets),
+            _redact(read, secrets),
         ).replace("<!--", "&lt;!--")
         # Budget the escaped text, leaving room for a fence longer than three backticks.
-        limit = max(share - 2 * len(_fence(report)), 1000)
-        encoded = report.encode("utf-8")
+        limit = max(share - 2 * len(_fence(read)), 1000)
+        encoded = read.encode("utf-8")
         if len(encoded) > limit:
             kept = encoded[:limit].decode("utf-8", errors="ignore").rstrip()
-            report = (
+            read = (
                 f"{kept}\n…[cut to fit one comment; the rest is in this run's diagnostics "
                 "artifact]"
             )
-        fence = _fence(report)
-        summary = html.escape(_redact(target, secrets)[:120])
+        fence = _fence(read)
         section = (
-            f"<details>\n<summary>Report from {summary}</summary>\n\n"
-            f"{fence}text\n{report}\n{fence}\n\n</details>\n"
+            f"<details>\n<summary>Reports Polly received, inbox read {index + 1} of "
+            f"{len(reads)}</summary>\n\n{fence}text\n{read}\n{fence}\n\n</details>\n"
         )
         if used + len(section.encode("utf-8")) > _PARTIAL_BUDGET:
             sections.append(
-                f"{len(reports) - index} more reports are in this run's diagnostics artifact.\n"
+                f"{len(reads) - index} more inbox reads are in this run's diagnostics artifact.\n"
             )
             break
         sections.append(section)
@@ -450,18 +468,23 @@ def main() -> None:
         result = compose_review(review.read_text(encoding="utf-8"), stats)
         review.write_text(result, encoding="utf-8")
     elif mode == "partial":
-        # Writes nothing when no reviewer finished, so the caller posts nothing.
-        reports = reviewer_reports(Path(source))
-        if reports:
-            key, gateway = (
-                os.environ.get(name, "") for name in ("LLM_API_KEY", "GATEWAY_BASE_URL")
+        # Writes nothing when no report can be recovered, so the caller posts nothing.
+        reads, codex_logs = inbox_reads(Path(source))
+        if not reads:
+            reason = (
+                "no reviewer had reported before the time limit"
+                if codex_logs
+                else "only the Codex harness's logs record what Polly's inbox delivered"
             )
-            # The key, and the gateway as a URL, without its path, and as a bare host.
-            address = urlsplit(gateway)
-            values = {key, gateway, gateway.rstrip("/").removesuffix("/serving-endpoints")}
-            values |= {address.netloc, address.hostname or ""}
-            secrets = sorted(filter(None, values), key=len, reverse=True)
-            Path(destination).write_text(partial_review(reports, secrets), encoding="utf-8")
+            print(f"::notice::No reviewer reports to post: {reason}.")
+            return
+        key, gateway = (os.environ.get(name, "") for name in ("LLM_API_KEY", "GATEWAY_BASE_URL"))
+        # The key, and the gateway as a URL, without its path, and as a bare host.
+        address = urlsplit(gateway)
+        values = {key, gateway, gateway.rstrip("/").removesuffix("/serving-endpoints")}
+        values |= {address.netloc, address.hostname or ""}
+        secrets = sorted(filter(None, values), key=len, reverse=True)
+        Path(destination).write_text(partial_review(reads, secrets), encoding="utf-8")
     else:
         raise ValueError(f"Unknown command: {mode}")
 

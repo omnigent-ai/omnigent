@@ -986,8 +986,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 .github/scripts/polly-review-summary.py partial "$HOME/.omnigent/logs" /tmp/polly_partial.md
+          # The script says why when it finds nothing to post.
           if [ ! -s /tmp/polly_partial.md ]; then
-            echo "::notice::No reviewer finished before the time limit."
             exit 0
           fi
           # The same exfiltration guard as the full review.
