@@ -45,15 +45,15 @@ import {
 import {
   type ShareGrant,
   type ShareTarget,
+  useGrantList,
   useGrantPermission,
-  usePermissions,
   useRevokePermission,
-  useSessionManagingAutomation,
 } from "@/hooks/usePermissions";
 import { useSession } from "@/hooks/useSession";
 import { usePublicSharingMaxLevel } from "@/hooks/useSharing";
 import { useUserSearch } from "@/hooks/useUserSearch";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { SHARING_OFF_REASON } from "@/lib/capabilities";
 import { copyText } from "@/lib/clipboard";
 import { updateSession } from "@/lib/sessionsApi";
 import { getOmnigentUserSearch } from "@/lib/host";
@@ -120,21 +120,20 @@ export function PermissionsModal(props: PermissionsModalProps) {
       ? 2
       : 1;
   // In "off" mode never fetch the grant list — the modal short-circuits to a
-  // notice below, so the request would be wasted (and the server rejects any
-  // grant anyway).
+  // notice below. Closing keeps the loaded list through the close animation.
   const {
-    data: permissions,
+    data: grantList,
     isLoading,
+    isError: grantsFailed,
+    error: grantsError,
     refetch: refreshPermissions,
-  } = usePermissions(open && !sharingOff ? target : null);
+  } = useGrantList(target, open && !sharingOff);
+  const permissions = grantList?.permissions;
+  // The server names an automation only to its owner, while it replaces this
+  // session's shares on each run.
+  const managingAutomation = grantList?.managedByAutomation ?? null;
   const grant = useGrantPermission(target);
   const revoke = useRevokePermission(target);
-  // The server names an automation only to its owner, and only while it
-  // overwrites this session's sharing on each run.
-  const automationSharing = info !== "loading" && info.scheduled_task_sharing === true;
-  const { data: managingAutomation } = useSessionManagingAutomation(
-    open && !sharingOff && automationSharing ? sessionId : null,
-  );
 
   const [newUserId, setNewUserId] = useState("");
   const [newLevel, setNewLevel] = useState("1");
@@ -231,7 +230,7 @@ export function PermissionsModal(props: PermissionsModalProps) {
     setCheckingPermissions(!!filePath);
     try {
       const currentPermissions = filePath
-        ? (await refreshPermissions({ throwOnError: true })).data
+        ? (await refreshPermissions({ throwOnError: true })).data?.permissions
         : undefined;
       const existingGrant = currentPermissions?.find((p) => p.user_id === trimmed);
       if (await grantAccess(trimmed, parseInt(newLevel, 10), existingGrant?.level, !!filePath)) {
@@ -288,9 +287,7 @@ export function PermissionsModal(props: PermissionsModalProps) {
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">Sharing unavailable</DialogTitle>
-            <DialogDescription>
-              Sharing has been disabled for this Omnigent server.
-            </DialogDescription>
+            <DialogDescription>{SHARING_OFF_REASON}</DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button variant="outline" onClick={() => onOpenChange(false)}>
@@ -318,8 +315,9 @@ export function PermissionsModal(props: PermissionsModalProps) {
               <p>{description}</p>
               {automation?.sessionMode === "continue" && (
                 <p>
-                  This automation continues one session, so that session&apos;s sharing is kept in
-                  step with this list. Sharing changes made on the session are overwritten.
+                  Sharing it replaces the shares on the session it continues with this list,
+                  including people added there by hand, even at Edit or Manage. The owner and
+                  General access are kept.
                 </p>
               )}
               {sharingReadOnly && !filePath && (
@@ -336,13 +334,13 @@ export function PermissionsModal(props: PermissionsModalProps) {
             title="Sharing is managed by an automation"
             testId="share-managed-by-automation"
           >
+            Shares added or removed here are replaced with the automation&apos;s list on each run of{" "}
             <AutomationLink
               task={managingAutomation}
               to={automationSharePath(info, managingAutomation)}
               onNavigate={() => onOpenChange(false)}
             />{" "}
-            keeps this session shared with the people the automation is shared with. Changes made
-            here are overwritten on its next run.
+            and whenever its sharing changes. General access isn&apos;t affected.
           </AutomationCallout>
         )}
         {filePath && (
@@ -441,6 +439,10 @@ export function PermissionsModal(props: PermissionsModalProps) {
         <div className="min-w-0" data-testid="share-grants">
           {isLoading ? (
             <p className="text-ui text-muted-foreground py-2">Loading…</p>
+          ) : grantsFailed && !permissions ? (
+            <p role="alert" className="text-ui text-destructive py-2">
+              Couldn&apos;t load who has access: {grantsError.message}
+            </p>
           ) : userGrants.length === 0 ? (
             <p className="text-ui text-muted-foreground py-2">No grants yet.</p>
           ) : (

@@ -13,6 +13,7 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
 import { showToast } from "@/components/ui/toast";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 
@@ -173,17 +174,19 @@ function renderPage(
 ) {
   return render(
     <CapabilitiesProvider info={info}>
-      <MemoryRouter initialEntries={[`${basename}${path}`]}>
-        <RoutingProvider value={basenamedRouting(basename)}>
-          <Routes>
-            <Route path={`${basename}/tasks`} element={<TasksPage />} />
-            <Route
-              path={`${basename}/tasks/templates`}
-              element={<TasksPage key="templates" templatesOnly />}
-            />
-          </Routes>
-        </RoutingProvider>
-      </MemoryRouter>
+      <TooltipProvider>
+        <MemoryRouter initialEntries={[`${basename}${path}`]}>
+          <RoutingProvider value={basenamedRouting(basename)}>
+            <Routes>
+              <Route path={`${basename}/tasks`} element={<TasksPage />} />
+              <Route
+                path={`${basename}/tasks/templates`}
+                element={<TasksPage key="templates" templatesOnly />}
+              />
+            </Routes>
+          </RoutingProvider>
+        </MemoryRouter>
+      </TooltipProvider>
     </CapabilitiesProvider>,
   );
 }
@@ -775,6 +778,14 @@ describe("sharing from the row menu", () => {
       "data-automation-id",
       "st_share",
     );
+  });
+
+  it("disables Share while the server turns sharing off", () => {
+    openRowMenu("alice@example.com", { ...SHARING_INFO, sharing_mode: "off" });
+    const share = screen.getByTestId("task-share");
+    expect(share).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(share);
+    expect(screen.queryByTestId("share-dialog-open")).toBeNull();
   });
 
   it.each([

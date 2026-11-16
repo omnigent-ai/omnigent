@@ -32,12 +32,12 @@ vi.mock("@/lib/permissionsApi", async (importOriginal) => ({
   ...(await importOriginal<typeof PermissionsApiModule>()),
   grantPermission: vi.fn().mockResolvedValue({}),
   revokePermission: vi.fn().mockResolvedValue(undefined),
-  grantAutomationPermission: vi.fn().mockResolvedValue({}),
-  revokeAutomationPermission: vi.fn().mockResolvedValue(undefined),
+  grantSharePermission: vi.fn().mockResolvedValue({}),
+  revokeSharePermission: vi.fn().mockResolvedValue(undefined),
 }));
 
 import { PINNED_CONVERSATIONS_KEY, useConversations } from "./useConversations";
-import { grantAutomationPermission, revokeAutomationPermission } from "@/lib/permissionsApi";
+import { grantSharePermission, revokeSharePermission } from "@/lib/permissionsApi";
 import { useSession } from "./useSession";
 import {
   useCanEdit,
@@ -215,7 +215,6 @@ describe("share mutations refresh the session lists", () => {
   const automationKeys = [
     ["automation-permissions", "st_1"],
     ["permissions"],
-    ["session-sharing-manager"],
     ["conversations"],
     ["project-sessions"],
     PINNED_CONVERSATIONS_KEY,
@@ -225,14 +224,14 @@ describe("share mutations refresh the session lists", () => {
     const target = { kind: "automation", id: "st_1" } as const;
     const grant = renderWithClient(() => useGrantPermission(target));
     await act(() => grant.result.current.mutateAsync({ userId: "bob", level: 1 }));
-    expect(grantAutomationPermission).toHaveBeenCalledWith("st_1", "bob");
+    expect(grantSharePermission).toHaveBeenCalledWith(target, "bob", 1);
     expect(grant.invalidate.mock.calls.map(([filters]) => filters?.queryKey)).toEqual(
       automationKeys,
     );
 
     const revoke = renderWithClient(() => useRevokePermission(target));
     await act(() => revoke.result.current.mutateAsync("bob"));
-    expect(revokeAutomationPermission).toHaveBeenCalledWith("st_1", "bob");
+    expect(revokeSharePermission).toHaveBeenCalledWith(target, "bob");
     expect(revoke.invalidate.mock.calls.map(([filters]) => filters?.queryKey)).toEqual(
       automationKeys,
     );

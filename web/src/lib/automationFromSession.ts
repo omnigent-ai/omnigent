@@ -97,12 +97,16 @@ export function automationPagePath(
 /** Query parameter that opens the share dialog on an automation's page. */
 export const AUTOMATION_SHARE_PARAM = "share";
 
-/** An automation's page with its share dialog open. */
+/**
+ * An automation's page with its share dialog open. Without automation pages it
+ * is the automations list, where the owner can still edit or delete the automation.
+ */
 export function automationSharePath(
   info: ServerInfo | "loading",
   task: Pick<ScheduledTask, "id">,
 ): string {
-  return `${automationPagePath(info, task)}?${AUTOMATION_SHARE_PARAM}=1`;
+  const page = automationPagePath(info, task);
+  return isFeatureEnabled(info, "automations_v2") ? `${page}?${AUTOMATION_SHARE_PARAM}=1` : page;
 }
 
 /**

@@ -14,14 +14,13 @@ import {
   LEVEL_OWNER,
   canShareAutomation,
   derivePermissionLevel,
-  getSessionManagingAutomation,
-  grantAutomationPermission,
   grantPermission,
+  grantSharePermission,
   isOwnerLevel,
   listAutomationPermissions,
   listPermissions,
-  revokeAutomationPermission,
   revokePermission,
+  revokeSharePermission,
   workspaceSharingBlocked,
 } from "./permissionsApi";
 
@@ -85,7 +84,7 @@ afterEach(() => {
 });
 
 describe("listPermissions", () => {
-  it("GETs /v1/sessions/{id}/permissions and returns the array", async () => {
+  it("GETs /v1/sessions/{id}/permissions and returns the grants", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({
         permissions: [
@@ -102,8 +101,9 @@ describe("listPermissions", () => {
     expect(url).toBe("/v1/sessions/conv_abc/permissions");
     // GET — no method or undefined method are both valid.
     expect(init?.method ?? "GET").toBe("GET");
-    expect(result).toHaveLength(2);
-    expect(result[0]).toEqual({
+    expect(result.permissions).toHaveLength(2);
+    expect(result.managedByAutomation).toBeNull();
+    expect(result.permissions[0]).toEqual({
       user_id: "alice",
       conversation_id: "conv_abc",
       level: 3,
@@ -283,6 +283,8 @@ describe("revokePermission used to leave (self-revoke)", () => {
 });
 
 describe("automation permissions", () => {
+  const automation = { kind: "automation", id: "st_1" } as const;
+
   it("lists every page of an automation's grants with their display names", async () => {
     fetchMock
       .mockResolvedValueOnce(
@@ -313,7 +315,8 @@ describe("automation permissions", () => {
       "/v1/scheduled-tasks/st%201/permissions",
       "/v1/scheduled-tasks/st%201/permissions?after=alice%40example.com",
     ]);
-    expect(grants.map((grant) => [grant.user_id, grant.display_name])).toEqual([
+    expect(grants.managedByAutomation).toBeNull();
+    expect(grants.permissions.map((grant) => [grant.user_id, grant.display_name])).toEqual([
       ["alice@example.com", "Alice"],
       ["team-b", "team-b"],
     ]);
@@ -328,7 +331,7 @@ describe("automation permissions", () => {
         display_name: "Bob",
       }),
     );
-    await grantAutomationPermission("st_1", "bob@example.com");
+    await grantSharePermission(automation, "bob@example.com", 1);
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/scheduled-tasks/st_1/permissions");
     expect(init.method).toBe("PUT");
@@ -340,14 +343,14 @@ describe("automation permissions", () => {
         { ok: false, status: 400 },
       ),
     );
-    await expect(grantAutomationPermission("st_1", "__public__")).rejects.toThrow(
+    await expect(grantSharePermission(automation, "__public__", 1)).rejects.toThrow(
       "Automations cannot be shared publicly",
     );
   });
 
   it("DELETEs one grantee and surfaces a failed revoke", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse(null, { status: 204 }));
-    await revokeAutomationPermission("st_1", "bob@example.com");
+    await revokeSharePermission(automation, "bob@example.com");
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/scheduled-tasks/st_1/permissions/bob%40example.com");
     expect(init.method).toBe("DELETE");
@@ -358,7 +361,7 @@ describe("automation permissions", () => {
         { ok: false, status: 500 },
       ),
     );
-    await expect(revokeAutomationPermission("st_1", "bob@example.com")).rejects.toThrow(
+    await expect(revokeSharePermission(automation, "bob@example.com")).rejects.toThrow(
       "Could not update the session",
     );
   });
@@ -370,17 +373,29 @@ describe("automation permissions", () => {
     ],
     [null, null],
     [undefined, null],
-  ])("reads a session's managing automation %j as %j", async (marker, expected) => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({
-        permissions: [],
-        next_cursor: null,
-        ...(marker === undefined ? {} : { managed_by_automation: marker }),
-      }),
-    );
-    expect(await getSessionManagingAutomation("conv_abc")).toEqual(expected);
-    expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv_abc/permissions?limit=1");
-  });
+  ])(
+    "reads a session's managing automation %j as %j from its first page",
+    async (marker, expected) => {
+      fetchMock
+        .mockResolvedValueOnce(
+          mockResponse({
+            permissions: [{ user_id: "alice", conversation_id: "conv_abc", level: 1 }],
+            next_cursor: "alice",
+            ...(marker === undefined ? {} : { managed_by_automation: marker }),
+          }),
+        )
+        .mockResolvedValueOnce(
+          mockResponse({ permissions: [], next_cursor: null, managed_by_automation: null }),
+        );
+      const grants = await listPermissions("conv_abc");
+      expect(grants.managedByAutomation).toEqual(expected);
+      expect(grants.permissions.map((grant) => grant.user_id)).toEqual(["alice"]);
+      expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+        "/v1/sessions/conv_abc/permissions",
+        "/v1/sessions/conv_abc/permissions?after=alice",
+      ]);
+    },
+  );
 });
 
 describe("canShareAutomation", () => {

@@ -6,7 +6,7 @@
  */
 
 import type { Conversation } from "@/hooks/useConversations";
-import type { ServerInfo } from "@/lib/capabilities";
+import { isSingleUserMode, type ServerInfo } from "@/lib/capabilities";
 import type { Session } from "@/lib/types";
 import { authenticatedFetch } from "./identity";
 
@@ -153,6 +153,16 @@ export interface ManagingAutomation {
   name: string;
 }
 
+/** Every grant on a session or an automation, as one list. */
+export interface GrantList<T extends ShareGrant = ShareGrant> {
+  permissions: T[];
+  /**
+   * The viewer's continue-session automation that replaces a session's shares
+   * on each run, or `null`; always `null` for an automation's own grants.
+   */
+  managedByAutomation: ManagingAutomation | null;
+}
+
 function permissionsPath(target: ShareTarget): string {
   const collection = target.kind === "session" ? "sessions" : "scheduled-tasks";
   return `/v1/${collection}/${encodeURIComponent(target.id)}/permissions`;
@@ -164,9 +174,13 @@ async function responseError(res: Response): Promise<Error> {
   return new Error(body?.error?.message ?? `${res.status} ${res.statusText}`);
 }
 
-/** Every grant from a cursor-paginated ({permissions, next_cursor}) list. */
-async function listAllGrants<T extends ShareGrant>(target: ShareTarget): Promise<T[]> {
+/**
+ * Every grant from a cursor-paginated ({permissions, next_cursor}) list, with
+ * the managing automation the server names on its first page.
+ */
+async function listAllGrants<T extends ShareGrant>(target: ShareTarget): Promise<GrantList<T>> {
   const all: T[] = [];
+  let managedByAutomation: ManagingAutomation | null = null;
   let after: string | null = null;
   // Each page provides the cursor for the next request.
   /* oxlint-disable no-await-in-loop */
@@ -174,36 +188,28 @@ async function listAllGrants<T extends ShareGrant>(target: ShareTarget): Promise
     const query = after !== null ? `?after=${encodeURIComponent(after)}` : "";
     const res = await authenticatedFetch(`${permissionsPath(target)}${query}`);
     if (!res.ok) throw await responseError(res);
-    const data = (await res.json()) as { permissions: T[]; next_cursor: string | null };
+    const data = (await res.json()) as {
+      permissions: T[];
+      next_cursor: string | null;
+      managed_by_automation?: ManagingAutomation | null;
+    };
+    if (after === null) managedByAutomation = data.managed_by_automation ?? null;
     all.push(...data.permissions);
     after = data.next_cursor;
   } while (after !== null);
   /* oxlint-enable no-await-in-loop */
-  return all;
+  return { permissions: all, managedByAutomation };
 }
 
-export async function listPermissions(sessionId: string): Promise<Permission[]> {
+export async function listPermissions(sessionId: string): Promise<GrantList<Permission>> {
   return listAllGrants<Permission>({ kind: "session", id: sessionId });
 }
 
 /** Everyone an automation is shared with, which only its owner may list. */
-export async function listAutomationPermissions(taskId: string): Promise<AutomationPermission[]> {
+export async function listAutomationPermissions(
+  taskId: string,
+): Promise<GrantList<AutomationPermission>> {
   return listAllGrants<AutomationPermission>({ kind: "automation", id: taskId });
-}
-
-/**
- * The viewer's continue-session automation that overwrites this session's
- * sharing on each run, or `null`. The server names it on every grants page.
- */
-export async function getSessionManagingAutomation(
-  sessionId: string,
-): Promise<ManagingAutomation | null> {
-  const res = await authenticatedFetch(
-    `${permissionsPath({ kind: "session", id: sessionId })}?limit=1`,
-  );
-  if (!res.ok) throw await responseError(res);
-  const data = (await res.json()) as { managed_by_automation?: ManagingAutomation | null };
-  return data.managed_by_automation ?? null;
 }
 
 export async function getSessionOwner(sessionId: string): Promise<string | null> {
@@ -213,13 +219,18 @@ export async function getSessionOwner(sessionId: string): Promise<string | null>
   return data.owner;
 }
 
-export async function grantPermission(
-  sessionId: string,
+/**
+ * Grant a user or group access to a session or an automation. An automation
+ * takes read access only; the server refuses the owner, the public and reserved
+ * IDs (400) and what its sharing policy forbids (403), with a message saying why.
+ */
+export async function grantSharePermission<T extends ShareGrant = ShareGrant>(
+  target: ShareTarget,
   userId: string,
   level: number,
   ensureMinimum = false,
-): Promise<Permission> {
-  const res = await authenticatedFetch(permissionsPath({ kind: "session", id: sessionId }), {
+): Promise<T> {
+  const res = await authenticatedFetch(permissionsPath(target), {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -229,25 +240,29 @@ export async function grantPermission(
     }),
   });
   if (!res.ok) throw await responseError(res);
-  return (await res.json()) as Permission;
+  return (await res.json()) as T;
 }
 
-/**
- * Share an automation with a user or group at read access, the only level it
- * offers. The server refuses the owner, the public and reserved IDs (400) and
- * grants its sharing policy forbids (403), with a message saying why.
- */
-export async function grantAutomationPermission(
-  taskId: string,
+export async function grantPermission(
+  sessionId: string,
   userId: string,
-): Promise<AutomationPermission> {
-  const res = await authenticatedFetch(permissionsPath({ kind: "automation", id: taskId }), {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ user_id: userId, level: LEVEL_READ }),
+  level: number,
+  ensureMinimum = false,
+): Promise<Permission> {
+  return grantSharePermission<Permission>(
+    { kind: "session", id: sessionId },
+    userId,
+    level,
+    ensureMinimum,
+  );
+}
+
+/** Remove a grant on a session or an automation; removing a missing one is harmless (204). */
+export async function revokeSharePermission(target: ShareTarget, userId: string): Promise<void> {
+  const res = await authenticatedFetch(`${permissionsPath(target)}/${encodeURIComponent(userId)}`, {
+    method: "DELETE",
   });
-  if (!res.ok) throw await responseError(res);
-  return (await res.json()) as AutomationPermission;
+  if (!res.ok && res.status !== 204) throw await responseError(res);
 }
 
 /**
@@ -259,20 +274,7 @@ export async function grantAutomationPermission(
  * Either way it refuses to remove the owner's grant (403).
  */
 export async function revokePermission(sessionId: string, userId: string): Promise<void> {
-  const res = await authenticatedFetch(
-    `${permissionsPath({ kind: "session", id: sessionId })}/${encodeURIComponent(userId)}`,
-    { method: "DELETE" },
-  );
-  if (!res.ok && res.status !== 204) throw await responseError(res);
-}
-
-/** Stop sharing an automation with someone; repeating it is harmless (204). */
-export async function revokeAutomationPermission(taskId: string, userId: string): Promise<void> {
-  const res = await authenticatedFetch(
-    `${permissionsPath({ kind: "automation", id: taskId })}/${encodeURIComponent(userId)}`,
-    { method: "DELETE" },
-  );
-  if (!res.ok && res.status !== 204) throw await responseError(res);
+  return revokeSharePermission({ kind: "session", id: sessionId }, userId);
 }
 
 /**
@@ -287,7 +289,7 @@ export function canShareAutomation(
   return (
     info !== "loading" &&
     info.scheduled_task_sharing === true &&
-    !info.single_user &&
+    !isSingleUserMode(info) &&
     viewerId !== null &&
     ownerUserId === viewerId
   );

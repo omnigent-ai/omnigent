@@ -12,7 +12,7 @@
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation, useNavigationType } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
@@ -299,6 +299,19 @@ beforeEach(() => {
 
 afterEach(cleanup);
 
+/** Reports the current search and how the router last got there (push or replace). */
+function LocationProbe() {
+  const location = useLocation();
+  const navigationType = useNavigationType();
+  return (
+    <div
+      data-testid="location-probe"
+      data-search={location.search}
+      data-navigation={navigationType}
+    />
+  );
+}
+
 function pageTree(initialEntries?: string[]) {
   // QueryClient required by other hooks in the tree (useScheduledTask, etc.).
   const queryClient = new QueryClient({
@@ -309,6 +322,7 @@ function pageTree(initialEntries?: string[]) {
       <TooltipProvider>
         <MemoryRouter initialEntries={initialEntries}>
           <TaskDetailPage />
+          <LocationProbe />
         </MemoryRouter>
       </TooltipProvider>
     </QueryClientProvider>
@@ -959,18 +973,40 @@ describe("sharing", () => {
     expect(screen.queryByTestId("share-dialog-open")).toBeNull();
   });
 
-  it("opens the share dialog from a session's link and closes it for good", () => {
+  it("opens the share dialog from a session's link and replaces the request on close", () => {
     vi.mocked(useViewerId).mockReturnValue("alice@example.com");
     renderSharingPage(sharingInfo, "/tasks/st_1?share=1");
 
     expect(screen.getByTestId("share-dialog-open")).toHaveAttribute("data-automation-id", "st_1");
     fireEvent.click(screen.getByRole("button", { name: "Close share" }));
     expect(screen.queryByTestId("share-dialog-open")).toBeNull();
+    // Replaced, not pushed: Back leaves the page instead of reopening the dialog.
+    const probe = screen.getByTestId("location-probe");
+    expect(probe).toHaveAttribute("data-search", "");
+    expect(probe).toHaveAttribute("data-navigation", "REPLACE");
   });
 
-  it("ignores the link's request when the viewer cannot share", () => {
-    vi.mocked(useViewerId).mockReturnValue("bob@example.com");
-    renderSharingPage(sharingInfo, "/tasks/st_1?share=1");
+  it.each([
+    ["the viewer cannot share", sharingInfo, "bob@example.com"],
+    ["sharing is off", { ...sharingInfo, sharing_mode: "off" as const }, "alice@example.com"],
+  ])("ignores the link's request when %s", (_label, info, viewerId) => {
+    vi.mocked(useViewerId).mockReturnValue(viewerId);
+    renderSharingPage(info, "/tasks/st_1?share=1");
+    expect(screen.queryByTestId("share-dialog-open")).toBeNull();
+  });
+
+  it("disables Share with the session Share's reason while sharing is off", () => {
+    vi.mocked(useViewerId).mockReturnValue("alice@example.com");
+    renderSharingPage({ ...sharingInfo, sharing_mode: "off" });
+
+    const share = screen.getByRole("button", { name: "Share automation" });
+    expect(share).toBeDisabled();
+    expect(
+      screen.getByLabelText(
+        "Share automation disabled: Sharing has been disabled for this Omnigent server.",
+      ),
+    ).toContainElement(share);
+    fireEvent.click(share);
     expect(screen.queryByTestId("share-dialog-open")).toBeNull();
   });
 });
