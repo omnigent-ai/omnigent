@@ -659,8 +659,11 @@ def _triggered_task_review(args: dict[str, object], *, action: str) -> PolicyRes
             "What it watches (each line quoted with '> '):\n"
             f"{_quoted(describe_trigger_watch(config))}\n"
         )
-        if action == "create":
-            # An update keeps its saved link-back unless it passes one, shown with the trigger.
+        if action == "update":
+            if "link_back" not in args:
+                # A new search keeps the saved link-back, whatever the new event's default.
+                watch += "Link back: unchanged\n"
+        else:
             link_back = "on, posting each session's link on its item"
             watch += f"Link back: {link_back if config['linkBack'] else 'off'}\n"
             worker = config["worker"]

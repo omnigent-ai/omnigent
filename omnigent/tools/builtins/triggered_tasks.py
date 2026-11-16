@@ -683,9 +683,10 @@ def _partial_search_error(args: Mapping[str, object]) -> str | None:
     provider, event = args.get("provider"), args.get("event")
     if provider in TRIGGER_SOURCES:
         source = cast(Any, provider)
-        events = {spec.id: spec for spec in TRIGGER_TEMPLATES[source].events}
+        events = {item.id: item for item in TRIGGER_TEMPLATES[source].events}
         # Left out, these would fall back to create's defaults rather than the saved values.
-        if event in events and events[event].target is not None and "target" not in args:
+        spec = events.get(event) if isinstance(event, str) else None
+        if spec is not None and spec.target is not None and "target" not in args:
             absent.append("target")
         if "contains" in trigger_scope_operators(source) and "scope_match" not in args:
             absent.append("scope_match")

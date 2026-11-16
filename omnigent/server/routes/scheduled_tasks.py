@@ -403,6 +403,11 @@ def _validate_timezone_or_400(timezone: str) -> None:
         ) from exc
 
 
+def _page_unsupported() -> HTTPException:
+    """The error for a page the task store can't read without scanning every task or run."""
+    return HTTPException(status_code=501, detail="This server's task store can't page tasks")
+
+
 def _cursor_task_id(task_id: str) -> str:
     """A page cursor's task ID: bare hex if a UUID, else as the store allocated it.
 
@@ -1223,9 +1228,7 @@ def create_scheduled_tasks_router(
                     owner_user_id=owner_id, limit=limit, after=cursor
                 )
             except NotImplementedError:
-                raise HTTPException(
-                    status_code=501, detail="This server's task store can't page tasks"
-                ) from None
+                raise _page_unsupported() from None
         tasks = [
             t
             for t in listed
@@ -1241,7 +1244,10 @@ def create_scheduled_tasks_router(
         else:
             # A page reads only each task's latest run, so its work stays bounded by
             # the page; that run is the one its badge reports.
-            latest = store.list_latest_runs_for_tasks(task_ids)
+            try:
+                latest = store.list_latest_runs_for_tasks(task_ids)
+            except NotImplementedError:
+                raise _page_unsupported() from None
             latest_status = {
                 run.scheduled_task_id: run.status
                 for run in force_fail_stale_runs(store, list(latest.values()))

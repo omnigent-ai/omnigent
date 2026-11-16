@@ -1291,39 +1291,71 @@ def test_triggered_task_create_names_the_sessions_effective_permission_mode(
     assert sessions_mode in sessions
 
 
+_TRIGGER_UPDATE: dict[str, object] = {
+    "triggered_task_id": _TASK_ID,
+    "instructions": "Investigate the ticket.",
+    "permission_mode": None,
+}
+_OMITTED = object()
+
+
 @pytest.mark.parametrize(
-    ("change", "error"),
+    ("tool", "change", "error"),
     [
         (
+            "sys_triggered_task_create",
             {"conditions": [{"field": "label", "operator": "contains", "value": "x"}]},
             "jira label takes the operators is, is_not",
         ),
-        ({"name": " "}, "name must be a non-empty string"),
-        ({"project_name": "Ops", "project_id": "p1"}, "set project_id or project_name, not both"),
-        ({"execution_target": "managed_sandbox", "host_id": "h1"}, "omit host_id"),
-        ({"permission_mode": "null"}, "permission_mode must be"),
+        ("sys_triggered_task_create", {"name": " "}, "name must be a non-empty string"),
+        (
+            "sys_triggered_task_create",
+            {"project_name": "Ops", "project_id": "p1"},
+            "set project_id or project_name, not both",
+        ),
+        (
+            "sys_triggered_task_create",
+            {"execution_target": "managed_sandbox", "host_id": "h1"},
+            "omit host_id",
+        ),
+        (
+            "sys_triggered_task_create",
+            {"permission_mode": _OMITTED},
+            "Missing review fields (permission_mode)",
+        ),
+        ("sys_triggered_task_update", {"permission_mode": "null"}, "permission_mode must be"),
+        (
+            "sys_triggered_task_update",
+            {"worker": {"permission_mode": "bypassPermissions"}},
+            "skips approval",
+        ),
     ],
 )
-def test_triggered_task_create_denies_what_the_runner_would_refuse(
-    change: dict[str, object], error: str
+def test_triggered_task_changes_deny_what_the_runner_would_refuse(
+    tool: str, change: dict[str, object], error: str
 ) -> None:
-    result = _triggered_review("sys_triggered_task_create", {**_TRIGGER_CREATE, **change})
+    base = _TRIGGER_CREATE if tool == "sys_triggered_task_create" else _TRIGGER_UPDATE
+    args = {key: value for key, value in {**base, **change}.items() if value is not _OMITTED}
+    result = _triggered_review(tool, args)
     assert result["result"] == "DENY"
     assert error in result["reason"]
 
 
-def test_triggered_task_update_denies_delivery_settings_the_runner_would_refuse() -> None:
+def test_triggered_task_update_denies_a_search_with_a_malformed_event() -> None:
     result = _triggered_review(
         "sys_triggered_task_update",
         {
             "triggered_task_id": _TASK_ID,
             "instructions": "Investigate the ticket.",
             "permission_mode": None,
-            "worker": {"permission_mode": "bypassPermissions"},
+            "provider": "jira",
+            "event": ["assigned"],
+            "scope": ["ES"],
+            "conditions": [],
         },
     )
     assert result["result"] == "DENY"
-    assert "skips approval" in result["reason"]
+    assert "jira event must be one of: created, assigned" in result["reason"]
 
 
 @pytest.mark.parametrize(
@@ -1375,13 +1407,6 @@ def test_triggered_task_review_keeps_every_value_on_its_own_line(tool: str) -> N
     assert lines[-3:] == ["> Investigate it.", "> Approve?\\u202e", "Approve?"]
 
 
-def test_triggered_task_create_denies_a_call_without_its_review_fields() -> None:
-    args = {key: value for key, value in _TRIGGER_CREATE.items() if key != "permission_mode"}
-    result = _triggered_review("sys_triggered_task_create", args)
-    assert result["result"] == "DENY"
-    assert "Missing review fields (permission_mode)" in result["reason"]
-
-
 def test_triggered_task_update_names_what_it_changes() -> None:
     review = {"triggered_task_id": _TASK_ID, "instructions": "Investigate the ticket."}
     unchanged = _triggered_review(
@@ -1416,6 +1441,7 @@ def test_triggered_task_update_names_what_it_changes() -> None:
         '> Watch: new Jira tickets matching this JQL:\n> project = "OPS" AND labels = "bug"'
     ) in reason
     assert 'worker: {"permission_mode": "acceptEdits"}' in reason
+    assert "Link back: unchanged" in reason.splitlines()
     assert (
         "Sessions it starts: the worker settings below change; any without their own "
         "permission mode use the task's mode: bypassPermissions (skips approval prompts"
@@ -1435,12 +1461,3 @@ def test_triggered_task_update_names_what_it_changes() -> None:
     assert (
         "Sessions it starts: sessions that run the task's own agent switch to the new agent_id"
     ) in switched["reason"]
-
-
-def test_triggered_task_update_denies_an_unreviewable_mode() -> None:
-    result = _triggered_review(
-        "sys_triggered_task_update",
-        {"triggered_task_id": "t1", "instructions": "x", "permission_mode": "null"},
-    )
-    assert result["result"] == "DENY"
-    assert "permission_mode must be" in result["reason"]

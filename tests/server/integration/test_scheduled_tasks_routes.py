@@ -934,6 +934,18 @@ async def test_a_page_reads_only_each_tasks_latest_run(
     # The stale run heads the history, so the page fails it before reporting it.
     assert row["last_run_status"] == "failed"
 
+    # A store that can't read either part of a page answers 501, even for an empty page.
+    monkeypatch.setattr(
+        store,
+        "list_latest_runs_for_tasks",
+        lambda task_ids: ScheduledTaskStore.list_latest_runs_for_tasks(store, task_ids),
+    )
+    past_the_end = f"{2**62}:{'f' * 32}"
+    for params in ({"limit": 1}, {"limit": 1, "after": past_the_end}):
+        unsupported = await auth_client.get(
+            "/v1/scheduled-tasks", params=params, headers=_headers()
+        )
+        assert unsupported.status_code == 501, unsupported.text
     monkeypatch.setattr(
         store, "list_page", lambda **kwargs: ScheduledTaskStore.list_page(store, **kwargs)
     )
