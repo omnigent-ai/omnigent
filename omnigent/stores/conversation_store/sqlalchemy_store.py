@@ -763,13 +763,15 @@ def _read_session_recovery(session: Session, conversation_id: str) -> SessionRec
             SqlConversationLabel.key.in_(_RECOVERY_LABEL_KEYS),
         )
     ).all()
-    return (
-        SessionRecovery(
+    if not rows:
+        return None
+    try:
+        return SessionRecovery(
             **{key.removeprefix(RECOVERY_LABEL_PREFIX): json.loads(value) for key, value in rows}
         )
-        if rows
-        else None
-    )
+    except (TypeError, ValueError):
+        # These keys could be user-authored before recovery reserved the prefix.
+        return None
 
 
 def _write_session_recovery(
@@ -3344,7 +3346,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 if item.stable_id is None or item.stable_id not in seen_stable_ids:
                     if (
                         recovery is not None
-                        and recovery.phase in {"dispatching", "submitted"}
+                        and recovery.phase in {"dispatching", "submitted", "failed", "stopped"}
                         and recovery.attempt_id
                         and index in recovery_candidates
                     ):
