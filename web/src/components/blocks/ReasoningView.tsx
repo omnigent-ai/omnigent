@@ -12,18 +12,27 @@ interface ReasoningViewProps {
   duration: number | undefined;
 }
 
+// Code fences and thematic breaks carry no prose worth previewing.
+const MARKUP_ONLY_LINE_RE = /^(?:`{3,}|~{3,}|[-*_](?:\s*[-*_]){2,}$)/;
 // Leading heading, blockquote, and list markers on the preview line.
 const LEADING_BLOCK_MARKERS_RE = /^(?:#{1,6}\s+|>\s*|[-*+]\s+|\d+[.)]\s+)+/;
-const STRONG_RE = /(\*\*|__)(.+?)\1/g;
+// `**` only: `__` would mangle dunder names like `__init__.py`.
+const STRONG_RE = /\*\*(.+?)\*\*/g;
 const INLINE_CODE_RE = /`([^`]+)`/g;
 
-/** First line of a thought as plain text, e.g. `"**Planning** the fix"` -> `"Planning the fix"`. */
+/** First prose line of a thought as plain text, e.g. `"**Planning** the fix"` -> `"Planning the fix"`. */
 function reasoningPreview(text: string): string {
-  return firstLine(text)
-    .replace(LEADING_BLOCK_MARKERS_RE, "")
-    .replace(STRONG_RE, "$2")
-    .replace(INLINE_CODE_RE, "$1")
-    .trim();
+  for (const rawLine of text.split("\n")) {
+    const line = firstLine(rawLine);
+    if (line.length === 0 || MARKUP_ONLY_LINE_RE.test(line)) continue;
+    const preview = line
+      .replace(LEADING_BLOCK_MARKERS_RE, "")
+      .replace(STRONG_RE, "$1")
+      .replace(INLINE_CODE_RE, "$1")
+      .trim();
+    if (preview.length > 0) return preview;
+  }
+  return "";
 }
 
 export function ReasoningView({ text, isStreaming, duration }: ReasoningViewProps) {

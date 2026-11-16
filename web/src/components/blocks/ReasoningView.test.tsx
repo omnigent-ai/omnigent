@@ -94,6 +94,30 @@ describe("ReasoningView — header preview", () => {
     expect(screen.getByRole("button")).toHaveTextContent(/^Thinking: Planning the retry fix$/);
   });
 
+  it("keeps dunder names intact in the preview", () => {
+    render(
+      <ReasoningView
+        text="Checking __init__.py and `__main__` first."
+        isStreaming={false}
+        duration={undefined}
+      />,
+    );
+    expect(screen.getByRole("button")).toHaveTextContent(
+      /^Thinking: Checking __init__\.py and __main__ first\.$/,
+    );
+  });
+
+  it("skips code fence and thematic break lines when choosing the preview", () => {
+    render(
+      <ReasoningView
+        text={"---\n```python\nimport os\n```"}
+        isStreaming={false}
+        duration={undefined}
+      />,
+    );
+    expect(screen.getByRole("button")).toHaveTextContent(/^Thinking: import os$/);
+  });
+
   it("keeps the shimmer while streaming rather than previewing partial text", () => {
     render(<ReasoningView text="Checking the lockfile" isStreaming={true} duration={undefined} />);
     expect(screen.getByText("Thinking...")).toBeTruthy();
