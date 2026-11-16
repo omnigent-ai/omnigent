@@ -8,6 +8,7 @@ import {
   parseSystemMessage,
   stripAutomationContext,
   AUTOMATION_CONTEXT_NOTE,
+  EARLIER_AUTOMATION_CONTEXT_NOTES,
 } from "./systemMessage";
 
 describe("isClaudeAgentMessageContent", () => {
@@ -327,4 +328,10 @@ describe("stripAutomationContext", () => {
       ).toBe("Review the changes.");
     },
   );
+
+  it("strips the note an earlier server sent", () => {
+    for (const note of EARLIER_AUTOMATION_CONTEXT_NOTES) {
+      expect(stripAutomationContext(`Review the changes.\n\n${note}`)).toBe("Review the changes.");
+    }
+  });
 });

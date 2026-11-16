@@ -47,6 +47,7 @@ from omnigent.cli import _build_resume_parts
 from omnigent.cli_diagnostics import suppresses_recovery_hint
 from omnigent.inner.databricks_executor import DatabricksCredentials
 from omnigent.models.model_resolver import ModelResolutionError
+from omnigent.session_host import SessionRoutingTransport, get_session_host
 from omnigent.spec import load as load_spec
 from omnigent.spec import validate as validate_spec
 from omnigent.telemetry.request_headers import client_user_agent
@@ -2217,7 +2218,7 @@ def test_chat_with_server_fork_uses_source_not_catalog(
     assert requests == ["http://127.0.0.1:6767/v1/sessions/conv_source"]
     assert dispatched["agent_name"] == (session_agent or "agent")
     assert dispatched["fork_session_id"] == "conv_source"
-    assert chat_module.get_session_host("conv_source") == "host_source"
+    assert get_session_host("conv_source") == "host_source"
     assert dispatched["registered_agent"] is None
 
 
@@ -3705,7 +3706,7 @@ def test_run_repl_auto_opens_conversation_when_session_starts(
         del warn
         opened.append((base_url, conversation_id, enabled))
 
-    monkeypatch.setattr(chat_module, "OmnigentClient", _Client)
+    monkeypatch.setattr(chat_module, "open_sdk_client", _Client)
     monkeypatch.setattr("omnigent.repl.run_repl", _fake_run_repl)
     monkeypatch.setattr(chat_module, "open_conversation_link_if_enabled", _fake_open)
     monkeypatch.setattr("omnigent.repl._tmux_pane.register_pane", lambda **kwargs: None)
@@ -3890,7 +3891,7 @@ def _stub_run_repl_deps(
 
     monkeypatch.setattr(_repl_pkg, "run_repl", _fake_run_repl)
     monkeypatch.setattr("omnigent.repl._repl.run_repl", _fake_run_repl)
-    monkeypatch.setattr("omnigent.chat.OmnigentClient", _FakeClientCtx)
+    monkeypatch.setattr("omnigent.chat.open_sdk_client", lambda *_a, **kw: _FakeClientCtx(**kw))
     monkeypatch.setattr(
         "omnigent.chat._server_auth", lambda server_url=None, *, session_id=None: None
     )
@@ -5711,6 +5712,7 @@ async def test_one_shot_host_launch_routes_actual_http_requests(
     else:
         monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)
     base_url = "http://srv"
+    routed = "c0" * 16
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -5732,32 +5734,31 @@ async def test_one_shot_host_launch_routes_actual_http_requests(
             return httpx.Response(
                 201,
                 json={
-                    "id": "conv_routed",
+                    "id": routed,
                     "agent_id": "ag_s",
                     "host_id": "host_local",
                     "status": "idle",
                     "created_at": 0,
                 },
             )
-        if path == "/v1/sessions/conv_routed/events":
+        if path == f"/v1/sessions/{routed}/events":
             assert json.loads(request.content) == _STOP
             return httpx.Response(200, json={"queued": False})
-        assert path == "/v1/sessions/conv_routed"
+        assert path == f"/v1/sessions/{routed}"
         return httpx.Response(
             200,
-            json={"id": "conv_routed", "agent_id": "ag_s", "status": "idle", "created_at": 0},
+            json={"id": routed, "agent_id": "ag_s", "status": "idle", "created_at": 0},
         )
 
     async def turn(*, client: object, bound: object, **_kwargs: object) -> str:
-        await sessions.get("conv_routed")
+        await sessions.get(routed)
         return "pong"
 
     monkeypatch.setattr(chat_module, "_run_bound_turn", turn)
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler),
+        transport=SessionRoutingTransport(transport=httpx.MockTransport(handler)),
         headers=chat_module._server_headers(),
-        auth=chat_module._server_auth(server_url=base_url, session_id=None),
-        event_hooks={"request": [chat_module.route_session_request]},
+        auth=chat_module._server_auth(server_url=base_url),
     ) as http:
         sessions = SessionsNamespace(http, base_url)
         result = await _query_sessions_once(
@@ -5775,8 +5776,8 @@ async def test_one_shot_host_launch_routes_actual_http_requests(
         "GET /v1/runners",
         "GET /v1/hosts",
         "POST /v1/sessions",
-        "GET /v1/sessions/conv_routed",
-        "POST /v1/sessions/conv_routed/events",
+        f"GET /v1/sessions/{routed}",
+        f"POST /v1/sessions/{routed}/events",
     ]
 
 
@@ -5807,7 +5808,7 @@ def test_one_shot_host_launch_timeout_is_a_clean_cli_error(
 
     client = chat_module.OmnigentClient("http://127.0.0.1")
     monkeypatch.setattr(client._http, "_transport", httpx.MockTransport(handler))
-    monkeypatch.setattr(chat_module, "OmnigentClient", lambda **_kwargs: client)
+    monkeypatch.setattr(chat_module, "open_sdk_client", lambda *_a, **_kw: client)
     with pytest.raises(SystemExit) as excinfo:
         chat_module._run_headless_prompt(
             "http://127.0.0.1",

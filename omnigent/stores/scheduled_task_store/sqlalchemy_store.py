@@ -465,6 +465,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
         expected_schedule: ScheduledTask | None = None,
+        guard: Callable[[ScheduledTask], None] | None = None,
     ) -> ScheduledTask | None:
         """Update mutable fields.
 
@@ -479,7 +480,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         managed-sandbox execution). Passing ``rrule`` updates the recurring
         trigger and ``agent_id`` rebinds the task to a different agent
         (switching the harness future firings run); ``None`` leaves either
-        unchanged.
+        unchanged. ``guard`` runs on the locked row before any write; see the base class.
         """
         updated_at = now_epoch()
         checks_owner = state is not None and state != "deleted"
@@ -505,6 +506,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             )
             if row is None or row.state == encode_scheduled_task_state("deleted"):
                 return None
+            if guard is not None:
+                guard(_to_entity(row))
             if expected_schedule is not None:
                 current = _to_entity(row)
                 if any(
@@ -964,6 +967,12 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                         )
                     )
             return failures, cursor
+
+    def get_run(self, run_id: str) -> ScheduledTaskRun | None:
+        """Read a run's durable outcome without scanning its task's history."""
+        with self._session("select_task_run") as session:
+            row = session.get(SqlScheduledTaskRun, (current_workspace_id(), run_id))
+            return _run_to_entity(row) if row is not None else None
 
     def list_runs(
         self,

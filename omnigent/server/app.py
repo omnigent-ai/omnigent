@@ -85,9 +85,11 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import (
     managed_host_keepalive,
+    session_journal,
     session_live_state,
     session_pull_requests,
     shutdown_state,
+    workflows,
 )
 from omnigent.server.auth import (
     RESERVED_USER_LOCAL,
@@ -114,6 +116,10 @@ from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
 from omnigent.server.mcp_gateway import McpGatewayBackend
 from omnigent.server.mcp_pool import ServerMcpPool
+from omnigent.server.openapi_request_bodies import (
+    SESSION_CREATE_BODY_MODELS,
+    register_component_models,
+)
 from omnigent.server.openapi_stream_events import install_stream_event_schemas
 from omnigent.server.performance_metrics import (
     ServerMetricsOtelPublisher,
@@ -144,6 +150,7 @@ from omnigent.server.routes.proactive_agent_settings import (
 )
 from omnigent.server.routes.projects import create_projects_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
+from omnigent.server.routes.scheduled_task_permissions import scheduled_task_sharing_supported
 from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
 from omnigent.server.routes.session_policies import create_session_policies_router
@@ -340,6 +347,8 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_harness_settings: bool = True
     # Session creates accept ``permission_mode``; older servers ignore it.
     session_create_permission_modes: bool = True
+    # Session creates accept ``workflow_id``; older servers ignore it.
+    session_create_workflow_id: bool = True
     scripted_sessions: bool = False
     # Scheduled tasks accept explicit modes that skip approval; servers that omit
     # this may reject them, so clients hide those modes.
@@ -381,6 +390,12 @@ class ServerInfoResponse(BaseModel):
     # GET/DELETE /v1/sessions/{id}/pull-requests and SessionListItem.pull_request;
     # absent on older servers, which clients treat as unsupported.
     session_pull_requests: bool = False
+    # GET/POST /v1/sessions/{id}/journal and session.journal.appended; absent on
+    # older servers, which clients treat as unsupported.
+    session_journal: bool = False
+    # /v1/workflows, the caller's saved workflows; absent on older servers, which
+    # clients treat as unsupported.
+    workflows: bool = False
     # GET/PUT /v1/settings/session-title-instructions; absent on older servers,
     # which clients treat as unsupported.
     session_title_instructions: bool = False
@@ -393,6 +408,10 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_projects: bool = False
     # Bounded latest-failure feed for the Inbox.
     scheduled_task_inbox: bool = False
+    # Grants can be added through ``/v1/scheduled-tasks/{id}/permissions``: needs
+    # ``automations_v2`` and a store that keeps them. Listing and removing need only the
+    # store, through the API; the automation pages need the flag.
+    scheduled_task_sharing: bool = False
     # Session PATCH and project create check the agent tool's calling session;
     # absent on older servers, where moves must not run.
     session_move_source_checks: bool = False
@@ -1927,7 +1946,9 @@ def create_app(
         scheduler. When provided, the FastAPI lifespan starts the database
         scheduler (:class:`PersistentTaskScheduler`), or with automations_v2 off,
         a :class:`ScheduledTaskScheduler` that arms a timer per active task.
-        ``None`` disables the scheduler entirely, in either mode.
+        ``None`` disables the scheduler entirely, in either mode. The
+        ``automations`` release feature disables both schedulers and all
+        automation access without deleting saved tasks.
     :param preference_store: Optional shared-preference API; no launcher adoption.
     :param automations: Whether this request's caller can use automations. A static
         bool or a zero-arg callable resolved per request; ``None`` enables them.
@@ -2109,9 +2130,10 @@ def create_app(
         if mcp_disabled_servers is None
         else mcp_disabled_servers
     )
+    automations_enabled = resolved_feature_flags.enabled(Feature.AUTOMATIONS)
     automations_v2_enabled = resolved_feature_flags.enabled(Feature.AUTOMATIONS_V2)
     # Without a store there are no automations, so neither mode starts a scheduler.
-    if automations_v2_enabled and scheduled_task_store is not None:
+    if automations_enabled and automations_v2_enabled and scheduled_task_store is not None:
         if not isinstance(scheduled_task_store, ScheduledTaskDispatchStore):
             raise TypeError(
                 "The configured scheduled task store does not implement the operations needed "
@@ -2395,7 +2417,7 @@ def create_app(
         # The release flag selects one scheduler for the lifetime of this server.
         scheduler_start_retry: asyncio.Task[None] | None = None
         scheduled_task_scheduler: ScheduledTaskScheduler | PersistentTaskScheduler | None = None
-        if scheduled_task_store is not None:
+        if automations_enabled and scheduled_task_store is not None:
             from omnigent.server.scheduled.fire import (
                 ClaimedRunExecutor,
                 FireDeps,
@@ -2660,8 +2682,10 @@ def create_app(
     app.state.automations = True if automations is None else automations
 
     def automations_available() -> bool:
-        return scheduled_task_store is not None and deployment_gate_enabled(
-            app.state.automations, "automations"
+        return (
+            automations_enabled
+            and scheduled_task_store is not None
+            and deployment_gate_enabled(app.state.automations, "automations")
         )
 
     app.state.automations_available = automations_available
@@ -4073,16 +4097,22 @@ def create_app(
                 "session_rewind": True,
                 "session_pull_requests": session_pull_requests.open_store(conversation_store)
                 is not None,
+                "session_journal": frontend_features[Feature.WORKFLOWS.value]
+                and session_journal.open_store(conversation_store) is not None,
+                "workflows": frontend_features[Feature.WORKFLOWS.value]
+                and workflows.open_store(conversation_store) is not None,
                 "session_title_instructions": user_settings_store is not None,
                 "admin_view": admin_view_supported,
                 "filesystem_attachments": {
                     "extensions": sorted(filesystem_attachment_policy.extensions),
                     "all_types": filesystem_attachment_policy.all_types,
                 },
-                "scheduled_task_projects": project_store is not None,
+                "scheduled_task_projects": automations_enabled and project_store is not None,
                 "scheduled_task_inbox": automations_enabled,
                 "scheduled_task_one_time": automations_enabled
                 and bool(app.state.one_time_automations_enabled),
+                "scheduled_task_sharing": automations_enabled
+                and scheduled_task_sharing_supported(app.state, permission_store),
                 "session_move_source_checks": True,
                 "session_organize_source_checks": True,
                 "sibling_other_project_standalone": True,
@@ -4347,6 +4377,24 @@ def create_app(
         prefix="/v1",
         tags=["session_mcp_servers"],
     )
+    app.include_router(
+        session_journal.create_session_journal_router(
+            conversation_store,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+        tags=["session_journal"],
+    )
+    app.include_router(
+        workflows.create_workflows_router(
+            conversation_store,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+        tags=["workflows"],
+    )
     if inbox_item_store is not None:
         app.include_router(
             create_inbox_items_router(
@@ -4431,7 +4479,7 @@ def create_app(
                 artifact_store=artifact_store,
                 file_store=file_store,
                 project_store=project_store,
-                automations=app.state.automations,
+                automations=app.state.automations_available,
                 liveness_lookup=_bulk_session_liveness,
             ),
             prefix="/v1",
@@ -5866,6 +5914,7 @@ def create_app(
         app.add_middleware(BasePathMiddleware, base_path=resolved_base_path)
 
     install_stream_event_schemas(app)
+    register_component_models(app, SESSION_CREATE_BODY_MODELS)
     return app
 
 

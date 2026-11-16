@@ -12,6 +12,7 @@ import {
   FolderIcon,
   FolderOpenIcon,
   MonitorIcon,
+  PlugIcon,
   RefreshCwIcon,
   ShieldCheckIcon,
   TriangleAlertIcon,
@@ -52,8 +53,15 @@ import { ComposerConfigSections } from "@/components/composer/ComposerConfigSect
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { ComposerHarnessTrigger } from "@/components/composer/ComposerControls";
 import { PickerSectionHeader } from "@/components/composer/HarnessMenuRow";
-import { TriggerTemplateFields } from "@/components/scheduled/TriggerTemplateFields";
+import {
+  TriggerTemplateFields,
+  type TriggerMcpService,
+} from "@/components/scheduled/TriggerTemplateFields";
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
+import { WorkflowField } from "@/components/scheduled/WorkflowField";
+import { type SavedWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
+import { skillInvocationPrefix } from "@/lib/harnessSetup";
+import { parseSavedWorkflowMessage, savedWorkflowMessage } from "@/lib/workflow";
 import {
   TriggerWorkerHarnessField,
   TriggerWorkerSettingsFields,
@@ -75,6 +83,7 @@ import {
   TRIGGER_TEMPLATES,
   triggerFieldsComplete,
   triggerPromptSource,
+  triggerMcpService,
   triggerServiceName,
   triggerWorkerSettingsOf,
   updateTriggerWorkerSettings,
@@ -93,6 +102,9 @@ import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAge
 import { useHosts } from "@/hooks/useHosts";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { McpRegistryPicker } from "@/components/McpRegistry";
+import { useMcpRegistryCatalog, useRegistrySignIn } from "@/hooks/useMcpRegistry";
+import { withBasePath } from "@/lib/basePath";
 import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { isFeatureEnabled, pickerCuration, sandboxOptionLabel } from "@/lib/capabilities";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
@@ -214,6 +226,7 @@ export function CreateScheduledTaskDialog({
   sessionLink = "",
   editingTask = null,
   sourceSession = null,
+  lockedWorkflow = null,
   onCreated,
 }: {
   open: boolean;
@@ -229,6 +242,8 @@ export function CreateScheduledTaskDialog({
   editingTask?: ScheduledTask | null;
   /** Create the automation from this session: every run starts from a copy of it. */
   sourceSession?: AutomationSourceSession | null;
+  /** Create the automation from this saved workflow: runs follow it, and it can't be changed. */
+  lockedWorkflow?: SavedWorkflow | null;
   /** Called once with the new automation after it is created (not after an edit). */
   onCreated?: (task: ScheduledTask) => void;
 }) {
@@ -236,6 +251,7 @@ export function CreateScheduledTaskDialog({
   const { data: hosts, isPending: hostsPending } = useHosts({ enabled: open });
   const info = useServerInfo();
   const anchoredScheduling = isFeatureEnabled(info, "automations_v2");
+  const workflowsEnabled = isFeatureEnabled(info, "workflows");
   const subhourSupported = info !== "loading" && info.scheduled_task_subhour === true;
   const triggerPollMinutes = info !== "loading" ? (info.automation_trigger_poll_minutes ?? 10) : 10;
   const triggerHeadersSupported =
@@ -246,6 +262,11 @@ export function CreateScheduledTaskDialog({
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
   // Older servers reject a task's project fields, so the picker needs the flag.
   const projectsSupported = info !== "loading" && info.scheduled_task_projects === true;
+  // Older servers reject a task's mcp_services, and without a registry there is nothing to pick.
+  const mcpRegistryEnabled =
+    info !== "loading" &&
+    info.scheduled_task_mcp_services === true &&
+    !!info.enabled_connections?.includes("mcp");
   const sandboxRepoCatalog =
     info !== "loading" && info.scheduled_task_sandbox_workspaces === true && info.sandbox_provider
       ? (info.sandbox_provider_capabilities?.[info.sandbox_provider]?.repo_catalog ?? [])
@@ -312,6 +333,9 @@ export function CreateScheduledTaskDialog({
 
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
+  // A saved workflow for each run to follow; the instructions then hold the run's details.
+  const [workflowChoice, setWorkflowChoice] = useState<SavedWorkflow | null>(null);
+  const savedWorkflows = useSavedWorkflows({ enabled: open });
   // The rendered template text around the instructions of an older trigger. Never shown.
   const [systemPrompt, setSystemPrompt] = useState<string | null>(null);
   const promptFieldsRef = useRef<HTMLDivElement>(null);
@@ -450,6 +474,7 @@ export function CreateScheduledTaskDialog({
     setAgentMenuOpen(false);
     setScheduleMenuOpen(false);
     setEndingMenuOpen(false);
+    setMcpMenuOpen(false);
     selectOpenCountRef.current = 0;
     nestedMenuOpenCountRef.current = 0;
     nestedMenuClosedAtRef.current = 0;
@@ -519,6 +544,9 @@ export function CreateScheduledTaskDialog({
   const [pickedProjectId, setPickedProjectId] = useState<string | null>(null);
   const [sessionMode, setSessionMode] = useState<ScheduledTaskSessionMode>("new");
   const [startNewSession, setStartNewSession] = useState(false);
+  const [mcpServices, setMcpServices] = useState<string[]>([]);
+  const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
+  const [mcpMenuOpen, setMcpMenuOpen] = useState(false);
   const executionTarget: ScheduledTaskExecutionTarget = sandboxMode
     ? "managed_sandbox"
     : "connected_host";
@@ -601,18 +629,21 @@ export function CreateScheduledTaskDialog({
         editingTask && isTaskSessionTriggerPrompt(editingTask.prompt) ? "continue" : "new",
       );
       const savedPrompt = editingTask?.prompt ?? initialPrompt ?? "";
-      if (editingTriggerConfig !== null) {
-        setPrompt("");
-        setSystemPrompt(null);
-      } else if (hasTriggerHeader(savedPrompt)) {
-        // The header no longer matches, so trust only the text the model runs.
-        setPrompt(stripTriggerHeader(savedPrompt));
-        setSystemPrompt(null);
-      } else {
-        const parts = splitTriggerPrompt(savedPrompt);
-        setPrompt(parts.userPrompt);
-        setSystemPrompt(parts.systemPrompt);
-      }
+      // An invalid header is ignored; only its rendered prompt remains authoritative.
+      const parts = editingTriggerConfig
+        ? { userPrompt: editingTriggerConfig.instructions, systemPrompt: null }
+        : hasTriggerHeader(savedPrompt)
+          ? { userPrompt: stripTriggerHeader(savedPrompt), systemPrompt: null }
+          : splitTriggerPrompt(savedPrompt);
+      const savedRun = workflowsEnabled ? parseSavedWorkflowMessage(parts.userPrompt) : null;
+      setWorkflowChoice(
+        workflowsEnabled
+          ? (lockedWorkflow ??
+              (savedRun && { id: savedRun.id, name: savedRun.name, description: "" }))
+          : null,
+      );
+      setPrompt(editingTriggerConfig ? "" : (savedRun?.details ?? parts.userPrompt));
+      setSystemPrompt(parts.systemPrompt);
       setTimezone(editingTask?.timezone ?? localTimezone());
       if (editingTask) {
         const parsedSchedule = savedSchedule;
@@ -632,6 +663,7 @@ export function CreateScheduledTaskDialog({
         setPickedProjectId(null);
         setSessionMode(editingTask.sessionMode);
         setStartNewSession(false);
+        setMcpServices(editingTask.mcpServices);
         if (editingTriggerConfig !== null) {
           const {
             source,
@@ -640,7 +672,7 @@ export function CreateScheduledTaskDialog({
             ...fields
           } = editingTriggerConfig;
           setTrigger(source);
-          setTriggerFields(fields);
+          setTriggerFields({ ...fields, instructions: savedRun?.details ?? fields.instructions });
           setSwitchedWorkerSettings(triggerWorkerSettingsOf(worker));
           setSwitchedWorkerPlacement(worker.placement);
         } else {
@@ -672,6 +704,7 @@ export function CreateScheduledTaskDialog({
         setSandboxMode(false);
         setProjectChoice(null);
         setPickedProjectId(null);
+        setMcpServices([]);
       }
       setError(null);
     }
@@ -687,6 +720,8 @@ export function CreateScheduledTaskDialog({
     savedSchedule,
     savedWorkspace,
     sourceSession,
+    lockedWorkflow,
+    workflowsEnabled,
   ]);
 
   // A new task starts on a server sandbox when one is offered, so it doesn't
@@ -795,7 +830,7 @@ export function CreateScheduledTaskDialog({
     const updated = updateTriggerWorkerSettings(effectivePrompt, settings);
     if (updated === null) return;
     const parts = splitTriggerPrompt(updated);
-    setPrompt(parts.userPrompt);
+    setPrompt(withoutWorkflow(parts.userPrompt));
     setSystemPrompt(parts.systemPrompt);
   }
 
@@ -1020,6 +1055,31 @@ export function CreateScheduledTaskDialog({
     unsupportedByScheduler ||
     validateSchedule(schedule, { allowPastEnd, sessionMode, subhourSupported, executionTarget }) !==
       null;
+  const workflowPrefix = skillInvocationPrefix(harnessSettings.harness);
+  const withWorkflow = (text: string) =>
+    workflowChoice ? savedWorkflowMessage(workflowPrefix, workflowChoice, text, false) : text;
+  // The saved list's copy, once loaded, has the workflow's current name.
+  const workflowShown =
+    workflowChoice &&
+    (savedWorkflows.workflows.find((workflow) => workflow.id === workflowChoice.id) ??
+      workflowChoice);
+  const withoutWorkflow = (text: string) =>
+    (workflowChoice && parseSavedWorkflowMessage(text)?.details) ?? text;
+  const workflowField =
+    workflowsEnabled && (savedWorkflows.workflows.length > 0 || workflowChoice) ? (
+      <WorkflowField
+        workflows={savedWorkflows.workflows}
+        pagination={savedWorkflows.pagination}
+        value={workflowShown}
+        onChange={setWorkflowChoice}
+        onOpenChange={handleSelectOpenChange}
+        locked={lockedWorkflow !== null}
+      />
+    ) : null;
+  const promptTriggerFields = {
+    ...triggerFields,
+    instructions: withWorkflow(triggerFields.instructions),
+  };
   const triggerPromptContext = {
     sessionLink,
     pollingIntervalMinutes:
@@ -1029,10 +1089,10 @@ export function CreateScheduledTaskDialog({
   // An edit keeps the saved workers; a new trigger's workers run where the manager
   // runs (beside it on a connected host, or each in its own sandbox).
   const renderedTriggerConfig: TriggerConfig | null =
-    trigger !== null && triggerFieldsComplete(triggerFields, trigger)
+    trigger !== null && triggerFieldsComplete(promptTriggerFields, trigger)
       ? {
           source: trigger,
-          ...triggerFields,
+          ...promptTriggerFields,
           ...(triggerTaskSessionMode === "continue" ? { taskSessionMode: "continue" } : {}),
           worker: {
             placement: workerPlacement ?? (sandboxMode ? "managed" : "same_host"),
@@ -1053,7 +1113,9 @@ export function CreateScheduledTaskDialog({
     renderedTriggerPrompt = renderTriggerConfigPrompt(renderedTriggerConfig, triggerPromptContext);
   }
   const effectivePrompt =
-    trigger !== null ? renderedTriggerPrompt : combineTriggerPrompt(prompt, systemPrompt);
+    trigger !== null
+      ? renderedTriggerPrompt
+      : combineTriggerPrompt(withWorkflow(prompt), systemPrompt);
   const triggerMode =
     trigger !== null ||
     (sessionMode === "continue" && (editingTemplateTrigger || isTriggerPrompt(effectivePrompt)));
@@ -1243,11 +1305,88 @@ export function CreateScheduledTaskDialog({
   // Set across the whole submit, which may first find or create a project.
   const [submitting, setSubmitting] = useState(false);
   const mutationPending = submitting || createMutation.isPending || updateMutation.isPending;
+  // A trigger's saved worker settings hide the session controls, so its services stay as saved.
+  const mcpPickerShown = mcpRegistryEnabled && !editingWorkerSettings;
+  const mcpCatalog = useMcpRegistryCatalog(open && mcpPickerShown);
+  // A saved or remembered service the catalog no longer offers is not saved again.
+  const offeredMcpServices = mcpServices.filter((id) =>
+    mcpCatalog.services.some((service) => service.id === id),
+  );
+  const mcpNeedsSignIn = mcpCatalog.services.filter(
+    (service) => offeredMcpServices.includes(service.id) && !service.connected,
+  ).length;
+  // Runs start unattended, so every selected service must already be signed in.
+  const mcpBlockedReason =
+    !mcpPickerShown || reusesExistingSession || mcpServices.length === 0
+      ? null
+      : mcpCatalog.loading
+        ? "Loading MCP services…"
+        : mcpCatalog.error
+          ? "Could not load MCP services. Retry, or turn them off."
+          : mcpNeedsSignIn > 0
+            ? "Sign in to each selected MCP service, or turn it off."
+            : null;
+  const mcpServicesChanged =
+    editingTask === null
+      ? offeredMcpServices.length > 0
+      : !sameServices(offeredMcpServices, editingTask.mcpServices);
+  const toggleMcpService = (id: string, next: boolean) =>
+    setMcpServices((current) =>
+      next ? [...new Set([...current, id])] : current.filter((service) => service !== id),
+    );
+  const {
+    signIn: signInMcp,
+    authorizing: mcpSigningIn,
+    error: mcpSignInError,
+    clearError: clearMcpSignInError,
+    cancel: cancelMcpSignIn,
+  } = useRegistrySignIn(mcpCatalog.refresh);
+  // The dialog stays mounted between drafts, so a sign-in must not outlive its own.
+  useEffect(() => {
+    if (!open) cancelMcpSignIn();
+  }, [open, cancelMcpSignIn]);
+  // A trigger reads its source through that service's MCP, when the server offers one.
+  const triggerMcp =
+    mcpPickerShown && trigger !== null && !reusesExistingSession
+      ? triggerMcpService(trigger, mcpCatalog.services)
+      : undefined;
+  // The owner adds a trigger's service; picking or switching triggers never changes them.
+  const triggerMcpNote: TriggerMcpService | undefined =
+    triggerMcp === undefined
+      ? undefined
+      : {
+          title: triggerMcp.title,
+          selected: triggerMcp.connected && offeredMcpServices.includes(triggerMcp.id),
+          signingIn: mcpSigningIn === triggerMcp.id,
+          error: mcpSignInError?.id === triggerMcp.id ? mcpSignInError.message : null,
+          // A pasted token has no sign-in popup, so it is connected in settings.
+          settingsHref:
+            !triggerMcp.connected && triggerMcp.auth === "bearer"
+              ? withBasePath("/settings/mcp")
+              : undefined,
+          onAdd: () => {
+            clearMcpSignInError();
+            if (triggerMcp.connected) {
+              toggleMcpService(triggerMcp.id, true);
+              return;
+            }
+            // A Databricks service first asks for its workspace, which the menu collects.
+            if (triggerMcp.auth === "databricks") {
+              setAdvancedOpen(true);
+              setMcpMenuOpen(true);
+              return;
+            }
+            void signInMcp(triggerMcp).then(
+              (signedIn) => signedIn && toggleMcpService(triggerMcp.id, true),
+            );
+          },
+        };
   const canSubmit =
     !curationPending &&
     name.trim() !== "" &&
     (startsFromSession ||
-      (effectivePrompt.trim() !== "" && (trigger !== null || prompt.trim() !== ""))) &&
+      (effectivePrompt.trim() !== "" &&
+        (trigger !== null || withWorkflow(prompt).trim() !== ""))) &&
     (trigger !== null || systemPrompt === null || systemPrompt.trim() !== "") &&
     (isEdit || effectiveAgentId !== null) &&
     (isEdit || sandboxMode || hostId !== "") &&
@@ -1255,6 +1394,9 @@ export function CreateScheduledTaskDialog({
     !scheduleInvalid &&
     !pollingBlockedReason &&
     !(workerSettings !== null && workerHarnessSettings.blockedReason) &&
+    mcpBlockedReason === null &&
+    !mcpAuthorizing &&
+    mcpSigningIn === null &&
     !mutationPending;
   // Problems that disable Save but whose explanation or fix lives under Advanced settings.
   const advancedBlocksSubmit =
@@ -1266,7 +1408,8 @@ export function CreateScheduledTaskDialog({
       workspaceWithoutHost ||
       Boolean(pollingBlockedReason) ||
       (workerSettings !== null && Boolean(workerHarnessSettings.blockedReason)) ||
-      (!isEdit && agents !== undefined && effectiveAgentId === null));
+      (!isEdit && agents !== undefined && effectiveAgentId === null) ||
+      (mcpBlockedReason !== null && !mcpCatalog.loading));
   useEffect(() => {
     if (open && advancedBlocksSubmit) setAdvancedOpen(true);
   }, [open, advancedBlocksSubmit]);
@@ -1380,6 +1523,7 @@ export function CreateScheduledTaskDialog({
     setTrigger(null);
     setTriggerFields(emptyTriggerFields("jira"));
     setTriggerTaskSessionMode("new");
+    setMcpServices([]);
     setError(null);
     setScheduleUnsupported(false);
   }
@@ -1446,6 +1590,7 @@ export function CreateScheduledTaskDialog({
                   }
                 : {}),
               ...(supportsPermission ? { permissionMode: effectivePermission || null } : {}),
+              ...(mcpPickerShown && mcpServicesChanged ? { mcpServices: offeredMcpServices } : {}),
             };
         await updateMutation.mutateAsync({
           id: editingTask.id,
@@ -1481,6 +1626,7 @@ export function CreateScheduledTaskDialog({
           ...(supportsPermission && effectivePermission !== ""
             ? { permissionMode: effectivePermission }
             : {}),
+          ...(mcpPickerShown && mcpServicesChanged ? { mcpServices: offeredMcpServices } : {}),
         });
         onCreated?.(created);
       }
@@ -1756,20 +1902,28 @@ export function CreateScheduledTaskDialog({
                           }) !== null
                         }
                         taskSessionMode={triggerTaskSessionMode}
+                        workflowField={workflowField}
+                        instructionsAreDetails={workflowChoice !== null}
+                        mcpService={triggerMcpNote}
                       />
                     ) : (
                       <div ref={promptFieldsRef} className="flex flex-col gap-1.5">
+                        {workflowField && <div className="mb-3.5">{workflowField}</div>}
                         <Textarea
                           id="task-prompt"
                           aria-label={
-                            startsFromSession ? "Additional instructions" : "Instructions"
+                            startsFromSession || workflowChoice
+                              ? "Additional instructions"
+                              : "Instructions"
                           }
                           value={prompt}
                           rows={5}
                           placeholder={
-                            startsFromSession
-                              ? "Optional. For example: Use this week's data."
-                              : "What should the agent do each run?"
+                            workflowChoice
+                              ? "Optional. Instructions to customize the workflow."
+                              : startsFromSession
+                                ? "Optional. For example: Use this week's data."
+                                : "What should the agent do each run?"
                           }
                           data-testid="task-prompt-input"
                           componentId="tasks.scheduled.prompt"
@@ -1936,6 +2090,7 @@ export function CreateScheduledTaskDialog({
                         </SelectContent>
                       </Select>
                     )}
+
                     <Collapsible
                       open={advancedOpen}
                       onOpenChange={setAdvancedOpen}
@@ -2060,6 +2215,78 @@ export function CreateScheduledTaskDialog({
                                 </DropdownMenu>
                               </div>
                             )}
+                          {mcpPickerShown && (
+                            <div className="py-px" data-testid="task-mcp-services-field">
+                              <div className="flex min-h-9 items-center justify-between gap-4">
+                                <span className="text-ui text-muted-foreground">MCP services</span>
+                                <Popover
+                                  open={mcpMenuOpen}
+                                  onOpenChange={(next) => !mcpAuthorizing && setMcpMenuOpen(next)}
+                                >
+                                  <PopoverTrigger asChild>
+                                    <ComposerHarnessTrigger
+                                      label="MCP services"
+                                      model={
+                                        reusesExistingSession
+                                          ? "Session's MCPs"
+                                          : offeredMcpServices.length === 0
+                                            ? "No MCPs"
+                                            : `MCPs · ${offeredMcpServices.length}`
+                                      }
+                                      icon={
+                                        <PlugIcon
+                                          className={`size-4 shrink-0${
+                                            mcpBlockedReason && !mcpCatalog.loading
+                                              ? " text-amber-600 dark:text-amber-500"
+                                              : ""
+                                          }`}
+                                        />
+                                      }
+                                      disabled={reusesExistingSession}
+                                      title={
+                                        reusesExistingSession
+                                          ? "The continued session keeps its MCP services"
+                                          : undefined
+                                      }
+                                      className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
+                                      data-testid="task-mcp-services-trigger"
+                                    />
+                                  </PopoverTrigger>
+                                  <PopoverContent
+                                    align="end"
+                                    collisionPadding={12}
+                                    onPointerDownOutside={keepParentPopoverOpenForNestedMenu}
+                                    className="flex max-h-[var(--radix-popover-content-available-height)] w-72 max-w-[calc(100vw-2rem)] flex-col p-0"
+                                    data-testid="task-mcp-services-menu"
+                                  >
+                                    <div className="shrink-0 border-b border-border px-3 py-2.5">
+                                      <PickerSectionHeader>MCP services</PickerSectionHeader>
+                                      <p className="mt-0.5 text-xs text-muted-foreground">
+                                        Every run starts with these. Runs are unattended, so sign in
+                                        to each one now.
+                                      </p>
+                                    </div>
+                                    <McpRegistryPicker
+                                      attached={mcpServices}
+                                      onToggle={toggleMcpService}
+                                      busy={mutationPending}
+                                      onAuthorizingChange={setMcpAuthorizing}
+                                      catalog={mcpCatalog}
+                                    />
+                                  </PopoverContent>
+                                </Popover>
+                              </div>
+                              {mcpBlockedReason && !mcpCatalog.loading && (
+                                <p
+                                  role="alert"
+                                  data-testid="task-mcp-services-blocked"
+                                  className="pb-2 text-sm text-destructive"
+                                >
+                                  {mcpBlockedReason}
+                                </p>
+                              )}
+                            </div>
+                          )}
 
                           {!usesTriggerSchedule && (isEdit || fromSession !== null) && (
                             <div className="flex min-h-9 items-center justify-between gap-4 py-px">
@@ -2565,3 +2792,8 @@ const SANDBOX_HOST = "__sandbox__";
 // other dialogs (project settings) can reuse it without pulling this file's
 // module graph. Re-exported here to keep existing imports and tests stable.
 export { isBackdropOverlay, isInsidePopper, shouldGuardDialogDismiss };
+
+/** Whether two MCP service lists name the same services, in any order. */
+function sameServices(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((service) => right.includes(service));
+}

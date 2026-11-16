@@ -1656,6 +1656,7 @@ async def test_multi_repo_routes_bind_session_git_and_preserve_repository_metada
                 ["git", *argv], cwd=repo, env=_git_env(), check=True, capture_output=True
             )
         (repo / "same.txt").write_text(f"{name} changed\n")
+    (workspace / "alpha" / "new.txt").write_text("one\ntwo\n")
     environment = registry._primary_envs["conv_test"]
     request.addfinalizer(environment.close)
     run_git = environment.run_git
@@ -1675,12 +1676,15 @@ async def test_multi_repo_routes_bind_session_git_and_preserve_repository_metada
     response = await client.get(f"{base}/changes")
     assert response.status_code == 200, response.text
     entries = {entry["path"]: entry for entry in response.json()["data"]}
-    assert set(entries) == {"alpha/same.txt", "beta/same.txt", "hello.txt"}
+    assert set(entries) == {"alpha/new.txt", "alpha/same.txt", "beta/same.txt", "hello.txt"}
     assert "repository_root" not in entries["hello.txt"]
     for name in ("alpha", "beta"):
         assert entries[f"{name}/same.txt"]["repository_root"] == name
         assert entries[f"{name}/same.txt"]["lines_added"] == 1
         assert entries[f"{name}/same.txt"]["lines_removed"] == 1
+        assert entries[f"{name}/same.txt"]["untracked_lines"] is None
+    assert entries["alpha/new.txt"]["lines_added"] is None
+    assert entries["alpha/new.txt"]["untracked_lines"] == 2
     assert calls == [
         (command, workspace / name) for name in ("alpha", "beta") for command in ("status", "diff")
     ]

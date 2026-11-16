@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 
-import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+import { isMacPlatform } from "@/lib/hotkeys";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 
 type ViewMode = "chat" | "terminal";
 
@@ -15,13 +16,7 @@ export function isViewModeToggleHotkey(
   event: globalThis.KeyboardEvent,
   isMac = isMacPlatform(),
 ): boolean {
-  if (!hasCommandModifier(event, isMac) || !event.altKey || event.shiftKey || event.isComposing) {
-    return false;
-  }
-  if (typeof event.getModifierState === "function" && event.getModifierState("AltGraph")) {
-    return false;
-  }
-  return event.code === "Backslash";
+  return !event.isComposing && matchesShortcut(event, "view.mode", { mac: isMac });
 }
 
 export function useViewModeToggleHotkey(

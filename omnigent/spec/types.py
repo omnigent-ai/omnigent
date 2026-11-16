@@ -893,6 +893,8 @@ class ToolGroupsConfig:
     :param comments: ``list_comments`` and ``update_comment``.
     :param policies: ``sys_add_policy`` and ``sys_policy_registry``.
     :param agent_discovery: The read-only ``sys_agent_*`` tools (3).
+    :param journal: The ``sys_journal_*`` tools (4): the session's plan, step
+        statuses and notes.
     :param projects: ``sys_project_list``, ``sys_project_update`` and
         ``sys_session_update``.
     :param user_inbox: ``sys_user_inbox_post`` and ``sys_user_inbox_list``,
@@ -904,6 +906,7 @@ class ToolGroupsConfig:
     comments: bool = True
     policies: bool = True
     agent_discovery: bool = True
+    journal: bool = True
     projects: bool = True
     user_inbox: bool = False
 

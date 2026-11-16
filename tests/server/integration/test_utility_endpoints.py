@@ -100,11 +100,14 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "automations_v2": True,
         "splittable_terminal_view_ui": False,
         "sidebar_windowed_rows": False,
+        "workflows": False,
         "session_overview": False,
         "project_repository_creation": True,
         "session_orchestration": True,
         "sibling_sessions": True,
         "codex_plan_at_launch": True,
+        "workspace_direct_access": False,
+        "workspace_api_server_access": False,
     }
     assert data["sibling_sessions"] is True
     # Compatibility field for frontend builds predating the nested map.
@@ -131,6 +134,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["scheduled_task_harness_settings"] is True
     # Lets sys_session_create refuse permission_mode on servers that would ignore it.
     assert data["session_create_permission_modes"] is True
+    # Lets sys_session_create refuse workflow_id on servers that would ignore it.
+    assert data["session_create_workflow_id"] is True
     # Gates the automation picker's approval-skipping modes; older servers reject them.
     assert data["scheduled_task_approval_skipping_modes"] is True
     assert data["agent_detail"] is True

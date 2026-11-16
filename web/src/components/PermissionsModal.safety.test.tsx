@@ -31,6 +31,11 @@ import * as api from "@/lib/permissionsApi";
 
 const listMock = vi.mocked(api.listPermissions);
 
+/** A session's grants list as the API returns it. */
+function grantList(permissions: api.Permission[]): api.GrantList<api.Permission> {
+  return { permissions, managedByAutomation: null };
+}
+
 // The unsafe (no-sandbox) primary-environment resource, exactly as the backend
 // serializes it on the wire: `sandbox_active` is the load-bearing field and is
 // false because `sandbox_type` is "none", i.e. a shared collaborator's shell
@@ -104,9 +109,9 @@ describe("PermissionsModal share-safety", () => {
     // so the only operation that can fail here is the warning lookup — it
     // fails today because no warning element exists, not because the modal
     // failed to render.
-    listMock.mockResolvedValue([
-      { user_id: "owner@example.com", conversation_id: "conv_unsafe", level: 4 },
-    ]);
+    listMock.mockResolvedValue(
+      grantList([{ user_id: "owner@example.com", conversation_id: "conv_unsafe", level: 4 }]),
+    );
 
     render(<PermissionsModal sessionId="conv_unsafe" open={true} onOpenChange={() => {}} />, {
       wrapper: createWrapper(),

@@ -19,7 +19,7 @@ import asyncio
 import contextlib
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -32,11 +32,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from omnigent.db.account_authority import account_generation, current_account_user
 from omnigent.entities import Agent, Conversation, ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.inner._subprocess_lifecycle import await_cleanup_task
 from omnigent.runtime import pending_elicitations
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.feature_flags import DeploymentGate, deployment_gate_enabled
-from omnigent.server.managed_hosts import is_repo_workspace, parse_repo_workspace
+from omnigent.server.managed_hosts import parse_repo_workspace
 from omnigent.server.proactive_agent import (
     PROACTIVE_AGENT_IDS,
     is_proactive_task,
@@ -56,6 +57,13 @@ from omnigent.server.routes._sessions.helpers import (
     _session_status_from_cache,
 )
 from omnigent.server.routes._sessions.orchestration import _list_status_with_starting
+from omnigent.server.routes.scheduled_task_permissions import (
+    agent_shared_target_guard,
+    owns_scheduled_task,
+    register_scheduled_task_permissions_routes,
+    require_agent_keeps_shared_target,
+    without_legacy_sandbox_workspace,
+)
 from omnigent.server.scheduled.harness_settings import (
     validate_scheduled_permission_mode,
     validate_scheduled_permission_support,
@@ -67,10 +75,13 @@ from omnigent.server.scheduled.rrule import (
     validate_rrule,
 )
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
+from omnigent.server.scheduled.run_sharing import delete_task_grants
 from omnigent.server.scheduled.telemetry import log_task_created
 from omnigent.server.session_mcp_selection import MAX_SESSION_MCP_SERVICES, session_mcp_selection
+from omnigent.server.workflows import require_workflows
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
+from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import (
     AutomationFailure,
@@ -391,6 +402,19 @@ def _validate_timezone_or_400(timezone: str) -> None:
 _AGENT_AUTOMATION_ACTION = "Agent automation changes"
 
 
+def _inbox_cursor_task_id(task_id: str) -> str:
+    """An Inbox cursor's task ID: bare hex if a UUID, else as the store allocated it.
+
+    :raises ValueError: If the ID is empty.
+    """
+    if not task_id:
+        raise ValueError("missing task ID")
+    try:
+        return uuid.UUID(task_id).hex
+    except ValueError:
+        return task_id
+
+
 def create_scheduled_tasks_router(
     store: ScheduledTaskStore,
     *,
@@ -562,16 +586,6 @@ def create_scheduled_tasks_router(
             agent_for_user, agent_store, artifact_store, agent, owner_id
         )
 
-    def _owns_task(task: ScheduledTask, owner: str | None) -> bool:
-        return (
-            task.state != "deleted"
-            and task.user_id == owner
-            and (
-                current_account_user() is None
-                or task.account_generation == account_generation(owner or RESERVED_USER_LOCAL)
-            )
-        )
-
     def _require_owned(scheduled_task_id: str, owner: str | None) -> ScheduledTask:
         """Load a task the caller owns, or raise 404.
 
@@ -580,7 +594,7 @@ def create_scheduled_tasks_router(
         """
         task = store.get(scheduled_task_id)
         # Proactive tasks are framework-owned and never shown to their owner.
-        if task is None or is_proactive_task(task) or not _owns_task(task, owner):
+        if task is None or is_proactive_task(task) or not owns_scheduled_task(task, owner):
             raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
         return task
 
@@ -855,6 +869,44 @@ def create_scheduled_tasks_router(
         except Exception:
             _logger.exception("could not delete the unused session copy %s", session_id)
 
+    @contextlib.asynccontextmanager
+    async def _allocated_task_id(owner_id: str | None, name: str) -> AsyncIterator[str]:
+        """Allocate a new task's ID, releasing it if the block fails, cancellation included.
+
+        The block must end once the store saves the task, so a saved task keeps its ID.
+        """
+        # An allocator may create an external object, which a cancel must not leak.
+        allocating = asyncio.create_task(
+            asyncio.to_thread(store.allocate_scheduled_task_id, user_id=owner_id, name=name)
+        )
+        try:
+            task_id = await asyncio.shield(allocating)
+        except asyncio.CancelledError:
+
+            async def settle_and_release() -> None:
+                # A failed allocation has no ID to release.
+                with contextlib.suppress(Exception):
+                    await _release_task_id_quietly(await allocating)
+
+            await await_cleanup_task(asyncio.create_task(settle_and_release()))
+            raise
+        try:
+            yield task_id
+        except BaseException:
+            await _release_task_id_quietly(task_id)
+            raise
+
+    async def _release_task_id_quietly(task_id: str) -> None:
+        """Release an unused task ID, finishing through cancellations; failures are only logged."""
+        releasing = asyncio.create_task(
+            asyncio.to_thread(store.release_scheduled_task_id, task_id)
+        )
+        try:
+            await await_cleanup_task(releasing)
+        except Exception:
+            # The original error still reaches the client.
+            _logger.exception("could not release the unused scheduled task ID %s", task_id)
+
     async def _require_mode_fits_session(request: Request, task: ScheduledTask) -> None:
         """Reject a mode change that leaves *task*'s continued session unable to take prompts.
 
@@ -923,113 +975,116 @@ def create_scheduled_tasks_router(
         project_owner = _project_owner(owner)
         # Known before the task exists, since a sandbox session must run on the
         # sandbox host derived from it.
-        task_id = uuid.uuid4().hex
-        host_id = body.host_id
-        source: Conversation | None = None
-        source_up_to = ""
-        carry = False
-        mcp_services = await _validated_mcp_services(request, body.mcp_services, agent, owner)
-        if body.session_id is not None:
-            # A picked session keeps the agent it runs, so the task takes no copy.
-            bound = agent
-            picked = await _require_continuable(
-                request,
-                ScheduledTask(
-                    id=task_id,
+        async with _allocated_task_id(owner_id, body.name) as task_id:
+            host_id = body.host_id
+            source: Conversation | None = None
+            source_up_to = ""
+            carry = False
+            mcp_services = await _validated_mcp_services(request, body.mcp_services, agent, owner)
+            if body.session_id is not None:
+                # A picked session keeps the agent it runs, so the task takes no copy.
+                bound = agent
+                picked = await _require_continuable(
+                    request,
+                    ScheduledTask(
+                        id=task_id,
+                        name=body.name,
+                        prompt=body.prompt,
+                        rrule=body.rrule,
+                        user_id=owner_id,
+                        agent_id=agent.id,
+                        timezone=body.timezone,
+                        created_at=0,
+                        workspace=workspace,
+                        base_branch=body.base_branch,
+                        host_id=body.host_id,
+                        execution_target=body.execution_target,
+                        permission_mode=permission_mode,
+                        session_mode=body.session_mode,
+                        session_id=body.session_id,
+                    ),
+                )
+                _require_mcp_services_fit_session(request, picked, mcp_services)
+                # The session cannot move, so the task routes every run to its host.
+                if host_id is None and body.execution_target != "managed_sandbox":
+                    host_id = picked.host_id
+            else:
+                if body.source_session_id is not None:
+                    source, source_up_to = await _require_source_session(
+                        body.source_session_id, owner
+                    )
+                    # Runs rebuild the copied history in the task's agent, so it must carry one,
+                    # and open the files it refers to.
+                    await _source_history_carry(agent)
+                    await _require_openable_attachments(source.id, agent, source_up_to)
+                    carry = await _copy_history_carry(source)
+                bound = await _bind_agent(agent, owner_id)
+            project_id: str | None = None
+            source_copy: Conversation | None = None
+            try:
+                if body.project_id is not None:
+                    project_id = await _owned_project_id(project_owner, body.project_id)
+                if source is not None:
+                    source_copy = await _copy_source_session(
+                        source,
+                        up_to=source_up_to,
+                        task_id=task_id,
+                        name=body.name,
+                        owner=owner,
+                        project_id=project_id,
+                        carry=carry,
+                    )
+                # Synchronous, so a cancel can't land after the save and release the saved ID.
+                task = store.create(
+                    scheduled_task_id=task_id,
                     name=body.name,
                     prompt=body.prompt,
                     rrule=body.rrule,
                     user_id=owner_id,
-                    agent_id=agent.id,
+                    agent_id=bound.id,
                     timezone=body.timezone,
-                    created_at=0,
-                    workspace=workspace,
-                    base_branch=body.base_branch,
-                    host_id=body.host_id,
-                    execution_target=body.execution_target,
+                    model_override=model_override,
+                    reasoning_effort=reasoning_effort,
                     permission_mode=permission_mode,
+                    mcp_services=mcp_services,
+                    max_cost_usd=body.max_cost_usd,
                     session_mode=body.session_mode,
                     session_id=body.session_id,
-                ),
-            )
-            _require_mcp_services_fit_session(request, picked, mcp_services)
-            # The session cannot move, so the task routes every run to its host.
-            if host_id is None and body.execution_target != "managed_sandbox":
-                host_id = picked.host_id
-        else:
-            if body.source_session_id is not None:
-                source, source_up_to = await _require_source_session(body.source_session_id, owner)
-                # Runs rebuild the copied history in the task's agent, so it must carry one,
-                # and open the files it refers to.
-                await _source_history_carry(agent)
-                await _require_openable_attachments(source.id, agent, source_up_to)
-                carry = await _copy_history_carry(source)
-            bound = await _bind_agent(agent, owner_id)
-        project_id: str | None = None
-        source_copy: Conversation | None = None
-        try:
-            if body.project_id is not None:
-                project_id = await _owned_project_id(project_owner, body.project_id)
-            if source is not None:
-                source_copy = await _copy_source_session(
-                    source,
-                    up_to=source_up_to,
-                    task_id=task_id,
-                    name=body.name,
-                    owner=owner,
+                    source_session_id=source_copy.id if source_copy is not None else None,
+                    workspace=workspace,
+                    base_branch=body.base_branch,
+                    host_id=host_id,
                     project_id=project_id,
-                    carry=carry,
+                    execution_target=body.execution_target,
+                    first_run_at=body.first_run_at,
+                    kind=body.kind,
                 )
-            task = store.create(
-                scheduled_task_id=task_id,
-                name=body.name,
-                prompt=body.prompt,
-                rrule=body.rrule,
-                user_id=owner_id,
-                agent_id=bound.id,
-                timezone=body.timezone,
-                model_override=model_override,
-                reasoning_effort=reasoning_effort,
-                permission_mode=permission_mode,
-                mcp_services=mcp_services,
-                max_cost_usd=body.max_cost_usd,
-                session_mode=body.session_mode,
-                session_id=body.session_id,
-                source_session_id=source_copy.id if source_copy is not None else None,
-                workspace=workspace,
-                base_branch=body.base_branch,
-                host_id=host_id,
-                project_id=project_id,
-                execution_target=body.execution_target,
-                first_run_at=body.first_run_at,
-                kind=body.kind,
-            )
-        except Exception as exc:
-            if source_copy is not None:
-                await _delete_session_quietly(source_copy.id)
-            if bound.id != agent.id:
-                agent_store.delete(bound.id)
-            if isinstance(exc, ScheduledTaskFirstRunMismatchError):
-                actual = (
-                    datetime.fromtimestamp(exc.actual, UTC).isoformat()
-                    if exc.actual is not None
-                    else "never"
-                )
-                raise OmnigentError(
-                    "The schedule's first run would be "
-                    f"{actual}, not {datetime.fromtimestamp(exc.expected, UTC).isoformat()} "
-                    "as requested: the request may have arrived after that time, the "
-                    "client's clock may be behind the server's, or the rule may not match "
-                    "it. The task was not created.",
-                    code=ErrorCode.INVALID_INPUT,
-                ) from exc
-            if isinstance(exc, RRuleSearchError):
-                raise OmnigentError(
-                    "Could not calculate the next run time for this schedule. "
-                    "The task was not created.",
-                    code=ErrorCode.INVALID_INPUT,
-                ) from exc
-            raise
+            except Exception as exc:
+                if source_copy is not None:
+                    await _delete_session_quietly(source_copy.id)
+                if bound.id != agent.id:
+                    agent_store.delete(bound.id)
+                if isinstance(exc, ScheduledTaskFirstRunMismatchError):
+                    actual = (
+                        datetime.fromtimestamp(exc.actual, UTC).isoformat()
+                        if exc.actual is not None
+                        else "never"
+                    )
+                    raise OmnigentError(
+                        "The schedule's first run would be "
+                        f"{actual}, not {datetime.fromtimestamp(exc.expected, UTC).isoformat()} "
+                        "as requested: the request may have arrived after that time, the "
+                        "client's clock may be behind the server's, or the rule may not match "
+                        "it. The task was not created.",
+                        code=ErrorCode.INVALID_INPUT,
+                    ) from exc
+                if isinstance(exc, RRuleSearchError):
+                    raise OmnigentError(
+                        "Could not calculate the next run time for this schedule. "
+                        "The task was not created.",
+                        code=ErrorCode.INVALID_INPUT,
+                    ) from exc
+                raise
         if source_copy is not None:
             from omnigent.server.routes._sessions.helpers import _announce_session_added
 
@@ -1079,7 +1134,7 @@ def create_scheduled_tasks_router(
         tasks = [
             t
             for t in store.list(owner_user_id=owner_id, exclude_agent_ids=PROACTIVE_AGENT_IDS)
-            if _owns_task(t, owner_id) and (kind == "all" or t.kind == "automation")
+            if owns_scheduled_task(t, owner_id) and (kind == "all" or t.kind == "automation")
         ]
         task_ids = [t.id for t in tasks]
         running = store.list_running_runs_for_tasks(task_ids)
@@ -1102,7 +1157,8 @@ def create_scheduled_tasks_router(
     async def list_automation_inbox(
         request: Request,
         limit: int = Query(default=50, ge=1, le=100),
-        after: str | None = Query(default=None, max_length=64),
+        # Room for a timestamp and a task ID in any form the store allocates.
+        after: str | None = Query(default=None, max_length=256),
     ) -> AutomationFailurePage:
         """Latest sessionless failures; session-linked failures use the session Inbox."""
         owner = _owner(request)
@@ -1110,8 +1166,8 @@ def create_scheduled_tasks_router(
         cursor = None
         if after is not None:
             try:
-                timestamp, task_id = after.split(":")
-                cursor = (int(timestamp), uuid.UUID(task_id).hex)
+                timestamp, task_id = after.split(":", 1)
+                cursor = (int(timestamp), _inbox_cursor_task_id(task_id))
                 if not 0 <= cursor[0] <= 2**63 - 1:
                     raise ValueError("invalid timestamp")
             except ValueError as exc:
@@ -1235,6 +1291,75 @@ def create_scheduled_tasks_router(
             "next_cursor": next_cursor,
         }
 
+    @router.get(
+        "/scheduled-tasks/{scheduled_task_id}/run-steps",
+        dependencies=[Depends(require_workflows)],
+    )
+    async def list_scheduled_task_run_steps(
+        request: Request,
+        scheduled_task_id: str,
+        limit: int = Query(default=20, ge=1, le=50),
+        after: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        """The plan steps of one page of a scheduled task's runs, for their timelines.
+
+        Pages like ``GET /scheduled-tasks/{id}/runs``, most recent first. Each
+        run that wrote a plan lists its latest plan within that invocation and
+        each step's newest status entry. The first plan's ID still guards actions.
+        The response is ``{"runs": [{"run_id", "plan_id", "plan_graph_revision",
+        "workflow_id", "plan_name", "is_current", "steps", "statuses"}], "next_cursor"}``.
+        """
+        from omnigent.server.session_journal import entry_to_response, open_store
+
+        owner = _owner(request)
+        _require_owned(scheduled_task_id, None if owner == RESERVED_USER_LOCAL else owner)
+        runs, next_cursor = store.list_runs(scheduled_task_id, limit=limit, after_id=after)
+        journal = open_store(conversation_store)
+        served = [run for run in runs if run.conversation_id is not None]
+        if journal is None or not served:
+            return {"runs": [], "next_cursor": next_cursor}
+        plans = await asyncio.to_thread(
+            journal.run_start_plans, [(run.id, run.conversation_id or "") for run in served]
+        )
+        found = [(run, plan) for run, plan in zip(served, plans, strict=True) if plan is not None]
+        latest_plans = await asyncio.to_thread(
+            journal.run_latest_plans, [plan for _, plan in found]
+        )
+        revisions = await asyncio.to_thread(journal.plan_graph_revisions, latest_plans)
+        statuses = await asyncio.to_thread(journal.plan_step_statuses, latest_plans)
+        current_plans = await asyncio.to_thread(
+            journal.current_run_plan_ids, [plan for _, plan in found]
+        )
+        sessions = await asyncio.to_thread(
+            conversation_store.get_conversations, [plan.conversation_id for _, plan in found]
+        )
+        return {
+            "runs": [
+                {
+                    "run_id": run.id,
+                    "plan_id": plan.id,
+                    "plan_graph_revision": revision,
+                    "workflow_id": plan.workflow_id,
+                    "plan_name": plan.content.get("name"),
+                    "is_current": (
+                        plan.id in current_plans
+                        and (session := sessions.get(plan.conversation_id)) is not None
+                        and session.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY) == run.id
+                        and not session.archived
+                    ),
+                    "steps": latest_plan.content.get("steps", []),
+                    "statuses": [
+                        entry_to_response(entry).model_dump(mode="json")
+                        for entry in step_statuses.values()
+                    ],
+                }
+                for (run, plan), latest_plan, revision, step_statuses in zip(
+                    found, latest_plans, revisions, statuses, strict=True
+                )
+            ],
+            "next_cursor": next_cursor,
+        }
+
     @router.post("/scheduled-tasks/{scheduled_task_id}/run", status_code=202)
     async def run_scheduled_task_now(
         request: Request,
@@ -1309,16 +1434,10 @@ def create_scheduled_tasks_router(
             permission_store=permission_store,
         )
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        existing = _require_owned(scheduled_task_id, owner_id)
+        stored = _require_owned(scheduled_task_id, owner_id)
         _reject_proactive_agent(body.agent_id)
-        legacy_workspace = (
-            existing.execution_target == "managed_sandbox"
-            and existing.workspace is not None
-            and not is_repo_workspace(existing.workspace)
-        )
-        if legacy_workspace:
-            # Legacy directory pins already run with the provider default.
-            existing = replace(existing, workspace=None)
+        existing = without_legacy_sandbox_workspace(stored)
+        legacy_workspace = existing.workspace != stored.workspace
         if body.timezone is not None:
             _validate_timezone_or_400(body.timezone)
         fields = body.model_dump(exclude_unset=True)
@@ -1496,9 +1615,17 @@ def create_scheduled_tasks_router(
             await _require_mode_fits_session(request, continuing)
         project_owner = _project_owner(owner)
         try:
+            # On the derived fields, so a session the update clears counts as a change.
+            await require_agent_keeps_shared_target(request, fields, existing, permission_store)
             if fields.get("project_id") is not None:
                 fields["project_id"] = await _owned_project_id(project_owner, fields["project_id"])
-            updated = store.update(scheduled_task_id, expected_schedule=existing, **fields)
+            updated = store.update(
+                scheduled_task_id,
+                expected_schedule=existing,
+                # Rechecked under the task's lock, so a grant made meanwhile counts.
+                guard=agent_shared_target_guard(request, fields, permission_store),
+                **fields,
+            )
             if updated is None:
                 raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
         except Exception as exc:
@@ -1561,6 +1688,8 @@ def create_scheduled_tasks_router(
                         {SCHEDULED_TASK_SOURCE_LABEL_KEY: task.id},
                     )
             raise
+        # After the task, so a grant racing the delete is refused rather than left behind.
+        await delete_task_grants(permission_store, scheduled_task_id)
         scheduler = _scheduler(request)
         if scheduler is not None and not getattr(
             request.app.state, "scheduled_task_dispatch_enabled", False
@@ -1568,4 +1697,14 @@ def create_scheduled_tasks_router(
             scheduler.remove(scheduled_task_id)
         return {"deleted": True, "id": scheduled_task_id}
 
+    def _load_owned_by_caller(request: Request, scheduled_task_id: str) -> ScheduledTask:
+        owner = _owner(request)
+        return _require_owned(scheduled_task_id, None if owner == RESERVED_USER_LOCAL else owner)
+
+    register_scheduled_task_permissions_routes(
+        router,
+        load_owned_task=_load_owned_by_caller,
+        conversation_store=conversation_store,
+        permission_store=permission_store,
+    )
     return router
