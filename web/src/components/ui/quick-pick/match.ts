@@ -338,8 +338,7 @@ export function matchField(
     };
   }
   if (matching === "contiguous") return null;
-  const match =
-    matching === "words" ? wordsMatch(query, target) : subsequenceMatch(query, target);
+  const match = matching === "words" ? wordsMatch(query, target) : subsequenceMatch(query, target);
   if (!match) return null;
   return {
     matchClass: MatchClass.subsequence,

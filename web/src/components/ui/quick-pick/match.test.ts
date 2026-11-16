@@ -158,6 +158,7 @@ describe("matchField with words", () => {
     const tight = words("stn", "Stand")!.penalty;
     expect(compact).toBeLessThan(skipping);
     expect(tight).toBeLessThan(gapped);
+    expect(words("abcd", "Ab Cd")!.penalty).toBeLessThan(words("abcd", "A B Cd")!.penalty);
   });
 
   it("still finds a scattered subsequence with the default strategy", () => {
@@ -181,6 +182,14 @@ describe("matchCandidate", () => {
     expect(match?.ranges.label).toEqual([{ start: 4, end: 9 }]);
     expect(match?.ranges.description).toEqual([{ start: 0, end: 4 }]);
     expect(matchCandidate(tokenizeQuery("login nothing"), fields)).toBeNull();
+  });
+
+  it("keeps every token's range when several tokens match the same field", () => {
+    const match = matchCandidate(tokenizeQuery("redirect fix"), fields);
+    expect(match?.ranges.label).toEqual([
+      { start: 0, end: 3 },
+      { start: 10, end: 18 },
+    ]);
   });
 
   it("treats #123 as the bare number so PR numbers match hidden keywords", () => {
@@ -240,6 +249,14 @@ describe("whole-query matches", () => {
       .sort((first, second) => compareCandidateMatches(first.match, second.match))
       .map(({ name }) => name);
     expect(order).toEqual(Object.keys(ranked));
+  });
+
+  it("breaks a tie on the worst match class by the classes' total, before penalty and weight", () => {
+    const scattered = { wholeQuery: false, worstClass: MatchClass.substring, ranges: {} };
+    const fewerWeakMatches = { ...scattered, classTotal: 4, penalty: 9, weight: 0 };
+    const moreWeakMatches = { ...scattered, classTotal: 6, penalty: 0, weight: 30 };
+    expect(compareCandidateMatches(fewerWeakMatches, moreWeakMatches)).toBeLessThan(0);
+    expect(compareCandidateMatches(moreWeakMatches, fewerWeakMatches)).toBeGreaterThan(0);
   });
 
   it("lets a synonym phrase win when no label holds the phrase", () => {
