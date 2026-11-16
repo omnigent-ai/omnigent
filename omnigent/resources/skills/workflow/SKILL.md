@@ -1,6 +1,6 @@
 ---
 name: workflow
-description: Plan and run a multi-step workflow from a description or one of the user's saved workflows. Keeps the plan and every step's status in the session's journal, so people can follow along in the Tasks tab and the work resumes cleanly.
+description: Run a multi-step workflow from a description or one of the user's saved workflows. Keeps the plan and every step's status in the session's journal, so people can follow along in the Tasks tab and the work resumes cleanly.
 ---
 
 # Run a workflow
@@ -11,9 +11,63 @@ each step stands as you go. The user watches
 the plan's steps as tasks in the session's Tasks tab and can steer or stop you
 in chat at any time.
 
-You need the `sys_journal_*` tools and `sys_workflow_request_input`, and
-`sys_workflow_load` and `sys_workflow_list` for a saved workflow. If you don't
-have them, tell the user this agent can't run workflows and stop.
+For a request to design, edit or save a reusable workflow, including a workflow
+page's planning chat, use the [save-workflow skill](../save-workflow/SKILL.md).
+Research the procedure and publish a proposal without executing it. The
+execution instructions below apply when the user asks to run the work.
+
+You need the `sys_journal_*` tools, plus `sys_workflow_load` and
+`sys_workflow_list` for a saved workflow. If a required tool is missing, report
+the specific limitation. `sys_workflow_request_input` is only needed when a
+person must answer; its absence does not block work you can do independently.
+
+## Work independently
+
+- Carry the requested work through to completion within its scope and existing
+  authorization. Use the conversation, journal, saved workflow and project
+  context before asking the user to supply information or make a choice.
+- Resolve routine ambiguity with a reasonable, reversible default. Record
+  important assumptions in a note and proceed. Do not pause for naming,
+  implementation choices, optional preferences or confirmation to continue.
+- A request to run a workflow, including an automation's configured request,
+  authorizes the actions it clearly calls for within its scope and existing
+  permissions. Do not require a fresh go-ahead for each step. An action being
+  external or important does not by itself require another approval. Honor
+  explicit review gates and restrictions imposed by policy or tools.
+- CI, background jobs and delegated work are things to monitor, not questions
+  for the user. Keep working on independent steps, and use the recovery and
+  delegation guidance below before treating a problem as a human blocker.
+
+## Before asking or declaring a blocker
+
+First check the relevant conversation, journal, project files and available
+tools. Use documented defaults or choose a reversible implementation that
+meets the request. If an operation fails, inspect the error and try applicable
+recovery or an equivalent authorized way to finish it. Do all preparation and
+independent work that can proceed. Do not retry an explicit permission denial.
+
+Human intervention is justified only for one of these concrete obstacles:
+
+- A required fact, artifact or access is unavailable after relevant lookups,
+  and the named operation cannot produce a correct result without it. State
+  exactly what is missing; an optional preference or extra reassurance does
+  not qualify. Do not invent data, credentials or successful results.
+- An unresolved choice would cause different irreversible external effects.
+  Identify the alternatives and their consequences. Continue reversible
+  preparation; ordinary naming, implementation and scheduling choices are
+  yours to make.
+- An explicit instruction, applicable policy or enforced tool gate requires
+  a human review, approval or action that has not been satisfied. Cite that
+  requirement and check the existing request and authorization first. Do not
+  infer a gate from a general preference for caution.
+
+Before asking or writing `failed` for one of these obstacles, record the
+blocked operation, the evidence, the lookups or recovery attempted and the
+exact input or action needed. Explain why a default or authorized alternative
+cannot finish that work. "Needs clarification", "might need approval" and
+"to be safe" are not sufficient reasons. This requirement applies to workers
+too; check their evidence before accepting a claimed blocker. Block only the
+affected work and keep independent steps moving.
 
 ## When another workflow started you
 
@@ -22,7 +76,9 @@ workflow, that session is waiting on you. When your plan finishes, with every
 step done or failed, message that session with `sys_session_message`, saying
 how it went and what's left. This is very important: don't skip it, even if
 you also tell the user, since the other workflow can't go on without your
-message.
+message. Report blockers to the starting session too, with the evidence and
+what you need. It may already have the answer or authorization; don't send
+the user to a child session to repeat information.
 
 ## When an automation runs you
 
@@ -35,33 +91,29 @@ so nothing in the run may wait for a person:
 - Choose reversible defaults within that authorization, and record what you
   chose and why in the step's status. Don't use `sys_workflow_request_input`,
   and write no `needs_input`.
-- If a step needs an ungranted approval, an explicitly required plan review,
-  a consequential decision, or a sign-in only a person can do, write `failed`
-  saying what it needs. Do not perform that action or approve it yourself.
-  Go on with steps that do not depend on it.
-- A session you start for a step (see "Running another workflow as a step")
-  can't ask anyone either: say in its first message that no one is watching
-  this run.
+- Apply "Before asking or declaring a blocker" before writing `failed` for
+  missing input or approval. Being unattended, uncertainty or a worker's
+  question is not itself a failure. Resolve decisions within the authorized
+  scope; fail only the affected step when the concrete obstacle remains,
+  with the required evidence. Do not perform an action whose required
+  approval is missing. Go on with steps that do not depend on it.
+- Every subagent, task and session you start inherits these constraints.
+  Include the unattended context, available inputs, authorized scope and
+  recovery expectations in its instructions, and tell it to pass them to its
+  own workers. It must report blockers to you instead of waiting for a person.
 
 ## Plan
 
-1. Read your journal first with `sys_journal_read`. If the session's plan has
-   steps that aren't done or failed, ask the user what to do with the new
-   workflow before you plan it. Ask with `sys_workflow_request_input` on the
-   step you'd work on next, saying what's left ("The current workflow has 2
-   tasks left. What should I do with the new one?"), with these options and
-   your recommendation:
-   - "Add to the current workflow": replan with the current steps, which keep
-     their status, plus steps for the new work.
-   - "Replace the current workflow": plan the new work alone, dropping the
-     steps left in the current plan.
-   - "Keep the current workflow": go on with the current plan, and leave the
-     new work aside.
-
-   If the plan still has the step you asked on, write `started` on it when you
-   get to it. A plan whose steps are all done or failed is finished: plan the
-   new work without asking.
-2. Write the plan with `sys_journal_write_plan` before you start working. Name
+1. Read your journal first with `sys_journal_read` and interpret the request
+   against it. Resume an unfinished workflow when asked to continue it; add
+   compatible new work or revisions while preserving completed results and
+   unfinished steps. Follow an explicit request to replace the plan or start
+   a fresh run. Don't ask what to do merely because unfinished steps exist.
+   Choose a reversible ordering for competing work. A conflict justifies a
+   question only under "Before asking or declaring a blocker". A finished
+   plan does not block a new one.
+   An explicit Stop still requires an explicit Continue for the stopped work.
+2. Write the plan with `sys_journal_write_plan` before executing its steps. Name
    the plan for its goal in a few words ("Cut GET /orders p95 by 20%"). Give
    each step a short, stable ID (`profile`, `opt-pool`), a name, and its
    dependencies. A new step needs an ID the journal hasn't used yet, since a
@@ -69,44 +121,50 @@ so nothing in the run may wait for a person:
 
    List the steps in the order you'll work on them. The Tasks tab numbers
    them in that order, so the user should see the work move steadily down the
-   list. Put each step right after the steps it depends on: a step that needs
-   only the exploration, such as a check, goes right after the exploration,
-   and steps that can run at the same time go next to each other. Steps that
-   would change the same files, or measure on the same machine, can't run at
-   the same time: make the later one depend on the earlier.
-3. Make the first step exploring the work: ID `explore` (`explore-2`,
-   `explore-3` and on when an earlier workflow in this session used it), and a
-   name that starts with "Explore" ("Explore the open PRs and pick 3"), so the
-   user can tell it apart in the Tasks tab. Explore without changing anything,
-   deeply enough that the steps you add from it are reasonably specific: each
-   a concrete piece of work, such as one change or one PR, rather than a broad
-   phase like "implement the changes". A small, clear task needs only a quick
-   look.
-4. Once you've explored, replan: keep the exploration first and add the work
-   after it, depending on it. A single goal is one step after the exploration.
-5. Ask first only if the description is ambiguous: write the plan with what
-   you know, and ask with `sys_workflow_request_input` on its first step.
-   Otherwise start.
+   list. Put each step after the steps whose results it needs, and steps that
+   can run at the same time next to each other. Steps that would change the
+   same files, or measure on the same machine, can't run at the same time:
+   make the later one depend on the earlier.
+3. Include a discovery step when the run needs new information, such as which
+   PRs to review or what causes today's failing tests. Name it for the result
+   it must produce, and investigate deeply enough to make dependent work
+   concrete. An already understood procedure does not need an initial
+   exploration step. Use the current instructions while doing each task;
+   rereading a known SOP is not itself a default workflow step.
+4. Replan when discovery or changed instructions affect the work. Preserve
+   completed results and add concrete steps, with dependencies only on the
+   results they need. Do not repeat research already completed while authoring
+   the saved workflow unless new evidence makes it necessary.
+5. Start once the goal is clear enough to make progress. Discover missing
+   run inputs as needed and record reasonable assumptions. If a question meets
+   "Before asking or declaring a blocker", ask it on a ready step with
+   `sys_workflow_request_input`; don't turn routine uncertainty into a
+   plan-review pause. In an unattended run, follow the automation rules.
 
 ## Run a saved workflow
 
 When the user names a saved workflow ("Run the saved workflow "Triage flaky
 tests" (ID …)", or "run my triage workflow" in chat):
 
-- Do the plan's step 1 first: ask before you replace a plan with steps left.
+- Do the plan's step 1 first: decide whether this resumes, extends or starts
+  a run from the request and journal.
 - Load it with `sys_workflow_load`, by its ID when you have one, otherwise by
   name. If they describe it without its exact name, or the load returns
   `workflow_not_found`, list their workflows with `sys_workflow_list` and pick
-  the one whose description fits. If more than one fits, or none does, ask
-  the user which they meant, or whether to describe the work instead.
+  the one whose description and context clearly fit. If the intended workflow
+  still cannot be identified, follow "Before asking or declaring a blocker";
+  don't choose an unrelated workflow just to avoid a question.
 - Its steps are your plan: write them with `sys_journal_write_plan`, named
   after the workflow, keeping their IDs and dependencies, and with
   `workflow_id` set to its ID, so the workflow's page lists this run. Put
   them in the order you'll work on them (see Plan), even if the saved order
   differs. Rename an ID only if this session's journal already used it. Fill
   the run's details into the step names and goals.
-- Its description says what a run needs. If the details the user gave leave
-  something out, ask with `sys_workflow_request_input` on the first step.
+- Its description says what a run needs. Resolve missing details from the
+  conversation, journal, current workspace and available tools, then use
+  documented or reversible defaults. Any remaining missing input must meet
+  "Before asking or declaring a blocker"; in an unattended run, follow the
+  automation rules.
 - The saved steps are a starting point: replan as the work needs, as with any
   plan. A replan leaves out `workflow_id`, since the run already started.
 
@@ -114,16 +172,15 @@ tests" (ID …)", or "run my triage workflow" in chat):
 
 When the user asks to review the plan before the work starts:
 
-- Make the review the second step (`review`, numbered like the exploration
-  when an earlier workflow used it), depending on the exploration, and make
-  every step you add after it depend on the review. Keep those two steps first
-  in every version of the plan.
-- Once you've explored and added the work, ask the user to approve the plan
-  with `sys_workflow_request_input` on the review. Start none of the later
-  steps until they approve, then write `done` on the review.
-- If they ask for changes, write `started` on the review first, then restart
-  the exploration to look into what they asked, update the steps after the
-  review, and ask again.
+- Add a review step (`review`, or a new ID if that ID was used earlier) before
+  the work requiring approval. Any read-only discovery needed to form the plan
+  comes before it; when the plan is already concrete, review can be first.
+  Make the work requiring approval depend on the review.
+- Once the plan is concrete, ask the user to approve it with
+  `sys_workflow_request_input` on the review. Start none of the later steps
+  until they approve, then write `done` on the review.
+- If they ask for changes, write `started` on the review first, investigate
+  what the revision requires, update the affected steps and ask again.
 
 ## Work through it
 
@@ -151,7 +208,7 @@ When the user asks to review the plan before the work starts:
   everything left is done, failed, waiting for the user, running in another
   session, or waits on one of those, unless the user or your instructions say
   to stop sooner.
-- When a step needs the user (an approval or a decision), first finish the
+- When a step meets "Before asking or declaring a blocker", first finish the
   ready steps that don't depend on the answer, since asking pauses your turn.
   Then ask with `sys_workflow_request_input`: the step, and everything you need
   in one call, each question with your options and your recommendation. It
@@ -164,14 +221,21 @@ When the user asks to review the plan before the work starts:
   step. Don't leave a step you acted on waiting for the user.
 - If the user asks you to stop, follow "Stop and resume" below. Do not ask
   for confirmation or create a workflow question just to pause.
-- When something you can't clear yourself stops a step, such as CI being down
-  or a review you're waiting on, the user decides how to go on. If it may clear
-  by itself, such as a flaky check, retry once first. Then ask with
-  `sys_workflow_request_input`, saying what's in the way and offering the ways
-  forward you see (retry later, a workaround, or dropping the step), with your
-  recommendation.
-- Write `failed` when a step's own work failed. The text says why in a few
-  words.
+- When a step stalls, inspect the failure, fix problems within scope and use
+  an equivalent authorized fallback when available. Retry transient failures
+  with a bounded retry or time budget appropriate to the operation. Before
+  repeating an external action, check whether it already succeeded so a
+  retry cannot duplicate it. Don't skip required checks or broaden permissions
+  to get past a failure.
+- Keep a step `started` while an external job or review is pending and arrange
+  a completion notification or background check. A slow service or exhausted
+  retry budget alone is not a reason to ask the user what to do. If recovery
+  is exhausted and no work is still progressing, write `failed` with the
+  evidence and continue independent steps. A question must meet "Before
+  asking or declaring a blocker", and the run must be attended.
+- Write `failed` when a step's own work failed. State the cause and what would
+  allow a future retry. Don't mark blocked dependents done or remove required
+  dependencies to pretend the workflow completed; report what remains blocked.
 - When you resume, check your `needs_input` steps, the steps running in other
   sessions and the steps waiting for something on its way first, and write a
   new status for any that can go ahead.
@@ -183,9 +247,14 @@ When the user asks to review the plan before the work starts:
   steps already in the plan.
 - Write a note with `sys_journal_write_note` before any external side effect
   (push, merge, tag, deploy), and look for those notes when you resume.
-- Make an approval a step of its own, and ask for it with
-  `sys_workflow_request_input` ("Approve the deploy to prod?"). Write `done` if
-  approved, or `failed` if rejected.
+- If an explicit approval gate remains unsatisfied after checking the
+  existing authorization, cite it and make that approval a step of its own.
+  Finish the preparation and checks first so the decision concerns a concrete
+  result, then use `sys_workflow_request_input`. Write `done` if approved, or
+  `failed` if rejected. In an unattended run, record the missing approval as
+  a failure with the evidence required above. Saving a plan alone does not
+  authorize running it; a request to run it supplies that instruction within
+  the requested scope.
 - Keep entries short, and point to files, PRs and sessions instead of pasting
   them.
 
@@ -240,6 +309,10 @@ run it in its own session:
   must:
   - tell it to load the `workflow` skill and run the workflow
   - give it everything it needs, since it doesn't see this conversation
+  - include the relevant decisions, existing authorization and limits, and
+    whether this is an unattended run; tell it to resolve routine choices
+    itself and report any remaining blockers to you, passing this context
+    to its own workers
   - say that this session (give its ID) started it for the step (give the
     step ID), and that it must report back when its plan finishes
 - If you can't start one, do the step's work in this session instead.
@@ -247,11 +320,20 @@ run it in its own session:
   such as a background shell that sleeps 5 minutes. Each time it fires, read
   the other session's journal with `sys_journal_read`, update the step, and
   start the timer again while that session is still working.
-- When its plan finishes or it reports back, write `done` on the step if
-  every task is done, or `failed` naming the tasks that failed. If it stopped
-  with tasks left, ask the user how to go on with `sys_workflow_request_input`
-  on the step, as for anything else you can't clear yourself. If it's waiting
-  for the user, leave the step alone: the user answers in that session.
+- When its plan finishes or it reports back, verify the result and write
+  `done` on the step if every required task is done. For failures or an
+  unexpected stop with tasks left, read its journal and result: supply missing
+  context, resume or replace the worker, or finish the work here within the
+  original scope. Check for work still running before replacing it to avoid
+  duplicates. After recovery is exhausted, write `failed` naming the
+  unresolved tasks. Preserve an intentional user Stop.
+- Resolve a worker's questions from the context and authority you already
+  have; do not grant permissions the user has not granted. Check a worker's
+  claimed blocker against "Before asking or declaring a blocker" and send it
+  a decision or missing context whenever possible. Consolidate any remaining
+  human question in the coordinating session. For unattended runs, record
+  only substantiated, unrecoverable blockers as `failed` and keep independent
+  work moving; never leave a worker waiting for human input.
 
 ## Measurable goals
 
