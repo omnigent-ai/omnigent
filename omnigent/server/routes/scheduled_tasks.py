@@ -336,6 +336,7 @@ def _run_to_response(
     viewer_unread: bool | None = None,
     session_cost_usd: float | None = None,
     conversation_pending_approvals: int = 0,
+    include_error_detail: bool = True,
 ) -> dict[str, Any]:
     """Serialize a :class:`ScheduledTaskRun` to a JSON-safe dict.
 
@@ -343,6 +344,7 @@ def _run_to_response(
     ``error`` is sent as ``error_detail``, capped at
     :data:`_RUN_ERROR_DETAIL_MAX_CHARS`, so the run list can say why a run failed,
     e.g. the sandbox provider's recovery steps for a sandbox that never connected.
+    Each session field defaults to its value for a run with no session.
 
     :param conversation_updated_at: The conversation's ``updated_at`` epoch
         seconds, or ``None`` for runs without a conversation. Embedded so the
@@ -361,6 +363,8 @@ def _run_to_response(
     :param session_cost_usd: Current cumulative session cost, or ``None`` when
         unreported. Runs continuing the same session share this total.
     :param conversation_pending_approvals: Current session approval/question count.
+    :param include_error_detail: ``False`` leaves ``error_detail`` null, for a caller
+        who sees only the run's outcome.
     """
     return {
         "id": run.id,
@@ -371,7 +375,9 @@ def _run_to_response(
         "fired_at": run.fired_at,
         "finished_at": run.finished_at,
         "error_code": run.error_code,
-        "error_detail": run.error[:_RUN_ERROR_DETAIL_MAX_CHARS] if run.error else None,
+        "error_detail": (
+            run.error[:_RUN_ERROR_DETAIL_MAX_CHARS] if include_error_detail and run.error else None
+        ),
         "conversation_updated_at": conversation_updated_at,
         "conversation_status": conversation_status,
         "viewer_last_seen": viewer_last_seen,
@@ -1355,6 +1361,12 @@ def create_scheduled_tasks_router(
         back most-recent-first (``scheduled_at DESC``); an empty history is an
         empty list.
 
+        Someone it is shared with gets every run's times, status, ``error_code`` and
+        ``conversation_id``, but none of its session's data: ``error_detail``, the
+        ``conversation_*`` and ``viewer_*`` fields and ``session_cost_usd`` are null and
+        ``conversation_pending_approvals`` is 0, since they may not be able to open
+        that session.
+
         Cursor-paginated so history is never silently truncated: pass ``limit``
         (1-1000, default 100) and ``after`` (a prior page's ``next_cursor``).
         The response is ``{"runs": [...], "next_cursor": <id or null>}``; a
@@ -1369,12 +1381,17 @@ def create_scheduled_tasks_router(
         conversation I/O); a young in-flight run is untouched, and the
         conditional ``update_run`` never clobbers an already-terminal row.
         """
-        await _require_readable(request, scheduled_task_id)
+        _, role = await _require_readable(request, scheduled_task_id)
+        runs, next_cursor = store.list_runs(scheduled_task_id, limit=limit, after_id=after)
+        runs = force_fail_stale_runs(store, runs)
+        if role == "viewer":
+            return {
+                "runs": [_run_to_response(r, include_error_detail=False) for r in runs],
+                "next_cursor": next_cursor,
+            }
         # Read state is keyed by the caller's raw identity, as the session
         # read-state routes key it.
         viewer_id = require_user(request, auth_provider)
-        runs, next_cursor = store.list_runs(scheduled_task_id, limit=limit, after_id=after)
-        runs = force_fail_stale_runs(store, runs)
         # Batch-fetch conversation metadata for runs that produced a session so
         # the frontend can compute unread dots without per-row session GETs.
         # Runs without a conversation_id (skipped/failed) contribute null fields.
@@ -1442,10 +1459,14 @@ def create_scheduled_tasks_router(
         each step's newest status entry. The first plan's ID still guards actions.
         The response is ``{"runs": [{"run_id", "plan_id", "plan_graph_revision",
         "workflow_id", "plan_name", "is_current", "steps", "statuses"}], "next_cursor"}``.
+        Plans are session content, so someone it is shared with always gets
+        ``{"runs": [], "next_cursor": null}``.
         """
         from omnigent.server.session_journal import entry_to_response, open_store
 
-        await _require_readable(request, scheduled_task_id)
+        _, role = await _require_readable(request, scheduled_task_id)
+        if role == "viewer":
+            return {"runs": [], "next_cursor": None}
         runs, next_cursor = store.list_runs(scheduled_task_id, limit=limit, after_id=after)
         journal = open_store(conversation_store)
         served = [run for run in runs if run.conversation_id is not None]

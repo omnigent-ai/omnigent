@@ -217,7 +217,8 @@ const RUN_STEPS_PAGE = 20;
  * refresh a page when a short continuation finishes between history polls.
  *
  * @param runs - The task's runs, most recent first, from `useScheduledTaskRuns`.
- * @param enabled - Whether the server supports workflow history.
+ * @param enabled - Whether to fetch: the server supports workflow history and the
+ *     caller owns the automation, since a viewer's history has no plans.
  */
 export function useScheduledTaskRunSteps(
   id: string,

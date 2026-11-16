@@ -8,10 +8,11 @@
  * All data + mutations come from the existing scheduled-tasks hooks; editing
  * reuses `CreateScheduledTaskDialog` in its edit mode. For an automation shared
  * with the viewer the page names its owner and is read-only: every action that
- * changes it shows disabled with a tooltip, and run history stays visible. Nothing here is
- * fabricated: each run renders only the fields the server actually returns
- * (status, timestamp, duration, an errorCode-derived message, and an
- * open-conversation link) — never an invented summary line.
+ * changes it shows disabled with a tooltip, and each run shows its outcome, without
+ * its session's cost, approvals or tasks. Nothing here is fabricated: each run
+ * renders only the fields the server actually returns (status, timestamp,
+ * duration, an errorCode-derived message, and an open-conversation link) — never
+ * an invented summary line.
  */
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
@@ -144,8 +145,11 @@ function TaskDetail({ taskId }: { taskId: string }) {
     isError: runsError,
     isFetchedAfterMount: runsFetchedAfterMount,
   } = useScheduledTaskRuns(taskId, taskId !== "", awaitingRunRow);
-  const workflowsEnabled = isFeatureEnabled(info, "workflows");
-  const runSteps = useScheduledTaskRunSteps(taskId, runs, workflowsEnabled);
+  // Plans are session content, which a viewer's run history leaves out. The owner's
+  // steps load alongside the task; the server sends a viewer none either way.
+  const runStepsEnabled =
+    isFeatureEnabled(info, "workflows") && !(task != null && isSharedWithViewer(task));
+  const runSteps = useScheduledTaskRunSteps(taskId, runs, runStepsEnabled);
 
   const updateMutation = useUpdateScheduledTask();
   const deleteMutation = useDeleteScheduledTask();
@@ -722,8 +726,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
               run={run}
               now={now}
               highlighted={run.id === highlightedRunId}
-              steps={workflowsEnabled ? runSteps.get(run.id) : undefined}
-              readOnly={readOnly}
+              steps={runStepsEnabled ? runSteps.get(run.id) : undefined}
             />
           ))}
         </ul>
@@ -856,15 +859,12 @@ function RunRow({
   now,
   highlighted,
   steps,
-  readOnly = false,
 }: {
   run: ScheduledTaskRun;
   now: Date;
   highlighted: boolean;
   /** The run's latest plan, independent of the automation's current prompt. */
   steps?: ScheduledTaskRunSteps;
-  /** A viewer's row: its tasks show, without the owner's plan controls or workflow. */
-  readOnly?: boolean;
 }) {
   const timestamp = formatRunTimestamp(run.firedAt ?? run.scheduledAt, now);
   // A workflow run's tasks, as the workflow's page shows them.
@@ -881,13 +881,12 @@ function RunRow({
   const showTasks = progress.length > 0 && sessionId != null;
   const [graphOpen, setGraphOpen] = useState(false);
   // The saved workflow the run's plan follows, when the Workflows page can open it.
-  const workflowId =
-    isFeatureEnabled(useServerInfo(), "workflows") && !readOnly
-      ? (steps?.workflowId ?? null)
-      : null;
+  const workflowId = isFeatureEnabled(useServerInfo(), "workflows")
+    ? (steps?.workflowId ?? null)
+    : null;
   // Stop while the run's session works; play once it stopped with tasks left.
   const control =
-    showTasks && steps?.isCurrent && steps.planId && !readOnly
+    showTasks && steps?.isCurrent && steps.planId
       ? planRunControl(progress, steps.statuses, sessionWorking, steps.planGraphRevision)
       : null;
   // What the run's buttons and task menus refresh once its session takes them.
@@ -897,7 +896,7 @@ function RunRow({
   ];
   // Its tasks' ⋯ menus, on the timeline's cards and the graph's nodes.
   const taskMenus = useRunTaskMenus(
-    steps?.isCurrent && !readOnly ? sessionId : null,
+    steps?.isCurrent ? sessionId : null,
     refreshKeys,
     steps?.planId ?? null,
   );

@@ -5619,13 +5619,57 @@ async def workflows_client(
         yield client
 
 
+@pytest.mark.usefixtures("clean_session_read_state")
 async def test_recipients_read_an_automation_its_runs_and_their_steps(
     workflows_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from omnigent.runtime import pending_elicitations
+    from omnigent.server.auth import LEVEL_READ
+    from omnigent.server.routes._sessions.helpers import _set_read_state
+    from omnigent.stores.session_journal_store import SessionJournalStore
+
     client = workflows_client
     task_id = await _create_task(client)
-    run_id = uuid.uuid4().hex
-    _seed_run(db_uri, task_id, run_id, conversation_id=_owned_session(db_uri))
+    # Bob can open this run's session, which has a cost, an approval and a plan.
+    run_id, shared_session = uuid.uuid4().hex, _owned_session(db_uri)
+    _seed_run(db_uri, task_id, run_id, scheduled_at=3000, conversation_id=shared_session)
+    SqlAlchemyPermissionStore(db_uri).grant("bob@example.com", shared_session, LEVEL_READ)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conversations.set_session_live_status(shared_session, "idle")
+    conversations.set_session_usage(shared_session, {"total_cost_usd": 1.5})
+    elicitation_id = uuid.uuid4().hex
+    pending_elicitations.record_publish(
+        shared_session,
+        {"type": "response.elicitation_request", "elicitation_id": elicitation_id},
+    )
+    for user_id in ("alice@example.com", "bob@example.com"):
+        _set_read_state(user_id, shared_session, 1, True)
+    plan = {"name": "Triage", "steps": [{"id": "explore", "name": "Explore"}]}
+    SessionJournalStore(db_uri).append(
+        shared_session, "plan", plan, idempotency_key="plan", scheduled_task_run_id=run_id
+    )
+    # A run from a session that isn't shared with anyone, and one with no session.
+    failed_id, skipped_id = uuid.uuid4().hex, uuid.uuid4().hex
+    _seed_run(
+        db_uri,
+        task_id,
+        failed_id,
+        scheduled_at=2000,
+        status="failed",
+        error_code="runner_start_failed",
+        error="the agent at runner.example.com exited",
+        conversation_id=_owned_session(db_uri),
+    )
+    _seed_run(
+        db_uri,
+        task_id,
+        skipped_id,
+        scheduled_at=1000,
+        status="skipped",
+        error_code="no_online_host",
+        error="no host was online",
+        conversation_id=None,
+    )
     assert (await _share(client, task_id, "bob@example.com")).status_code == 200
     assert (await _share(client, task_id, "team")).status_code == 200
     _in_groups(monkeypatch, {"carol@example.com": ["team"]})
@@ -5634,16 +5678,47 @@ async def test_recipients_read_an_automation_its_runs_and_their_steps(
         return {user_id: user_id.split("@")[0].title() for user_id in user_ids}
 
     monkeypatch.setattr(SqlAlchemyPermissionStore, "display_names", display_names)
-    owned = (await client.get(_read_urls(task_id)[0], headers=_headers())).json()
+    owned, owned_runs, owned_steps = [
+        (await client.get(url, headers=_headers())).json() for url in _read_urls(task_id)
+    ]
     assert (owned["viewer_role"], owned["owner_display_name"]) == ("owner", None)
+    newest = owned_runs["runs"][0]
+    assert (newest["session_cost_usd"], newest["conversation_pending_approvals"]) == (1.5, 1)
+    assert (newest["conversation_status"], newest["viewer_unread"]) == ("idle", True)
+    assert owned_runs["runs"][1]["error_detail"] == "the agent at runner.example.com exited"
+    assert [run["run_id"] for run in owned_steps["runs"]] == [run_id]
+    # A recipient sees each run's outcome, none of its session's data, and no plans.
+    without_session = {
+        "error_detail": None,
+        "conversation_updated_at": None,
+        "conversation_status": None,
+        "viewer_last_seen": None,
+        "viewer_unread": None,
+        "session_cost_usd": None,
+        "conversation_pending_approvals": 0,
+    }
+
+    def refuse_session_read(*args: object) -> None:
+        raise AssertionError("a recipient's history reads no session")
+
     # Directly and through a group.
     for recipient in (_BOB, _CAROL):
-        responses = [await client.get(url, headers=recipient) for url in _read_urls(task_id)]
+        with pytest.MonkeyPatch.context() as patched:
+            patched.setattr(
+                SqlAlchemyConversationStore, "get_session_activity", refuse_session_read
+            )
+            patched.setattr(SessionJournalStore, "run_start_plans", refuse_session_read)
+            responses = [await client.get(url, headers=recipient) for url in _read_urls(task_id)]
         assert [r.status_code for r in responses] == [200, 200, 200], responses[-1].text
         task, runs, steps = (r.json() for r in responses)
         assert task == {**owned, "viewer_role": "viewer", "owner_display_name": "Alice"}
-        assert [run["id"] for run in runs["runs"]] == [run_id]
+        assert runs == {
+            "runs": [{**run, **without_session} for run in owned_runs["runs"]],
+            "next_cursor": None,
+        }
+        assert [run["id"] for run in runs["runs"]] == [run_id, failed_id, skipped_id]
         assert steps == {"runs": [], "next_cursor": None}
+    pending_elicitations.resolve(shared_session, elicitation_id)
 
     # Someone it isn't shared with sees what a missing automation shows.
     missing = await client.get(

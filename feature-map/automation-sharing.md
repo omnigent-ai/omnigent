@@ -53,10 +53,11 @@ runs' sessions in their own Omnigent Automation folder.
 - `read-only-view`: on those cards' ⋯ and right-click menus and on the
   automation's page, Run now, Edit, Share, Pause/Resume and Delete are visible
   but disabled, each with a tooltip such as Only the automation's owner can edit
-  it. The page shows Shared by and the owner under the title, keeps the run
-  history and each run's tasks and graph, and leaves out the plan Stop/Continue
-  button and the workflow link. The owner's host reads The owner's host, the
-  Project field is hidden, and Starts from names no session.
+  it. The page shows Shared by and the owner under the title. Its run history
+  lists every run's time, outcome and error code, and a run opens its session
+  (if it's shared with the viewer) for the details: no session cost, error
+  details, approvals, unread dots or tasks. The owner's host reads The owner's
+  host, the Project field is hidden, and Starts from names no session.
 - `sidebar-folder`: in the sidebar's All sessions view (and Archived), another
   user's run session shared with the viewer, or a session launched from a run's
   session tree, sits in the viewer's Omnigent Automation folder instead of
@@ -140,11 +141,12 @@ uses, because the session Share button is disabled on a local server.
 - **Recipient, manually:** share an automation with bob and run it once. As
   bob, open Automations → Shared with me: the card says Shared by alice, and
   its menu's actions are disabled with their tooltips. Open it: the page is
-  read-only with the run listed. In the sidebar, choose All sessions: the run's
-  session is in Omnigent Automation with alice on its row, and bob, who has no
-  such project, sees the folder anyway. Fork that session as bob: the fork is
-  bob's own and lists with his sessions. Remove bob from the automation: the
-  automation leaves his list and its page shows not found.
+  read-only with the run listed, without the session cost alice's page shows.
+  In the sidebar, choose All sessions: the run's session is in Omnigent
+  Automation with alice on its row, and bob, who has no such project, sees the
+  folder anyway. Fork that session as bob: the fork is bob's own and lists with
+  his sessions. Remove bob from the automation: the automation leaves his list
+  and its page shows not found.
 
 ## Gotchas
 
@@ -166,7 +168,9 @@ uses, because the session Share button is disabled on a local server.
   They never read an automation through a recipient either, and get 403 from
   the shared list.
 - A recipient sees runs whose sessions were not shared with them, such as runs
-  from before they were added; opening such a session is refused.
+  from before they were added; opening such a session is refused. That is why
+  no run in their history carries its session's data, even when they can open
+  that session: the server checks no session's permissions to list runs.
 - Groups come from the permission store's `caller_principals`; the built-in
   store has no groups, so a grant to a group reaches nobody there.
 - The sidebar only places shared runs it has loaded: the Omnigent Automation

@@ -1081,7 +1081,7 @@ describe("an automation shared with the viewer", () => {
     expect(screen.queryByTestId("task-detail-project")).toBeNull();
   });
 
-  it("shows run history and each run's tasks, without the owner's plan controls", () => {
+  it("lists each run's outcome without its session's data or tasks", () => {
     const steps: ScheduledTaskRunSteps = {
       runId: "run_1",
       planId: "plan_1",
@@ -1095,23 +1095,76 @@ describe("an automation shared with the viewer", () => {
       ],
       statuses: [],
     };
-    setRuns([run({ id: "run_1", status: "succeeded", conversationId: "c_9" })]);
+    // The server leaves every session field of a viewer's runs empty.
+    const withoutSession = {
+      conversationUpdatedAt: null,
+      conversationStatus: null,
+      viewerLastSeen: null,
+      viewerUnread: null,
+      sessionCostUsd: null,
+      conversationPendingApprovals: 0,
+      errorDetail: null,
+    };
+    setRuns([
+      run({ id: "run_1", conversationId: "c_9", ...withoutSession }),
+      run({
+        id: "run_2",
+        status: "failed",
+        errorCode: "runner_start_failed",
+        conversationId: "c_7",
+        ...withoutSession,
+      }),
+      run({ id: "run_3", status: "skipped", errorCode: "no_online_host", ...withoutSession }),
+    ]);
+    // Even a session the viewer flagged unread shows no dot on its run.
+    markConversationUnread("c_9", 1_700_000_500);
     vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(new Map([["run_1", steps]]));
     renderShared(sharedTask());
-    const row = screen.getByTestId("task-detail-run");
-    expect(within(row).getByTestId("run-open")).toHaveAttribute("href", "/c/c_9");
-    expect(within(row).getAllByTestId("tasks-progress-segment")).toHaveLength(2);
-    expect(within(row).getByTestId("run-graph-button")).toBeInTheDocument();
-    expect(within(row).queryByTestId("run-workflow-button")).toBeNull();
-    expect(within(row).queryByTestId("plan-continue")).toBeNull();
-    expect(within(row).queryByTestId("plan-stop")).toBeNull();
 
-    // The owner's same row keeps them.
+    expect(hooks.useScheduledTaskRunSteps).toHaveBeenLastCalledWith(
+      "st_1",
+      expect.any(Array),
+      false,
+    );
+    const [succeeded, failed, skipped] = screen.getAllByTestId("task-detail-run");
+    expect(within(succeeded!).getByTestId("run-open")).toHaveAttribute("href", "/c/c_9");
+    expect(succeeded).toHaveAttribute("data-run-unread", "false");
+    expect(within(succeeded!).getByTestId("run-status-dot")).toHaveAttribute(
+      "data-run-icon",
+      "read",
+    );
+    expect(within(failed!).getByTestId("run-open")).toHaveAttribute("href", "/c/c_7");
+    expect(within(failed!).getByTestId("run-failure")).toHaveTextContent(
+      "Runner · The agent didn't start.",
+    );
+    expect(within(skipped!).getByTestId("run-failure")).toHaveTextContent(
+      "Host · None of your hosts was online.",
+    );
+    for (const testId of [
+      "run-cost",
+      "run-pending-approval",
+      "run-failure-detail",
+      "run-status-label",
+      "tasks-progress-segment",
+      "run-graph-button",
+    ]) {
+      expect(screen.queryByTestId(testId)).toBeNull();
+    }
+    expect(screen.queryByText(/Session cost is each session/)).toBeNull();
+
+    // The owner's same row shows its tasks and their controls.
     cleanup();
     vi.mocked(useViewerId).mockReturnValue("alice@example.com");
     setTask(sharedTask({ viewerRole: "owner", ownerDisplayName: null }));
+    setRuns([run({ id: "run_1", status: "succeeded", conversationId: "c_9" })]);
     render(<CapabilitiesProvider info={sharingInfo}>{pageTree()}</CapabilitiesProvider>);
+    expect(hooks.useScheduledTaskRunSteps).toHaveBeenLastCalledWith(
+      "st_1",
+      expect.any(Array),
+      true,
+    );
     const ownersRow = screen.getByTestId("task-detail-run");
+    expect(within(ownersRow).getAllByTestId("tasks-progress-segment")).toHaveLength(2);
     expect(within(ownersRow).getByTestId("plan-continue")).toBeInTheDocument();
     expect(within(ownersRow).getByTestId("run-workflow-button")).toBeInTheDocument();
     expect(screen.queryByTestId("task-detail-owner")).toBeNull();

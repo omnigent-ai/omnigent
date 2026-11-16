@@ -428,6 +428,32 @@ describe("useScheduledTaskRuns live refresh", () => {
     expect(api.listScheduledTaskRunSteps).toHaveBeenCalledTimes(7);
   });
 
+  it("asks for no steps while disabled, even with a run in flight", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    try {
+      const { wrapper } = makeWrapper();
+      // A viewer's history: in flight, with none of its session's data.
+      const runs = [{ ...RUNNING_RUN, conversationStatus: null, conversationUpdatedAt: null }];
+      vi.mocked(api.listScheduledTaskRunSteps).mockResolvedValueOnce([]);
+      const { rerender } = renderHook(
+        ({ enabled }) => useScheduledTaskRunSteps("st_1", runs, enabled),
+        { wrapper, initialProps: { enabled: false } },
+      );
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      expect(api.listScheduledTaskRunSteps).not.toHaveBeenCalled();
+
+      rerender({ enabled: true });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(api.listScheduledTaskRunSteps).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps refetching a >20s run until it settles, WITHOUT a remount", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: false });
     try {
