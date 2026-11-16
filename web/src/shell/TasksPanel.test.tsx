@@ -791,12 +791,13 @@ describe("TasksPanel", () => {
   });
 
   it("opens the plan on its graph, with where each task stands and its ⋯ action", async () => {
-    showJournal([
+    const entries = [
       journalPlan(0, ["baseline"], ["batch", ["baseline"]], ["pool", ["baseline"]]),
       status(1, "baseline", "done"),
       status(2, "batch", "failed", "Reverted"),
       status(3, "pool", "needs_input", "Raise the pool size?"),
-    ]);
+    ];
+    showJournal(entries);
     const question = {
       type: "elicitation",
       elicitationId: "elicit_pool",
@@ -809,6 +810,13 @@ describe("TasksPanel", () => {
     const withdraw = registerTaskAction("conv", taskAction);
     try {
       const { rerender } = renderPanel();
+      const showSession = (conversationId: string) =>
+        rerender(
+          <>
+            <TasksPanel conversationId={conversationId} active />
+            <SearchProbe />
+          </>,
+        );
       fireEvent.click(screen.getByTestId("tasks-plan-graph"));
       const overlay = await screen.findByTestId("workflow-graph-overlay");
       expect(overlay).toHaveAttribute("data-title", "The plan");
@@ -816,6 +824,11 @@ describe("TasksPanel", () => {
       expect(overlay).toHaveTextContent("baseline:done batch:failed pool:needs_input");
       fireEvent.click(within(overlay).getByRole("button", { name: "retry batch" }));
       expect(taskAction).toHaveBeenCalledWith("retry", "batch");
+      // The open graph follows the journal: once batch starts again, it offers Continue.
+      showJournal([...entries, status(4, "batch", "started")]);
+      showSession("conv");
+      expect(overlay).toHaveTextContent("baseline:done batch:stopped pool:needs_input");
+      expect(within(overlay).getByRole("button", { name: "continue batch" })).toBeTruthy();
       // Continue shows the task's question in the chat, which the graph would cover.
       fireEvent.click(within(overlay).getByRole("button", { name: "proceed pool" }));
       expect(screen.queryByTestId("workflow-graph-overlay")).toBeNull();
@@ -833,13 +846,6 @@ describe("TasksPanel", () => {
       // Leaving the session closes the graph, and coming back doesn't reopen it.
       fireEvent.click(screen.getByTestId("tasks-plan-graph"));
       await screen.findByTestId("workflow-graph-overlay");
-      const showSession = (conversationId: string) =>
-        rerender(
-          <>
-            <TasksPanel conversationId={conversationId} active />
-            <SearchProbe />
-          </>,
-        );
       showSession("other");
       expect(screen.queryByTestId("workflow-graph-overlay")).toBeNull();
       showSession("conv");
