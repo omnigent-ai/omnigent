@@ -10,6 +10,7 @@ import { GIT_SETTINGS } from "./git";
 import { IMPORT_SETTINGS } from "./import";
 import { INTEGRATION_SETTINGS } from "./integrations";
 import { MCP_SETTINGS } from "./mcp";
+import { MEMBERS_SETTINGS } from "./members";
 import type { SettingsEntry } from "./types";
 import { UPDATES_SETTINGS } from "./updates";
 
@@ -25,7 +26,7 @@ export const SECTION_CATALOGS: Readonly<Record<SettingsSectionId, readonly Setti
   import: IMPORT_SETTINGS,
   account: ACCOUNT_SETTINGS,
   admin: [],
-  members: [],
+  members: MEMBERS_SETTINGS,
   policies: [],
   sharing: [],
   archived: ARCHIVED_SETTINGS,
