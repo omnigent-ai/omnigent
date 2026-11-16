@@ -82,6 +82,8 @@ import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
 import { SettingsGroup } from "@/components/SettingsGroup";
 import { SettingsLabel } from "@/components/SettingsLabel";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { TilesSettingsGroup } from "@/tiles/TilesSettingsGroup";
 import { SessionTitleInstructionsControl } from "@/components/SessionTitleInstructionsControl";
 import { McpRegistryConnections } from "@/components/McpRegistry";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
@@ -2087,6 +2089,7 @@ function GeneralSection() {
             <OpenSubagentsInPanelControl />
           </div>
         </SettingsGroup>
+        {isFeatureEnabled(info, "tiles_view") && <TilesSettingsGroup />}
         <SettingsGroup title="Terminal" testId="settings-group-terminal">
           <TerminalClipboardControl />
         </SettingsGroup>

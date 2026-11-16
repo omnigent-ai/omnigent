@@ -55,6 +55,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "codex_plan_at_launch": True,
         "workspace_direct_access": False,
         "workspace_api_server_access": False,
+        "tiles_view": False,
     }
 
 
@@ -173,6 +174,14 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
         "sibling_sessions",
         "sidebar_grouping_ui",
     )
+
+
+def test_tiles_view_is_a_default_off_frontend_visible_feature() -> None:
+    assert not resolve_feature_flags({}).enabled(Feature.TILES_VIEW)
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "tiles_view"})
+
+    assert flags.enabled(Feature.TILES_VIEW)
+    assert flags.frontend_dict()["tiles_view"] is True
 
 
 def test_arca_shutdown_warnings_are_frontend_visible() -> None:

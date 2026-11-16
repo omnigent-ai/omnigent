@@ -73,6 +73,7 @@ export type FeatureKey =
   | "session_overview"
   | "project_repository_creation"
   | "workspace_direct_access"
+  | "tiles_view"
   | "workspace_api_server_access";
 
 /** Deployment-wide release-feature values advertised by the server. */
