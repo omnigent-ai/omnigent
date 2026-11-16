@@ -3163,6 +3163,16 @@ describe("Session overview", () => {
     expect(chip()).toHaveAttribute("aria-expanded", "false");
     expect(docked()).toBeNull();
     expect(popover()).toBeNull();
+
+    // A reload keeps the hand-closed card closed, and reopening it is remembered too.
+    cleanup();
+    await renderOverviewShell(true, "collapsed");
+    expect(docked()).toBeNull();
+    fireEvent.click(chip());
+    expect(docked()).toBeInTheDocument();
+    cleanup();
+    await renderOverviewShell(true, "collapsed");
+    expect(docked()).toBeInTheDocument();
   });
 
   it.each([

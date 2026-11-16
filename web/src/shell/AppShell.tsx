@@ -166,7 +166,12 @@ import { resolveDefaultShell } from "./preferredShell";
 import { WorkspacePanel } from "./WorkspacePanel";
 import { SessionRail } from "./SessionRail";
 import { TasksTabOnOpen } from "./TasksTabOnOpen";
-import { SessionCostButton, SessionOverview, useIsWideViewport } from "./SessionOverview";
+import {
+  SessionCostButton,
+  SessionOverview,
+  useDockedOverviewOpen,
+  useIsWideViewport,
+} from "./SessionOverview";
 import type { RightRailTab } from "./railTabs";
 
 /**
@@ -2986,7 +2991,7 @@ function AppShellImpl() {
     !executionLogsOpen &&
     !filesPanelOpen &&
     !canvasMode;
-  const [sessionOverviewDockedOpen, setSessionOverviewDockedOpen] = useState(true);
+  const [sessionOverviewDockedOpen, setSessionOverviewDockedOpen] = useDockedOverviewOpen();
   const [sessionOverviewOverlayOpen, setSessionOverviewOverlayOpen] = useState(false);
   const sessionOverviewOpen =
     sessionOverviewEnabled &&

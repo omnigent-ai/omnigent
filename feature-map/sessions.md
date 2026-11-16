@@ -271,7 +271,9 @@ the header menu), and each place is a separate entry point.
   with the session cost, each model's cost and the total tokens, which then
   leave the desktop Agent info popover. Windows at least 1280px wide with the
   workspace collapsed and chat in view dock the card open beneath the chip;
-  other layouts open it as a popover from the chip. Mobile keeps cost in Agent
+  closed there by hand, it stays closed on that device, including after a
+  reload, until the chip opens it again. Other layouts open it as a popover
+  from the chip. Mobile keeps cost in Agent
   info.
   When the session has sub-agents, a **Sub-agents** list names each direct one
   with its cost, including its own sub-agents; an unpriced one shows no cost.

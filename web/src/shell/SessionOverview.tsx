@@ -7,6 +7,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { formatSessionCostUsd, formatTokenCount } from "@/lib/formatCost";
+import { createStoredChoicePreference } from "@/lib/storedChoicePreference";
 import { cn } from "@/lib/utils";
 import { useChatStore } from "@/store/chatStore";
 import { SessionOverviewChanges } from "./SessionOverviewChanges";
@@ -28,6 +29,20 @@ export function useIsWideViewport(): boolean {
     () => window.matchMedia(WIDE_QUERY).matches,
     () => false,
   );
+}
+
+// Per device, so a docked overview closed by hand stays closed after a reload.
+const dockedOverviewPreference = createStoredChoicePreference(
+  "omnigent:session-overview-docked",
+  ["open", "closed"],
+  "open",
+);
+
+/** Whether the docked overview shows, and a setter that remembers the choice. */
+export function useDockedOverviewOpen(): readonly [boolean, (open: boolean) => void] {
+  const open = dockedOverviewPreference.use() === "open";
+  const setOpen = (next: boolean) => dockedOverviewPreference.write(next ? "open" : "closed");
+  return [open, setOpen];
 }
 
 /** The bound session's cost: a spinner while the first read runs, then the value. */
