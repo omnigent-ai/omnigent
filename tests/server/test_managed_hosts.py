@@ -6757,6 +6757,119 @@ def test_parse_gensee_rejects_invalid_config(gensee: dict[str, object]) -> None:
         )
 
 
+# ── kosa8 sandbox provider ──────────────────────────────────
+
+
+def test_parse_kosa8_builds_core_launcher() -> None:
+    """The documented kosa8 block reaches the launcher with a 7-day token TTL."""
+    from omnigent.onboarding.sandboxes.kosa8 import Kosa8SandboxLauncher
+
+    deployment = parse_sandbox_config(
+        {
+            "provider": "kosa8",
+            "server_url": "https://omnigent.example.com/",
+            "kosa8": {
+                "image": "registry.example.com/omnigent-host:dev",
+                "env": ["ANTHROPIC_API_KEY", "GIT_TOKEN"],
+                "size": "4x8",
+                "region": "eu",
+                "labels": {"team": "infra"},
+            },
+        }
+    )
+
+    assert deployment is not None
+    config = deployment.default
+    assert config.provider == "kosa8"
+    assert config.server_url == "https://omnigent.example.com"
+    assert config.managed_launch_supported is True
+    assert config.token_ttl_s == 7 * 24 * 3600
+    launcher = config.launcher_factory()
+    assert isinstance(launcher, Kosa8SandboxLauncher)
+    assert launcher.image == "registry.example.com/omnigent-host:dev"
+    assert launcher.env == ("ANTHROPIC_API_KEY", "GIT_TOKEN")
+    assert (launcher.size, launcher.region, launcher.snapshot) == ("4x8", "eu", None)
+    assert launcher.labels == {"created-by": "omnigent", "team": "infra"}
+
+
+def test_parse_kosa8_snapshot_config() -> None:
+    """A snapshot alone is a complete kosa8 block."""
+    from omnigent.onboarding.sandboxes.kosa8 import Kosa8SandboxLauncher
+
+    deployment = parse_sandbox_config(
+        {
+            "provider": "kosa8",
+            "server_url": "https://omnigent.example.com",
+            "kosa8": {"snapshot": "snap_0123456789abcdef"},
+        }
+    )
+
+    assert deployment is not None
+    launcher = deployment.default.launcher_factory()
+    assert isinstance(launcher, Kosa8SandboxLauncher)
+    assert (launcher.snapshot, launcher.image, launcher.size) == (
+        "snap_0123456789abcdef",
+        None,
+        None,
+    )
+
+
+def test_parse_kosa8_minimal_config_uses_launcher_defaults() -> None:
+    """`provider: kosa8` + `server_url` is a complete config."""
+    from omnigent.onboarding.sandboxes.kosa8 import Kosa8SandboxLauncher
+
+    deployment = parse_sandbox_config(
+        {"provider": "kosa8", "server_url": "https://omnigent.example.com"}
+    )
+
+    assert deployment is not None
+    launcher = deployment.default.launcher_factory()
+    assert isinstance(launcher, Kosa8SandboxLauncher)
+    assert (launcher.image, launcher.env, launcher.size, launcher.region) == (
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+def test_parse_kosa8_rejects_unknown_config_key() -> None:
+    with pytest.raises(ValueError, match=r"sandbox\.kosa8.*unknown"):
+        parse_sandbox_config(
+            {
+                "provider": "kosa8",
+                "server_url": "https://omnigent.example.com",
+                "kosa8": {"vcpu": 2},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "kosa8",
+    [
+        {"size": "3x6"},
+        {"size": 2},
+        {"snapshot": "omnigent-host"},
+        {"snapshot": "snap_0123456789abcdef", "size": "4x8"},
+        {"snapshot": "snap_0123456789abcdef", "image": "registry.example.com/host:1"},
+        {"region": ""},
+        {"env": "ANTHROPIC_API_KEY"},
+        {"labels": ["team=infra"]},
+        {"labels": {"-team": "infra"}},
+    ],
+)
+def test_parse_kosa8_rejects_invalid_config(kosa8: dict[str, object]) -> None:
+    """Bad sizes, a snapshot with an image or size, and malformed fields stop startup."""
+    with pytest.raises(ValueError, match=r"sandbox\.kosa8"):
+        parse_sandbox_config(
+            {
+                "provider": "kosa8",
+                "server_url": "https://omnigent.example.com",
+                "kosa8": kosa8,
+            }
+        )
+
+
 # ── contributed sandbox providers ───────────────────────────
 
 

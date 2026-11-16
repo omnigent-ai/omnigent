@@ -222,6 +222,13 @@ def _builtin_contribution() -> SandboxProviderContribution:
                     "omnigent.onboarding.sandboxes.lambda_microvm:LambdaMicroVMSandboxLauncher"
                 ),
             ),
+            # kosa8 Cloud microVMs, reached over the kosa8 REST API with the
+            # built-in HTTP client.
+            "kosa8": SandboxProviderMetadata(
+                name="kosa8",
+                launcher_class="omnigent.onboarding.sandboxes.kosa8:Kosa8SandboxLauncher",
+                managed_token_ttl_s=7 * 24 * 3600,
+            ),
         },
     )
 

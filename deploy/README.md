@@ -93,6 +93,9 @@ deploy/
 ├── gensee/            ← Gensee managed sandbox-provider guide (ephemeral
 │   └── README.md         provider-managed runtimes); NOT a server deploy target.
 │
+├── kosa8/             ← kosa8 sandbox-provider guide (hosted microVMs that
+│   └── README.md         sleep and wake in place); NOT a server deploy target.
+│
 ├── openshell/         ← NVIDIA OpenShell sandbox-provider guide (self-hosted
 │   └── README.md         gRPC gateway, on-prem/air-gapped); NOT a server target.
 │
@@ -336,10 +339,10 @@ omnigent run path/to/agent.yaml --server https://your-host
 
 Don't want a laptop to be the host? Run the host in a cloud sandbox instead.
 
-**From the CLI (Modal, Daytona, Blaxel, Islo, or E2B).** Install the provider extra when needed (`pip install 'omnigent[modal]'`, `'omnigent[daytona]'`, `'omnigent[blaxel]'`, or `'omnigent[e2b]'`; Islo uses the built-in HTTP client). Authenticate with `modal token new`, `DAYTONA_API_KEY`, Blaxel's `BL_WORKSPACE` and `BL_API_KEY`, `ISLO_API_KEY`, or `E2B_API_KEY`. Then run:
+**From the CLI (Modal, Daytona, Blaxel, Islo, E2B, or kosa8).** Install the provider extra when needed (`pip install 'omnigent[modal]'`, `'omnigent[daytona]'`, `'omnigent[blaxel]'`, or `'omnigent[e2b]'`; Islo and kosa8 use the built-in HTTP client). Authenticate with `modal token new`, `DAYTONA_API_KEY`, Blaxel's `BL_WORKSPACE` and `BL_API_KEY`, `ISLO_API_KEY`, `E2B_API_KEY`, or `KOSA8_API_KEY`. Then run:
 
 ```bash
-omnigent sandbox create --provider modal     # or --provider daytona / blaxel / islo / e2b
+omnigent sandbox create --provider modal     # or --provider daytona / blaxel / islo / e2b / kosa8
 omnigent sandbox connect --provider modal --sandbox-id <id> --server https://your-host
 ```
 
@@ -352,7 +355,7 @@ omnigent sandbox connect --provider modal --sandbox-id <id> --server https://you
 > rather than a registry image — build it once first; see
 > [`e2b/README.md`](e2b/README.md).
 
-**Server-managed (Modal, Daytona, Blaxel, Islo, E2B, or Gensee).** With
+**Server-managed (Modal, Daytona, Blaxel, Islo, E2B, Gensee, or kosa8).** With
 *managed hosts*, creating a session with `"host_type": "managed"` (e.g.
 `POST /v1/sessions {"agent_id": ..., "host_type": "managed"}`) makes the
 server provision a sandbox, start a host in it, and run the session there.
@@ -376,6 +379,7 @@ Daytona reads `DAYTONA_API_KEY`. Blaxel reads `BL_WORKSPACE` and `BL_API_KEY`.
 Islo reads `ISLO_API_KEY` and optional `ISLO_BASE_URL`. E2B reads `E2B_API_KEY`.
 Gensee reads `GENSEE_CONTROLLER_API_TOKEN`; see
 [`gensee/README.md`](gensee/README.md) for its managed-only configuration.
+kosa8 reads `KOSA8_API_KEY` and optional `KOSA8_API_URL`.
 All credentials come from the server environment.
 Each sandbox authenticates back with a server-minted, per-launch token, so
 no user credentials ever enter the sandbox.
@@ -477,7 +481,7 @@ sandbox:
     secrets: [omnigent-llm]
 ```
 
-For Daytona, Blaxel, and Islo, list server environment variable names under `sandbox.daytona.env`, `sandbox.blaxel.env`, or `sandbox.islo.env`. The launcher copies the current server values into each sandbox:
+For Daytona, Blaxel, Islo, and kosa8, list server environment variable names under `sandbox.daytona.env`, `sandbox.blaxel.env`, `sandbox.islo.env`, or `sandbox.kosa8.env`. The launcher copies the current server values into each sandbox:
 
 ```yaml
 sandbox:
@@ -502,7 +506,7 @@ a Modal secret (GitLab: add `GIT_USERNAME=oauth2`). The host image's git
 credential helper picks it up for the clone and for the agent's later
 fetch/push.
 
-See the [`modal`](modal/README.md), [`daytona`](daytona/README.md), [`blaxel`](blaxel/README.md), and [`islo`](islo/README.md) guides for provider setup and troubleshooting.
+See the [`modal`](modal/README.md), [`daytona`](daytona/README.md), [`blaxel`](blaxel/README.md), [`islo`](islo/README.md), and [`kosa8`](kosa8/README.md) guides for provider setup and troubleshooting.
 
 ## Auth
 

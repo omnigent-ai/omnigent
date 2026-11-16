@@ -34,7 +34,7 @@ stores into ``create_app``):
 
        sandbox:
          # lakebox|databricks|modal|daytona|blaxel|boxlite|cwsandbox|islo|
-         # e2b|openshell|kubernetes|microsandbox|gensee
+         # e2b|openshell|kubernetes|microsandbox|gensee|kosa8
          provider: modal
          server_url: https://omnigent.example.com
          # For SEVERAL providers, replace `provider:` with a `providers:`
@@ -135,6 +135,16 @@ stores into ``create_app``):
            execution_role_arn: arn:aws:iam::123:role/omnigent-microvm-exec
            env: [ANTHROPIC_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected
                                                 # as MicroVM env
+         kosa8:                   # optional block (provider: kosa8)
+           image: ghcr.io/me/omnigent-host:latest  # optional; default: the
+                                                   # official host image
+           env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES set on
+                                             # the sandbox at create
+           size: 4x8                         # optional 2x4|4x8|8x16|16x32
+           region: eu                        # optional kosa8 region
+           snapshot: snap_0123456789abcdef   # optional; instead of image,
+                                             # size and region
+           labels: {team: agents}            # optional extra kosa8 labels
 
    Most providers default to a public prebaked host image, so
    ``provider`` + ``server_url`` is a complete config. Gensee instead starts a
@@ -152,7 +162,8 @@ stores into ``create_app``):
    reads ``ISLO_API_KEY`` (plus optional ``ISLO_BASE_URL``) from the
    server process environment. Gensee reads the environment variable named by
    ``sandbox.gensee.api_token_env`` (``GENSEE_CONTROLLER_API_TOKEN`` by
-   default). The Blaxel launcher reads ``BL_WORKSPACE``
+   default). The kosa8 launcher reads ``KOSA8_API_KEY`` (plus optional
+   ``KOSA8_API_URL``). The Blaxel launcher reads ``BL_WORKSPACE``
    and ``BL_API_KEY`` or the local ``bl login`` profile. The OpenShell
    launcher needs no API key:
    it connects to the gateway made active with ``openshell gateway
@@ -258,6 +269,7 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
         "microsandbox",
         "agent_sandbox",
         "lambda_microvm",
+        "kosa8",
     }
 )
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
@@ -276,6 +288,7 @@ PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
         "microsandbox",
         "agent_sandbox",
         "lambda_microvm",
+        "kosa8",
     }
 )
 
@@ -2129,6 +2142,25 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         # outlives the (operator-overridable) 8 h MicroVM lifetime, mirroring the
         # cwsandbox / e2b path. A resume that preserves the host keeps this token.
         token_ttl_s = managed_token_ttl_s()
+    elif provider == "kosa8":
+        from omnigent.onboarding.sandboxes.kosa8 import MANAGED_TOKEN_TTL_S
+
+        kosa8_section = _parse_provider_section(raw, "kosa8")
+        if kosa8_section is not None:
+            _reject_unknown_keys(
+                kosa8_section,
+                {"image", "env", "size", "region", "snapshot", "labels"},
+                "sandbox.kosa8",
+            )
+        launcher_factory = _kosa8_launcher_factory(
+            image=_parse_provider_image(raw, "kosa8"),
+            env=_parse_provider_env(raw, "kosa8"),
+            size=_parse_provider_string(raw, "kosa8", "size"),
+            region=_parse_provider_string(raw, "kosa8", "region"),
+            snapshot=_parse_provider_string(raw, "kosa8", "snapshot"),
+            labels=_parse_provider_str_mapping(raw, "kosa8", "labels"),
+        )
+        token_ttl_s = MANAGED_TOKEN_TTL_S
     elif provider in community:
         # A provider contributed through the `omnigent.sandbox_providers`
         # entry point group. The registry has validated it (name not shadowing
@@ -2778,6 +2810,56 @@ def _gensee_launcher_factory(
         _build()
     except ValueError as exc:
         raise ValueError(f"server config 'sandbox.gensee' is invalid: {exc}") from exc
+
+    return _build
+
+
+def _kosa8_launcher_factory(
+    *,
+    image: str | None,
+    env: list[str] | None,
+    size: str | None,
+    region: str | None,
+    snapshot: str | None,
+    labels: dict[str, str] | None = None,
+) -> Callable[[], SandboxHostLauncher]:
+    """
+    Build the launcher factory for the YAML ``provider: kosa8`` path.
+
+    The launcher is constructed once here so an invalid size, a malformed
+    snapshot id, a snapshot combined with an image, size or region, or a bad
+    label stops server startup instead of the first managed session.
+
+    :param image: OCI image sandboxes boot, or ``None`` for the launcher's
+        env-var / official host image fallback.
+    :param env: Server-process environment variable names set on every
+        sandbox, or ``None`` for the launcher's env-var fallback.
+    :param size: kosa8 size (``2x4``, ``4x8``, ``8x16`` or ``16x32``), or
+        ``None`` for 2x4.
+    :param region: kosa8 region, or ``None`` for the org's default.
+    :param snapshot: kosa8 snapshot (``snap_...``) to create sandboxes from,
+        or ``None`` to boot the image.
+    :param labels: kosa8 labels added to every sandbox, or ``None`` for only
+        ``created-by=omnigent``.
+    :returns: A factory producing parameterized kosa8 launchers.
+    :raises ValueError: When the combination is invalid.
+    """
+    from omnigent.onboarding.sandboxes.kosa8 import Kosa8SandboxLauncher
+
+    def _build() -> SandboxHostLauncher:
+        return Kosa8SandboxLauncher(
+            image=image,
+            env=env,
+            size=size,
+            region=region,
+            snapshot=snapshot,
+            labels=labels,
+        )
+
+    try:
+        _build()
+    except ValueError as exc:
+        raise ValueError(f"server config 'sandbox.kosa8' is invalid: {exc}") from exc
 
     return _build
 
