@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import random
 import uuid
 from collections import Counter
 from collections.abc import AsyncIterator
@@ -97,6 +98,12 @@ def _runner(session_id: str, user: str = ALICE) -> dict[str, str]:
         ORCHESTRATION_SOURCE_HEADER: session_id,
         RUNNER_TUNNEL_TOKEN_HEADER: _RUNNER_TOKEN,
     }
+
+
+def _oversized_description() -> str:
+    """CJK noise within the 2,000-character limit whose stored form is over 2,000 bytes."""
+    noise = random.Random(0)
+    return "".join(chr(noise.randrange(0x4E00, 0x9FFF)) for _ in range(2000))
 
 
 def _write(kind: str, content: dict[str, object], key: str, **fields: object) -> dict[str, object]:
@@ -574,6 +581,19 @@ async def test_reading_needs_read_access_and_writing_needs_edit(
             _write("plan", {"steps": [{"id": "a", "name": "A"}]}, "k"),
             400,
             "a plan's content has name and steps, and optionally description",
+        ),
+        (
+            _write(
+                "plan",
+                {
+                    "name": "A",
+                    "steps": [{"id": "a", "name": "A"}],
+                    "description": _oversized_description(),
+                },
+                "k",
+            ),
+            400,
+            "stored bytes; the limit is 2000",
         ),
         (_write("dispatch", {"dispatch_id": "x"}, "k"), 422, "kind"),
         (

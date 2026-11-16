@@ -44,7 +44,7 @@ from omnigent.entities.session_journal import (
     normalize_status,
     normalize_step_id,
 )
-from omnigent.entities.workflow import Workflow
+from omnigent.entities.workflow import InvalidWorkflowError, Workflow
 from omnigent.entities.workflow_questions import (
     normalize_questions,
     question_form,
@@ -227,6 +227,17 @@ async def load_workflow_for_run(
             {"name": workflow.name, "steps": workflow.steps, "source": "workflow"},
         )
     return workflow
+
+
+def _check_proposed_description(conversation_store: ConversationStore, description: str) -> None:
+    """Refuse a proposed description its workflow couldn't store, so Save plan can save it."""
+    workflows = open_workflow_store(conversation_store)
+    if workflows is None:
+        return
+    try:
+        workflows.check_description(description)
+    except InvalidWorkflowError as exc:
+        raise OmnigentError(f"invalid_entry: {exc}", code=ErrorCode.INVALID_INPUT) from exc
 
 
 async def _load_workflow(
@@ -478,6 +489,9 @@ def create_session_journal_router(
                 "invalid_entry: a plan's content has name and steps, and optionally description",
                 code=ErrorCode.INVALID_INPUT,
             )
+        description = body.content.get("description") if body.kind == "plan" else None
+        if isinstance(description, str) and description.strip():
+            await asyncio.to_thread(_check_proposed_description, conversation_store, description)
         if body.workflow_id is not None:
             await _require_workflow(request, body.kind, body.workflow_id)
         entry = await _append(

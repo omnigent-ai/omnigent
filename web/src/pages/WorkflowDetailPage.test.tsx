@@ -551,7 +551,7 @@ describe("WorkflowDetailPage", () => {
     expect(description()).toBe("Edited by hand");
   });
 
-  it("saves only the steps when an older server refuses the description check", async () => {
+  it("keeps a newer proposal's description unsaved when an older save lands after it", async () => {
     const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
     vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
     mockRuns([]);
@@ -562,22 +562,28 @@ describe("WorkflowDetailPage", () => {
       planning_session_id: "a".repeat(32),
       updated_at: 100,
     };
-    const patches: unknown[] = [];
+    const patches: { description?: string }[] = [];
+    let releaseFirstSave = () => {};
     vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
       if (options?.method === "PATCH") {
         const body = JSON.parse(String(options.body));
         patches.push(body);
-        // How a server from before expected_description refuses the unknown field.
-        if ("expected_description" in body) {
-          const detail = [{ type: "extra_forbidden", loc: ["body", "expected_description"] }];
-          return new Response(JSON.stringify({ detail }), { status: 422 });
-        }
-        stored = { ...stored, steps: body.steps, is_draft: false, updated_at: 200 };
+        if (patches.length === 1)
+          await new Promise<void>((resolve) => {
+            releaseFirstSave = resolve;
+          });
+        stored = {
+          ...stored,
+          steps: body.steps,
+          description: body.description ?? stored.description,
+          is_draft: false,
+          updated_at: 300 + patches.length,
+        };
       }
       return new Response(JSON.stringify(stored));
     });
-    const proposal: JournalEntry = {
-      id: "proposal",
+    const first: JournalEntry = {
+      id: "first",
       position: 1,
       created_at: 150,
       scheduled_task_run_id: null,
@@ -586,31 +592,46 @@ describe("WorkflowDetailPage", () => {
       kind: "plan",
       content: { steps: WORKFLOW.steps, description: "Fixes one flaky test." },
     };
-    vi.mocked(useSessionJournal).mockReturnValue({
-      entries: [proposal],
+    const journal = {
+      entries: [first],
       isLoading: false,
       error: null,
       hasOlder: false,
       loadingOlder: false,
       loadOlder: vi.fn(),
       retry: vi.fn(),
-    });
-    renderPage();
-
+    };
+    vi.mocked(useSessionJournal).mockImplementation(() => journal);
+    const { rerender } = renderPage();
     await screen.findByTestId("workflow-detail-title");
+
+    // The agent revises only the description while the first proposal's save is in flight,
+    // and that save lands after the revision was written.
+    fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+    await waitFor(() => expect(patches).toHaveLength(1));
+    journal.entries = [
+      first,
+      {
+        ...first,
+        id: "second",
+        position: 2,
+        created_at: 200,
+        content: { steps: WORKFLOW.steps, description: "Fixes flaky tests." },
+      },
+    ];
+    rerender(<WorkflowDetailPage />);
+    await act(async () => releaseFirstSave());
+
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes"));
+    expect(screen.getByTestId("workflow-detail-description").textContent).toBe(
+      "Fixes flaky tests.",
+    );
     fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
     await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Saved plan"));
-    expect(patches).toEqual([
-      {
-        steps: WORKFLOW.steps,
-        description: "Fixes one flaky test.",
-        expected_description: WORKFLOW.description,
-      },
-      { steps: WORKFLOW.steps },
+    expect(patches.map((patch) => patch.description)).toEqual([
+      "Fixes one flaky test.",
+      "Fixes flaky tests.",
     ]);
-    expect(screen.getByTestId("workflow-detail-description").textContent).toBe(
-      WORKFLOW.description,
-    );
   });
 
   it("shows the workflow, its steps, and the sessions that ran it", () => {

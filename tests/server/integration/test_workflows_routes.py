@@ -461,6 +461,17 @@ async def test_draft_planning_is_persistent_private_and_separate_from_runs(
     )
     assert linked.status_code == 200, linked.text
     assert linked.json()["description"] == "Prepare the next release."
+    # Save plan names the description it replaces, so one written meanwhile stays.
+    for expected, kept in [
+        ("Plan the next release.", "Prepare the next release."),
+        ("Prepare the next release.", "Ship the next release."),
+    ]:
+        saved = await client.patch(
+            path,
+            json={"description": "Ship the next release.", "expected_description": expected},
+            headers=_headers(ALICE),
+        )
+        assert saved.status_code == 200 and saved.json()["description"] == kept
     assert (await client.get(path, headers=_headers(ALICE))).json()[
         "planning_session_id"
     ] == planner

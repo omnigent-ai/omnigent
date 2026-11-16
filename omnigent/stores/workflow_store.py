@@ -134,6 +134,14 @@ class WorkflowStore:
                 )
         return stored
 
+    def check_description(self, description: str) -> None:
+        """Refuse a description too large to store, such as one a planning chat proposes.
+
+        :param description: e.g. ``"Triage flaky tests."``; checked as it would be stored.
+        :raises InvalidWorkflowError: If its stored form is over the limit.
+        """
+        self._stored_texts(description.strip(), None)
+
     def _workflows(self, rows: Sequence[SqlWorkflow]) -> list[Workflow]:
         """Decode a page's descriptions and plans in one call."""
         texts = (
