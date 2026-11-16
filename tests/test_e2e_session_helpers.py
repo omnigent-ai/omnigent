@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 
 import httpx
 import pytest
@@ -419,6 +420,20 @@ def test_native_create_failure_keeps_bounded_redacted_response(
     assert len(note) < 2200
 
 
+@pytest.fixture
+def default_recursion_limit():
+    """Pin the default recursion limit so a 1100-deep body is still omitted.
+
+    celpy raises the process limit and leaves it raised for later tests.
+    """
+    previous_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(1000)
+    try:
+        yield
+    finally:
+        sys.setrecursionlimit(previous_limit)
+
+
 def _sized_json_response_body(size_bytes: int, character: str) -> str:
     envelope_bytes = len(json.dumps({"message": ""}, ensure_ascii=False).encode("utf-8"))
     count, remainder = divmod(size_bytes - envelope_bytes, len(character.encode("utf-8")))
@@ -447,6 +462,7 @@ def _sized_json_response_body(size_bytes: int, character: str) -> str:
         ],
     ],
 )
+@pytest.mark.usefixtures("default_recursion_limit")
 def test_redacted_response_text_omits_unsafe_bodies(
     body: str, expected_bytes: int | None, omitted: bool
 ) -> None:
