@@ -12,7 +12,7 @@ const { createSshSession } = require("./ssh_connect");
 const IDLE_MS = 10 * 60_000;
 // A file read waits on this, so give up soon and let the page use the server.
 const OPEN_TIMEOUT_MS = 10_000;
-// Never prompt: a password or an unknown host key fails, and the page uses the server.
+// No password or host-key prompts: those fail, and the page uses the server.
 const SSH_ARGS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"];
 
 /**

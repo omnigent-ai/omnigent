@@ -33,7 +33,9 @@ describe("createSshHostStore", () => {
     );
     assert.equal(reloaded.destination("https://b.example/", hostId), null);
     assert.equal(reloaded.destination("https://a.example/", "__proto__"), null);
-    assert.equal((fs.statSync(file).mode & 0o777).toString(8), "600");
+    if (process.platform !== "win32") {
+      assert.equal((fs.statSync(file).mode & 0o777).toString(8), "600");
+    }
   });
 
   it("records a dashed id under the same key a lookup uses", () => {

@@ -9,12 +9,12 @@ routes. The session's host answers every call with one implementation
 
 Each read uses the first route that works:
 
-| Route | When | Path of the file's bytes |
-|---|---|---|
-| Direct, local socket | Desktop app, host on the same machine | host → desktop |
-| Direct, over SSH | Desktop app, host on a machine this desktop connected with "Connect over SSH" | host → SSH → desktop |
-| Server workspace API | Any client, or the desktop when direct fails | host → host tunnel → server → client |
-| REST file routes | Everything else, and paths outside the workspace | runner (or host) → server → client |
+| Route                | When                                                                          | Path of the file's bytes             |
+| -------------------- | ----------------------------------------------------------------------------- | ------------------------------------ |
+| Direct, local socket | Desktop app, host on the same machine                                         | host → desktop                       |
+| Direct, over SSH     | Desktop app, host on a machine this desktop connected with "Connect over SSH" | host → SSH → desktop                 |
+| Server workspace API | Any client, or the desktop when direct fails                                  | host → host tunnel → server → client |
+| REST file routes     | Everything else, and paths outside the workspace                              | runner (or host) → server → client   |
 
 Direct reads keep file bytes off the server: it only issues a token. The server
 API skips the runner and streams protobuf messages through without re-encoding
@@ -23,15 +23,16 @@ answers such as "not found" go to REST, so callers keep the errors they expect.
 
 ## Turning it on
 
-| Where | What |
-|---|---|
-| Server | `OMNIGENT_FEATURES=workspace_direct_access,workspace_api_server_access` |
-| Server | `omnigent[workspace-api]`, for the server API route only |
-| Hosts | `omnigent[workspace-api]`. A host with it always opens its workspace socket; it has no flag of its own. |
-| Desktop app | A release with the workspace socket bridge. Older shells fall back to the server routes. |
+| Where       | What                                                                                                    |
+| ----------- | ------------------------------------------------------------------------------------------------------- |
+| Server      | `OMNIGENT_FEATURES=workspace_direct_access,workspace_api_server_access`                                 |
+| Server      | `omnigent[workspace-api]`, for the server API route only                                                |
+| Hosts       | `omnigent[workspace-api]`. A host with it always opens its workspace socket; it has no flag of its own. |
+| Desktop app | A release with the workspace socket bridge. Older shells fall back to the server routes.                |
 
 Both flags are off by default and appear in `/v1/info`, which is how the page
-picks its route. Turn one off to stop that route for every client at once.
+picks its route. Turn one off to stop new grants for every client at once. A
+token already issued keeps working until it expires, up to five minutes later.
 
 `omnigent[workspace-api]` adds `connectrpc` and its HTTP client, `pyqwest`.
 On Linux older than glibc 2.28, `pyqwest` has no prebuilt wheel and builds from
@@ -65,9 +66,10 @@ source with Rust.
 - **SSH destinations.** Main records which destination reaches each host it
   connected (`ssh-hosts.json` in the app's data folder, mode 0600), per server.
   Pages and servers only ever name a host id, never a destination.
-- **No new trust prompts.** SSH runs with `BatchMode=yes` and the user's own
-  SSH config. Anything that would prompt fails, and the read goes through the
-  server.
+- **No password or host-key prompts.** SSH runs with `BatchMode=yes` and the
+  user's own SSH config, so a password or an unknown host key fails, and the
+  read goes through the server. An SSH agent's confirmation dialog, or a
+  `ProxyCommand` that talks to the user, can still appear.
 - **Confined sessions** always use the REST routes, which apply their sandbox.
 
 ## Checking it
@@ -80,12 +82,12 @@ source with Rust.
   shell don't appear in the Network tab. A server API read shows
   `…/WorkspaceService/ReadFile`.
 
-| Symptom | Likely cause |
-|---|---|
-| `…/filesystem/…` requests only | Flags off, an old page, a confined session, or a path outside the workspace |
-| `ReadFile` instead of a direct read | Direct failed. Electron main logs why in its console. |
-| `not a workspace socket on this machine` in main's log | The host is on another machine and this desktop has no SSH record for it |
-| `ReadFile` answers `unimplemented` | The host lacks `omnigent[workspace-api]` or predates the workspace API |
+| Symptom                                                | Likely cause                                                                |
+| ------------------------------------------------------ | --------------------------------------------------------------------------- |
+| `…/filesystem/…` requests only                         | Flags off, an old page, a confined session, or a path outside the workspace |
+| `ReadFile` instead of a direct read                    | Direct failed. Electron main logs why in its console.                       |
+| `not a workspace socket on this machine` in main's log | The host is on another machine and this desktop has no SSH record for it    |
+| `ReadFile` answers `unimplemented`                     | The host lacks `omnigent[workspace-api]` or predates the workspace API      |
 
 ## Not covered yet
 

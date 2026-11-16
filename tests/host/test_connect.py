@@ -3221,6 +3221,7 @@ async def test_installed_workspace_extra_starts_the_socket_without_a_host_flag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An installed `omnigent[workspace-api]` opens the socket; no host flag gates it."""
+    monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
     socket = object()
     started_for: list[str] = []
 
