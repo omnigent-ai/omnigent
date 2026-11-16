@@ -264,6 +264,11 @@ the header menu), and each place is a separate entry point.
   a third of its width, or after a quick flick, closes it; a shorter drag springs
   back. List scrolling, row taps, long-press reordering and horizontal scrollers
   keep their own touch handling.
+- `mobile-primary-nav-strip`: on phone layouts, the drawer shows New session,
+  Automations and Inbox as one strip of equal-width icon-over-label
+  cells under the header instead of stacked rows. Cells are at least 44px tall.
+  Flag-gated pages (Canvas, Usage) and extension pages stay full-width rows
+  below the strip.
 - `session-overview`: behind the `session_overview` release flag (off by
   default), the desktop chat header shows the session cost as a `$x.xx` chip.
   Clicking it shows or hides a **Session overview** card with the session cost
@@ -592,6 +597,16 @@ left edge. Swipe left on the drawer or the dimmed chat strip beside it; past a
 third of the drawer's width or after a quick flick it closes on the current
 chat, otherwise it springs back. Settings and desktop widths don't use it.
 
+**Primary navigation on phones:** at phone width, open the sidebar drawer. New
+(named New session for screen readers), Automations and Inbox share one strip
+under the header; the current page's cell keeps the active highlight and the
+Inbox count sits on its cell's corner. With Automations off for the user, the
+strip has two cells. The strip never scrolls; Canvas, Usage and extension pages,
+when enabled, are ordinary rows directly below it. Tapping a cell or row opens
+the page and closes the drawer; a modifier-click leaves it open. The strip
+follows the overlay drawer (narrower than 768px); wider windows and a wide phone
+showing the sidebar beside the chat keep the stacked rows.
+
 **Databricks Sandbox and Arclet sessions:** Fork is enabled in the header,
 sidebar menus, and message actions, and offers the same destinations as any
 other session: connected hosts and each offered sandbox provider. Sessions
@@ -798,6 +813,10 @@ plain `uv run pytest`, which starts a private server for the test.
   These touch-drive the built SPA in desktop Chromium at a phone viewport with
   mocked APIs and a stubbed iOS bridge. Thresholds, multi-touch and long-press
   hand-off are covered in `web/src/hooks/useSidebarSwipeToClose.test.tsx`.
+- **`mobile-primary-nav-strip`:** component coverage only, in
+  `web/src/shell/Sidebar.mobileDrawer.test.tsx` (strip cells with and
+  without Automations, Canvas and Usage as rows below the strip, active state, Inbox badge, drawer closing, rows on desktop and
+  side by side) and `web/src/shell/Sidebar.test.tsx` (extension pages as rows).
 - **`archive`:**
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_archive_moves_session_to_archived`,
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_narrows_and_resets`,
