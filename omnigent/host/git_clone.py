@@ -89,7 +89,8 @@ def clone_repository(frame: HostCloneRepositoryFrame) -> HostCloneRepositoryResu
         returncode = -1
 
     if returncode == 0:
-        _logger.info("Cloned %s into %s", frame.url, destination)
+        # The URL may carry a credential in its path, so only the destination is logged.
+        _logger.info("Cloned a repository into %s", destination)
         return HostCloneRepositoryResultFrame(
             request_id=frame.request_id, status="ok", path=str(destination)
         )
