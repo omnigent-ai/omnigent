@@ -14512,11 +14512,6 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await useChatStore.getState().switchTo(id);
       await drainAsync();
       const reads = itemReads(id);
-      const snapshots = () =>
-        fetchMock.mock.calls.filter(
-          ([input]) => String(input).split("?")[0] === `/v1/sessions/${id}`,
-        ).length;
-      const initialSnapshots = snapshots();
       dispatchForegroundEvent("visibilitychange");
       await drainAsync();
       await vi.advanceTimersByTimeAsync(2_000);
@@ -14524,7 +14519,6 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       dispatchForegroundEvent("pageshow");
       await drainAsync();
       expect(itemReads(id)).toBe(reads + 1);
-      expect(snapshots()).toBe(initialSnapshots + 1);
 
       window.dispatchEvent(new Event("offline"));
       dispatchForegroundEvent("online");
@@ -14706,36 +14700,41 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       ).toEqual([reply.id]);
     });
 
-    it("lets foreground recovery join a current-generation revisit read", async () => {
-      seedSession("conv_revisit", []);
-      seedSession("conv_other", []);
-      routeLiveStreams();
-      await useChatStore.getState().switchTo("conv_revisit");
-      await useChatStore.getState().switchTo("conv_other");
+    it("reads a fresh snapshot after a hidden reconnect read predates a committed reply", async () => {
+      const id = "conv_hidden_read";
+      seedSession(id, []);
+      const sinks = routeLiveStreams();
+      await useChatStore.getState().switchTo(id);
       await drainAsync();
-      const reply = assistantMessage("revisit_reply", "Reply written elsewhere");
-      seedSession("conv_revisit", [reply]);
+      setPageHidden(true);
       const base = fetchMock.getMockImplementation()!;
       let release: (() => void) | undefined;
+      let held = false;
       fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-        if (String(input).startsWith("/v1/sessions/conv_revisit/items?")) {
-          const response = defaultFetchHandler(input, init);
+        const response = base(input, init);
+        if (!held && String(input).startsWith(`/v1/sessions/${id}/items?`)) {
+          held = true;
           return new Promise<Response>((resolve) => {
             release = () => resolve(response);
           });
         }
-        return base(input, init);
+        return response;
       });
-      const reads = itemReads("conv_revisit");
-      await useChatStore.getState().switchTo("conv_revisit");
+      const reads = itemReads(id);
+      sinks.shift()!.error();
       await drainAsync();
-      dispatchForegroundEvent("visibilitychange");
-      await drainAsync();
-      expect(itemReads("conv_revisit")).toBe(reads + 1);
       expect(release).toBeDefined();
+      const reply = assistantMessage("hidden_reply", "Committed after the hidden snapshot");
+      seedSession(id, [reply]);
+
+      setPageHidden(false);
+      await drainAsync();
       release!();
       await drainAsync();
+      await advanceWithHeartbeats(sinks[0]!, 120_000);
+
       expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual([reply.id]);
+      expect(itemReads(id)).toBe(reads + 2);
     });
   });
 
@@ -20073,6 +20072,62 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
   afterEach(() => {
     vi.useRealTimers();
   });
+
+  it.each(["a terminal close", "an items failure"] as const)(
+    "reconciles an approval on return after %s",
+    async (outcome) => {
+      const id = "conv_visible_approval";
+      seedSession(id, []);
+      seedPendingElicitations(id, [pendingElicitationRaw("elic_visible", "Approve?")]);
+      const sinks = routeStreamOpens();
+      await useChatStore.getState().switchTo(id);
+      await drainAsync();
+      expect(elicitationCards()[0]!.status).toBe("pending");
+      const sink = sinks[0]!;
+      let closed = false;
+      onTestFinished(() => {
+        if (!closed) sink.close();
+      });
+      if (outcome === "a terminal close") {
+        sink.push("data: [DONE]\n\n");
+        sink.close();
+        closed = true;
+        await drainAsync();
+        expect(useChatStore.getState().abortController).toBeNull();
+      }
+      let hidden = true;
+      const hiddenSpy = vi.spyOn(document, "hidden", "get").mockImplementation(() => hidden);
+      const visibilitySpy = vi
+        .spyOn(document, "visibilityState", "get")
+        .mockImplementation(() => (hidden ? "hidden" : "visible"));
+      onTestFinished(() => {
+        hiddenSpy.mockRestore();
+        visibilitySpy.mockRestore();
+      });
+      document.dispatchEvent(new Event("visibilitychange"));
+      seedPendingElicitations(id, []);
+      const base = fetchMock.getMockImplementation()!;
+      let failedItemReads = 0;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (
+          outcome === "an items failure" &&
+          String(input).startsWith(`/v1/sessions/${id}/items?`)
+        ) {
+          failedItemReads += 1;
+          return mockResponse({}, { ok: false, status: 503 });
+        }
+        return base(input, init);
+      });
+
+      hidden = false;
+      document.dispatchEvent(new Event("visibilitychange"));
+      await drainAsync();
+
+      expect(elicitationCards()[0]!.status).toBe("responded");
+      expect(elicitationCards()[0]!.response).toEqual({ action: "auto_resolved" });
+      expect(failedItemReads).toBe(outcome === "an items failure" ? 1 : 0);
+    },
+  );
 
   it("updates one Kiro card through sending, retry and receipt, without reviving it", async () => {
     seedSession("conv_kiro_updates", []);

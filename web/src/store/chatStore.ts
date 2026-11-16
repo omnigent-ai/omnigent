@@ -5268,7 +5268,8 @@ export async function retryConversationLoad(id: string): Promise<void> {
   await bindStream(id, entrySetter(entry), entryGetter(entry), true);
 }
 
-// Includes slot acquisition, before a bind publishes its controller.
+// A send's bind can hydrate after publishing its controller without setting
+// loadingConversation; foreground recovery must wait for that snapshot.
 const conversationBindings = new WeakSet<ConversationEntry>();
 
 /**
@@ -5361,9 +5362,7 @@ async function bindStreamAndHydrate(
   // the stream unbinds (abort), so it never leaks across conversations.
   if (typeof document !== "undefined") {
     const onVisible = (): void => {
-      // The active chat's foreground snapshot also reconciles approval cards.
-      if (document.visibilityState === "visible" && useChatStore.getState().conversationId !== id)
-        void reconcilePendingElicitations(id);
+      if (document.visibilityState === "visible") void reconcilePendingElicitations(id);
     };
     document.addEventListener("visibilitychange", onVisible);
     controller.signal.addEventListener("abort", () => {
@@ -6405,37 +6404,6 @@ async function rehydrateWindowOnReconnect(
 /** A reconnect backfill's outcome; only a failed read leaves history owed. */
 type ReconnectBackfill = "applied" | "failed" | "skipped";
 
-// Only foreground recovery may reuse a status-settling read from this generation.
-const reconnectReconciles = new WeakMap<
-  ConversationEntry,
-  { generation: number; promise: Promise<ReconnectBackfill> }
->();
-
-/** Stream recovery always starts a fresh read after subscribing. */
-function reconcileOnReconnect(
-  id: string,
-  set: Setter,
-  get: Getter,
-  ignoredNativeMessageIds: Set<string> = new Set<string>(),
-  settleStatus = true,
-): Promise<ReconnectBackfill> {
-  const entry = conversationRegistry.peek(id);
-  const generation = get().historyGeneration;
-  const promise = reconcileSnapshotOnReconnect(
-    id,
-    set,
-    get,
-    ignoredNativeMessageIds,
-    settleStatus,
-  ).finally(() => {
-    if (entry !== undefined && reconnectReconciles.get(entry)?.promise === promise) {
-      reconnectReconciles.delete(entry);
-    }
-  });
-  if (entry !== undefined && settleStatus) reconnectReconciles.set(entry, { generation, promise });
-  return promise;
-}
-
 /**
  * Reconcile committed state after a reconnect.
  *
@@ -6464,7 +6432,7 @@ function reconcileOnReconnect(
  * mid-fetch voids them. `settleStatus: false` skips the status patch; a live
  * turn edge or send latch change during the reads skips only its turn lifecycle.
  */
-async function reconcileSnapshotOnReconnect(
+async function reconcileOnReconnect(
   id: string,
   set: Setter,
   get: Getter,
@@ -6718,19 +6686,17 @@ function reconcileForegroundConversation(): void {
   if (id === null || isTempConvId(id)) return;
   const entry = conversationRegistry.peek(id);
   if (entry === undefined || entry.disposed) return;
-  const { abortController, loadingConversation, historyGeneration } = entry.getState();
+  const { abortController, loadingConversation } = entry.getState();
   // A pending bind owns hydration; exited pumps wait for an explicit retry.
   if (abortController === null || loadingConversation || conversationBindings.has(entry)) return;
   foregroundRecoveryArmed = false;
-  const pending = reconnectReconciles.get(entry);
-  void (pending?.generation === historyGeneration
-    ? pending.promise
-    : reconcileOnReconnect(
-        id,
-        entrySetter(entry),
-        entryGetter(entry),
-        nativePreviewTombstonesByController.get(abortController),
-      ));
+  // A read started while hidden can predate items committed before this edge.
+  void reconcileOnReconnect(
+    id,
+    entrySetter(entry),
+    entryGetter(entry),
+    nativePreviewTombstonesByController.get(abortController),
+  );
 }
 
 if (typeof document !== "undefined") {
