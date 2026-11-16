@@ -8,6 +8,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { ChunkLoadErrorBoundary } from "@/components/ChunkLoadErrorBoundary";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { Outlet, useLocation, useNavigate } from "@/lib/routing";
+import { TilesLaunchRedirect } from "@/tiles/TilesLaunchRedirect";
 import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
@@ -58,6 +59,10 @@ const InboxPage = withPageView(
 const CanvasLandingPage = withPageView("canvas", () => null);
 const GridPage = withPageView("grid", () => null);
 const TasksPage = lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage })));
+const TilesPage = withPageView(
+  "tiles",
+  lazy(() => import("@/pages/TilesPage").then((m) => ({ default: m.TilesPage }))),
+);
 const UsagePage = withPageView(
   "usage",
   lazy(() => import("@/pages/UsagePage").then((m) => ({ default: m.UsagePage }))),
@@ -178,6 +183,7 @@ function AppRoutes({ basename }: AppProps) {
 
   return (
     <Suspense fallback={<PageLoading />}>
+      <TilesLaunchRedirect prefix={prefix} />
       <Routes>
         {info !== "loading" && info.accounts_enabled && (
           <>
@@ -252,6 +258,14 @@ function AppRoutes({ basename }: AppProps) {
             element={
               <FeatureGatedPage feature="workflows">
                 <WorkflowDetailPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/tiles`}
+            element={
+              <FeatureGatedPage feature="tiles_view">
+                <TilesPage />
               </FeatureGatedPage>
             }
           />

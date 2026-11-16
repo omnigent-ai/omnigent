@@ -25,6 +25,12 @@ the header menu), and each place is a separate entry point.
   conversation to split left/right or top/bottom with a hover preview. Up to four
   independent chats fit in two rows and two columns. Grids live at `/grid/<id>`
   and are saved only in this browser, scoped to server and user.
+- `session-tiles`: behind `tiles_view`, **Tiles** in the sidebar shows your active
+  sessions as live tiles. Click a tile to make it the active agent (the only one
+  with a composer); **Single agent** returns to that session. Gallery tiles resize
+  by their edges, Focus shows the active agent beside a live strip, and Cards
+  show status only. Settings → General → Tiles can hide the button or open the
+  app in Tiles.
 - `pin`: standalone sessions and family representatives move to Pinned and back;
   pinning a representative moves its whole family.
 - `pin-undo`: unpinning shows an Undo toast that re-pins the session into its

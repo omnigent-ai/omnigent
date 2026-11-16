@@ -54,6 +54,7 @@ class Feature(StrEnum):
     WORKSPACE_DIRECT_ACCESS = "workspace_direct_access"
     WORKSPACE_API_SERVER_ACCESS = "workspace_api_server_access"
     PROACTIVE_AGENT = "proactive_agent"
+    TILES_VIEW = "tiles_view"
 
 
 @dataclass(frozen=True)
@@ -280,6 +281,13 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         # Clients probe proactive_agent_available in GET /v1/info; the settings
         # decide whether it is enabled.
         frontend_visible=False,
+    ),
+    FeatureDefinition(
+        feature=Feature.TILES_VIEW,
+        description="Tile view: active agents as live tiles in Gallery, Focus and Cards layouts",
+        owner="web",
+        review_by_release="0.28.0",
+        frontend_visible=True,
     ),
 )
 
