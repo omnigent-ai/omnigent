@@ -4529,27 +4529,50 @@ async def test_concurrent_relaunches_are_single_flight(
 
 
 @pytest.mark.parametrize(
-    "scenario", ["replaced", "gone", "denied", "replaced_again", "ack_timeout", "cancelled"]
+    "scenario",
+    [
+        "replaced",
+        "gone",
+        "denied",
+        "replaced_again",
+        "ack_timeout",
+        "cancelled",
+        "recovery_replaced",
+    ],
 )
 async def test_relaunch_recovers_only_a_rejected_enqueue(
     db_uri: str, monkeypatch: pytest.MonkeyPatch, scenario: str
 ) -> None:
-    """A replacement gets one identical launch, only before enqueue succeeds."""
+    """Ordinary launches retry once; recovery waits for the replacement's own request."""
+    from dataclasses import replace
+
     from omnigent.errors import ErrorCode, OmnigentError
     from omnigent.server.host_registry import HostRegistry
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes._sessions import helpers as sessions_helpers
+    from omnigent.session_recovery import SessionRecovery
 
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation()
     store.set_host_id(conv.id, _HOST_ID, workspace=_WORKSPACE)
     conv = store.get_conversation(conv.id)
     assert conv is not None
+    recovery = None
+    if scenario == "recovery_replaced":
+        recovery = SessionRecovery(
+            _HOST_ID, conv.runner_id or "", 100, phase="launching", attempts=1
+        )
+        assert store.replace_session_recovery(conv.id, None, recovery)
     registry = HostRegistry()
     host_store = HostStore(db_uri)
     host_store.upsert_on_connect(host_id=_HOST_ID, name="laptop", user_id="local")
     registry.launch_authorizer = host_store.admit_launch
-    hello = HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="laptop")
+    hello = HostHelloFrame(
+        version="0.1.0-test",
+        frame_protocol_version=1,
+        name="laptop",
+        recover_interrupted_sessions=recovery is not None,
+    )
     original = registry.register(_HOST_ID, _NoopRunnerWS(), hello, owner=None)
     connections = [original]
     admissions: list[HostConnection] = []
@@ -4576,7 +4599,7 @@ async def test_relaunch_recovers_only_a_rejected_enqueue(
                     registry.register(
                         _HOST_ID,
                         _NoopRunnerWS(),
-                        hello,
+                        replace(hello, recover_interrupted_sessions=False),
                         owner="different-owner@example.test" if scenario == "denied" else None,
                     )
                 )
@@ -4605,7 +4628,9 @@ async def test_relaunch_recovers_only_a_rejected_enqueue(
     monkeypatch.setattr(sessions_helpers, "_HOST_LAUNCH_RESULT_TIMEOUT_S", 0.01)
 
     async def launch() -> Any:
-        return await sessions_module._launch_runner_on_host(conv, store, registry, original)
+        return await sessions_module._launch_runner_on_host(
+            conv, store, registry, original, recovery=recovery
+        )
 
     if scenario == "denied":
         with pytest.raises(OmnigentError) as rejected:
@@ -4621,10 +4646,10 @@ async def test_relaunch_recovers_only_a_rejected_enqueue(
 
     assert len(bound_runner_ids) == 1
     assert store.get_conversation(conv.id).runner_id == bound_runner_ids[0]
-    expected_attempts = 1 if scenario in ("gone", "denied") else 2
+    expected_attempts = 1 if scenario in ("gone", "denied", "recovery_replaced") else 2
     assert len(attempted_frames) == expected_attempts
     assert len(set(attempted_frames)) == 1
-    assert len(admissions) == (1 if scenario == "gone" else 2)
+    assert len(admissions) == (1 if scenario in ("gone", "recovery_replaced") else 2)
     assert admissions == connections[: len(admissions)]
     assert len(accepted_frames) == (scenario in ("replaced", "ack_timeout", "cancelled"))
     if accepted_frames:
@@ -4633,6 +4658,12 @@ async def test_relaunch_recovers_only_a_rejected_enqueue(
         assert accepted_frames[0].session_id == conv.id
     assert all(not conn.pending_launches for conn in connections)
     assert all(future.done() for future in pending_futures)
+    if recovery is not None:
+        assert original.hello.recover_interrupted_sessions
+        assert not connections[-1].hello.recover_interrupted_sessions
+        frame = decode_host_frame(attempted_frames[0])
+        assert isinstance(frame, HostLaunchRunnerFrame) and frame.recovery
+        assert connections[-1].outbound_queue.empty()
 
 
 async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(

@@ -22,7 +22,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
@@ -43,11 +43,13 @@ from omnigent.runner.transports.ws_tunnel.frames import EventAckFrame, EventBatc
 from omnigent.runtime import inflight_text
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.background_session_titles import BackgroundTitleRequest
+from omnigent.server.host_session_recovery import HostSessionRecoverer
 from omnigent.server.routes._sessions.helpers import (
     _NativeTerminalEnsureOutcome,
     _RunnerForwardResult,
 )
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
+from omnigent.session_recovery import SessionRecovery
 from omnigent.spec.types import SkillSpec
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -10855,6 +10857,7 @@ async def test_stop_session_no_runner_lifts_stop_fence(
 
 async def test_retry_session_reports_live_runner_noop_without_mutating_history(
     client: httpx.AsyncClient,
+    app: FastAPI,
     monkeypatch: pytest.MonkeyPatch,
     metadata_rows: list[dict[str, object]],
 ) -> None:
@@ -10870,6 +10873,8 @@ async def test_retry_session_reports_live_runner_noop_without_mutating_history(
     monkeypatch.setattr(routes_events, "_ensure_runner_session_initialized", initialize)
     get_runner = AsyncMock(return_value=runner_client)
     monkeypatch.setattr(routes_events, "_get_runner_client", get_runner)
+    recoverer = Mock()
+    monkeypatch.setattr(app.state, "host_session_recoverer", recoverer, raising=False)
 
     response = await client.post(
         f"/v1/sessions/{session['id']}/events",
@@ -10877,6 +10882,8 @@ async def test_retry_session_reports_live_runner_noop_without_mutating_history(
     )
 
     assert response.status_code == 202, response.text
+    recoverer.stop_recovery.assert_called_once()
+    assert recoverer.stop_recovery.call_args.kwargs == {"only_pending": True}
     _assert_activity_metadata(metadata_rows, session["id"], "retry_session")
     initialize.assert_awaited_once()
     assert initialize.await_args.kwargs["suppress_recovery_turn"] is True
@@ -11107,10 +11114,14 @@ async def test_native_message_is_refused_with_input_kept_when_host_runner_tunnel
 
 async def test_retry_session_keeps_error_actionable_when_runner_is_unavailable(
     client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Retry fails loud when no runner can reconnect, without adding history."""
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
+    recoverer = Mock()
+    monkeypatch.setattr(app.state, "host_session_recoverer", recoverer, raising=False)
 
     response = await client.post(
         f"/v1/sessions/{session['id']}/events",
@@ -11118,6 +11129,7 @@ async def test_retry_session_keeps_error_actionable_when_runner_is_unavailable(
     )
 
     assert response.status_code == 503, response.text
+    recoverer.stop_recovery.assert_not_called()
     snapshot = await client.get(f"/v1/sessions/{session['id']}")
     assert snapshot.json()["items"] == []
 
@@ -13039,10 +13051,22 @@ async def test_patch_reasoning_effort_swallows_runner_failure(
 
 async def test_session_event_tools_malformed_returns_400(
     client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A malformed ``tools`` entry fails fast at the route boundary."""
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    host_id, runner_id = "a" * 32, "runner_recovery"
+    store.set_host_id(session["id"], host_id, workspace="/workspace")
+    store.set_runner_id(session["id"], runner_id)
+    recovery = SessionRecovery(host_id, runner_id, 100)
+    assert store.replace_session_recovery(session["id"], None, recovery)
+    recoverer = HostSessionRecoverer(store, Mock(), Mock(), Mock(), Mock())
+    monkeypatch.setattr(recoverer, "enabled", lambda _: True)
+    monkeypatch.setattr(app.state, "host_session_recoverer", recoverer, raising=False)
 
     # Missing function.name is the canonical malformed case.
     resp = await client.post(
@@ -13059,6 +13083,7 @@ async def test_session_event_tools_malformed_returns_400(
     assert resp.status_code == 400, (
         f"Expected 400 for malformed tools; got {resp.status_code}: {resp.text[:200]}"
     )
+    assert store.get_session_recovery(session["id"]) == recovery
 
 
 # ── POST /v1/sessions/{id}/events external_codex_subagent_start ──────────────

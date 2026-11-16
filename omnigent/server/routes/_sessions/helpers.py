@@ -6813,8 +6813,10 @@ async def _launch_runner_on_host_locked(
                 host_conn.pending_launches.pop(request_id, None)
                 launch_future.cancel()
                 replacement = host_registry.get(host_conn.host_id)
+                # A replacement must request recovery under its own capability and policy.
                 if (
-                    enqueue_attempt == 0
+                    recovery is None
+                    and enqueue_attempt == 0
                     and replacement is not None
                     and replacement is not host_conn
                 ):

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import time
 from types import SimpleNamespace
+from typing import Literal
 from unittest.mock import Mock
 
 import httpx
@@ -42,7 +43,7 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.routes._sessions.orchestration import HOST_OFFLINE_HOLD_S
 from omnigent.server.schemas import ErrorDetail
-from omnigent.session_recovery import RECOVERY_LABEL_PREFIX
+from omnigent.session_recovery import RECOVERY_LABEL_PREFIX, SessionRecovery
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -130,17 +131,36 @@ def test_reconcile_is_conditional_and_marks_scheduled_run_incomplete(
     assert fresh.live_status == "running"
 
 
-@pytest.mark.parametrize("enabled", [False, True], ids=["opt-out", "opt-in"])
+@pytest.mark.parametrize(
+    ("enabled", "phase"),
+    [
+        pytest.param(False, None, id="opt-out"),
+        pytest.param(True, None, id="opt-in"),
+        pytest.param(True, "stopped", id="stopped"),
+        pytest.param(True, "failed", id="failed"),
+    ],
+)
 @pytest.mark.parametrize("path", ["orphan", "offline"])
 async def test_interrupted_runner_bookkeeping_requires_recovery_opt_in(
-    db_uri: str, monkeypatch: pytest.MonkeyPatch, enabled: bool, path: str
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: bool,
+    phase: Literal["stopped", "failed"] | None,
+    path: str,
 ) -> None:
     sid = _seed_running_session(db_uri, runner_fresh=False)
     store = SqlAlchemyConversationStore(db_uri)
     host_id = "a" * 32
     store.set_host_id(sid, host_id, workspace="/workspace")
     conv = store.get_conversation(sid)
-    assert conv is not None
+    assert conv is not None and conv.runner_id is not None
+    previous = (
+        SessionRecovery(host_id, conv.runner_id, now_epoch(), phase=phase)
+        if phase is not None
+        else None
+    )
+    if previous is not None:
+        assert store.replace_session_recovery(sid, None, previous)
     config = ManagedSandboxDeployment.single(
         ManagedSandboxConfig(
             server_url="https://server.example.test",
@@ -173,7 +193,7 @@ async def test_interrupted_runner_bookkeeping_requires_recovery_opt_in(
             [conv], error, store, host_session_recoverer=service
         )
     recovery = store.get_session_recovery(sid)
-    if enabled:
+    if enabled and previous is None:
         assert recovery is not None
         assert (recovery.host_id, recovery.runner_id, recovery.phase) == (
             host_id,
@@ -182,7 +202,7 @@ async def test_interrupted_runner_bookkeeping_requires_recovery_opt_in(
         )
         publish_status.assert_not_called()
     else:
-        assert recovery is None
+        assert recovery == previous
         current = store.get_conversation(sid)
         assert current is not None
         assert not any(key.startswith(RECOVERY_LABEL_PREFIX) for key in current.labels)
