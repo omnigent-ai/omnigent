@@ -4,6 +4,7 @@
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MemoryRouter } from "react-router-dom";
 import { SharingPage } from "./SharingPage";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import * as identity from "@/lib/identity";
@@ -73,9 +74,11 @@ function radiosIn(group: string): HTMLInputElement[] {
 
 function renderPage() {
   return render(
-    <TooltipProvider>
-      <SharingPage />
-    </TooltipProvider>,
+    <MemoryRouter>
+      <TooltipProvider>
+        <SharingPage />
+      </TooltipProvider>
+    </MemoryRouter>,
   );
 }
 
@@ -203,9 +206,11 @@ describe("SharingPage", () => {
 
     setSharingState(state({ sharing_mode: "restricted_read_only" }));
     view.rerender(
-      <TooltipProvider>
-        <SharingPage />
-      </TooltipProvider>,
+      <MemoryRouter>
+        <TooltipProvider>
+          <SharingPage />
+        </TooltipProvider>
+      </MemoryRouter>,
     );
     expect(trigger).toHaveTextContent(/^Read only \(restricted\)$/);
     expect(trigger).toHaveAccessibleDescription(
@@ -436,9 +441,11 @@ describe("SharingPage", () => {
 
       setSharingState(state({ public_sharing_enabled: true, default_public_sessions: "all" }));
       view.rerender(
-        <TooltipProvider>
-          <SharingPage />
-        </TooltipProvider>,
+        <MemoryRouter>
+          <TooltipProvider>
+            <SharingPage />
+          </TooltipProvider>
+        </MemoryRouter>,
       );
 
       const radios = radiosIn(GROUP);
@@ -583,5 +590,41 @@ describe("SharingPage", () => {
       );
       expect(enabledArgs().every((enabled) => enabled === false)).toBe(true);
     });
+  });
+});
+
+describe("SharingPage Settings rows", () => {
+  it("renders each row from its Settings catalog entry", async () => {
+    setSharingState(state({ sharing_mode: "on", default_public_sessions: "sandbox" }));
+    renderPage();
+    await screen.findByRole("combobox", { name: "Session sharing mode" });
+    for (const id of [
+      "sharing-mode",
+      "public-access",
+      "public-max-permission",
+      "default-public-sessions",
+      "peer-session-messaging",
+    ]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(
+      document.querySelector('[data-settings-control="default-public-sessions:scope"]'),
+    ).not.toBeNull();
+    expect(screen.getByRole("switch", { name: "Public access" })).toHaveAttribute(
+      "data-settings-control",
+      "public-access",
+    );
+  });
+
+  it("names the reason a row is greyed out as that row's blocked part", async () => {
+    setSharingState(state({ sharing_mode: "off" }));
+    renderPage();
+    await screen.findByRole("switch", { name: "Public access" });
+    expect(
+      document.querySelector('[data-settings-control="public-access:blocked"]'),
+    ).toHaveAttribute("tabindex", "0");
+    expect(
+      document.querySelector('[data-settings-control="default-public-sessions:blockedBySharing"]'),
+    ).not.toBeNull();
   });
 });
