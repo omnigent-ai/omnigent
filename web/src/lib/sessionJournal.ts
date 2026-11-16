@@ -130,7 +130,8 @@ export function currentPlan(entries: readonly JournalEntry[]): JournalEntry | nu
 export function planGraphRevision(entries: readonly JournalEntry[]): string | number | undefined {
   const plan = currentPlan(entries);
   if (!plan) return undefined;
-  if (typeof plan.content.graph_revision === "string") return plan.content.graph_revision;
+  const recorded = plan.content.graph_revision;
+  if (typeof recorded === "string" || typeof recorded === "number") return recorded;
   const graphKey = (entry: JournalEntry) => {
     const graph = planSteps(entry).map((step) => [step.id, [...step.depends_on].sort()] as const);
     graph.sort(([left], [right]) => left.localeCompare(right));
@@ -138,8 +139,11 @@ export function planGraphRevision(entries: readonly JournalEntry[]): string | nu
   };
   const key = graphKey(plan);
   let position = plan.position;
+  let previousPosition = plan.position;
   for (let index = entries.indexOf(plan) - 1; index >= 0; index -= 1) {
     const entry = entries[index];
+    if (entry.position !== previousPosition - 1) break;
+    previousPosition = entry.position;
     if (entry.kind === "plan_status") break;
     if (entry.kind !== "plan") continue;
     if (graphKey(entry) !== key) break;

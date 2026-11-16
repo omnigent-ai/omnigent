@@ -3525,8 +3525,8 @@ class WorkflowRun(BaseModel):
     One run of a saved workflow: a session that started it.
 
     :param id: The run's ID: that of the plan entry that started it.
-    :param plan_graph_revision: Stable graph ID, or the latest plan position for legacy journals.
-        ``None`` when authoritative plan context is unavailable.
+    :param plan_graph_revision: Stable graph ID, or the earliest position of the
+        unchanged legacy graph. ``None`` when authoritative context is unavailable.
     :param session_id: The session that ran it.
     :param title: The session's title; empty when it has none yet.
     :param started_at: Unix epoch seconds when the run's plan was written.

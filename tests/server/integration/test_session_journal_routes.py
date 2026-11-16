@@ -1312,6 +1312,20 @@ async def test_a_workflows_runs_list_the_sessions_that_ran_it(
     legacy_run = next(run for run in legacy_runs if run["id"] == first_plan.id)
     assert legacy_run["plan_graph_revision"] == first_plan.position
 
+    journal_url = f"/v1/sessions/{first}/journal"
+    latest = await client.get(
+        journal_url, params={"kind": "plan", "order": "desc", "limit": 1}, headers=_headers(ALICE)
+    )
+    assert latest.json()["data"][0]["content"]["graph_revision"] == first_plan.position
+    unchanged = await client.post(
+        journal_url,
+        json=_write("plan", plan, "legacy-post-save"),
+        headers=_runner(first),
+    )
+    assert unchanged.status_code == 200, unchanged.text
+    assert unchanged.json()["content"]["graph_revision"] == first_plan.position
+    assert SessionJournalStore(db_uri).current_plan(first).content["graph_revision"] is None
+
     conversations = SqlAlchemyConversationStore(db_uri)
     child = _session(db_uri, parent_conversation_id=first)
     for _ in range(60):

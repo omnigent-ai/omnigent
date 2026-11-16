@@ -168,6 +168,9 @@ class SessionJournalStore:
         self._session = make_named_managed_session_maker(
             engine, query_name_prefix="omnigent.session_journal"
         )
+        self._history_session = make_named_managed_session_maker(
+            engine, query_name_prefix="omnigent.session_journal", reuse_shared_reads=False
+        )
         self._session_immediate = make_named_managed_session_maker(
             engine, query_name_prefix="omnigent.session_journal", immediate=True
         )
@@ -735,18 +738,20 @@ class SessionJournalStore:
         """
         entries = SqlSessionJournalEntry
         revisions: list[str | int] = []
-        with self._session("read_plan_graph_revisions") as session:
-            for plan in plans:
-                revision = plan.content.get("graph_revision")
-                if isinstance(revision, str):
-                    revisions.append(revision)
-                    continue
+        for plan in plans:
+            revision = plan.content.get("graph_revision")
+            if isinstance(revision, str):
+                revisions.append(revision)
+                continue
+            with self._history_session("read_plan_graph_boundary") as session:
                 boundary = self._newest_kind_row(
                     session, plan.conversation_id, _PLAN_STATUS_KIND, before_position=plan.position
                 )
-                graph = _plan_graph(plan.content)
-                position = plan.position
-                while True:
+                boundary_position = boundary.position if boundary else -1
+            graph = _plan_graph(plan.content)
+            position = plan.position
+            while True:
+                with self._history_session("read_plan_graph_revisions") as session:
                     rows = list(
                         session.execute(
                             _using(
@@ -757,7 +762,7 @@ class SessionJournalStore:
                                     entries.conversation_id == plan.conversation_id,
                                     entries.kind == _PLAN_KIND,
                                     entries.position < position,
-                                    entries.position > (boundary.position if boundary else -1),
+                                    entries.position > boundary_position,
                                 )
                                 .order_by(entries.position.desc())
                                 .limit(JOURNAL_COPY_BATCH),
@@ -765,15 +770,15 @@ class SessionJournalStore:
                             )
                         ).scalars()
                     )
-                    for previous in self._entries(rows):
-                        if _plan_graph(previous.content) != graph:
-                            break
-                        position = previous.position
-                    else:
-                        if len(rows) == JOURNAL_COPY_BATCH:
-                            continue
-                    break
-                revisions.append(position)
+                for previous in self._entries(rows):
+                    if _plan_graph(previous.content) != graph:
+                        break
+                    position = previous.position
+                else:
+                    if len(rows) == JOURNAL_COPY_BATCH:
+                        continue
+                break
+            revisions.append(position)
         return revisions
 
     def current_run_plan_ids(self, plans: Sequence[JournalEntry]) -> set[str]:

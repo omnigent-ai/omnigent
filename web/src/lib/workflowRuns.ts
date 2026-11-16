@@ -10,7 +10,7 @@ import {
 export interface WorkflowRun {
   /** The ID of the plan entry that started the run. */
   id: string;
-  /** Graph ID, or latest legacy plan position; absent on older servers. */
+  /** Graph ID, or earliest unchanged legacy graph position; absent on older servers. */
   planGraphRevision?: string | number;
   sessionId: string;
   /** The session's title; empty when it has none yet. */

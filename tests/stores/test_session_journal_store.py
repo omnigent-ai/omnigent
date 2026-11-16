@@ -14,6 +14,7 @@ import sqlalchemy as sa
 from omnigent.db import current_query_name
 from omnigent.db.compression import EncryptedTextPayload, decode, encode_encrypted
 from omnigent.db.db_models import MAX_STORED_VALUE_BYTES, SqlSessionJournalEntry
+from omnigent.db.utils import get_or_create_engine, shared_read_scope
 from omnigent.entities import MessageData, NewConversationItem
 from omnigent.entities.session_journal import (
     InvalidJournalEntryError,
@@ -824,9 +825,25 @@ def test_legacy_graph_revisions_ignore_saves_and_isolate_replans_and_invocations
                 .values(content=journal._stored_contents([content])[0])
             )
     legacy = {entry.id: entry for entry in journal.list_entries(SESSION, kind="plan").entries}
-    assert journal.plan_graph_revisions(
-        [legacy[entry.id] for entry in (saved, renamed, latest, first)]
-    ) == [first.position, changed.position, next_run.position, first.position]
+    transactions: list[object] = []
+
+    def capture(connection, _cursor, statement, _parameters, _context, _executemany):
+        if "session_journal_entries" in statement:
+            transaction = connection.get_transaction()
+            assert transaction is not None
+            transactions.append(transaction)
+
+    engine = get_or_create_engine(journal.storage_location)
+    sa.event.listen(engine, "before_cursor_execute", capture)
+    try:
+        with shared_read_scope():
+            assert journal.plan_graph_revisions(
+                [legacy[entry.id] for entry in (saved, renamed, latest, first)]
+            ) == [first.position, changed.position, next_run.position, first.position]
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", capture)
+    assert len(transactions) > 4
+    assert len({id(transaction) for transaction in transactions}) == len(transactions)
 
 
 @pytest.mark.parametrize("next_workflow", [None, WORKFLOW, OTHER_WORKFLOW])

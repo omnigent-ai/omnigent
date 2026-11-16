@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from collections.abc import Sequence
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -187,6 +188,24 @@ def entry_to_response(entry: JournalEntry) -> SessionJournalEntry:
     )
 
 
+def _entries_to_responses(
+    store: SessionJournalStore, entries: Sequence[JournalEntry]
+) -> list[SessionJournalEntry]:
+    """Include authoritative legacy graph context even when the page omits replans."""
+    responses = [entry_to_response(entry) for entry in entries]
+    latest = max(
+        (entry for entry in entries if entry.kind == "plan"),
+        key=lambda entry: entry.position,
+        default=None,
+    )
+    if latest is not None:
+        (revision,) = store.plan_graph_revisions([latest])
+        for response in responses:
+            if response.id == latest.id:
+                response.content = {**response.content, "graph_revision": revision}
+    return responses
+
+
 def create_session_journal_router(
     conversation_store: ConversationStore,
     *,
@@ -263,7 +282,7 @@ def create_session_journal_router(
             )
         except ValueError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
-        data = [entry_to_response(entry) for entry in page.entries]
+        data = await asyncio.to_thread(_entries_to_responses, store, page.entries)
         return SessionJournalPage(
             data=data,
             first_id=data[0].id if data else None,
@@ -357,7 +376,7 @@ def create_session_journal_router(
             workflow_id=body.workflow_id,
             start_run=body.start_run,
         )
-        return entry_to_response(entry)
+        return (await asyncio.to_thread(_entries_to_responses, _store(), [entry]))[0]
 
     async def _require_workflow(request: Request, kind: str, workflow_id: str) -> None:
         """Refuse a workflow on anything but a plan, or one that isn't the caller's."""

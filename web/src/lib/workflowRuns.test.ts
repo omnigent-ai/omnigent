@@ -69,6 +69,12 @@ describe("describeWorkflowRun", () => {
     });
   });
 
+  it("keeps older-server activity when authoritative graph context is absent", () => {
+    expect(
+      describeWorkflowRun({ ...run({ done: 5 }, "running"), planGraphRevision: undefined }),
+    ).toEqual({ kind: "running", label: "5 of 5 done" });
+  });
+
   it("counts background work while keeping completed and input states", () => {
     const active = { ...run({ started: 1 }), backgroundWorkRunning: true };
     expect(describeWorkflowRun(active).kind).toBe("running");

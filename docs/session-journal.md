@@ -69,6 +69,9 @@ Omnigent records a stable `graph_revision` ID in plan content when step IDs or
 dependencies change, or a new invocation starts. Statuses record that revision,
 and saving unchanged steps keeps it, so saves and forks preserve completion.
 Older plans can omit this metadata or carry `null` when the revision is unknown.
+Journal responses resolve the newest plan's legacy graph on read and return its
+earliest unchanged position as a numeric `graph_revision`, without changing stored content.
+This keeps completion accurate when a client's loaded history skips replans.
 
 Limits: a plan has at most 100 steps and 32 KiB of JSON, and its name at most 80
 characters; status text is required except for `started`; a note is at most 4

@@ -266,6 +266,37 @@ describe("isPlanComplete", () => {
     expect(isPlanComplete([])).toBe(false);
   });
 
+  it("does not infer unchanged legacy graphs across missing history", () => {
+    const original = plan(1, ["review"], ["report", ["review"]]);
+    const independent = plan(4, ["review"], ["report"]);
+    const reviewing = status(5, "review", "started");
+    const reported = status(6, "report", "done");
+    const restored = plan(200, ["review"], ["report", ["review"]]);
+    const sparse = [original, reviewing, reported, restored];
+    const complete = [
+      original,
+      status(2, "review", "done"),
+      status(3, "report", "done"),
+      independent,
+      reviewing,
+      reported,
+      ...Array.from({ length: 193 }, (_, index) => journalEntry(index + 7)),
+      restored,
+    ];
+    for (const entries of [sparse, complete]) {
+      const revision = planGraphRevision(entries);
+      expect(revision).toBe(200);
+      expect(isPlanComplete(stepProgress(planSteps(restored), entries, false), revision)).toBe(
+        false,
+      );
+    }
+    // The server can establish an unchanged graph despite gaps in the loaded history.
+    const saved = { ...restored, content: { ...restored.content, graph_revision: 1 } };
+    const entries = [...sparse.slice(0, -1), saved];
+    expect(planGraphRevision(entries)).toBe(1);
+    expect(isPlanComplete(stepProgress(planSteps(saved), entries, false), 1)).toBe(true);
+  });
+
   it("reopens after a restart, new invocation, or replan with another final step", () => {
     const entries = [status(1, "report", "done")];
     expect(isPlanComplete(stepProgress(steps, entries, false))).toBe(true);

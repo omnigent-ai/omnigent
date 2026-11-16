@@ -1305,7 +1305,7 @@ def create_scheduled_tasks_router(
         Pages like ``GET /scheduled-tasks/{id}/runs``, most recent first. Each
         run that wrote a plan lists its latest plan within that invocation and
         each step's newest status entry. The first plan's ID still guards actions.
-        The response is ``{"runs": [{"run_id",
+        The response is ``{"runs": [{"run_id", "plan_id", "plan_graph_revision",
         "workflow_id", "plan_name", "is_current", "steps", "statuses"}], "next_cursor"}``.
         """
         from omnigent.server.session_journal import entry_to_response, open_store
