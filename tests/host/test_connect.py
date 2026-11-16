@@ -3207,26 +3207,10 @@ async def test_hello_advertises_the_workspace_socket_only_while_it_runs(
         assert hello.workspace_token_key is None
 
 
-@pytest.mark.parametrize(
-    ("features", "enabled"),
-    [("workspace_direct_access", True), ("", False), ("not_a_feature", False)],
-)
-async def test_workspace_direct_access_follows_omnigent_features(
-    monkeypatch: pytest.MonkeyPatch, features: str, enabled: bool
-) -> None:
-    """The host opens its socket only when enabled, and an invalid list never stops the host."""
-    from omnigent.host.connect import _workspace_direct_access_enabled
-
-    monkeypatch.setenv("OMNIGENT_FEATURES", features)
-
-    assert _workspace_direct_access_enabled() is enabled
-
-
 async def test_workspace_socket_without_its_extra_leaves_the_host_running(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Enabling direct access without `omnigent[workspace-api]` turns it off, not the host."""
-    monkeypatch.setenv("OMNIGENT_FEATURES", "workspace_direct_access")
+    """Without `omnigent[workspace-api]` the host runs with no workspace socket."""
     # None in sys.modules makes the import fail as if connectrpc weren't installed.
     monkeypatch.setitem(sys.modules, "omnigent.host.workspace_service", None)
 
