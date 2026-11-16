@@ -386,10 +386,12 @@ export async function listScheduledTaskRuns(id: string): Promise<ScheduledTaskRu
   return (body.runs ?? []).map(runFromWire);
 }
 
-/** The plan a run started with: its steps and each step's newest status. */
+/** The latest plan within a run: its steps and each step's newest status. */
 export interface ScheduledTaskRunSteps {
   runId: string;
   planId: string | null;
+  /** Graph ID, or latest legacy plan position; absent on older servers. */
+  planGraphRevision?: string | number;
   isCurrent: boolean;
   /** The saved workflow the plan runs, when it named one. */
   workflowId: string | null;
@@ -417,6 +419,7 @@ export async function listScheduledTaskRunSteps(
     runs?: {
       run_id: string;
       plan_id?: string;
+      plan_graph_revision?: string | number | null;
       is_current?: boolean;
       workflow_id: string | null;
       plan_name?: string | null;
@@ -427,6 +430,7 @@ export async function listScheduledTaskRunSteps(
   return (body.runs ?? []).map((run) => ({
     runId: run.run_id,
     planId: run.plan_id ?? null,
+    planGraphRevision: run.plan_graph_revision ?? undefined,
     isCurrent: run.is_current === true,
     workflowId: run.workflow_id,
     planName: run.plan_name ?? null,

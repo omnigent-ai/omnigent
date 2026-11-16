@@ -85,10 +85,28 @@ export function canCreateAutomationFromSession({
 }
 
 /** An automation's page, or the automations list on servers without automation pages. */
-export function automationPagePath(info: ServerInfo | "loading", task: ScheduledTask): string {
+export function automationPagePath(
+  info: ServerInfo | "loading",
+  task: Pick<ScheduledTask, "id">,
+): string {
   return isFeatureEnabled(info, "automations_v2")
     ? `/tasks/${encodeURIComponent(task.id)}`
     : "/tasks";
+}
+
+/** Query parameter that opens the share dialog on an automation's page. */
+export const AUTOMATION_SHARE_PARAM = "share";
+
+/**
+ * An automation's page with its share dialog open. Without automation pages it
+ * is the automations list, where the owner can still edit or delete the automation.
+ */
+export function automationSharePath(
+  info: ServerInfo | "loading",
+  task: Pick<ScheduledTask, "id">,
+): string {
+  const page = automationPagePath(info, task);
+  return isFeatureEnabled(info, "automations_v2") ? `${page}?${AUTOMATION_SHARE_PARAM}=1` : page;
 }
 
 /**

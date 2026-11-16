@@ -202,7 +202,12 @@ import { isOwnerLevel } from "@/lib/permissionsApi";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled, isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
+import {
+  isFeatureEnabled,
+  isSingleUserMode,
+  sandboxOptionLabel,
+  SHARING_OFF_REASON,
+} from "@/lib/capabilities";
 import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
 import { showToast } from "@/components/ui/toast";
@@ -4926,9 +4931,7 @@ function ConversationMenuItems({
             {/* Sharing-off is server-wide, so it outranks the per-user owner
                 reason when both apply. */}
             <TooltipContent side="left">
-              {sharingOff
-                ? "Sharing has been disabled for this Omnigent server."
-                : "Only the session owner can share this session"}
+              {sharingOff ? SHARING_OFF_REASON : "Only the session owner can share this session"}
             </TooltipContent>
           </Tooltip>
         ))}
