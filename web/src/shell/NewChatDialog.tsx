@@ -213,8 +213,8 @@ import { isHostAbsolutePath, isNavigablePath } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { RecentWorkspaceList } from "./RecentWorkspaceList";
 import {
-  WORKTREE_RADIO_SELECTOR_INPUT_CLASS,
   WORKTREE_RADIO_SELECTOR_ROW_CLASS,
+  WorktreeRadio,
   WorktreeRadioRow,
   worktreeDisplayName,
 } from "./WorktreeRadioRow";
@@ -7254,8 +7254,8 @@ function NewChatLandingContent({
                           className={cn("cursor-pointer", WORKTREE_RADIO_SELECTOR_ROW_CLASS)}
                           data-testid="new-chat-landing-no-worktree-option"
                         >
-                          <input
-                            type="radio"
+                          <WorktreeRadio
+                            compact
                             name="new-chat-existing-worktree"
                             checked={branchName.trim() === "" && activeWorktree === null}
                             onChange={() => {
@@ -7267,10 +7267,6 @@ function NewChatLandingContent({
                               setAutoSeededBranch("");
                               setWorktreePopoverOpen(false);
                             }}
-                            className={cn(
-                              "size-4 shrink-0 accent-primary",
-                              WORKTREE_RADIO_SELECTOR_INPUT_CLASS,
-                            )}
                           />
                           <span className="font-normal text-foreground">No worktree</span>
                         </label>

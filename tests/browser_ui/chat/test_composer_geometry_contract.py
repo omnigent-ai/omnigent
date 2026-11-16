@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from itertools import pairwise
 
@@ -651,6 +652,73 @@ def test_workspace_tray_aligns_with_the_card(
     )
     assert compact_inset < expected
     assert box(chip)["x"] - tray_box["x"] == pytest.approx(compact_inset, abs=TOLERANCE)
+
+
+@pytest.mark.parametrize(
+    "native_radio_css",
+    [
+        "",
+        # Reproduces the reported layout: an engine that reserves space around native radios.
+        'input[type="radio"] { margin: 0 7px 6px 0 !important; }',
+    ],
+    ids=["default", "native-radio-spacing"],
+)
+def test_worktree_radios_center_on_their_labels(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    native_radio_css: str,
+) -> None:
+    chat = chat_session_contract
+    chat.contract.json(
+        "/v1/hosts",
+        {
+            "hosts": [
+                {
+                    "host_id": chat.host_id,
+                    "name": "Browser host",
+                    "owner": "local",
+                    "status": "online",
+                    "configured_harnesses": {chat.harness: True},
+                }
+            ]
+        },
+    )
+    chat.contract.json(
+        f"/v1/hosts/{chat.host_id}/worktrees",
+        {
+            "data": [
+                {"path": "/work/repo", "branch": "main", "is_main": True},
+                {
+                    "path": "/work/repo-worktrees/alpha",
+                    "branch": "feature/alpha",
+                    "is_main": False,
+                },
+                {"path": "/work/repo-worktrees/beta", "branch": "feature/beta", "is_main": False},
+            ]
+        },
+    )
+    chat.contract.json("/v1/skills", {"skills": []})
+    recent = json.dumps({chat.host_id: ["/work/repo"]})
+    page.add_init_script(
+        f"localStorage.setItem('omnigent:recent-workspaces', {json.dumps(recent)});"
+    )
+    open_landing(page, chat, DESKTOP)
+    if native_radio_css:
+        page.add_style_tag(content=native_radio_css)
+    page.get_by_test_id("new-chat-landing-branch-chip").click()
+    no_worktree = page.get_by_test_id("new-chat-landing-no-worktree-option")
+    worktrees = page.get_by_test_id("new-chat-landing-worktree-option")
+    expect(worktrees).to_have_count(2)
+    expect(no_worktree.get_by_role("radio")).to_be_checked()
+    _settle_menu(page.get_by_role("dialog"))
+    labels = [no_worktree, worktrees.nth(0).locator("label"), worktrees.nth(1).locator("label")]
+    for label in labels:
+        circle = box(label.locator(":scope > :first-child"))
+        text = box(label.locator(":scope > :nth-child(2)"))
+        assert circle["width"] == pytest.approx(16, abs=TOLERANCE)
+        assert circle["height"] == pytest.approx(16, abs=TOLERANCE)
+        assert_same_vertical_center(circle, text)
+        assert text["x"] - (circle["x"] + circle["width"]) == pytest.approx(8, abs=TOLERANCE)
 
 
 def test_queued_rows_and_nested_workspace_share_the_tray_grid(

@@ -2,7 +2,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { WorktreeRadioRow } from "./WorktreeRadioRow";
+import { WORKTREE_RADIO_INDICATOR_CLASS, WorktreeRadioRow } from "./WorktreeRadioRow";
 
 const copyTextMock = vi.fn();
 vi.mock("@/lib/clipboard", () => ({ copyText: (text: string) => copyTextMock(text) }));
@@ -150,8 +150,9 @@ describe("WorktreeRadioRow", () => {
       "focus-within:bg-muted",
       "focus-within:ring-1",
     );
-    expect(screen.getByRole("radio")).toHaveClass("size-4", "appearance-none", "rounded-full");
-    expect(screen.getByRole("radio")).not.toHaveClass("sr-only");
+    const radio = screen.getByRole("radio");
+    expect(radio.parentElement).toHaveClass("relative", "size-4", "shrink-0");
+    expect(radio.nextElementSibling).toHaveClass(...WORKTREE_RADIO_INDICATOR_CLASS.split(" "));
     expect(screen.getByText("auth-refresh")).toHaveClass("font-normal", "leading-4");
     expect(screen.getByText("Unknown")).toHaveClass("text-xs", "leading-4");
   });

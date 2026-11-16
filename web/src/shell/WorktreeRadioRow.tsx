@@ -1,3 +1,4 @@
+import type { ComponentProps } from "react";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
 import { copyText } from "@/lib/clipboard";
 import { relativeTime } from "@/lib/relativeTime";
@@ -22,13 +23,31 @@ import {
 
 export const WORKTREE_RADIO_SPACIOUS_ROW_CLASS = "h-7 rounded-md px-2 py-[3px] text-ui leading-4";
 
-export const WORKTREE_RADIO_SPACIOUS_INPUT_CLASS =
-  "appearance-none rounded-full border border-muted-foreground/60 bg-background checked:border-[5px] checked:border-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2";
-
 export const WORKTREE_RADIO_SELECTOR_ROW_CLASS =
   "h-7 shrink-0 rounded-md px-2 py-[3px] text-ui leading-4";
 
-export const WORKTREE_RADIO_SELECTOR_INPUT_CLASS = WORKTREE_RADIO_SPACIOUS_INPUT_CLASS;
+export const WORKTREE_RADIO_INDICATOR_CLASS =
+  "pointer-events-none absolute inset-0 rounded-full border border-muted-foreground/60 bg-background peer-checked:border-[5px] peer-checked:border-primary peer-focus-visible:ring-2 peer-focus-visible:ring-ring peer-focus-visible:ring-offset-2";
+
+/** Compact rows draw their own circle so engines' native radio layout cannot offset it. */
+export function WorktreeRadio({
+  compact,
+  ...props
+}: Omit<ComponentProps<"input">, "type" | "className"> & { compact: boolean }) {
+  if (!compact) {
+    return <input type="radio" className="size-4 shrink-0 accent-primary" {...props} />;
+  }
+  return (
+    <span className="relative size-4 shrink-0">
+      <input
+        type="radio"
+        className="peer absolute inset-0 m-0 size-full cursor-pointer appearance-none opacity-0"
+        {...props}
+      />
+      <span aria-hidden className={WORKTREE_RADIO_INDICATOR_CLASS} />
+    </span>
+  );
+}
 
 export function worktreeDisplayName(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
@@ -81,16 +100,11 @@ export function WorktreeRadioRow({
       <Tooltip>
         <TooltipTrigger asChild>
           <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2">
-            <input
-              type="radio"
+            <WorktreeRadio
+              compact={spacious || selector}
               name={name}
               checked={checked}
               onChange={onSelect}
-              className={cn(
-                "size-4 shrink-0 accent-primary",
-                spacious && WORKTREE_RADIO_SPACIOUS_INPUT_CLASS,
-                selector && WORKTREE_RADIO_SELECTOR_INPUT_CLASS,
-              )}
               aria-label={`Use worktree ${displayName}`}
             />
             <span

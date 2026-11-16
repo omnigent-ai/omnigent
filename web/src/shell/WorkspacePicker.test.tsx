@@ -33,7 +33,7 @@ import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 import { useDesktopHostId } from "./RevealInFileManager";
 import type * as RevealInFileManagerModule from "./RevealInFileManager";
 import {
-  WORKTREE_RADIO_SPACIOUS_INPUT_CLASS,
+  WORKTREE_RADIO_INDICATOR_CLASS,
   WORKTREE_RADIO_SPACIOUS_ROW_CLASS,
 } from "./WorktreeRadioRow";
 
@@ -1192,13 +1192,15 @@ describe("WorkspacePicker modal actions", () => {
         "workspace-picker-worktree-/Users/corey/worktrees/feature-layout",
       );
       const spaciousRowClasses = WORKTREE_RADIO_SPACIOUS_ROW_CLASS.split(" ");
-      const spaciousInputClasses = WORKTREE_RADIO_SPACIOUS_INPUT_CLASS.split(" ");
+      const indicatorClasses = WORKTREE_RADIO_INDICATOR_CLASS.split(" ");
       expect(currentFolderRow).toHaveClass(...spaciousRowClasses);
       expect(linkedWorktreeRow).toHaveClass(...spaciousRowClasses);
-      expect(screen.getByRole("radio", { name: "Don't use" })).toHaveClass(...spaciousInputClasses);
-      expect(screen.getByRole("radio", { name: "Use worktree feature-layout" })).toHaveClass(
-        ...spaciousInputClasses,
+      expect(screen.getByRole("radio", { name: "Don't use" }).nextElementSibling).toHaveClass(
+        ...indicatorClasses,
       );
+      expect(
+        screen.getByRole("radio", { name: "Use worktree feature-layout" }).nextElementSibling,
+      ).toHaveClass(...indicatorClasses);
       expect(screen.getByRole("radiogroup", { name: "Choose a worktree" })).toHaveClass(
         "space-y-px",
         "px-2",

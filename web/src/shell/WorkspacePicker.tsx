@@ -37,8 +37,8 @@ import {
 } from "@/lib/workspacePickerPreferences";
 import { fileManagerName, useDesktopHostId } from "./RevealInFileManager";
 import {
-  WORKTREE_RADIO_SPACIOUS_INPUT_CLASS,
   WORKTREE_RADIO_SPACIOUS_ROW_CLASS,
+  WorktreeRadio,
   WorktreeRadioRow,
 } from "./WorktreeRadioRow";
 import { WorkspacePickerEntry } from "./WorkspacePickerEntry";
@@ -1229,15 +1229,11 @@ export function WorkspacePicker({
                   )}
                   data-testid="workspace-picker-current-folder"
                 >
-                  <input
-                    type="radio"
+                  <WorktreeRadio
+                    compact={showGitDialog}
                     name="workspace-picker-worktree"
                     checked={selectedWorktreePath === null}
                     onChange={() => setSelectedWorktreePath(null)}
-                    className={cn(
-                      "size-4 shrink-0 accent-primary",
-                      showGitDialog && WORKTREE_RADIO_SPACIOUS_INPUT_CLASS,
-                    )}
                   />
                   <span
                     className={cn("font-medium text-foreground", showGitDialog && "font-normal")}
