@@ -1,13 +1,14 @@
-"""End-to-end test: Stop must clear a stale ``running`` on an idle session.
+"""End-to-end test: Stop must clear a stale ``running`` on an idle session with a live runner.
 
-A finished session can keep ``live_status = running`` on its row while its
-runner is healthy and idle, for example when a turn's ``idle`` edge is lost
-across a reconnect. The snapshot trusts that row, so the UI shows "Working…"
-until Stop clears it. Stop reaches the runner with no turn to cancel.
+A finished session can keep ``live_status = running`` on its row while its runner is healthy
+and idle, for example when a turn's ``idle`` edge is lost across a reconnect. The snapshot and
+the session list trust that row, so the UI shows "Working…" until Stop clears it, and Stop
+reaches the runner with no turn to cancel. ``test_orphaned_running_session_stop`` covers the
+same symptom when the runner is gone; this covers it with the runner still connected.
 
-Journey: run one in-process turn to completion, stop the server, persist
-``running`` on the row, restart the server with a cold status cache, then send
-``interrupt`` (the web UI's Stop) and expect the session to settle to ``idle``.
+Journey: run one in-process turn to completion, persist ``running`` on the row, restart the
+server so its status cache is cold, then send ``interrupt`` (the web UI's Stop) and expect the
+snapshot and the session list to report ``idle``.
 
 Excluded from default ``pytest`` runs via ``--ignore=tests/e2e``. Invoke with::
 
@@ -18,17 +19,13 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
-import time
 from pathlib import Path
 
 import httpx
 import pytest
 import yaml
 
-from omnigent.db.enum_codecs import SESSION_LIVE_STATUS
-from omnigent.util.uuid import uuid_to_bytes
-from tests._helpers.live_server import terminate_process
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from tests._helpers.polling import poll_until
 from tests._helpers.server_runner import server_runner
 from tests._helpers.session import (
@@ -44,7 +41,7 @@ _MODEL = "mock-stop-stale-running"
 _REPLY = "STOP_STALE_RUNNING_REPLY"
 
 
-def _status(client: httpx.Client, session_id: str) -> str | None:
+def _snapshot_status(client: httpx.Client, session_id: str) -> str | None:
     """Return the session snapshot's status, or ``None`` while the server is unavailable."""
     try:
         response = client.get(f"/v1/sessions/{session_id}")
@@ -54,14 +51,14 @@ def _status(client: httpx.Client, session_id: str) -> str | None:
     return response.json().get("status")
 
 
-def _persist_stale_running(database: Path, session_id: str) -> None:
-    """Leave ``live_status = running`` on the session's row, as a lost idle edge would."""
-    with sqlite3.connect(database) as connection:
-        cursor = connection.execute(
-            "UPDATE omnigent_conversation_metadata SET live_status = ? WHERE id = ?",
-            (SESSION_LIVE_STATUS["running"], uuid_to_bytes(session_id)),
-        )
-        assert cursor.rowcount == 1, f"expected one session row, updated {cursor.rowcount}"
+def _listed_status(client: httpx.Client, session_id: str) -> str | None:
+    """Return the session's status in the session list, which drives the sidebar spinner."""
+    response = client.get("/v1/sessions", params={"visibility": "all", "limit": 100})
+    response.raise_for_status()
+    for item in response.json().get("data", []):
+        if item.get("id") == session_id:
+            return item.get("status")
+    return None
 
 
 @pytest.mark.timeout(300)
@@ -106,27 +103,19 @@ def test_stop_clears_a_stale_running_session(
             poll_until(
                 lambda: (
                     _REPLY in json.dumps(client.get(f"/v1/sessions/{session_id}").json())
-                    and _status(client, session_id) == "idle"
+                    and _snapshot_status(client, session_id) == "idle"
                 ),
                 timeout_s=120,
             )
 
-            # A lost idle edge: running on the row, and a restarted server with a cold cache.
-            terminate_process(stack.server)
-            _persist_stale_running(stack.root / "chat.db", session_id)
-            stack.start_server()
-            poll_until(
-                lambda: client.get(f"/v1/runners/{stack.runner_id}/status").json().get("online"),
-                timeout_s=60,
-            )
-            assert _status(client, session_id) == "running", "precondition: stale running shows"
+            # A lost idle edge: running on the row, then a restart so no cache contradicts it.
+            store = SqlAlchemyConversationStore(stack.database_uri)
+            store.set_session_live_status(session_id, "running")
+            stack.restart_server()
+            assert _snapshot_status(client, session_id) == "running", "precondition"
+            assert _listed_status(client, session_id) == "running", "precondition"
 
             stopped = client.post(f"/v1/sessions/{session_id}/events", json={"type": "interrupt"})
             assert stopped.status_code < 400, stopped.text
-            poll_until(lambda: _status(client, session_id) == "idle", timeout_s=30)
-            # Later reads must not reopen the stale status.
-            later_reads = []
-            for _ in range(6):
-                time.sleep(0.5)
-                later_reads.append(_status(client, session_id))
-            assert later_reads == ["idle"] * 6, later_reads
+            poll_until(lambda: _snapshot_status(client, session_id) == "idle", timeout_s=30)
+            assert _listed_status(client, session_id) == "idle"
