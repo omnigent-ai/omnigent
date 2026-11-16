@@ -119,6 +119,16 @@ export function useSaveWorkflowPlan(workflowId: string) {
   });
 }
 
+/** Replace the workflow's description with the user's own wording. */
+export function useSaveWorkflowDescription(workflowId: string) {
+  const onSuccess = useWorkflowSaved();
+  return useMutation({
+    mutationFn: (description: string) =>
+      writeWorkflow(workflowPath(workflowId), "PATCH", { description }),
+    onSuccess,
+  });
+}
+
 /** Persist the planning chat so reopening the workflow restores it on any device. */
 export function useSetWorkflowPlanningSession(workflowId: string) {
   const onSuccess = useWorkflowSaved();

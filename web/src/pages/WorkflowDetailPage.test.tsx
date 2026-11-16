@@ -26,9 +26,10 @@ import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import type * as IdentityModule from "@/lib/identity";
 import type * as RoutingModule from "@/lib/routing";
 import { sessionJournalKey, type JournalEntry, type StepProgress } from "@/lib/sessionJournal";
-import { getSession, sendUserMessage } from "@/lib/sessionsApi";
+import { ApiError, getSession, sendUserMessage } from "@/lib/sessionsApi";
 import { taskActionMessage } from "@/lib/workflow";
 import type * as SessionsApi from "@/lib/sessionsApi";
+import { useChatStore } from "@/store/chatStore";
 import { openTasksTab } from "@/store/sessionTasksActions";
 import type * as TasksActions from "@/store/sessionTasksActions";
 import type { WorkflowStep } from "@/lib/workflowGraphLayout";
@@ -334,7 +335,7 @@ describe("WorkflowDetailPage", () => {
       cleanup();
       renderPage();
       await screen.findByTestId("workflow-detail-title");
-      fireEvent.click(screen.getByRole("button", { name: "Edit workflow" }));
+      fireEvent.click(screen.getByRole("button", { name: "Edit plan with agent" }));
       expect(screen.getByTestId("planning-chat")).toHaveAttribute("data-session", planner);
       expect(screen.getByTestId("workflow-detail-run")).toBeEnabled();
       const edited = [
@@ -393,6 +394,56 @@ describe("WorkflowDetailPage", () => {
     }
   });
 
+  it("opens the planning chat ready to type, and flashes it when pressed while open", () => {
+    const planner = "e".repeat(32);
+    mockWorkflow({ data: { ...WORKFLOW, planning_session_id: planner } });
+    mockRuns([]);
+    // Pressed before the planning session loads, the request waits for its composer.
+    vi.mocked(useSession).mockReturnValue({ session: null, isLoading: true, error: null });
+    vi.useFakeTimers();
+    try {
+      const { rerender } = renderPage();
+      const edit = screen.getByRole("button", { name: "Edit plan with agent" });
+
+      fireEvent.click(edit);
+      expect(screen.getByTestId("planning-chat")).toHaveAttribute("data-session", planner);
+      expect(useChatStore.getState().sideChatComposers[planner]?.autoFocus).toBe(true);
+      expect(screen.queryByTestId("workflow-planning-chat-flash")).toBeNull();
+
+      // The real composer drops the request as it takes focus.
+      useChatStore.getState().clearSideChatComposer(planner);
+      vi.mocked(useSession).mockReturnValue({
+        session: { id: planner, archived: false, labels: {} } as Session,
+        isLoading: false,
+        error: null,
+      });
+      rerender(<WorkflowDetailPage />);
+      fireEvent.click(edit);
+      expect(useChatStore.getState().sideChatComposers[planner]?.autoFocus).toBe(true);
+      expect(screen.getByTestId("workflow-planning-chat-flash")).toBeInTheDocument();
+      act(() => vi.runOnlyPendingTimers());
+      expect(screen.queryByTestId("workflow-planning-chat-flash")).toBeNull();
+    } finally {
+      useChatStore.getState().clearSideChatComposer(planner);
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ["archived", { session: { archived: true, labels: {} } as Session, error: null }],
+    ["deleted", { session: null, error: new ApiError("Session not found", 404, null) }],
+  ])("queues no composer focus for a %s planning session", (_, state) => {
+    const planner = "f".repeat(32);
+    mockWorkflow({ data: { ...WORKFLOW, planning_session_id: planner } });
+    mockRuns([]);
+    vi.mocked(useSession).mockReturnValue({ ...state, isLoading: false });
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit plan with agent" }));
+    expect(screen.getByTestId("planning-chat")).toBeInTheDocument();
+    expect(useChatStore.getState().sideChatComposers[planner]).toBeUndefined();
+  });
+
   it("shows the workflow, its steps, and the sessions that ran it", () => {
     mockWorkflow({});
     mockRuns([
@@ -446,7 +497,7 @@ describe("WorkflowDetailPage", () => {
       vi.useFakeTimers({ shouldAdvanceTime: true });
       try {
         renderPage(client);
-        fireEvent.click(screen.getByRole("button", { name: "Edit workflow" }));
+        fireEvent.click(screen.getByRole("button", { name: "Edit plan with agent" }));
         await act(async () =>
           vi.advanceTimersByTimeAsync(journalHooks.JOURNAL_FALLBACK_REFETCH_MS * 2),
         );
@@ -486,6 +537,96 @@ describe("WorkflowDetailPage", () => {
     } finally {
       scroll.mockRestore();
       client.mockRestore();
+    }
+  });
+
+  it("edits the description in place, keeping the draft when a save fails", async () => {
+    const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+    vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+    mockRuns([]);
+    let stored: WorkflowDetail = { ...WORKFLOW };
+    const patches: unknown[] = [];
+    let rejectSave = true;
+    vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
+      if (options?.method === "PATCH") {
+        patches.push(JSON.parse(String(options.body)));
+        if (rejectSave)
+          return new Response(
+            JSON.stringify({ error: { message: "Try again", type: "server_error" } }),
+            { status: 500 },
+          );
+        stored = {
+          ...stored,
+          description: (patches.at(-1) as { description: string }).description,
+        };
+      }
+      return new Response(JSON.stringify(stored));
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    try {
+      renderPage();
+      await screen.findByTestId("workflow-detail-description");
+      const editorName = { name: "Workflow description" };
+
+      // An unchanged description closes on Escape without saving.
+      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+      const unchanged = screen.getByRole("textbox", editorName);
+      expect(unchanged).toHaveValue(WORKFLOW.description);
+      expect(unchanged).toHaveFocus();
+      expect((unchanged as HTMLTextAreaElement).selectionStart).toBe(WORKFLOW.description.length);
+      fireEvent.keyDown(unchanged, { key: "Escape" });
+      expect(screen.queryByRole("textbox", editorName)).toBeNull();
+
+      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+      const editor = screen.getByRole("textbox", editorName);
+      // The shortcut can't save an empty description, just as the button can't.
+      fireEvent.change(editor, { target: { value: "   " } });
+      fireEvent.keyDown(editor, { key: "Enter", ctrlKey: true });
+      expect(patches).toEqual([]);
+      fireEvent.change(editor, {
+        target: { value: "  Finds flaky tests and fixes the clear ones.  " },
+      });
+      // Keys that end an IME composition neither cancel nor save.
+      fireEvent.keyDown(editor, { key: "Escape", isComposing: true });
+      fireEvent.keyDown(editor, { key: "Enter", ctrlKey: true, isComposing: true });
+      expect(confirm).not.toHaveBeenCalled();
+      expect(patches).toEqual([]);
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      // Browsers blur a control as saving disables it; jsdom doesn't.
+      act(() => editor.blur());
+      expect(await screen.findByRole("alert")).toHaveTextContent("Couldn’t save the description");
+      expect(editor).toHaveFocus();
+      // Escape asks before discarding the edit.
+      fireEvent.keyDown(editor, { key: "Escape" });
+      expect(confirm).toHaveBeenCalledOnce();
+      expect(editor).toHaveValue("  Finds flaky tests and fixes the clear ones.  ");
+
+      rejectSave = false;
+      fireEvent.keyDown(editor, { key: "Enter", metaKey: true });
+      await waitFor(() => expect(screen.queryByRole("textbox", editorName)).toBeNull());
+      expect(patches).toEqual([
+        { description: "Finds flaky tests and fixes the clear ones." },
+        { description: "Finds flaky tests and fixes the clear ones." },
+      ]);
+      expect(screen.getByTestId("workflow-detail-description").textContent).toBe(
+        "Finds flaky tests and fixes the clear ones.",
+      );
+      expect(screen.queryByRole("alert")).toBeNull();
+
+      // Cancel discards an edit once confirmed.
+      confirm.mockReturnValue(true);
+      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+      fireEvent.change(screen.getByRole("textbox", editorName), {
+        target: { value: "Something else" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      expect(screen.queryByRole("textbox", editorName)).toBeNull();
+      expect(screen.getByTestId("workflow-detail-description").textContent).toBe(
+        "Finds flaky tests and fixes the clear ones.",
+      );
+      expect(patches).toHaveLength(2);
+    } finally {
+      confirm.mockRestore();
     }
   });
 
@@ -849,7 +990,7 @@ describe("WorkflowDetailPage", () => {
         fireEvent.click(screen.getByTestId("workflow-detail-create-automation"));
         expect(screen.getByTestId("new-automation-dialog")).toHaveTextContent("Triage flaky tests");
       }
-      fireEvent.click(screen.getByRole("button", { name: "Edit workflow" }));
+      fireEvent.click(screen.getByRole("button", { name: "Edit plan with agent" }));
       expect(screen.getByTestId("planning-chat")).toBeInTheDocument();
 
       // A capability refresh can disable an already-open creation dialog.
