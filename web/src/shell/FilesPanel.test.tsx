@@ -1758,38 +1758,53 @@ describe("FilesPanel browse location", () => {
     expect(screen.queryByRole("button", { name: "Back to working folder" })).toBeNull();
   });
 
-  it("restores the browsed location across unmount/remount (file-viewer round trip)", () => {
+  it.each([
+    ["storage saves it", false],
+    ["storage refuses writes", true],
+  ])("restores the browsed location across a file-viewer round trip when %s", (_, refused) => {
     // Opening a file swaps the panel for the FileViewer, unmounting it.
     // Closing the viewer must land back in the directory the file was opened
     // from, not snap to the workspace root.
-    const first = renderPanel({
-      conversationId: "conv_viewer_roundtrip",
-      files: [],
-      workingDir: "/home/user/proj",
-      reachable: UNCONFINED,
-    });
-    fireEvent.click(screen.getByTestId("browse-location-path"));
-    fireEvent.click(screen.getByTestId("stub-picker-navigate"));
-    fireEvent.click(screen.getByTestId("stub-picker-confirm"));
-    expect(useAllFilesMock).toHaveBeenLastCalledWith(
-      "conv_viewer_roundtrip",
-      expect.anything(),
-      "/etc",
-    );
+    const setItem = vi.spyOn(Storage.prototype, "setItem");
+    if (refused) {
+      setItem.mockImplementation(() => {
+        throw new Error("quota exceeded");
+      });
+    }
+    try {
+      const first = renderPanel({
+        conversationId: "conv_viewer_roundtrip",
+        files: [],
+        workingDir: "/home/user/proj",
+        reachable: UNCONFINED,
+      });
+      fireEvent.click(screen.getByTestId("browse-location-path"));
+      fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+      fireEvent.click(screen.getByTestId("stub-picker-confirm"));
+      expect(useAllFilesMock).toHaveBeenLastCalledWith(
+        "conv_viewer_roundtrip",
+        expect.anything(),
+        "/etc",
+      );
 
-    first.unmount();
-    renderPanel({
-      conversationId: "conv_viewer_roundtrip",
-      files: [],
-      workingDir: "/home/user/proj",
-      reachable: UNCONFINED,
-    });
+      first.unmount();
+      renderPanel({
+        conversationId: "conv_viewer_roundtrip",
+        files: [],
+        workingDir: "/home/user/proj",
+        reachable: UNCONFINED,
+      });
 
-    expect(useAllFilesMock).toHaveBeenLastCalledWith(
-      "conv_viewer_roundtrip",
-      expect.anything(),
-      "/etc",
-    );
+      expect(useAllFilesMock).toHaveBeenLastCalledWith(
+        "conv_viewer_roundtrip",
+        expect.anything(),
+        "/etc",
+      );
+    } finally {
+      // A successful write drops the page-only copy kept while storage refused.
+      setItem.mockRestore();
+      writeFilesTreeBrowseLocation("conv_viewer_roundtrip", null);
+    }
   });
 
   it("reopens a reloaded session in the folder it was browsing", () => {

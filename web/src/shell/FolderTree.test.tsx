@@ -613,7 +613,8 @@ describe("FolderTree expansion across reloads", () => {
     lazyErrors.clear();
   });
 
-  it("saves the folders the user opens, per browsed location", () => {
+  it("saves the folders the user opens and closes, per browsed location", () => {
+    vi.useFakeTimers();
     lazyChildren.set("guides", [file("guides/intro.md")]);
     renderTree({
       files: [dir("guides")],
@@ -622,9 +623,13 @@ describe("FolderTree expansion across reloads", () => {
     });
 
     fireEvent.click(screen.getByRole("button", { name: "guides/" }));
-
     expect(readFilesTreeExpandedPaths("conv_save_expansion", "docs")).toEqual(["guides"]);
     expect(readFilesTreeExpandedPaths("conv_save_expansion", "")).toBeUndefined();
+
+    // Collapsing is saved once its exit animation removes the folder's rows.
+    fireEvent.click(screen.getByRole("button", { name: "guides/" }));
+    act(() => vi.advanceTimersByTime(180));
+    expect(readFilesTreeExpandedPaths("conv_save_expansion", "docs")).toEqual([]);
   });
 
   it("reopens a reloaded session with its saved folders expanded", async () => {

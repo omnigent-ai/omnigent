@@ -1,14 +1,16 @@
 // Per-session Files tree navigation (browsed folder, user-expanded folders per
 // location) kept in localStorage so a reload lands where the user left off.
-// Every level is capped so one busy session can't crowd out other storage.
+// Every level and the total size are capped so it can't crowd out other storage.
 
 const STORAGE_KEY = "omnigent:files-panel-tree-state";
-// Sessions kept, least-recently-touched pruned first.
+// Sessions kept, least recently changed pruned first.
 const MAX_SESSIONS = 30;
-// Browsed locations kept per session, least-recently-touched pruned first.
+// Browsed locations kept per session, least recently changed pruned first.
 const MAX_LOCATIONS_PER_SESSION = 10;
 // Expanded folders kept per location; the shallowest win so restored folders stay reachable.
 export const MAX_EXPANDED_PATHS = 300;
+// Serialized size budget; the least recently changed sessions go first to stay within it.
+export const MAX_STORE_CHARS = 200_000;
 
 interface ExpandedEntry {
   location: string;
@@ -18,12 +20,16 @@ interface ExpandedEntry {
 interface TreeState {
   /** Absolute browsed folder; absent while browsing the workspace root. */
   browseLocation?: string;
-  /** Expanded folders per browsed location, oldest-touched first. */
+  /** Expanded folders per browsed location, least recently changed first. */
   expanded: ExpandedEntry[];
 }
 
-/** Ordered array, oldest-touched first, so recency survives serialization of any id format. */
+/** Ordered array, least recently changed first, so order survives serialization. */
 type Store = { id: string; state: TreeState }[];
+
+// The latest store when localStorage refused it (quota, privacy mode), so this
+// page keeps its navigation until a write succeeds.
+let unsavedStore: Store | undefined;
 
 function stringArray(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) return undefined;
@@ -50,6 +56,7 @@ function sanitizeState(value: unknown): TreeState {
 }
 
 function readStore(): Store {
+  if (unsavedStore) return structuredClone(unsavedStore);
   if (typeof window === "undefined") return [];
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
@@ -69,12 +76,27 @@ function readStore(): Store {
   }
 }
 
+/** Serialize `store`, dropping the least recently changed entries to fit the budget. */
+function serializeWithinBudget(store: Store): string {
+  let json = JSON.stringify(store);
+  while (json.length > MAX_STORE_CHARS) {
+    if (store.length > 1) store.shift();
+    else if (store.length === 1 && store[0].state.expanded.length > 1) {
+      store[0].state.expanded.shift();
+    } else break;
+    json = JSON.stringify(store);
+  }
+  return json;
+}
+
 function writeStore(store: Store): void {
   if (typeof window === "undefined") return;
+  const json = serializeWithinBudget(store);
   try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+    window.localStorage.setItem(STORAGE_KEY, json);
+    unsavedStore = undefined;
   } catch {
-    // Storage quota/access errors must not break the Files panel.
+    unsavedStore = store;
   }
 }
 

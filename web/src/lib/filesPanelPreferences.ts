@@ -10,10 +10,8 @@
 // helpers only seed that state on mount and snapshot it when the user changes
 // the sort, so a refresh (or a brand-new conversation) starts from the last
 // choice instead of the hardcoded default.
-//
-// The hidden-files toggle lives under its own key so every mounted Files panel
-// (main shell, Grid panes, other windows) follows a change live.
 
+import { useSyncExternalStore } from "react";
 import { type ChangedSort, isValidSort } from "@/lib/changedSort";
 import { createStoredChoicePreference } from "./storedChoicePreference";
 
@@ -67,6 +65,7 @@ export function writeFilesPanelPreferences(prefs: FilesPanelPreferences): void {
   }
 }
 
+// Own key, so every mounted Files panel (shell, Grid panes, other windows) follows a toggle live.
 export const FILES_PANEL_SHOW_HIDDEN_STORAGE_KEY = "omnigent:files-panel-show-hidden";
 
 /** Hidden (dot-prefixed) files are shown until the user hides them. */
@@ -78,17 +77,35 @@ const showHiddenPreference = createStoredChoicePreference(
   DEFAULT_FILES_PANEL_SHOW_HIDDEN ? "true" : "false",
 );
 
+// A choice storage refused (quota, privacy mode) still applies on this page.
+let unsavedShowHidden: boolean | undefined;
+const unsavedShowHiddenListeners = new Set<() => void>();
+
+function subscribeUnsavedShowHidden(listener: () => void): () => void {
+  unsavedShowHiddenListeners.add(listener);
+  return () => unsavedShowHiddenListeners.delete(listener);
+}
+
 /** Read whether the Files panel shows hidden files; storage errors mean the default. */
 export function readFilesPanelShowHidden(): boolean {
-  return showHiddenPreference.read() === "true";
+  return unsavedShowHidden ?? showHiddenPreference.read() === "true";
 }
 
 /** Persist the hidden-files choice and update every Files panel on screen. */
 export function writeFilesPanelShowHidden(showHidden: boolean): void {
   showHiddenPreference.write(showHidden ? "true" : "false");
+  const saved = (showHiddenPreference.read() === "true") === showHidden;
+  unsavedShowHidden = saved ? undefined : showHidden;
+  for (const listener of unsavedShowHiddenListeners) listener();
 }
 
 /** Live hidden-files choice, including changes made in other windows. */
 export function useFilesPanelShowHidden(): boolean {
-  return showHiddenPreference.use() === "true";
+  const stored = showHiddenPreference.use() === "true";
+  const unsaved = useSyncExternalStore(
+    subscribeUnsavedShowHidden,
+    () => unsavedShowHidden,
+    () => undefined,
+  );
+  return unsaved ?? stored;
 }

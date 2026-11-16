@@ -1,5 +1,5 @@
 import { act, renderHook } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_FILES_PANEL_PREFERENCES,
   FILES_PANEL_SHOW_HIDDEN_STORAGE_KEY,
@@ -47,7 +47,14 @@ describe("filesPanelPreferences", () => {
 });
 
 describe("Files panel hidden-files preference", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    writeFilesPanelShowHidden(true);
+  });
+
   it("shows hidden files until the user hides them, and remembers the choice", () => {
+    expect(readFilesPanelShowHidden()).toBe(true);
+    localStorage.setItem(FILES_PANEL_SHOW_HIDDEN_STORAGE_KEY, "sometimes");
     expect(readFilesPanelShowHidden()).toBe(true);
 
     writeFilesPanelShowHidden(false);
@@ -60,12 +67,13 @@ describe("Files panel hidden-files preference", () => {
     expect(readFilesPanelShowHidden()).toBe(true);
   });
 
-  it("ignores an unknown stored value", () => {
-    localStorage.setItem(FILES_PANEL_SHOW_HIDDEN_STORAGE_KEY, "sometimes");
-    expect(readFilesPanelShowHidden()).toBe(true);
-  });
-
-  it("updates every mounted panel when one of them toggles", () => {
+  it("keeps every mounted panel following the toggle when storage refuses writes", () => {
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("quota exceeded");
+    });
+    vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+      throw new Error("access denied");
+    });
     const first = renderHook(() => useFilesPanelShowHidden());
     const second = renderHook(() => useFilesPanelShowHidden());
     expect(first.result.current).toBe(true);
@@ -73,5 +81,10 @@ describe("Files panel hidden-files preference", () => {
     act(() => writeFilesPanelShowHidden(false));
     expect(first.result.current).toBe(false);
     expect(second.result.current).toBe(false);
+    expect(localStorage.getItem(FILES_PANEL_SHOW_HIDDEN_STORAGE_KEY)).toBeNull();
+
+    act(() => writeFilesPanelShowHidden(true));
+    expect(first.result.current).toBe(true);
+    expect(second.result.current).toBe(true);
   });
 });

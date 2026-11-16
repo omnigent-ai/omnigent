@@ -1,6 +1,7 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   MAX_EXPANDED_PATHS,
+  MAX_STORE_CHARS,
   readFilesTreeBrowseLocation,
   readFilesTreeExpandedPaths,
   writeFilesTreeBrowseLocation,
@@ -10,6 +11,7 @@ import {
 const STORAGE_KEY = "omnigent:files-panel-tree-state";
 
 afterEach(() => {
+  vi.restoreAllMocks();
   localStorage.clear();
 });
 
@@ -56,18 +58,56 @@ describe("filesPanelTreeState", () => {
     expect(kept).not.toContain(`a/b/${MAX_EXPANDED_PATHS - 1}`);
   });
 
-  it("forgets the least recently used locations and sessions first", () => {
-    for (let index = 0; index < 11; index++) {
+  it("forgets the least recently changed locations and sessions first", () => {
+    for (let index = 0; index < 10; index++) {
       writeFilesTreeExpandedPaths("conv_a", `dir${index}`, ["x"]);
     }
-    expect(readFilesTreeExpandedPaths("conv_a", "dir0")).toBeUndefined();
+    // Changing the oldest location again makes dir1 the oldest instead.
+    writeFilesTreeExpandedPaths("conv_a", "dir0", ["y"]);
+    writeFilesTreeExpandedPaths("conv_a", "dir10", ["x"]);
+    expect(readFilesTreeExpandedPaths("conv_a", "dir0")).toEqual(["y"]);
+    expect(readFilesTreeExpandedPaths("conv_a", "dir1")).toBeUndefined();
     expect(readFilesTreeExpandedPaths("conv_a", "dir10")).toEqual(["x"]);
 
-    for (let index = 0; index < 31; index++) {
+    for (let index = 0; index < 30; index++) {
       writeFilesTreeBrowseLocation(`conv_${index}`, "/tmp");
     }
-    expect(readFilesTreeBrowseLocation("conv_0")).toBeNull();
+    writeFilesTreeBrowseLocation("conv_0", "/srv");
+    writeFilesTreeBrowseLocation("conv_30", "/tmp");
+    expect(readFilesTreeBrowseLocation("conv_0")).toBe("/srv");
+    expect(readFilesTreeBrowseLocation("conv_1")).toBeNull();
     expect(readFilesTreeBrowseLocation("conv_30")).toBe("/tmp");
+  });
+
+  it("keeps the whole store within its size budget, dropping the oldest sessions", () => {
+    const longPaths = Array.from(
+      { length: MAX_EXPANDED_PATHS },
+      (_, index) => `${"deeply-nested-folder-name/".repeat(4)}${index}`,
+    );
+    for (let index = 0; index < 8; index++) {
+      writeFilesTreeExpandedPaths(`conv_${index}`, "", longPaths);
+    }
+
+    expect(localStorage.getItem(STORAGE_KEY)!.length).toBeLessThanOrEqual(MAX_STORE_CHARS);
+    expect(readFilesTreeExpandedPaths("conv_0", "")).toBeUndefined();
+    expect(readFilesTreeExpandedPaths("conv_7", "")).toHaveLength(MAX_EXPANDED_PATHS);
+  });
+
+  it("keeps navigation on this page when storage refuses the write", () => {
+    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("quota exceeded");
+    });
+    writeFilesTreeBrowseLocation("conv_a", "/srv");
+    writeFilesTreeExpandedPaths("conv_a", "", ["src"]);
+    expect(readFilesTreeBrowseLocation("conv_a")).toBe("/srv");
+    expect(readFilesTreeExpandedPaths("conv_a", "")).toEqual(["src"]);
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
+
+    // Once storage accepts a write again, everything kept meanwhile is saved.
+    setItem.mockRestore();
+    writeFilesTreeExpandedPaths("conv_b", "", ["docs"]);
+    expect(JSON.parse(localStorage.getItem(STORAGE_KEY)!)).toHaveLength(2);
+    expect(readFilesTreeBrowseLocation("conv_a")).toBe("/srv");
   });
 
   it("treats malformed storage as empty and recovers on the next write", () => {

@@ -585,15 +585,16 @@ function FolderTreeInner({
     setExpandedPaths(new Set(initial));
   }, [cacheKey, conversationId, browseLocation, treeFiles]);
 
-  // Record an expansion the user made, for remounts and for later reloads.
-  const rememberExpanded = useCallback(
-    (next: Set<string>) => {
-      if (!cacheKey || !conversationId) return;
-      expandedPathsCache.set(cacheKey, next);
-      writeFilesTreeExpandedPaths(conversationId, browseLocation, next);
-    },
-    [cacheKey, conversationId, browseLocation],
-  );
+  // Set by user expand/collapse/reveal; the committed expansion is then kept for
+  // remounts and later reloads. Restored or default expansion isn't re-saved.
+  const userChangedExpansion = useRef(false);
+  useEffect(() => {
+    if (!userChangedExpansion.current) return;
+    userChangedExpansion.current = false;
+    if (!cacheKey || !conversationId) return;
+    expandedPathsCache.set(cacheKey, expandedPaths);
+    writeFilesTreeExpandedPaths(conversationId, browseLocation, expandedPaths);
+  }, [expandedPaths, cacheKey, conversationId, browseLocation]);
 
   // Map from file path → change status, for file-level badges in the tree.
   const changedFileMap = useMemo<Map<string, WorkspaceChangedFile["status"]>>(() => {
@@ -618,39 +619,36 @@ function FolderTreeInner({
     return result;
   }, [scopedChangedFiles]);
 
-  const startPathMotion = useCallback(
-    (path: string, motion: TreeMotion) => {
-      const existingTimer = motionTimers.current.get(path);
-      if (existingTimer) clearTimeout(existingTimer);
-      setPathMotions((prev) => new Map(prev).set(path, motion));
+  const startPathMotion = useCallback((path: string, motion: TreeMotion) => {
+    const existingTimer = motionTimers.current.get(path);
+    if (existingTimer) clearTimeout(existingTimer);
+    setPathMotions((prev) => new Map(prev).set(path, motion));
 
-      const reduceMotion =
-        typeof window !== "undefined" &&
-        window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
-      const timer = setTimeout(
-        () => {
-          if (motion === "exit") {
-            setExpandedPaths((prev) => {
-              const next = new Set(prev);
-              next.delete(path);
-              rememberExpanded(next);
-              return next;
-            });
-          }
-          setPathMotions((prev) => {
-            if (prev.get(path) !== motion) return prev;
-            const next = new Map(prev);
+    const reduceMotion =
+      typeof window !== "undefined" &&
+      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    const timer = setTimeout(
+      () => {
+        if (motion === "exit") {
+          userChangedExpansion.current = true;
+          setExpandedPaths((prev) => {
+            const next = new Set(prev);
             next.delete(path);
             return next;
           });
-          motionTimers.current.delete(path);
-        },
-        reduceMotion ? 0 : TREE_MOTION_MS,
-      );
-      motionTimers.current.set(path, timer);
-    },
-    [rememberExpanded],
-  );
+        }
+        setPathMotions((prev) => {
+          if (prev.get(path) !== motion) return prev;
+          const next = new Map(prev);
+          next.delete(path);
+          return next;
+        });
+        motionTimers.current.delete(path);
+      },
+      reduceMotion ? 0 : TREE_MOTION_MS,
+    );
+    motionTimers.current.set(path, timer);
+  }, []);
 
   const togglePath = useCallback(
     (path: string) => {
@@ -660,14 +658,11 @@ function FolderTreeInner({
         return;
       }
 
-      setExpandedPaths((prev) => {
-        const next = new Set(prev).add(path);
-        rememberExpanded(next);
-        return next;
-      });
+      userChangedExpansion.current = true;
+      setExpandedPaths((prev) => new Set(prev).add(path));
       startPathMotion(path, "enter");
     },
-    [rememberExpanded, expandedPaths, pathMotions, startPathMotion],
+    [expandedPaths, pathMotions, startPathMotion],
   );
 
   // A directory just revealed from search results: the tree scrolls it into
@@ -690,20 +685,20 @@ function FolderTreeInner({
   // and highlights the row once it appears.
   const revealDirectory = useCallback(
     (path: string) => {
+      userChangedExpansion.current = true;
       setExpandedPaths((prev) => {
         const next = new Set(prev);
         const parts = path.split("/");
         // Expand every ancestor, but not the target itself — revealing a folder
         // scrolls to it collapsed, the way clicking it in the tree would.
         for (let i = 1; i < parts.length; i++) next.add(parts.slice(0, i).join("/"));
-        rememberExpanded(next);
         return next;
       });
       pendingRevealRef.current = path;
       setRevealedPath(path);
       onExitSearch?.();
     },
-    [rememberExpanded, onExitSearch],
+    [onExitSearch],
   );
 
   // Build the nested top-level tree once per files/sort/showHidden change.

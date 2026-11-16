@@ -25,6 +25,8 @@ import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
+from tests.e2e_ui.conftest import open_right_rail
+
 # The agent spec uses ``os_env.cwd: .`` (see ``_TEST_AGENT_YAML`` in
 # conftest), so filesystem PUTs land in ``<repo-root>/<session_id>/``
 # next to the spawned server. Clean that per-session dir up in teardown
@@ -209,13 +211,8 @@ def seeded_files_panel_pair(
 
 def _files_rail(page: Page, base_url: str, session_id: str) -> Locator:
     page.goto(f"{base_url}/c/{session_id}?view=explore")
-    rail_toggle = page.locator(
-        'button[aria-label="Expand right panel"], button[aria-label="Collapse right panel"]'
-    )
-    expect(rail_toggle).to_be_visible(timeout=30_000)
     # A session the user has never opened starts with the right panel closed.
-    if rail_toggle.get_attribute("aria-label") == "Expand right panel":
-        rail_toggle.click()
+    open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
     expect(rail.get_by_role("searchbox", name="Search all files")).to_be_visible(timeout=30_000)
     expect(rail.get_by_text(_VISIBLE_FILE, exact=True)).to_be_visible(timeout=15_000)
