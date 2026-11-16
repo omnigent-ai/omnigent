@@ -189,6 +189,24 @@ describe("matchCandidate", () => {
     expect(match?.ranges).toEqual({});
   });
 
+  it("keeps highlights for field keys that name Object properties", () => {
+    const words = matchCandidate(
+      tokenizeQuery("o"),
+      prepareFields([{ key: "constructor", text: "o", weight: 1 }]),
+    );
+    expect(Object.hasOwn(words!.ranges, "constructor")).toBe(true);
+    expect(words!.ranges.constructor).toEqual([{ start: 0, end: 1 }]);
+    const phrase = matchCandidate(
+      tokenizeQuery("open settings"),
+      prepareFields([{ key: "__proto__", text: "Open settings", weight: 1 }]),
+    );
+    expect(Object.hasOwn(phrase!.ranges, "__proto__")).toBe(true);
+    expect(phrase!.ranges["__proto__"]).toEqual([
+      { start: 0, end: 4 },
+      { start: 5, end: 13 },
+    ]);
+  });
+
   it("ignores empty fields", () => {
     expect(prepareFields([{ text: "", weight: 1 }])).toEqual([]);
   });

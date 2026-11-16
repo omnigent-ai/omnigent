@@ -362,6 +362,11 @@ export interface PreparedField {
   matching: MatchStrategy;
 }
 
+/** Highlight ranges by field key, without a prototype, so keys like `constructor` are just keys. */
+function emptyRanges(): Record<string, MatchRange[]> {
+  return Object.create(null) as Record<string, MatchRange[]>;
+}
+
 export function prepareFields(fields: readonly SearchField[]): PreparedField[] {
   return fields
     .filter((field) => field.text.length > 0)
@@ -441,7 +446,7 @@ function wholeQueryMatch(
     }
   }
   if (!best || !bestField) return null;
-  const ranges: Record<string, MatchRange[]> = {};
+  const ranges = emptyRanges();
   if (bestField.key !== undefined) {
     // Mark each word, not the spaces between them, as separately matched words are marked.
     let wordStart = best.start;
@@ -472,7 +477,7 @@ export function matchCandidate(
   let classTotal = 0;
   let penalty = 0;
   let weight = 0;
-  const ranges: Record<string, MatchRange[]> = {};
+  const ranges = emptyRanges();
   for (const token of tokens) {
     let best: FieldMatch | null = null;
     let bestKey: string | undefined;
