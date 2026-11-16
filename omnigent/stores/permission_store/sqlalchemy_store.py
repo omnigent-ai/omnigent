@@ -607,6 +607,30 @@ class SqlAlchemyPermissionStore(PermissionStore):
         self._invalidate_resolve_cache_for_session(conversation_id)
         return deleted
 
+    def revoke_if_level(self, user_id: str, conversation_id: str, level: int) -> bool:
+        """Remove a grant still at *level* in one conditional delete. See base class."""
+
+        def write(session: Session) -> bool:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    delete(SqlSessionPermission).where(
+                        SqlSessionPermission.workspace_id == current_workspace_id(),
+                        SqlSessionPermission.user_id == user_id,
+                        SqlSessionPermission.conversation_id == conversation_id,
+                        SqlSessionPermission.level == level,
+                    )
+                ),
+            )
+            return result.rowcount > 0
+
+        deleted = run_write_transaction(
+            self._session_immediate, "revoke_permission_at_level", write
+        )
+        # Evict after commit, as revoke does.
+        self._invalidate_resolve_cache_for_session(conversation_id)
+        return deleted
+
     def get(self, user_id: str, conversation_id: str) -> SessionPermission | None:
         """Look up a single grant. See base class for contract."""
         with self._session("select_permission") as session:

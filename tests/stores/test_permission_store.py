@@ -353,6 +353,33 @@ def test_revoke_nonexistent_returns_false(store: SqlAlchemyPermissionStore, db_u
     )
 
 
+@pytest.mark.parametrize("implementation", ["store", "default"])
+@pytest.mark.parametrize("held", [None, LEVEL_READ, LEVEL_EDIT])
+def test_revoke_if_level_removes_only_a_grant_still_at_that_level(
+    store: SqlAlchemyPermissionStore, db_uri: str, implementation: str, held: int | None
+) -> None:
+    """Removes a Read grant, and leaves a grant at another level or a missing one alone.
+
+    ``default`` runs the base class's read-then-revoke fallback on the same store.
+    """
+    owner = SqlAlchemyPermissionStore if implementation == "store" else PermissionStore
+    _ensure_user(store, "erin@example.com")
+    conv_id = _create_conversation(db_uri)
+    if held is not None:
+        store.grant("erin@example.com", conv_id, held)
+    # Cache Erin's access, which a removal must evict.
+    assert store.resolve_access("erin@example.com", conv_id).user_grant_level == held
+
+    removed = owner.revoke_if_level(store, "erin@example.com", conv_id, LEVEL_READ)
+
+    assert removed is (held == LEVEL_READ)
+    kept = None if held == LEVEL_READ else held
+    assert store.get("erin@example.com", conv_id) == (
+        SessionPermission("erin@example.com", conv_id, kept) if kept is not None else None
+    )
+    assert store.resolve_access("erin@example.com", conv_id).user_grant_level == kept
+
+
 # ── get ──────────────────────────────────────────────────────────────────────
 
 

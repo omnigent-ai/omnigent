@@ -117,6 +117,24 @@ class PermissionStore(ABC):
         """
         ...
 
+    def revoke_if_level(self, user_id: str, conversation_id: str, level: int) -> bool:
+        """Remove a grant only while it is still at exactly *level*.
+
+        Unlike :meth:`revoke`, leaves a grant changed since the caller wrote it, such as
+        an upgrade made meanwhile. This default reads, then revokes, so it isn't atomic:
+        a change committed in between can still be removed. Stores with a conditional
+        delete override it.
+
+        :param user_id: The grantee, e.g. ``"alice@example.com"``.
+        :param conversation_id: The session to revoke access from.
+        :param level: The level the grant must still hold.
+        :returns: ``True`` if a grant was removed, ``False`` if none was at *level*.
+        """
+        held = self.get(user_id, conversation_id)
+        if held is None or held.level != level:
+            return False
+        return self.revoke(user_id, conversation_id)
+
     @abstractmethod
     def get(self, user_id: str, conversation_id: str) -> SessionPermission | None:
         """Look up a single permission grant.
