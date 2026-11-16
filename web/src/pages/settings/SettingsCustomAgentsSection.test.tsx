@@ -236,6 +236,32 @@ describe("Custom agents settings", () => {
     );
   });
 
+  it("renders the list from its Settings catalog entry, with each agent's open link and paging", async () => {
+    vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.searchParams.get("scope") !== "user") return response(page([polly]));
+      return response(page(users, true, "a2"));
+    });
+    mount();
+    await screen.findAllByRole("link", { name: "research" });
+
+    expect(document.querySelector('[data-settings-item="custom-agents-list"]')).not.toBeNull();
+    expect(screen.getByRole("searchbox", { name: "Search agents" })).toHaveAttribute(
+      "data-settings-control",
+      "custom-agents-list:search",
+    );
+    expect(
+      document.querySelector('[data-settings-region="custom-agents-list:yourAgents"]'),
+    ).not.toBeNull();
+    const yoursLink = screen.getAllByRole("link", { name: "research" })[0];
+    expect(yoursLink.getAttribute("data-settings-row-action")).toBe("open");
+    expect(
+      screen
+        .getByRole("button", { name: "Load more agents" })
+        .getAttribute("data-settings-control"),
+    ).toBe("custom-agents-list:loadMoreYours");
+  });
+
   it("updates search results when the term or loaded pages change", async () => {
     vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
       const url = new URL(String(input), "http://localhost");
