@@ -76,10 +76,17 @@ def test_a_trigger_takes_the_place_of_the_prompt_and_rule() -> None:
 
 @pytest.mark.parametrize(
     "fields",
-    [{"rrule": "FREQ=DAILY"}, {"prompt": "ping"}, {"session_mode": "continue"}],
-    ids=["rrule", "prompt", "session_mode"],
+    [
+        {"rrule": "FREQ=DAILY"},
+        {"prompt": "ping"},
+        {"session_mode": "continue"},
+        {"session_id": "conv_1"},
+        {"source_session_id": "conv_1"},
+        {"first_run_at": 1_900_000_000},
+    ],
+    ids=["rrule", "prompt", "session_mode", "session_id", "source_session_id", "first_run_at"],
 )
-def test_a_trigger_leaves_out_what_the_server_sets(fields: dict[str, str]) -> None:
+def test_a_trigger_leaves_out_what_the_server_sets(fields: dict[str, object]) -> None:
     with pytest.raises(ValidationError, match="the server sets them"):
         CreateScheduledTaskRequest(**_TRIGGER_BODY, **fields, trigger_config=_TRIGGER)
 

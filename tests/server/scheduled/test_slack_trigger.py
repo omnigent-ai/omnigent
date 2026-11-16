@@ -67,6 +67,10 @@ def test_the_compiled_prompt_is_a_trigger_that_watches_the_channels() -> None:
         "that are about a bug report and not posted by @alerts-bot\n"
     ) in prompt
     assert "use one hour ago and nothing pending" in prompt
+    # The recovery steps the form's template relies on, so a later edit can't drop them.
+    assert "For each pending delivery, find its session" in prompt
+    assert 'list its title as "<title> unconfirmed" on a "Delivery pending:" line' in prompt
+    assert "call sys_session_list once with include_archived true" in prompt
     assert "Instructions for each session:\nInvestigate it and propose a fix.\n" in prompt
     assert prompt.endswith("Do not add a session link.")
     # Sessions start beside a connected-host poller, each in its own worktree.
