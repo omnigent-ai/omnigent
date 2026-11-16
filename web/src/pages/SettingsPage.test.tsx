@@ -1823,6 +1823,25 @@ describe("SettingsPage", () => {
     ).toHaveAttribute("aria-label", "Translucent sidebars");
   });
 
+  it("renders the typography rows and their controls from their Settings catalog entries", () => {
+    renderPage("/settings/appearance");
+    for (const id of [
+      "ui-font-size",
+      "ui-font-family",
+      "code-font-size",
+      "code-font-family",
+      "code-font-weight",
+    ]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(
+      document.querySelector('[data-settings-control="ui-font-size:decrease"]'),
+    ).toHaveAttribute("aria-label", "Decrease interface font size");
+    expect(
+      document.querySelector('[data-settings-control="code-font-weight:toggle"]'),
+    ).toHaveAttribute("aria-label", "Use heavier code text");
+  });
+
   it("renders the Sandbox Integrations rows from their Settings catalog entries", async () => {
     mocks.enabledConnections = ["github", "databricks"];
     renderPage("/settings/integrations");
