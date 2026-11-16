@@ -186,7 +186,12 @@ def require_orchestration_source(
 
 
 def orchestration_message(source_id: str, message: object) -> SessionStartupInput:
-    """Build a text-only task with a display label, not proof of message origin."""
+    """
+    Build a text-only task with a display label, not proof of message origin.
+
+    ``peer_message`` tells the receiving runner not to forward the reply to the
+    receiver's parent: ``sys_session_message`` never forwards replies.
+    """
     if not isinstance(message, str) or not message.strip() or len(message) > 8000:
         raise OmnigentError("Provide a message of 1–8000 characters", code=ErrorCode.INVALID_INPUT)
     return SessionStartupInput(
@@ -196,5 +201,6 @@ def orchestration_message(source_id: str, message: object) -> SessionStartupInpu
             "content": [
                 {"type": "input_text", "text": f"[Message from session {source_id}]\n{message}"}
             ],
+            "peer_message": True,
         },
     )

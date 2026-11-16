@@ -143,6 +143,8 @@ class _SubagentWorkEntry:
         launch-liveness reaper rather than from the child itself. Such a
         failure is a guess ("no start acknowledgment"), so a genuine
         terminal edge from the child afterwards must replace it.
+    :param response_id: Native turn id named by the confirmed turn end that
+        settled this work, e.g. ``"resp_claude_ab12"``; ``None`` when unknown.
     """
 
     parent_session_id: str
@@ -160,6 +162,7 @@ class _SubagentWorkEntry:
     cancellation_confirmed: bool = False
     corrected_status: str | None = None
     launch_timed_out: bool = False
+    response_id: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -187,6 +190,9 @@ class _SubagentDeliveryAck:
 _subagent_work_by_child: dict[str, _SubagentWorkEntry] = {}
 _subagent_work_by_parent: dict[str, set[str]] = {}
 _drained_delivered_subagent_children: set[str] = set()
+# The last work delivered for each child, kept after the parent drains it, so a
+# turn the child runs without a new send can be tracked for the same parent.
+_answered_subagent_work: dict[str, _SubagentWorkEntry] = {}
 # Optimistic (grace-timer) cancellations, delivered then drained, kept so a
 # surviving child's confirmed completion can still correct the parent under the
 # same dispatch. Confirmed aborts are not kept; a new send or teardown clears it.
@@ -317,6 +323,54 @@ def register_subagent_work(
     return entry
 
 
+def start_subagent_follow_up_work(child_session_id: str) -> _SubagentWorkEntry | None:
+    """
+    Track a turn an answered child runs on its own as new work for its parent.
+
+    A child's result reaches its parent once per ``sys_session_send``. A later
+    turn the child runs without a new send, e.g. after a user message, its own
+    timer, or Claude Code continuing on its own, would otherwise end against an
+    already delivered entry and be dropped. This registers what a fresh send
+    would, so that turn's result is delivered and wakes the parent.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: The new entry, or ``None`` when the child's current work still
+        awaits its own outcome or no result of this child was delivered here.
+    """
+    current = _subagent_work_by_child.get(child_session_id)
+    if current is not None and (not current.delivered or current.launch_timed_out):
+        # Undelivered, or the reaper's provisional guess: the real turn may still end.
+        return None
+    if child_session_id in _provisional_cancelled_subagent_work:
+        # A surviving child's completion still corrects the optimistic cancellation.
+        return None
+    answered = _answered_subagent_work.get(child_session_id)
+    if answered is None:
+        return None
+    entry = register_subagent_work(
+        parent_session_id=answered.parent_session_id,
+        child_session_id=child_session_id,
+        agent=answered.agent,
+        title=answered.title,
+        wrapper_label=answered.wrapper_label,
+        created_by=answered.created_by,
+    )
+    # The turn is already starting, so it must not look like a stalled launch.
+    entry.status = "running"
+    return entry
+
+
+def answered_subagent_response_id(child_session_id: str) -> str | None:
+    """
+    Return the native turn id of the child's last delivered result, if known.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: A response id such as ``"resp_claude_ab12"``, else ``None``.
+    """
+    answered = _answered_subagent_work.get(child_session_id)
+    return answered.response_id if answered is not None else None
+
+
 def get_subagent_work(child_session_id: str) -> _SubagentWorkEntry | None:
     """
     Return registered sub-agent work by child session id.
@@ -406,6 +460,10 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
     _drained_delivered_subagent_children.discard(session_id)
     _provisional_cancelled_subagent_work.pop(session_id, None)
     _in_flight_send_locks.pop(session_id, None)
+    _answered_subagent_work.pop(session_id, None)
+    for child_id, answered in list(_answered_subagent_work.items()):
+        if answered.parent_session_id == session_id:
+            _answered_subagent_work.pop(child_id, None)
     for child_id in list(_subagent_work_by_parent.get(session_id, set())):
         _subagent_work_by_child.pop(child_id, None)
         _drained_delivered_subagent_children.discard(child_id)
@@ -905,6 +963,7 @@ def _deliver_subagent_completion(entry: _SubagentWorkEntry) -> _SubagentDelivery
         item["corrected_status"] = entry.corrected_status
     inbox.put_nowait(item)
     entry.delivered = True
+    _answered_subagent_work[entry.child_session_id] = entry
     return _SubagentDeliveryAck(
         entry=entry,
         delivered=True,
