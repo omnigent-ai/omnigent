@@ -31,6 +31,7 @@ import * as identity from "@/lib/identity";
 import * as sandboxModelsHook from "@/hooks/useSandboxModelOptions";
 import * as hostsHook from "@/hooks/useHosts";
 import * as scheduledHooks from "@/hooks/useScheduledTasks";
+import { authorizeRegistryService, registryRequest, type RegistryService } from "@/lib/mcpRegistry";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
@@ -71,6 +72,10 @@ vi.mock("@/hooks/useHostWorktrees", () => ({
   },
 }));
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
+vi.mock("@/lib/mcpRegistry", () => ({
+  registryRequest: vi.fn(),
+  authorizeRegistryService: vi.fn(),
+}));
 // useHostModelOptions is consumed by the ModelEffortFields sub-form (model
 // dropdown source). Returning no data makes it fall back to the static Claude
 // alias list, which is what a no-host-pinned scheduled task uses anyway.
@@ -505,6 +510,7 @@ function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask>
     modelOverride: null,
     reasoningEffort: null,
     permissionMode: null,
+    mcpServices: [],
     sessionMode: "new",
     sessionId: null,
     workspace: null,
@@ -6872,4 +6878,318 @@ describe("CreateScheduledTaskDialog workflow", () => {
       expect(updated).toContain("repo:acme/app");
     },
   );
+});
+
+describe("CreateScheduledTaskDialog MCP services", () => {
+  const github: RegistryService = {
+    id: "github",
+    title: "GitHub",
+    description: "",
+    auth: "oauth",
+    connected: true,
+    tools: [],
+    connect_provider: "oauth",
+  };
+  const linear: RegistryService = { ...github, id: "linear", title: "Linear", connected: false };
+
+  const registryInfo = {
+    ...SERVER_INFO_OFFLINE_FALLBACK,
+    features: { automations_v2: true },
+    scheduled_task_harness_settings: true,
+    scheduled_task_mcp_services: true,
+    enabled_connections: ["mcp"],
+  };
+
+  function renderWithRegistry(ui: React.ReactElement) {
+    const view = render(<CapabilitiesProvider info={registryInfo}>{ui}</CapabilitiesProvider>);
+    return {
+      ...view,
+      rerender: (next: React.ReactElement) =>
+        view.rerender(<CapabilitiesProvider info={registryInfo}>{next}</CapabilitiesProvider>),
+    };
+  }
+
+  beforeEach(() => {
+    vi.mocked(registryRequest).mockResolvedValue({ data: [github, linear] });
+    vi.mocked(authorizeRegistryService).mockReset();
+  });
+
+  /** The MCP row lives under Advanced settings, so expand it first. */
+  async function mcpTrigger() {
+    if (!screen.queryByTestId("task-mcp-services-trigger")) {
+      fireEvent.click(screen.getByTestId("task-advanced-settings-trigger"));
+    }
+    return screen.findByTestId("task-mcp-services-trigger");
+  }
+
+  /** Open the MCP row's menu and return a service's switch. */
+  async function mcpSwitch(name: string) {
+    fireEvent.click(await mcpTrigger());
+    return screen.findByRole("switch", { name });
+  }
+
+  it("is hidden without the registry or on a server that rejects task MCP services", () => {
+    renderDialog();
+    expect(screen.queryByTestId("task-mcp-services-trigger")).not.toBeInTheDocument();
+    cleanup();
+    render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, enabled_connections: ["mcp"] }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
+      </CapabilitiesProvider>,
+    );
+    expect(screen.queryByTestId("task-mcp-services-trigger")).not.toBeInTheDocument();
+    expect(registryRequest).not.toHaveBeenCalled();
+  });
+
+  it("saves the services a new automation starts with", async () => {
+    renderWithRegistry(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Triage" } });
+    expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("No MCPs");
+    fireEvent.click(await mcpSwitch("GitHub"));
+    await waitFor(() =>
+      expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("MCPs · 1"),
+    );
+    fireEvent.click(screen.getByTestId("task-mcp-services-trigger"));
+    const hostTrigger = screen.getByTestId("task-host-trigger");
+    fireEvent.pointerDown(hostTrigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(hostTrigger);
+    fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0].mcpServices).toEqual(["github"]);
+  });
+
+  it("starts a new automation with no services, whatever a new chat last picked", async () => {
+    localStorage.setItem("omnigent:last-mcp-services", JSON.stringify(["github"]));
+    renderWithRegistry(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
+    expect(await mcpSwitch("GitHub")).not.toBeChecked();
+    expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("No MCPs");
+  });
+
+  it("blocks saving until every selected service is signed in", async () => {
+    renderWithRegistry(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ mcpServices: ["linear"] })}
+      />,
+    );
+    expect(await screen.findByTestId("task-mcp-services-blocked")).toHaveTextContent(
+      "Sign in to each selected MCP service",
+    );
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+
+    fireEvent.click(await mcpSwitch("Linear"));
+    expect(screen.queryByTestId("task-mcp-services-blocked")).not.toBeInTheDocument();
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
+  });
+
+  it.each([
+    ["unchanged", false, undefined],
+    ["turned off", true, []],
+  ])("sends the services on edit only when they change (%s)", async (_, turnOff, expected) => {
+    renderWithRegistry(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ mcpServices: ["github"] })}
+      />,
+    );
+    const toggle = await mcpSwitch("GitHub");
+    expect(toggle).toBeChecked();
+    if (turnOff) fireEvent.click(toggle);
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.mcpServices).toEqual(expected);
+  });
+
+  const triggerInfo = {
+    ...SERVER_INFO_OFFLINE_FALLBACK,
+    features: { session_orchestration: true },
+    scheduled_task_session_modes: true,
+    scheduled_task_trigger_headers: true,
+    scheduled_task_mcp_services: true,
+    enabled_connections: ["mcp"],
+  };
+
+  function renderTrigger(source: "slack" | "jira", services: RegistryService[]) {
+    vi.mocked(registryRequest).mockResolvedValue({ data: services });
+    return render(
+      <CapabilitiesProvider info={triggerInfo}>
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} initialTrigger={source} />
+      </CapabilitiesProvider>,
+    );
+  }
+  const slack: RegistryService = { ...github, id: "slack", title: "Slack" };
+
+  it("leaves the services alone when a trigger is picked or switched", async () => {
+    renderTrigger("slack", [github, slack, { ...github, id: "jira", title: "Jira" }]);
+    const add = await screen.findByTestId("task-trigger-mcp-add");
+    const chip = await mcpTrigger();
+    // A signed-in service is offered, not turned on.
+    expect(add).toHaveTextContent("Add Slack MCP");
+    expect(chip).toHaveTextContent("No MCPs");
+    expect(screen.queryByTestId("task-trigger-tools-note")).not.toBeInTheDocument();
+
+    fireEvent.click(add);
+    await waitFor(() => expect(chip).toHaveTextContent("MCPs · 1"));
+    expect(screen.getByTestId("task-trigger-mcp-note")).toHaveTextContent("Uses Slack MCP");
+    expect(authorizeRegistryService).not.toHaveBeenCalled();
+
+    // Switching triggers keeps what the owner added, and offers the new trigger's service.
+    fireEvent.keyDown(screen.getByTestId("task-trigger-type"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: /Jira/ }));
+    await waitFor(() =>
+      expect(screen.getByTestId("task-trigger-mcp-add")).toHaveTextContent("Add Jira MCP"),
+    );
+    expect(chip).toHaveTextContent("MCPs · 1");
+  });
+
+  it("signs in to a trigger's MCP service from the trigger without blocking the save", async () => {
+    vi.mocked(authorizeRegistryService).mockResolvedValue(undefined);
+    renderTrigger("slack", [github, { ...slack, connected: false }]);
+    const add = await screen.findByTestId("task-trigger-mcp-add");
+    expect(add).toHaveTextContent("Add Slack MCP");
+    // Nothing is picked for the owner, so nothing needs sign-in to save.
+    expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("No MCPs");
+    expect(screen.queryByTestId("task-mcp-services-blocked")).not.toBeInTheDocument();
+    expect(authorizeRegistryService).not.toHaveBeenCalled();
+
+    vi.mocked(registryRequest).mockResolvedValue({ data: [github, slack] });
+    fireEvent.click(add);
+    await waitFor(() =>
+      expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("MCPs · 1"),
+    );
+    expect(authorizeRegistryService).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("task-trigger-mcp-note")).toHaveTextContent("Uses Slack MCP");
+  });
+
+  it("says why a trigger's MCP sign-in failed, and lets the owner retry", async () => {
+    vi.mocked(authorizeRegistryService).mockRejectedValueOnce(
+      new Error("Allow popups for this site to sign in."),
+    );
+    renderTrigger("slack", [github, { ...slack, connected: false }]);
+    fireEvent.click(await screen.findByTestId("task-trigger-mcp-add"));
+    expect(await screen.findByTestId("task-trigger-mcp-sign-in-error")).toHaveTextContent(
+      "Allow popups for this site to sign in.",
+    );
+    expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("No MCPs");
+
+    vi.mocked(authorizeRegistryService).mockResolvedValueOnce(undefined);
+    vi.mocked(registryRequest).mockResolvedValue({ data: [github, slack] });
+    fireEvent.click(screen.getByTestId("task-trigger-mcp-add"));
+    await waitFor(() =>
+      expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("MCPs · 1"),
+    );
+    expect(screen.queryByTestId("task-trigger-mcp-sign-in-error")).not.toBeInTheDocument();
+  });
+
+  it("drops a trigger sign-in still pending when its draft closes", async () => {
+    let finish!: () => void;
+    vi.mocked(authorizeRegistryService).mockImplementation(
+      (_service, signal) =>
+        new Promise<void>((done, reject) => {
+          finish = done;
+          signal.addEventListener("abort", () => reject(new Error("Sign-in cancelled.")), {
+            once: true,
+          });
+        }),
+    );
+    const view = renderTrigger("slack", [github, { ...slack, connected: false }]);
+    fireEvent.click(await screen.findByTestId("task-trigger-mcp-add"));
+    expect(screen.getByTestId("task-trigger-mcp-add")).toHaveTextContent("Signing in to Slack");
+
+    const reopen = (open: boolean) =>
+      view.rerender(
+        <CapabilitiesProvider info={triggerInfo}>
+          <CreateScheduledTaskDialog open={open} onOpenChange={vi.fn()} initialTrigger="slack" />
+        </CapabilitiesProvider>,
+      );
+    reopen(false);
+    reopen(true);
+    vi.mocked(registryRequest).mockResolvedValue({ data: [github, slack] });
+    await act(async () => finish());
+
+    // The new draft neither gains the old draft's service nor waits on its sign-in.
+    expect(await screen.findByTestId("task-trigger-mcp-add")).toHaveTextContent("Add Slack MCP");
+    expect(await mcpTrigger()).toHaveTextContent("No MCPs");
+    expect(screen.queryByTestId("task-trigger-mcp-sign-in-error")).not.toBeInTheDocument();
+  });
+
+  it("sends a pasted-token trigger service to settings rather than a sign-in popup", async () => {
+    renderTrigger("slack", [github, { ...slack, auth: "bearer", connected: false }]);
+    const add = await screen.findByTestId("task-trigger-mcp-add");
+    expect(add).toHaveTextContent("Add Slack MCP");
+    expect(add).toHaveAttribute("href", "/settings/mcp");
+    fireEvent.click(add);
+    expect(authorizeRegistryService).not.toHaveBeenCalled();
+  });
+
+  it("keeps the tools warning for a trigger the server has no MCP service for", async () => {
+    renderTrigger("jira", [github, slack]);
+    await waitFor(() => expect(registryRequest).toHaveBeenCalled());
+    expect(screen.getByTestId("task-trigger-tools-note")).toHaveTextContent("MCP required");
+    expect(screen.queryByTestId("task-trigger-mcp-add")).not.toBeInTheDocument();
+    expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("No MCPs");
+  });
+
+  it("leaves a continued session's services alone", async () => {
+    renderWithRegistry(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          sessionMode: "continue",
+          sessionId: "conv_kept",
+          mcpServices: ["linear"],
+        })}
+      />,
+    );
+    const trigger = await screen.findByTestId("task-mcp-services-trigger");
+    expect(trigger).toBeDisabled();
+    expect(trigger).toHaveTextContent("Session's MCPs");
+    // An unsigned service it can't add to the session does not block saving.
+    expect(screen.queryByTestId("task-mcp-services-blocked")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("mcpServices");
+  });
+
+  it.each([
+    ["loading", () => new Promise<never>(() => {}), null],
+    ["failed", () => Promise.reject(new Error("down")), "Could not load MCP services"],
+  ])("blocks saving while the catalog is %s", async (_, response, message) => {
+    vi.mocked(registryRequest).mockImplementation(response);
+    renderWithRegistry(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ mcpServices: ["github"] })}
+      />,
+    );
+    if (message === null) {
+      // The reason waits for the catalog, but saving is held until then.
+      await waitFor(() => expect(registryRequest).toHaveBeenCalled());
+      expect(screen.queryByTestId("task-mcp-services-blocked")).not.toBeInTheDocument();
+    } else {
+      expect(await screen.findByTestId("task-mcp-services-blocked")).toHaveTextContent(message);
+    }
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+  });
+
+  it("closes the MCP menu when the dialog is reopened", async () => {
+    const view = renderWithRegistry(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
+    await mcpSwitch("GitHub");
+    expect(screen.getByTestId("task-mcp-services-menu")).toBeInTheDocument();
+    view.rerender(<CreateScheduledTaskDialog open={false} onOpenChange={vi.fn()} />);
+    view.rerender(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
+    expect(await screen.findByTestId("task-mcp-services-trigger")).toBeInTheDocument();
+    expect(screen.queryByTestId("task-mcp-services-menu")).not.toBeInTheDocument();
+  });
 });
