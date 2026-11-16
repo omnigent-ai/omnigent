@@ -624,7 +624,7 @@ function HarnessCard({
     </>
   );
   const className =
-    "flex flex-col gap-2 rounded-[20px] border border-border bg-card p-4 transition-colors";
+    "flex flex-col gap-2 rounded-xl border border-border bg-card p-4 transition-colors";
   return opensDetail ? (
     <Link
       to={`/settings/harnesses/${entry.harness}${status.ready ? "" : "?tab=settings"}`}
