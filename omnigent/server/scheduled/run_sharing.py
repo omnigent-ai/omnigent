@@ -243,10 +243,6 @@ async def _add_missing_grantees(
                 continue
             if held is not None:
                 continue
-            if visible_from is not None and not await asyncio.to_thread(
-                _holds_grant, permission_store, task, grantee, visible_from
-            ):
-                continue
             if not policy_checked:
                 try:
                     await asyncio.to_thread(
@@ -265,7 +261,9 @@ async def _add_missing_grantees(
                     )
                     return
                 policy_checked = True
-            if await _share_with_grantee(permission_store, task, session, grantee):
+            if await _share_with_grantee(
+                permission_store, task, session, grantee, visible_from=visible_from
+            ):
                 _announce_session_added(grantee, session.id)
         if cursor is None:
             return
@@ -312,7 +310,12 @@ def _held_under_the_stores_comparison(
 
 
 async def _share_with_grantee(
-    permission_store: PermissionStore, task: ScheduledTask, session: Conversation, grantee: str
+    permission_store: PermissionStore,
+    task: ScheduledTask,
+    session: Conversation,
+    grantee: str,
+    *,
+    visible_from: str | None,
 ) -> bool:
     """Run :func:`_share_and_confirm` in a thread, which a cancelled run waits for.
 
@@ -323,7 +326,14 @@ async def _share_with_grantee(
     :raises asyncio.CancelledError: When cancelled, once the thread has finished.
     """
     sharing = asyncio.ensure_future(
-        asyncio.to_thread(_share_and_confirm, permission_store, task, session, grantee)
+        asyncio.to_thread(
+            _share_and_confirm,
+            permission_store,
+            task,
+            session,
+            grantee,
+            visible_from=visible_from,
+        )
     )
     try:
         return await asyncio.shield(sharing)
@@ -333,15 +343,22 @@ async def _share_with_grantee(
 
 
 def _share_and_confirm(
-    permission_store: PermissionStore, task: ScheduledTask, session: Conversation, grantee: str
+    permission_store: PermissionStore,
+    task: ScheduledTask,
+    session: Conversation,
+    grantee: str,
+    *,
+    visible_from: str | None,
 ) -> bool:
     """Grant *grantee* Read on *session* if they still hold the automation's grant.
 
     Pins the grantee's account as the session share route does, so an account deleted
-    and registered again since the list was read is refused, not granted. The grant is
-    checked again after the write, and the share is taken back if it was revoked. Never
-    raises: a failure is logged.
+    and registered again since the list was read is refused, not granted. The grants
+    are checked again after the write, and the share is taken back if one was revoked.
+    Never raises: a failure is logged.
 
+    :param visible_from: A session ID, or ``None``. When set, *grantee* must also
+        hold a direct grant on it, both before and after the write.
     :returns: Whether a grant was written and kept.
     """
     try:
@@ -349,6 +366,10 @@ def _share_and_confirm(
         with target_account_scope(grantee, account.account_generation if account else None):
             # Checked after the pin: a replaced account no longer holds the grant.
             if permission_store.resolve_scheduled_task_access([grantee], task.id) is None:
+                return False
+            if visible_from is not None and not _holds_grant(
+                permission_store, task, grantee, visible_from
+            ):
                 return False
             permission_store.ensure_user(grantee)
             # Automations grant Read only (SCHEDULED_TASK_GRANT_LEVELS). A share made
@@ -359,8 +380,9 @@ def _share_and_confirm(
             "automation %s: could not share session %s with %r", task.id, session.id, grantee
         )
         return False
-    if not written or _held_under_the_stores_comparison(
-        permission_store, task, grantee, if_unknown=False
+    if not written or (
+        _held_under_the_stores_comparison(permission_store, task, grantee, if_unknown=False)
+        and (visible_from is None or _holds_grant(permission_store, task, grantee, visible_from))
     ):
         return written
     # Revoked since the check, perhaps after the revoke's own sync ran, or the recheck

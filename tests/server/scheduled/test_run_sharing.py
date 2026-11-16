@@ -178,6 +178,14 @@ async def test_a_launch_is_shared_only_with_grantees_who_can_see_its_root(
 
         monkeypatch.setattr(permissions, "get", fail_alices_root_grant)
     launched = _session(permissions)
+    written: list[str] = []
+    grant_if_absent = permissions.grant_if_absent
+
+    def record_write(user_id: str, conversation_id: str, level: int) -> bool:
+        written.append(user_id)
+        return grant_if_absent(user_id, conversation_id, level)
+
+    monkeypatch.setattr(permissions, "grant_if_absent", record_write)
 
     await share_launched_session(
         task,
@@ -189,6 +197,8 @@ async def test_a_launch_is_shared_only_with_grantees_who_can_see_its_root(
         host_registry=None,
     )
 
+    # Alice is refused before anything is written for her.
+    assert written == [bob]
     assert _levels(permissions, launched.id) == {bob: LEVEL_READ}
     assert announced == [(bob, launched.id)]
 
@@ -381,14 +391,16 @@ async def test_a_sync_keeps_a_grant_the_database_matches_to_a_grantee(
 
 
 @pytest.mark.parametrize("upgraded", [False, True], ids=["unchanged", "upgraded"])
-@pytest.mark.parametrize("fault", ["revoked", "recheck_failed"])
+@pytest.mark.parametrize("fault", ["revoked", "recheck_failed", "launch_source_revoked"])
 async def test_a_share_is_taken_back_unless_the_grant_outlasts_its_write(
     permissions, task, announced, monkeypatch, fault, upgraded
 ) -> None:
     """A revoke that lands between the run's check and its write, after which the
     revoke's own sync finds nothing to remove, must not leave Alice on the session.
-    Taking the share back never removes an upgrade made by hand since the write."""
+    Taking the share back never removes an upgrade made by hand since the write.
+    A launch also takes it back when Alice loses the session it was launched from."""
     session = _session(permissions, **{RESERVED_USER_LOCAL: LEVEL_OWNER})
+    launch_source = _session(permissions, **dict.fromkeys(GRANTEES, LEVEL_READ))
     grant_if_absent = permissions.grant_if_absent
     resolve = permissions.resolve_scheduled_task_access
     fail_next_check = False
@@ -398,6 +410,9 @@ async def test_a_share_is_taken_back_unless_the_grant_outlasts_its_write(
         if user_id == "alice@example.com":
             if fault == "revoked":
                 permissions.revoke_for_scheduled_task(user_id, task.id)
+            elif fault == "launch_source_revoked":
+                # She keeps the automation's grant.
+                permissions.revoke(user_id, launch_source.id)
             else:
                 fail_next_check = True
         written = grant_if_absent(user_id, conversation_id, level)
@@ -415,7 +430,18 @@ async def test_a_share_is_taken_back_unless_the_grant_outlasts_its_write(
 
     monkeypatch.setattr(permissions, "grant_if_absent", write)
     monkeypatch.setattr(permissions, "resolve_scheduled_task_access", check)
-    await _sync(permissions, task, session)
+    if fault == "launch_source_revoked":
+        await share_launched_session(
+            task,
+            session,
+            launched_from_root=launch_source.id,
+            managed=False,
+            permission_store=permissions,
+            app_state=None,
+            host_registry=None,
+        )
+    else:
+        await _sync(permissions, task, session)
 
     upgrade = {"alice@example.com": LEVEL_EDIT} if upgraded else {}
     assert _levels(permissions, session.id) == {
