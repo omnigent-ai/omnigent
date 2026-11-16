@@ -154,10 +154,10 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     bind_session_runner as _bind_session_runner,
 )
+from omnigent.native.native_terminal import file_in_launch_project, post_initial_prompt
 from omnigent.native.native_terminal import (
     normalize_extra_args as _normalize_extra_args,
 )
-from omnigent.native.native_terminal import post_initial_prompt
 from omnigent.native.native_terminal import (
     request_with_429_retry as _request_with_429_retry,
 )
@@ -1780,6 +1780,7 @@ def run_claude_native(
     use_claude_config: bool = False,
     auto_open_conversation: bool = False,
     startup_profiler: StartupProfiler | None = None,
+    project_id: str | None = None,
 ) -> None:
     """
     Launch Claude Code in an Omnigent terminal and attach locally.
@@ -1811,9 +1812,13 @@ def run_claude_native(
     :param startup_profiler: Optional shared startup profiler from the
         Click command. ``None`` creates one from
         ``OMNIGENT_CLAUDE_STARTUP_PROFILE``.
+    :param project_id: Project to file a new session in, e.g.
+        ``"proj_abc123"``. Requires *server*; ignored when resuming.
     :returns: None after the attach session ends.
     :raises click.ClickException: If setup, launch, or attach fails.
     """
+    if project_id is not None and server is None:
+        raise click.ClickException("Filing a Claude session in a project requires a server.")
     claude_args = _normalize_extra_args(
         extra_args=extra_args, legacy_args=claude_args, legacy_param="claude_args"
     )
@@ -1872,6 +1877,7 @@ def run_claude_native(
                 prompt=prompt,
                 auto_open_conversation=auto_open_conversation,
                 startup_profiler=startup_profiler,
+                project_id=project_id,
             )
 
 
@@ -4874,6 +4880,7 @@ async def _prepare_claude_terminal_via_daemon(
     workspace: str,
     startup_profiler: StartupProfiler | None = None,
     startup_progress: RunnerStartupProgress | None = None,
+    project_id: str | None = None,
 ) -> PreparedClaudeTerminal:
     """
     Create/resolve a session and bring its terminal up via the daemon.
@@ -4906,6 +4913,8 @@ async def _prepare_claude_terminal_via_daemon(
         marks. ``None`` disables output.
     :param startup_progress: Optional user-visible progress renderer,
         e.g. a handle from :func:`runner_startup_progress`.
+    :param project_id: Project to file a fresh session in, e.g.
+        ``"proj_abc123"``. Unused when resuming *session_id*.
     :returns: Prepared terminal details (with tmux coordinates when the
         runner is local, enabling the direct-attach fast path).
     :raises click.ClickException: If any setup step fails.
@@ -4943,6 +4952,7 @@ async def _prepare_claude_terminal_via_daemon(
                     bridge_id=None,
                     claude_args=tuple(persist_args),
                     terminal_launch_args=persist_args or None,
+                    project_id=project_id,
                 ),
                 wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S),
             )
@@ -5111,6 +5121,7 @@ def _run_with_remote_server(
     prompt: str | None = None,
     auto_open_conversation: bool = False,
     startup_profiler: StartupProfiler | None = None,
+    project_id: str | None = None,
 ) -> None:
     """
     Launch Claude on a remote Omnigent server via the connect daemon.
@@ -5141,6 +5152,7 @@ def _run_with_remote_server(
         conversation URL after the session is prepared.
     :param startup_profiler: Optional startup profiler for timing
         marks. ``None`` disables output.
+    :param project_id: Project to file a new session in, e.g. ``"proj_abc123"``.
     :returns: None.
     """
     from omnigent.chat import _bundle_agent, _remote_headers, _server_auth
@@ -5236,6 +5248,7 @@ def _run_with_remote_server(
                         workspace=str(Path.cwd().resolve()),
                         startup_profiler=startup_profiler,
                         startup_progress=progress,
+                        project_id=project_id,
                     )
                 )
                 _mark_startup_step(
@@ -6739,6 +6752,7 @@ async def _create_claude_session(
     bridge_id: str | None,
     claude_args: tuple[str, ...] = (),
     terminal_launch_args: list[str] | None = None,
+    project_id: str | None = None,
 ) -> str:
     """
     Create a bundled terminal-first Claude session.
@@ -6767,6 +6781,8 @@ async def _create_claude_session(
         and applies them when it auto-launches the terminal. ``None``
         (the CLI-direct path, which passes args via the live terminal
         POST instead) persists nothing.
+    :param project_id: Project to file the session in, e.g.
+        ``"proj_abc123"``. ``None`` leaves it unfiled.
     :returns: New session id, e.g. ``"conv_abc123"``.
     :raises click.ClickException: If creation fails.
     """
@@ -6780,6 +6796,7 @@ async def _create_claude_session(
     effort = resolve_launch_effort_level(claude_args)
     if effort is not None:
         metadata["reasoning_effort"] = effort
+    file_in_launch_project(metadata, project_id)
     resp = await client.post(
         "/v1/sessions",
         data={"metadata": json.dumps(metadata)},

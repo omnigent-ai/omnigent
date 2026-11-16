@@ -89,6 +89,23 @@ def register_native_commands(cli: click.Group) -> None:
     _reject_smart_routing_prompt = _late_bound(lambda: _cli._reject_smart_routing_prompt)
     _reject_smart_routing_resume = _late_bound(lambda: _cli._reject_smart_routing_resume)
     _smart_routing_decision = _late_bound(lambda: _cli._smart_routing_decision)
+    _smart_routing_preflight = _late_bound(lambda: _cli._smart_routing_preflight)
+    _launch_project_name = _late_bound(lambda: _cli._launch_project_name)
+    _reject_project_on_resume = _late_bound(lambda: _cli._reject_project_on_resume)
+    _resolve_launch_project_id = _late_bound(lambda: _cli._resolve_launch_project_id)
+
+    # Shared by the launchers that can file their new session in a project.
+    project_option = click.option(
+        "--project",
+        "project",
+        metavar="NAME",
+        default=None,
+        callback=_launch_project_name,
+        help=(
+            "File the new session in your project named NAME, creating the "
+            "project if you have none by that name."
+        ),
+    )
 
     @cli.command(
         context_settings={
@@ -186,6 +203,7 @@ def register_native_commands(cli: click.Group) -> None:
             "you type in the TUI is what gets routed, so this takes no -p."
         ),
     )
+    @project_option
     @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
     @observe_native_startup("claude-native")
     def claude(
@@ -198,6 +216,7 @@ def register_native_commands(cli: click.Group) -> None:
         claude_command: str | None,
         prompt: str | None,
         smart_routing: bool,
+        project: str | None,
         claude_args: tuple[str, ...],
     ) -> None:
         # Param docs live in comments — Click uses the docstring for --help.
@@ -210,6 +229,7 @@ def register_native_commands(cli: click.Group) -> None:
         # :param prompt: Optional initial TUI prompt.
         # :param smart_routing: When True, arm Smart Routing for the session so
         #     the first typed message picks the model.
+        # :param project: Trimmed project name to file the new session in.
         # :param claude_args: Pass-through args for ``claude``.
         """Launch Claude Code with Omnigent.
 
@@ -220,6 +240,7 @@ def register_native_commands(cli: click.Group) -> None:
           omnigent claude --resume                  # interactive picker
           omnigent claude --server https://<app>.databricksapps.com
           omnigent claude --smart-routing           # first message picks the model
+          omnigent claude --project "factory workers"
         """
         _reject_native_on_windows("claude")
         if smart_routing:
@@ -253,12 +274,10 @@ def register_native_commands(cli: click.Group) -> None:
                 "--session and --resume are mutually exclusive; "
                 "prefer --resume (--session is deprecated).",
             )
+        resuming = choice.picker or choice.conversation_id is not None or session_id is not None
+        _reject_project_on_resume(project, resuming=resuming)
         if smart_routing:
-            _reject_smart_routing_resume(
-                resuming=choice.picker
-                or choice.conversation_id is not None
-                or session_id is not None
-            )
+            _reject_smart_routing_resume(resuming=resuming)
         startup_profiler.mark("arguments validated")
 
         # Ensure the host daemon (local when ``--server`` is omitted/empty,
@@ -268,6 +287,17 @@ def register_native_commands(cli: click.Group) -> None:
         startup_profiler.mark("ensuring backend")
         server = _ensure_backend(server)
         startup_profiler.mark("backend ready", detail=f"server={server}")
+        # Preflight first, so an unavailable Smart Routing leaves no new project.
+        routing_host_id = (
+            _smart_routing_preflight(server=server, harness="claude-native")
+            if smart_routing
+            else None
+        )
+        project_id = (
+            _resolve_launch_project_id(server=server, project_name=project)
+            if project is not None
+            else None
+        )
 
         resolved_session_id = (
             choice.conversation_id if choice.conversation_id is not None else session_id
@@ -301,7 +331,12 @@ def register_native_commands(cli: click.Group) -> None:
             # Arming creates the session (that is where Smart Routing is turned
             # on and the decision card lands), so attach to it instead of
             # letting the wrapper bundle a fresh one.
-            armed = _smart_routing_decision(server=server, harness="claude-native")
+            armed = _smart_routing_decision(
+                server=server,
+                harness="claude-native",
+                host_id=routing_host_id,
+                project_id=project_id,
+            )
             resolved_session_id = armed.session_id or resolved_session_id
         run_claude_native(
             server=server,
@@ -313,6 +348,7 @@ def register_native_commands(cli: click.Group) -> None:
             auto_open_conversation=auto_open_conversation,
             startup_profiler=startup_profiler,
             command=resolved_command,
+            project_id=project_id,
         )
 
     @cli.command(
@@ -369,6 +405,7 @@ def register_native_commands(cli: click.Group) -> None:
             "you type in the TUI is what gets routed, so this takes no -p."
         ),
     )
+    @project_option
     @click.argument("codex_args", nargs=-1, type=click.UNPROCESSED)
     @observe_native_startup("codex-native")
     def codex(
@@ -378,6 +415,7 @@ def register_native_commands(cli: click.Group) -> None:
         model: str | None,
         prompt: str | None,
         smart_routing: bool,
+        project: str | None,
         codex_args: tuple[str, ...],
     ) -> None:
         # Param docs live in comments — Click uses the docstring for --help.
@@ -388,6 +426,7 @@ def register_native_commands(cli: click.Group) -> None:
         # :param prompt: Optional first prompt.
         # :param smart_routing: When True, arm Smart Routing for the session so
         #     the first typed message picks the model.
+        # :param project: Trimmed project name to file the new session in.
         # :param codex_args: Pass-through args for ``codex`` before ``resume``.
         """Launch Codex with Omnigent.
 
@@ -398,6 +437,7 @@ def register_native_commands(cli: click.Group) -> None:
           omnigent codex --resume                  # interactive picker
           omnigent codex --server https://<app>.databricksapps.com
           omnigent codex --smart-routing           # first message picks the model
+          omnigent codex --project "factory workers"
         """
         _reject_native_on_windows("codex")
         if smart_routing:
@@ -410,12 +450,10 @@ def register_native_commands(cli: click.Group) -> None:
                 "--session and --resume are mutually exclusive; "
                 "prefer --resume (--session is deprecated).",
             )
+        resuming = choice.picker or choice.conversation_id is not None or session_id is not None
+        _reject_project_on_resume(project, resuming=resuming)
         if smart_routing:
-            _reject_smart_routing_resume(
-                resuming=choice.picker
-                or choice.conversation_id is not None
-                or session_id is not None
-            )
+            _reject_smart_routing_resume(resuming=resuming)
         _reject_reserved_codex_transport_args(codex_args)
 
         from omnigent.harness_startup_config import resolve_harness_command
@@ -433,6 +471,17 @@ def register_native_commands(cli: click.Group) -> None:
         # the same ownership model as attach/run/claude: the daemon-spawned runner
         # owns the app-server and TUI; the CLI attaches to the tmux terminal.
         server = _ensure_backend(server)
+        # Preflight first, so an unavailable Smart Routing leaves no new project.
+        routing_host_id = (
+            _smart_routing_preflight(server=server, harness="codex-native")
+            if smart_routing
+            else None
+        )
+        project_id = (
+            _resolve_launch_project_id(server=server, project_name=project)
+            if project is not None
+            else None
+        )
 
         resolved_session_id = (
             choice.conversation_id if choice.conversation_id is not None else session_id
@@ -448,7 +497,12 @@ def register_native_commands(cli: click.Group) -> None:
             # Attach to the armed session — arming created it. Nothing is picked
             # yet, so ``model`` keeps whatever the user or config asked for
             # until the first typed message routes.
-            armed = _smart_routing_decision(server=server, harness="codex-native")
+            armed = _smart_routing_decision(
+                server=server,
+                harness="codex-native",
+                host_id=routing_host_id,
+                project_id=project_id,
+            )
             resolved_session_id = armed.session_id or resolved_session_id
         run_codex_native(
             server=server,
@@ -459,6 +513,7 @@ def register_native_commands(cli: click.Group) -> None:
             prompt=prompt,
             auto_open_conversation=auto_open_conversation,
             command=resolved_command,
+            project_id=project_id,
         )
 
     @cli.command(

@@ -47,7 +47,7 @@ def test_remote_prompt_is_separate_from_persistent_launch_args(
     monkeypatch: pytest.MonkeyPatch,
     session_id: str | None,
 ) -> None:
-    """Fresh and resumed launches submit an explicit prompt separately."""
+    """Fresh and resumed launches submit an explicit prompt and project separately."""
     captured = _capture_remote(monkeypatch)
 
     claude_native.run_claude_native(
@@ -55,10 +55,12 @@ def test_remote_prompt_is_separate_from_persistent_launch_args(
         session_id=session_id,
         extra_args=("--dangerously-skip-permissions",),
         prompt="review the last commit",
+        project_id="proj_factory",
     )
 
     assert captured["claude_args"] == ("--dangerously-skip-permissions",)
     assert captured["prompt"] == "review the last commit"
+    assert captured["project_id"] == "proj_factory"
 
 
 def test_prompt_precedes_variadic_value_flags(monkeypatch: pytest.MonkeyPatch) -> None:

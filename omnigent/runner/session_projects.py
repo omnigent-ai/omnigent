@@ -58,11 +58,8 @@ async def resolve_project_id(
         raise ValueError("project_name must not be empty")
 
     async def find() -> str | None:
-        resp = await client.get("/v1/projects", timeout=30.0)
-        if resp.status_code >= 400:
-            raise ValueError(f"could not list projects: {resp.text[:200]}")
-        projects = resp.json().get("data", [])
-        return next((p["id"] for p in projects if p.get("name") == trimmed), None)
+        match = await _find_project(client, trimmed)
+        return str(match["id"]) if match is not None else None
 
     existing = await find()
     if existing is not None:

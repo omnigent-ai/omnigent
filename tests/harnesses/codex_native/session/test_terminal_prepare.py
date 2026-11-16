@@ -661,6 +661,7 @@ async def test_prepare_codex_terminal_via_daemon_overlaps_create_and_host_wait(
     """
     order: list[str] = []
     host_waits = 0
+    created_in_projects: list[str | None] = []
 
     async def fake_create(
         client: object,
@@ -668,9 +669,11 @@ async def test_prepare_codex_terminal_via_daemon_overlaps_create_and_host_wait(
         *,
         bridge_id: str | None,
         terminal_launch_args: list[str] | None = None,
+        project_id: str | None = None,
     ) -> str:
         """Record the create window, yielding so a concurrent wait can start."""
         del client, bundle, bridge_id, terminal_launch_args
+        created_in_projects.append(project_id)
         order.append("create:start")
         await asyncio.sleep(0)
         order.append("create:end")
@@ -737,9 +740,11 @@ async def test_prepare_codex_terminal_via_daemon_overlaps_create_and_host_wait(
         model=None,
         host_id="host_local",
         workspace="/repo",
+        project_id="proj_factory",
     )
 
     assert prepared.session_id == "conv_new"
+    assert created_in_projects == ["proj_factory"]
     assert order.index("host:start") < order.index("create:end")
     assert host_waits == 1
 

@@ -332,7 +332,7 @@ def test_run_codex_native_does_not_require_local_codex_binary(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    remote_called = False
+    remote_project_ids: list[str | None] = []
 
     def fake_which(command: str) -> str | None:
         """
@@ -355,13 +355,13 @@ def test_run_codex_native_does_not_require_local_codex_binary(
         model: str | None,
         prompt: str | None,
         auto_open_conversation: bool,
+        project_id: str | None,
     ) -> None:
         """
         Record that the remote daemon path was selected.
 
         :returns: None.
         """
-        nonlocal remote_called
         del (
             base_url,
             spec_path,
@@ -372,7 +372,7 @@ def test_run_codex_native_does_not_require_local_codex_binary(
             prompt,
             auto_open_conversation,
         )
-        remote_called = True
+        remote_project_ids.append(project_id)
 
     monkeypatch.setattr(codex_native.shutil, "which", fake_which)
     monkeypatch.setattr(codex_native, "_run_with_remote_server", fake_remote)
@@ -382,9 +382,10 @@ def test_run_codex_native_does_not_require_local_codex_binary(
         session_id=None,
         codex_args=(),
         command="codex",
+        project_id="proj_factory",
     )
 
-    assert remote_called is True
+    assert remote_project_ids == ["proj_factory"]
 
 
 def test_record_launch_for_fresh_session_persists_current_cwd(

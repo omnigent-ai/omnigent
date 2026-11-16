@@ -108,6 +108,8 @@ the header menu), and each place is a separate entry point.
   project folder from the row menu, the header menu, or the header's folder tag.
   Agents file sessions the same way with `sys_session_update` (see
   [session orchestration](session-orchestration.md)).
+  `omnigent claude|codex --project NAME` files a new native session at creation,
+  creating the project if missing and keeping the launch directory as workspace.
 - `project-create-run-on`: New project's **Run on** picks a connected host or a
   sandbox provider (behind the `project_repository_creation` release feature, on by
   default; append `-project_repository_creation` to keep the folder-only dialog).

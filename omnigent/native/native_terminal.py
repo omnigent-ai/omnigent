@@ -6,6 +6,7 @@ import asyncio
 import urllib.parse
 import warnings
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 import click
 import httpx
@@ -87,6 +88,24 @@ def normalize_extra_args(
         if extra_args is None:
             return tuple(legacy_args)
     return tuple(extra_args or ())
+
+
+def file_in_launch_project(body: dict[str, Any], project_id: str | None) -> None:
+    """
+    Add the session-create fields that file a new CLI-launched session in a project.
+
+    Explicit ``workspace`` and ``git`` nulls keep the project's saved folder
+    defaults from replacing the directory the CLI was launched in; a body that
+    already names a workspace keeps it.
+
+    :param body: Session-create JSON body or multipart metadata, updated in place.
+    :param project_id: The project to file the session in, or ``None`` for none.
+    """
+    if project_id is None:
+        return
+    body["project_id"] = project_id
+    body.setdefault("workspace", None)
+    body.setdefault("git", None)
 
 
 def url_component(value: str) -> str:
