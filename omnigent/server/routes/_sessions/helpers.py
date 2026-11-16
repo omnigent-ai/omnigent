@@ -5622,6 +5622,9 @@ def _publish_sandbox_status(*args: Any, **kwargs: Any) -> None:
     return _facade._publish_sandbox_status(*args, **kwargs)
 
 
+_SANDBOX_LAUNCH_ERROR_ATTRIBUTE_MAX_CHARS = 300
+
+
 def _publish_sandbox_status_impl(
     session_id: str,
     stage: str,
@@ -5685,6 +5688,12 @@ def _publish_sandbox_status_impl(
             stage=(previous.stage if previous else "unknown") if stage == "failed" else stage,
             # Every stage row names the sandbox, even when the launch's host never connects.
             provider=status.provider,
+            # The reason lets failure dashboards group launches; capped to keep rows small.
+            **(
+                {"error": status.error[:_SANDBOX_LAUNCH_ERROR_ATTRIBUTE_MAX_CHARS]}
+                if stage == "failed" and status.error
+                else {}
+            ),
         ),
     )
     # "ready" evicts launch state; failures stay cached (like ManagedLaunchTracker)

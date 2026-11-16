@@ -6336,7 +6336,9 @@ def test_launch_stage_rows_name_the_provider(caplog: pytest.LogCaptureFixture) -
     session_id = "conv_provider_rows"
     try:
         with caplog.at_level(logging.INFO):
-            helpers._publish_sandbox_status_impl(session_id, "provisioning", provider="arclet")
+            helpers._publish_sandbox_status_impl(
+                session_id, "provisioning", provider="example-sandbox"
+            )
             helpers._publish_sandbox_status_impl(session_id, "starting")
             helpers._publish_sandbox_status_impl(session_id, "failed", "host never connected")
     finally:
@@ -6347,10 +6349,44 @@ def test_launch_stage_rows_name_the_provider(caplog: pytest.LogCaptureFixture) -
         if getattr(record, "event_name", None) in {"sandbox_launch_stage", "sandbox_launch_failed"}
     ]
     assert rows == [
-        ("sandbox_launch_stage", {"stage": "provisioning", "provider": "arclet"}),
-        ("sandbox_launch_stage", {"stage": "starting", "provider": "arclet"}),
-        ("sandbox_launch_failed", {"stage": "starting", "provider": "arclet"}),
+        ("sandbox_launch_stage", {"stage": "provisioning", "provider": "example-sandbox"}),
+        ("sandbox_launch_stage", {"stage": "starting", "provider": "example-sandbox"}),
+        (
+            "sandbox_launch_failed",
+            {"stage": "starting", "provider": "example-sandbox", "error": "host never connected"},
+        ),
     ]
+
+
+def test_launch_failure_row_carries_truncated_error_but_event_keeps_full_error(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The failed debug row carries a capped reason; the user-facing event keeps the full error.
+    """
+    from omnigent.server.routes._sessions import helpers
+    from omnigent.server.routes._sessions.common import _session_sandbox_status_cache
+
+    session_id = "conv_failure_reason"
+    long_error = "managed sandbox launch failed: " + "x" * 500
+    published: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        helpers.session_stream, "publish", lambda _id, event: published.append(event)
+    )
+    try:
+        with caplog.at_level(logging.INFO):
+            helpers._publish_sandbox_status_impl(
+                session_id, "failed", long_error, provider="example-sandbox"
+            )
+    finally:
+        _session_sandbox_status_cache.pop(session_id, None)
+    (failed_row,) = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "sandbox_launch_failed"
+    ]
+    assert failed_row.attributes["error"] == long_error[:300]
+    assert published[-1]["error"] == long_error
 
 
 async def test_run_managed_wake_re_stamps_the_woken_runner(
