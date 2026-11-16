@@ -1,7 +1,6 @@
 import {
   useCallback,
   useEffect,
-  useRef,
   useState,
   type ComponentProps,
   type DragEvent,
@@ -37,8 +36,6 @@ import { Button } from "@/components/ui/button";
 import { useChatStore } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { cn } from "@/lib/utils";
-import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
-import { readDefaultWorkspacePanelOpen } from "@/lib/workspacePanelPreferences";
 import { SidebarEditRow } from "@/shell/SidebarEditRow";
 import {
   SIDEBAR_ROW,
@@ -58,7 +55,8 @@ import {
   ContextMenuItem,
 } from "@/components/ui/context-menu";
 import { gridPanes, gridSessionIds, type SessionGrid } from "./gridLayout";
-import { GridSessionPane, type GridWorkspacePanelProps } from "./GridSessionPane";
+import { useResizableWorkspacePanel } from "@/shell/useResizableWorkspacePanel";
+import { GridSessionPane } from "./GridSessionPane";
 import { GridDropOverlay, type GridDropTarget } from "./GridDropTargets";
 import { gridTitle, useGridSessions } from "./GridSessionsContext";
 
@@ -194,24 +192,22 @@ export function RearrangeableGrid({
   const sessionIds = gridSessionIds(layout);
   const { selectedSessionId: activeSessionId, selectSession } = useGridSessions()!;
   const workspaceKey = `grid:${grid.id}`;
-  const [workspace, setWorkspace] = useState(() => {
-    const saved = readSessionWorkspaceState(workspaceKey);
-    return { open: saved.open ?? readDefaultWorkspacePanelOpen(), widthPx: saved.widthPx };
-  });
-  useEffect(() => writeSessionWorkspaceState(workspaceKey, workspace), [workspaceKey, workspace]);
-  const [maximized, setMaximized] = useState(false);
   const [workspaceTarget, setWorkspaceTarget] = useState<HTMLDivElement | null>(null);
+  const {
+    container,
+    open: workspaceOpen,
+    maximized,
+    openWorkspace: openSharedWorkspace,
+    toggleWorkspace,
+    workspacePanel,
+  } = useResizableWorkspacePanel(workspaceKey, "Resize grid workspace");
   const openWorkspace = useCallback(
     (sessionId: string) => {
       selectSession(sessionId);
-      setWorkspace((previous) => ({ ...previous, open: true }));
+      openSharedWorkspace();
     },
-    [selectSession],
+    [selectSession, openSharedWorkspace],
   );
-  const toggleWorkspace = () => {
-    setMaximized(false);
-    setWorkspace((previous) => ({ ...previous, open: !previous.open }));
-  };
   useSidebarToggleHotkeys({ onToggleRight: toggleWorkspace });
   // The cell a pane-cycle chord moved to; that cell then claims keyboard focus.
   const [focusRequest, setFocusRequest] = useState<{ sessionId: string } | null>(null);
@@ -224,52 +220,6 @@ export function RearrangeableGrid({
       setFocusRequest({ sessionId });
     },
   });
-  const container = useRef<HTMLDivElement>(null);
-  const [containerWidth, setContainerWidth] = useState(0);
-  useEffect(() => {
-    const node = container.current;
-    if (!node) return;
-    const observer = new ResizeObserver(() => setContainerWidth(node.clientWidth));
-    observer.observe(node);
-    setContainerWidth(node.clientWidth);
-    return () => observer.disconnect();
-  }, []);
-  const maximumWidth = Math.max(0, containerWidth - 280);
-  const width = Math.min(workspace.widthPx ?? Math.min(600, containerWidth * 0.4), maximumWidth);
-  const resize = (next: number) =>
-    setWorkspace((previous) => ({
-      ...previous,
-      widthPx: Math.max(Math.min(240, maximumWidth), Math.min(maximumWidth, next)),
-    }));
-  const workspacePanel: GridWorkspacePanelProps = {
-    open: workspace.open,
-    width,
-    maximized,
-    onToggleMaximized: () => setMaximized((previous) => !previous),
-    handleProps: {
-      tabIndex: 0,
-      role: "separator",
-      "aria-label": "Resize grid workspace",
-      "aria-orientation": "vertical",
-      "aria-valuenow": Math.round(width),
-      "aria-valuemin": 0,
-      "aria-valuemax": maximumWidth,
-      onPointerDown: (event) => {
-        event.preventDefault();
-        event.currentTarget.setPointerCapture(event.pointerId);
-      },
-      onPointerMove: (event) => {
-        if (event.currentTarget.hasPointerCapture(event.pointerId) && container.current)
-          resize(container.current.getBoundingClientRect().right - event.clientX);
-      },
-      onPointerUp: (event) => event.currentTarget.releasePointerCapture(event.pointerId),
-      onKeyDown: (event) => {
-        if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
-        event.preventDefault();
-        resize(width + (event.key === "ArrowLeft" ? 24 : -24));
-      },
-    },
-  };
   const grids = useGridSessions()!;
   const [dragged, setDragged] = useState<{ id: string; title: string } | null>(null);
   const rearrangeTargetId =
@@ -342,12 +292,12 @@ export function RearrangeableGrid({
             <Button
               variant="ghost"
               size="icon-xs"
-              aria-label={`${workspace.open ? "Collapse" : "Expand"} grid workspace`}
-              // aria-expanded={workspace.open}
+              aria-label={`${workspaceOpen ? "Collapse" : "Expand"} grid workspace`}
+              // aria-expanded={workspaceOpen}
               onClick={toggleWorkspace}
               className="text-muted-foreground hover:text-foreground border-none"
             >
-              {workspace.open ? <PanelRightCloseIcon /> : <PanelRightIcon />}
+              {workspaceOpen ? <PanelRightCloseIcon /> : <PanelRightIcon />}
             </Button>
           </header>
           <div
