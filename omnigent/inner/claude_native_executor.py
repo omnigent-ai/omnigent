@@ -44,6 +44,7 @@ from omnigent.harnesses.claude_native.bridge import (
     terminal_dialog_pending,
 )
 from omnigent.host.identity_env import in_managed_sandbox
+from omnigent.inner.async_utils import run_sync_cleanup
 from omnigent.inner.executor import (
     EnqueuedContent,
     Executor,
@@ -199,7 +200,7 @@ class ClaudeNativeExecutor(Executor):
         async with self._inject_lock:
             self._require_active_session()
             context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
-            context_path.unlink(missing_ok=True)
+            await self._inject(partial(context_path.unlink, missing_ok=True))
             if wanted_model_arg is not None:
                 # Accepted trade-off: ``/model <id>`` also saves the
                 # pick as the person's global default for new Claude
@@ -350,15 +351,24 @@ class ClaudeNativeExecutor(Executor):
 
     async def _inject_prompt(self, text: str, notices: list[str]) -> None:
         """Inject user text with one-shot context while holding the injection lock."""
-        self._require_active_session()
         context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
-        context_path.unlink(missing_ok=True)
-        if notices:
-            context_path.write_text("\n\n".join(notices), encoding="utf-8")
-        try:
-            await self._inject(partial(inject_user_message, self._bridge_dir, content=text))
-        except BaseException:
+
+        def inject() -> None:
+            self._require_active_session()
             context_path.unlink(missing_ok=True)
+            if notices:
+                context_path.write_text("\n\n".join(notices), encoding="utf-8")
+            inject_user_message(self._bridge_dir, content=text)
+
+        try:
+            await self._inject(inject)
+        except BaseException:
+            await run_sync_cleanup(
+                context_path.unlink,
+                missing_ok=True,
+                component="claude_prompt_context",
+                session_id=self._request_session_id,
+            )
             raise
 
     def _require_active_session(self) -> None:
