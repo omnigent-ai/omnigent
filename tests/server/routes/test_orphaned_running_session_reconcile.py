@@ -154,6 +154,9 @@ async def test_interrupted_runner_bookkeeping_requires_recovery_opt_in(
     store.set_host_id(sid, host_id, workspace="/workspace")
     conv = store.get_conversation(sid)
     assert conv is not None and conv.runner_id is not None
+    store.touch_runner_liveness([conv.runner_id], now_epoch() - RUNNER_LIVENESS_TTL_S - 1)
+    conv = store.get_conversation(sid)
+    assert conv is not None and conv.runner_id is not None
     previous = (
         SessionRecovery(host_id, conv.runner_id, now_epoch(), phase=phase)
         if phase is not None

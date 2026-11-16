@@ -33,6 +33,7 @@ def recovery(db_uri: str, monkeypatch: pytest.MonkeyPatch) -> Any:
         agent_id=agent.id, host_id=host_id, workspace="/workspace", runner_id="old"
     )
     store.set_session_live_status(conv.id, "running")
+    store.touch_runner_liveness(["old"], 1000)
     conv = store.get_conversation(conv.id)
     connection = SimpleNamespace(
         host_id=host_id,
@@ -321,11 +322,12 @@ async def test_disabling_recovery_leaves_existing_intent_untouched(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("action", ["message", "stop", "opt_out", "rebind"])
-async def test_user_intent_during_launch_prevents_continuation(recovery: Any, action: str) -> None:
-    launch = recovery.launch.side_effect
+@pytest.mark.parametrize("stage", ["launch", "routing"])
+async def test_user_intent_during_launch_prevents_continuation(
+    recovery: Any, action: str, stage: str
+) -> None:
 
-    async def interrupted_launch(*args: Any, **kwargs: Any) -> Any:
-        result = await launch(*args, **kwargs)
+    def interrupt() -> None:
         if action == "message":
             user_input(recovery.store, recovery.conv.id)
         elif action == "stop":
@@ -334,10 +336,42 @@ async def test_user_intent_during_launch_prevents_continuation(recovery: Any, ac
             recovery.store.replace_runner_id(recovery.conv.id, "explicit")
         else:
             recovery.host_config["host"]["recover_interrupted_sessions"] = False
-        return result
 
-    recovery.launch.side_effect = interrupted_launch
+    if stage == "launch":
+        launch = recovery.launch.side_effect
+
+        async def interrupted_launch(*args: Any, **kwargs: Any) -> Any:
+            result = await launch(*args, **kwargs)
+            interrupt()
+            return result
+
+        recovery.launch.side_effect = interrupted_launch
+    else:
+        route = recovery.service.runners.client_for_existing_conversation
+
+        def interrupted_route(session_id: str) -> Any:
+            result = route(session_id)
+            interrupt()
+            return result
+
+        recovery.service.runners.client_for_existing_conversation = interrupted_route
+
     await recovery.service.recover(recovery.connection, [])
+    recovery.initializer.initialize.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_accepted_input_before_initial_claim_prevents_recovery(recovery: Any) -> None:
+    claim = recovery.store.replace_session_recovery
+
+    def accept_input_before_claim(*args: Any, **kwargs: Any) -> bool:
+        user_input(recovery.store, recovery.conv.id)
+        return claim(*args, **kwargs)
+
+    recovery.store.replace_session_recovery = accept_input_before_claim
+    await recovery.service.recover(recovery.connection, [])
+    assert recovery.store.get_session_recovery(recovery.conv.id) is None
+    recovery.launch.assert_not_awaited()
     recovery.initializer.initialize.assert_not_awaited()
 
 
@@ -398,6 +432,8 @@ def test_stop_survives_store_restart_and_fresh_user_input_reenables_recovery(
     assert restarted.get_session_recovery(recovery.conv.id).phase == "stopped"
     user_input(restarted, recovery.conv.id)
     restarted_service.record_interruption(recovery.conv)
+    assert restarted.get_session_recovery(recovery.conv.id) is None
+    restarted_service.record_interruption(restarted.get_conversation(recovery.conv.id))
     assert restarted.get_session_recovery(recovery.conv.id).phase == "pending"
 
 
@@ -460,6 +496,25 @@ async def test_failed_session_keeps_its_original_interruption_time(
         recovery.initializer.initialize.assert_not_awaited()
     else:
         recovery.initializer.initialize.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("age", [60, RECOVERY_MAX_AGE_S + 1, None])
+async def test_persisted_running_session_does_not_receive_a_fresh_deadline(
+    recovery: Any, age: int | None
+) -> None:
+    if age is None:
+        recovery.store.clear_runner_liveness("old")
+    else:
+        recovery.store.touch_runner_liveness(["old"], recovery.clock[0] - age)
+    await recovery.service.recover(recovery.connection, [])
+    state = recovery.store.get_session_recovery(recovery.conv.id)
+    if age is None:
+        assert state is None
+    else:
+        assert state.interrupted_at == recovery.clock[0] - age
+        assert state.phase == ("failed" if age > RECOVERY_MAX_AGE_S else "submitted")
+    assert recovery.initializer.initialize.await_count == (age == 60)
 
 
 @pytest.mark.asyncio

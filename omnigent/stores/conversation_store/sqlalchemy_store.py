@@ -401,6 +401,7 @@ def _to_conversation(
         ),
         pending_elicitation_count=meta.pending_elicitation_count if meta else None,
         runner_last_seen=meta.runner_last_seen if meta else None,
+        next_position=row.next_position,
         background_work_running=meta.background_work_running if meta else None,
         blocked_on=meta.blocked_on if meta else None,
         project_id=meta.project_id if meta else None,
@@ -2924,11 +2925,18 @@ class SqlAlchemyConversationStore(ConversationStore):
         conversation_id: str,
         expected: SessionRecovery | None,
         recovery: SessionRecovery | None,
+        *,
+        expected_conversation: Conversation | None = None,
     ) -> bool:
         def write(session: Session) -> bool:
             self._lock_conversation(session, conversation_id)
             conversation = session.get(SqlConversation, (current_workspace_id(), conversation_id))
             if conversation is None or conversation.archived:
+                return False
+            if (
+                expected_conversation is not None
+                and conversation.next_position != expected_conversation.next_position
+            ):
                 return False
             actual = _read_session_recovery(session, conversation_id)
             if actual != expected:

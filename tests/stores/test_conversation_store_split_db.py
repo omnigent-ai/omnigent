@@ -880,8 +880,9 @@ def test_get_conversation_takes_one_checkout_per_engine(
     )
 
 
+@pytest.mark.parametrize("legacy_counter", [False, True])
 def test_recovery_state_shares_input_transaction_and_workspace_scope(
-    store: SqlAlchemyConversationStore, conv_db: Path
+    store: SqlAlchemyConversationStore, conv_db: Path, legacy_counter: bool
 ) -> None:
     from dataclasses import fields
 
@@ -898,8 +899,14 @@ def test_recovery_state_shares_input_transaction_and_workspace_scope(
         labels={f"custom.{index}": "value" for index in range(100)},
     )
     intent = SessionRecovery("a" * 32, "old", 100)
+    if legacy_counter:
+        from omnigent.db.db_models import SqlConversation
+
+        with store._conv_session("seed_legacy_counter") as session:
+            session.get(SqlConversation, (0, conv.id)).next_position = None
+    snapshot = store.get_conversation(conv.id)
     tables = _tables(conv_db)
-    assert store.replace_session_recovery(conv.id, None, intent)
+    assert store.replace_session_recovery(conv.id, None, intent, expected_conversation=snapshot)
     assert _tables(conv_db) == tables
     assert "session_recovery" not in tables
     assert _count(conv_db, "conversation_labels") > 0
@@ -940,6 +947,9 @@ def test_recovery_state_shares_input_transaction_and_workspace_scope(
             assert "(workspace_id=? AND conversation_id=? AND key=?)" in plan, plan
             assert len(parameters) == 2 + len(fields(SessionRecovery))
     assert store.get_session_recovery(conv.id) is None
+    assert not store.replace_session_recovery(
+        conv.id, None, intent, expected_conversation=snapshot
+    )
     assert not store.replace_session_recovery(conv.id, intent, None)
     assert store.replace_session_recovery(conv.id, None, intent)
     asyncio.run(store.delete_conversation(conv.id))

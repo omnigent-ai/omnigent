@@ -34,7 +34,9 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 
-def _record_interruption(store: ConversationStore, conv: Conversation) -> None:
+def _record_interruption(
+    store: ConversationStore, conv: Conversation, *, interrupted_at: int | None = None
+) -> None:
     """Retain interruption intent even when orphan settlement later clears status."""
     from omnigent.server.child_session_recovery import _restorable
 
@@ -53,11 +55,12 @@ def _record_interruption(store: ConversationStore, conv: Conversation) -> None:
         return
     previous = store.get_session_recovery(conv.id)
     if previous is None:
-        interrupted_at = (
-            now_epoch()
-            if conv.live_status in {"running", "waiting"}
-            else store.get_session_interruption_time(conv.id)
-        )
+        if interrupted_at is None:
+            interrupted_at = (
+                conv.runner_last_seen
+                if conv.live_status in {"running", "waiting"}
+                else store.get_session_interruption_time(conv.id)
+            )
         if interrupted_at is None:
             return
         recovery = SessionRecovery(conv.host_id, conv.runner_id, interrupted_at)
@@ -65,7 +68,7 @@ def _record_interruption(store: ConversationStore, conv: Conversation) -> None:
         recovery = replace(previous, phase="pending", attempt_id=None)
     else:
         return
-    store.replace_session_recovery(conv.id, previous, recovery)
+    store.replace_session_recovery(conv.id, previous, recovery, expected_conversation=conv)
 
 
 def _stop_recovery(
@@ -148,9 +151,11 @@ class HostSessionRecoverer:
     def enabled(self, host_id: str | None) -> bool:
         return self.prompt(host_id) is not None
 
-    def record_interruption(self, conv: Conversation) -> None:
+    def record_interruption(
+        self, conv: Conversation, *, interrupted_at: int | None = None
+    ) -> None:
         if self.enabled(conv.host_id):
-            _record_interruption(self.store, conv)
+            _record_interruption(self.store, conv, interrupted_at=interrupted_at)
 
     def stop_recovery(self, conv: Conversation, *, only_pending: bool = False) -> None:
         if self.enabled(conv.host_id):
@@ -356,9 +361,27 @@ class HostSessionRecoverer:
         routed = await asyncio.to_thread(self.runners.client_for_existing_conversation, conv.id)
         if routed is None or routed.runner_id != conv.runner_id:
             raise ConnectionError("runner disconnected before continuation")
+        from omnigent.server.child_session_recovery import _restorable
+
+        fresh = await asyncio.to_thread(self.store.get_conversation, conv.id)
+        prompt = await asyncio.to_thread(self.prompt, connection.host_id)
+        if (
+            fresh is None
+            or prompt is None
+            or self.hosts.get(connection.host_id) is not connection
+            or fresh.host_id != conv.host_id
+            or fresh.runner_id != conv.runner_id
+            or not _restorable(fresh)
+            or fresh.pending_elicitation_count
+        ):
+            return
         dispatch = replace(attempt, phase="dispatching", runner_id=conv.runner_id)
         if not await asyncio.to_thread(
-            self.store.replace_session_recovery, conv.id, attempt, dispatch
+            self.store.replace_session_recovery,
+            conv.id,
+            attempt,
+            dispatch,
+            expected_conversation=fresh,
         ):
             return
         try:

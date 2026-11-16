@@ -5838,6 +5838,8 @@ async def test_publish_status_tracks_in_flight_response_id(
 @pytest.mark.parametrize("child_lookup_fails", [False, True])
 async def test_patch_runner_rebind_clears_stale_failed_status(
     client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     child_lookup_fails: bool,
 ) -> None:
@@ -5942,6 +5944,15 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     sid = session["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    host_id, runner_id = "a" * 32, "runner_recovery"
+    store.set_host_id(sid, host_id, workspace="/workspace")
+    store.set_runner_id(sid, runner_id)
+    recovery = SessionRecovery(host_id, runner_id, 100)
+    assert store.replace_session_recovery(sid, None, recovery)
+    recoverer = HostSessionRecoverer(store, Mock(), Mock(), Mock(), Mock())
+    monkeypatch.setattr(recoverer, "enabled", lambda _: True)
+    monkeypatch.setattr(app.state, "host_session_recoverer", recoverer, raising=False)
     # The monkeypatched runner client can see setup work during session
     # creation. This test targets the later PATCH rebind path only.
     runner_client.posts.clear()
@@ -5977,6 +5988,7 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
         sessions_module._session_status_cache.pop(sid, None)
 
     assert resp.status_code == (500 if child_lookup_fails else 200), resp.text
+    assert store.get_session_recovery(sid).phase == "stopped"
     assert len(runner_client.posts) == 1
     init_post = runner_client.posts[0]
     assert init_post["url"] == "/v1/sessions"
