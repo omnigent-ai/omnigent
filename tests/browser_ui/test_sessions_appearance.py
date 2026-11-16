@@ -16,15 +16,7 @@ _COMPOSER = "Send a message…"
 
 
 @pytest.fixture
-def appearance_features() -> dict[str, bool]:
-    """Feature flags served by ``/v1/info``; a test may change them before reloading."""
-    return {}
-
-
-@pytest.fixture
-def appearance_url(
-    browser_contract: BrowserContract, appearance_features: dict[str, bool]
-) -> Iterator[str]:
+def appearance_url(browser_contract: BrowserContract) -> Iterator[str]:
     empty_list = {
         "object": "list",
         "data": [],
@@ -50,7 +42,7 @@ def appearance_url(
             "server_version": "browser-contract",
             "smart_routing_enabled": False,
             "smart_routing_sources": {"external": False, "oss": False},
-            "features": appearance_features,
+            "features": {},
             "harness_install_enabled": False,
             "installable_harnesses": [],
             "dictation_available": False,
@@ -82,7 +74,6 @@ def appearance_url(
 def test_custom_order_keeps_the_list_and_commits_on_drop(
     page: Page,
     appearance_url: str,
-    appearance_features: dict[str, bool],
     browser_contract: BrowserContract,
 ) -> None:
     """Custom keeps the Updated list, moves a row only on drop, and adds new sessions above."""

@@ -863,7 +863,7 @@ function SidebarImpl({
     lastSelectedIdRef.current = null;
   }, []);
 
-  // Enter selection mode with a fresh selection.
+  // Reset so rows picked in another view don't linger.
   const enterSelectionMode = useCallback(() => {
     setSelectedIds(new Set());
     lastSelectedIdRef.current = null;
