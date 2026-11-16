@@ -1764,6 +1764,7 @@ describe("getSessionUsage", () => {
 
 describe("fetchFirstUserPrompt", () => {
   it("returns the oldest visible user prompt with text", async () => {
+    // The first page holds only context, an attachment and a reply; the prompt is on the next.
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
         object: "list",
@@ -1787,6 +1788,15 @@ describe("fetchFirstUserPrompt", () => {
             role: "assistant",
             content: [{ type: "output_text", text: "Hi" }],
           },
+        ],
+        last_id: "m2",
+        has_more: true,
+      }),
+    );
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        object: "list",
+        data: [
           {
             id: "m3",
             type: "message",
@@ -1797,21 +1807,48 @@ describe("fetchFirstUserPrompt", () => {
             ],
           },
         ],
-        has_more: false,
+        last_id: "m3",
+        has_more: true,
       }),
     );
+    const controller = new AbortController();
 
-    expect(await fetchFirstUserPrompt("sess_1")).toBe("Fix it\nnow");
-    expect(fetchMock.mock.calls[0]![0]).toBe(
-      "/v1/sessions/sess_1/items?limit=20&order=asc&type=message",
-    );
+    expect(await fetchFirstUserPrompt("sess_1", controller.signal)).toBe("Fix it\nnow");
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/v1/sessions/sess_1/items?limit=100&order=asc&type=message",
+      "/v1/sessions/sess_1/items?limit=100&order=asc&type=message&after=m2",
+    ]);
+    for (const [, init] of fetchMock.mock.calls)
+      expect((init as RequestInit).signal).toBe(controller.signal);
   });
 
-  it("returns null when the session has no prompt yet", async () => {
+  it("returns null once the whole history has no prompt", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        object: "list",
+        data: [{ id: "m1", type: "message", role: "assistant", content: [] }],
+        last_id: "m1",
+        has_more: true,
+      }),
+    );
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({ object: "list", data: [], has_more: false }),
     );
     expect(await fetchFirstUserPrompt("sess_1")).toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops when the history cursor doesn't move", async () => {
+    const stuck = () =>
+      mockJsonResponse({
+        object: "list",
+        data: [{ id: "m1", type: "message", role: "assistant", content: [] }],
+        last_id: "m1",
+        has_more: true,
+      });
+    fetchMock.mockResolvedValueOnce(stuck()).mockResolvedValueOnce(stuck());
+    expect(await fetchFirstUserPrompt("sess_1")).toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
 

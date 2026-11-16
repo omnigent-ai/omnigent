@@ -1196,30 +1196,40 @@ export async function fetchRewindPrompts(
 /**
  * The text of a session's first user prompt, or `null` when it has none.
  *
- * Reads the oldest message items (`GET /v1/sessions/{id}/items?type=message`)
- * and skips hidden context messages, like {@link fetchRewindPrompts}.
+ * Reads message items oldest first (`GET /v1/sessions/{id}/items?type=message`),
+ * page by page until a user prompt with text turns up or the history ends.
+ * Hidden context messages are skipped, like {@link fetchRewindPrompts}.
  *
  * @param sessionId - Session to read, e.g. "conv_abc".
- * @param signal - Aborts the request.
+ * @param signal - Aborts the requests.
  */
 export async function fetchFirstUserPrompt(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<string | null> {
-  const params = new URLSearchParams({ limit: "20", order: "asc", type: "message" });
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
-    { signal },
-  );
-  const body = await readJsonOrThrow<SessionItemsResponseWire>(res);
-  for (const item of body.data) {
-    if (!isMessageItem(item) || item.role !== "user" || item.is_meta) continue;
-    const text = item.content
-      .flatMap((part) => (part.type === "input_text" ? [part.text] : []))
-      .join("\n");
-    if (text.trim()) return text;
+  let cursor: string | null = null;
+  // Each page needs the previous page's cursor.
+  /* oxlint-disable no-await-in-loop */
+  for (;;) {
+    const params = new URLSearchParams({ limit: "100", order: "asc", type: "message" });
+    if (cursor) params.set("after", cursor);
+    const res = await authenticatedFetch(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
+      { signal },
+    );
+    const body = await readJsonOrThrow<SessionItemsResponseWire>(res);
+    for (const item of body.data) {
+      if (!isMessageItem(item) || item.role !== "user" || item.is_meta) continue;
+      const text = item.content
+        .flatMap((part) => (part.type === "input_text" ? [part.text] : []))
+        .join("\n");
+      if (text.trim()) return text;
+    }
+    // Stop too if the cursor doesn't move, so a server ignoring `after` can't loop forever.
+    if (!body.has_more || body.last_id == null || body.last_id === cursor) return null;
+    cursor = body.last_id;
   }
-  return null;
+  /* oxlint-enable no-await-in-loop */
 }
 
 /** A file the chosen `/rewind` prompt attached, as the rewound session holds it. */
