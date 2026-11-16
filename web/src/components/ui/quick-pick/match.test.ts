@@ -8,9 +8,12 @@ import {
   foldText,
   matchCandidate,
   matchField,
+  matchText,
   mergeRanges,
+  occurrenceRanges,
   prepareFields,
   tokenizeQuery,
+  wordCoalescedRanges,
 } from "./match";
 
 function match(query: string, text: string, matching?: MatchStrategy) {
@@ -391,6 +394,16 @@ describe("wordCoalescedRanges", () => {
   it("marks a word whole when it holds several matched pieces", () => {
     expect(words("gostng", "Go to Settings")).toEqual(["Go", "Settings"]);
     expect(words("stng", "Settings")).toEqual(["Settings"]);
+  });
+
+  it("still marks a word whole when a range crosses into it from the word before", () => {
+    const text = "Show-Files";
+    const ranges = [
+      { start: 3, end: 6 },
+      { start: 7, end: 8 },
+      { start: 9, end: 10 },
+    ];
+    expect(wordCoalescedRanges(text, ranges)).toEqual([{ start: 3, end: 10 }]);
   });
 
   it("keeps a single run inside a word as typed", () => {
