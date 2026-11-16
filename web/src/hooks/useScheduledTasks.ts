@@ -13,6 +13,7 @@ import {
   useQueryClient,
   type QueryClient,
 } from "@tanstack/react-query";
+import { invalidateSessionGrants } from "@/hooks/usePermissions";
 import { LIST_ROW_QUERY_ROOTS } from "@/lib/sessionListCache";
 import {
   createScheduledTask,
@@ -248,6 +249,8 @@ export function useUpdateScheduledTask() {
       // A schedule/state change can shift the run history too (e.g. a
       // just-reactivated task), so refresh that task's runs if they're loaded.
       void queryClient.invalidateQueries({ queryKey: scheduledTaskRunsKey(updated.id) });
+      // Switching to new sessions stops it managing its session's sharing.
+      invalidateSessionGrants(queryClient);
     },
   });
 }
@@ -293,6 +296,8 @@ export function useDeleteScheduledTask() {
         queryClient.getQueryData<ScheduledTask>(scheduledTaskKey(id)) ??
         queryClient.getQueryData<ScheduledTask[]>(SCHEDULED_TASKS_KEY)?.find((t) => t.id === id);
       forgetScheduledTasks(queryClient, [id]);
+      // A deleted automation no longer manages its session's sharing.
+      invalidateSessionGrants(queryClient);
       // The server cleared the automation's label from the session it ran from,
       // so menus and delete warnings must stop naming the automation.
       if (deleted?.sourceSessionId) {
