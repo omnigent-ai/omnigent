@@ -1670,13 +1670,23 @@ def create_scheduled_tasks_router(
             await require_agent_keeps_shared_target(request, fields, existing, permission_store)
             if fields.get("project_id") is not None:
                 fields["project_id"] = await _owned_project_id(project_owner, fields["project_id"])
-            updated = store.update(
-                scheduled_task_id,
-                expected_schedule=existing,
-                # Rechecked under the task's lock, so a grant made meanwhile counts.
-                guard=agent_shared_target_guard(request, fields, permission_store),
-                **fields,
+            # Off the event loop: a deployment's store may call out while it writes.
+            updating = asyncio.ensure_future(
+                asyncio.to_thread(
+                    store.update,
+                    scheduled_task_id,
+                    expected_schedule=existing,
+                    # Rechecked under the task's lock, so a grant made meanwhile counts.
+                    guard=agent_shared_target_guard(request, fields, permission_store),
+                    **fields,
+                )
             )
+            try:
+                updated = await asyncio.shield(updating)
+            except asyncio.CancelledError:
+                # The write runs on; its failure still gets the cleanup below.
+                await await_cleanup_task(updating)
+                raise
             if updated is None:
                 raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
         except Exception as exc:
