@@ -38,11 +38,13 @@ import {
   ROW_META_SLOT_CLASS,
   ROW_STATUS_SLOT_CLASS,
 } from "./fileStatusUtils";
+import { readFilesTreeExpandedPaths, writeFilesTreeExpandedPaths } from "@/lib/filesPanelTreeState";
 import { FolderTree } from "./FolderTree";
 
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+  localStorage.clear();
 });
 beforeEach(() => copyTextMock.mockClear());
 
@@ -602,6 +604,39 @@ describe("FolderTree nested lazy loading", () => {
     unmount();
     renderTree({ files: [dir("src")], conversationId });
     expect(await screen.findByText("leaf.ts")).toBeInTheDocument();
+  });
+});
+
+describe("FolderTree expansion across reloads", () => {
+  beforeEach(() => {
+    lazyChildren.clear();
+    lazyErrors.clear();
+  });
+
+  it("saves the folders the user opens, per browsed location", () => {
+    lazyChildren.set("guides", [file("guides/intro.md")]);
+    renderTree({
+      files: [dir("guides")],
+      conversationId: "conv_save_expansion",
+      browseLocation: "docs",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "guides/" }));
+
+    expect(readFilesTreeExpandedPaths("conv_save_expansion", "docs")).toEqual(["guides"]);
+    expect(readFilesTreeExpandedPaths("conv_save_expansion", "")).toBeUndefined();
+  });
+
+  it("reopens a reloaded session with its saved folders expanded", async () => {
+    // Nothing of this conversation is in memory, as after a page reload.
+    writeFilesTreeExpandedPaths("conv_reloaded_tree", "", ["src", "src/deep"]);
+    lazyChildren.set("src", [dir("src/deep")]);
+    lazyChildren.set("src/deep", [file("src/deep/leaf.ts")]);
+
+    renderTree({ files: [dir("src"), dir("docs")], conversationId: "conv_reloaded_tree" });
+
+    expect(await screen.findByText("leaf.ts")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "docs/" })).toHaveAttribute("aria-expanded", "false");
   });
 });
 

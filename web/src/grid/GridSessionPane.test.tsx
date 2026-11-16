@@ -172,7 +172,11 @@ vi.mock("@/shell/WorkspacePanel", () => ({
         data-terminal={props.selectedTerminalKey ?? ""}
         data-tab={props.rightRailTab ?? ""}
         data-end-line={props.filePosition?.endLine}
+        data-show-hidden={String(props.filesPanelShowHidden)}
       >
+        <button type="button" onClick={() => props.onShowHiddenChange(!props.filesPanelShowHidden)}>
+          Toggle hidden files
+        </button>
         <span>{props.selectedFilePath ?? "No file"}</span>
         <span>{props.filePosition?.line}</span>
         <span>{props.agentId}</span>
@@ -632,5 +636,37 @@ it("shares one workspace, preserves per-session files and drafts, and persists g
   expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveAttribute(
     "data-width",
     "504",
+  );
+});
+
+it("shares the hidden-files choice across grid panes and keeps it after a reload", () => {
+  const grid = { id: "hidden-files", layout: splitGrid("first", "first", "second", "right")! };
+  const tree = () => (
+    <MemoryRouter>
+      <RearrangeableGrid grid={grid} />
+    </MemoryRouter>
+  );
+  const view = render(tree());
+  const first = screen.getByRole("region", { name: "first (active)" });
+  const second = screen.getByRole("region", { name: "second" });
+  fireEvent.click(within(first).getByText("Open citation"));
+  let workspace = screen.getByRole("complementary", { name: "Workspace" });
+  expect(workspace).toHaveAttribute("data-show-hidden", "true");
+  fireEvent.click(within(workspace).getByText("Toggle hidden files"));
+  expect(workspace).toHaveAttribute("data-show-hidden", "false");
+
+  fireEvent.click(within(second).getByRole("textbox", { name: "Message" }));
+  workspace = screen.getByRole("complementary", { name: "Workspace" });
+  expect(workspace).toHaveAttribute("data-testid", "workspace-second");
+  expect(workspace).toHaveAttribute("data-show-hidden", "false");
+
+  view.unmount();
+  render(tree());
+  fireEvent.click(
+    within(screen.getByRole("region", { name: "first (active)" })).getByText("Open citation"),
+  );
+  expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveAttribute(
+    "data-show-hidden",
+    "false",
   );
 });

@@ -23,6 +23,7 @@ vi.mock("@/hooks/useHostSshTarget", () => ({ useHostSshTarget: () => null }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 
 import { useSession } from "@/hooks/useSession";
+import { writeFilesTreeBrowseLocation } from "@/lib/filesPanelTreeState";
 import { FilesPanel, fileListStatus, revealFolderInFilesPanel } from "./FilesPanel";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import { FolderTree } from "./FolderTree";
@@ -291,6 +292,7 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   vi.useRealTimers();
+  localStorage.clear();
 });
 
 describe("FilesPanel working folder directory", () => {
@@ -1785,6 +1787,23 @@ describe("FilesPanel browse location", () => {
 
     expect(useAllFilesMock).toHaveBeenLastCalledWith(
       "conv_viewer_roundtrip",
+      expect.anything(),
+      "/etc",
+    );
+  });
+
+  it("reopens a reloaded session in the folder it was browsing", () => {
+    // Nothing of this conversation is in memory, as after a page reload.
+    writeFilesTreeBrowseLocation("conv_reloaded_location", "/etc");
+    renderPanel({
+      conversationId: "conv_reloaded_location",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED,
+    });
+
+    expect(useAllFilesMock).toHaveBeenLastCalledWith(
+      "conv_reloaded_location",
       expect.anything(),
       "/etc",
     );

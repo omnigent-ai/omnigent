@@ -1,8 +1,13 @@
+import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   DEFAULT_FILES_PANEL_PREFERENCES,
+  FILES_PANEL_SHOW_HIDDEN_STORAGE_KEY,
   readFilesPanelPreferences,
+  readFilesPanelShowHidden,
+  useFilesPanelShowHidden,
   writeFilesPanelPreferences,
+  writeFilesPanelShowHidden,
 } from "./filesPanelPreferences";
 
 const STORAGE_KEY = "omnigent:files-panel-preferences";
@@ -38,5 +43,35 @@ describe("filesPanelPreferences", () => {
   it("defaults sort when the stored value is invalid", () => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ sort: "bogus" }));
     expect(readFilesPanelPreferences()).toEqual({ sort: "recent" });
+  });
+});
+
+describe("Files panel hidden-files preference", () => {
+  it("shows hidden files until the user hides them, and remembers the choice", () => {
+    expect(readFilesPanelShowHidden()).toBe(true);
+
+    writeFilesPanelShowHidden(false);
+    expect(localStorage.getItem(FILES_PANEL_SHOW_HIDDEN_STORAGE_KEY)).toBe("false");
+    expect(readFilesPanelShowHidden()).toBe(false);
+
+    // Showing them again is the default, so nothing stays stored.
+    writeFilesPanelShowHidden(true);
+    expect(localStorage.getItem(FILES_PANEL_SHOW_HIDDEN_STORAGE_KEY)).toBeNull();
+    expect(readFilesPanelShowHidden()).toBe(true);
+  });
+
+  it("ignores an unknown stored value", () => {
+    localStorage.setItem(FILES_PANEL_SHOW_HIDDEN_STORAGE_KEY, "sometimes");
+    expect(readFilesPanelShowHidden()).toBe(true);
+  });
+
+  it("updates every mounted panel when one of them toggles", () => {
+    const first = renderHook(() => useFilesPanelShowHidden());
+    const second = renderHook(() => useFilesPanelShowHidden());
+    expect(first.result.current).toBe(true);
+
+    act(() => writeFilesPanelShowHidden(false));
+    expect(first.result.current).toBe(false);
+    expect(second.result.current).toBe(false);
   });
 });

@@ -12,6 +12,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useDraggable, useDroppable } from "@dnd-kit/core";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
+import { useFilesPanelShowHidden, writeFilesPanelShowHidden } from "@/lib/filesPanelPreferences";
 import { cn } from "@/lib/utils";
 import { Maximize2Icon, XIcon } from "lucide-react";
 import { SideChatPane } from "@/components/chat/SideChatPane";
@@ -238,7 +239,7 @@ export function GridSessionPane({
     setWorkspace((previous) => ({ ...previous, ...patch }));
   }, []);
   const [sort, setSort] = useState<ChangedSort>("recent");
-  const [showHidden, setShowHidden] = useState(false);
+  const showHidden = useFilesPanelShowHidden();
   const [position, setPosition] = useState<FilePosition>();
   const navigationGuard = useRef<FileNavigationGuard | null>(null);
   const registerNavigationGuard = useCallback((guard: FileNavigationGuard) => {
@@ -560,7 +561,7 @@ export function GridSessionPane({
                 filesPanelSort={sort}
                 onSortChange={setSort}
                 filesPanelShowHidden={showHidden}
-                onShowHiddenChange={setShowHidden}
+                onShowHiddenChange={writeFilesPanelShowHidden}
                 liveness={liveness}
               />
             </div>,

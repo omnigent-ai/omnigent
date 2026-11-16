@@ -23,7 +23,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Locator, Page, expect
 
 # The agent spec uses ``os_env.cwd: .`` (see ``_TEST_AGENT_YAML`` in
 # conftest), so filesystem PUTs land in ``<repo-root>/<session_id>/``
@@ -181,3 +181,91 @@ def test_comment_persists_across_reload(
     ).json()
     assert len(comments) == 1, f"Expected exactly 1 persisted comment, got {comments}"
     assert comments[0]["body"] == _COMMENT_BODY
+
+
+# Files-panel navigation: a dotfile beside an ordinary file, and nested folders
+# the listing returns collapsed so only the user's own expansion opens them.
+_DOTFILE = ".env.example"
+_VISIBLE_FILE = "visible.txt"
+_NESTED_FILE = "alpha/inner/deep.txt"
+_SIBLING_FILE = "beta/sibling.txt"
+
+
+@pytest.fixture
+def seeded_files_panel_pair(
+    seeded_session_pair: tuple[str, str, str],
+) -> Iterator[tuple[str, str, str]]:
+    """Seed both sessions with a dotfile, a plain file and nested folders."""
+    base_url, first_session, second_session = seeded_session_pair
+    for session_id in (first_session, second_session):
+        for path in (_DOTFILE, _VISIBLE_FILE, _NESTED_FILE, _SIBLING_FILE):
+            _seed_file(base_url, session_id, path, f"{path}\n")
+    try:
+        yield (base_url, first_session, second_session)
+    finally:
+        _cleanup_session_workdir(first_session)
+        _cleanup_session_workdir(second_session)
+
+
+def _files_rail(page: Page, base_url: str, session_id: str) -> Locator:
+    page.goto(f"{base_url}/c/{session_id}?view=explore")
+    rail_toggle = page.locator(
+        'button[aria-label="Expand right panel"], button[aria-label="Collapse right panel"]'
+    )
+    expect(rail_toggle).to_be_visible(timeout=30_000)
+    # A session the user has never opened starts with the right panel closed.
+    if rail_toggle.get_attribute("aria-label") == "Expand right panel":
+        rail_toggle.click()
+    rail = page.get_by_role("complementary", name="Workspace")
+    expect(rail.get_by_role("searchbox", name="Search all files")).to_be_visible(timeout=30_000)
+    expect(rail.get_by_text(_VISIBLE_FILE, exact=True)).to_be_visible(timeout=15_000)
+    return rail
+
+
+def test_hidden_files_choice_survives_reload_and_session_switch(
+    request: pytest.FixtureRequest,
+    seeded_files_panel_pair: tuple[str, str, str],
+) -> None:
+    """Hiding hidden files sticks after a reload and in another session."""
+    base_url, first_session, second_session = seeded_files_panel_pair
+    page: Page = request.getfixturevalue("page")
+    rail = _files_rail(page, base_url, first_session)
+    expect(rail.get_by_text(_DOTFILE, exact=True)).to_be_visible()
+
+    rail.get_by_role("button", name="Hide hidden files").click()
+    expect(rail.get_by_text(_DOTFILE, exact=True)).to_have_count(0)
+
+    page.reload()
+    expect(rail.get_by_text(_VISIBLE_FILE, exact=True)).to_be_visible(timeout=30_000)
+    expect(rail.get_by_role("button", name="Show hidden files")).to_be_visible()
+    expect(rail.get_by_text(_DOTFILE, exact=True)).to_have_count(0)
+
+    rail = _files_rail(page, base_url, second_session)
+    expect(rail.get_by_role("button", name="Show hidden files")).to_be_visible()
+    expect(rail.get_by_text(_DOTFILE, exact=True)).to_have_count(0)
+
+
+def test_expanded_folders_survive_reload_and_session_switch(
+    request: pytest.FixtureRequest,
+    seeded_files_panel_pair: tuple[str, str, str],
+) -> None:
+    """Folders the user opened are still open after a reload and a round trip."""
+    base_url, first_session, second_session = seeded_files_panel_pair
+    page: Page = request.getfixturevalue("page")
+    rail = _files_rail(page, base_url, first_session)
+
+    rail.get_by_role("button", name="alpha/", exact=True).click()
+    rail.get_by_role("button", name="inner/", exact=True).click()
+    expect(rail.get_by_text("deep.txt", exact=True)).to_be_visible(timeout=15_000)
+    expect(rail.get_by_text("sibling.txt", exact=True)).to_have_count(0)
+
+    page.reload()
+    expect(rail.get_by_text("deep.txt", exact=True)).to_be_visible(timeout=30_000)
+    expect(rail.get_by_text("sibling.txt", exact=True)).to_have_count(0)
+
+    # Another session keeps its own tree; coming back restores this one.
+    rail = _files_rail(page, base_url, second_session)
+    expect(rail.get_by_text("deep.txt", exact=True)).to_have_count(0)
+    rail = _files_rail(page, base_url, first_session)
+    expect(rail.get_by_text("deep.txt", exact=True)).to_be_visible(timeout=15_000)
+    expect(rail.get_by_text("sibling.txt", exact=True)).to_have_count(0)

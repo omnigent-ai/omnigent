@@ -9,6 +9,7 @@ import {
   type WorkspaceFile,
   useWorkspaceDirectories,
 } from "@/hooks/useWorkspaceChangedFiles";
+import { readFilesTreeExpandedPaths, writeFilesTreeExpandedPaths } from "@/lib/filesPanelTreeState";
 import { cn } from "@/lib/utils";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { RunnerAsleepHint } from "./RunnerAsleepHint";
@@ -362,6 +363,7 @@ function expandedLazyPaths(
 /**
  * Module-level cache that survives component unmount/remount within a JS
  * session (e.g. when the user opens the FileViewer and navigates back).
+ * Expansions the user makes are also persisted, so a reload restores them.
  *
  * Keyed by conversation AND browse location: node paths are relative to the
  * browsed root, so a set captured at one root describes different directories
@@ -374,6 +376,21 @@ const expandedPathsCache = new Map<string, Set<string>>();
 /** Cache key for one conversation's tree at one browsed root. */
 function expandedCacheKey(conversationId: string, browseLocation: string): string {
   return `${conversationId}\u0000${browseLocation}`;
+}
+
+/** Expansion remembered for one tree, from memory or else from the persisted store. */
+function rememberedExpandedPaths(
+  conversationId: string,
+  browseLocation: string,
+): Set<string> | undefined {
+  const cacheKey = expandedCacheKey(conversationId, browseLocation);
+  const cached = expandedPathsCache.get(cacheKey);
+  if (cached) return cached;
+  const stored = readFilesTreeExpandedPaths(conversationId, browseLocation);
+  if (!stored) return undefined;
+  const restored = new Set(stored);
+  expandedPathsCache.set(cacheKey, restored);
+  return restored;
 }
 
 /** Compute the default open set: all non-lazy dirs start expanded. */
@@ -518,8 +535,8 @@ function FolderTreeInner({
     return [...files, ...changedOnly];
   }, [files, scopedChangedFiles]);
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => {
-    if (!cacheKey) return new Set();
-    const cached = expandedPathsCache.get(cacheKey);
+    if (!cacheKey || !conversationId) return new Set();
+    const cached = rememberedExpandedPaths(conversationId, browseLocation);
     if (cached) return new Set(cached);
     // If files are already available (React Query cache hit), seed defaults now
     // to avoid a flash of all-collapsed state.
@@ -556,8 +573,8 @@ function FolderTreeInner({
       motionTimers.current.clear();
       setPathMotions(new Map());
     }
-    if (!cacheKey) return;
-    const cached = expandedPathsCache.get(cacheKey);
+    if (!cacheKey || !conversationId) return;
+    const cached = rememberedExpandedPaths(conversationId, browseLocation);
     if (cached) {
       if (switched) setExpandedPaths(new Set(cached));
       return;
@@ -566,7 +583,17 @@ function FolderTreeInner({
     const initial = defaultExpandedPaths(treeFiles);
     expandedPathsCache.set(cacheKey, initial);
     setExpandedPaths(new Set(initial));
-  }, [cacheKey, treeFiles]);
+  }, [cacheKey, conversationId, browseLocation, treeFiles]);
+
+  // Record an expansion the user made, for remounts and for later reloads.
+  const rememberExpanded = useCallback(
+    (next: Set<string>) => {
+      if (!cacheKey || !conversationId) return;
+      expandedPathsCache.set(cacheKey, next);
+      writeFilesTreeExpandedPaths(conversationId, browseLocation, next);
+    },
+    [cacheKey, conversationId, browseLocation],
+  );
 
   // Map from file path → change status, for file-level badges in the tree.
   const changedFileMap = useMemo<Map<string, WorkspaceChangedFile["status"]>>(() => {
@@ -606,7 +633,7 @@ function FolderTreeInner({
             setExpandedPaths((prev) => {
               const next = new Set(prev);
               next.delete(path);
-              if (cacheKey) expandedPathsCache.set(cacheKey, next);
+              rememberExpanded(next);
               return next;
             });
           }
@@ -622,7 +649,7 @@ function FolderTreeInner({
       );
       motionTimers.current.set(path, timer);
     },
-    [cacheKey],
+    [rememberExpanded],
   );
 
   const togglePath = useCallback(
@@ -635,12 +662,12 @@ function FolderTreeInner({
 
       setExpandedPaths((prev) => {
         const next = new Set(prev).add(path);
-        if (cacheKey) expandedPathsCache.set(cacheKey, next);
+        rememberExpanded(next);
         return next;
       });
       startPathMotion(path, "enter");
     },
-    [cacheKey, expandedPaths, pathMotions, startPathMotion],
+    [rememberExpanded, expandedPaths, pathMotions, startPathMotion],
   );
 
   // A directory just revealed from search results: the tree scrolls it into
@@ -669,14 +696,14 @@ function FolderTreeInner({
         // Expand every ancestor, but not the target itself — revealing a folder
         // scrolls to it collapsed, the way clicking it in the tree would.
         for (let i = 1; i < parts.length; i++) next.add(parts.slice(0, i).join("/"));
-        if (cacheKey) expandedPathsCache.set(cacheKey, next);
+        rememberExpanded(next);
         return next;
       });
       pendingRevealRef.current = path;
       setRevealedPath(path);
       onExitSearch?.();
     },
-    [cacheKey, onExitSearch],
+    [rememberExpanded, onExitSearch],
   );
 
   // Build the nested top-level tree once per files/sort/showHidden change.

@@ -1,0 +1,144 @@
+// Per-session Files tree navigation (browsed folder, user-expanded folders per
+// location) kept in localStorage so a reload lands where the user left off.
+// Every level is capped so one busy session can't crowd out other storage.
+
+const STORAGE_KEY = "omnigent:files-panel-tree-state";
+// Sessions kept, least-recently-touched pruned first.
+const MAX_SESSIONS = 30;
+// Browsed locations kept per session, least-recently-touched pruned first.
+const MAX_LOCATIONS_PER_SESSION = 10;
+// Expanded folders kept per location; the shallowest win so restored folders stay reachable.
+export const MAX_EXPANDED_PATHS = 300;
+
+interface ExpandedEntry {
+  location: string;
+  paths: string[];
+}
+
+interface TreeState {
+  /** Absolute browsed folder; absent while browsing the workspace root. */
+  browseLocation?: string;
+  /** Expanded folders per browsed location, oldest-touched first. */
+  expanded: ExpandedEntry[];
+}
+
+/** Ordered array, oldest-touched first, so recency survives serialization of any id format. */
+type Store = { id: string; state: TreeState }[];
+
+function stringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.filter((item): item is string => typeof item === "string");
+}
+
+function sanitizeState(value: unknown): TreeState {
+  const state: TreeState = { expanded: [] };
+  if (typeof value !== "object" || value === null) return state;
+  const record = value as Record<string, unknown>;
+  if (typeof record.browseLocation === "string" && record.browseLocation !== "") {
+    state.browseLocation = record.browseLocation;
+  }
+  if (Array.isArray(record.expanded)) {
+    for (const item of record.expanded) {
+      if (typeof item !== "object" || item === null) continue;
+      const entry = item as Record<string, unknown>;
+      const paths = stringArray(entry.paths);
+      if (typeof entry.location !== "string" || !paths) continue;
+      state.expanded.push({ location: entry.location, paths });
+    }
+  }
+  return state;
+}
+
+function readStore(): Store {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const store: Store = [];
+    for (const item of parsed) {
+      if (typeof item !== "object" || item === null) continue;
+      const record = item as Record<string, unknown>;
+      if (typeof record.id !== "string") continue;
+      store.push({ id: record.id, state: sanitizeState(record.state) });
+    }
+    return store;
+  } catch {
+    return [];
+  }
+}
+
+function writeStore(store: Store): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+  } catch {
+    // Storage quota/access errors must not break the Files panel.
+  }
+}
+
+/** Apply `update` to one session's state and move it to the most-recent end. */
+function updateSession(conversationId: string, update: (state: TreeState) => void): void {
+  const store = readStore();
+  const index = store.findIndex((entry) => entry.id === conversationId);
+  const state = index >= 0 ? store[index].state : { expanded: [] };
+  if (index >= 0) store.splice(index, 1);
+  update(state);
+  store.push({ id: conversationId, state });
+  if (store.length > MAX_SESSIONS) store.splice(0, store.length - MAX_SESSIONS);
+  writeStore(store);
+}
+
+function depth(path: string): number {
+  return path.split("/").length;
+}
+
+/** The folder a session was last browsing, or null for its workspace root. */
+export function readFilesTreeBrowseLocation(conversationId: string): string | null {
+  const entry = readStore().find((item) => item.id === conversationId);
+  return entry?.state.browseLocation ?? null;
+}
+
+/** Remember the folder a session is browsing; null returns it to the workspace root. */
+export function writeFilesTreeBrowseLocation(
+  conversationId: string,
+  browseLocation: string | null,
+): void {
+  updateSession(conversationId, (state) => {
+    if (browseLocation) state.browseLocation = browseLocation;
+    else delete state.browseLocation;
+  });
+}
+
+/** Folders the user left expanded at a location; undefined means use the tree's defaults. */
+export function readFilesTreeExpandedPaths(
+  conversationId: string,
+  location: string,
+): string[] | undefined {
+  const entry = readStore().find((item) => item.id === conversationId);
+  return entry?.state.expanded.find((item) => item.location === location)?.paths;
+}
+
+/** Remember the folders expanded at one browsed location. */
+export function writeFilesTreeExpandedPaths(
+  conversationId: string,
+  location: string,
+  paths: Iterable<string>,
+): void {
+  let kept = [...new Set(paths)];
+  if (kept.length > MAX_EXPANDED_PATHS) {
+    kept = kept
+      .map((path, order) => ({ path, order }))
+      .sort((a, b) => depth(a.path) - depth(b.path) || a.order - b.order)
+      .slice(0, MAX_EXPANDED_PATHS)
+      .map(({ path }) => path);
+  }
+  updateSession(conversationId, (state) => {
+    state.expanded = state.expanded.filter((item) => item.location !== location);
+    state.expanded.push({ location, paths: kept });
+    if (state.expanded.length > MAX_LOCATIONS_PER_SESSION) {
+      state.expanded.splice(0, state.expanded.length - MAX_LOCATIONS_PER_SESSION);
+    }
+  });
+}

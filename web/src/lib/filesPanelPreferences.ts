@@ -10,8 +10,12 @@
 // helpers only seed that state on mount and snapshot it when the user changes
 // the sort, so a refresh (or a brand-new conversation) starts from the last
 // choice instead of the hardcoded default.
+//
+// The hidden-files toggle lives under its own key so every mounted Files panel
+// (main shell, Grid panes, other windows) follows a change live.
 
 import { type ChangedSort, isValidSort } from "@/lib/changedSort";
+import { createStoredChoicePreference } from "./storedChoicePreference";
 
 export interface FilesPanelPreferences {
   /** Sort order for the changed-files flat list. */
@@ -61,4 +65,30 @@ export function writeFilesPanelPreferences(prefs: FilesPanelPreferences): void {
   } catch {
     // localStorage quota or access errors shouldn't break the app.
   }
+}
+
+export const FILES_PANEL_SHOW_HIDDEN_STORAGE_KEY = "omnigent:files-panel-show-hidden";
+
+/** Hidden (dot-prefixed) files are shown until the user hides them. */
+export const DEFAULT_FILES_PANEL_SHOW_HIDDEN = true;
+
+const showHiddenPreference = createStoredChoicePreference(
+  FILES_PANEL_SHOW_HIDDEN_STORAGE_KEY,
+  ["true", "false"],
+  DEFAULT_FILES_PANEL_SHOW_HIDDEN ? "true" : "false",
+);
+
+/** Read whether the Files panel shows hidden files; storage errors mean the default. */
+export function readFilesPanelShowHidden(): boolean {
+  return showHiddenPreference.read() === "true";
+}
+
+/** Persist the hidden-files choice and update every Files panel on screen. */
+export function writeFilesPanelShowHidden(showHidden: boolean): void {
+  showHiddenPreference.write(showHidden ? "true" : "false");
+}
+
+/** Live hidden-files choice, including changes made in other windows. */
+export function useFilesPanelShowHidden(): boolean {
+  return showHiddenPreference.use() === "true";
 }

@@ -168,16 +168,25 @@ vi.mock("./FilesPanel", () => ({
     onFileSelect,
     flatView,
     showHidden,
+    onShowHiddenChange,
   }: {
     onFileSelect: (path: string) => void;
     flatView: boolean;
     showHidden: boolean;
+    onShowHiddenChange: (showHidden: boolean) => void;
   }) => (
     <div
       data-testid="files-panel"
       data-flat-view={String(flatView)}
       data-show-hidden={String(showHidden)}
     >
+      <button
+        type="button"
+        aria-label="files: toggle hidden"
+        onClick={() => onShowHiddenChange(!showHidden)}
+      >
+        toggle-hidden
+      </button>
       <button
         type="button"
         aria-label="files: select README.md"
@@ -3075,6 +3084,32 @@ describe("FilesPanel visibility", () => {
     // dotfiles would disappear the moment the user moves between sessions.
     fireEvent.click(screen.getByTestId("nav-session"));
     expect(screen.getByTestId("files-panel")).toHaveAttribute("data-show-hidden", "true");
+  });
+
+  it("keeps hidden files hidden across a session switch and a reload once the user hides them", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      { id: "conv_abc", permission_level: null },
+      { id: "conv_xyz", permission_level: null },
+    ]);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const first = render(
+      sessionShellTree(qc, "/c/conv_abc", <SessionNavButton to="/c/conv_xyz" />),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "files: toggle hidden" }));
+    expect(screen.getByTestId("files-panel")).toHaveAttribute("data-show-hidden", "false");
+
+    fireEvent.click(screen.getByTestId("nav-session"));
+    expect(screen.getByTestId("files-panel")).toHaveAttribute("data-show-hidden", "false");
+
+    // A fresh shell stands in for a page reload: the choice comes back from storage.
+    first.unmount();
+    render(sessionShellTree(qc, "/c/conv_abc"));
+    expect(screen.getByTestId("files-panel")).toHaveAttribute("data-show-hidden", "false");
   });
 });
 

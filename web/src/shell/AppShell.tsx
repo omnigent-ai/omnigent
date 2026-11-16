@@ -46,7 +46,12 @@ import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
+import {
+  readFilesPanelPreferences,
+  useFilesPanelShowHidden,
+  writeFilesPanelPreferences,
+  writeFilesPanelShowHidden,
+} from "@/lib/filesPanelPreferences";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
@@ -583,7 +588,8 @@ function AppShellImpl() {
   // restore has re-rendered. Set by the conversation-restore effect.
   const stateConvRef = useRef<string | null>(conversationId ?? null);
   // Hidden (dot-prefixed) files are shown by default; the eye toggle hides them.
-  const [filesPanelShowHidden, setFilesPanelShowHidden] = useState(true);
+  // The choice is a device preference, so it carries across sessions and reloads.
+  const filesPanelShowHidden = useFilesPanelShowHidden();
   // Lifted so the Changes list order and the FileViewer prev/next order
   // share one source of truth (otherwise the "X/N" index won't match the
   // list position). Default "recent" mirrors the prior FilesPanel default.
@@ -1345,7 +1351,6 @@ function AppShellImpl() {
     setTasksPanelOpen(false);
     setContentSearchPanelOpen(false);
     setSideChatsPanelOpen(false);
-    setFilesPanelShowHidden(true);
     // An open "Close shell?" dialog would target a terminal absent from the
     // new session's list.
     setTerminalPendingClose(null);
@@ -3343,7 +3348,7 @@ function AppShellImpl() {
                     filesPanelSort={filesPanelSort}
                     onSortChange={handleFilesSortChange}
                     filesPanelShowHidden={filesPanelShowHidden}
-                    onShowHiddenChange={setFilesPanelShowHidden}
+                    onShowHiddenChange={writeFilesPanelShowHidden}
                     liveness={liveness}
                     onShellCreateStart={markShellCreateStarted}
                     onShellCreateFailed={clearShellCreatePending}
@@ -3371,7 +3376,7 @@ function AppShellImpl() {
                 openFileViewer={openFileViewer}
                 filesDrawerFlatView={filesDrawerFlatView}
                 filesPanelShowHidden={filesPanelShowHidden}
-                setFilesPanelShowHidden={setFilesPanelShowHidden}
+                setFilesPanelShowHidden={writeFilesPanelShowHidden}
                 filesPanelSort={filesPanelSort}
                 handleFilesSortChange={handleFilesSortChange}
                 rootSessionId={rootSessionId}
