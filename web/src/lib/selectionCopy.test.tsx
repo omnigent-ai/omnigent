@@ -4,6 +4,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { BlockRenderer } from "@/components/blocks/BlockRenderer";
+import { selectionToLinkedPayload } from "@/lib/selectionCopy";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 
 afterEach(() => {
@@ -87,6 +88,16 @@ describe("copying a selection from an agent reply", () => {
     expect(flavors["text/html"]).toBe(
       'Read the <a href="https://example.com/setup">setup guide</a> before you start.',
     );
+
+    // Spaces selected on either side of the link survive in both flavors.
+    const range = document.createRange();
+    range.setStart(textNodeContaining(section, "Read the "), "Read the".length);
+    range.setEnd(textNodeContaining(section, " before"), 1);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    const spaced = copy(section).flavors;
+    expect(spaced["text/plain"]).toBe(" [setup guide](<https://example.com/setup>) ");
+    expect(spaced["text/html"]).toBe(' <a href="https://example.com/setup">setup guide</a> ');
   });
 
   it("keeps the link when only part of its text is selected", async () => {
@@ -136,6 +147,12 @@ describe("copying a selection from an agent reply", () => {
     expect(copy(section).flavors["text/plain"]).toBe(
       "mydoc or [doc](<https://example.com/doc>) and [docs](<https://example.com/page>)",
     );
+
+    // The label's words also start one character before the link.
+    cleanup();
+    const overlapping = await renderReply("an[ana](https://example.com)");
+    select(overlapping, "an", "ana");
+    expect(copy(overlapping).flavors["text/plain"]).toBe("an[ana](<https://example.com/>)");
   });
 
   it("keeps list and table containers around selected items", async () => {
@@ -165,11 +182,18 @@ describe("copying a selection from an agent reply", () => {
     const section = await renderReply(
       "1. one\n2. two [guide](https://example.com/guide)\n3. three\n\nAfter.",
     );
+    const expected =
+      '<ol start="2"><li>two <a href="https://example.com/guide">guide</a></li><li>three</li></ol><p>After.</p>';
     select(section, "two", "After.");
+    expect(copy(section).flavors["text/html"]!.replace(/>\s+</g, "><")).toBe(expected);
 
-    expect(copy(section).flavors["text/html"]!.replace(/>\s+</g, "><")).toBe(
-      '<ol start="2"><li>two <a href="https://example.com/guide">guide</a></li><li>three</li></ol><p>After.</p>',
-    );
+    // Starting at the very end of item 1 selects none of it.
+    const range = document.createRange();
+    range.setStart(textNodeContaining(section, "one"), "one".length);
+    range.setEnd(textNodeContaining(section, "After."), "After.".length);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    expect(copy(section).flavors["text/html"]!.replace(/>\s+</g, "><")).toBe(expected);
   });
 
   it("counts earlier words across block breaks the way the browser copies them", async () => {
@@ -263,6 +287,34 @@ describe("copying a selection from an agent reply", () => {
     expect(flavors["text/html"]).not.toMatch(/<(button|svg|div|span)\b/);
   });
 
+  it("pastes a formula once, as its TeX source", async () => {
+    const section = await renderReply("Area is $$x^2$$ per [docs](https://example.com).");
+    expect(section.querySelector(".katex")).not.toBeNull();
+    select(section, "Area", "docs");
+
+    const html = copy(section).flavors["text/html"]!;
+
+    expect(html).toBe('Area is x^2 per <a href="https://example.com/">docs</a>');
+  });
+
+  it("keeps button and image text but not hidden text in the HTML", () => {
+    const root = document.body.appendChild(document.createElement("div"));
+    root.innerHTML =
+      '<p>Open <button type="button"><svg></svg><span>notes.md</span></button>, see ' +
+      '<img alt="the diagram" src="https://example.com/d.png">' +
+      '<span style="display: none">hidden</span> and <a href="https://example.com">docs</a></p>';
+    const range = document.createRange();
+    range.selectNodeContents(root);
+
+    const payload = selectionToLinkedPayload(range, root, "Open notes.md, see  and docs");
+    root.remove();
+
+    expect(payload?.html).toBe(
+      '<p>Open notes.md, see the diagram and <a href="https://example.com">docs</a></p>',
+    );
+    expect(payload?.text).toBe("Open notes.md, see  and [docs](<https://example.com>)");
+  });
+
   it("keeps the browser's copy for a selection without a pasteable link", async () => {
     const section = await renderReply("Plain **prose** and [a file](src/App.tsx) here.");
     select(section, "Plain", "here.");
@@ -288,7 +340,7 @@ describe("copying a selection from an agent reply", () => {
   it("keeps the browser's copy when the conversion fails", async () => {
     const section = await renderReply("Read [docs](https://example.com) first.");
     select(section, "Read", "first.");
-    vi.spyOn(Range.prototype, "cloneContents").mockImplementation(() => {
+    vi.spyOn(Range.prototype, "intersectsNode").mockImplementation(() => {
       throw new Error("conversion failed");
     });
 
@@ -296,6 +348,24 @@ describe("copying a selection from an agent reply", () => {
 
     expect(prevented).toBe(false);
     expect(flavors).toEqual({});
+  });
+
+  it("keeps links when the selection ends at the start of the next block", async () => {
+    const section = await renderReply("Read [docs](https://example.com) first.");
+    const nextMessage = document.body.appendChild(document.createElement("p"));
+    nextMessage.textContent = "Next message";
+    // Triple-clicking a reply's last paragraph can select up to here.
+    const range = document.createRange();
+    range.setStart(textNodeContaining(section, "Read"), 0);
+    range.setEnd(nextMessage.firstChild!, 0);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+
+    const { flavors } = copy(section);
+    nextMessage.remove();
+
+    expect(flavors["text/plain"]).toBe("Read [docs](<https://example.com/>) first.");
+    expect(flavors["text/html"]).toContain('<a href="https://example.com/">docs</a>');
   });
 
   it("keeps the browser's copy for a selection that runs past the reply", async () => {

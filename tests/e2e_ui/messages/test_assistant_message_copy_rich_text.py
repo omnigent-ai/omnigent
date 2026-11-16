@@ -32,6 +32,8 @@ import httpx
 import pytest
 from playwright.sync_api import Browser, expect
 
+from tests._helpers.browser import user_page
+
 _AGENT_NAME = "hello_world"
 _ASSISTANT_BUBBLE = '[data-testid="message-bubble"][data-role="assistant"]'
 
@@ -205,10 +207,7 @@ def test_selection_copy_keeps_links(
         timeout=10.0,
     ).raise_for_status()
 
-    ctx = browser.new_context()
-    ctx.grant_permissions(["clipboard-read", "clipboard-write"])
-    try:
-        page = ctx.new_page()
+    with user_page(browser, headers={}, permissions=["clipboard-read", "clipboard-write"]) as page:
         page.goto(f"{base_url}/c/{session_id}")
         bubble = page.locator(_ASSISTANT_BUBBLE).filter(has_text="before upgrading.")
         expect(bubble.get_by_role("link", name="migration guide")).to_be_visible(timeout=30_000)
@@ -228,5 +227,3 @@ def test_selection_copy_keeps_links(
         # The browser's default copy inlines computed styles and app attributes.
         assert "style=" not in html, html
         assert "data-streamdown" not in html, html
-    finally:
-        ctx.close()
