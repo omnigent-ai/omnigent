@@ -1856,6 +1856,25 @@ describe("SettingsPage", () => {
     ).toHaveAttribute("aria-label", "Reset");
   });
 
+  it("renders the chat default rows from their Settings catalog entries", async () => {
+    renderPage("/settings/appearance");
+    for (const id of [
+      "transcript-view-default",
+      "hide-unconfigured-harnesses",
+      "picker-visibility",
+      "show-final-answer",
+      "peer-session-messages",
+    ]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(
+      document.querySelector('[data-settings-control="picker-visibility:edit"]'),
+    ).toHaveAttribute("aria-label", "Edit");
+    expect(
+      document.querySelector('[data-settings-control="hide-unconfigured-harnesses"]'),
+    ).toHaveAttribute("aria-labelledby", "settings-hide-unconfigured-harnesses-label");
+  });
+
   it("renders the Sandbox Integrations rows from their Settings catalog entries", async () => {
     mocks.enabledConnections = ["github", "databricks"];
     renderPage("/settings/integrations");

@@ -129,6 +129,65 @@ export const APPEARANCE_DATA_ENTRY = settingsEntry({
   },
 });
 
+export const TRANSCRIPT_VIEW_DEFAULT_ENTRY = settingsEntry({
+  id: "transcript-view-default",
+  section: "appearance",
+  label: "Default transcript view",
+  description:
+    "Open terminal-backed chats in Chat or Terminal view. In-chat choices are remembered for the current tab.",
+  keywords: ["chat", "terminal", "transcript", "view"],
+  choices: ["Chat", "Terminal"],
+});
+
+export const HIDE_UNCONFIGURED_HARNESSES_ENTRY = settingsEntry({
+  id: "hide-unconfigured-harnesses",
+  section: "appearance",
+  label: "Hide unconfigured harnesses",
+  description:
+    "Hide harnesses that need a CLI install or sign-in on the selected host from the new-chat picker.",
+  keywords: ["harness", "picker", "new chat", "setup", "hide"],
+});
+
+export const PEER_SESSION_MESSAGES_ENTRY = settingsEntry({
+  id: "peer-session-messages",
+  section: "appearance",
+  label: "Messages from other sessions",
+  description:
+    "Collapse or hide messages that agents in other sessions send to a chat. The agent still reads them in full.",
+  keywords: ["supervisor", "peer", "agents", "messages", "collapse", "hide", "other sessions"],
+  choices: ["Collapse", "Show", "Hide"],
+});
+
+export const PICKER_VISIBILITY_ENTRY = settingsEntry({
+  id: "picker-visibility",
+  section: "appearance",
+  label: "Show in agent pickers",
+  description:
+    "Choose this server's harnesses and agents for new chats, automations, and project defaults. Existing sessions stay unchanged; the selected entry stays visible.",
+  keywords: ["agents", "harnesses", "picker", "hide", "show", "new chat"],
+  parts: {
+    edit: "Edit",
+    showAll: "Show all",
+    retry: "Retry",
+    filter: "Filter harnesses and agents",
+  },
+  presence: {
+    retry: { states: ["load failed"] },
+    filter: { overlay: "edit" },
+  },
+  // Its list is this server's harnesses and agents; none of their names is searchable.
+  overlays: { edit: { runtimeChoices: {} } },
+});
+
+export const SHOW_FINAL_ANSWER_ENTRY = settingsEntry({
+  id: "show-final-answer",
+  section: "appearance",
+  label: "Show only the final answer",
+  description:
+    "Fold other agents' progress into the Worked row, keeping each turn's last message visible. Codex already folds completed turns.",
+  keywords: ["fold", "progress", "narration", "worked", "transcript", "collapse"],
+});
+
 export const APPEARANCE_SETTINGS = [
   THEME_MODE_ENTRY,
   TERMINAL_THEME_ENTRY,
@@ -139,4 +198,9 @@ export const APPEARANCE_SETTINGS = [
   CODE_FONT_FAMILY_ENTRY,
   CODE_FONT_WEIGHT_ENTRY,
   APPEARANCE_DATA_ENTRY,
+  TRANSCRIPT_VIEW_DEFAULT_ENTRY,
+  HIDE_UNCONFIGURED_HARNESSES_ENTRY,
+  PICKER_VISIBILITY_ENTRY,
+  SHOW_FINAL_ANSWER_ENTRY,
+  PEER_SESSION_MESSAGES_ENTRY,
 ] as const;

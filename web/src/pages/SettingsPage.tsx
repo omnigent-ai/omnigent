@@ -114,8 +114,12 @@ import {
   CODE_FONT_SIZE_ENTRY,
   CODE_FONT_WEIGHT_ENTRY,
   COLOR_THEME_ENTRY,
+  HIDE_UNCONFIGURED_HARNESSES_ENTRY,
+  PEER_SESSION_MESSAGES_ENTRY,
+  SHOW_FINAL_ANSWER_ENTRY,
   TERMINAL_THEME_ENTRY,
   THEME_MODE_ENTRY,
+  TRANSCRIPT_VIEW_DEFAULT_ENTRY,
   UI_FONT_FAMILY_ENTRY,
   UI_FONT_SIZE_ENTRY,
 } from "@/pages/settings/search/catalog/appearance";
@@ -661,31 +665,35 @@ function TerminalThemeControl() {
 /** Default surface for terminal-first transcripts without a per-tab choice. */
 function TranscriptViewDefaultControl() {
   const [value, setValue] = useState(() => readTranscriptViewDefault());
-  const labelId = useId();
   const choose = useCallback((next: TranscriptViewDefault) => {
     setValue(next);
     writeTranscriptViewDefault(next);
   }, []);
   return (
-    <ThemeSubsection
-      labelId={labelId}
-      title="Default transcript view"
-      helper="Open terminal-backed chats in Chat or Terminal view. In-chat choices are remembered for the current tab."
-    >
-      <CardRadioGroup<TranscriptViewDefault>
-        compact
-        labelledBy={labelId}
-        value={value}
-        onSelect={choose}
-        componentId="settings.appearance.transcript_view"
-        className="flex flex-wrap gap-2"
-        items={transcriptViewCards.map((card) => ({
-          value: card.value,
-          testId: `transcript-view-default-${card.value}`,
-          body: iconButtonBody(card.icon, card.label),
-        }))}
-      />
-    </ThemeSubsection>
+    <SettingsItem entry={TRANSCRIPT_VIEW_DEFAULT_ENTRY}>
+      <ThemeSubsection
+        labelId={settingsLabelId(TRANSCRIPT_VIEW_DEFAULT_ENTRY)}
+        descriptionId={settingsDescriptionId(TRANSCRIPT_VIEW_DEFAULT_ENTRY)}
+        title="Default transcript view"
+        helper="Open terminal-backed chats in Chat or Terminal view. In-chat choices are remembered for the current tab."
+      >
+        <SettingsOwner entry={TRANSCRIPT_VIEW_DEFAULT_ENTRY}>
+          <CardRadioGroup<TranscriptViewDefault>
+            compact
+            labelledBy={settingsLabelId(TRANSCRIPT_VIEW_DEFAULT_ENTRY)}
+            value={value}
+            onSelect={choose}
+            componentId="settings.appearance.transcript_view"
+            className="flex flex-wrap gap-2"
+            items={transcriptViewCards.map((card) => ({
+              value: card.value,
+              testId: `transcript-view-default-${card.value}`,
+              body: iconButtonBody(card.icon, card.label),
+            }))}
+          />
+        </SettingsOwner>
+      </ThemeSubsection>
+    </SettingsItem>
   );
 }
 
@@ -1029,77 +1037,77 @@ function ColorThemeControl() {
  */
 function HideUnconfiguredHarnessesControl() {
   const [value, setValue] = useState(() => readHideUnconfiguredHarnesses());
-  const labelId = useId();
   const toggle = useCallback((next: boolean) => {
     setValue(next);
     writeHideUnconfiguredHarnesses(next);
   }, []);
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Hide unconfigured harnesses"
-        labelId={labelId}
-        description="Hide harnesses that need a CLI install or sign-in on the selected host from the new-chat picker."
-      />
+    <SettingsItem
+      entry={HIDE_UNCONFIGURED_HARNESSES_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel entry={HIDE_UNCONFIGURED_HARNESSES_ENTRY} />
       <Switch
-        aria-labelledby={labelId}
+        {...settingsControlProps(HIDE_UNCONFIGURED_HARNESSES_ENTRY)}
         checked={value}
         onCheckedChange={toggle}
         data-testid="hide-unconfigured-harnesses-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.appearance.hide_unconfigured_harnesses"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
 /** How messages other sessions send appear in a chat, e.g. a supervisor's. */
 function PeerSessionMessageDisplayControl() {
   const value = usePeerSessionMessageDisplay();
-  const labelId = useId();
   return (
-    <ThemeSubsection
-      labelId={labelId}
-      title="Messages from other sessions"
-      helper="Collapse or hide messages that agents in other sessions send to a chat. The agent still reads them in full."
-    >
-      <CardRadioGroup<PeerSessionMessageDisplay>
-        compact
-        labelledBy={labelId}
-        value={value}
-        onSelect={writePeerSessionMessageDisplay}
-        componentId="settings.appearance.peer_session_messages"
-        className="flex flex-wrap gap-2"
-        items={peerSessionMessageCards.map((card) => ({
-          value: card.value,
-          testId: `peer-session-messages-${card.value}`,
-          body: iconButtonBody(card.icon, card.label),
-        }))}
-      />
-    </ThemeSubsection>
+    <SettingsItem entry={PEER_SESSION_MESSAGES_ENTRY}>
+      <ThemeSubsection
+        labelId={settingsLabelId(PEER_SESSION_MESSAGES_ENTRY)}
+        descriptionId={settingsDescriptionId(PEER_SESSION_MESSAGES_ENTRY)}
+        title="Messages from other sessions"
+        helper="Collapse or hide messages that agents in other sessions send to a chat. The agent still reads them in full."
+      >
+        <SettingsOwner entry={PEER_SESSION_MESSAGES_ENTRY}>
+          <CardRadioGroup<PeerSessionMessageDisplay>
+            compact
+            labelledBy={settingsLabelId(PEER_SESSION_MESSAGES_ENTRY)}
+            value={value}
+            onSelect={writePeerSessionMessageDisplay}
+            componentId="settings.appearance.peer_session_messages"
+            className="flex flex-wrap gap-2"
+            items={peerSessionMessageCards.map((card) => ({
+              value: card.value,
+              testId: `peer-session-messages-${card.value}`,
+              body: iconButtonBody(card.icon, card.label),
+            }))}
+          />
+        </SettingsOwner>
+      </ThemeSubsection>
+    </SettingsItem>
   );
 }
 
 /** Opt-in: fold other agents' progress messages the way Codex turns fold. */
 function FoldAssistantNarrationControl() {
   const enabled = useFoldAssistantNarration();
-  const labelId = useId();
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Show only the final answer"
-        labelId={labelId}
-        description="Fold other agents' progress into the Worked row, keeping each turn's last message visible. Codex already folds completed turns."
-      />
+    <SettingsItem
+      entry={SHOW_FINAL_ANSWER_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel entry={SHOW_FINAL_ANSWER_ENTRY} />
       <Switch
-        aria-labelledby={labelId}
+        {...settingsControlProps(SHOW_FINAL_ANSWER_ENTRY)}
         checked={enabled}
         onCheckedChange={writeFoldAssistantNarration}
         data-testid="fold-assistant-narration-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.appearance.fold_assistant_narration"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
