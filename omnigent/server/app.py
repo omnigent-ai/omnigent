@@ -1859,7 +1859,9 @@ def create_app(
         scheduler. When provided, the FastAPI lifespan starts the database
         scheduler (:class:`PersistentTaskScheduler`), or with automations_v2 off,
         a :class:`ScheduledTaskScheduler` that arms a timer per active task.
-        ``None`` disables the scheduler entirely, in either mode.
+        ``None`` disables the scheduler entirely, in either mode. The
+        ``automations`` release feature disables both schedulers and all
+        automation access without deleting saved tasks.
     :param preference_store: Optional shared-preference API; no launcher adoption.
     :param automations: Whether this request's caller can use automations. A static
         bool or a zero-arg callable resolved per request; ``None`` enables them.
@@ -2029,9 +2031,10 @@ def create_app(
         if mcp_disabled_servers is None
         else mcp_disabled_servers
     )
+    automations_enabled = resolved_feature_flags.enabled(Feature.AUTOMATIONS)
     automations_v2_enabled = resolved_feature_flags.enabled(Feature.AUTOMATIONS_V2)
     # Without a store there are no automations, so neither mode starts a scheduler.
-    if automations_v2_enabled and scheduled_task_store is not None:
+    if automations_enabled and automations_v2_enabled and scheduled_task_store is not None:
         if not isinstance(scheduled_task_store, ScheduledTaskDispatchStore):
             raise TypeError(
                 "The configured scheduled task store does not implement the operations needed "
@@ -2310,7 +2313,7 @@ def create_app(
         # The release flag selects one scheduler for the lifetime of this server.
         scheduler_start_retry: asyncio.Task[None] | None = None
         scheduled_task_scheduler: ScheduledTaskScheduler | PersistentTaskScheduler | None = None
-        if scheduled_task_store is not None:
+        if automations_enabled and scheduled_task_store is not None:
             from omnigent.server.scheduled.fire import (
                 ClaimedRunExecutor,
                 FireDeps,
@@ -2575,8 +2578,10 @@ def create_app(
     app.state.automations = True if automations is None else automations
 
     def automations_available() -> bool:
-        return scheduled_task_store is not None and deployment_gate_enabled(
-            app.state.automations, "automations"
+        return (
+            automations_enabled
+            and scheduled_task_store is not None
+            and deployment_gate_enabled(app.state.automations, "automations")
         )
 
     app.state.automations_available = automations_available
@@ -3945,7 +3950,7 @@ def create_app(
                     "extensions": sorted(filesystem_attachment_policy.extensions),
                     "all_types": filesystem_attachment_policy.all_types,
                 },
-                "scheduled_task_projects": project_store is not None,
+                "scheduled_task_projects": automations_enabled and project_store is not None,
                 "scheduled_task_inbox": automations_enabled,
                 "scheduled_task_one_time": automations_enabled
                 and bool(app.state.one_time_automations_enabled),
@@ -4280,7 +4285,7 @@ def create_app(
                 artifact_store=artifact_store,
                 file_store=file_store,
                 project_store=project_store,
-                automations=app.state.automations,
+                automations=app.state.automations_available,
                 liveness_lookup=_bulk_session_liveness,
             ),
             prefix="/v1",

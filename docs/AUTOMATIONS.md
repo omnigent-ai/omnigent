@@ -14,6 +14,20 @@ An automation is a saved instruction that fires an agent session on a recurring 
 
 "Automations" is the user-facing name in the web UI. Everywhere else the feature is called a **scheduled task**: the REST paths (`/v1/scheduled-tasks`), the agent tools (`sys_scheduled_task_*`), the database tables (`scheduled_tasks`, `scheduled_task_runs`), and the code. This guide uses whichever name matches the surface being described.
 
+## Disabling automations
+
+Automations are enabled by default. Append `-automations` to the server's
+`OMNIGENT_FEATURES` and restart every server replica to disable them. This hides
+automation navigation and agent tools, refuses scheduled-task API requests, and
+starts neither scheduler. Reload the web app after restarting. Saved tasks and
+run history remain intact; re-enabling the feature allows scheduling to resume.
+Already running agent sessions are not cancelled.
+
+`-automations_v2` only selects the legacy scheduler; it does not disable
+automations. Embedded deployments can separately use `create_app(automations=...)`
+to control access per caller while existing schedules continue running. The
+deployment-wide `-automations` switch takes precedence over that access gate.
+
 ## Creating an automation
 
 There are three surfaces, all writing the same rows.
