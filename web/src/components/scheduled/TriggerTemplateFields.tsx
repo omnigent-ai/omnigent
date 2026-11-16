@@ -17,6 +17,11 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { Label } from "@/components/scheduled/Label";
+import {
+  WORKFLOW_DETAILS_LABEL,
+  WORKFLOW_DETAILS_PLACEHOLDER,
+} from "@/components/scheduled/WorkflowField";
 import {
   MAX_INSTRUCTIONS_CHARS,
   MAX_SESSIONS_PER_RUN,
@@ -112,6 +117,9 @@ export function TriggerTemplateFields({
   taskSessionMode = "new",
   workflowField = null,
   instructionsAreDetails = false,
+  instructionsMaxChars = MAX_INSTRUCTIONS_CHARS,
+  instructionsUpgradeHint = null,
+  hideInstructions = false,
 }: {
   source: TriggerSource;
   fields: TriggerFields;
@@ -124,10 +132,16 @@ export function TriggerTemplateFields({
   toolsProvided?: boolean;
   /** The dialog's Workflow field, shown above the instructions. */
   workflowField?: ReactNode;
-  /** A workflow was chosen, so the instructions are each run's details. */
+  /** A workflow was chosen, so the instructions are optional details for its runs. */
   instructionsAreDetails?: boolean;
+  /** Runs follow the chosen workflow as saved, so there are no instructions to edit. */
+  hideInstructions?: boolean;
   /** The matching MCP service, which replaces the warning that one is needed. */
   mcpService?: TriggerMcpService;
+  /** From triggerMessageBudget: smaller where the server or host is older. */
+  instructionsMaxChars?: number;
+  /** What to update for the full budget, shown with the length error. */
+  instructionsUpgradeHint?: string | null;
 }) {
   const template = TRIGGER_TEMPLATES[source];
   const Icon = template.icon;
@@ -141,10 +155,11 @@ export function TriggerTemplateFields({
   const scope = triggerScope(source, fields.event);
   const conditionFields = triggerConditionFields(source, fields.event);
   const scopeEntries = triggerScopeEntries(source, fields);
-  const instructionsTooLong = fields.instructions.trim().length > MAX_INSTRUCTIONS_CHARS;
-  const instructionsTooLongMessage = `Keep instructions to ${MAX_INSTRUCTIONS_CHARS.toLocaleString("en-US")} characters or fewer so each ${
+  const instructionsTooLong =
+    !hideInstructions && fields.instructions.trim().length > instructionsMaxChars;
+  const instructionsTooLongMessage = `Keep instructions to ${instructionsMaxChars.toLocaleString("en-US")} characters or fewer so each ${
     taskSessionMode === "continue" ? "message to the task session" : "session's first message"
-  } has room for the item.`;
+  } has room for the item.${instructionsUpgradeHint ? ` ${instructionsUpgradeHint}` : ""}`;
   const [activeSection, setActiveSection] = useState<"trigger" | "instructions">("trigger");
   const fullTriggerDescription = triggerEventDescription(source, fields.event);
   const firstSentenceEnd = fullTriggerDescription.indexOf(". ");
@@ -197,7 +212,7 @@ export function TriggerTemplateFields({
             className="h-7 flex-none px-3"
           >
             Instructions
-            {fields.instructions.trim() === "" && (
+            {fields.instructions.trim() === "" && !instructionsAreDetails && (
               <span aria-hidden="true" data-testid="task-trigger-instructions-required">
                 *
               </span>
@@ -667,38 +682,43 @@ export function TriggerTemplateFields({
             data-testid="task-trigger-instructions-panel"
           >
             {workflowField}
-            <div className="flex flex-col gap-1.5">
-              <Textarea
-                id="task-trigger-instructions"
-                aria-label={
-                  instructionsAreDetails
-                    ? "Additional instructions"
-                    : taskSessionMode === "continue"
-                      ? "Instructions for the task session"
-                      : "Instructions for each session"
-                }
-                value={fields.instructions}
-                rows={3}
-                placeholder={
-                  instructionsAreDetails
-                    ? "Optional. Instructions to customize the workflow."
-                    : template.instructionsPlaceholder
-                }
-                data-testid="task-trigger-instructions"
-                componentId="tasks.scheduled.trigger_instructions"
-                className="min-h-[240px] resize-none text-ui"
-                onChange={(e) => onChange({ ...fields, instructions: e.target.value })}
-              />
-              {instructionsTooLong && (
-                <p
-                  className="text-sm text-destructive"
-                  role="alert"
-                  data-testid="task-trigger-too-long"
-                >
-                  {instructionsTooLongMessage}
-                </p>
-              )}
-            </div>
+            {!hideInstructions && (
+              <div className="flex flex-col gap-1.5">
+                {instructionsAreDetails && (
+                  <Label htmlFor="task-trigger-instructions">{WORKFLOW_DETAILS_LABEL}</Label>
+                )}
+                <Textarea
+                  id="task-trigger-instructions"
+                  aria-label={
+                    instructionsAreDetails
+                      ? undefined
+                      : taskSessionMode === "continue"
+                        ? "Instructions for the task session"
+                        : "Instructions for each session"
+                  }
+                  value={fields.instructions}
+                  rows={3}
+                  placeholder={
+                    instructionsAreDetails
+                      ? WORKFLOW_DETAILS_PLACEHOLDER
+                      : template.instructionsPlaceholder
+                  }
+                  data-testid="task-trigger-instructions"
+                  componentId="tasks.scheduled.trigger_instructions"
+                  className="min-h-[240px] resize-none text-ui"
+                  onChange={(e) => onChange({ ...fields, instructions: e.target.value })}
+                />
+                {instructionsTooLong && (
+                  <p
+                    className="text-sm text-destructive"
+                    role="alert"
+                    data-testid="task-trigger-too-long"
+                  >
+                    {instructionsTooLongMessage}
+                  </p>
+                )}
+              </div>
+            )}
           </div>
         </TabsContent>
       </Tabs>

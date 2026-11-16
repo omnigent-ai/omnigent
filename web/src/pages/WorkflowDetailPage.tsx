@@ -3,7 +3,7 @@
  * Drafts become runnable when the user saves the agent's proposed plan.
  */
 
-import { useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronDownIcon,
   ChevronLeftIcon,
@@ -16,11 +16,14 @@ import {
   WorkflowIcon,
 } from "lucide-react";
 
+import { KeyboardShortcutTooltip } from "@/components/KeyboardShortcut";
 import { PageScroll } from "@/components/PageScroll";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { DeleteWorkflowDialog } from "@/components/workflows/DeleteWorkflowDialog";
+import { WorkflowAutomations } from "@/components/workflows/WorkflowAutomations";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+import { Textarea } from "@/components/ui/textarea";
 import { showToast } from "@/components/ui/toast";
 import {
   type WorkflowSessionRequest,
@@ -41,6 +44,7 @@ import { useNow } from "@/hooks/useNow";
 import {
   useWorkflow,
   useWorkflowRuns,
+  useSaveWorkflowDescription,
   useSaveWorkflowPlan,
   WorkflowNotFoundError,
 } from "@/hooks/useWorkflow";
@@ -51,6 +55,7 @@ import { useSession } from "@/hooks/useSession";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { WorkflowPlanningChat } from "@/components/workflows/WorkflowPlanningChat";
 import { automationPagePath } from "@/lib/automationFromSession";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { Link, useNavigate, useParams } from "@/lib/routing";
 import { formatRunTimestamp } from "@/lib/scheduleText";
@@ -65,6 +70,10 @@ import {
   type WorkflowRunState,
 } from "@/lib/workflowRuns";
 import { StepGlyph } from "@/shell/TasksPanel";
+import { useChatStore } from "@/store/chatStore";
+
+// The planning chat's outline flash lasts as long as `.animate-user-msg-flash`.
+const PLANNING_CHAT_FLASH_MS = 800;
 
 export function WorkflowDetailPage() {
   const { workflowId = "" } = useParams<{ workflowId: string }>();
@@ -85,20 +94,29 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const [sessionOpen, setSessionOpen] = useState(false);
   const [automationOpen, setAutomationOpen] = useState(false);
   const [plannerOpen, setPlannerOpen] = useState<boolean | null>(null);
+  const [plannerExpanded, setPlannerExpanded] = useState(false);
+  // Non-zero while the open planning chat flashes; each press restarts it.
+  const [plannerFlash, setPlannerFlash] = useState(0);
   const showPlanner = plannerOpen ?? workflow?.is_draft ?? false;
   const isMobile = useIsMobileViewport();
   const { session: planningSession, error: planningSessionError } = useSession(
     workflow?.planning_session_id,
   );
-  const canReadProposal =
-    !!planningSession &&
-    !planningSession.archived &&
-    !(planningSessionError instanceof ApiError && planningSessionError.status === 404);
+  // Known archived or deleted; a session still loading may yet open.
+  const planningSessionGone =
+    !!planningSession?.archived ||
+    (planningSessionError instanceof ApiError && planningSessionError.status === 404);
+  const canReadProposal = !!planningSession && !planningSessionGone;
   const journal = useSessionJournal(
     canReadProposal ? planningSession.id : undefined,
     canReadProposal,
   );
   const savePlan = useSaveWorkflowPlan(workflowId);
+  useEffect(() => {
+    if (plannerFlash === 0) return;
+    const timer = setTimeout(() => setPlannerFlash(0), PLANNING_CHAT_FLASH_MS);
+    return () => clearTimeout(timer);
+  }, [plannerFlash]);
 
   if (isLoading) {
     return (
@@ -152,10 +170,31 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
     !!proposedSteps?.length && stepSignature(proposedSteps) !== stepSignature(workflow.steps);
   const isDraft = workflow.is_draft ?? workflow.steps.length === 0;
   const canRun = !isDraft && !hasChanges;
+  // Expanded, the planner covers the page, which keeps its width underneath so
+  // it doesn't reflow; `invisible` keeps its scroll position and tab order out.
+  const plannerFillsPage = showPlanner && !isMobile && plannerExpanded;
+  // Every close path resets expansion, including the phone sheet after the window
+  // narrows, so the planner reopens beside the page.
+  const closePlanner = () => {
+    setPlannerOpen(false);
+    setPlannerExpanded(false);
+  };
+  // Opens the planning chat ready to type, or flashes it when it's already open.
+  const openPlanner = () => {
+    if (showPlanner) setPlannerFlash((count) => count + 1);
+    setPlannerOpen(true);
+    // A session still loading keeps the request until its composer mounts.
+    const sessionId = workflow.planning_session_id;
+    if (sessionId && !planningSessionGone) useChatStore.getState().requestSideChatFocus(sessionId);
+  };
 
   return (
     <div className="relative flex h-full min-h-0 flex-1 overflow-hidden">
-      <PageScroll className="min-w-0" contentClassName="px-6" data-testid="workflow-detail-page">
+      <PageScroll
+        className={cn("min-w-0", plannerFillsPage && "invisible")}
+        contentClassName="px-6"
+        data-testid="workflow-detail-page"
+      >
         <BackLink />
 
         <div className="mt-4 flex flex-wrap items-start justify-between gap-4">
@@ -173,15 +212,17 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
             )}
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              aria-label="Edit workflow"
-              data-testid="workflow-detail-edit"
-              onClick={() => setPlannerOpen(true)}
-            >
-              <PencilIcon className="size-4" />
-            </Button>
+            <KeyboardShortcutTooltip label="Edit plan with agent">
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label="Edit plan with agent"
+                data-testid="workflow-detail-edit"
+                onClick={openPlanner}
+              >
+                <PencilIcon className="size-4" />
+              </Button>
+            </KeyboardShortcutTooltip>
             <Button
               variant="ghost"
               size="icon-sm"
@@ -215,7 +256,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
             </Button>
           </div>
         </div>
-        <WorkflowDescription text={workflow.description} />
+        <WorkflowDescription workflowId={workflow.id} text={workflow.description} />
 
         <section className="mt-6">
           <div className="mb-3 flex items-center justify-between gap-3">
@@ -267,13 +308,17 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
                 Your proposed steps will appear here.
               </p>
               {!showPlanner && (
-                <Button variant="outline" size="sm" onClick={() => setPlannerOpen(true)}>
+                <Button variant="outline" size="sm" onClick={openPlanner}>
                   Create plan
                 </Button>
               )}
             </div>
           )}
         </section>
+
+        {automationsEnabled && !isDraft && (
+          <WorkflowAutomations workflowId={workflowId} now={now} />
+        )}
 
         {!isDraft && (
           <>
@@ -348,7 +393,12 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
       </PageScroll>
       {showPlanner &&
         (isMobile ? (
-          <Dialog open onOpenChange={setPlannerOpen}>
+          <Dialog
+            open
+            onOpenChange={(open) => {
+              if (!open) closePlanner();
+            }}
+          >
             <DialogContent
               showCloseButton={false}
               aria-describedby={undefined}
@@ -357,15 +407,36 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
               <DialogTitle className="sr-only">
                 {workflow.steps.length > 0 ? "Edit plan" : "Create plan"}
               </DialogTitle>
-              <WorkflowPlanningChat workflow={workflow} onClose={() => setPlannerOpen(false)} />
+              <WorkflowPlanningChat workflow={workflow} onClose={closePlanner} />
             </DialogContent>
           </Dialog>
         ) : (
-          <aside
-            aria-label="Workflow planning chat"
-            className="w-[42%] min-w-96 max-w-xl shrink-0 border-l border-border bg-background pt-[calc(var(--omnigent-header-height)+var(--omnigent-inset-top))] pb-[var(--omnigent-inset-bottom)]"
-          >
-            <WorkflowPlanningChat workflow={workflow} onClose={() => setPlannerOpen(false)} />
+          // The aside keeps its width in the row while its panel covers the page.
+          <aside aria-label="Workflow planning chat" className="w-[42%] min-w-96 max-w-xl shrink-0">
+            <div
+              data-testid="workflow-planner-panel"
+              className={cn(
+                "bg-background pt-[calc(var(--omnigent-header-height)+var(--omnigent-inset-top))] pb-[var(--omnigent-inset-bottom)]",
+                plannerFillsPage ? "absolute inset-0" : "h-full border-l border-border",
+              )}
+            >
+              <div className="relative h-full">
+                <WorkflowPlanningChat
+                  workflow={workflow}
+                  expanded={plannerFillsPage}
+                  onExpandedChange={setPlannerExpanded}
+                  onClose={closePlanner}
+                />
+                {plannerFlash > 0 && (
+                  <span
+                    key={plannerFlash}
+                    aria-hidden="true"
+                    data-testid="workflow-planning-chat-flash"
+                    className="pointer-events-none absolute inset-1 z-10 animate-user-msg-flash"
+                  />
+                )}
+              </div>
+            </div>
           </aside>
         ))}
     </div>
@@ -374,12 +445,19 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
 
 /**
  * The description, in a section like an automation's prompt: three lines and
- * an ellipsis, with a chevron to show the rest when there is more.
+ * an ellipsis, with a chevron to show the rest when there is more. Its pencil
+ * edits it in place, like a pull request's description.
  */
-function WorkflowDescription({ text }: { text: string }) {
+function WorkflowDescription({ workflowId, text }: { workflowId: string; text: string }) {
   const [expanded, setExpanded] = useState(false);
   const [clamped, setClamped] = useState(false);
+  // The text being edited; null while the description is shown.
+  const [draft, setDraft] = useState<string | null>(null);
+  const editing = draft !== null;
   const bodyRef = useRef<HTMLParagraphElement>(null);
+  const editorRef = useRef<HTMLFormElement>(null);
+  const errorId = useId();
+  const update = useSaveWorkflowDescription(workflowId);
 
   // Whether three lines cut the text off, measured again as the page resizes.
   useLayoutEffect(() => {
@@ -391,39 +469,146 @@ function WorkflowDescription({ text }: { text: string }) {
     const observer = new ResizeObserver(measure);
     observer.observe(body);
     return () => observer.disconnect();
-  }, [text, expanded]);
+  }, [text, expanded, editing]);
+
+  // The editor opens ready to continue the text, with the caret after it.
+  useEffect(() => {
+    const input = editorRef.current?.querySelector("textarea");
+    if (!editing || !input) return;
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+  }, [editing]);
+
+  // Saving disables the editor, which drops its focus; a failed save hands it back.
+  useEffect(() => {
+    if (update.isError) editorRef.current?.querySelector("textarea")?.focus();
+  }, [update.isError]);
+
+  const close = () => {
+    setDraft(null);
+    update.reset();
+  };
+  const save = () => {
+    if (draft === null) return;
+    const next = draft.trim();
+    // The shortcut follows the Save button: a workflow needs a description.
+    if (!next) return;
+    if (next === text) {
+      close();
+      return;
+    }
+    update.mutate(next, { onSuccess: close });
+  };
+  const cancel = () => {
+    const changed = draft !== null && draft.trim() !== text;
+    if (changed && !window.confirm("Discard your description changes?")) return;
+    close();
+  };
 
   return (
     <section className="mt-6">
-      <h2 className="mb-2 text-sm font-medium text-muted-foreground">
-        {clamped || expanded ? (
-          <button
-            type="button"
-            aria-expanded={expanded}
-            data-testid="workflow-detail-description-toggle"
-            onClick={() => setExpanded(!expanded)}
-            className="flex cursor-pointer items-center gap-1 rounded-sm text-left transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <ChevronDownIcon
-              aria-hidden="true"
-              className={cn("size-4 transition-transform", !expanded && "-rotate-90")}
-            />
-            Description
-          </button>
-        ) : (
-          "Description"
+      <div className="mb-2 flex items-center gap-1">
+        <h2 className="text-sm font-medium text-muted-foreground">
+          {!editing && (clamped || expanded) ? (
+            <button
+              type="button"
+              aria-expanded={expanded}
+              data-testid="workflow-detail-description-toggle"
+              onClick={() => setExpanded(!expanded)}
+              className="flex cursor-pointer items-center gap-1 rounded-sm text-left transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <ChevronDownIcon
+                aria-hidden="true"
+                className={cn("size-4 transition-transform", !expanded && "-rotate-90")}
+              />
+              Description
+            </button>
+          ) : (
+            "Description"
+          )}
+        </h2>
+        {!editing && (
+          <KeyboardShortcutTooltip label="Edit description">
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              aria-label="Edit description"
+              className="-my-0.5 text-muted-foreground"
+              onClick={() => setDraft(text)}
+            >
+              <PencilIcon aria-hidden="true" className="size-3" />
+            </Button>
+          </KeyboardShortcutTooltip>
         )}
-      </h2>
-      <p
-        ref={bodyRef}
-        className={cn(
-          "whitespace-pre-wrap text-sm text-foreground/90",
-          !expanded && "line-clamp-3",
-        )}
-        data-testid="workflow-detail-description"
-      >
-        {text}
-      </p>
+      </div>
+      {editing ? (
+        <form
+          ref={editorRef}
+          className="flex flex-col gap-2"
+          onSubmit={(event) => {
+            event.preventDefault();
+            save();
+          }}
+        >
+          <Textarea
+            aria-label="Workflow description"
+            aria-invalid={update.isError || undefined}
+            aria-describedby={update.isError ? errorId : undefined}
+            value={draft}
+            maxLength={2000}
+            rows={4}
+            disabled={update.isPending}
+            onChange={(event) => setDraft(event.currentTarget.value)}
+            onKeyDown={(event) => {
+              // These keys end an IME composition first; leave them to the IME.
+              if (isImeCompositionKeyEvent(event)) return;
+              if (event.key === "Escape") {
+                event.preventDefault();
+                cancel();
+              } else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                event.preventDefault();
+                save();
+              }
+            }}
+            className="min-h-24 resize-y text-sm"
+          />
+          {update.isError && (
+            <p id={errorId} role="alert" className="text-sm text-destructive">
+              Couldn’t save the description. {update.error.message}
+            </p>
+          )}
+          <div className="flex items-center gap-2">
+            <Button
+              type="submit"
+              size="sm"
+              loading={update.isPending}
+              disabled={update.isPending || !draft.trim()}
+            >
+              Save
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              disabled={update.isPending}
+              onClick={cancel}
+            >
+              Cancel
+            </Button>
+          </div>
+        </form>
+      ) : (
+        <p
+          ref={bodyRef}
+          className={cn(
+            "whitespace-pre-wrap text-sm text-foreground/90",
+            !expanded && "line-clamp-3",
+          )}
+          data-testid="workflow-detail-description"
+        >
+          {text}
+        </p>
+      )}
     </section>
   );
 }

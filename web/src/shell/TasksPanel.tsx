@@ -1,7 +1,17 @@
 // The Tasks tab: where the session's tasks stand, one row each. Tasks are a
 // plan's steps, or the agent's own task list when the session has no plan.
 
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  Fragment,
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import {
   CheckIcon,
   ChevronRightIcon,
@@ -9,6 +19,7 @@ import {
   ListChecksIcon,
   Loader2Icon,
   MessageCircleQuestionMarkIcon,
+  NetworkIcon,
   PlayIcon,
   RotateCcwIcon,
   SquareIcon,
@@ -68,6 +79,13 @@ import { PlanRunButton } from "@/shell/PlanRunButton";
 import { useSessionTasksActions } from "@/store/sessionTasksActions";
 
 const NO_ENTRIES: JournalEntry[] = [];
+
+// React Flow loads only once a plan opens on its graph.
+const WorkflowGraphOverlay = lazy(() =>
+  import("@/components/workflows/WorkflowStepsGraph").then((module) => ({
+    default: module.WorkflowGraphOverlay,
+  })),
+);
 
 export const STATE_LABELS: Record<StepState, string> = {
   waiting: "Not started",
@@ -942,6 +960,7 @@ function TasksHeader({
   onContinuePlan,
   menuActionFor,
   onStop,
+  onOpenGraph,
 }: {
   plan: JournalEntry | null;
   /** The saved workflow the plan came from, or null. */
@@ -958,6 +977,8 @@ function TasksHeader({
   menuActionFor: (item: StepProgress) => TaskMenuAction | undefined;
   /** Stops the agent; offered only while it works. */
   onStop?: () => void;
+  /** Opens the plan on its graph; absent without a plan, which says what waits on what. */
+  onOpenGraph?: () => void;
 }) {
   const tally = planTally(progress);
   const updatedAt = Math.max(
@@ -1021,6 +1042,19 @@ function TasksHeader({
                     onClick={onContinuePlan}
                   />
                 )
+              )}
+              {onOpenGraph && (
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label="View the plan on the graph"
+                  title="View the plan on the graph"
+                  className="shrink-0 self-center text-muted-foreground"
+                  data-testid="tasks-plan-graph"
+                  onClick={onOpenGraph}
+                >
+                  <NetworkIcon className="size-3.5" />
+                </Button>
               )}
               {onSaveWorkflow && (
                 <DropdownMenu>
@@ -1196,10 +1230,19 @@ export function TasksPanel({
     // The rail or drawer may still be opening; its rows mount by the next frame.
     requestAnimationFrame(() => jumpToStep(taskToShow.stepId));
   }, [active, showPlan, taskToShow, conversationId, jumpToStep]);
+  const [graphOpen, setGraphOpen] = useState(false);
+  // The panel stays mounted across sessions, so a switch closes the graph rather than hiding it.
+  const [graphConversationId, setGraphConversationId] = useState(conversationId);
+  if (graphConversationId !== conversationId) {
+    setGraphConversationId(conversationId);
+    setGraphOpen(false);
+  }
   const location = useLocation();
   const navigate = useNavigate();
   const showInChat = useCallback(
     (markerId: string) => {
+      // The graph covers the chat it scrolls.
+      setGraphOpen(false);
       onShowInChat?.();
       const pathname = `/c/${encodeURIComponent(conversationId)}`;
       const search = messageDeepLinkParams(new URLSearchParams(location.search), markerId);
@@ -1313,6 +1356,7 @@ export function TasksPanel({
                   ? undefined
                   : stopActiveWork
               }
+              onOpenGraph={plan ? () => setGraphOpen(true) : undefined}
             />
             <TaskList
               progress={progress}
@@ -1323,6 +1367,17 @@ export function TasksPanel({
               menuActionFor={menuActionFor}
               nativeMarkerIds={nativeMarkerIds}
             />
+            {plan && graphOpen && (
+              <Suspense fallback={null}>
+                <WorkflowGraphOverlay
+                  title={planName(plan) ?? "Tasks"}
+                  steps={progress.map((item) => item.step)}
+                  progress={progress}
+                  menuActionFor={menuActionFor}
+                  onClose={() => setGraphOpen(false)}
+                />
+              </Suspense>
+            )}
           </>
         )}
       </div>

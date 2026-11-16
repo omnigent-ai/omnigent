@@ -26,9 +26,10 @@ import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import type * as IdentityModule from "@/lib/identity";
 import type * as RoutingModule from "@/lib/routing";
 import { sessionJournalKey, type JournalEntry, type StepProgress } from "@/lib/sessionJournal";
-import { getSession, sendUserMessage } from "@/lib/sessionsApi";
+import { ApiError, getSession, sendUserMessage } from "@/lib/sessionsApi";
 import { taskActionMessage } from "@/lib/workflow";
 import type * as SessionsApi from "@/lib/sessionsApi";
+import { useChatStore } from "@/store/chatStore";
 import { openTasksTab } from "@/store/sessionTasksActions";
 import type * as TasksActions from "@/store/sessionTasksActions";
 import type { WorkflowStep } from "@/lib/workflowGraphLayout";
@@ -59,11 +60,20 @@ vi.mock("@/components/workflows/WorkflowPlanningChat", () => ({
   WorkflowPlanningChat: ({
     workflow,
     onClose,
+    expanded,
+    onExpandedChange,
   }: {
     workflow: WorkflowDetail;
     onClose: () => void;
+    expanded?: boolean;
+    onExpandedChange?: (expanded: boolean) => void;
   }) => (
     <div data-testid="planning-chat" data-session={workflow.planning_session_id}>
+      {onExpandedChange && (
+        <button type="button" onClick={() => onExpandedChange(!expanded)}>
+          {expanded ? "Collapse planning chat" : "Expand planning chat"}
+        </button>
+      )}
       <button type="button" onClick={onClose}>
         Close planning chat
       </button>
@@ -113,6 +123,12 @@ vi.mock("@/components/workflows/WorkflowSessionDialog", () => ({
 vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
   CreateScheduledTaskDialog: (props: { open: boolean; lockedWorkflow?: SavedWorkflow | null }) =>
     props.open ? <div data-testid="new-automation-dialog">{props.lockedWorkflow?.name}</div> : null,
+}));
+// The automations list has its own tests; here it names the workflow it lists.
+vi.mock("@/components/workflows/WorkflowAutomations", () => ({
+  WorkflowAutomations: ({ workflowId }: { workflowId: string }) => (
+    <div data-testid="workflow-automations-section" data-workflow={workflowId} />
+  ),
 }));
 const navigate = vi.fn();
 vi.mock("@/lib/routing", async (importOriginal) => {
@@ -294,6 +310,7 @@ describe("WorkflowDetailPage", () => {
       expect(screen.getByTestId("planning-chat")).toHaveAttribute("data-session", planner);
       expect(screen.getByTestId("workflow-detail-run")).toBeDisabled();
       expect(screen.getByTestId("workflow-detail-create-automation")).toBeDisabled();
+      expect(screen.queryByTestId("workflow-automations-section")).toBeNull();
       if (mobile) {
         fireEvent.click(screen.getByRole("button", { name: "Close planning chat" }));
         expect(screen.queryByTestId("planning-chat")).toBeNull();
@@ -310,11 +327,15 @@ describe("WorkflowDetailPage", () => {
       else expect(screen.getByTestId("planning-chat")).toBeInTheDocument();
       expect(screen.queryByText("Draft")).toBeNull();
       expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+      expect(screen.getByTestId("workflow-automations-section")).toHaveAttribute(
+        "data-workflow",
+        WORKFLOW.id,
+      );
 
       cleanup();
       renderPage();
       await screen.findByTestId("workflow-detail-title");
-      fireEvent.click(screen.getByRole("button", { name: "Edit workflow" }));
+      fireEvent.click(screen.getByRole("button", { name: "Edit plan with agent" }));
       expect(screen.getByTestId("planning-chat")).toHaveAttribute("data-session", planner);
       expect(screen.getByTestId("workflow-detail-run")).toBeEnabled();
       const edited = [
@@ -327,6 +348,101 @@ describe("WorkflowDetailPage", () => {
       await waitFor(() => expect(stored.steps).toEqual(edited));
     },
   );
+
+  it("expands the planner over the page in place, on wide screens only", () => {
+    mockWorkflow({ data: { ...WORKFLOW, steps: [], is_draft: true } });
+    mockRuns([]);
+    const { rerender } = renderPage();
+    const setPhone = (phone: boolean) => {
+      vi.mocked(useIsMobileViewport).mockReturnValue(phone);
+      rerender(<WorkflowDetailPage />);
+    };
+    const page = screen.getByTestId("workflow-detail-page");
+    const planner = screen.getByRole("complementary", { name: "Workflow planning chat" });
+    const panel = screen.getByTestId("workflow-planner-panel");
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand planning chat" }));
+    expect(panel).toHaveClass("absolute", "inset-0");
+    expect(page).toHaveClass("invisible");
+    // The aside still reserves its width, so the hidden page doesn't reflow.
+    expect(planner).toHaveClass("w-[42%]");
+    expect(planner).not.toHaveClass("absolute");
+    fireEvent.click(screen.getByRole("button", { name: "Collapse planning chat" }));
+    expect(panel).not.toHaveClass("absolute");
+    expect(page).not.toHaveClass("invisible");
+
+    // Every close path, including the phone sheet after the window narrows,
+    // reopens the planner beside the page.
+    const closeButton = () =>
+      fireEvent.click(screen.getByRole("button", { name: "Close planning chat" }));
+    const dismissSheet = () =>
+      fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    for (const [phone, close] of [
+      [false, closeButton],
+      [true, closeButton],
+      [true, dismissSheet],
+    ] as const) {
+      fireEvent.click(screen.getByRole("button", { name: "Expand planning chat" }));
+      setPhone(phone);
+      // Phones already show the planner as a near-full-screen sheet.
+      if (phone) expect(screen.queryByRole("button", { name: "Expand planning chat" })).toBeNull();
+      close();
+      expect(screen.queryByTestId("planning-chat")).toBeNull();
+      setPhone(false);
+      fireEvent.click(screen.getByRole("button", { name: "Create plan" }));
+      expect(page).not.toHaveClass("invisible");
+    }
+  });
+
+  it("opens the planning chat ready to type, and flashes it when pressed while open", () => {
+    const planner = "e".repeat(32);
+    mockWorkflow({ data: { ...WORKFLOW, planning_session_id: planner } });
+    mockRuns([]);
+    // Pressed before the planning session loads, the request waits for its composer.
+    vi.mocked(useSession).mockReturnValue({ session: null, isLoading: true, error: null });
+    vi.useFakeTimers();
+    try {
+      const { rerender } = renderPage();
+      const edit = screen.getByRole("button", { name: "Edit plan with agent" });
+
+      fireEvent.click(edit);
+      expect(screen.getByTestId("planning-chat")).toHaveAttribute("data-session", planner);
+      expect(useChatStore.getState().sideChatComposers[planner]?.autoFocus).toBe(true);
+      expect(screen.queryByTestId("workflow-planning-chat-flash")).toBeNull();
+
+      // The real composer drops the request as it takes focus.
+      useChatStore.getState().clearSideChatComposer(planner);
+      vi.mocked(useSession).mockReturnValue({
+        session: { id: planner, archived: false, labels: {} } as Session,
+        isLoading: false,
+        error: null,
+      });
+      rerender(<WorkflowDetailPage />);
+      fireEvent.click(edit);
+      expect(useChatStore.getState().sideChatComposers[planner]?.autoFocus).toBe(true);
+      expect(screen.getByTestId("workflow-planning-chat-flash")).toBeInTheDocument();
+      act(() => vi.runOnlyPendingTimers());
+      expect(screen.queryByTestId("workflow-planning-chat-flash")).toBeNull();
+    } finally {
+      useChatStore.getState().clearSideChatComposer(planner);
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ["archived", { session: { archived: true, labels: {} } as Session, error: null }],
+    ["deleted", { session: null, error: new ApiError("Session not found", 404, null) }],
+  ])("queues no composer focus for a %s planning session", (_, state) => {
+    const planner = "f".repeat(32);
+    mockWorkflow({ data: { ...WORKFLOW, planning_session_id: planner } });
+    mockRuns([]);
+    vi.mocked(useSession).mockReturnValue({ ...state, isLoading: false });
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit plan with agent" }));
+    expect(screen.getByTestId("planning-chat")).toBeInTheDocument();
+    expect(useChatStore.getState().sideChatComposers[planner]).toBeUndefined();
+  });
 
   it("shows the workflow, its steps, and the sessions that ran it", () => {
     mockWorkflow({});
@@ -381,7 +497,7 @@ describe("WorkflowDetailPage", () => {
       vi.useFakeTimers({ shouldAdvanceTime: true });
       try {
         renderPage(client);
-        fireEvent.click(screen.getByRole("button", { name: "Edit workflow" }));
+        fireEvent.click(screen.getByRole("button", { name: "Edit plan with agent" }));
         await act(async () =>
           vi.advanceTimersByTimeAsync(journalHooks.JOURNAL_FALLBACK_REFETCH_MS * 2),
         );
@@ -421,6 +537,96 @@ describe("WorkflowDetailPage", () => {
     } finally {
       scroll.mockRestore();
       client.mockRestore();
+    }
+  });
+
+  it("edits the description in place, keeping the draft when a save fails", async () => {
+    const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+    vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+    mockRuns([]);
+    let stored: WorkflowDetail = { ...WORKFLOW };
+    const patches: unknown[] = [];
+    let rejectSave = true;
+    vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
+      if (options?.method === "PATCH") {
+        patches.push(JSON.parse(String(options.body)));
+        if (rejectSave)
+          return new Response(
+            JSON.stringify({ error: { message: "Try again", type: "server_error" } }),
+            { status: 500 },
+          );
+        stored = {
+          ...stored,
+          description: (patches.at(-1) as { description: string }).description,
+        };
+      }
+      return new Response(JSON.stringify(stored));
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    try {
+      renderPage();
+      await screen.findByTestId("workflow-detail-description");
+      const editorName = { name: "Workflow description" };
+
+      // An unchanged description closes on Escape without saving.
+      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+      const unchanged = screen.getByRole("textbox", editorName);
+      expect(unchanged).toHaveValue(WORKFLOW.description);
+      expect(unchanged).toHaveFocus();
+      expect((unchanged as HTMLTextAreaElement).selectionStart).toBe(WORKFLOW.description.length);
+      fireEvent.keyDown(unchanged, { key: "Escape" });
+      expect(screen.queryByRole("textbox", editorName)).toBeNull();
+
+      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+      const editor = screen.getByRole("textbox", editorName);
+      // The shortcut can't save an empty description, just as the button can't.
+      fireEvent.change(editor, { target: { value: "   " } });
+      fireEvent.keyDown(editor, { key: "Enter", ctrlKey: true });
+      expect(patches).toEqual([]);
+      fireEvent.change(editor, {
+        target: { value: "  Finds flaky tests and fixes the clear ones.  " },
+      });
+      // Keys that end an IME composition neither cancel nor save.
+      fireEvent.keyDown(editor, { key: "Escape", isComposing: true });
+      fireEvent.keyDown(editor, { key: "Enter", ctrlKey: true, isComposing: true });
+      expect(confirm).not.toHaveBeenCalled();
+      expect(patches).toEqual([]);
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      // Browsers blur a control as saving disables it; jsdom doesn't.
+      act(() => editor.blur());
+      expect(await screen.findByRole("alert")).toHaveTextContent("Couldn’t save the description");
+      expect(editor).toHaveFocus();
+      // Escape asks before discarding the edit.
+      fireEvent.keyDown(editor, { key: "Escape" });
+      expect(confirm).toHaveBeenCalledOnce();
+      expect(editor).toHaveValue("  Finds flaky tests and fixes the clear ones.  ");
+
+      rejectSave = false;
+      fireEvent.keyDown(editor, { key: "Enter", metaKey: true });
+      await waitFor(() => expect(screen.queryByRole("textbox", editorName)).toBeNull());
+      expect(patches).toEqual([
+        { description: "Finds flaky tests and fixes the clear ones." },
+        { description: "Finds flaky tests and fixes the clear ones." },
+      ]);
+      expect(screen.getByTestId("workflow-detail-description").textContent).toBe(
+        "Finds flaky tests and fixes the clear ones.",
+      );
+      expect(screen.queryByRole("alert")).toBeNull();
+
+      // Cancel discards an edit once confirmed.
+      confirm.mockReturnValue(true);
+      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+      fireEvent.change(screen.getByRole("textbox", editorName), {
+        target: { value: "Something else" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      expect(screen.queryByRole("textbox", editorName)).toBeNull();
+      expect(screen.getByTestId("workflow-detail-description").textContent).toBe(
+        "Finds flaky tests and fixes the clear ones.",
+      );
+      expect(patches).toHaveLength(2);
+    } finally {
+      confirm.mockRestore();
     }
   });
 
@@ -775,11 +981,16 @@ describe("WorkflowDetailPage", () => {
       if (automations === "loading" || automations === false) {
         expect(screen.queryByTestId("workflow-detail-create-automation")).toBeNull();
         expect(screen.queryByTestId("new-automation-dialog")).toBeNull();
+        expect(screen.queryByTestId("workflow-automations-section")).toBeNull();
       } else {
+        expect(screen.getByTestId("workflow-automations-section")).toHaveAttribute(
+          "data-workflow",
+          WORKFLOW.id,
+        );
         fireEvent.click(screen.getByTestId("workflow-detail-create-automation"));
         expect(screen.getByTestId("new-automation-dialog")).toHaveTextContent("Triage flaky tests");
       }
-      fireEvent.click(screen.getByRole("button", { name: "Edit workflow" }));
+      fireEvent.click(screen.getByRole("button", { name: "Edit plan with agent" }));
       expect(screen.getByTestId("planning-chat")).toBeInTheDocument();
 
       // A capability refresh can disable an already-open creation dialog.
@@ -789,6 +1000,7 @@ describe("WorkflowDetailPage", () => {
       });
       rerender(<WorkflowDetailPage />);
       expect(screen.queryByTestId("new-automation-dialog")).toBeNull();
+      expect(screen.queryByTestId("workflow-automations-section")).toBeNull();
 
       fireEvent.click(screen.getByRole("button", { name: "Delete workflow" }));
       expect(deleteWorkflow).not.toHaveBeenCalled();

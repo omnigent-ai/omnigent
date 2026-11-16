@@ -54,7 +54,10 @@ The newest status for a step is its current one:
   uncertainty and pending CI, jobs or workers do not need this status.
   The agent asks with `sys_workflow_request_input`, which writes the status for
   it, so the question reaches the user's Inbox. It shows as Waiting for you,
-  in pink.
+  in pink. The tool waits about four minutes for the answer. After that the
+  question stays open in the Inbox and chat, the agent ends its turn, and an
+  answer (or a dismissal) reaches the session as a `[System: …]` message that
+  starts the agent's next turn. An unanswered question expires after a day.
 - `failed`: the step's own work failed.
 
 The workflow skill keeps the agent working while any step is ready or started:
@@ -110,7 +113,7 @@ spec can drop it with `tool_groups.journal: false` (see
 | `sys_journal_write_plan(name, steps, workflow_id?)`                | Sets the session's plan: its name and the whole graph; returns `{id, position, version}`. `workflow_id` names the saved workflow the plan starts a run of.                                                                                                                      |
 | `sys_journal_write_status(status, step?, text?)`                    | Records a step's status. `step` may be left out when the plan has one step. Every status needs every step it depends on to be done first; otherwise the write fails with `step_not_ready`, naming them.                                                                         |
 | `sys_journal_write_note(body, step?)`                               | Adds a note.                                                                                                                                                                                                                                                                    |
-| `sys_workflow_request_input(step, questions)`                      | Asks the user about a task in the current plan and waits for the answer. It marks the task `needs_input` with the first question, raises the questions as an elicitation in the Inbox with the options as buttons, and returns `{answered, answers}`.                           |
+| `sys_workflow_request_input(step, questions)`                      | Asks the user about a task in the current plan and waits a few minutes for the answer. It marks the task `needs_input` with the first question, raises the questions as an elicitation in the Inbox with the options as buttons, and returns `{answered, answers}`, or `{answered: false, still_open: true}` when no answer came in time; a later answer reaches the session as a message. |
 | `sys_workflow_save(name, description, steps)` | Saves a reusable workflow for the session's owner through `POST /v1/workflows`, and returns `{id, name}`, or `name_taken`. The session's current plan is then written again naming the workflow, with no new chat line. The `save-workflow` skill says how to make the steps generic. A save from a session shared with edit access is refused. |
 | `sys_workflow_load(workflow)` | Loads one of the owner's saved workflows by ID or name, with its steps. A name with no exact match returns `workflow_not_found` with the closest names. |
 | `sys_workflow_list(cursor?, limit?)` | Lists the owner's saved workflows by name, 20 at a time unless `limit` says otherwise (at most 50): each one's ID, name and the start of its description, without steps. `next_cursor` pages to the rest. |
@@ -165,18 +168,24 @@ duplicating external actions. An unrecoverable step fails with a reason while
 independent work continues. A worker's claimed blocker must meet the same
 evidence requirement before the coordinator accepts it.
 
-A workflow can run another workflow as one of its steps, such as getting each
-PR in a stack ready to merge. The agent starts the other workflow in its own
-session on the same host, with the workflow skill running. For a saved
-workflow, it passes `workflow_id` to `sys_session_create`, so that session
-starts with the workflow's plan and appears in the workflow's runs. That session
-reports back with `sys_session_message` when its plan finishes, and the agent
-also checks on it periodically with a background timer of its own. Workers get
-the relevant inputs, decisions, authorization and limits, and report blockers
-to their coordinating session. That session resolves them or consolidates the
-remaining human question instead of sending the user to each worker. With the
-`sibling_sessions` feature on, these sessions are grouped with the session that
-started them.
+The agent hands off steps to nested agents rather than its harness's
+sub-agents: steps that run at the same time, long work, and steps that are
+workflows of their own, such as getting each PR in a stack ready to merge.
+Each nested agent is a session of its own, named for its step, where the step
+runs as its workflow and you can follow and message it. The agent chooses
+where each one runs for the step: on its own host and workspace, in a new
+worktree on a host, or in a new managed sandbox, falling back when the server
+doesn't offer one. It also chooses the nested agent's harness, model and
+reasoning effort for the step's complexity, starting from its own.
+For a saved workflow, the agent passes `workflow_id` to `sys_session_create`,
+so that session starts with the workflow's plan and appears in the workflow's
+runs. That session reports back with `sys_session_message` when its plan
+finishes, and the agent also checks on it periodically with a background timer
+of its own. Workers get the relevant inputs, decisions, authorization and
+limits, and report blockers to their coordinating session. That session
+resolves them or consolidates the remaining human question instead of sending
+the user to each worker. With the `sibling_sessions` feature on, these sessions
+are grouped with the session that started them.
 
 ## Saving and reusing a workflow
 
@@ -218,9 +227,9 @@ also ask for a saved workflow by name in chat ("run my flaky-test triage
 workflow").
 
 To run a saved workflow on a schedule or a trigger, pick it in New
-automation's **Workflow (optional)** field. Each run follows the workflow
-without a plan review, and the automation's **Additional instructions**
-customize it. No one is watching the run, so nothing in it waits for you.
+automation's **Workflow (optional)** field. Each run follows the workflow as
+saved, without a plan review. No one is watching the run, so nothing in it
+waits for you.
 The agent first looks up missing inputs, chooses reversible defaults and tries
 bounded recovery within your existing authorization. It records its choices
 in the journal. Missing input or approval justifies a failure only with the
@@ -312,7 +321,9 @@ segment of the strip for a card with that task's status and its **⋯** menu, or
 click it to jump to the task. In
 a plan, the strip links two neighboring tasks when one waits on the other, so a
 gap between them means they can run at the same time; hovering a task's segment
-arcs it to the tasks it waits on and the tasks that wait on it. When the agent replans, the new
+arcs it to the tasks it waits on and the tasks that wait on it. To see a plan's
+parallel branches, the graph button beside "Updated …" opens the plan's graph
+full screen, as a run's row does, with each task's state and **⋯** menu. When the agent replans, the new
 tasks simply appear. A task's chevron opens what it waits on, its goal and its
 history: each status, oldest first. Tasks from the agent's own list show only
 their name and state.

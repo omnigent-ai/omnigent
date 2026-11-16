@@ -109,6 +109,8 @@ from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMP
 from omnigent.runner.background_work_reports import BackgroundWorkReporter
 from omnigent.runner.codex.goal import CodexGoalRunner
 from omnigent.runner.journal_tools import (
+    answer_arrives_as_message,
+    cancel_session_questions,
     invalidate_server_workflow_flag,
     server_workflows_enabled,
 )
@@ -4077,6 +4079,7 @@ def create_runner_app(
             with contextlib.suppress(asyncio.CancelledError):
                 await turn_task
         await mcp_execution_registry.cancel_session(session_id)
+        await cancel_session_questions(session_id)
         _session_message_buffers.pop(session_id, None)
         _live_response_id.pop(session_id, None)
         _turn_occurrences.pop(session_id, None)
@@ -8547,6 +8550,9 @@ def create_runner_app(
             # more than consent (an MCP ``requestedSchema``). Dropping it here
             # is what used to make the awaiting caller invent one.
             _elicit_content = _data.get("content")
+            # A workflow question whose tool call already returned: dismissing it
+            # mustn't interrupt whatever the agent is doing by then.
+            answer_by_message = answer_arrives_as_message(str(_data.get("elicitation_id", "")))
             runner_owned_approval = pending_approvals.resolve(
                 _data.get("elicitation_id", ""),
                 _elicit_action == "accept",
@@ -8554,7 +8560,11 @@ def create_runner_app(
             )
             # Ordinary Pi dialog rejection is an answer, not a tool denial.
             pi_dialog = str(_data.get("elicitation_id", "")).startswith("elicit_pi_")
-            if _elicit_action == "decline" and (runner_owned_approval or not pi_dialog):
+            if (
+                _elicit_action == "decline"
+                and not answer_by_message
+                and (runner_owned_approval or not pi_dialog)
+            ):
                 try:
                     _int_client = await process_manager.get_client(conversation_id, "any")
                     await _int_client.post(
