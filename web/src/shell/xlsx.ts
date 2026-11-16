@@ -171,6 +171,34 @@ async function inflateRaw(data: Uint8Array, limit: number): Promise<Uint8Array> 
   return out;
 }
 
+/**
+ * An XML part's text, decoded as its byte-order mark, the shape of its first
+ * ``<``, or its encoding declaration says; UTF-8 otherwise.
+ */
+function xmlText(bytes: Uint8Array): string {
+  const [first, second] = bytes;
+  if ((first === 0xff && second === 0xfe) || (first === 0x3c && second === 0x00)) {
+    return new TextDecoder("utf-16le").decode(bytes);
+  }
+  if ((first === 0xfe && second === 0xff) || (first === 0x00 && second === 0x3c)) {
+    return new TextDecoder("utf-16be").decode(bytes);
+  }
+  const utf8Bom = first === 0xef && second === 0xbb && bytes[2] === 0xbf;
+  // Otherwise the declaration's bytes are ASCII whatever the encoding.
+  const head = new TextDecoder("latin1").decode(bytes.subarray(0, 256));
+  const declared = head.match(/^<\?xml\s[^>]*?encoding\s*=\s*["']([\w.:-]+)["']/)?.[1];
+  let decoder = new TextDecoder();
+  if (!utf8Bom && declared) {
+    try {
+      decoder = new TextDecoder(declared);
+    } catch {
+      // A label the browser doesn't know falls back to UTF-8.
+    }
+  }
+  // A UTF-16 label (or an alias such as ucs-2) on ASCII-shaped bytes is wrong; they are UTF-8.
+  return (decoder.encoding.startsWith("utf-16") ? new TextDecoder() : decoder).decode(bytes);
+}
+
 async function readPart(
   bytes: Uint8Array,
   entries: Map<string, ZipEntry>,
@@ -194,6 +222,9 @@ async function readPart(
   let xml: Uint8Array;
   if (entry.method === 0) xml = data;
   else if (entry.method === 8) {
+    // A spent allowance opens no more compressed parts, even one declaring no
+    // bytes; compressed input counts too, so padding that inflates to little isn't free.
+    if (limit <= 0 || data.length > limit) throw new WorkbookTooLargeError(TOO_LARGE);
     try {
       xml = await inflateRaw(data, limit);
     } catch (error) {
@@ -203,8 +234,8 @@ async function readPart(
     }
   } else throw new WorkbookError("This workbook uses a compression the preview can't read.");
   if (xml.length > limit) throw new WorkbookTooLargeError(TOO_LARGE);
-  budget.left -= xml.length;
-  const parsed = new DOMParser().parseFromString(new TextDecoder().decode(xml), "application/xml");
+  budget.left -= Math.max(xml.length, data.length);
+  const parsed = new DOMParser().parseFromString(xmlText(xml), "application/xml");
   // DOMParser reports malformed XML as a <parsererror> element, not by throwing.
   if (parsed.getElementsByTagName("parsererror").length > 0) {
     throw new WorkbookError("This Excel workbook is damaged.");

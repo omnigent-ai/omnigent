@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { deflateRawSync } from "node:zlib";
 import { describe, expect, it, vi } from "vitest";
 import { DATA_TABLE_MAX_CHARS, DATA_TABLE_MAX_COLUMNS } from "./dataTable";
 import {
@@ -11,6 +12,7 @@ import {
   readWorkbook,
   resolvePartPath,
   WorkbookError,
+  type WorkbookSheet,
 } from "./xlsx";
 
 /** A fixture's bytes, copied into this realm's buffer as the browser's base64 decode makes them. */
@@ -18,6 +20,113 @@ function fixture(name: string): Uint8Array {
   const file = readFileSync(`src/shell/__fixtures__/${name}`);
   const bytes = new Uint8Array(file.byteLength);
   bytes.set(file);
+  return bytes;
+}
+
+interface ZipPart {
+  name: string;
+  data: Uint8Array;
+  /** Deflate the part (method 8) rather than store it. */
+  deflate?: boolean;
+  /** The uncompressed size the headers declare, when not the true one. */
+  declaredSize?: number;
+  /** Empty stored deflate blocks before the data, which inflate to nothing. */
+  emptyBlocks?: number;
+}
+
+const EMPTY_STORED_BLOCK = [0x00, 0x00, 0x00, 0xff, 0xff];
+
+/** A zip of *parts*, with the header fields the reader uses (no CRC). */
+function zipOf(parts: ZipPart[]): Uint8Array {
+  const encoder = new TextEncoder();
+  const locals: Uint8Array[] = [];
+  const centrals: Uint8Array[] = [];
+  let offset = 0;
+  for (const part of parts) {
+    const name = encoder.encode(part.name);
+    const data = part.deflate
+      ? new Uint8Array([
+          ...Array.from({ length: part.emptyBlocks ?? 0 }, () => EMPTY_STORED_BLOCK).flat(),
+          ...deflateRawSync(part.data),
+        ])
+      : part.data;
+    const size = part.declaredSize ?? part.data.length;
+    const local = new Uint8Array(30 + name.length + data.length);
+    const localView = new DataView(local.buffer);
+    localView.setUint32(0, 0x04034b50, true);
+    localView.setUint16(8, part.deflate ? 8 : 0, true);
+    localView.setUint32(18, data.length, true);
+    localView.setUint32(22, size, true);
+    localView.setUint16(26, name.length, true);
+    local.set(name, 30);
+    local.set(data, 30 + name.length);
+    const central = new Uint8Array(46 + name.length);
+    const centralView = new DataView(central.buffer);
+    centralView.setUint32(0, 0x02014b50, true);
+    centralView.setUint16(10, part.deflate ? 8 : 0, true);
+    centralView.setUint32(20, data.length, true);
+    centralView.setUint32(24, size, true);
+    centralView.setUint16(28, name.length, true);
+    centralView.setUint32(42, offset, true);
+    central.set(name, 46);
+    locals.push(local);
+    centrals.push(central);
+    offset += local.length;
+  }
+  const directorySize = centrals.reduce((total, central) => total + central.length, 0);
+  const end = new Uint8Array(22);
+  const endView = new DataView(end.buffer);
+  endView.setUint32(0, 0x06054b50, true);
+  endView.setUint16(8, parts.length, true);
+  endView.setUint16(10, parts.length, true);
+  endView.setUint32(12, directorySize, true);
+  endView.setUint32(16, offset, true);
+  const zip = new Uint8Array(offset + directorySize + end.length);
+  let cursor = 0;
+  for (const chunk of [...locals, ...centrals, end]) {
+    zip.set(chunk, cursor);
+    cursor += chunk.length;
+  }
+  return zip;
+}
+
+const MAIN_NAMESPACE = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+const RELATIONSHIPS_NAMESPACE =
+  "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+
+/** A workbook whose sheets ``S1``, ``S2``, … are *sheets*, each at ``xl/worksheets/sheetN.xml``. */
+function workbookOf(sheets: Omit<ZipPart, "name">[]): Uint8Array {
+  const encoder = new TextEncoder();
+  const numbers = sheets.map((_, index) => index + 1);
+  const workbook = `<workbook xmlns="${MAIN_NAMESPACE}" xmlns:r="${RELATIONSHIPS_NAMESPACE}"><sheets>${numbers
+    .map((n) => `<sheet name="S${n}" sheetId="${n}" r:id="rId${n}"/>`)
+    .join("")}</sheets></workbook>`;
+  const relationships = `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${numbers
+    .map(
+      (n) =>
+        `<Relationship Id="rId${n}" Type="${RELATIONSHIPS_NAMESPACE}/worksheet" Target="worksheets/sheet${n}.xml"/>`,
+    )
+    .join("")}</Relationships>`;
+  return zipOf([
+    { name: "xl/workbook.xml", data: encoder.encode(workbook) },
+    { name: "xl/_rels/workbook.xml.rels", data: encoder.encode(relationships) },
+    ...sheets.map((sheet, index) => ({ ...sheet, name: `xl/worksheets/sheet${index + 1}.xml` })),
+  ]);
+}
+
+/** A worksheet of inline-text cells, one row per entry of *rows*. */
+function worksheetXml(rows: string[][], declaration = ""): string {
+  const cells = rows.map(
+    (row) =>
+      `<row>${row.map((text) => `<c t="inlineStr"><is><t>${text}</t></is></c>`).join("")}</row>`,
+  );
+  return `${declaration}<worksheet xmlns="${MAIN_NAMESPACE}"><sheetData>${cells.join("")}</sheetData></worksheet>`;
+}
+
+/** *text* as UTF-16 bytes, big- or little-endian, after a byte-order mark if *bom*. */
+function utf16(text: string, bigEndian: boolean, bom: boolean): Uint8Array {
+  const bytes = new Uint8Array(Buffer.from(`${bom ? "\ufeff" : ""}${text}`, "utf16le"));
+  if (bigEndian) for (let i = 0; i < bytes.length; i += 2) bytes.subarray(i, i + 2).reverse();
   return bytes;
 }
 
@@ -61,6 +170,37 @@ describe("readWorkbook", () => {
     expect(report.name).toBe("Report");
     expect(report.table?.header).toEqual(["item", "count"]);
     expect(report.table?.rows).toEqual([["pens", "12"]]);
+  });
+
+  it.each([
+    ["UTF-16LE with a byte-order mark", false, true],
+    ["UTF-16BE with a byte-order mark", true, true],
+    ["UTF-16LE declared, without a mark", false, false],
+    ["UTF-16BE declared, without a mark", true, false],
+  ])("reads a worksheet encoded as %s", async (_, bigEndian, bom) => {
+    const xml = worksheetXml(
+      [["item"], ["café, crème"]],
+      '<?xml version="1.0" encoding="UTF-16"?>',
+    );
+    const [sheet] = await readWorkbook(workbookOf([{ data: utf16(xml, bigEndian, bom) }]));
+    expect(sheet.message).toBeUndefined();
+    expect(sheet.table?.rows).toEqual([["café, crème"]]);
+  });
+
+  it.each(["UTF-16", "ucs-2"])("reads ASCII bytes declared as %s as UTF-8", async (label) => {
+    const xml = worksheetXml([["item"], ["pens"]], `<?xml version="1.0" encoding="${label}"?>`);
+    const [sheet] = await readWorkbook(workbookOf([{ data: new TextEncoder().encode(xml) }]));
+    expect(sheet.table?.rows).toEqual([["pens"]]);
+  });
+
+  it("reads a worksheet in the single-byte encoding it declares", async () => {
+    const xml = worksheetXml(
+      [["item"], ["caf\u00e9"]],
+      '<?xml version="1.0" encoding="ISO-8859-1"?>',
+    );
+    const latin1 = new Uint8Array(Buffer.from(xml, "latin1"));
+    const [sheet] = await readWorkbook(workbookOf([{ data: latin1 }]));
+    expect(sheet.table?.rows).toEqual([["café"]]);
   });
 
   it("shows the first 500 columns of a wider sheet, counting columns and rows past them", async () => {
@@ -172,6 +312,61 @@ describe("readWorkbook time formats and limits", () => {
       ["Big", "This sheet is too large to preview. Download the workbook to open it."],
       ["Again", undefined],
     ]);
+  });
+});
+
+describe("workbook inflation budget", () => {
+  /** Read *workbook*, counting the decompressors it opens. */
+  async function readCountingInflates(workbook: Uint8Array, maxBytes: number) {
+    const RealDecompressionStream = globalThis.DecompressionStream;
+    let opened = 0;
+    vi.stubGlobal(
+      "DecompressionStream",
+      class extends RealDecompressionStream {
+        constructor(format: CompressionFormat) {
+          super(format);
+          opened += 1;
+        }
+      },
+    );
+    try {
+      const sheets = await readWorkbook(workbook, maxBytes);
+      return { sheets, opened };
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  }
+
+  const tooLarge = (sheet: WorkbookSheet) => sheet.message?.includes("too large to preview");
+
+  it("opens no compressed part once the workbook's allowance is spent", async () => {
+    // Twenty distinct sheets each declare no bytes but inflate to 100 KB; the
+    // first spends the whole 8 KB allowance.
+    const sheets = Array.from({ length: 20 }, (_, index) => ({
+      data: new TextEncoder().encode(worksheetXml([[`sheet ${index}`, "x".repeat(100_000)]])),
+      deflate: true,
+      declaredSize: 0,
+    }));
+    const { sheets: read, opened } = await readCountingInflates(workbookOf(sheets), 8_192);
+    expect(read).toHaveLength(20);
+    expect(read.every(tooLarge)).toBe(true);
+    expect(opened).toBe(1);
+  });
+
+  it("counts compressed bytes that inflate to almost nothing", async () => {
+    // Ten distinct sheets, each 10 KB of empty deflate blocks before a tiny table.
+    const sheets = Array.from({ length: 10 }, (_, index) => ({
+      data: new TextEncoder().encode(worksheetXml([[`sheet ${index}`]])),
+      deflate: true,
+      emptyBlocks: 2_000,
+    }));
+    const { sheets: read, opened } = await readCountingInflates(workbookOf(sheets), 25_000);
+    expect(read.slice(0, 2).map((sheet) => sheet.table?.header)).toEqual([
+      ["sheet 0"],
+      ["sheet 1"],
+    ]);
+    expect(read.slice(2).every(tooLarge)).toBe(true);
+    expect(opened).toBe(2);
   });
 });
 

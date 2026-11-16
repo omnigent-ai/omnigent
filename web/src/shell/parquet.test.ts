@@ -1,6 +1,12 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { DATA_TABLE_MAX_CHARS, DATA_TABLE_MAX_COLUMNS, DATA_TABLE_MAX_ROWS } from "./dataTable";
+import {
+  compareCells,
+  DATA_TABLE_MAX_CHARS,
+  DATA_TABLE_MAX_COLUMNS,
+  DATA_TABLE_MAX_ROWS,
+  inferColumnType,
+} from "./dataTable";
 import { ParquetError, parquetCellText, readParquet, SKIPPED_NESTED_VALUE } from "./parquet";
 
 /** A fixture's bytes, copied into this realm's buffer as the browser's base64 decode makes them. */
@@ -120,6 +126,19 @@ describe("readParquet", () => {
     ],
   ])("shows %s as %s", (value, isDate, expected) => {
     expect(parquetCellText(value, isDate)).toBe(expected);
+  });
+
+  it("sorts INT64 values past a float's precision exactly", () => {
+    const cells = [9007199254740993n, -(2n ** 63n), 9007199254740992n, 2n ** 63n - 1n].map(
+      (value) => parquetCellText(value, false),
+    );
+    expect(inferColumnType(cells)).toBe("number");
+    expect(cells.sort((a, b) => compareCells(a, b, "number"))).toEqual([
+      "-9223372036854775808",
+      "9007199254740992",
+      "9007199254740993",
+      "9223372036854775807",
+    ]);
   });
 
   it("stops building a nested value's text at its limit", () => {
