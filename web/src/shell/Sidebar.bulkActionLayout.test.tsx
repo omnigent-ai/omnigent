@@ -1,4 +1,4 @@
-import { renderSidebar } from "@/test/sidebarTestHelpers";
+import { openDisplaySubmenu, renderSidebar } from "@/test/sidebarTestHelpers";
 import { conversationPage } from "@/test/sidebarMockHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -154,7 +154,7 @@ describe("bulk-action bar layout", () => {
       "session-filter",
       "Group, sort, and filter sessions",
       () => {
-        fireEvent.keyDown(screen.getByTestId("session-display-menu"), { key: "ArrowRight" });
+        openDisplaySubmenu();
         fireEvent.click(screen.getByTestId("session-filter-all"));
       },
     ],

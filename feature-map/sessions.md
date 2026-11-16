@@ -246,8 +246,7 @@ the header menu), and each place is a separate entry point.
   arrive;
   requests, pagination, and project folders use that order too. Switching order
   clears the cached rows and shows loading while session timestamps refresh,
-  including project folders, pins, and Archived. With the flag off,
-  sessions always use Updated regardless of the saved preference. Sessions shared
+  including project folders, pins, and Archived. Sessions shared
   with the viewer get their own "Shared with me" section above Sessions, without a
   per-row people icon. Status groups are Needs attention, Unread,
   Working, Draft, and Done. Working stays visible with muted “No sessions” text
@@ -507,8 +506,7 @@ session and Select sessions. Hovering a row opens
 its tooltip; the repo and PR rows load from the session's GitHub info only once
 the tooltip opens, and fall back to the PR the server stored for the session
 when the live lookup has none, with its age once that state is over five
-minutes old. With the flag off, the funnel sits on the Sessions header and
-offers Display only.
+minutes old.
 
 **Offline pull requests:** link PRs to a session, then stop its host. Open the
 Pull Requests tab from the Workspace rail or composer (desktop and mobile).
@@ -807,8 +805,7 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`custom-order`:**
   `tests/browser_ui/test_sessions_appearance.py::test_custom_order_keeps_the_list_and_commits_on_drop`
   (built SPA, mocked backend) covers the menu, the insertion line,
-  committing on drop, reload, new sessions above, per-tab state and the flag-off
-  fallback.
+  committing on drop, reload, new sessions above and per-tab state.
   `tests/e2e_ui/sessions/test_sidebar_projects.py::test_move_session_into_new_project`
   files a session dropped on another project's row and releases a row over
   itself without navigating. Group limits, both Move menus and the click after a

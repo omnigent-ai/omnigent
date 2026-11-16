@@ -45,6 +45,11 @@ export function renderSidebar(
   return { ...view, setOpen: (open: boolean) => view.rerender(tree(open)) };
 }
 
+/** Open the Display submenu of the already-open session filter funnel. */
+export function openDisplaySubmenu() {
+  fireEvent.keyDown(screen.getByTestId("session-display-menu"), { key: "ArrowRight" });
+}
+
 /** Open the session filter funnel's Display submenu, which lists the filters. */
 export function openSessionFilters() {
   fireEvent.pointerDown(screen.getByTestId("session-filter"), {
@@ -52,7 +57,7 @@ export function openSessionFilters() {
     ctrlKey: false,
     pointerType: "mouse",
   });
-  fireEvent.keyDown(screen.getByTestId("session-display-menu"), { key: "ArrowRight" });
+  openDisplaySubmenu();
 }
 
 /** Pick a session filter from the funnel. */

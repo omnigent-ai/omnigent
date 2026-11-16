@@ -274,7 +274,6 @@ describe("Sidebar shift-click selection", () => {
     localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));
     renderSidebar();
 
-    // Enter selection mode from the Projects header.
     selectSessionsFromProjects();
 
     // Shift-select across the project sessions: p1 anchor → p3 selects p1..p3.

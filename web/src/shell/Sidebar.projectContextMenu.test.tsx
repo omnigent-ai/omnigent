@@ -475,4 +475,20 @@ describe("project folder header context menu", () => {
     fireEvent.contextMenu(folderHeader());
     expect(screen.queryByTestId("rename-project")).toBeNull();
   });
+
+  it("keeps the collapse toggle active when selection mode unmounts an open menu", () => {
+    renderSidebar();
+    const before = folderHeader().getAttribute("aria-expanded");
+    if (before === null) throw new Error("Folder header is missing aria-expanded");
+
+    fireEvent.contextMenu(folderHeader());
+    expect(screen.getByTestId("rename-project")).toBeInTheDocument();
+    // The open menu hides the rest of the tree from role queries.
+    fireEvent.click(screen.getByTestId("toggle-selection-mode"));
+    const selectionHeader = folderHeader();
+    expect(selectionHeader.closest('[data-slot="context-menu-trigger"]')).toBeNull();
+    fireEvent.click(selectionHeader);
+
+    expect(selectionHeader).toHaveAttribute("aria-expanded", before === "true" ? "false" : "true");
+  });
 });

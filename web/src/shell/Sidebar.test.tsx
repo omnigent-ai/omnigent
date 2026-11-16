@@ -561,7 +561,7 @@ describe("Sidebar session list", () => {
     }
   });
 
-  describe.each(["legacy", "grouping", "pinned"] as const)(
+  describe.each(["regular", "pinned"] as const)(
     "%s hover surface sharing explanation",
     (surface) => {
       it.each([true, false])("says shared with others only when shared is %s", async (shared) => {
@@ -580,8 +580,7 @@ describe("Sidebar session list", () => {
               labels: pinned ? { omni_project: "Customer X" } : {},
             }),
           ]);
-          if (surface === "grouping") renderLoadedSidebar();
-          else renderSidebar();
+          renderSidebar();
 
           const link = screen.getByRole("link", { name: id });
           if (pinned) fireEvent.focus(link);
@@ -1392,6 +1391,8 @@ describe("Sidebar session list", () => {
     expect(selectSessions.closest('[class*="md:opacity-0"]')).toHaveClass(
       "md:opacity-0",
       "md:group-hover/header:opacity-100",
+      "md:has-[:focus-visible]:opacity-100",
+      "md:group-has-[[data-state=open]]/header:opacity-100",
     );
 
     const filterSessions = within(projectsSection).getByRole("button", {
