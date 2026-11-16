@@ -295,6 +295,7 @@ describe.each([
   "scheduled_task_sandbox_workspaces",
   "scheduled_task_inbox",
   "scheduled_task_sharing",
+  "proactive_agent_available",
 ] as const)("resolveServerInfo %s", (capability) => {
   it.each([
     [true, true],

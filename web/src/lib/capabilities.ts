@@ -365,6 +365,11 @@ export interface ServerInfo {
    * absent on older servers (off).
    */
   scheduled_task_sharing?: boolean;
+  /**
+   * The deployment offers the proactive agent (Omni Advisor) to this caller;
+   * whether it is on for them is at ``GET /v1/proactive-agent/settings``.
+   */
+  proactive_agent_available?: boolean;
   /** Scheduled permissions support native harnesses beyond Claude Code. */
   scheduled_task_harness_settings?: boolean;
   /** Automations accept modes that skip approval; older servers may reject them. */
@@ -565,6 +570,14 @@ export function sandboxProfilesEnabled(info: ServerInfo | "loading"): boolean {
   );
 }
 
+/** Whether the Admin > General page has a setting to show: nested agents or Omni Advisor. */
+export function adminGeneralSettingsAvailable(info: ServerInfo | "loading"): boolean {
+  return (
+    info !== "loading" &&
+    (info.sibling_sessions === true || info.proactive_agent_available === true)
+  );
+}
+
 export function customAgentsSettingsEnabled(info: ServerInfo | "loading"): boolean {
   return info !== "loading" && info.agent_install === true;
 }
@@ -730,6 +743,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,
           scheduled_task_sharing: data.scheduled_task_sharing === true,
+          proactive_agent_available: data.proactive_agent_available === true,
           scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
           scheduled_task_approval_skipping_modes:
             data.scheduled_task_approval_skipping_modes === true,
