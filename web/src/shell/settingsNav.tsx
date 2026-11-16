@@ -73,6 +73,11 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "updates",
 ];
 
+/** Where a section lives; the sidebar link and its ⌘K command both go here. */
+export function settingsSectionPath(id: SettingsSectionId): string {
+  return `/settings/${id}`;
+}
+
 interface SettingsNavItem {
   id: SettingsSectionId;
   label: string;
@@ -331,7 +336,7 @@ export function SettingsSidebarBody({
                     )}
                   >
                     <Link
-                      to={`/settings/${item.id}`}
+                      to={settingsSectionPath(item.id)}
                       onClick={onNavClick}
                       data-testid={`settings-nav-${item.id}`}
                       componentId={`settings.nav.${item.id}`}
