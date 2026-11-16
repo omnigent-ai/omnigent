@@ -7,7 +7,7 @@ import logging
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
-from dataclasses import asdict, replace
+from dataclasses import asdict, fields, replace
 from itertools import batched
 from pathlib import PureWindowsPath
 from typing import Any, Literal, Protocol, cast
@@ -180,6 +180,9 @@ _logger = logging.getLogger(__name__)
 _DELETE_METADATA_BATCH_SIZE = 100
 _DELETE_LABEL_BATCH_SIZE = 100
 _FAMILY_READ_BATCH_SIZE = 10
+_RECOVERY_LABEL_KEYS = tuple(
+    RECOVERY_LABEL_PREFIX + field.name for field in fields(SessionRecovery)
+)
 
 _SESSION_TODOS_STATE_KEY = "_omnigent_native_plan_snapshot_v1"
 _RUNNER_BINDING_LIMIT = 200
@@ -756,7 +759,7 @@ def _read_session_recovery(session: Session, conversation_id: str) -> SessionRec
         select(SqlConversationLabel.key, SqlConversationLabel.value).where(
             SqlConversationLabel.workspace_id == current_workspace_id(),
             SqlConversationLabel.conversation_id == conversation_id,
-            SqlConversationLabel.key.startswith(RECOVERY_LABEL_PREFIX),
+            SqlConversationLabel.key.in_(_RECOVERY_LABEL_KEYS),
         )
     ).all()
     return (
@@ -777,7 +780,7 @@ def _write_session_recovery(
             delete(SqlConversationLabel).where(
                 SqlConversationLabel.workspace_id == current_workspace_id(),
                 SqlConversationLabel.conversation_id == conversation_id,
-                SqlConversationLabel.key.startswith(RECOVERY_LABEL_PREFIX),
+                SqlConversationLabel.key.in_(_RECOVERY_LABEL_KEYS),
             )
         )
         return
@@ -2786,6 +2789,20 @@ class SqlAlchemyConversationStore(ConversationStore):
             return [_to_item(r, d) for r, d in zip(ordered, decoded, strict=True)]
 
     supports_session_recovery = True
+
+    def get_session_interruption_time(self, conversation_id: str) -> int | None:
+        """Read the interruption error's write time without loading conversation data."""
+        with self._conv_session("get_session_interruption_time") as session:
+            row = session.execute(
+                select(SqlConversationLabel.value, SqlConversationLabel.updated_at).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id == conversation_id,
+                    SqlConversationLabel.key == "omnigent.last_task_error_code",
+                )
+            ).one_or_none()
+        if row is None or row.value not in {"runner_disconnected", "runner_interrupted"}:
+            return None
+        return row.updated_at
 
     def get_session_recovery(self, conversation_id: str) -> SessionRecovery | None:
         with self._conv_session("get_session_recovery") as session:

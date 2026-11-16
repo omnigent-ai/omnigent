@@ -333,9 +333,10 @@ The feature does not provision compute or call provider wake methods: the provid
 or infrastructure supervisor must bring the host back first.
 
 Recovery intent uses private `omnigent.recovery.*` conversation labels: the host
-and runner bindings, interruption time, phase, attempt count and identity, and
-next retry time. These labels are hidden from normal label reads and forks and
-cannot be written through ordinary label APIs. No new table or ledger is needed.
+and runner bindings, expected launch runner, interruption time, phase, attempt
+count and identity, and next retry time. These labels are hidden from normal label
+reads and forks and cannot be written through ordinary label APIs. No new table
+or ledger is needed.
 
 Recovery permits at most three launch attempts
 and a 24-hour window per interrupted task. Launch retries back off; the budget
@@ -348,9 +349,11 @@ message to continue.” This is not an exactly-once guarantee for tool side effe
 
 Custom conversation stores opt in with `supports_session_recovery = True` after
 implementing `get_session_recovery` and atomic `replace_session_recovery`, ordered
-with user input, Stop, archive, and deletion. The SQLAlchemy store implements this
-contract using private `omnigent.recovery.*` rows in the existing conversation
-labels table. Each field fits the existing label limit; no schema migration is
+with user input, Stop, archive, and deletion. To recover sessions already marked
+disconnected, implement `get_session_interruption_time` using the original error
+timestamp; without it, only interruptions observed while active are recorded.
+The SQLAlchemy store implements this contract using private `omnigent.recovery.*`
+rows in the existing conversation labels table. Each field fits the label limit; no schema migration is
 needed. These rows are excluded from ordinary label reads and forks, and ordinary
 label writes cannot change them. Recovery and input acceptance share a transaction,
 including in split-database deployments.

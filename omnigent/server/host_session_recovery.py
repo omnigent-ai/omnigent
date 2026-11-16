@@ -53,7 +53,14 @@ def _record_interruption(store: ConversationStore, conv: Conversation) -> None:
         return
     previous = store.get_session_recovery(conv.id)
     if previous is None:
-        recovery = SessionRecovery(conv.host_id, conv.runner_id, now_epoch())
+        interrupted_at = (
+            now_epoch()
+            if conv.live_status in {"running", "waiting"}
+            else store.get_session_interruption_time(conv.id)
+        )
+        if interrupted_at is None:
+            return
+        recovery = SessionRecovery(conv.host_id, conv.runner_id, interrupted_at)
     elif previous.phase == "submitted" and previous.runner_id == conv.runner_id:
         recovery = replace(previous, phase="pending", attempt_id=None)
     else:
@@ -111,6 +118,8 @@ class HostSessionRecoverer:
 
     def prompt(self, host_id: str | None) -> str | None:
         """Resolve administrator policy without waking or changing the host."""
+        from omnigent.server.sharing_settings import host_is_managed_sandbox
+
         if not self.store.supports_session_recovery or self.sandbox_config is None or not host_id:
             return None
         host = self.host_store.get_host(host_id)
@@ -126,7 +135,10 @@ class HostSessionRecoverer:
         ):
             return None
         connection = self.hosts.get(host_id)
-        if connection is not None and not connection.hello.recover_interrupted_sessions:
+        if connection is not None and (
+            not host_is_managed_sandbox(self.hosts, host_id)
+            or not connection.hello.recover_interrupted_sessions
+        ):
             return None
         custom = settings.get("recovery_prompt")
         return (
@@ -204,7 +216,11 @@ class HostSessionRecoverer:
             if recovery.host_id != connection.host_id:
                 return
             if recovery.runner_id != conv.runner_id:
-                if recovery.phase != "launching" or conv.runner_id is None:
+                if (
+                    recovery.phase != "launching"
+                    or conv.runner_id is None
+                    or conv.runner_id != recovery.launch_runner_id
+                ):
                     return
                 # Binding and intent commit separately in split-DB stores.
                 # Finish a launch interrupted between those two writes.
@@ -263,6 +279,7 @@ class HostSessionRecoverer:
             attempts=recovery.attempts + 1,
             attempt_id=uuid4().hex,
             retry_at=now + RECOVERY_ATTEMPT_S,
+            launch_runner_id=None,
         )
         if not await asyncio.to_thread(
             self.store.replace_session_recovery, session_id, recovery, attempt
@@ -283,6 +300,8 @@ class HostSessionRecoverer:
                 attempt = current
                 if launch.error or launch.error_code:
                     raise RuntimeError(launch.error or launch.error_code)
+                if launch.runner_id != attempt.launch_runner_id:
+                    return
                 while not self.runners.runner_is_online(launch.runner_id):
                     if self.hosts.get(connection.host_id) is not connection:
                         return
@@ -327,7 +346,12 @@ class HostSessionRecoverer:
             self.hosts.get(connection.host_id) is not connection
             or not connection.hello.recover_interrupted_sessions
             or prompt is None
+            or attempt.runner_id != conv.runner_id
+            or attempt.launch_runner_id != conv.runner_id
         ):
+            return
+        if now_epoch() - attempt.interrupted_at > RECOVERY_MAX_AGE_S:
+            await self._fail(conv, attempt, "Automatic session recovery exceeded its deadline.")
             return
         routed = await asyncio.to_thread(self.runners.client_for_existing_conversation, conv.id)
         if routed is None or routed.runner_id != conv.runner_id:

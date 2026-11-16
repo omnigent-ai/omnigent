@@ -6675,6 +6675,8 @@ async def _launch_runner_on_host_locked(
     recovery: SessionRecovery | None = None,
 ) -> _HostLaunchAttempt:
     """The launch round-trip proper; runs under the conversation's lock."""
+    from dataclasses import replace
+
     from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
     from omnigent.runner.identity import token_bound_runner_id
     from omnigent.scheduled_context import current_scheduled_run
@@ -6697,6 +6699,17 @@ async def _launch_runner_on_host_locked(
     binding_token = secrets.token_urlsafe(32)
     new_runner_id = token_bound_runner_id(binding_token)
 
+    if recovery is not None:
+        launching = replace(recovery, launch_runner_id=new_runner_id)
+        if not await asyncio.to_thread(
+            conversation_store.replace_session_recovery, conv.id, recovery, launching
+        ):
+            return _HostLaunchAttempt(
+                runner_id=conv.runner_id or "",
+                error_code="recovery_cancelled",
+                error="Recovery was superseded before runner launch",
+            )
+        recovery = launching
     try:
         # Only while the runner is still the one this launch read, so a claim a
         # move took meanwhile isn't overwritten. The host may have changed: an
@@ -6714,8 +6727,6 @@ async def _launch_runner_on_host_locked(
             error="the session's host or runner changed before the runner could start",
         )
     if recovery:
-        from dataclasses import replace
-
         if not await asyncio.to_thread(
             conversation_store.replace_session_recovery,
             conv.id,

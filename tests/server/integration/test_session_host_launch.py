@@ -5507,7 +5507,7 @@ async def test_switch_host_stops_before_releasing_the_old_binding(
 
 
 async def test_recovery_binding_is_durable_before_host_receives_launch(
-    app: FastAPI, client: httpx.AsyncClient, db_uri: str
+    app: FastAPI, client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from dataclasses import replace
 
@@ -5531,6 +5531,15 @@ async def test_recovery_binding_is_durable_before_host_receives_launch(
         _HOST_ID, conv.runner_id, 100, phase="launching", attempts=1, attempt_id="interruption"
     )
     assert store.replace_session_recovery(conv.id, None, intent)
+    replace_runner_id = store.replace_runner_id
+
+    def bind_runner(session_id: str, runner_id: str, **kwargs: Any) -> Conversation:
+        assert store.get_session_recovery(session_id) == replace(
+            intent, launch_runner_id=runner_id
+        )
+        return replace_runner_id(session_id, runner_id, **kwargs)
+
+    monkeypatch.setattr(store, "replace_runner_id", bind_runner)
     registry = app.state.host_registry
     task = asyncio.create_task(
         _launch_runner_on_host(conv, store, registry, registry.get(_HOST_ID), recovery=intent)
@@ -5538,7 +5547,9 @@ async def test_recovery_binding_is_durable_before_host_receives_launch(
     frame = await _wait_for_launch(comm, budget_s=5)
     assert frame is not None and frame.recovery
     bound_id = token_bound_runner_id(frame.binding_token)
-    assert store.get_session_recovery(conv.id) == replace(intent, runner_id=bound_id)
+    assert store.get_session_recovery(conv.id) == replace(
+        intent, runner_id=bound_id, launch_runner_id=bound_id
+    )
     assert store.get_conversation(conv.id).runner_id == bound_id
     await comm.send_input(
         {
