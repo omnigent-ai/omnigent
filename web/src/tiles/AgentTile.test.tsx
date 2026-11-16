@@ -31,7 +31,13 @@ function conversation(overrides: Partial<Conversation> = {}): Conversation {
 }
 
 function renderTile(
-  props: Partial<{ active: boolean; live: boolean; variant: AgentTileVariant }> & {
+  props: Partial<{
+    active: boolean;
+    live: boolean;
+    variant: AgentTileVariant;
+    starred: boolean;
+    onToggleStar: (conversation: Conversation) => void;
+  }> & {
     conversation?: Conversation;
   } = {},
 ) {
@@ -46,6 +52,8 @@ function renderTile(
         variant={props.variant ?? "tile"}
         onActivate={onActivate}
         onOpenSingle={onOpenSingle}
+        starred={props.starred}
+        onToggleStar={props.onToggleStar}
       />
     </TooltipProvider>,
   );
@@ -94,5 +102,20 @@ describe("AgentTile", () => {
     const { tile, onActivate } = renderTile({ live: false });
     fireEvent.keyDown(tile, { key: "Enter" });
     expect(onActivate).toHaveBeenCalledWith("conv_1");
+  });
+
+  it("stars without activating the tile", () => {
+    const onToggleStar = vi.fn();
+    const { onActivate } = renderTile({ starred: true, onToggleStar });
+    const star = screen.getByRole("button", { name: /unstar/i });
+    expect(star).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(star);
+    expect(onToggleStar).toHaveBeenCalledWith(expect.objectContaining({ id: "conv_1" }));
+    expect(onActivate).not.toHaveBeenCalled();
+  });
+
+  it("hides the star when the session can't be pinned on its own", () => {
+    renderTile();
+    expect(screen.queryByRole("button", { name: /star/i })).not.toBeInTheDocument();
   });
 });

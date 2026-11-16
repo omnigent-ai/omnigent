@@ -15,7 +15,6 @@ import { ColumnsPicker } from "@/tiles/ColumnsPicker";
 import { TileGrid, type TileResize } from "@/tiles/TileGrid";
 import { fittingColumns, setTileColumns, useTileColumns } from "@/tiles/tileLayout";
 import {
-  needsYou,
   parseTilesView,
   partitionActive,
   pickLiveIds,
@@ -23,8 +22,17 @@ import {
   tileStreamBudget,
   type TilesView,
 } from "@/tiles/tileSelection";
-import { readTilesView, writeTilesView } from "@/tiles/tilesPreferences";
+import {
+  readTilesView,
+  useTileStatusFilter,
+  writeTileStatusFilter,
+  writeTilesView,
+} from "@/tiles/tilesPreferences";
 import { useReleaseIdleTileStreams } from "@/tiles/useTileStreams";
+import { canFavorite, useTileFavorite } from "@/tiles/useTileFavorite";
+import { TileFilterBar } from "@/tiles/TileFilterBar";
+import { favoritesFirst, filterTiles, projectsOf, statusCounts } from "@/tiles/tileFilters";
+import { isSessionPinned } from "@/lib/sessionFamilies";
 
 const VIEW_OPTIONS: { view: TilesView; label: string; icon: typeof LayoutGridIcon }[] = [
   { view: "cards", label: "Cards", icon: RectangleHorizontalIcon },
@@ -46,7 +54,21 @@ export function TilesPage() {
     [mine.data],
   );
   const isLoading = mine.data === undefined && mine.isLoading;
-  const { active: tiles, dormant } = useMemo(() => partitionActive(rows, Date.now()), [rows]);
+  const { active: activeTiles, dormant } = useMemo(() => partitionActive(rows, Date.now()), [rows]);
+  const statusFilter = useTileStatusFilter();
+  const projectFilter = searchParams.get("project");
+  const [query, setQuery] = useState("");
+  const tiles = useMemo(
+    () =>
+      favoritesFirst(
+        filterTiles(activeTiles, { status: statusFilter, project: projectFilter, query }),
+      ),
+    [activeTiles, statusFilter, projectFilter, query],
+  );
+  const counts = useMemo(() => statusCounts(activeTiles), [activeTiles]);
+  const projects = useMemo(() => projectsOf(activeTiles), [activeTiles]);
+  const filtering = statusFilter !== "all" || projectFilter !== null || query !== "";
+  const favorite = useTileFavorite();
   const tilesById = useMemo(() => new Map(tiles.map((tile) => [tile.id, tile])), [tiles]);
   const orderedIds = useMemo(() => tiles.map((tile) => tile.id), [tiles]);
   const activeId = resolveActiveId(tiles, chosenId);
@@ -100,8 +122,8 @@ export function TilesPage() {
   const chosenColumns = useTileColumns();
   const [gridWidth, setGridWidth] = useState(0);
 
-  const working = tiles.filter((tile) => tile.status === "running").length;
-  const waiting = tiles.filter(needsYou).length;
+  const working = counts.working;
+  const waiting = counts["needs-you"];
   const activeTile = activeId ? (tilesById.get(activeId) ?? null) : null;
 
   const renderTile = (id: string, variant: AgentTileVariant, resize?: TileResize) => {
@@ -116,6 +138,9 @@ export function TilesPage() {
         onActivate={activate}
         onOpenSingle={openSingle}
         resize={resize}
+        starred={isSessionPinned(conversation)}
+        starDisabled={favorite.saving}
+        onToggleStar={canFavorite(conversation) ? favorite.toggle : undefined}
       />
     );
   };
@@ -125,7 +150,9 @@ export function TilesPage() {
       <div className="flex shrink-0 flex-wrap items-center gap-3 border-b px-4 py-2.5">
         <h1 className="text-base font-semibold">Agents</h1>
         <p className="text-xs text-muted-foreground" data-testid="tiles-summary">
-          {tiles.length} active · {working} working · {waiting} need you · {dormant.length} dormant
+          {activeTiles.length} active · {working} working · {waiting} need you · {dormant.length}{" "}
+          dormant
+          {filtering && ` · ${tiles.length} shown`}
           {view !== "cards" && liveIds.size < tiles.length && ` · ${liveIds.size} streaming`}
         </p>
         <div className="ml-auto flex items-center gap-2">
@@ -158,10 +185,54 @@ export function TilesPage() {
           </div>
         </div>
       </div>
+      {activeTiles.length > 0 && (
+        <TileFilterBar
+          status={statusFilter}
+          counts={counts}
+          onStatusChange={writeTileStatusFilter}
+          projects={projects}
+          project={projectFilter}
+          onProjectChange={(next) =>
+            setSearchParams(
+              (current) => {
+                const params = new URLSearchParams(current);
+                if (next) params.set("project", next);
+                else params.delete("project");
+                return params;
+              },
+              { replace: true },
+            )
+          }
+          query={query}
+          onQueryChange={setQuery}
+        />
+      )}
 
       {isLoading ? (
         <div className="flex flex-1 items-center justify-center text-muted-foreground">
           <Loader2Icon className="size-5 animate-spin" aria-label="Loading agents" />
+        </div>
+      ) : tiles.length === 0 && filtering ? (
+        <div className="flex flex-1 flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
+          No agents match these filters.
+          <Button
+            variant="outline"
+            size="xs"
+            onClick={() => {
+              writeTileStatusFilter("all");
+              setQuery("");
+              setSearchParams(
+                (current) => {
+                  const params = new URLSearchParams(current);
+                  params.delete("project");
+                  return params;
+                },
+                { replace: true },
+              );
+            }}
+          >
+            Clear filters
+          </Button>
         </div>
       ) : tiles.length === 0 ? (
         <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">

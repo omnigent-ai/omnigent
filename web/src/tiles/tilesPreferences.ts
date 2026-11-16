@@ -2,6 +2,7 @@
 // sidebar, and whether the app opens in Tiles.
 
 import { createStoredChoicePreference } from "@/lib/storedChoicePreference";
+import { TILE_STATUS_FILTERS, type TileStatusFilter } from "./tileFilters";
 import { TILES_VIEWS, type TilesView } from "./tileSelection";
 
 const viewPreference = createStoredChoicePreference("omnigent:tiles-view", TILES_VIEWS, "gallery");
@@ -27,3 +28,12 @@ export const readOpenTilesOnLaunch = (): boolean => openOnLaunchPreference.read(
 export const useOpenTilesOnLaunch = (): boolean => openOnLaunchPreference.use() === "true";
 export const writeOpenTilesOnLaunch = (enabled: boolean): void =>
   openOnLaunchPreference.write(enabled ? "true" : "false");
+
+const statusFilterPreference = createStoredChoicePreference(
+  "omnigent:tiles-status-filter",
+  TILE_STATUS_FILTERS,
+  "all",
+);
+export const useTileStatusFilter = (): TileStatusFilter => statusFilterPreference.use();
+export const writeTileStatusFilter = (filter: TileStatusFilter): void =>
+  statusFilterPreference.write(filter);
