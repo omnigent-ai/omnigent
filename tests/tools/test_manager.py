@@ -114,6 +114,9 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "browser_click",
         "browser_type",
         "browser_screenshot",
+        # Timer tools are on unless a spec sets ``timers: false``.
+        "sys_timer_set",
+        "sys_timer_cancel",
     }
     | ADVANCED_BROWSER_TOOL_NAMES
 )

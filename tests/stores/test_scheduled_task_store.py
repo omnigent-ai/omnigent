@@ -192,6 +192,23 @@ def test_an_edit_that_stops_a_reminder_fitting_makes_it_an_automation(
     assert restored.kind == "automation"
 
 
+@pytest.mark.parametrize("rrule", [_REMINDER_RULE, "FREQ=MINUTELY;INTERVAL=10"])
+def test_a_timer_continues_its_session_once_or_on_repeat(
+    store: SqlAlchemyScheduledTaskStore, rrule: str
+) -> None:
+    fields = _reminder_fields(name="Timer: check-in", rrule=rrule, kind="timer")
+    task_id = store.create(scheduled_task_id=_uid("st_timer"), **fields).id
+    assert store.get(task_id).kind == "timer"
+    assert store.update(task_id, name="renamed").kind == "timer"
+    # Leaving its session makes it an ordinary automation, as for a reminder.
+    assert store.update(task_id, session_id=None).kind == "automation"
+    with pytest.raises(ValueError, match="a timer needs"):
+        store.create(
+            scheduled_task_id=_uid("st_bad_timer"),
+            **_reminder_fields(kind="timer", session_mode="new", session_id=None),
+        )
+
+
 @pytest.mark.parametrize(
     "arrival", ["on_time", "one_second_early", "at_the_minute", "late", "late_and_exhausted"]
 )

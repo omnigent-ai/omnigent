@@ -98,9 +98,12 @@ class ScheduledTask:
         firing, or ``None``.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
-    :param kind: ``"automation"``, or ``"reminder"`` for a one-time message an
-        agent set for its own session. Clients list reminders apart from
-        automations; scheduling and firing ignore it.
+    :param kind: ``"automation"``, ``"reminder"`` for a one-time message an
+        agent set for its own session, or ``"timer"`` for a ``sys_timer_set``
+        timer the server keeps for its session, once or on repeat. Clients list
+        reminders apart from automations and don't list timers. A reminder's or
+        timer's firing belongs to its session's current work, and a repeating
+        timer skips a firing while its session is busy.
     """
 
     id: str

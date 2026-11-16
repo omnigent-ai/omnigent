@@ -289,22 +289,18 @@ def test_cancel_malformed_json_returns_parse_error() -> None:
 # ─── ToolManager registration gating ─────────────────────────
 
 
-def test_timers_false_does_not_register() -> None:
+def test_timers_are_registered_unless_the_spec_turns_them_off() -> None:
     """
-    With ``timers=False`` (the default) the manager does NOT
-    register either timer tool.
+    Every agent has both timer tools unless its spec sets ``timers: false``.
 
-    The default-off behavior matches the inner stack
-    (``AgentDef.timers`` defaults to False there too) — agents
-    that don't declare ``timers: true`` get the same minimal tool
-    surface they did pre-step-10. A regression that flipped the
-    default to True would surprise existing agents.
+    A workflow keeps a check-in timer, so the tools are on for every agent, the
+    same as in the inner stack, where ``AgentDef.timers`` defaults to True too.
     """
-    spec = AgentSpec(spec_version=1)  # timers defaults to False
-    manager = ToolManager(spec=spec)
-    names = manager.get_tool_names()
-    assert SysTimerSetTool.name() not in names
-    assert SysTimerCancelTool.name() not in names
+    default = ToolManager(spec=AgentSpec(spec_version=1)).get_tool_names()
+    assert {SysTimerSetTool.name(), SysTimerCancelTool.name()} <= set(default)
+    turned_off = ToolManager(spec=AgentSpec(spec_version=1, timers=False)).get_tool_names()
+    assert SysTimerSetTool.name() not in turned_off
+    assert SysTimerCancelTool.name() not in turned_off
 
 
 def test_timers_true_registers_both_tools_and_schemas() -> None:

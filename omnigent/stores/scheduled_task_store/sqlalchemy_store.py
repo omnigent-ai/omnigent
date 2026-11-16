@@ -53,6 +53,7 @@ from omnigent.server.scheduled.run_reconciler import (
 from omnigent.server.scheduled.schedule import (
     continued_sandbox_host_id,
     fits_reminder,
+    fits_timer,
     is_trigger_automation,
     next_scheduled_time,
     occurrence_host_id,
@@ -271,21 +272,22 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
     ) -> ScheduledTask:
         """Insert a new scheduled task with a required recurring ``rrule``."""
         encoded_kind = encode_scheduled_task_kind(kind)
-        if kind == "reminder" and not fits_reminder(
-            ScheduledTask(
-                id=scheduled_task_id,
-                name=name,
-                prompt=prompt,
-                rrule=rrule,
-                user_id=user_id,
-                agent_id=agent_id,
-                timezone=timezone,
-                created_at=0,
-                session_mode=session_mode,
-                session_id=session_id,
-            )
-        ):
+        shape = ScheduledTask(
+            id=scheduled_task_id,
+            name=name,
+            prompt=prompt,
+            rrule=rrule,
+            user_id=user_id,
+            agent_id=agent_id,
+            timezone=timezone,
+            created_at=0,
+            session_mode=session_mode,
+            session_id=session_id,
+        )
+        if kind == "reminder" and not fits_reminder(shape):
             raise ValueError("a reminder needs a one-time rule that continues a given session")
+        if kind == "timer" and not fits_timer(shape):
+            raise ValueError("a timer needs to continue a given session")
         created_at = now_epoch()
 
         def write(session: Session) -> ScheduledTask:
@@ -605,10 +607,13 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             ):
                 row.last_run_conversation_id = last_run_conversation_id
                 changed = True
-            if row.kind == encode_scheduled_task_kind("reminder") and not fits_reminder(
-                _to_entity(row)
+            if (
+                row.kind == encode_scheduled_task_kind("reminder")
+                and not fits_reminder(_to_entity(row))
+            ) or (
+                row.kind == encode_scheduled_task_kind("timer") and not fits_timer(_to_entity(row))
             ):
-                # An edit that makes it recur or leave its session makes it an automation.
+                # A reminder that comes to recur, or one that leaves its session, is an automation.
                 row.kind = encode_scheduled_task_kind("automation")
                 changed = True
             # Becoming or ceasing to be a trigger changes who picks the next poll.

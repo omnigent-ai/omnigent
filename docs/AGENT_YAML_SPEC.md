@@ -49,7 +49,7 @@ of the agent YAML.
 | `terminals` | Optional | Named interactive terminal environments the agent can launch. |
 | `async` | Optional | Whether async work tools are exposed. Defaults to `true`. |
 | `cancellable` | Optional | Whether the session can be cancelled. Defaults to `true`. |
-| `timers` | Optional | Whether timer tools are exposed. Defaults to `false`. |
+| `timers` | Optional | Whether timer tools (`sys_timer_set`, `sys_timer_cancel`) are exposed. Defaults to `true`; set `false` to leave them out. |
 | `tool_groups` | Optional | Opt out of framework-owned tool groups the agent cannot use. Every group defaults to `true`. |
 
 ## Executor

@@ -2729,6 +2729,79 @@ async def test_other_continued_sessions_keep_their_schedule_and_send_while_busy(
     assert store.get(task.id).next_run_at == task.next_run_at + 600
 
 
+async def test_a_busy_session_skips_a_repeating_timers_firing_without_a_run(store) -> None:
+    task = _task(
+        store,
+        rrule="FREQ=MINUTELY;INTERVAL=10",
+        session_mode="continue",
+        session_id=uuid.uuid4().hex,
+        kind="timer",
+    )
+    clock = FakeClock(task.next_run_at)
+    fire = AsyncMock()
+    # The session is mid-turn, so this firing waits for the timer's next one.
+    busy = AsyncMock(return_value=task.next_run_at + 600)
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(return_value=None), now=clock.now, busy_until=busy
+    )
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    busy.assert_awaited_once_with(task, task.next_run_at)
+    fire.assert_not_awaited()
+    assert store.list_runs(task.id)[0] == []
+    assert store.get(task.id).next_run_at == task.next_run_at + 600
+
+    busy.return_value = None
+    clock.advance(600)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    fire.assert_awaited_once()
+    [run] = store.list_runs(task.id)[0]
+    assert run.scheduled_at == task.next_run_at + 600
+
+
+async def test_a_repeating_timer_survives_a_restart_and_fires_once_each_time(
+    db_uri, store
+) -> None:
+    task = _task(
+        store,
+        rrule="FREQ=MINUTELY;INTERVAL=10",
+        session_mode="continue",
+        session_id=uuid.uuid4().hex,
+        kind="timer",
+    )
+    fired = []
+
+    async def fire(snapshot, lease):
+        fired.append(lease.run.scheduled_at)
+        await lease.attach_session(snapshot.session_id)
+        await lease.finish("succeeded")
+
+    def restarted(clock: FakeClock) -> PersistentTaskScheduler:
+        # A new process: a fresh store and scheduler over the same database.
+        fresh = SqlAlchemyScheduledTaskStore(db_uri)
+        fresh.configure_dispatch(True)
+        return PersistentTaskScheduler(fresh, fire, AsyncMock(), now=clock.now)
+
+    clock = FakeClock(task.next_run_at)
+    for _ in range(2):
+        # The same minute after another restart fires nothing again.
+        scheduler = restarted(clock)
+        await scheduler.poll_once()
+        await _drain(scheduler)
+    clock.advance(600)
+    scheduler = restarted(clock)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert fired == [task.next_run_at, task.next_run_at + 600]
+    saved = store.get(task.id)
+    assert (saved.state, saved.kind, saved.next_run_at) == (
+        "active",
+        "timer",
+        task.next_run_at + 1200,
+    )
+
+
 async def test_without_a_busy_check_a_trigger_keeps_its_saved_schedule(store) -> None:
     task = _task(
         store, rrule="FREQ=MINUTELY;INTERVAL=10", prompt=_TRIGGER_PROMPT, session_mode="continue"

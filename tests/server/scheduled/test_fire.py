@@ -3745,25 +3745,38 @@ async def test_a_legacy_fire_names_its_run_on_the_session_before_sending(continu
 
 
 @pytest.mark.asyncio
-async def test_a_reminder_continues_its_sessions_current_run(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("kind", "prompt", "rrule", "hidden"),
+    [
+        (
+            "reminder",
+            "[Reminder set for 2026-11-12 23:00 UTC]\nCheck whether CI passed.",
+            "FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=12;BYHOUR=23;BYMINUTE=0;BYSECOND=0;COUNT=1",
+            False,
+        ),
+        (
+            "timer",
+            "[System: timer timer_0123 fired]\nnote: 'workflow check-in'",
+            "FREQ=MINUTELY;INTERVAL=10",
+            True,
+        ),
+    ],
+)
+async def test_a_reminder_or_timer_continues_its_sessions_current_run(
+    monkeypatch: pytest.MonkeyPatch, kind: str, prompt: str, rrule: str, hidden: bool
 ) -> None:
-    """A reminder names no run on its session and doesn't say no one is watching.
+    """A reminder or timer names no run on its session and doesn't say no one is watching.
 
     Naming one would make the journal start a new run, resetting the session's plan
-    progress, and refuse a watched workflow's questions as unattended.
+    progress, and refuse a watched workflow's questions as unattended. A timer's
+    firing is hidden, like one the runner keeps.
     """
     import omnigent.server.routes.sessions as sessions_routes
     from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
 
-    prompt = "[Reminder set for 2026-11-12 23:00 UTC]\nCheck whether CI passed."
-    reminder = _continuing_task(
-        kind="reminder",
-        prompt=prompt,
-        rrule="FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=12;BYHOUR=23;BYMINUTE=0;BYSECOND=0;COUNT=1",
-    )
+    task = _continuing_task(kind=kind, prompt=prompt, rrule=rrule)
     conv_store = _ExistingConversationStore(_continued_session())
-    store = FakeScheduledTaskStore(rows={"task_1": reminder})
+    store = FakeScheduledTaskStore(rows={"task_1": task})
     sent: list[Any] = []
 
     async def _runner_start(*args: Any) -> None:
@@ -3785,11 +3798,65 @@ async def test_a_reminder_continues_its_sessions_current_run(
 
     assert SCHEDULED_TASK_RUN_LABEL_KEY not in conv_store.label_writes.get("conv_prev", {})
     assert [event.data for event in sent] == [
-        {"role": "user", "content": [{"type": "input_text", "text": prompt}]}
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": prompt}],
+            **({"is_meta": True} if hidden else {}),
+        }
     ]
     assert [(run["status"], run["conversation_id"]) for run in store.runs] == [
         ("succeeded", "conv_prev")
     ]
+
+
+def _timer(**overrides: Any) -> ScheduledTask:
+    return _continuing_task(
+        kind="timer",
+        rrule="FREQ=MINUTELY;INTERVAL=10",
+        prompt="[System: timer timer_0123 fired]",
+        **overrides,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_timer_wakes_a_session_whose_mode_skips_approval() -> None:
+    """Like a timer the runner keeps, it fires into the mode its session already runs."""
+    session = _continued_session(
+        labels={"omnigent.claude_native.permission_mode": "bypassPermissions"}
+    )
+    conv_store = _ExistingConversationStore(session)
+    store = FakeScheduledTaskStore(rows={"task_1": _timer()})
+
+    launched = await _fire_once(_deps(store, conversation_store=conv_store))
+
+    assert [conv.id for conv in launched] == ["conv_prev"]
+    assert [run["status"] for run in store.runs] == ["succeeded"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("existing", "error_code"),
+    [
+        (None, "continued_session_missing"),
+        (_continued_session(archived=True), "continued_session_archived"),
+    ],
+    ids=["deleted", "archived"],
+)
+async def test_a_timer_whose_session_cannot_take_it_is_cancelled(
+    existing: _FakeConversation | None, error_code: str
+) -> None:
+    """A repeating timer never starts a new session, and stops once its session is gone."""
+    conv_store = _ExistingConversationStore(*([existing] if existing else []))
+    store = FakeScheduledTaskStore(rows={"task_1": _timer()})
+
+    launched = await _fire_once(_deps(store, conversation_store=conv_store))
+
+    assert launched == []
+    assert conv_store.created == []
+    assert store.released == []
+    assert [(run["status"], run["error_code"]) for run in store.runs] == [("failed", error_code)]
+    assert "the timer was cancelled" in store.runs[0]["error"]
+    assert {"id": "task_1", "state": "deleted"} in store.updates
 
 
 @pytest.mark.asyncio
@@ -5178,3 +5245,38 @@ async def test_an_idle_session_is_polled_two_quiet_minutes_after_its_last_change
     check = _busy_until_check("idle", due - 5 * 60, updated_at=due - seconds_since_change)
     task = _task(session_mode="continue", session_id="sess_busy_check", next_run_at=due)
     assert await check(task, due) == (None if wait_seconds is None else due + wait_seconds)
+
+
+@pytest.mark.parametrize(
+    ("live_status", "pending", "status", "minutes_since_last_firing", "skips"),
+    [
+        pytest.param("running", None, "succeeded", 10, True, id="turn-in-progress"),
+        # A status that never left running can't hold the check-ins back for good.
+        pytest.param("running", None, "succeeded", 60, False, id="running-for-an-hour"),
+        pytest.param("idle", 1, "succeeded", 10, True, id="waiting-on-a-person"),
+        pytest.param("idle", 1, "succeeded", 180, True, id="waiting-on-a-person-for-hours"),
+        pytest.param("idle", 0, "starting", 10, True, id="last-firing-on-its-way"),
+        pytest.param("idle", 0, "succeeded", 10, False, id="idle"),
+    ],
+)
+async def test_a_busy_session_skips_its_repeating_timers_firing(
+    live_status, pending, status, minutes_since_last_firing, skips
+) -> None:
+    due = 1_800_003_600
+    # Quiet for only ten seconds: unlike a trigger's poll, a timer doesn't wait for quiet.
+    check = _busy_until_check(
+        live_status,
+        due - minutes_since_last_firing * 60,
+        updated_at=due - 10,
+        status=status,
+        pending=pending,
+    )
+    timer = _task(
+        kind="timer",
+        rrule="FREQ=MINUTELY;INTERVAL=10",
+        session_mode="continue",
+        session_id="sess_busy_check",
+        next_run_at=due,
+    )
+    # Skipped to its next firing, ten minutes on.
+    assert await check(timer, due) == (due + 600 if skips else None)

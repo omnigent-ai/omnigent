@@ -299,12 +299,10 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     # ``false`` / ``no``) consistently.
     async_enabled = bool(raw.get("async", True))
     # Top-level ``timers:`` flag gates the LLM-callable timer
-    # builtins (``sys_timer_set``, ``sys_timer_cancel``).
-    # Defaults to False to match
-    # ``omnigent/inner/datamodel.py::AgentDef.timers`` — agents
-    # opt into the timer surface explicitly. See step 10 of the
-    # harness contract migration.
-    timers = bool(raw.get("timers", False))
+    # builtins (``sys_timer_set``, ``sys_timer_cancel``). On unless
+    # the spec sets ``timers: false``, like
+    # ``omnigent/inner/datamodel.py::AgentDef.timers``.
+    timers = bool(raw.get("timers", True))
     # Top-level ``spawn:`` flag grants spawning OUTSIDE any declared
     # sub-agent list: ``sys_session_create`` (existing agents by id,
     # or custom bundles via config_path) plus send/close to drive the

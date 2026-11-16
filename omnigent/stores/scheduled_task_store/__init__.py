@@ -201,13 +201,14 @@ class ScheduledTaskStore(ABC):
         :param first_run_at: Epoch seconds the first run must fall at, checked
             against the schedule computed from the task's recorded creation timestamp, in
             the same write. ``None`` skips the check.
-        :param kind: ``"automation"`` (default), or ``"reminder"`` for a one-time
-            (``COUNT=1``) task that continues ``session_id``.
+        :param kind: ``"automation"`` (default), ``"reminder"`` for a one-time
+            (``COUNT=1``) task that continues ``session_id``, or ``"timer"`` for a
+            ``sys_timer_set`` timer that continues ``session_id`` once or on repeat.
         :returns: The newly created :class:`ScheduledTask`.
         :raises ScheduledTaskFirstRunMismatchError: If ``first_run_at`` is set and
             the first run differs; nothing is saved.
         :raises ValueError: If ``state`` or ``kind`` is not a recognized value, or a
-            reminder's rule, session mode or session doesn't fit one.
+            reminder's or timer's rule, session mode or session doesn't fit one.
         """
         ...
 

@@ -230,6 +230,14 @@ the full message, and after approval the message arrives in the same session at
 that time. See the reminder recipe under "Driving it with the repro
 environment".
 
+**Timers:** native sessions also get `sys_timer_set` and `sys_timer_cancel`. On a
+server with `automations_v2` and `durable_timers`, ask a native session to "check
+back every 10 minutes": the tool result says `durable: true`, and after you stop
+the session's runner, the next firing still wakes the session with its hidden
+`[System: timer … fired]` message. While the session is busy or waiting on you, a
+repeating timer skips that firing. Timers shorter than ten minutes stay in the
+runner (`durable: false`).
+
 **Agent instructions:** supported native startup paths add Omnigent's guidance
 to embed existing workspace screenshots in replies using their real file paths.
 After upgrading, start a new session or restart/cold-resume an existing one to

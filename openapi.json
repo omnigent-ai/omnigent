@@ -8009,6 +8009,11 @@
             "title": "Scheduled Task Subhour",
             "type": "boolean"
           },
+          "scheduled_task_timers": {
+            "default": false,
+            "title": "Scheduled Task Timers",
+            "type": "boolean"
+          },
           "scheduled_task_trigger_headers": {
             "default": true,
             "title": "Scheduled Task Trigger Headers",
@@ -14439,6 +14444,39 @@
         "title": "SetProactiveAgentPrompt",
         "type": "object"
       },
+      "SetSessionTimerRequest": {
+        "additionalProperties": false,
+        "description": "Body for `POST /v1/sessions/{session_id}/timers`: a `sys_timer_set` call.",
+        "properties": {
+          "note": {
+            "anyOf": [
+              {
+                "maxLength": 1000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "repeat": {
+            "default": false,
+            "title": "Repeat",
+            "type": "boolean"
+          },
+          "seconds": {
+            "format": "double",
+            "title": "Seconds",
+            "type": "number"
+          }
+        },
+        "required": [
+          "seconds"
+        ],
+        "title": "SetSessionTimerRequest",
+        "type": "object"
+      },
       "SetSharingRequest": {
         "description": "Body for `PUT /v1/sharing`.\n\nEvery field is optional so an admin can update each setting\nindependently; at least one must be present.",
         "properties": {
@@ -20467,7 +20505,7 @@
     },
     "/v1/scheduled-tasks": {
       "get": {
-        "description": "List the caller's scheduled tasks.\n\nLists automations unless *kind* is `all`, so the reminders agents set for\ntheir own sessions stay off the Automations page. There is no reminders-only\nview: this list reads every task the owner has, and a selective filter needs\nan indexed, paginated query first.\n\nLazy-on-read stale backstop: before returning, force-fail any of this\nowner's runs still `running` past the 6h max age (`incomplete`), so\na future Tasks-list \"last-run status\" badge never shows a stale orphan\nas `running`. Pure age check \u2014 one indexed, owner-scoped query for the\nowner's running runs, then a conditional `update_run`; NO per-run\nconversation I/O. Young in-flight runs are untouched, and completion of\na normal run is handled event-driven (the `_publish_status` hook), not\nhere.",
+        "description": "List the caller's scheduled tasks.\n\nLists automations unless *kind* is `all`, so the reminders agents set for\ntheir own sessions stay off the Automations page. Timers are never listed: their\nsession's agent manages them with its timer tools. There is no reminders-only\nview: this list reads every task the owner has, and a selective filter needs\nan indexed, paginated query first.\n\nLazy-on-read stale backstop: before returning, force-fail any of this\nowner's runs still `running` past the 6h max age (`incomplete`), so\na future Tasks-list \"last-run status\" badge never shows a stale orphan\nas `running`. Pure age check \u2014 one indexed, owner-scoped query for the\nowner's running runs, then a conditional `update_run`; NO per-run\nconversation I/O. Young in-flight runs are untouched, and completion of\na normal run is handled event-driven (the `_publish_status` hook), not\nhere.",
         "operationId": "list_scheduled_tasks_v1_scheduled_tasks_get",
         "parameters": [
           {
@@ -27382,6 +27420,115 @@
         "summary": "Stream Session",
         "tags": [
           "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/timers": {
+      "post": {
+        "description": "Keep a `sys_timer_set` timer for the calling session, firing into it.\n\nOnly the session's own runner sets its timers. Like a timer the runner keeps\nin memory, it needs no approval: each firing sends the session a fixed notice\nwith the agent's note, in the permission mode the session already runs.",
+        "operationId": "set_session_timer_v1_sessions__session_id__timers_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetSessionTimerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Set Session Timer V1 Sessions  Session Id  Timers Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Session Timer",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/timers/{timer_id}": {
+      "delete": {
+        "description": "Cancel one of the calling session's kept timers; only its own runner calls this.",
+        "operationId": "cancel_session_timer_v1_sessions__session_id__timers__timer_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "timer_id",
+            "required": true,
+            "schema": {
+              "title": "Timer Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Cancel Session Timer V1 Sessions  Session Id  Timers  Timer Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Session Timer",
+        "tags": [
+          "scheduled_tasks"
         ]
       }
     },

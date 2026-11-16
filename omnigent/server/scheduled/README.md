@@ -217,9 +217,22 @@ check) follow the saved schedule and never skip, and neither does Run now.
 
 A continued run names itself on the session (`omnigent.scheduled_task_run`)
 before sending, so the journal starts a new run of the plan and the session counts
-as unattended. A reminder belongs to the session's current work instead: its
-message goes in as written, without the unattended-run note, and names no run, so
-a workflow keeps its progress and can still ask its user questions.
+as unattended. A reminder or a timer belongs to the session's current work instead:
+its message goes in as written, without the unattended-run note, and names no run,
+so a workflow keeps its progress and can still ask its user questions.
+
+A timer (`kind: "timer"`) is a `sys_timer_set` timer the server keeps for its
+session, created through `POST /v1/sessions/{id}/timers` by that session's own
+runner. Its message is hidden (`is_meta`), like an in-memory timer's firing. It
+fires in the permission mode its session already runs, even one that skips
+approval. It never starts a session: when its session is gone or can no longer
+take it, the firing fails and the timer is cancelled. A repeating timer goes
+through the same busy check as a trigger, but while its session is running,
+waiting on an approval or question, or still taking the previous firing, it skips
+to its next occurrence instead of checking again two minutes later. A session that
+has shown as running for an hour since the timer's last firing gets the firing
+anyway (`TIMER_BUSY_SKIP_MAX_SECONDS`), so a stale status can't stall the
+check-ins meant to recover it; a pending approval or question always holds it back.
 
 If the replica stops before recording, recovery finds no session on the run and
 records `failed`; it never resends. A first run of such a task records its

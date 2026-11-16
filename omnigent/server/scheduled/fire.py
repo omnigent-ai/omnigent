@@ -131,7 +131,9 @@ from omnigent.server.scheduled.run_sharing import (
 )
 from omnigent.server.scheduled.schedule import (
     continued_sandbox_host_id,
+    is_repeating_timer,
     is_trigger_automation,
+    next_scheduled_time,
     strip_trigger_header,
     task_timezone,
 )
@@ -501,17 +503,21 @@ def _prompt_event(prompt: str) -> SessionEventInput:
 
 # Kinds an agent sets to message its own session later. A firing belongs to the
 # session's current work, not to a new run, so nothing says no one is watching.
-SESSION_MESSAGE_KINDS = frozenset({"reminder"})
+SESSION_MESSAGE_KINDS = frozenset({"reminder", "timer"})
 
 
 def _task_prompt_event(task: ScheduledTask) -> SessionEventInput:
-    """The message a firing sends: a reminder's text as set, else the prompt and the note."""
+    """The message a firing sends: a reminder's or timer's text as set, else prompt and note."""
     if task.kind not in SESSION_MESSAGE_KINDS:
         return _prompt_event(run_prompt_text(task))
-    return SessionEventInput(
-        type="message",
-        data={"role": "user", "content": [{"type": "input_text", "text": task.prompt}]},
-    )
+    data: dict[str, Any] = {
+        "role": "user",
+        "content": [{"type": "input_text", "text": task.prompt}],
+    }
+    if task.kind == "timer":
+        # Hidden, like an in-memory timer's firing: it wakes the agent without a chat line.
+        data["is_meta"] = True
+    return SessionEventInput(type="message", data=data)
 
 
 def build_on_fire(
@@ -553,6 +559,9 @@ BUSY_RECHECK_SECONDS = 2 * 60
 # While its session looks busy, a trigger automation still gets a prompt this often, so a
 # stale "running" status cannot stall it.
 BUSY_SKIP_MAX_SECONDS = 10 * 60
+# A repeating timer still fires this long after its last firing while its session shows
+# as running, so a stale status can't hold back the check-ins meant to recover it.
+TIMER_BUSY_SKIP_MAX_SECONDS = 60 * 60
 
 
 def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable[int | None]]:
@@ -564,7 +573,10 @@ def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable
     :data:`BUSY_RECHECK_SECONDS` from now while it shows as running (a turn in progress,
     or waiting on an approval or question), has an approval or question pending, or the
     previous poll is still being delivered. It never waits past
-    :data:`BUSY_SKIP_MAX_SECONDS` after the latest poll went out.
+    :data:`BUSY_SKIP_MAX_SECONDS` after the latest poll went out. A repeating timer skips
+    to its next occurrence instead while its session is busy, except that it fires once
+    its session has shown as running for :data:`TIMER_BUSY_SKIP_MAX_SECONDS` since its
+    last firing; an approval or question waiting on a person always holds it back.
     """
 
     async def busy_until(task: ScheduledTask, now: int) -> int | None:
@@ -589,12 +601,6 @@ def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable
         waiting = session.runner_id is not None and bool(session.pending_elicitation_count)
         # The previous poll may still be on its way in, e.g. while a sandbox starts.
         delivering = latest is not None and latest.status in ("scheduled", "starting")
-        if running or waiting or delivering:
-            until = now + BUSY_RECHECK_SECONDS
-        else:
-            until = session.updated_at + BUSY_QUIET_SECONDS
-        if until <= now:
-            return None
         # The latest poll went out at the task's last firing or when its newest run started,
         # whichever is later; either can be later than the poll was due.
         sent_times = [task.last_run_at]
@@ -603,7 +609,18 @@ def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable
                 latest.fired_at if latest.fired_at is not None else latest.scheduled_at
             )
         sent_at = max((t for t in sent_times if t is not None), default=None)
-        if sent_at is None:
+        if is_repeating_timer(task):
+            last_fired = sent_at if sent_at is not None else task.created_at
+            stale = now - last_fired >= TIMER_BUSY_SKIP_MAX_SECONDS
+            if waiting or delivering or (running and not stale):
+                # Its next firing comes on schedule.
+                return await asyncio.to_thread(next_scheduled_time, task, now)
+            return None
+        if running or waiting or delivering:
+            until = now + BUSY_RECHECK_SECONDS
+        else:
+            until = session.updated_at + BUSY_QUIET_SECONDS
+        if until <= now or sent_at is None:
             return None
         backstop = sent_at + BUSY_SKIP_MAX_SECONDS
         return min(until, backstop) if backstop > now else None
@@ -805,9 +822,9 @@ async def _run_fire_for_task(
         )
         return
 
-    if task.continues_session and not is_one_time_rule(task.rrule):
-        # A one-time task, such as a reminder, belongs to its session: with the
-        # session gone it fails instead of running in a new one without its context.
+    if task.continues_session and not is_one_time_rule(task.rrule) and task.kind != "timer":
+        # A one-time task, such as a reminder, and a timer belong to their session: with
+        # the session gone they fail instead of running in a new one without its context.
         task = await _release_replaceable_session(deps, task)
     if task.continues_session:
         await _continue_session(
@@ -1130,13 +1147,21 @@ async def _continue_session(
     if problem is not None:
         reason, error_code = problem
         _logger.warning("scheduled fire: task %s cannot continue its session: %s", task.id, reason)
+        if task.kind == "timer":
+            # Its session can't take it now, so later firings would fail the same way.
+            await asyncio.to_thread(deps.scheduled_task_store.update, task.id, state="deleted")
         await recorder.finish(
             "failed", error=f"{reason}; {_recovery_hint(task)}", error_code=error_code
         )
         return
     assert conv is not None
     agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
-    inherited = await _inherited_permission_problem(deps, task, agent, continued=True)
+    # A timer wakes its session in the mode it already runs, as an in-memory timer does.
+    inherited = (
+        None
+        if task.kind == "timer"
+        else await _inherited_permission_problem(deps, task, agent, continued=True)
+    )
     if inherited is not None:
         reason, error_code = inherited
         await recorder.finish(
@@ -1298,6 +1323,8 @@ _ONE_TIME_HINT = "it has no later run; set a new reminder or create a new automa
 
 def _recovery_hint(task: ScheduledTask) -> str:
     """What the owner can do about a continued run that failed."""
+    if task.kind == "timer":
+        return "the timer was cancelled"
     return _ONE_TIME_HINT if is_one_time_rule(task.rrule) else _NEW_SESSION_HINT
 
 
@@ -1387,7 +1414,12 @@ async def continued_session_problem(
     if conv.agent_id != task.agent_id:
         return "the session runs a different agent", "continued_session_incompatible"
     session_mode = session_approval_skipping_mode(conv)
-    if session_mode is not None and task.permission_mode not in APPROVAL_SKIPPING_PERMISSION_MODES:
+    if (
+        session_mode is not None
+        # A timer wakes its session in the mode it already runs, as an in-memory timer does.
+        and task.kind != "timer"
+        and task.permission_mode not in APPROVAL_SKIPPING_PERMISSION_MODES
+    ):
         return (
             f"the session is in permission mode {session_mode!r}, which skips approval, but the "
             "automation does not select such a mode; switch the session to a mode that asks for "

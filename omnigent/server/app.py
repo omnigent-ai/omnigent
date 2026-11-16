@@ -340,6 +340,10 @@ class ServerInfoResponse(BaseModel):
     # a reminder, and ``first_run_at``. Needs the database scheduler and the
     # ``one_time_automations`` release feature; absent on older servers.
     scheduled_task_one_time: bool = False
+    # Sessions' runners can keep sys_timer_set timers on the server
+    # (``/v1/sessions/{id}/timers``). Needs the database scheduler and the
+    # ``durable_timers`` release feature; absent on older servers.
+    scheduled_task_timers: bool = False
     # Scheduled-task runs drop a trigger prompt's ``<!-- omnigent-trigger ... -->`` header
     # before dispatch; older servers would send it to the model.
     scheduled_task_trigger_headers: bool = True
@@ -2730,6 +2734,10 @@ def create_app(
     app.state.one_time_automations_enabled = automations_v2_enabled and (
         resolved_feature_flags.enabled(Feature.ONE_TIME_AUTOMATIONS)
     )
+    # Timer tasks need every scheduler on the database to know their kind.
+    app.state.durable_timers_enabled = automations_v2_enabled and (
+        resolved_feature_flags.enabled(Feature.DURABLE_TIMERS)
+    )
 
     app.state.scheduled_task_store = scheduled_task_store
     app.state.proactive_provisioner = ProactiveProvisioner()
@@ -4115,6 +4123,8 @@ def create_app(
                 "scheduled_task_inbox": automations_enabled,
                 "scheduled_task_one_time": automations_enabled
                 and bool(app.state.one_time_automations_enabled),
+                "scheduled_task_timers": automations_enabled
+                and bool(app.state.durable_timers_enabled),
                 "scheduled_task_sharing": automations_enabled
                 and scheduled_task_sharing_supported(app.state, permission_store),
                 "session_move_source_checks": True,

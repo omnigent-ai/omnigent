@@ -955,7 +955,7 @@ class AgentDef:
     async_enabled: bool = True
     cancellable: bool = True
     runtime: bool = False
-    timers: bool = False
+    timers: bool = True
     # Grant for spawning OUTSIDE any declared sub-agent list:
     # sys_session_create (existing agents by id, or custom bundles via
     # config_path) plus send/close to drive the children. Distinct
