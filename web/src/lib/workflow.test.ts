@@ -177,6 +177,12 @@ describe("editWorkflowPlanPrompt", () => {
     expect(prompt).toContain("Draft a useful first proposal now");
     expect(prompt).toContain("I will use Save plan on the workflow page to apply the proposal");
   });
+
+  it("asks for a description on every proposal, which Save plan stores", () => {
+    const prompt = editWorkflowPlanPrompt(workflow);
+    expect(prompt).toContain("Set description on every plan you publish");
+    expect(prompt).toContain("Save plan stores it as the workflow description");
+  });
 });
 
 describe("parseSavedWorkflowMessage", () => {

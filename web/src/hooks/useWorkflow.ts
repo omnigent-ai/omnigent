@@ -11,6 +11,8 @@ import { ApiError, apiErrorFromResponse } from "@/lib/sessionsApi";
 export interface WorkflowDetail extends SavedWorkflow {
   steps: WorkflowStep[];
   planning_session_id?: string | null;
+  /** Epoch seconds of its last write. */
+  updated_at?: number;
 }
 
 /** The workflow doesn't exist, or isn't the user's. */
@@ -109,12 +111,12 @@ export function useCloneWorkflow() {
   });
 }
 
-/** Apply the reviewed proposal to the existing workflow. */
+/** Apply the reviewed proposal, its steps and any new description, to the existing workflow. */
 export function useSaveWorkflowPlan(workflowId: string) {
   const onSuccess = useWorkflowSaved();
   return useMutation({
-    mutationFn: (steps: WorkflowStep[]) =>
-      writeWorkflow(workflowPath(workflowId), "PATCH", { steps }),
+    mutationFn: (proposal: { steps: WorkflowStep[]; description?: string }) =>
+      writeWorkflow(workflowPath(workflowId), "PATCH", proposal),
     onSuccess,
   });
 }

@@ -286,6 +286,10 @@ async def test_invalid_arguments_never_reach_the_server() -> None:
         assert (await _run(client, "sys_journal_write_plan", stray))["error"] == (
             "invalid_entry: workflow_id must be a saved workflow's ID"
         )
+        blank = {**unnamed, "name": "Run", "description": " "}
+        assert (await _run(client, "sys_journal_write_plan", blank))["error"] == (
+            "invalid_entry: description must not be empty"
+        )
         assert (await _run(client, "sys_journal_read", {"limit": 101}))["error"].startswith(
             "invalid_entry"
         )

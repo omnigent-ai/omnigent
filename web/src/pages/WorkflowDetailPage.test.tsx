@@ -444,6 +444,96 @@ describe("WorkflowDetailPage", () => {
     expect(useChatStore.getState().sideChatComposers[planner]).toBeUndefined();
   });
 
+  it("saves a proposal's description with its steps, but not over a later edit", async () => {
+    const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+    vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+    mockRuns([]);
+    let now = 100;
+    let stored: WorkflowDetail = {
+      ...WORKFLOW,
+      description: "Pull the board's open tickets and group them",
+      steps: [],
+      is_draft: true,
+      planning_session_id: "a".repeat(32),
+      updated_at: now,
+    };
+    const patches: unknown[] = [];
+    vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
+      if (options?.method === "PATCH") {
+        const body = JSON.parse(String(options.body));
+        patches.push(body);
+        now += 100;
+        stored = { ...stored, ...body, is_draft: false, updated_at: now };
+      }
+      return new Response(JSON.stringify(stored));
+    });
+    const proposal: JournalEntry = {
+      id: "proposal",
+      position: 1,
+      created_at: 150,
+      scheduled_task_run_id: null,
+      step: null,
+      author: { type: "agent" },
+      kind: "plan",
+      content: { steps: WORKFLOW.steps, description: WORKFLOW.description },
+    };
+    vi.mocked(useSessionJournal).mockReturnValue({
+      entries: [proposal],
+      isLoading: false,
+      error: null,
+      hasOlder: false,
+      loadingOlder: false,
+      loadOlder: vi.fn(),
+      retry: vi.fn(),
+    });
+    const description = () => screen.getByTestId("workflow-detail-description").textContent;
+    const saveAndReload = async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+      await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Saved plan"));
+      cleanup();
+      renderPage();
+      await screen.findByTestId("workflow-detail-title");
+    };
+    renderPage();
+
+    // The draft's description gives way to the proposal's until it saves with the steps.
+    await screen.findByTestId("workflow-detail-title");
+    expect(description()).toBe(WORKFLOW.description);
+    await saveAndReload();
+    expect(patches).toEqual([{ steps: WORKFLOW.steps, description: WORKFLOW.description }]);
+    expect(description()).toBe(WORKFLOW.description);
+    expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+
+    // A newer proposal can revise the description alone.
+    proposal.created_at = 250;
+    proposal.content = { steps: WORKFLOW.steps, description: "Fixes one flaky test." };
+    cleanup();
+    renderPage();
+    await screen.findByTestId("workflow-detail-title");
+    expect(description()).toBe("Fixes one flaky test.");
+    expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes");
+    await saveAndReload();
+    expect(patches[1]).toEqual({ steps: WORKFLOW.steps, description: "Fixes one flaky test." });
+
+    // An edit made after the newest proposal stands; Save plan applies only its steps.
+    const edited = [
+      ...WORKFLOW.steps,
+      { id: "report", name: "Report", goal: null, depends_on: [] },
+    ];
+    proposal.created_at = 350;
+    proposal.content = { steps: edited, description: "Fixes flaky tests and reports them." };
+    now = 400;
+    stored = { ...stored, description: "Edited by hand", updated_at: now };
+    cleanup();
+    renderPage();
+    await screen.findByTestId("workflow-detail-title");
+    expect(description()).toBe("Edited by hand");
+    expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes");
+    await saveAndReload();
+    expect(patches[2]).toEqual({ steps: edited });
+    expect(description()).toBe("Edited by hand");
+  });
+
   it("shows the workflow, its steps, and the sessions that ran it", () => {
     mockWorkflow({});
     mockRuns([

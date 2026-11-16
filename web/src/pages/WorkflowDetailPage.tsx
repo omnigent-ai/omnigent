@@ -60,7 +60,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { Link, useNavigate, useParams } from "@/lib/routing";
 import { formatRunTimestamp } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
-import { currentPlan, planSteps, type StepState } from "@/lib/sessionJournal";
+import { currentPlan, planDescription, planSteps, type StepState } from "@/lib/sessionJournal";
 import { ApiError } from "@/lib/sessionsApi";
 import {
   describeWorkflowRun,
@@ -162,12 +162,23 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const runList = runs.data?.pages.flatMap((page) => page.runs) ?? [];
   const proposal = canReadProposal ? currentPlan(journal.entries) : null;
   const proposedSteps = proposal ? planSteps(proposal) : null;
+  // A proposal older than the workflow's last write doesn't replace its description,
+  // so an edit made since then stands.
+  const proposedDescription =
+    proposal && proposal.created_at >= (workflow.updated_at ?? 0)
+      ? planDescription(proposal)
+      : null;
+  const newDescription =
+    proposedSteps?.length && proposedDescription !== workflow.description
+      ? proposedDescription
+      : null;
   const stepSignature = (steps: typeof workflow.steps) =>
     JSON.stringify(
       steps.map(({ id, name, goal, depends_on }) => [id, name, goal ?? null, depends_on]),
     );
   const hasChanges =
-    !!proposedSteps?.length && stepSignature(proposedSteps) !== stepSignature(workflow.steps);
+    !!proposedSteps?.length &&
+    (stepSignature(proposedSteps) !== stepSignature(workflow.steps) || newDescription !== null);
   const isDraft = workflow.is_draft ?? workflow.steps.length === 0;
   const canRun = !isDraft && !hasChanges;
   // Expanded, the planner covers the page, which keeps its width underneath so
@@ -256,7 +267,10 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
             </Button>
           </div>
         </div>
-        <WorkflowDescription workflowId={workflow.id} text={workflow.description} />
+        <WorkflowDescription
+          workflowId={workflow.id}
+          text={newDescription ?? workflow.description}
+        />
 
         <section className="mt-6">
           <div className="mb-3 flex items-center justify-between gap-3">
@@ -276,7 +290,10 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
                 onClick={() => {
                   if (!proposedSteps) return;
                   setPlannerOpen(showPlanner);
-                  savePlan.mutate(proposedSteps, { onSuccess: () => showToast("Plan saved") });
+                  savePlan.mutate(
+                    { steps: proposedSteps, description: newDescription ?? undefined },
+                    { onSuccess: () => showToast("Plan saved") },
+                  );
                 }}
               >
                 <SaveIcon className="size-4" /> Save plan

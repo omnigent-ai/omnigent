@@ -568,12 +568,12 @@ async def test_reading_needs_read_access_and_writing_needs_edit(
                 "k",
             ),
             400,
-            "exactly two fields, name and steps",
+            "a plan's content has name and steps, and optionally description",
         ),
         (
             _write("plan", {"steps": [{"id": "a", "name": "A"}]}, "k"),
             400,
-            "exactly two fields, name and steps",
+            "a plan's content has name and steps, and optionally description",
         ),
         (_write("dispatch", {"dispatch_id": "x"}, "k"), 422, "kind"),
         (
@@ -704,8 +704,11 @@ async def test_the_agents_tools_write_and_read_through_the_runner(
             {"id": "nightly", "name": "Get the nightly build green", "depends_on": []},
             {"id": "ship", "name": "Ship", "depends_on": ["nightly"]},
         ],
+        # A workflow planning chat's proposal also carries the description Save plan stores.
+        "description": "Gets the nightly build green, then ships it.",
     }
     assert (await run("sys_journal_write_plan", replan))["version"] == 2
+    assert published[-1][1]["entry"]["content"]["description"] == replan["description"]
     early = await run("sys_journal_write_status", {"status": "started", "step": "ship"})
     assert early["error"].startswith("step_not_ready: ship waits on nightly, not done yet")
     await run(

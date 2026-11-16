@@ -472,10 +472,10 @@ def create_session_journal_router(
     ) -> SessionJournalEntry:
         """Append an entry written by the session's agent; only its runner calls this."""
         session = await _agent_session(request, session_id)
-        if body.kind == "plan" and set(body.content) != {"name", "steps"}:
+        if body.kind == "plan" and set(body.content) - {"description"} != {"name", "steps"}:
             # Only the server can attribute a plan to a saved workflow snapshot.
             raise OmnigentError(
-                "invalid_entry: a plan's content has exactly two fields, name and steps",
+                "invalid_entry: a plan's content has name and steps, and optionally description",
                 code=ErrorCode.INVALID_INPUT,
             )
         if body.workflow_id is not None:

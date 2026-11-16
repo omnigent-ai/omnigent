@@ -191,12 +191,13 @@ def _write_request(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     if tool_name == "sys_journal_write_status":
         content = normalize_status(args.get("status"), text=args.get("text"))
         return {"kind": "status", "content": content, "step": step}
-    plan = normalize_plan(args.get("steps"), name=args.get("name"))
-    body: dict[str, Any] = {
-        "kind": "plan",
-        "content": {"name": plan["name"], "steps": plan["steps"]},
-        "step": None,
-    }
+    plan = normalize_plan(
+        args.get("steps"), name=args.get("name"), description=args.get("description")
+    )
+    content = {"name": plan["name"], "steps": plan["steps"]}
+    if "description" in plan:
+        content["description"] = plan["description"]
+    body: dict[str, Any] = {"kind": "plan", "content": content, "step": None}
     workflow_id = args.get("workflow_id")
     if workflow_id is not None:
         if not (isinstance(workflow_id, str) and _WORKFLOW_ID.fullmatch(workflow_id)):
