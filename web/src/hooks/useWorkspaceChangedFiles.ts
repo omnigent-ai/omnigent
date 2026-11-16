@@ -114,6 +114,8 @@ export interface WorkspaceChangedFile {
   lines_added: number | null;
   /** Lines removed, or null when unknown. */
   lines_removed: number | null;
+  /** An untracked file's own lines; absent from runners that don't count them. */
+  untracked_lines?: number | null;
 }
 
 export interface WorkspaceChangedFilesResult {
@@ -246,6 +248,7 @@ interface ChangedFilesResponse {
     modified_at: number | null;
     lines_added: number | null;
     lines_removed: number | null;
+    untracked_lines?: number | null;
   }[];
   has_more: boolean;
 }
@@ -291,6 +294,7 @@ async function fetchWorkspaceChangedFiles(
     modified_at: e.modified_at,
     lines_added: e.lines_added ?? null,
     lines_removed: e.lines_removed ?? null,
+    untracked_lines: e.untracked_lines ?? null,
   }));
   return { available: true, data };
 }

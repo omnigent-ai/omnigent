@@ -141,6 +141,7 @@ from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.preferences import create_preferences_router
 from omnigent.server.routes.projects import create_projects_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
+from omnigent.server.routes.scheduled_task_permissions import scheduled_task_sharing_supported
 from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
 from omnigent.server.routes.session_policies import create_session_policies_router
@@ -332,6 +333,8 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_harness_settings: bool = True
     # Session creates accept ``permission_mode``; older servers ignore it.
     session_create_permission_modes: bool = True
+    # Session creates accept ``workflow_id``; older servers ignore it.
+    session_create_workflow_id: bool = True
     scripted_sessions: bool = False
     # Scheduled tasks accept explicit modes that skip approval; servers that omit
     # this may reject them, so clients hide those modes.
@@ -391,6 +394,10 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_projects: bool = False
     # Bounded latest-failure feed for the Inbox.
     scheduled_task_inbox: bool = False
+    # Grants can be added through ``/v1/scheduled-tasks/{id}/permissions``: needs
+    # ``automations_v2`` and a store that keeps them. Listing and removing need only the
+    # store, through the API; the automation pages need the flag.
+    scheduled_task_sharing: bool = False
     # Session PATCH and project create check the agent tool's calling session;
     # absent on older servers, where moves must not run.
     session_move_source_checks: bool = False
@@ -3942,6 +3949,8 @@ def create_app(
                 "scheduled_task_inbox": automations_enabled,
                 "scheduled_task_one_time": automations_enabled
                 and bool(app.state.one_time_automations_enabled),
+                "scheduled_task_sharing": automations_enabled
+                and scheduled_task_sharing_supported(app.state, permission_store),
                 "session_move_source_checks": True,
                 "session_organize_source_checks": True,
                 "sibling_other_project_standalone": True,

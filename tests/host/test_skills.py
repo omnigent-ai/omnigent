@@ -119,8 +119,10 @@ def test_session_catalog_ends_with_the_framework_workflow_skills(tmp_path: Path)
         expected = ["bundled", "save-workflow", "workflow"] if enabled else ["bundled"]
         assert [skill["name"] for skill in catalog] == expected
         if enabled:
-            assert catalog[1]["description"].startswith("Save this session's plan")
-            assert catalog[2]["description"].startswith("Plan and run a multi-step workflow")
+            assert catalog[1]["description"].startswith(
+                "Design, revise, or save a reusable workflow"
+            )
+            assert catalog[2]["description"].startswith("Run a multi-step workflow")
         resolved = resolve_session_skills(
             spec,
             (tmp_path,),

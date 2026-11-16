@@ -9,14 +9,15 @@ parallel workers contends on them and CockroachDB aborts a transaction with
 product's serialization-retry path, so a losing worker surfaces the abort as
 a hard failure — a different migration test each run.
 
-Serialize the DDL-heavy tests behind a cross-process lock so only one worker
-mutates the shared schema catalog at a time. Scoped to CockroachDB (other
-dialects keep per-database isolation) and to the migration modules (the small
-non-DDL ``tests/db`` unit tests stay fully parallel).
+Serialize configured CockroachDB migration tests behind a cross-process lock.
+SQLite-only migration tests and non-DDL unit tests stay fully parallel. Wait
+for the lock before starting the per-test timeout, which still covers setup,
+the test, and teardown once the lock is acquired.
 """
 
 from __future__ import annotations
 
+import os
 import tempfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -30,16 +31,25 @@ _CRDB_SCHEMA_LOCK = Path(tempfile.gettempdir()) / "omnigent-crdb-schema-ddl.lock
 
 
 def _runs_schema_ddl(node: pytest.Item) -> bool:
-    """Whether a test issues migration DDL (the modules that hit the catalog)."""
+    """Whether a test changes the configured database's schema."""
     name = node.path.name
-    return name.startswith("test_migration") or name == "test_cockroachdb.py"
+    if not (name.startswith("test_migration") or name == "test_cockroachdb.py"):
+        return False
+    fixtures = getattr(node, "fixturenames", ())
+    parameters = getattr(getattr(node, "callspec", None), "params", {})
+    # Scheduled-task tests also use scratch databases or request db_uri dynamically.
+    return (
+        "db_uri" in fixtures
+        or "dispatch_migration_engine" in fixtures
+        or parameters.get("db_engine") == "configured"
+    )
 
 
-@pytest.fixture(autouse=True)
-def _serialize_crdb_schema_ddl(
-    request: pytest.FixtureRequest, _worker_db_uri: str
-) -> Iterator[None]:
-    if "cockroachdb" not in _worker_db_uri or not _runs_schema_ddl(request.node):
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
+def pytest_runtest_protocol(item: pytest.Item) -> Iterator[None]:
+    if "cockroachdb" not in os.environ.get("OMNIGENT_TEST_DB_URI", "") or not _runs_schema_ddl(
+        item
+    ):
         yield
         return
     from filelock import FileLock

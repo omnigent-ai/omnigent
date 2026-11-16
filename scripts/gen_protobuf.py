@@ -3,9 +3,12 @@
 Each API ships a protobuf schema (e.g. ``omnigent/api/routing/v1/routing.proto``)
 and the runtime imports its generated modules: ``*_pb2`` for messages, plus
 ``*_connect`` (Connect RPC server and client stubs) for schemas that declare a
-service. Generated code is checked in (so a plain ``pip install`` / editor / type
-checker sees it without a build step), and this script is the one blessed way to
-regenerate it — run it whenever a ``.proto`` changes and commit the result.
+service. Schemas that declare a service also get TypeScript bindings
+(``*_pb.js`` and ``*_pb.d.ts``, from ``protoc-gen-es``) under ``web/src/gen/``,
+which the web client imports. Generated code is checked in (so a plain
+``pip install`` / editor / type checker sees it without a build step), and this
+script is the one blessed way to regenerate it — run it whenever a ``.proto``
+changes and commit the result.
 
 It shells out to ``grpc_tools.protoc`` (the ``grpcio-tools`` dev dependency),
 which bundles both the compiler and the well-known-type protos, so imports such
@@ -42,11 +45,19 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _API_ROOT = Path("omnigent/api")
 # The plugin sits next to the interpreter in the venv that has the dev dependencies.
 _CONNECT_PLUGIN = Path(sys.executable).parent / "protoc-gen-connectrpc"
+# The TypeScript generator is a web devDependency.
+_ES_PLUGIN = _REPO_ROOT / "web/node_modules/.bin/protoc-gen-es"
+_TS_OUT = Path("web/src/gen")
 
 
 def _protos() -> list[Path]:
     """Every ``.proto`` under the API root, relative to the repo root."""
     return sorted(p.relative_to(_REPO_ROOT) for p in (_REPO_ROOT / _API_ROOT).rglob("*.proto"))
+
+
+def _services() -> list[Path]:
+    """The API schemas that declare a service: the ones clients call."""
+    return [p for p in _protos() if "\nservice " in (_REPO_ROOT / p).read_text()]
 
 
 def _run_protoc(out_dir: Path) -> None:
@@ -56,11 +67,15 @@ def _run_protoc(out_dir: Path) -> None:
             "grpc_tools or protoc-gen-connectrpc not found. Install the dev dependencies first:\n"
             "  uv sync --group lint"
         )
+    if not _ES_PLUGIN.exists():
+        raise SystemExit(
+            "protoc-gen-es not found. Install the web dependencies first:\n"
+            "  pnpm install --frozen-lockfile --filter web"
+        )
+    protoc = [sys.executable, "-m", "grpc_tools.protoc", f"--proto_path={_REPO_ROOT}"]
+    (out_dir / _TS_OUT).mkdir(parents=True)
     cmd = [
-        sys.executable,
-        "-m",
-        "grpc_tools.protoc",
-        f"--proto_path={_REPO_ROOT}",
+        *protoc,
         f"--python_out={out_dir}",
         f"--pyi_out={out_dir}",
         f"--plugin=protoc-gen-connectrpc={_CONNECT_PLUGIN}",
@@ -70,6 +85,13 @@ def _run_protoc(out_dir: Path) -> None:
         *(str(p) for p in _protos()),
     ]
     subprocess.run(cmd, check=True, cwd=_REPO_ROOT)
+    ts_cmd = [
+        *protoc,
+        f"--plugin=protoc-gen-es={_ES_PLUGIN}",
+        f"--es_out={out_dir / _TS_OUT}",
+        *(str(p) for p in _services()),
+    ]
+    subprocess.run(ts_cmd, check=True, cwd=_REPO_ROOT)
 
 
 def _generated(root: Path) -> list[Path]:
@@ -81,7 +103,9 @@ def _committed() -> set[Path]:
     """Generated-looking files in the repo's API tree, relative to the repo root."""
     api = _REPO_ROOT / _API_ROOT
     patterns = ("*_pb2.py", "*_pb2.pyi", "*_connect.py")
-    return {p.relative_to(_REPO_ROOT) for pattern in patterns for p in api.rglob(pattern)}
+    python = {p.relative_to(_REPO_ROOT) for pattern in patterns for p in api.rglob(pattern)}
+    typescript = {p.relative_to(_REPO_ROOT) for p in (_REPO_ROOT / _TS_OUT).rglob("*_pb.*")}
+    return python | typescript
 
 
 def _generate() -> int:
@@ -90,6 +114,7 @@ def _generate() -> int:
         _run_protoc(tmp_dir)
         outputs = _generated(tmp_dir)
         for p in outputs:
+            (_REPO_ROOT / p).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(tmp_dir / p, _REPO_ROOT / p)
         # Bindings whose schema or service is gone would otherwise still import.
         for p in _committed() - set(outputs):
