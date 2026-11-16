@@ -288,6 +288,11 @@ export interface ServerInfo {
   scheduled_task_trigger_headers?: boolean;
   /** Server default for new trigger templates, from 10 to 240 minutes. */
   automation_trigger_poll_minutes?: number;
+  /**
+   * Longest session message the server delivers, e.g. 32000. Older servers
+   * omit it and deliver at most 8,000 characters.
+   */
+  session_message_max_chars?: number;
   /** Sandbox automations accept a repository URL as their workspace. */
   scheduled_task_sandbox_workspaces?: boolean;
   /**
@@ -690,6 +695,12 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_source_sessions: data.scheduled_task_source_sessions === true,
           scheduled_task_subhour: data.scheduled_task_subhour === true,
           scheduled_task_trigger_headers: data.scheduled_task_trigger_headers === true,
+          session_message_max_chars:
+            typeof data.session_message_max_chars === "number" &&
+            Number.isInteger(data.session_message_max_chars) &&
+            data.session_message_max_chars > 0
+              ? data.session_message_max_chars
+              : undefined,
           automation_trigger_poll_minutes:
             typeof data.automation_trigger_poll_minutes === "number" &&
             Number.isInteger(data.automation_trigger_poll_minutes) &&

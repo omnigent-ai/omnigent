@@ -59,11 +59,20 @@ vi.mock("@/components/workflows/WorkflowPlanningChat", () => ({
   WorkflowPlanningChat: ({
     workflow,
     onClose,
+    expanded,
+    onExpandedChange,
   }: {
     workflow: WorkflowDetail;
     onClose: () => void;
+    expanded?: boolean;
+    onExpandedChange?: (expanded: boolean) => void;
   }) => (
     <div data-testid="planning-chat" data-session={workflow.planning_session_id}>
+      {onExpandedChange && (
+        <button type="button" onClick={() => onExpandedChange(!expanded)}>
+          {expanded ? "Collapse planning chat" : "Expand planning chat"}
+        </button>
+      )}
       <button type="button" onClick={onClose}>
         Close planning chat
       </button>
@@ -113,6 +122,12 @@ vi.mock("@/components/workflows/WorkflowSessionDialog", () => ({
 vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
   CreateScheduledTaskDialog: (props: { open: boolean; lockedWorkflow?: SavedWorkflow | null }) =>
     props.open ? <div data-testid="new-automation-dialog">{props.lockedWorkflow?.name}</div> : null,
+}));
+// The automations list has its own tests; here it names the workflow it lists.
+vi.mock("@/components/workflows/WorkflowAutomations", () => ({
+  WorkflowAutomations: ({ workflowId }: { workflowId: string }) => (
+    <div data-testid="workflow-automations-section" data-workflow={workflowId} />
+  ),
 }));
 const navigate = vi.fn();
 vi.mock("@/lib/routing", async (importOriginal) => {
@@ -294,6 +309,7 @@ describe("WorkflowDetailPage", () => {
       expect(screen.getByTestId("planning-chat")).toHaveAttribute("data-session", planner);
       expect(screen.getByTestId("workflow-detail-run")).toBeDisabled();
       expect(screen.getByTestId("workflow-detail-create-automation")).toBeDisabled();
+      expect(screen.queryByTestId("workflow-automations-section")).toBeNull();
       if (mobile) {
         fireEvent.click(screen.getByRole("button", { name: "Close planning chat" }));
         expect(screen.queryByTestId("planning-chat")).toBeNull();
@@ -310,6 +326,10 @@ describe("WorkflowDetailPage", () => {
       else expect(screen.getByTestId("planning-chat")).toBeInTheDocument();
       expect(screen.queryByText("Draft")).toBeNull();
       expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+      expect(screen.getByTestId("workflow-automations-section")).toHaveAttribute(
+        "data-workflow",
+        WORKFLOW.id,
+      );
 
       cleanup();
       renderPage();
@@ -327,6 +347,51 @@ describe("WorkflowDetailPage", () => {
       await waitFor(() => expect(stored.steps).toEqual(edited));
     },
   );
+
+  it("expands the planner over the page in place, on wide screens only", () => {
+    mockWorkflow({ data: { ...WORKFLOW, steps: [], is_draft: true } });
+    mockRuns([]);
+    const { rerender } = renderPage();
+    const setPhone = (phone: boolean) => {
+      vi.mocked(useIsMobileViewport).mockReturnValue(phone);
+      rerender(<WorkflowDetailPage />);
+    };
+    const page = screen.getByTestId("workflow-detail-page");
+    const planner = screen.getByRole("complementary", { name: "Workflow planning chat" });
+    const panel = screen.getByTestId("workflow-planner-panel");
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand planning chat" }));
+    expect(panel).toHaveClass("absolute", "inset-0");
+    expect(page).toHaveClass("invisible");
+    // The aside still reserves its width, so the hidden page doesn't reflow.
+    expect(planner).toHaveClass("w-[42%]");
+    expect(planner).not.toHaveClass("absolute");
+    fireEvent.click(screen.getByRole("button", { name: "Collapse planning chat" }));
+    expect(panel).not.toHaveClass("absolute");
+    expect(page).not.toHaveClass("invisible");
+
+    // Every close path, including the phone sheet after the window narrows,
+    // reopens the planner beside the page.
+    const closeButton = () =>
+      fireEvent.click(screen.getByRole("button", { name: "Close planning chat" }));
+    const dismissSheet = () =>
+      fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    for (const [phone, close] of [
+      [false, closeButton],
+      [true, closeButton],
+      [true, dismissSheet],
+    ] as const) {
+      fireEvent.click(screen.getByRole("button", { name: "Expand planning chat" }));
+      setPhone(phone);
+      // Phones already show the planner as a near-full-screen sheet.
+      if (phone) expect(screen.queryByRole("button", { name: "Expand planning chat" })).toBeNull();
+      close();
+      expect(screen.queryByTestId("planning-chat")).toBeNull();
+      setPhone(false);
+      fireEvent.click(screen.getByRole("button", { name: "Create plan" }));
+      expect(page).not.toHaveClass("invisible");
+    }
+  });
 
   it("shows the workflow, its steps, and the sessions that ran it", () => {
     mockWorkflow({});
@@ -775,7 +840,12 @@ describe("WorkflowDetailPage", () => {
       if (automations === "loading" || automations === false) {
         expect(screen.queryByTestId("workflow-detail-create-automation")).toBeNull();
         expect(screen.queryByTestId("new-automation-dialog")).toBeNull();
+        expect(screen.queryByTestId("workflow-automations-section")).toBeNull();
       } else {
+        expect(screen.getByTestId("workflow-automations-section")).toHaveAttribute(
+          "data-workflow",
+          WORKFLOW.id,
+        );
         fireEvent.click(screen.getByTestId("workflow-detail-create-automation"));
         expect(screen.getByTestId("new-automation-dialog")).toHaveTextContent("Triage flaky tests");
       }
@@ -789,6 +859,7 @@ describe("WorkflowDetailPage", () => {
       });
       rerender(<WorkflowDetailPage />);
       expect(screen.queryByTestId("new-automation-dialog")).toBeNull();
+      expect(screen.queryByTestId("workflow-automations-section")).toBeNull();
 
       fireEvent.click(screen.getByRole("button", { name: "Delete workflow" }));
       expect(deleteWorkflow).not.toHaveBeenCalled();

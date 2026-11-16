@@ -6,7 +6,8 @@ its retries reuse, and once the server accepts it the runner publishes
 ``session.journal.appended`` on the session stream, the way it reports
 child-session updates. Reads come back as compact lines the model can scan.
 ``sys_workflow_request_input`` has the server mark a task waiting and raise its
-questions, then waits for the answer like any other elicitation.
+questions, then waits a few minutes for the answer like any other elicitation;
+an answer that comes later reaches the session as a message.
 ``sys_workflow_save``, ``sys_workflow_load`` and ``sys_workflow_list`` call
 ``/v1/workflows`` as the session's owner, naming the session so the server can
 refuse a shared one's save.
@@ -17,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import difflib
 import hashlib
 import itertools
@@ -51,6 +53,7 @@ from omnigent.entities.workflow_questions import (
 )
 from omnigent.runner import pending_approvals
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+from omnigent.runner.subagent_work import _deliver_subagent_wake_post
 from omnigent.tools.builtins.journal import (
     JOURNAL_READ_PAGE_MAX,
     JOURNAL_TOOLS,
@@ -283,6 +286,48 @@ async def _write(
 
 # ── Asking the user ───────────────────────────────────
 
+# How long a question holds its tool call. Stays under the native tool relay's
+# 300s budget and a hosted front door's 300s request cap.
+_ANSWER_WAIT_IN_TURN_S = 240.0
+_STILL_OPEN_DETAIL = (
+    "No answer yet. The question stays in the user's Inbox. Finish work that doesn't depend "
+    "on it, then end your turn; their answer will arrive as a new message."
+)
+# Once a late answer's message fails every attempt, the next tries wait for the
+# server's reconnect or these delays, whichever comes first.
+_ANSWER_REDELIVERY_DELAYS_S = (30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0)
+
+
+@dataclass(frozen=True)
+class _OpenQuestion:
+    """A question whose tool call returned unanswered."""
+
+    session_id: str
+    answer: asyncio.Task[pending_approvals.Verdict]
+    # Sends the answer, or the dismissal, to the session as a message.
+    delivery: asyncio.Task[None]
+
+
+# By elicitation ID.
+_answers_by_message: dict[str, _OpenQuestion] = {}
+
+
+def answer_arrives_as_message(elicitation_id: str) -> bool:
+    """Whether a workflow question outlived its tool call, so its answer becomes a message."""
+    return elicitation_id in _answers_by_message
+
+
+async def cancel_session_questions(session_id: str) -> None:
+    """Withdraw a deleted session's open questions and any answer on its way to the session."""
+    owned = [key for key, item in _answers_by_message.items() if item.session_id == session_id]
+    tasks: list[asyncio.Task[Any]] = []
+    for elicitation_id in owned:
+        question = _answers_by_message.pop(elicitation_id)
+        tasks += [question.answer, question.delivery]
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
 
 class _InputRequestFailed(Exception):
     def __init__(self, result: str) -> None:
@@ -309,7 +354,11 @@ async def _request_input(
     call_id: str | None,
     publish_event: _Publisher | None,
 ) -> str:
-    """Mark a task waiting, raise its questions, and wait for the user's answers."""
+    """Mark a task waiting, raise its questions, and wait a while for the user's answers.
+
+    A question still open when the wait ends stays in the Inbox, and its answer
+    reaches the session later as a message.
+    """
     tool_name = "sys_workflow_request_input"
     try:
         step = normalize_step_id(args.get("step"))
@@ -319,6 +368,7 @@ async def _request_input(
     body = {"step": step, "questions": questions, "idempotency_key": _idempotency_key(call_id)}
     url = f"{_journal_url(conversation_id)}/input-requests"
     elicitation_id = workflow_elicitation_id(conversation_id, body["idempotency_key"])
+    asked = asyncio.Event()
 
     async def publish_question() -> None:
         response = await _post_with_retries(server_client, url, body, conversation_id)
@@ -334,30 +384,66 @@ async def _request_input(
         if requested["elicitation_id"] != elicitation_id:
             raise _InputRequestFailed(_error(f"{tool_name}: unexpected question ID from server"))
         _publish(publish_event, conversation_id, requested["entry"])
+        asked.set()
 
-    while True:
-        try:
-            verdict = await pending_approvals.wait_for_user_verdict(
-                elicitation_id=elicitation_id,
-                conversation_id=conversation_id,
-                publish_event=_stream_publisher(publish_event),
-                retry_on_server_reconnect=True,
-                keep_pending_on_reconnect=True,
-                on_registered=publish_question,
+    async def wait_for_answer() -> pending_approvals.Verdict:
+        while True:
+            try:
+                return await pending_approvals.wait_for_user_verdict(
+                    elicitation_id=elicitation_id,
+                    conversation_id=conversation_id,
+                    publish_event=_stream_publisher(publish_event),
+                    retry_on_server_reconnect=True,
+                    keep_pending_on_reconnect=True,
+                    on_registered=publish_question,
+                )
+            except pending_approvals.ServerReconnected:
+                # The server may have lost the question; the same key raises it again.
+                continue
+
+    answer = asyncio.create_task(wait_for_answer(), name=f"workflow-question:{elicitation_id}")
+
+    def stop_waiting() -> bool:
+        """Leave an asked question open for a later answer; withdraw one never asked."""
+        if not asked.is_set():
+            answer.cancel()
+            return False
+        _deliver_answer_as_message(
+            answer,
+            server_client=server_client,
+            conversation_id=conversation_id,
+            step=step,
+            questions=questions,
+            elicitation_id=elicitation_id,
+        )
+        # No turn waits on it now, so the session's messages flow as usual.
+        pending_approvals.detach(elicitation_id, conversation_id)
+        return True
+
+    try:
+        done, _ = await asyncio.wait({answer}, timeout=_ANSWER_WAIT_IN_TURN_S)
+    except asyncio.CancelledError:
+        # A stopped turn keeps an asked question open; answering it resumes the session.
+        stop_waiting()
+        raise
+    if not done:
+        if stop_waiting():
+            return json.dumps(
+                {"answered": False, "still_open": True, "detail": _STILL_OPEN_DETAIL}
             )
-        except _InputRequestFailed as exc:
-            return exc.result
-        except pending_approvals.ServerReconnected:
-            # The server may have lost the question; the same key raises it again.
-            continue
-        break
+        await asyncio.gather(answer, return_exceptions=True)
+        return _error(f"{tool_name} failed: the server didn't take the question in time")
+    try:
+        verdict = answer.result()
+    except _InputRequestFailed as exc:
+        return exc.result
     if not verdict.approved:
         return json.dumps(
             {
                 "answered": False,
                 "detail": (
-                    "No answer: the user dismissed the question, or it timed out. The "
-                    "task stays waiting for them; don't ask again this turn."
+                    "No answer: the user dismissed the question. The task stays waiting "
+                    "for them; don't ask again this turn."
                 ),
             }
         )
@@ -365,6 +451,75 @@ async def _request_input(
         {"answered": True, "answers": answers_from_content(questions, verdict.content)},
         ensure_ascii=False,
     )
+
+
+def _deliver_answer_as_message(
+    answer: asyncio.Task[pending_approvals.Verdict],
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    step: str,
+    questions: list[dict[str, Any]],
+    elicitation_id: str,
+) -> None:
+    """Once a still-open question is answered or dismissed, tell its session in a message."""
+
+    async def deliver() -> None:
+        try:
+            try:
+                verdict = await answer
+            except Exception:
+                _logger.warning(
+                    "workflow question %s closed without an answer",
+                    elicitation_id,
+                    exc_info=True,
+                    extra={"session_id": conversation_id},
+                )
+                return
+            if verdict.timed_out:
+                return
+            notice = _answer_notice(step, questions, verdict)
+            for delay_s in _ANSWER_REDELIVERY_DELAYS_S:
+                generation = pending_approvals.current_server_generation()
+                if await _deliver_subagent_wake_post(server_client, conversation_id, notice):
+                    return
+                with contextlib.suppress(TimeoutError):
+                    await pending_approvals.wait_for_server_reconnect(
+                        generation, timeout_seconds=delay_s
+                    )
+            if not await _deliver_subagent_wake_post(server_client, conversation_id, notice):
+                _logger.warning(
+                    "could not deliver the answer to workflow question %s",
+                    elicitation_id,
+                    extra={"session_id": conversation_id},
+                )
+        finally:
+            # Registered until delivered, so deleting the session can still cancel it.
+            entry = _answers_by_message.get(elicitation_id)
+            if entry is not None and entry.delivery is asyncio.current_task():
+                del _answers_by_message[elicitation_id]
+
+    delivery = asyncio.create_task(deliver(), name=f"workflow-answer:{elicitation_id}")
+    _answers_by_message[elicitation_id] = _OpenQuestion(conversation_id, answer, delivery)
+
+
+def _answer_notice(
+    step: str, questions: list[dict[str, Any]], verdict: pending_approvals.Verdict
+) -> str:
+    """The message that brings a question's late answer, or its dismissal, to the agent."""
+    if not verdict.approved:
+        return (
+            f'[System: the user dismissed your question on task "{step}"]\n'
+            "The task stays waiting for them; don't ask again unless they bring it up."
+        )
+    lines = [f'[System: the user answered your question on task "{step}"]']
+    for item in answers_from_content(questions, verdict.content):
+        lines += [f"Q: {item['question']}", f"A: {item['answer'] or '(no answer)'}"]
+    lines.append(
+        "Write the task's next status: started to resume it, done for an approval given, "
+        "failed for one refused. Then go on with the plan."
+    )
+    return "\n".join(lines)
 
 
 # ── Reads ─────────────────────────────────────────────

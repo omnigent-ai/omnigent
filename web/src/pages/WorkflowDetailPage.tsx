@@ -19,6 +19,7 @@ import {
 import { PageScroll } from "@/components/PageScroll";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { DeleteWorkflowDialog } from "@/components/workflows/DeleteWorkflowDialog";
+import { WorkflowAutomations } from "@/components/workflows/WorkflowAutomations";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { showToast } from "@/components/ui/toast";
@@ -85,6 +86,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const [sessionOpen, setSessionOpen] = useState(false);
   const [automationOpen, setAutomationOpen] = useState(false);
   const [plannerOpen, setPlannerOpen] = useState<boolean | null>(null);
+  const [plannerExpanded, setPlannerExpanded] = useState(false);
   const showPlanner = plannerOpen ?? workflow?.is_draft ?? false;
   const isMobile = useIsMobileViewport();
   const { session: planningSession, error: planningSessionError } = useSession(
@@ -152,10 +154,23 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
     !!proposedSteps?.length && stepSignature(proposedSteps) !== stepSignature(workflow.steps);
   const isDraft = workflow.is_draft ?? workflow.steps.length === 0;
   const canRun = !isDraft && !hasChanges;
+  // Expanded, the planner covers the page, which keeps its width underneath so
+  // it doesn't reflow; `invisible` keeps its scroll position and tab order out.
+  const plannerFillsPage = showPlanner && !isMobile && plannerExpanded;
+  // Every close path resets expansion, including the phone sheet after the window
+  // narrows, so the planner reopens beside the page.
+  const closePlanner = () => {
+    setPlannerOpen(false);
+    setPlannerExpanded(false);
+  };
 
   return (
     <div className="relative flex h-full min-h-0 flex-1 overflow-hidden">
-      <PageScroll className="min-w-0" contentClassName="px-6" data-testid="workflow-detail-page">
+      <PageScroll
+        className={cn("min-w-0", plannerFillsPage && "invisible")}
+        contentClassName="px-6"
+        data-testid="workflow-detail-page"
+      >
         <BackLink />
 
         <div className="mt-4 flex flex-wrap items-start justify-between gap-4">
@@ -275,6 +290,10 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
           )}
         </section>
 
+        {automationsEnabled && !isDraft && (
+          <WorkflowAutomations workflowId={workflowId} now={now} />
+        )}
+
         {!isDraft && (
           <>
             <hr className="my-6 border-border" />
@@ -348,7 +367,12 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
       </PageScroll>
       {showPlanner &&
         (isMobile ? (
-          <Dialog open onOpenChange={setPlannerOpen}>
+          <Dialog
+            open
+            onOpenChange={(open) => {
+              if (!open) closePlanner();
+            }}
+          >
             <DialogContent
               showCloseButton={false}
               aria-describedby={undefined}
@@ -357,15 +381,26 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
               <DialogTitle className="sr-only">
                 {workflow.steps.length > 0 ? "Edit plan" : "Create plan"}
               </DialogTitle>
-              <WorkflowPlanningChat workflow={workflow} onClose={() => setPlannerOpen(false)} />
+              <WorkflowPlanningChat workflow={workflow} onClose={closePlanner} />
             </DialogContent>
           </Dialog>
         ) : (
-          <aside
-            aria-label="Workflow planning chat"
-            className="w-[42%] min-w-96 max-w-xl shrink-0 border-l border-border bg-background pt-[calc(var(--omnigent-header-height)+var(--omnigent-inset-top))] pb-[var(--omnigent-inset-bottom)]"
-          >
-            <WorkflowPlanningChat workflow={workflow} onClose={() => setPlannerOpen(false)} />
+          // The aside keeps its width in the row while its panel covers the page.
+          <aside aria-label="Workflow planning chat" className="w-[42%] min-w-96 max-w-xl shrink-0">
+            <div
+              data-testid="workflow-planner-panel"
+              className={cn(
+                "bg-background pt-[calc(var(--omnigent-header-height)+var(--omnigent-inset-top))] pb-[var(--omnigent-inset-bottom)]",
+                plannerFillsPage ? "absolute inset-0" : "h-full border-l border-border",
+              )}
+            >
+              <WorkflowPlanningChat
+                workflow={workflow}
+                expanded={plannerFillsPage}
+                onExpandedChange={setPlannerExpanded}
+                onClose={closePlanner}
+              />
+            </div>
           </aside>
         ))}
     </div>

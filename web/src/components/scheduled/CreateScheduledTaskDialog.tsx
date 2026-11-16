@@ -75,6 +75,7 @@ import {
   hasTriggerHeader,
   isTriggerPrompt,
   readTriggerWorkerPlacement,
+  readTriggerMessageMaxChars,
   readTriggerWorkerSettings,
   renderTriggerConfigPrompt,
   splitTriggerPrompt,
@@ -82,6 +83,7 @@ import {
   stripTriggerHeader,
   TRIGGER_TEMPLATES,
   triggerFieldsComplete,
+  triggerMessageBudget,
   triggerPromptSource,
   triggerMcpService,
   triggerServiceName,
@@ -1031,6 +1033,20 @@ export function CreateScheduledTaskDialog({
   // first ONLINE host so unconfigured agents show "needs setup" right away.
   const badgeHost =
     selectedHost ?? hostOptions.find((h) => h.status === "online") ?? hostOptions[0];
+  // Trigger messages fit what both the server and the pinned polling host deliver.
+  const savedMessageMaxChars =
+    editingTemplateTrigger && originalTargetSelected
+      ? readTriggerMessageMaxChars(editingTask.prompt)
+      : null;
+  const loadedMessageBudget = triggerMessageBudget(
+    // Until server info loads, a saved trigger keeps its limit; Save waits for it.
+    curationPending ? (savedMessageMaxChars ?? undefined) : info.session_message_max_chars,
+    sandboxMode ? "managed_sandbox" : selectedHost,
+    savedMessageMaxChars,
+  );
+  const messageBudget = curationPending
+    ? { ...loadedMessageBudget, upgradeHint: null }
+    : loadedMessageBudget;
 
   // A workspace is only valid with a host — mirror the server's pairing rule so
   // the user gets inline feedback instead of a 400. In sandbox mode there is no
@@ -1085,11 +1101,13 @@ export function CreateScheduledTaskDialog({
     pollingIntervalMinutes:
       schedule.preset === "custom" && schedule.customFreq === "minutely" ? schedule.interval : 60,
     taskSessionTitle: name,
+    messageMaxChars: messageBudget.messageMaxChars,
   };
   // An edit keeps the saved workers; a new trigger's workers run where the manager
   // runs (beside it on a connected host, or each in its own sandbox).
   const renderedTriggerConfig: TriggerConfig | null =
-    trigger !== null && triggerFieldsComplete(promptTriggerFields, trigger)
+    trigger !== null &&
+    triggerFieldsComplete(promptTriggerFields, trigger, messageBudget.instructionsMaxChars)
       ? {
           source: trigger,
           ...promptTriggerFields,
@@ -1905,6 +1923,8 @@ export function CreateScheduledTaskDialog({
                         workflowField={workflowField}
                         instructionsAreDetails={workflowChoice !== null}
                         mcpService={triggerMcpNote}
+                        instructionsMaxChars={messageBudget.instructionsMaxChars}
+                        instructionsUpgradeHint={messageBudget.upgradeHint}
                       />
                     ) : (
                       <div ref={promptFieldsRef} className="flex flex-col gap-1.5">
