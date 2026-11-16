@@ -582,7 +582,8 @@ jobs:
               stop = int(os.environ["POLLY_REVIEW_DEADLINE"])
               stop_clock = time.strftime("%H:%M", time.gmtime(stop))
               publish_clock = time.strftime("%H:%M", time.gmtime(stop - 7 * 60))
-              timer_seconds = max(stop - 7 * 60 - int(time.time()), 0)
+              # Polly sets the timer after startup, about 20 seconds after this.
+              timer_seconds = max(stop - 7 * 60 - 30 - int(time.time()), 0)
               time_budget_rule = f"""
           **Time budget** — this run is stopped at {stop_clock} UTC, and a review
           that isn't finished by then is never posted. Before you dispatch anything,
