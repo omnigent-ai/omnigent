@@ -470,23 +470,38 @@ describe("WorkflowDetailPage", () => {
 
   it("finishes a run when its final step is done despite earlier statuses and session activity", () => {
     mockWorkflow({});
-    mockRuns([
-      {
-        ...run("a".repeat(32), "Finished run", { done: 1, needsInput: 1 }, [
-          status("explore", "needs_input"),
-          status("fix", "done"),
-        ]),
-        sessionStatus: "running",
-        backgroundWorkRunning: true,
-      },
-    ]);
-    renderPage();
+    const completedRun: WorkflowRun = {
+      ...run("a".repeat(32), "Finished run", { done: 1, needsInput: 1 }, [
+        status("explore", "needs_input"),
+        status("fix", "done"),
+      ]),
+      sessionStatus: "running",
+      backgroundWorkRunning: true,
+    };
+    mockRuns([completedRun]);
+    const { rerender } = renderPage();
     const row = screen.getByTestId("workflow-run");
     expect(row).toHaveAttribute("data-run-state", "done");
     expect(within(row).getByTestId("workflow-run-state")).toHaveTextContent("Done");
     expect(within(row).queryByTestId("plan-continue")).toBeNull();
     expect(within(row).queryByTestId("plan-stop")).toBeNull();
     expect(screen.getByTestId("workflow-detail-run")).toBeEnabled();
+
+    // A replan keeps the run's ID and can add work after its original last step.
+    mockRuns([
+      {
+        ...completedRun,
+        steps: [
+          ...completedRun.steps,
+          { id: "publish", name: "Publish", goal: null, depends_on: ["fix"] },
+        ],
+        progress: { total: 3, started: 1, done: 2, needsInput: 0, failed: 0 },
+        statuses: [status("explore", "done"), status("fix", "done"), status("publish", "started")],
+      },
+    ]);
+    rerender(<WorkflowDetailPage />);
+    expect(row).toHaveAttribute("data-run-state", "running");
+    expect(within(row).getByRole("button", { name: "Stop" })).toBeInTheDocument();
   });
 
   it.each([

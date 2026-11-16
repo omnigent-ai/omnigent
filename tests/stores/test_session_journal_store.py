@@ -765,6 +765,7 @@ def test_plan_step_statuses_reads_each_steps_newest_status(
             SESSION, "status", {"status": status, "text": "x"}, idempotency_key=key, step=step
         )
     other = journal.append(OTHER, "plan", _plan("a"), idempotency_key="k4").entry
+    assert journal.run_latest_plans([plan, other]) == [plan, other]
 
     statuses = journal.plan_step_statuses([plan, other])
     assert [{step: e.content["status"] for step, e in s.items()} for s in statuses] == [
@@ -780,6 +781,11 @@ def test_plan_step_statuses_reads_each_steps_newest_status(
         idempotency_key="k5",
         workflow_id=next_workflow,
     ).entry
+    assert journal.run_latest_plans([plan, other, later]) == [
+        later if next_workflow is None else plan,
+        other,
+        later,
+    ]
     assert journal.plan_step_statuses([later]) == (
         [statuses[0]] if next_workflow is None else [{}]
     )
@@ -831,7 +837,9 @@ def test_an_automation_runs_start_plan_is_its_first(
         step="a",
         scheduled_task_run_id=RUN,
     )
-    journal.append(SESSION, "plan", content, idempotency_key="k2", scheduled_task_run_id=RUN)
+    replan = journal.append(
+        SESSION, "plan", content, idempotency_key="k2", scheduled_task_run_id=RUN
+    ).entry
     journal.append(
         SESSION,
         "status",
@@ -844,6 +852,7 @@ def test_an_automation_runs_start_plan_is_its_first(
 
     plans = journal.run_start_plans([(RUN, SESSION), (other_run, SESSION), (RUN, OTHER)])
     assert [plan.id if plan else None for plan in plans] == [first.id, None, None]
+    assert journal.run_latest_plans([first]) == [replan]
     assert journal.is_current_run(SESSION, first.id, RUN)
     assert not journal.is_current_run(OTHER, first.id, RUN)
     assert not journal.is_current_run(SESSION, MISSING, RUN)
@@ -884,6 +893,7 @@ def test_an_automation_runs_start_plan_is_its_first(
     second = journal.run_start_plans([(other_run, SESSION)])[0]
     assert second is not None
     assert second.content["steps"] == first.content["steps"]
+    assert journal.run_latest_plans([first, second]) == [replan, second]
     assert not journal.is_current_run(SESSION, first.id, RUN)
     assert journal.is_current_run(SESSION, second.id, other_run)
     with pytest.raises(StepNotReadyError, match="b waits on a"):

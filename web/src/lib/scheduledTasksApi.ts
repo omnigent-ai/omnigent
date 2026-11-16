@@ -386,7 +386,7 @@ export async function listScheduledTaskRuns(id: string): Promise<ScheduledTaskRu
   return (body.runs ?? []).map(runFromWire);
 }
 
-/** The plan a run started with: its steps and each step's newest status. */
+/** The latest plan within a run: its steps and each step's newest status. */
 export interface ScheduledTaskRunSteps {
   runId: string;
   planId: string | null;

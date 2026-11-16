@@ -24,7 +24,7 @@ from collections.abc import Mapping, Sequence
 from itertools import batched
 from typing import Any, TypeVar
 
-from sqlalchemy import Select, delete, select, tuple_, update
+from sqlalchemy import Select, delete, func, select, tuple_, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -656,6 +656,51 @@ class SessionJournalStore:
         with self._session("read_current_plan") as session:
             row = self._newest_kind_row(session, conversation_id, _PLAN_KIND)
         return None if row is None else self._entries([row])[0]
+
+    def run_latest_plans(self, plans: Sequence[JournalEntry]) -> list[JournalEntry]:
+        """Each run's latest plan before the next invocation, in input order.
+
+        One indexed lookup per run keeps replans while isolating later runs.
+        The starting entries still identify the runs and guard their actions.
+        """
+        entries = SqlSessionJournalEntry
+        rows: list[SqlSessionJournalEntry | None] = []
+        with self._session("read_run_latest_plans") as session:
+            for plan in plans:
+                next_boundary = (
+                    _using(
+                        select(func.min(entries.position)).where(
+                            entries.workspace_id == current_workspace_id(),
+                            entries.conversation_id == plan.conversation_id,
+                            entries.kind == _PLAN_STATUS_KIND,
+                            entries.position > plan.position,
+                        ),
+                        "ix_session_journal_entries_kind",
+                    )
+                    .correlate(None)
+                    .scalar_subquery()
+                )
+                row = session.execute(
+                    _using(
+                        select(entries)
+                        .prefix_with("/*+ MAX_EXECUTION_TIME(1000) */", dialect="mysql")
+                        .where(
+                            entries.workspace_id == current_workspace_id(),
+                            entries.conversation_id == plan.conversation_id,
+                            entries.kind == _PLAN_KIND,
+                            entries.position >= plan.position,
+                            entries.position < func.coalesce(next_boundary, JOURNAL_MAX_ENTRIES),
+                        )
+                        .order_by(entries.position.desc())
+                        .limit(1),
+                        "ix_session_journal_entries_kind",
+                    )
+                ).scalar_one_or_none()
+                rows.append(row)
+            found = iter(self._entries([row for row in rows if row is not None]))
+        return [
+            plan if row is None else next(found) for plan, row in zip(plans, rows, strict=True)
+        ]
 
     def current_run_plan_ids(self, plans: Sequence[JournalEntry]) -> set[str]:
         """Which plans belong to their session's latest run, including its replans.

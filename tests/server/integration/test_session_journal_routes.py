@@ -1325,14 +1325,39 @@ async def test_a_workflows_runs_list_the_sessions_that_ran_it(
     assert bad.status_code == 400
 
     journal = SessionJournalStore(db_uri)
-    # Editing the current plan retains its run; another workflow supersedes it.
-    journal.append(first, "plan", plan, idempotency_key="replan")
+    # A replan can add work after the original final step is done.
+    journal.append(
+        first, "status", {"status": "done", "text": "Fixed"}, idempotency_key="fixed", step="fix"
+    )
+    expanded_steps = [*steps, {"id": "publish", "name": "Publish", "depends_on": ["fix"]}]
+    journal.append(first, "plan", {**plan, "steps": expanded_steps}, idempotency_key="replan")
+    journal.append(
+        first, "status", {"status": "started"}, idempotency_key="publishing", step="publish"
+    )
     page = (await client.get(url, headers=_headers(ALICE))).json()
-    assert next(run for run in page["data"] if run["id"] == first_plan.id)["is_current"]
+    original = next(run for run in page["data"] if run["id"] == first_plan.id)
+    assert original["is_current"]
+    assert [step["id"] for step in original["steps"]] == ["explore", "fix", "publish"]
+    assert original["progress"] == {
+        "total": 3,
+        "started": 1,
+        "done": 2,
+        "needs_input": 0,
+        "failed": 0,
+    }
+    assert [(s["step"], s["content"]["status"]) for s in original["statuses"]] == [
+        ("explore", "done"),
+        ("fix", "done"),
+        ("publish", "started"),
+    ]
     journal.append(first, "plan", plan, idempotency_key="another-run", workflow_id=workflow_id)
     page = (await client.get(url, headers=_headers(ALICE))).json()
     first_runs = [run for run in page["data"] if run["session_id"] == first]
     assert [run["is_current"] for run in first_runs] == [True, False]
+    assert [step["id"] for step in first_runs[0]["steps"]] == ["explore", "fix"]
+    assert first_runs[0]["statuses"] == []
+    assert first_runs[1]["steps"] == original["steps"]
+    assert first_runs[1]["statuses"] == original["statuses"]
     journal.append(
         first, "plan", plan, idempotency_key="another-workflow", workflow_id=uuid.uuid4().hex
     )
@@ -1346,7 +1371,7 @@ async def test_a_workflows_runs_list_the_sessions_that_ran_it(
 
 
 @pytest.mark.parametrize("supersede_at", ["before_dispatch", "runner_lookup", "sdk_routing"])
-async def test_an_automations_runs_list_the_steps_of_their_first_plans(
+async def test_an_automations_runs_list_the_steps_of_their_latest_plans(
     client: httpx.AsyncClient,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -1426,10 +1451,24 @@ async def test_an_automations_runs_list_the_steps_of_their_first_plans(
         == run_ids[0]
     )
 
-    replan = _write("plan", {"name": "Triage", "steps": steps}, "tool:replan")
-    assert (await client.post(url, json=replan, headers=_runner(planned))).status_code == 200
+    expanded_steps = [*steps, {"id": "publish", "name": "Publish", "depends_on": ["fix"]}]
+    for body in (
+        _write("status", {"status": "done", "text": "Fixed"}, "tool:fixed", step="fix"),
+        _write("plan", {"name": "Triage", "steps": expanded_steps}, "tool:replan"),
+        _write("status", {"status": "started"}, "tool:publishing", step="publish"),
+    ):
+        response = await client.post(url, json=body, headers=_runner(planned))
+        assert response.status_code == 200, response.text
     runs_url = f"/v1/scheduled-tasks/{task.id}/run-steps"
-    assert (await client.get(runs_url, headers=_headers(ALICE))).json()["runs"][0]["is_current"]
+    shown = (await client.get(runs_url, headers=_headers(ALICE))).json()["runs"][0]
+    assert shown["is_current"]
+    assert shown["plan_id"] == plan_id
+    assert [step["id"] for step in shown["steps"]] == ["explore", "fix", "publish"]
+    assert [(s["step"], s["content"]["status"]) for s in shown["statuses"]] == [
+        ("explore", "done"),
+        ("fix", "done"),
+        ("publish", "started"),
+    ]
     current = await client.post(events_url, json=action, headers=_headers(ALICE))
     assert current.status_code == 202, current.text
 
@@ -1498,6 +1537,6 @@ async def test_an_automations_runs_list_the_steps_of_their_first_plans(
     assert [(s["step"], s["content"]["status"]) for s in runs[0]["statuses"]] == [
         ("explore", "started")
     ]
-    assert [(s["step"], s["content"]["status"]) for s in runs[1]["statuses"]] == [
-        ("explore", "done")
-    ]
+    assert runs[1]["plan_id"] == plan_id
+    assert runs[1]["steps"] == shown["steps"]
+    assert runs[1]["statuses"] == shown["statuses"]

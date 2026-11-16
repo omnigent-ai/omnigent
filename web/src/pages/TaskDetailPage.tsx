@@ -701,7 +701,7 @@ function RunRow({
   run: ScheduledTaskRun;
   now: Date;
   highlighted: boolean;
-  /** The plan the run started with, independent of the automation's current prompt. */
+  /** The run's latest plan, independent of the automation's current prompt. */
   steps?: ScheduledTaskRunSteps;
 }) {
   const timestamp = formatRunTimestamp(run.firedAt ?? run.scheduledAt, now);

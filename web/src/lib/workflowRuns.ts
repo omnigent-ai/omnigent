@@ -21,7 +21,7 @@ export interface WorkflowRun {
   /** Work that outlives the parent turn, such as background shells or an active goal. */
   backgroundWorkRunning?: boolean;
   archived: boolean;
-  /** The run's starting steps, counted by their current status. */
+  /** The run's latest steps, counted by their current status. */
   progress: {
     total: number;
     started: number;
@@ -29,7 +29,7 @@ export interface WorkflowRun {
     needsInput: number;
     failed: number;
   };
-  /** The steps of the plan that started the run. */
+  /** The latest plan's steps within this invocation. */
   steps: JournalPlanStep[];
   /** Each of those steps' newest status entry. */
   statuses: JournalEntry[];
